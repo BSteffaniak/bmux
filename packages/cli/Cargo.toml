@@ -125,7 +125,7 @@ futures-util = { workspace = true }
 git_sshripped_recipient = { workspace = true }
 git_sshripped_ssh_agent = { workspace = true }
 git_sshripped_ssh_identity = { workspace = true }
-iroh = { workspace = true }
+iroh = { workspace = true, optional = true }
 moosicbox_log_runtime = { workspace = true, features = ["file"] }
 moosicbox_log_watch = { workspace = true, features = [
     "tui",
@@ -157,7 +157,7 @@ tokio = { workspace = true, features = [
 tokio-rustls = { workspace = true }
 toml = { workspace = true }
 toml_edit = { workspace = true }
-tracing = { workspace = true, features = ["std"] }
+tracing = { workspace = true, features = ["attributes", "std"] }
 tracing-appender = { workspace = true }
 tracing-log = { workspace = true, features = ["log-tracer", "std"] }
 tracing-subscriber = { workspace = true, features = [
@@ -324,11 +324,12 @@ bundled-plugin-cli = ["dep:bmux_plugin_cli_plugin"]
 bundled-plugin-clients = ["dep:bmux_clients_plugin"]
 bundled-plugin-clipboard = ["dep:bmux_clipboard_plugin"]
 bundled-plugin-cluster = [
+    "remote-iroh",
     "dep:bmux_cluster_plugin",
     "dep:bmux_cluster_plugin_client",
 ]
 bundled-plugin-command-palette = ["dep:bmux_command_palette_plugin"]
-bundled-plugin-connections = ["dep:bmux_connections_plugin"]
+bundled-plugin-connections = ["remote-iroh", "dep:bmux_connections_plugin"]
 bundled-plugin-contexts = ["dep:bmux_contexts_plugin"]
 bundled-plugin-control-catalog = ["dep:bmux_control_catalog_plugin"]
 bundled-plugin-decoration = [
@@ -351,6 +352,7 @@ bundled-plugin-theme = ["dep:bmux_theme_plugin"]
 bundled-plugin-windows = ["dep:bmux_tabs_plugin"]
 bundled-plugin-workspaces = ["dep:bmux_workspaces_plugin"]
 bundled-visual-adapters = ["dep:bmux_visual_adapters_plugin_renderer"]
+remote-iroh = ["dep:iroh"]
 
 # Optional features
 bundled-fonts = ["bmux_recording_plugin?/bundled-fonts"]

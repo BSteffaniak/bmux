@@ -1,19 +1,21 @@
-use crate::ssh_access::{
-    IrohTargetCompression, authenticate_client_connection,
-    parse_iroh_target as parse_iroh_target_parts,
-};
+#[cfg(feature = "remote-iroh")]
+use crate::ssh_access::authenticate_client_connection;
+use crate::ssh_access::{IrohTargetCompression, parse_iroh_target as parse_iroh_target_parts};
 use anyhow::{Context, Result};
 use bmux_client::{AttachEndpointConnectFuture, AttachEndpointConnector, BmuxClient, ClientError};
 use bmux_config::{
     BmuxConfig, ConfigPaths, ConnectionTargetConfig, ConnectionTransport, StaleBuildAction,
 };
 use bmux_ipc::IncompatibilityReason;
+#[cfg(feature = "remote-iroh")]
 use bmux_ipc::compressed_stream::CompressedStream;
 use bmux_ipc::transport::ErasedIpcStream;
+#[cfg(feature = "remote-iroh")]
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
 use std::sync::Arc;
+#[cfg(feature = "remote-iroh")]
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -160,6 +162,7 @@ struct IrohTarget {
     connect_timeout_ms: u64,
 }
 
+#[cfg(feature = "remote-iroh")]
 const BMUX_IROH_ALPN: &[u8] = b"bmux/gateway/iroh/1";
 
 /// A stop operation resolves its target once, so retries cannot switch to a
@@ -227,6 +230,12 @@ async fn connect_tls_target(target: &TlsTarget, client_name: &'static str) -> Re
     .map_err(map_client_connect_error)
 }
 
+#[cfg(not(feature = "remote-iroh"))]
+async fn connect_iroh_target(_: &IrohTarget, _: &'static str) -> Result<BmuxClient> {
+    Err(crate::ssh_access::iroh_unavailable())
+}
+
+#[cfg(feature = "remote-iroh")]
 async fn connect_iroh_target(target: &IrohTarget, client_name: &'static str) -> Result<BmuxClient> {
     let endpoint = Endpoint::builder(presets::N0)
         .alpns(vec![BMUX_IROH_ALPN.to_vec()])
@@ -474,6 +483,7 @@ fn resolve_named_target(name: &str, target: &ConnectionTargetConfig) -> Result<A
     }
 }
 
+#[cfg(feature = "remote-iroh")]
 fn iroh_target_uses_compression(target: &IrohTarget) -> bool {
     match target.transport_compression {
         IrohTargetCompression::Zstd => true,

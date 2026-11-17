@@ -1,7 +1,8 @@
+use crate::ssh_access::{IrohTargetCompression, parse_iroh_target as parse_iroh_target_parts};
+#[cfg(feature = "remote-iroh")]
 use crate::ssh_access::{
-    IrohTargetCompression, authenticate_client_connection, authenticate_host_connection,
-    ensure_iroh_ssh_access_ready, iroh_ssh_access_enabled, iroh_target_compression_from_config,
-    iroh_target_url, parse_iroh_target as parse_iroh_target_parts,
+    authenticate_client_connection, authenticate_host_connection, ensure_iroh_ssh_access_ready,
+    iroh_ssh_access_enabled, iroh_target_compression_from_config, iroh_target_url,
 };
 use anyhow::{Context, Result};
 use bmux_cli_schema::{Cli, Command, ServerAutostartCommand, ServerCommand, SessionCommand};
@@ -41,6 +42,7 @@ use bmux_cli_schema::HostedModeArg;
 use bmux_config::{ConnectionTargetConfig, ConnectionTransport, HostedMode, RemoteServerStartMode};
 use bmux_ipc::IpcEndpoint;
 use bmux_ipc::transport::{ErasedIpcStream, LocalIpcStream};
+#[cfg(feature = "remote-iroh")]
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
 use qrcode::QrCode;
 use qrcode::render::unicode;
@@ -53,7 +55,9 @@ use std::ffi::OsString;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+#[cfg(feature = "remote-iroh")]
+use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command as TokioProcessCommand};
 use tokio::time::sleep;
@@ -708,6 +712,9 @@ async fn run_connect_with(
             }
             Ok(status)
         }
+        #[cfg(not(feature = "remote-iroh"))]
+        ResolvedTarget::Iroh(_) => return Err(crate::ssh_access::iroh_unavailable()),
+        #[cfg(feature = "remote-iroh")]
         ResolvedTarget::Iroh(iroh_target) => {
             let mut perf_emitter = perf_telemetry::PerfEventEmitter::new(
                 perf_telemetry::PerfCaptureSettings::from_config(config),
@@ -797,6 +804,9 @@ pub(super) async fn connect_attach_target_with_kernel(
             let kernel_factory = build_tls_kernel_client_factory(&tls_target);
             Ok((client, Some(kernel_factory)))
         }
+        #[cfg(not(feature = "remote-iroh"))]
+        ResolvedTarget::Iroh(_) => return Err(crate::ssh_access::iroh_unavailable()),
+        #[cfg(feature = "remote-iroh")]
         ResolvedTarget::Iroh(iroh_target) => {
             let (client, connection) = connect_iroh_bridge(&iroh_target, client_name, None).await?;
             let kernel_factory = build_iroh_kernel_client_factory(connection, &iroh_target);
@@ -1042,196 +1052,204 @@ pub(super) async fn run_host(
     if stop {
         return run_host_stop();
     }
-    super::server_commands::refuse_unadmitted_remote_ingress("legacy Iroh host")?;
-    let mut config = BmuxConfig::load()?;
-    ensure_iroh_ssh_access_ready(&config)?;
-    let require_ssh_auth = iroh_ssh_access_enabled(&config);
-    let ssh_allowlist = config.connections.iroh_ssh_access.allowlist.clone();
-    let hosted_mode = resolve_hosted_mode(&config, mode);
-    if restart {
-        let _ = run_host_stop()?;
-        return spawn_host_daemon(listen, name, hosted_mode);
+    #[cfg(not(feature = "remote-iroh"))]
+    {
+        let _ = (listen, name, copy, daemon, restart, mode, setup_summary);
+        Err(crate::ssh_access::iroh_unavailable())
     }
-    if daemon {
-        return spawn_host_daemon(listen, name, hosted_mode);
-    }
-
-    let control_plane_url = control_plane_url(&config);
-    let auth_state = if hosted_mode == HostedMode::ControlPlane {
-        Some(ensure_authenticated(&config).await?)
-    } else {
-        None
-    };
-    let bridge_paths = ConfigPaths::default();
-    ensure_local_ipc_backend_ready(&bridge_paths, hosted_mode).await?;
-
-    let endpoint = Endpoint::builder(presets::N0)
-        .alpns(vec![BMUX_IROH_ALPN.to_vec()])
-        .bind()
-        .await
-        .context("failed binding iroh endpoint")?;
-    endpoint.online().await;
-    let addr = endpoint.addr();
-    let endpoint_id = endpoint.id();
-    let relay = addr
-        .relay_urls()
-        .next()
-        .map(|value| normalize_relay_url_for_display(&value.to_string()));
-    let transport_compression = iroh_target_compression_from_config(&config);
-    let target = iroh_target_url(
-        &endpoint_id.to_string(),
-        relay.as_deref(),
-        require_ssh_auth,
-        transport_compression,
-    );
-
-    let resolved_share = if hosted_mode == HostedMode::ControlPlane {
-        let auth_state = auth_state
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("internal error: missing auth state"))?;
-        let share_name = suggest_share_name(name, auth_state);
-        let resolved_share = ensure_host_share_link(
-            &mut config,
-            &control_plane_url,
-            &auth_state.access_token,
-            &share_name,
-            &target,
-        )
-        .await?;
-        register_host_presence(
-            &control_plane_url,
-            &auth_state.access_token,
-            name.map(ToString::to_string)
-                .or_else(|| Some(resolved_share.clone())),
-            &target,
-        )
-        .await?;
-        Some(resolved_share)
-    } else {
-        None
-    };
-
-    let join_link = resolved_share
-        .as_ref()
-        .map_or_else(|| target.clone(), |value| format!("bmux://{value}"));
-
-    let host_name = name
-        .map(ToString::to_string)
-        .or_else(|| {
-            auth_state
-                .as_ref()
-                .and_then(|state| state.account_name.clone())
-        })
-        .unwrap_or_else(|| "host".to_string());
-    save_host_runtime_state(
-        &ConfigPaths::default(),
-        &HostRuntimeState {
-            pid: std::process::id(),
-            target: target.clone(),
-            share_link: resolved_share
-                .as_ref()
-                .map(|value| format!("bmux://{value}")),
-            name: Some(host_name.clone()),
-            started_at_unix: current_unix_timestamp(),
-        },
-    )?;
-
-    if copy {
-        match crate::runtime::attach::runtime::copy_text_with_clipboard_plugin(&join_link) {
-            Ok(()) => println!("Copied to clipboard: {join_link}"),
-            Err(error) => eprintln!(
-                "warning: clipboard copy failed: {}",
-                crate::runtime::attach::runtime::format_clipboard_service_error(&error)
-            ),
+    #[cfg(feature = "remote-iroh")]
+    {
+        super::server_commands::refuse_unadmitted_remote_ingress("legacy Iroh host")?;
+        let mut config = BmuxConfig::load()?;
+        ensure_iroh_ssh_access_ready(&config)?;
+        let require_ssh_auth = iroh_ssh_access_enabled(&config);
+        let ssh_allowlist = config.connections.iroh_ssh_access.allowlist.clone();
+        let hosted_mode = resolve_hosted_mode(&config, mode);
+        if restart {
+            let _ = run_host_stop()?;
+            return spawn_host_daemon(listen, name, hosted_mode);
         }
-    }
+        if daemon {
+            return spawn_host_daemon(listen, name, hosted_mode);
+        }
 
-    let summary_share_link = resolved_share
-        .as_ref()
-        .map(|value| format!("bmux://{value}"));
-    if setup_summary {
-        let account = auth_state
-            .as_ref()
-            .and_then(|state| state.account_name.as_deref());
-        for line in format_setup_summary_lines(
-            account,
-            &host_name,
-            summary_share_link.as_deref(),
-            &join_link,
-            hosted_mode == HostedMode::ControlPlane,
-        ) {
-            println!("{line}");
-        }
-    } else {
-        println!("bmux iroh gateway online");
-        println!("Host online: {host_name}");
-        if require_ssh_auth {
-            println!("SSH key auth: enabled");
-        }
-        if listen != "127.0.0.1:7443" {
-            println!("note: --listen is ignored for iroh host mode ({listen})");
-        }
-        println!("connect URL: {target}");
-        if let Some(share) = resolved_share.as_deref() {
-            println!("Share link: bmux://{share}");
-            println!("Join from another machine: bmux join bmux://{share}");
+        let control_plane_url = control_plane_url(&config);
+        let auth_state = if hosted_mode == HostedMode::ControlPlane {
+            Some(ensure_authenticated(&config).await?)
         } else {
-            println!("Join from another machine: bmux join {target}");
-        }
-    }
-
-    while let Some(incoming) = endpoint.accept().await {
-        let mut accepting = match incoming.accept() {
-            Ok(accepting) => accepting,
-            Err(error) => {
-                tracing::warn!(?error, "iroh incoming accept failed");
-                continue;
-            }
+            None
         };
-        let bridge_paths = bridge_paths.clone();
-        let ssh_allowlist = ssh_allowlist.clone();
-        tokio::spawn(async move {
-            let result: Result<()> = async {
-                let alpn = accepting.alpn().await.context("failed reading ALPN")?;
-                if alpn.as_slice() != BMUX_IROH_ALPN {
-                    anyhow::bail!("unexpected iroh ALPN");
-                }
-                let conn = accepting
-                    .await
-                    .context("failed accepting iroh connection")?;
+        let bridge_paths = ConfigPaths::default();
+        ensure_local_ipc_backend_ready(&bridge_paths, hosted_mode).await?;
 
-                if require_ssh_auth {
-                    authenticate_host_connection(&conn, &ssh_allowlist)
+        let endpoint = Endpoint::builder(presets::N0)
+            .alpns(vec![BMUX_IROH_ALPN.to_vec()])
+            .bind()
+            .await
+            .context("failed binding iroh endpoint")?;
+        endpoint.online().await;
+        let addr = endpoint.addr();
+        let endpoint_id = endpoint.id();
+        let relay = addr
+            .relay_urls()
+            .next()
+            .map(|value| normalize_relay_url_for_display(&value.to_string()));
+        let transport_compression = iroh_target_compression_from_config(&config);
+        let target = iroh_target_url(
+            &endpoint_id.to_string(),
+            relay.as_deref(),
+            require_ssh_auth,
+            transport_compression,
+        );
+
+        let resolved_share = if hosted_mode == HostedMode::ControlPlane {
+            let auth_state = auth_state
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("internal error: missing auth state"))?;
+            let share_name = suggest_share_name(name, auth_state);
+            let resolved_share = ensure_host_share_link(
+                &mut config,
+                &control_plane_url,
+                &auth_state.access_token,
+                &share_name,
+                &target,
+            )
+            .await?;
+            register_host_presence(
+                &control_plane_url,
+                &auth_state.access_token,
+                name.map(ToString::to_string)
+                    .or_else(|| Some(resolved_share.clone())),
+                &target,
+            )
+            .await?;
+            Some(resolved_share)
+        } else {
+            None
+        };
+
+        let join_link = resolved_share
+            .as_ref()
+            .map_or_else(|| target.clone(), |value| format!("bmux://{value}"));
+
+        let host_name = name
+            .map(ToString::to_string)
+            .or_else(|| {
+                auth_state
+                    .as_ref()
+                    .and_then(|state| state.account_name.clone())
+            })
+            .unwrap_or_else(|| "host".to_string());
+        save_host_runtime_state(
+            &ConfigPaths::default(),
+            &HostRuntimeState {
+                pid: std::process::id(),
+                target: target.clone(),
+                share_link: resolved_share
+                    .as_ref()
+                    .map(|value| format!("bmux://{value}")),
+                name: Some(host_name.clone()),
+                started_at_unix: current_unix_timestamp(),
+            },
+        )?;
+
+        if copy {
+            match crate::runtime::attach::runtime::copy_text_with_clipboard_plugin(&join_link) {
+                Ok(()) => println!("Copied to clipboard: {join_link}"),
+                Err(error) => eprintln!(
+                    "warning: clipboard copy failed: {}",
+                    crate::runtime::attach::runtime::format_clipboard_service_error(&error)
+                ),
+            }
+        }
+
+        let summary_share_link = resolved_share
+            .as_ref()
+            .map(|value| format!("bmux://{value}"));
+        if setup_summary {
+            let account = auth_state
+                .as_ref()
+                .and_then(|state| state.account_name.as_deref());
+            for line in format_setup_summary_lines(
+                account,
+                &host_name,
+                summary_share_link.as_deref(),
+                &join_link,
+                hosted_mode == HostedMode::ControlPlane,
+            ) {
+                println!("{line}");
+            }
+        } else {
+            println!("bmux iroh gateway online");
+            println!("Host online: {host_name}");
+            if require_ssh_auth {
+                println!("SSH key auth: enabled");
+            }
+            if listen != "127.0.0.1:7443" {
+                println!("note: --listen is ignored for iroh host mode ({listen})");
+            }
+            println!("connect URL: {target}");
+            if let Some(share) = resolved_share.as_deref() {
+                println!("Share link: bmux://{share}");
+                println!("Join from another machine: bmux join bmux://{share}");
+            } else {
+                println!("Join from another machine: bmux join {target}");
+            }
+        }
+
+        while let Some(incoming) = endpoint.accept().await {
+            let mut accepting = match incoming.accept() {
+                Ok(accepting) => accepting,
+                Err(error) => {
+                    tracing::warn!(?error, "iroh incoming accept failed");
+                    continue;
+                }
+            };
+            let bridge_paths = bridge_paths.clone();
+            let ssh_allowlist = ssh_allowlist.clone();
+            tokio::spawn(async move {
+                let result: Result<()> = async {
+                    let alpn = accepting.alpn().await.context("failed reading ALPN")?;
+                    if alpn.as_slice() != BMUX_IROH_ALPN {
+                        anyhow::bail!("unexpected iroh ALPN");
+                    }
+                    let conn = accepting
                         .await
-                        .context("iroh SSH auth failed")?;
-                }
+                        .context("failed accepting iroh connection")?;
 
-                // Accept multiple bi-streams per connection.  The first stream is
-                // the primary attach session; additional streams are opened by the
-                // client-side kernel bridge for plugin-to-server IPC calls.
-                loop {
-                    let Ok((send, recv)) = conn.accept_bi().await else {
-                        break; // connection closed
-                    };
-                    let stream_paths = bridge_paths.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) =
-                            proxy_iroh_stream_to_local_ipc(send, recv, &stream_paths).await
-                        {
-                            tracing::debug!(?error, "iroh stream proxy failed");
-                        }
-                    });
+                    if require_ssh_auth {
+                        authenticate_host_connection(&conn, &ssh_allowlist)
+                            .await
+                            .context("iroh SSH auth failed")?;
+                    }
+
+                    // Accept multiple bi-streams per connection.  The first stream is
+                    // the primary attach session; additional streams are opened by the
+                    // client-side kernel bridge for plugin-to-server IPC calls.
+                    loop {
+                        let Ok((send, recv)) = conn.accept_bi().await else {
+                            break; // connection closed
+                        };
+                        let stream_paths = bridge_paths.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) =
+                                proxy_iroh_stream_to_local_ipc(send, recv, &stream_paths).await
+                            {
+                                tracing::debug!(?error, "iroh stream proxy failed");
+                            }
+                        });
+                    }
+                    Ok(())
                 }
-                Ok(())
-            }
-            .await;
-            if let Err(error) = result {
-                tracing::warn!(?error, "iroh connection handling failed");
-            }
-        });
+                .await;
+                if let Err(error) = result {
+                    tracing::warn!(?error, "iroh connection handling failed");
+                }
+            });
+        }
+        let _ = clear_host_runtime_state(&ConfigPaths::default());
+        Ok(0)
     }
-    let _ = clear_host_runtime_state(&ConfigPaths::default());
-    Ok(0)
 }
 
 /// Proxy a single iroh QUIC bi-stream to/from a local IPC connection.
@@ -1239,6 +1257,7 @@ pub(super) async fn run_host(
 /// Used by the iroh gateway to bridge each bi-stream (primary attach session or
 /// kernel bridge side-channel) to an independent local IPC session with the bmux
 /// server.
+#[cfg(feature = "remote-iroh")]
 async fn proxy_iroh_stream_to_local_ipc(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
@@ -2916,6 +2935,7 @@ fn iroh_connect_error_is_transient(error: &anyhow::Error) -> bool {
                 _ => false,
             };
         }
+        #[cfg(feature = "remote-iroh")]
         if let Some(error) = source.downcast_ref::<iroh::endpoint::ConnectingError>()
             && !matches!(
                 error,
@@ -2924,6 +2944,7 @@ fn iroh_connect_error_is_transient(error: &anyhow::Error) -> bool {
         {
             return false;
         }
+        #[cfg(feature = "remote-iroh")]
         if let Some(error) = source.downcast_ref::<iroh::endpoint::ConnectionError>() {
             return matches!(
                 error,
@@ -2959,6 +2980,7 @@ fn iroh_io_error_is_transient(error: &io::Error) -> bool {
     clippy::too_many_arguments,
     reason = "Existing transport attachment passes independent runtime and telemetry state."
 )]
+#[cfg(feature = "remote-iroh")]
 async fn run_iroh_attach_with_reconnect(
     mut client: BmuxClient,
     mut iroh_connection: iroh::endpoint::Connection,
@@ -3217,6 +3239,9 @@ pub(super) async fn run_remote_test(target: &str) -> Result<u8> {
             println!("target '{}' OK (tls)", tls_target.label);
             Ok(0)
         }
+        #[cfg(not(feature = "remote-iroh"))]
+        ResolvedTarget::Iroh(_) => return Err(crate::ssh_access::iroh_unavailable()),
+        #[cfg(feature = "remote-iroh")]
         ResolvedTarget::Iroh(iroh_target) => {
             let (mut client, _) =
                 connect_iroh_bridge(&iroh_target, "bmux-cli-remote-test-iroh", None).await?;
@@ -3294,6 +3319,9 @@ pub(super) async fn run_remote_doctor(target: &str, fix: bool) -> Result<u8> {
             println!("doctor result: OK ({})", tls_target.label);
             Ok(0)
         }
+        #[cfg(not(feature = "remote-iroh"))]
+        ResolvedTarget::Iroh(_) => return Err(crate::ssh_access::iroh_unavailable()),
+        #[cfg(feature = "remote-iroh")]
         ResolvedTarget::Iroh(iroh_target) => {
             let (mut client, _) =
                 connect_iroh_bridge(&iroh_target, "bmux-cli-remote-doctor-iroh", None).await?;
@@ -3628,6 +3656,9 @@ pub(super) async fn run_remote_complete_sessions(target: &str) -> Result<u8> {
         ResolvedTarget::Tls(tls_target) => {
             connect_tls_bridge(&tls_target, "bmux-cli-complete-sessions-tls").await?
         }
+        #[cfg(not(feature = "remote-iroh"))]
+        ResolvedTarget::Iroh(_) => return Err(crate::ssh_access::iroh_unavailable()),
+        #[cfg(feature = "remote-iroh")]
         ResolvedTarget::Iroh(iroh_target) => {
             connect_iroh_bridge(&iroh_target, "bmux-cli-complete-sessions-iroh", None)
                 .await?
@@ -3902,6 +3933,7 @@ async fn try_connect_tls_bridge(target: &TlsTarget, client_name: &str) -> Result
         .map_err(map_cli_client_error)
 }
 
+#[cfg(feature = "remote-iroh")]
 async fn connect_iroh_bridge(
     target: &IrohTarget,
     client_name: &str,
@@ -3926,6 +3958,7 @@ async fn iroh_connect_with_deadline<T>(
 }
 
 #[allow(clippy::too_many_lines)] // staged iroh bridge setup is clearer inline for troubleshooting
+#[cfg(feature = "remote-iroh")]
 async fn connect_iroh_bridge_inner(
     target: &IrohTarget,
     client_name: &str,
@@ -4047,6 +4080,7 @@ async fn connect_iroh_bridge_inner(
 /// Build a [`KernelClientFactory`] that opens new QUIC bi-streams on `connection`
 /// for each kernel bridge invocation.  Each call produces a fresh, independently-
 /// handshaked [`BmuxClient`] whose lifetime is a single IPC request/response pair.
+#[cfg(feature = "remote-iroh")]
 fn build_iroh_kernel_client_factory(
     connection: iroh::endpoint::Connection,
     target: &IrohTarget,
@@ -5668,6 +5702,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "remote-iroh")]
     fn iroh_reconnect_classifies_typed_errors_not_messages() {
         for error in [
             anyhow::Error::from(iroh::endpoint::ConnectionError::TimedOut),

@@ -1,3 +1,4 @@
+#[cfg(feature = "remote-iroh")]
 use crate::ssh_access::{
     authenticate_host_connection, ensure_iroh_ssh_access_ready, iroh_ssh_access_enabled,
     iroh_target_compression_from_config, iroh_target_url,
@@ -8,6 +9,7 @@ use bmux_config::{ConfigPaths, ServerGatewayConfig};
 use bmux_ipc::IpcEndpoint;
 use bmux_ipc::transport::LocalIpcStream;
 use bmux_snapshot_plugin_api::{snapshot_commands, snapshot_state, snapshot_types};
+#[cfg(feature = "remote-iroh")]
 use iroh::{Endpoint, endpoint::presets};
 use std::process::{Command as ProcessCommand, Stdio};
 use uuid::Uuid;
@@ -887,7 +889,13 @@ pub(super) async fn run_server_gateway(
     Ok(0)
 }
 
+#[cfg(not(feature = "remote-iroh"))]
+async fn run_server_gateway_iroh() -> Result<u8> {
+    Err(crate::ssh_access::iroh_unavailable())
+}
+
 #[allow(clippy::too_many_lines)]
+#[cfg(feature = "remote-iroh")]
 async fn run_server_gateway_iroh() -> Result<u8> {
     const BMUX_IROH_ALPN: &[u8] = b"bmux/gateway/iroh/1";
     const IROH_DIRECT_BIND_ENV: &str = "BMUX_IROH_DIRECT_BIND";
@@ -1011,6 +1019,7 @@ async fn run_server_gateway_iroh() -> Result<u8> {
 }
 
 /// Proxy a single iroh QUIC bi-stream to/from a local IPC connection.
+#[cfg(feature = "remote-iroh")]
 async fn proxy_gateway_iroh_stream(
     mut send: iroh::endpoint::SendStream,
     mut recv: iroh::endpoint::RecvStream,
