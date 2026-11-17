@@ -10,6 +10,7 @@ use super::{
     cleanup_stale_terminal_graphics_for_surface, queue_terminal_graphic_overlay,
     terminal_graphic_can_render,
 };
+use crate::canvas::Canvas;
 
 fn retain_cached_terminal_graphics_for_visible_surfaces(
     scene: &AttachScene,
@@ -50,6 +51,9 @@ pub(super) struct TerminalGraphicsFrameResources {
 
 impl TerminalGraphicsFrameResources {
     pub(super) fn begin(
+        // Only Kitty cleanup writes to the frame.
+        #[cfg(feature = "image-kitty")] canvas: &mut Canvas<'_, '_, '_>,
+        #[cfg(not(feature = "image-kitty"))] canvas: &Canvas<'_, '_, '_>,
         scene: &AttachScene,
         graphics_cache: &mut TerminalGraphicsCache,
         capabilities: TerminalRenderCapabilities,
@@ -61,7 +65,7 @@ impl TerminalGraphicsFrameResources {
             capabilities,
             &mut resources.active_graphics,
         );
-        resources.cleanup_stale(graphics_cache, capabilities)?;
+        resources.cleanup_stale(canvas, graphics_cache, capabilities)?;
         Ok(resources)
     }
 
@@ -71,6 +75,9 @@ impl TerminalGraphicsFrameResources {
 
     pub(super) fn cleanup_stale_for_surface(
         &mut self,
+        // Only Kitty cleanup writes to the frame.
+        #[cfg(feature = "image-kitty")] canvas: &mut Canvas<'_, '_, '_>,
+        #[cfg(not(feature = "image-kitty"))] canvas: &Canvas<'_, '_, '_>,
         pane_id: Uuid,
         surface_id: Uuid,
         current_graphics: &BTreeSet<u64>,
@@ -78,6 +85,7 @@ impl TerminalGraphicsFrameResources {
         capabilities: TerminalRenderCapabilities,
     ) -> Result<bool> {
         cleanup_stale_terminal_graphics_for_surface(
+            canvas,
             pane_id,
             surface_id,
             current_graphics,
@@ -90,6 +98,7 @@ impl TerminalGraphicsFrameResources {
     #[allow(clippy::too_many_arguments)] // Centralizes terminal graphic reconciliation inputs at call sites.
     pub(super) fn queue_graphic_overlay(
         &mut self,
+        canvas: &mut Canvas<'_, '_, '_>,
         pane_id: Uuid,
         surface_id: Uuid,
         instance_key: u64,
@@ -98,6 +107,7 @@ impl TerminalGraphicsFrameResources {
         capabilities: TerminalRenderCapabilities,
     ) -> Result<bool> {
         queue_terminal_graphic_overlay(
+            canvas,
             pane_id,
             surface_id,
             instance_key,
@@ -110,10 +120,14 @@ impl TerminalGraphicsFrameResources {
 
     pub(super) fn cleanup_stale(
         &mut self,
+        // Only Kitty cleanup writes to the frame.
+        #[cfg(feature = "image-kitty")] canvas: &mut Canvas<'_, '_, '_>,
+        #[cfg(not(feature = "image-kitty"))] canvas: &Canvas<'_, '_, '_>,
         graphics_cache: &mut TerminalGraphicsCache,
         capabilities: TerminalRenderCapabilities,
     ) -> Result<bool> {
         cleanup_stale_terminal_graphics(
+            canvas,
             &self.active_graphics,
             graphics_cache,
             capabilities,
@@ -123,11 +137,14 @@ impl TerminalGraphicsFrameResources {
 
     pub(super) fn finish(
         &mut self,
+        // Only Kitty cleanup writes to the frame.
+        #[cfg(feature = "image-kitty")] canvas: &mut Canvas<'_, '_, '_>,
+        #[cfg(not(feature = "image-kitty"))] canvas: &Canvas<'_, '_, '_>,
         graphics_cache: &mut TerminalGraphicsCache,
         capabilities: TerminalRenderCapabilities,
         render_stats: Option<&mut AttachSceneRenderStats>,
     ) -> Result<()> {
-        self.cleanup_stale(graphics_cache, capabilities)?;
+        self.cleanup_stale(canvas, graphics_cache, capabilities)?;
         if let Some(stats) = render_stats {
             self.stats.apply_to(stats);
         }
@@ -136,18 +153,24 @@ impl TerminalGraphicsFrameResources {
 }
 
 pub(super) fn begin_terminal_graphics_frame(
+    // Only Kitty cleanup writes to the frame.
+    #[cfg(feature = "image-kitty")] canvas: &mut Canvas<'_, '_, '_>,
+    #[cfg(not(feature = "image-kitty"))] canvas: &Canvas<'_, '_, '_>,
     scene: &AttachScene,
     graphics_cache: &mut TerminalGraphicsCache,
     capabilities: TerminalRenderCapabilities,
 ) -> Result<TerminalGraphicsFrameResources> {
-    TerminalGraphicsFrameResources::begin(scene, graphics_cache, capabilities)
+    TerminalGraphicsFrameResources::begin(canvas, scene, graphics_cache, capabilities)
 }
 
 pub(super) fn finish_terminal_graphics_frame(
+    // Only Kitty cleanup writes to the frame.
+    #[cfg(feature = "image-kitty")] canvas: &mut Canvas<'_, '_, '_>,
+    #[cfg(not(feature = "image-kitty"))] canvas: &Canvas<'_, '_, '_>,
     terminal_graphics: &mut TerminalGraphicsFrameResources,
     graphics_cache: &mut TerminalGraphicsCache,
     capabilities: TerminalRenderCapabilities,
     render_stats: Option<&mut AttachSceneRenderStats>,
 ) -> Result<()> {
-    terminal_graphics.finish(graphics_cache, capabilities, render_stats)
+    terminal_graphics.finish(canvas, graphics_cache, capabilities, render_stats)
 }

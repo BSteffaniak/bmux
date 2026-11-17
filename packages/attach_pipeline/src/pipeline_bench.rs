@@ -127,8 +127,8 @@ struct Replay {
     open: bool,
     frames: usize,
     margins: bool,
-    /// Presents captured frames, as the attach client does.
-    presenter: bmux_tui::terminal::Terminal<Vec<u8>>,
+    /// Presents the frames the renderer paints, as the attach client does.
+    presenter: crate::frame_presenter::FramePresenter,
     /// Also prepares and publishes each frame as an observed client does.
     observer: Option<bmux_tui::presentation::PresentationState>,
     /// Published frames an observer still holds, every other one kept (its cells cannot then be
@@ -165,15 +165,7 @@ impl Replay {
             open: false,
             frames: 0,
             margins: false,
-            presenter: {
-                let mut terminal = bmux_tui::terminal::Terminal::new(
-                    Vec::new(),
-                    bmux_tui::geometry::Rect::new(0, 0, size.0, size.1),
-                );
-                terminal
-                    .set_pointer_capability(bmux_tui::pointer::PointerShapeCapability::Unsupported);
-                terminal
-            },
+            presenter: crate::frame_presenter::FramePresenter::new(),
             observer: None,
             held: Vec::new(),
             hold: false,
@@ -223,8 +215,9 @@ impl Replay {
             self.offset = end;
         }
         let applied = started.elapsed();
+        let full = self.frames == 0;
         let mut damage = FrameDamage::default();
-        if self.frames == 0 {
+        if full {
             damage.mark_full_frame();
         } else {
             damage.mark_content_surface(self.pane_id);
@@ -235,53 +228,55 @@ impl Replay {
             left_right_margins: self.margins,
             ..bmux_plugin::TerminalRenderCapabilities::default()
         };
-        let render = |buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>| {
-            render_attach_scene_with_stats_and_trace_with_capabilities_and_occluders(
-                &self.scene,
-                &[],
-                buffers,
-                &mut crate::TerminalGraphicsCache::new(),
-                &damage,
-                0,
-                0,
-                &PaneScrollbackViews::new(),
-                false,
-                self.size,
-                &bmux_appearance::RuntimeAppearance::default(),
-                self.policy,
-                &[],
-                capabilities,
-                &[],
-                None,
-            )
-            .expect("render")
+        let spec = crate::frame_presenter::FrameSpec {
+            full,
+            size: self.size,
+            margins: self.margins,
+            graphics: false,
         };
-        let (stats, operations) = {
-            let terminal = &mut self.presenter;
-            terminal.set_scroll_region_acceleration(if self.margins {
-                bmux_tui::terminal::ScrollRegionAcceleration::AutoWithMargins
-            } else {
-                bmux_tui::terminal::ScrollRegionAcceleration::Auto
-            });
-            let ((_, mut stats), operations) =
-                crate::projection::capture(|| render(&mut self.buffers));
-            terminal.writer_mut().clear();
-            terminal
-                .draw_over(|cx| {
-                    crate::projection::paint_over(cx, &operations).expect("terminal frame");
-                })
-                .expect("present");
-            output.extend_from_slice(terminal.writer());
-            stats.pane_rows_scrolled = terminal
-                .applied_scrolls()
-                .iter()
-                .map(|scroll| {
-                    u64::from(scroll.region.height).saturating_sub(scroll.rows.unsigned_abs())
-                })
-                .sum();
-            (stats, operations)
-        };
-        self.observe(&operations);
+        let (scene, policy, size, buffers) =
+            (&self.scene, self.policy, self.size, &mut self.buffers);
+        let presented = self
+            .presenter
+            .present(&spec, |canvas| {
+                render_attach_scene_with_stats_and_trace_with_capabilities_and_occluders(
+                    canvas,
+                    scene,
+                    &[],
+                    buffers,
+                    &mut crate::TerminalGraphicsCache::new(),
+                    &damage,
+                    0,
+                    0,
+                    &PaneScrollbackViews::new(),
+                    false,
+                    size,
+                    &bmux_appearance::RuntimeAppearance::default(),
+                    policy,
+                    &[],
+                    capabilities,
+                    &[],
+                    None,
+                )
+            })
+            .expect("render");
+        match presented.presented {
+            crate::frame_presenter::Presented::Frame(bytes) => output.extend_from_slice(&bytes),
+            crate::frame_presenter::Presented::Unchanged => {}
+            crate::frame_presenter::Presented::Unsupported(reason) => {
+                panic!("the frame should be presentable: {reason}")
+            }
+        }
+        let (_, mut stats) = presented.result;
+        stats.pane_rows_scrolled = self
+            .presenter
+            .applied_scrolls()
+            .iter()
+            .map(|scroll| {
+                u64::from(scroll.region.height).saturating_sub(scroll.rows.unsigned_abs())
+            })
+            .sum();
+        self.observe();
         Rendered {
             apply: applied,
             render: started.elapsed(),
@@ -291,9 +286,8 @@ impl Replay {
 
     /// Prepare and publish the frame just presented as an observed client's observer does, when
     /// this replay has one: repaired over the last frame with the change the host's terminal
-    /// made (`operations` when it has none), with its local grids installed (each staging
-    /// rechecks the frame's limits).
-    fn observe(&mut self, operations: &[crate::projection::PaintOperation]) {
+    /// made, with its local grids installed (each staging rechecks the frame's limits).
+    fn observe(&mut self) {
         let size = self.size;
         let Some(observer) = &mut self.observer else {
             return;
@@ -304,23 +298,18 @@ impl Replay {
             max_entries: 262_144,
             max_bytes: 32 * 1024 * 1024,
         };
-        // The host's change, copied from its terminal, or the operations when it has none.
-        let cells = self.presenter.retained_buffer();
-        let changes = self.presenter.last_changes();
-        let mut grids = None;
+        // The host's change, copied from its terminal.
+        let shown = self.presenter.shown_changes();
         let mut prepared = observer
             .prepare_repaired_bounded(limits, |cx| {
-                grids = Some(match (cells, &changes) {
-                    (Some(cells), Some(changes)) => {
-                        crate::frame_presenter::paint_shown_changes(cx, cells, changes);
-                        Vec::new()
-                    }
-                    _ => crate::projection::paint_frame(cx, operations).expect("observed frame"),
-                });
+                assert!(
+                    crate::frame_presenter::paint_shown_changes(cx, &shown),
+                    "the frame observed was presented"
+                );
             })
             .expect("prepared");
         prepared
-            .set_grid_fragments(grids.unwrap_or_default(), limits)
+            .set_grid_fragments(Vec::new(), limits)
             .expect("grids");
         let published = observer
             .present_prepared(Some(prepared), |frame, _| {
@@ -431,7 +420,7 @@ fn shown(
         )
 }
 
-/// Replay `frames` into a host terminal emulator, presenting what the renderer captures, and
+/// Replay `frames` into a host terminal emulator, presenting what the renderer paints, and
 /// check, after every frame that is drawn, that the host shows exactly the pane. Returns the rows
 /// moved on the host.
 fn assert_host_matches(
@@ -542,7 +531,7 @@ fn the_host_screen_matches_the_pane_after_every_frame() {
 }
 
 #[test]
-fn a_terminal_presenting_captured_frames_shows_the_pane_after_every_frame() {
+fn a_presenter_shows_the_pane_after_every_frame() {
     let size = (60, 16);
     for corpus in corpus::generated(size, 24) {
         let scrolled =
@@ -588,7 +577,7 @@ fn an_observer_shows_the_cells_the_host_terminal_does() {
                 let observed = replay.observer.as_ref().and_then(|o| o.retained_buffer());
                 assert_eq!(
                     observed,
-                    replay.presenter.retained_buffer(),
+                    replay.presenter.shown_cells(),
                     "{name} (holding frames {hold}) frame {index}: the observer's cells differ \
                      from the host's"
                 );

@@ -530,7 +530,7 @@ pub(super) fn deliver_prepared(
     view: &mut super::state::AttachViewState,
     layout: &bmux_client::AttachLayoutState,
     geometry: super::input::TerminalGeometry,
-    operations: &[bmux_attach_pipeline::projection::PaintOperation],
+    frame_images: &[std::sync::Arc<bmux_tui::image::ImagePlacement>],
     output: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let area = Rect::new(0, 0, geometry.cols, geometry.rows);
@@ -541,7 +541,7 @@ pub(super) fn deliver_prepared(
         )
     });
     let mut output_failed = false;
-    let result = deliver_prepared_inner(view, layout, geometry, operations, || {
+    let result = deliver_prepared_inner(view, layout, geometry, frame_images, || {
         let result = output();
         output_failed = result.is_err();
         result
@@ -559,10 +559,8 @@ pub(super) fn deliver_prepared(
             error
         } else {
             PresentationRejected(format!(
-                "browser frame rejected (viewport={}x{}, captured_operations={}): {error:#}",
-                geometry.cols,
-                geometry.rows,
-                operations.len()
+                "browser frame rejected (viewport={}x{}): {error:#}",
+                geometry.cols, geometry.rows
             ))
             .into()
         }
@@ -574,26 +572,10 @@ fn deliver_prepared_inner(
     view: &mut super::state::AttachViewState,
     layout: &bmux_client::AttachLayoutState,
     geometry: super::input::TerminalGeometry,
-    operations: &[bmux_attach_pipeline::projection::PaintOperation],
+    frame_images: &[std::sync::Arc<bmux_tui::image::ImagePlacement>],
     output: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     use bmux_tui::{image::ImageContribution, presentation::PresentationLimits};
-    for op in operations {
-        match op {
-            // A pane inside an unfinished synchronized update keeps the cells it showed, here as
-            // on the host.
-            bmux_attach_pipeline::projection::PaintOperation::Rejected(
-                bmux_attach_pipeline::projection::ProjectionFailure::Deferred { .. },
-            ) => {}
-            bmux_attach_pipeline::projection::PaintOperation::Rejected(reason) => {
-                anyhow::bail!("{reason}")
-            }
-            bmux_attach_pipeline::projection::PaintOperation::Unsupported => anyhow::bail!(
-                "unsupported legacy imperative capture (no neutral retained representation)"
-            ),
-            _ => {}
-        }
-    }
     let area = Rect::new(0, 0, geometry.cols, geometry.rows);
     let images = observed_images(view, layout, area).map_err(anyhow::Error::msg)?;
     let interactions =
@@ -624,28 +606,23 @@ fn deliver_prepared_inner(
         super::metadata::project_with_sources(&view.retained_compositor, area, &source_metadata)?;
     let modal_scopes = merge_frontend_metadata(&frontends, &mut metadata.text)?;
     let zoom_grids = super::pane_zoom_native::fragments(view)?;
-    // A frame presented on the host is kept here by applying the change the host's terminal made
-    // (its moves and changed cells), so both show one frame; otherwise its operations are
-    // painted.
-    let shown = if view.presenting {
-        view.terminal_presenter.shown_changes()
-    } else {
-        bmux_attach_pipeline::frame_presenter::ShownChanges::Unknown
-    };
-    let mut projected_grids = None;
+    // The frame the client's terminal presenter shows is kept here by applying the change the
+    // terminal made (its moves and changed cells): both hold one frame.
+    let shown = view.terminal_presenter.shown_changes();
+    anyhow::ensure!(
+        !matches!(
+            shown,
+            bmux_attach_pipeline::frame_presenter::ShownChanges::Unknown
+        ),
+        "no presented frame to deliver"
+    );
     let mut prepared = view
         .presentation
         .prepare_repaired_bounded(limits, |cx| {
-            projected_grids = Some(match &shown {
-                bmux_attach_pipeline::frame_presenter::ShownChanges::Changed { cells, changes } => {
-                    bmux_attach_pipeline::frame_presenter::paint_shown_changes(cx, cells, changes);
-                    Ok(Vec::new())
-                }
-                bmux_attach_pipeline::frame_presenter::ShownChanges::Unchanged => Ok(Vec::new()),
-                bmux_attach_pipeline::frame_presenter::ShownChanges::Unknown => {
-                    bmux_attach_pipeline::projection::paint_frame(cx, operations)
-                }
-            });
+            bmux_attach_pipeline::frame_presenter::paint_shown_changes(cx, &shown);
+            for image in frame_images {
+                cx.push_image(ImageContribution::Present(image.as_ref().clone()));
+            }
             // Root output owns chrome only in winning local-grid clips. Clear
             // retained uniform text there so scale reset/removal cannot expose
             // a second, stale copy of the source below the fragment.
@@ -683,12 +660,8 @@ fn deliver_prepared_inner(
             }
         })
         .map_err(|error| anyhow::anyhow!("presentation admission failed: resource={error:?}, cells={}, cell_limit={}, entry_limit={}, byte_limit={}", usize::from(area.width) * usize::from(area.height), limits.max_cells, limits.max_entries, limits.max_bytes))?;
-    let mut grids = projected_grids
-        .ok_or_else(|| anyhow::anyhow!("root projection missing"))?
-        .map_err(|error| anyhow::anyhow!("root projection rejected: {error}"))?;
-    grids.extend(zoom_grids);
     prepared
-        .set_grid_fragments(grids, limits)
+        .set_grid_fragments(zoom_grids, limits)
         .map_err(|error| anyhow::anyhow!("zoom fragment admission failed: {error:?}"))?;
     anyhow::ensure!(
         prepared.set_modal_scopes(&modal_scopes),

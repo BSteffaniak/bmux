@@ -1,8 +1,10 @@
-//! Frames presented on the host through a `bmux_tui` terminal.
+//! Frames presented through a `bmux_tui` terminal.
 //!
-//! The attach renderer captures what it draws instead of encoding it (the same capture an
-//! observer paints), and a [`FramePresenter`] paints it over the frame it last presented and
-//! encodes the difference.
+//! The attach renderer paints each frame straight into the terminal a
+//! [`bmux_attach_pipeline::frame_presenter::FramePresenter`] owns, over the frame it last
+//! presented, and the terminal encodes the difference. Every client presents this way: a headless
+//! client's terminal encodes nothing and keeps the frame for its observer, which mirrors the
+//! change the terminal made.
 //!
 //! Graphics protocols keep their own encoders: a frame's pane image and extension graphic overlay
 //! bytes are written through the terminal's output hooks, removals before its cells and
@@ -14,18 +16,22 @@ use bmux_attach_pipeline::projection::ProjectionFailure;
 
 use super::state::AttachViewState;
 
-pub(super) use bmux_attach_pipeline::frame_presenter::{CapturedFrame, Graphics, Presented};
+pub(super) use bmux_attach_pipeline::frame_presenter::Presented;
 
-/// Whether the next frame is presented on the host: it is not when the view is headless.
+/// Whether the next frame is written to a host: it is not when the view is headless.
 pub(super) const fn usable(view_state: &AttachViewState) -> bool {
     !view_state.presentation_only
 }
 
-/// Decide whether the next frame is presented on the host. A presenter that has shown nothing
-/// (or forgot what it showed) paints over a blank screen, so that frame repaints in full.
+/// Decide whether the next frame is written to a host; a headless client's presenter encodes
+/// nothing. A presenter that has shown nothing (or forgot what it showed) paints over a blank
+/// screen, so that frame repaints in full.
 pub(super) fn begin_frame(view_state: &mut AttachViewState) {
     view_state.presenting = usable(view_state);
-    if view_state.presenting && !view_state.terminal_presenter.shown() {
+    view_state
+        .terminal_presenter
+        .set_encoding(view_state.presenting);
+    if !view_state.terminal_presenter.shown() {
         view_state
             .dirty
             .mark_full_frame(super::state::AttachDirtySource::ManualRedraw);
@@ -43,12 +49,6 @@ impl std::fmt::Display for PresenterRejected {
 }
 
 impl std::error::Error for PresenterRejected {}
-
-/// Paint a captured frame over the last one presented and return the bytes that change the
-/// host to match.
-pub(super) fn present(view_state: &mut AttachViewState, frame: &CapturedFrame<'_>) -> Presented {
-    view_state.terminal_presenter.present(frame)
-}
 
 /// Forget what the terminal presented, so its next frame repaints in full: after its bytes
 /// failed to reach the host, or after a frame was not presented.

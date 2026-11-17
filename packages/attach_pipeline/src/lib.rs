@@ -2,6 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+pub mod canvas;
 pub mod compositor;
 pub mod frame_presenter;
 pub mod host_writer;

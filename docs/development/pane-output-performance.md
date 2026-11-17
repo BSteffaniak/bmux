@@ -276,6 +276,32 @@ Live with `bmux-bench replay` (render start to host p50), the presenter matches 
 own bytes on a review (1.05 to 1.23 ms against 1.07 to 1.56 ms) and on a scroll (0.39 ms
 against 0.30 to 0.46 ms, within run-to-run noise), writing 17 to 21% fewer bytes.
 
+## Phase 6: one paint path, no intermediate copies
+
+Phase 5 left the renderer *recording* what it draws (a thread-local list of paint operations,
+cloned once more for the observer) and a presenter replaying it into the terminal; pane rows
+are copied into owned strings first, and extension output passes through a terminal-command
+plan and a second conversion. Every client already presents through `Terminal`, so the
+intermediate forms are only copies:
+
+1. **One paint path.** The renderer paints into a `bmux_tui` frame through a `Canvas` (the
+   frame's `PaintCx`, the frame's graphics protocol output and its rejection) instead of
+   recording operations. `FramePresenter` runs the paint inside the terminal's in-place frame
+   and abandons the frame when the render rejects it. Every client presents through a
+   presenter; a headless client's terminal tracks changes without encoding them. Observers
+   mirror the terminal's change, so there is one observer path. The thread-local capture,
+   `staged_operations` and the per-frame operation list go.
+2. **Zero-copy pane rows.** Pane rows are painted straight from the grid: cells borrow the
+   grid's text, and each grid style converts to a `bmux_tui` style once (selection and content
+   effects applied there), with no per-row `String` or `Vec`.
+3. **Extensions paint directly.** Plugin render operations paint into the canvas; the
+   terminal-command plan and its conversion go.
+4. **One image pipeline.** Pane images and extension graphic overlays are `bmux_tui` image
+   placements, encoded by the terminal for host and headless clients alike, instead of the
+   attach renderer's own Kitty encoder.
+5. **Cleanup and numbers.** Leftovers removed; `pipeline_bench`, observed and not, compared with
+   phase 5.
+
 ## Order
 
 1. Phase 0: the corpus and `bmux-bench pipeline`; then `replay` with end-to-end markers.

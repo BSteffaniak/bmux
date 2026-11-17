@@ -1,3 +1,4 @@
+use crate::canvas::Canvas;
 use crate::compositor::retained_repaint_plan_from_frame_damage;
 #[cfg(feature = "image-kitty")]
 use crate::types::TerminalGraphicCacheEntry;
@@ -190,29 +191,41 @@ enum TerminalCommand {
     ResetStyle,
 }
 
-fn capture_terminal_commands(commands: &[TerminalCommand]) {
-    if !crate::projection::capturing() {
-        return;
-    }
-    let bytes = commands
-        .iter()
-        .map(|command| match command {
-            TerminalCommand::Print(text) => text.len(),
-            _ => 0,
-        })
-        .fold(0_usize, usize::saturating_add);
-    if bytes > 16 * 1024 * 1024 {
-        crate::projection::record(crate::projection::PaintOperation::Rejected(
-            crate::projection::ProjectionFailure::Budget {
-                resource: "terminal text bytes",
-                used: bytes,
-                limit: 16 * 1024 * 1024,
-            },
-        ));
-        return;
-    }
-    for operation in terminal_command_operations(commands) {
-        crate::projection::record(operation);
+/// Paint planned terminal commands into the frame, as a terminal running them would show them.
+fn paint_terminal_commands(canvas: &mut Canvas<'_, '_, '_>, commands: &[TerminalCommand]) {
+    let mut x = 0_u16;
+    let mut y = 0_u16;
+    let mut style = RenderStyle::default();
+    for command in commands {
+        match command {
+            TerminalCommand::MoveTo {
+                x: next_x,
+                y: next_y,
+            } => {
+                x = *next_x;
+                y = *next_y;
+            }
+            TerminalCommand::ApplyStyle(next) => style = *next,
+            TerminalCommand::ResetStyle => style = RenderStyle::default(),
+            TerminalCommand::Print(text) => {
+                canvas.text(x, y, text, crate::projection::style(style));
+                x = x.saturating_add(render_text_width_u16(text));
+            }
+            TerminalCommand::EraseCells {
+                x: erase_x,
+                y: erase_y,
+                width,
+                style: erase_style,
+            } => {
+                canvas.fill(
+                    bmux_tui::geometry::Rect::new(*erase_x, *erase_y, *width, 1),
+                    crate::projection::style(*erase_style),
+                );
+                x = erase_x.saturating_add(*width);
+                y = *erase_y;
+                style = *erase_style;
+            }
+        }
     }
 }
 
@@ -290,8 +303,8 @@ fn terminal_command_operations(
     operations
 }
 
-fn queue_terminal_commands(commands: &[TerminalCommand]) -> bool {
-    capture_terminal_commands(commands);
+fn queue_terminal_commands(canvas: &mut Canvas<'_, '_, '_>, commands: &[TerminalCommand]) -> bool {
+    paint_terminal_commands(canvas, commands);
     !commands.is_empty()
 }
 
@@ -310,6 +323,7 @@ fn queue_terminal_commands(commands: &[TerminalCommand]) -> bool {
 /// Returns an error if writing terminal control bytes fails.
 #[allow(clippy::too_many_arguments)] // Explicit hot-path render state keeps call sites allocation-free.
 pub fn queue_render_items(
+    canvas: &mut Canvas<'_, '_, '_>,
     surface_id: Uuid,
     surface_rect: ExtensionRect,
     damage: &RenderDamage,
@@ -320,6 +334,7 @@ pub fn queue_render_items(
 ) -> Result<bool> {
     let mut terminal_graphics = TerminalGraphicsFrameResources::default();
     let mut wrote = queue_render_items_for_frame(
+        canvas,
         surface_id,
         surface_id,
         surface_rect,
@@ -329,7 +344,7 @@ pub fn queue_render_items(
         &mut terminal_graphics,
         capabilities,
     )?;
-    wrote |= terminal_graphics.cleanup_stale(graphics_cache, capabilities)?;
+    wrote |= terminal_graphics.cleanup_stale(canvas, graphics_cache, capabilities)?;
     if let Some(stats) = render_stats {
         terminal_graphics.stats.apply_to(stats);
     }
@@ -348,6 +363,7 @@ pub fn queue_render_items(
 /// Returns an error if writing terminal control bytes fails.
 #[allow(clippy::too_many_arguments)] // Explicit render state keeps scoped reconciliation unambiguous.
 pub fn queue_render_items_for_surface(
+    canvas: &mut Canvas<'_, '_, '_>,
     surface_id: Uuid,
     surface_rect: ExtensionRect,
     damage: &RenderDamage,
@@ -358,6 +374,7 @@ pub fn queue_render_items_for_surface(
 ) -> Result<bool> {
     let mut terminal_graphics = TerminalGraphicsFrameResources::default();
     let wrote = queue_render_items_for_frame(
+        canvas,
         surface_id,
         surface_id,
         surface_rect,
@@ -375,6 +392,7 @@ pub fn queue_render_items_for_surface(
 
 #[allow(clippy::too_many_arguments)] // Explicit hot-path render state keeps call sites allocation-free.
 fn queue_render_items_for_frame(
+    canvas: &mut Canvas<'_, '_, '_>,
     pane_id: Uuid,
     surface_id: Uuid,
     surface_rect: ExtensionRect,
@@ -385,6 +403,7 @@ fn queue_render_items_for_frame(
     capabilities: TerminalRenderCapabilities,
 ) -> Result<bool> {
     queue_render_items_for_frame_with_cleanup(
+        canvas,
         pane_id,
         surface_id,
         surface_rect,
@@ -399,6 +418,7 @@ fn queue_render_items_for_frame(
 
 #[allow(clippy::too_many_arguments)] // Explicit hot-path render state keeps call sites allocation-free.
 fn queue_render_items_for_frame_with_cleanup(
+    canvas: &mut Canvas<'_, '_, '_>,
     pane_id: Uuid,
     surface_id: Uuid,
     surface_rect: ExtensionRect,
@@ -409,10 +429,17 @@ fn queue_render_items_for_frame_with_cleanup(
     capabilities: TerminalRenderCapabilities,
     cleanup_surface_graphics: bool,
 ) -> Result<bool> {
-    let current_graphics =
-        active_terminal_graphic_keys(pane_id, surface_id, surface_rect, items, capabilities);
+    let current_graphics = active_terminal_graphic_keys(
+        canvas.graphics_output(),
+        pane_id,
+        surface_id,
+        surface_rect,
+        items,
+        capabilities,
+    );
     let mut wrote = if cleanup_surface_graphics {
         terminal_graphics.cleanup_stale_for_surface(
+            canvas,
             pane_id,
             surface_id,
             &current_graphics,
@@ -428,9 +455,10 @@ fn queue_render_items_for_frame_with_cleanup(
         match item {
             RenderLayerItem::Op(op) => pending_ops.push(op.clone()),
             RenderLayerItem::Graphic(graphic) => {
-                wrote |= flush_render_item_ops(surface_rect, damage, &mut pending_ops)?;
+                wrote |= flush_render_item_ops(canvas, surface_rect, damage, &mut pending_ops)?;
                 let instance_key = terminal_graphic_instance_key(pane_id, surface_id, graphic.key);
                 if terminal_graphic_needs_reconcile(
+                    canvas.graphics_output(),
                     graphic,
                     instance_key,
                     surface_rect,
@@ -439,6 +467,7 @@ fn queue_render_items_for_frame_with_cleanup(
                     capabilities,
                 ) {
                     wrote |= terminal_graphics.queue_graphic_overlay(
+                        canvas,
                         pane_id,
                         surface_id,
                         instance_key,
@@ -450,11 +479,12 @@ fn queue_render_items_for_frame_with_cleanup(
             }
         }
     }
-    wrote |= flush_render_item_ops(surface_rect, damage, &mut pending_ops)?;
+    wrote |= flush_render_item_ops(canvas, surface_rect, damage, &mut pending_ops)?;
     Ok(wrote)
 }
 
 fn flush_render_item_ops(
+    canvas: &mut Canvas<'_, '_, '_>,
     surface_rect: ExtensionRect,
     damage: &RenderDamage,
     ops: &mut Vec<RenderOp>,
@@ -462,7 +492,7 @@ fn flush_render_item_ops(
     if ops.is_empty() {
         return Ok(false);
     }
-    let wrote = queue_render_ops(surface_rect, damage, ops);
+    let wrote = queue_render_ops(canvas, surface_rect, damage, ops);
     ops.clear();
     wrote
 }
@@ -473,11 +503,13 @@ fn flush_render_item_ops(
 ///
 /// Returns an error if writing terminal control bytes fails.
 pub fn queue_render_ops(
+    canvas: &mut Canvas<'_, '_, '_>,
     surface_rect: ExtensionRect,
     damage: &RenderDamage,
     ops: &[RenderOp],
 ) -> Result<bool> {
     queue_render_ops_with_capabilities(
+        canvas,
         surface_rect,
         damage,
         ops,
@@ -494,6 +526,7 @@ pub fn queue_render_ops(
 ///
 /// Returns an error if writing terminal control bytes fails.
 pub fn queue_render_ops_with_capabilities(
+    canvas: &mut Canvas<'_, '_, '_>,
     surface_rect: ExtensionRect,
     damage: &RenderDamage,
     ops: &[RenderOp],
@@ -501,7 +534,7 @@ pub fn queue_render_ops_with_capabilities(
 ) -> Result<bool> {
     let fallback_ops = render_ops_for_capabilities(ops, capabilities);
     let plan = build_render_ops_output_plan(surface_rect, damage, &fallback_ops);
-    Ok(queue_terminal_commands(&plan.commands))
+    Ok(queue_terminal_commands(canvas, &plan.commands))
 }
 
 fn render_ops_for_capabilities(
@@ -953,13 +986,14 @@ fn render_op_intersects_damage(op: &RenderOp, damage: &RenderDamage) -> bool {
 }
 
 fn active_terminal_graphic_keys(
+    graphics_output: bool,
     pane_id: Uuid,
     surface_id: Uuid,
     surface_rect: ExtensionRect,
     items: &[RenderLayerItem],
     capabilities: TerminalRenderCapabilities,
 ) -> BTreeSet<u64> {
-    if !terminal_graphic_can_render(capabilities) && crate::projection::graphics_output() {
+    if !terminal_graphic_can_render(capabilities) && graphics_output {
         return BTreeSet::new();
     }
     items
@@ -990,6 +1024,7 @@ const fn terminal_graphic_can_render(capabilities: TerminalRenderCapabilities) -
 }
 
 fn terminal_graphic_needs_reconcile(
+    graphics_output: bool,
     graphic: &TerminalGraphicOverlay,
     instance_key: u64,
     surface_rect: ExtensionRect,
@@ -997,7 +1032,7 @@ fn terminal_graphic_needs_reconcile(
     graphics_cache: &TerminalGraphicsCache,
     capabilities: TerminalRenderCapabilities,
 ) -> bool {
-    if (!terminal_graphic_can_render(capabilities) && crate::projection::graphics_output())
+    if (!terminal_graphic_can_render(capabilities) && graphics_output)
         || !graphic.cell_rect.intersects(surface_rect)
     {
         return false;
@@ -1062,6 +1097,7 @@ const fn terminal_graphic_placement_signature(
     unused_variables
 )]
 fn queue_terminal_graphic_overlay(
+    canvas: &mut Canvas<'_, '_, '_>,
     pane_id: Uuid,
     surface_id: Uuid,
     instance_key: u64,
@@ -1073,6 +1109,7 @@ fn queue_terminal_graphic_overlay(
     #[cfg(feature = "image-kitty")]
     {
         queue_kitty_graphic_overlay(
+            canvas,
             pane_id,
             surface_id,
             instance_key,
@@ -1089,16 +1126,21 @@ fn queue_terminal_graphic_overlay(
 }
 
 #[cfg(feature = "image-kitty")]
-fn capture_graphic_overlay(surface_id: Uuid, instance_key: u64, graphic: &TerminalGraphicOverlay) {
-    use crate::projection::{PaintOperation, ProjectionFailure};
+fn place_graphic_overlay(
+    canvas: &mut Canvas<'_, '_, '_>,
+    surface_id: Uuid,
+    instance_key: u64,
+    graphic: &TerminalGraphicOverlay,
+) {
+    use crate::projection::ProjectionFailure;
     let pixels = u64::from(graphic.pixel_width) * u64::from(graphic.pixel_height);
     if pixels > crate::projection_images::MAX_IMAGE_PIXELS {
-        crate::projection::record(PaintOperation::Rejected(ProjectionFailure::Budget {
+        canvas.reject(ProjectionFailure::Budget {
             resource: "image pixels",
             used: usize::try_from(pixels).unwrap_or(usize::MAX),
             limit: usize::try_from(crate::projection_images::MAX_IMAGE_PIXELS)
                 .unwrap_or(usize::MAX),
-        }));
+        });
         return;
     }
     let raw = bmux_tui::image::ImagePayload::Pixels {
@@ -1110,37 +1152,36 @@ fn capture_graphic_overlay(surface_id: Uuid, instance_key: u64, graphic: &Termin
     let payload = if let Ok(payload) = crate::projection_images::compact_payload(&raw) {
         payload.into_owned()
     } else {
-        crate::projection::record(PaintOperation::Rejected(ProjectionFailure::Unsupported {
+        canvas.reject(ProjectionFailure::Unsupported {
             reason: "invalid terminal image resource",
-        }));
+        });
         return;
     };
-    crate::projection::record(PaintOperation::Image(std::sync::Arc::new(
-        bmux_tui::image::ImagePlacement {
-            fit: bmux_tui::image::ImageFit::Stretch,
-            allocation: None,
-            key: bmux_tui::image::ImageKey::new(format!("{surface_id}:{instance_key}")),
-            payload,
-            destination: bmux_tui::geometry::Rect::new(
-                graphic.cell_rect.x,
-                graphic.cell_rect.y,
-                graphic.cell_rect.w,
-                graphic.cell_rect.h,
-            ),
-            clip: bmux_tui::geometry::Rect::new(
-                graphic.cell_rect.x,
-                graphic.cell_rect.y,
-                graphic.cell_rect.w,
-                graphic.cell_rect.h,
-            ),
-            lifecycle: bmux_tui::image::ImageLifecycle::Frame,
-        },
-    )));
+    canvas.image(std::sync::Arc::new(bmux_tui::image::ImagePlacement {
+        fit: bmux_tui::image::ImageFit::Stretch,
+        allocation: None,
+        key: bmux_tui::image::ImageKey::new(format!("{surface_id}:{instance_key}")),
+        payload,
+        destination: bmux_tui::geometry::Rect::new(
+            graphic.cell_rect.x,
+            graphic.cell_rect.y,
+            graphic.cell_rect.w,
+            graphic.cell_rect.h,
+        ),
+        clip: bmux_tui::geometry::Rect::new(
+            graphic.cell_rect.x,
+            graphic.cell_rect.y,
+            graphic.cell_rect.w,
+            graphic.cell_rect.h,
+        ),
+        lifecycle: bmux_tui::image::ImageLifecycle::Frame,
+    }));
 }
 
 #[cfg(feature = "image-kitty")]
 #[allow(clippy::too_many_arguments)] // Kitty reconciliation needs identity, payload, cache, capability, and stats state.
 fn queue_kitty_graphic_overlay(
+    canvas: &mut Canvas<'_, '_, '_>,
     pane_id: Uuid,
     surface_id: Uuid,
     instance_key: u64,
@@ -1149,18 +1190,16 @@ fn queue_kitty_graphic_overlay(
     capabilities: TerminalRenderCapabilities,
     resource_stats: Option<&mut TerminalGraphicsResourceStats>,
 ) -> Result<bool> {
-    // Otherwise the capture places them.
-    let encoding = crate::projection::graphics_output();
+    // Without graphics output, the overlay is placed as an image.
+    let encoding = canvas.graphics_output();
     if !terminal_graphic_can_render(capabilities) && encoding {
         return Ok(false);
     }
-    if crate::projection::capturing() && !crate::projection::graphics_output() {
-        capture_graphic_overlay(surface_id, instance_key, graphic);
-    }
     if !encoding {
+        place_graphic_overlay(canvas, surface_id, instance_key, graphic);
         return Ok(true);
     }
-    crate::projection::write_graphics(false, |stdout| {
+    canvas.write_graphics(false, |stdout| {
         write_kitty_graphic_overlay(
             stdout,
             pane_id,
@@ -1353,6 +1392,9 @@ impl TerminalGraphicsCleanupPlan {
 }
 
 fn cleanup_stale_terminal_graphics_for_surface(
+    // Only Kitty cleanup writes to the frame.
+    #[cfg(feature = "image-kitty")] canvas: &mut Canvas<'_, '_, '_>,
+    #[cfg(not(feature = "image-kitty"))] canvas: &Canvas<'_, '_, '_>,
     pane_id: Uuid,
     surface_id: Uuid,
     current_graphics: &BTreeSet<u64>,
@@ -1366,29 +1408,47 @@ fn cleanup_stale_terminal_graphics_for_surface(
         current_graphics,
         graphics_cache,
     );
-    cleanup_stale_terminal_graphics_by_plan(&plan, graphics_cache, capabilities, resource_stats)
+    cleanup_stale_terminal_graphics_by_plan(
+        canvas,
+        &plan,
+        graphics_cache,
+        capabilities,
+        resource_stats,
+    )
 }
 
 fn cleanup_stale_terminal_graphics(
+    // Only Kitty cleanup writes to the frame.
+    #[cfg(feature = "image-kitty")] canvas: &mut Canvas<'_, '_, '_>,
+    #[cfg(not(feature = "image-kitty"))] canvas: &Canvas<'_, '_, '_>,
     active_graphics: &BTreeSet<u64>,
     graphics_cache: &mut TerminalGraphicsCache,
     capabilities: TerminalRenderCapabilities,
     resource_stats: Option<&mut TerminalGraphicsResourceStats>,
 ) -> Result<bool> {
     let plan = TerminalGraphicsCleanupPlan::for_frame(active_graphics, graphics_cache);
-    cleanup_stale_terminal_graphics_by_plan(&plan, graphics_cache, capabilities, resource_stats)
+    cleanup_stale_terminal_graphics_by_plan(
+        canvas,
+        &plan,
+        graphics_cache,
+        capabilities,
+        resource_stats,
+    )
 }
 
 // The non-Kitty build only drops cache entries, but shares the fallible
 // signature with Kitty cleanup so callers remain feature-independent.
 #[cfg_attr(not(feature = "image-kitty"), allow(clippy::unnecessary_wraps))]
 fn cleanup_stale_terminal_graphics_by_plan(
+    // Only Kitty cleanup writes to the frame.
+    #[cfg(feature = "image-kitty")] canvas: &mut Canvas<'_, '_, '_>,
+    #[cfg(not(feature = "image-kitty"))] canvas: &Canvas<'_, '_, '_>,
     plan: &TerminalGraphicsCleanupPlan,
     graphics_cache: &mut TerminalGraphicsCache,
     capabilities: TerminalRenderCapabilities,
     resource_stats: Option<&mut TerminalGraphicsResourceStats>,
 ) -> Result<bool> {
-    if !crate::projection::graphics_output() {
+    if !canvas.graphics_output() {
         return Ok(false);
     }
     if plan.is_empty() {
@@ -1398,7 +1458,7 @@ fn cleanup_stale_terminal_graphics_by_plan(
         #[cfg(feature = "image-kitty")]
         TerminalGraphicsStaleCleanupPolicy::DeleteKittyPlacementAndImageSource => {
             // Removals go before a presented frame's cells, as they go before its text here.
-            crate::projection::write_graphics(true, |stdout| {
+            canvas.write_graphics(true, |stdout| {
                 cleanup_stale_kitty_graphics(
                     stdout,
                     &plan.stale,
@@ -2309,6 +2369,7 @@ impl FrameDamage {
 ///
 /// Returns an error if terminal control sequence generation fails.
 pub fn queue_frame_damage_overlay(
+    canvas: &mut Canvas<'_, '_, '_>,
     scene: &AttachScene,
     frame_damage: &FrameDamage,
     terminal_size: (u16, u16),
@@ -2316,6 +2377,7 @@ pub fn queue_frame_damage_overlay(
     bottom_inset: u16,
 ) -> Result<bool> {
     queue_frame_damage_overlay_with_trace(
+        canvas,
         scene,
         frame_damage,
         terminal_size,
@@ -2334,6 +2396,7 @@ pub fn queue_frame_damage_overlay(
 ///
 /// Returns an error if terminal control sequence generation fails.
 pub fn queue_frame_damage_overlay_with_trace(
+    canvas: &mut Canvas<'_, '_, '_>,
     scene: &AttachScene,
     frame_damage: &FrameDamage,
     terminal_size: (u16, u16),
@@ -2356,7 +2419,7 @@ pub fn queue_frame_damage_overlay_with_trace(
 
     let ops = frame_damage_overlay_render_ops_from_rects(&rects);
     let surface_rect = ExtensionRect::new(0, 0, terminal_size.0, terminal_size.1);
-    queue_render_ops(surface_rect, &RenderDamage::FullSurface, &ops)
+    queue_render_ops(canvas, surface_rect, &RenderDamage::FullSurface, &ops)
         .context("failed queueing declarative damage overlay")
 }
 
@@ -2617,7 +2680,10 @@ pub fn opaque_row_text(content: &str, width: usize) -> String {
 /// # Errors
 ///
 /// Returns an error when queueing cursor movement or text output fails.
-pub fn queue_layer_fill(surface: AttachLayerSurface) -> Result<()> {
+pub fn queue_layer_fill(
+    canvas: &mut Canvas<'_, '_, '_>,
+    surface: AttachLayerSurface,
+) -> Result<()> {
     if !surface.opaque || surface.content_rect.w == 0 || surface.content_rect.h == 0 {
         return Ok(());
     }
@@ -2628,15 +2694,10 @@ pub fn queue_layer_fill(surface: AttachLayerSurface) -> Result<()> {
         .y
         .saturating_add(surface.content_rect.h);
     for y in start_y..end_y {
-        crate::projection::record(crate::projection::PaintOperation::Fill {
-            rect: bmux_tui::geometry::Rect::new(
-                surface.content_rect.x,
-                y,
-                surface.content_rect.w,
-                1,
-            ),
-            style: bmux_tui::style::Style::new(),
-        });
+        canvas.fill(
+            bmux_tui::geometry::Rect::new(surface.content_rect.x, y, surface.content_rect.w, 1),
+            bmux_tui::style::Style::new(),
+        );
     }
     Ok(())
 }
@@ -2825,29 +2886,35 @@ struct GridRowRenderContext<'a> {
     before_content_cells: &'a BTreeMap<u16, RenderUnderCell>,
 }
 
-/// Capture columns `0..width` of `context`'s row, as the pane shows them, as one run of cells at
-/// terminal column `x` of row `y`.
-///
-/// The whole row is captured: the host's terminal compares what it is given with what it shows
-/// and writes only the cells that change.
-fn capture_pane_row(context: &GridRowRenderContext<'_>, x: u16, y: u16, width: u16) {
-    let mut text = String::with_capacity(usize::from(width));
-    let mut captured: Vec<crate::projection::CapturedCell> = Vec::with_capacity(usize::from(width));
-    let mut push = |text: &mut String, symbol: &str, width: u8, style: bmux_tui::style::Style| {
-        text.push_str(symbol);
-        captured.push(crate::projection::CapturedCell {
-            end: u32::try_from(text.len()).unwrap_or(u32::MAX),
-            width,
-            style,
+/// Paint columns `0..width` of `context`'s row, as the pane shows them, from column `x` of row
+/// `y`: whole, straight from the grid (each cell borrows the grid's text), with nothing copied
+/// on the way. The host's terminal writes only the cells that change.
+fn paint_pane_row(
+    canvas: &mut Canvas<'_, '_, '_>,
+    context: &GridRowRenderContext<'_>,
+    x: u16,
+    y: u16,
+    width: u16,
+) {
+    let row = context.row;
+    let style_of = |cell: Option<&bmux_terminal_grid::Cell>, selected: bool| {
+        let mut style = cell.map_or_else(CellStyle::default, |cell| {
+            grid_cell_style(context.palette.get(cell.style()))
         });
+        if selected {
+            style = selected_style(style);
+        }
+        cell_style_to_tui(apply_content_effects(style, context.runtime_appearance))
     };
     // Consecutive cells mostly share a style: resolve each grid style once while it repeats.
     let mut memo: Option<((bmux_terminal_grid::StyleId, bool), bmux_tui::style::Style)> = None;
     let mut col = 0u16;
     while col < width {
-        let cell = context.row.cells().get(usize::from(col));
-        let selected = cell_selected(context.selection, context.selection_line, usize::from(col));
+        // A glyph under a transparent pane cell shows through it, on its own.
         if let Some(under_cell) = context.before_content_cells.get(&col) {
+            let cell = row.cells().get(usize::from(col));
+            let selected =
+                cell_selected(context.selection, context.selection_line, usize::from(col));
             let raw_style = cell.map_or_else(CellStyle::default, |cell| {
                 grid_cell_style(context.palette.get(cell.style()))
             });
@@ -2860,58 +2927,72 @@ fn capture_pane_row(context: &GridRowRenderContext<'_>, x: u16, y: u16, width: u
                 if !matches!(background, CellColor::Default) {
                     style.bg = background;
                 }
-                push(
-                    &mut text,
-                    under_cell.ch.encode_utf8(&mut [0; 4]),
-                    1,
-                    cell_style_to_tui(style),
+                canvas.cells(
+                    x.saturating_add(col),
+                    y,
+                    std::iter::once(bmux_tui::paint::SizedCell {
+                        symbol: under_cell.ch.encode_utf8(&mut [0; 4]),
+                        width: 1,
+                        style: cell_style_to_tui(style),
+                    }),
                 );
                 col = col.saturating_add(1);
                 continue;
             }
         }
-        let style = match (cell, memo) {
-            (Some(cell), Some((key, style))) if key == (cell.style(), selected) => style,
-            _ => {
-                let mut style = cell.map_or_else(CellStyle::default, |cell| {
-                    grid_cell_style(context.palette.get(cell.style()))
-                });
-                if selected {
-                    style = selected_style(style);
-                }
-                let style =
-                    cell_style_to_tui(apply_content_effects(style, context.runtime_appearance));
-                if let Some(cell) = cell {
-                    memo = Some(((cell.style(), selected), style));
-                }
-                style
+        // A run of grid cells, up to the next glyph under the pane.
+        let end = context
+            .before_content_cells
+            .range(col.saturating_add(1)..)
+            .next()
+            .map_or(width, |(under, _)| (*under).min(width));
+        let mut next = col;
+        let cells = std::iter::from_fn(|| {
+            if next >= end {
+                return None;
             }
-        };
-        let Some(cell) = cell.filter(|cell| !cell.is_wide_continuation()) else {
-            // No cell, or the right half of a wide character whose left half is not in the row.
-            push(&mut text, " ", 1, style);
-            col = col.saturating_add(1);
-            continue;
-        };
-        let symbol = match cell.text() {
-            "" => " ",
-            text => text,
-        };
-        // A wide character the row cuts off at its right edge is drawn in its one column.
-        let span = if cell.width() >= 2 && width - col >= 2 {
-            2
-        } else {
-            1
-        };
-        push(&mut text, symbol, span, style);
-        col = col.saturating_add(u16::from(cell.width()).max(1));
+            let cell = row.cells().get(usize::from(next));
+            let selected =
+                cell_selected(context.selection, context.selection_line, usize::from(next));
+            let style = match (cell, memo) {
+                (Some(cell), Some((key, style))) if key == (cell.style(), selected) => style,
+                _ => {
+                    let style = style_of(cell, selected);
+                    if let Some(cell) = cell {
+                        memo = Some(((cell.style(), selected), style));
+                    }
+                    style
+                }
+            };
+            let Some(cell) = cell.filter(|cell| !cell.is_wide_continuation()) else {
+                // No cell, or the right half of a wide character whose left half is not here.
+                next = next.saturating_add(1);
+                return Some(bmux_tui::paint::SizedCell {
+                    symbol: " ",
+                    width: 1,
+                    style,
+                });
+            };
+            let symbol = match cell.text() {
+                "" => " ",
+                text => text,
+            };
+            // A wide character the row cuts off at its right edge is drawn in its one column.
+            let span = if cell.width() >= 2 && width - next >= 2 {
+                2
+            } else {
+                1
+            };
+            next = next.saturating_add(u16::from(cell.width()).max(1));
+            Some(bmux_tui::paint::SizedCell {
+                symbol,
+                width: span,
+                style,
+            })
+        });
+        canvas.cells(x.saturating_add(col), y, cells);
+        col = next;
     }
-    crate::projection::record(crate::projection::PaintOperation::Cells {
-        x,
-        y,
-        text,
-        cells: captured,
-    });
 }
 
 fn cell_style_to_tui(value: CellStyle) -> bmux_tui::style::Style {
@@ -3241,6 +3322,7 @@ pub fn collect_visual_projection_updates(
 ///
 /// Returns an error when queueing frame bytes fails.
 pub fn render_attach_scene(
+    canvas: &mut Canvas<'_, '_, '_>,
     scene: &AttachScene,
     panes: &[PaneSummary],
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
@@ -3257,6 +3339,7 @@ pub fn render_attach_scene(
     let render_context = RenderExtensionContext::default();
     let mut terminal_graphics_cache = TerminalGraphicsCache::new();
     render_attach_scene_inner(
+        canvas,
         scene,
         panes,
         pane_buffers,
@@ -3288,6 +3371,7 @@ pub fn render_attach_scene(
 ///
 /// Returns an error when queueing frame bytes fails.
 pub fn render_attach_scene_with_terminal_graphics_cache(
+    canvas: &mut Canvas<'_, '_, '_>,
     scene: &AttachScene,
     panes: &[PaneSummary],
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
@@ -3304,6 +3388,7 @@ pub fn render_attach_scene_with_terminal_graphics_cache(
 ) -> Result<Option<AttachCursorState>> {
     let render_context = RenderExtensionContext::default();
     render_attach_scene_inner(
+        canvas,
         scene,
         panes,
         pane_buffers,
@@ -3335,6 +3420,7 @@ pub fn render_attach_scene_with_terminal_graphics_cache(
 ///
 /// Returns an error when queueing frame bytes fails.
 pub fn render_attach_scene_with_stats(
+    canvas: &mut Canvas<'_, '_, '_>,
     scene: &AttachScene,
     panes: &[PaneSummary],
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
@@ -3349,6 +3435,7 @@ pub fn render_attach_scene_with_stats(
     render_extensions: &[std::sync::Arc<dyn AttachRenderExtension>],
 ) -> Result<(Option<AttachCursorState>, AttachSceneRenderStats)> {
     render_attach_scene_with_stats_and_trace(
+        canvas,
         scene,
         panes,
         pane_buffers,
@@ -3381,6 +3468,7 @@ pub fn render_attach_scene_with_stats(
 ///
 /// Returns an error when queueing frame bytes fails.
 pub fn render_attach_scene_with_stats_and_trace(
+    canvas: &mut Canvas<'_, '_, '_>,
     scene: &AttachScene,
     panes: &[PaneSummary],
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
@@ -3397,6 +3485,7 @@ pub fn render_attach_scene_with_stats_and_trace(
 ) -> Result<(Option<AttachCursorState>, AttachSceneRenderStats)> {
     let mut terminal_graphics_cache = TerminalGraphicsCache::new();
     render_attach_scene_with_stats_and_trace_with_capabilities(
+        canvas,
         scene,
         panes,
         pane_buffers,
@@ -3427,6 +3516,7 @@ pub fn render_attach_scene_with_stats_and_trace(
 ///
 /// Returns an error when queueing frame bytes fails.
 pub fn render_attach_scene_with_stats_and_trace_with_capabilities(
+    canvas: &mut Canvas<'_, '_, '_>,
     scene: &AttachScene,
     panes: &[PaneSummary],
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
@@ -3444,6 +3534,7 @@ pub fn render_attach_scene_with_stats_and_trace_with_capabilities(
     render_trace: Option<&mut AttachRenderTrace>,
 ) -> Result<(Option<AttachCursorState>, AttachSceneRenderStats)> {
     render_attach_scene_with_stats_and_trace_with_capabilities_and_occluders(
+        canvas,
         scene,
         panes,
         pane_buffers,
@@ -3475,6 +3566,7 @@ pub fn render_attach_scene_with_stats_and_trace_with_capabilities(
 ///
 /// Returns an error when queueing frame bytes fails.
 pub fn render_attach_scene_with_stats_and_trace_with_capabilities_and_occluders(
+    canvas: &mut Canvas<'_, '_, '_>,
     scene: &AttachScene,
     panes: &[PaneSummary],
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
@@ -3499,6 +3591,7 @@ pub fn render_attach_scene_with_stats_and_trace_with_capabilities_and_occluders(
         opaque_occluders: opaque_occluders.to_vec(),
     };
     let cursor_state = render_attach_scene_inner(
+        canvas,
         scene,
         panes,
         pane_buffers,
@@ -3575,6 +3668,7 @@ fn vacated_cleanup_style(appearance: &RuntimeAppearance) -> RenderStyle {
 }
 
 fn queue_vacated_cleanup_for_damage(
+    canvas: &mut Canvas<'_, '_, '_>,
     surface_rect: ExtensionRect,
     damage: &RenderDamage,
     appearance: &RuntimeAppearance,
@@ -3587,10 +3681,11 @@ fn queue_vacated_cleanup_for_damage(
         .into_iter()
         .map(|rect| RenderOp::ClearRect { rect, style })
         .collect::<Vec<_>>();
-    queue_render_ops(surface_rect, &RenderDamage::FullSurface, &clear_ops)
+    queue_render_ops(canvas, surface_rect, &RenderDamage::FullSurface, &clear_ops)
 }
 
 fn queue_after_content_cleanup_for_damage(
+    canvas: &mut Canvas<'_, '_, '_>,
     surface_rect: ExtensionRect,
     damage: &RenderDamage,
 ) -> Result<bool> {
@@ -3604,7 +3699,7 @@ fn queue_after_content_cleanup_for_damage(
             style: RenderStyle::default(),
         })
         .collect::<Vec<_>>();
-    queue_render_ops(surface_rect, &RenderDamage::FullSurface, &clear_ops)
+    queue_render_ops(canvas, surface_rect, &RenderDamage::FullSurface, &clear_ops)
 }
 
 struct AfterContentCleanupPlan {
@@ -3719,6 +3814,7 @@ fn merge_render_damage(
 
 #[allow(clippy::too_many_arguments)] // Coordinates output plans with mutable frame-local caches/resources.
 fn execute_before_content_surface_output_plan(
+    canvas: &mut Canvas<'_, '_, '_>,
     plan: &BeforeContentSurfaceOutputPlan,
     content: PaneRect,
     render_context: &RenderExtensionContext,
@@ -3730,6 +3826,7 @@ fn execute_before_content_surface_output_plan(
     for extension_plan in &plan.plans {
         record_before_content_extension_output_plan(extension_plan, render_stats);
         execute_before_content_extension_output_plan(
+            canvas,
             &mut cells,
             content,
             extension_plan,
@@ -3776,6 +3873,7 @@ fn record_before_content_extension_output_plan(
 
 #[allow(clippy::too_many_arguments)] // Executes one planned before-content action with frame-local mutable resources.
 fn execute_before_content_extension_output_plan(
+    canvas: &mut Canvas<'_, '_, '_>,
     cells: &mut BeforeContentCells,
     content: PaneRect,
     plan: &BeforeContentExtensionOutputPlan,
@@ -3792,6 +3890,7 @@ fn execute_before_content_extension_output_plan(
             ..
         } => {
             cleanup_removed_retained_terminal_graphics(
+                canvas,
                 (plan.snapshot.pane_id, plan.snapshot.surface_id),
                 diff_plan,
                 retained_snapshot,
@@ -3800,6 +3899,7 @@ fn execute_before_content_extension_output_plan(
                 render_context.capabilities,
             )?;
             let ops = queue_before_content_render_items_with_cleanup(
+                canvas,
                 plan.snapshot.pane_id,
                 plan.snapshot.surface_id,
                 plan.snapshot.surface_rect,
@@ -3819,6 +3919,7 @@ fn execute_before_content_extension_output_plan(
         }
         BeforeContentExtensionOutputAction::RenderItems { items } => {
             let ops = queue_before_content_render_items(
+                canvas,
                 plan.snapshot.pane_id,
                 plan.snapshot.surface_id,
                 plan.snapshot.surface_rect,
@@ -3902,6 +4003,7 @@ fn insert_before_content_cell(
 
 #[allow(clippy::too_many_arguments)] // Terminal graphic reconciliation needs frame-local cache state.
 fn queue_before_content_render_items(
+    canvas: &mut Canvas<'_, '_, '_>,
     pane_id: Uuid,
     surface_id: Uuid,
     surface_rect: ExtensionRect,
@@ -3912,6 +4014,7 @@ fn queue_before_content_render_items(
     capabilities: TerminalRenderCapabilities,
 ) -> Result<Vec<RenderOp>> {
     queue_before_content_render_items_with_cleanup(
+        canvas,
         pane_id,
         surface_id,
         surface_rect,
@@ -3926,6 +4029,7 @@ fn queue_before_content_render_items(
 
 #[allow(clippy::too_many_arguments)] // Terminal graphic reconciliation needs frame-local cache state.
 fn queue_before_content_render_items_with_cleanup(
+    canvas: &mut Canvas<'_, '_, '_>,
     pane_id: Uuid,
     surface_id: Uuid,
     surface_rect: ExtensionRect,
@@ -3936,10 +4040,17 @@ fn queue_before_content_render_items_with_cleanup(
     capabilities: TerminalRenderCapabilities,
     cleanup_surface_graphics: bool,
 ) -> Result<Vec<RenderOp>> {
-    let current_graphics =
-        active_terminal_graphic_keys(pane_id, surface_id, surface_rect, items, capabilities);
+    let current_graphics = active_terminal_graphic_keys(
+        canvas.graphics_output(),
+        pane_id,
+        surface_id,
+        surface_rect,
+        items,
+        capabilities,
+    );
     if cleanup_surface_graphics {
         terminal_graphics.cleanup_stale_for_surface(
+            canvas,
             pane_id,
             surface_id,
             &current_graphics,
@@ -3956,6 +4067,7 @@ fn queue_before_content_render_items_with_cleanup(
             RenderLayerItem::Graphic(graphic) => {
                 let instance_key = terminal_graphic_instance_key(pane_id, surface_id, graphic.key);
                 if terminal_graphic_needs_reconcile(
+                    canvas.graphics_output(),
                     graphic,
                     instance_key,
                     surface_rect,
@@ -3964,6 +4076,7 @@ fn queue_before_content_render_items_with_cleanup(
                     capabilities,
                 ) {
                     terminal_graphics.queue_graphic_overlay(
+                        canvas,
                         pane_id,
                         surface_id,
                         instance_key,
@@ -3980,6 +4093,7 @@ fn queue_before_content_render_items_with_cleanup(
 
 #[allow(clippy::too_many_arguments)] // Coordinates output plans with mutable frame-local caches/resources.
 fn execute_after_content_surface_output_plan(
+    canvas: &mut Canvas<'_, '_, '_>,
     plan: &AfterContentSurfaceOutputPlan,
     render_context: &RenderExtensionContext,
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
@@ -3991,6 +4105,7 @@ fn execute_after_content_surface_output_plan(
     for extension_plan in &plan.plans {
         record_after_content_extension_output_plan(extension_plan, render_stats, render_trace);
         execute_after_content_extension_output_plan(
+            canvas,
             extension_plan,
             render_context,
             pane_buffers,
@@ -4094,7 +4209,10 @@ fn cache_neutral_extension(
     );
 }
 
-fn capture_cached_extension(
+/// Replay an unchanged extension's retained output; until it has any, the cells under it keep
+/// what they showed.
+fn replay_cached_extension(
+    canvas: &mut Canvas<'_, '_, '_>,
     plan: &AfterContentExtensionOutputPlan,
     buffers: &BTreeMap<Uuid, PaneRenderBuffer>,
 ) {
@@ -4102,20 +4220,13 @@ fn capture_cached_extension(
         .get(&plan.snapshot.pane_id)
         .and_then(|buffer| buffer.extension_projection_cache.get(&plan.cache_key))
     {
-        for operation in operations {
-            crate::projection::record_borrowed(operation);
-        }
-    } else {
-        crate::projection::record(crate::projection::PaintOperation::Rejected(
-            crate::projection::ProjectionFailure::Deferred {
-                reason: "extension projection cache not yet populated",
-            },
-        ));
+        canvas.replay(operations);
     }
 }
 
 #[allow(clippy::too_many_arguments)] // Executes one planned after-content action with frame-local mutable resources.
 fn execute_after_content_extension_output_plan(
+    canvas: &mut Canvas<'_, '_, '_>,
     plan: &AfterContentExtensionOutputPlan,
     render_context: &RenderExtensionContext,
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
@@ -4132,6 +4243,7 @@ fn execute_after_content_extension_output_plan(
             ..
         } => {
             execute_retained_after_content_extension_output_plan(
+                canvas,
                 plan,
                 diff_plan,
                 retained_snapshot,
@@ -4144,10 +4256,11 @@ fn execute_after_content_extension_output_plan(
             );
         }
         AfterContentExtensionOutputAction::CachedReplay => {
-            capture_cached_extension(plan, pane_buffers);
+            replay_cached_extension(canvas, plan, pane_buffers);
         }
         AfterContentExtensionOutputAction::RenderItems { items } => {
             if let Err(err) = queue_render_items_for_frame(
+                canvas,
                 snapshot.pane_id,
                 snapshot.surface_id,
                 snapshot.surface_rect,
@@ -4166,7 +4279,7 @@ fn execute_after_content_extension_output_plan(
             }
         }
         AfterContentExtensionOutputAction::RenderOps { output_plan } => {
-            queue_terminal_commands(&output_plan.commands);
+            queue_terminal_commands(canvas, &output_plan.commands);
             if let Some(revision) = snapshot.revision
                 && let Some(buffer) = pane_buffers.get_mut(&snapshot.pane_id)
             {
@@ -4187,6 +4300,7 @@ fn execute_after_content_extension_output_plan(
 
 #[allow(clippy::too_many_arguments)] // Retained execution needs the same frame-local sinks/resources as legacy render items.
 fn execute_retained_after_content_extension_output_plan(
+    canvas: &mut Canvas<'_, '_, '_>,
     plan: &AfterContentExtensionOutputPlan,
     diff_plan: &ExtensionLayerDiffPlan,
     retained_snapshot: &ExtensionRetainedLayerSnapshot,
@@ -4199,6 +4313,7 @@ fn execute_retained_after_content_extension_output_plan(
 ) {
     let snapshot = &plan.snapshot;
     if let Err(err) = cleanup_removed_retained_terminal_graphics(
+        canvas,
         (snapshot.pane_id, snapshot.surface_id),
         diff_plan,
         retained_snapshot,
@@ -4215,6 +4330,7 @@ fn execute_retained_after_content_extension_output_plan(
     }
     if (!output_damage.is_none() || !diff_plan.stale_cleanup_damage.is_none())
         && let Err(err) = queue_render_items_for_frame_with_cleanup(
+            canvas,
             snapshot.pane_id,
             snapshot.surface_id,
             snapshot.surface_rect,
@@ -4244,6 +4360,9 @@ fn execute_retained_after_content_extension_output_plan(
 }
 
 fn cleanup_removed_retained_terminal_graphics(
+    // Only Kitty cleanup writes to the frame.
+    #[cfg(feature = "image-kitty")] canvas: &mut Canvas<'_, '_, '_>,
+    #[cfg(not(feature = "image-kitty"))] canvas: &Canvas<'_, '_, '_>,
     surface_identity: (Uuid, Uuid),
     diff_plan: &ExtensionLayerDiffPlan,
     retained_snapshot: &ExtensionRetainedLayerSnapshot,
@@ -4271,6 +4390,7 @@ fn cleanup_removed_retained_terminal_graphics(
         ));
     }
     cleanup_stale_terminal_graphics(
+        canvas,
         &active,
         graphics_cache,
         capabilities,
@@ -4279,6 +4399,7 @@ fn cleanup_removed_retained_terminal_graphics(
 }
 
 fn queue_full_frame_content_clear(
+    canvas: &mut Canvas<'_, '_, '_>,
     terminal_size: (u16, u16),
     viewport_insets: (u16, u16),
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
@@ -4290,10 +4411,10 @@ fn queue_full_frame_content_clear(
     let clear_start = top_inset.min(rows);
     let clear_end = rows.saturating_sub(bottom_inset).max(clear_start);
     for y in clear_start..clear_end {
-        crate::projection::record(crate::projection::PaintOperation::Fill {
-            rect: bmux_tui::geometry::Rect::new(0, y, cols, 1),
-            style: bmux_tui::style::Style::new(),
-        });
+        canvas.fill(
+            bmux_tui::geometry::Rect::new(0, y, cols, 1),
+            bmux_tui::style::Style::new(),
+        );
         if let Some(stats) = render_stats.as_deref_mut() {
             stats.clear_rows = stats.clear_rows.saturating_add(1);
             stats.clear_cells = stats.clear_cells.saturating_add(u64::from(cols));
@@ -4844,6 +4965,7 @@ fn record_render_frame_output_plan_stats(
 
 #[allow(clippy::too_many_arguments)] // Executes the planned frame with frame-local mutable resources.
 fn execute_render_frame_output_plan(
+    canvas: &mut Canvas<'_, '_, '_>,
     plan: &RenderFrameOutputPlan<'_>,
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
     terminal_graphics_cache: &mut TerminalGraphicsCache,
@@ -4855,6 +4977,7 @@ fn execute_render_frame_output_plan(
     let mut cursor_state = None;
     if plan.full_frame_clear {
         queue_full_frame_content_clear(
+            canvas,
             plan.terminal_size,
             plan.viewport_insets,
             pane_buffers,
@@ -4876,6 +4999,7 @@ fn execute_render_frame_output_plan(
             continue;
         }
         if let Some(content_cursor_state) = execute_surface_output_plan(
+            canvas,
             surface,
             pane_buffers,
             terminal_graphics_cache,
@@ -4939,6 +5063,7 @@ fn commit_before_content_surface_output_plan(
     clippy::too_many_lines, // Cleanup, content, and extension stages must remain one atomic synchronized transaction.
 )]
 fn execute_surface_output_plan(
+    canvas: &mut Canvas<'_, '_, '_>,
     plan: &SurfaceOutputPlan<'_>,
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
     terminal_graphics_cache: &mut TerminalGraphicsCache,
@@ -4951,6 +5076,7 @@ fn execute_surface_output_plan(
     let mut cursor_state = None;
     if !plan.vacated_cleanup_damage.is_none() && !plan.surface_plan.sync_deferred {
         queue_vacated_cleanup_for_damage(
+            canvas,
             plan.ext_rect,
             &plan.vacated_cleanup_damage,
             plan.runtime_appearance,
@@ -4976,6 +5102,7 @@ fn execute_surface_output_plan(
         match stage {
             SurfaceOutputStage::BeforeContent => {
                 before_content_cells = execute_before_content_surface_output_plan(
+                    canvas,
                     &plan.before_content_output_plan,
                     plan.content,
                     render_context,
@@ -4993,6 +5120,7 @@ fn execute_surface_output_plan(
             }
             SurfaceOutputStage::AfterContentCleanup => {
                 queue_after_content_cleanup_for_damage(
+                    canvas,
                     plan.ext_rect,
                     &plan.surface_plan.after_content_cleanup.surface_damage,
                 )
@@ -5006,6 +5134,7 @@ fn execute_surface_output_plan(
                     continue;
                 }
                 cursor_state = queue_pane_content_for_surface(
+                    canvas,
                     pane_buffers,
                     &PaneContentRenderStage {
                         pane_id: plan.pane_id,
@@ -5025,6 +5154,7 @@ fn execute_surface_output_plan(
             }
             SurfaceOutputStage::AfterContent => {
                 execute_after_content_surface_output_plan(
+                    canvas,
                     &plan.after_content_output_plan,
                     render_context,
                     pane_buffers,
@@ -5104,6 +5234,7 @@ fn note_pane_row_skipped(
 /// Returns the rows moved and the pane rows the move exposed, which must be drawn; no rows when
 /// the move is not allowed or not worth doing.
 fn scroll_host_rows(
+    canvas: &mut Canvas<'_, '_, '_>,
     stage: &PaneContentRenderStage<'_>,
     moved: ViewportScroll,
 ) -> (u64, std::ops::Range<usize>) {
@@ -5122,15 +5253,15 @@ fn scroll_host_rows(
     let (Ok(first), Ok(last)) = (u16::try_from(top), u16::try_from(bottom)) else {
         return (0, 0..0);
     };
-    crate::projection::record(crate::projection::PaintOperation::Scroll {
-        area: bmux_tui::geometry::Rect::new(
+    canvas.scroll(
+        bmux_tui::geometry::Rect::new(
             stage.content.x,
             stage.content.y.saturating_add(first),
             stage.content.w,
             last - first + 1,
         ),
         rows,
-    });
+    );
     let exposed = if rows > 0 {
         bottom + 1 - lines..bottom + 1
     } else {
@@ -5141,6 +5272,7 @@ fn scroll_host_rows(
 
 #[allow(clippy::too_many_lines)] // Preserve pane-row byte emission order while extracting the content stage.
 fn queue_pane_content_for_surface(
+    canvas: &mut Canvas<'_, '_, '_>,
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
     stage: &PaneContentRenderStage<'_>,
     render_stats: &mut Option<&mut AttachSceneRenderStats>,
@@ -5188,7 +5320,7 @@ fn queue_pane_content_for_surface(
             let mut exposed = 0..0;
             if live {
                 let scrolled;
-                (scrolled, exposed) = scroll_host_rows(stage, moved);
+                (scrolled, exposed) = scroll_host_rows(canvas, stage, moved);
                 rows_follow |= scrolled > 0;
                 if let Some(stats) = render_stats.as_deref_mut() {
                     stats.pane_rows_scrolled = stats.pane_rows_scrolled.saturating_add(scrolled);
@@ -5255,13 +5387,6 @@ fn queue_pane_content_for_surface(
             }
         }
         if !stage.content_damage.requires_redraw() || stage.sync_deferred {
-            if stage.sync_deferred {
-                crate::projection::record(crate::projection::PaintOperation::Rejected(
-                    crate::projection::ProjectionFailure::Deferred {
-                        reason: "pane synchronized update is unfinished",
-                    },
-                ));
-            }
             if stage.sync_deferred
                 && let Some(stats) = render_stats.as_deref_mut()
             {
@@ -5315,9 +5440,10 @@ fn queue_pane_content_for_surface(
                     note_pane_row_skipped(stage.surface_index, row_u16, render_stats, render_trace);
                     continue;
                 }
-                if crate::projection::capturing() {
+                {
                     let before_cells = before_content_row_cells(stage.before_content_cells, y);
-                    capture_pane_row(
+                    paint_pane_row(
+                        canvas,
                         &GridRowRenderContext {
                             row: grid_row,
                             selection,
@@ -5356,9 +5482,7 @@ fn queue_pane_content_for_surface(
                 palette: &palette,
                 before_content_cells: &before_cells,
             };
-            if crate::projection::capturing() {
-                capture_pane_row(&context, stage.content.x, y, inner_width);
-            }
+            paint_pane_row(canvas, &context, stage.content.x, y, inner_width);
             note_pane_row_captured(
                 stage.surface_index,
                 row_u16,
@@ -5378,6 +5502,7 @@ fn queue_pane_content_for_surface(
     clippy::fn_params_excessive_bools // explicit render-state flags keep hot-path call sites readable
 )]
 fn render_attach_scene_inner(
+    canvas: &mut Canvas<'_, '_, '_>,
     scene: &AttachScene,
     _panes: &[PaneSummary],
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
@@ -5432,10 +5557,15 @@ fn render_attach_scene_inner(
     );
     record_render_frame_output_plan_stats(&frame_output_plan, &mut render_stats);
 
-    let mut terminal_graphics_frame =
-        begin_terminal_graphics_frame(scene, terminal_graphics_cache, render_context.capabilities)?;
+    let mut terminal_graphics_frame = begin_terminal_graphics_frame(
+        canvas,
+        scene,
+        terminal_graphics_cache,
+        render_context.capabilities,
+    )?;
 
     let cursor_state = execute_render_frame_output_plan(
+        canvas,
         &frame_output_plan,
         pane_buffers,
         terminal_graphics_cache,
@@ -5446,6 +5576,7 @@ fn render_attach_scene_inner(
     )?;
 
     finish_terminal_graphics_frame(
+        canvas,
         &mut terminal_graphics_frame,
         terminal_graphics_cache,
         render_context.capabilities,
@@ -5472,10 +5603,10 @@ mod tests {
         queue_layer_fill, queue_render_ops, queue_render_ops_with_capabilities,
         render_attach_scene, render_attach_scene_with_stats_and_trace,
     };
-    use crate::frame_presenter::{CapturedFrame, FramePresenter, Presented};
+    use crate::canvas::Canvas;
+    use crate::frame_presenter::{FramePresenter, Presented};
     #[cfg(feature = "image-kitty")]
     use crate::projection::GraphicsOutput;
-    use crate::projection::PaintOperation;
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
         PaneScrollbackView, PaneScrollbackViews,
@@ -5560,20 +5691,20 @@ mod tests {
         }
     }
 
-    /// A simulated host terminal: each frame the renderer draws is captured, presented over the
-    /// frame presented before it (as the attach client presents them) and fed to an emulated
-    /// screen.
+    /// A simulated host terminal: each frame the renderer paints is presented over the frame
+    /// presented before it (as the attach client presents them) and fed to an emulated screen.
     struct TestHost {
         size: (u16, u16),
         presenter: FramePresenter,
         screen: bmux_terminal_grid::TerminalGridStream,
     }
 
-    /// One frame drawn on a [`TestHost`]: what the render returned, the operations it captured,
-    /// the graphics protocol bytes it wrote and the bytes presented to the host.
+    /// One frame drawn on a [`TestHost`]: what the render returned, the cells the frame changed
+    /// on the host (runs of text with where they start, every row of a full frame), the graphics
+    /// protocol bytes it wrote and the bytes presented to the host.
     struct HostFrame<T> {
         result: T,
-        operations: Vec<PaintOperation>,
+        changes: Vec<(u16, u16, String)>,
         #[cfg(feature = "image-kitty")]
         graphics: GraphicsOutput,
         bytes: Vec<u8>,
@@ -5595,16 +5726,24 @@ mod tests {
 
         /// Draw one frame: `full` for the renderer's full frames, which start from a blank
         /// screen.
-        fn frame<T>(&mut self, full: bool, render: impl FnOnce() -> T) -> HostFrame<T> {
-            let (result, operations, graphics) = crate::frame_presenter::capture_frame(render);
-            let bytes = match self.presenter.present(&CapturedFrame {
-                operations: &operations,
-                cursor: None,
-                full,
-                size: self.size,
-                margins: false,
-                graphics: (&graphics).into(),
-            }) {
+        fn frame<T>(
+            &mut self,
+            full: bool,
+            render: impl FnOnce(&mut Canvas<'_, '_, '_>) -> T,
+        ) -> HostFrame<T> {
+            let frame = self
+                .presenter
+                .present(
+                    &crate::frame_presenter::FrameSpec {
+                        full,
+                        size: self.size,
+                        margins: false,
+                        graphics: true,
+                    },
+                    |canvas| Ok::<_, std::convert::Infallible>(render(canvas)),
+                )
+                .unwrap_or_else(|never| match never {});
+            let bytes = match frame.presented {
                 Presented::Frame(bytes) => bytes,
                 Presented::Unchanged => Vec::new(),
                 Presented::Unsupported(reason) => {
@@ -5613,10 +5752,17 @@ mod tests {
             };
             self.screen.process(&bytes);
             HostFrame {
-                result,
-                operations,
+                result: frame.result,
+                changes: shown_runs(&self.presenter),
                 #[cfg(feature = "image-kitty")]
-                graphics,
+                graphics: frame
+                    .output
+                    .graphics()
+                    .map(|graphics| GraphicsOutput {
+                        before: graphics.before.clone(),
+                        after: graphics.after.clone(),
+                    })
+                    .unwrap_or_default(),
                 bytes,
             }
         }
@@ -5656,12 +5802,41 @@ mod tests {
         }
     }
 
-    /// Run `render` with graphics protocol output collected; returns its result and every
-    /// graphics byte in the order a presenter writes them (removals, then placements).
+    /// The runs of cells the last frame `presenter` presented changed, with their text, left to
+    /// right and top to bottom; every row of a full frame.
+    fn shown_runs(presenter: &FramePresenter) -> Vec<(u16, u16, String)> {
+        let text = |cells: &bmux_tui::buffer::Buffer, y: u16, columns: std::ops::Range<u16>| {
+            columns
+                .filter_map(|x| cells.get(bmux_tui::geometry::Point::new(x, y)))
+                .filter(|cell| !cell.is_wide_continuation())
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>()
+        };
+        match presenter.shown_changes() {
+            crate::frame_presenter::ShownChanges::Changed { cells, changes } => changes
+                .runs()
+                .map(|(y, columns)| (columns.start, y, text(cells, y, columns)))
+                .collect(),
+            crate::frame_presenter::ShownChanges::All { cells } => {
+                let area = cells.area();
+                (area.y..area.bottom())
+                    .map(|y| (area.x, y, text(cells, y, area.x..area.right())))
+                    .collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Paint with `render` into a scratch frame whose host takes graphics protocol output;
+    /// returns its result and every graphics byte in the order a presenter writes them
+    /// (removals, then placements).
     #[cfg(feature = "image-kitty")]
-    fn with_graphics<T>(render: impl FnOnce() -> T) -> (T, String) {
-        let (result, _, graphics) = crate::frame_presenter::capture_frame(render);
-        let mut bytes = graphics.before;
+    fn with_graphics<T>(render: impl FnOnce(&mut Canvas<'_, '_, '_>) -> T) -> (T, String) {
+        let mut buffer = bmux_tui::buffer::Buffer::empty(TuiRect::new(0, 0, 512, 128));
+        let mut output = crate::canvas::FrameOutput::with_graphics();
+        let result = crate::canvas::paint_on(&mut buffer, &mut output, render);
+        let graphics = output.graphics().expect("graphics output");
+        let mut bytes = graphics.before.clone();
         bytes.extend_from_slice(&graphics.after);
         (
             result,
@@ -5669,92 +5844,44 @@ mod tests {
         )
     }
 
-    /// Where an operation draws text, and the text: captured text runs and runs of cells.
-    fn drawn(operation: &PaintOperation) -> Option<(u16, u16, &str)> {
-        match operation {
-            PaintOperation::Text { x, y, text, .. } | PaintOperation::Cells { x, y, text, .. } => {
-                Some((*x, *y, text.as_str()))
-            }
-            _ => None,
-        }
+    /// Paint with `render` into a blank `cols` x `rows` frame; returns its result and the frame's
+    /// cells, for tests of what a single paint produces.
+    fn painted<T>(
+        cols: u16,
+        rows: u16,
+        render: impl FnOnce(&mut Canvas<'_, '_, '_>) -> T,
+    ) -> (T, bmux_tui::buffer::Buffer, crate::canvas::FrameOutput) {
+        let mut buffer = bmux_tui::buffer::Buffer::empty(TuiRect::new(0, 0, cols, rows));
+        let mut output = crate::canvas::FrameOutput::default();
+        let result = crate::canvas::paint_on(&mut buffer, &mut output, render);
+        (result, buffer, output)
     }
 
-    /// The character an operation draws starting at column `x` of row `y`, if any.
-    fn drawn_char_at(operation: &PaintOperation, x: u16, y: u16) -> Option<char> {
-        let (start, row, text) = drawn(operation)?;
-        if row != y {
-            return None;
-        }
-        let mut col = start;
-        for ch in text.chars() {
-            let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-            if width == 0 {
-                continue;
-            }
-            if col == x {
-                return Some(ch);
-            }
-            col = col.saturating_add(u16::try_from(width).unwrap_or(1));
-        }
-        None
+    /// Paint with `render` into a `cols` x `rows` frame whose every cell shows `~`, so the cells
+    /// the paint leaves alone keep showing it; returns its result, the frame's rows as text (one
+    /// symbol per column, nothing for the right half of a wide character) and its cells.
+    fn marked<T>(
+        cols: u16,
+        rows: u16,
+        render: impl FnOnce(&mut Canvas<'_, '_, '_>) -> T,
+    ) -> (T, Vec<String>, bmux_tui::buffer::Buffer) {
+        let area = TuiRect::new(0, 0, cols, rows);
+        let mut buffer = bmux_tui::buffer::Buffer::empty(area);
+        buffer.fill(area, "~", TuiStyle::new());
+        let mut output = crate::canvas::FrameOutput::default();
+        let result = crate::canvas::paint_on(&mut buffer, &mut output, render);
+        let text = (0..rows)
+            .map(|y| buffer.row_symbols(y).unwrap_or_default())
+            .collect();
+        (result, text, buffer)
     }
 
-    /// Every text run captured, with where it starts.
-    fn drawn_runs(operations: &[PaintOperation]) -> Vec<(u16, u16, String)> {
-        operations
-            .iter()
-            .filter_map(drawn)
-            .map(|(x, y, text)| (x, y, text.to_string()))
-            .collect()
-    }
-
-    /// Index of the first operation drawing text that contains `needle`.
-    fn position_of_text(operations: &[PaintOperation], needle: &str) -> Option<usize> {
-        operations.iter().position(|operation| {
-            drawn(operation).is_some_and(|(_, _, text)| text.contains(needle))
-        })
-    }
-
-    /// The cells an operation blanks: a fill, or text that is only spaces.
-    fn blanked(operation: &PaintOperation) -> Option<TuiRect> {
-        match operation {
-            PaintOperation::Fill { rect, .. } => Some(*rect),
-            PaintOperation::Text { x, y, text, .. } | PaintOperation::Cells { x, y, text, .. }
-                if !text.is_empty() && text.chars().all(|ch| ch == ' ') =>
-            {
-                Some(TuiRect::new(
-                    *x,
-                    *y,
-                    u16::try_from(text.len()).expect("blank run fits a row"),
-                    1,
-                ))
-            }
-            _ => None,
-        }
-    }
-
-    /// Whether `outer` covers every cell of `inner`.
-    fn covers(outer: TuiRect, inner: TuiRect) -> bool {
-        outer.x <= inner.x
-            && outer.y <= inner.y
-            && outer.x + outer.width >= inner.x + inner.width
-            && outer.y + outer.height >= inner.y + inner.height
-    }
-
-    /// Index of the first operation blanking every cell of `rect`.
-    fn position_of_blank(operations: &[PaintOperation], rect: TuiRect) -> Option<usize> {
-        operations
-            .iter()
-            .position(|operation| blanked(operation).is_some_and(|blank| covers(blank, rect)))
-    }
-
-    /// The style a captured run draws its first cell in.
-    fn drawn_style(operation: &PaintOperation) -> Option<TuiStyle> {
-        match operation {
-            PaintOperation::Text { style, .. } | PaintOperation::Fill { style, .. } => Some(*style),
-            PaintOperation::Cells { cells, .. } => cells.first().map(|cell| cell.style),
-            _ => None,
-        }
+    /// The style of the cell at column `x` of row `y` of `cells`.
+    fn style_at(cells: &bmux_tui::buffer::Buffer, x: u16, y: u16) -> TuiStyle {
+        cells
+            .get(bmux_tui::geometry::Point::new(x, y))
+            .map(|cell| cell.style)
+            .expect("the cell should be inside the frame")
     }
 
     /// Assert columns `0..width` of row `y` show the default foreground over the background
@@ -5821,8 +5948,9 @@ mod tests {
                 },
             },
         );
-        let ((), operations) = crate::projection::capture(|| {
-            super::capture_pane_row(
+        let ((), cells, _) = painted(1, 1, |canvas| {
+            super::paint_pane_row(
+                canvas,
                 &GridRowRenderContext {
                     row,
                     selection: None,
@@ -5836,13 +5964,10 @@ mod tests {
                 1,
             );
         });
-        let [PaintOperation::Cells { text, cells, .. }] = operations.as_slice() else {
-            panic!("one run of cells should be captured: {operations:?}");
-        };
-        let [cell] = cells.as_slice() else {
-            panic!("one cell should be captured: {cells:?}");
-        };
-        (text.clone(), cell.style)
+        let cell = cells
+            .get(bmux_tui::geometry::Point::new(0, 0))
+            .expect("the pane row should paint its one cell");
+        (cell.symbol.as_str().to_string(), cell.style)
     }
 
     #[test]
@@ -5931,8 +6056,9 @@ mod tests {
             vec![Arc::new(RetainedBeforeUnderlay) as Arc<dyn AttachRenderExtension>];
 
         let mut host = TestHost::new(4, 2);
-        host.frame(true, || {
+        host.frame(true, |canvas| {
             render_attach_scene(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -6012,8 +6138,9 @@ mod tests {
             vec![Arc::new(RetainedBeforeUnderlay) as Arc<dyn AttachRenderExtension>];
 
         let mut host = TestHost::new(4, 2);
-        host.frame(true, || {
+        host.frame(true, |canvas| {
             render_attach_scene(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -6103,8 +6230,9 @@ mod tests {
             vec![Arc::new(MovingBeforeUnderlay { x: x.clone() }) as Arc<dyn AttachRenderExtension>];
 
         let mut host = TestHost::new(4, 2);
-        host.frame(true, || {
+        host.frame(true, |canvas| {
             render_attach_scene(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -6123,8 +6251,9 @@ mod tests {
         assert_eq!(host.row(0), "U   ");
 
         x.store(2, Ordering::Relaxed);
-        let moved = host.frame(false, || {
+        let moved = host.frame(false, |canvas| {
             render_attach_scene_with_stats_and_trace(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -6144,9 +6273,12 @@ mod tests {
         let (_cursor, stats) = moved.result;
 
         assert!(
-            position_of_text(&moved.operations, "U").is_some(),
-            "moved underlay should render: {:?}",
-            moved.operations
+            moved
+                .changes
+                .iter()
+                .any(|(_, y, text)| *y == 0 && text.contains('U')),
+            "moved underlay should reach the host: {:?}",
+            moved.changes
         );
         assert_eq!(
             host.row(0),
@@ -6322,8 +6454,9 @@ mod tests {
             text: "e\u{301}".to_string(),
             style: RenderStyle::default(),
         }];
-        let (queued, operations) = crate::projection::capture(|| {
+        let (queued, rows, _) = marked(4, 1, |canvas| {
             queue_render_ops(
+                canvas,
                 ExtensionRect {
                     x: 0,
                     y: 0,
@@ -6337,11 +6470,7 @@ mod tests {
         });
 
         assert!(queued);
-        assert_eq!(
-            drawn_runs(&operations),
-            [(0, 0, "e\u{301}".to_string())],
-            "{operations:?}"
-        );
+        assert_eq!(rows, ["e\u{301}~~~"]);
     }
 
     #[test]
@@ -6365,8 +6494,9 @@ mod tests {
                 style: RenderStyle::default().named_foreground(RenderNamedColor::Cyan),
             },
         ];
-        let (queued, operations) = crate::projection::capture(|| {
+        let (queued, rows, _) = marked(10, 1, |canvas| {
             queue_render_ops(
+                canvas,
                 surface_rect,
                 &RenderDamage::Regions(vec![ExtensionRect {
                     x: 2,
@@ -6380,11 +6510,8 @@ mod tests {
         });
 
         assert!(queued);
-        assert_eq!(
-            drawn_runs(&operations),
-            [(2, 0, "HEAD".to_string())],
-            "{operations:?}"
-        );
+        // Only the damaged segment is painted: the fill outside it is not.
+        assert_eq!(rows, ["~~HEAD~~~~"]);
     }
 
     #[test]
@@ -7062,17 +7189,20 @@ mod tests {
             DamageCoalescingPolicy::default(),
         );
 
-        let (queued, operations) = crate::projection::capture(|| {
-            queue_frame_damage_overlay(&scene, &damage, (80, 24), 0, 1)
+        let (queued, rows, _) = marked(80, 24, |canvas| {
+            queue_frame_damage_overlay(canvas, &scene, &damage, (80, 24), 0, 1)
                 .expect("damage overlay should queue")
         });
 
         assert!(queued);
-        let runs = drawn_runs(&operations);
+        assert_eq!(
+            rows[7].chars().nth(13),
+            Some('█'),
+            "the damaged content rect should be marked at its absolute position: {rows:#?}"
+        );
         assert!(
-            runs.iter()
-                .any(|(x, y, text)| (*x, *y) == (13, 7) && text.contains('█')),
-            "the damaged content rect should be marked at its absolute position: {runs:?}"
+            rows[..7].iter().all(|row| row.chars().all(|ch| ch == '~')),
+            "nothing above the damaged rect should be marked: {rows:#?}"
         );
     }
 
@@ -7130,12 +7260,15 @@ mod tests {
             focus: AttachFocusTarget::None,
             surfaces: Vec::new(),
         };
-        let (queued, operations) = crate::projection::capture(|| {
-            queue_frame_damage_overlay(&scene, &FrameDamage::default(), (80, 24), 0, 1)
+        let (queued, rows, _) = marked(80, 24, |canvas| {
+            queue_frame_damage_overlay(canvas, &scene, &FrameDamage::default(), (80, 24), 0, 1)
                 .expect("empty damage overlay should queue")
         });
         assert!(!queued);
-        assert!(operations.is_empty(), "{operations:?}");
+        assert!(
+            rows.iter().all(|row| row.chars().all(|ch| ch == '~')),
+            "nothing should be painted: {rows:#?}"
+        );
     }
 
     #[test]
@@ -7155,19 +7288,25 @@ mod tests {
             }
         }
         assert!(commands.len() > 131_072);
-        let ((), operations) =
-            crate::projection::capture(|| super::capture_terminal_commands(&commands));
-        assert_eq!(operations.len(), 300);
-        assert!(operations.iter().all(|op| matches!(op, crate::projection::PaintOperation::Text { text, .. } if text.len() == 600)));
+        let ((), cells, output) = painted(600, 300, |canvas| {
+            super::paint_terminal_commands(canvas, &commands);
+        });
+        assert!(output.rejection().is_none(), "{:?}", output.rejection());
+        let row = "x".repeat(600);
+        for y in 0..300 {
+            assert_eq!(
+                cells.row_symbols(y).as_deref(),
+                Some(row.as_str()),
+                "row {y}"
+            );
+        }
     }
 
     #[test]
     fn offset_component_buffer_matches_neutral_retained_projection() {
         use bmux_tui::{
             buffer::Buffer,
-            frame::Frame,
             geometry::Rect,
-            paint::PaintCx,
             style::{Modifier, Style},
             text::Line,
         };
@@ -7185,18 +7324,20 @@ mod tests {
             );
         }
         let ops = bmux_plugin::component_render::buffer_render_ops(&source);
-        let (result, operations) = crate::projection::capture(|| {
-            queue_render_ops(
-                ExtensionRect::new(area.x, area.y, area.width, area.height),
-                &RenderDamage::FullSurface,
-                &ops,
-            )
-        });
-        assert!(result.unwrap());
         let mut projected = Buffer::empty(area);
-        let mut frame = Frame::new(&mut projected);
-        crate::projection::paint_over(&mut PaintCx::new(&mut frame), &operations)
-            .expect("paint projected fixture");
+        let result = crate::canvas::paint_on(
+            &mut projected,
+            &mut crate::canvas::FrameOutput::default(),
+            |canvas| {
+                queue_render_ops(
+                    canvas,
+                    ExtensionRect::new(area.x, area.y, area.width, area.height),
+                    &RenderDamage::FullSurface,
+                    &ops,
+                )
+            },
+        );
+        assert!(result.unwrap());
         for y in area.y..area.bottom() {
             assert_eq!(projected.row_symbols(y), source.row_symbols(y), "row {y}");
         }
@@ -7204,7 +7345,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_render_ops_batches_adjacent_text_runs() {
+    fn queue_render_ops_paints_adjacent_text_runs() {
         let ops = [
             RenderOp::TextRun {
                 x: 0,
@@ -7219,8 +7360,9 @@ mod tests {
                 style: RenderStyle::default(),
             },
         ];
-        let (queued, operations) = crate::projection::capture(|| {
+        let (queued, rows, _) = marked(8, 1, |canvas| {
             queue_render_ops(
+                canvas,
                 ExtensionRect {
                     x: 0,
                     y: 0,
@@ -7234,11 +7376,7 @@ mod tests {
         });
 
         assert!(queued);
-        assert_eq!(
-            drawn_runs(&operations),
-            [(0, 0, "abcd".to_string())],
-            "{operations:?}"
-        );
+        assert_eq!(rows, ["abcd~~~~"]);
     }
 
     #[cfg(feature = "image-kitty")]
@@ -7333,8 +7471,8 @@ mod tests {
         pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
         frame_damage: &FrameDamage,
     ) -> (String, AttachSceneRenderStats) {
-        let (frame_stats, graphics) = with_graphics(|| {
-            render_retained_graphic_frame_stats(state, cache, pane_buffers, frame_damage)
+        let (frame_stats, graphics) = with_graphics(|canvas| {
+            render_retained_graphic_frame_stats(canvas, state, cache, pane_buffers, frame_damage)
         });
         (graphics, frame_stats)
     }
@@ -7342,6 +7480,7 @@ mod tests {
     /// Render one frame of [`RetainedGraphicExtension`]'s scene; returns its statistics.
     #[cfg(feature = "image-kitty")]
     fn render_retained_graphic_frame_stats(
+        canvas: &mut Canvas<'_, '_, '_>,
         state: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
         cache: &mut TerminalGraphicsCache,
         pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
@@ -7355,6 +7494,7 @@ mod tests {
             })
                 as std::sync::Arc<dyn bmux_plugin::AttachRenderExtension>];
         let (_cursor, frame_stats) = render_attach_scene_with_stats_and_trace_with_capabilities(
+            canvas,
             &scene,
             &[],
             pane_buffers,
@@ -7451,38 +7591,35 @@ mod tests {
         let mut cache = TerminalGraphicsCache::new();
         let pane_id = Uuid::from_u128(7_777);
         let mut pane_buffers = BTreeMap::from([(pane_id, PaneRenderBuffer::default())]);
+        let mut cells = bmux_tui::buffer::Buffer::empty(TuiRect::new(0, 0, 10, 4));
         let mut frame = |damage: &FrameDamage| {
-            crate::projection::capture(|| {
-                crate::projection::with_graphics_output(|| {
-                    render_retained_graphic_frame_stats(
-                        &state,
-                        &mut cache,
-                        &mut pane_buffers,
-                        damage,
-                    );
-                    crate::projection::take_graphics_output()
-                })
-            })
+            let mut output = crate::canvas::FrameOutput::with_graphics();
+            crate::canvas::paint_on(&mut cells, &mut output, |canvas| {
+                render_retained_graphic_frame_stats(
+                    canvas,
+                    &state,
+                    &mut cache,
+                    &mut pane_buffers,
+                    damage,
+                );
+            });
+            output
         };
-        let (placed, operations) = frame(&FrameDamage::full_frame());
-        let after = String::from_utf8_lossy(&placed.after);
+        let placed = frame(&FrameDamage::full_frame());
+        let graphics = placed.graphics().expect("graphics output");
+        let after = String::from_utf8_lossy(&graphics.after);
         assert!(after.contains("Ga=t,"), "{after:?}");
         assert!(after.contains("Ga=p,"), "{after:?}");
-        assert_eq!(String::from_utf8_lossy(&placed.before), "");
-        assert!(
-            !operations.iter().any(|operation| matches!(
-                operation,
-                crate::projection::PaintOperation::Image(_)
-                    | crate::projection::PaintOperation::Rejected(_)
-            )),
-            "{operations:?}"
-        );
+        assert_eq!(String::from_utf8_lossy(&graphics.before), "");
+        assert!(placed.images().is_empty(), "{:?}", placed.images());
+        assert!(placed.rejection().is_none(), "{:?}", placed.rejection());
 
         state.store(2, std::sync::atomic::Ordering::Relaxed);
-        let (removed, _) = frame(&FrameDamage::default());
-        let before = String::from_utf8_lossy(&removed.before);
+        let removed = frame(&FrameDamage::default());
+        let graphics = removed.graphics().expect("graphics output");
+        let before = String::from_utf8_lossy(&graphics.before);
         assert!(before.contains("Ga=d,d=i,"), "{before:?}");
-        assert_eq!(String::from_utf8_lossy(&removed.after), "");
+        assert_eq!(String::from_utf8_lossy(&graphics.after), "");
         assert!(cache.is_empty());
     }
 
@@ -7524,8 +7661,9 @@ mod tests {
         let surface_rect = ExtensionRect::new(0, 0, 10, 4);
         let pane_items = [RenderLayerItem::Graphic(test_graphic_overlay(2))];
         let mut cache = TerminalGraphicsCache::new();
-        with_graphics(|| {
+        with_graphics(|canvas| {
             queue_render_items(
+                canvas,
                 pane_surface_id,
                 surface_rect,
                 &RenderDamage::FullSurface,
@@ -7539,8 +7677,9 @@ mod tests {
         let cached_keys = cache.keys().copied().collect::<BTreeSet<_>>();
         assert_eq!(cached_keys.len(), 1);
 
-        let (queued, menu_output) = with_graphics(|| {
+        let (queued, menu_output) = with_graphics(|canvas| {
             queue_render_items_for_surface(
+                canvas,
                 menu_surface_id,
                 surface_rect,
                 &RenderDamage::FullSurface,
@@ -7567,8 +7706,9 @@ mod tests {
         let items = [RenderLayerItem::Graphic(test_graphic_overlay(2))];
         let capabilities = test_kitty_capabilities();
         let mut cache = BTreeMap::new();
-        with_graphics(|| {
+        with_graphics(|canvas| {
             queue_render_items(
+                canvas,
                 Uuid::from_u128(7),
                 ExtensionRect {
                     x: 0,
@@ -7608,8 +7748,9 @@ mod tests {
         };
         let mut cache = BTreeMap::new();
         let mut initial_stats = AttachSceneRenderStats::default();
-        with_graphics(|| {
+        with_graphics(|canvas| {
             queue_render_items(
+                canvas,
                 Uuid::from_u128(7),
                 surface_rect,
                 &RenderDamage::FullSurface,
@@ -7627,8 +7768,9 @@ mod tests {
         assert!(initial_stats.terminal_graphic_bytes > 0);
 
         let mut cleanup_stats = AttachSceneRenderStats::default();
-        with_graphics(|| {
+        with_graphics(|canvas| {
             queue_render_items(
+                canvas,
                 Uuid::from_u128(7),
                 surface_rect,
                 &RenderDamage::FullSurface,
@@ -7652,8 +7794,9 @@ mod tests {
         let items = [RenderLayerItem::Graphic(test_graphic_overlay(2))];
         let capabilities = test_kitty_capabilities();
         let mut cache = BTreeMap::new();
-        let (queued, first) = with_graphics(|| {
+        let (queued, first) = with_graphics(|canvas| {
             queue_render_items(
+                canvas,
                 Uuid::from_u128(7),
                 ExtensionRect {
                     x: 0,
@@ -7675,8 +7818,9 @@ mod tests {
         assert!(first.contains("\u{1b}[2;3H\u{1b}_Ga=p,"), "{first:?}");
         assert!(first.contains(",z=8,c=4,r=1,q=2"), "{first:?}");
 
-        let (queued, second) = with_graphics(|| {
+        let (queued, second) = with_graphics(|canvas| {
             queue_render_items(
+                canvas,
                 Uuid::from_u128(7),
                 ExtensionRect {
                     x: 0,
@@ -7696,8 +7840,9 @@ mod tests {
         assert_eq!(second, "");
 
         let moved_items = [RenderLayerItem::Graphic(test_graphic_overlay(4))];
-        let (queued, third) = with_graphics(|| {
+        let (queued, third) = with_graphics(|canvas| {
             queue_render_items(
+                canvas,
                 Uuid::from_u128(7),
                 ExtensionRect {
                     x: 0,
@@ -7719,8 +7864,9 @@ mod tests {
         assert!(third.contains("Ga=p,"), "{third:?}");
         assert!(third.contains("\u{1b}[2;5H\u{1b}_Ga=p,"), "{third:?}");
 
-        let (queued, fourth) = with_graphics(|| {
+        let (queued, fourth) = with_graphics(|canvas| {
             queue_render_items(
+                canvas,
                 Uuid::from_u128(7),
                 ExtensionRect {
                     x: 0,
@@ -7772,8 +7918,9 @@ mod tests {
             ..inside
         };
         let mut cache = BTreeMap::new();
-        let (queued, rendered) = with_graphics(|| {
+        let (queued, rendered) = with_graphics(|canvas| {
             queue_render_items(
+                canvas,
                 Uuid::from_u128(7),
                 content,
                 &RenderDamage::FullSurface,
@@ -7791,6 +7938,7 @@ mod tests {
         );
         assert!(
             !terminal_graphic_needs_reconcile(
+                true,
                 &outside,
                 terminal_graphic_instance_key(Uuid::from_u128(7), Uuid::from_u128(7), outside.key,),
                 content,
@@ -7801,8 +7949,9 @@ mod tests {
             "graphics wholly outside padded content must be clipped"
         );
 
-        let (queued, clipped_output) = with_graphics(|| {
+        let (queued, clipped_output) = with_graphics(|canvas| {
             queue_render_items(
+                canvas,
                 Uuid::from_u128(7),
                 content,
                 &RenderDamage::FullSurface,
@@ -7832,8 +7981,9 @@ mod tests {
             h: 4,
         };
         let mut cache = BTreeMap::new();
-        with_graphics(|| {
+        with_graphics(|canvas| {
             queue_render_items(
+                canvas,
                 Uuid::from_u128(7),
                 surface_rect,
                 &RenderDamage::FullSurface,
@@ -7847,8 +7997,9 @@ mod tests {
 
         let mut changed_graphic = test_graphic_overlay(2);
         changed_graphic.color.r = 9;
-        let (queued, changed) = with_graphics(|| {
+        let (queued, changed) = with_graphics(|canvas| {
             queue_render_items(
+                canvas,
                 Uuid::from_u128(7),
                 surface_rect,
                 &RenderDamage::FullSurface,
@@ -7882,8 +8033,9 @@ mod tests {
             w: 10,
             h: 4,
         };
-        with_graphics(|| {
+        with_graphics(|canvas| {
             queue_render_items(
+                canvas,
                 Uuid::from_u128(7),
                 surface_rect,
                 &RenderDamage::FullSurface,
@@ -7895,8 +8047,9 @@ mod tests {
             .expect("initial kitty graphic should queue");
         });
 
-        let (queued, moved) = with_graphics(|| {
+        let (queued, moved) = with_graphics(|canvas| {
             queue_render_items(
+                canvas,
                 Uuid::from_u128(7),
                 surface_rect,
                 &RenderDamage::None,
@@ -7929,8 +8082,9 @@ mod tests {
         };
         let items = [RenderLayerItem::Graphic(test_graphic_overlay(2))];
         let mut terminal_graphics = TerminalGraphicsFrameResources::default();
-        with_graphics(|| {
+        with_graphics(|canvas| {
             queue_render_items_for_frame(
+                canvas,
                 pane_a,
                 surface_id,
                 surface_rect,
@@ -7946,8 +8100,9 @@ mod tests {
         assert_eq!(cache.values().next().expect("cache entry").pane_id, pane_a);
 
         let mut terminal_graphics = TerminalGraphicsFrameResources::default();
-        let ((), second) = with_graphics(|| {
+        let ((), second) = with_graphics(|canvas| {
             queue_render_items_for_frame(
+                canvas,
                 pane_b,
                 surface_id,
                 surface_rect,
@@ -7959,7 +8114,7 @@ mod tests {
             )
             .expect("new pane graphic should queue despite same surface/key");
             terminal_graphics
-                .cleanup_stale(&mut cache, capabilities)
+                .cleanup_stale(canvas, &mut cache, capabilities)
                 .expect("old pane graphic should be deleted");
         });
         assert!(second.contains("Ga=t,"), "{second:?}");
@@ -7981,8 +8136,9 @@ mod tests {
             h: 4,
         };
         let mut terminal_graphics = TerminalGraphicsFrameResources::default();
-        with_graphics(|| {
+        with_graphics(|canvas| {
             queue_render_items_for_frame(
+                canvas,
                 Uuid::from_u128(101),
                 Uuid::from_u128(7),
                 surface_rect,
@@ -7997,9 +8153,9 @@ mod tests {
         assert_eq!(cache.len(), 1);
 
         let mut terminal_graphics = TerminalGraphicsFrameResources::default();
-        let ((), deleted) = with_graphics(|| {
+        let ((), deleted) = with_graphics(|canvas| {
             terminal_graphics
-                .cleanup_stale(&mut cache, capabilities)
+                .cleanup_stale(canvas, &mut cache, capabilities)
                 .expect("terminal-scoped cleanup should delete stale image");
         });
         assert!(deleted.contains("Ga=d,d=i,"), "{deleted:?}");
@@ -8022,8 +8178,9 @@ mod tests {
         let mut cache = BTreeMap::new();
         let mut terminal_graphics = TerminalGraphicsFrameResources::default();
         let mut host = TestHost::new(10, 4);
-        host.frame(true, || {
+        host.frame(true, |canvas| {
             queue_render_items_for_frame(
+                canvas,
                 pane_id,
                 surface_id,
                 surface_rect,
@@ -8038,8 +8195,9 @@ mod tests {
         assert_eq!(cache.len(), 1);
 
         let mut terminal_graphics = TerminalGraphicsFrameResources::default();
-        let replacement = host.frame(false, || {
+        let replacement = host.frame(false, |canvas| {
             queue_render_items_for_frame(
+                canvas,
                 pane_id,
                 surface_id,
                 surface_rect,
@@ -8062,9 +8220,12 @@ mod tests {
         assert!(before.contains("Ga=d,d=i,"), "{before:?}");
         assert!(!after.contains("Ga=d,"), "{after:?}");
         assert!(
-            position_of_text(&replacement.operations, "HEADER").is_some(),
-            "replacement text should be drawn: {:?}",
-            replacement.operations
+            replacement
+                .changes
+                .iter()
+                .any(|(_, y, text)| *y == 1 && text.contains("HEADER")),
+            "replacement text should reach the host: {:?}",
+            replacement.changes
         );
         let presented = String::from_utf8_lossy(&replacement.bytes);
         let delete_at = presented
@@ -8163,8 +8324,9 @@ mod tests {
         let mut cache = TerminalGraphicsCache::new();
         let extensions: Vec<Arc<dyn AttachRenderExtension>> =
             vec![Arc::new(BeforeGraphicsExtension)];
-        let (_, output) = with_graphics(|| {
+        let (_, output) = with_graphics(|canvas| {
             render_attach_scene_with_stats_and_trace_with_capabilities(
+                canvas,
                 &scene,
                 &panes,
                 &mut pane_buffers,
@@ -8297,8 +8459,9 @@ mod tests {
         let mut graphics_cache = TerminalGraphicsCache::new();
         let capabilities = test_kitty_capabilities();
 
-        with_graphics(|| {
+        with_graphics(|canvas| {
             render_attach_scene_with_stats_and_trace_with_capabilities(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -8321,8 +8484,9 @@ mod tests {
 
         let mut damage = FrameDamage::default();
         damage.mark_content_surface(pane_a);
-        let (_, partial) = with_graphics(|| {
+        let (_, partial) = with_graphics(|canvas| {
             render_attach_scene_with_stats_and_trace_with_capabilities(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -8434,8 +8598,9 @@ mod tests {
         let mut graphics_cache = TerminalGraphicsCache::new();
         let capabilities = test_kitty_capabilities();
 
-        with_graphics(|| {
+        with_graphics(|canvas| {
             render_attach_scene_with_stats_and_trace_with_capabilities(
+                canvas,
                 &first_scene,
                 &[],
                 &mut pane_buffers,
@@ -8456,8 +8621,9 @@ mod tests {
         });
         assert_eq!(graphics_cache.len(), 1);
 
-        let (_, switched) = with_graphics(|| {
+        let (_, switched) = with_graphics(|canvas| {
             render_attach_scene_with_stats_and_trace_with_capabilities(
+                canvas,
                 &second_scene,
                 &[],
                 &mut pane_buffers,
@@ -8505,8 +8671,9 @@ mod tests {
             h: 4,
         };
         let items = [RenderLayerItem::Graphic(test_graphic_overlay(2))];
-        with_graphics(|| {
+        with_graphics(|canvas| {
             queue_render_items(
+                canvas,
                 Uuid::from_u128(7),
                 surface_rect,
                 &RenderDamage::FullSurface,
@@ -8518,8 +8685,9 @@ mod tests {
             .expect("initial kitty graphic should queue");
         });
 
-        let (queued, deleted) = with_graphics(|| {
+        let (queued, deleted) = with_graphics(|canvas| {
             queue_render_items(
+                canvas,
                 Uuid::from_u128(7),
                 surface_rect,
                 &RenderDamage::FullSurface,
@@ -8544,8 +8712,9 @@ mod tests {
             text: "界".to_string(),
             style: RenderStyle::default(),
         }];
-        let (queued, operations) = crate::projection::capture(|| {
+        let (queued, rows, _) = marked(8, 1, |canvas| {
             queue_render_ops(
+                canvas,
                 ExtensionRect {
                     x: 0,
                     y: 0,
@@ -8564,11 +8733,7 @@ mod tests {
         });
 
         assert!(queued);
-        assert_eq!(
-            drawn_runs(&operations),
-            [(0, 0, "界".to_string())],
-            "{operations:?}"
-        );
+        assert_eq!(rows, ["界~~~~~~"]);
     }
 
     #[test]
@@ -8590,8 +8755,9 @@ mod tests {
                 style: RenderStyle::default(),
             },
         ];
-        let (queued, operations) = crate::projection::capture(|| {
+        let (queued, rows, _) = marked(8, 3, |canvas| {
             queue_render_ops(
+                canvas,
                 ExtensionRect {
                     x: 0,
                     y: 0,
@@ -8605,16 +8771,7 @@ mod tests {
         });
 
         assert!(queued);
-        for rect in [
-            TuiRect::new(1, 0, 3, 1),
-            TuiRect::new(1, 1, 3, 1),
-            TuiRect::new(5, 1, 2, 1),
-        ] {
-            assert!(
-                position_of_blank(&operations, rect).is_some(),
-                "{rect:?} should be cleared: {operations:?}"
-            );
-        }
+        assert_eq!(rows, ["~   ~~~~", "~   ~  ~", "~~~~~~~~"]);
     }
 
     #[test]
@@ -8632,8 +8789,9 @@ mod tests {
             unicode_box_drawing: false,
             ..TerminalRenderCapabilities::default()
         };
-        let (queued, operations) = crate::projection::capture(|| {
+        let (queued, rows, cells) = marked(8, 4, |canvas| {
             queue_render_ops_with_capabilities(
+                canvas,
                 ExtensionRect::new(0, 0, 8, 4),
                 &RenderDamage::FullSurface,
                 &ops,
@@ -8643,26 +8801,16 @@ mod tests {
         });
 
         assert!(queued);
-        let x = position_of_text(&operations, "x").expect("text should be drawn");
-        assert_eq!(
-            drawn_style(&operations[x]).and_then(|style| style.fg),
-            Some(TuiColor::Indexed(196)),
-            "{operations:?}"
-        );
+        assert!(rows[0].starts_with('x'), "{rows:#?}");
+        assert_eq!(style_at(&cells, 0, 0).fg, Some(TuiColor::Indexed(196)));
         assert!(
-            !operations
-                .iter()
-                .filter_map(drawn_style)
-                .any(|style| matches!(
-                    (style.fg, style.bg),
-                    (Some(TuiColor::Rgb(..)), _) | (_, Some(TuiColor::Rgb(..)))
-                )),
-            "{operations:?}"
+            !cells.cells().iter().any(|cell| matches!(
+                (cell.style.fg, cell.style.bg),
+                (Some(TuiColor::Rgb(..)), _) | (_, Some(TuiColor::Rgb(..)))
+            )),
+            "{cells:?}"
         );
-        let text = drawn_runs(&operations)
-            .into_iter()
-            .map(|(_, _, text)| text)
-            .collect::<String>();
+        let text = rows.concat();
         assert!(text.contains('+'), "{text:?}");
         assert!(text.contains('-'), "{text:?}");
         assert!(!text.contains('╭'), "{text:?}");
@@ -8690,8 +8838,9 @@ mod tests {
                 },
             ],
         }];
-        let (queued, operations) = crate::projection::capture(|| {
+        let (queued, rows, cells) = marked(8, 1, |canvas| {
             queue_render_ops(
+                canvas,
                 ExtensionRect {
                     x: 0,
                     y: 0,
@@ -8705,30 +8854,17 @@ mod tests {
         });
 
         assert!(queued);
+        assert_eq!(rows, ["hi!~~~~~"]);
         // Bold is in effect for "hi"; the second span, right after it, is bright red and not
-        // bold.
-        let spans = operations
-            .iter()
-            .filter_map(|operation| Some((drawn(operation)?, drawn_style(operation)?)))
-            .map(|((x, y, text), style)| (x, y, text.to_string(), style))
-            .collect::<Vec<_>>();
+        // bold. Colors a span leaves unset are the terminal's defaults.
+        let defaults = TuiStyle::new().fg(TuiColor::Default).bg(TuiColor::Default);
         assert_eq!(
-            spans,
+            (0..3).map(|x| style_at(&cells, x, 0)).collect::<Vec<_>>(),
             [
-                (
-                    0,
-                    0,
-                    "hi".to_string(),
-                    TuiStyle::new().add_modifier(Modifier::BOLD)
-                ),
-                (
-                    2,
-                    0,
-                    "!".to_string(),
-                    TuiStyle::new().fg(TuiColor::BrightRed)
-                ),
-            ],
-            "{operations:?}"
+                defaults.add_modifier(Modifier::BOLD),
+                defaults.add_modifier(Modifier::BOLD),
+                defaults.fg(TuiColor::BrightRed),
+            ]
         );
     }
 
@@ -8752,8 +8888,9 @@ mod tests {
                 },
             ]],
         }];
-        let (queued, operations) = crate::projection::capture(|| {
+        let (queued, rows, _) = marked(4, 1, |canvas| {
             queue_render_ops(
+                canvas,
                 ExtensionRect {
                     x: 0,
                     y: 0,
@@ -8767,14 +8904,7 @@ mod tests {
         });
 
         assert!(queued);
-        assert_eq!(
-            operations
-                .iter()
-                .map(|operation| (drawn(operation), blanked(operation)))
-                .collect::<Vec<_>>(),
-            [(Some((0, 0, "A")), None), (Some((2, 0, "B")), None)],
-            "the empty cell should be skipped: {operations:?}"
-        );
+        assert_eq!(rows, ["A~B~"], "the empty cell should be skipped");
     }
 
     #[test]
@@ -8788,8 +8918,9 @@ mod tests {
                 ..RenderStyle::default()
             },
         }];
-        let (queued, operations) = crate::projection::capture(|| {
+        let (queued, rows, cells) = marked(8, 1, |canvas| {
             queue_render_ops(
+                canvas,
                 ExtensionRect {
                     x: 0,
                     y: 0,
@@ -8803,14 +8934,14 @@ mod tests {
         });
 
         assert!(queued);
-        let [operation] = operations.as_slice() else {
-            panic!("one text run should be captured: {operations:?}");
-        };
-        assert_eq!(drawn(operation), Some((0, 0, "named")));
-        assert_eq!(
-            drawn_style(operation).and_then(|style| style.fg),
-            Some(TuiColor::BrightYellow)
-        );
+        assert_eq!(rows, ["named~~~"]);
+        for x in 0..5 {
+            assert_eq!(
+                style_at(&cells, x, 0).fg,
+                Some(TuiColor::BrightYellow),
+                "column {x}"
+            );
+        }
     }
 
     #[test]
@@ -8839,8 +8970,9 @@ mod tests {
             },
         ];
         let mut host = TestHost::new(10, 1);
-        let frame = host.frame(true, || {
+        let frame = host.frame(true, |canvas| {
             queue_render_ops(
+                canvas,
                 ExtensionRect {
                     x: 0,
                     y: 0,
@@ -8854,13 +8986,6 @@ mod tests {
         });
 
         assert!(frame.result);
-        let operations = &frame.operations;
-        let lit = position_of_text(operations, "lit").expect("second span should render");
-        assert!(
-            drawn_style(&operations[lit])
-                .is_some_and(|style| !style.modifiers.contains(Modifier::DIM)),
-            "the non-dim span must not carry dim: {operations:?}"
-        );
         assert_eq!(host.row(0), "dimlit    ");
         assert!(host.cell(0, 0).1.dim, "the dim span should show dim");
         assert!(
@@ -8877,8 +9002,9 @@ mod tests {
             text: "界a".to_string(),
             style: RenderStyle::default(),
         }];
-        let (queued, operations) = crate::projection::capture(|| {
+        let (queued, rows, cells) = marked(8, 1, |canvas| {
             queue_render_ops(
+                canvas,
                 ExtensionRect {
                     x: 1,
                     y: 0,
@@ -8892,12 +9018,14 @@ mod tests {
         });
 
         assert!(queued);
-        let runs = drawn_runs(&operations);
-        assert!(runs.contains(&(2, 0, "a".to_string())), "{runs:?}");
-        assert!(
-            !runs.iter().any(|(_, _, text)| text.contains('界')),
-            "{runs:?}"
+        assert_eq!(
+            cells
+                .get(bmux_tui::geometry::Point::new(2, 0))
+                .map(|cell| cell.symbol.as_str()),
+            Some("a"),
+            "{rows:?}"
         );
+        assert!(!rows[0].contains('界'), "{rows:?}");
     }
 
     #[test]
@@ -8917,8 +9045,9 @@ mod tests {
                 ..RenderStyle::default()
             },
         }];
-        let (queued, operations) = crate::projection::capture(|| {
+        let (queued, rows, cells) = marked(8, 1, |canvas| {
             queue_render_ops(
+                canvas,
                 ExtensionRect {
                     x: 0,
                     y: 0,
@@ -8932,8 +9061,8 @@ mod tests {
         });
 
         assert!(queued);
-        let styled = position_of_text(&operations, "styled").expect("text should be drawn");
-        let style = drawn_style(&operations[styled]).expect("text should be styled");
+        assert_eq!(rows, ["styled~~"]);
+        let style = style_at(&cells, 0, 0);
         for modifier in [
             Modifier::BOLD,
             Modifier::DIM,
@@ -8968,24 +9097,19 @@ mod tests {
 
         // What the overlay covers is on the host before it.
         let mut host = TestHost::new(12, 4);
-        host.frame(true, || {
+        host.frame(true, |canvas| {
             for y in 0..4 {
-                crate::projection::record(PaintOperation::Text {
-                    x: 0,
-                    y,
-                    text: "X".repeat(12),
-                    style: TuiStyle::new(),
-                });
+                canvas.text(0, y, &"X".repeat(12), TuiStyle::new());
             }
         });
-        host.frame(false, || {
-            queue_layer_fill(surface).expect("overlay fill should succeed");
-            crate::projection::record(PaintOperation::Text {
-                x: 1,
-                y: 1,
-                text: opaque_row_text("help", usize::from(surface.content_rect.w)),
-                style: TuiStyle::new(),
-            });
+        host.frame(false, |canvas| {
+            queue_layer_fill(canvas, surface).expect("overlay fill should succeed");
+            canvas.text(
+                1,
+                1,
+                &opaque_row_text("help", usize::from(surface.content_rect.w)),
+                TuiStyle::new(),
+            );
         });
 
         assert_eq!(
@@ -9013,17 +9137,19 @@ mod tests {
         };
         let surface = AttachLayerSurface::new(rect, content_rect, AttachLayer::Overlay, true);
 
-        let ((), operations) = crate::projection::capture(|| {
-            queue_layer_fill(surface).expect("overlay fill should succeed");
+        let ((), rows, _) = marked(12, 4, |canvas| {
+            queue_layer_fill(canvas, surface).expect("overlay fill should succeed");
         });
 
         assert_eq!(
-            operations.iter().map(blanked).collect::<Vec<_>>(),
+            rows,
             [
-                Some(TuiRect::new(2, 1, 8, 1)),
-                Some(TuiRect::new(2, 2, 8, 1))
+                "~~~~~~~~~~~~",
+                "~~        ~~",
+                "~~        ~~",
+                "~~~~~~~~~~~~"
             ],
-            "only the content rect should be filled: {operations:?}"
+            "only the content rect should be filled"
         );
     }
 
@@ -9043,13 +9169,10 @@ mod tests {
         };
         let surface = AttachLayerSurface::new(rect, empty, AttachLayer::Overlay, true);
 
-        let ((), operations) = crate::projection::capture(|| {
-            queue_layer_fill(surface).expect("empty fill should succeed");
+        let ((), rows, _) = marked(4, 4, |canvas| {
+            queue_layer_fill(canvas, surface).expect("empty fill should succeed");
         });
-        assert!(
-            operations.is_empty(),
-            "zero-width content should produce no output: {operations:?}"
-        );
+        assert_eq!(rows, ["~~~~"; 4], "zero-width content should paint nothing");
     }
 
     #[test]
@@ -9119,8 +9242,9 @@ mod tests {
         pane_buffers.insert(pane_id, buffer);
 
         let mut host = TestHost::new(5, 3);
-        host.frame(true, || {
+        host.frame(true, |canvas| {
             render_attach_scene(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -9178,8 +9302,9 @@ mod tests {
         pane_buffers.insert(pane_id, buffer);
 
         let mut host = TestHost::new(8, 3);
-        host.frame(true, || {
+        host.frame(true, |canvas| {
             render_attach_scene(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -9204,8 +9329,9 @@ mod tests {
             DamageCoalescingPolicy::default(),
         );
         let mut trace = AttachRenderTrace::new();
-        let damaged = host.frame(false, || {
+        let damaged = host.frame(false, |canvas| {
             render_attach_scene_with_stats_and_trace(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -9224,13 +9350,9 @@ mod tests {
         });
         let (_cursor, stats) = damaged.result;
 
-        // The damaged row is drawn again; the host, which already shows it, writes nothing.
-        assert_eq!(
-            drawn_runs(&damaged.operations),
-            [(0, 1, "ijklmnop".to_string())],
-            "only the damaged row should be drawn: {:?}",
-            damaged.operations
-        );
+        // Only the damaged row is drawn again (the stats and trace below); the host, which
+        // already shows it, changes nothing and writes nothing.
+        assert!(damaged.changes.is_empty(), "{:?}", damaged.changes);
         assert!(
             damaged.bytes.is_empty(),
             "{:?}",
@@ -9285,22 +9407,54 @@ mod tests {
             content_damage: &damage,
             host_scroll: HostScroll::Margins,
         };
+        // Scroll over a 40x10 frame whose row `y` shows the digit `y` in every column; returns
+        // what scrolling returned and the frame's rows after.
+        let label = |y: u16| char::from(b'0' + u8::try_from(y).expect("one digit"));
+        let scroll = |stage: &PaneContentRenderStage<'_>, moved: ViewportScroll| {
+            let mut buffer = bmux_tui::buffer::Buffer::empty(TuiRect::new(0, 0, 40, 10));
+            let mut output = crate::canvas::FrameOutput::default();
+            let result = crate::canvas::paint_on(&mut buffer, &mut output, |canvas| {
+                for y in 0..10 {
+                    canvas.text(0, y, &label(y).to_string().repeat(40), TuiStyle::new());
+                }
+                scroll_host_rows(canvas, stage, moved)
+            });
+            let rows = (0..10)
+                .map(|y| buffer.row_symbols(y).unwrap_or_default())
+                .collect::<Vec<_>>();
+            (result, rows)
+        };
+        // The labelled frame with the cells of `area` moved up by `rows` (down when negative),
+        // the rows exposed blank.
+        let moved_frame = |area: TuiRect, rows: i64| {
+            (0..10_u16)
+                .map(|y| {
+                    (0..40_u16)
+                        .map(|x| {
+                            if !area.contains(bmux_tui::geometry::Point::new(x, y)) {
+                                return label(y);
+                            }
+                            let source = i64::from(y) + rows;
+                            if source >= i64::from(area.y) && source < i64::from(area.bottom()) {
+                                label(u16::try_from(source).expect("inside the frame"))
+                            } else {
+                                ' '
+                            }
+                        })
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let unmoved = moved_frame(TuiRect::new(0, 0, 0, 0), 0);
         let moved = ViewportScroll::Region {
             top: 1,
             bottom: 4,
             rows: 2,
         };
-        let ((scrolled, exposed), operations) =
-            crate::projection::capture(|| scroll_host_rows(&stage, moved));
+        let ((scrolled, exposed), rows) = scroll(&stage, moved);
         assert_eq!(scrolled, 2);
         // Columns 10 through 29, rows 3 through 6, up two lines: pane rows 3 and 4 are exposed.
-        assert_eq!(
-            operations,
-            [crate::projection::PaintOperation::Scroll {
-                area: TuiRect::new(10, 3, 20, 4),
-                rows: 2,
-            }]
-        );
+        assert_eq!(rows, moved_frame(TuiRect::new(10, 3, 20, 4), 2));
         assert_eq!(exposed, 3..5);
 
         // Down, as whole rows: the top row is exposed.
@@ -9310,16 +9464,9 @@ mod tests {
             bottom: 4,
             rows: -1,
         };
-        let ((scrolled, exposed), operations) =
-            crate::projection::capture(|| scroll_host_rows(&stage, moved));
+        let ((scrolled, exposed), rows) = scroll(&stage, moved);
         assert_eq!(scrolled, 4);
-        assert_eq!(
-            operations,
-            [crate::projection::PaintOperation::Scroll {
-                area: TuiRect::new(10, 2, 20, 5),
-                rows: -1,
-            }]
-        );
+        assert_eq!(rows, moved_frame(TuiRect::new(10, 2, 20, 5), -1));
         assert_eq!(exposed, 0..1);
 
         // Nothing moves when it is off, the move clears the region, or the move is unknown.
@@ -9336,11 +9483,10 @@ mod tests {
             (HostScroll::Rows, ViewportScroll::Unknown),
         ] {
             stage.host_scroll = host_scroll;
-            let ((scrolled, exposed), operations) =
-                crate::projection::capture(|| scroll_host_rows(&stage, moved));
+            let ((scrolled, exposed), rows) = scroll(&stage, moved);
             assert_eq!(scrolled, 0);
             assert!(exposed.is_empty());
-            assert!(operations.is_empty(), "{operations:?}");
+            assert_eq!(rows, unmoved);
         }
     }
 
@@ -9383,17 +9529,16 @@ mod tests {
             content_damage: &damage,
             host_scroll: super::HostScroll::Off,
         };
-        crate::projection::capture(|| {
-            queue_pane_content_for_surface(&mut buffers, &stage, &mut None, &mut None)
+        marked(8, 5, |canvas| {
+            queue_pane_content_for_surface(canvas, &mut buffers, &stage, &mut None, &mut None)
         });
-        let (_, operations) = crate::projection::capture(|| {
-            queue_pane_content_for_surface(&mut buffers, &stage, &mut None, &mut None)
+        // Painted again over cells that no longer show the pane, the cached rows are repainted.
+        let (_, rows, _) = marked(8, 5, |canvas| {
+            queue_pane_content_for_surface(canvas, &mut buffers, &stage, &mut None, &mut None)
         });
         assert!(
-            drawn_runs(&operations)
-                .iter()
-                .any(|(x, y, text)| (*x, *y) == (0, 0) && text.starts_with("hello")),
-            "full content damage must repaint cached cells: {operations:?}"
+            rows[0].starts_with("hello"),
+            "full content damage must repaint cached cells: {rows:#?}"
         );
     }
 
@@ -9433,21 +9578,24 @@ mod tests {
         feed_pane_buffer(&mut buffer, 1, 8, "ab界ef".as_bytes());
         pane_buffers.insert(pane_id, buffer);
 
-        render_attach_scene(
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (8, 2),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &[],
-        )
-        .expect("initial render should draw every row");
+        painted(8, 2, |canvas| {
+            render_attach_scene(
+                canvas,
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (8, 2),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &[],
+            )
+            .expect("initial render should draw every row")
+        });
 
         let mut damage = FrameDamage::default();
         damage.mark_content_surface_rect(
@@ -9456,8 +9604,10 @@ mod tests {
             (8, 1),
             DamageCoalescingPolicy::default(),
         );
-        let (_, operations) = crate::projection::capture(|| {
+        // Painted over cells that no longer show the pane, so what the frame paints shows.
+        let (_, rows, _) = marked(8, 2, |canvas| {
             render_attach_scene(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -9476,9 +9626,9 @@ mod tests {
 
         // The damaged row is drawn whole, so the wide glyph under the damage is drawn whole too.
         assert_eq!(
-            drawn_runs(&operations),
-            [(0, 0, "ab界ef  ".to_string())],
-            "damage on the right half of a wide glyph should redraw all of it: {operations:?}"
+            rows,
+            ["ab界ef  ", "~~~~~~~~"],
+            "damage on the right half of a wide glyph should redraw all of it"
         );
     }
 
@@ -9592,8 +9742,9 @@ mod tests {
         );
 
         let mut host = TestHost::new(20, 2);
-        host.frame(true, || {
+        host.frame(true, |canvas| {
             render_attach_scene(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -9616,7 +9767,7 @@ mod tests {
     }
 
     #[test]
-    fn neutral_grid_capture_records_each_row_as_one_run_of_cells() {
+    fn pane_rows_paint_every_cell_of_a_large_grid() {
         let mut buffer = PaneRenderBuffer::default();
         buffer.terminal_grid.resize(600, 300).unwrap();
         for row in 1..=300 {
@@ -9628,9 +9779,10 @@ mod tests {
         let under = BTreeMap::new();
         let grid = buffer.terminal_grid.grid();
         let rows = grid.viewport_rows();
-        let ((), operations) = crate::projection::capture(|| {
+        let ((), cells, _) = painted(600, 300, |canvas| {
             for (index, row) in rows.iter().enumerate() {
-                super::capture_pane_row(
+                super::paint_pane_row(
+                    canvas,
                     &GridRowRenderContext {
                         row,
                         selection: None,
@@ -9645,10 +9797,14 @@ mod tests {
                 );
             }
         });
-        assert_eq!(operations.len(), 300);
-        assert!(operations.iter().all(|op| matches!(op,
-            crate::projection::PaintOperation::Cells { text, cells, .. }
-                if text == &"x".repeat(600) && cells.len() == 600)));
+        let row = "x".repeat(600);
+        for y in 0..300 {
+            assert_eq!(
+                cells.row_symbols(y).as_deref(),
+                Some(row.as_str()),
+                "row {y}"
+            );
+        }
     }
 
     #[test]
@@ -9696,22 +9852,25 @@ mod tests {
         );
         let mut trace = AttachRenderTrace::new();
 
-        render_attach_scene_with_stats_and_trace(
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &damage,
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (30, 8),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &[],
-            Some(&mut trace),
-        )
-        .expect("extension repaint");
+        painted(30, 8, |canvas| {
+            render_attach_scene_with_stats_and_trace(
+                canvas,
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &damage,
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (30, 8),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &[],
+                Some(&mut trace),
+            )
+            .expect("extension repaint")
+        });
 
         assert!(
             !trace
@@ -9768,8 +9927,9 @@ mod tests {
         feed_pane_buffer(&mut buffer, 2, 20, b"XXXXXXXXXXXXXXXXXXXX");
         pane_buffers.insert(pane_id, buffer);
         let mut host = TestHost::new(30, 8);
-        host.frame(true, || {
+        host.frame(true, |canvas| {
             render_attach_scene(
+                canvas,
                 &previous,
                 &[],
                 &mut pane_buffers,
@@ -9797,8 +9957,9 @@ mod tests {
             background: "#123456".to_string(),
             ..RuntimeAppearance::default()
         };
-        let second = host.frame(false, || {
+        let second = host.frame(false, |canvas| {
             render_attach_scene_with_stats_and_trace(
+                canvas,
                 &next,
                 &[],
                 &mut pane_buffers,
@@ -9815,14 +9976,17 @@ mod tests {
             )
             .expect("constrained render")
         });
+        let cleared = Some(bmux_terminal_grid::Color::Rgb {
+            r: 18,
+            g: 52,
+            b: 86,
+        });
         assert!(
-            second
-                .operations
-                .iter()
-                .filter_map(drawn_style)
-                .any(|style| style.bg == Some(TuiColor::Rgb(18, 52, 86))),
-            "{:?}",
-            second.operations
+            (1..3).any(|y| (0..5)
+                .chain(15..20)
+                .any(|x| host.cell(x, y).1.bg == cleared)),
+            "the exposed gutters should be cleared in the appearance's background: {:?}",
+            second.changes
         );
         assert!(trace.ops().iter().any(|op| matches!(
             op,
@@ -9872,8 +10036,9 @@ mod tests {
         pane_buffers.insert(pane_id, buffer);
         let mut host = TestHost::new(80, 24);
         let cursor = host
-            .frame(true, || {
+            .frame(true, |canvas| {
                 render_attach_scene(
+                    canvas,
                     &scene,
                     &[],
                     &mut pane_buffers,
@@ -9941,30 +10106,33 @@ mod tests {
         feed_pane_buffer(&mut buffer, 4, 18, b"hello\r\nworld\r\n\x1b[?25l");
         pane_buffers.insert(pane_id, buffer);
 
-        let cursor_state = render_attach_scene(
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            1,
-            0,
-            &scrollback_views_for(
-                pane_id,
-                PaneScrollbackView {
-                    captured_selection: None,
-                    offset: 1,
-                    cursor: AttachScrollbackCursor { row: 0, col: 0 },
-                    selection_anchor: None,
-                    pin: None,
-                },
-            ),
-            false,
-            (80, 24),
-            &bmux_appearance::RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &[],
-        )
-        .expect("render should succeed");
+        let (cursor_state, _, _) = painted(80, 24, |canvas| {
+            render_attach_scene(
+                canvas,
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                1,
+                0,
+                &scrollback_views_for(
+                    pane_id,
+                    PaneScrollbackView {
+                        captured_selection: None,
+                        offset: 1,
+                        cursor: AttachScrollbackCursor { row: 0, col: 0 },
+                        selection_anchor: None,
+                        pin: None,
+                    },
+                ),
+                false,
+                (80, 24),
+                &bmux_appearance::RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &[],
+            )
+            .expect("render should succeed")
+        });
 
         if let Some(cursor_state) = cursor_state {
             assert!(cursor_state.visible);
@@ -10007,30 +10175,33 @@ mod tests {
         feed_pane_buffer(&mut buffer, 2, 10, b"abcdef\r\n");
         pane_buffers.insert(pane_id, buffer);
 
-        let _ = render_attach_scene(
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            1,
-            0,
-            &scrollback_views_for(
-                pane_id,
-                PaneScrollbackView {
-                    captured_selection: None,
-                    offset: 0,
-                    cursor: AttachScrollbackCursor { row: 0, col: 4 },
-                    selection_anchor: Some(AttachScrollbackPosition { line: 0, col: 1 }),
-                    pin: None,
-                },
-            ),
-            false,
-            (80, 24),
-            &bmux_appearance::RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &[],
-        )
-        .expect("render should succeed");
+        painted(80, 24, |canvas| {
+            render_attach_scene(
+                canvas,
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                1,
+                0,
+                &scrollback_views_for(
+                    pane_id,
+                    PaneScrollbackView {
+                        captured_selection: None,
+                        offset: 0,
+                        cursor: AttachScrollbackCursor { row: 0, col: 4 },
+                        selection_anchor: Some(AttachScrollbackPosition { line: 0, col: 1 }),
+                        pin: None,
+                    },
+                ),
+                false,
+                (80, 24),
+                &bmux_appearance::RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &[],
+            )
+            .expect("render should succeed")
+        });
     }
 
     #[test]
@@ -10044,8 +10215,9 @@ mod tests {
         let appearance = red_wash_appearance();
 
         let mut host = TestHost::new(80, 24);
-        host.frame(true, || {
+        host.frame(true, |canvas| {
             render_attach_scene(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -10077,8 +10249,9 @@ mod tests {
         let appearance = red_wash_appearance();
 
         let mut host = TestHost::new(8, 3);
-        host.frame(true, || {
+        host.frame(true, |canvas| {
             render_attach_scene(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -10108,16 +10281,12 @@ mod tests {
         let appearance = red_wash_appearance();
         let mut host = TestHost::new(8, 3);
         // The host shows stale text where the pane's rows must be blanked.
-        host.frame(true, || {
-            crate::projection::record(crate::projection::PaintOperation::Text {
-                x: 0,
-                y: 1,
-                text: "stale!!!".to_owned(),
-                style: bmux_tui::style::Style::new(),
-            });
+        host.frame(true, |canvas| {
+            canvas.text(0, 1, "stale!!!", bmux_tui::style::Style::new());
         });
-        host.frame(false, || {
+        host.frame(false, |canvas| {
             render_attach_scene(
+                canvas,
                 &scene,
                 &[],
                 &mut BTreeMap::new(),
@@ -10149,38 +10318,51 @@ mod tests {
         pane_buffers.insert(pane_id, buffer);
         let appearance = red_wash_appearance();
 
-        render_attach_scene(
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (8, 3),
-            &appearance,
-            DamageCoalescingPolicy::default(),
-            &[],
-        )
-        .expect("initial render should draw every row");
+        let mut host = TestHost::new(8, 3);
+        host.frame(true, |canvas| {
+            render_attach_scene(
+                canvas,
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (8, 3),
+                &appearance,
+                DamageCoalescingPolicy::default(),
+                &[],
+            )
+            .expect("initial render should draw every row")
+        });
 
-        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &content_damage(pane_id),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (8, 3),
-            &appearance,
-            DamageCoalescingPolicy::default(),
-            &[],
-            None,
-        )
-        .expect("cached render should succeed");
+        let cached = host.frame(false, |canvas| {
+            render_attach_scene_with_stats_and_trace(
+                canvas,
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &content_damage(pane_id),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (8, 3),
+                &appearance,
+                DamageCoalescingPolicy::default(),
+                &[],
+                None,
+            )
+            .expect("cached render should succeed")
+        });
+        let (_cursor, stats) = cached.result;
+        assert!(cached.changes.is_empty(), "{:?}", cached.changes);
+        assert_eq!(host.row(0), "x       ");
+        for y in 0..3 {
+            assert_washed_row(&host, y, 8);
+        }
 
         assert_eq!(stats.pane_rows_emitted, 0);
         assert_eq!(stats.pane_rows_cached_skipped, 3);
@@ -10196,8 +10378,9 @@ mod tests {
         pane_buffers.insert(pane_id, buffer);
 
         let mut host = TestHost::new(8, 3);
-        host.frame(true, || {
+        host.frame(true, |canvas| {
             render_attach_scene(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -10216,8 +10399,9 @@ mod tests {
         assert_eq!(host.cell(0, 0).1.bg, None);
 
         let (_cursor, stats) = host
-            .frame(true, || {
+            .frame(true, |canvas| {
                 render_attach_scene_with_stats_and_trace(
+                    canvas,
                     &scene,
                     &[],
                     &mut pane_buffers,
@@ -10362,8 +10546,9 @@ mod tests {
         let mut damage = FrameDamage::default();
         damage.mark_extension_query();
 
-        let ((_cursor, stats), operations) = crate::projection::capture(|| {
+        let ((_cursor, stats), rows, _) = marked(80, 24, |canvas| {
             render_attach_scene_with_stats_and_trace(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -10381,9 +10566,8 @@ mod tests {
             .expect("query render should succeed")
         });
 
-        let runs = drawn_runs(&operations);
-        assert!(runs.contains(&(0, 0, "FOCUS".to_string())), "{runs:?}");
-        assert!(runs.contains(&(12, 0, "OTHER".to_string())), "{runs:?}");
+        assert_eq!(&rows[0][..5], "FOCUS", "{rows:#?}");
+        assert_eq!(&rows[0][12..17], "OTHER", "{rows:#?}");
         assert_eq!(stats.damaged_extension_surfaces, 2);
     }
 
@@ -10435,21 +10619,26 @@ mod tests {
         let extensions: Vec<Arc<dyn AttachRenderExtension>> =
             vec![Arc::new(AfterContentOverlay) as Arc<dyn AttachRenderExtension>];
 
-        render_attach_scene(
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (10, 2),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-        )
-        .expect("initial render should draw every row");
+        let mut host = TestHost::new(10, 2);
+        host.frame(true, |canvas| {
+            render_attach_scene(
+                canvas,
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (10, 2),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &extensions,
+            )
+            .expect("initial render should draw every row")
+        });
+        assert_eq!(host.row(0), "OVR       ");
 
         append_pane_output(
             pane_buffers
@@ -10457,8 +10646,9 @@ mod tests {
                 .expect("pane buffer should exist"),
             b"!",
         );
-        let ((_cursor, stats), operations) = crate::projection::capture(|| {
+        let damaged = host.frame(false, |canvas| {
             render_attach_scene_with_stats_and_trace(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -10475,17 +10665,23 @@ mod tests {
             )
             .expect("content-damaged render should replay after-content overlay")
         });
+        let (_cursor, stats) = damaged.result;
 
-        // The content's changed cell is redrawn, and the overlay over it replayed after it.
-        let content_at = operations
-            .iter()
-            .position(|operation| drawn_char_at(operation, 3, 0) == Some('!'))
-            .expect("pane content should be emitted after content damage");
-        let overlay_at = position_of_text(&operations, "OVR")
-            .expect("after-content overlay should be replayed after content damage");
+        // The content's changed cell is redrawn, and the overlay over it replayed after it: the
+        // row is drawn whole, so without the replay the host would show the content under it.
+        // (The overlay's cells, repainted with the row and then replayed, count as changed.)
         assert!(
-            content_at < overlay_at,
-            "after-content overlay must render after pane content: {operations:?}"
+            damaged.changes.iter().any(|(x, y, text)| *y == 0
+                && *x <= 3
+                && text.chars().nth(usize::from(3 - x)) == Some('!')),
+            "the content's changed cell should reach the host: {:?}",
+            damaged.changes
+        );
+        assert_eq!(
+            host.row(0),
+            "OVR!      ",
+            "after-content overlay must render over pane content:\n{}",
+            host.text()
         );
         assert_eq!(stats.damaged_content_surfaces, 1);
         assert_eq!(stats.damaged_extension_surfaces, 1);
@@ -10538,26 +10734,34 @@ mod tests {
         feed_pane_buffer(&mut pane_buffer, 2, 8, b"abcdef");
         pane_buffers.insert(pane_id, pane_buffer);
 
-        render_attach_scene(
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (8, 2),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &[],
-        )
-        .expect("initial render should draw every row");
+        let mut host = TestHost::new(8, 2);
+        host.frame(true, |canvas| {
+            render_attach_scene(
+                canvas,
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &FrameDamage::full_frame(),
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (8, 2),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &[],
+            )
+            .expect("initial render should draw every row")
+        });
+        // The host shows stale after-content cells over the pane.
+        host.frame(false, |canvas| canvas.text(1, 0, "XYZ", TuiStyle::new()));
+        assert_eq!(host.row(0), "aXYZef  ");
 
         let extensions: Vec<Arc<dyn AttachRenderExtension>> =
             vec![Arc::new(StaleAfterContentCells) as Arc<dyn AttachRenderExtension>];
-        let ((_cursor, stats), operations) = crate::projection::capture(|| {
+        let cleaned = host.frame(false, |canvas| {
             render_attach_scene_with_stats_and_trace(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -10574,19 +10778,11 @@ mod tests {
             )
             .expect("stale after-content cleanup should render")
         });
+        let (_cursor, stats) = cleaned.result;
 
-        let clear_at = position_of_blank(&operations, TuiRect::new(1, 0, 3, 1))
-            .expect("stale after-content cells should be cleared");
-        let repaint_at = operations
-            .iter()
-            .rposition(|operation| {
-                drawn(operation).is_some_and(|(_, _, text)| text.contains("bcd"))
-            })
-            .expect("underlying pane content should be replayed after cleanup");
-        assert!(
-            clear_at < repaint_at,
-            "cleanup must precede content repaint: {operations:?}"
-        );
+        // The stale cells are gone and the pane content under them is shown again.
+        assert_eq!(cleaned.changes, [(1, 0, "bcd".to_string())]);
+        assert_eq!(host.text(), "abcdef  \n        ");
         assert_eq!(stats.damaged_content_surfaces, 1);
         assert_eq!(stats.pane_rows_emitted, 1);
     }
@@ -10656,8 +10852,9 @@ mod tests {
             }) as Arc<dyn AttachRenderExtension>];
 
         let mut host = TestHost::new(8, 2);
-        host.frame(true, || {
+        host.frame(true, |canvas| {
             render_attach_scene(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -10675,8 +10872,9 @@ mod tests {
         });
 
         state.store(2, Ordering::Relaxed);
-        let second = host.frame(false, || {
+        let second = host.frame(false, |canvas| {
             render_attach_scene_with_stats_and_trace(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -10694,19 +10892,12 @@ mod tests {
             .expect("retained update should render through retained diff path")
         });
         let (_cursor, update_stats) = second.result;
-        let operations = &second.operations;
-        assert!(
-            operations
-                .iter()
-                .any(|operation| drawn_char_at(operation, 1, 0) == Some('B')),
-            "updated retained text should render: {operations:?}"
-        );
-        assert!(
-            !operations
-                .iter()
-                .filter_map(blanked)
-                .any(|rect| rect.width >= 8),
-            "retained update should not clear full rows: {operations:?}"
+        // The updated text reaches the host and nothing else changes (the stats below show no
+        // row was cleared or replayed for it).
+        assert_eq!(
+            second.changes,
+            [(1, 0, "B".to_string())],
+            "updated retained text should render"
         );
         assert_eq!(host.row(0), "aBcdef  ");
         assert_eq!(update_stats.extension_full_surface_calls, 0);
@@ -10789,8 +10980,9 @@ mod tests {
             }) as Arc<dyn AttachRenderExtension>];
 
         let mut host = TestHost::new(8, 2);
-        host.frame(true, || {
+        host.frame(true, |canvas| {
             render_attach_scene(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -10806,10 +10998,12 @@ mod tests {
             )
             .expect("initial retained render should commit previous snapshot")
         });
+        assert_eq!(host.row(0), "aOLDef  ");
 
         visible.store(false, Ordering::Relaxed);
-        let second = host.frame(false, || {
+        let second = host.frame(false, |canvas| {
             render_attach_scene_with_stats_and_trace(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -10827,15 +11021,8 @@ mod tests {
             .expect("retained removal should clean stale cells")
         });
         let (_cursor, stats) = second.result;
-        let operations = &second.operations;
-        let clear_at = position_of_blank(operations, TuiRect::new(1, 0, 3, 1))
-            .expect("retained stale cells should be cleared");
-        let repaint_at = position_of_text(operations, "bcd")
-            .expect("pane content under removed retained text should replay");
-        assert!(
-            clear_at < repaint_at,
-            "cleanup should precede replay: {operations:?}"
-        );
+        // The stale cells are cleaned and the pane content under them replayed.
+        assert_eq!(second.changes, [(1, 0, "bcd".to_string())]);
         assert_eq!(host.row(0), "abcdef  ");
         assert_eq!(stats.extension_full_surface_calls, 0);
         assert_eq!(stats.pane_rows_emitted, 1);
@@ -10904,8 +11091,9 @@ mod tests {
                 as Arc<dyn AttachRenderExtension>];
 
         let mut host = TestHost::new(8, 2);
-        host.frame(true, || {
+        host.frame(true, |canvas| {
             render_attach_scene(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -10921,10 +11109,12 @@ mod tests {
             )
             .expect("initial retained render should commit previous snapshot")
         });
+        assert_eq!(host.row(0), "Pbcdef  ");
 
         x.store(3, Ordering::Relaxed);
-        let second = host.frame(false, || {
+        let second = host.frame(false, |canvas| {
             render_attach_scene(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -10940,24 +11130,11 @@ mod tests {
             )
             .expect("retained move should clean stale cells and draw new position")
         });
-        let operations = &second.operations;
-        let clear_at = position_of_blank(operations, TuiRect::new(0, 0, 1, 1))
-            .expect("old retained cell should be cleared");
-        let repaint_at = operations
-            .iter()
-            .position(|operation| drawn_char_at(operation, 0, 0) == Some('a'))
-            .expect("underlying content under old retained cell should replay");
-        let paint_at = operations
-            .iter()
-            .rposition(|operation| drawn_char_at(operation, 3, 0) == Some('P'))
-            .expect("new retained cell should render");
-        assert!(
-            clear_at < repaint_at,
-            "cleanup should precede content replay: {operations:?}"
-        );
-        assert!(
-            repaint_at < paint_at,
-            "new retained output should follow content replay: {operations:?}"
+        // The old cell shows the content under it again and the new one shows the paddle over
+        // the content (painted after the content's row is replayed).
+        assert_eq!(
+            second.changes,
+            [(0, 0, "a".to_string()), (3, 0, "P".to_string())]
         );
         assert_eq!(host.row(0), "abcPef  ");
     }
@@ -11017,8 +11194,9 @@ mod tests {
             vec![Arc::new(ContentReplayRetainedTextExtension) as Arc<dyn AttachRenderExtension>];
 
         let mut host = TestHost::new(8, 2);
-        host.frame(true, || {
+        host.frame(true, |canvas| {
             render_attach_scene(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -11037,8 +11215,9 @@ mod tests {
 
         let mut frame_damage = FrameDamage::default();
         frame_damage.mark_content_surface(pane_id);
-        let second = host.frame(false, || {
+        let second = host.frame(false, |canvas| {
             render_attach_scene_with_stats_and_trace(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -11056,16 +11235,16 @@ mod tests {
             .expect("content damage should replay retained after-content output")
         });
         let (_cursor, stats) = second.result;
-        let operations = &second.operations;
-        let content_at = position_of_text(operations, "abcdef")
-            .expect("pane content should repaint for content damage");
-        let overlay_at = operations
-            .iter()
-            .rposition(|operation| drawn(operation).is_some_and(|(_, _, text)| text.contains("OV")))
-            .expect("unchanged retained overlay should replay after content repaint");
+        // The content's row is repainted whole and the unchanged overlay replayed over it, so
+        // the host still shows the overlay.
         assert!(
-            content_at < overlay_at,
-            "retained overlay must render after content: {operations:?}"
+            stats.pane_rows_emitted > 0,
+            "pane content should repaint for content damage"
+        );
+        assert_eq!(
+            host.row(0),
+            "aOVdef  ",
+            "retained overlay must render after content"
         );
         assert_eq!(stats.retained_scene_update_cells, 0);
         assert_eq!(stats.retained_scene_content_replay_cells, 2);
@@ -11140,8 +11319,9 @@ mod tests {
             }) as Arc<dyn AttachRenderExtension>];
 
         let mut host = TestHost::new(8, 2);
-        host.frame(true, || {
+        host.frame(true, |canvas| {
             render_attach_scene(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -11159,8 +11339,9 @@ mod tests {
         });
 
         lower_changed.store(true, Ordering::Relaxed);
-        let second = host.frame(false, || {
+        let second = host.frame(false, |canvas| {
             render_attach_scene(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -11176,20 +11357,12 @@ mod tests {
             )
             .expect("lower retained update should preserve higher-z item")
         });
-        let operations = &second.operations;
-        let higher_at = operations
-            .iter()
-            .rposition(|operation| drawn_char_at(operation, 0, 1) == Some('H'))
-            .expect("higher-z retained item should render");
-        if let Some(lower_at) = operations
-            .iter()
-            .rposition(|operation| drawn_char_at(operation, 0, 1) == Some('l'))
-        {
-            assert!(
-                lower_at < higher_at,
-                "higher-z item must be emitted after lower-z item: {operations:?}"
-            );
-        }
+        // The higher-z item stays over the changed lower one: nothing changes on the host.
+        assert!(
+            second.changes.is_empty(),
+            "higher-z item must stay over lower-z item: {:?}",
+            second.changes
+        );
         assert_eq!(host.cell(0, 1).0, "H", "{}", host.text());
     }
 
@@ -11273,8 +11446,9 @@ mod tests {
             }) as Arc<dyn AttachRenderExtension>];
 
         let mut host = TestHost::new(8, 2);
-        host.frame(true, || {
+        host.frame(true, |canvas| {
             render_attach_scene(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -11290,10 +11464,14 @@ mod tests {
             )
             .expect("initial snapshot render should commit after-content metadata")
         });
+        // The host shows stale cells where the previous snapshot drew.
+        host.frame(false, |canvas| canvas.text(1, 0, "OLD", TuiStyle::new()));
+        assert_eq!(host.row(0), "aOLDef  ");
 
         revision.store(2, Ordering::Relaxed);
-        let second = host.frame(false, || {
+        let second = host.frame(false, |canvas| {
             render_attach_scene_with_stats_and_trace(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -11311,18 +11489,15 @@ mod tests {
             .expect("snapshot diff should clean stale after-content cells")
         });
         let (_cursor, stats) = second.result;
-        let operations = &second.operations;
-        let clear_at = position_of_blank(operations, TuiRect::new(0, 0, 8, 1))
-            .expect("previous after-content snapshot should be cleared");
-        let repaint_at = position_of_text(operations, "abcdef")
-            .expect("underlying pane content should be replayed after snapshot cleanup");
-        assert!(
-            clear_at < repaint_at,
-            "cleanup must precede content: {operations:?}"
-        );
-        assert!(
-            position_of_text(operations, "OLD").is_none(),
-            "stale overlay should not be redrawn: {operations:?}"
+        // The previous snapshot's cleanup covers the surface (its rows count as changed though
+        // the second ends as blank as it was) and the pane content is replayed over it; the
+        // stale overlay is not drawn again.
+        assert_eq!(
+            second.changes,
+            [
+                (0, 0, "abcdef  ".to_string()),
+                (0, 1, "        ".to_string())
+            ]
         );
         assert_eq!(host.row(0), "abcdef  ");
         assert_eq!(stats.damaged_content_surfaces, 1);
@@ -11464,8 +11639,10 @@ mod tests {
             as Arc<dyn AttachRenderExtension>];
 
         let mut trace = AttachRenderTrace::new();
-        let ((_cursor, stats), operations) = crate::projection::capture(|| {
+        let mut host = TestHost::new(80, 24);
+        let first = host.frame(true, |canvas| {
             render_attach_scene_with_stats_and_trace(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -11482,23 +11659,19 @@ mod tests {
             )
             .expect("render should succeed")
         });
+        let (_cursor, stats) = first.result;
 
-        let pane_at = position_of_text(&operations, "PANE").expect("pane content should render");
-        let ops_at =
-            position_of_text(&operations, "OPS").expect("after-pane extension should render");
-        assert!(
-            pane_at < ops_at,
-            "after-pane extension must be emitted after pane content: {operations:?}"
-        );
-        assert_eq!(drawn(&operations[ops_at]), Some((2, 1, "OPS")));
-        assert_eq!(
-            drawn_style(&operations[ops_at]),
-            Some(
-                TuiStyle::new()
-                    .fg(TuiColor::Rgb(1, 2, 3))
-                    .add_modifier(Modifier::BOLD)
-            )
-        );
+        assert_eq!(&host.row(2)[1..5], "PANE", "{}", host.text());
+        assert_eq!(&host.row(1)[2..5], "OPS", "{}", host.text());
+        for x in 2..5 {
+            let (_, style) = host.cell(x, 1);
+            assert_eq!(
+                style.fg,
+                Some(bmux_terminal_grid::Color::Rgb { r: 1, g: 2, b: 3 }),
+                "column {x}"
+            );
+            assert!(style.bold, "column {x}");
+        }
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(refreshes.load(Ordering::Relaxed), 1);
         assert_eq!(stats.extension_render_op_calls, 1);
@@ -11510,8 +11683,9 @@ mod tests {
         }));
 
         let mut cached_trace = AttachRenderTrace::new();
-        let ((_cursor, cached_stats), cached_operations) = crate::projection::capture(|| {
+        let cached = host.frame(true, |canvas| {
             render_attach_scene_with_stats_and_trace(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -11528,10 +11702,17 @@ mod tests {
             )
             .expect("cached render should succeed")
         });
+        let (_cursor, cached_stats) = cached.result;
+        // The cached output is replayed into the full frame.
         assert!(
-            position_of_text(&cached_operations, "OPS").is_some(),
-            "{cached_operations:?}"
+            cached
+                .changes
+                .iter()
+                .any(|(x, y, text)| (*x, *y) == (0, 1) && text.get(2..5) == Some("OPS")),
+            "{:?}",
+            cached.changes
         );
+        assert_eq!(&host.row(1)[2..5], "OPS", "{}", host.text());
         assert_eq!(calls.load(Ordering::Relaxed), 1);
         assert_eq!(refreshes.load(Ordering::Relaxed), 2);
         assert_eq!(cached_stats.extension_cache_hits, 1);
@@ -11571,22 +11752,25 @@ mod tests {
         );
         let mut trace = AttachRenderTrace::new();
 
-        render_attach_scene_with_stats_and_trace(
-            &scene,
-            &[],
-            &mut pane_buffers,
-            &damage,
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (80, 24),
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &[],
-            Some(&mut trace),
-        )
-        .expect("defer cleanup");
+        painted(80, 24, |canvas| {
+            render_attach_scene_with_stats_and_trace(
+                canvas,
+                &scene,
+                &[],
+                &mut pane_buffers,
+                &damage,
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                (80, 24),
+                &RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &[],
+                Some(&mut trace),
+            )
+            .expect("defer cleanup")
+        });
 
         assert!(
             !trace
@@ -11635,8 +11819,9 @@ mod tests {
         // Draw every row once.
         pane_buffers.insert(pane_id, buffer);
         let mut host = TestHost::new(80, 24);
-        let first = host.frame(true, || {
+        let first = host.frame(true, |canvas| {
             render_attach_scene(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -11653,7 +11838,7 @@ mod tests {
             .expect("initial render should succeed")
         });
         assert!(
-            !first.operations.is_empty(),
+            !first.bytes.is_empty(),
             "initial render should produce output"
         );
         assert!(host.row(1).starts_with("hello "), "{}", host.text());
@@ -11666,8 +11851,9 @@ mod tests {
         entry.sync_update_in_progress = true;
 
         // Render with the pane dirty but NOT a full redraw.
-        let deferred = host.frame(false, || {
+        let deferred = host.frame(false, |canvas| {
             render_attach_scene(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -11687,9 +11873,12 @@ mod tests {
         // The frame should NOT draw the partial content "partial" because the pane was
         // sync-deferred.
         assert!(
-            position_of_text(&deferred.operations, "partial").is_none(),
-            "sync-deferred render should not contain partial pane content: {:?}",
-            deferred.operations
+            !deferred
+                .changes
+                .iter()
+                .any(|(_, _, text)| text.contains("partial")),
+            "sync-deferred render should not show partial pane content: {:?}",
+            deferred.changes
         );
         assert!(
             host.row(1).starts_with("hello "),
@@ -11702,8 +11891,9 @@ mod tests {
         append_pane_output(entry, b" done");
         entry.sync_update_in_progress = false;
 
-        let completed = host.frame(false, || {
+        let completed = host.frame(false, |canvas| {
             render_attach_scene(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -11721,8 +11911,8 @@ mod tests {
         });
 
         assert!(
-            !completed.operations.is_empty(),
-            "completed render should produce output"
+            !completed.changes.is_empty(),
+            "completed render should change the host"
         );
         assert!(
             host.row(1).starts_with("hellopartial") && host.row(2).starts_with(" done "),
@@ -11771,8 +11961,10 @@ mod tests {
         buffer.sync_update_in_progress = true;
         pane_buffers.insert(pane_id, buffer);
 
-        let (_, operations) = crate::projection::capture(|| {
+        // Painted over cells that do not show the pane, so whatever the frame paints shows.
+        let (_, rows, _) = marked(80, 24, |canvas| {
             render_attach_scene(
+                canvas,
                 &scene,
                 &[],
                 &mut pane_buffers,
@@ -11789,14 +11981,15 @@ mod tests {
             .expect("full redraw should defer while sync flag is active")
         });
 
-        assert!(
-            position_of_text(&operations, "content").is_none(),
-            "full-frame redraw must not draw partial pane content while sync_update_in_progress is set: {operations:?}"
-        );
-        assert!(
-            position_of_blank(&operations, TuiRect::new(0, 1, 12, 4)).is_none(),
-            "full-frame redraw must not clear the pane while its content is sync-deferred: {operations:?}"
-        );
+        // Neither drawn nor cleared: the pane's cells keep what they showed.
+        for row in &rows[1..5] {
+            assert_eq!(
+                &row[..12],
+                "~".repeat(12),
+                "full-frame redraw must neither draw partial pane content nor clear the pane \
+                 while sync_update_in_progress is set: {rows:#?}"
+            );
+        }
     }
 
     #[test]
@@ -11823,8 +12016,9 @@ mod tests {
         let appearance = RuntimeAppearance::default();
         let under = BTreeMap::new();
         let mut host = TestHost::new(8, 2);
-        host.frame(true, || {
-            super::capture_pane_row(
+        host.frame(true, |canvas| {
+            super::paint_pane_row(
+                canvas,
                 &GridRowRenderContext {
                     row: &rows[0],
                     selection: None,

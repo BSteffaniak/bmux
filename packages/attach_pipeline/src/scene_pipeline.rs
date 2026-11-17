@@ -1,4 +1,4 @@
-use crate::frame_presenter::{CapturedFrame, FramePresenter, Presented, capture_frame};
+use crate::frame_presenter::{FramePresenter, FrameSpec, Presented};
 use crate::reconcile::{
     apply_attach_output_chunk_with, attach_layout_pane_id_set,
     attach_layout_requires_snapshot_hydration, attach_scene_revealed_pane_ids,
@@ -136,34 +136,38 @@ impl UndecoratedGridPresenter {
             damage.mark_content_surface(surface_id);
             damage
         };
-        let (cursor, operations, graphics) = capture_frame(|| {
-            render_attach_scene_with_terminal_graphics_cache(
-                &scene,
-                &[],
-                &mut pending_buffers,
-                &mut pending_graphics,
-                &frame_damage,
-                0,
-                0,
-                &PaneScrollbackViews::new(),
-                false,
-                dimensions,
-                &bmux_appearance::RuntimeAppearance::default(),
-                DamageCoalescingPolicy::default(),
-                &[],
-            )
-        });
-        let pending_cursor = cursor?;
         self.presenter
             .set_synchronized_output(self.synchronized_updates);
-        let frame_bytes = match self.presenter.present(&CapturedFrame {
-            operations: &operations,
-            cursor: pending_cursor,
-            full: full_frame,
-            size: dimensions,
-            margins: false,
-            graphics: (&graphics).into(),
-        }) {
+        let frame = self.presenter.present(
+            &FrameSpec {
+                full: full_frame,
+                size: dimensions,
+                margins: false,
+                graphics: true,
+            },
+            |canvas| {
+                let cursor = render_attach_scene_with_terminal_graphics_cache(
+                    canvas,
+                    &scene,
+                    &[],
+                    &mut pending_buffers,
+                    &mut pending_graphics,
+                    &frame_damage,
+                    0,
+                    0,
+                    &PaneScrollbackViews::new(),
+                    false,
+                    dimensions,
+                    &bmux_appearance::RuntimeAppearance::default(),
+                    DamageCoalescingPolicy::default(),
+                    &[],
+                )?;
+                canvas.set_cursor(cursor);
+                Ok::<_, anyhow::Error>(cursor)
+            },
+        )?;
+        let pending_cursor = frame.result;
+        let frame_bytes = match frame.presented {
             Presented::Frame(bytes) => bytes,
             Presented::Unchanged => Vec::new(),
             Presented::Unsupported(reason) => {
@@ -645,35 +649,39 @@ impl AttachScenePipeline {
         let pane_buffers = &mut self.pane_buffers;
         let graphics_cache = &mut self.terminal_graphics_cache;
         let viewport = self.viewport;
-        let (cursor, operations, graphics) = capture_frame(|| {
-            render_attach_scene_with_terminal_graphics_cache(
-                &layout_state.scene,
-                &layout_state.panes,
-                pane_buffers,
-                graphics_cache,
-                &frame_damage,
-                viewport.top_inset,
-                viewport.bottom_inset,
-                // Snapshot-mode scene pipeline renders live pane output only; it has
-                // no per-pane scrollback views.
-                &PaneScrollbackViews::new(),
-                layout_state.zoomed,
-                (viewport.cols, viewport.rows),
-                &bmux_appearance::RuntimeAppearance::default(),
-                DamageCoalescingPolicy::default(),
-                &[],
-            )
-        });
-        let cursor_state = cursor?;
+        let frame = self.presenter.present(
+            &FrameSpec {
+                full: self.full_pane_redraw,
+                size: (viewport.cols, viewport.rows),
+                margins: false,
+                graphics: true,
+            },
+            |canvas| {
+                let cursor = render_attach_scene_with_terminal_graphics_cache(
+                    canvas,
+                    &layout_state.scene,
+                    &layout_state.panes,
+                    pane_buffers,
+                    graphics_cache,
+                    &frame_damage,
+                    viewport.top_inset,
+                    viewport.bottom_inset,
+                    // Snapshot-mode scene pipeline renders live pane output only; it has
+                    // no per-pane scrollback views.
+                    &PaneScrollbackViews::new(),
+                    layout_state.zoomed,
+                    (viewport.cols, viewport.rows),
+                    &bmux_appearance::RuntimeAppearance::default(),
+                    DamageCoalescingPolicy::default(),
+                    &[],
+                )?;
+                canvas.set_cursor(cursor);
+                Ok::<_, anyhow::Error>(cursor)
+            },
+        )?;
+        let cursor_state = frame.result;
         // The caller delivers the frame; it counts as shown once returned.
-        let frame_bytes = match self.presenter.present(&CapturedFrame {
-            operations: &operations,
-            cursor: cursor_state,
-            full: self.full_pane_redraw,
-            size: (viewport.cols, viewport.rows),
-            margins: false,
-            graphics: (&graphics).into(),
-        }) {
+        let frame_bytes = match frame.presented {
             Presented::Frame(bytes) => bytes,
             Presented::Unchanged => Vec::new(),
             Presented::Unsupported(reason) => {

@@ -497,7 +497,7 @@ pub(super) fn prepare_frame(
     view: &mut AttachViewState,
     layout: &bmux_client::AttachLayoutState,
     surfaces: &mut [bmux_attach_pipeline::RetainedSurface],
-) {
+) -> Option<bmux_attach_pipeline::projection::ProjectionFailure> {
     view.pane_zoom.cursor_owners = layout
         .scene
         .surfaces
@@ -505,17 +505,16 @@ pub(super) fn prepare_frame(
         .filter(|surface| surface.cursor_owner)
         .map(|surface| surface.id)
         .collect();
-    if let Err(error) = prepare(view, surfaces) {
-        tracing::warn!(%error, "local zoom preparation rejected");
-        // Reject the complete candidate instead of presenting an unzoomed fallback.
-        bmux_attach_pipeline::projection::record(
-            bmux_attach_pipeline::projection::PaintOperation::Rejected(
-                bmux_attach_pipeline::projection::ProjectionFailure::Unsupported {
-                    reason: "local zoom projection rejected",
-                },
-            ),
-        );
-    }
+    let Err(error) = prepare(view, surfaces) else {
+        return None;
+    };
+    tracing::warn!(%error, "local zoom preparation rejected");
+    // Reject the complete candidate instead of presenting an unzoomed fallback.
+    Some(
+        bmux_attach_pipeline::projection::ProjectionFailure::Unsupported {
+            reason: "local zoom projection rejected",
+        },
+    )
 }
 
 #[allow(clippy::too_many_lines)] // Live and pinned sources share one ordered preparation/admission boundary.
@@ -1375,7 +1374,9 @@ mod history_tests {
         view.pane_zoom.committed_history.insert(id, top);
         view.pane_zoom.shared_pointer_root = Some([3.4, 0.2]);
         let event = bmux_terminal::event::MouseEvent {
-            kind: bmux_terminal::event::MouseEventKind::Down(bmux_terminal::event::MouseButton::Left),
+            kind: bmux_terminal::event::MouseEventKind::Down(
+                bmux_terminal::event::MouseButton::Left,
+            ),
             column: 0,
             row: 0,
             modifiers: bmux_terminal::event::KeyModifiers::empty(),
@@ -1411,7 +1412,9 @@ mod history_tests {
         let (mut view, pane, id) = history_fixture();
         assert_eq!(history_fragments(&view).unwrap().len(), 1);
         let event = bmux_terminal::event::MouseEvent {
-            kind: bmux_terminal::event::MouseEventKind::Down(bmux_terminal::event::MouseButton::Left),
+            kind: bmux_terminal::event::MouseEventKind::Down(
+                bmux_terminal::event::MouseButton::Left,
+            ),
             column: 0,
             row: 0,
             modifiers: bmux_terminal::event::KeyModifiers::empty(),

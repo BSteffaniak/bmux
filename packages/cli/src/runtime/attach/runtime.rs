@@ -8,6 +8,7 @@ use bmux_attach_layout_protocol::{
     AttachScene, AttachSurface, AttachSurfaceKind,
 };
 use bmux_attach_pipeline::TerminalGraphicsCache;
+use bmux_attach_pipeline::canvas::Canvas;
 use bmux_attach_pipeline::host_writer::HostWriter;
 use bmux_attach_pipeline::mouse as attach_mouse;
 use bmux_attach_pipeline::reconcile::{
@@ -4574,9 +4575,17 @@ fn render_native_provider_scene<W: AttachTerminal>(
         .collect::<Vec<_>>();
     let geometry = terminal.geometry();
     let size = (geometry.cols, geometry.rows);
-    let (rendered, operations, graphics) =
-        bmux_attach_pipeline::frame_presenter::capture_frame(|| {
-            render_attach_scene_with_stats_and_trace_with_capabilities(
+    // Every scene is drawn in full, from a blank screen.
+    let frame = bmux_attach_pipeline::frame_presenter::FramePresenter::new().present(
+        &bmux_attach_pipeline::frame_presenter::FrameSpec {
+            full: true,
+            size,
+            margins: false,
+            graphics: true,
+        },
+        |canvas| {
+            let (cursor, _) = render_attach_scene_with_stats_and_trace_with_capabilities(
+                canvas,
                 scene,
                 &panes,
                 pane_buffers,
@@ -4593,20 +4602,12 @@ fn render_native_provider_scene<W: AttachTerminal>(
                 &[],
                 bmux_plugin::TerminalRenderCapabilities::default(),
                 None,
-            )
-        });
-    let (cursor, _) = rendered?;
-    // Every scene is drawn in full, from a blank screen.
-    match bmux_attach_pipeline::frame_presenter::FramePresenter::new().present(
-        &bmux_attach_pipeline::frame_presenter::CapturedFrame {
-            operations: &operations,
-            cursor,
-            full: true,
-            size,
-            margins: false,
-            graphics: (&graphics).into(),
+            )?;
+            canvas.set_cursor(cursor);
+            Ok::<_, anyhow::Error>(())
         },
-    ) {
+    )?;
+    match frame.presented {
         bmux_attach_pipeline::frame_presenter::Presented::Frame(bytes) => {
             terminal.write_all(&bytes)?;
         }
@@ -10384,21 +10385,20 @@ fn render_damage_from_retained_damage_rects(rects: &[DamageRect]) -> RenderDamag
 }
 
 /// Clear the retained background where the graph changed, before surfaces repaint over it.
-fn clear_retained_background(damage: &RetainedDamage) {
+fn clear_retained_background(canvas: &mut Canvas<'_, '_, '_>, damage: &RetainedDamage) {
     let RetainedDamage::Regions(rects) = damage else {
         return;
     };
     for rect in rects {
-        bmux_attach_pipeline::projection::record(
-            bmux_attach_pipeline::projection::PaintOperation::Fill {
-                rect: bmux_tui::geometry::Rect::new(rect.x, rect.y, rect.w, rect.h),
-                style: bmux_tui::style::Style::new(),
-            },
+        canvas.fill(
+            bmux_tui::geometry::Rect::new(rect.x, rect.y, rect.w, rect.h),
+            bmux_tui::style::Style::new(),
         );
     }
 }
 
 fn queue_retained_render_ops(
+    canvas: &mut Canvas<'_, '_, '_>,
     surface: &RetainedSurface,
     repaint: &RetainedRepaintSurface,
     capabilities: bmux_plugin::TerminalRenderCapabilities,
@@ -10413,11 +10413,12 @@ fn queue_retained_render_ops(
         surface.rect.h,
     );
     let damage = render_damage_from_retained_damage_rects(&repaint.damage);
-    queue_render_ops_with_capabilities(surface_rect, &damage, ops, capabilities)
+    queue_render_ops_with_capabilities(canvas, surface_rect, &damage, ops, capabilities)
         .context("failed queueing retained render ops")
 }
 
 fn queue_retained_extension_ops(
+    canvas: &mut Canvas<'_, '_, '_>,
     surface: &RetainedSurface,
     repaint: &RetainedRepaintSurface,
     extensions: &[Arc<dyn bmux_plugin::AttachRenderExtension>],
@@ -10446,6 +10447,7 @@ fn queue_retained_extension_ops(
         ) {
             let items = plugin_scene_items_to_render_items(&scene);
             wrote |= queue_render_items_for_surface(
+                canvas,
                 surface.id,
                 surface_rect,
                 &damage,
@@ -10470,6 +10472,7 @@ fn queue_retained_extension_ops(
             &context,
         ) {
             wrote |= queue_render_items_for_surface(
+                canvas,
                 surface.id,
                 surface_rect,
                 &damage,
@@ -10495,7 +10498,7 @@ fn queue_retained_extension_ops(
         ) else {
             continue;
         };
-        wrote |= queue_render_ops(surface_rect, &damage, &ops)
+        wrote |= queue_render_ops(canvas, surface_rect, &damage, &ops)
             .with_context(|| format!("failed queueing retained extension {}", extension.name()))?;
     }
     Ok(wrote)
@@ -10631,6 +10634,8 @@ struct RetainedFramePlan {
     scene_repaint: bool,
     damage: RetainedDamagePlan,
     repaint_plan: Vec<RetainedRepaintSurface>,
+    /// Why the frame cannot be shown, found while planning it (a rejected local zoom).
+    rejection: Option<bmux_attach_pipeline::projection::ProjectionFailure>,
 }
 
 impl RetainedFramePlan {
@@ -10731,7 +10736,8 @@ fn build_retained_frame_plan(
     }
     retained_surfaces.extend(help_surface.iter().cloned());
     retained_surfaces.extend(prompt_surface.iter().cloned());
-    super::pane_zoom_native::prepare_frame(view_state, layout_state, &mut retained_surfaces);
+    let rejection =
+        super::pane_zoom_native::prepare_frame(view_state, layout_state, &mut retained_surfaces);
     let graph_damage = replace_retained_surfaces(
         view_state,
         retained_surfaces.clone(),
@@ -10789,6 +10795,7 @@ fn build_retained_frame_plan(
             merged: merged_damage,
         },
         repaint_plan,
+        rejection,
     }
 }
 
@@ -11086,30 +11093,19 @@ fn render_attach_frame_to_output(
     let previous = view_state.retained_compositor.clone();
     let previous_focus = view_state.plugin_focus.clone();
     super::presenter::begin_frame(view_state);
-    let presenting = view_state.presenting;
-    let (result, _operations) = bmux_attach_pipeline::projection::capture(|| {
-        let render = || {
-            render_attach_frame_inner(
-                terminal_writer,
-                view_state,
-                layout_state,
-                runtime_appearance,
-                help_lines,
-                help_scroll,
-                damage_config,
-                slow_terminal_write_ms,
-                display_capture,
-                geometry,
-                render_trace,
-            )
-        };
-        // A presented frame writes graphics around its captured cells.
-        if presenting {
-            bmux_attach_pipeline::projection::with_graphics_output(render)
-        } else {
-            render()
-        }
-    });
+    let result = render_attach_frame_inner(
+        terminal_writer,
+        view_state,
+        layout_state,
+        runtime_appearance,
+        help_lines,
+        help_scroll,
+        damage_config,
+        slow_terminal_write_ms,
+        display_capture,
+        geometry,
+        render_trace,
+    );
     if let Err(error) = &result {
         restore_unpresented_frame(view_state, &previous, &previous_focus);
         view_state
@@ -11216,6 +11212,13 @@ fn acknowledge_plugin_surface_output(view_state: &AttachViewState) {
     for (endpoint, revision) in published {
         view_state.presentation_input.committed(&endpoint, revision);
     }
+}
+
+/// What painting a frame produced, beside its cells.
+struct PaintedFrame {
+    scene_render_stats: AttachSceneRenderStats,
+    overlay_rendered: bool,
+    pending_cursor_state: Option<bmux_attach_pipeline::AttachCursorState>,
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
@@ -11325,11 +11328,6 @@ fn render_attach_frame_inner(
         && !view_state.graphics_on_host();
     let retained_repaint_by_id = frame_plan.retained.repaint_by_id();
 
-    let mut frame_bytes = Vec::new();
-    // Graphics protocol bytes of a frame presented through the terminal presenter, written before
-    // and after its cells.
-    let mut images_before: Vec<u8> = Vec::new();
-    let mut images_after: Vec<u8> = Vec::new();
     #[cfg(any(
         feature = "image-sixel",
         feature = "image-kitty",
@@ -11339,298 +11337,353 @@ fn render_attach_frame_inner(
     // Reconciliation describes encoded output, not yet-presented resources.
     // Keep the committed cache intact until the terminal accepts the frame.
     let mut pending_graphics_cache = view_state.terminal_graphics_cache.clone();
-    // Deletion belongs to the same synchronized frame as replacement pixels.
-    #[cfg(any(
-        feature = "image-sixel",
-        feature = "image-kitty",
-        feature = "image-iterm2"
-    ))]
-    if view_state.presenting {
-        // Capability changes release resources even on partial frames. Visibility
-        // reconciliation, however, requires a complete image scene.
-        let out = &mut images_before;
-        pending_kitty_state
-            .select_protocol(out, view_state.host_image_caps.preferred_protocol())?;
-        if frame_plan.render_scene {
-            pending_kitty_state.begin_frame();
-            pending_kitty_state.clear_placements(out)?;
-        }
-    }
-    #[cfg(any(
-        feature = "image-sixel",
-        feature = "image-kitty",
-        feature = "image-iterm2"
-    ))]
-    if view_state.pane_images_presented {
-        // Repainting characters is not a portable raster deletion operation.
-        // ED2 repairs prior Sixel/iTerm2 pixels; the full-damage frame above
-        // reconstructs all cells and retained surfaces without erasing history.
-        bmux_attach_pipeline::projection::record(
-            bmux_attach_pipeline::projection::PaintOperation::Fill {
-                rect: bmux_tui::geometry::Rect::new(0, 0, terminal_size.0, terminal_size.1),
-                style: bmux_tui::style::Style::new(),
-            },
-        );
-        if view_state.presenting {
-            images_before.extend_from_slice(b"\x1b[2J");
-        }
-    }
     // The cursor the host shows now, kept while nothing moves it.
     let previous_cursor_state = view_state.last_cursor_state;
-    clear_retained_background(&frame_plan.retained.damage.graph);
-    let retained_capabilities = terminal_render_capabilities(view_state);
-    let status_rendered = false;
-    let appearance_mode_id = if view_state.help_overlay_open {
-        "help"
-    } else if view_state.prompt.is_active() {
-        "prompt"
-    } else if view_state.scrollback_active() {
-        "scroll"
-    } else if layout_state.zoomed {
-        "zoom"
-    } else {
-        view_state.active_mode_id.as_str()
+    let frame_spec = bmux_attach_pipeline::frame_presenter::FrameSpec {
+        full: frame_damage.is_full_frame(),
+        size: terminal_size,
+        margins: terminal_render_capabilities(view_state).left_right_margins,
+        graphics: view_state.presenting,
     };
-    let opaque_overlay_rects = view_state
-        .retained_compositor
-        .content_occluders()
-        .into_iter()
-        .map(|rect| ExtensionRect::new(rect.x, rect.y, rect.w, rect.h))
-        .collect::<Vec<_>>();
-    let active_runtime_appearance = runtime_appearance.for_mode(appearance_mode_id);
-    let mut scene_render_stats = AttachSceneRenderStats::default();
-    let cursor_state = if frame_plan.render_scene {
-        // Snapshot the current set of registered render extensions
-        // once per frame. The snapshot is cheap (Arc-clones) and
-        // keeps the per-surface loop inside `render_attach_scene`
-        // free of registry-lock churn.
-        let extensions = view_state
-            .prepared_extensions
-            .clone()
-            .expect("entry prepares retained extension intent");
-        view_state
-            .visual_projection_updates
-            .extend(collect_visual_projection_updates(
-                &layout_state.scene,
-                &view_state.pane_buffers,
-                &extensions,
-            ));
-        let terminal_render_capabilities = terminal_render_capabilities(view_state);
-        let (cursor_state, stats) =
-            render_attach_scene_with_stats_and_trace_with_capabilities_and_occluders(
-                &layout_state.scene,
-                &layout_state.panes,
-                &mut view_state.pane_buffers,
-                &mut pending_graphics_cache,
-                &frame_damage,
-                top_inset,
-                bottom_inset,
-                &view_state.pane_scrollback,
-                layout_state.zoomed,
-                terminal_size,
-                &active_runtime_appearance,
-                damage_policy,
-                &extensions,
-                terminal_render_capabilities,
-                &opaque_overlay_rects,
-                render_trace.as_deref_mut(),
-            )?;
-        scene_render_stats = stats;
-        cursor_state
-    } else {
-        previous_cursor_state
-    };
+    // Every client presents through its terminal presenter; the frame is painted into it.
+    let mut presenter = std::mem::take(&mut view_state.terminal_presenter);
+    let painted = presenter.present(&frame_spec, |canvas| -> Result<PaintedFrame> {
+        // Deletion belongs to the same synchronized frame as replacement pixels.
+        #[cfg(any(
+            feature = "image-sixel",
+            feature = "image-kitty",
+            feature = "image-iterm2"
+        ))]
+        if view_state.presenting {
+            // Capability changes release resources even on partial frames. Visibility
+            // reconciliation, however, requires a complete image scene.
+            canvas.write_graphics(true, |mut out| {
+                pending_kitty_state
+                    .select_protocol(&mut out, view_state.host_image_caps.preferred_protocol())?;
+                if frame_plan.render_scene {
+                    pending_kitty_state.begin_frame();
+                    pending_kitty_state.clear_placements(&mut out)?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(rejection) = frame_plan.retained.rejection.clone() {
+            canvas.reject(rejection);
+        }
+        #[cfg(any(
+            feature = "image-sixel",
+            feature = "image-kitty",
+            feature = "image-iterm2"
+        ))]
+        if view_state.pane_images_presented {
+            // Repainting characters is not a portable raster deletion operation.
+            // ED2 repairs prior Sixel/iTerm2 pixels; the full-damage frame above
+            // reconstructs all cells and retained surfaces without erasing history.
+            canvas.fill(
+                bmux_tui::geometry::Rect::new(0, 0, terminal_size.0, terminal_size.1),
+                bmux_tui::style::Style::new(),
+            );
+            canvas.write_graphics(true, |writer| {
+                writer.write_all(b"\x1b[2J").map_err(Into::into)
+            })?;
+        }
+        clear_retained_background(canvas, &frame_plan.retained.damage.graph);
+        let retained_capabilities = terminal_render_capabilities(view_state);
+        let appearance_mode_id = if view_state.help_overlay_open {
+            "help"
+        } else if view_state.prompt.is_active() {
+            "prompt"
+        } else if view_state.scrollback_active() {
+            "scroll"
+        } else if layout_state.zoomed {
+            "zoom"
+        } else {
+            view_state.active_mode_id.as_str()
+        };
+        let opaque_overlay_rects = view_state
+            .retained_compositor
+            .content_occluders()
+            .into_iter()
+            .map(|rect| ExtensionRect::new(rect.x, rect.y, rect.w, rect.h))
+            .collect::<Vec<_>>();
+        let active_runtime_appearance = runtime_appearance.for_mode(appearance_mode_id);
+        let mut scene_render_stats = AttachSceneRenderStats::default();
+        let cursor_state = if frame_plan.render_scene {
+            // Snapshot the current set of registered render extensions
+            // once per frame. The snapshot is cheap (Arc-clones) and
+            // keeps the per-surface loop inside `render_attach_scene`
+            // free of registry-lock churn.
+            let extensions = view_state
+                .prepared_extensions
+                .clone()
+                .expect("entry prepares retained extension intent");
+            view_state
+                .visual_projection_updates
+                .extend(collect_visual_projection_updates(
+                    &layout_state.scene,
+                    &view_state.pane_buffers,
+                    &extensions,
+                ));
+            let terminal_render_capabilities = terminal_render_capabilities(view_state);
+            let (cursor_state, stats) =
+                render_attach_scene_with_stats_and_trace_with_capabilities_and_occluders(
+                    canvas,
+                    &layout_state.scene,
+                    &layout_state.panes,
+                    &mut view_state.pane_buffers,
+                    &mut pending_graphics_cache,
+                    &frame_damage,
+                    top_inset,
+                    bottom_inset,
+                    &view_state.pane_scrollback,
+                    layout_state.zoomed,
+                    terminal_size,
+                    &active_runtime_appearance,
+                    damage_policy,
+                    &extensions,
+                    terminal_render_capabilities,
+                    &opaque_overlay_rects,
+                    render_trace.as_deref_mut(),
+                )?;
+            scene_render_stats = stats;
+            cursor_state
+        } else {
+            previous_cursor_state
+        };
 
-    // Image overlay: render terminal images (Sixel, Kitty, iTerm2) on top
-    // of the cell content, translated to host terminal coordinates.
-    #[cfg(any(
-        feature = "image-sixel",
-        feature = "image-kitty",
-        feature = "image-iterm2"
-    ))]
-    // The gate below concerns native raster emission only. Browser images are
-    // fetched independently and materialized by observer::observed_images from
-    // authoritative registry data, even when no terminal protocol is supported.
-    if frame_plan.render_scene && view_state.host_image_caps.any_supported() {
-        for surface in &layout_state.scene.surfaces {
-            let Some(pane_id) = surface.pane_id else {
-                continue;
-            };
-            let images = view_state.presented_images(pane_id);
-            if !images.is_empty() {
-                let pane_images: Vec<bmux_image::PaneImage> =
-                    images.iter().map(bmux_image::PaneImage::from).collect();
-                let pane_rect = bmux_image::compositor::PaneRect {
-                    x: surface.content_rect.x,
-                    y: surface.content_rect.y,
-                    w: surface.content_rect.w,
-                    h: surface.content_rect.h,
+        // Image overlay: render terminal images (Sixel, Kitty, iTerm2) on top
+        // of the cell content, translated to host terminal coordinates.
+        #[cfg(any(
+            feature = "image-sixel",
+            feature = "image-kitty",
+            feature = "image-iterm2"
+        ))]
+        // The gate below concerns native raster emission only. Browser images are
+        // fetched independently and materialized by observer::observed_images from
+        // authoritative registry data, even when no terminal protocol is supported.
+        if frame_plan.render_scene && view_state.host_image_caps.any_supported() {
+            for surface in &layout_state.scene.surfaces {
+                let Some(pane_id) = surface.pane_id else {
+                    continue;
                 };
-                let covers = opaque_overlay_rects
-                    .iter()
-                    .map(|rect| bmux_tui::geometry::Rect::new(rect.x, rect.y, rect.w, rect.h))
-                    .collect::<Vec<_>>();
-                if !view_state.presentation_only {
-                    bmux_image::compositor::render_pane_images_clipped(
-                        &mut images_after,
-                        &pane_images,
-                        pane_rect,
-                        &covers,
-                        &view_state.host_image_caps,
-                        &mut pending_kitty_state,
-                    )
-                    .context("failed composing pane images")?;
+                let images = view_state.presented_images(pane_id);
+                if !images.is_empty() {
+                    let pane_images: Vec<bmux_image::PaneImage> =
+                        images.iter().map(bmux_image::PaneImage::from).collect();
+                    let pane_rect = bmux_image::compositor::PaneRect {
+                        x: surface.content_rect.x,
+                        y: surface.content_rect.y,
+                        w: surface.content_rect.w,
+                        h: surface.content_rect.h,
+                    };
+                    let covers = opaque_overlay_rects
+                        .iter()
+                        .map(|rect| bmux_tui::geometry::Rect::new(rect.x, rect.y, rect.w, rect.h))
+                        .collect::<Vec<_>>();
+                    if !view_state.presentation_only {
+                        canvas
+                            .write_graphics(false, |mut writer| {
+                                bmux_image::compositor::render_pane_images_clipped(
+                                    &mut writer,
+                                    &pane_images,
+                                    pane_rect,
+                                    &covers,
+                                    &view_state.host_image_caps,
+                                    &mut pending_kitty_state,
+                                )
+                                .map_err(Into::into)
+                            })
+                            .context("failed composing pane images")?;
+                    }
                 }
             }
         }
-    }
 
-    let mut overlay_rendered = false;
-    let retained_extensions = view_state
-        .prepared_extensions
-        .clone()
-        .expect("entry prepares retained extension intent");
-    let retained_plugin_repaints = if frame_plan.render_scene {
-        view_state
-            .retained_compositor
-            .surfaces()
-            .values()
-            .filter(|surface| view_state.retained_plugin_surface_ids.contains(&surface.id))
-            .cloned()
-            .map(|surface| {
-                let repaint = retained_full_surface_repaint(&surface);
-                (surface, repaint)
-            })
-            .collect::<Vec<_>>()
-    } else {
-        frame_plan
-            .retained
-            .repaint_plan
-            .iter()
-            .filter(|repaint| {
-                view_state
-                    .retained_plugin_surface_ids
-                    .contains(&repaint.surface_id)
-            })
-            .filter_map(|repaint| {
-                view_state
-                    .retained_compositor
-                    .surfaces()
-                    .get(&repaint.surface_id)
-                    .cloned()
-                    .map(|surface| (surface, repaint.clone()))
-            })
-            .collect::<Vec<_>>()
-    };
-    for (surface, repaint) in retained_plugin_repaints {
-        overlay_rendered |= queue_retained_render_ops(&surface, &repaint, retained_capabilities)?;
-    }
-    let mut overlay_cursor_state = None;
-    if let Some(help_surface) = frame_plan.retained.help_surface.as_ref()
-        && let Some(repaint) = retained_repaint_by_id.get(&help_surface.id)
-        && queue_retained_render_ops(help_surface, repaint, retained_capabilities)?
-    {
-        if let Some(trace) = render_trace.as_deref_mut() {
-            trace.push(AttachRenderTraceOp::HelpOverlay {
-                rows: help_surface.rect.h,
-                cells: u64::from(help_surface.rect.w)
-                    .saturating_mul(u64::from(help_surface.rect.h)),
+        let mut overlay_rendered = false;
+        let retained_extensions = view_state
+            .prepared_extensions
+            .clone()
+            .expect("entry prepares retained extension intent");
+        let retained_plugin_repaints = if frame_plan.render_scene {
+            view_state
+                .retained_compositor
+                .surfaces()
+                .values()
+                .filter(|surface| view_state.retained_plugin_surface_ids.contains(&surface.id))
+                .cloned()
+                .map(|surface| {
+                    let repaint = retained_full_surface_repaint(&surface);
+                    (surface, repaint)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            frame_plan
+                .retained
+                .repaint_plan
+                .iter()
+                .filter(|repaint| {
+                    view_state
+                        .retained_plugin_surface_ids
+                        .contains(&repaint.surface_id)
+                })
+                .filter_map(|repaint| {
+                    view_state
+                        .retained_compositor
+                        .surfaces()
+                        .get(&repaint.surface_id)
+                        .cloned()
+                        .map(|surface| (surface, repaint.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (surface, repaint) in retained_plugin_repaints {
+            overlay_rendered |=
+                queue_retained_render_ops(canvas, &surface, &repaint, retained_capabilities)?;
+        }
+        let mut overlay_cursor_state = None;
+        if let Some(help_surface) = frame_plan.retained.help_surface.as_ref()
+            && let Some(repaint) = retained_repaint_by_id.get(&help_surface.id)
+            && queue_retained_render_ops(canvas, help_surface, repaint, retained_capabilities)?
+        {
+            if let Some(trace) = render_trace.as_deref_mut() {
+                trace.push(AttachRenderTraceOp::HelpOverlay {
+                    rows: help_surface.rect.h,
+                    cells: u64::from(help_surface.rect.w)
+                        .saturating_mul(u64::from(help_surface.rect.h)),
+                });
+            }
+            overlay_rendered = true;
+            overlay_rendered |= queue_retained_extension_ops(
+                canvas,
+                help_surface,
+                repaint,
+                &retained_extensions,
+                retained_capabilities,
+                &mut pending_graphics_cache,
+            )?;
+        }
+        if let Some(prompt_surface) = frame_plan.retained.prompt_surface.as_ref()
+            && let Some(repaint) = retained_repaint_by_id.get(&prompt_surface.id)
+            && queue_retained_render_ops(canvas, prompt_surface, repaint, retained_capabilities)?
+        {
+            overlay_cursor_state = frame_plan
+                .retained
+                .prompt_overlay_render
+                .as_ref()
+                .and_then(|render| render.cursor_state);
+            if let Some(trace) = render_trace.as_deref_mut() {
+                trace.push(AttachRenderTraceOp::PromptOverlay {
+                    rows: prompt_surface.rect.h,
+                    cells: u64::from(prompt_surface.rect.w)
+                        .saturating_mul(u64::from(prompt_surface.rect.h)),
+                });
+            }
+            overlay_rendered = true;
+            overlay_rendered |= queue_retained_extension_ops(
+                canvas,
+                prompt_surface,
+                repaint,
+                &retained_extensions,
+                retained_capabilities,
+                &mut pending_graphics_cache,
+            )?;
+        } else if view_state.prompt.is_active() {
+            overlay_cursor_state = previous_cursor_state.map(|mut cursor| {
+                cursor.visible = true;
+                cursor
             });
         }
-        overlay_rendered = true;
-        overlay_rendered |= queue_retained_extension_ops(
-            help_surface,
-            repaint,
-            &retained_extensions,
-            retained_capabilities,
-            &mut pending_graphics_cache,
-        )?;
-    }
-    if let Some(prompt_surface) = frame_plan.retained.prompt_surface.as_ref()
-        && let Some(repaint) = retained_repaint_by_id.get(&prompt_surface.id)
-        && queue_retained_render_ops(prompt_surface, repaint, retained_capabilities)?
-    {
-        overlay_cursor_state = frame_plan
-            .retained
-            .prompt_overlay_render
-            .as_ref()
-            .and_then(|render| render.cursor_state);
-        if let Some(trace) = render_trace.as_deref_mut() {
-            trace.push(AttachRenderTraceOp::PromptOverlay {
-                rows: prompt_surface.rect.h,
-                cells: u64::from(prompt_surface.rect.w)
-                    .saturating_mul(u64::from(prompt_surface.rect.h)),
-            });
-        }
-        overlay_rendered = true;
-        overlay_rendered |= queue_retained_extension_ops(
-            prompt_surface,
-            repaint,
-            &retained_extensions,
-            retained_capabilities,
-            &mut pending_graphics_cache,
-        )?;
-    } else if view_state.prompt.is_active() {
-        overlay_cursor_state = previous_cursor_state.map(|mut cursor| {
-            cursor.visible = true;
-            cursor
-        });
-    }
 
-    if damage_config.visualize
-        && let Some(damage_surface) = retained_damage_overlay_surface(
-            &layout_state.scene,
-            &frame_damage,
-            terminal_size,
-            top_inset,
-            bottom_inset,
-        )
-    {
-        let repaint = retained_full_surface_repaint(&damage_surface);
-        if queue_retained_render_ops(&damage_surface, &repaint, retained_capabilities)? {
-            let rects = frame_damage_overlay_rects(
+        if damage_config.visualize
+            && let Some(damage_surface) = retained_damage_overlay_surface(
                 &layout_state.scene,
                 &frame_damage,
                 terminal_size,
                 top_inset,
                 bottom_inset,
-            );
-            if let Some(trace) = render_trace.as_mut() {
-                trace.push(AttachRenderTraceOp::DamageOverlay {
-                    rects: u16::try_from(rects.len()).unwrap_or(u16::MAX),
-                    cells: rects.iter().map(|rect| u64::from(rect.area())).sum::<u64>(),
-                });
+            )
+        {
+            let repaint = retained_full_surface_repaint(&damage_surface);
+            if queue_retained_render_ops(canvas, &damage_surface, &repaint, retained_capabilities)?
+            {
+                let rects = frame_damage_overlay_rects(
+                    &layout_state.scene,
+                    &frame_damage,
+                    terminal_size,
+                    top_inset,
+                    bottom_inset,
+                );
+                if let Some(trace) = render_trace.as_mut() {
+                    trace.push(AttachRenderTraceOp::DamageOverlay {
+                        rects: u16::try_from(rects.len()).unwrap_or(u16::MAX),
+                        cells: rects.iter().map(|rect| u64::from(rect.area())).sum::<u64>(),
+                    });
+                }
+                overlay_rendered = true;
             }
-            overlay_rendered = true;
         }
-    }
 
-    let pending_cursor_state = if view_state.help_overlay_open || view_state.prompt.is_active() {
-        overlay_cursor_state
-    } else {
-        cursor_state.map(|mut cursor| {
-            cursor.visible &= layout_state
-                .scene
-                .surfaces
-                .iter()
-                .filter(|surface| surface.cursor_owner)
-                .any(|surface| {
-                    view_state
-                        .retained_compositor
-                        .point_visible_from(surface.id, cursor.x, cursor.y)
-                });
-            cursor
+        let pending_cursor_state = if view_state.help_overlay_open || view_state.prompt.is_active()
+        {
+            overlay_cursor_state
+        } else {
+            cursor_state.map(|mut cursor| {
+                cursor.visible &= layout_state
+                    .scene
+                    .surfaces
+                    .iter()
+                    .filter(|surface| surface.cursor_owner)
+                    .any(|surface| {
+                        view_state
+                            .retained_compositor
+                            .point_visible_from(surface.id, cursor.x, cursor.y)
+                    });
+                cursor
+            })
+        };
+
+        #[cfg(any(
+            feature = "image-sixel",
+            feature = "image-kitty",
+            feature = "image-iterm2"
+        ))]
+        if frame_plan.render_scene && view_state.presenting {
+            canvas.write_graphics(false, |mut writer| {
+                pending_kitty_state
+                    .finish_frame(&mut writer)
+                    .map_err(Into::into)
+            })?;
+        }
+        canvas.set_cursor(pending_cursor_state);
+        Ok(PaintedFrame {
+            scene_render_stats,
+            overlay_rendered,
+            pending_cursor_state,
         })
+    });
+    view_state.terminal_presenter = presenter;
+    let bmux_attach_pipeline::frame_presenter::PresentedFrame {
+        result:
+            PaintedFrame {
+                scene_render_stats,
+                overlay_rendered,
+                pending_cursor_state,
+            },
+        presented,
+        output: frame_output,
+    } = painted?;
+    let status_rendered = false;
+    let frame_bytes = match presented {
+        super::presenter::Presented::Frame(bytes) => bytes,
+        super::presenter::Presented::Unchanged => Vec::new(),
+        super::presenter::Presented::Unsupported(reason) => {
+            // Nothing reached the host: the next frame repaints every row.
+            for buffer in view_state.pane_buffers.values_mut() {
+                buffer.forget_drawn_rows();
+            }
+            return Err(super::presenter::PresenterRejected(reason).into());
+        }
     };
-
-    #[cfg(any(
-        feature = "image-sixel",
-        feature = "image-kitty",
-        feature = "image-iterm2"
-    ))]
-    if frame_plan.render_scene && view_state.presenting {
-        pending_kitty_state.finish_frame(&mut images_after)?;
-    }
 
     let composition_ns = frame_started_at.map_or(0, |start| {
         u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
@@ -11651,38 +11704,6 @@ fn render_attach_frame_inner(
     let write_result = if observer_unchanged {
         Ok(())
     } else {
-        let operations = bmux_attach_pipeline::projection::staged_operations();
-        if view_state.presenting {
-            let margins = terminal_render_capabilities(view_state).left_right_margins;
-            let graphics = bmux_attach_pipeline::projection::take_graphics_output();
-            images_before.extend_from_slice(&graphics.before);
-            images_after.extend_from_slice(&graphics.after);
-            frame_bytes = match super::presenter::present(
-                view_state,
-                &super::presenter::CapturedFrame {
-                    operations: &operations,
-                    cursor: pending_cursor_state,
-                    full: frame_damage.is_full_frame(),
-                    size: terminal_size,
-                    margins,
-                    graphics: super::presenter::Graphics {
-                        before: &images_before,
-                        after: &images_after,
-                    },
-                },
-            ) {
-                super::presenter::Presented::Frame(bytes) => bytes,
-                super::presenter::Presented::Unchanged => Vec::new(),
-                super::presenter::Presented::Unsupported(reason) => {
-                    // Nothing reached the host: the next frame repaints every row.
-                    for buffer in view_state.pane_buffers.values_mut() {
-                        buffer.forget_drawn_rows();
-                    }
-                    super::presenter::forget(view_state);
-                    return Err(super::presenter::PresenterRejected(reason).into());
-                }
-            };
-        }
         let write = |terminal_writer: Option<&mut (dyn Write + '_)>, bytes: &[u8]| {
             if bytes.is_empty() {
                 return Ok(());
@@ -11702,7 +11723,7 @@ fn render_attach_frame_inner(
                 view_state,
                 layout_state,
                 geometry,
-                &operations,
+                frame_output.images(),
                 || {
                     if headless {
                         Ok(())
@@ -18346,9 +18367,10 @@ mod tests {
             DamageCoalescingPolicy::default(),
         );
         assert_eq!(state.plugin_focus.focused(), focused.as_ref());
-        let ((), lines) = presented_lines((80, 24), || {
+        let ((), lines) = presented_lines((80, 24), |canvas| {
             for surface in state.retained_compositor.surfaces().values() {
                 queue_retained_render_ops(
+                    canvas,
                     surface,
                     &retained_full_surface_repaint(surface),
                     bmux_plugin::TerminalRenderCapabilities::default(),
@@ -20263,26 +20285,29 @@ mod tests {
         InputProcessor::new(attach_keymap_from_config(&config), false)
     }
 
-    /// The rows a blank host of `size` shows once `render`'s captured frame is presented on it.
-    fn presented_lines<T>(size: (u16, u16), render: impl FnOnce() -> T) -> (T, Vec<String>) {
-        let (result, operations, graphics) =
-            bmux_attach_pipeline::frame_presenter::capture_frame(render);
+    /// The rows a blank host of `size` shows once the frame `render` paints is presented on it.
+    fn presented_lines<T>(
+        size: (u16, u16),
+        render: impl FnOnce(&mut Canvas<'_, '_, '_>) -> T,
+    ) -> (T, Vec<String>) {
         let mut screen = bmux_terminal_grid::TerminalGridStream::new(
             size.0,
             size.1,
             bmux_terminal_grid::GridLimits::default(),
         )
         .unwrap();
-        match bmux_attach_pipeline::frame_presenter::FramePresenter::new().present(
-            &bmux_attach_pipeline::frame_presenter::CapturedFrame {
-                operations: &operations,
-                cursor: None,
-                full: true,
-                size,
-                margins: false,
-                graphics: (&graphics).into(),
-            },
-        ) {
+        let frame = bmux_attach_pipeline::frame_presenter::FramePresenter::new()
+            .present(
+                &bmux_attach_pipeline::frame_presenter::FrameSpec {
+                    full: true,
+                    size,
+                    margins: false,
+                    graphics: true,
+                },
+                |canvas| Ok::<_, std::convert::Infallible>(render(canvas)),
+            )
+            .unwrap_or_else(|never| match never {});
+        match frame.presented {
             bmux_attach_pipeline::frame_presenter::Presented::Frame(bytes) => {
                 screen.process(&bytes);
             }
@@ -20292,7 +20317,7 @@ mod tests {
             }
         }
         let lines = bmux_terminal_grid::visible_text_lines(screen.grid(), 0, usize::from(size.1));
-        (result, lines)
+        (frame.result, lines)
     }
 
     struct RetainedOverlayExtension;
@@ -20333,8 +20358,9 @@ mod tests {
             .build();
         let repaint = retained_full_surface_repaint(&surface);
 
-        let ((), lines) = presented_lines((80, 30), || {
+        let ((), lines) = presented_lines((80, 30), |canvas| {
             queue_retained_render_ops(
+                canvas,
                 &surface,
                 &repaint,
                 bmux_plugin::TerminalRenderCapabilities::default(),
@@ -20356,8 +20382,9 @@ mod tests {
             vec![Arc::new(RetainedOverlayExtension)];
         let mut graphics_cache = TerminalGraphicsCache::new();
 
-        let (wrote, lines) = presented_lines((20, 10), || {
+        let (wrote, lines) = presented_lines((20, 10), |canvas| {
             queue_retained_extension_ops(
+                canvas,
                 &surface,
                 &repaint,
                 &extensions,

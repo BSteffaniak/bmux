@@ -1,57 +1,36 @@
-//! Frames presented through a `bmux_tui` terminal from what the attach renderer captures.
+//! Frames painted straight into a `bmux_tui` terminal by the attach renderer.
 //!
-//! The renderer captures what it draws (the same paint operations an observer paints) instead of
-//! encoding it, and a [`FramePresenter`] paints them over the frame it last presented and encodes
-//! the difference: styles, cursor, synchronized output and row moves come from the terminal, not
-//! the renderer. Graphics protocols keep their own encoders: their bytes are written through the
-//! terminal's output hooks, removals before the frame's cells and placements after them.
+//! A [`FramePresenter`] owns the terminal a client presents through: the attach renderer paints
+//! each frame into it in place, over the frame it shows (see [`crate::canvas`]), and the terminal
+//! encodes only what changed. Styles, the cursor, synchronized output and row moves come from the
+//! terminal, not the renderer. Graphics protocols keep their own encoders: their bytes are
+//! written through the terminal's output hooks, removals before the frame's cells and placements
+//! after them.
+//!
+//! Every client presents this way. A headless client's terminal encodes nothing; it keeps the
+//! frame and its change for observers, which mirror the change the terminal made (see
+//! [`FramePresenter::shown_changes`]).
 
+use std::cell::RefCell;
 use std::io::Write;
 
 use bmux_tui::buffer::Buffer;
-use bmux_tui::geometry::{Point, Rect};
+use bmux_tui::geometry::Rect;
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::pointer::PointerShapeCapability;
-use bmux_tui::terminal::{FrameChanges, ScrollRegionAcceleration, Terminal};
+use bmux_tui::terminal::{FrameChanges, ScrollRegionAcceleration, Terminal, TryDrawError};
 
-use crate::AttachCursorState;
-use crate::projection::{GraphicsOutput, PaintOperation, ProjectionFailure};
+use crate::canvas::{Canvas, FrameOutput};
+use crate::projection::ProjectionFailure;
 
-/// Presents captured frames on a host through a `bmux_tui` terminal.
+/// Presents frames through a `bmux_tui` terminal.
 pub struct FramePresenter {
     terminal: Terminal<Vec<u8>>,
-    /// The cursor the last presented frame left on the host.
-    cursor: Option<AttachCursorState>,
     /// A frame was presented since the presenter was made or last forgot: the next frame can be
     /// painted over it rather than over a blank screen.
     shown: bool,
     /// What the last call to [`Self::present`] did to the frame shown before it.
     last: Last,
-}
-
-/// What presenting a frame did to the frame shown before it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Last {
-    /// Nothing is known (nothing presented, a full frame, a frame not presented).
-    Unknown,
-    /// Nothing changed.
-    Unchanged,
-    /// It was painted in place over it: the terminal holds what changed.
-    Over,
-}
-
-/// What the last frame presented changed in the frame shown before it, so the same frame can be
-/// kept elsewhere (an observer's copy) by applying the change instead of painting it again.
-pub enum ShownChanges<'presenter> {
-    /// Unknown: paint the frame's operations instead.
-    Unknown,
-    /// Nothing changed.
-    Unchanged,
-    /// The frame's moves and changed cells, and the cells it shows.
-    Changed {
-        cells: &'presenter Buffer,
-        changes: FrameChanges<'presenter>,
-    },
 }
 
 impl Default for FramePresenter {
@@ -60,44 +39,72 @@ impl Default for FramePresenter {
     }
 }
 
-/// Graphics protocol bytes of a frame: written before its cells (clearing placements, erasing
-/// raster images) and after them (placing images), inside the same synchronized frame.
-#[derive(Clone, Copy, Default)]
-pub struct Graphics<'bytes> {
-    pub before: &'bytes [u8],
-    pub after: &'bytes [u8],
+/// What presenting a frame did to the frame shown before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Last {
+    /// Nothing is known (nothing presented, a frame not presented).
+    Unknown,
+    /// Nothing changed.
+    Unchanged,
+    /// It was painted in place over it: the terminal holds what changed.
+    Over,
+    /// It was painted whole, over a blank screen.
+    Full,
 }
 
-impl<'bytes> From<&'bytes GraphicsOutput> for Graphics<'bytes> {
-    fn from(output: &'bytes GraphicsOutput) -> Self {
-        Self {
-            before: &output.before,
-            after: &output.after,
-        }
-    }
+/// What the last frame presented changed in the frame shown before it, so the same frame can be
+/// kept elsewhere (an observer's copy) by applying the change instead of painting it again.
+pub enum ShownChanges<'presenter> {
+    /// Nothing is known: no frame was presented.
+    Unknown,
+    /// Nothing changed.
+    Unchanged,
+    /// The frame's moves and changed cells, and the cells it shows.
+    Changed {
+        cells: &'presenter Buffer,
+        changes: FrameChanges<'presenter>,
+    },
+    /// The frame was painted whole: these are its cells.
+    All { cells: &'presenter Buffer },
 }
 
-/// What presenting a captured frame produced.
+/// What presenting a frame produced.
 #[derive(Debug)]
 pub enum Presented {
-    /// Bytes to write to the host, the whole frame.
+    /// Bytes to write to the host, the whole frame (empty for a terminal that encodes nothing).
     Frame(Vec<u8>),
     /// Nothing changed on the host.
     Unchanged,
-    /// The frame holds what a terminal frame cannot show; nothing was presented.
+    /// The frame holds what a terminal frame cannot show; nothing was presented, and the next
+    /// frame repaints in full.
     Unsupported(ProjectionFailure),
 }
 
-/// A captured frame to present.
-pub struct CapturedFrame<'frame> {
-    pub operations: &'frame [PaintOperation],
-    pub cursor: Option<AttachCursorState>,
+/// A frame to present.
+#[derive(Clone, Copy, Debug)]
+pub struct FrameSpec {
     /// The frame starts from a blank screen, as the renderer's full frames do.
     pub full: bool,
     pub size: (u16, u16),
     /// The host has left and right margins (DECSLRM), so a narrower pane scrolls inside them.
     pub margins: bool,
-    pub graphics: Graphics<'frame>,
+    /// The host takes graphics protocol bytes; otherwise graphics are placed as images.
+    pub graphics: bool,
+}
+
+/// A presented frame: what the render returned, what presenting produced, and what the frame
+/// produced beside its cells.
+#[derive(Debug)]
+pub struct PresentedFrame<T> {
+    pub result: T,
+    pub presented: Presented,
+    pub output: FrameOutput,
+}
+
+/// Why a frame was not painted: the render failed, or the frame cannot be shown.
+enum Abandoned<E> {
+    Render(E),
+    Unsupported,
 }
 
 impl FramePresenter {
@@ -109,7 +116,6 @@ impl FramePresenter {
         terminal.set_pointer_capability(PointerShapeCapability::Unsupported);
         Self {
             terminal,
-            cursor: None,
             shown: false,
             last: Last::Unknown,
         }
@@ -120,84 +126,130 @@ impl FramePresenter {
         self.terminal.set_synchronized_output(enabled);
     }
 
-    /// Paint `frame` over the last frame presented, as the host must show it, and return the
-    /// bytes that change the host to match.
+    /// Select whether frames are encoded (the default); a headless client's are not, and are
+    /// kept only for observers.
+    pub const fn set_encoding(&mut self, enabled: bool) {
+        self.terminal.set_encoding(enabled);
+    }
+
+    /// Paint a frame with `paint`, over the last frame presented, and return the bytes that
+    /// change the host to match.
     ///
     /// The frame counts as shown once its bytes are returned; when they do not reach the host,
     /// [`Self::forget`] makes the next frame repaint in full.
-    pub fn present(&mut self, frame: &CapturedFrame<'_>) -> Presented {
+    ///
+    /// # Errors
+    /// Returns the render's error; nothing is presented, and the next frame repaints in full.
+    pub fn present<T, E>(
+        &mut self,
+        spec: &FrameSpec,
+        paint: impl FnOnce(&mut Canvas<'_, '_, '_>) -> Result<T, E>,
+    ) -> Result<PresentedFrame<T>, E> {
         self.last = Last::Unknown;
-        if let Some(failure) = unsupported(frame.operations) {
-            return Presented::Unsupported(failure);
-        }
-        let (cols, rows) = frame.size;
+        let (cols, rows) = spec.size;
         self.terminal.resize(Rect::new(0, 0, cols, rows));
-        if frame.full {
+        if spec.full {
             self.terminal.reset();
         }
-        let graphics = frame.graphics;
-        let has_graphics = !graphics.before.is_empty() || !graphics.after.is_empty();
-        if frame.operations.is_empty()
-            && frame.cursor == self.cursor
-            && !frame.full
-            && !has_graphics
-        {
-            self.last = Last::Unchanged;
-            return Presented::Unchanged;
-        }
         self.terminal
-            .set_scroll_region_acceleration(if frame.margins {
+            .set_scroll_region_acceleration(if spec.margins {
                 ScrollRegionAcceleration::AutoWithMargins
             } else {
                 ScrollRegionAcceleration::Auto
             });
         self.terminal.writer_mut().clear();
-        let operations = frame.operations;
-        let cursor = frame.cursor;
-        let paint = |cx: &mut bmux_tui::paint::PaintCx<'_, '_>| {
-            // Checked above: every operation paints.
-            let _ = crate::projection::paint_over(cx, operations);
-            if let Some(cursor) = cursor {
-                cx.set_cursor(Point::new(cursor.x, cursor.y), cursor.visible);
+        let output = RefCell::new(if spec.graphics {
+            FrameOutput::with_graphics()
+        } else {
+            FrameOutput::default()
+        });
+        let mut result = None;
+        let drawn = self.terminal.try_draw_over_with_output_hooks(
+            |cx| {
+                let mut output = output.borrow_mut();
+                let value = paint(&mut Canvas::new(cx, &mut output)).map_err(Abandoned::Render)?;
+                result = Some(value);
+                if output.rejection().is_some() {
+                    return Err(Abandoned::Unsupported);
+                }
+                Ok(output.has_graphics())
+            },
+            |writer| {
+                if let Some(graphics) = output.borrow().graphics() {
+                    writer.write_all(&graphics.before)?;
+                }
+                Ok(false)
+            },
+            |writer, _, _| {
+                let output = output.borrow();
+                let Some(graphics) = output
+                    .graphics()
+                    .filter(|graphics| !graphics.after.is_empty())
+                else {
+                    return Ok(());
+                };
+                // Placing images moves the cursor: keep the frame's.
+                writer.write_all(b"\x1b7")?;
+                writer.write_all(&graphics.after)?;
+                writer.write_all(b"\x1b8")
+            },
+        );
+        let mut output = output.into_inner();
+        let presented = match drawn {
+            Ok(Some(_)) => {
+                self.shown = true;
+                self.last = if self.terminal.last_changes().is_some() {
+                    Last::Over
+                } else {
+                    Last::Full
+                };
+                Presented::Frame(std::mem::take(self.terminal.writer_mut()))
+            }
+            Ok(None) => {
+                self.last = Last::Unchanged;
+                Presented::Unchanged
+            }
+            Err(TryDrawError::Rejected(Abandoned::Render(error))) => {
+                self.forget();
+                return Err(error);
+            }
+            Err(TryDrawError::Rejected(Abandoned::Unsupported)) => {
+                self.forget();
+                Presented::Unsupported(output.take_rejection().unwrap_or(
+                    ProjectionFailure::Unsupported {
+                        reason: "frame rejected",
+                    },
+                ))
+            }
+            Err(TryDrawError::Io(_)) => {
+                // Frames are written into memory; a failing hook leaves nothing shown.
+                self.forget();
+                Presented::Unchanged
             }
         };
-        let drawn = if has_graphics {
-            self.terminal.draw_over_with_output_hooks(
-                paint,
-                |writer| writer.write_all(graphics.before).map(|()| false),
-                |writer, _, _| {
-                    if graphics.after.is_empty() {
-                        return Ok(());
-                    }
-                    // Placing images moves the cursor: keep the frame's.
-                    writer.write_all(b"\x1b7")?;
-                    writer.write_all(graphics.after)?;
-                    writer.write_all(b"\x1b8")
-                },
-            )
-        } else {
-            self.terminal.draw_over(paint)
+        let Some(result) = result else {
+            unreachable!("a frame that was painted returned the render's result");
         };
-        if drawn.is_ok() {
-            self.cursor = cursor;
-            self.shown = true;
-            if self.terminal.last_changes().is_some() {
-                self.last = Last::Over;
-            }
-            Presented::Frame(std::mem::take(self.terminal.writer_mut()))
-        } else {
-            self.forget();
-            Presented::Unchanged
-        }
+        Ok(PresentedFrame {
+            result,
+            presented,
+            output,
+        })
     }
 
     /// Forget what was presented, so the next frame repaints in full: after its bytes failed to
     /// reach the host, or after the host was changed some other way.
     pub fn forget(&mut self) {
         self.terminal.reset();
-        self.cursor = None;
         self.shown = false;
         self.last = Last::Unknown;
+    }
+
+    /// Whether a frame was presented since the presenter was made or last forgot. Until one is,
+    /// frames must be full: they are painted over a blank screen.
+    #[must_use]
+    pub const fn shown(&self) -> bool {
+        self.shown
     }
 
     /// The cells of the last frame presented, unless forgotten.
@@ -206,6 +258,13 @@ impl FramePresenter {
         self.shown
             .then(|| self.terminal.retained_buffer())
             .flatten()
+    }
+
+    /// The scrolls the terminal applied presenting the last frame: rows it moved on the host
+    /// instead of writing them again.
+    #[must_use]
+    pub fn applied_scrolls(&self) -> &[bmux_tui::terminal::AppliedScroll] {
+        self.terminal.applied_scrolls()
     }
 
     /// What the last frame presented changed in the one shown before it.
@@ -218,95 +277,72 @@ impl FramePresenter {
         ) {
             (Last::Unchanged, _, _) => ShownChanges::Unchanged,
             (Last::Over, Some(cells), Some(changes)) => ShownChanges::Changed { cells, changes },
+            (Last::Full, Some(cells), _) => ShownChanges::All { cells },
             _ => ShownChanges::Unknown,
         }
     }
-
-    /// Whether a frame was presented since the presenter was made or last forgot. Until one is,
-    /// frames must be full: they are painted over a blank screen.
-    #[must_use]
-    pub const fn shown(&self) -> bool {
-        self.shown
-    }
 }
 
-/// Paint over a copy of the frame shown before a frame was presented the change the frame made:
-/// its moves, then its changed cells copied from `cells`, the cells it shows.
-pub fn paint_shown_changes(cx: &mut PaintCx<'_, '_>, cells: &Buffer, changes: &FrameChanges<'_>) {
-    for (area, rows) in changes.moves() {
-        cx.move_cells(LocalRect::terminal(area), rows);
-    }
-    for (y, run) in changes.runs() {
-        cx.copy_cells(cells, y, run);
-    }
-}
-
-/// The first operation a terminal frame cannot show, if any.
-#[must_use]
-pub fn unsupported(operations: &[PaintOperation]) -> Option<ProjectionFailure> {
-    operations.iter().find_map(|operation| match operation {
-        PaintOperation::Rejected(ProjectionFailure::Deferred { .. })
-        | PaintOperation::Text { .. }
-        | PaintOperation::Fill { .. }
-        | PaintOperation::Scroll { .. }
-        | PaintOperation::Cells { .. } => None,
-        PaintOperation::Rejected(reason) => Some(reason.clone()),
-        PaintOperation::Unsupported => Some(ProjectionFailure::Unsupported {
-            reason: "legacy imperative capture",
-        }),
-        PaintOperation::Grid(_) => Some(ProjectionFailure::Unsupported {
-            reason: "local grid",
-        }),
-        PaintOperation::Image(_) => Some(ProjectionFailure::Unsupported {
-            reason: "image placement",
-        }),
-    })
-}
-
-/// Run `render` with its cells captured and its graphics protocol output collected, as a
-/// [`FramePresenter`] presents them.
+/// Bring a copy of the frames a presenter shows up to date.
 ///
-/// # Panics
-/// Panics if called inside another capture.
-pub fn capture_frame<T>(render: impl FnOnce() -> T) -> (T, Vec<PaintOperation>, GraphicsOutput) {
-    let ((result, graphics), operations) = crate::projection::capture(|| {
-        crate::projection::with_graphics_output(|| {
-            let result = render();
-            (result, crate::projection::take_graphics_output())
-        })
-    });
-    (result, operations, graphics)
+/// Paints over the copy of the frame shown before the last one the change the last one made.
+/// Returns `false` when the change is unknown (no frame was presented), leaving the copy as it
+/// was.
+pub fn paint_shown_changes(cx: &mut PaintCx<'_, '_>, shown: &ShownChanges<'_>) -> bool {
+    match shown {
+        ShownChanges::Unknown => false,
+        ShownChanges::Unchanged => true,
+        ShownChanges::Changed { cells, changes } => {
+            for (area, rows) in changes.moves() {
+                cx.move_cells(LocalRect::terminal(area), rows);
+            }
+            for (y, run) in changes.runs() {
+                cx.copy_cells(cells, y, run);
+            }
+            true
+        }
+        ShownChanges::All { cells } => {
+            let area = cells.area();
+            for y in area.y..area.bottom() {
+                cx.copy_cells(cells, y, area.x..area.right());
+            }
+            true
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CapturedFrame, FramePresenter, Graphics, Presented};
+    use super::{FramePresenter, FrameSpec, Presented, ShownChanges};
     use crate::AttachCursorState;
-    use crate::projection::{PaintOperation, ProjectionFailure};
+    use crate::projection::ProjectionFailure;
     use bmux_tui::style::Style;
 
-    fn frame(
-        operations: &[PaintOperation],
-        cursor: Option<AttachCursorState>,
-        full: bool,
-    ) -> CapturedFrame<'_> {
-        CapturedFrame {
-            operations,
-            cursor,
+    fn spec(full: bool) -> FrameSpec {
+        FrameSpec {
             full,
             size: (10, 2),
             margins: false,
-            graphics: Graphics::default(),
+            graphics: false,
         }
     }
 
-    fn text(x: u16, y: u16, text: &str) -> PaintOperation {
-        PaintOperation::Text {
-            x,
-            y,
-            text: text.to_owned(),
-            style: Style::new(),
-        }
+    fn present(
+        presenter: &mut FramePresenter,
+        full: bool,
+        text: Option<(u16, &str)>,
+        cursor: Option<AttachCursorState>,
+    ) -> Presented {
+        presenter
+            .present(&spec(full), |canvas| {
+                if let Some((y, text)) = text {
+                    canvas.text(0, y, text, Style::new());
+                }
+                canvas.set_cursor(cursor);
+                Ok::<_, ()>(())
+            })
+            .unwrap()
+            .presented
     }
 
     #[test]
@@ -318,19 +354,22 @@ mod tests {
             y: 1,
             visible: true,
         });
-        let Presented::Frame(first) =
-            presenter.present(&frame(&[text(0, 0, "hello")], cursor, true))
+        let Presented::Frame(first) = present(&mut presenter, true, Some((0, "hello")), cursor)
         else {
             panic!("the first frame is presented");
         };
         assert!(String::from_utf8_lossy(&first).contains("hello"));
         assert!(presenter.shown());
         assert!(matches!(
-            presenter.present(&frame(&[], cursor, false)),
+            presenter.shown_changes(),
+            ShownChanges::All { .. }
+        ));
+        assert!(matches!(
+            present(&mut presenter, false, None, cursor),
             Presented::Unchanged
         ));
-        let Presented::Frame(edit) =
-            presenter.present(&frame(&[text(0, 1, "world")], cursor, false))
+        assert!(matches!(presenter.shown_changes(), ShownChanges::Unchanged));
+        let Presented::Frame(edit) = present(&mut presenter, false, Some((1, "world")), cursor)
         else {
             panic!("an edit is presented");
         };
@@ -339,13 +378,17 @@ mod tests {
             edit.contains("world") && !edit.contains("hello"),
             "{edit:?}"
         );
+        assert!(matches!(
+            presenter.shown_changes(),
+            ShownChanges::Changed { .. }
+        ));
         let moved = Some(AttachCursorState {
             x: 2,
             y: 0,
             visible: true,
         });
         assert!(matches!(
-            presenter.present(&frame(&[], moved, false)),
+            present(&mut presenter, false, None, moved),
             Presented::Frame(_)
         ));
     }
@@ -354,29 +397,36 @@ mod tests {
     fn rejected_frames_present_nothing_and_forgetting_repaints() {
         let mut presenter = FramePresenter::new();
         assert!(matches!(
-            presenter.present(&frame(&[text(0, 0, "kept")], None, true)),
+            present(&mut presenter, true, Some((0, "kept")), None),
             Presented::Frame(_)
         ));
-        let rejected = [PaintOperation::Rejected(ProjectionFailure::Budget {
-            resource: "operations",
-            used: 2,
-            limit: 1,
-        })];
+        let rejected = presenter
+            .present(&spec(false), |canvas| {
+                canvas.text(0, 1, "half", Style::new());
+                canvas.reject(ProjectionFailure::Budget {
+                    resource: "operations",
+                    used: 2,
+                    limit: 1,
+                });
+                Ok::<_, ()>(())
+            })
+            .unwrap();
         assert!(matches!(
-            presenter.present(&frame(&rejected, None, false)),
+            rejected.presented,
             Presented::Unsupported(ProjectionFailure::Budget { .. })
         ));
-        assert!(
-            presenter.shown(),
-            "a rejected frame leaves the last one shown"
-        );
-        presenter.forget();
-        assert!(!presenter.shown());
-        let Presented::Frame(repaint) =
-            presenter.present(&frame(&[text(0, 0, "kept")], None, true))
+        assert!(!presenter.shown(), "a rejected frame leaves nothing shown");
+        let Presented::Frame(repaint) = present(&mut presenter, true, Some((0, "kept")), None)
         else {
-            panic!("a full frame after forgetting is presented");
+            panic!("a full frame after a rejection is presented");
         };
         assert!(String::from_utf8_lossy(&repaint).contains("kept"));
+        assert!(
+            presenter
+                .present(&spec(false), |_| Err::<(), _>("render failed"))
+                .is_err(),
+            "a failed render presents nothing"
+        );
+        assert!(!presenter.shown());
     }
 }

@@ -228,6 +228,22 @@ impl OverChanges {
         self.area
     }
 
+    /// How many cells are marked.
+    pub(crate) fn marked_cells(&self) -> usize {
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(_, marked)| **marked)
+            .map(|(row, _)| {
+                let start = row * usize::from(self.area.width);
+                self.dirty[start..start + usize::from(self.area.width)]
+                    .iter()
+                    .filter(|dirty| **dirty)
+                    .count()
+            })
+            .sum()
+    }
+
     /// Whether nothing is marked.
     pub(crate) fn is_clean(&self) -> bool {
         self.rows

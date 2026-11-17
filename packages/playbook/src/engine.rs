@@ -681,9 +681,16 @@ impl PlaybookRenderTraceState {
         let mut trace = AttachRenderTrace::new();
         let buffers = &mut self.attach_render_buffers;
         let trace_ref = &mut trace;
-        let (rendered, operations, graphics) =
-            bmux_attach_pipeline::frame_presenter::capture_frame(|| {
-                render_attach_scene_with_stats_and_trace(
+        let frame = self.attach_presenter.present(
+            &bmux_attach_pipeline::frame_presenter::FrameSpec {
+                full: damage.is_full_frame(),
+                size: viewport,
+                margins: false,
+                graphics: true,
+            },
+            |canvas| {
+                let rendered = render_attach_scene_with_stats_and_trace(
+                    canvas,
                     &layout.scene,
                     &layout.panes,
                     buffers,
@@ -698,19 +705,13 @@ impl PlaybookRenderTraceState {
                     DamageCoalescingPolicy::default(),
                     &[],
                     Some(trace_ref),
-                )
-            });
-        let (cursor, stats) = rendered?;
-        let bytes = match self.attach_presenter.present(
-            &bmux_attach_pipeline::frame_presenter::CapturedFrame {
-                operations: &operations,
-                cursor,
-                full: damage.is_full_frame(),
-                size: viewport,
-                margins: false,
-                graphics: (&graphics).into(),
+                )?;
+                canvas.set_cursor(rendered.0);
+                Ok::<_, anyhow::Error>(rendered)
             },
-        ) {
+        )?;
+        let (_, stats) = frame.result;
+        let bytes = match frame.presented {
             bmux_attach_pipeline::frame_presenter::Presented::Frame(bytes) => bytes,
             bmux_attach_pipeline::frame_presenter::Presented::Unchanged => Vec::new(),
             bmux_attach_pipeline::frame_presenter::Presented::Unsupported(reason) => {

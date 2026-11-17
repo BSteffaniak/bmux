@@ -241,6 +241,15 @@ fn write_painted_run(
 
 /// A simple ANSI terminal runtime backed by an arbitrary writer.
 ///
+/// Why a fallible frame was not drawn (see [`Terminal::try_draw_over_with_output_hooks`]).
+#[derive(Debug)]
+pub enum TryDrawError<E> {
+    /// The render rejected the frame; nothing was written or committed.
+    Rejected(E),
+    /// Output or a hook failed; nothing was committed.
+    Io(io::Error),
+}
+
 /// What a frame painted in place over the last one changed: its cell moves, then the cells it
 /// changed (see [`Terminal::last_changes`]).
 pub struct FrameChanges<'terminal> {
@@ -289,6 +298,9 @@ pub struct Terminal<W> {
     /// The last frame was painted in place over the one before, and `over_storage` holds what it
     /// changed.
     last_over: bool,
+    /// Frames are encoded and written; when off, changes are only tracked (see
+    /// [`Terminal::set_encoding`]).
+    encoding: bool,
     /// Frames are wrapped in a synchronized update (DEC mode 2026).
     synchronized_output: bool,
 }
@@ -336,6 +348,7 @@ impl<W: Write> Terminal<W> {
             applied_scrolls: Vec::new(),
             over_storage: None,
             last_over: false,
+            encoding: true,
             synchronized_output: true,
         }
     }
@@ -359,6 +372,7 @@ impl<W: Write> Terminal<W> {
             applied_scrolls: self.applied_scrolls.clone(),
             over_storage: None,
             last_over: false,
+            encoding: true,
             synchronized_output: self.synchronized_output,
         }
     }
@@ -391,6 +405,7 @@ impl<W: Write> Terminal<W> {
             applied_scrolls: self.applied_scrolls.clone(),
             over_storage: None,
             last_over: false,
+            encoding: true,
             synchronized_output: self.synchronized_output,
         }
     }
@@ -422,6 +437,13 @@ impl<W: Write> Terminal<W> {
     #[must_use]
     pub const fn scroll_region_acceleration(&self) -> ScrollRegionAcceleration {
         self.scroll_acceleration
+    }
+
+    /// Select whether frames are encoded and written (the default). Off, a frame painted over
+    /// the last one is committed and its change tracked (see [`Self::last_changes`]) without
+    /// encoding or writing anything: for a frame kept only for whoever mirrors it.
+    pub const fn set_encoding(&mut self, enabled: bool) {
+        self.encoding = enabled;
     }
 
     /// Select whether frames are wrapped in a synchronized update (DEC mode 2026), for a host
@@ -774,6 +796,25 @@ impl<W: Write> Terminal<W> {
         self.draw_over_inner(render, |_| Ok(false), |_, _, _| Ok(()), true)
     }
 
+    /// [`Self::draw_over_with_output_hooks`] for a render that may reject its frame, and that
+    /// says whether the frame writes anything besides its cells (`Ok(true)`: the hooks have
+    /// output). A frame that changes no cell, keeps the cursor and has no other output writes
+    /// nothing and returns `Ok(None)`.
+    ///
+    /// A rejected frame writes and commits nothing; the terminal then holds no committed cells,
+    /// so the next frame repaints in full.
+    ///
+    /// # Errors
+    /// Returns the render's rejection, or output and hook errors without committing the frame.
+    pub fn try_draw_over_with_output_hooks<E>(
+        &mut self,
+        render: impl FnOnce(&mut PaintCx<'_, '_>) -> Result<bool, E>,
+        before: impl FnOnce(&mut W) -> io::Result<bool>,
+        overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
+    ) -> Result<Option<DrawStats>, TryDrawError<E>> {
+        self.draw_over_core(render, before, overlay, true)
+    }
+
     /// [`Self::draw_over`] with the output hooks of
     /// [`Self::draw_damage_with_output_hooks`]; `overlay` receives the committed image scene. The
     /// frame is written even when it paints nothing, so the hooks always run.
@@ -796,26 +837,73 @@ impl<W: Write> Terminal<W> {
         overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
         skip_unchanged: bool,
     ) -> io::Result<DrawStats> {
+        let painted = |cx: &mut PaintCx<'_, '_>| {
+            render(cx);
+            Ok::<bool, std::convert::Infallible>(false)
+        };
+        match self.draw_over_core(painted, before, overlay, skip_unchanged) {
+            Ok(stats) => Ok(stats.unwrap_or(DrawStats {
+                changed_cells: 0,
+                full_repaint: false,
+            })),
+            Err(TryDrawError::Io(error)) => Err(error),
+            Err(TryDrawError::Rejected(never)) => match never {},
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // One ordered frame: paint, decide, encode, commit.
+    fn draw_over_core<E>(
+        &mut self,
+        render: impl FnOnce(&mut PaintCx<'_, '_>) -> Result<bool, E>,
+        before: impl FnOnce(&mut W) -> io::Result<bool>,
+        overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
+        skip_unchanged: bool,
+    ) -> Result<Option<DrawStats>, TryDrawError<E>> {
         self.last_over = false;
         let Some(mut buffer) = self.state.take_retained() else {
-            return self.draw_damage_with_output_hooks(Damage::Full, render, before, overlay);
+            // Nothing to paint over: a full frame, which a rejection leaves uncommitted.
+            let mut outcome = None;
+            let prepared = self
+                .state
+                .prepare(Damage::Full, |cx| outcome = Some(render(cx)));
+            if let Some(Err(rejection)) = outcome {
+                return Err(TryDrawError::Rejected(rejection));
+            }
+            return self
+                .draw_prepared_with_output_hooks(prepared, before, overlay)
+                .map(Some)
+                .map_err(TryDrawError::Io);
         };
         let area = buffer.area();
-        let (mut changes, cursor) = {
+        let (outcome, mut changes, cursor) = {
             let mut frame = Frame::new(&mut buffer);
             frame.set_clock(self.state.clock());
             frame.track_over(self.over_storage.take());
-            PresentationPhase::Paint.measure(|| render(&mut PaintCx::new(&mut frame)), |()| true);
+            let outcome = PresentationPhase::Paint
+                .measure(|| render(&mut PaintCx::new(&mut frame)), |_| true);
             let cursor = frame.cursor();
             (
+                outcome,
                 frame
                     .take_over()
                     .unwrap_or_else(|| OverChanges::empty(area)),
                 cursor,
             )
         };
-        // Painting nothing, with the cursor where it was, changes nothing.
+        let extra_output = match outcome {
+            Ok(extra_output) => extra_output,
+            Err(rejection) => {
+                // The lent cells were painted but will not be shown: drop them, so the next
+                // frame repaints in full.
+                self.over_storage = Some(changes);
+                self.applied_scrolls.clear();
+                return Err(TryDrawError::Rejected(rejection));
+            }
+        };
+        // Painting nothing, with the cursor where it was and nothing else to write, changes
+        // nothing.
         if skip_unchanged
+            && !extra_output
             && changes.is_clean()
             && changes.moves.is_empty()
             && cursor == self.state.cursor()
@@ -825,10 +913,20 @@ impl<W: Write> Terminal<W> {
             self.committed_damage = Damage::None;
             self.applied_scrolls.clear();
             self.last_over = true;
-            return Ok(DrawStats {
-                changed_cells: 0,
+            return Ok(None);
+        }
+        if !self.encoding {
+            // Changes are tracked for whoever mirrors the frame; nothing is written.
+            let changed_cells = changes.marked_cells();
+            self.over_storage = Some(changes);
+            self.state.install_painted_over(buffer, cursor);
+            self.committed_damage = Damage::Regions(Vec::new());
+            self.applied_scrolls.clear();
+            self.last_over = true;
+            return Ok(Some(DrawStats {
+                changed_cells,
                 full_repaint: false,
-            });
+            }));
         }
         let scrolls = self.over_scrolls(&mut changes, area);
         let position = self.pointer_position;
@@ -843,7 +941,8 @@ impl<W: Write> Terminal<W> {
         };
         let transaction = self
             .pointer_output
-            .begin_present(self.pointer_capability, shape)?;
+            .begin_present(self.pointer_capability, shape)
+            .map_err(TryDrawError::Io)?;
         let depth = self.color_depth;
         let synchronized = self.synchronized_output;
         let writer = &mut self.writer;
@@ -883,13 +982,13 @@ impl<W: Write> Terminal<W> {
                 self.committed_damage = Damage::Regions(Vec::new());
                 self.applied_scrolls = scrolls;
                 self.last_over = true;
-                Ok(stats)
+                Ok(Some(stats))
             }
             Err(error) => {
                 // The lent cells were painted but not shown: the next frame repaints in full.
                 self.state.reset();
                 self.applied_scrolls.clear();
-                Err(error)
+                Err(TryDrawError::Io(error))
             }
         }
     }
@@ -1392,6 +1491,84 @@ mod tests {
                 style: Style::new(),
             })
             .collect()
+    }
+
+    /// A rejected frame writes and commits nothing, and the next frame repaints in full; an
+    /// unchanged frame with no other output writes nothing; other output is always written.
+    #[test]
+    fn fallible_frames_write_nothing_when_rejected_or_unchanged() {
+        let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 20, 2));
+        let shown = |terminal: &mut Terminal<Vec<u8>>, text: &'static str| {
+            terminal.try_draw_over_with_output_hooks(
+                |cx| {
+                    cx.replace_cells(0, 0, sized(text));
+                    Ok::<_, &str>(false)
+                },
+                |_| Ok(false),
+                |_, _, _| Ok(()),
+            )
+        };
+        assert!(matches!(shown(&mut terminal, "first"), Ok(Some(_))));
+        terminal.writer_mut().clear();
+        assert!(matches!(shown(&mut terminal, "first"), Ok(None)));
+        assert_eq!(terminal.writer().as_slice(), b"");
+
+        let rejected = terminal.try_draw_over_with_output_hooks(
+            |cx| {
+                cx.replace_cells(0, 0, sized("half"));
+                Err::<bool, _>("rejected")
+            },
+            |_| Ok(false),
+            |_, _, _| Ok(()),
+        );
+        assert!(matches!(
+            rejected,
+            Err(super::TryDrawError::Rejected("rejected"))
+        ));
+        assert!(
+            terminal.writer().is_empty(),
+            "a rejected frame writes nothing"
+        );
+        assert!(terminal.retained_buffer().is_none(), "and commits nothing");
+        let repaint = shown(&mut terminal, "first").unwrap().unwrap();
+        assert!(repaint.full_repaint, "the next frame repaints in full");
+
+        terminal.writer_mut().clear();
+        let extra = terminal.try_draw_over_with_output_hooks(
+            |_| Ok::<_, &str>(true),
+            |writer| writer.write_all(b"<graphics>").map(|()| false),
+            |_, _, _| Ok(()),
+        );
+        assert!(matches!(extra, Ok(Some(_))));
+        assert!(String::from_utf8_lossy(terminal.writer()).contains("<graphics>"));
+    }
+
+    /// With encoding off, frames painted over the last one commit and track their change but
+    /// write nothing.
+    #[test]
+    fn frames_without_encoding_track_changes_and_write_nothing() {
+        let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 20, 2));
+        terminal
+            .draw(|cx| cx.replace_cells(0, 0, sized("hello")))
+            .unwrap();
+        terminal.set_encoding(false);
+        terminal.writer_mut().clear();
+        let stats = terminal
+            .draw_over(|cx| cx.replace_cells(0, 1, sized("there")))
+            .unwrap();
+        assert_eq!(terminal.writer().as_slice(), b"");
+        assert_eq!(stats.changed_cells, 5);
+        let changes = terminal.last_changes().expect("the change is tracked");
+        assert_eq!(changes.runs().collect::<Vec<_>>(), [(1, 0..5)]);
+        assert_eq!(
+            terminal
+                .retained_buffer()
+                .unwrap()
+                .row_symbols(1)
+                .unwrap()
+                .trim_end(),
+            "there"
+        );
     }
 
     /// A frame painted in place writes the cells that change, not every cell it is given.
