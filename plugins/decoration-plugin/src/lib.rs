@@ -2218,28 +2218,17 @@ fn plugin_event_kind_from_string(kind: String) -> bmux_plugin_sdk::PluginEventKi
     bmux_plugin_sdk::PluginEventKind::from_owned(kind)
 }
 
-fn spawn_local_current_thread_runtime(
-    label: &'static str,
-    task: impl Future<Output = ()> + Send + 'static,
-) {
-    static EXECUTOR: std::sync::OnceLock<tokio::runtime::Handle> = std::sync::OnceLock::new();
-    let executor = EXECUTOR.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::sync_channel(1);
-        std::thread::Builder::new()
-            .name("decoration.events".into())
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("decoration event executor");
-                tx.send(runtime.handle().clone())
-                    .expect("executor startup receiver");
-                runtime.block_on(std::future::pending::<()>());
-            })
-            .expect("decoration event executor thread");
-        rx.recv().expect("decoration event executor startup")
-    });
-    executor.spawn(task);
+fn spawn_host_subscriber(label: &'static str, task: impl Future<Output = ()> + Send + 'static) {
+    // Without an activation task handle the subscriber still runs on the
+    // host's runtime through plug-rt; plugins never build a runtime.
+    if !bmux_plugin_sdk::rt::runtime_available() {
+        tracing::warn!(
+            label,
+            "decoration event subscriber needs the host runtime; not started"
+        );
+        return;
+    }
+    drop(bmux_plugin_sdk::rt::spawn_named(label, task));
     tracing::trace!(label, "decoration event subscriber scheduled");
 }
 
@@ -2313,7 +2302,7 @@ fn spawn_script_state_subscription(
     if let Some(async_handle) = host_async_handle {
         async_handle.spawn_with_name("decoration.script_state_subscriber", task);
     } else {
-        spawn_local_current_thread_runtime("script state subscriber", task);
+        spawn_host_subscriber("script state subscriber", task);
     }
 }
 
@@ -2359,7 +2348,7 @@ fn spawn_script_broadcast_subscription(shared: SharedState, kind: &str, generati
     if let Some(async_handle) = host_async_handle {
         async_handle.spawn_with_name("decoration.script_event_subscriber", task);
     } else {
-        spawn_local_current_thread_runtime("script event subscriber", task);
+        spawn_host_subscriber("script event subscriber", task);
     }
 }
 
@@ -3700,7 +3689,7 @@ fn spawn_windows_pane_event_subscriber(state: SharedState) {
     if let Some(async_handle) = host_async_handle {
         async_handle.spawn_with_name("decoration.windows_pane_event_subscriber", task);
     } else {
-        spawn_local_current_thread_runtime("windows pane event subscriber", task);
+        spawn_host_subscriber("windows pane event subscriber", task);
     }
 }
 
@@ -3769,7 +3758,7 @@ fn spawn_pane_runtime_focus_state_subscriber(state: SharedState) {
     if let Some(async_handle) = host_async_handle {
         async_handle.spawn_with_name("decoration.focus_state_subscriber", task);
     } else {
-        spawn_local_current_thread_runtime("focus-state subscriber", task);
+        spawn_host_subscriber("focus-state subscriber", task);
     }
 }
 
@@ -3875,7 +3864,7 @@ fn spawn_attach_layout_subscriber(state: SharedState) {
     if let Some(async_handle) = host_async_handle {
         async_handle.spawn_with_name("decoration.attach_layout_subscriber", task);
     } else {
-        spawn_local_current_thread_runtime("attach-layout subscriber", task);
+        spawn_host_subscriber("attach-layout subscriber", task);
     }
 }
 
@@ -4033,7 +4022,7 @@ fn spawn_visual_projection_subscriber(state: SharedState) {
     if let Some(async_handle) = host_async_handle {
         async_handle.spawn_with_name("decoration.visual_projection_subscriber", task);
     } else {
-        spawn_local_current_thread_runtime("visual projection subscriber", task);
+        spawn_host_subscriber("visual projection subscriber", task);
     }
 }
 
@@ -5443,8 +5432,10 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn event_bus_focus_change_updates_scene_paint_commands() {
+    // The subscriber runs on the host runtime through plug-rt; this test is
+    // that host.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn event_bus_focus_change_updates_scene_paint_commands() {
         use bmux_attach_layout_protocol::attach_layout_protocol::{
             AttachLayoutSnapshot, AttachSurfaceSummary,
         };

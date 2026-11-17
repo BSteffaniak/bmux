@@ -460,33 +460,24 @@ fn run_storage_get(context: &NativeCommandContext) -> i32 {
 }
 
 fn run_prompt_showcase_command() -> i32 {
+    if !bmux_plugin_sdk::rt::runtime_available() {
+        eprintln!("example.native: prompt showcase needs the host runtime");
+        return EXIT_ERROR;
+    }
     spawn_prompt_showcase_task();
     println!("example.native: prompt showcase task started");
     EXIT_OK
 }
 
 fn spawn_prompt_showcase_task() {
-    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-        std::mem::drop(handle.spawn(async {
+    // Runs on the host's runtime through plug-rt, owned by the current
+    // activation scope; plugins never build a runtime of their own.
+    drop(bmux_plugin_sdk::rt::spawn_named(
+        "example.native.prompt-showcase",
+        async {
             print_prompt_showcase_result(run_prompt_showcase_sequence().await);
-        }));
-        return;
-    }
-
-    std::mem::drop(std::thread::spawn(|| {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build();
-        match runtime {
-            Ok(runtime) => {
-                let result = runtime.block_on(run_prompt_showcase_sequence());
-                print_prompt_showcase_result(result);
-            }
-            Err(error) => {
-                eprintln!("example.native: failed starting prompt showcase runtime: {error}");
-            }
-        }
-    }));
+        },
+    ));
 }
 
 /// Run the plugin-provided prompt showcase sequence.
@@ -586,7 +577,7 @@ where
             Err(PromptSubmitError::HostUnavailable)
                 if started.elapsed() < PROMPT_HOST_WAIT_TIMEOUT =>
             {
-                tokio::time::sleep(PROMPT_HOST_WAIT_POLL).await;
+                bmux_plugin_sdk::rt::time::sleep(PROMPT_HOST_WAIT_POLL).await;
             }
             Err(PromptSubmitError::HostUnavailable) => {
                 return Err("prompt host did not become available in time".to_string());

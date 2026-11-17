@@ -2342,7 +2342,6 @@ dependencies = [
  "bmux_tab_bar_plugin_api",
  "serde",
  "serde_json",
- "tokio",
  "uuid",
 ]
 

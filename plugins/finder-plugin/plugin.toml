@@ -1,3 +1,4 @@
+bundled_only = "uses Tokio tasks and timers directly instead of plug-rt"
 component_roles = ["frontend"]
 contracts = []
 execution_class = "native_fast"

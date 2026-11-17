@@ -1,3 +1,4 @@
+bundled_only = "uses a private executor, host sockets, Tokio tasks and timers directly instead of plug-rt"
 component_roles = ["backend", "frontend"]
 contracts = [
     { interface_id = "presenter-view-v2", major = 2, minor = 0 },

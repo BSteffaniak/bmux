@@ -28,6 +28,9 @@ toml                         = { workspace = true, features = ["parse"] }
 tracing                      = { workspace = true, features = ["std"] }
 uuid                         = { workspace = true, features = ["serde", "std"] }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
 [package.metadata.cargo-machete]
 # `serde` is consumed by the BPDL-generated bindings re-exported from the
 # decoration-plugin-api crate; cargo-machete cannot see into proc-macro

@@ -34,6 +34,21 @@ pub use task::{
     JoinError, JoinHandle, spawn, spawn_blocking, spawn_blocking_named, spawn_named, yield_now,
 };
 
+/// Whether the host runtime is reachable from the calling thread: inside a
+/// runtime context (bundled) or with an installed host table (dynamic). When
+/// it is not, [`spawn`] returns a handle that fails with an unavailable error.
+#[must_use]
+pub fn runtime_available() -> bool {
+    #[cfg(bmux_plugin_dylib)]
+    {
+        guest::installed().is_some()
+    }
+    #[cfg(not(bmux_plugin_dylib))]
+    {
+        tokio::runtime::Handle::try_current().is_ok()
+    }
+}
+
 /// Whether this build of the plugin runtime routes plug-rt through a host
 /// table (a dynamic plugin build) rather than Tokio directly.
 #[must_use]

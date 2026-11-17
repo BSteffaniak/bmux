@@ -1,3 +1,4 @@
+bundled_only = "uses block_in_place, Tokio tasks and timers directly instead of plug-rt"
 execution_class = "native_fast"
 id = "bmux.snapshot"
 name = "bmux Snapshot"

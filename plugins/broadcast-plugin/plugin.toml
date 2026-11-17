@@ -1,3 +1,4 @@
+bundled_only = "uses a private executor, host sockets, child processes, Tokio tasks and timers directly instead of plug-rt"
 component_roles = ["backend", "frontend"]
 execution_class = "native_fast"
 id = "bmux.broadcast"
