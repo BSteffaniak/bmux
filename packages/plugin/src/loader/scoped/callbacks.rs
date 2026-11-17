@@ -3,7 +3,7 @@
 #[path = "callbacks/tests.rs"]
 mod tests;
 use super::{Arc, InvocationScope, LoadedExecution, Mutex, ServiceCancellation};
-use bmux_plugin_runtime::{AdmissionGuard, PluginInstanceId};
+use bmux_plugin_runtime::{AdmissionGuard, PluginInstanceId, background::BackgroundTasks};
 use bmux_plugin_sdk::PluginCommandError;
 use bmux_plugin_sdk::callback_execution::{
     PluginBlockingCallback, PluginCallbackAuthority, PluginCallbackAuthoritySource,
@@ -858,6 +858,14 @@ impl PluginCallbackExecution for SelectedExecutor {
             let runtime = binding.0.host.0.runtime.clone().ok_or_else(|| {
                 rejected("selected callback runtime unavailable; native reactor ownership is not projected")
             })?;
+            // Synchronous author code runs inside the instance's activation
+            // task scope, exactly like its async code: plug-rt work it spawns
+            // is owned by the activation and stopped at teardown.
+            let scope = binding
+                .0
+                .execution
+                .as_ref()
+                .map(|execution| execution.background.clone());
             // A blocking-pool job of the one host runtime, never a thread per
             // callback. Its context is the selected runtime (execution
             // plumbing, not authority); the prepared guard stays live.
@@ -865,6 +873,7 @@ impl PluginCallbackExecution for SelectedExecutor {
                 .spawn_blocking(move || {
                     let _permit = permit;
                     let _async_route = async_route.map(crate::enter_async_command_route);
+                    let _scope = scope.as_ref().map(BackgroundTasks::enter);
                     let result = entry
                         .validate_for(&selected, instance)
                         .and_then(|()| entry.validate_for(&authority, instance))

@@ -608,6 +608,38 @@ fn activation_dispatch_keeps_the_chosen_entry_route_when_the_author_leaves() {
     // Once that call returned, the entry is gone: later calls route outside it.
     assert!(root.active_entry().is_err());
 }
+/// A synchronous author callback runs inside the instance's activation scope,
+/// so plug-rt work it spawns is owned by the activation and torn down with
+/// it instead of escaping as an untracked runtime task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sync_callback_spawns_join_the_activation_scope() {
+    // The fixture binds the current runtime as the selected callback runtime.
+    let execution = crate::loader::scoped::tests::fixture();
+    let root = binding(&execution);
+    let context = root.context();
+    let entry = context.enter_adapter_entry(execution.scope.id()).unwrap();
+    context
+        .execute_entered(
+            execution.scope.id(),
+            entry,
+            Box::new(|| {
+                drop(bmux_plugin_runtime::rt::spawn_named(
+                    "callback-spawned",
+                    std::future::pending::<()>(),
+                ));
+                Ok(())
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(
+        execution
+            .pending_background_work()
+            .contains(&"callback-spawned".to_string())
+    );
+    execution.drain_background_tasks().await.unwrap();
+    assert_eq!(execution.pending_background_work(), Vec::<String>::new());
+}
 #[test]
 fn reentrant_query_binding_enters_same_instance_while_default_binding_is_rejected() {
     let first = crate::loader::scoped::tests::fixture();
