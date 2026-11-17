@@ -305,15 +305,19 @@ Implemented, each with its numbers in its commit:
 * Phase 4: scroll passthrough (inside left/right margins for a narrower pane), cell diffs, and the
   host writer thread with render deferral while the host is behind. A pane whose own content
   changed no longer gets a repair rect over all of it from the retained compositor.
+* Phase 5 (steps 5 to 8): every attach frame is captured and presented through bmux_tui's
+  `Terminal` (`FramePresenter`), including observed clients, the recording and mobile scene
+  pipelines and playbook traces; graphics go through its output hooks. Imperative render
+  extensions and the renderer's byte encoding (SGR and cursor writes, row strings, host scroll
+  emission, the command optimizer) are deleted. Instructions per frame at 420x90 after the
+  deletion: SU scroll 1.54M, plain stream 1.65M, full repaint 30.0M, review 14.16M and 14.30M.
 
 At 420x90, SU scroll, the attach client renders in about 1 ms and writes 12 KB a frame (from
 2.9 ms and 169 KB); a review scroll writes about what the application wrote (x1.0, from x4.2).
 
 Not done:
 
-* Phase 5: the attach client presents through bmux_tui's `Terminal` by default, at fewer
-  instructions and bytes than the renderer's own output on every corpus, with pane images.
-  Left: deleting the renderer's byte encoding (step 8).
+* The observer still receives the capture rather than a shared frame (the rest of step 8).
 * Output events (`OutputAvailable`) are still JSON-encoded and broadcast; clients that have their
   output pushed ignore them.
 * The end-to-end budget (p95 4 ms) was measured only on a loaded machine; quiet-machine numbers
