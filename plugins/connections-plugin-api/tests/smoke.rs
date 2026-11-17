@@ -128,14 +128,14 @@ fn only_admission_probe_is_reentrant_in_generated_declarations() {
     let services = bmux_connections_plugin_api::service_declarations().unwrap();
     let provider = services
         .iter()
-        .find(|service| service.interface_id == "admission-provider-state")
+        .find(|service| service.interface_id == "admission-provider-state/v2")
         .expect("admission-provider-state is declared");
     assert!(provider.is_reentrant_query("probe"));
     assert!(!provider.is_reentrant_query("validate"));
     assert!(
         services
             .iter()
-            .filter(|service| service.interface_id != "admission-provider-state")
+            .filter(|service| service.interface_id != "admission-provider-state/v2")
             .all(|service| service.reentrant_operations.is_empty())
     );
 }
@@ -163,7 +163,7 @@ fn pairing_contract_is_generated_and_explicit() {
     assert_eq!(pairing_state::OP_CHECK_DEVICE_ACCESS, "check-device-access");
     assert_eq!(
         bmux_connections_plugin_api::admission_provider_state::INTERFACE_ID,
-        "admission-provider-state"
+        "admission-provider-state/v2"
     );
     assert_eq!(
         bmux_connections_plugin_api::admission_provider_commands::INTERFACE_ID,

@@ -1416,13 +1416,13 @@ mod tests {
         use bmux_server::StreamAdmissionProviderRoutes;
         for (interface, operation, kind, contract) in [
             (
-                "admission-provider-state",
+                "admission-provider-state/v2",
                 "probe",
                 InvokeServiceKind::Query,
                 state_api::SERVICE_CONTRACT,
             ),
             (
-                "admission-provider-state",
+                "admission-provider-state/v2",
                 "validate",
                 InvokeServiceKind::Query,
                 state_api::SERVICE_CONTRACT,
@@ -1481,7 +1481,7 @@ mod tests {
                 .install_stream_admission_provider(
                     StreamAdmissionProviderRoutes {
                         probe: provider_route(
-                            "admission-provider-state",
+                            "admission-provider-state/v2",
                             "probe",
                             InvokeServiceKind::Query
                         ),
@@ -1491,7 +1491,7 @@ mod tests {
                             InvokeServiceKind::Command
                         ),
                         validate: provider_route(
-                            "admission-provider-state",
+                            "admission-provider-state/v2",
                             "validate",
                             InvokeServiceKind::Query
                         ),

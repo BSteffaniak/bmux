@@ -194,6 +194,8 @@ interface pairing-peer-commands {
 // Private host-selected provider. Every operation also requires HostInternal
 // provenance; ordinary local and admitted callers are rejected.
 @capability(CONNECTIONS_PAIRING)
+// v2: `probe` became `@reentrant`, which changes the contract identity.
+@interface-version(2)
 interface admission-provider-state {
     // A listener start confirms its admission backend from inside its own
     // pairing invocation, so the host's probe re-enters this instance on the

@@ -652,7 +652,7 @@ impl ConnectionsPlugin {
             "pairing-commands", "start-listener" => |(): (), ctx| { self.start_listener(ctx) },
             "pairing-commands", "stop-listener" => |(): (), ctx| { self.stop_listener(ctx) },
             "pairing-state", "listener-status" => |(): (), ctx| { let _owner = pairing_owner(ctx)?; self.listener_status() },
-            "admission-provider-state", "probe" => |(): (), ctx| {
+            "admission-provider-state/v2", "probe" => |(): (), ctx| {
                 host_internal(ctx)?;
                 Ok::<_, ServiceResponse>(self.admission()?.instance())
             },
@@ -661,7 +661,7 @@ impl ConnectionsPlugin {
                 let binding = self.admission()?.consume(&request.ticket).map_err(|_| ServiceResponse::error("admission_denied", "invalid ticket"))?;
                 Ok::<_, ServiceResponse>(bmux_connections_plugin_api::pairing_types::AdmissionBinding { subject_id: binding.subject_id(), lease_id: binding.lease_id() })
             },
-            "admission-provider-state", "validate" => |request: bmux_connections_plugin_api::admission_provider_state::client::ValidateRequest, ctx| {
+            "admission-provider-state/v2", "validate" => |request: bmux_connections_plugin_api::admission_provider_state::client::ValidateRequest, ctx| {
                 host_internal(ctx)?;
                 let binding = bmux_plugin::stream_admission::StreamAdmissionBinding::new(request.subject_id, request.lease_id);
                 Ok::<_, ServiceResponse>(self.admission()?.validate(&binding).is_ok())
@@ -1702,7 +1702,7 @@ mod tests {
             "probe",
             bmux_plugin_sdk::encode_service_message(&()).unwrap(),
         );
-        context.request.service.interface_id = "admission-provider-state".into();
+        context.request.service.interface_id = "admission-provider-state/v2".into();
         assert!(plugin.invoke_service(&context).error.is_some());
         for origin in [
             Origin::Local,
