@@ -21,6 +21,10 @@ tempfile                  = { workspace = true }
 uuid                      = { workspace = true, features = ["v4", "std", "serde"] }
 
 [features]
+# Package this crate as a dynamic library for one component. Only the
+# plugin packager enables these, together with `--cfg bmux_plugin_dylib`.
+dynamic-backend = []
+dynamic-frontend = []
 fail-on-warnings = [
     "bmux_playbook/fail-on-warnings",
     "bmux_playbook_plugin_api/fail-on-warnings",

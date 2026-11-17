@@ -44,7 +44,11 @@ ignored = ["serde"]
 features = ["bundled-decoration-scripts", "scripting-luau"]
 
 [features]
-default = ["bundled-decoration-scripts", "scripting-luau"]
+# Package this crate as a dynamic library for one component. Only the
+# plugin packager enables these, together with `--cfg bmux_plugin_dylib`.
+default          = ["bundled-decoration-scripts", "scripting-luau"]
+dynamic-backend  = []
+dynamic-frontend = []
 # Bundle the decoration plugin's sample Lua scripts via `include_str!`.
 # Orthogonal to `scripting-*` — the scripts are always compiled in as
 # data; whether they run depends on whether a Lua backend is enabled.

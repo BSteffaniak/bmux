@@ -210,7 +210,7 @@ class PublicationTests(unittest.TestCase):
 
 
 class GenerationTests(unittest.TestCase):
-    def test_wrapper_builds_select_dynamic_mode_by_cfg_not_feature(self):
+    def test_dylib_builds_select_dynamic_mode_by_cfg_not_feature(self):
         plain = pack.dynamic_mode_environment({"RUSTFLAGS": "-C debuginfo=1"})
         self.assertEqual(plain["RUSTFLAGS"], "-C debuginfo=1 --cfg bmux_plugin_dylib")
         empty = pack.dynamic_mode_environment({})
@@ -221,31 +221,25 @@ class GenerationTests(unittest.TestCase):
         self.assertNotIn("RUSTFLAGS", encoded)
 
     def test_component_features_come_from_implementation_metadata(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            implementation = root / "impl/Cargo.toml"
-            implementation.parent.mkdir()
-            implementation.write_text(
-                '[package]\nname = "demo_plugin"\nversion = "0.0.0"\n\n'
-                '[package.metadata.bmux-plugin.components.backend]\nfeatures = ["native"]\n'
-                '[package.metadata.bmux-plugin.components.frontend]\nfeatures = ["native", "presentation"]\n')
-            sdk = ROOT / "packages/plugin-sdk/Cargo.toml"
-            backend = tomllib.loads(pack.generate(
-                implementation, sdk, root / "backend", "backend", [], "b").read_text())
-            self.assertEqual(backend["dependencies"]["implementation"]["features"], ["native"])
-            self.assertFalse(backend["dependencies"]["implementation"]["default-features"])
-            frontend = tomllib.loads(pack.generate(
-                implementation, sdk, root / "frontend", "frontend", ["native", "tui"], "f").read_text())
-            # Declared features come first; explicit ones extend without duplicates.
-            self.assertEqual(frontend["dependencies"]["implementation"]["features"],
-                             ["native", "presentation", "tui"])
-            self.assertEqual(json.loads((root / "frontend/packaging.json").read_text())["features"],
-                             ["native", "presentation", "tui"])
-            implementation.write_text(
-                '[package]\nname = "demo_plugin"\nversion = "0.0.0"\n\n'
-                '[package.metadata.bmux-plugin.components.backend]\nfeatures = "native"\n')
-            with self.assertRaises(ValueError):
-                pack.generate(implementation, sdk, root / "invalid", "backend", [], "x")
+        manifest = tomllib.loads(
+            '[package]\nname = "demo_plugin"\nversion = "0.0.0"\n\n'
+            '[package.metadata.bmux-plugin.components.backend]\nfeatures = ["native"]\n'
+            '[package.metadata.bmux-plugin.components.frontend]\nfeatures = ["native", "presentation"]\n')
+        self.assertEqual(pack.component_features(manifest, "backend", []), ["native"])
+        # Declared features come first; explicit ones extend without duplicates.
+        self.assertEqual(pack.component_features(manifest, "frontend", ["native", "tui"]),
+                         ["native", "presentation", "tui"])
+        invalid = tomllib.loads(
+            '[package]\nname = "demo_plugin"\nversion = "0.0.0"\n\n'
+            '[package.metadata.bmux-plugin.components.backend]\nfeatures = "native"\n')
+        with self.assertRaises(ValueError):
+            pack.component_features(invalid, "backend", [])
+
+    def test_packager_has_no_generated_wrapper_path(self):
+        for legacy in ("generate", "build", "wrapper_target_dir", "workspace_patches"):
+            self.assertNotIn(legacy, vars(pack))
+        source = (ROOT / "scripts/package-plugin.py").read_text()
+        self.assertNotIn("--sdk-manifest", source)
 
     def test_fixture_is_one_self_packaging_crate_without_a_wrapper(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -254,7 +248,7 @@ class GenerationTests(unittest.TestCase):
             value = tomllib.loads(manifest.read_text())
             self.assertEqual(value["lib"]["crate-type"], ["rlib"])
             self.assertEqual(value["lib"]["path"], "src/scoped_loader_native.rs")
-            self.assertEqual(set(value["dependencies"]), {"bmux_plugin_sdk", "serde_json"})
+            self.assertEqual(set(value["dependencies"]), {"bmux_plugin", "bmux_plugin_sdk", "serde_json", "tokio"})
             self.assertTrue(pack.packages_itself(value, "backend"))
             self.assertNotIn("members", value["workspace"])
             self.assertFalse((output / "implementation").exists(), "no wrapper/implementation split")
@@ -275,39 +269,28 @@ class GenerationTests(unittest.TestCase):
                 acceptance.fixture_package(ROOT, foreign, vars(pack))
 
 
-    def test_driver_generates_fixture_and_real_bcode_wrapper_without_cargo(self):
-        bcode = ROOT.parents[1] / "wt-bcode/shared-plugin-architecture"
-        self.assertTrue(bcode.is_dir(), "required approved sibling Bcode worktree unavailable")
+    def test_driver_generates_only_the_fixture_without_cargo(self):
         with tempfile.TemporaryDirectory() as temporary:
             with patch.dict("os.environ", {"PATH": ""}):
                 subprocess.run([sys.executable, str(ROOT / "scripts/package-plugin-acceptance.py"),
-                                "--bcode-root", str(bcode), "--output", temporary], check=True)
-            source = (Path(temporary) / "file-references/src/lib.rs").read_text()
-            self.assertIn("implementation::plugin_definition()", source)
-            manifest = tomllib.loads((Path(temporary) / "file-references/Cargo.toml").read_text())
-            self.assertEqual(manifest["dependencies"]["implementation"]["package"], "bcode_file_references_plugin")
-            # hello exports its own entry: nothing is generated for it.
-            self.assertFalse((Path(temporary) / "hello/Cargo.toml").exists())
-            for domain in ("filesystem", "shell"):
-                generated = Path(temporary) / domain
-                manifest = tomllib.loads((generated / "Cargo.toml").read_text())
-                self.assertEqual(manifest["package"]["name"], f"bcode_{domain}_plugin_dynamic_backend")
-                self.assertEqual(manifest["dependencies"]["implementation"]["package"], f"bcode_{domain}_plugin")
-                self.assertEqual(manifest["lib"]["crate-type"], ["cdylib"])
-                self.assertIn("implementation::plugin_definition()", (generated / "src/lib.rs").read_text())
+                                "--bcode-root", str(Path(temporary) / "bcode"),
+                                "--output", temporary], check=True)
+            self.assertTrue((Path(temporary) / "scoped-loader/Cargo.toml").exists())
+            # Every other artifact is a crate that packages itself: nothing is generated.
+            for domain in ("hello", "file-references", "filesystem", "shell"):
+                self.assertFalse((Path(temporary) / domain / "Cargo.toml").exists())
             self.assertFalse((Path(temporary) / "acceptance-artifacts.json").exists())
 
     def test_built_artifact_report_records_exact_filesystem_and_shell_paths(self):
         bcode = ROOT.parents[1] / "wt-bcode/shared-plugin-architecture"
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
-            def built(manifest, release, target):
-                # Build-result plumbing only: no native code is loaded here.
-                return manifest.parent / "cargo-selected-native-artifact"
             def built_direct(manifest, role, features, release, target, target_dir, artifact_id):
-                return manifest.parent / "cargo-selected-native-artifact", {}
+                # Build-result plumbing only: no native code is loaded here.
+                name = manifest.parent.name.removesuffix("-plugin")
+                return output / name / "cargo-selected-native-artifact", {}
             with patch.object(acceptance.runpy, "run_path",
-                              return_value={**vars(pack), "build": built, "build_direct": built_direct}):
+                              return_value={**vars(pack), "build_direct": built_direct}):
                 with patch.object(sys, "argv", ["acceptance", "--bcode-root", str(bcode),
                                                "--output", str(output), "--build"]):
                     acceptance.main()
@@ -317,17 +300,6 @@ class GenerationTests(unittest.TestCase):
                 artifact = str(output / domain / "cargo-selected-native-artifact")
                 self.assertEqual(report["environment"][f"BCODE_{domain.upper()}_WRAPPER_ARTIFACT"], artifact)
                 self.assertIn({"expected_id": f"bcode.{domain}", "path": artifact}, report["artifacts"])
-
-    def test_bcode_entrypoint_delegates_without_cargo(self):
-        bcode = ROOT.parents[1] / "wt-bcode/shared-plugin-architecture"
-        self.assertTrue(bcode.is_dir(), "required approved sibling Bcode worktree unavailable")
-        with tempfile.TemporaryDirectory() as temporary:
-            with patch.dict("os.environ", {"PATH": "", "BMUX_PLUGIN_PACKAGER": str(ROOT / "scripts/package-plugin.py")}):
-                subprocess.run([sys.executable, str(bcode / "scripts/package-plugin-acceptance.py"),
-                                "--output", temporary], check=True)
-            wrapper = (Path(temporary) / "file-references/src/lib.rs").read_text()
-            self.assertIn("implementation::plugin_definition()", wrapper)
-            self.assertFalse((Path(temporary) / "acceptance-artifacts.json").exists())
 
 
 class DirectPackagingTests(unittest.TestCase):

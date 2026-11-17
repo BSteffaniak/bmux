@@ -55,8 +55,8 @@ Add `--build` in the integration phase to build X2's exact
 `scoped_loader_native.rs` plus sibling `scoped_loader_definition.rs` as one
 generated package (no wrapper), with the shared SDK and workspace-selected
 serde_json, directly through `cargo rustc --crate-type cdylib`. No fixture
-workspace member is checked in. Hello packages itself; only bcode plugins not
-yet ported still get a legacy wrapper.
+workspace member is checked in. Every artifact packages itself; there is no
+generated wrapper, so a bcode plugin builds once it declares the role features.
 The other artifact is the actual Bcode file-references implementation packaged
 through its public definition, never a fixture substituting its identity.
 `acceptance-artifacts.json` records Cargo-reported paths and the exact

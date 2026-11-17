@@ -39,6 +39,10 @@ bmux_session_models       = { workspace = true }
 bmux_tab_bar_plugin       = { workspace = true }
 
 [features]
+# Package this crate as a dynamic library for one component. Only the
+# plugin packager enables these, together with `--cfg bmux_plugin_dylib`.
+dynamic-backend = []
+dynamic-frontend = []
 fail-on-warnings = [
     "bmux_ipc/fail-on-warnings",
     "bmux_plugin/fail-on-warnings",

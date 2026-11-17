@@ -21,11 +21,14 @@ bmux_presentation_state     = { workspace = true }
 serde                       = { workspace = true, features = ["derive", "std"] }
 serde_json                  = { workspace = true }
 sysinfo                     = { workspace = true }
-tokio                       = { workspace = true, features = ["rt"] }
 tracing                     = { workspace = true }
 uuid                        = { workspace = true, features = ["std"] }
 
 [features]
+# Package this crate as a dynamic library for one component. Only the
+# plugin packager enables these, together with `--cfg bmux_plugin_dylib`.
+dynamic-backend = []
+dynamic-frontend = []
 fail-on-warnings = [
     "bmux_plugin/fail-on-warnings",
     "bmux_plugin_schema_macros/fail-on-warnings",

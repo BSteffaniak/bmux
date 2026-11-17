@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Prepare real acceptance artifacts using the shared packager (integration only).
 
-Crates that export their own entry (`plugin!` + role features) are built
-directly; only bcode plugins not yet ported still get a generated wrapper.
-Without --build, only generate packaging sources under --output. Never creates a
+Every artifact is a crate that exports its own entry (`plugin!` + role
+features), built directly; a crate without the role feature fails to build.
+Without --build, only the fixture package is generated under --output. Never creates a
 workspace member, installs an artifact, or modifies test fixtures. --build is an
 explicit later-phase action; no test or native artifact is executed by default.
 """
@@ -15,6 +15,47 @@ import subprocess
 import sys
 import tomllib
 import uuid
+
+
+def quote(value: str) -> str:
+    """JSON strings are also valid TOML basic strings for these path/name inputs."""
+    return json.dumps(value, ensure_ascii=False)
+
+
+def toml_value(value: object) -> str:
+    if isinstance(value, str):
+        return quote(value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        return "{ " + ", ".join(f"{quote(key)} = {toml_value(item)}" for key, item in value.items()) + " }"
+    if isinstance(value, int):
+        return str(value)
+    raise ValueError(f"unsupported Cargo patch value: {type(value).__name__}")
+
+
+def workspace_patches(implementation: Path) -> str:
+    """Carry workspace source selection into the standalone fixture workspace."""
+    for parent in implementation.parents:
+        candidate = parent / "Cargo.toml"
+        if candidate.exists():
+            workspace = tomllib.loads(candidate.read_text())
+            if "workspace" in workspace:
+                patches = workspace.get("patch", {})
+                break
+    else:
+        patches = {}
+    lines = []
+    for registry, dependencies in patches.items():
+        lines.append(f"\n[patch.{quote(registry)}]")
+        for name, dependency in dependencies.items():
+            dependency = dict(dependency)
+            if "path" in dependency:
+                dependency["path"] = str((parent / dependency["path"]).resolve())
+            lines.append(f"{quote(name)} = {toml_value(dependency)}")
+    return "\n".join(lines) + "\n"
 
 
 def fixture_package(root: Path, output: Path, shared: dict) -> Path:
@@ -50,10 +91,10 @@ crate-type = ["rlib"]
 path = "src/scoped_loader_native.rs"
 
 [dependencies]
-bmux_plugin_sdk = {{ path = {shared['quote'](str(sdk))}, default-features = false }}
-bmux_plugin = {{ path = {shared['quote'](str(host))}, default-features = false }}
-tokio = {shared['toml_value'](tokio)}
-serde_json = {shared['toml_value'](serde)}
+bmux_plugin_sdk = {{ path = {quote(str(sdk))}, default-features = false }}
+bmux_plugin = {{ path = {quote(str(host))}, default-features = false }}
+tokio = {toml_value(tokio)}
+serde_json = {toml_value(serde)}
 
 [features]
 # The fixture exports its two-role definition unconditionally; the packager
@@ -61,7 +102,7 @@ serde_json = {shared['toml_value'](serde)}
 dynamic-backend = []
 dynamic-frontend = []
 '''
-    cargo += shared["workspace_patches"](sdk / "Cargo.toml")
+    cargo += workspace_patches(sdk / "Cargo.toml")
     (output / "src").mkdir(parents=True, exist_ok=True)
     for name in ("scoped_loader_native.rs", "scoped_loader_definition.rs"):
         (output / "src" / name).write_bytes((source / name).read_bytes())
@@ -105,26 +146,18 @@ def main() -> None:
             return library
         return build
 
-    def wrapped(implementation: Path, directory: Path):
-        """Not yet ported (bcode): generate the legacy wrapper, then build it."""
-        manifest = shared["generate"](implementation, root / "packages/plugin-sdk/Cargo.toml",
-                                      directory, "backend", [], str(uuid.uuid4()))
-        print(manifest)
-        return lambda: shared["build"](manifest, args.release, args.target)
-
     specifications = [
         ("acceptance.scoped-loader", fixture,
          lambda: direct(fixture_package(root, fixture, shared))),
         ("example.hello", output / "hello",
          lambda: direct(root / "examples/hello-plugin/Cargo.toml")),
         ("bcode.file-references", output / "file-references",
-         lambda: wrapped(bcode / "plugins/file-references-plugin/Cargo.toml", output / "file-references")),
+         lambda: direct(bcode / "plugins/file-references-plugin/Cargo.toml")),
     ]
     for domain in ("filesystem", "shell"):
         directory = output / domain
         specifications.append((f"bcode.{domain}", directory,
-            lambda domain=domain, directory=directory: wrapped(
-                bcode / f"plugins/{domain}-plugin/Cargo.toml", directory)))
+            lambda domain=domain: direct(bcode / f"plugins/{domain}-plugin/Cargo.toml")))
     for expected, directory, prepare in specifications:
         with shared["packaging_owner"](directory):
             build = prepare()

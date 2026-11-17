@@ -22,7 +22,11 @@ tracing                                  = { workspace = true }
 uuid                                     = { workspace = true, features = ["serde", "v4"] }
 
 [features]
+# Package this crate as a dynamic library for one component. Only the
+# plugin packager enables these, together with `--cfg bmux_plugin_dylib`.
 default = []
+dynamic-backend = []
+dynamic-frontend = []
 fail-on-warnings = [
     "bmux_application_resurrection_plugin_api/fail-on-warnings",
     "bmux_plugin_schema_macros/fail-on-warnings",

@@ -94,7 +94,11 @@ tokio           = { workspace = true, features = ["test-util"] }
 ttf-parser      = { workspace = true }
 
 [features]
+# Package this crate as a dynamic library for one component. Only the
+# plugin packager enables these, together with `--cfg bmux_plugin_dylib`.
 default = []
+dynamic-backend = []
+dynamic-frontend = []
 fail-on-warnings = [
     "bmux_broadcast_plugin_api/fail-on-warnings",
     "bmux_client/fail-on-warnings",

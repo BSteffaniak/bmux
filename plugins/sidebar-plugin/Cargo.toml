@@ -25,6 +25,10 @@ unicode-width             = { workspace = true }
 uuid                      = { workspace = true, features = ["std"] }
 
 [features]
+# Package this crate as a dynamic library for one component. Only the
+# plugin packager enables these, together with `--cfg bmux_plugin_dylib`.
+dynamic-backend = []
+dynamic-frontend = []
 fail-on-warnings = [
     "bmux_plugin/fail-on-warnings",
     "bmux_plugin_schema_macros/fail-on-warnings",

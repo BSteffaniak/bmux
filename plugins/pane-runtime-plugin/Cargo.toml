@@ -65,7 +65,11 @@ uuid = { workspace = true, features = ["serde", "std"] }
 [dev-dependencies]
 
 [features]
+# Package this crate as a dynamic library for one component. Only the
+# plugin packager enables these, together with `--cfg bmux_plugin_dylib`.
 default = []
+dynamic-backend = []
+dynamic-frontend = []
 fail-on-warnings = [
     "bmux_attach_layout_protocol/fail-on-warnings",
     "bmux_clients_plugin_api/fail-on-warnings",

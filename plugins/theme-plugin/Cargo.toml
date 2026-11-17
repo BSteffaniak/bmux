@@ -40,6 +40,10 @@ uuid = { workspace = true }
 ignored = ["bmux_codec", "bmux_ipc"]
 
 [features]
+# Package this crate as a dynamic library for one component. Only the
+# plugin packager enables these, together with `--cfg bmux_plugin_dylib`.
+dynamic-backend = []
+dynamic-frontend = []
 fail-on-warnings = [
     "bmux_appearance/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",

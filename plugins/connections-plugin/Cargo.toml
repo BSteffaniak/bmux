@@ -48,6 +48,10 @@ url = { workspace = true, features = ["std"] }
 uuid = { workspace = true, features = ["std", "v4"] }
 
 [features]
+# Package this crate as a dynamic library for one component. Only the
+# plugin packager enables these, together with `--cfg bmux_plugin_dylib`.
+dynamic-backend = []
+dynamic-frontend = []
 fail-on-warnings = [
     "bmux_client/fail-on-warnings",
     "bmux_config/fail-on-warnings",
