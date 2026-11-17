@@ -287,6 +287,27 @@ impl Replay {
         }
     }
 
+    /// Apply `frame` without rendering it.
+    fn apply_only(&mut self, frame: &[u8]) {
+        for chunk in frame.chunks(self.chunk_size) {
+            self.open = sync_after(self.open, chunk);
+            let end = self.offset + chunk.len() as u64;
+            apply_attach_output_chunk_with(
+                &mut self.buffers,
+                self.pane_id,
+                chunk,
+                AttachOutputChunkMeta {
+                    stream_start: self.offset,
+                    stream_end: end,
+                    stream_gap: false,
+                    sync_update_active: self.open,
+                },
+                append_pane_output,
+            );
+            self.offset = end;
+        }
+    }
+
     fn pane(&self) -> &bmux_terminal_grid::TerminalGrid {
         self.buffers[&self.pane_id].terminal_grid.grid()
     }
@@ -591,6 +612,52 @@ fn pipeline_bench() {
                 Replay::new(size, true, delivery()).presented(),
                 &frames,
             );
+        }
+    }
+}
+
+/// A fixed amount of work for counting instructions, which machine load does not change (wall
+/// time on a busy machine varies more than the differences being measured):
+///
+/// ```text
+/// BMUX_BENCH_CORPUS=frames BMUX_BENCH_MODE=terminal /usr/bin/time -l <test binary> \
+///     --ignored --exact pipeline_bench::pipeline_bench_loop
+/// ```
+///
+/// A corpus named `generated:NAME` is that generated corpus. `BMUX_BENCH_MODE` is `bytes` (the renderer's own output, with passthrough), `terminal`
+/// (presented through a `bmux_tui` terminal) or `apply` (applying only, to subtract). The first
+/// corpus in `BMUX_BENCH_CORPUS` is played `BMUX_BENCH_ROUNDS` times (5 by default).
+#[test]
+#[ignore = "instruction-count workload; run explicitly"]
+fn pipeline_bench_loop() {
+    let paths = std::env::var("BMUX_BENCH_CORPUS").expect("BMUX_BENCH_CORPUS");
+    let path = paths.split(',').next().expect("a corpus");
+    let frames = path.strip_prefix("generated:").map_or_else(
+        || corpus::read(std::path::Path::new(path)).expect("corpus"),
+        |name| {
+            corpus::generated(size(), 300)
+                .into_iter()
+                .find(|corpus| corpus.name == name)
+                .expect("generated corpus")
+                .frames
+        },
+    );
+    let mode = std::env::var("BMUX_BENCH_MODE").unwrap_or_else(|_| "terminal".to_owned());
+    let rounds =
+        std::env::var("BMUX_BENCH_ROUNDS").map_or(5, |rounds| rounds.parse().expect("rounds"));
+    for _ in 0..rounds {
+        let mut replay = match mode.as_str() {
+            "terminal" => Replay::new(size(), true, delivery()).presented(),
+            _ => Replay::new(size(), true, delivery()),
+        };
+        let mut output = Vec::new();
+        for frame in &frames {
+            output.clear();
+            if mode == "apply" {
+                replay.apply_only(frame);
+            } else {
+                replay.frame(frame, &mut output);
+            }
         }
     }
 }
