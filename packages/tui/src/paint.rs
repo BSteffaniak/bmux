@@ -357,7 +357,7 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
             return;
         };
         let style = self.inherited_style;
-        let buffer = self.frame.buffer_mut(row);
+        let buffer = self.frame.buffer_for_write();
         let mut cells = cells
             .into_iter()
             .map(|cell| {
@@ -391,6 +391,14 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
             }
             cells.next();
             column = end;
+        }
+        // Report only the columns written: callers paint runs much shorter than the row.
+        let start = projected_unclipped_x(self.origin_x, x).max(i64::from(row.x));
+        let end = column.min(i64::from(row.right()));
+        if end > start {
+            let start = u16::try_from(start).unwrap_or(row.x);
+            let end = u16::try_from(end).unwrap_or_else(|_| row.right());
+            self.frame.wrote(Rect::new(start, row.y, end - start, 1));
         }
     }
 

@@ -810,8 +810,22 @@ enum Start {
     Over,
 }
 
-/// A spare grid and where it may differ from the committed cells (`None`: anywhere).
-type Spare = (Buffer, Option<Vec<Rect>>);
+/// A spare grid and how it differs from the committed cells.
+type Spare = (Buffer, Stale);
+
+/// How a spare grid differs from the committed cells.
+#[derive(Debug)]
+enum Stale {
+    /// Anywhere.
+    Unknown,
+    /// Only inside these regions.
+    Regions(Vec<Rect>),
+    /// By these cell moves, in order, then the cells of these painted regions.
+    Moved {
+        moves: Vec<(Rect, i64)>,
+        painted: Vec<Rect>,
+    },
+}
 
 impl Clone for SpareBuffer {
     fn clone(&self) -> Self {
@@ -828,7 +842,7 @@ impl SpareBuffer {
     }
 
     fn put(&self, buffer: Buffer) {
-        self.put_spare((buffer, None));
+        self.put_spare((buffer, Stale::Unknown));
     }
 
     fn put_spare(&self, spare: Spare) {
@@ -1025,6 +1039,26 @@ impl PresentationState {
     pub fn images(&self) -> &[ImageContribution] {
         &self.images
     }
+    /// Lend the committed cells out to be painted in place; until they are returned with
+    /// [`Self::install_painted_over`], no cells are committed and the next frame is a full one.
+    pub(crate) fn take_retained(&mut self) -> Option<Buffer> {
+        self.previous
+            .take()
+            .filter(|previous| previous.area() == self.area)
+    }
+
+    /// Commit cells painted in place over the committed ones, and the cursor they show; every
+    /// other piece of committed state stays as it was.
+    pub(crate) fn install_painted_over(&mut self, buffer: Buffer, cursor: Option<Cursor>) {
+        self.previous = Some(buffer);
+        self.cursor = cursor;
+    }
+
+    /// The presentation clock frames paint with.
+    pub(crate) const fn clock(&self) -> Option<crate::clock::PresentationClock> {
+        self.clock
+    }
+
     /// Invalidate cells without discarding interaction authority.
     pub fn reset(&mut self) {
         if let Some(previous) = self.previous.take() {
@@ -1229,10 +1263,20 @@ impl PresentationState {
                     in_place.or_else(|| repair.then_some(self.previous.as_ref()).flatten()),
                     spare,
                 ) {
-                    (Some(previous), Some((mut spare, Some(stale))))
+                    (Some(previous), Some((mut spare, Stale::Regions(stale))))
                         if in_place.is_some() && spare.area() == previous.area() =>
                     {
                         spare.copy_regions_from(previous, &stale);
+                        spare
+                    }
+                    (Some(previous), Some((mut spare, Stale::Moved { moves, painted })))
+                        if in_place.is_some() && spare.area() == previous.area() =>
+                    {
+                        // Moving rows costs less than copying them.
+                        for (area, rows) in moves {
+                            spare.move_band(area, rows);
+                        }
+                        spare.copy_regions_from(previous, &painted);
                         spare
                     }
                     (Some(previous), Some((mut spare, _))) => {
@@ -1557,11 +1601,16 @@ impl PresentationState {
             || {
                 self.grid_fragments = prepared.grid_fragments;
                 // A regional frame changed only its regions, so the retired cells differ from
-                // the new ones only there.
-                let changed = prepared
-                    .damage
-                    .is_regional()
-                    .then(|| prepared.damage.retained_regions().to_vec());
+                // the new ones only there; a frame that moved cells and painted others differs
+                // by those moves and paints.
+                let changed = match (&prepared.painted, prepared.damage.is_regional()) {
+                    (Some(painted), true) => Stale::Moved {
+                        moves: prepared.moves.clone(),
+                        painted: painted.clone(),
+                    },
+                    (None, true) => Stale::Regions(prepared.damage.retained_regions().to_vec()),
+                    (_, false) => Stale::Unknown,
+                };
                 if let Some(retired) = self.previous.replace(prepared.buffer) {
                     self.spare.put_spare((retired, changed));
                 }
@@ -1602,6 +1651,7 @@ mod tests {
         Line(LocalRect, &'static str),
         Restyle(LocalRect, Style),
         Occlude(LocalRect),
+        Move(LocalRect, i64),
     }
 
     fn apply_ops(cx: &mut PaintCx<'_, '_>, ops: &[PaintOp]) {
@@ -1613,6 +1663,7 @@ mod tests {
                 PaintOp::Line(area, text) => cx.write_line(area, &crate::text::Line::raw(text)),
                 PaintOp::Restyle(area, style) => cx.restyle(area, style),
                 PaintOp::Occlude(area) => cx.occlude(area),
+                PaintOp::Move(area, rows) => cx.move_cells(area, rows),
             }
         }
     }
@@ -1680,7 +1731,7 @@ mod tests {
     }
 
     /// Up to 13 paint operations at random places, some partly outside `area`.
-    fn random_ops(next: &mut dyn FnMut(u64) -> u64, area: Rect) -> Vec<PaintOp> {
+    fn random_ops(next: &mut dyn FnMut(u64) -> u64, area: Rect, moves: bool) -> Vec<PaintOp> {
         let symbols = ["a", "b", " ", "\u{754c}", "x"];
         let texts = [
             "hello",
@@ -1714,6 +1765,9 @@ mod tests {
                     2 => PaintOp::Fill(rect(next), symbol, style),
                     3 => PaintOp::Line(rect(next), texts[usize::try_from(next(5)).unwrap()]),
                     4 => PaintOp::Restyle(rect(next), style),
+                    5 if moves && next(2) == 0 => {
+                        PaintOp::Move(rect(next), i64::try_from(next(5)).unwrap() - 2)
+                    }
                     _ => PaintOp::Occlude(rect(next)),
                 }
             })
@@ -1739,7 +1793,7 @@ mod tests {
                 let height = u16::try_from(next(3)).unwrap() + 1;
                 Rect::new(x, y, width, height).intersection(area)
             };
-            let ops = random_ops(&mut next, area);
+            let ops = random_ops(&mut next, area, false);
             let full = frame == 0 || next(10) == 0;
             let regions: Vec<Rect> = (0..=next(3))
                 .map(|_| rect(&mut next))
@@ -1813,7 +1867,7 @@ mod tests {
         };
         let mut state = PresentationState::new(area);
         for frame in 0..2_000 {
-            let ops = random_ops(&mut next, area);
+            let ops = random_ops(&mut next, area, true);
             let expected = state.retained_buffer().map_or_else(
                 || {
                     let mut buffer = Buffer::empty(area);

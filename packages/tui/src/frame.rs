@@ -81,6 +81,121 @@ pub struct Frame<'buffer> {
     painted: Option<WrittenSpans>,
     /// A move covered cells painted before it, which then left the painted spans.
     moved_painted: bool,
+    over: Option<OverChanges>,
+}
+
+/// What a frame painted in place over the last one changed: the cells painted, carried along by
+/// later moves, and the moves themselves.
+#[derive(Debug)]
+pub(crate) struct OverChanges {
+    area: Rect,
+    dirty: Vec<bool>,
+    /// The moves, in order.
+    pub(crate) moves: Vec<OverMove>,
+}
+
+/// One cell move of a frame painted over the last one.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OverMove {
+    pub(crate) area: Rect,
+    pub(crate) rows: i64,
+    /// No wide grapheme crossed the area's left or right edge, and nothing had been painted
+    /// beside them: a terminal can move the area inside left/right margins.
+    pub(crate) clean_edges: bool,
+}
+
+impl OverChanges {
+    /// No changes over `area`.
+    pub(crate) fn empty(area: Rect) -> Self {
+        Self::new(area)
+    }
+
+    fn new(area: Rect) -> Self {
+        Self {
+            area,
+            dirty: vec![false; usize::from(area.width) * usize::from(area.height)],
+            moves: Vec::new(),
+        }
+    }
+
+    fn index(&self, x: u16, y: u16) -> usize {
+        usize::from(y - self.area.y) * usize::from(self.area.width) + usize::from(x - self.area.x)
+    }
+
+    /// Mark the cells of `area` changed.
+    pub(crate) fn mark(&mut self, area: Rect) {
+        let area = area.intersection(self.area);
+        for y in area.y..area.bottom() {
+            let start = self.index(area.x, y);
+            self.dirty[start..start + usize::from(area.width)].fill(true);
+        }
+    }
+
+    /// Whether any cell of `area` is marked.
+    fn any(&self, area: Rect) -> bool {
+        let area = area.intersection(self.area);
+        (area.y..area.bottom()).any(|y| {
+            let start = self.index(area.x, y);
+            self.dirty[start..start + usize::from(area.width)].contains(&true)
+        })
+    }
+
+    /// Move the marks of `band` by `rows` with the cells; the rows it exposes are unmarked, as a
+    /// terminal scroll blanks them too.
+    fn shift(&mut self, band: Rect, rows: i64) {
+        let band = band.intersection(self.area);
+        let height = usize::from(band.height);
+        let moved = usize::try_from(rows.unsigned_abs())
+            .unwrap_or(usize::MAX)
+            .min(height);
+        let columns = usize::from(band.width);
+        if band.is_empty() {
+            return;
+        }
+        let (first, stride) = (self.index(band.x, band.y), usize::from(self.area.width));
+        let row = |offset: usize| first + offset * stride;
+        if rows > 0 {
+            for offset in 0..height - moved {
+                let (target, source) = (row(offset), row(offset + moved));
+                self.dirty.copy_within(source..source + columns, target);
+            }
+            for offset in height - moved..height {
+                self.dirty[row(offset)..row(offset) + columns].fill(false);
+            }
+        } else if rows < 0 {
+            for offset in (moved..height).rev() {
+                let (target, source) = (row(offset), row(offset - moved));
+                self.dirty.copy_within(source..source + columns, target);
+            }
+            for offset in 0..moved {
+                self.dirty[row(offset)..row(offset) + columns].fill(false);
+            }
+        }
+    }
+
+    /// The marked runs of row `y`, left to right.
+    pub(crate) fn runs(&self, y: u16) -> impl Iterator<Item = std::ops::Range<u16>> + '_ {
+        let start = self.index(self.area.x, y);
+        let row = &self.dirty[start..start + usize::from(self.area.width)];
+        let x0 = self.area.x;
+        let mut column = 0;
+        std::iter::from_fn(move || {
+            let first = column + row[column..].iter().position(|dirty| *dirty)?;
+            let end = first
+                + row[first..]
+                    .iter()
+                    .position(|dirty| !*dirty)
+                    .unwrap_or(row.len() - first);
+            column = end;
+            let to = |offset: usize| x0 + u16::try_from(offset).unwrap_or(u16::MAX);
+            Some(to(first)..to(end))
+        })
+    }
+
+    /// Whether nothing is marked.
+    pub(crate) fn is_clean(&self) -> bool {
+        !self.dirty.contains(&true)
+    }
 }
 
 /// The columns each row of a frame's buffer may have been written in, one `start..end` span
@@ -206,6 +321,7 @@ impl<'buffer> Frame<'buffer> {
             written: None,
             painted: None,
             moved_painted: false,
+            over: None,
         }
     }
 
@@ -213,6 +329,29 @@ impl<'buffer> Frame<'buffer> {
     pub(crate) fn track_writes(&mut self) {
         self.written = Some(WrittenSpans::new(self.buffer.area()));
         self.painted = Some(WrittenSpans::new(self.buffer.area()));
+    }
+
+    /// Record which cells change, for a frame painted in place over the last one.
+    pub(crate) fn track_over(&mut self) {
+        self.over = Some(OverChanges::new(self.buffer.area()));
+        self.buffer.log_spill();
+    }
+
+    /// The changes since [`Self::track_over`].
+    pub(crate) fn take_over(&mut self) -> Option<OverChanges> {
+        self.mark_spill();
+        self.buffer.stop_spill();
+        self.over.take()
+    }
+
+    /// Mark the cells writes changed beside the ones they asked for.
+    fn mark_spill(&mut self) {
+        let spill = self.buffer.take_spill();
+        if let Some(over) = self.over.as_mut() {
+            for point in spill {
+                over.mark(Rect::new(point.x, point.y, 1, 1));
+            }
+        }
     }
 
     /// The cells painted since [`Self::track_writes`]: those written, less the ones only moved.
@@ -227,6 +366,9 @@ impl<'buffer> Frame<'buffer> {
     }
 
     fn note_written(&mut self, area: Rect) {
+        if let Some(over) = self.over.as_mut() {
+            over.mark(area);
+        }
         self.note_moved(area);
         if let Some(painted) = self.painted.as_mut() {
             painted.note(area);
@@ -375,6 +517,17 @@ impl<'buffer> Frame<'buffer> {
         self.buffer
     }
 
+    /// The buffer, for a write whose extent is known only once it is done; the caller reports it
+    /// with [`Self::wrote`].
+    pub(crate) const fn buffer_for_write(&mut self) -> &mut Buffer {
+        self.buffer
+    }
+
+    /// Report the cells of `area` written through [`Self::buffer_for_write`].
+    pub(crate) fn wrote(&mut self, area: Rect) {
+        self.note_written(area);
+    }
+
     pub(crate) const fn set_cursor(&mut self, cursor: Cursor) {
         self.cursor = Some(cursor);
     }
@@ -440,7 +593,40 @@ impl<'buffer> Frame<'buffer> {
         if area.is_empty() || rows == 0 {
             return;
         }
+        // Spill logged so far is at positions this move may carry away: mark it first.
+        self.mark_spill();
+        if let Some(over) = self.over.as_mut() {
+            // Margins can hold the move only if no grapheme straddles them on the terminal,
+            // which shows what the buffer does wherever nothing was painted yet.
+            let edges = [
+                Rect::new(area.x.saturating_sub(1), area.y, 2, area.height),
+                Rect::new(area.right().saturating_sub(1), area.y, 2, area.height),
+            ];
+            let clean_edges = !edges.iter().any(|edge| over.any(*edge))
+                && self.buffer.band_has_clean_margins(area);
+            for y in area.y..area.bottom() {
+                let left = Point::new(area.x, y);
+                let right = Point::new(area.right().saturating_sub(1), y);
+                if self
+                    .buffer
+                    .get(left)
+                    .is_some_and(Cell::is_wide_continuation)
+                {
+                    over.mark(Rect::new(left.x.saturating_sub(1), y, 2, 1));
+                }
+                if self.buffer.get(right).is_some_and(Cell::is_wide_leader) {
+                    over.mark(Rect::new(right.x, y, 2, 1));
+                }
+            }
+            over.shift(area, rows);
+            over.moves.push(OverMove {
+                area,
+                rows,
+                clean_edges,
+            });
+        }
         self.note_moved(area);
+        let tracking_over = self.over.is_some();
         if self
             .painted
             .as_ref()
@@ -466,6 +652,11 @@ impl<'buffer> Frame<'buffer> {
             }
         }
         self.buffer.move_band(area, rows);
+        if tracking_over {
+            // The cells the move blanked at its edges were marked where they were, and moved
+            // with the marks.
+            let _ = self.buffer.take_spill();
+        }
         self.moves.push((area, rows));
         self.hint_scroll(area, rows);
     }

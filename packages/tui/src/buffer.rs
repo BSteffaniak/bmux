@@ -136,18 +136,31 @@ impl Cell {
 }
 
 /// A two-dimensional terminal render buffer.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Buffer {
     area: Rect,
     cells: Vec<Cell>,
+    /// While logging, the cells written outside the cells a write asked for: both halves of
+    /// a wide grapheme it cut, and a wide grapheme's continuation.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    spill: Option<Vec<Point>>,
 }
+
+impl PartialEq for Buffer {
+    fn eq(&self, other: &Self) -> bool {
+        self.area == other.area && self.cells == other.cells
+    }
+}
+
+impl Eq for Buffer {}
 
 impl Clone for Buffer {
     fn clone(&self) -> Self {
         Self {
             area: self.area,
             cells: self.cells.clone(),
+            spill: None,
         }
     }
 
@@ -166,6 +179,28 @@ impl Buffer {
         Self {
             area,
             cells: vec![Cell::default(); len],
+            spill: None,
+        }
+    }
+
+    /// Start logging the cells writes change outside the cells they ask for.
+    pub(crate) fn log_spill(&mut self) {
+        self.spill = Some(Vec::new());
+    }
+
+    /// Take the cells logged so far, leaving logging on; empty when not logging.
+    pub(crate) fn take_spill(&mut self) -> Vec<Point> {
+        self.spill.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    /// Stop logging spilled cells.
+    pub(crate) fn stop_spill(&mut self) {
+        self.spill = None;
+    }
+
+    fn spilled(&mut self, point: Point) {
+        if let Some(spill) = self.spill.as_mut() {
+            spill.push(point);
         }
     }
 
@@ -466,6 +501,7 @@ impl Buffer {
             self.cells[index].assign(symbol, 2, style);
             if let Some(cell) = self.get_mut(next) {
                 cell.set_continuation(style);
+                self.spilled(next);
             }
         } else {
             self.cells[index].assign(if width == 2 { " " } else { symbol }, 1, style);
@@ -484,8 +520,12 @@ impl Buffer {
             (point, 1)
         };
         for offset in 0..width {
-            if let Some(cell) = self.get_mut(Point::new(start.x.saturating_add(offset), start.y)) {
+            let point = Point::new(start.x.saturating_add(offset), start.y);
+            if let Some(cell) = self.get_mut(point) {
                 cell.reset();
+                if width == 2 {
+                    self.spilled(point);
+                }
             }
         }
     }

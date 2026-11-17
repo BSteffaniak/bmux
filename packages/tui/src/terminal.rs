@@ -8,6 +8,7 @@ use crate::capabilities::TerminalColorDepth;
 use crate::damage::Damage;
 use crate::event::{Event, FocusEvent};
 use crate::focus::{FocusId, FocusTrap};
+use crate::frame::{Cursor, Frame, OverChanges};
 use crate::geometry::Point;
 use crate::geometry::Rect;
 use crate::hit::HitId;
@@ -158,6 +159,84 @@ fn encode_frame(
         .map(|(scroll, _)| *scroll)
         .collect();
     Ok((stats.into(), applied))
+}
+
+/// Unchanged cells between two painted runs that are cheaper to rewrite than to move the cursor
+/// over (a cursor move and a style change cost about this many bytes).
+const PAINTED_RUN_GAP: u16 = 8;
+
+/// Encode a frame painted in place: `scrolls` first, then every painted run of `buffer` (joined
+/// across short gaps and widened to whole graphemes), then the cursor.
+fn encode_painted_over(
+    encoded: &mut Vec<u8>,
+    buffer: &Buffer,
+    changes: &OverChanges,
+    scrolls: &[AppliedScroll],
+    cursor: Option<Cursor>,
+    depth: TerminalColorDepth,
+) -> io::Result<DrawStats> {
+    let area = buffer.area();
+    encoded.extend_from_slice(b"\x1b[?25l");
+    for scroll in scrolls {
+        let full = scroll.region.x == area.x && scroll.region.width == area.width;
+        crate::ansi::write_scroll(encoded, scroll.region, scroll.rows, full)?;
+    }
+    let mut style = crate::style::Style::new();
+    let mut changed_cells = 0_usize;
+    for y in area.y..area.bottom() {
+        let mut pending: Option<(u16, u16)> = None;
+        for run in changes.runs(y) {
+            match pending.as_mut() {
+                Some((_, end)) if run.start <= end.saturating_add(PAINTED_RUN_GAP) => {
+                    *end = run.end;
+                }
+                _ => {
+                    if let Some((start, end)) = pending.replace((run.start, run.end)) {
+                        changed_cells +=
+                            write_painted_run(encoded, buffer, y, start, end, &mut style, depth)?;
+                    }
+                }
+            }
+        }
+        if let Some((start, end)) = pending {
+            changed_cells += write_painted_run(encoded, buffer, y, start, end, &mut style, depth)?;
+        }
+    }
+    crate::ansi::write_ansi_style(encoded, crate::style::Style::new(), depth)?;
+    crate::ansi::write_ansi_cursor(encoded, cursor)?;
+    Ok(DrawStats {
+        changed_cells,
+        full_repaint: false,
+    })
+}
+
+/// Write row `y`, columns `start..end` widened to whole graphemes, returning the cells written.
+fn write_painted_run(
+    encoded: &mut Vec<u8>,
+    buffer: &Buffer,
+    y: u16,
+    mut start: u16,
+    mut end: u16,
+    style: &mut crate::style::Style,
+    depth: TerminalColorDepth,
+) -> io::Result<usize> {
+    let area = buffer.area();
+    if start > area.x
+        && buffer
+            .get(Point::new(start, y))
+            .is_some_and(crate::buffer::Cell::is_wide_continuation)
+    {
+        start -= 1;
+    }
+    if end < area.right()
+        && buffer
+            .get(Point::new(end, y))
+            .is_some_and(crate::buffer::Cell::is_wide_continuation)
+    {
+        end += 1;
+    }
+    crate::ansi::emit_row_span(encoded, buffer, y, start, end, style, depth)?;
+    Ok(usize::from(end - start))
 }
 
 /// A simple ANSI terminal runtime backed by an arbitrary writer.
@@ -592,9 +671,16 @@ impl<W: Write> Terminal<W> {
     }
 
     /// Draw a frame painted over the committed one: what `render` paints replaces what the
-    /// terminal shows and nothing else changes (see [`PresentationState::prepare_over`]). Only
-    /// the painted cells are compared and written, so output already planned as changes, such
-    /// as a multiplexer's, costs what it changed.
+    /// terminal shows and nothing else changes.
+    ///
+    /// This is for output already planned as changes, such as a multiplexer's: the frame is
+    /// painted in place over the committed cells, and every painted cell is written without
+    /// comparing it to what it replaced (writing a cell that did not change is harmless, and
+    /// the caller painted it because it changed). Cell moves
+    /// ([`PaintCx::move_cells`](crate::paint::PaintCx::move_cells)) are emitted as scroll
+    /// regions where the terminal can hold them, or else rewritten. The committed hit regions
+    /// and other interaction metadata stay as they were; only the cells and cursor change.
+    /// Without committed cells the frame is a full one painted over a blank screen.
     ///
     /// # Errors
     /// Returns any I/O error reported by the backend writer.
@@ -606,7 +692,7 @@ impl<W: Write> Terminal<W> {
     }
 
     /// [`Self::draw_over`] with the output hooks of
-    /// [`Self::draw_damage_with_output_hooks`].
+    /// [`Self::draw_damage_with_output_hooks`]; `overlay` receives the committed image scene.
     ///
     /// # Errors
     /// Returns output or hook errors without committing failed output.
@@ -616,13 +702,136 @@ impl<W: Write> Terminal<W> {
         before: impl FnOnce(&mut W) -> io::Result<bool>,
         overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
     ) -> io::Result<DrawStats> {
-        // Painting nothing over the last frame, with the cursor where it was, changes nothing.
-        let prepared = self.state.prepare_over(render).filter(|prepared| {
-            !prepared.damage().retained_regions().is_empty()
-                || !prepared.damage().is_regional()
-                || prepared.cursor() != self.state.cursor()
+        let Some(mut buffer) = self.state.take_retained() else {
+            return self.draw_damage_with_output_hooks(Damage::Full, render, before, overlay);
+        };
+        let area = buffer.area();
+        let (mut changes, cursor) = {
+            let mut frame = Frame::new(&mut buffer);
+            frame.set_clock(self.state.clock());
+            frame.track_over();
+            PresentationPhase::Paint.measure(|| render(&mut PaintCx::new(&mut frame)), |()| true);
+            let cursor = frame.cursor();
+            (
+                frame
+                    .take_over()
+                    .unwrap_or_else(|| OverChanges::empty(area)),
+                cursor,
+            )
+        };
+        // Painting nothing, with the cursor where it was, changes nothing.
+        if changes.is_clean() && changes.moves.is_empty() && cursor == self.state.cursor() {
+            self.state.install_painted_over(buffer, cursor);
+            self.committed_damage = Damage::None;
+            self.applied_scrolls.clear();
+            return Ok(DrawStats {
+                changed_cells: 0,
+                full_repaint: false,
+            });
+        }
+        let scrolls = self.over_scrolls(&mut changes, area);
+        let position = self.pointer_position;
+        let shape = match resolve_pointer_intent(
+            self.state.hits(),
+            position,
+            self.state.focus().active_scope(),
+            self.pointer_context.capture.as_ref(),
+        ) {
+            PointerIntent::Shape(shape) => shape,
+            PointerIntent::Auto | PointerIntent::Hidden => PointerShape::Default,
+        };
+        let transaction = self
+            .pointer_output
+            .begin_present(self.pointer_capability, shape)?;
+        let depth = self.color_depth;
+        let writer = &mut self.writer;
+        let encoded = &mut self.encoded;
+        let image_scene = self.state.image_scene();
+        let result = (|| -> io::Result<DrawStats> {
+            writer.write_all(b"\x1b[?2026h")?;
+            let output = (|| -> io::Result<DrawStats> {
+                let repaint = before(writer)?;
+                encoded.clear();
+                let stats = PresentationPhase::AnsiEncode.measure(
+                    || -> io::Result<DrawStats> {
+                        if repaint {
+                            write_ansi_frame_with_color_depth(encoded, &buffer, cursor, depth)?;
+                            return Ok(DrawStats::full(buffer.cells().len()));
+                        }
+                        encode_painted_over(encoded, &buffer, &changes, &scrolls, cursor, depth)
+                    },
+                    Result::is_ok,
+                )?;
+                writer.write_all(encoded)?;
+                overlay(writer, image_scene, &ImageSceneDelta::default())?;
+                if let Some(transaction) = &transaction {
+                    writer.write_all(transaction.bytes())?;
+                }
+                Ok(stats)
+            })();
+            let end = writer.write_all(b"\x1b[?2026l");
+            let stats = output?;
+            end?;
+            PresentationPhase::WriterFlush.measure(|| writer.flush(), Result::is_ok)?;
+            Ok(stats)
+        })();
+        if let Some(transaction) = transaction {
+            self.pointer_output.complete(transaction, result.is_ok());
+        }
+        match result {
+            Ok(stats) => {
+                self.state.install_painted_over(buffer, cursor);
+                self.committed_damage = Damage::Regions(Vec::new());
+                self.applied_scrolls = scrolls;
+                Ok(stats)
+            }
+            Err(error) => {
+                // The lent cells were painted but not shown: the next frame repaints in full.
+                self.state.reset();
+                self.applied_scrolls.clear();
+                Err(error)
+            }
+        }
+    }
+
+    /// The scrolls that show a frame's moves, all of them or none: a move the terminal cannot
+    /// hold (an image under it, no left/right margins for a narrow area, a shift as tall as
+    /// the area) leaves every moved area to be rewritten.
+    fn over_scrolls(&self, changes: &mut OverChanges, area: Rect) -> Vec<AppliedScroll> {
+        let images: Vec<Rect> = self
+            .state
+            .image_scene()
+            .placements()
+            .map(|placement| placement.destination.intersection(placement.clip))
+            .collect();
+        let shown = changes.moves.iter().all(|moved| {
+            let full = moved.area.x == area.x && moved.area.width == area.width;
+            self.scroll_acceleration != ScrollRegionAcceleration::Off
+                && moved.rows != 0
+                && moved.rows.unsigned_abs() < u64::from(moved.area.height)
+                && images
+                    .iter()
+                    .all(|image| image.intersection(moved.area).is_empty())
+                && (full
+                    || (self.scroll_acceleration == ScrollRegionAcceleration::AutoWithMargins
+                        && moved.clean_edges))
         });
-        self.draw_prepared_with_output_hooks(prepared, before, overlay)
+        if shown {
+            changes
+                .moves
+                .iter()
+                .map(|moved| AppliedScroll {
+                    region: moved.area,
+                    rows: moved.rows,
+                })
+                .collect()
+        } else {
+            let areas: Vec<Rect> = changes.moves.iter().map(|moved| moved.area).collect();
+            for moved in areas {
+                changes.mark(moved);
+            }
+            Vec::new()
+        }
     }
 
     /// Paint an owned frame without encoding or committing it.

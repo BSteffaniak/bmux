@@ -436,28 +436,7 @@ pub(crate) fn scroll_moves_diff(
         .map(|(scroll, _)| *scroll)
         .collect();
     for (region, rows) in &applied {
-        let command = if *rows > 0 { 'S' } else { 'T' };
-        // Reset attributes first so the cells the terminal exposes are erased with
-        // the default background, which is what the screen model assumes.
-        if full_width(*region) {
-            write!(
-                writer,
-                "\x1b[?25l\x1b[0m\x1b[{};{}r\x1b[{}{command}\x1b[r",
-                u32::from(region.y) + 1,
-                u32::from(region.bottom()),
-                rows.unsigned_abs(),
-            )?;
-        } else {
-            write!(
-                writer,
-                "\x1b[?25l\x1b[0m\x1b[?69h\x1b[{};{}s\x1b[{};{}r\x1b[{}{command}\x1b[r\x1b[s\x1b[?69l",
-                u32::from(region.x) + 1,
-                u32::from(region.right()),
-                u32::from(region.y) + 1,
-                u32::from(region.bottom()),
-                rows.unsigned_abs(),
-            )?;
-        }
+        write_scroll(writer, *region, *rows, full_width(*region))?;
     }
     // The diff reads the model only in its scope (and a wide grapheme's other half beside it),
     // so only those cells of the scrolled screen are built when the scope is known.
@@ -493,6 +472,38 @@ pub(crate) fn scroll_moves_diff(
     }
     let diff = write_ansi_cells_diff(writer, model, current, cursor, depth, scope.as_deref())?;
     Ok((diff, emitted))
+}
+
+/// Move the terminal's cells of `region` by `rows` (positive up) with a scroll region: full rows
+/// when `full_width`, otherwise inside left/right margins (DECLRMM with DECSLRM).
+pub(crate) fn write_scroll(
+    writer: &mut impl Write,
+    region: crate::geometry::Rect,
+    rows: i64,
+    full_width: bool,
+) -> io::Result<()> {
+    let command = if rows > 0 { 'S' } else { 'T' };
+    // Reset attributes first so the cells the terminal exposes are erased with
+    // the default background, which is what the screen model assumes.
+    if full_width {
+        write!(
+            writer,
+            "\x1b[?25l\x1b[0m\x1b[{};{}r\x1b[{}{command}\x1b[r",
+            u32::from(region.y) + 1,
+            u32::from(region.bottom()),
+            rows.unsigned_abs(),
+        )
+    } else {
+        write!(
+            writer,
+            "\x1b[?25l\x1b[0m\x1b[?69h\x1b[{};{}s\x1b[{};{}r\x1b[{}{command}\x1b[r\x1b[s\x1b[?69l",
+            u32::from(region.x) + 1,
+            u32::from(region.right()),
+            u32::from(region.y) + 1,
+            u32::from(region.bottom()),
+            rows.unsigned_abs(),
+        )
+    }
 }
 
 /// Set row `y`, `columns`, of `model` to what the terminal shows there after `moves` (regions
@@ -578,7 +589,7 @@ fn write_ansi_cells_diff(
     })
 }
 
-fn write_ansi_cursor(writer: &mut impl Write, cursor: Option<Cursor>) -> io::Result<()> {
+pub(crate) fn write_ansi_cursor(writer: &mut impl Write, cursor: Option<Cursor>) -> io::Result<()> {
     if let Some(cursor) = cursor {
         write_ansi_move_to(writer, cursor.position)?;
         if cursor.visible {
@@ -696,7 +707,7 @@ fn changed_row_suffix(
     Some((start, end))
 }
 
-fn emit_row_span(
+pub(crate) fn emit_row_span(
     writer: &mut impl Write,
     buffer: &Buffer,
     y: u16,
@@ -1128,7 +1139,7 @@ fn write_style_difference(writer: &mut impl Write, from: Style, to: Style) -> io
     writer.write_all(b"m")
 }
 
-fn write_ansi_style(
+pub(crate) fn write_ansi_style(
     writer: &mut impl Write,
     style: Style,
     depth: TerminalColorDepth,
