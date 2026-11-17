@@ -1,7 +1,7 @@
 # Pane output performance plan
 
-Status: phases 0 through 4 are implemented except phase 4's single renderer, which is planned
-in [Phase 5](#phase-5-one-renderer) (see [Progress](#progress)).
+Status: phases 0 through 5 are implemented; phase 4's single renderer landed as
+[Phase 5](#phase-5-one-renderer) (see [Progress](#progress)).
 
 A full-screen application in a large pane (420×90, 37,800 cells) feels laggy inside bmux and
 smooth in the same terminal without it. The application is not the cost: a code review scrolled
@@ -211,13 +211,13 @@ Each step lands on its own, with numbers from `pipeline_bench`, bcode's screen b
    Render statistics and traces map onto the new stages, so `bmux perf` keeps its fields.
 
 Steps 1 to 4 change only bmux_tui and are measured in bcode first. Steps 5 to 8 change the
-attach client, keep the old renderer reachable until step 8, and delete it then.
+attach client; the old renderer stayed reachable until step 8 and is deleted.
 
 **The presenter replaces the renderer's bytes only when it beats them everywhere:** on every
 corpus of the pipeline benchmark and in `bmux-bench replay`, it must take less client time and
 write no more bytes than the renderer's own output, as well as show the same screen.
 
-### How steps 5 and 6 landed
+### How steps 5 to 8 landed
 
 `Terminal` keeps a model of the screen, so pane content cannot move onto it while borders,
 extensions and overlays still write their own bytes beside it. Instead of a new compositor, the
@@ -245,17 +245,32 @@ Since then:
 * Pane images (Kitty, Sixel, iTerm2) and extension graphic overlays are placed through the
   terminal's output hooks. Imperative render extensions, which wrote their own bytes, are
   gone; nothing falls back to the renderer's own bytes.
+* The host's terminal is the only record of what the host shows. A frame painted in place
+  marks only the cells a write changes, so the renderer keeps no copy of the rows it drew
+  (`ShownRow`, `prev_rows` and the row output plans are gone): it captures every row the grid
+  changed whole, straight from the grid, and a pane remembers only whether its rows are drawn.
+  A grid rebuilt from a snapshot (the scene pipeline, playbook traces) keeps only its changes
+  since the grid drawn before it.
+* An observed client's observer keeps the same frame: it applies the change the host's terminal
+  made (its moves, then its changed cells copied from the terminal's cells) to its own copy,
+  instead of painting the captured operations again. Its copy shares cells with the frame it
+  publishes, and starts from a spare grid brought up to date rather than a copy of the screen.
+  Both paint captured operations the same way where they do paint them (a headless client).
 
 Instructions per frame at 420x90 (`pipeline_bench_loop` under `/usr/bin/time -l`, which other
-load does not change), and bytes out per byte the application wrote:
+load does not change; `BMUX_BENCH_MODE=observed` adds an observer), and bytes out per byte the
+application wrote:
 
-| Corpus | Renderer's bytes | Presenter |
-|---|---|---|
-| SU scroll | 2.0M, x1.31 | 1.6M (0.77), x1.00 |
-| Plain stream | 1.9M, x1.41 | 1.6M (0.87), x1.10 |
-| Full repaint | 54M, x1.31 | 30M (0.56), x0.99 |
-| Review, unified | 15.9M, x1.01 | 14.8M (0.93), x0.68 |
-| Review, side by side | 16.6M, x0.96 | 14.9M (0.90), x0.61 |
+| Corpus | Renderer's bytes | Presenter, at the switch | Now | Now, observed |
+| --- | --- | --- | --- | --- |
+| SU scroll | 2.0M, x1.31 | 1.6M, x1.00 | 1.29M (0.65), x1.00 | 2.64M |
+| Plain stream | 1.9M, x1.41 | 1.6M, x1.10 | 1.39M (0.73), x1.10 | 2.68M |
+| Full repaint | 54M, x1.31 | 30M, x0.99 | 23.8M (0.44), x0.99 | 27.3M |
+| Review, unified | 15.9M, x1.01 | 14.8M, x0.68 | 13.36M (0.84), x0.68 | 15.08M |
+| Review, side by side | 16.6M, x0.96 | 14.9M, x0.61 | 13.66M (0.82), x0.61 | 15.40M |
+
+An observer used to add 4.8M a frame on a scroll and 6.1M on a review (two copies of the screen
+and a second paint); it now adds 1.3M to 1.7M (3.5M on a full repaint).
 
 Live with `bmux-bench replay` (render start to host p50), the presenter matches the renderer's
 own bytes on a review (1.05 to 1.23 ms against 1.07 to 1.56 ms) and on a scroll (0.39 ms
@@ -309,15 +324,20 @@ Implemented, each with its numbers in its commit:
   `Terminal` (`FramePresenter`), including observed clients, the recording and mobile scene
   pipelines and playbook traces; graphics go through its output hooks. Imperative render
   extensions and the renderer's byte encoding (SGR and cursor writes, row strings, host scroll
-  emission, the command optimizer) are deleted. Instructions per frame at 420x90 after the
-  deletion: SU scroll 1.54M, plain stream 1.65M, full repaint 30.0M, review 14.16M and 14.30M.
+  emission, the command optimizer) are deleted, and so is its copy of the rows it drew: the
+  host's terminal is the only record of what the host shows, and an observer keeps the frame
+  the terminal presented by applying the change it made. Instructions per frame at 420x90: SU
+  scroll 1.29M, plain stream 1.39M, full repaint 23.8M, review 13.36M and 13.66M.
 
 At 420x90, SU scroll, the attach client renders in about 1 ms and writes 12 KB a frame (from
 2.9 ms and 169 KB); a review scroll writes about what the application wrote (x1.0, from x4.2).
 
+`bmux perf` keeps its fields except `pane_row_segments_emitted`: rows are drawn whole and the
+host's terminal decides which cells to write, so `pane_rows_emitted` and `pane_cells_emitted`
+count the rows and cells drawn.
+
 Not done:
 
-* The observer still receives the capture rather than a shared frame (the rest of step 8).
 * Output events (`OutputAvailable`) are still JSON-encoded and broadcast; clients that have their
   output pushed ignore them.
 * The end-to-end budget (p95 4 ms) was measured only on a loaded machine; quiet-machine numbers

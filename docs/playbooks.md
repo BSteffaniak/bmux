@@ -718,7 +718,8 @@ as `full-frame` and `pane-row-segment:<pane>:<row>:<start_col>:<cells>`; the
 same
 compact format also covers actual attach-render trace ops such as `status-line`,
 `help-overlay`, and `extension-cached-replay:<surface>` for trace-backed
-summaries.
+summaries. Trace-backed summaries draw pane rows whole (`pane-row-full`): the
+host's terminal writes only the cells that change.
 
 ```
 @render-trace true
