@@ -11001,6 +11001,21 @@ fn request_native_presentation_retry(
     }
 }
 
+/// A frame the presenter could not show reached neither the host nor an observer. Its
+/// baselines were invalidated, so the next frame repaints in full; it is retried on the next
+/// source or viewport event rather than at once, which would only be rejected again.
+fn recover_presenter_rejection(view: &mut AttachViewState, error: &anyhow::Error) -> bool {
+    let Some(rejection) = error.downcast_ref::<super::presenter::PresenterRejected>() else {
+        return false;
+    };
+    tracing::warn!(reason = %rejection.0, "attach frame was not presented");
+    if let Some(observer) = &mut view.observer {
+        observer.report_rejection(Some(&error.to_string()));
+    }
+    view.dirty.clear_frame_damage();
+    true
+}
+
 fn recover_browser_rejection(view: &mut AttachViewState, error: &anyhow::Error) -> bool {
     if view.observer.is_none()
         || error
@@ -11049,7 +11064,7 @@ pub fn render_attach_frame_to_writer<W: Write + ?Sized>(
 
 #[allow(clippy::too_many_arguments)] // Common retained composition with explicit optional terminal output.
 fn render_attach_frame_to_output(
-    mut terminal_writer: Option<&mut dyn Write>,
+    terminal_writer: Option<&mut dyn Write>,
     view_state: &mut AttachViewState,
     layout_state: &AttachLayoutState,
     runtime_appearance: &RuntimeAppearance,
@@ -11059,7 +11074,7 @@ fn render_attach_frame_to_output(
     slow_terminal_write_ms: u64,
     display_capture: &mut DisplayCaptureFanout,
     geometry: TerminalGeometry,
-    mut render_trace: Option<&mut AttachRenderTrace>,
+    render_trace: Option<&mut AttachRenderTrace>,
 ) -> Result<AttachFrameRenderStats> {
     view_state.driver_geometry = Some(geometry);
     // A retained publication is a complete view, not a mixture of committed
@@ -11074,88 +11089,39 @@ fn render_attach_frame_to_output(
     view_state.pointer_shape = super::pointer_shape::resolve(view_state);
     let previous = view_state.retained_compositor.clone();
     let previous_focus = view_state.plugin_focus.clone();
-    // A frame the presenter rejects reached nothing: it is rendered again, at once, as the
-    // renderer's own bytes (the rejection paused the presenter, so the loop runs at most twice).
-    let (result, _operations) = loop {
-        let observing = view_state.observer.is_some();
-        super::presenter::begin_frame(view_state);
-        let attempt = if view_state.presentation_only || view_state.presenting {
-            let presenting = view_state.presenting;
-            bmux_attach_pipeline::projection::capture_neutral(|| {
-                let mut render = || {
-                    render_attach_frame_inner(
-                        terminal_writer.as_deref_mut(),
-                        view_state,
-                        layout_state,
-                        runtime_appearance,
-                        help_lines,
-                        help_scroll,
-                        damage_config,
-                        slow_terminal_write_ms,
-                        display_capture,
-                        geometry,
-                        render_trace.as_deref_mut(),
-                    )
-                };
-                // A presented frame writes graphics around its captured cells.
-                if presenting {
-                    bmux_attach_pipeline::projection::with_graphics_output(render)
-                } else {
-                    render()
-                }
-            })
-        } else if observing || view_state.presenter_paused {
-            // While the presenter is paused, frames also capture: what they record says when a
-            // terminal frame can show them again.
-            bmux_attach_pipeline::projection::capture(|| {
-                render_attach_frame_inner(
-                    terminal_writer.as_deref_mut(),
-                    view_state,
-                    layout_state,
-                    runtime_appearance,
-                    help_lines,
-                    help_scroll,
-                    damage_config,
-                    slow_terminal_write_ms,
-                    display_capture,
-                    geometry,
-                    render_trace.as_deref_mut(),
-                )
-            })
-        } else {
-            (
-                render_attach_frame_inner(
-                    terminal_writer.as_deref_mut(),
-                    view_state,
-                    layout_state,
-                    runtime_appearance,
-                    help_lines,
-                    help_scroll,
-                    damage_config,
-                    slow_terminal_write_ms,
-                    display_capture,
-                    geometry,
-                    render_trace.as_deref_mut(),
-                ),
-                Vec::new(),
+    super::presenter::begin_frame(view_state);
+    let presenting = view_state.presenting;
+    let (result, _operations) = bmux_attach_pipeline::projection::capture_neutral(|| {
+        let render = || {
+            render_attach_frame_inner(
+                terminal_writer,
+                view_state,
+                layout_state,
+                runtime_appearance,
+                help_lines,
+                help_scroll,
+                damage_config,
+                slow_terminal_write_ms,
+                display_capture,
+                geometry,
+                render_trace,
             )
         };
-        if let Err(error) = &attempt.0
-            && error
-                .downcast_ref::<super::presenter::PresenterRejected>()
-                .is_some()
-        {
-            restore_unpresented_frame(view_state, &previous, &previous_focus);
-            continue;
+        // A presented frame writes graphics around its captured cells.
+        if presenting {
+            bmux_attach_pipeline::projection::with_graphics_output(render)
+        } else {
+            render()
         }
-        break attempt;
-    };
+    });
     if let Err(error) = &result {
         restore_unpresented_frame(view_state, &previous, &previous_focus);
         view_state
             .dirty
             .mark_full_frame(AttachDirtySource::PluginCommand);
-        if recover_browser_rejection(view_state, error) {
+        if recover_browser_rejection(view_state, error)
+            || recover_presenter_rejection(view_state, error)
+        {
             return Ok(AttachFrameRenderStats::default());
         }
         return result;
@@ -11258,8 +11224,7 @@ fn acknowledge_plugin_surface_output(view_state: &AttachViewState) {
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn render_attach_frame_inner(
-    // Its own lifetime for the writer's: a frame rendered again reborrows the same writer.
-    terminal_writer: Option<&mut (dyn Write + '_)>,
+    terminal_writer: Option<&mut dyn Write>,
     view_state: &mut AttachViewState,
     layout_state: &AttachLayoutState,
     runtime_appearance: &RuntimeAppearance,
@@ -11767,82 +11732,73 @@ fn render_attach_frame_inner(
         && view_state.pointer_shape == view_state.last_pointer_shape;
     let write_result = if observer_unchanged {
         Ok(())
-    } else if view_state.presenting {
-        let operations = bmux_attach_pipeline::projection::staged_operations();
-        let margins = terminal_render_capabilities(view_state).left_right_margins;
-        let graphics = bmux_attach_pipeline::projection::take_graphics_output();
-        images_before.extend_from_slice(&graphics.before);
-        images_after.extend_from_slice(&graphics.after);
-        match super::presenter::present(
-            view_state,
-            &super::presenter::CapturedFrame {
-                operations: &operations,
-                cursor: pending_cursor_state,
-                full: frame_damage.is_full_frame(),
-                size: terminal_size,
-                margins,
-                graphics: super::presenter::Graphics {
-                    before: &images_before,
-                    after: &images_after,
-                },
-            },
-        ) {
-            super::presenter::Presented::Frame(bytes) => {
-                frame_bytes = bytes;
-                bmux_attach_pipeline::terminal::write_frame(
-                    terminal_writer
-                        .context("terminal output is unavailable for encoded presentation")?,
-                    &frame_bytes,
-                )
-                .context("failed writing or flushing attach frame")
-            }
-            super::presenter::Presented::Unchanged => Ok(()),
-            super::presenter::Presented::Unsupported(reason) => {
-                // Nothing reached the host: the frame is rendered again in full, as bytes.
-                tracing::debug!(%reason, "attach frame needs the renderer's own bytes");
-                view_state.presenter_paused = true;
-                for buffer in view_state.pane_buffers.values_mut() {
-                    buffer.prev_rows.clear();
-                }
-                view_state
-                    .dirty
-                    .mark_full_frame(AttachDirtySource::ManualRedraw);
-                return Err(super::presenter::PresenterRejected.into());
-            }
-        }
-    } else if view_state.observer.is_some() || view_state.presentation_only {
-        let cursor = view_state.last_cursor_state;
-        view_state.last_cursor_state = pending_cursor_state;
-        let operations = bmux_attach_pipeline::projection::staged_operations();
-        let headless = view_state.presentation_only;
-        let delivered = super::observer::deliver_prepared(
-            view_state,
-            layout_state,
-            geometry,
-            &operations,
-            || {
-                if headless {
-                    Ok(())
-                } else {
-                    bmux_attach_pipeline::terminal::write_frame(
-                        terminal_writer
-                            .context("terminal output is unavailable for encoded presentation")?,
-                        &frame_bytes,
-                    )
-                    .context("failed writing or flushing attach frame")
-                }
-            },
-        );
-        if delivered.is_err() {
-            view_state.last_cursor_state = cursor;
-        }
-        delivered
     } else {
-        bmux_attach_pipeline::terminal::write_frame(
-            terminal_writer.context("terminal output is unavailable for encoded presentation")?,
-            &frame_bytes,
-        )
-        .context("failed writing or flushing attach frame")
+        let operations = bmux_attach_pipeline::projection::staged_operations();
+        if view_state.presenting {
+            let margins = terminal_render_capabilities(view_state).left_right_margins;
+            let graphics = bmux_attach_pipeline::projection::take_graphics_output();
+            images_before.extend_from_slice(&graphics.before);
+            images_after.extend_from_slice(&graphics.after);
+            frame_bytes = match super::presenter::present(
+                view_state,
+                &super::presenter::CapturedFrame {
+                    operations: &operations,
+                    cursor: pending_cursor_state,
+                    full: frame_damage.is_full_frame(),
+                    size: terminal_size,
+                    margins,
+                    graphics: super::presenter::Graphics {
+                        before: &images_before,
+                        after: &images_after,
+                    },
+                },
+            ) {
+                super::presenter::Presented::Frame(bytes) => bytes,
+                super::presenter::Presented::Unchanged => Vec::new(),
+                super::presenter::Presented::Unsupported(reason) => {
+                    // Nothing reached the host: the next frame repaints every row.
+                    for buffer in view_state.pane_buffers.values_mut() {
+                        buffer.prev_rows.clear();
+                    }
+                    super::presenter::forget(view_state);
+                    return Err(super::presenter::PresenterRejected(reason).into());
+                }
+            };
+        }
+        let write = |terminal_writer: Option<&mut (dyn Write + '_)>, bytes: &[u8]| {
+            if bytes.is_empty() {
+                return Ok(());
+            }
+            bmux_attach_pipeline::terminal::write_frame(
+                terminal_writer.context("terminal output is unavailable for encoded presentation")?,
+                bytes,
+            )
+            .context("failed writing or flushing attach frame")
+        };
+        if view_state.observer.is_some() || view_state.presentation_only {
+            let cursor = view_state.last_cursor_state;
+            view_state.last_cursor_state = pending_cursor_state;
+            let headless = view_state.presentation_only;
+            let delivered = super::observer::deliver_prepared(
+                view_state,
+                layout_state,
+                geometry,
+                &operations,
+                || {
+                    if headless {
+                        Ok(())
+                    } else {
+                        write(terminal_writer, &frame_bytes)
+                    }
+                },
+            );
+            if delivered.is_err() {
+                view_state.last_cursor_state = cursor;
+            }
+            delivered
+        } else {
+            write(terminal_writer, &frame_bytes)
+        }
     };
     if let Err(error) = write_result {
         #[cfg(any(
@@ -11873,13 +11829,6 @@ fn render_attach_frame_inner(
     view_state.last_cursor_state = pending_cursor_state;
     view_state.last_pointer_shape = view_state.pointer_shape;
     view_state.terminal_graphics_cache = pending_graphics_cache;
-    if !view_state.presenting {
-        super::presenter::rendered_as_bytes(
-            view_state,
-            frame_damage.is_full_frame(),
-            &bmux_attach_pipeline::projection::staged_operations(),
-        );
-    }
     #[cfg(any(
         feature = "image-sixel",
         feature = "image-kitty",
@@ -19251,7 +19200,7 @@ mod tests {
     }
 
     #[test]
-    fn frames_presented_through_a_terminal_show_what_the_renderer_draws() {
+    fn incremental_frames_show_what_a_full_repaint_shows() {
         let panes = [Uuid::new_v4(), Uuid::new_v4()];
         let open = || {
             let mut state = AttachViewState::with_private_presentation(AttachOpenInfo {
@@ -19262,9 +19211,10 @@ mod tests {
             install_bundled_render_extensions(&mut state);
             state
         };
+        // `drawn` repaints in full from a blank screen every frame: the reference for what the
+        // incremental frames of `presented` must show.
         let mut drawn = open();
         let mut presented = open();
-        presented.terminal_presenter = Some(super::super::presenter::terminal());
         let layout = presenter_test_layout(&mut drawn, panes);
         presenter_test_layout(&mut presented, panes);
         let screen = || {
@@ -19299,6 +19249,8 @@ mod tests {
             PresenterTestStep::Output(1, b"\r\nafter the prompt".to_vec()),
         ];
         for (index, step) in steps.iter().enumerate() {
+            drawn.terminal_presenter.forget();
+            screens[0] = screen();
             for (state, screen) in [&mut drawn, &mut presented].into_iter().zip(&mut screens) {
                 apply_presenter_test_step(state, panes, step);
                 let mut bytes = Vec::new();
@@ -19323,7 +19275,7 @@ mod tests {
                 assert_eq!(
                     presenter_test_row(&screens[1], row),
                     presenter_test_row(&screens[0], row),
-                    "step {index}, row {row}: presented\n{}\ndrawn\n{}",
+                    "step {index}, row {row}: presented\n{}\nrepainted\n{}",
                     bmux_terminal_grid::visible_text(screens[1].grid(), 0, 24),
                     bmux_terminal_grid::visible_text(screens[0].grid(), 0, 24),
                 );
@@ -19555,6 +19507,8 @@ mod tests {
         );
         let committed = observer.latest().unwrap();
         let revision = committed.revision;
+        // A frame that changes nothing writes nothing: repaint so there is output to fail.
+        state.dirty.mark_full_frame(AttachDirtySource::ManualRedraw);
         let result = render_attach_frame_to_writer(
             &mut FailingWriter { fail_flush: true },
             &mut state,
@@ -19778,34 +19732,13 @@ mod tests {
     #[cfg(feature = "image-sixel")]
     #[test]
     fn historical_images_are_emitted_and_cleared_by_attachment_frames() {
-        historical_image_frames(false);
-    }
-
-    #[cfg(feature = "image-sixel")]
-    #[test]
-    fn raster_images_are_emitted_and_cleared_through_the_terminal_presenter() {
-        historical_image_frames(true);
-    }
-
-    #[cfg(feature = "image-sixel")]
-    fn historical_image_frames(presented: bool) {
         let session = Uuid::new_v4();
         let pane = Uuid::new_v4();
-        // Presented frames use private registries: an extension another test registered
-        // globally could be one a terminal frame cannot show.
-        let info = bmux_client::AttachOpenInfo {
+        let mut state = AttachViewState::new(bmux_client::AttachOpenInfo {
             session_id: session,
             context_id: None,
             can_write: true,
-        };
-        let mut state = if presented {
-            AttachViewState::with_private_presentation(info)
-        } else {
-            AttachViewState::new(info)
-        };
-        // The other variant covers the renderer's own bytes, the fallback.
-        state.terminal_presenter = presented.then(super::super::presenter::terminal);
-        state.presenting = presented;
+        });
         let layout = retry_test_layout(&mut state, pane, session);
         state.host_image_caps = bmux_image::host_caps::HostImageCapabilities {
             sixel: true,
@@ -19884,10 +19817,7 @@ mod tests {
                 assert!(begin < clear, "raster deletion must be inside the frame");
             }
             assert_eq!(state.pane_images_presented, visible);
-            assert_eq!(
-                state.presenting, presented,
-                "frames went through the presenter"
-            );
+            assert!(state.presenting, "frames went through the presenter");
         }
     }
 
@@ -19930,34 +19860,13 @@ mod tests {
     #[cfg(feature = "image-kitty")]
     #[test]
     fn kitty_pane_images_survive_idle_redraw_and_slide_navigation_without_ed2() {
-        kitty_pane_image_frames(false);
-    }
-
-    #[cfg(feature = "image-kitty")]
-    #[test]
-    fn kitty_pane_images_are_placed_through_the_terminal_presenter() {
-        kitty_pane_image_frames(true);
-    }
-
-    #[cfg(feature = "image-kitty")]
-    fn kitty_pane_image_frames(presented: bool) {
         let session = Uuid::new_v4();
         let pane = Uuid::new_v4();
-        // Presented frames use private registries: an extension another test registered
-        // globally could be one a terminal frame cannot show.
-        let info = bmux_client::AttachOpenInfo {
+        let mut state = AttachViewState::new(bmux_client::AttachOpenInfo {
             session_id: session,
             context_id: None,
             can_write: true,
-        };
-        let mut state = if presented {
-            AttachViewState::with_private_presentation(info)
-        } else {
-            AttachViewState::new(info)
-        };
-        // The other variant covers the renderer's own bytes, the fallback.
-        state.terminal_presenter = presented.then(super::super::presenter::terminal);
-        state.presenting = presented;
+        });
         let layout = retry_test_layout(&mut state, pane, session);
         state.host_image_caps.kitty_graphics = true;
         let image = bmux_attach_image_protocol::AttachPaneImage {
@@ -20005,10 +19914,7 @@ mod tests {
                 !state.pane_images_presented,
                 "Kitty marked as raster footprint"
             );
-            assert_eq!(
-                state.presenting, presented,
-                "frames went through the presenter"
-            );
+            assert!(state.presenting, "frames went through the presenter");
         }
     }
 

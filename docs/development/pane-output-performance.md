@@ -229,10 +229,9 @@ paints into a bmux_tui presentation:
 * A pane's scroll is captured as a cell move (`PaintCx::move_cells`), which `Terminal` emits as a
   scroll region (one per pane, inside margins where the host has them) and diffs only the cells
   painted besides; pane rows are captured as runs of cells with the widths their grid measured.
-* The attach client presents frames this way by default (`BMUX_ATTACH_PRESENTER=bytes` asks
-  for the renderer's own bytes). A frame holding what a terminal frame cannot show is rendered
-  again at once as the renderer's own bytes, and frames stay on bytes until a full frame holds
-  none of it.
+* The attach client presents every host frame this way, an observed client's too. A frame
+  holding what a terminal frame cannot show (a capture over its budget, a rejected local zoom)
+  is not presented; the next frame repaints in full.
 
 Since then:
 
@@ -244,8 +243,8 @@ Since then:
 * Grid rows carry a changed flag, so the renderer resolves only the rows the grid changed since
   they were drawn, in both paths.
 * Pane images (Kitty, Sixel, iTerm2) and extension graphic overlays are placed through the
-  terminal's output hooks; only imperative extensions and rejected projections fall back to the
-  renderer's own bytes.
+  terminal's output hooks. Imperative render extensions, which wrote their own bytes, are
+  gone; nothing falls back to the renderer's own bytes.
 
 Instructions per frame at 420x90 (`pipeline_bench_loop` under `/usr/bin/time -l`, which other
 load does not change), and bytes out per byte the application wrote:

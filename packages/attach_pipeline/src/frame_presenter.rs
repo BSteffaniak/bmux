@@ -20,6 +20,9 @@ pub struct FramePresenter {
     terminal: Terminal<Vec<u8>>,
     /// The cursor the last presented frame left on the host.
     cursor: Option<AttachCursorState>,
+    /// A frame was presented since the presenter was made or last forgot: the next frame can be
+    /// painted over it rather than over a blank screen.
+    shown: bool,
 }
 
 impl Default for FramePresenter {
@@ -78,6 +81,7 @@ impl FramePresenter {
         Self {
             terminal,
             cursor: None,
+            shown: false,
         }
     }
 
@@ -144,6 +148,7 @@ impl FramePresenter {
         };
         if drawn.is_ok() {
             self.cursor = cursor;
+            self.shown = true;
             Presented::Frame(std::mem::take(self.terminal.writer_mut()))
         } else {
             self.forget();
@@ -156,6 +161,14 @@ impl FramePresenter {
     pub fn forget(&mut self) {
         self.terminal.reset();
         self.cursor = None;
+        self.shown = false;
+    }
+
+    /// Whether a frame was presented since the presenter was made or last forgot. Until one is,
+    /// frames must be full: they are painted over a blank screen.
+    #[must_use]
+    pub const fn shown(&self) -> bool {
+        self.shown
     }
 }
 
@@ -194,4 +207,107 @@ pub fn capture_frame<T>(render: impl FnOnce() -> T) -> (T, Vec<PaintOperation>, 
         })
     });
     (result, operations, graphics)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CapturedFrame, FramePresenter, Graphics, Presented};
+    use crate::AttachCursorState;
+    use crate::projection::{PaintOperation, ProjectionFailure};
+    use bmux_tui::style::Style;
+
+    fn frame(
+        operations: &[PaintOperation],
+        cursor: Option<AttachCursorState>,
+        full: bool,
+    ) -> CapturedFrame<'_> {
+        CapturedFrame {
+            operations,
+            cursor,
+            full,
+            size: (10, 2),
+            margins: false,
+            graphics: Graphics::default(),
+        }
+    }
+
+    fn text(x: u16, y: u16, text: &str) -> PaintOperation {
+        PaintOperation::Text {
+            x,
+            y,
+            text: text.to_owned(),
+            style: Style::new(),
+        }
+    }
+
+    #[test]
+    fn frames_write_what_changed_and_nothing_when_nothing_did() {
+        let mut presenter = FramePresenter::new();
+        assert!(!presenter.shown());
+        let cursor = Some(AttachCursorState {
+            x: 1,
+            y: 1,
+            visible: true,
+        });
+        let Presented::Frame(first) =
+            presenter.present(&frame(&[text(0, 0, "hello")], cursor, true))
+        else {
+            panic!("the first frame is presented");
+        };
+        assert!(String::from_utf8_lossy(&first).contains("hello"));
+        assert!(presenter.shown());
+        assert!(matches!(
+            presenter.present(&frame(&[], cursor, false)),
+            Presented::Unchanged
+        ));
+        let Presented::Frame(edit) =
+            presenter.present(&frame(&[text(0, 1, "world")], cursor, false))
+        else {
+            panic!("an edit is presented");
+        };
+        let edit = String::from_utf8_lossy(&edit);
+        assert!(
+            edit.contains("world") && !edit.contains("hello"),
+            "{edit:?}"
+        );
+        let moved = Some(AttachCursorState {
+            x: 2,
+            y: 0,
+            visible: true,
+        });
+        assert!(matches!(
+            presenter.present(&frame(&[], moved, false)),
+            Presented::Frame(_)
+        ));
+    }
+
+    #[test]
+    fn rejected_frames_present_nothing_and_forgetting_repaints() {
+        let mut presenter = FramePresenter::new();
+        assert!(matches!(
+            presenter.present(&frame(&[text(0, 0, "kept")], None, true)),
+            Presented::Frame(_)
+        ));
+        let rejected = [PaintOperation::Rejected(ProjectionFailure::Budget {
+            resource: "operations",
+            used: 2,
+            limit: 1,
+        })];
+        assert!(matches!(
+            presenter.present(&frame(&rejected, None, false)),
+            Presented::Unsupported(ProjectionFailure::Budget { .. })
+        ));
+        assert!(
+            presenter.shown(),
+            "a rejected frame leaves the last one shown"
+        );
+        presenter.forget();
+        assert!(!presenter.shown());
+        let Presented::Frame(repaint) =
+            presenter.present(&frame(&[text(0, 0, "kept")], None, true))
+        else {
+            panic!("a full frame after forgetting is presented");
+        };
+        assert!(String::from_utf8_lossy(&repaint).contains("kept"));
+    }
 }
