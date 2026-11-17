@@ -57,14 +57,6 @@ impl std::fmt::Display for ProjectionFailure {
     }
 }
 
-/// Graphics protocol bytes of a frame: removals, written before the frame's cells, and
-/// transmissions and placements, written after them.
-#[derive(Debug, Default)]
-pub struct GraphicsOutput {
-    pub before: Vec<u8>,
-    pub after: Vec<u8>,
-}
-
 /// Lower only original retained paint, never flattened root cells.
 ///
 /// Each span is sparse and retains its optional background. Clips are applied again against

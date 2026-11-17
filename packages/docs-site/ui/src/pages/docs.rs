@@ -124,7 +124,7 @@ mod tests {
         let doc = generate_config_reference();
 
         assert!(doc.contains("mouse.enabled"));
-        assert!(doc.contains("images.decode_mode"));
+        assert!(doc.contains("images.max_image_bytes"));
         assert!(doc.contains("compression.remote"));
         assert!(doc.contains("export.cursor"));
         assert!(doc.contains("routing.conflict_mode"));

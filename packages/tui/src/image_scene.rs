@@ -100,7 +100,7 @@ impl ImageScene {
         #[cfg(test)]
         RECONCILE_WORK.with(|work| work.set((work.get().0 + 1, work.get().1)));
         let previous = self.active.clone();
-        self.apply_contributions(contributions);
+        self.apply_contributions(contributions, true);
         #[cfg(test)]
         RECONCILE_WORK.with(|work| work.set((work.get().0, work.get().1 + 1)));
         let upserted = self
@@ -117,7 +117,9 @@ impl ImageScene {
 
         ImageSceneDelta { upserted, removed }
     }
-    fn apply_contributions(&mut self, contributions: &[ImageContribution]) {
+    /// Apply `contributions` to the sources; when they are a frame's `complete` image set,
+    /// frame-scoped images they omit are removed.
+    fn apply_contributions(&mut self, contributions: &[ImageContribution], complete: bool) {
         if self.sources.is_empty() && self.visibility_sources.is_empty() {
             // Older serialized scenes contain only the original active map.
             self.sources.clone_from(&self.active);
@@ -131,7 +133,9 @@ impl ImageScene {
             .collect::<BTreeSet<_>>();
 
         self.sources.retain(|key, placement| {
-            placement.lifecycle == ImageLifecycle::Persistent || contributed_keys.contains(key)
+            !complete
+                || placement.lifecycle == ImageLifecycle::Persistent
+                || contributed_keys.contains(key)
         });
 
         for contribution in contributions {
@@ -170,12 +174,34 @@ impl ImageScene {
         self.reconcile_occluded_regions(contributions, occlusions, None)
     }
 
+    /// [`Self::reconcile_occluded`] for a frame painted in place whose contributions may not be
+    /// its `complete` image set: an incomplete one changes only the images it contributes or
+    /// removes, keeping the rest. Either way the frame's occlusions alone decide visibility.
+    pub(crate) fn reconcile_painted_over(
+        &mut self,
+        contributions: &[ImageContribution],
+        occlusions: &[(usize, crate::geometry::Rect)],
+        complete: bool,
+    ) -> ImageSceneDelta {
+        self.reconcile_occluded_inner(contributions, occlusions, None, complete)
+    }
+
     /// Retain the already-occluded visibility of sources outside a regional patch.
     pub(crate) fn reconcile_occluded_regions(
         &mut self,
         contributions: &[ImageContribution],
         occlusions: &[(usize, crate::geometry::Rect)],
         regional: Option<(&[crate::geometry::Rect], usize)>,
+    ) -> ImageSceneDelta {
+        self.reconcile_occluded_inner(contributions, occlusions, regional, true)
+    }
+
+    fn reconcile_occluded_inner(
+        &mut self,
+        contributions: &[ImageContribution],
+        occlusions: &[(usize, crate::geometry::Rect)],
+        regional: Option<(&[crate::geometry::Rect], usize)>,
+        complete: bool,
     ) -> ImageSceneDelta {
         #[cfg(test)]
         RECONCILE_WORK.with(|work| work.set((work.get().0 + 1, work.get().1)));
@@ -191,7 +217,7 @@ impl ImageScene {
                     .push(placement.clip.intersection(placement.destination));
             }
         }
-        self.apply_contributions(contributions);
+        self.apply_contributions(contributions, complete);
         let mut painted_at = BTreeMap::new();
         for (index, contribution) in contributions.iter().enumerate() {
             if let ImageContribution::Present(placement) = contribution {

@@ -58,61 +58,6 @@ type PreparedOutput = dyn FnMut(bmux_frontend_runtime::presentation::PreparedDel
     + Send
     + Sync;
 
-#[cfg(any(
-    test,
-    feature = "image-sixel",
-    feature = "image-kitty",
-    feature = "image-iterm2"
-))]
-#[derive(Default)]
-struct ImagePayloadCache {
-    entries: Vec<(
-        bmux_attach_image_protocol::AttachPaneImage,
-        bmux_tui::image::ImagePayload,
-    )>,
-    bytes: usize,
-}
-
-#[cfg(any(
-    test,
-    feature = "image-sixel",
-    feature = "image-kitty",
-    feature = "image-iterm2"
-))]
-impl ImagePayloadCache {
-    fn get_or_decode(
-        &mut self,
-        image: &bmux_attach_image_protocol::AttachPaneImage,
-        decode: impl FnOnce() -> Result<bmux_tui::image::ImagePayload, String>,
-    ) -> Result<bmux_tui::image::ImagePayload, String> {
-        if let Some((_, payload)) = self.entries.iter().find(|(source, _)| {
-            source.protocol == image.protocol
-                && source.compression == image.compression
-                && source.pixel_width == image.pixel_width
-                && source.pixel_height == image.pixel_height
-                && source.raw_data == image.raw_data
-        }) {
-            return Ok(payload.clone());
-        }
-        let payload = decode()?;
-        let size = image.raw_data.len().saturating_add(match &payload {
-            bmux_tui::image::ImagePayload::Png { bytes, .. }
-            | bmux_tui::image::ImagePayload::Pixels { bytes, .. } => bytes.len(),
-        });
-        // Bounded attach-local immutable payload reuse, not a source registry.
-        // Placement/occlusion are still recomputed from the retained compositor.
-        if size <= 8 * 1024 * 1024 {
-            if self.bytes.saturating_add(size) > 8 * 1024 * 1024 || self.entries.len() >= 4096 {
-                self.entries.clear();
-                self.bytes = 0;
-            }
-            self.entries.push((image.clone(), payload.clone()));
-            self.bytes += size;
-        }
-        Ok(payload)
-    }
-}
-
 /// Single publisher, owned and dropped by one attach view.
 pub struct AttachObserverPublisher {
     pub(super) pane_zoom_shared: Option<super::pane_zoom_native::SharedZoom>,
@@ -127,12 +72,6 @@ pub struct AttachObserverPublisher {
     prepared_authority: Option<bmux_frontend_runtime::presentation::PresentationAuthority>,
     capture_interval: Option<std::time::Duration>,
     last_capture: Option<std::time::Instant>,
-    #[cfg(any(
-        feature = "image-sixel",
-        feature = "image-kitty",
-        feature = "image-iterm2"
-    ))]
-    image_payloads: std::sync::Mutex<ImagePayloadCache>,
 }
 
 impl std::fmt::Debug for AttachObserverPublisher {
@@ -170,12 +109,6 @@ pub fn attach_observer_channel() -> (AttachObserverPublisher, AttachObserver) {
             prepared_authority: None,
             capture_interval: None,
             last_capture: None,
-            #[cfg(any(
-                feature = "image-sixel",
-                feature = "image-kitty",
-                feature = "image-iterm2"
-            ))]
-            image_payloads: std::sync::Mutex::default(),
         },
         AttachObserver { epoch, receiver },
     )
@@ -528,9 +461,7 @@ pub(super) fn deliver_pointer_shape(
 
 pub(super) fn deliver_prepared(
     view: &mut super::state::AttachViewState,
-    layout: &bmux_client::AttachLayoutState,
     geometry: super::input::TerminalGeometry,
-    frame_images: &[std::sync::Arc<bmux_tui::image::ImagePlacement>],
     output: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let area = Rect::new(0, 0, geometry.cols, geometry.rows);
@@ -541,7 +472,7 @@ pub(super) fn deliver_prepared(
         )
     });
     let mut output_failed = false;
-    let result = deliver_prepared_inner(view, layout, geometry, frame_images, || {
+    let result = deliver_prepared_inner(view, geometry, || {
         let result = output();
         output_failed = result.is_err();
         result
@@ -570,14 +501,12 @@ pub(super) fn deliver_prepared(
 #[allow(clippy::too_many_lines)] // Admission and successful-output commit stay one ordered transaction.
 fn deliver_prepared_inner(
     view: &mut super::state::AttachViewState,
-    layout: &bmux_client::AttachLayoutState,
     geometry: super::input::TerminalGeometry,
-    frame_images: &[std::sync::Arc<bmux_tui::image::ImagePlacement>],
     output: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     use bmux_tui::{image::ImageContribution, presentation::PresentationLimits};
     let area = Rect::new(0, 0, geometry.cols, geometry.rows);
-    let images = observed_images(view, layout, area).map_err(anyhow::Error::msg)?;
+    let images = mirrored_images(view);
     let interactions =
         projected_interactions(&view.retained_compositor, area).map_err(anyhow::Error::msg)?;
     view.presentation.resize(area);
@@ -620,8 +549,8 @@ fn deliver_prepared_inner(
         .presentation
         .prepare_repaired_bounded(limits, |cx| {
             bmux_attach_pipeline::frame_presenter::paint_shown_changes(cx, &shown);
-            for image in frame_images {
-                cx.push_image(ImageContribution::Present(image.as_ref().clone()));
+            for image in images {
+                cx.push_image(ImageContribution::Present(image));
             }
             // Root output owns chrome only in winning local-grid clips. Clear
             // retained uniform text there so scale reset/removal cannot expose
@@ -634,9 +563,6 @@ fn deliver_prepared_inner(
                     // Root metadata was occluded above; matching projected metadata
                     // is installed below in the same presentation transaction.
                 }
-            }
-            for image in images {
-                cx.push_image(ImageContribution::Present(image));
             }
             for hit in interactions {
                 cx.push_hit(hit);
@@ -828,170 +754,29 @@ fn projected_interactions(
     Ok(hits)
 }
 
-#[cfg(not(any(
-    feature = "image-sixel",
-    feature = "image-kitty",
-    feature = "image-iterm2"
-)))]
-fn observed_images(
-    _view: &super::state::AttachViewState,
-    _layout: &bmux_client::AttachLayoutState,
-    _area: Rect,
-) -> Result<Vec<bmux_tui::image::ImagePlacement>, String> {
-    Ok(Vec::new())
-}
-
-#[cfg(any(
-    feature = "image-sixel",
-    feature = "image-kitty",
-    feature = "image-iterm2"
-))]
-fn observed_images(
-    view: &super::state::AttachViewState,
-    layout: &bmux_client::AttachLayoutState,
-    area: Rect,
-) -> Result<Vec<bmux_tui::image::ImagePlacement>, String> {
-    use bmux_tui::image::ImagePayload;
-    let mut result = Vec::new();
-    let mut budget = 0_usize;
-    for surface in &layout.scene.surfaces {
-        let Some(content_id) = surface.pane_id else {
-            continue;
-        };
-        if !surface.visible
-            || view.pane_zoom.prepared.contains_key(&surface.id)
-            || view.pane_zoom.prepared_history.contains_key(&surface.id)
-        {
-            continue;
-        }
-        let content = Rect::new(
-            surface.content_rect.x,
-            surface.content_rect.y,
-            surface.content_rect.w,
-            surface.content_rect.h,
-        );
-        for image in view.presented_images(content_id) {
-            let payload = match &view.observer {
-                Some(observer) => observer
-                    .image_payloads
-                    .lock()
-                    .map_err(|_| "observer image cache poisoned")?
-                    .get_or_decode(image, || observed_image_payload(image))?,
-                None => observed_image_payload(image)?,
-            };
-            let destination = Rect::new(
-                content.x.saturating_add(image.position_col),
-                content.y.saturating_add(image.position_row),
-                image.cell_cols,
-                image.cell_rows,
-            );
-            let clip = content.intersection(area);
-            let incarnation = view
-                .image_execution_incarnations
-                .get(&content_id)
-                .copied()
-                .unwrap_or(Uuid::nil());
-            let key = format!("{}:{}:{incarnation}:{}", surface.id, content_id, image.id);
-            let strips = bmux_attach_pipeline::projection_images::visible_image_strips(
-                &key,
-                &payload,
-                destination,
-                clip,
-                |x, y| {
-                    view.retained_compositor
-                        .point_visible_from(surface.id, x, y)
-                },
-            )?;
-            for strip in strips {
-                budget = budget.saturating_add(match &strip.payload {
-                    ImagePayload::Png { bytes, .. } | ImagePayload::Pixels { bytes, .. } => {
-                        bytes.len()
-                    }
-                });
-                if budget > 8 * 1024 * 1024 || result.len() >= 4096 {
-                    return Err("full-view image budget exceeded".into());
-                }
-                result.push(strip);
-            }
-        }
-    }
-    Ok(result)
-}
-
-#[cfg(any(
-    feature = "image-sixel",
-    feature = "image-kitty",
-    feature = "image-iterm2"
-))]
-pub(super) fn observed_image_payload(
-    image: &bmux_attach_image_protocol::AttachPaneImage,
-) -> Result<bmux_tui::image::ImagePayload, String> {
-    use bmux_tui::image::ImagePayload;
-    #[cfg(feature = "image-sixel")]
-    use bmux_tui::image::ImagePixelFormat;
-
-    if image.raw_data.len() > 16 * 1024 * 1024 {
-        return Err("encoded image budget exceeded".into());
-    }
-    let native = bmux_image::PaneImage::from(image);
-    match image.protocol {
-        bmux_attach_image_protocol::AttachImageProtocol::KittyGraphics => {
-            // The authoritative registry normalizes completed Kitty transfers to PNG.
-            Ok(ImagePayload::Png {
-                bytes: native.payload.raw.ok_or("missing Kitty image")?.into(),
-                width: image.pixel_width,
-                height: image.pixel_height,
-            })
-        }
-        bmux_attach_image_protocol::AttachImageProtocol::ITerm2 => {
-            #[cfg(feature = "image-iterm2")]
-            {
-                let (_, bytes) = bmux_image::codec::iterm2::parse_body(
-                    native.payload.raw.as_deref().ok_or("missing iTerm image")?,
-                )
-                .ok_or("invalid iTerm image")?;
-                Ok(ImagePayload::Png {
-                    bytes: bytes.into(),
-                    width: image.pixel_width,
-                    height: image.pixel_height,
-                })
-            }
-            #[cfg(not(feature = "image-iterm2"))]
-            {
-                Err("iTerm decoding disabled".into())
-            }
-        }
-        bmux_attach_image_protocol::AttachImageProtocol::Sixel => {
-            #[cfg(feature = "image-sixel")]
-            {
-                if u64::from(image.pixel_width) * u64::from(image.pixel_height)
-                    > bmux_attach_pipeline::projection_images::MAX_IMAGE_PIXELS
-                {
-                    return Err("sixel pixel budget exceeded".into());
-                }
-                let pixels = bmux_image::codec::sixel::decode(
-                    native.payload.raw.as_deref().ok_or("missing sixel image")?,
-                )
-                .ok_or("invalid sixel image")?;
-                Ok(ImagePayload::Pixels {
-                    bytes: pixels.data.into(),
-                    width: pixels.width,
-                    height: pixels.height,
-                    format: match pixels.format {
-                        bmux_image::model::PixelFormat::Rgb8 => ImagePixelFormat::Rgb8,
-                        bmux_image::model::PixelFormat::Rgba8 => ImagePixelFormat::Rgba8,
-                        bmux_image::model::PixelFormat::Png => {
-                            return Err("unexpected sixel PNG".into());
-                        }
-                    },
-                })
-            }
-            #[cfg(not(feature = "image-sixel"))]
-            {
-                Err("sixel decoding disabled".into())
-            }
-        }
-    }
+/// The images the client's presenter shows, as one frame's images: what the observer shows,
+/// except the pane images of surfaces it shows natively zoomed (their fragments carry them).
+fn mirrored_images(view: &super::state::AttachViewState) -> Vec<bmux_tui::image::ImagePlacement> {
+    let zoomed = view
+        .pane_zoom
+        .prepared
+        .keys()
+        .chain(view.pane_zoom.prepared_history.keys())
+        .map(|surface| super::pane_images::surface_key_prefix(*surface))
+        .collect::<Vec<_>>();
+    view.terminal_presenter
+        .image_scene()
+        .placements()
+        .filter(|image| {
+            !zoomed
+                .iter()
+                .any(|prefix| image.key.as_str().starts_with(prefix.as_str()))
+        })
+        .map(|image| bmux_tui::image::ImagePlacement {
+            lifecycle: bmux_tui::image::ImageLifecycle::Frame,
+            ..image.clone()
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1290,47 +1075,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(publisher.revision, 1);
-    }
-
-    #[test]
-    fn immutable_payload_cache_reuses_assets_not_placement() {
-        use bmux_attach_image_protocol::{AttachImageProtocol, AttachPaneImage, CompressionId};
-        let mut image = AttachPaneImage {
-            id: 1,
-            protocol: AttachImageProtocol::KittyGraphics,
-            raw_data: vec![1, 2, 3],
-            compression: CompressionId::None,
-            position_row: 0,
-            position_col: 0,
-            cell_rows: 1,
-            cell_cols: 1,
-            pixel_width: 1,
-            pixel_height: 1,
-        };
-        let mut cache = ImagePayloadCache::default();
-        let payload = bmux_tui::image::ImagePayload::Png {
-            bytes: vec![4].into(),
-            width: 1,
-            height: 1,
-        };
-        assert_eq!(
-            cache.get_or_decode(&image, || Ok(payload.clone())).unwrap(),
-            payload
-        );
-        image.position_col = 3;
-        image.id = 2;
-        assert_eq!(
-            cache
-                .get_or_decode(&image, || panic!("immutable asset decoded twice"))
-                .unwrap(),
-            payload
-        );
-        image.raw_data.push(4);
-        assert!(
-            cache
-                .get_or_decode(&image, || Err("changed asset".into()))
-                .is_err()
-        );
     }
 
     #[test]

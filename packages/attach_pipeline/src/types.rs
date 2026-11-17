@@ -269,13 +269,14 @@ pub struct PaneRenderBuffer {
 
 pub type TerminalGraphicsCache = BTreeMap<u64, TerminalGraphicCacheEntry>;
 
+/// An extension graphic overlay in the frame's image scene: its owner and what it was
+/// contributed as.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TerminalGraphicCacheEntry {
     pub pane_id: Uuid,
     pub surface_id: Uuid,
     pub source: TerminalGraphicSourceSignature,
-    pub placement: Option<TerminalGraphicPlacementSignature>,
-    pub host_image_id: u32,
+    pub placement: TerminalGraphicPlacementSignature,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

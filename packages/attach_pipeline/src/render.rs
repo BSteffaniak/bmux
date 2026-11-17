@@ -1,6 +1,5 @@
 use crate::canvas::Canvas;
 use crate::compositor::retained_repaint_plan_from_frame_damage;
-#[cfg(feature = "image-kitty")]
 use crate::types::TerminalGraphicCacheEntry;
 use crate::types::{
     AttachCursorState, AttachScrollbackPosition, ExtensionRenderCacheEntry, PaneRect,
@@ -13,7 +12,6 @@ use bmux_appearance::{
     RuntimeContentEffectScope,
 };
 use bmux_attach_layout_protocol::{AttachFocusTarget, AttachScene, AttachSurfaceKind, PaneSummary};
-#[cfg(feature = "image-kitty")]
 use bmux_plugin::TerminalGraphicFill;
 use bmux_plugin::{
     AttachRenderExtension, AttachVisualCellRef, AttachVisualFrameView,
@@ -23,15 +21,11 @@ use bmux_plugin::{
     TerminalRenderCapabilities, clip_render_text_run_to_rect, render_text_width_u16,
 };
 use bmux_scene_protocol_render::paint::opaque_row_text as shared_opaque_row_text;
-#[cfg(feature = "image-kitty")]
-use bmux_terminal::cursor::MoveTo;
 use bmux_terminal_grid::{
     Cell, Color as GridColor, PhysicalRow, Style as GridStyle, ViewportScroll,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
-#[cfg(feature = "image-kitty")]
-use std::io;
 use uuid::Uuid;
 
 #[path = "render/extension_plans.rs"]
@@ -61,9 +55,7 @@ use extension_retained::{
     ExtensionLayerDiffPlan, ExtensionRetainedLayerSnapshot, RenderSceneItemKind,
     commit_retained_layer_snapshot, retained_graphic_key_from_item_key,
 };
-use terminal_graphics::{
-    TerminalGraphicsFrameResources, begin_terminal_graphics_frame, finish_terminal_graphics_frame,
-};
+use terminal_graphics::TerminalGraphicsFrameResources;
 #[cfg(test)]
 use visible_segments::{RenderVisibleCell, RenderVisibleCellPlan};
 use visible_segments::{
@@ -250,7 +242,7 @@ pub fn queue_render_items(
         &mut terminal_graphics,
         capabilities,
     )?;
-    wrote |= terminal_graphics.cleanup_stale(canvas, graphics_cache, capabilities)?;
+    wrote |= terminal_graphics.cleanup_stale(canvas, graphics_cache);
     if let Some(stats) = render_stats {
         terminal_graphics.stats.apply_to(stats);
     }
@@ -335,26 +327,17 @@ fn queue_render_items_for_frame_with_cleanup(
     capabilities: TerminalRenderCapabilities,
     cleanup_surface_graphics: bool,
 ) -> Result<bool> {
-    let current_graphics = active_terminal_graphic_keys(
-        canvas.graphics_output(),
-        pane_id,
-        surface_id,
-        surface_rect,
-        items,
-        capabilities,
-    );
-    let mut wrote = if cleanup_surface_graphics {
-        terminal_graphics.cleanup_stale_for_surface(
+    let shown = terminal_graphics_shown(canvas.for_host(), capabilities);
+    let current_graphics =
+        active_terminal_graphic_keys(shown, pane_id, surface_id, surface_rect, items);
+    let mut wrote = cleanup_surface_graphics
+        && terminal_graphics.cleanup_stale_for_surface(
             canvas,
             pane_id,
             surface_id,
             &current_graphics,
             graphics_cache,
-            capabilities,
-        )?
-    } else {
-        false
-    };
+        );
     terminal_graphics.activate_graphics(current_graphics);
     let mut pending_ops = Vec::new();
     for item in items {
@@ -363,24 +346,20 @@ fn queue_render_items_for_frame_with_cleanup(
             RenderLayerItem::Graphic(graphic) => {
                 wrote |= flush_render_item_ops(canvas, surface_rect, damage, &mut pending_ops)?;
                 let instance_key = terminal_graphic_instance_key(pane_id, surface_id, graphic.key);
-                if terminal_graphic_needs_reconcile(
-                    canvas.graphics_output(),
-                    graphic,
-                    instance_key,
-                    surface_rect,
-                    damage,
-                    graphics_cache,
-                    capabilities,
-                ) {
+                if shown
+                    && terminal_graphic_needs_reconcile(
+                        graphic,
+                        instance_key,
+                        surface_rect,
+                        graphics_cache,
+                    )
+                {
                     wrote |= terminal_graphics.queue_graphic_overlay(
                         canvas,
-                        pane_id,
-                        surface_id,
-                        instance_key,
+                        (pane_id, surface_id, instance_key),
                         graphic,
                         graphics_cache,
-                        capabilities,
-                    )?;
+                    );
                 }
             }
         }
@@ -816,14 +795,13 @@ fn render_op_intersects_damage(op: &RenderOp, damage: &RenderDamage) -> bool {
 }
 
 fn active_terminal_graphic_keys(
-    graphics_output: bool,
+    shown: bool,
     pane_id: Uuid,
     surface_id: Uuid,
     surface_rect: ExtensionRect,
     items: &[RenderLayerItem],
-    capabilities: TerminalRenderCapabilities,
 ) -> BTreeSet<u64> {
-    if !terminal_graphic_can_render(capabilities) && graphics_output {
+    if !shown {
         return BTreeSet::new();
     }
     items
@@ -853,42 +831,29 @@ const fn terminal_graphic_can_render(capabilities: TerminalRenderCapabilities) -
     capabilities.kitty_graphics && capabilities.has_cell_pixels()
 }
 
+/// Whether a frame shows extension graphic overlays: always for a client without a host (its
+/// observers mirror them), and on a host only one whose terminal layers images under text (Kitty
+/// graphics, with the cell pixel size known); elsewhere an overlay would cover the text it
+/// decorates.
+const fn terminal_graphics_shown(host: bool, capabilities: TerminalRenderCapabilities) -> bool {
+    !host || terminal_graphic_can_render(capabilities)
+}
+
+/// Whether an overlay must be contributed to the frame's image scene: it is not there yet, or it
+/// changed. The scene keeps an unchanged one however the cells around it are repainted.
 fn terminal_graphic_needs_reconcile(
-    graphics_output: bool,
     graphic: &TerminalGraphicOverlay,
     instance_key: u64,
     surface_rect: ExtensionRect,
-    damage: &RenderDamage,
     graphics_cache: &TerminalGraphicsCache,
-    capabilities: TerminalRenderCapabilities,
 ) -> bool {
-    if (!terminal_graphic_can_render(capabilities) && graphics_output)
-        || !graphic.cell_rect.intersects(surface_rect)
-    {
+    if !graphic.cell_rect.intersects(surface_rect) {
         return false;
     }
-    if terminal_graphic_intersects_damage(graphic, damage) {
-        return true;
-    }
-    let Some(entry) = graphics_cache.get(&instance_key) else {
-        return true;
-    };
-    entry.source != terminal_graphic_source_signature(graphic)
-        || entry.placement != Some(terminal_graphic_placement_signature(graphic))
-}
-
-fn terminal_graphic_intersects_damage(
-    graphic: &TerminalGraphicOverlay,
-    damage: &RenderDamage,
-) -> bool {
-    match damage {
-        RenderDamage::None => false,
-        RenderDamage::FullSurface => true,
-        RenderDamage::Regions(regions) => regions
-            .iter()
-            .copied()
-            .any(|region| graphic.cell_rect.intersects(region)),
-    }
+    graphics_cache.get(&instance_key).is_none_or(|entry| {
+        entry.source != terminal_graphic_source_signature(graphic)
+            || entry.placement != terminal_graphic_placement_signature(graphic)
+    })
 }
 
 const fn terminal_graphic_source_signature(
@@ -911,58 +876,22 @@ const fn terminal_graphic_placement_signature(
     }
 }
 
-// The non-Kitty build keeps this signature aligned with the Kitty build so
-// call sites do not need feature-specific control flow.
-#[cfg_attr(
-    not(feature = "image-kitty"),
-    allow(
-        clippy::missing_const_for_fn,
-        clippy::needless_pass_by_ref_mut,
-        clippy::needless_pass_by_value,
-        clippy::unnecessary_wraps
-    )
-)]
-#[allow(
-    clippy::too_many_arguments, // Explicit graphics identity fields keep cache reconciliation call sites clear.
-    unused_variables
-)]
-fn queue_terminal_graphic_overlay(
-    canvas: &mut Canvas<'_, '_, '_>,
-    pane_id: Uuid,
-    surface_id: Uuid,
-    instance_key: u64,
-    graphic: &TerminalGraphicOverlay,
-    graphics_cache: &mut TerminalGraphicsCache,
-    capabilities: TerminalRenderCapabilities,
-    resource_stats: Option<&mut TerminalGraphicsResourceStats>,
-) -> Result<bool> {
-    #[cfg(feature = "image-kitty")]
-    {
-        queue_kitty_graphic_overlay(
-            canvas,
-            pane_id,
-            surface_id,
-            instance_key,
-            graphic,
-            graphics_cache,
-            capabilities,
-            resource_stats,
-        )
-    }
-    #[cfg(not(feature = "image-kitty"))]
-    {
-        Ok(false)
-    }
+/// The image scene key of an extension graphic overlay.
+fn terminal_graphic_image_key(instance_key: u64) -> bmux_tui::image::ImageKey {
+    bmux_tui::image::ImageKey::new(format!("overlay:{instance_key:016x}"))
 }
 
-#[cfg(feature = "image-kitty")]
-fn place_graphic_overlay(
+/// Contribute an extension graphic overlay to the frame as a persistent image (it stays until
+/// removed), and record it in `graphics_cache`; whether it was contributed.
+fn queue_terminal_graphic_overlay(
     canvas: &mut Canvas<'_, '_, '_>,
-    surface_id: Uuid,
-    instance_key: u64,
+    identity: (Uuid, Uuid, u64),
     graphic: &TerminalGraphicOverlay,
-) {
+    graphics_cache: &mut TerminalGraphicsCache,
+    resource_stats: Option<&mut TerminalGraphicsResourceStats>,
+) -> bool {
     use crate::projection::ProjectionFailure;
+    let (pane_id, surface_id, instance_key) = identity;
     let pixels = u64::from(graphic.pixel_width) * u64::from(graphic.pixel_height);
     if pixels > crate::projection_images::MAX_IMAGE_PIXELS {
         canvas.reject(ProjectionFailure::Budget {
@@ -971,7 +900,7 @@ fn place_graphic_overlay(
             limit: usize::try_from(crate::projection_images::MAX_IMAGE_PIXELS)
                 .unwrap_or(usize::MAX),
         });
-        return;
+        return false;
     }
     let raw = bmux_tui::image::ImagePayload::Pixels {
         bytes: terminal_graphic_pixels(graphic).into(),
@@ -979,142 +908,53 @@ fn place_graphic_overlay(
         height: graphic.pixel_height,
         format: bmux_tui::image::ImagePixelFormat::Rgba8,
     };
-    let payload = if let Ok(payload) = crate::projection_images::compact_payload(&raw) {
-        payload.into_owned()
-    } else {
+    let Ok(payload) =
+        crate::projection_images::compact_payload(&raw).map(std::borrow::Cow::into_owned)
+    else {
         canvas.reject(ProjectionFailure::Unsupported {
             reason: "invalid terminal image resource",
         });
-        return;
+        return false;
     };
+    let source = terminal_graphic_source_signature(graphic);
+    let transmitted = graphics_cache
+        .get(&instance_key)
+        .is_none_or(|entry| entry.source != source);
+    if let Some(stats) = resource_stats {
+        if transmitted {
+            stats.record_transmit_bytes(match &payload {
+                bmux_tui::image::ImagePayload::Png { bytes, .. }
+                | bmux_tui::image::ImagePayload::Pixels { bytes, .. } => bytes.len(),
+            });
+        }
+        stats.record_place();
+    }
+    let rect = bmux_tui::geometry::Rect::new(
+        graphic.cell_rect.x,
+        graphic.cell_rect.y,
+        graphic.cell_rect.w,
+        graphic.cell_rect.h,
+    );
     canvas.image(bmux_tui::image::ImagePlacement {
         fit: bmux_tui::image::ImageFit::Stretch,
         allocation: None,
-        key: bmux_tui::image::ImageKey::new(format!("{surface_id}:{instance_key}")),
+        key: terminal_graphic_image_key(instance_key),
         payload,
-        destination: bmux_tui::geometry::Rect::new(
-            graphic.cell_rect.x,
-            graphic.cell_rect.y,
-            graphic.cell_rect.w,
-            graphic.cell_rect.h,
-        ),
-        clip: bmux_tui::geometry::Rect::new(
-            graphic.cell_rect.x,
-            graphic.cell_rect.y,
-            graphic.cell_rect.w,
-            graphic.cell_rect.h,
-        ),
-        lifecycle: bmux_tui::image::ImageLifecycle::Frame,
+        destination: rect,
+        clip: rect,
+        lifecycle: bmux_tui::image::ImageLifecycle::Persistent,
         z: graphic.z_index,
     });
-}
-
-#[cfg(feature = "image-kitty")]
-#[allow(clippy::too_many_arguments)] // Kitty reconciliation needs identity, payload, cache, capability, and stats state.
-fn queue_kitty_graphic_overlay(
-    canvas: &mut Canvas<'_, '_, '_>,
-    pane_id: Uuid,
-    surface_id: Uuid,
-    instance_key: u64,
-    graphic: &TerminalGraphicOverlay,
-    graphics_cache: &mut TerminalGraphicsCache,
-    capabilities: TerminalRenderCapabilities,
-    resource_stats: Option<&mut TerminalGraphicsResourceStats>,
-) -> Result<bool> {
-    // Without graphics output, the overlay is placed as an image.
-    let encoding = canvas.graphics_output();
-    if !terminal_graphic_can_render(capabilities) && encoding {
-        return Ok(false);
-    }
-    if !encoding {
-        place_graphic_overlay(canvas, surface_id, instance_key, graphic);
-        return Ok(true);
-    }
-    canvas.write_graphics(false, |stdout| {
-        write_kitty_graphic_overlay(
-            stdout,
+    graphics_cache.insert(
+        instance_key,
+        TerminalGraphicCacheEntry {
             pane_id,
             surface_id,
-            instance_key,
-            graphic,
-            graphics_cache,
-            resource_stats,
-        )
-    })
-}
-
-#[cfg(feature = "image-kitty")]
-fn write_kitty_graphic_overlay(
-    stdout: &mut dyn io::Write,
-    pane_id: Uuid,
-    surface_id: Uuid,
-    instance_key: u64,
-    graphic: &TerminalGraphicOverlay,
-    graphics_cache: &mut TerminalGraphicsCache,
-    mut resource_stats: Option<&mut TerminalGraphicsResourceStats>,
-) -> Result<bool> {
-    let source = terminal_graphic_source_signature(graphic);
-    let placement = terminal_graphic_placement_signature(graphic);
-    let host_image_id = terminal_graphic_host_image_id(instance_key);
-    let previous = graphics_cache.get(&instance_key).cloned();
-    let source_changed = previous
-        .as_ref()
-        .is_some_and(|entry| entry.source != source || entry.host_image_id != host_image_id);
-    let previous_placement = previous.as_ref().and_then(|entry| entry.placement);
-    let placement_changed = previous_placement.is_some_and(|old| old != placement);
-    let needs_transmit = previous.is_none() || source_changed;
-    if needs_transmit {
-        let pixels = terminal_graphic_pixels(graphic);
-        stdout.write_all(b"\x1b_")?;
-        stdout.write_all(&bmux_image::codec::kitty::encode_transmit(
-            host_image_id,
-            bmux_image::model::KittyFormat::Rgba,
-            &pixels,
-            graphic.pixel_width,
-            graphic.pixel_height,
-        ))?;
-        stdout.write_all(b"\x1b\\")?;
-        graphics_cache.insert(
-            instance_key,
-            TerminalGraphicCacheEntry {
-                pane_id,
-                surface_id,
-                source,
-                placement: previous_placement,
-                host_image_id,
-            },
-        );
-        if let Some(stats) = resource_stats.as_mut() {
-            stats.record_transmit_bytes(pixels.len());
-        }
-    }
-    let needs_place = previous_placement != Some(placement);
-    if needs_place {
-        // Graphics bytes are written wherever they go (the terminal or a presenter's graphics
-        // output), never gated on encoding cells.
-        let mut writer = &mut *stdout;
-        bmux_terminal::queue!(
-            &mut writer,
-            MoveTo(graphic.cell_rect.x, graphic.cell_rect.y)
-        )
-        .context("failed moving cursor for kitty graphic placement")?;
-        stdout.write_all(b"\x1b_")?;
-        stdout.write_all(&bmux_image::codec::kitty::encode_place_with_z_and_cells(
-            host_image_id,
-            host_image_id,
-            graphic.z_index,
-            graphic.cell_rect.w,
-            graphic.cell_rect.h,
-        ))?;
-        stdout.write_all(b"\x1b\\")?;
-        if let Some(entry) = graphics_cache.get_mut(&instance_key) {
-            entry.placement = Some(placement);
-        }
-        if let Some(stats) = resource_stats.as_mut() {
-            stats.record_place();
-        }
-    }
-    Ok(source_changed || placement_changed || needs_transmit || needs_place)
+            source,
+            placement: terminal_graphic_placement_signature(graphic),
+        },
+    );
+    true
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1126,7 +966,6 @@ struct TerminalGraphicsResourceStats {
 }
 
 impl TerminalGraphicsResourceStats {
-    #[cfg(feature = "image-kitty")]
     fn record_transmit_bytes(&mut self, bytes: usize) {
         self.transmits = self.transmits.saturating_add(1);
         self.bytes = self
@@ -1134,12 +973,10 @@ impl TerminalGraphicsResourceStats {
             .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
     }
 
-    #[cfg(feature = "image-kitty")]
     const fn record_place(&mut self) {
         self.places = self.places.saturating_add(1);
     }
 
-    #[cfg(feature = "image-kitty")]
     const fn record_delete(&mut self) {
         self.deletes = self.deletes.saturating_add(1);
     }
@@ -1155,203 +992,60 @@ impl TerminalGraphicsResourceStats {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TerminalGraphicsStaleCleanupPolicy {
-    #[cfg(feature = "image-kitty")]
-    DeleteKittyPlacementAndImageSource,
-    #[cfg(not(feature = "image-kitty"))]
-    DropCacheOnly,
-}
-
-impl TerminalGraphicsStaleCleanupPolicy {
-    const fn current_terminal() -> Self {
-        #[cfg(feature = "image-kitty")]
-        {
-            Self::DeleteKittyPlacementAndImageSource
-        }
-        #[cfg(not(feature = "image-kitty"))]
-        {
-            Self::DropCacheOnly
-        }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct TerminalGraphicsCleanupPlan {
-    stale: Vec<(u64, u32)>,
-    policy: TerminalGraphicsStaleCleanupPolicy,
-}
-
-impl TerminalGraphicsCleanupPlan {
-    fn for_surface(
-        pane_id: Uuid,
-        surface_id: Uuid,
-        current_graphics: &BTreeSet<u64>,
-        graphics_cache: &TerminalGraphicsCache,
-    ) -> Self {
-        let stale = graphics_cache
-            .iter()
-            .filter_map(|(key, entry)| {
-                (entry.pane_id == pane_id
-                    && entry.surface_id == surface_id
-                    && !current_graphics.contains(key))
-                .then_some((*key, entry.host_image_id))
-            })
-            .collect::<Vec<_>>();
-        Self {
-            stale,
-            policy: TerminalGraphicsStaleCleanupPolicy::current_terminal(),
-        }
-    }
-
-    fn for_frame(active_graphics: &BTreeSet<u64>, graphics_cache: &TerminalGraphicsCache) -> Self {
-        let stale = graphics_cache
-            .iter()
-            .filter_map(|(key, entry)| {
-                (!active_graphics.contains(key)).then_some((*key, entry.host_image_id))
-            })
-            .collect::<Vec<_>>();
-        Self {
-            stale,
-            policy: TerminalGraphicsStaleCleanupPolicy::current_terminal(),
-        }
-    }
-
-    const fn is_empty(&self) -> bool {
-        self.stale.is_empty()
-    }
-}
-
+/// Remove the cached overlays of the surface (`pane_id`, `surface_id`) outside
+/// `current_graphics` from the frame's image scene; whether any was removed.
 fn cleanup_stale_terminal_graphics_for_surface(
-    // Only Kitty cleanup writes to the frame.
-    #[cfg(feature = "image-kitty")] canvas: &mut Canvas<'_, '_, '_>,
-    #[cfg(not(feature = "image-kitty"))] canvas: &Canvas<'_, '_, '_>,
+    canvas: &mut Canvas<'_, '_, '_>,
     pane_id: Uuid,
     surface_id: Uuid,
     current_graphics: &BTreeSet<u64>,
     graphics_cache: &mut TerminalGraphicsCache,
-    capabilities: TerminalRenderCapabilities,
     resource_stats: Option<&mut TerminalGraphicsResourceStats>,
-) -> Result<bool> {
-    let plan = TerminalGraphicsCleanupPlan::for_surface(
-        pane_id,
-        surface_id,
-        current_graphics,
-        graphics_cache,
-    );
-    cleanup_stale_terminal_graphics_by_plan(
-        canvas,
-        &plan,
-        graphics_cache,
-        capabilities,
-        resource_stats,
-    )
+) -> bool {
+    let stale = graphics_cache
+        .iter()
+        .filter(|(key, entry)| {
+            entry.pane_id == pane_id
+                && entry.surface_id == surface_id
+                && !current_graphics.contains(key)
+        })
+        .map(|(key, _)| *key)
+        .collect::<Vec<_>>();
+    remove_terminal_graphics(canvas, &stale, graphics_cache, resource_stats)
 }
 
+/// Remove every cached overlay outside `active_graphics` from the frame's image scene; whether
+/// any was removed.
 fn cleanup_stale_terminal_graphics(
-    // Only Kitty cleanup writes to the frame.
-    #[cfg(feature = "image-kitty")] canvas: &mut Canvas<'_, '_, '_>,
-    #[cfg(not(feature = "image-kitty"))] canvas: &Canvas<'_, '_, '_>,
+    canvas: &mut Canvas<'_, '_, '_>,
     active_graphics: &BTreeSet<u64>,
     graphics_cache: &mut TerminalGraphicsCache,
-    capabilities: TerminalRenderCapabilities,
     resource_stats: Option<&mut TerminalGraphicsResourceStats>,
-) -> Result<bool> {
-    let plan = TerminalGraphicsCleanupPlan::for_frame(active_graphics, graphics_cache);
-    cleanup_stale_terminal_graphics_by_plan(
-        canvas,
-        &plan,
-        graphics_cache,
-        capabilities,
-        resource_stats,
-    )
+) -> bool {
+    let stale = graphics_cache
+        .keys()
+        .filter(|key| !active_graphics.contains(key))
+        .copied()
+        .collect::<Vec<_>>();
+    remove_terminal_graphics(canvas, &stale, graphics_cache, resource_stats)
 }
 
-// The non-Kitty build only drops cache entries, but shares the fallible
-// signature with Kitty cleanup so callers remain feature-independent.
-#[cfg_attr(not(feature = "image-kitty"), allow(clippy::unnecessary_wraps))]
-fn cleanup_stale_terminal_graphics_by_plan(
-    // Only Kitty cleanup writes to the frame.
-    #[cfg(feature = "image-kitty")] canvas: &mut Canvas<'_, '_, '_>,
-    #[cfg(not(feature = "image-kitty"))] canvas: &Canvas<'_, '_, '_>,
-    plan: &TerminalGraphicsCleanupPlan,
+fn remove_terminal_graphics(
+    canvas: &mut Canvas<'_, '_, '_>,
+    stale: &[u64],
     graphics_cache: &mut TerminalGraphicsCache,
-    capabilities: TerminalRenderCapabilities,
-    resource_stats: Option<&mut TerminalGraphicsResourceStats>,
-) -> Result<bool> {
-    if !canvas.graphics_output() {
-        return Ok(false);
-    }
-    if plan.is_empty() {
-        return Ok(false);
-    }
-    match plan.policy {
-        #[cfg(feature = "image-kitty")]
-        TerminalGraphicsStaleCleanupPolicy::DeleteKittyPlacementAndImageSource => {
-            // Removals go before a presented frame's cells, as they go before its text here.
-            canvas.write_graphics(true, |stdout| {
-                cleanup_stale_kitty_graphics(
-                    stdout,
-                    &plan.stale,
-                    graphics_cache,
-                    capabilities,
-                    resource_stats,
-                )
-            })
-        }
-        #[cfg(not(feature = "image-kitty"))]
-        TerminalGraphicsStaleCleanupPolicy::DropCacheOnly => {
-            let _ = (capabilities, resource_stats);
-            for (key, _) in &plan.stale {
-                graphics_cache.remove(key);
-            }
-            Ok(false)
-        }
-    }
-}
-
-#[cfg(feature = "image-kitty")]
-fn cleanup_stale_kitty_graphics(
-    stdout: &mut dyn io::Write,
-    stale: &[(u64, u32)],
-    graphics_cache: &mut TerminalGraphicsCache,
-    _capabilities: TerminalRenderCapabilities,
     mut resource_stats: Option<&mut TerminalGraphicsResourceStats>,
-) -> Result<bool> {
-    let mut wrote = false;
-    for (key, host_image_id) in stale {
+) -> bool {
+    for key in stale {
         graphics_cache.remove(key);
-        stdout.write_all(b"\x1b_")?;
-        stdout.write_all(&bmux_image::codec::kitty::encode_delete_placement(
-            *host_image_id,
-            *host_image_id,
-        ))?;
-        stdout.write_all(b"\x1b\\")?;
-        // Some Kitty-compatible hosts (notably Ghostty in real attach) keep
-        // negative-z placements visible after a placement-scoped delete. Once
-        // a BMUX terminal graphic is stale there are no active placements left
-        // for its host image id, so deleting the image source is safe here and
-        // makes tab/window switches remove semantic-border graphics reliably.
-        stdout.write_all(b"\x1b_")?;
-        stdout.write_all(&bmux_image::codec::kitty::encode_delete_image(
-            *host_image_id,
-        ))?;
-        stdout.write_all(b"\x1b\\")?;
-        wrote = true;
+        canvas.remove_image(terminal_graphic_image_key(*key));
         if let Some(stats) = resource_stats.as_mut() {
             stats.record_delete();
         }
     }
-    Ok(wrote)
+    !stale.is_empty()
 }
 
-#[cfg(feature = "image-kitty")]
-fn terminal_graphic_host_image_id(key: u64) -> u32 {
-    let id = (key & 0x7fff_ffff) as u32;
-    id.max(1)
-}
-
-#[cfg(feature = "image-kitty")]
 fn terminal_graphic_pixels(graphic: &TerminalGraphicOverlay) -> Vec<u8> {
     let width = usize::try_from(graphic.pixel_width).unwrap_or(0);
     let height = usize::try_from(graphic.pixel_height).unwrap_or(0);
@@ -1371,7 +1065,6 @@ fn terminal_graphic_pixels(graphic: &TerminalGraphicOverlay) -> Vec<u8> {
     pixels
 }
 
-#[cfg(feature = "image-kitty")]
 fn terminal_graphic_fill_contains(
     fill: TerminalGraphicFill,
     x: usize,
@@ -3607,7 +3300,7 @@ fn execute_before_content_surface_output_plan(
     terminal_graphics_cache: &mut TerminalGraphicsCache,
     terminal_graphics: &mut TerminalGraphicsFrameResources,
     render_stats: &mut Option<&mut AttachSceneRenderStats>,
-) -> Result<BeforeContentCells> {
+) -> BeforeContentCells {
     let mut cells = BTreeMap::new();
     for extension_plan in &plan.plans {
         record_before_content_extension_output_plan(extension_plan, render_stats);
@@ -3619,9 +3312,9 @@ fn execute_before_content_surface_output_plan(
             render_context,
             terminal_graphics_cache,
             terminal_graphics,
-        )?;
+        );
     }
-    Ok(cells)
+    cells
 }
 
 fn record_before_content_extension_output_plan(
@@ -3666,12 +3359,11 @@ fn execute_before_content_extension_output_plan(
     render_context: &RenderExtensionContext,
     terminal_graphics_cache: &mut TerminalGraphicsCache,
     terminal_graphics: &mut TerminalGraphicsFrameResources,
-) -> Result<()> {
+) {
     match &plan.action {
         BeforeContentExtensionOutputAction::RetainedScene {
             diff_plan,
             snapshot: retained_snapshot,
-            output_damage,
             output_items,
             ..
         } => {
@@ -3682,20 +3374,18 @@ fn execute_before_content_extension_output_plan(
                 retained_snapshot,
                 terminal_graphics_cache,
                 terminal_graphics,
-                render_context.capabilities,
-            )?;
+            );
             let ops = queue_before_content_render_items_with_cleanup(
                 canvas,
                 plan.snapshot.pane_id,
                 plan.snapshot.surface_id,
                 plan.snapshot.surface_rect,
-                output_damage,
                 output_items,
                 terminal_graphics_cache,
                 terminal_graphics,
                 render_context.capabilities,
                 false,
-            )?;
+            );
             insert_before_content_cells(
                 cells,
                 content,
@@ -3704,17 +3394,17 @@ fn execute_before_content_extension_output_plan(
             insert_retained_before_content_under_cells(cells, content, retained_snapshot);
         }
         BeforeContentExtensionOutputAction::RenderItems { items } => {
-            let ops = queue_before_content_render_items(
+            let ops = queue_before_content_render_items_with_cleanup(
                 canvas,
                 plan.snapshot.pane_id,
                 plan.snapshot.surface_id,
                 plan.snapshot.surface_rect,
-                &plan.snapshot.render_damage,
                 items,
                 terminal_graphics_cache,
                 terminal_graphics,
                 render_context.capabilities,
-            )?;
+                true,
+            );
             insert_before_content_cells(
                 cells,
                 content,
@@ -3733,7 +3423,6 @@ fn execute_before_content_extension_output_plan(
         }
         BeforeContentExtensionOutputAction::NoOutput => {}
     }
-    Ok(())
 }
 
 fn insert_before_content_cells(
@@ -3788,52 +3477,20 @@ fn insert_before_content_cell(
 }
 
 #[allow(clippy::too_many_arguments)] // Terminal graphic reconciliation needs frame-local cache state.
-fn queue_before_content_render_items(
-    canvas: &mut Canvas<'_, '_, '_>,
-    pane_id: Uuid,
-    surface_id: Uuid,
-    surface_rect: ExtensionRect,
-    damage: &RenderDamage,
-    items: &[RenderLayerItem],
-    graphics_cache: &mut TerminalGraphicsCache,
-    terminal_graphics: &mut TerminalGraphicsFrameResources,
-    capabilities: TerminalRenderCapabilities,
-) -> Result<Vec<RenderOp>> {
-    queue_before_content_render_items_with_cleanup(
-        canvas,
-        pane_id,
-        surface_id,
-        surface_rect,
-        damage,
-        items,
-        graphics_cache,
-        terminal_graphics,
-        capabilities,
-        true,
-    )
-}
-
-#[allow(clippy::too_many_arguments)] // Terminal graphic reconciliation needs frame-local cache state.
 fn queue_before_content_render_items_with_cleanup(
     canvas: &mut Canvas<'_, '_, '_>,
     pane_id: Uuid,
     surface_id: Uuid,
     surface_rect: ExtensionRect,
-    damage: &RenderDamage,
     items: &[RenderLayerItem],
     graphics_cache: &mut TerminalGraphicsCache,
     terminal_graphics: &mut TerminalGraphicsFrameResources,
     capabilities: TerminalRenderCapabilities,
     cleanup_surface_graphics: bool,
-) -> Result<Vec<RenderOp>> {
-    let current_graphics = active_terminal_graphic_keys(
-        canvas.graphics_output(),
-        pane_id,
-        surface_id,
-        surface_rect,
-        items,
-        capabilities,
-    );
+) -> Vec<RenderOp> {
+    let shown = terminal_graphics_shown(canvas.for_host(), capabilities);
+    let current_graphics =
+        active_terminal_graphic_keys(shown, pane_id, surface_id, surface_rect, items);
     if cleanup_surface_graphics {
         terminal_graphics.cleanup_stale_for_surface(
             canvas,
@@ -3841,8 +3498,7 @@ fn queue_before_content_render_items_with_cleanup(
             surface_id,
             &current_graphics,
             graphics_cache,
-            capabilities,
-        )?;
+        );
     }
     terminal_graphics.activate_graphics(current_graphics);
 
@@ -3852,29 +3508,25 @@ fn queue_before_content_render_items_with_cleanup(
             RenderLayerItem::Op(op) => ops.push(op.clone()),
             RenderLayerItem::Graphic(graphic) => {
                 let instance_key = terminal_graphic_instance_key(pane_id, surface_id, graphic.key);
-                if terminal_graphic_needs_reconcile(
-                    canvas.graphics_output(),
-                    graphic,
-                    instance_key,
-                    surface_rect,
-                    damage,
-                    graphics_cache,
-                    capabilities,
-                ) {
+                if shown
+                    && terminal_graphic_needs_reconcile(
+                        graphic,
+                        instance_key,
+                        surface_rect,
+                        graphics_cache,
+                    )
+                {
                     terminal_graphics.queue_graphic_overlay(
                         canvas,
-                        pane_id,
-                        surface_id,
-                        instance_key,
+                        (pane_id, surface_id, instance_key),
                         graphic,
                         graphics_cache,
-                        capabilities,
-                    )?;
+                    );
                 }
             }
         }
     }
-    Ok(ops)
+    ops
 }
 
 #[allow(clippy::too_many_arguments)] // Coordinates output plans with mutable frame-local caches/resources.
@@ -4097,22 +3749,14 @@ fn execute_retained_after_content_extension_output_plan(
     terminal_graphics: &mut TerminalGraphicsFrameResources,
 ) {
     let snapshot = &plan.snapshot;
-    if let Err(err) = cleanup_removed_retained_terminal_graphics(
+    cleanup_removed_retained_terminal_graphics(
         canvas,
         (snapshot.pane_id, snapshot.surface_id),
         diff_plan,
         retained_snapshot,
         terminal_graphics_cache,
         terminal_graphics,
-        render_context.capabilities,
-    ) {
-        tracing::warn!(
-            extension = snapshot.extension.name(),
-            surface_id = %snapshot.surface_id,
-            error = %err,
-            "retained render extension stale graphic cleanup failed",
-        );
-    }
+    );
     if (!output_damage.is_none() || !diff_plan.stale_cleanup_damage.is_none())
         && let Err(err) = queue_render_items_for_frame_with_cleanup(
             canvas,
@@ -4145,18 +3789,15 @@ fn execute_retained_after_content_extension_output_plan(
 }
 
 fn cleanup_removed_retained_terminal_graphics(
-    // Only Kitty cleanup writes to the frame.
-    #[cfg(feature = "image-kitty")] canvas: &mut Canvas<'_, '_, '_>,
-    #[cfg(not(feature = "image-kitty"))] canvas: &Canvas<'_, '_, '_>,
+    canvas: &mut Canvas<'_, '_, '_>,
     surface_identity: (Uuid, Uuid),
     diff_plan: &ExtensionLayerDiffPlan,
     retained_snapshot: &ExtensionRetainedLayerSnapshot,
     graphics_cache: &mut TerminalGraphicsCache,
     terminal_graphics: &mut TerminalGraphicsFrameResources,
-    capabilities: TerminalRenderCapabilities,
-) -> Result<bool> {
-    if diff_plan.removed_items.is_empty() || !terminal_graphic_can_render(capabilities) {
-        return Ok(false);
+) -> bool {
+    if diff_plan.removed_items.is_empty() {
+        return false;
     }
     let current_keys = retained_snapshot
         .items
@@ -4178,7 +3819,6 @@ fn cleanup_removed_retained_terminal_graphics(
         canvas,
         &active,
         graphics_cache,
-        capabilities,
         Some(&mut terminal_graphics.stats),
     )
 }
@@ -4894,7 +4534,7 @@ fn execute_surface_output_plan(
                     terminal_graphics_cache,
                     terminal_graphics,
                     render_stats,
-                )?;
+                );
             }
             SurfaceOutputStage::CommitBeforeContentSnapshot => {
                 commit_before_content_surface_output_plan(
@@ -5336,12 +4976,12 @@ fn render_attach_scene_inner(
     );
     record_render_frame_output_plan_stats(&frame_output_plan, &mut render_stats);
 
-    let mut terminal_graphics_frame = begin_terminal_graphics_frame(
+    let mut terminal_graphics_frame = TerminalGraphicsFrameResources::begin(
         canvas,
         scene,
         terminal_graphics_cache,
         render_context.capabilities,
-    )?;
+    );
 
     let cursor_state = execute_render_frame_output_plan(
         canvas,
@@ -5354,13 +4994,7 @@ fn render_attach_scene_inner(
         &mut render_trace,
     )?;
 
-    finish_terminal_graphics_frame(
-        canvas,
-        &mut terminal_graphics_frame,
-        terminal_graphics_cache,
-        render_context.capabilities,
-        render_stats,
-    )?;
+    terminal_graphics_frame.finish(canvas, terminal_graphics_cache, render_stats);
 
     Ok(cursor_state)
 }
@@ -5384,8 +5018,6 @@ mod tests {
     };
     use crate::canvas::Canvas;
     use crate::frame_presenter::{FramePresenter, Presented};
-    #[cfg(feature = "image-kitty")]
-    use crate::projection::GraphicsOutput;
     use crate::types::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
         PaneScrollbackView, PaneScrollbackViews,
@@ -5409,11 +5041,10 @@ mod tests {
 
     #[cfg(feature = "image-kitty")]
     use super::{
-        AttachSceneRenderStats, TerminalGraphicsCleanupPlan, TerminalGraphicsFrameResources,
-        TerminalGraphicsStaleCleanupPolicy, queue_render_items, queue_render_items_for_frame,
-        queue_render_items_for_surface, render_attach_scene_with_stats_and_trace_with_capabilities,
-        terminal_graphic_instance_key, terminal_graphic_needs_reconcile,
-        terminal_graphic_placement_signature,
+        AttachSceneRenderStats, TerminalGraphicsFrameResources, queue_render_items,
+        queue_render_items_for_frame, queue_render_items_for_surface,
+        render_attach_scene_with_stats_and_trace_with_capabilities, terminal_graphic_instance_key,
+        terminal_graphic_needs_reconcile, terminal_graphic_placement_signature,
     };
     #[cfg(feature = "image-kitty")]
     use crate::types::TerminalGraphicsCache;
@@ -5479,13 +5110,11 @@ mod tests {
     }
 
     /// One frame drawn on a [`TestHost`]: what the render returned, the cells the frame changed
-    /// on the host (runs of text with where they start, every row of a full frame), the graphics
-    /// protocol bytes it wrote and the bytes presented to the host.
+    /// on the host (runs of text with where they start, every row of a full frame) and the bytes
+    /// presented to the host.
     struct HostFrame<T> {
         result: T,
         changes: Vec<(u16, u16, String)>,
-        #[cfg(feature = "image-kitty")]
-        graphics: GraphicsOutput,
         bytes: Vec<u8>,
     }
 
@@ -5503,6 +5132,22 @@ mod tests {
             }
         }
 
+        /// A host whose terminal takes Kitty graphics, with 8x16-pixel cells.
+        #[cfg(feature = "image-kitty")]
+        fn kitty(cols: u16, rows: u16) -> Self {
+            let mut host = Self::new(cols, rows);
+            host.presenter.set_image_host(
+                bmux_image::host_caps::HostImageCapabilities {
+                    kitty_graphics: true,
+                    cell_pixel_width: 8,
+                    cell_pixel_height: 16,
+                    ..bmux_image::host_caps::HostImageCapabilities::default()
+                },
+                bmux_image::ImageConfig::default(),
+            );
+            host
+        }
+
         /// Draw one frame: `full` for the renderer's full frames, which start from a blank
         /// screen.
         fn frame<T>(
@@ -5517,7 +5162,7 @@ mod tests {
                         full,
                         size: self.size,
                         margins: false,
-                        graphics: true,
+                        host: true,
                     },
                     |canvas| Ok::<_, std::convert::Infallible>(render(canvas)),
                 )
@@ -5533,15 +5178,6 @@ mod tests {
             HostFrame {
                 result: frame.result,
                 changes: shown_runs(&self.presenter),
-                #[cfg(feature = "image-kitty")]
-                graphics: frame
-                    .output
-                    .graphics()
-                    .map(|graphics| GraphicsOutput {
-                        before: graphics.before.clone(),
-                        after: graphics.after.clone(),
-                    })
-                    .unwrap_or_default(),
                 bytes,
             }
         }
@@ -5606,20 +5242,18 @@ mod tests {
         }
     }
 
-    /// Paint with `render` into a scratch frame whose host takes graphics protocol output;
-    /// returns its result and every graphics byte in the order a presenter writes them
-    /// (removals, then placements).
+    /// Present a frame painted by `render` on `host` (a Kitty host: see [`TestHost::kitty`]);
+    /// returns its result and the bytes presented to the host.
     #[cfg(feature = "image-kitty")]
-    fn with_graphics<T>(render: impl FnOnce(&mut Canvas<'_, '_, '_>) -> T) -> (T, String) {
-        let mut buffer = bmux_tui::buffer::Buffer::empty(TuiRect::new(0, 0, 512, 128));
-        let mut output = crate::canvas::FrameOutput::with_graphics();
-        let result = crate::canvas::paint_on(&mut buffer, &mut output, render);
-        let graphics = output.graphics().expect("graphics output");
-        let mut bytes = graphics.before.clone();
-        bytes.extend_from_slice(&graphics.after);
+    fn with_graphics<T>(
+        host: &mut TestHost,
+        render: impl FnOnce(&mut Canvas<'_, '_, '_>) -> T,
+    ) -> (T, String) {
+        let full = !host.presenter.shown();
+        let frame = host.frame(full, render);
         (
-            result,
-            String::from_utf8(bytes).expect("graphics bytes should be utf8"),
+            frame.result,
+            String::from_utf8_lossy(&frame.bytes).into_owned(),
         )
     }
 
@@ -7239,16 +6873,17 @@ mod tests {
         }
     }
 
-    /// Render one frame of [`RetainedGraphicExtension`]'s scene; returns the graphics protocol
-    /// bytes it wrote, removals first.
+    /// Present one frame of [`RetainedGraphicExtension`]'s scene on `host`; returns the Kitty
+    /// graphics commands it wrote.
     #[cfg(feature = "image-kitty")]
     fn render_retained_graphic_frame(
+        host: &mut TestHost,
         state: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
         cache: &mut TerminalGraphicsCache,
         pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
         frame_damage: &FrameDamage,
     ) -> (String, AttachSceneRenderStats) {
-        let (frame_stats, graphics) = with_graphics(|canvas| {
+        let (frame_stats, graphics) = with_graphics(host, |canvas| {
             render_retained_graphic_frame_stats(canvas, state, cache, pane_buffers, frame_damage)
         });
         (graphics, frame_stats)
@@ -7295,11 +6930,13 @@ mod tests {
     #[cfg(feature = "image-kitty")]
     #[test]
     fn retained_graphic_uses_scene_key_and_unchanged_graphic_does_not_delete_or_retransmit() {
+        let mut kitty_host = TestHost::kitty(512, 128);
         let state = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut cache = TerminalGraphicsCache::new();
         let pane_id = Uuid::from_u128(7_777);
         let mut pane_buffers = BTreeMap::from([(pane_id, PaneRenderBuffer::default())]);
         let (initial, initial_stats) = render_retained_graphic_frame(
+            &mut kitty_host,
             &state,
             &mut cache,
             &mut pane_buffers,
@@ -7314,6 +6951,7 @@ mod tests {
 
         state.store(1, std::sync::atomic::Ordering::Relaxed);
         let (unchanged, unchanged_stats) = render_retained_graphic_frame(
+            &mut kitty_host,
             &state,
             &mut cache,
             &mut pane_buffers,
@@ -7337,11 +6975,13 @@ mod tests {
     #[cfg(feature = "image-kitty")]
     #[test]
     fn retained_graphic_removed_deletes_stale_placement_and_source() {
+        let mut kitty_host = TestHost::kitty(512, 128);
         let state = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut cache = TerminalGraphicsCache::new();
         let pane_id = Uuid::from_u128(7_777);
         let mut pane_buffers = BTreeMap::from([(pane_id, PaneRenderBuffer::default())]);
         let _ = render_retained_graphic_frame(
+            &mut kitty_host,
             &state,
             &mut cache,
             &mut pane_buffers,
@@ -7350,6 +6990,7 @@ mod tests {
 
         state.store(2, std::sync::atomic::Ordering::Relaxed);
         let (removed, removed_stats) = render_retained_graphic_frame(
+            &mut kitty_host,
             &state,
             &mut cache,
             &mut pane_buffers,
@@ -7361,53 +7002,84 @@ mod tests {
         assert!(cache.is_empty());
     }
 
+    /// Extension graphic overlays are images of the frame: a host frame writes them after its
+    /// cells through the presenter's image compositor, a headless one keeps them in its image
+    /// scene for observers, and a removed overlay leaves both.
     #[cfg(feature = "image-kitty")]
     #[test]
-    fn captured_frames_write_graphics_around_their_cells_instead_of_capturing_them() {
+    fn graphic_overlays_are_images_of_the_frame() {
         let state = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut cache = TerminalGraphicsCache::new();
         let pane_id = Uuid::from_u128(7_777);
-        let mut pane_buffers = BTreeMap::from([(pane_id, PaneRenderBuffer::default())]);
-        let mut cells = bmux_tui::buffer::Buffer::empty(TuiRect::new(0, 0, 10, 4));
-        let mut frame = |damage: &FrameDamage| {
-            let mut output = crate::canvas::FrameOutput::with_graphics();
-            crate::canvas::paint_on(&mut cells, &mut output, |canvas| {
-                render_retained_graphic_frame_stats(
-                    canvas,
-                    &state,
-                    &mut cache,
-                    &mut pane_buffers,
-                    damage,
-                );
-            });
-            output
-        };
-        let placed = frame(&FrameDamage::full_frame());
-        let graphics = placed.graphics().expect("graphics output");
-        let after = String::from_utf8_lossy(&graphics.after);
-        assert!(after.contains("Ga=t,"), "{after:?}");
-        assert!(after.contains("Ga=p,"), "{after:?}");
-        assert_eq!(String::from_utf8_lossy(&graphics.before), "");
-        assert!(placed.images().is_empty(), "{:?}", placed.images());
-        assert!(placed.rejection().is_none(), "{:?}", placed.rejection());
+        for host in [true, false] {
+            state.store(0, std::sync::atomic::Ordering::Relaxed);
+            let mut cache = TerminalGraphicsCache::new();
+            let mut pane_buffers = BTreeMap::from([(pane_id, PaneRenderBuffer::default())]);
+            let mut presenter = FramePresenter::new();
+            if host {
+                presenter = TestHost::kitty(10, 4).presenter;
+            } else {
+                presenter.set_encoding(false);
+            }
+            let mut frame = |damage: &FrameDamage, full: bool| {
+                let frame = presenter
+                    .present(
+                        &crate::frame_presenter::FrameSpec {
+                            full,
+                            size: (10, 4),
+                            margins: false,
+                            host,
+                        },
+                        |canvas| {
+                            render_retained_graphic_frame_stats(
+                                canvas,
+                                &state,
+                                &mut cache,
+                                &mut pane_buffers,
+                                damage,
+                            );
+                            Ok::<_, std::convert::Infallible>(())
+                        },
+                    )
+                    .unwrap_or_else(|never| match never {});
+                let bytes = match frame.presented {
+                    Presented::Frame(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                    Presented::Unchanged => String::new(),
+                    Presented::Unsupported(reason) => panic!("unsupported frame: {reason}"),
+                };
+                let scene = presenter
+                    .image_scene()
+                    .placements()
+                    .map(|image| (image.key.as_str().to_owned(), image.z))
+                    .collect::<Vec<_>>();
+                (bytes, scene)
+            };
+            let (placed, scene) = frame(&FrameDamage::full_frame(), true);
+            assert_eq!(scene.len(), 1, "{scene:?}");
+            assert!(
+                scene[0].0.starts_with("overlay:") && scene[0].1 == test_graphic_overlay(2).z_index,
+                "{scene:?}"
+            );
+            assert_eq!(placed.contains("\x1b_Ga=t,"), host, "{placed:?}");
+            assert_eq!(placed.contains("\x1b_Ga=p,"), host, "{placed:?}");
 
-        state.store(2, std::sync::atomic::Ordering::Relaxed);
-        let removed = frame(&FrameDamage::default());
-        let graphics = removed.graphics().expect("graphics output");
-        let before = String::from_utf8_lossy(&graphics.before);
-        assert!(before.contains("Ga=d,d=i,"), "{before:?}");
-        assert_eq!(String::from_utf8_lossy(&graphics.after), "");
-        assert!(cache.is_empty());
+            state.store(2, std::sync::atomic::Ordering::Relaxed);
+            let (removed, scene) = frame(&FrameDamage::default(), false);
+            assert!(scene.is_empty(), "{scene:?}");
+            assert_eq!(removed.contains("\x1b_Ga=d,d=i,"), host, "{removed:?}");
+            assert!(cache.is_empty());
+        }
     }
 
     #[cfg(feature = "image-kitty")]
     #[test]
     fn retained_graphic_geometry_change_places_without_source_delete() {
+        let mut kitty_host = TestHost::kitty(512, 128);
         let state = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut cache = TerminalGraphicsCache::new();
         let pane_id = Uuid::from_u128(7_777);
         let mut pane_buffers = BTreeMap::from([(pane_id, PaneRenderBuffer::default())]);
         let _ = render_retained_graphic_frame(
+            &mut kitty_host,
             &state,
             &mut cache,
             &mut pane_buffers,
@@ -7416,12 +7088,14 @@ mod tests {
 
         state.store(3, std::sync::atomic::Ordering::Relaxed);
         let (moved, moved_stats) = render_retained_graphic_frame(
+            &mut kitty_host,
             &state,
             &mut cache,
             &mut pane_buffers,
             &FrameDamage::default(),
         );
-        assert!(!moved.contains("Ga=d,"), "{moved:?}");
+        // The uploaded source is placed at the new cells: no new upload, and the source stays.
+        assert!(!moved.contains("Ga=d,d=I,"), "{moved:?}");
         assert!(!moved.contains("Ga=t,"), "{moved:?}");
         assert!(moved.contains("\u{1b}[2;5H\u{1b}_Ga=p,"), "{moved:?}");
         assert_eq!(moved_stats.terminal_graphic_transmits, 0);
@@ -7432,13 +7106,14 @@ mod tests {
     #[cfg(feature = "image-kitty")]
     #[test]
     fn surface_scoped_render_items_preserve_unrelated_kitty_graphics() {
+        let mut kitty_host = TestHost::kitty(512, 128);
         let capabilities = test_kitty_capabilities();
         let pane_surface_id = Uuid::from_u128(7);
         let menu_surface_id = Uuid::from_u128(8);
         let surface_rect = ExtensionRect::new(0, 0, 10, 4);
         let pane_items = [RenderLayerItem::Graphic(test_graphic_overlay(2))];
         let mut cache = TerminalGraphicsCache::new();
-        with_graphics(|canvas| {
+        with_graphics(&mut kitty_host, |canvas| {
             queue_render_items(
                 canvas,
                 pane_surface_id,
@@ -7454,7 +7129,7 @@ mod tests {
         let cached_keys = cache.keys().copied().collect::<BTreeSet<_>>();
         assert_eq!(cached_keys.len(), 1);
 
-        let (queued, menu_output) = with_graphics(|canvas| {
+        let (queued, menu_output) = with_graphics(&mut kitty_host, |canvas| {
             queue_render_items_for_surface(
                 canvas,
                 menu_surface_id,
@@ -7479,42 +7154,8 @@ mod tests {
 
     #[cfg(feature = "image-kitty")]
     #[test]
-    fn terminal_graphics_cleanup_plan_records_stale_kitty_policy() {
-        let items = [RenderLayerItem::Graphic(test_graphic_overlay(2))];
-        let capabilities = test_kitty_capabilities();
-        let mut cache = BTreeMap::new();
-        with_graphics(|canvas| {
-            queue_render_items(
-                canvas,
-                Uuid::from_u128(7),
-                ExtensionRect {
-                    x: 0,
-                    y: 0,
-                    w: 10,
-                    h: 4,
-                },
-                &RenderDamage::FullSurface,
-                &items,
-                &mut cache,
-                capabilities,
-                None,
-            )
-            .expect("initial kitty graphic should queue")
-        });
-
-        let active = BTreeSet::new();
-        let plan = TerminalGraphicsCleanupPlan::for_frame(&active, &cache);
-
-        assert_eq!(plan.stale.len(), 1);
-        assert_eq!(
-            plan.policy,
-            TerminalGraphicsStaleCleanupPolicy::DeleteKittyPlacementAndImageSource
-        );
-    }
-
-    #[cfg(feature = "image-kitty")]
-    #[test]
     fn terminal_graphics_resource_stats_track_graphic_churn() {
+        let mut kitty_host = TestHost::kitty(512, 128);
         let items = [RenderLayerItem::Graphic(test_graphic_overlay(2))];
         let capabilities = test_kitty_capabilities();
         let surface_rect = ExtensionRect {
@@ -7525,7 +7166,7 @@ mod tests {
         };
         let mut cache = BTreeMap::new();
         let mut initial_stats = AttachSceneRenderStats::default();
-        with_graphics(|canvas| {
+        with_graphics(&mut kitty_host, |canvas| {
             queue_render_items(
                 canvas,
                 Uuid::from_u128(7),
@@ -7545,7 +7186,7 @@ mod tests {
         assert!(initial_stats.terminal_graphic_bytes > 0);
 
         let mut cleanup_stats = AttachSceneRenderStats::default();
-        with_graphics(|canvas| {
+        with_graphics(&mut kitty_host, |canvas| {
             queue_render_items(
                 canvas,
                 Uuid::from_u128(7),
@@ -7568,10 +7209,11 @@ mod tests {
     #[cfg(feature = "image-kitty")]
     #[test]
     fn queue_render_items_caches_kitty_graphic_transmits() {
+        let mut kitty_host = TestHost::kitty(512, 128);
         let items = [RenderLayerItem::Graphic(test_graphic_overlay(2))];
         let capabilities = test_kitty_capabilities();
         let mut cache = BTreeMap::new();
-        let (queued, first) = with_graphics(|canvas| {
+        let (queued, first) = with_graphics(&mut kitty_host, |canvas| {
             queue_render_items(
                 canvas,
                 Uuid::from_u128(7),
@@ -7595,7 +7237,7 @@ mod tests {
         assert!(first.contains("\u{1b}[2;3H\u{1b}_Ga=p,"), "{first:?}");
         assert!(first.contains(",z=8,c=4,r=1,q=2"), "{first:?}");
 
-        let (queued, second) = with_graphics(|canvas| {
+        let (queued, second) = with_graphics(&mut kitty_host, |canvas| {
             queue_render_items(
                 canvas,
                 Uuid::from_u128(7),
@@ -7617,7 +7259,7 @@ mod tests {
         assert_eq!(second, "");
 
         let moved_items = [RenderLayerItem::Graphic(test_graphic_overlay(4))];
-        let (queued, third) = with_graphics(|canvas| {
+        let (queued, third) = with_graphics(&mut kitty_host, |canvas| {
             queue_render_items(
                 canvas,
                 Uuid::from_u128(7),
@@ -7636,12 +7278,13 @@ mod tests {
             .expect("moved cached kitty graphic should place")
         });
         assert!(queued);
-        assert!(!third.contains("Ga=d,d=i,"), "{third:?}");
+        // Moving re-places the uploaded source: no new upload, and the source stays.
+        assert!(!third.contains("Ga=d,d=I,"), "{third:?}");
         assert!(!third.contains("Ga=t,"), "{third:?}");
         assert!(third.contains("Ga=p,"), "{third:?}");
         assert!(third.contains("\u{1b}[2;5H\u{1b}_Ga=p,"), "{third:?}");
 
-        let (queued, fourth) = with_graphics(|canvas| {
+        let (queued, fourth) = with_graphics(&mut kitty_host, |canvas| {
             queue_render_items(
                 canvas,
                 Uuid::from_u128(7),
@@ -7668,6 +7311,7 @@ mod tests {
     #[cfg(feature = "image-kitty")]
     #[test]
     fn padded_content_graphic_placement_is_clipped_and_positioned_in_content_cells() {
+        let mut kitty_host = TestHost::kitty(512, 128);
         let capabilities = test_kitty_capabilities();
         let content = ExtensionRect {
             x: 7,
@@ -7695,7 +7339,7 @@ mod tests {
             ..inside
         };
         let mut cache = BTreeMap::new();
-        let (queued, rendered) = with_graphics(|canvas| {
+        let (queued, rendered) = with_graphics(&mut kitty_host, |canvas| {
             queue_render_items(
                 canvas,
                 Uuid::from_u128(7),
@@ -7715,18 +7359,15 @@ mod tests {
         );
         assert!(
             !terminal_graphic_needs_reconcile(
-                true,
                 &outside,
                 terminal_graphic_instance_key(Uuid::from_u128(7), Uuid::from_u128(7), outside.key,),
                 content,
-                &RenderDamage::FullSurface,
                 &cache,
-                capabilities,
             ),
             "graphics wholly outside padded content must be clipped"
         );
 
-        let (queued, clipped_output) = with_graphics(|canvas| {
+        let (queued, clipped_output) = with_graphics(&mut kitty_host, |canvas| {
             queue_render_items(
                 canvas,
                 Uuid::from_u128(7),
@@ -7749,7 +7390,8 @@ mod tests {
 
     #[cfg(feature = "image-kitty")]
     #[test]
-    fn queue_render_items_updates_kitty_graphic_source_without_delete_or_replacement() {
+    fn queue_render_items_uploads_a_changed_kitty_graphic_source_and_keeps_the_old() {
+        let mut kitty_host = TestHost::kitty(512, 128);
         let capabilities = test_kitty_capabilities();
         let surface_rect = ExtensionRect {
             x: 0,
@@ -7758,7 +7400,7 @@ mod tests {
             h: 4,
         };
         let mut cache = BTreeMap::new();
-        with_graphics(|canvas| {
+        with_graphics(&mut kitty_host, |canvas| {
             queue_render_items(
                 canvas,
                 Uuid::from_u128(7),
@@ -7774,7 +7416,7 @@ mod tests {
 
         let mut changed_graphic = test_graphic_overlay(2);
         changed_graphic.color.r = 9;
-        let (queued, changed) = with_graphics(|canvas| {
+        let (queued, changed) = with_graphics(&mut kitty_host, |canvas| {
             queue_render_items(
                 canvas,
                 Uuid::from_u128(7),
@@ -7788,20 +7430,21 @@ mod tests {
             .expect("changed kitty source should retransmit")
         });
         assert!(queued);
+        // The changed source is uploaded and placed; the old one stays on the host for reuse
+        // (a focus color toggled back costs no upload).
         assert!(changed.contains("Ga=t,"), "{changed:?}");
-        assert!(!changed.contains("Ga=d,"), "{changed:?}");
-        assert!(!changed.contains("Ga=p,"), "{changed:?}");
+        assert!(changed.contains("Ga=p,"), "{changed:?}");
+        assert!(!changed.contains("Ga=d,d=I,"), "{changed:?}");
         assert_eq!(
             cache.values().next().expect("cache entry").placement,
-            Some(terminal_graphic_placement_signature(&test_graphic_overlay(
-                2
-            )))
+            terminal_graphic_placement_signature(&test_graphic_overlay(2))
         );
     }
 
     #[cfg(feature = "image-kitty")]
     #[test]
     fn queue_render_items_reconciles_graphics_without_text_damage() {
+        let mut kitty_host = TestHost::kitty(512, 128);
         let capabilities = test_kitty_capabilities();
         let mut cache = BTreeMap::new();
         let surface_rect = ExtensionRect {
@@ -7810,7 +7453,7 @@ mod tests {
             w: 10,
             h: 4,
         };
-        with_graphics(|canvas| {
+        with_graphics(&mut kitty_host, |canvas| {
             queue_render_items(
                 canvas,
                 Uuid::from_u128(7),
@@ -7824,7 +7467,7 @@ mod tests {
             .expect("initial kitty graphic should queue");
         });
 
-        let (queued, moved) = with_graphics(|canvas| {
+        let (queued, moved) = with_graphics(&mut kitty_host, |canvas| {
             queue_render_items(
                 canvas,
                 Uuid::from_u128(7),
@@ -7838,7 +7481,7 @@ mod tests {
             .expect("moved graphic should reconcile despite no text damage")
         });
         assert!(queued);
-        assert!(!moved.contains("Ga=d,d=i,"), "{moved:?}");
+        assert!(!moved.contains("Ga=d,d=I,"), "{moved:?}");
         assert!(!moved.contains("Ga=t,"), "{moved:?}");
         assert!(moved.contains("\u{1b}[2;5H\u{1b}_Ga=p,"), "{moved:?}");
     }
@@ -7846,6 +7489,7 @@ mod tests {
     #[cfg(feature = "image-kitty")]
     #[test]
     fn terminal_graphics_cache_distinguishes_panes_reusing_surface_ids() {
+        let mut kitty_host = TestHost::kitty(512, 128);
         let capabilities = test_kitty_capabilities();
         let mut cache = BTreeMap::new();
         let surface_id = Uuid::from_u128(7);
@@ -7859,7 +7503,7 @@ mod tests {
         };
         let items = [RenderLayerItem::Graphic(test_graphic_overlay(2))];
         let mut terminal_graphics = TerminalGraphicsFrameResources::default();
-        with_graphics(|canvas| {
+        with_graphics(&mut kitty_host, |canvas| {
             queue_render_items_for_frame(
                 canvas,
                 pane_a,
@@ -7877,7 +7521,7 @@ mod tests {
         assert_eq!(cache.values().next().expect("cache entry").pane_id, pane_a);
 
         let mut terminal_graphics = TerminalGraphicsFrameResources::default();
-        let ((), second) = with_graphics(|canvas| {
+        let ((), second) = with_graphics(&mut kitty_host, |canvas| {
             queue_render_items_for_frame(
                 canvas,
                 pane_b,
@@ -7890,12 +7534,11 @@ mod tests {
                 capabilities,
             )
             .expect("new pane graphic should queue despite same surface/key");
-            terminal_graphics
-                .cleanup_stale(canvas, &mut cache, capabilities)
-                .expect("old pane graphic should be deleted");
+            terminal_graphics.cleanup_stale(canvas, &mut cache);
         });
-        assert!(second.contains("Ga=t,"), "{second:?}");
-        assert!(second.contains("Ga=d,d=i,"), "{second:?}");
+        // The new pane's graphic has the same pixels: its upload is reused, placed anew, and
+        // the old pane's placement deleted.
+        assert!(second.contains("Ga=p,"), "{second:?}");
         assert!(second.contains("Ga=d,d=i,"), "{second:?}");
         assert_eq!(cache.len(), 1);
         assert_eq!(cache.values().next().expect("cache entry").pane_id, pane_b);
@@ -7904,6 +7547,7 @@ mod tests {
     #[cfg(feature = "image-kitty")]
     #[test]
     fn terminal_graphics_cleanup_does_not_depend_on_pane_buffers() {
+        let mut kitty_host = TestHost::kitty(512, 128);
         let capabilities = test_kitty_capabilities();
         let mut cache = BTreeMap::new();
         let surface_rect = ExtensionRect {
@@ -7913,7 +7557,7 @@ mod tests {
             h: 4,
         };
         let mut terminal_graphics = TerminalGraphicsFrameResources::default();
-        with_graphics(|canvas| {
+        with_graphics(&mut kitty_host, |canvas| {
             queue_render_items_for_frame(
                 canvas,
                 Uuid::from_u128(101),
@@ -7930,10 +7574,8 @@ mod tests {
         assert_eq!(cache.len(), 1);
 
         let mut terminal_graphics = TerminalGraphicsFrameResources::default();
-        let ((), deleted) = with_graphics(|canvas| {
-            terminal_graphics
-                .cleanup_stale(canvas, &mut cache, capabilities)
-                .expect("terminal-scoped cleanup should delete stale image");
+        let ((), deleted) = with_graphics(&mut kitty_host, |canvas| {
+            terminal_graphics.cleanup_stale(canvas, &mut cache);
         });
         assert!(deleted.contains("Ga=d,d=i,"), "{deleted:?}");
         assert!(deleted.contains("Ga=d,d=i,"), "{deleted:?}");
@@ -7942,7 +7584,7 @@ mod tests {
 
     #[cfg(feature = "image-kitty")]
     #[test]
-    fn same_surface_stale_graphics_cleanup_runs_before_replacement_text() {
+    fn same_surface_stale_graphics_are_removed_with_replacement_text() {
         let capabilities = test_kitty_capabilities();
         let pane_id = Uuid::from_u128(101);
         let surface_id = Uuid::from_u128(7);
@@ -7954,7 +7596,7 @@ mod tests {
         };
         let mut cache = BTreeMap::new();
         let mut terminal_graphics = TerminalGraphicsFrameResources::default();
-        let mut host = TestHost::new(10, 4);
+        let mut host = TestHost::kitty(10, 4);
         host.frame(true, |canvas| {
             queue_render_items_for_frame(
                 canvas,
@@ -7991,11 +7633,7 @@ mod tests {
             )
             .expect("replacement text should queue after stale graphic cleanup");
         });
-        // Removals are written before the frame's cells; the presented frame shows the order.
-        let before = String::from_utf8_lossy(&replacement.graphics.before);
-        let after = String::from_utf8_lossy(&replacement.graphics.after);
-        assert!(before.contains("Ga=d,d=i,"), "{before:?}");
-        assert!(!after.contains("Ga=d,"), "{after:?}");
+        // The stale graphic leaves in the frame that writes the text replacing it.
         assert!(
             replacement
                 .changes
@@ -8005,13 +7643,7 @@ mod tests {
             replacement.changes
         );
         let presented = String::from_utf8_lossy(&replacement.bytes);
-        let delete_at = presented
-            .find("Ga=d,d=i,")
-            .expect("stale graphic should be deleted before text");
-        let text_at = presented
-            .find("HEADER")
-            .expect("replacement text should be written");
-        assert!(delete_at < text_at, "{presented:?}");
+        assert!(presented.contains("Ga=d,d=i,"), "{presented:?}");
         assert_eq!(host.row(1), "  HEADER  ");
         assert!(cache.is_empty());
     }
@@ -8101,7 +7733,8 @@ mod tests {
         let mut cache = TerminalGraphicsCache::new();
         let extensions: Vec<Arc<dyn AttachRenderExtension>> =
             vec![Arc::new(BeforeGraphicsExtension)];
-        let (_, output) = with_graphics(|canvas| {
+        let mut kitty_host = TestHost::kitty(512, 128);
+        let (_, output) = with_graphics(&mut kitty_host, |canvas| {
             render_attach_scene_with_stats_and_trace_with_capabilities(
                 canvas,
                 &scene,
@@ -8236,7 +7869,8 @@ mod tests {
         let mut graphics_cache = TerminalGraphicsCache::new();
         let capabilities = test_kitty_capabilities();
 
-        with_graphics(|canvas| {
+        let mut kitty_host = TestHost::kitty(512, 128);
+        with_graphics(&mut kitty_host, |canvas| {
             render_attach_scene_with_stats_and_trace_with_capabilities(
                 canvas,
                 &scene,
@@ -8261,7 +7895,7 @@ mod tests {
 
         let mut damage = FrameDamage::default();
         damage.mark_content_surface(pane_a);
-        let (_, partial) = with_graphics(|canvas| {
+        let (_, partial) = with_graphics(&mut kitty_host, |canvas| {
             render_attach_scene_with_stats_and_trace_with_capabilities(
                 canvas,
                 &scene,
@@ -8290,7 +7924,7 @@ mod tests {
     #[cfg(feature = "image-kitty")]
     #[test]
     #[allow(clippy::too_many_lines)] // Regression fixture models a tab/window switch replacing the visible pane surface.
-    fn tab_switch_deletes_stale_surface_kitty_graphics_before_new_graphics() {
+    fn tab_switch_replaces_stale_surface_kitty_graphics() {
         use bmux_plugin::AttachRenderExtension;
         use std::sync::Arc;
 
@@ -8375,7 +8009,8 @@ mod tests {
         let mut graphics_cache = TerminalGraphicsCache::new();
         let capabilities = test_kitty_capabilities();
 
-        with_graphics(|canvas| {
+        let mut kitty_host = TestHost::kitty(512, 128);
+        with_graphics(&mut kitty_host, |canvas| {
             render_attach_scene_with_stats_and_trace_with_capabilities(
                 canvas,
                 &first_scene,
@@ -8398,7 +8033,7 @@ mod tests {
         });
         assert_eq!(graphics_cache.len(), 1);
 
-        let (_, switched) = with_graphics(|canvas| {
+        let (_, switched) = with_graphics(&mut kitty_host, |canvas| {
             render_attach_scene_with_stats_and_trace_with_capabilities(
                 canvas,
                 &second_scene,
@@ -8420,25 +8055,16 @@ mod tests {
             .expect("tab switch render should delete stale graphic and queue replacement")
         });
 
-        let placement_delete_at = switched
-            .find("Ga=d,d=i,")
-            .expect("stale placement should be deleted on tab switch");
-        let image_delete_at = switched
-            .find("Ga=d,d=i,")
-            .expect("stale image source should be deleted on tab switch");
-        let transmit_at = switched
-            .find("Ga=t,")
-            .expect("replacement tab graphic should be transmitted");
-        assert!(
-            placement_delete_at < transmit_at && image_delete_at < transmit_at,
-            "stale deletes should precede replacement graphic: {switched:?}"
-        );
+        // The stale tab's graphic leaves and the new tab's is placed, in the same frame.
+        assert!(switched.contains("Ga=d,d=i,"), "{switched:?}");
+        assert!(switched.contains("Ga=p,"), "{switched:?}");
         assert_eq!(graphics_cache.len(), 1);
     }
 
     #[cfg(feature = "image-kitty")]
     #[test]
     fn queue_render_items_deletes_cached_graphics_when_capability_is_lost() {
+        let mut kitty_host = TestHost::kitty(512, 128);
         let capabilities = test_kitty_capabilities();
         let mut cache = BTreeMap::new();
         let surface_rect = ExtensionRect {
@@ -8448,7 +8074,7 @@ mod tests {
             h: 4,
         };
         let items = [RenderLayerItem::Graphic(test_graphic_overlay(2))];
-        with_graphics(|canvas| {
+        with_graphics(&mut kitty_host, |canvas| {
             queue_render_items(
                 canvas,
                 Uuid::from_u128(7),
@@ -8462,7 +8088,7 @@ mod tests {
             .expect("initial kitty graphic should queue");
         });
 
-        let (queued, deleted) = with_graphics(|canvas| {
+        let (queued, deleted) = with_graphics(&mut kitty_host, |canvas| {
             queue_render_items(
                 canvas,
                 Uuid::from_u128(7),

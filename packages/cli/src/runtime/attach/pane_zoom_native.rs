@@ -752,7 +752,7 @@ pub(super) fn fragments(view: &AttachViewState) -> anyhow::Result<Vec<PreparedGr
                     images.push(Arc::new(ImagePlacement {
                         key: format!("zoom:{id}:{}:{}", projection.source.execution, image.id)
                             .into(),
-                        payload: super::observer::observed_image_payload(image)
+                        payload: super::pane_images::image_payload(image)
                             .map_err(anyhow::Error::msg)?,
                         destination,
                         fit: ImageFit::Contain,
@@ -872,8 +872,7 @@ fn history_images(
                     image.id
                 )
                 .into(),
-                payload: super::observer::observed_image_payload(image)
-                    .map_err(anyhow::Error::msg)?,
+                payload: super::pane_images::image_payload(image).map_err(anyhow::Error::msg)?,
                 destination,
                 fit: ImageFit::Contain,
                 allocation: None,

@@ -407,20 +407,16 @@ pub struct AttachViewState {
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    pub kitty_host_state: bmux_image::compositor::KittyHostState,
+    /// Decoded payloads of the pane images frames place.
+    pub pane_image_payloads: super::pane_images::PaneImagePayloads,
+    /// Image limits from config (read once at attach time); frames are presented with them and
+    /// `host_image_caps`.
     #[cfg(any(
         feature = "image-sixel",
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    pub pane_images_presented: bool,
-    /// Cached image decode mode from config (read once at attach time).
-    #[cfg(any(
-        feature = "image-sixel",
-        feature = "image-kitty",
-        feature = "image-iterm2"
-    ))]
-    pub image_decode_mode: bmux_image::config::ImageDecodeMode,
+    pub image_config: bmux_image::ImageConfig,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -796,19 +792,13 @@ impl AttachViewState {
                 feature = "image-kitty",
                 feature = "image-iterm2"
             ))]
-            kitty_host_state: bmux_image::compositor::KittyHostState::default(),
+            pane_image_payloads: super::pane_images::PaneImagePayloads::default(),
             #[cfg(any(
                 feature = "image-sixel",
                 feature = "image-kitty",
                 feature = "image-iterm2"
             ))]
-            pane_images_presented: false,
-            #[cfg(any(
-                feature = "image-sixel",
-                feature = "image-kitty",
-                feature = "image-iterm2"
-            ))]
-            image_decode_mode: bmux_image::config::ImageDecodeMode::Passthrough,
+            image_config: bmux_image::ImageConfig::default(),
         }
     }
 
@@ -928,6 +918,13 @@ impl AttachViewState {
             .any(|pane| !self.presented_images(*pane).is_empty())
     }
 
+    /// Whether the last frame presented left any image showing (on the host, and for
+    /// observers).
+    #[must_use]
+    pub fn shows_images(&self) -> bool {
+        self.terminal_presenter.shows_images()
+    }
+
     /// Whether graphics are, or were last frame, on the host terminal: pane rows must then not
     /// be moved there, since moving them would move or orphan the graphics.
     #[must_use]
@@ -938,7 +935,7 @@ impl AttachViewState {
             feature = "image-iterm2"
         ))]
         {
-            self.pane_images_presented || self.has_presented_images()
+            self.has_presented_images() || self.shows_images()
         }
         #[cfg(not(any(
             feature = "image-sixel",

@@ -303,26 +303,33 @@ intermediate forms are only copies:
 5. **Cleanup and numbers.** Leftovers removed; `pipeline_bench`, observed and not, compared with
    phase 5.
 
-Steps 1, 2, 3 and 5 are implemented. Step 4 replaces the attach client's three image paths
-(pane images through its own `KittyHostState`, extension overlays through a Kitty-only cache and
-writer, observer images through a separate conversion) with the one bcode uses: images are frame
-contributions, the terminal reconciles them into an image scene and its change, and
-`bmux_image::tui::TuiImageCompositor` alone encodes that change through the terminal's output
-hooks (its pre-frame hook's repaint answer carries Sixel and iTerm2 repair). Every pane image can
-take part: Sixel is decoded to pixels, iTerm2 carries a PNG/JPEG/GIF, and the registry keeps
-completed Kitty transfers as PNG; the attach client already decodes all of them. In order:
+All five steps are implemented. Step 4 replaced the attach client's three image paths (pane
+images through its own `KittyHostState`, extension overlays through a Kitty-only cache and
+writer, observer images through a separate conversion) with one:
 
-1. `bmux_tui`: image payload bytes are shared (`Arc<[u8]>`), so contributing images every frame
-   copies nothing; frames painted in place carry image contributions, and the terminal commits
-   their scene and change with the cells.
-2. `FramePresenter` owns the compositor and encodes the scene's change through the hooks;
-   `Canvas::image` always contributes to the frame.
-3. Extension graphic overlays are image placements; the attach graphics cache and Kitty overlay
-   writer go (overlays gain Sixel and iTerm2).
-4. Pane images are image placements with stable keys, converted once per image; the attach
-   client's own Kitty host state and pane image path go.
-5. The CLI's raster repair (forced full frames and ED2), the observer's own image conversion and
-   the unused `images.decode_mode` setting go; observers mirror the terminal's image scene.
+* **Images are frame contributions.** `Canvas::image` contributes a placement and
+  `Canvas::remove_image` removes one; payload bytes are shared (`Arc<[u8]>`), so contributing
+  copies nothing. A frame painted in place that declares its image set replaces the scene's
+  frame-scoped images with it; one that only contributes changes what it names. The terminal
+  commits the scene and its change with the cells, and keeps it across full repaints.
+* **One encoder.** `FramePresenter` owns `bmux_image::tui::TuiImageCompositor` and runs it
+  through the terminal's output hooks, which say what the frame did: the hook before the cells
+  gets the image delta (none for a full frame) and asks for raster repair (ED2 and every cell)
+  only on a full frame or a changed scene; the hook after them gets the cells written and writes
+  the scene only after a full repaint, a scene change, a change of host capabilities, or, for
+  Sixel and iTerm2, cells written over an image. A frame that only edits text writes no image
+  bytes and clones no compositor. Placements carry a layer (`z`), so Kitty keeps overlays under
+  text; an image placed under text that leaves loses its source too, since some hosts keep such
+  placements visible after a placement delete.
+* **Pane images** are placements keyed by surface, pane execution and image id, decoded once
+  (and compacted for observers) and kept while frames place them, split into the strips left
+  visible around surfaces drawn over them. Every `render_scene` frame declares them.
+* **Extension overlays** are persistent placements, contributed when new or changed and removed
+  when stale, on a Kitty host (which layers them under text) and for headless clients; a raster
+  host does not show them, since a raster image would cover the text it decorates.
+* **Observers mirror the scene** the presenter committed (minus the pane images of panes they
+  show natively zoomed); the CLI's raster repair (forced full frames and ED2), its Kitty state,
+  the frame's graphics byte channel and the unused `images.decode_mode` setting are gone.
 
 Known limitation, unchanged: the Kitty intake accepts direct (inline) transmissions only; file,
 temporary-file and shared-memory media, zlib compression, Unicode placeholders and animation
@@ -390,6 +397,9 @@ At 420x90, SU scroll, the attach client renders in about 1 ms and writes 12 KB a
   terminal's change; pane rows are painted from the grid without per-row allocations, and
   render operations are lowered straight into the frame. Instructions per frame at 420x90: SU
   scroll 1.27M, plain stream 1.35M, full repaint 22.9M, review 12.71M and 12.99M.
+* Phase 6 step 4: one image pipeline (above). Pane images, extension overlays and observer
+  images are the frame's image scene, written by the one compositor only when the frame needs
+  it; a Kitty image stays put through text edits instead of being cleared and placed again.
 
 `bmux perf` keeps its fields except `pane_row_segments_emitted`: rows are drawn whole and the
 host's terminal decides which cells to write, so `pane_rows_emitted` and `pane_cells_emitted`

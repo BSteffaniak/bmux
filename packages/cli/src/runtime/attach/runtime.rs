@@ -4581,7 +4581,7 @@ fn render_native_provider_scene<W: AttachTerminal>(
             full: true,
             size,
             margins: false,
-            graphics: true,
+            host: true,
         },
         |canvas| {
             let (cursor, _) = render_attach_scene_with_stats_and_trace_with_capabilities(
@@ -5525,26 +5525,14 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
             cell_pixel_height = view_state.host_image_caps.cell_pixel_height,
             "detected host image capabilities"
         );
-        // The presenter's image compositor writes the frame's image scene with these.
+        // The presenter's image compositor writes each frame's image scene with these.
         let images = &attach_config.behavior.images;
-        view_state.terminal_presenter.set_image_host(
-            view_state.host_image_caps.clone(),
-            bmux_image::ImageConfig {
-                enabled: images.enabled,
-                max_image_bytes: usize::try_from(images.max_image_bytes).unwrap_or(usize::MAX),
-                max_images_per_pane: usize::try_from(images.max_images_per_pane)
-                    .unwrap_or(usize::MAX),
-                ..bmux_image::ImageConfig::default()
-            },
-        );
-        // Cache the decode mode from config so we don't read config per-frame.
-        let img_cfg = attach_config.behavior.images.decode_mode;
-        view_state.image_decode_mode = match img_cfg {
-            bmux_config::ImageDecodeMode::Server => bmux_image::config::ImageDecodeMode::Server,
-            bmux_config::ImageDecodeMode::Client => bmux_image::config::ImageDecodeMode::Client,
-            bmux_config::ImageDecodeMode::Passthrough => {
-                bmux_image::config::ImageDecodeMode::Passthrough
-            }
+        view_state.image_config = bmux_image::ImageConfig {
+            enabled: images.enabled,
+            max_image_bytes: usize::try_from(images.max_image_bytes).unwrap_or(usize::MAX),
+            max_images_per_pane: usize::try_from(images.max_images_per_pane)
+                .unwrap_or(usize::MAX),
+            ..bmux_image::ImageConfig::default()
         };
     }
 
@@ -6893,18 +6881,16 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         feature = "image-iterm2"
     ))]
     if !terminal.presentation_only() {
-        let mut candidate = view_state.kitty_host_state.clone();
+        let presenter = &mut view_state.terminal_presenter;
         let cleanup = terminal.output().map_or(Ok(()), |mut output| {
-            candidate.reset(&mut output).and_then(|()| output.flush())
+            presenter
+                .release_images(&mut output)
+                .and_then(|()| output.flush())
         });
         if let Err(error) = cleanup {
-            view_state
-                .kitty_host_state
-                .invalidate_after_failed_output(&candidate);
             terminal.restore_after_attach_ui()?;
             return Err(error.into());
         }
-        view_state.kitty_host_state = candidate;
     }
     terminal.restore_after_attach_ui()?;
     drop(started_companions);
@@ -11275,26 +11261,6 @@ fn render_attach_frame_inner(
     };
     let current_prompt_overlay_surface = view_state.prompt.overlay_surface(geometry);
     let mut frame_damage = view_state.dirty.frame_damage(&layout_state.scene);
-    #[cfg(any(
-        feature = "image-sixel",
-        feature = "image-kitty",
-        feature = "image-iterm2"
-    ))]
-    let raster_image_protocol = view_state.host_image_caps.preferred_protocol()
-        != Some(bmux_image::model::ImageProtocol::KittyGraphics);
-    #[cfg(any(
-        feature = "image-sixel",
-        feature = "image-kitty",
-        feature = "image-iterm2"
-    ))]
-    if view_state.pane_images_presented
-        || (raster_image_protocol && view_state.has_presented_images())
-    {
-        // Non-persistent raster protocols require cell repair before replacing
-        // or removing a prior image. Use an explicit full repair until damage
-        // can retain protocol-specific raster footprints.
-        frame_damage.mark_full_frame();
-    }
 
     let (top_inset, bottom_inset) = (0, 0);
     let terminal_size = (geometry.cols, geometry.rows);
@@ -11340,12 +11306,6 @@ fn render_attach_frame_inner(
         && !view_state.graphics_on_host();
     let retained_repaint_by_id = frame_plan.retained.repaint_by_id();
 
-    #[cfg(any(
-        feature = "image-sixel",
-        feature = "image-kitty",
-        feature = "image-iterm2"
-    ))]
-    let mut pending_kitty_state = view_state.kitty_host_state.clone();
     // Reconciliation describes encoded output, not yet-presented resources.
     // Keep the committed cache intact until the terminal accepts the frame.
     let mut pending_graphics_cache = view_state.terminal_graphics_cache.clone();
@@ -11355,49 +11315,22 @@ fn render_attach_frame_inner(
         full: frame_damage.is_full_frame(),
         size: terminal_size,
         margins: terminal_render_capabilities(view_state).left_right_margins,
-        graphics: view_state.presenting,
+        host: view_state.presenting,
     };
     // Every client presents through its terminal presenter; the frame is painted into it.
     let mut presenter = std::mem::take(&mut view_state.terminal_presenter);
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    presenter.set_image_host(
+        view_state.host_image_caps.clone(),
+        view_state.image_config.clone(),
+    );
     let painted = presenter.present(&frame_spec, |canvas| -> Result<PaintedFrame> {
-        // Deletion belongs to the same synchronized frame as replacement pixels.
-        #[cfg(any(
-            feature = "image-sixel",
-            feature = "image-kitty",
-            feature = "image-iterm2"
-        ))]
-        if view_state.presenting {
-            // Capability changes release resources even on partial frames. Visibility
-            // reconciliation, however, requires a complete image scene.
-            canvas.write_graphics(true, |mut out| {
-                pending_kitty_state
-                    .select_protocol(&mut out, view_state.host_image_caps.preferred_protocol())?;
-                if frame_plan.render_scene {
-                    pending_kitty_state.begin_frame();
-                    pending_kitty_state.clear_placements(&mut out)?;
-                }
-                Ok(())
-            })?;
-        }
         if let Some(rejection) = frame_plan.retained.rejection.clone() {
             canvas.reject(rejection);
-        }
-        #[cfg(any(
-            feature = "image-sixel",
-            feature = "image-kitty",
-            feature = "image-iterm2"
-        ))]
-        if view_state.pane_images_presented {
-            // Repainting characters is not a portable raster deletion operation.
-            // ED2 repairs prior Sixel/iTerm2 pixels; the full-damage frame above
-            // reconstructs all cells and retained surfaces without erasing history.
-            canvas.fill(
-                bmux_tui::geometry::Rect::new(0, 0, terminal_size.0, terminal_size.1),
-                bmux_tui::style::Style::new(),
-            );
-            canvas.write_graphics(true, |writer| {
-                writer.write_all(b"\x1b[2J").map_err(Into::into)
-            })?;
         }
         clear_retained_background(canvas, &frame_plan.retained.damage.graph);
         let retained_capabilities = terminal_render_capabilities(view_state);
@@ -11463,51 +11396,24 @@ fn render_attach_frame_inner(
             previous_cursor_state
         };
 
-        // Image overlay: render terminal images (Sixel, Kitty, iTerm2) on top
-        // of the cell content, translated to host terminal coordinates.
+        // Pane images: a frame that paints the scene holds every pane image it shows (the
+        // presenter's image compositor writes them for the host, and observers mirror them).
         #[cfg(any(
             feature = "image-sixel",
             feature = "image-kitty",
             feature = "image-iterm2"
         ))]
-        // The gate below concerns native raster emission only. Browser images are
-        // fetched independently and materialized by observer::observed_images from
-        // authoritative registry data, even when no terminal protocol is supported.
-        if frame_plan.render_scene && view_state.host_image_caps.any_supported() {
-            for surface in &layout_state.scene.surfaces {
-                let Some(pane_id) = surface.pane_id else {
-                    continue;
-                };
-                let images = view_state.presented_images(pane_id);
-                if !images.is_empty() {
-                    let pane_images: Vec<bmux_image::PaneImage> =
-                        images.iter().map(bmux_image::PaneImage::from).collect();
-                    let pane_rect = bmux_image::compositor::PaneRect {
-                        x: surface.content_rect.x,
-                        y: surface.content_rect.y,
-                        w: surface.content_rect.w,
-                        h: surface.content_rect.h,
-                    };
-                    let covers = opaque_overlay_rects
-                        .iter()
-                        .map(|rect| bmux_tui::geometry::Rect::new(rect.x, rect.y, rect.w, rect.h))
-                        .collect::<Vec<_>>();
-                    if !view_state.presentation_only {
-                        canvas
-                            .write_graphics(false, |mut writer| {
-                                bmux_image::compositor::render_pane_images_clipped(
-                                    &mut writer,
-                                    &pane_images,
-                                    pane_rect,
-                                    &covers,
-                                    &view_state.host_image_caps,
-                                    &mut pending_kitty_state,
-                                )
-                                .map_err(Into::into)
-                            })
-                            .context("failed composing pane images")?;
-                    }
-                }
+        if frame_plan.render_scene {
+            canvas.declare_images();
+            let mut payloads = std::mem::take(&mut view_state.pane_image_payloads);
+            let placements = payloads.placements(
+                view_state,
+                layout_state,
+                bmux_tui::geometry::Rect::new(0, 0, terminal_size.0, terminal_size.1),
+            );
+            view_state.pane_image_payloads = payloads;
+            for placement in placements {
+                canvas.image(placement);
             }
         }
 
@@ -11654,18 +11560,6 @@ fn render_attach_frame_inner(
             })
         };
 
-        #[cfg(any(
-            feature = "image-sixel",
-            feature = "image-kitty",
-            feature = "image-iterm2"
-        ))]
-        if frame_plan.render_scene && view_state.presenting {
-            canvas.write_graphics(false, |mut writer| {
-                pending_kitty_state
-                    .finish_frame(&mut writer)
-                    .map_err(Into::into)
-            })?;
-        }
         canvas.set_cursor(pending_cursor_state);
         Ok(PaintedFrame {
             scene_render_stats,
@@ -11682,7 +11576,7 @@ fn render_attach_frame_inner(
                 pending_cursor_state,
             },
         presented,
-        output: frame_output,
+        ..
     } = painted?;
     let status_rendered = false;
     let frame_bytes = match presented {
@@ -11731,19 +11625,13 @@ fn render_attach_frame_inner(
             let cursor = view_state.last_cursor_state;
             view_state.last_cursor_state = pending_cursor_state;
             let headless = view_state.presentation_only;
-            let delivered = super::observer::deliver_prepared(
-                view_state,
-                layout_state,
-                geometry,
-                frame_output.images(),
-                || {
-                    if headless {
-                        Ok(())
-                    } else {
-                        write(terminal_writer, &frame_bytes)
-                    }
-                },
-            );
+            let delivered = super::observer::deliver_prepared(view_state, geometry, || {
+                if headless {
+                    Ok(())
+                } else {
+                    write(terminal_writer, &frame_bytes)
+                }
+            });
             if delivered.is_err() {
                 view_state.last_cursor_state = cursor;
             }
@@ -11753,14 +11641,6 @@ fn render_attach_frame_inner(
         }
     };
     if let Err(error) = write_result {
-        #[cfg(any(
-            feature = "image-sixel",
-            feature = "image-kitty",
-            feature = "image-iterm2"
-        ))]
-        view_state
-            .kitty_host_state
-            .invalidate_after_failed_output(&pending_kitty_state);
         // Encoding has advanced row baselines, but partial output is not a
         // presented frame. Repaint every row before using incremental diffs.
         for buffer in view_state.pane_buffers.values_mut() {
@@ -11781,18 +11661,6 @@ fn render_attach_frame_inner(
     view_state.last_cursor_state = pending_cursor_state;
     view_state.last_pointer_shape = view_state.pointer_shape;
     view_state.terminal_graphics_cache = pending_graphics_cache;
-    #[cfg(any(
-        feature = "image-sixel",
-        feature = "image-kitty",
-        feature = "image-iterm2"
-    ))]
-    {
-        view_state.kitty_host_state = pending_kitty_state;
-        // This flag tracks raster footprints requiring ED2, not persistent
-        // Kitty placements. ED2 can destroy cached Kitty uploads on the host.
-        view_state.pane_images_presented =
-            raster_image_protocol && view_state.has_presented_images();
-    }
 
     // Capture only frames that were successfully written and flushed.
     display_capture.record_frame(
@@ -19853,7 +19721,7 @@ mod tests {
                     .unwrap();
                 assert!(begin < clear, "raster deletion must be inside the frame");
             }
-            assert_eq!(state.pane_images_presented, visible);
+            assert_eq!(state.shows_images(), visible);
             assert!(state.presenting, "frames went through the presenter");
         }
     }
@@ -19947,22 +19815,16 @@ mod tests {
                 "Kitty frame erased uploads"
             );
             assert_eq!(String::from_utf8_lossy(&output).contains("Ga=p"), visible);
-            assert!(
-                !state.pane_images_presented,
-                "Kitty marked as raster footprint"
-            );
+            assert_eq!(state.shows_images(), visible);
             assert!(state.presenting, "frames went through the presenter");
         }
     }
 
+    /// A Kitty image stays on the host through frames that do not change it (no deletion, no
+    /// second upload); losing the capability removes it even when nothing else changed.
     #[cfg(feature = "image-kitty")]
     #[test]
     fn partial_attach_frame_preserves_retained_kitty_image() {
-        use bmux_image::compositor::{PaneRect, render_pane_images};
-        use bmux_image::model::{
-            ImageCellSize, ImagePayload, ImagePixelSize, ImagePosition, ImageProtocol, PaneImage,
-            PixelBuffer, PixelFormat,
-        };
         let session = Uuid::new_v4();
         let pane = Uuid::new_v4();
         let mut state = AttachViewState::new(bmux_client::AttachOpenInfo {
@@ -19972,6 +19834,22 @@ mod tests {
         });
         let layout = retry_test_layout(&mut state, pane, session);
         state.host_image_caps.kitty_graphics = true;
+        state.pane_images.insert(
+            pane,
+            vec![bmux_attach_image_protocol::AttachPaneImage {
+                id: 42,
+                protocol: bmux_attach_image_protocol::AttachImageProtocol::KittyGraphics,
+                raw_data: include_bytes!("../../../../presenter/examples/architecture.png")
+                    .to_vec(),
+                compression: bmux_attach_image_protocol::CompressionId::None,
+                position_row: 1,
+                position_col: 3,
+                cell_rows: 8,
+                cell_cols: 30,
+                pixel_width: 640,
+                pixel_height: 240,
+            }],
+        );
         let render = |state: &mut AttachViewState| {
             let mut output = Vec::new();
             render_attach_frame_to_writer(
@@ -19988,60 +19866,25 @@ mod tests {
                 None,
             )
             .unwrap();
-            output
+            String::from_utf8_lossy(&output).into_owned()
         };
-        render(&mut state);
-        let image = PaneImage {
-            id: 42,
-            protocol: ImageProtocol::KittyGraphics,
-            position: ImagePosition { row: 0, col: 0 },
-            cell_size: ImageCellSize { rows: 1, cols: 1 },
-            pixel_size: ImagePixelSize {
-                width: 1,
-                height: 1,
-            },
-            payload: ImagePayload {
-                raw: None,
-                pixels: Some(PixelBuffer {
-                    width: 1,
-                    height: 1,
-                    format: PixelFormat::Rgba8,
-                    data: vec![255, 0, 0, 255],
-                }),
-            },
-        };
-        let mut initial = Vec::new();
-        state.kitty_host_state.begin_frame();
-        render_pane_images(
-            &mut initial,
-            &[image],
-            PaneRect {
-                x: 0,
-                y: 0,
-                w: 80,
-                h: 24,
-            },
-            &state.host_image_caps,
-            bmux_image::config::ImageDecodeMode::Server,
-            &mut state.kitty_host_state,
-        )
-        .unwrap();
-        state.kitty_host_state.finish_frame(&mut initial).unwrap();
-        let committed = state.kitty_host_state.transmitted.clone();
+        state.dirty.mark_full_frame(AttachDirtySource::ManualRedraw);
+        let first = render(&mut state);
+        assert!(first.contains("a=t") && first.contains("a=p"), "{first:?}");
         for _ in 0..3 {
+            append_pane_output(state.pane_buffers.get_mut(&pane).unwrap(), b"x");
+            state
+                .dirty
+                .mark_pane_dirty(pane, AttachDirtySource::PaneOutput);
             let output = render(&mut state);
             assert!(
-                !String::from_utf8_lossy(&output).contains("Ga=d"),
-                "partial frame erased image"
+                !output.contains("\x1b_G"),
+                "a frame that keeps the image writes none: {output:?}"
             );
-            assert_eq!(state.kitty_host_state.transmitted, committed);
         }
-        // Losing the capability is explicit resource invalidation, not an
-        // incomplete visibility pass: it still cleans up on a partial frame.
         state.host_image_caps.kitty_graphics = false;
         let output = render(&mut state);
-        assert!(String::from_utf8_lossy(&output).contains("Ga=d,d=I"));
-        assert!(state.kitty_host_state.transmitted.is_empty());
+        assert!(output.contains("a=d"), "{output:?}");
     }
 
     fn seed_retry_graphics_cache(state: &mut AttachViewState, pane_id: Uuid) {
@@ -20061,8 +19904,10 @@ mod tests {
                     },
                     fill: bmux_plugin::TerminalGraphicFill::Full,
                 },
-                placement: None,
-                host_image_id: 1,
+                placement: bmux_attach_pipeline::types::TerminalGraphicPlacementSignature {
+                    cell_rect: bmux_plugin::ExtensionRect::new(0, 0, 1, 1),
+                    z_index: -1,
+                },
             },
         );
     }
@@ -20314,7 +20159,7 @@ mod tests {
                     full: true,
                     size,
                     margins: false,
-                    graphics: true,
+                    host: true,
                 },
                 |canvas| Ok::<_, std::convert::Infallible>(render(canvas)),
             )

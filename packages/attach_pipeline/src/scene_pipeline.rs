@@ -143,7 +143,7 @@ impl UndecoratedGridPresenter {
                 full: full_frame,
                 size: dimensions,
                 margins: false,
-                graphics: true,
+                host: true,
             },
             |canvas| {
                 let cursor = render_attach_scene_with_terminal_graphics_cache(
@@ -654,7 +654,7 @@ impl AttachScenePipeline {
                 full: self.full_pane_redraw,
                 size: (viewport.cols, viewport.rows),
                 margins: false,
-                graphics: true,
+                host: true,
             },
             |canvas| {
                 let cursor = render_attach_scene_with_terminal_graphics_cache(

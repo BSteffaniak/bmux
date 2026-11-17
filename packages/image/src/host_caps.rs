@@ -7,7 +7,7 @@
 use crate::model::ImageProtocol;
 
 /// Detected host terminal image capabilities.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HostImageCapabilities {
     /// Host supports Sixel graphics.
     pub sixel: bool,

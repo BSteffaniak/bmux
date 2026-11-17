@@ -686,7 +686,7 @@ impl PlaybookRenderTraceState {
                 full: damage.is_full_frame(),
                 size: viewport,
                 margins: false,
-                graphics: true,
+                host: true,
             },
             |canvas| {
                 let rendered = render_attach_scene_with_stats_and_trace(

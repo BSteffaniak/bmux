@@ -2907,6 +2907,55 @@ mod tests {
         assert!(output.contains("c=4,r=2"));
     }
 
+    /// A removed image placed below the text loses its source with its placement (hosts keep
+    /// such placements visible otherwise); a removed image over the text keeps its source for
+    /// reuse.
+    #[cfg(feature = "kitty")]
+    #[test]
+    fn removing_an_image_below_text_deletes_its_source() {
+        let terminal = PaneRect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 10,
+        };
+        let render = |compositor: &mut TuiImageCompositor, images: Vec<ImagePlacement>| {
+            let mut scene = ImageScene::default();
+            scene.reconcile(
+                &images
+                    .into_iter()
+                    .map(ImageContribution::Present)
+                    .collect::<Vec<_>>(),
+            );
+            let mut output = Vec::new();
+            compositor
+                .render(
+                    &mut output,
+                    &scene,
+                    terminal,
+                    &kitty_caps(),
+                    &ImageConfig::default(),
+                )
+                .unwrap();
+            String::from_utf8(output).unwrap()
+        };
+        for (z, deletes_source) in [(-1, true), (0, false)] {
+            let mut compositor = TuiImageCompositor::new();
+            let image = ImagePlacement {
+                z,
+                ..placement("border", Rect::new(0, 0, 4, 2), Rect::new(0, 0, 20, 10), 1)
+            };
+            render(&mut compositor, vec![image]);
+            let removed = render(&mut compositor, Vec::new());
+            assert!(removed.contains("a=d,d=i"), "{removed:?}");
+            assert_eq!(
+                removed.contains("a=d,d=I"),
+                deletes_source,
+                "z={z}: {removed:?}"
+            );
+        }
+    }
+
     #[cfg(feature = "kitty")]
     #[test]
     fn places_each_image_at_its_layer() {

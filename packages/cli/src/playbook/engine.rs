@@ -1611,7 +1611,7 @@ mod tests {
                 .windows(cursor.len())
                 .any(|bytes| bytes == cursor.as_bytes())
         );
-        assert!(state.pane_images_presented);
+        assert!(state.shows_images());
     }
 
     #[cfg(feature = "image-sixel")]

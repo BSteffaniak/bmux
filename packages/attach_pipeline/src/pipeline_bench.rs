@@ -232,7 +232,7 @@ impl Replay {
             full,
             size: self.size,
             margins: self.margins,
-            graphics: false,
+            host: false,
         };
         let (scene, policy, size, buffers) =
             (&self.scene, self.policy, self.size, &mut self.buffers);

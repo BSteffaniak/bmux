@@ -4,10 +4,8 @@
 //! terminal shows, or a headless client's copy of them), with a terminal's semantics: a text run
 //! replaces the cells it covers with exactly its style, colors it leaves unset being the
 //! terminal's defaults. Nothing is recorded and replayed. Beside the cells, a frame carries what
-//! the cells cannot hold: graphics protocol bytes for a host that takes them, images for a client
-//! without, and the reason a frame cannot be shown at all.
-
-use std::sync::Arc;
+//! the cells cannot hold: its images (the terminal's image scene, which the presenter writes for
+//! the host and observers mirror), and the reason a frame cannot be shown at all.
 
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::image::ImagePlacement;
@@ -16,48 +14,25 @@ use bmux_tui::style::{Color, Style};
 use bmux_tui::text::{Line, Span};
 
 use crate::AttachCursorState;
-use crate::projection::{GraphicsOutput, PaintOperation, ProjectionFailure};
+use crate::projection::{PaintOperation, ProjectionFailure};
 
 /// What a frame produces beside its cells.
 #[derive(Debug, Default)]
 pub struct FrameOutput {
-    /// Graphics protocol bytes, when the host takes them; `None` when it does not.
-    graphics: Option<GraphicsOutput>,
-    /// Images for a client whose host takes no graphics protocol output.
-    images: Vec<Arc<ImagePlacement>>,
+    /// The frame is shown on a host terminal (not only kept for observers).
+    host: bool,
     /// Why the frame cannot be shown, if it cannot.
     rejection: Option<ProjectionFailure>,
 }
 
 impl FrameOutput {
-    /// Output for a frame whose host takes graphics protocol bytes: graphics are encoded, not
-    /// placed as images.
+    /// Output for a frame shown on a host terminal.
     #[must_use]
-    pub fn with_graphics() -> Self {
+    pub fn for_host() -> Self {
         Self {
-            graphics: Some(GraphicsOutput::default()),
+            host: true,
             ..Self::default()
         }
-    }
-
-    /// The graphics protocol bytes written, when the host takes them.
-    #[must_use]
-    pub const fn graphics(&self) -> Option<&GraphicsOutput> {
-        self.graphics.as_ref()
-    }
-
-    /// Whether the frame writes graphics protocol bytes.
-    #[must_use]
-    pub fn has_graphics(&self) -> bool {
-        self.graphics
-            .as_ref()
-            .is_some_and(|graphics| !graphics.before.is_empty() || !graphics.after.is_empty())
-    }
-
-    /// The images placed for a client whose host takes no graphics protocol output.
-    #[must_use]
-    pub fn images(&self) -> &[Arc<ImagePlacement>] {
-        &self.images
     }
 
     /// Why the frame cannot be shown, if it cannot.
@@ -167,9 +142,14 @@ impl<'canvas, 'frame, 'buffer> Canvas<'canvas, 'frame, 'buffer> {
     /// Contribute an image to the frame: the terminal's image scene keeps it, the presenter's
     /// image compositor writes it for the host, and observers mirror it.
     pub fn image(&mut self, placement: ImagePlacement) {
-        self.output.images.push(Arc::new(placement.clone()));
         self.cx
             .push_image(bmux_tui::image::ImageContribution::Present(placement));
+    }
+
+    /// Remove the image `key` (one contributed as persistent) from the frame's image scene.
+    pub fn remove_image(&mut self, key: bmux_tui::image::ImageKey) {
+        self.cx
+            .push_image(bmux_tui::image::ImageContribution::Remove(key));
     }
 
     /// Declare this frame's images its complete image set (see
@@ -198,30 +178,10 @@ impl<'canvas, 'frame, 'buffer> Canvas<'canvas, 'frame, 'buffer> {
         self.output.rejection.is_some()
     }
 
-    /// Whether the host takes graphics protocol bytes.
+    /// Whether the frame is shown on a host terminal (not only kept for observers).
     #[must_use]
-    pub const fn graphics_output(&self) -> bool {
-        self.output.graphics.is_some()
-    }
-
-    /// Write graphics protocol bytes, `before` the frame's cells (removals) or after them
-    /// (placements); without graphics output, nothing is written.
-    ///
-    /// # Errors
-    /// Returns what `write` returns.
-    pub fn write_graphics<T: Default>(
-        &mut self,
-        before: bool,
-        write: impl FnOnce(&mut dyn std::io::Write) -> anyhow::Result<T>,
-    ) -> anyhow::Result<T> {
-        let Some(output) = self.output.graphics.as_mut() else {
-            return Ok(T::default());
-        };
-        write(if before {
-            &mut output.before
-        } else {
-            &mut output.after
-        })
+    pub const fn for_host(&self) -> bool {
+        self.output.host
     }
 
     /// Show the cursor the frame leaves, if any.

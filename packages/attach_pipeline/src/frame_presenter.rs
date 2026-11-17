@@ -3,15 +3,17 @@
 //! A [`FramePresenter`] owns the terminal a client presents through: the attach renderer paints
 //! each frame into it in place, over the frame it shows (see [`crate::canvas`]), and the terminal
 //! encodes only what changed. Styles, the cursor, synchronized output and row moves come from the
-//! terminal, not the renderer. Graphics protocols keep their own encoders: their bytes are
-//! written through the terminal's output hooks, removals before the frame's cells and placements
-//! after them.
+//! terminal, not the renderer. Images are the terminal's image scene: the presenter's image
+//! compositor, the one encoder of image protocol bytes, writes it through the terminal's output
+//! hooks, after the frame's cells.
 //!
 //! Every client presents this way. A headless client's terminal encodes nothing; it keeps the
 //! frame and its change for observers, which mirror the change the terminal made (see
 //! [`FramePresenter::shown_changes`]).
 
+#[cfg(image_protocols)]
 use std::cell::RefCell;
+#[cfg(image_protocols)]
 use std::io::Write;
 
 use bmux_tui::buffer::Buffer;
@@ -53,6 +55,9 @@ struct Images {
         bmux_image::host_caps::HostImageCapabilities,
         bmux_image::ImageConfig,
     )>,
+    /// The capabilities or limits changed since a frame was last written: the next frame writes
+    /// the scene with them, releasing what they no longer allow.
+    reconfigured: bool,
 }
 
 /// One frame's image output: the compositor it works on once it is written, committed with it.
@@ -78,7 +83,9 @@ impl ImageFrame<'_> {
         writer: &mut Vec<u8>,
         delta: Option<&bmux_tui::image_scene::ImageSceneDelta>,
     ) -> std::io::Result<bool> {
-        if self.images.host.is_none() || delta.is_some_and(delta_is_empty) {
+        if self.images.host.is_none()
+            || (!self.images.reconfigured && delta.is_some_and(delta_is_empty))
+        {
             return Ok(false);
         }
         self.staged().prepare_output(writer)
@@ -101,7 +108,8 @@ impl ImageFrame<'_> {
         };
         let raster = capabilities.preferred_protocol()
             != Some(bmux_image::model::ImageProtocol::KittyGraphics);
-        let needed = matches!(written, bmux_tui::terminal::Written::All)
+        let needed = self.images.reconfigured
+            || matches!(written, bmux_tui::terminal::Written::All)
             || !delta_is_empty(delta)
             || (raster
                 && scene
@@ -140,12 +148,13 @@ impl Images {
         written: bool,
         failed: bool,
     ) {
-        let Some(staged) = staged else {
-            return;
-        };
         if written {
-            self.compositor = staged;
-        } else if failed {
+            // A written frame wrote what the host needed (a headless one writes nothing).
+            self.reconfigured = false;
+            if let Some(staged) = staged {
+                self.compositor = staged;
+            }
+        } else if failed && let Some(staged) = staged {
             self.compositor.invalidate_after_failed_output(&staged);
         }
     }
@@ -200,8 +209,8 @@ pub struct FrameSpec {
     pub size: (u16, u16),
     /// The host has left and right margins (DECSLRM), so a narrower pane scrolls inside them.
     pub margins: bool,
-    /// The host takes graphics protocol bytes; otherwise graphics are placed as images.
-    pub graphics: bool,
+    /// The frame is shown on a host terminal; otherwise it is only kept for observers.
+    pub host: bool,
 }
 
 /// A presented frame: what the render returned, what presenting produced, and what the frame
@@ -237,19 +246,53 @@ impl FramePresenter {
 
     /// Select the host's image capabilities and limits: the image scene is written with them.
     #[cfg(image_protocols)]
-    pub const fn set_image_host(
+    pub fn set_image_host(
         &mut self,
         capabilities: bmux_image::host_caps::HostImageCapabilities,
         config: bmux_image::ImageConfig,
     ) {
+        let unchanged = self.images.host.as_ref().is_some_and(|(shown, limits)| {
+            *shown == capabilities
+                && (
+                    limits.enabled,
+                    limits.max_image_bytes,
+                    limits.max_images_per_pane,
+                ) == (
+                    config.enabled,
+                    config.max_image_bytes,
+                    config.max_images_per_pane,
+                )
+        });
+        if !unchanged {
+            self.images.reconfigured = true;
+        }
         self.images.host = Some((capabilities, config));
     }
 
-    /// The image compositor, for host protocol exchanges outside frames (a Kitty shared-memory
-    /// probe and its reply).
+    /// Remove every image the compositor put on the host (when leaving it), writing the removal
+    /// to `out`; nothing is written without image capabilities.
+    ///
+    /// # Errors
+    /// Returns what writing to `out` returns; the removal is then repeated by the next frame.
     #[cfg(image_protocols)]
-    pub const fn image_compositor(&mut self) -> &mut bmux_image::tui::TuiImageCompositor {
-        &mut self.images.compositor
+    pub fn release_images(&mut self, out: &mut impl Write) -> std::io::Result<()> {
+        let Some((capabilities, _)) = &self.images.host else {
+            return Ok(());
+        };
+        self.images.compositor.cleanup(out, capabilities)
+    }
+
+    /// The images the last frame presented left showing: the terminal's committed image scene,
+    /// which observers mirror.
+    #[must_use]
+    pub const fn image_scene(&self) -> &bmux_tui::image_scene::ImageScene {
+        self.terminal.image_scene()
+    }
+
+    /// Whether the last frame presented left any image showing.
+    #[must_use]
+    pub fn shows_images(&self) -> bool {
+        self.terminal.image_scene().placements().next().is_some()
     }
 
     /// Select whether frames are wrapped in a synchronized update (DEC mode 2026).
@@ -289,11 +332,11 @@ impl FramePresenter {
                 ScrollRegionAcceleration::Auto
             });
         self.terminal.writer_mut().clear();
-        let output = RefCell::new(if spec.graphics {
-            FrameOutput::with_graphics()
+        let mut output = if spec.host {
+            FrameOutput::for_host()
         } else {
             FrameOutput::default()
-        });
+        };
         let mut result = None;
         // The image compositor is staged when the frame is written and committed with it.
         #[cfg(image_protocols)]
@@ -303,42 +346,32 @@ impl FramePresenter {
         };
         let drawn = self.terminal.try_draw_over_with_output_hooks(
             |cx| {
-                let mut output = output.borrow_mut();
                 let value = paint(&mut Canvas::new(cx, &mut output)).map_err(Abandoned::Render)?;
                 result = Some(value);
                 if output.rejection().is_some() {
                     return Err(Abandoned::Unsupported);
                 }
-                Ok(output.has_graphics())
+                #[cfg(image_protocols)]
+                let reconfigured = images.images.reconfigured;
+                #[cfg(not(image_protocols))]
+                let reconfigured = false;
+                Ok(reconfigured)
             },
             |writer, delta| {
-                if let Some(graphics) = output.borrow().graphics() {
-                    writer.write_all(&graphics.before)?;
-                }
                 // Raster images leave footprints only a cleared screen and a full repaint remove.
                 #[cfg(image_protocols)]
                 return images.prepare_output(writer, delta);
                 #[cfg(not(image_protocols))]
                 {
-                    let _ = delta;
+                    let _ = (writer, delta);
                     Ok(false)
                 }
             },
             |writer, scene, delta, written| {
-                // Placing images moves the cursor: keep the frame's.
-                if let Some(graphics) = output
-                    .borrow()
-                    .graphics()
-                    .filter(|graphics| !graphics.after.is_empty())
-                {
-                    writer.write_all(b"\x1b7")?;
-                    writer.write_all(&graphics.after)?;
-                    writer.write_all(b"\x1b8")?;
-                }
                 #[cfg(image_protocols)]
                 images.render(writer, scene, delta, written, (cols, rows))?;
                 #[cfg(not(image_protocols))]
-                let _ = (scene, delta, written);
+                let _ = (writer, scene, delta, written);
                 Ok(())
             },
         );
@@ -348,7 +381,6 @@ impl FramePresenter {
             matches!(drawn, Ok(Some(_))),
             matches!(drawn, Err(TryDrawError::Io(_))),
         );
-        let mut output = output.into_inner();
         let presented = self.settle(drawn, &mut output)?;
         let Some(result) = result else {
             unreachable!("a frame that was painted returned the render's result");
@@ -503,7 +535,7 @@ mod tests {
             full,
             size: (10, 2),
             margins: false,
-            graphics: false,
+            host: false,
         }
     }
 
@@ -664,7 +696,7 @@ mod image_tests {
             full: !presenter.shown(),
             size: (20, 6),
             margins: false,
-            graphics: false,
+            host: false,
         };
         let frame = presenter
             .present(&spec, |canvas| {
@@ -685,6 +717,41 @@ mod image_tests {
             Presented::Unchanged => String::new(),
             Presented::Unsupported(failure) => panic!("unsupported frame: {failure:?}"),
         }
+    }
+
+    /// Changing the image host is applied by one frame: a headless presenter, whose terminal
+    /// writes nothing, presents unchanged frames as unchanged after it.
+    #[test]
+    fn a_headless_presenter_skips_unchanged_frames_after_setting_its_image_host() {
+        let mut presenter = presenter(true);
+        presenter.set_encoding(false);
+        frame(&mut presenter, Some((0, "hello")), None);
+        presenter.set_image_host(
+            HostImageCapabilities {
+                kitty_graphics: true,
+                sixel: false,
+                cell_pixel_width: 8,
+                cell_pixel_height: 4,
+                ..HostImageCapabilities::default()
+            },
+            bmux_image::ImageConfig::default(),
+        );
+        let spec = FrameSpec {
+            full: false,
+            size: (20, 6),
+            margins: false,
+            host: false,
+        };
+        let mut present = || {
+            presenter
+                .present(&spec, |_| Ok::<_, ()>(()))
+                .unwrap()
+                .presented
+        };
+        // The frame after the change applies it; the next one changes nothing.
+        assert!(matches!(present(), Presented::Frame(_)));
+        let unchanged = present();
+        assert!(matches!(unchanged, Presented::Unchanged), "{unchanged:?}");
     }
 
     /// Kitty keeps placements apart from the cells: images are written when the scene changes,

@@ -919,7 +919,11 @@ impl<W: Write> Terminal<W> {
             let outcome = PresentationPhase::Paint
                 .measure(|| render(&mut PaintCx::new(&mut frame)), |_| true);
             let cursor = frame.cursor();
-            let declared_images = frame.images_declared().then(|| frame.take_images());
+            let declared = frame.images_declared();
+            let (contributions, occlusions) = frame.take_images();
+            // A frame changes the image scene when it declares its image set or contributes to it.
+            let declared_images = (declared || !contributions.is_empty() || !occlusions.is_empty())
+                .then_some((contributions, occlusions, declared));
             (
                 outcome,
                 frame
@@ -939,11 +943,12 @@ impl<W: Write> Terminal<W> {
                 return Err(TryDrawError::Rejected(rejection));
             }
         };
-        // A frame that declared its image set replaces the scene with it; one that did not keeps
-        // the scene.
-        let images = declared_images.map(|(images, occlusions)| {
+        // A frame that declared its image set replaces the scene with it; one that contributed
+        // without declaring changes only what it contributed; one that did neither keeps the
+        // scene.
+        let images = declared_images.map(|(images, occlusions, complete)| {
             let mut scene = self.state.image_scene().clone();
-            let delta = scene.reconcile_occluded(&images, &occlusions);
+            let delta = scene.reconcile_painted_over(&images, &occlusions, complete);
             (images, scene, delta)
         });
         let image_delta_empty = images
@@ -1794,6 +1799,70 @@ mod tests {
         assert_eq!(first.upserted.len(), 1);
         let removal = deltas[3].as_ref().expect("the removal wrote");
         assert_eq!(removal.removed, vec![ImageKey::new("a")]);
+    }
+
+    /// A frame painted in place that contributes images without declaring its image set changes
+    /// only what it contributes: frame-scoped images it leaves out stay, and an explicit removal
+    /// removes.
+    #[test]
+    fn undeclared_contributions_change_only_what_they_name() {
+        let placement = |key: &str, x: u16, lifecycle| ImagePlacement {
+            key: ImageKey::new(key),
+            payload: ImagePayload::Png {
+                bytes: std::sync::Arc::from(&b"png"[..]),
+                width: 1,
+                height: 1,
+            },
+            destination: Rect::new(x, 0, 2, 1),
+            fit: crate::image::ImageFit::default(),
+            allocation: None,
+            clip: Rect::new(x, 0, 2, 1),
+            lifecycle,
+            z: 0,
+        };
+        let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 10, 2));
+        terminal.draw(|_| {}).unwrap();
+        let mut frame = |declare: bool, images: Vec<ImageContribution>| {
+            terminal
+                .try_draw_over_with_output_hooks(
+                    |cx| {
+                        if declare {
+                            cx.declare_images();
+                        }
+                        for image in images {
+                            cx.push_image(image);
+                        }
+                        Ok::<_, ()>(false)
+                    },
+                    |_, _| Ok(false),
+                    |_, _, _, _| Ok(()),
+                )
+                .unwrap();
+            let mut keys: Vec<String> = terminal
+                .image_scene()
+                .placements()
+                .map(|image| image.key.as_str().to_owned())
+                .collect();
+            keys.sort();
+            keys
+        };
+        let pane = ImageContribution::Present(placement("pane", 0, ImageLifecycle::Frame));
+        let overlay =
+            ImageContribution::Present(placement("overlay", 4, ImageLifecycle::Persistent));
+        assert_eq!(frame(true, vec![pane]), ["pane"]);
+        assert_eq!(frame(false, vec![overlay]), ["overlay", "pane"]);
+        assert_eq!(
+            frame(true, Vec::new()),
+            ["overlay"],
+            "declaring drops frame images"
+        );
+        assert_eq!(
+            frame(
+                false,
+                vec![ImageContribution::Remove(ImageKey::new("overlay"))]
+            ),
+            Vec::<String>::new()
+        );
     }
 
     /// A frame painted in place writes the cells that change, not every cell it is given.

@@ -11,6 +11,7 @@ mod local_presentation;
 mod metadata;
 mod native_input_metrics;
 pub mod observer;
+mod pane_images;
 mod pane_zoom;
 mod pane_zoom_native;
 mod pane_zoom_receipt;

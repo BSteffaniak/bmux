@@ -70,6 +70,11 @@ pub struct KittyHostState {
     seen_placements: std::collections::BTreeSet<(u32, u16, u16, u64)>,
     #[cfg(feature = "kitty")]
     next_placement_id: u32,
+    /// Host images placed below the cells' text. Some Kitty-compatible hosts (Ghostty) keep a
+    /// negative-z placement visible after a placement-scoped delete, so once such an image has no
+    /// placement left its source is deleted too.
+    #[cfg(feature = "kitty")]
+    below_text: std::collections::BTreeSet<u32>,
 }
 
 impl KittyHostState {
@@ -465,6 +470,25 @@ impl KittyHostState {
                 out.write_all(&crate::codec::kitty::encode_delete_placement(key.0, id))?;
                 out.write_all(b"\x1b\\")?;
                 self.placements.remove(&key);
+                let host = key.0;
+                if self.below_text.contains(&host)
+                    && !self.placements.keys().any(|placed| placed.0 == host)
+                {
+                    write!(out, "\x1b_Ga=d,d=I,i={host},q=2\x1b\\")?;
+                    self.below_text.remove(&host);
+                    let retired: Vec<u64> = self
+                        .resources
+                        .iter()
+                        .filter(|(_, resource)| **resource == host)
+                        .map(|(id, _)| *id)
+                        .collect();
+                    for id in retired {
+                        self.resources.remove(&id);
+                        self.content_bytes.remove(&id);
+                        self.residency.remove(id);
+                    }
+                    self.transmitted.retain(|_, value| *value != host);
+                }
             }
             let mut inactive: Vec<_> = self
                 .resources
@@ -515,6 +539,7 @@ impl KittyHostState {
             self.residency.clear();
             self.placements.clear();
             self.seen_placements.clear();
+            self.below_text.clear();
             self.frame_seen.clear();
             self.frame_protected.clear();
         }
@@ -617,6 +642,9 @@ impl KittyHostState {
             self.next_placement_id
         };
         self.seen_placements.insert(key);
+        if self.placement_z < 0 {
+            self.below_text.insert(host);
+        }
         // Kitty places relative to the current terminal cursor; the cache key
         // alone does not position output. Apply this for cached and cropped
         // placements too, after any upload/deletion commands.

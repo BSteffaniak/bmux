@@ -268,12 +268,6 @@ config.
 # Master switch for image protocol support.
 enabled = true
 
-# How image decoding is distributed.
-# passthrough = forward raw bytes (fastest, default)
-# server = decode on server, re-encode for client
-# client = send raw bytes, client decodes
-decode_mode = "passthrough"
-
 # Maximum image payload size (bytes). Images larger than this are discarded.
 max_image_bytes = 10485760  # 10 MiB
 

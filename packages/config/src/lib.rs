@@ -2530,12 +2530,6 @@ pub struct ImageBehaviorConfig {
     /// support.  When false, image escape sequences are passed through to
     /// the host terminal without interception or registry tracking.
     pub enabled: bool,
-    /// How image decoding is distributed between server and client.
-    /// PASSTHROUGH forwards raw protocol bytes with coordinate translation
-    /// (fastest, requires same protocol support on the host terminal).
-    /// SERVER decodes images to pixel buffers on the server side.
-    /// CLIENT sends raw bytes for the client to decode and re-encode.
-    pub decode_mode: ImageDecodeMode,
     /// Maximum image payload size in bytes per image.  Images exceeding
     /// this limit are silently discarded to prevent memory exhaustion.
     pub max_image_bytes: u64,
@@ -2548,7 +2542,6 @@ impl Default for ImageBehaviorConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            decode_mode: ImageDecodeMode::Passthrough,
             max_image_bytes: 10 * 1024 * 1024, // 10 MiB
             max_images_per_pane: 100,
         }
@@ -2561,19 +2554,6 @@ impl ImageBehaviorConfig {
     pub const fn config_doc_values() -> &'static [&'static str] {
         &[]
     }
-}
-
-/// How image decoding is distributed between server and client.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, ConfigDocEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum ImageDecodeMode {
-    /// Server decodes images to pixel buffers; client encodes for host protocol.
-    Server,
-    /// Server sends raw protocol bytes; client decodes + re-encodes.
-    Client,
-    /// Raw bytes forwarded with coordinate translation (same-protocol only).
-    #[default]
-    Passthrough,
 }
 
 /// IPC compression settings.
