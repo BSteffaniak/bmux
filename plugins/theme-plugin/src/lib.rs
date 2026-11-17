@@ -1545,19 +1545,12 @@ async fn run_theme_picker_with(inputs: PickerInputs, transport: PickerTransport)
     let mut events_open = true;
     let selected_name = loop {
         tokio::select! {
+            // Events come first: the host emits every selection change
+            // before it responds, so draining queued events before reading
+            // the response handles them in host order. A navigation key and
+            // Esc handled in one host pass would otherwise race, and the
+            // response would discard the selection the user saw.
             biased;
-            response = &mut response_rx => {
-                break match response {
-                    Ok(PromptResponse::Submitted(PromptValue::Single(name))) => Some(name),
-                    Ok(PromptResponse::Cancelled | PromptResponse::RejectedBusy | PromptResponse::Submitted(_)) | Err(_) => None,
-                };
-            }
-            _ = heartbeat.tick() => {
-                if let Some(token) = preview_token
-                    && !matches!(control_contract::theme_control_v1::client::renew_preview(&mut control, token).await, Ok(Ok(()))) {
-                    break None;
-                }
-            }
             event = event_rx.recv(), if events_open => {
                 let Some(event) = event else {
                     events_open = false;
@@ -1578,6 +1571,18 @@ async fn run_theme_picker_with(inputs: PickerInputs, transport: PickerTransport)
                         report_picker_error(format!("Preview failed: {result:?}"));
                         break None;
                     }
+                }
+            }
+            response = &mut response_rx => {
+                break match response {
+                    Ok(PromptResponse::Submitted(PromptValue::Single(name))) => Some(name),
+                    Ok(PromptResponse::Cancelled | PromptResponse::RejectedBusy | PromptResponse::Submitted(_)) | Err(_) => None,
+                };
+            }
+            _ = heartbeat.tick() => {
+                if let Some(token) = preview_token
+                    && !matches!(control_contract::theme_control_v1::client::renew_preview(&mut control, token).await, Ok(Ok(()))) {
+                    break None;
                 }
             }
         }
@@ -3591,6 +3596,69 @@ mod tests {
         .await
         .expect("picker must finish without spinning");
         assert_eq!(*calls.lock().expect("calls"), 0);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(theme_prompt_host)]
+    #[allow(clippy::result_large_err)] // TestServiceRouter fixes the external error type.
+    async fn picker_previews_selection_queued_before_cancellation() {
+        let operations = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = operations.clone();
+        let router: TestServiceRouter = Arc::new(
+            move |_, _, capability, _, _, operation, _| match (capability, operation) {
+                ("bmux.theme.write", "current") => {
+                    encode_service_message(&control_contract::theme_control_v1::Snapshot {
+                        revision: 0,
+                        selection: ThemeSelection::Configured,
+                    })
+                }
+                ("bmux.theme.write", "begin-preview") => {
+                    observed.lock().expect("operations").push(operation.into());
+                    encode_service_message(&Ok::<u64, String>(7))
+                }
+                ("bmux.theme.write", "preview" | "cancel-preview") => {
+                    observed.lock().expect("operations").push(operation.into());
+                    encode_service_message(&Ok::<(), String>(()))
+                }
+                ("bmux.storage", "get") => {
+                    encode_service_message(&StorageGetResponse { value: None })
+                }
+                _ => encode_service_message(&()),
+            },
+        );
+        let _router = install_test_service_router(checked_test_router(router));
+        let (sender, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let _host = prompt::register_host(sender);
+        let host = async {
+            let request = requests.recv().await.expect("prompt");
+            // The attach host handles a navigation key and then Esc in one
+            // pass: the selection event is queued before the cancellation,
+            // with no chance for the picker to run in between.
+            request
+                .event_tx
+                .as_ref()
+                .expect("live-preview picker requests events")
+                .send(PromptEvent::SelectionChanged {
+                    index: 1,
+                    value: "preset:cyberpunk".into(),
+                })
+                .expect("event");
+            request
+                .response_tx
+                .send(PromptResponse::Cancelled)
+                .expect("response");
+            request.event_tx
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(run_theme_picker(picker_context()), host);
+        })
+        .await
+        .expect("picker must settle");
+        assert_eq!(
+            &*operations.lock().expect("operations"),
+            &["begin-preview", "preview", "cancel-preview"],
+            "a selection the host emitted before cancelling must be previewed and then restored"
+        );
     }
 
     #[tokio::test]
