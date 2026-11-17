@@ -22,7 +22,8 @@
 
 pub mod abi;
 pub mod guest;
-#[cfg(not(bmux_plugin_dylib))]
+// Always compiled: host crates can appear in a dynamic plugin's dependency
+// graph, and the host side never depends on the packaging mode.
 pub mod host;
 pub(crate) mod scope;
 mod task;

@@ -51,7 +51,6 @@ struct State {
     aborting: bool,
     failures: Vec<String>,
     tasks: Vec<(String, JoinHandle<Result<(), String>>)>,
-    #[cfg_attr(bmux_plugin_dylib, allow(dead_code))] // Host-side admission only.
     next: u64,
     /// Raw plug-rt tasks, removed when their future is dropped.
     spawned: BTreeMap<u64, Spawned>,
@@ -77,7 +76,6 @@ impl Default for BackgroundTasks {
 }
 
 /// Registration of one raw task or blocking job; dropping it settles the entry.
-#[cfg_attr(bmux_plugin_dylib, allow(dead_code))] // Host-side admission only.
 #[derive(Debug)]
 pub(crate) struct Ticket {
     id: u64,
@@ -85,7 +83,6 @@ pub(crate) struct Ticket {
     state: Arc<Mutex<State>>,
     settled: watch::Sender<u64>,
 }
-#[cfg_attr(bmux_plugin_dylib, allow(dead_code))]
 impl Ticket {
     pub(crate) const fn id(&self) -> u64 {
         self.id
@@ -144,7 +141,6 @@ impl BackgroundTasks {
         }
     }
 
-    #[cfg_attr(bmux_plugin_dylib, allow(dead_code))] // Host-side admission only.
     fn admit(&self, name: &str, blocking: bool) -> Result<Ticket, String> {
         let mut state = self
             .state
@@ -175,19 +171,16 @@ impl BackgroundTasks {
         })
     }
 
-    #[cfg_attr(bmux_plugin_dylib, allow(dead_code))]
     /// Admit one raw plug-rt task. Refused once teardown began.
     pub(crate) fn admit_task(&self, name: &str) -> Result<Ticket, String> {
         self.admit(name, false)
     }
 
-    #[cfg_attr(bmux_plugin_dylib, allow(dead_code))]
     /// Admit one blocking job. Refused once teardown began.
     pub(crate) fn admit_blocking(&self, name: &str) -> Result<Ticket, String> {
         self.admit(name, true)
     }
 
-    #[cfg_attr(bmux_plugin_dylib, allow(dead_code))]
     /// Attach the abort action of an admitted raw task. If teardown is
     /// already aborting raw tasks, the task is aborted immediately.
     pub(crate) fn bind_abort(&self, id: u64, abort: Box<dyn Fn() + Send + Sync>) {
@@ -365,17 +358,18 @@ impl BackgroundTasks {
     /// Drain until `deadline`. On expiry the remaining tasks are aborted and
     /// the error names them; their handles remain retained. Running blocking
     /// jobs are then awaited until the deadline and stragglers are reported.
+    /// Host-side teardown: it uses the host runtime's timers.
     ///
     /// # Errors
     /// Reports deadline expiry (with pending task names), task failures, or
     /// poisoned state.
     pub async fn shutdown_until(
         &self,
-        deadline: rt::time::Instant,
+        deadline: tokio::time::Instant,
         progress: Option<crate::shutdown_progress::ShutdownProgress>,
     ) -> Result<(), String> {
         let outcome = if let Ok(outcome) =
-            rt::time::timeout_at(deadline, self.shutdown_retained(progress)).await
+            tokio::time::timeout_at(deadline, self.shutdown_retained(progress)).await
         {
             outcome
         } else {
@@ -393,7 +387,7 @@ impl BackgroundTasks {
         // Blocking jobs cannot be aborted: wait for them within the same
         // deadline, then report (never unload) any that are still running.
         let blocking_settled =
-            rt::time::timeout_at(deadline, self.wait_until(|state| state.blocking.is_empty()))
+            tokio::time::timeout_at(deadline, self.wait_until(|state| state.blocking.is_empty()))
                 .await
                 .is_ok();
         if !blocking_settled {
@@ -413,7 +407,7 @@ impl BackgroundTasks {
     /// Returns the work still outstanding at the deadline, which is abandoned
     /// and reported, never unloaded. Cooperative task outcomes are not
     /// re-reported here; [`Self::shutdown_until`] owns them.
-    pub async fn abort_and_settle(&self, deadline: rt::time::Instant) -> Vec<String> {
+    pub async fn abort_and_settle(&self, deadline: tokio::time::Instant) -> Vec<String> {
         {
             let mut state = self
                 .state
@@ -423,7 +417,7 @@ impl BackgroundTasks {
         }
         self.cancel.send_replace(true);
         self.abort_spawned();
-        let settled = rt::time::timeout_at(
+        let settled = tokio::time::timeout_at(
             deadline,
             self.wait_until(|state| state.spawned.is_empty() && state.blocking.is_empty()),
         )
@@ -460,7 +454,7 @@ impl BackgroundTasks {
     /// # Errors
     /// Reports timeout, task failure, panic, or poisoned state.
     pub async fn shutdown(&self, timeout: Duration) -> Result<(), String> {
-        rt::time::timeout(timeout, self.shutdown_retained(None))
+        tokio::time::timeout(timeout, self.shutdown_retained(None))
             .await
             .map_err(|_| "background tasks did not drain".to_string())?
     }
