@@ -1,4 +1,6 @@
 fn main() {
+    // Set only by the plugin packager; selects the dylib entry in `plugin!`.
+    println!("cargo::rustc-check-cfg=cfg(bmux_plugin_dylib)");
     let source = "bpdl/cli-bridge.bpdl";
     println!("cargo:rerun-if-changed={source}");
     let source = std::fs::read_to_string(source).expect("read argv bridge BPDL");

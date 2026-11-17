@@ -182,6 +182,7 @@ impl<'a> Author<'a> {
             self.bound(&trait_name, &functions, scope, out);
             self.client(&functions, scope, out);
             Self::dispatch(&trait_name, &functions, out);
+            Self::dispatch_streaming(&trait_name, &functions, out);
             Self::portable(&trait_name, &functions, out);
             Self::markers(&trait_name, out);
         }
@@ -380,6 +381,42 @@ impl<'a> Author<'a> {
         );
     }
 
+    fn dispatch_streaming(trait_name: &str, functions: &[&Function], out: &mut String) {
+        out.push_str("        /// Serve one streaming host invocation (`PluginInstance::invoke_streaming`).\n        ///\n        /// Event frames go to the invocation's sink in order before the single\n        /// terminal response; cancellation stops the provider's sink.\n        ///\n        /// # Errors\n        /// Returns when a checked frame does not match this contract or event\n        /// delivery failed.\n");
+        let _ = writeln!(
+            out,
+            "        {}pub async fn dispatch_streaming<P: {trait_name}>(provider: &P, call: {SDK}::author::Call, context: {SDK}::NativeStreamingServiceContext) -> {SDK}::author::Result<{SDK}::ServiceResponse> {{\n            let {SDK}::NativeStreamingServiceContext {{ service: context, events }} = context;\n            if context.request.service.interface_id != INTERFACE_ID.as_str() {{\n                return Ok({SDK}::ServiceResponse::error(\"unsupported_service_interface\", format!(\"interface '{{}}' is not '{{}}'\", context.request.service.interface_id, INTERFACE_ID.as_str())));\n            }}\n            let checked = {SDK}::service_contract::is_checked(&context.request.payload);\n            let body = if checked {{\n                {SDK}::service_contract::decode_for(INTERFACE_ID.as_str(), SERVICE_CONTRACT, &context.request.payload).map_err(|error| {SDK}::author::Error::failed(error.to_string()))?.to_vec()\n            }} else {{\n                context.request.payload.clone()\n            }};\n            let stream = {SDK}::typed_dispatch::ServiceStreamContext {{\n                invocation_id: context.cancellation.invocation_id.clone(),\n                cancellation: call.cancellation().cloned().unwrap_or_default(),\n                events,\n            }};\n            let _ = (&provider, &call, &body, &stream);\n            let mut response = match context.request.operation.as_str() {{",
+            // Interfaces without streaming operations keep the uniform async
+            // signature `Provides` stores, with nothing to await.
+            if functions.iter().any(|function| function.emits.is_some()) {
+                ""
+            } else {
+                "#[allow(clippy::unused_async)]\n        "
+            }
+        );
+        for function in functions.iter().filter(|function| function.emits.is_some()) {
+            let request = request_type(function);
+            let _ = writeln!(
+                out,
+                "                {:?} => {{\n                    let (stream, completion) = stream.scoped();\n                    if stream.cancellation.is_cancelled() {{\n                        {SDK}::ServiceResponse::error(\"cancelled\", \"service stream cancelled\")\n                    }} else {{\n                        match {SDK}::decode_service_message::<{request}>(&body) {{\n                            Err(error) => {SDK}::ServiceResponse::error(\"invalid_request\", error.to_string()),\n                            Ok(request) => {{\n                                let _ = &request;\n                                let events = stream.typed_sink();\n                                let cancellation = stream.cancellation.clone();\n                                let result = provider.{}(&call{}).await;\n                                completion.finish().map_err(|error| {SDK}::author::Error::failed(error.to_string()))?;\n                                match result {{\n                                    Ok(value) => {SDK}::ServiceResponse::ok({SDK}::encode_service_message(&value).map_err(|error| {SDK}::author::Error::failed(error.to_string()))?),\n                                    Err(error) => {SDK}::author::error_response(&error),\n                                }}\n                            }}\n                        }}\n                    }}\n                }}",
+                function.name,
+                snake_case(&function.name),
+                Self::args(function, "request.")
+            );
+        }
+        for function in functions.iter().filter(|function| function.emits.is_none()) {
+            let _ = writeln!(
+                out,
+                "                {:?} => {SDK}::ServiceResponse::error(\"unary_operation\", \"operation '{}' is unary; invoke it without a stream\"),",
+                function.name, function.name
+            );
+        }
+        let _ = writeln!(
+            out,
+            "                other => {SDK}::ServiceResponse::error(\"unsupported_service_operation\", format!(\"'{{}}' has no operation '{{other}}'\", INTERFACE_ID.as_str())),\n            }};\n            if checked && response.error.is_none() {{\n                response.payload = {SDK}::service_contract::encode_response(&response.payload);\n            }}\n            Ok(response)\n        }}\n"
+        );
+    }
+
     fn portable(trait_name: &str, functions: &[&Function], out: &mut String) {
         out.push_str("        /// Checked byte adapter over a provider, for dylib and cross-process callers.\n        /// Calls run with the provider-bound base call.\n");
         let _ = writeln!(
@@ -454,7 +491,7 @@ impl<'a> Author<'a> {
     fn markers(trait_name: &str, out: &mut String) {
         let _ = writeln!(
             out,
-            "        impl {SDK}::author::ProvidedInterface for dyn {trait_name} {{\n            const DESCRIPTOR: {SDK}::ServiceInterfaceDescriptor = super::SERVICE_DESCRIPTOR;\n        }}\n\n        impl<P: {trait_name}> {SDK}::author::Provides<P> for dyn {trait_name} {{\n            fn portable(provider: ::std::sync::Arc<P>, base: {SDK}::author::Call) -> ::std::sync::Arc<dyn {SDK}::PortableServiceProvider> {{ ::std::sync::Arc::new(Portable::new(provider, base)) }}\n            fn register(provider: ::std::sync::Arc<P>, base: {SDK}::author::Call, registry: &mut {SDK}::TypedServiceRegistry) -> {SDK}::Result<()> {{ register(provider, base, registry) }}\n            fn dispatch(provider: &P, call: {SDK}::author::Call, context: {SDK}::NativeServiceContext) -> {SDK}::author::BoxFuture<'_, {SDK}::author::Result<{SDK}::ServiceResponse>> {{ Box::pin(dispatch(provider, call, context)) }}\n        }}\n\n        impl<T> {SDK}::author::RequiredInterface for Client<T> {{\n            const DESCRIPTOR: {SDK}::ServiceInterfaceDescriptor = super::SERVICE_DESCRIPTOR;\n        }}"
+            "        impl {SDK}::author::ProvidedInterface for dyn {trait_name} {{\n            const DESCRIPTOR: {SDK}::ServiceInterfaceDescriptor = super::SERVICE_DESCRIPTOR;\n        }}\n\n        impl<P: {trait_name}> {SDK}::author::Provides<P> for dyn {trait_name} {{\n            fn portable(provider: ::std::sync::Arc<P>, base: {SDK}::author::Call) -> ::std::sync::Arc<dyn {SDK}::PortableServiceProvider> {{ ::std::sync::Arc::new(Portable::new(provider, base)) }}\n            fn register(provider: ::std::sync::Arc<P>, base: {SDK}::author::Call, registry: &mut {SDK}::TypedServiceRegistry) -> {SDK}::Result<()> {{ register(provider, base, registry) }}\n            fn dispatch(provider: &P, call: {SDK}::author::Call, context: {SDK}::NativeServiceContext) -> {SDK}::author::BoxFuture<'_, {SDK}::author::Result<{SDK}::ServiceResponse>> {{ Box::pin(dispatch(provider, call, context)) }}\n            fn dispatch_streaming(provider: &P, call: {SDK}::author::Call, context: {SDK}::NativeStreamingServiceContext) -> {SDK}::author::BoxFuture<'_, {SDK}::author::Result<{SDK}::ServiceResponse>> {{ Box::pin(dispatch_streaming(provider, call, context)) }}\n        }}\n\n        impl<T> {SDK}::author::RequiredInterface for Client<T> {{\n            const DESCRIPTOR: {SDK}::ServiceInterfaceDescriptor = super::SERVICE_DESCRIPTOR;\n        }}\n\n        impl {SDK}::author::ServiceClient for Client<{SDK}::definition::PluginHostServices> {{\n            fn connect(host: {SDK}::definition::PluginHostServices) -> Self {{ Self::remote(host) }}\n        }}"
         );
     }
 

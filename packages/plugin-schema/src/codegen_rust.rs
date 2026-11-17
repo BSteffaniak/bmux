@@ -2213,6 +2213,9 @@ mod tests {
         assert!(rust.contains("fn incr(&self, cx: &::bmux_plugin_sdk::author::Call, by: u64) -> impl ::std::future::Future<Output = ::bmux_plugin_sdk::author::Result<u64>> + Send where Self: Sized;"), "{rust}");
         assert!(rust.contains("events: ::bmux_plugin_sdk::typed_dispatch::TypedServiceEventSink<u32>, cancellation: ::bmux_plugin_sdk::ServiceCancellation"));
         assert!(rust.contains("pub async fn dispatch<P: CounterProvider>"));
+        assert!(rust.contains("pub async fn dispatch_streaming<P: CounterProvider>"));
+        assert!(rust.contains("\"unary_operation\""));
+        assert!(rust.contains("impl ::bmux_plugin_sdk::author::ServiceClient for Client<::bmux_plugin_sdk::definition::PluginHostServices>"));
         assert!(rust.contains("\"streaming_required\""));
         assert!(rust.contains(
             "impl<P: CounterProvider> ::bmux_plugin_sdk::PortableServiceProvider for Portable<P>"

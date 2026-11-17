@@ -25,10 +25,16 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+mod plugin;
+pub use plugin::{
+    Activation, CommandHandler, Deactivation, Declarations, DeclaredInstance, EventHandler,
+    NativeCommandHandler, Plugin, ServiceClient, definition, packaged,
+};
+
 use crate::definition::{PluginCallContext, PluginHostServices};
 use crate::{
-    NativeServiceContext, PluginCommandError, PluginEventKind, PortableServiceProvider,
-    ServiceCancellation, ServiceInterfaceDescriptor, TypedServiceRegistry,
+    NativeServiceContext, NativeStreamingServiceContext, PluginCommandError, PluginEventKind,
+    PortableServiceProvider, ServiceCancellation, ServiceInterfaceDescriptor, TypedServiceRegistry,
 };
 
 /// Result of an author handler.
@@ -83,6 +89,15 @@ impl Call {
                 .filter(|id| !id.is_empty()),
             caller_client_id: context.caller_client_id,
             events: None,
+        }
+    }
+
+    /// A call admitted by the host with no service request (commands).
+    #[must_use]
+    pub fn from_invocation(call: PluginCallContext) -> Self {
+        Self {
+            invocation: Some(call),
+            ..Self::default()
         }
     }
 
@@ -204,6 +219,13 @@ pub trait Provides<P>: ProvidedInterface {
         provider: &P,
         call: Call,
         context: NativeServiceContext,
+    ) -> BoxFuture<'_, Result<crate::ServiceResponse>>;
+
+    /// Serve one streaming host invocation (`PluginInstance::invoke_streaming`).
+    fn dispatch_streaming(
+        provider: &P,
+        call: Call,
+        context: NativeStreamingServiceContext,
     ) -> BoxFuture<'_, Result<crate::ServiceResponse>>;
 }
 
@@ -357,6 +379,20 @@ fn identity_metadata(manifest: &str) -> Result<crate::definition::PluginMetadata
         contracts: identity.contracts,
         manifest_toml: Some(manifest.to_owned()),
     })
+}
+
+/// Run a synchronous body (for example legacy blocking host calls) on the
+/// host's blocking pool, owned by the current operation, and await it.
+///
+/// # Errors
+/// Fails when the host cannot run the work or it panicked.
+pub async fn blocking<T: Send + 'static>(
+    name: &str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    crate::rt::spawn_blocking_for_operation(name, work)
+        .await
+        .map_err(|error| Error::failed(format!("{name}: {error}")))
 }
 
 /// Map a transport failure from a generated client call to an author error.
