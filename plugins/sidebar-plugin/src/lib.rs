@@ -20,6 +20,7 @@ use bmux_plugin::{
     AttachInputEvent, AttachInputResult, BorderGlyphs, ExtensionRect, RenderNamedColor, RenderOp,
     RenderStyle, ServiceCallerDispatchClient, block_on_typed_dispatch,
 };
+use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::prelude::*;
 use bmux_presentation_state::{PresentationEntityRef, PresentationFact, PresentationFactRole};
 use bmux_tabs_plugin_api::{tabs_commands, tabs_list};
@@ -436,14 +437,23 @@ type CompanionHandle = std::sync::Arc<Mutex<Option<CompanionState>>>;
 #[derive(Default)]
 pub struct SidebarPlugin;
 
-impl RustPlugin for SidebarPlugin {
-    type Contract = bmux_plugin_sdk::NoPluginContract;
+impl Plugin for SidebarPlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        d.blocking_activate(Self::activate)
+            .blocking_services(Self::invoke_service, None);
+    }
+}
 
-    fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+impl SidebarPlugin {
+    fn activate(
+        &self,
+        context: NativeLifecycleContext,
+        _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
+    ) -> std::result::Result<(), PluginCommandError> {
         // Validate configuration up front. The backend owns no presentation:
         // attach runtimes install their own `SidebarPresentation`.
         Settings::parse(context.settings.as_ref())?;
-        Ok(EXIT_OK)
+        Ok(())
     }
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
@@ -1323,29 +1333,7 @@ fn handle_input(context: &NativeServiceContext, event: &AttachInputEvent) -> Att
     }
 }
 
-bmux_plugin_sdk::define_plugin!(
-    factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| Ok(std::sync::Arc::new(
-        bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(SidebarPlugin, scope.instance)
-    )
-        as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
-    metadata = {
-        let manifest_toml = crate::declaration::PLUGIN_MANIFEST;
-        let manifest = bmux_plugin::PluginManifest::from_toml_str(manifest_toml)
-            .expect("embedded plugin declaration must be valid");
-        bmux_plugin_sdk::definition::PluginMetadata {
-            plugin_id: manifest.id,
-            version: manifest.version,
-            roles: manifest.component_roles,
-            required_capabilities: manifest
-                .required_capabilities
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            contracts: manifest.contracts,
-            manifest_toml: Some(manifest_toml.into()),
-        }
-    },
-);
+bmux_plugin_sdk::plugin!(SidebarPlugin, create = |_| Ok(SidebarPlugin));
 
 #[cfg(test)]
 mod tests {

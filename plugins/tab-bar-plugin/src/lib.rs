@@ -40,6 +40,7 @@ use bmux_plugin::{
     AttachInputEvent, AttachInputResult, AttachInputServiceInvocation, ExtensionRect, RenderOp,
     RenderStyle, ServiceCallerDispatchClient, block_on_typed_dispatch,
 };
+use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::{TypedServiceEndpoint, prelude::*};
 #[cfg(test)]
 use bmux_presentation_state::{
@@ -480,10 +481,20 @@ pub struct TabBarPlugin {
     external: std::sync::Arc<external::ExternalPresentation>,
 }
 
-impl RustPlugin for TabBarPlugin {
-    type Contract = contract::Contract;
+impl Plugin for TabBarPlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        d.blocking_activate(Self::activate)
+            .blocking_deactivate(Self::deactivate)
+            .blocking_services(Self::invoke_service, None);
+    }
+}
 
-    fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+impl TabBarPlugin {
+    fn activate(
+        &self,
+        context: NativeLifecycleContext,
+        _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
+    ) -> std::result::Result<(), PluginCommandError> {
         // Validate configuration up front. The backend owns no presentation:
         // attach runtimes install their own `TabBarPresentation`.
         Settings::parse(context.settings.as_ref())?;
@@ -491,12 +502,15 @@ impl RustPlugin for TabBarPlugin {
         // the server forwards them to attach clients (see plugin.toml).
         self.external
             .activate(bmux_plugin::activation_event_bus(&context));
-        Ok(EXIT_OK)
+        Ok(())
     }
 
-    fn deactivate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+    fn deactivate(
+        &self,
+        _context: NativeLifecycleContext,
+    ) -> std::result::Result<(), PluginCommandError> {
         self.external.activate(None);
-        Ok(EXIT_OK)
+        Ok(())
     }
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
@@ -537,32 +551,7 @@ impl TabBarPlugin {
     }
 }
 
-bmux_plugin_sdk::define_plugin!(
-    factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| Ok(std::sync::Arc::new(
-        bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
-            TabBarPlugin::default(),
-            scope.instance,
-        )
-    )
-        as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
-    metadata = {
-        let manifest_toml = crate::declaration::PLUGIN_MANIFEST;
-        let manifest = bmux_plugin::PluginManifest::from_toml_str(manifest_toml)
-            .expect("embedded plugin declaration must be valid");
-        bmux_plugin_sdk::definition::PluginMetadata {
-            plugin_id: manifest.id,
-            version: manifest.version,
-            roles: manifest.component_roles,
-            required_capabilities: manifest
-                .required_capabilities
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            contracts: manifest.contracts,
-            manifest_toml: Some(manifest_toml.into()),
-        }
-    },
-);
+bmux_plugin_sdk::plugin!(TabBarPlugin);
 
 fn input_endpoint() -> bmux_plugin::AttachInputEndpoint {
     bmux_plugin::AttachInputEndpoint {
@@ -2279,7 +2268,6 @@ fn decode_action_payload<T: serde::de::DeserializeOwned>(
 
 #[cfg(test)]
 mod tests {
-    use bmux_plugin_sdk::PluginContract;
 
     #[test]
     fn shared_definition_preserves_contract_and_capability_requirements() {
@@ -2301,10 +2289,20 @@ mod tests {
             "presentation-actions/v2"
         );
         assert_eq!(definition.metadata.contracts[0].major, 2);
-        assert_eq!(
-            definition.metadata.manifest_toml.as_deref(),
-            Some(crate::declaration::PLUGIN_MANIFEST)
-        );
+        // The embedded manifest is the generated one plus the generated
+        // contract evidence hosts need to route checked frames.
+        let modeled = definition
+            .declarations()
+            .unwrap()
+            .modeled_service_contracts
+            .into_iter()
+            .map(|contract| contract.interface_id)
+            .collect::<Vec<_>>();
+        let generated = crate::declaration::SERVICE_CONTRACTS
+            .iter()
+            .map(|descriptor| descriptor.interface_id.as_str().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(modeled, generated);
     }
 
     #[test]
@@ -2359,12 +2357,17 @@ mod tests {
         let decoded: workspaces_commands::client::RenameWorkspaceRequest =
             decode_action_payload(&rename).unwrap();
         assert_eq!(decoded.name, "new name");
-        assert!(<TabBarPlugin as RustPlugin>::Contract::service_contract_for(
-            "presentation-actions/v2",
-        ).is_some());
         assert!(
-            <TabBarPlugin as RustPlugin>::Contract::service_contract_for("presentation-input",)
-                .is_none()
+            <crate::contract::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(
+                "presentation-actions/v2",
+            )
+            .is_some()
+        );
+        assert!(
+            <crate::contract::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(
+                "presentation-input",
+            )
+            .is_none()
         );
     }
 
@@ -3294,7 +3297,7 @@ width = 60
         }
         for interface in ["status-items", "status-items-state", "notifications"] {
             assert!(
-                <TabBarPlugin as RustPlugin>::Contract::service_contract_for(interface).is_some(),
+                <crate::contract::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface).is_some(),
                 "contract missing {interface}"
             );
         }

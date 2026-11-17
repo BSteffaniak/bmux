@@ -36,6 +36,7 @@ pub use orchestrator::BmuxSnapshotOrchestrator;
 
 use std::sync::{Arc, RwLock};
 
+use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_snapshot_plugin_api::{SnapshotPluginConfig, snapshot_types};
@@ -116,8 +117,15 @@ impl SnapshotRuntime {
 
 pub struct SnapshotPlugin {
     runtime: SnapshotRuntime,
-    orchestrator: Option<Arc<BmuxSnapshotOrchestrator>>,
+    orchestrator: std::sync::RwLock<Option<Arc<BmuxSnapshotOrchestrator>>>,
     bound: bool,
+}
+
+fn slot_mut<T>(
+    slot: &std::sync::RwLock<T>,
+) -> std::result::Result<std::sync::RwLockWriteGuard<'_, T>, bmux_plugin_sdk::PluginCommandError> {
+    slot.write()
+        .map_err(|_| bmux_plugin_sdk::PluginCommandError::failed("plugin state lock poisoned"))
 }
 
 impl SnapshotPlugin {
@@ -125,7 +133,7 @@ impl SnapshotPlugin {
     pub fn new(runtime: SnapshotRuntime) -> Self {
         Self {
             runtime,
-            orchestrator: None,
+            orchestrator: std::sync::RwLock::new(None),
             bound: true,
         }
     }
@@ -182,6 +190,13 @@ impl SnapshotPlugin {
         })
     }
 
+    fn orchestrator(&self) -> Option<Arc<BmuxSnapshotOrchestrator>> {
+        self.orchestrator
+            .read()
+            .ok()
+            .and_then(|orchestrator| orchestrator.clone())
+    }
+
     fn snapshot_handle(&self) -> Result<SnapshotOrchestratorHandle, snapshot_types::SnapshotError> {
         snapshot_handle(&self.runtime.state)
     }
@@ -191,20 +206,28 @@ impl Default for SnapshotPlugin {
     fn default() -> Self {
         Self {
             runtime: SnapshotRuntime::new(Arc::new(bmux_plugin::PluginStateRegistry::new())),
-            orchestrator: None,
+            orchestrator: std::sync::RwLock::new(None),
             bound: false,
         }
     }
 }
 
-impl RustPlugin for SnapshotPlugin {
-    type Contract = bmux_snapshot_plugin_api::Contract;
+impl Plugin for SnapshotPlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        d.blocking_activate(Self::activate)
+            .blocking_deactivate(Self::deactivate)
+            .blocking_services(Self::invoke_service, None)
+            .typed_services(Self::register_typed_services);
+    }
+}
 
+impl SnapshotPlugin {
     fn activate(
-        &mut self,
+        &self,
         _context: NativeLifecycleContext,
-    ) -> std::result::Result<i32, PluginCommandError> {
-        if !self.bound || self.orchestrator.is_some() {
+        _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
+    ) -> std::result::Result<(), PluginCommandError> {
+        if !self.bound || self.orchestrator().is_some() {
             return Err(PluginCommandError::unavailable(
                 "snapshot runtime unbound or already activated",
             ));
@@ -280,7 +303,7 @@ impl RustPlugin for SnapshotPlugin {
         .with_managed_catalog(managed_catalog)
         .with_progress(self.runtime.progress.clone());
         let orchestrator = Arc::new(orchestrator);
-        self.orchestrator = Some(Arc::clone(&orchestrator));
+        *slot_mut(&self.orchestrator)? = Some(Arc::clone(&orchestrator));
         let handle = SnapshotOrchestratorHandle::from_shared(Arc::clone(&orchestrator));
         let handle_entry = Arc::new(RwLock::new(handle));
         registry.register::<SnapshotOrchestratorHandle>(&handle_entry);
@@ -306,24 +329,20 @@ impl RustPlugin for SnapshotPlugin {
             .register(Arc::new(SnapshotShutdown(Arc::clone(&orchestrator))))
             .map_err(PluginCommandError::failed)?;
 
-        Ok(bmux_plugin_sdk::EXIT_OK)
+        Ok(())
     }
 
-    fn deactivate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
-        if let Some(orchestrator) = &self.orchestrator {
+    fn deactivate(
+        &self,
+        _context: NativeLifecycleContext,
+    ) -> std::result::Result<(), PluginCommandError> {
+        if let Some(orchestrator) = &self.orchestrator() {
             orchestrator
                 .stop_debounce()
                 .map_err(PluginCommandError::failed)?;
         }
         // Deactivation does not discard retained snapshot/recovery authority.
-        Ok(bmux_plugin_sdk::EXIT_OK)
-    }
-
-    fn run_command(
-        &mut self,
-        _context: NativeCommandContext,
-    ) -> std::result::Result<i32, PluginCommandError> {
-        Err(PluginCommandError::unknown_command(""))
+        Ok(())
     }
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
@@ -530,39 +549,22 @@ fn spawn_debounce_loop(
 pub fn plugin_definition_with_runtime(
     runtime: SnapshotRuntime,
 ) -> bmux_plugin_sdk::definition::PluginDefinition {
-    use bmux_plugin_sdk::definition::{
-        ComponentRole, PluginDefinition, PluginInstance, RustPluginAdapter,
-    };
-    PluginDefinition::new(
-        PluginDefinition::from_rust_plugin::<SnapshotPlugin>(
-            crate::declaration::PLUGIN_MANIFEST,
-            vec![ComponentRole::Backend],
-        )
-        .expect("embedded snapshot declaration must be valid")
-        .metadata,
-        move |scope: bmux_plugin_sdk::definition::PluginCreateContext| {
-            Ok(Arc::new(RustPluginAdapter::for_instance(
-                SnapshotPlugin::new(runtime.clone()),
-                scope.instance,
-            )) as Arc<dyn PluginInstance>)
-        },
+    bmux_plugin_sdk::author::definition::<SnapshotPlugin>(
+        crate::declaration::PLUGIN_MANIFEST,
+        crate::declaration::SERVICE_CONTRACTS,
+        move |_| Ok(SnapshotPlugin::new(runtime.clone())),
     )
+    .expect("embedded snapshot declaration must be valid")
 }
 
-/// Unbound discovery remains inert. Creation fails rather than silently using an
-/// empty registry and accepting an apparently successful, incomplete snapshot.
-#[must_use]
-pub fn plugin_definition() -> bmux_plugin_sdk::definition::PluginDefinition {
-    let metadata = plugin_definition_with_runtime(SnapshotRuntime::new(Arc::new(
-        bmux_plugin::PluginStateRegistry::new(),
-    )))
-    .metadata;
-    bmux_plugin_sdk::definition::PluginDefinition::new(metadata, |_scope| {
-        Err(PluginCommandError::unavailable(
-            "snapshot requires explicit host runtime ports",
-        ))
-    })
-}
+// Unbound discovery remains inert. Creation fails rather than silently using an
+// empty registry and accepting an apparently successful, incomplete snapshot.
+bmux_plugin_sdk::plugin!(
+    SnapshotPlugin,
+    create = |_| Err(PluginCommandError::unavailable(
+        "snapshot requires explicit host runtime ports",
+    ))
+);
 
 #[cfg(test)]
 mod scoped_runtime_tests {
@@ -628,20 +630,12 @@ mod definition_contract_tests {
         let manifest =
             bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
                 .unwrap();
-        let canonical = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<
-            super::SnapshotPlugin,
-        >(
-            crate::declaration::PLUGIN_MANIFEST,
-            vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
-        )
-        .unwrap();
         let injected = super::plugin_definition_with_runtime(super::SnapshotRuntime::new(
             std::sync::Arc::new(bmux_plugin::PluginStateRegistry::new()),
         ));
         injected.validate().unwrap();
-        assert_eq!(injected.metadata, canonical.metadata);
+        assert_eq!(injected.metadata, definition.metadata);
         definition.validate().unwrap();
-        assert_eq!(definition.metadata, canonical.metadata);
         assert_eq!(definition.metadata.plugin_id, manifest.id);
         assert_eq!(definition.metadata.version, manifest.version);
         assert_eq!(definition.metadata.roles, manifest.component_roles);

@@ -54,6 +54,7 @@ use bmux_decoration_plugin_api::decoration_state::{
     SetStyleError, ValidationError, ValidationResult,
 };
 use bmux_plugin::{AttachInputEvent, AttachInputResult, ServiceCaller};
+use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{HostAsyncHandle, TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_scene_protocol::scene_protocol::{
@@ -3200,22 +3201,35 @@ impl DecorationPlugin {
     }
 }
 
-impl RustPlugin for DecorationPlugin {
-    type Contract = bmux_decoration_plugin_api::Contract;
+impl Plugin for DecorationPlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        d.blocking_activate(Self::activate_with_async)
+            .blocking_services(Self::invoke_service, None)
+            .typed_services(Self::register_typed_services);
+    }
+}
 
-    fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+impl DecorationPlugin {
+    fn activate(
+        &self,
+        context: NativeLifecycleContext,
+        _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
+    ) -> std::result::Result<(), PluginCommandError> {
         self.activate_instance(&context);
-        Ok(EXIT_OK)
+        Ok(())
     }
 
     fn activate_with_async(
-        &mut self,
+        &self,
         context: NativeLifecycleContext,
-        async_handle: HostAsyncHandle,
-    ) -> Result<i32, PluginCommandError> {
+        async_handle: Option<bmux_plugin_sdk::HostAsyncHandle>,
+    ) -> std::result::Result<(), PluginCommandError> {
+        let Some(async_handle) = async_handle else {
+            return self.activate(context, None);
+        };
         self.state.set_host_async_handle(async_handle);
         self.activate_instance(&context);
-        Ok(EXIT_OK)
+        Ok(())
     }
 
     fn register_typed_services(
@@ -4351,32 +4365,7 @@ fn interface_ids_match_bpdl_constants() {
     );
 }
 
-bmux_plugin_sdk::define_plugin!(
-    factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| Ok(std::sync::Arc::new(
-        bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
-            DecorationPlugin::new(),
-            scope.instance
-        )
-    )
-        as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
-    metadata = {
-        let manifest_toml = crate::declaration::PLUGIN_MANIFEST;
-        let manifest = bmux_plugin::PluginManifest::from_toml_str(manifest_toml)
-            .expect("embedded plugin declaration must be valid");
-        bmux_plugin_sdk::definition::PluginMetadata {
-            plugin_id: manifest.id,
-            version: manifest.version,
-            roles: manifest.component_roles,
-            required_capabilities: manifest
-                .required_capabilities
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            contracts: manifest.contracts,
-            manifest_toml: Some(manifest_toml.into()),
-        }
-    },
-);
+bmux_plugin_sdk::plugin!(DecorationPlugin, create = |_| Ok(DecorationPlugin::new()));
 
 #[cfg(test)]
 mod tests {
@@ -5231,7 +5220,7 @@ mod tests {
             connection: &host_connection,
             plugin_settings_map: &settings,
         };
-        RustPlugin::register_typed_services(&plugin, context, &mut registry);
+        plugin.register_typed_services(context, &mut registry);
         let cap = bmux_plugin_sdk::HostScope::new("bmux.decoration.read").expect("cap");
         let handle = registry
             .get(

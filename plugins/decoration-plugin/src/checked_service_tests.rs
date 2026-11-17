@@ -1,5 +1,6 @@
-//! Checked transport regressions execute the actual legacy decoration handler.
+//! Checked transport regressions execute the actual synchronous decoration handler.
 use super::*;
+use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::definition::{
     LoadedInstanceId, PluginCallContext, PluginCreateContext, PluginInstance,
 };
@@ -77,14 +78,18 @@ struct CountedDecoration {
     plugin: DecorationPlugin,
     effects: Arc<AtomicUsize>,
 }
-impl RustPlugin for CountedDecoration {
-    type Contract = bmux_decoration_plugin_api::Contract;
+impl Plugin for CountedDecoration {
+    fn declare(d: &mut Declarations<Self>) {
+        d.blocking_services(Self::invoke_service, None);
+    }
+}
 
+impl CountedDecoration {
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         if context.request.operation == "apply-view-theme-extension" {
             self.effects.fetch_add(1, Ordering::SeqCst);
         }
-        RustPlugin::invoke_service(&self.plugin, context)
+        self.plugin.invoke_service(context)
     }
 }
 
@@ -119,10 +124,13 @@ fn invocation(context: &NativeServiceContext) -> PluginCallContext {
 async fn wrong_schema_has_no_effect_and_checked_apply_executes_once() {
     let counted = CountedDecoration::default();
     let effects = counted.effects.clone();
-    let adapter = bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
+    let adapter = bmux_plugin_sdk::author::DeclaredInstance::new(
         counted,
-        LoadedInstanceId::from_uuid(Uuid::from_u128(0x43)),
-    );
+        crate::declaration::PLUGIN_MANIFEST,
+        crate::declaration::SERVICE_CONTRACTS,
+    )
+    .unwrap()
+    .for_instance(LoadedInstanceId::from_uuid(Uuid::from_u128(0x43)));
     let wrong = apply_context(&[0; 32]);
     assert!(adapter.invoke(invocation(&wrong), wrong).await.is_err());
     assert_eq!(effects.load(Ordering::SeqCst), 0);

@@ -677,7 +677,6 @@ mod tests {
         operation: &str,
         request: &Request,
     ) -> Response {
-        use bmux_plugin_sdk::RustPlugin;
         let payload = bmux_plugin_sdk::encode_service_message(request).unwrap();
         let response = plugin.invoke_service(service_context(
             caller, capability, interface, operation, payload,

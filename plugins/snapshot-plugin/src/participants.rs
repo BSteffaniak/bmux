@@ -200,14 +200,10 @@ mod tests {
     #[test]
     fn unbound_definition_retains_canonical_identity() {
         let definition = crate::plugin_definition();
-        let canonical = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<
-            crate::SnapshotPlugin,
-        >(
-            crate::declaration::PLUGIN_MANIFEST,
-            vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
-        )
-        .unwrap();
-        assert_eq!(definition.metadata, canonical.metadata);
+        let bound = crate::plugin_definition_with_runtime(crate::SnapshotRuntime::new(
+            std::sync::Arc::new(bmux_plugin::PluginStateRegistry::new()),
+        ));
+        assert_eq!(definition.metadata, bound.metadata);
     }
 
     #[test]

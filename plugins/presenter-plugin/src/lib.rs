@@ -39,33 +39,46 @@ mod web_host;
 pub use demo::linked_registry as linked_demo_registry;
 pub use owner::LinkedOwner;
 
+use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::{
-    NativeCommandContext, NativeServiceContext, PluginCommandError, RustPlugin, ServiceResponse,
+    NativeCommandContext, NativeServiceContext, PluginCommandError, ServiceResponse,
 };
 
 #[derive(Default)]
 pub struct PresenterPlugin {
     managed: services::ManagedHosts,
 }
-impl RustPlugin for PresenterPlugin {
-    type Contract = bmux_presenter_plugin_api::Contract;
+impl Plugin for PresenterPlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        d.blocking_activate(Self::activate)
+            .blocking_deactivate(Self::deactivate)
+            .blocking_command("present-play", Self::run_command)
+            .blocking_command("present-host", Self::run_command)
+            .blocking_command("present-join", Self::run_command)
+            .blocking_command("present-check", Self::run_command)
+            .blocking_services(Self::invoke_service, None);
+    }
+}
+
+impl PresenterPlugin {
     fn activate(
-        &mut self,
+        &self,
         _context: bmux_plugin_sdk::NativeLifecycleContext,
-    ) -> Result<i32, PluginCommandError> {
+        _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
+    ) -> std::result::Result<(), PluginCommandError> {
         self.managed
             .bind_runtime(tokio::runtime::Handle::try_current().ok());
-        Ok(bmux_plugin_sdk::EXIT_OK)
+        Ok(())
     }
     fn deactivate(
-        &mut self,
+        &self,
         _context: bmux_plugin_sdk::NativeLifecycleContext,
-    ) -> Result<i32, PluginCommandError> {
+    ) -> std::result::Result<(), PluginCommandError> {
         self.managed.admit_retirement()?;
-        Ok(bmux_plugin_sdk::EXIT_OK)
+        Ok(())
     }
 
-    fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
+    fn run_command(&self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         self.run(context)
     }
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
@@ -104,32 +117,7 @@ impl PresenterPlugin {
     }
 }
 
-bmux_plugin_sdk::define_plugin!(
-    factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| Ok(std::sync::Arc::new(
-        bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
-            PresenterPlugin::default(),
-            scope.instance
-        )
-    )
-        as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
-    metadata = {
-        let manifest_toml = crate::declaration::PLUGIN_MANIFEST;
-        let manifest = bmux_plugin::PluginManifest::from_toml_str(manifest_toml)
-            .expect("embedded plugin declaration must be valid");
-        bmux_plugin_sdk::definition::PluginMetadata {
-            plugin_id: manifest.id,
-            version: manifest.version,
-            roles: manifest.component_roles,
-            required_capabilities: manifest
-                .required_capabilities
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            contracts: manifest.contracts,
-            manifest_toml: Some(manifest_toml.into()),
-        }
-    },
-);
+bmux_plugin_sdk::plugin!(PresenterPlugin);
 
 #[cfg(test)]
 mod tests {
