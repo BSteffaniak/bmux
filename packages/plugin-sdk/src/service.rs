@@ -154,25 +154,6 @@ impl PluginService {
     }
 }
 
-/// Merge one service declaration into `services`.
-///
-/// A new endpoint is appended. An endpoint already declared (for example by an
-/// explicit manifest `[[services]]` entry that predates generated evidence)
-/// keeps its existing fields and gains the incoming reentrant operations, so
-/// generated BPDL metadata is never dropped or duplicated by routing aliases.
-pub fn merge_service_declaration(services: &mut Vec<PluginService>, service: PluginService) {
-    if let Some(existing) = services
-        .iter_mut()
-        .find(|existing| existing.same_endpoint(&service))
-    {
-        existing
-            .reentrant_operations
-            .extend(service.reentrant_operations);
-    } else {
-        services.push(service);
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderId {
     Plugin(String),
@@ -897,14 +878,10 @@ mod tests {
     }
 
     #[test]
-    fn reentrant_set_merges_into_existing_route_and_validates_query_only() {
-        let mut services = vec![declared(ServiceKind::Query, &[])];
-        super::merge_service_declaration(&mut services, declared(ServiceKind::Query, &["get"]));
-        assert_eq!(services.len(), 1);
+    fn reentrant_operations_are_query_only() {
+        let services = [declared(ServiceKind::Query, &["get"])];
         assert!(services[0].is_reentrant_query("get"));
         assert!(!services[0].is_reentrant_query("other"));
-        super::merge_service_declaration(&mut services, declared(ServiceKind::Command, &[]));
-        assert_eq!(services.len(), 2);
         assert!(services[0].validate("example").is_ok());
         assert!(matches!(
             declared(ServiceKind::Command, &["get"]).validate("example"),

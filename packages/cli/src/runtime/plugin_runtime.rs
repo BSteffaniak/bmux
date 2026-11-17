@@ -3798,7 +3798,7 @@ enabled_by_default = false
         );
         let mut inventory = bmux_plugin::PluginCandidateInventory::new();
         inventory.add_bundled_manifest(
-            "id='example.frontend'\nname='Frontend'\nversion='1.0.0'\ncomponent_roles=['frontend']\n", Vec::new(),
+            "id='example.frontend'\nname='Frontend'\nversion='1.0.0'\ncomponent_roles=['frontend']\n"
         ).unwrap();
         assert_eq!(
             inventory_component_role(

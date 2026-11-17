@@ -151,35 +151,6 @@ pub struct PluginDeclaration {
 }
 
 impl PluginDeclaration {
-    /// Merge additional service declarations into this declaration.
-    ///
-    /// Used by native bundled plugins to add BPDL-generated service
-    /// descriptors exported by the plugin binary. Existing manifest services
-    /// are preserved so non-BPDL compatibility/override services remain
-    /// supported.
-    ///
-    /// # Errors
-    ///
-    /// Returns if an added service is invalid or uses a capability the plugin
-    /// does not provide.
-    pub fn merge_services(
-        &mut self,
-        services: impl IntoIterator<Item = PluginService>,
-    ) -> Result<()> {
-        for service in services {
-            service.validate(self.id.as_str())?;
-            if !self.provided_capabilities.contains(&service.capability) {
-                return Err(PluginError::UnownedServiceCapability {
-                    plugin_id: self.id.as_str().to_string(),
-                    capability: service.capability.as_str().to_string(),
-                    interface_id: service.interface_id,
-                });
-            }
-            bmux_plugin_sdk::merge_service_declaration(&mut self.services, service);
-        }
-        self.validate()
-    }
-
     fn validate_version_ranges(&self) -> Result<()> {
         for (field, range) in [
             ("plugin_api", self.plugin_api),

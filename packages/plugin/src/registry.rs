@@ -129,28 +129,10 @@ impl PluginRegistry {
     ///
     /// Returns an error when the manifest is invalid or uses a duplicate id.
     pub fn register_bundled_manifest(&mut self, manifest_toml: &str) -> Result<()> {
-        self.register_bundled_manifest_with_services(manifest_toml, Vec::new())
-    }
-
-    /// Register a statically-linked bundled plugin and merge services exported
-    /// by the native plugin implementation.
-    ///
-    /// BPDL-generated descriptors reach the host through this path, making the
-    /// generated contract the routing source of truth for bundled plugins while
-    /// preserving explicit manifest services for compatibility/overrides.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the manifest is invalid, an exported service uses
-    /// an unowned capability, or the plugin id is a duplicate.
-    pub fn register_bundled_manifest_with_services(
-        &mut self,
-        manifest_toml: &str,
-        services: Vec<bmux_plugin_sdk::PluginService>,
-    ) -> Result<()> {
+        // Bundled manifests are generated from the plugin's BPDL world, so the
+        // declaration is exactly the manifest's; nothing is merged at runtime.
         let manifest = PluginManifest::from_toml_str(manifest_toml)?;
-        let mut declaration = manifest.to_declaration()?;
-        declaration.merge_services(services)?;
+        let declaration = manifest.to_declaration()?;
         let plugin_id = declaration.id.as_str().to_string();
 
         if self.plugins.contains_key(&plugin_id) {
@@ -689,19 +671,12 @@ impl PluginCandidateInventory {
     /// Returns an error for invalid identity/declarations or duplicate bundled candidates.
     pub fn add_registered_plugin(&mut self, plugin: &RegisteredPlugin) -> Result<()> {
         plugin.declaration.validate()?;
-        let mut expected = plugin.manifest.to_declaration()?;
-        expected.merge_services(plugin.declaration.services.clone())?;
-        if expected != plugin.declaration {
+        if plugin.manifest.to_declaration()? != plugin.declaration {
             return Err(candidate_error(
                 "registered declaration does not match its manifest",
             ));
         }
         if !plugin.bundled_static {
-            if plugin.declaration != plugin.manifest.to_declaration()? {
-                return Err(candidate_error(
-                    "dynamic declarations must be verified from artifact metadata, not imported service overrides",
-                ));
-            }
             return self.add_dynamic_manifest(
                 &plugin.search_root,
                 &plugin.manifest_path,
@@ -795,17 +770,13 @@ impl PluginCandidateInventory {
         Ok(())
     }
 
-    /// Add a bundled declaration using the existing generated-service merge path.
+    /// Add a bundled declaration from its generated manifest.
     ///
     /// # Errors
     /// Returns an error for an invalid or duplicate bundled candidate.
-    pub fn add_bundled_manifest(
-        &mut self,
-        manifest_toml: &str,
-        services: Vec<bmux_plugin_sdk::PluginService>,
-    ) -> Result<()> {
+    pub fn add_bundled_manifest(&mut self, manifest_toml: &str) -> Result<()> {
         let mut registry = PluginRegistry::new();
-        registry.register_bundled_manifest_with_services(manifest_toml, services)?;
+        registry.register_bundled_manifest(manifest_toml)?;
         for (_, plugin) in registry.plugins {
             let candidates = self
                 .candidates
@@ -1163,7 +1134,7 @@ mod candidate_tests {
              provided_capabilities = ['example.read']\n\
              [[services]]\ncapability = 'example.read'\ninterface_id = 'legacy-state'\nkind = 'query'\n".to_owned();
         let mut inventory = PluginCandidateInventory::new();
-        inventory.add_bundled_manifest(&text, Vec::new()).unwrap();
+        inventory.add_bundled_manifest(&text).unwrap();
         let mut required = request();
         required.contracts.clear();
         let selected = inventory.select(&required).unwrap();
@@ -1250,9 +1221,7 @@ mod candidate_tests {
     fn explicit_missing_selection_does_not_fall_back_to_bundled() {
         let root = tempfile::tempdir().unwrap();
         let mut inventory = PluginCandidateInventory::new();
-        inventory
-            .add_bundled_manifest(manifest(), Vec::new())
-            .unwrap();
+        inventory.add_bundled_manifest(manifest()).unwrap();
         let mut selected = request();
         selected.preference = PluginCandidatePreference::Dynamic {
             manifest_path: root.path().join("missing.toml"),
@@ -1265,9 +1234,7 @@ mod candidate_tests {
         let root = tempfile::tempdir().unwrap();
         let mut inventory = PluginCandidateInventory::new();
         let path = dynamic(&mut inventory, root.path(), "plugin.toml");
-        inventory
-            .add_bundled_manifest(manifest(), Vec::new())
-            .unwrap();
+        inventory.add_bundled_manifest(manifest()).unwrap();
         assert_eq!(inventory.iter().count(), 2);
         assert_eq!(
             inventory.select(&request()).unwrap().candidate().source,
@@ -1310,14 +1277,8 @@ mod candidate_tests {
             )
             .unwrap();
         assert_eq!(inventory.iter().count(), 1);
-        inventory
-            .add_bundled_manifest(manifest(), Vec::new())
-            .unwrap();
-        assert!(
-            inventory
-                .add_bundled_manifest(manifest(), Vec::new())
-                .is_err()
-        );
+        inventory.add_bundled_manifest(manifest()).unwrap();
+        assert!(inventory.add_bundled_manifest(manifest()).is_err());
     }
 
     #[test]
@@ -1325,9 +1286,7 @@ mod candidate_tests {
         let root = tempfile::tempdir().unwrap();
         let mut inventory = PluginCandidateInventory::new();
         let path = dynamic(&mut inventory, root.path(), "plugin.toml");
-        inventory
-            .add_bundled_manifest(manifest(), Vec::new())
-            .unwrap();
+        inventory.add_bundled_manifest(manifest()).unwrap();
         let mut selected = request();
         selected.preference = PluginCandidatePreference::Dynamic {
             manifest_path: path,
@@ -1348,10 +1307,7 @@ mod candidate_tests {
         let mut inventory = PluginCandidateInventory::new();
         dynamic(&mut inventory, root.path(), "plugin.toml");
         inventory
-            .add_bundled_manifest(
-                &manifest().replace("maximum = '1.5'", "maximum = '1.0'"),
-                Vec::new(),
-            )
+            .add_bundled_manifest(&manifest().replace("maximum = '1.5'", "maximum = '1.0'"))
             .unwrap();
         assert!(inventory.select(&request()).is_err());
     }
@@ -1359,9 +1315,7 @@ mod candidate_tests {
     #[test]
     fn role_and_contract_bounds_are_checked_before_loading() {
         let mut inventory = PluginCandidateInventory::new();
-        inventory
-            .add_bundled_manifest(manifest(), Vec::new())
-            .unwrap();
+        inventory.add_bundled_manifest(manifest()).unwrap();
         let mut selected = request();
         selected.role = ComponentRole::Frontend;
         assert!(inventory.select(&selected).is_ok());
@@ -1382,9 +1336,7 @@ mod candidate_tests {
     fn backend_only_legacy_manifest_rejects_frontend() {
         let mut inventory = PluginCandidateInventory::new();
         let manifest = manifest().replace("component_roles = ['backend', 'frontend']", "");
-        inventory
-            .add_bundled_manifest(&manifest, Vec::new())
-            .unwrap();
+        inventory.add_bundled_manifest(&manifest).unwrap();
         let mut selected = request();
         selected.role = ComponentRole::Frontend;
         assert!(inventory.select(&selected).is_err());
@@ -1495,7 +1447,7 @@ mod candidate_tests {
     fn open_upper_bound_does_not_implicitly_select_a_new_major() {
         let mut inventory = PluginCandidateInventory::new();
         inventory
-            .add_bundled_manifest(&manifest().replace("maximum = '1.5'", ""), Vec::new())
+            .add_bundled_manifest(&manifest().replace("maximum = '1.5'", ""))
             .unwrap();
         let mut selected = request();
         selected.plugin_api = ApiVersion::new(2, 0);
@@ -1507,7 +1459,7 @@ mod candidate_tests {
 mod tests {
     use super::PluginRegistry;
     use crate::PluginManifest;
-    use bmux_plugin_sdk::{ApiVersion, HostMetadata, HostScope, PluginService, ServiceKind};
+    use bmux_plugin_sdk::{ApiVersion, HostMetadata, HostScope};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1703,40 +1655,6 @@ minimum = "1.0"
             .get(&HostScope::new("bmux.tabs.read").expect("scope should parse"))
             .expect("capability should be present");
         assert_eq!(selected.provider.to_string(), "one.plugin");
-    }
-
-    #[test]
-    fn bundled_manifest_merges_generated_service_declarations() {
-        let generated = PluginService {
-            capability: HostScope::new("bmux.recording.write").expect("scope should parse"),
-            kind: ServiceKind::Command,
-            interface_id: "recording-commands".to_string(),
-            concurrency: None,
-            reentrant_operations: std::collections::BTreeSet::new(),
-        };
-        let mut registry = PluginRegistry::new();
-        registry
-            .register_bundled_manifest_with_services(
-                r#"
-id = "bmux.recording"
-name = "Recording"
-version = "0.1.0"
-provided_capabilities = ["bmux.recording.write"]
-
-[plugin_api]
-minimum = "1.0"
-
-[native_abi]
-minimum = "1.0"
-"#,
-                vec![generated.clone()],
-            )
-            .expect("bundled manifest should merge generated services");
-
-        let plugin = registry
-            .get("bmux.recording")
-            .expect("bundled plugin should register");
-        assert!(plugin.declaration.services.contains(&generated));
     }
 
     #[test]

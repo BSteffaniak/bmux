@@ -385,7 +385,7 @@ mod embedded_declaration_identity_tests {
         let pinned = format!("artifact_sha256 = \"{expected_digest}\"\n{embedded}");
         let mut inventory = bmux_plugin::PluginCandidateInventory::new();
         inventory
-            .add_bundled_manifest(&pinned, Vec::new())
+            .add_bundled_manifest(&pinned)
             .expect("inventory declaration");
         for role in &manifest.component_roles {
             let selected = inventory
