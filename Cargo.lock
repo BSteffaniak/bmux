@@ -1602,7 +1602,6 @@ dependencies = [
  "bmux_client",
  "bmux_image",
  "bmux_plugin",
- "bmux_scene_protocol",
  "bmux_scene_protocol_render",
  "bmux_terminal",
  "bmux_terminal_grid",
