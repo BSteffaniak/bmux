@@ -3,6 +3,7 @@
 //! Kitty graphics uses APC sequences: `ESC _ G <key>=<value>;... ; <payload> ESC \`
 //! The first byte after `ESC _ ` is always `G`.
 
+pub(crate) mod medium;
 pub mod shared_memory;
 
 /// Status of a complete Kitty graphics reply.
@@ -60,7 +61,8 @@ pub fn parse_reply_frame(frame: &[u8]) -> Option<KittyReply<'_>> {
 }
 
 use crate::model::{
-    ImagePosition, KittyCommand, KittyDeleteSpecifier, KittyFormat, KittyPlacement, KittySourceRect,
+    ImagePosition, KittyCommand, KittyDeleteSpecifier, KittyFormat, KittyMedium, KittyPlacement,
+    KittySourceRect, KittyTransmitDetails,
 };
 
 /// Encode a placement with an integral source-pixel crop. Position remains
@@ -110,76 +112,97 @@ pub fn parse_command(body: &[u8], cursor_pos: ImagePosition) -> Option<KittyComm
     }
 
     let action = params.get("a").and_then(|s| s.as_bytes().first().copied());
+    let image_id = parse_u32(&params, "i").unwrap_or(0);
+    let quiet = parse_u32(&params, "q").map_or(0, |quiet| u8::try_from(quiet.min(2)).unwrap_or(2));
+    // Transmission fields, shared by transmit, transmit-and-display and query.
+    let transmission = || -> Option<(KittyFormat, u32, u32, KittyTransmitDetails)> {
+        let format = match parse_u32(&params, "f").unwrap_or(32) {
+            24 => KittyFormat::Rgb,
+            32 => KittyFormat::Rgba,
+            100 => KittyFormat::Png,
+            _ => KittyFormat::Rgba,
+        };
+        let medium = match params.get("t").map(|medium| medium.as_bytes()) {
+            None | Some(b"d") => KittyMedium::Direct,
+            Some(b"f") => KittyMedium::File,
+            Some(b"t") => KittyMedium::TempFile,
+            Some(b"s") => KittyMedium::SharedMemory,
+            Some(_) => return None,
+        };
+        let details = KittyTransmitDetails {
+            medium,
+            compressed: params
+                .get("o")
+                .is_some_and(|compression| *compression == "z"),
+            size: params.get("S").and_then(|size| size.parse().ok()),
+            offset: params
+                .get("O")
+                .and_then(|offset| offset.parse().ok())
+                .unwrap_or(0),
+            quiet,
+            display: None,
+        };
+        Some((
+            format,
+            parse_u32(&params, "s").unwrap_or(0),
+            parse_u32(&params, "v").unwrap_or(0),
+            details,
+        ))
+    };
+    // Placement fields, shared by place and transmit-and-display. Kitty placements are
+    // anchored at the current cursor; C controls cursor movement, not a column.
+    let placement = || -> Option<KittyPlacement> {
+        let source_rect = if params.contains_key("x")
+            || params.contains_key("y")
+            || params.contains_key("w")
+            || params.contains_key("h")
+        {
+            Some(KittySourceRect {
+                x: parse_u32(&params, "x").unwrap_or(0),
+                y: parse_u32(&params, "y").unwrap_or(0),
+                width: parse_u32(&params, "w").unwrap_or(0),
+                height: parse_u32(&params, "h").unwrap_or(0),
+            })
+        } else {
+            None
+        };
+        Some(KittyPlacement {
+            image_id,
+            placement_id: parse_u32(&params, "p").unwrap_or(0),
+            position: cursor_pos,
+            cell_size: crate::model::ImageCellSize {
+                cols: u16::try_from(parse_u32(&params, "c").unwrap_or(0)).ok()?,
+                rows: u16::try_from(parse_u32(&params, "r").unwrap_or(0)).ok()?,
+            },
+            source_rect,
+            z_index: params
+                .get("z")
+                .and_then(|v| v.parse::<i32>().ok())
+                .unwrap_or(0),
+            quiet,
+        })
+    };
 
     match action {
-        // Transmit (default if no action specified, or a=t, a=T)
+        // Transmit (the default action), or transmit and display (a=T).
         None | Some(b't') | Some(b'T') => {
-            let image_id = parse_u32(&params, "i").unwrap_or(0);
-            let format = match parse_u32(&params, "f").unwrap_or(32) {
-                24 => KittyFormat::Rgb,
-                32 => KittyFormat::Rgba,
-                100 => KittyFormat::Png,
-                _ => KittyFormat::Rgba,
-            };
-            let width = parse_u32(&params, "s").unwrap_or(0);
-            let height = parse_u32(&params, "v").unwrap_or(0);
-            let more_chunks = params.get("m").map(|v| *v == "1").unwrap_or(false);
-
-            // Decode base64 payload.
-            let data = base64_decode(payload);
-
+            let (format, width, height, mut details) = transmission()?;
+            if action == Some(b'T') {
+                details.display = Some(placement()?);
+            }
             Some(KittyCommand::Transmit {
                 image_id,
                 format,
-                data,
+                data: base64_decode(payload),
                 width,
                 height,
-                more_chunks,
+                more_chunks: params.get("m").is_some_and(|more| *more == "1"),
+                details,
             })
         }
 
         // Place
-        Some(b'p') => {
-            let image_id = parse_u32(&params, "i").unwrap_or(0);
-            let placement_id = parse_u32(&params, "p").unwrap_or(0);
-            let z_index = params
-                .get("z")
-                .and_then(|v| v.parse::<i32>().ok())
-                .unwrap_or(0);
-
-            // Kitty placements are anchored at the current cursor. C controls
-            // cursor movement; it is not a column coordinate.
-            let position = cursor_pos;
-            let cell_size = crate::model::ImageCellSize {
-                cols: u16::try_from(parse_u32(&params, "c").unwrap_or(0)).ok()?,
-                rows: u16::try_from(parse_u32(&params, "r").unwrap_or(0)).ok()?,
-            };
-
-            // Source rectangle for sub-image display.
-            let source_rect = if params.contains_key("x")
-                || params.contains_key("y")
-                || params.contains_key("w")
-                || params.contains_key("h")
-            {
-                Some(KittySourceRect {
-                    x: parse_u32(&params, "x").unwrap_or(0),
-                    y: parse_u32(&params, "y").unwrap_or(0),
-                    width: parse_u32(&params, "w").unwrap_or(0),
-                    height: parse_u32(&params, "h").unwrap_or(0),
-                })
-            } else {
-                None
-            };
-
-            Some(KittyCommand::Place(KittyPlacement {
-                image_id,
-                placement_id,
-                position,
-                cell_size,
-                source_rect,
-                z_index,
-            }))
-        }
+        Some(b'p') => placement().map(KittyCommand::Place),
 
         // Delete
         Some(b'd') => {
@@ -226,8 +249,15 @@ pub fn parse_command(body: &[u8], cursor_pos: ImagePosition) -> Option<KittyComm
 
         // Query
         Some(b'q') => {
-            let image_id = parse_u32(&params, "i").unwrap_or(0);
-            Some(KittyCommand::Query { image_id })
+            let (format, width, height, details) = transmission()?;
+            Some(KittyCommand::Query {
+                image_id,
+                format,
+                data: base64_decode(payload),
+                width,
+                height,
+                details,
+            })
         }
 
         _ => None,

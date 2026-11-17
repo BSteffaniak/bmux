@@ -1129,3 +1129,127 @@ mod pipeline {
         assert_eq!(result.events[0].filtered_byte_offset(), 5);
     }
 }
+
+/// What pane programs send Kitty, and what they are answered: transmit and display, queries,
+/// chunked and compressed transmissions, through the interceptor and registry as a pane's
+/// output goes.
+#[cfg(feature = "kitty")]
+mod kitty_intake {
+    use bmux_image::codec::base64::base64_encode;
+    use bmux_image::intercept::ImageInterceptor;
+    use bmux_image::model::ImagePosition;
+    use bmux_image::registry::ImageRegistry;
+
+    fn png() -> Vec<u8> {
+        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
+        let mut png = Vec::new();
+        image
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        png
+    }
+
+    /// Feed `wire` to a registry at cursor row 1, column 2; its images and the replies owed.
+    fn intake(registry: &mut ImageRegistry, wire: &str) -> String {
+        for mut event in ImageInterceptor::new().process(wire.as_bytes()).events {
+            event.set_position(ImagePosition { row: 1, col: 2 });
+            registry.handle_event(event, 10, 20);
+        }
+        String::from_utf8(registry.take_replies()).unwrap()
+    }
+
+    #[test]
+    fn transmit_and_display_places_the_image_at_the_cursor_and_answers() {
+        let mut registry = ImageRegistry::default();
+        let replies = intake(
+            &mut registry,
+            &format!(
+                "\x1b_Ga=T,f=100,i=5,c=4,r=2;{}\x1b\\",
+                base64_encode(&png())
+            ),
+        );
+        assert_eq!(replies, "\x1b_Gi=5;OK\x1b\\");
+        let images = registry.images();
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].position, ImagePosition { row: 1, col: 2 });
+        assert_eq!((images[0].cell_size.cols, images[0].cell_size.rows), (4, 2));
+    }
+
+    #[test]
+    fn replies_follow_quietness_and_name_what_failed() {
+        let mut registry = ImageRegistry::default();
+        let png = base64_encode(&png());
+        assert_eq!(
+            intake(&mut registry, &format!("\x1b_Gf=100,i=6,q=1;{png}\x1b\\")),
+            "",
+            "q=1 suppresses OK"
+        );
+        assert_eq!(
+            intake(&mut registry, "\x1b_Ga=p,i=99,p=3,q=1\x1b\\"),
+            "\x1b_Gi=99,p=3;ENOENT: no such image\x1b\\",
+            "q=1 still reports errors"
+        );
+        assert_eq!(intake(&mut registry, "\x1b_Ga=p,i=99,q=2\x1b\\"), "");
+        assert_eq!(
+            intake(&mut registry, &format!("\x1b_Gf=100;{png}\x1b\\")),
+            "",
+            "a command without an image id is not answered"
+        );
+        assert_eq!(
+            intake(&mut registry, "\x1b_Gi=7,f=32,s=2,v=2;AAAA\x1b\\"),
+            "\x1b_Gi=7;EINVAL: image data does not match its size\x1b\\"
+        );
+    }
+
+    #[test]
+    fn queries_answer_whether_an_image_loads_and_keep_nothing() {
+        let mut registry = ImageRegistry::default();
+        assert_eq!(
+            intake(&mut registry, "\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\"),
+            "\x1b_Gi=31;OK\x1b\\"
+        );
+        assert_eq!(
+            intake(&mut registry, "\x1b_Gi=32,a=q,t=f;L25vbmV4aXN0ZW50\x1b\\"),
+            "\x1b_Gi=32;ENOENT: no such file\x1b\\"
+        );
+        assert!(registry.images().is_empty());
+        assert_eq!(
+            intake(&mut registry, "\x1b_Ga=p,i=31\x1b\\"),
+            "\x1b_Gi=31;ENOENT: no such image\x1b\\",
+            "a queried image is not stored"
+        );
+    }
+
+    #[test]
+    fn chunks_without_an_image_id_continue_the_transmission_in_flight() {
+        let mut registry = ImageRegistry::default();
+        let png = base64_encode(&png());
+        let (first, rest) = png.split_at(8);
+        let replies = intake(
+            &mut registry,
+            &format!("\x1b_Ga=T,f=100,i=9,m=1;{first}\x1b\\\x1b_Gm=0;{rest}\x1b\\"),
+        );
+        assert_eq!(replies, "\x1b_Gi=9;OK\x1b\\");
+        assert_eq!(registry.images().len(), 1);
+    }
+
+    #[test]
+    fn compressed_transmissions_are_inflated() {
+        use std::io::Write;
+        let mut compressed = Vec::new();
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(&mut compressed, flate2::Compression::default());
+        encoder.write_all(&[9_u8; 2 * 2 * 4]).unwrap();
+        encoder.finish().unwrap();
+        let mut registry = ImageRegistry::default();
+        let replies = intake(
+            &mut registry,
+            &format!(
+                "\x1b_Ga=T,f=32,s=2,v=2,o=z,i=11;{}\x1b\\",
+                base64_encode(&compressed)
+            ),
+        );
+        assert_eq!(replies, "\x1b_Gi=11;OK\x1b\\");
+        assert_eq!(registry.images().len(), 1);
+    }
+}

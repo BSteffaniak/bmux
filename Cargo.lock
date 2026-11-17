@@ -2469,6 +2469,7 @@ dependencies = [
  "bmux_attach_image_protocol",
  "bmux_ipc",
  "bmux_tui",
+ "flate2",
  "image",
  "png",
  "serde",

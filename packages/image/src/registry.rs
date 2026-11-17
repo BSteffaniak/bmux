@@ -25,7 +25,14 @@ struct KittyChunkAccumulator {
     format: crate::model::KittyFormat,
     width: u32,
     height: u32,
+    /// The first chunk's medium, compression, quietness and placement: later chunks carry only
+    /// their data.
+    details: crate::model::KittyTransmitDetails,
 }
+
+/// Most bytes one Kitty image may hold when the registry sets no byte limit.
+#[cfg(feature = "kitty")]
+const KITTY_IMAGE_BYTE_LIMIT: usize = 64 * 1024 * 1024;
 
 /// Per-pane image storage with scroll tracking and delta queries.
 #[derive(Clone)]
@@ -58,6 +65,12 @@ pub struct ImageRegistry {
     /// Accumulator for kitty chunked transmissions.
     #[cfg(feature = "kitty")]
     kitty_pending_chunks: std::collections::BTreeMap<u32, KittyChunkAccumulator>,
+    /// The image whose chunks are arriving: a chunk without an image id continues it.
+    #[cfg(feature = "kitty")]
+    kitty_chunking: Option<u32>,
+    /// Kitty replies owed to the pane's program, in order (see [`Self::take_replies`]).
+    #[cfg(feature = "kitty")]
+    kitty_replies: Vec<u8>,
 }
 
 /// Immutable retained placements for a text capture. No live delta log or
@@ -196,6 +209,23 @@ impl ImageRegistry {
             kitty_placements: std::collections::BTreeMap::new(),
             #[cfg(feature = "kitty")]
             kitty_pending_chunks: std::collections::BTreeMap::new(),
+            #[cfg(feature = "kitty")]
+            kitty_chunking: None,
+            #[cfg(feature = "kitty")]
+            kitty_replies: Vec::new(),
+        }
+    }
+
+    /// Take the protocol replies owed to the pane's program for the events handled so far (Kitty
+    /// graphics answers), to write back to it.
+    pub fn take_replies(&mut self) -> Vec<u8> {
+        #[cfg(feature = "kitty")]
+        {
+            std::mem::take(&mut self.kitty_replies)
+        }
+        #[cfg(not(feature = "kitty"))]
+        {
+            Vec::new()
         }
     }
 
@@ -899,6 +929,171 @@ impl ImageRegistry {
         }
     }
 
+    /// Most bytes one Kitty image may hold.
+    #[cfg(feature = "kitty")]
+    const fn kitty_byte_limit(&self) -> usize {
+        if self.max_bytes > 0 {
+            self.max_bytes
+        } else {
+            KITTY_IMAGE_BYTE_LIMIT
+        }
+    }
+
+    /// A transmission's image data, loaded from its medium and checked against its format;
+    /// the Kitty error reply when it cannot be.
+    #[cfg(feature = "kitty")]
+    fn load_kitty(
+        format: crate::model::KittyFormat,
+        data: Vec<u8>,
+        width: u32,
+        height: u32,
+        details: &crate::model::KittyTransmitDetails,
+        limit: usize,
+    ) -> Result<Vec<u8>, &'static str> {
+        use crate::model::KittyFormat;
+        let data = crate::codec::kitty::medium::load(data, details, limit)?;
+        let channels = match format {
+            KittyFormat::Rgb => 3,
+            KittyFormat::Rgba => 4,
+            KittyFormat::Png => {
+                if !data.starts_with(b"\x89PNG\r\n\x1a\n") {
+                    return Err("EINVAL: not PNG data");
+                }
+                return Ok(data);
+            }
+        };
+        let expected = u64::from(width) * u64::from(height) * channels;
+        if expected == 0 || u64::try_from(data.len()).ok() != Some(expected) {
+            return Err("EINVAL: image data does not match its size");
+        }
+        Ok(data)
+    }
+
+    /// Owe the pane's program Kitty's answer to a command about `image_id`: none for a command
+    /// without an image id, or when `quiet` suppresses it (1: successes, 2: everything).
+    #[cfg(feature = "kitty")]
+    fn kitty_reply(
+        &mut self,
+        image_id: u32,
+        placement_id: u32,
+        quiet: u8,
+        result: Result<(), &'static str>,
+    ) {
+        use std::io::Write;
+        let suppressed = match result {
+            Ok(()) => quiet >= 1,
+            Err(_) => quiet >= 2,
+        };
+        if image_id == 0 || suppressed {
+            return;
+        }
+        let reply = &mut self.kitty_replies;
+        let _ = write!(reply, "\x1b_Gi={image_id}");
+        if placement_id > 0 {
+            let _ = write!(reply, ",p={placement_id}");
+        }
+        let _ = write!(reply, ";{}\x1b\\", result.err().unwrap_or("OK"));
+    }
+
+    /// Show a transmitted Kitty image at a placement; the Kitty error reply when it cannot be.
+    #[cfg(feature = "kitty")]
+    fn place_kitty(
+        &mut self,
+        placement: &crate::model::KittyPlacement,
+        cell_pixel_width: u16,
+        cell_pixel_height: u16,
+    ) -> Result<(), &'static str> {
+        let Some(transmitted) = self.kitty_transmitted.get(&placement.image_id) else {
+            return Err("ENOENT: no such image");
+        };
+        let pixel_size = ImagePixelSize {
+            width: transmitted.width,
+            height: transmitted.height,
+        };
+        let mut cell_size = pixel_size_to_cells(pixel_size, cell_pixel_width, cell_pixel_height);
+        if placement.cell_size.cols > 0 && placement.cell_size.rows == 0 {
+            cell_size.rows = u16::try_from(
+                (u64::from(placement.cell_size.cols)
+                    * u64::from(cell_pixel_width.max(1))
+                    * u64::from(pixel_size.height))
+                .div_ceil(u64::from(pixel_size.width.max(1)) * u64::from(cell_pixel_height.max(1))),
+            )
+            .unwrap_or(u16::MAX);
+        } else if placement.cell_size.rows > 0 && placement.cell_size.cols == 0 {
+            cell_size.cols = u16::try_from(
+                (u64::from(placement.cell_size.rows)
+                    * u64::from(cell_pixel_height.max(1))
+                    * u64::from(pixel_size.width))
+                .div_ceil(u64::from(pixel_size.height.max(1)) * u64::from(cell_pixel_width.max(1))),
+            )
+            .unwrap_or(u16::MAX);
+        }
+        if placement.cell_size.cols > 0 {
+            cell_size.cols = placement.cell_size.cols;
+        }
+        if placement.cell_size.rows > 0 {
+            cell_size.rows = placement.cell_size.rows;
+        }
+        // Preserve the transmitted format rather than treating raw
+        // RGB/RGBA bytes as an encoded PNG during host rendering.
+        let format = match transmitted.format {
+            crate::model::KittyFormat::Rgb => crate::model::PixelFormat::Rgb8,
+            crate::model::KittyFormat::Rgba => crate::model::PixelFormat::Rgba8,
+            crate::model::KittyFormat::Png => crate::model::PixelFormat::Png,
+        };
+        let pixels = crate::model::PixelBuffer {
+            data: transmitted.data.clone(),
+            width: transmitted.width,
+            height: transmitted.height,
+            format,
+        };
+        // The existing attach representation carries Kitty PNG
+        // payloads. Normalize here without changing the wire format.
+        let raw = if format == crate::model::PixelFormat::Png {
+            pixels.data.clone()
+        } else {
+            use image::ImageEncoder;
+            let color = if format == crate::model::PixelFormat::Rgb8 {
+                image::ExtendedColorType::Rgb8
+            } else {
+                image::ExtendedColorType::Rgba8
+            };
+            let expected = u64::from(pixels.width)
+                .checked_mul(u64::from(pixels.height))
+                .and_then(|size| size.checked_mul(u64::from(color.channel_count())));
+            if expected != Some(pixels.data.len() as u64) {
+                return Err("EINVAL: image data does not match its size");
+            }
+            let mut png = Vec::new();
+            if image::codecs::png::PngEncoder::new(&mut png)
+                .write_image(&pixels.data, pixels.width, pixels.height, color)
+                .is_err()
+            {
+                return Err("EINVAL: image cannot be encoded");
+            }
+            png
+        };
+        let key = (placement.image_id, placement.placement_id);
+        if let Some(old_id) = self.kitty_placements.remove(&key) {
+            self.remove_image(old_id);
+        }
+        let retained_id = self.next_id;
+        self.add_image(
+            ImageProtocol::KittyGraphics,
+            ImagePayload {
+                raw: Some(raw),
+                pixels: Some(pixels),
+            },
+            placement.position,
+            cell_size,
+            pixel_size,
+        );
+        if self.images.iter().any(|image| image.id == retained_id) {
+            self.kitty_placements.insert(key, retained_id);
+        }
+        Ok(())
+    }
+
     /// Handle a kitty graphics command.
     #[cfg(feature = "kitty")]
     fn handle_kitty_command(
@@ -916,173 +1111,95 @@ impl ImageRegistry {
                 data,
                 width,
                 height,
-                more_chunks: false,
+                more_chunks,
+                details,
             } => {
-                // Check if this is the final chunk of a multi-chunk transmission.
-                let (final_data, format, width, height) =
-                    if let Some(mut acc) = self.kitty_pending_chunks.remove(&image_id) {
-                        if self.max_bytes > 0
-                            && acc.data.len().saturating_add(data.len()) > self.max_bytes
-                        {
-                            return;
-                        }
-                        acc.data.extend_from_slice(&data);
-                        (acc.data, acc.format, acc.width, acc.height)
+                // Every path reaches the upload trim below.
+                'transmit: {
+                    // A chunk without an image id continues the transmission in flight.
+                    let image_id = if image_id == 0 {
+                        self.kitty_chunking.unwrap_or(0)
                     } else {
-                        if self.max_bytes > 0 && data.len() > self.max_bytes {
-                            return;
+                        image_id
+                    };
+                    let limit = self.kitty_byte_limit();
+                    if more_chunks {
+                        let acc = self
+                            .kitty_pending_chunks
+                            .entry(image_id)
+                            .or_insert_with(|| KittyChunkAccumulator {
+                                data: Vec::new(),
+                                format,
+                                width,
+                                height,
+                                details,
+                            });
+                        if acc.data.len().saturating_add(data.len()) > limit {
+                            let quiet = acc.details.quiet;
+                            self.kitty_pending_chunks.remove(&image_id);
+                            self.kitty_chunking = None;
+                            self.kitty_reply(
+                                image_id,
+                                0,
+                                quiet,
+                                Err("EFBIG: image data too large"),
+                            );
+                        } else {
+                            acc.data.extend_from_slice(&data);
+                            self.kitty_chunking = Some(image_id);
                         }
-                        (data, format, width, height)
+                        break 'transmit;
+                    }
+                    self.kitty_chunking = None;
+                    let (data, format, width, height, details) =
+                        match self.kitty_pending_chunks.remove(&image_id) {
+                            Some(mut acc) => {
+                                acc.data.extend_from_slice(&data);
+                                (acc.data, acc.format, acc.width, acc.height, acc.details)
+                            }
+                            None => (data, format, width, height, details),
+                        };
+                    let quiet = details.quiet;
+                    let display = details.display.clone();
+                    let data = match Self::load_kitty(format, data, width, height, &details, limit)
+                    {
+                        Ok(data) => data,
+                        Err(error) => {
+                            let placement_id = display.as_ref().map_or(0, |p| p.placement_id);
+                            self.kitty_reply(image_id, placement_id, quiet, Err(error));
+                            break 'transmit;
+                        }
                     };
-                // An evicted/incomplete chunk stream must not be published as a
-                // complete raw image when its final suffix arrives.
-                if matches!(
-                    format,
-                    crate::model::KittyFormat::Rgb | crate::model::KittyFormat::Rgba
-                ) {
-                    let channels = if matches!(format, crate::model::KittyFormat::Rgb) {
-                        3
+                    self.kitty_transmitted.insert(
+                        image_id,
+                        KittyTransmittedImage {
+                            image_id,
+                            format,
+                            data,
+                            width,
+                            height,
+                        },
+                    );
+                    self.sequence += 1;
+                    // Transmit and display (a=T) places the image at the cursor, answering once.
+                    if let Some(mut placement) = display {
+                        placement.image_id = image_id;
+                        let placed =
+                            self.place_kitty(&placement, cell_pixel_width, cell_pixel_height);
+                        self.kitty_reply(image_id, placement.placement_id, quiet, placed);
                     } else {
-                        4
-                    };
-                    let expected = u64::from(width) * u64::from(height) * channels;
-                    if expected == 0 || u64::try_from(final_data.len()).ok() != Some(expected) {
-                        return;
+                        self.kitty_reply(image_id, 0, quiet, Ok(()));
                     }
                 }
-                self.kitty_transmitted.insert(
-                    image_id,
-                    KittyTransmittedImage {
-                        image_id,
-                        format,
-                        data: final_data,
-                        width,
-                        height,
-                    },
-                );
-                self.sequence += 1;
-            }
-            KittyCommand::Transmit {
-                image_id,
-                format,
-                data,
-                width,
-                height,
-                more_chunks: true,
-            } => {
-                // Accumulate chunks until the final chunk arrives.
-                let acc = self
-                    .kitty_pending_chunks
-                    .entry(image_id)
-                    .or_insert_with(|| KittyChunkAccumulator {
-                        data: Vec::new(),
-                        format,
-                        width,
-                        height,
-                    });
-                if self.max_bytes > 0 && acc.data.len().saturating_add(data.len()) > self.max_bytes
-                {
-                    self.kitty_pending_chunks.remove(&image_id);
-                    return;
-                }
-                acc.data.extend_from_slice(&data);
             }
             KittyCommand::Place(placement) => {
-                // If we have the transmitted image, create a PaneImage.
-                if let Some(transmitted) = self.kitty_transmitted.get(&placement.image_id) {
-                    let pixel_size = ImagePixelSize {
-                        width: transmitted.width,
-                        height: transmitted.height,
-                    };
-                    let mut cell_size =
-                        pixel_size_to_cells(pixel_size, cell_pixel_width, cell_pixel_height);
-                    if placement.cell_size.cols > 0 && placement.cell_size.rows == 0 {
-                        cell_size.rows = u16::try_from(
-                            (u64::from(placement.cell_size.cols)
-                                * u64::from(cell_pixel_width.max(1))
-                                * u64::from(pixel_size.height))
-                            .div_ceil(
-                                u64::from(pixel_size.width.max(1))
-                                    * u64::from(cell_pixel_height.max(1)),
-                            ),
-                        )
-                        .unwrap_or(u16::MAX);
-                    } else if placement.cell_size.rows > 0 && placement.cell_size.cols == 0 {
-                        cell_size.cols = u16::try_from(
-                            (u64::from(placement.cell_size.rows)
-                                * u64::from(cell_pixel_height.max(1))
-                                * u64::from(pixel_size.width))
-                            .div_ceil(
-                                u64::from(pixel_size.height.max(1))
-                                    * u64::from(cell_pixel_width.max(1)),
-                            ),
-                        )
-                        .unwrap_or(u16::MAX);
-                    }
-                    if placement.cell_size.cols > 0 {
-                        cell_size.cols = placement.cell_size.cols;
-                    }
-                    if placement.cell_size.rows > 0 {
-                        cell_size.rows = placement.cell_size.rows;
-                    }
-                    // Preserve the transmitted format rather than treating raw
-                    // RGB/RGBA bytes as an encoded PNG during host rendering.
-                    let format = match transmitted.format {
-                        crate::model::KittyFormat::Rgb => crate::model::PixelFormat::Rgb8,
-                        crate::model::KittyFormat::Rgba => crate::model::PixelFormat::Rgba8,
-                        crate::model::KittyFormat::Png => crate::model::PixelFormat::Png,
-                    };
-                    let pixels = crate::model::PixelBuffer {
-                        data: transmitted.data.clone(),
-                        width: transmitted.width,
-                        height: transmitted.height,
-                        format,
-                    };
-                    // The existing attach representation carries Kitty PNG
-                    // payloads. Normalize here without changing the wire format.
-                    let raw = if format == crate::model::PixelFormat::Png {
-                        pixels.data.clone()
-                    } else {
-                        use image::ImageEncoder;
-                        let color = if format == crate::model::PixelFormat::Rgb8 {
-                            image::ExtendedColorType::Rgb8
-                        } else {
-                            image::ExtendedColorType::Rgba8
-                        };
-                        let expected = u64::from(pixels.width)
-                            .checked_mul(u64::from(pixels.height))
-                            .and_then(|size| size.checked_mul(u64::from(color.channel_count())));
-                        if expected != Some(pixels.data.len() as u64) {
-                            return;
-                        }
-                        let mut png = Vec::new();
-                        if image::codecs::png::PngEncoder::new(&mut png)
-                            .write_image(&pixels.data, pixels.width, pixels.height, color)
-                            .is_err()
-                        {
-                            return;
-                        }
-                        png
-                    };
-                    let key = (placement.image_id, placement.placement_id);
-                    if let Some(old_id) = self.kitty_placements.remove(&key) {
-                        self.remove_image(old_id);
-                    }
-                    let retained_id = self.next_id;
-                    self.add_image(
-                        ImageProtocol::KittyGraphics,
-                        ImagePayload {
-                            raw: Some(raw),
-                            pixels: Some(pixels),
-                        },
-                        placement.position,
-                        cell_size,
-                        pixel_size,
-                    );
-                    if self.images.iter().any(|image| image.id == retained_id) {
-                        self.kitty_placements.insert(key, retained_id);
-                    }
-                }
+                let placed = self.place_kitty(&placement, cell_pixel_width, cell_pixel_height);
+                self.kitty_reply(
+                    placement.image_id,
+                    placement.placement_id,
+                    placement.quiet,
+                    placed,
+                );
             }
             KittyCommand::Delete { specifier } => match specifier {
                 KittyDeleteSpecifier::All | KittyDeleteSpecifier::AllAndData => {
@@ -1143,8 +1260,18 @@ impl ImageRegistry {
                     }
                 }
             },
-            KittyCommand::Query { .. } => {
-                // Queries are forwarded, not stored.
+            KittyCommand::Query {
+                image_id,
+                format,
+                data,
+                width,
+                height,
+                details,
+            } => {
+                // A query answers whether the image could be loaded; nothing is kept.
+                let limit = self.kitty_byte_limit();
+                let loaded = Self::load_kitty(format, data, width, height, &details, limit);
+                self.kitty_reply(image_id, 0, details.quiet, loaded.map(|_| ()));
             }
         }
         self.trim_kitty_uploads();
@@ -1424,6 +1551,7 @@ mod tests {
                 width: 100,
                 height: 50,
                 more_chunks: false,
+                details: crate::model::KittyTransmitDetails::default(),
             },
             8,
             16,
@@ -1474,6 +1602,7 @@ mod tests {
                 width: 1,
                 height: 1,
                 more_chunks: true,
+                details: crate::model::KittyTransmitDetails::default(),
             },
             8,
             16,
@@ -1494,6 +1623,7 @@ mod tests {
                 width: 1,
                 height: 1,
                 more_chunks: false,
+                details: crate::model::KittyTransmitDetails::default(),
             },
             8,
             16,

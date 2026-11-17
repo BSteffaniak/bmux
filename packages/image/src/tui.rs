@@ -2812,6 +2812,7 @@ mod tests {
                     width,
                     height,
                     more_chunks,
+                    ..
                 } => {
                     assert!(!more_chunks, "small regression images must fit one chunk");
                     let pixels = match format {

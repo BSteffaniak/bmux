@@ -197,6 +197,7 @@ fn kitty_exact_transmit_and_bounded_chunks_roundtrip() {
                         width: parsed_width,
                         height: parsed_height,
                         more_chunks,
+                        ..
                     }) = parse_command(chunk, ImagePosition { row: 0, col: 0 })
                     else {
                         panic!("chunk must parse");

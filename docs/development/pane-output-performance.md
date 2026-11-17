@@ -331,9 +331,12 @@ writer, observer images through a separate conversion) with one:
   show natively zoomed); the CLI's raster repair (forced full frames and ED2), its Kitty state,
   the frame's graphics byte channel and the unused `images.decode_mode` setting are gone.
 
-Known limitation, unchanged: the Kitty intake accepts direct (inline) transmissions only; file,
-temporary-file and shared-memory media, zlib compression, Unicode placeholders and animation
-frames never reach the registry.
+The Kitty intake answers programs as Kitty does (`OK` or an error, by `q`, so probes such as
+`kitty +kitten icat`'s find graphics supported), places transmit-and-display (`a=T`) images at
+the cursor, and loads zlib-compressed data and file, temporary-file and (on Linux) shared-memory
+media, read under Kitty's rules (regular files only, never `/proc`, `/sys` or `/dev`; a temporary
+file only from a temporary directory and deleted once read; a shared memory object unlinked).
+Unicode placeholders and animation frames still never reach the registry.
 
 ## Order
 

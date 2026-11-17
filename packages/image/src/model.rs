@@ -222,6 +222,41 @@ pub struct KittyPlacement {
     pub cell_size: ImageCellSize,
     pub source_rect: Option<KittySourceRect>,
     pub z_index: i32,
+    /// Which replies the program asked to suppress (`q`): 0 none, 1 successes, 2 all.
+    #[serde(default)]
+    pub quiet: u8,
+}
+
+/// Where a Kitty transmission's bytes are (`t`).
+#[cfg(feature = "kitty")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KittyMedium {
+    /// In the command's payload (`t=d`).
+    #[default]
+    Direct,
+    /// In a file the payload names (`t=f`).
+    File,
+    /// In a temporary file the payload names, deleted once read (`t=t`).
+    TempFile,
+    /// In a shared memory object the payload names, unlinked once read (`t=s`).
+    SharedMemory,
+}
+
+/// How a Kitty transmission is to be loaded and answered, beside its image data.
+#[cfg(feature = "kitty")]
+#[derive(Clone, Debug, Default)]
+pub struct KittyTransmitDetails {
+    pub medium: KittyMedium,
+    /// The bytes are zlib-compressed (`o=z`).
+    pub compressed: bool,
+    /// Bytes to read from a file or shared memory object (`S`), when given.
+    pub size: Option<u64>,
+    /// Where to start reading a file or shared memory object (`O`).
+    pub offset: u64,
+    /// Which replies the program asked to suppress (`q`): 0 none, 1 successes, 2 all.
+    pub quiet: u8,
+    /// Where to show the image once loaded (`a=T`), at the cursor.
+    pub display: Option<KittyPlacement>,
 }
 
 /// Sub-region of a kitty image to display.
@@ -284,6 +319,7 @@ pub enum KittyCommand {
         width: u32,
         height: u32,
         more_chunks: bool,
+        details: KittyTransmitDetails,
     },
     /// Place a previously transmitted image (action=p).
     Place(KittyPlacement),
@@ -292,8 +328,15 @@ pub enum KittyCommand {
         /// What to delete (image id, placement id, or all).
         specifier: KittyDeleteSpecifier,
     },
-    /// Query (action=q) — not stored, only forwarded.
-    Query { image_id: u32 },
+    /// Query (action=q): whether the described image could be loaded; it is not stored.
+    Query {
+        image_id: u32,
+        format: KittyFormat,
+        data: Vec<u8>,
+        width: u32,
+        height: u32,
+        details: KittyTransmitDetails,
+    },
 }
 
 /// What a kitty delete command targets.
@@ -339,11 +382,18 @@ impl ImageEvent {
             #[cfg(feature = "sixel")]
             Self::SixelImage { position, .. } => *position = pos,
             #[cfg(feature = "kitty")]
-            Self::KittyCommand { command, .. } => {
-                if let KittyCommand::Place(placement) = command {
-                    placement.position = pos;
-                }
-            }
+            Self::KittyCommand { command, .. } => match command {
+                KittyCommand::Place(placement)
+                | KittyCommand::Transmit {
+                    details:
+                        KittyTransmitDetails {
+                            display: Some(placement),
+                            ..
+                        },
+                    ..
+                } => placement.position = pos,
+                _ => {}
+            },
             #[cfg(feature = "iterm2")]
             Self::ITerm2Image { position, .. } => *position = pos,
             #[allow(unreachable_patterns)]

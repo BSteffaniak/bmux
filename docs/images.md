@@ -22,6 +22,13 @@ When a program running inside a bmux pane emits image escape sequences, bmux:
 3. **Re-emits** the image to the host terminal using the appropriate protocol for display
 4. **Tracks changes** -- when images scroll, move, or are removed, the registry updates automatically
 
+Kitty graphics programs are answered as Kitty answers them (`OK` or an error,
+unless they ask for quiet), so a program probing for support finds it. Images
+may be sent inline, zlib-compressed, or through a file, a temporary file (deleted
+once read) or, on Linux, a shared memory object; transmit-and-display (`a=T`)
+places the image at the cursor. Unicode placeholders and animation are not
+supported.
+
 Applications can use the implemented image operations without a bmux-specific
 API. Compatibility depends on the host terminal, protocol operations, image
 format, and build features; support for a protocol does not imply support for

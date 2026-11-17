@@ -1169,6 +1169,31 @@ mod pointer_query_tests {
         assert!(replies.ends_with(b"\x1b]22;pointer\x1b\\"));
     }
 
+    /// A program probing for Kitty graphics (a query, then a cursor position report as a
+    /// fence, as `kitty +kitten icat` does) is answered in order: the Kitty reply first.
+    #[cfg(feature = "image-registry")]
+    #[test]
+    fn kitty_queries_are_answered_in_order_with_other_replies() {
+        use super::{PaneCursorTracker, TerminalProtocolEngine, ordered_image_output};
+
+        let mut interceptor = bmux_image::ImageInterceptor::new();
+        let mut output = interceptor.process(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[6n");
+        let mut tracker = PaneCursorTracker::new(24, 80);
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        let mut registry = bmux_image::ImageRegistry::default();
+        let mut replies = Vec::new();
+        ordered_image_output(
+            &mut tracker,
+            &mut engine,
+            &mut registry,
+            &mut output,
+            (8, 16),
+            &mut replies,
+        )
+        .unwrap();
+        assert_eq!(replies, b"\x1b_Gi=31;OK\x1b\\\x1b[1;1R");
+    }
+
     #[test]
     fn support_and_policy_queries_are_bmux_profile_only() {
         use bmux_terminal_protocol::pointer_shape::PointerShape;
@@ -2632,6 +2657,8 @@ fn ordered_image_output(
         let (row, col) = tracker.cursor_position();
         event.set_position(bmux_image::ImagePosition { row, col });
         registry.handle_event(event.clone(), cell_pixels.0, cell_pixels.1);
+        // Kitty graphics answers go back to the program in order with its other replies.
+        replies.extend(registry.take_replies());
     }
     image_terminal_bytes(
         tracker,
