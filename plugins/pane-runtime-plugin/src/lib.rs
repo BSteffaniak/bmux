@@ -397,7 +397,8 @@ impl PaneRuntimePlugin {
             )
     }
 
-    fn activate(
+    /// Activate this instance's runtime (synchronous body).
+    pub fn activate(
         &self,
         context: NativeLifecycleContext,
         _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
@@ -485,7 +486,8 @@ impl PaneRuntimePlugin {
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 
-    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+    /// Serve one hand-routed service invocation (synchronous body).
+    pub fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         handlers::route(&self.host(), context)
     }
 

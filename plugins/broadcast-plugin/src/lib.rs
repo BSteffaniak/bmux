@@ -39,8 +39,9 @@ pub mod terminal;
 use bmux_broadcast_plugin_api::{
     broadcast_control_v1 as control, broadcast_output_v1 as output, broadcast_turnkey_v1 as turnkey,
 };
+use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::{
-    NativeCommandContext, NativeServiceContext, PluginCommandError, RustPlugin, ServiceResponse,
+    NativeCommandContext, NativeServiceContext, PluginCommandError, ServiceResponse,
 };
 use std::sync::{Arc, Mutex};
 
@@ -157,30 +158,45 @@ impl BroadcastPlugin {
         Ok(())
     }
 }
-impl RustPlugin for BroadcastPlugin {
-    type Contract = bmux_broadcast_plugin_api::Contract;
+impl Plugin for BroadcastPlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        d.blocking_activate(Self::activate)
+            .blocking_deactivate(Self::deactivate)
+            .blocking_command("broadcast", Self::run_command)
+            .blocking_command("broadcast-start", Self::run_command)
+            .blocking_command("broadcast-pause", Self::run_command)
+            .blocking_command("broadcast-resume", Self::run_command)
+            .blocking_command("broadcast-stop", Self::run_command)
+            .blocking_command("broadcast-setup", Self::run_command)
+            .blocking_command("broadcast-doctor", Self::run_command)
+            .blocking_services(Self::invoke_service, None);
+    }
+}
+
+impl BroadcastPlugin {
     fn activate(
-        &mut self,
+        &self,
         context: bmux_plugin_sdk::NativeLifecycleContext,
-    ) -> Result<i32, PluginCommandError> {
+        _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
+    ) -> std::result::Result<(), PluginCommandError> {
         if let Some(indicator) = &self.activation_indicator {
             let states = bmux_plugin::activation_state_registry(&context);
             indicator.bind(Some(indicator::fact_host(&states)));
         }
         self.activate_owner()?;
-        Ok(bmux_plugin_sdk::EXIT_OK)
+        Ok(())
     }
     fn deactivate(
-        &mut self,
+        &self,
         _context: bmux_plugin_sdk::NativeLifecycleContext,
-    ) -> Result<i32, PluginCommandError> {
+    ) -> std::result::Result<(), PluginCommandError> {
         self.deactivate_owner()?;
-        Ok(bmux_plugin_sdk::EXIT_OK)
+        Ok(())
     }
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         self.service(context)
     }
-    fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
+    fn run_command(&self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         if context.invocation_source
             == bmux_plugin_sdk::NativeCommandInvocationSource::AttachKeybinding
         {
@@ -318,121 +334,26 @@ fn run_command(mut context: NativeCommandContext) -> Result<i32, PluginCommandEr
         Ok(bmux_plugin_sdk::EXIT_OK)
     })
 }
-impl bmux_plugin_sdk::definition::PluginInstance for BroadcastPlugin {
-    fn service_contract_for(&self, interface: &str) -> Option<&'static [u8]> {
-        <bmux_broadcast_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface)
-    }
-
-    fn activate(
-        &self,
-        _context: bmux_plugin_sdk::definition::PluginLifecycleContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
-    {
-        Box::pin(async move { self.activate_owner() })
-    }
-    fn deactivate(
-        &self,
-        _context: bmux_plugin_sdk::definition::PluginLifecycleContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
-    {
-        let owner = self.clone();
-        Box::pin(async move {
-            tokio::runtime::Handle::try_current().map_err(|_| {
-                PluginCommandError::unavailable("broadcast cleanup requires host async runtime")
-            })?;
-            tokio::task::spawn_blocking(move || owner.deactivate_owner())
-                .await
-                .map_err(|_| PluginCommandError::failed("broadcast cleanup task panicked"))?
-        })
-    }
-    fn invoke(
-        &self,
-        call: bmux_plugin_sdk::definition::PluginCallContext,
-        context: NativeServiceContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<
-        '_,
-        bmux_plugin_sdk::definition::PluginResult<ServiceResponse>,
-    > {
-        Box::pin(async move {
-            if call.cancellation.is_cancelled() {
-                return Err(PluginCommandError::unavailable(
-                    "broadcast invocation cancelled",
-                ));
-            }
-            Ok(self.service(context))
-        })
-    }
-    fn command(
-        &self,
-        call: bmux_plugin_sdk::definition::PluginCallContext,
-        context: NativeCommandContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::CommandOutcome>
-    {
-        Box::pin(async move {
-            if call.cancellation.is_cancelled() {
-                return Err(PluginCommandError::unavailable(
-                    "broadcast command cancelled",
-                ))
-                .into();
-            }
-            // Same command workflow; no new domain transport client or ABI.
-            std::thread::scope(|scope| {
-                scope
-                    .spawn(move || run_command(context))
-                    .join()
-                    .unwrap_or_else(|_| Err(PluginCommandError::failed("broadcast caller failed")))
-            })
-            .into()
-        })
-    }
-}
 // The one definition both bundling and generated dynamic packaging use:
 // fresh default author state per created instance.
-bmux_plugin_sdk::define_plugin!(
-    rust_plugin = BroadcastPlugin,
-    manifest = crate::declaration::PLUGIN_MANIFEST,
-    roles = vec![
-        bmux_plugin_sdk::definition::ComponentRole::Backend,
-        bmux_plugin_sdk::definition::ComponentRole::Frontend
-    ],
-);
+bmux_plugin_sdk::plugin!(BroadcastPlugin);
 
 pub fn plugin_definition_with_indicator(
     indicator: Arc<dyn IndicatorPort>,
 ) -> bmux_plugin_sdk::definition::PluginDefinition {
-    use bmux_plugin_sdk::definition::{PluginDefinition, PluginInstance};
-    PluginDefinition::new(definition_metadata(), move |_scope| {
-        Ok(
-            Arc::new(BroadcastPlugin::with_indicator(Arc::clone(&indicator)))
-                as Arc<dyn PluginInstance>,
-        )
-    })
-}
-
-fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
-    bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<BroadcastPlugin>(
+    bmux_plugin_sdk::author::definition::<BroadcastPlugin>(
         crate::declaration::PLUGIN_MANIFEST,
-        vec![
-            bmux_plugin_sdk::definition::ComponentRole::Backend,
-            bmux_plugin_sdk::definition::ComponentRole::Frontend,
-        ],
+        crate::declaration::SERVICE_CONTRACTS,
+        move |_| Ok(BroadcastPlugin::with_indicator(Arc::clone(&indicator))),
     )
-    .expect("plugin manifest must define valid canonical metadata")
-    .metadata
+    .expect("embedded broadcast declaration must be valid")
 }
 
 #[cfg(test)]
 mod canonical_metadata_tests {
     #[test]
     fn embedded_manifest_matches_definition_metadata() {
-        let definition = bmux_plugin_sdk::definition::PluginDefinition::new(
-            super::definition_metadata(),
-            |_scope| {
-                Err(bmux_plugin_sdk::PluginCommandError::unavailable(
-                    "metadata-only regression",
-                ))
-            },
-        );
+        let definition = super::plugin_definition();
         definition
             .validate()
             .expect("canonical embedded identity must validate");

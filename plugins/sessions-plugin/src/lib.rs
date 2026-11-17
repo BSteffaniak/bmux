@@ -381,7 +381,8 @@ impl SessionsPlugin {
         )
     }
 
-    fn activate(
+    /// Activate this instance (synchronous body).
+    pub fn activate(
         &self,
         context: NativeLifecycleContext,
         _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
@@ -461,7 +462,8 @@ impl SessionsPlugin {
         }
     }
 
-    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+    /// Serve one hand-routed service invocation (synchronous body).
+    pub fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         let (events, states) = (self.events(), self.states());
         bmux_plugin_sdk::route_service!(context, {
             "sessions-state", "list-sessions" => |_req: (), _ctx| {

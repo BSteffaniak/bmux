@@ -215,7 +215,8 @@ impl PermissionsPlugin {
             )
     }
 
-    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+    /// Serve one hand-routed service invocation (synchronous body).
+    pub fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "permissions-state", "list-permissions" => |req: ListPermissionsRequest, ctx| {
                 let entries = list_entries(ctx, &req.session)

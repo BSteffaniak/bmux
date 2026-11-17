@@ -598,7 +598,6 @@ mod tests {
         server: &bmux_server::BmuxServer,
         paths: &bmux_config::ConfigPaths,
     ) -> Arc<bmux_pane_runtime_plugin::PaneRuntimePlugin> {
-        use bmux_plugin_sdk::RustPlugin;
         use sha2::Digest;
         use std::fmt::Write as _;
         let helper = std::env::current_exe()
@@ -670,12 +669,12 @@ mod tests {
         let mut sessions_context = context.clone();
         sessions_context.capabilities = host_values();
         bmux_sessions_plugin::SessionsPlugin::default()
-            .activate(sessions_context)
+            .activate(sessions_context, None)
             .unwrap();
-        let mut pane_runtime = bmux_pane_runtime_plugin::PaneRuntimePlugin::default();
+        let pane_runtime = bmux_pane_runtime_plugin::PaneRuntimePlugin::default();
         let mut context = context;
         context.capabilities = host_values();
-        pane_runtime.activate(context).unwrap();
+        pane_runtime.activate(context, None).unwrap();
         Arc::new(pane_runtime)
     }
 
@@ -878,7 +877,6 @@ mod tests {
         pairing: &Arc<PairingAuthority>,
         pane_runtime: &Arc<bmux_pane_runtime_plugin::PaneRuntimePlugin>,
     ) {
-        use bmux_plugin_sdk::RustPlugin;
         let storage = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::<
             String,
             Vec<u8>,

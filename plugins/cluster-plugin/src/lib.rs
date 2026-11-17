@@ -39,6 +39,7 @@ pub mod worker_reconciler;
 pub mod worker_runtime;
 pub(crate) mod workspace;
 
+use bmux_plugin_sdk::author::{Declarations, Plugin};
 pub(crate) use commands::*;
 pub(crate) use events::*;
 pub(crate) use membership::*;
@@ -100,8 +101,8 @@ pub(crate) const CLUSTER_CONNECTION_EVENTS_MAX: usize = 256;
 
 #[derive(Default)]
 pub struct ClusterPlugin {
-    node_identity: Option<NodeIdentity>,
-    cluster_id: Option<ClusterId>,
+    node_identity: std::sync::RwLock<Option<NodeIdentity>>,
+    cluster_id: std::sync::RwLock<Option<ClusterId>>,
     nodes: consensus_network::ConsensusNodeRegistry,
     bootstrap: Arc<tokio::sync::Mutex<()>>,
     /// A one-command CLI instance never hosts the node's consensus runtime:
@@ -112,7 +113,7 @@ pub struct ClusterPlugin {
     /// per call and fail closed once deactivation begins, so the persistent
     /// consensus runtime (peer RPCs, reconciler) may outlive the request that
     /// started it. Never a request-scoped caller.
-    activation_caller: Option<Arc<bmux_plugin::TypedServiceCaller>>,
+    activation_caller: std::sync::RwLock<Option<Arc<bmux_plugin::TypedServiceCaller>>>,
     /// This instance's gateway breaker, cooldown and history state.
     gateway: Arc<gateway::GatewayRuntime>,
 }
@@ -122,9 +123,25 @@ const NO_ACTIVATION: &str = "cluster consensus requires an active plugin activat
 impl ClusterPlugin {
     fn activation_caller(&self) -> Result<Arc<bmux_plugin::TypedServiceCaller>, String> {
         self.activation_caller
-            .clone()
+            .read()
+            .ok()
+            .and_then(|caller| caller.clone())
             .ok_or_else(|| NO_ACTIVATION.to_string())
     }
+
+    fn node_identity(&self) -> Option<NodeIdentity> {
+        self.node_identity
+            .read()
+            .ok()
+            .and_then(|identity| identity.clone())
+    }
+}
+
+fn slot_mut<T>(
+    slot: &std::sync::RwLock<T>,
+) -> std::result::Result<std::sync::RwLockWriteGuard<'_, T>, bmux_plugin_sdk::PluginCommandError> {
+    slot.write()
+        .map_err(|_| bmux_plugin_sdk::PluginCommandError::failed("plugin state lock poisoned"))
 }
 
 async fn ensure_persistent_consensus_runtime(
@@ -230,14 +247,50 @@ async fn ensure_persistent_consensus_runtime(
     Ok(())
 }
 
-impl RustPlugin for ClusterPlugin {
-    type Contract = bmux_cluster_plugin_api::Contract;
+impl Plugin for ClusterPlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        d.blocking_activate(Self::activate_with_async)
+            .blocking_deactivate(Self::deactivate)
+            .blocking_command("cluster-init", Self::run_command)
+            .blocking_command("cluster-enrollment-token-create", Self::run_command)
+            .blocking_command("cluster-enrollment-list", Self::run_command)
+            .blocking_command("cluster-enrollment-revoke", Self::run_command)
+            .blocking_command("cluster-credential-rotate", Self::run_command)
+            .blocking_command("cluster-member-revoke", Self::run_command)
+            .blocking_command("cluster-join", Self::run_command)
+            .blocking_command("cluster-leave", Self::run_command)
+            .blocking_command("cluster-members", Self::run_command)
+            .blocking_command("cluster-up", Self::run_command)
+            .blocking_command("cluster-status", Self::run_command)
+            .blocking_command("cluster-gateway-reset", Self::run_command)
+            .blocking_command("cluster-doctor", Self::run_command)
+            .blocking_command("cluster-events", Self::run_command)
+            .blocking_command("cluster-hosts", Self::run_command)
+            .blocking_command("cluster-gateway-status", Self::run_command)
+            .blocking_command("cluster-gateway-explain", Self::run_command)
+            .blocking_command("cluster-gateway-doctor", Self::run_command)
+            .blocking_command("cluster-gateway-history", Self::run_command)
+            .blocking_command("cluster-gateway-history-export", Self::run_command)
+            .blocking_command("cluster-gateway-history-clear", Self::run_command)
+            .blocking_command("cluster-gateway-why", Self::run_command)
+            .blocking_command("cluster-pane-new", Self::run_command)
+            .blocking_command("cluster-pane-move", Self::run_command)
+            .blocking_command("cluster-pane-retry", Self::run_command)
+            .blocking_services(Self::invoke_service, None)
+            .typed_services(Self::register_typed_services)
+            .registrations(Self::register_contributions);
+    }
+}
 
+impl ClusterPlugin {
     // This plugin uses the default no-op event handler. Taking an event write
     // lock can prevent reentrant Raft RPC readers while a quorum read is pending.
-    const HANDLES_EVENTS: bool = false;
 
-    fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+    fn activate(
+        &self,
+        context: bmux_plugin_sdk::NativeLifecycleContext,
+        _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
+    ) -> std::result::Result<(), PluginCommandError> {
         durable_storage::configure(&context.connection.data_dir)
             .map_err(PluginCommandError::failed)?;
         let node_identity = load_or_create_node_identity(&context).map_err(|error| {
@@ -253,9 +306,9 @@ impl RustPlugin for ClusterPlugin {
             cluster_id = cluster_id.as_ref().map(ToString::to_string),
             "cluster identity loaded"
         );
-        self.node_identity = Some(node_identity);
-        self.cluster_id = cluster_id;
-        self.activation_caller = Some(Arc::new(
+        *slot_mut(&self.node_identity)? = Some(node_identity);
+        *slot_mut(&self.cluster_id)? = cluster_id;
+        *slot_mut(&self.activation_caller)? = Some(Arc::new(
             bmux_plugin::TypedServiceCaller::from_lifecycle_context(&context),
         ));
         let configured_endpoint = configured_consensus_endpoint(context.settings.as_ref())
@@ -268,17 +321,20 @@ impl RustPlugin for ClusterPlugin {
             // retained node endpoint/history from its existing authority.
             tracing::warn!(%error, "cluster consensus capability requires its retained authority");
         }
-        Ok(EXIT_OK)
+        Ok(())
     }
 
     fn activate_with_async(
-        &mut self,
+        &self,
         context: NativeLifecycleContext,
-        async_handle: bmux_plugin_sdk::HostAsyncHandle,
-    ) -> Result<i32, PluginCommandError> {
-        let result = self.activate(context.clone())?;
+        async_handle: Option<bmux_plugin_sdk::HostAsyncHandle>,
+    ) -> std::result::Result<(), PluginCommandError> {
+        self.activate(context.clone(), None)?;
+        let Some(async_handle) = async_handle else {
+            return Ok(());
+        };
         if self.command_scoped {
-            return Ok(result);
+            return Ok(());
         }
         let caller = self
             .activation_caller()
@@ -293,12 +349,15 @@ impl RustPlugin for ClusterPlugin {
                 tracing::error!(%error, "failed ensuring persistent cluster consensus runtime");
             }
         });
-        Ok(result)
+        Ok(())
     }
 
-    fn deactivate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
-        self.activation_caller = None;
-        if let Some(identity) = self.node_identity.as_ref() {
+    fn deactivate(
+        &self,
+        _context: bmux_plugin_sdk::NativeLifecycleContext,
+    ) -> std::result::Result<(), PluginCommandError> {
+        *slot_mut(&self.activation_caller)? = None;
+        if let Some(identity) = self.node_identity().as_ref() {
             let node_id = *identity.node_id();
             if let Ok(node) = self.nodes.get(node_id) {
                 let handle = tokio::runtime::Handle::try_current().map_err(|error| {
@@ -316,7 +375,7 @@ impl RustPlugin for ClusterPlugin {
                     .map_err(PluginCommandError::failed)?;
             }
         }
-        Ok(EXIT_OK)
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)] // Registration keeps generated service wiring auditable in one place.
@@ -467,7 +526,7 @@ impl RustPlugin for ClusterPlugin {
         );
     }
 
-    fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
+    fn run_command(&self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         durable_storage::configure(&context.connection.data_dir)
             .map_err(PluginCommandError::failed)?;
         let gateway_result = if context.command.starts_with("cluster-") {
@@ -548,7 +607,7 @@ impl RustPlugin for ClusterPlugin {
                 &context,
                 &self.nodes,
                 &self.bootstrap,
-                self.activation_caller.as_ref(),
+                self.activation_caller().ok().as_ref(),
             );
         }
         bmux_plugin_sdk::route_service!(context, {
@@ -1052,42 +1111,24 @@ fn invoke_cluster_lifecycle_service(
 /// Returns an error if the embedded declaration is invalid.
 pub fn command_scoped_plugin_definition()
 -> bmux_plugin_sdk::Result<bmux_plugin_sdk::definition::PluginDefinition> {
-    use bmux_plugin_sdk::definition::{
-        ComponentRole, PluginCreateContext, PluginDefinition, PluginInstance, RustPluginAdapter,
-    };
-    let metadata = PluginDefinition::from_rust_plugin::<ClusterPlugin>(
+    bmux_plugin_sdk::author::definition::<ClusterPlugin>(
         crate::declaration::PLUGIN_MANIFEST,
-        // Mirrors `component_roles` in plugin.toml.
-        vec![ComponentRole::Backend, ComponentRole::Frontend],
+        crate::declaration::SERVICE_CONTRACTS,
+        |_| {
+            Ok(ClusterPlugin {
+                command_scoped: true,
+                ..ClusterPlugin::default()
+            })
+        },
     )
     .map_err(|error| bmux_plugin_sdk::PluginError::ServiceProtocol {
         details: error.message,
-    })?
-    .metadata;
-    Ok(PluginDefinition::new(
-        metadata,
-        |scope: PluginCreateContext| {
-            Ok(Arc::new(RustPluginAdapter::for_instance(
-                ClusterPlugin {
-                    command_scoped: true,
-                    ..ClusterPlugin::default()
-                },
-                scope.instance,
-            )) as Arc<dyn PluginInstance>)
-        },
-    ))
+    })
 }
 
 // The one definition both bundling and generated dynamic packaging use:
 // fresh default author state per created instance.
-bmux_plugin_sdk::define_plugin!(
-    rust_plugin = ClusterPlugin,
-    manifest = crate::declaration::PLUGIN_MANIFEST,
-    roles = vec![
-        bmux_plugin_sdk::definition::ComponentRole::Backend,
-        bmux_plugin_sdk::definition::ComponentRole::Frontend
-    ],
-);
+bmux_plugin_sdk::plugin!(ClusterPlugin);
 
 /// Constructor-injected consensus authority. The supplied registry must belong
 /// to this runtime scope; it is not reconstructed from a logical plugin ID.
@@ -1095,145 +1136,18 @@ bmux_plugin_sdk::define_plugin!(
 pub fn plugin_definition_with_nodes(
     nodes: consensus_network::ConsensusNodeRegistry,
 ) -> bmux_plugin_sdk::definition::PluginDefinition {
-    use bmux_plugin_sdk::definition::{PluginDefinition, PluginInstance};
-    PluginDefinition::new(definition_metadata(), move |_scope| {
-        Ok(Arc::new(ClusterInstance {
-            plugin: std::sync::RwLock::new(ClusterPlugin {
+    bmux_plugin_sdk::author::definition::<ClusterPlugin>(
+        crate::declaration::PLUGIN_MANIFEST,
+        crate::declaration::SERVICE_CONTRACTS,
+        move |_| {
+            Ok(ClusterPlugin {
                 nodes: nodes.clone(),
                 ..ClusterPlugin::default()
-            }),
-        }) as Arc<dyn PluginInstance>)
-    })
+            })
+        },
+    )
+    .expect("embedded cluster declaration must be valid")
 }
-pub struct ClusterInstance {
-    plugin: std::sync::RwLock<ClusterPlugin>,
-}
-impl bmux_plugin_sdk::definition::PluginInstance for ClusterInstance {
-    fn register_typed_services_with_context(
-        &self,
-        context: bmux_plugin_sdk::TypedServiceRegistrationContext<'_>,
-        registry: &mut bmux_plugin_sdk::TypedServiceRegistry,
-    ) -> bmux_plugin_sdk::definition::PluginResult<()> {
-        self.plugin
-            .try_read()
-            .map_err(|_| PluginCommandError::unavailable("cluster registration busy"))?
-            .register_typed_services(context, registry);
-        Ok(())
-    }
-
-    fn service_contract_for(&self, interface: &str) -> Option<&'static [u8]> {
-        <bmux_cluster_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(
-            interface,
-        )
-    }
-
-    fn activate(
-        &self,
-        context: bmux_plugin_sdk::definition::PluginLifecycleContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
-    {
-        Box::pin(async move {
-            let (nodes, bootstrap, caller) = {
-                let mut plugin = self
-                    .plugin
-                    .try_write()
-                    .map_err(|_| PluginCommandError::unavailable("cluster lifecycle busy"))?;
-                RustPlugin::activate(&mut *plugin, context.native.clone())?;
-                (
-                    plugin.nodes.clone(),
-                    Arc::clone(&plugin.bootstrap),
-                    plugin
-                        .activation_caller()
-                        .map_err(PluginCommandError::failed)?,
-                )
-            };
-            ensure_persistent_consensus_runtime(
-                caller,
-                PathBuf::from(&context.native.connection.state_dir),
-                nodes,
-                bootstrap,
-            )
-            .await
-            .map_err(PluginCommandError::failed)
-        })
-    }
-    fn deactivate(
-        &self,
-        _context: bmux_plugin_sdk::definition::PluginLifecycleContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
-    {
-        Box::pin(async move {
-            let (nodes, identity, bootstrap) = {
-                let mut plugin = self
-                    .plugin
-                    .try_write()
-                    .map_err(|_| PluginCommandError::unavailable("cluster lifecycle busy"))?;
-                plugin.activation_caller = None;
-                (
-                    plugin.nodes.clone(),
-                    plugin
-                        .node_identity
-                        .as_ref()
-                        .map(|identity| *identity.node_id()),
-                    Arc::clone(&plugin.bootstrap),
-                )
-            };
-            let _bootstrap = bootstrap.lock().await;
-            if let Some(identity) = identity
-                && nodes
-                    .contains(identity)
-                    .map_err(PluginCommandError::failed)?
-            {
-                let node = nodes.get(identity).map_err(PluginCommandError::failed)?;
-                node.shutdown().await.map_err(|error| {
-                    PluginCommandError::failed(format!("consensus cleanup required: {error}"))
-                })?;
-                nodes.remove(identity).map_err(PluginCommandError::failed)?;
-            }
-            Ok(())
-        })
-    }
-    fn invoke(
-        &self,
-        call: bmux_plugin_sdk::definition::PluginCallContext,
-        context: NativeServiceContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<
-        '_,
-        bmux_plugin_sdk::definition::PluginResult<ServiceResponse>,
-    > {
-        Box::pin(async move {
-            if call.cancellation.is_cancelled() {
-                return Err(PluginCommandError::unavailable(
-                    "cluster invocation cancelled",
-                ));
-            }
-            let plugin = self
-                .plugin
-                .try_read()
-                .map_err(|_| PluginCommandError::unavailable("cluster lifecycle busy"))?;
-            Ok(plugin.invoke_service(context))
-        })
-    }
-    fn command(
-        &self,
-        call: bmux_plugin_sdk::definition::PluginCallContext,
-        context: NativeCommandContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::CommandOutcome>
-    {
-        Box::pin(async move {
-            if call.cancellation.is_cancelled() {
-                return Err(PluginCommandError::unavailable("cluster command cancelled")).into();
-            }
-            let result = self
-                .plugin
-                .try_write()
-                .map_err(|_| PluginCommandError::unavailable("cluster command busy"))
-                .and_then(|mut plugin| plugin.run_command(context));
-            result.into()
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4215,30 +4129,11 @@ mod tests {
     }
 }
 
-fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
-    bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<ClusterPlugin>(
-        crate::declaration::PLUGIN_MANIFEST,
-        vec![
-            bmux_plugin_sdk::definition::ComponentRole::Backend,
-            bmux_plugin_sdk::definition::ComponentRole::Frontend,
-        ],
-    )
-    .expect("plugin manifest must define valid canonical metadata")
-    .metadata
-}
-
 #[cfg(test)]
 mod canonical_metadata_tests {
     #[test]
     fn embedded_manifest_matches_definition_metadata() {
-        let definition = bmux_plugin_sdk::definition::PluginDefinition::new(
-            super::definition_metadata(),
-            |_scope| {
-                Err(bmux_plugin_sdk::PluginCommandError::unavailable(
-                    "metadata-only regression",
-                ))
-            },
-        );
+        let definition = super::plugin_definition();
         definition
             .validate()
             .expect("canonical embedded identity must validate");
