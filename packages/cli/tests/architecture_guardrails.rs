@@ -1337,10 +1337,7 @@ fn recording_plugin_exists() {
         .unwrap()
         .0;
     assert!(legacy_host.contains("sink: RecordingSinkHandle"));
-    assert!(
-        legacy_host
-            .contains("global_plugin_state_registry().register(&Arc::new(RwLock::new(sink)))")
-    );
+    assert!(legacy_host.contains("self.states.register(&Arc::new(RwLock::new(sink)))"));
 }
 
 /// Verify that `Request::Recording*` (15 variants) and
@@ -2574,13 +2571,47 @@ fn plugin_api_crates_do_not_own_runtime_implementation() {
     }
 }
 
-/// Plugins reach the host only through handles in their activation context.
-/// A process-wide event bus would be a different object in every dynamic
-/// library and would be shared by every instance of a plugin, so no plugin
-/// crate (tests included) may name one or keep a bus in a process static.
+/// Plugins reach the host only through handles in their activation context
+/// or the presentation resources a host installs them with. A process-wide
+/// registry would be a different object in every dynamic library and would
+/// be shared by every instance of a plugin, so no plugin crate (tests
+/// included) may name one or keep host state in a process static.
 #[test]
-fn plugin_crates_never_reach_a_process_wide_event_bus() {
-    const FORBIDDEN: &[&str] = &["global_event_bus", "fn global_bus", "GLOBAL_EVENT_BUS"];
+fn plugin_crates_never_reach_process_wide_host_registries() {
+    const FORBIDDEN: &[&str] = &[
+        "global_event_bus",
+        "fn global_bus",
+        "GLOBAL_EVENT_BUS",
+        "global_plugin_state_registry",
+        "plugin_state::global_registry",
+        "bmux_plugin::shutdown_progress()",
+        "global_presentation_fact_host_service",
+        "register_startup_ready_gate",
+        "registered_startup_ready_gates",
+        "global_startup_ready_gate_registry",
+        "global_visual_adapter_registry",
+        "register_visual_adapter(",
+        "registered_visual_adapter",
+        "global_render_extension_registry",
+        "register_render_extension(",
+        "registered_render_extensions",
+        "global_plugin_layout_registry",
+        "global_plugin_surface_registry",
+        "global_allocation_registry",
+        "global_attach_presentation_input_registry",
+        "register_attach_presentation_input_handler",
+        "remove_attach_presentation_input_handler",
+        "dispatch_attach_presentation_input_handler",
+        "invoke_attach_presentation_input_handler",
+        "remove_allocation_handler",
+        "register_allocation_handler",
+        "register_attach_companion",
+        "global_attach_companion_registry",
+        "registered_attach_companions",
+        "global_service_locations",
+        "global_attach_provider_registry",
+    ];
+    const HOST_STATE_TYPES: &[&str] = &["EventBus", "PluginStateRegistry", "FactHostService"];
     for plugin_dir in iter_plugin_crate_dirs() {
         for source_path in rust_source_files(&plugin_dir) {
             let source = std::fs::read_to_string(&source_path)
@@ -2588,8 +2619,10 @@ fn plugin_crates_never_reach_a_process_wide_event_bus() {
             for marker in FORBIDDEN {
                 assert!(
                     !source.contains(marker),
-                    "{} names `{marker}`; take the activation's bus with \
-                     `bmux_plugin::activation_event_bus` instead",
+                    "{} names `{marker}`; take the host handle from the activation \
+                     (`bmux_plugin::activation_event_bus`, \
+                     `bmux_plugin::activation_state_registry`) or the installing \
+                     `AttachPresentationResources` instead",
                     source_path.display(),
                 );
             }
@@ -2599,22 +2632,25 @@ fn plugin_crates_never_reach_a_process_wide_event_bus() {
                     || line.starts_with("pub static ")
                     || line.starts_with("pub(crate) static ")
                     || line.contains("thread_local!");
-                assert!(
-                    !(declares_static && line.contains("EventBus")),
-                    "{}:{} keeps an event bus in process-wide state; hold the \
-                     activation's bus in plugin instance state instead",
-                    source_path.display(),
-                    index + 1,
-                );
+                for host_type in HOST_STATE_TYPES {
+                    assert!(
+                        !(declares_static && line.contains(host_type)),
+                        "{}:{} keeps a `{host_type}` in process-wide state; hold the \
+                         activation's handle in plugin instance state instead",
+                        source_path.display(),
+                        index + 1,
+                    );
+                }
             }
         }
     }
 }
 
-/// The host owns exactly one root bus per runtime and hands out scoped views;
-/// no crate in the workspace may reintroduce a process-wide accessor.
+/// The host owns one root bus and state registry per runtime and hands out
+/// scoped views; no crate in the workspace may reintroduce a process-wide
+/// accessor for them.
 #[test]
-fn workspace_has_no_process_wide_event_bus_accessor() {
+fn workspace_has_no_process_wide_host_registry_accessors() {
     let root = repo_root();
     for dir in ["packages", "plugins"] {
         for source_path in rust_source_files_under(&root.join(dir)) {
@@ -2623,11 +2659,21 @@ fn workspace_has_no_process_wide_event_bus_accessor() {
             }
             let source = std::fs::read_to_string(&source_path)
                 .unwrap_or_else(|error| panic!("reading {}: {error}", source_path.display()));
-            assert!(
-                !source.contains("global_event_bus"),
-                "{} references a process-wide event bus",
-                source_path.display(),
-            );
+            for removed in [
+                "global_event_bus",
+                "global_plugin_state_registry",
+                "global_presentation_fact_host_service",
+                "global_startup_ready_gate_registry",
+                "global_visual_adapter_registry",
+                "global_render_extension_registry",
+                "global_attach_provider_registry",
+            ] {
+                assert!(
+                    !source.contains(removed),
+                    "{} references the removed process-wide accessor `{removed}`",
+                    source_path.display(),
+                );
+            }
         }
     }
 }
