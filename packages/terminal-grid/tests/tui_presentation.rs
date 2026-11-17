@@ -244,6 +244,16 @@ fn run(acceleration: ScrollRegionAcceleration, over: bool) {
                             pane.paint(cx);
                             continue;
                         };
+                        // Now and then a row is repainted as it was before the move carries it
+                        // along, which leaves the painted cells where nothing was painted.
+                        if extra % 3 == 0 {
+                            let before = Pane {
+                                rect: pane.rect,
+                                top: pane.top.saturating_add_signed(-*rows),
+                            };
+                            let row = extra % pane.rect.height;
+                            before.paint_rows(cx, row..row + 1);
+                        }
                         cx.move_cells(LocalRect::terminal(pane.rect), *rows);
                         let height = pane.rect.height;
                         let moved = u16::try_from(rows.unsigned_abs()).unwrap().min(height);

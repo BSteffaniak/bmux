@@ -739,3 +739,77 @@ fn an_image_stops_only_the_scroll_it_overlaps() {
     );
     assert_eq!(screen.rows(), expected.rows());
 }
+
+/// One random operation of a frame painted over the last one.
+#[derive(Clone, Debug)]
+enum OverOp {
+    Line(i64, i32, String),
+    Move(Rect, i64),
+}
+
+fn apply_over_ops(cx: &mut PaintCx<'_, '_>, ops: &[OverOp]) {
+    for op in ops {
+        match op {
+            OverOp::Line(row, column, text) => cx.write_line(
+                LocalRect::new(*column, *row, WIDTH, 1),
+                &Line::raw(text.clone()),
+            ),
+            OverOp::Move(area, rows) => cx.move_cells(LocalRect::terminal(*area), *rows),
+        }
+    }
+}
+
+#[test]
+fn frames_painted_over_with_moves_show_the_frame_on_the_host() {
+    let mut seed = 0x51f1_5e4f_u64;
+    let mut next = move |bound: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % bound
+    };
+    let area = Rect::new(0, 0, WIDTH, HEIGHT);
+    let mut terminal = terminal(ScrollRegionAcceleration::AutoWithMargins);
+    let mut screen = Screen::new(WIDTH, HEIGHT);
+    let mut expected = Buffer::empty(area);
+    for frame in 0..3000 {
+        let mut ops = Vec::new();
+        for _ in 0..next(5) {
+            let op = if next(3) == 0 {
+                let x = u16::try_from(next(u64::from(WIDTH) - 2)).unwrap();
+                let width = if next(2) == 0 {
+                    WIDTH - x
+                } else {
+                    u16::try_from(next(u64::from(WIDTH - x - 1))).unwrap() + 2
+                };
+                let y = u16::try_from(next(3)).unwrap();
+                let height = u16::try_from(next(u64::from(HEIGHT - y - 1))).unwrap() + 2;
+                let rows = i64::try_from(next(5)).unwrap() - 2;
+                OverOp::Move(Rect::new(x, y, width, height), rows)
+            } else {
+                let text: String = (0..next(8))
+                    .map(|_| ["a", "b", "\u{754c}", " ", "z"][usize::try_from(next(5)).unwrap()])
+                    .collect();
+                OverOp::Line(
+                    i64::try_from(next(u64::from(HEIGHT))).unwrap(),
+                    i32::try_from(next(u64::from(WIDTH))).unwrap(),
+                    text,
+                )
+            };
+            ops.push(op);
+        }
+        apply_over_ops(&mut PaintCx::new(&mut Frame::new(&mut expected)), &ops);
+        terminal.writer_mut().clear();
+        if frame == 0 {
+            terminal.draw(|cx| apply_over_ops(cx, &ops)).unwrap();
+        } else {
+            terminal.draw_over(|cx| apply_over_ops(cx, &ops)).unwrap();
+        }
+        screen.feed(terminal.writer());
+        let mut full = Vec::new();
+        bmux_tui::ansi::write_ansi_frame(&mut full, &expected, None).unwrap();
+        let mut reference = Screen::new(WIDTH, HEIGHT);
+        reference.feed(&full);
+        assert_eq!(screen.rows(), reference.rows(), "frame {frame}: {ops:?}");
+    }
+}

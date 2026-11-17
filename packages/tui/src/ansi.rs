@@ -753,11 +753,16 @@ fn emit_row_cells(
             continue;
         }
         writer.write_all(cell.symbol.as_bytes())?;
-        let width = u16::from(cell.width()).max(
-            u16::try_from(display_width(&cell.symbol))
-                .unwrap_or(u16::MAX)
-                .min(2),
-        );
+        // A one-byte symbol is one printable ASCII character: one column.
+        let width = if cell.symbol.len() == 1 {
+            1
+        } else {
+            u16::from(cell.width()).max(
+                u16::try_from(display_width(&cell.symbol))
+                    .unwrap_or(u16::MAX)
+                    .min(2),
+            )
+        };
         x = x.saturating_add(width.max(1));
     }
     Ok(())
@@ -1020,12 +1025,26 @@ const fn standard_color(offset: u16, bright: bool) -> Color {
 }
 
 fn write_ansi_move_to(writer: &mut impl Write, point: Point) -> io::Result<()> {
-    write!(
-        writer,
-        "\x1b[{};{}H",
-        u32::from(point.y).saturating_add(1),
-        u32::from(point.x).saturating_add(1)
-    )
+    writer.write_all(b"\x1b[")?;
+    write_decimal_u32(writer, u32::from(point.y) + 1)?;
+    writer.write_all(b";")?;
+    write_decimal_u32(writer, u32::from(point.x) + 1)?;
+    writer.write_all(b"H")
+}
+
+/// Write `value` in decimal without the formatting machinery.
+fn write_decimal_u32(writer: &mut impl Write, mut value: u32) -> io::Result<()> {
+    let mut digits = [0_u8; 10];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + u8::try_from(value % 10).unwrap_or(0);
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    writer.write_all(&digits[start..])
 }
 
 /// Change the terminal's style from `from` to `to`, writing whichever is shorter: the
@@ -1164,33 +1183,64 @@ enum ColorRole {
 }
 
 fn write_ansi_color(writer: &mut impl Write, color: Color, role: ColorRole) -> io::Result<()> {
-    match color {
-        Color::Default => Ok(()),
-        Color::Black => write!(writer, ";{}", color_base(role)),
-        Color::Red => write!(writer, ";{}", color_base(role) + 1),
-        Color::Green => write!(writer, ";{}", color_base(role) + 2),
-        Color::Yellow => write!(writer, ";{}", color_base(role) + 3),
-        Color::Blue => write!(writer, ";{}", color_base(role) + 4),
-        Color::Magenta => write!(writer, ";{}", color_base(role) + 5),
-        Color::Cyan => write!(writer, ";{}", color_base(role) + 6),
-        Color::White => write!(writer, ";{}", color_base(role) + 7),
-        Color::BrightBlack => write!(writer, ";{}", bright_color_base(role)),
-        Color::BrightRed => write!(writer, ";{}", bright_color_base(role) + 1),
-        Color::BrightGreen => write!(writer, ";{}", bright_color_base(role) + 2),
-        Color::BrightYellow => write!(writer, ";{}", bright_color_base(role) + 3),
-        Color::BrightBlue => write!(writer, ";{}", bright_color_base(role) + 4),
-        Color::BrightMagenta => write!(writer, ";{}", bright_color_base(role) + 5),
-        Color::BrightCyan => write!(writer, ";{}", bright_color_base(role) + 6),
-        Color::BrightWhite => write!(writer, ";{}", bright_color_base(role) + 7),
-        Color::Indexed(index) => match role {
-            ColorRole::Foreground => write!(writer, ";38;5;{index}"),
-            ColorRole::Background => write!(writer, ";48;5;{index}"),
-        },
-        Color::Rgb(red, green, blue) => match role {
-            ColorRole::Foreground => write!(writer, ";38;2;{red};{green};{blue}"),
-            ColorRole::Background => write!(writer, ";48;2;{red};{green};{blue}"),
-        },
-    }
+    let named = |offset: u8| (color_base(role) + offset, false);
+    let bright = |offset: u8| (bright_color_base(role) + offset, false);
+    let (code, _) = match color {
+        Color::Default => return Ok(()),
+        Color::Black => named(0),
+        Color::Red => named(1),
+        Color::Green => named(2),
+        Color::Yellow => named(3),
+        Color::Blue => named(4),
+        Color::Magenta => named(5),
+        Color::Cyan => named(6),
+        Color::White => named(7),
+        Color::BrightBlack => bright(0),
+        Color::BrightRed => bright(1),
+        Color::BrightGreen => bright(2),
+        Color::BrightYellow => bright(3),
+        Color::BrightBlue => bright(4),
+        Color::BrightMagenta => bright(5),
+        Color::BrightCyan => bright(6),
+        Color::BrightWhite => bright(7),
+        Color::Indexed(index) => {
+            writer.write_all(match role {
+                ColorRole::Foreground => b";38;5;",
+                ColorRole::Background => b";48;5;",
+            })?;
+            return write_decimal(writer, index);
+        }
+        Color::Rgb(red, green, blue) => {
+            writer.write_all(match role {
+                ColorRole::Foreground => b";38;2;",
+                ColorRole::Background => b";48;2;",
+            })?;
+            write_decimal(writer, red)?;
+            writer.write_all(b";")?;
+            write_decimal(writer, green)?;
+            writer.write_all(b";")?;
+            return write_decimal(writer, blue);
+        }
+    };
+    writer.write_all(b";")?;
+    write_decimal(writer, code)
+}
+
+/// Write `value` in decimal without the formatting machinery (styles are written per cell run).
+fn write_decimal(writer: &mut impl Write, value: u8) -> io::Result<()> {
+    let digits = [
+        b'0' + value / 100,
+        b'0' + value / 10 % 10,
+        b'0' + value % 10,
+    ];
+    let start = if value >= 100 {
+        0
+    } else if value >= 10 {
+        1
+    } else {
+        2
+    };
+    writer.write_all(&digits[start..])
 }
 
 const fn color_base(role: ColorRole) -> u8 {

@@ -79,6 +79,8 @@ pub struct Frame<'buffer> {
     clock: Option<crate::clock::PresentationClock>,
     written: Option<WrittenSpans>,
     painted: Option<WrittenSpans>,
+    /// A move covered cells painted before it, which then left the painted spans.
+    moved_painted: bool,
 }
 
 /// The columns each row of a frame's buffer may have been written in, one `start..end` span
@@ -115,6 +117,15 @@ impl WrittenSpans {
             row.0 = row.0.min(start);
             row.1 = row.1.max(end);
         }
+    }
+
+    /// Whether any written span meets `area`.
+    fn intersects(&self, area: Rect) -> bool {
+        let area = area.intersection(self.area);
+        (area.y..area.bottom()).any(|y| {
+            let (start, end) = self.rows[usize::from(y - self.area.y)];
+            start < end && start < area.right() && area.x < end
+        })
     }
 
     /// The written `(y, start..end)` spans, top to bottom.
@@ -194,6 +205,7 @@ impl<'buffer> Frame<'buffer> {
             clock: None,
             written: None,
             painted: None,
+            moved_painted: false,
         }
     }
 
@@ -204,8 +216,9 @@ impl<'buffer> Frame<'buffer> {
     }
 
     /// The cells painted since [`Self::track_writes`]: those written, less the ones only moved.
-    pub(crate) const fn take_painted(&mut self) -> Option<WrittenSpans> {
-        self.painted.take()
+    /// `None` when a move carried painted cells away from where they were painted.
+    pub(crate) fn take_painted(&mut self) -> Option<WrittenSpans> {
+        self.painted.take().filter(|_| !self.moved_painted)
     }
 
     /// The cells written since [`Self::track_writes`], or `None` when writes were not tracked.
@@ -428,6 +441,13 @@ impl<'buffer> Frame<'buffer> {
             return;
         }
         self.note_moved(area);
+        if self
+            .painted
+            .as_ref()
+            .is_some_and(|painted| painted.intersects(area))
+        {
+            self.moved_painted = true;
+        }
         // Wide graphemes the edges cut are blanked: painted, not moved.
         if let Some(painted) = self.painted.as_mut() {
             for y in area.y..area.bottom() {
