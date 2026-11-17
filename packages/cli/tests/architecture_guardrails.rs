@@ -2,6 +2,8 @@
 //! from the legacy source guards below.
 #[path = "bterm_architecture/mod.rs"]
 mod bterm_architecture;
+#[path = "support/generated_manifest.rs"]
+mod generated_manifest;
 
 #[test]
 fn context_retarget_preserves_attachment_owned_decoration_lifetime() {
@@ -2882,11 +2884,15 @@ fn resolve_const_reference(
 /// Parse `required_capabilities` + `provided_capabilities` from a
 /// plugin.toml. Returns a set of capability strings declared in the
 /// manifest.
-fn declared_capabilities(plugin_toml_path: &std::path::Path) -> std::collections::BTreeSet<String> {
-    let source = std::fs::read_to_string(plugin_toml_path)
-        .unwrap_or_else(|err| panic!("failed reading {}: {err}", plugin_toml_path.display()));
+/// Capabilities in the plugin's generated manifest (its BPDL world plus
+/// `plugin.toml` settings).
+fn declared_capabilities(plugin_dir: &std::path::Path) -> std::collections::BTreeSet<String> {
+    let source = generated_manifest::generated_manifest(plugin_dir);
     let parsed: toml::Value = toml::from_str(&source).unwrap_or_else(|err| {
-        panic!("failed parsing {}: {err}", plugin_toml_path.display());
+        panic!(
+            "failed parsing generated manifest of {}: {err}",
+            plugin_dir.display()
+        );
     });
     let mut out = std::collections::BTreeSet::new();
     for key in ["required_capabilities", "provided_capabilities"] {
@@ -2907,8 +2913,7 @@ fn every_plugin_declares_capabilities_it_calls() {
     let mut failures: Vec<String> = Vec::new();
 
     for plugin_dir in iter_plugin_dirs() {
-        let plugin_toml = plugin_dir.join("plugin.toml");
-        let declared = declared_capabilities(&plugin_toml);
+        let declared = declared_capabilities(&plugin_dir);
 
         let mut used: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for src in rust_source_files(&plugin_dir) {
@@ -2930,7 +2935,7 @@ fn every_plugin_declares_capabilities_it_calls() {
             .collect();
         if !missing.is_empty() {
             failures.push(format!(
-                "plugin '{}' calls capabilities {missing:?} but declares only {declared:?} in plugin.toml",
+                "plugin '{}' calls capabilities {missing:?} but its BPDL world declares only {declared:?}",
                 plugin_dir
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -2942,8 +2947,8 @@ fn every_plugin_declares_capabilities_it_calls() {
     assert!(
         failures.is_empty(),
         "capability-declaration drift detected:\n  - {}\n\n\
-         Fix: for each plugin listed above, add the missing capability literals to \
-         `required_capabilities` in that plugin's plugin.toml.",
+         Fix: for each plugin listed above, add `require capability <cap>;` (or a \
+         `require` of the interface that carries it) to that plugin's BPDL world.",
         failures.join("\n  - ")
     );
 }

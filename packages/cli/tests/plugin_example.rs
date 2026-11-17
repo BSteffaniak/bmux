@@ -2,6 +2,9 @@ use bmux_plugin::{PluginManifest, discover_plugin_manifests};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+#[path = "support/generated_manifest.rs"]
+mod generated_manifest;
+
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -16,7 +19,11 @@ fn bundled_manifest(plugin_id: &str) -> PluginManifest {
     report
         .manifest_paths
         .iter()
-        .map(|path| PluginManifest::from_path(path).expect("manifest should parse"))
+        .map(|path| {
+            let dir = path.parent().expect("manifest has a plugin directory");
+            PluginManifest::from_toml_str(&generated_manifest::generated_manifest(dir))
+                .expect("generated manifest should parse")
+        })
         .find(|manifest| manifest.id.as_str() == plugin_id)
         .unwrap_or_else(|| panic!("{plugin_id} bundled manifest should exist"))
 }
@@ -28,7 +35,11 @@ fn bundled_plugin_manifests_include_core_shipped_plugins() {
     let manifests = report
         .manifest_paths
         .iter()
-        .map(|path| PluginManifest::from_path(path).expect("manifest should parse"))
+        .map(|path| {
+            let dir = path.parent().expect("manifest has a plugin directory");
+            PluginManifest::from_toml_str(&generated_manifest::generated_manifest(dir))
+                .expect("generated manifest should parse")
+        })
         .collect::<Vec<_>>();
 
     assert!(

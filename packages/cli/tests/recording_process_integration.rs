@@ -13,6 +13,8 @@
 #[path = "support/recording_cleanup.rs"]
 mod recording_cleanup;
 use recording_cleanup::cleanup_short_tmp;
+#[path = "support/generated_manifest.rs"]
+mod generated_manifest;
 
 use serde_json::Value;
 use serial_test::serial;
@@ -725,9 +727,20 @@ fn retired_lifecycle_selectors_are_rejected_before_launch() {
 
 #[test]
 fn process_manifest_exposes_only_the_cohesive_contract() {
-    let manifest = include_str!("../../../plugins/recording-plugin/plugin.toml");
-    assert!(manifest.contains("interface_id = \"recording-process-v4\""));
-    assert!(manifest.contains("capability   = \"bmux.recording.process.v4\""));
+    let plugin_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../plugins/recording-plugin");
+    let manifest = generated_manifest::generated_manifest(&plugin_dir);
+    let parsed: toml::Table = toml::from_str(&manifest).expect("generated manifest is TOML");
+    assert!(
+        parsed["services"]
+            .as_array()
+            .expect("services")
+            .iter()
+            .any(
+                |service| service["interface_id"].as_str() == Some("recording-process-v4")
+                    && service["capability"].as_str() == Some("bmux.recording.process.v4")
+            )
+    );
     assert!(manifest.contains("\"bmux.pane_runtime.execution.v4\""));
     for version in [1, 2, 3] {
         assert!(!manifest.contains(&format!("recording-process-v{version}\"")));
