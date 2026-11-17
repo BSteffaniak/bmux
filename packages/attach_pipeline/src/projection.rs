@@ -54,6 +54,14 @@ pub struct CapturedCell {
     pub style: Style,
 }
 
+/// Whether `ch` is always a grapheme of its own, one or two columns wide: not zero-width (a
+/// joiner, a combining mark, a variation selector) and not one of the characters that combine with
+/// a neighbour into one grapheme (regional indicators, emoji skin-tone modifiers).
+fn standalone_char(ch: char) -> bool {
+    !matches!(ch, '\u{1f1e6}'..='\u{1f1ff}' | '\u{1f3fb}'..='\u{1f3ff}')
+        && matches!(unicode_width::UnicodeWidthChar::width(ch), Some(1 | 2))
+}
+
 /// Paint a captured run of cells, each replacing the cell it covers.
 fn paint_cells(cx: &mut PaintCx<'_, '_>, x: u16, y: u16, text: &str, cells: &[CapturedCell]) {
     let mut start = 0_usize;
@@ -464,6 +472,23 @@ pub fn paint_over(
                             width: 1,
                             style,
                         }),
+                    );
+                    continue;
+                }
+                if text.chars().all(standalone_char) {
+                    // Every character is a grapheme of its own (box drawing, most symbols).
+                    cx.replace_cells(
+                        i32::from(*x),
+                        i64::from(*y),
+                        text.char_indices()
+                            .map(|(start, ch)| bmux_tui::paint::SizedCell {
+                                symbol: &text[start..start + ch.len_utf8()],
+                                width: u8::try_from(
+                                    unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1),
+                                )
+                                .unwrap_or(1),
+                                style,
+                            }),
                     );
                     continue;
                 }
