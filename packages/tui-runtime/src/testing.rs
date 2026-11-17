@@ -880,7 +880,7 @@ impl<'a> FrameView<'a> {
     /// Return the committed cell buffer, absent before the first presentation
     /// and after a resize until the next one.
     #[must_use]
-    pub const fn buffer(&self) -> Option<&'a Buffer> {
+    pub fn buffer(&self) -> Option<&'a Buffer> {
         self.terminal.retained_buffer()
     }
 
