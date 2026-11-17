@@ -5,8 +5,8 @@
 //! wake (author future, settlement, cancellation, guest host-wake callback)
 //! releases exactly one waiting observer, synchronously or asynchronously.
 //! The timer fires wakes at explicit instants only: caller-supplied operation
-//! deadlines, and the documented legacy repoll of native guests that did not
-//! negotiate `CAP_HOST_WAKE_V1`.
+//! deadlines. Native guests must negotiate `CAP_HOST_WAKE_V1`; nothing is
+//! repolled.
 
 use bmux_plugin_sdk::{PluginError, Result};
 use std::{
@@ -14,14 +14,8 @@ use std::{
     collections::BinaryHeap,
     sync::{Arc, Condvar, Mutex, OnceLock},
     task::{Poll, Wake, Waker},
-    time::{Duration, Instant},
+    time::Instant,
 };
-
-/// Repoll interval for legacy native guests without `CAP_HOST_WAKE_V1`.
-///
-/// Such guests poll author futures with a no-op waker and promise no wake, so
-/// the ABI requires periodic host polling. This applies to no other operation.
-pub(super) const LEGACY_NATIVE_REPOLL: Duration = Duration::from_millis(2);
 
 #[derive(Default)]
 struct SignalState {
@@ -179,8 +173,8 @@ impl Timer {
     }
 }
 
-/// Wake `waker` once at `at`. Used only for explicit deadlines and the legacy
-/// native repoll; never as a substitute for a real completion wake.
+/// Wake `waker` once at `at`. Used only for explicit operation deadlines;
+/// never as a substitute for a real completion wake.
 ///
 /// # Errors
 /// The timer thread cannot be started or its state is poisoned.
@@ -199,6 +193,7 @@ pub(super) fn wake_at(at: Instant, waker: Waker) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn signal_retains_wake_that_precedes_wait() {

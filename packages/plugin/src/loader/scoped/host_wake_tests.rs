@@ -224,17 +224,9 @@ fn load(
     unsafe { DefinitionArtifact::from_process_descriptor(&raw const descriptor.base.base) }
 }
 
-fn negotiated_wake(artifact: &DefinitionArtifact) -> bool {
-    let ArtifactBackend::Dynamic(dynamic) = &artifact.backend else {
-        panic!("dynamic artifact expected");
-    };
-    dynamic.read_wake.is_some()
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn negotiated_guest_completes_from_its_own_wake_without_repolling() {
     let artifact = load(&native::WAKE).unwrap();
-    assert!(negotiated_wake(&artifact));
     let execution = selected_execution(&artifact, &Arc::new(Recorder::default()));
     let polls = activate(&execution).await;
     // A 2ms repoll would need ~30 polls over the 60ms delay. Waker-driven
@@ -244,16 +236,15 @@ async fn negotiated_guest_completes_from_its_own_wake_without_repolling() {
     retire(execution).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn legacy_guest_without_wake_bit_keeps_explicit_periodic_repoll() {
-    let artifact = load(&native::LEGACY).unwrap();
-    assert!(!negotiated_wake(&artifact));
-    let execution = selected_execution(&artifact, &Arc::new(Recorder::default()));
-    let polls = activate(&execution).await;
-    // The guest polls its future with a no-op waker; only the documented
-    // legacy repoll drives it, so completion takes many timer-driven polls.
-    assert!(polls > 6, "observed {polls} polls");
-    retire(execution).await;
+#[test]
+fn legacy_guest_without_wake_bit_is_rejected_at_load() {
+    // Such a guest polls with a no-op waker and would need host repolling,
+    // which no longer exists: every operation is driven by real wakers.
+    let error = load(&native::LEGACY)
+        .err()
+        .expect("legacy repolled guests are refused")
+        .to_string();
+    assert!(error.contains("CAP_HOST_WAKE_V1"), "{error}");
 }
 
 #[test]

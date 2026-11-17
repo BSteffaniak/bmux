@@ -286,8 +286,11 @@ fn async_activation_table() -> NativeInvocationPortsV3 {
     }
 }
 
-#[test]
-fn negotiated_native_async_activation_polls_timer_on_owned_runtime_and_retires() {
+/// The adapter owns no runtime: activation work (a timer and a background
+/// task) runs on the runtime of the host polling it, and destruction needs no
+/// runtime retirement.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn negotiated_native_async_activation_runs_on_the_host_runtime_and_retires() {
     struct AsyncAuthor(Arc<AtomicUsize>);
     impl PluginInstance for AsyncAuthor {
         fn activate_with_async(
@@ -303,7 +306,7 @@ fn negotiated_native_async_activation_polls_timer_on_owned_runtime_and_retires()
                         Ok(())
                     })
                     .map_err(crate::PluginCommandError::failed)?;
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                crate::rt::time::sleep(std::time::Duration::from_millis(2)).await;
                 seen.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })
@@ -341,7 +344,7 @@ fn negotiated_native_async_activation_polls_timer_on_owned_runtime_and_retires()
         unsafe { adapter.start_scoped(id, 1, bytes.as_ptr(), bytes.len(), &raw const table.base) },
         PENDING
     );
-    let settle = |operation| {
+    let settle = async |operation| {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
             let (status, bytes) = read(&adapter, id, operation);
@@ -354,28 +357,21 @@ fn negotiated_native_async_activation_polls_timer_on_owned_runtime_and_retires()
             }
             assert!(matches!(status, PENDING | BUSY));
             assert!(std::time::Instant::now() < deadline);
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            // The legacy `read` export promises no wake; this test observer
+            // repolls it while the host runtime drives the timer.
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         assert_eq!(adapter.ack(id, operation), OK);
     };
-    settle(1);
+    settle(1).await;
     assert_eq!(effects.load(Ordering::SeqCst), 1);
     let bytes = serde_json::to_vec(&NativeOperation::Deactivate(context)).unwrap();
     assert_eq!(
         unsafe { adapter.start(id, 2, bytes.as_ptr(), bytes.len()) },
         PENDING
     );
-    settle(2);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    loop {
-        let status = adapter.destroy(id);
-        if status == OK {
-            break;
-        }
-        assert_eq!(status, BUSY);
-        assert!(std::time::Instant::now() < deadline);
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
+    settle(2).await;
+    assert_eq!(adapter.destroy(id), OK);
 }
 
 #[test]

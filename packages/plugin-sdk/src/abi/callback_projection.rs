@@ -392,21 +392,18 @@ impl PluginCallbackExecution for Executor {
             entry.validate_for(&authority, instance)?;
             reserve(&jobs)?;
             let slot = JobSlot(jobs);
-            let (send, receive) = tokio::sync::oneshot::channel();
-            std::thread::Builder::new()
-                .name("native-plugin-callback".into())
-                .spawn(move || {
-                    let _slot = slot;
-                    let result = entry.validate_for(&authority, instance).and_then(|()| {
-                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback))
-                            .unwrap_or_else(|_| Err(failure(PANICKED)))
-                    });
-                    drop(entry);
-                    let _ = send.send(result);
-                })
-                .map_err(|error| PluginCommandError::failed(error.to_string()))?;
-            receive
-                .await
+            // Blocking author code runs on the host's blocking pool through
+            // plug-rt, never on a thread created per callback.
+            let job = crate::rt::spawn_blocking_named("native-plugin-callback", move || {
+                let _slot = slot;
+                let result = entry.validate_for(&authority, instance).and_then(|()| {
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback))
+                        .unwrap_or_else(|_| Err(failure(PANICKED)))
+                });
+                drop(entry);
+                result
+            });
+            job.await
                 .map_err(|error| PluginCommandError::failed(error.to_string()))?
         })
     }

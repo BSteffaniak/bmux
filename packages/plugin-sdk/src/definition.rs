@@ -774,6 +774,12 @@ pub struct PluginDeclarations {
     pub ready_signals: Vec<crate::ReadySignalDecl>,
     #[serde(default)]
     pub extensions: Vec<ExtensionDeclaration>,
+    /// Why this plugin must ship bundled. Set by plugins that use host
+    /// facilities plug-rt does not proxy into dynamic libraries (sockets,
+    /// child processes, a private executor). The dynamic loader refuses such
+    /// a plugin with a typed error instead of letting it fail at runtime.
+    #[serde(default)]
+    pub bundled_only: Option<String>,
 }
 /// Owned portable representation of a generated modeled contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

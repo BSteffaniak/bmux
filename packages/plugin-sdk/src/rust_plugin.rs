@@ -372,96 +372,71 @@ pub struct TypedServiceRegistrationContext<'a> {
     pub plugin_settings_map: &'a std::collections::BTreeMap<String, toml::Value>,
 }
 
-/// Handle for scheduling plugin-owned background work on the host's existing
-/// async runtime.
+/// The activation's task scope, handed to async activation hooks.
 ///
-/// This wrapper is intentionally exposed only through in-process Rust plugin
-/// hooks. It is not serialized into lifecycle contexts and should not be passed
-/// across process or dynamic-library ABI boundaries.
+/// It is not a runtime handle: every spawn goes through plug-rt
+/// ([`crate::rt`]) onto the host's single runtime and is owned by this
+/// activation, so host teardown cancels, drains and aborts it. It is never
+/// serialized into lifecycle contexts.
 #[derive(Debug, Clone)]
 pub struct HostAsyncHandle {
-    inner: switchy::unsync::runtime::Handle,
-    background: Option<bmux_plugin_runtime::background::BackgroundTasks>,
+    background: bmux_plugin_runtime::background::BackgroundTasks,
 }
 
 impl HostAsyncHandle {
-    /// Wrap a switchy async runtime handle.
+    /// Bind to one host-managed activation's task scope.
     #[must_use]
-    pub const fn new(inner: switchy::unsync::runtime::Handle) -> Self {
-        Self {
-            inner,
-            background: None,
-        }
-    }
-
-    /// Bind background task ownership to one host-managed activation.
-    #[must_use]
-    pub fn with_background_tasks(
-        mut self,
-        tasks: bmux_plugin_runtime::background::BackgroundTasks,
-    ) -> Self {
-        self.background = Some(tasks);
-        self
+    pub const fn new(tasks: bmux_plugin_runtime::background::BackgroundTasks) -> Self {
+        Self { background: tasks }
     }
 
     /// Start cooperative work owned by this activation.
     ///
     /// # Errors
-    /// Rejects unscoped handles and closed or full task scopes.
+    /// Rejects closed or full task scopes.
     pub fn spawn_background<F, Fut>(&self, name: &str, work: F) -> Result<(), String>
     where
         F: FnOnce(bmux_plugin_runtime::background::TaskCancellation) -> Fut,
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
         let task_name = name.to_string();
-        self.background
-            .as_ref()
-            .ok_or("host activation task scope unavailable")?
-            .spawn(name, move |cancel| {
-                let future = work(cancel);
-                async move {
-                    let result = future.await;
-                    if let Err(error) = &result {
-                        tracing::error!(task = %task_name, %error, "plugin background task failed");
-                    }
-                    result
+        self.background.spawn(name, move |cancel| {
+            let future = work(cancel);
+            async move {
+                let result = future.await;
+                if let Err(error) = &result {
+                    tracing::error!(task = %task_name, %error, "plugin background task failed");
                 }
-            })
+                result
+            }
+        })
     }
 
-    /// Try to capture the async runtime currently entered on this thread.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error string when no runtime is currently entered.
-    pub fn try_current() -> std::result::Result<Self, String> {
-        switchy::unsync::runtime::Handle::try_current()
-            .map(Self::new)
-            .map_err(|error| error.to_string())
-    }
-
-    /// Spawn a named `Send` future onto the host runtime.
+    /// Spawn a future owned by this activation onto the host runtime.
     pub fn spawn<T: Send + 'static>(
         &self,
         future: impl Future<Output = T> + Send + 'static,
-    ) -> switchy::unsync::task::JoinHandle<T> {
-        self.inner.spawn(future)
+    ) -> crate::rt::JoinHandle<T> {
+        let _scope = self.background.enter();
+        crate::rt::spawn(future)
     }
 
-    /// Spawn a named `Send` future onto the host runtime.
+    /// Spawn a named future owned by this activation onto the host runtime.
     pub fn spawn_with_name<T: Send + 'static>(
         &self,
         name: &str,
         future: impl Future<Output = T> + Send + 'static,
-    ) -> switchy::unsync::task::JoinHandle<T> {
-        self.inner.spawn_with_name(name, future)
+    ) -> crate::rt::JoinHandle<T> {
+        let _scope = self.background.enter();
+        crate::rt::spawn_named(name, future)
     }
 
-    /// Spawn blocking work onto the host runtime's blocking pool.
+    /// Run blocking work owned by this activation on the host's blocking pool.
     pub fn spawn_blocking<T: Send + 'static>(
         &self,
         f: impl FnOnce() -> T + Send + 'static,
-    ) -> switchy::unsync::task::JoinHandle<T> {
-        self.inner.spawn_blocking(f)
+    ) -> crate::rt::JoinHandle<T> {
+        let _scope = self.background.enter();
+        crate::rt::spawn_blocking(f)
     }
 }

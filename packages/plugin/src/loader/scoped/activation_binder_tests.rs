@@ -232,7 +232,7 @@ async fn dynamic_artifact_is_refused_an_activation_binder() {
     // owned by the process handle for the artifact's whole lifetime.
     let artifact = unsafe {
         DefinitionArtifact::from_process_descriptor(
-            &raw const super::activation_parity_tests::native::DESCRIPTOR.base,
+            &raw const super::activation_parity_tests::native::DESCRIPTOR.base.base,
         )
     }
     .unwrap();

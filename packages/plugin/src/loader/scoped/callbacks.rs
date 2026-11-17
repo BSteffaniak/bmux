@@ -777,10 +777,10 @@ impl PluginCallbackExecution for SelectedExecutor {
     ) -> PluginCallbackSettlement {
         let binding = self.binding.clone();
         let selected = self.authority.clone();
-        // The callback body runs on a dedicated worker thread. Carry the
-        // issuing command's async service route (a thread-local on the
-        // scheduling thread) across that hop so work the body leaves running
-        // can still reach host services after the command returns.
+        // The callback body runs on the selected runtime's blocking pool.
+        // Carry the issuing command's async service route (a thread-local on
+        // the scheduling thread) across that hop so work the body leaves
+        // running can still reach host services after the command returns.
         let async_route = crate::capture_async_command_route(crate::ASYNC_SERVICE_ROUTE_V1).ok();
         Box::pin(async move {
             entry.validate_for(&selected, instance)?;
@@ -832,10 +832,11 @@ impl PluginCallbackExecution for SelectedExecutor {
             let runtime = binding.0.host.0.runtime.clone().ok_or_else(|| {
                 rejected("selected callback runtime unavailable; native reactor ownership is not projected")
             })?;
-            let (sender, receiver) = tokio::sync::oneshot::channel();
-            std::thread::Builder::new()
-                .name("plugin-callback".into())
-                .spawn(move || {
+            // A blocking-pool job of the one host runtime, never a thread per
+            // callback. Its context is the selected runtime (execution
+            // plumbing, not authority); the prepared guard stays live.
+            runtime
+                .spawn_blocking(move || {
                     let _permit = permit;
                     let _async_route = async_route.map(crate::enter_async_command_route);
                     let result = entry
@@ -843,17 +844,12 @@ impl PluginCallbackExecution for SelectedExecutor {
                         .and_then(|()| entry.validate_for(&authority, instance))
                         .and_then(|()| binding.check())
                         .and_then(|()| {
-                            // Runtime entry is execution plumbing, not authority.
-                            // The actual prepared guard/code owner remains live.
-                            let _runtime_entry = runtime.enter();
                             std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback))
                                 .unwrap_or_else(|_| Err(rejected("author callback panicked")))
                         });
                     drop(entry);
-                    let _ = sender.send(result);
+                    result
                 })
-                .map_err(|e| rejected(format!("callback worker admission failed: {e}")))?;
-            receiver
                 .await
                 .map_err(|_| rejected("callback settlement unavailable"))?
         })

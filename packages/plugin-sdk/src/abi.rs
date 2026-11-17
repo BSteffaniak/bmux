@@ -303,82 +303,7 @@ struct InstanceLifecycle {
     activation: Option<ActivationId>,
     ports: Option<Arc<ports::InvocationPorts>>,
 }
-struct NativeRuntime {
-    handle: tokio::runtime::Handle,
-    shutdown: Mutex<NativeRuntimeState>,
-}
-enum NativeRuntimeState {
-    Running(tokio::runtime::Runtime),
-    Draining(std::thread::JoinHandle<()>),
-    Closed,
-    Failed,
-}
-impl NativeRuntime {
-    fn new() -> Result<Self, AbiStatus> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("bmux-native-author")
-            .enable_all()
-            .build()
-            .map_err(|_| FAILED)?;
-        Ok(Self {
-            handle: runtime.handle().clone(),
-            shutdown: Mutex::new(NativeRuntimeState::Running(runtime)),
-        })
-    }
-    fn retire(&self) -> AbiStatus {
-        let Ok(mut state) = self.shutdown.lock() else {
-            return PANICKED;
-        };
-        match &*state {
-            NativeRuntimeState::Closed => return OK,
-            NativeRuntimeState::Failed => return PANICKED,
-            NativeRuntimeState::Draining(thread) if !thread.is_finished() => return BUSY,
-            _ => {}
-        }
-        match std::mem::replace(&mut *state, NativeRuntimeState::Closed) {
-            NativeRuntimeState::Running(runtime) => {
-                // Runtime destruction must not block a host async worker. The
-                // instance/artifact remains retained until join proves shutdown.
-                let (send, receive) = std::sync::mpsc::sync_channel::<tokio::runtime::Runtime>(1);
-                if let Ok(thread) = std::thread::Builder::new()
-                    .name("bmux-native-retire".into())
-                    .spawn(move || {
-                        if let Ok(runtime) = receive.recv() {
-                            drop(runtime);
-                        }
-                    })
-                {
-                    if let Err(error) = send.send(runtime) {
-                        *state = NativeRuntimeState::Running(error.0);
-                        return PANICKED;
-                    }
-                    *state = NativeRuntimeState::Draining(thread);
-                    BUSY
-                } else {
-                    *state = NativeRuntimeState::Running(runtime);
-                    FAILED
-                }
-            }
-            NativeRuntimeState::Draining(thread) => {
-                if thread.join().is_ok() {
-                    OK
-                } else {
-                    *state = NativeRuntimeState::Failed;
-                    PANICKED
-                }
-            }
-            NativeRuntimeState::Failed => {
-                *state = NativeRuntimeState::Failed;
-                PANICKED
-            }
-            NativeRuntimeState::Closed => OK,
-        }
-    }
-}
-
 struct Instance {
-    runtime: Mutex<Option<Arc<NativeRuntime>>>,
     tasks: Mutex<Option<bmux_plugin_runtime::background::BackgroundTasks>>,
     callback_executor: Arc<callback_projection::Executor>,
     implementation: Arc<dyn PluginInstance>,
@@ -493,7 +418,6 @@ impl NativeAdapter {
         instances.insert(
             id,
             Arc::new(Instance {
-                runtime: Mutex::new(None),
                 tasks: Mutex::new(None),
                 callback_executor: Arc::default(),
                 implementation,
@@ -543,16 +467,6 @@ impl NativeAdapter {
         };
         if lifecycle.phase != 0 {
             return BUSY;
-        }
-        if let Ok(runtime) = instance.runtime.lock() {
-            if let Some(runtime) = &*runtime {
-                let retired = runtime.retire();
-                if retired != OK {
-                    return retired;
-                }
-            }
-        } else {
-            return PANICKED;
         }
         drop(lifecycle);
         drop(operations);
@@ -669,7 +583,7 @@ impl NativeAdapter {
             if lifecycle.phase != 0 || !operations.is_empty() {
                 return BUSY;
             }
-            if let Err(status) = initialize_activation_runtime(&instance) {
+            if let Err(status) = initialize_activation_tasks(&instance) {
                 return status;
             }
         }
@@ -861,11 +775,9 @@ impl NativeAdapter {
                 _ => unreachable!(),
             }
         };
-        let runtime = match instance.runtime.lock() {
-            Ok(runtime) => runtime.clone(),
-            Err(_) => return (PANICKED, false),
-        };
-        let _entered = runtime.as_ref().map(|runtime| runtime.handle.enter());
+        // Work the author spawns through plug-rt joins this instance's
+        // host-owned activation scope; no plugin-side runtime exists.
+        let _scope = bmux_plugin_runtime::rt::enter_instance(id);
         let polled = catch_unwind(AssertUnwindSafe(|| {
             future.as_mut().poll(&mut Context::from_waker(waker))
         }));
@@ -990,22 +902,15 @@ fn settle_lifecycle(
     Ok(())
 }
 
-// Install the negotiated activation runtime and its task owner together, after
-// both slots are locked. The caller retains operation admission throughout.
-fn initialize_activation_runtime(instance: &Instance) -> Result<(), AbiStatus> {
-    let mut runtime_slot = instance.runtime.lock().map_err(|_| PANICKED)?;
+// Install the negotiated activation task owner. Its tasks run on the host's
+// runtime through plug-rt; the caller retains operation admission throughout.
+fn initialize_activation_tasks(instance: &Instance) -> Result<(), AbiStatus> {
     let mut task_slot = instance.tasks.lock().map_err(|_| PANICKED)?;
-    if runtime_slot.is_some() || task_slot.is_some() {
+    if task_slot.is_some() {
         return Err(BUSY);
     }
-    let runtime = Arc::new(NativeRuntime::new()?);
-    let tasks = {
-        let _entered = runtime.handle.enter();
-        bmux_plugin_runtime::background::BackgroundTasks::new()
-    };
-    *runtime_slot = Some(runtime);
-    *task_slot = Some(tasks);
-    drop((task_slot, runtime_slot));
+    *task_slot = Some(bmux_plugin_runtime::background::BackgroundTasks::new());
+    drop(task_slot);
     Ok(())
 }
 
@@ -1120,20 +1025,13 @@ async fn activate_author(
     tasks: Option<&bmux_plugin_runtime::background::BackgroundTasks>,
 ) -> crate::definition::PluginResult<()> {
     if let Some(tasks) = tasks {
-        match crate::HostAsyncHandle::try_current() {
-            Ok(runtime) => {
-                instance
-                    .activate_scoped_async(
-                        context,
-                        host_services,
-                        runtime.with_background_tasks(tasks.clone()),
-                    )
-                    .await
-            }
-            Err(error) => Err(crate::PluginCommandError::failed(format!(
-                "negotiated async activation runtime unavailable: {error}"
-            ))),
-        }
+        instance
+            .activate_scoped_async(
+                context,
+                host_services,
+                crate::HostAsyncHandle::new(tasks.clone()),
+            )
+            .await
     } else {
         instance.activate_scoped(context, host_services).await
     }
@@ -1437,6 +1335,16 @@ macro_rules! export_plugin_entrypoint {
             }
             unsafe extern "C" fn cancel(id: u64, op: u64) -> i32 {
                 $crate::abi::ffi_guard(|| adapter().cancel(id, op))
+            }
+            /// plug-rt installation: the host hands this library its runtime
+            /// table before creating any instance. Refused unless the library
+            /// was built in dynamic mode (`--cfg bmux_plugin_dylib`).
+            #[unsafe(no_mangle)]
+            pub unsafe extern "C" fn bmux_plug_rt_install_v1(
+                table: *const $crate::rt::abi::PlugRtV1,
+                guest: *mut $crate::rt::abi::PlugRtGuestV1,
+            ) -> i32 {
+                unsafe { $crate::rt::guest::install(table, guest) }
             }
             unsafe extern "C" fn ack(id: u64, op: u64) -> i32 {
                 $crate::abi::ffi_guard(|| adapter().ack(id, op))

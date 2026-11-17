@@ -11,22 +11,20 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_codec = { workspace = true }
-bmux_ipc = { workspace = true }
+bmux_codec          = { workspace = true }
+bmux_ipc            = { workspace = true }
 bmux_perf_telemetry = { workspace = true }
 bmux_plugin_runtime = { workspace = true }
-serde = { workspace = true, features = ["derive", "std"] }
-serde_json = { workspace = true }
-switchy = { workspace = true, features = [
-    "async",
-    "async-tokio",
-    "random-rand",
-] }
-thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "time", "net"] }
-toml = { workspace = true, features = ["parse"] }
+serde               = { workspace = true, features = ["derive", "std"] }
+serde_json          = { workspace = true }
+switchy             = { workspace = true, features = ["random-rand"] }
+thiserror           = { workspace = true }
+# Runtime-agnostic primitives only: plugins reach the host runtime through
+# plug-rt (`bmux_plugin_runtime::rt`), never a runtime of their own.
+tokio   = { workspace = true, features = ["sync"] }
+toml    = { workspace = true, features = ["parse"] }
 tracing = { workspace = true }
-uuid = { workspace = true, features = ["serde", "std"] }
+uuid    = { workspace = true, features = ["serde", "std"] }
 
 [build-dependencies]
 bmux_plugin_schema = { workspace = true }

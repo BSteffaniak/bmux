@@ -94,31 +94,44 @@ pub(super) mod native {
     unsafe extern "C" fn ack(id: u64, op: u64) -> i32 {
         abi::ffi_guard(|| adapter().ack(id, op))
     }
-    const fn descriptor(capabilities: u64) -> abi::NativePluginDescriptorV3 {
-        abi::NativePluginDescriptorV3 {
-            base: abi::NativePluginDescriptor {
-                size: abi::NATIVE_DESCRIPTOR_SIZE,
-                version: abi::ABI_VERSION,
-                capabilities,
-                start_scoped,
-                metadata,
-                create,
-                destroy,
-                start,
-                read,
-                cancel,
-                ack,
+    unsafe extern "C" fn read_wake(
+        id: u64,
+        op: u64,
+        out: *mut u8,
+        cap: usize,
+        len: *mut usize,
+        waker: *const abi::NativeHostWakerV1,
+    ) -> i32 {
+        abi::ffi_guard(|| unsafe { adapter().read_wake(id, op, out, cap, len, waker) })
+    }
+    const fn descriptor(capabilities: u64) -> abi::NativePluginDescriptorV3HostWakeV1 {
+        abi::NativePluginDescriptorV3HostWakeV1 {
+            base: abi::NativePluginDescriptorV3 {
+                base: abi::NativePluginDescriptor {
+                    size: abi::NATIVE_DESCRIPTOR_SIZE_HOST_WAKE_V1,
+                    version: abi::ABI_VERSION,
+                    capabilities: capabilities | abi::CAP_HOST_WAKE_V1,
+                    start_scoped,
+                    metadata,
+                    create,
+                    destroy,
+                    start,
+                    read,
+                    cancel,
+                    ack,
+                },
+                declarations,
             },
-            declarations,
+            read_wake,
         }
     }
-    pub(in super::super) static DESCRIPTOR: abi::NativePluginDescriptorV3 =
+    pub(in super::super) static DESCRIPTOR: abi::NativePluginDescriptorV3HostWakeV1 =
         descriptor(abi::SCOPED_CAPABILITIES);
     /// An older guest that never negotiated the retained activation port.
-    pub(super) static WITHOUT_ACTIVATION_PORT: abi::NativePluginDescriptorV3 =
+    pub(super) static WITHOUT_ACTIVATION_PORT: abi::NativePluginDescriptorV3HostWakeV1 =
         descriptor(abi::SCOPED_CAPABILITIES & !abi::CAP_RETAINED_LIFECYCLE);
     /// A guest advertising a capability bit this host does not understand.
-    pub(super) static UNKNOWN_CAPABILITY: abi::NativePluginDescriptorV3 =
+    pub(super) static UNKNOWN_CAPABILITY: abi::NativePluginDescriptorV3HostWakeV1 =
         descriptor(abi::SCOPED_CAPABILITIES | (1 << 40));
 }
 
@@ -269,9 +282,10 @@ async fn static_activation_services_outlive_activate_and_fail_closed_at_deactiva
 async fn dynamic_activation_services_outlive_activate_and_fail_closed_at_deactivation() {
     // SAFETY: the descriptor is this test binary's own in-process adapter,
     // owned by the process handle for the artifact's whole lifetime.
-    let artifact =
-        unsafe { DefinitionArtifact::from_process_descriptor(&raw const native::DESCRIPTOR.base) }
-            .unwrap();
+    let artifact = unsafe {
+        DefinitionArtifact::from_process_descriptor(&raw const native::DESCRIPTOR.base.base)
+    }
+    .unwrap();
     exercise(artifact, native::captured()).await;
 }
 
@@ -279,7 +293,9 @@ async fn dynamic_activation_services_outlive_activate_and_fail_closed_at_deactiv
 async fn dynamic_guest_without_activation_port_is_never_handed_call_scoped_services() {
     // SAFETY: as above; same in-process adapter, narrower advertised bits.
     let artifact = unsafe {
-        DefinitionArtifact::from_process_descriptor(&raw const native::WITHOUT_ACTIVATION_PORT.base)
+        DefinitionArtifact::from_process_descriptor(
+            &raw const native::WITHOUT_ACTIVATION_PORT.base.base,
+        )
     }
     .unwrap();
     let recorder = Arc::new(Recorder::default());
@@ -304,7 +320,7 @@ async fn dynamic_guest_without_activation_port_is_never_handed_call_scoped_servi
 fn dynamic_guest_with_unknown_capability_bits_is_rejected_at_load() {
     // SAFETY: as above; validation must reject before any operation runs.
     let error = unsafe {
-        DefinitionArtifact::from_process_descriptor(&raw const native::UNKNOWN_CAPABILITY.base)
+        DefinitionArtifact::from_process_descriptor(&raw const native::UNKNOWN_CAPABILITY.base.base)
     }
     .err()
     .expect("unknown capability bits are rejected")

@@ -105,6 +105,16 @@ pub enum PluginError {
     #[error("plugin '{plugin_id}' cannot depend on itself")]
     PluginDependencyOnSelf { plugin_id: String },
 
+    /// The plugin declared `bundled_only`: it needs host facilities plug-rt
+    /// does not proxy into dynamic libraries, so it must ship bundled.
+    #[error("plugin '{plugin_id}' is bundled-only and cannot load as a dynamic library: {reason}")]
+    BundledOnlyPlugin { plugin_id: String, reason: String },
+
+    /// The dynamic library cannot be served by the host runtime (not built in
+    /// dynamic mode, plug-rt ABI mismatch, or loaded outside the runtime).
+    #[error("plugin '{plugin_id}' cannot use the host runtime: {details}")]
+    DynamicRuntimeUnavailable { plugin_id: String, details: String },
+
     #[error(
         "plugin '{plugin_id}' declares invalid dependency version requirement for '{dependency_id}': '{version_req}' ({details})"
     )]

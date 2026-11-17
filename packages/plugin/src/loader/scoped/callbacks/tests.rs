@@ -469,7 +469,9 @@ fn callback_workers_use_the_selected_reactor_not_the_observers() {
             execution.scope.id(),
             entry,
             Box::new(move || {
-                assert_eq!(std::thread::current().name(), Some("plugin-callback"));
+                // A blocking-pool thread of the selected runtime, not a
+                // thread created for this callback.
+                assert_eq!(std::thread::current().name(), Some(name));
                 wait.recv_timeout(std::time::Duration::from_secs(5))
                     .unwrap();
                 tokio::runtime::Handle::current().block_on(async move {

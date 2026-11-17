@@ -70,7 +70,6 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll, Wake, Waker},
-    time::Duration,
 };
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -263,13 +262,20 @@ enum ArtifactBackend {
     Dynamic(Arc<DynamicArtifact>),
 }
 struct DynamicArtifact {
-    // Every instance and retained operation keeps this owner alive.
-    _library: Library,
+    // Never unloaded: once plug-rt is installed the host holds plugin wakers,
+    // futures and drop functions, so the library must outlive every reference.
+    _library: std::mem::ManuallyDrop<Library>,
     artifact_copy: Option<tempfile::TempDir>,
     descriptor: &'static NativePluginDescriptor,
-    // Present only when the guest negotiated `CAP_HOST_WAKE_V1`. `None` is an
-    // explicit legacy guest, which the ABI requires hosts to repoll periodically.
-    read_wake: Option<abi::NativeReadWakeV1>,
+    // Guests must negotiate `CAP_HOST_WAKE_V1`: operations are driven by real
+    // wakers only, never by host repolling.
+    read_wake: abi::NativeReadWakeV1,
+    // The plug-rt table installed into this library. `None` only for this
+    // test process's own in-process descriptors, which share the host's
+    // runtime statics.
+    plug_rt: Option<&'static bmux_plugin_runtime::rt::host::PlugRtHost>,
+    // Declared by plugins that use host facilities plug-rt does not proxy.
+    bundled_only: Option<String>,
     // Copied once from this retained library's validated v3 declaration export.
     // Never substitute discovery metadata or another implementation's contracts.
     service_contracts: Vec<bmux_plugin_sdk::definition::DeclaredServiceContract>,
@@ -304,7 +310,46 @@ impl DefinitionArtifact {
                 .map_err(|e| failure(e.to_string()))?;
             unsafe { entry() }
         };
-        unsafe { Self::from_descriptor(library, pointer) }
+        let install = unsafe {
+            library.get::<bmux_plugin_runtime::rt::abi::PlugRtInstallV1>(
+                bmux_plugin_runtime::rt::abi::INSTALL_SYMBOL.as_bytes(),
+            )
+        }
+        .map(|symbol| *symbol)
+        .ok();
+        let mut artifact = unsafe { Self::from_descriptor(library, pointer) }?;
+        let plugin_id = artifact.metadata.plugin_id.clone();
+        let ArtifactBackend::Dynamic(owner) = &mut artifact.backend else {
+            return Err(failure("native load produced a static artifact"));
+        };
+        if let Some(reason) = &owner.bundled_only {
+            return Err(PluginError::BundledOnlyPlugin {
+                plugin_id,
+                reason: reason.clone(),
+            });
+        }
+        let install = install.ok_or_else(|| PluginError::DynamicRuntimeUnavailable {
+            plugin_id: plugin_id.clone(),
+            details: format!(
+                "library does not export {}; rebuild it with the plugin packager",
+                bmux_plugin_runtime::rt::abi::INSTALL_SYMBOL
+            ),
+        })?;
+        let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+            PluginError::DynamicRuntimeUnavailable {
+                plugin_id: plugin_id.clone(),
+                details: format!("dynamic plugins load inside the host runtime: {error}"),
+            }
+        })?;
+        let host = bmux_plugin_runtime::rt::host::PlugRtHost::new(runtime, plugin_id.clone());
+        // SAFETY: `install` is this library's export and the library is never
+        // unloaded (`DynamicArtifact::_library` is never dropped).
+        unsafe { host.install(install) }
+            .map_err(|details| PluginError::DynamicRuntimeUnavailable { plugin_id, details })?;
+        Arc::get_mut(owner)
+            .ok_or_else(|| failure("artifact unexpectedly shared during loading"))?
+            .plug_rt = Some(host);
+        Ok(artifact)
     }
 
     /// Adopt this test process's own in-process adapter descriptor as a
@@ -349,7 +394,13 @@ impl DefinitionArtifact {
         let metadata = serde_json::from_slice(&bytes).map_err(|e| failure(e.to_string()))?;
         let read_wake = unsafe { abi::validate_descriptor_host_wake(pointer) }
             .map_err(|code| failure(format!("unsupported native host-wake descriptor: {code}")))?
-            .map(|extension| extension.read_wake);
+            .map(|extension| extension.read_wake)
+            .ok_or_else(|| {
+                failure(
+                    "native guest lacks CAP_HOST_WAKE_V1; legacy repolled guests are unsupported",
+                )
+            })?;
+        let mut bundled_only = None;
         let service_contracts = if descriptor.version == abi::ABI_VERSION {
             let extension = unsafe { abi::validate_descriptor_v3(pointer) }
                 .map_err(|code| failure(format!("unsupported native v3 descriptor: {code}")))?;
@@ -361,6 +412,7 @@ impl DefinitionArtifact {
                 serde_json::from_slice(&declarations)
                     .map_err(|error| failure(error.to_string()))?;
             validate_native_service_contracts(&declarations.modeled_service_contracts)?;
+            bundled_only = declarations.bundled_only;
             declarations.modeled_service_contracts
         } else {
             Vec::new()
@@ -368,10 +420,12 @@ impl DefinitionArtifact {
         Ok(Self {
             metadata,
             backend: ArtifactBackend::Dynamic(Arc::new(DynamicArtifact {
-                _library: library,
+                _library: std::mem::ManuallyDrop::new(library),
                 artifact_copy: None,
                 descriptor,
                 read_wake,
+                plug_rt: None,
+                bundled_only,
                 service_contracts,
             })),
             bundled_executable: None,
@@ -548,6 +602,7 @@ impl DefinitionArtifact {
             return Err(failure("component role or required capability unavailable"));
         }
         let scope = InstanceScope::new(runtime);
+        let background = bmux_plugin_runtime::background::BackgroundTasks::new();
         // Attribute every holder of this instance to its plugin in diagnostics.
         scope
             .set_label(self.metadata.plugin_id.as_str())
@@ -576,27 +631,7 @@ impl DefinitionArtifact {
                 }
             }
             ArtifactBackend::Dynamic(artifact) => {
-                let input = encode_bounded(&context)?;
-                let mut handle = 0;
-                let created = unsafe {
-                    (artifact.descriptor.create)(input.as_ptr(), input.len(), &raw mut handle)
-                };
-                if created != abi::OK || handle == 0 {
-                    // A failed native create can have partially initialized code
-                    // or foreign cleanup requirements. Retain executable evidence
-                    // instead of unloading based on an uncertain return status.
-                    std::mem::forget(artifact.clone());
-                    scope
-                        .fail_cleanup(format!("native create failed: {created}"))
-                        .map_err(scope_error)?;
-                    return Err(failure(format!(
-                        "native create failed: {created}; artifact retained"
-                    )));
-                }
-                ExecutionBackend::Dynamic {
-                    artifact: artifact.clone(),
-                    handle,
-                }
+                create_native(artifact, &context, &scope, &background)?
             }
         };
         let verified_artifact = self.verified_for_context(&context);
@@ -610,7 +645,7 @@ impl DefinitionArtifact {
             retained_factory: Mutex::new(None),
             retained_dispatch: Mutex::new(None),
             verified_artifact,
-            background: bmux_plugin_runtime::background::BackgroundTasks::new(),
+            background,
             scope,
             context,
             backend,
@@ -641,6 +676,39 @@ impl DefinitionArtifact {
             .retained = Some(execution.clone());
         Ok(execution)
     }
+}
+
+fn create_native(
+    artifact: &Arc<DynamicArtifact>,
+    context: &PluginCreateContext,
+    scope: &InstanceScope,
+    background: &bmux_plugin_runtime::background::BackgroundTasks,
+) -> Result<ExecutionBackend> {
+    let input = encode_bounded(context)?;
+    let mut handle = 0;
+    let created =
+        unsafe { (artifact.descriptor.create)(input.as_ptr(), input.len(), &raw mut handle) };
+    if created != abi::OK || handle == 0 {
+        // A failed native create can have partially initialized code or
+        // foreign cleanup requirements. Retain executable evidence instead of
+        // unloading based on an uncertain return status.
+        std::mem::forget(artifact.clone());
+        scope
+            .fail_cleanup(format!("native create failed: {created}"))
+            .map_err(scope_error)?;
+        return Err(failure(format!(
+            "native create failed: {created}; artifact retained"
+        )));
+    }
+    if let Some(plug_rt) = artifact.plug_rt {
+        // Work the instance spawns through plug-rt joins the same activation
+        // scope as bundled work.
+        plug_rt.bind_scope(handle, background.clone());
+    }
+    Ok(ExecutionBackend::Dynamic {
+        artifact: artifact.clone(),
+        handle,
+    })
 }
 
 /// The actual selected reactor owner, shared by an instance and the callback
@@ -2602,27 +2670,18 @@ impl LoadedExecution {
         call.observe(context.waker());
         let polled = self.poll_call(&call, id, context);
         if matches!(polled, Ok(Poll::Pending)) {
-            self.arm_pending_wakes(&call, context.waker())?;
+            Self::arm_pending_wakes(&call)?;
         }
         polled
     }
 
-    fn arm_pending_wakes(&self, call: &Arc<Call>, waker: &Waker) -> Result<()> {
+    fn arm_pending_wakes(call: &Arc<Call>) -> Result<()> {
         if let Some(deadline) = call.deadline
             && !call.deadline_armed.swap(true, Ordering::AcqRel)
         {
             wake::wake_at(
                 deadline,
                 Waker::from(Arc::new(DeadlineWake(Arc::downgrade(call)))),
-            )?;
-        }
-        if let ExecutionBackend::Dynamic { artifact, .. } = &self.backend
-            && artifact.read_wake.is_none()
-        {
-            // Legacy guest: it polls with a no-op waker and promises no wake.
-            wake::wake_at(
-                std::time::Instant::now() + wake::LEGACY_NATIVE_REPOLL,
-                waker.clone(),
             )?;
         }
         Ok(())
@@ -2668,6 +2727,8 @@ impl LoadedExecution {
         }
         let result = catch_unwind(AssertUnwindSafe(|| -> Result<Poll<NativeOutcome>> {
             if let Some(future) = &mut future {
+                // Bundled plug-rt spawns made while polling join this scope.
+                let _scope = self.background.enter();
                 return Ok(future.as_mut().poll(context));
             }
             let ExecutionBackend::Dynamic { artifact, handle } = &self.backend else {
@@ -2676,24 +2737,18 @@ impl LoadedExecution {
             if call.cancellation.is_cancelled() {
                 status(unsafe { (artifact.descriptor.cancel)(*handle, id) })?;
             }
-            let bytes = if let Some(read_wake) = artifact.read_wake {
-                // The guest retains its own references; ours ends with this read.
-                let waker = abi::HostWaker::new(context.waker());
-                read_bounded(|out, length| unsafe {
-                    read_wake(
-                        *handle,
-                        id,
-                        out.as_mut_ptr(),
-                        out.len(),
-                        length,
-                        waker.as_ptr(),
-                    )
-                })?
-            } else {
-                read_bounded(|out, length| unsafe {
-                    (artifact.descriptor.read)(*handle, id, out.as_mut_ptr(), out.len(), length)
-                })?
-            };
+            // The guest retains its own references; ours ends with this read.
+            let waker = abi::HostWaker::new(context.waker());
+            let bytes = read_bounded(|out, length| unsafe {
+                (artifact.read_wake)(
+                    *handle,
+                    id,
+                    out.as_mut_ptr(),
+                    out.len(),
+                    length,
+                    waker.as_ptr(),
+                )
+            })?;
             bytes.map_or(Ok(Poll::Pending), |bytes| {
                 serde_json::from_slice(&bytes)
                     .map(Poll::Ready)
@@ -3117,24 +3172,19 @@ impl LoadedExecution {
             .drain_until(bmux_plugin_runtime::teardown_deadline())
             .await
             .map_err(scope_error)?;
+        // Abort work still owned by the activation scope (plugin futures are
+        // dropped through the plugin's own drop function), wait for blocking
+        // jobs until the deadline and report stragglers, then stop resolving
+        // the instance's plug-rt scope before releasing the instance.
+        self.background
+            .abort_and_settle(bmux_plugin_runtime::teardown_deadline())
+            .await;
         if let ExecutionBackend::Dynamic { artifact, handle } = &self.backend {
-            // Native runtime retirement has no wake protocol (it joins the
-            // guest runtime thread), so it is retried within the host's
-            // explicit teardown budget rather than a hidden fixed cap.
-            let deadline = bmux_plugin_runtime::teardown_deadline();
-            loop {
-                let retired = unsafe { (artifact.descriptor.destroy)(*handle) };
-                if retired != abi::BUSY {
-                    status(retired)?;
-                    break;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(failure(
-                        "native runtime retirement pending; artifact retained",
-                    ));
-                }
-                tokio::time::sleep(Duration::from_millis(2)).await;
+            if let Some(plug_rt) = artifact.plug_rt {
+                plug_rt.unbind_scope(*handle);
             }
+            // The guest owns no runtime: destruction completes synchronously.
+            status(unsafe { (artifact.descriptor.destroy)(*handle) })?;
         }
         self.scope.finish().map_err(scope_error)?;
         let mut state = self
@@ -3454,20 +3504,13 @@ fn static_operation_with_tasks(
             NativeOperation::Activate(mut context) => {
                 context.callback_execution = callback.clone();
                 let result = if let Some(tasks) = &tasks {
-                    match bmux_plugin_sdk::HostAsyncHandle::try_current() {
-                        Ok(runtime) => {
-                            implementation
-                                .activate_scoped_async(
-                                    context,
-                                    host_services.clone(),
-                                    runtime.with_background_tasks(tasks.clone()),
-                                )
-                                .await
-                        }
-                        Err(error) => Err(bmux_plugin_sdk::PluginCommandError::failed(format!(
-                            "selected async activation runtime unavailable: {error}"
-                        ))),
-                    }
+                    implementation
+                        .activate_scoped_async(
+                            context,
+                            host_services.clone(),
+                            bmux_plugin_sdk::HostAsyncHandle::new(tasks.clone()),
+                        )
+                        .await
                 } else {
                     implementation
                         .activate_scoped(context, host_services.clone())
@@ -3575,6 +3618,7 @@ fn read_bounded(mut read: impl FnMut(&mut [u8], &mut usize) -> i32) -> Result<Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn unverified_static_definition_has_no_artifact_receipt() {
@@ -4968,6 +5012,16 @@ mod tests {
         .expect("selected activation polling failed")
     }
 
+    thread_local! {
+        static OBSERVER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    /// Synchronous author code runs on the host runtime's blocking pool,
+    /// never on the observing async thread.
+    fn assert_blocking_pool() {
+        assert!(!OBSERVER.with(std::cell::Cell::get));
+        assert!(tokio::runtime::Handle::try_current().is_ok());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn selected_factory_instance_binds_adapter_lifecycle_before_author_effects() {
@@ -4979,7 +5033,7 @@ mod tests {
                 &mut self,
                 _: NativeLifecycleContext,
             ) -> std::result::Result<i32, bmux_plugin_sdk::PluginCommandError> {
-                assert_eq!(std::thread::current().name(), Some("plugin-callback"));
+                assert_blocking_pool();
                 self.0.fetch_add(1, Ordering::AcqRel);
                 Ok(0)
             }
@@ -4987,11 +5041,12 @@ mod tests {
                 &mut self,
                 _: NativeLifecycleContext,
             ) -> std::result::Result<i32, bmux_plugin_sdk::PluginCommandError> {
-                assert_eq!(std::thread::current().name(), Some("plugin-callback"));
+                assert_blocking_pool();
                 self.0.fetch_add(1, Ordering::AcqRel);
                 Ok(0)
             }
         }
+        OBSERVER.with(|observer| observer.set(true));
         for bound in [false, true] {
             let effects = Arc::new(AtomicUsize::new(0));
             let author_effects = effects.clone();

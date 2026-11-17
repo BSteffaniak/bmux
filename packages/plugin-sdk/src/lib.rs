@@ -98,6 +98,9 @@ mod wire_event_sink;
 
 pub use bmux_codec as codec;
 pub use bmux_perf_telemetry as perf_telemetry;
+/// plug-rt: spawn, blocking work and timers on the host's single runtime.
+/// Plugin code uses this instead of building or reaching a runtime directly.
+pub use bmux_plugin_runtime::rt;
 pub use cancellation::{
     CancellationToken, PluginCancellationToken, PluginInvocationId, ServiceCancellation,
 };
