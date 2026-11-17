@@ -195,7 +195,11 @@ interface pairing-peer-commands {
 // provenance; ordinary local and admitted callers are rejected.
 @capability(CONNECTIONS_PAIRING)
 interface admission-provider-state {
-    query probe() -> uuid;
+    // A listener start confirms its admission backend from inside its own
+    // pairing invocation, so the host's probe re-enters this instance on the
+    // same call chain. It reads only the immutable instance id and its sole
+    // outbound call is the `@reentrant` clients provenance query.
+    @reentrant query probe() -> uuid;
     query validate(subject_id: uuid, lease_id: uuid) -> bool;
 }
 @capability(CONNECTIONS_PAIRING)

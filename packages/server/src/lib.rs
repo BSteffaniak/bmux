@@ -443,8 +443,17 @@ impl SerializedAdmissionAuthority {
     /// the one the provider's probe invocation needs, so the probe stalls
     /// until its deadline. This dispatches on the current runtime instead,
     /// under the same capacity bound and deadline.
+    ///
+    /// `host_dispatch_context` is the requesting invocation's opaque host
+    /// context. The probe is a nested call of that invocation, so it carries
+    /// the same host-local call-chain context exactly like any nested
+    /// `InvokeService`: without it, a host that serializes provider entries
+    /// cannot tell the probe apart from unrelated work and may queue it
+    /// behind work that waits for the requester itself. It confers no
+    /// authority; the probe still runs host-internal.
     async fn probe_async(
         &self,
+        host_dispatch_context: Option<Arc<dyn std::any::Any + Send + Sync>>,
     ) -> Result<Uuid, bmux_plugin::stream_admission::StreamAdmissionError> {
         use bmux_plugin::stream_admission::StreamAdmissionError;
         let state = self.state.upgrade().ok_or(StreamAdmissionError)?;
@@ -455,7 +464,7 @@ impl SerializedAdmissionAuthority {
             tracing::warn!(%error, "stream admission probe encoding failed");
         })?;
         let context = ServiceInvokeContext {
-            host_dispatch_context: None,
+            host_dispatch_context,
             host_internal: true,
             state: Arc::clone(&state),
             shutdown_tx: watch::channel(false).0,
@@ -701,7 +710,7 @@ impl ServiceInvokeContext {
             // instance; only how the probe waits differs from admission.
             let authority_id = match backend {
                 Some(backend) => backend
-                    .probe_async()
+                    .probe_async(self.host_dispatch_context.clone())
                     .await
                     .ok()
                     .filter(|id| *id == backend.instance),
@@ -5184,6 +5193,98 @@ mod tests {
         retention
             .publish(owner, "replacement".into(), vec![])
             .unwrap();
+    }
+
+    // A provider can ask for its own admission backend from inside one of its
+    // invocations; the host's probe is then a nested call of that invocation
+    // and must carry its host-local call-chain context like any nested call.
+    #[tokio::test]
+    async fn admission_backend_probe_inherits_requester_host_dispatch_context() {
+        use bmux_plugin::stream_admission::{
+            StreamAdmissionProviderDeclaration, StreamAdmissionProviderOperation,
+        };
+        struct Marker(u64);
+        let server = BmuxServer::new(IpcEndpoint::unix_socket("provider-chain-test"));
+        let instance = Uuid::new_v4();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let operation = |name: &str| StreamAdmissionProviderOperation {
+            capability: "example.admission".into(),
+            interface_id: "admission-state/v1".into(),
+            operation: name.into(),
+            contract: [3; 32],
+        };
+        let declaration = StreamAdmissionProviderDeclaration {
+            probe: operation("probe"),
+            consume: operation("consume"),
+            validate: operation("validate"),
+            deadline_ms: 1000,
+            max_in_flight: 2,
+        };
+        let route = |name: &str| ServiceRoute {
+            capability: "example.admission".into(),
+            interface_id: "admission-state/v1".into(),
+            operation: name.into(),
+            kind: if name == "consume" {
+                bmux_ipc::InvokeServiceKind::Command
+            } else {
+                bmux_ipc::InvokeServiceKind::Query
+            },
+        };
+        for name in ["probe", "consume", "validate"] {
+            let seen = Arc::clone(&seen);
+            server
+                .register_checked_service_handler_with_metadata(
+                    "example.admission",
+                    route(name).kind,
+                    "admission-state/v1",
+                    name,
+                    move |_, context, _| {
+                        let seen = Arc::clone(&seen);
+                        async move {
+                            seen.lock()
+                                .unwrap()
+                                .push(context.host_dispatch_context::<Marker>()?.map(|m| m.0));
+                            Ok(ServiceInvokeOutput::from(
+                                bmux_plugin_sdk::service_contract::encode_response(
+                                    &bmux_plugin_sdk::encode_service_message(&instance)?,
+                                ),
+                            ))
+                        }
+                    },
+                )
+                .unwrap();
+        }
+        let routes = StreamAdmissionProviderRoutes {
+            probe: route("probe"),
+            consume: route("consume"),
+            validate: route("validate"),
+        };
+        server
+            .install_stream_admission_provider(
+                routes,
+                Arc::new(declaration),
+                Duration::from_secs(1),
+                2,
+            )
+            .unwrap();
+        // The install-time probe has no requester.
+        assert_eq!(seen.lock().unwrap().as_slice(), [None]);
+        let requester = server
+            .host_service_context()
+            .with_host_dispatch_context(Arc::new(Marker(7)));
+        assert_eq!(
+            decode::<Response>(
+                &requester
+                    .execute_raw(encode(&Request::StreamAdmissionBackend).unwrap())
+                    .await
+                    .unwrap()
+            )
+            .unwrap(),
+            Response::Ok(ResponsePayload::StreamAdmissionBackend {
+                authority_id: Some(instance)
+            })
+        );
+        assert_eq!(seen.lock().unwrap().as_slice(), [None, Some(7)]);
     }
 
     #[tokio::test]

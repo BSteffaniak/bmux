@@ -958,9 +958,6 @@ impl ProductionPlugin {
                     bmux_plugin_sdk::ServiceCancellation::new,
                     crate::runtime::plugin_kernel::AuthenticatedServiceInvocation::cancellation,
                 );
-                let kernel = authority
-                    .clone()
-                    .and_then(|authority| self.granted_kernel_dispatch(authority));
                 let invocation = execution.begin_invocation_scope()?;
                 let runtime = host_runtime(execution)?;
                 let binding = if let Some(parent) = callback_parent {
@@ -968,6 +965,11 @@ impl ProductionPlugin {
                 } else {
                     execution.bind_root_callback(invocation.clone(), cancellation)?
                 };
+                let kernel = self
+                    .kernel_grant
+                    .as_ref()
+                    .zip(authority.clone())
+                    .map(|(grant, authority)| grant.bind_context(authority, binding.clone()));
                 let dispatch = KernelServices {
                     declaration: self.declaration.clone(),
                     instance: execution.scope().id(),
@@ -1037,7 +1039,6 @@ impl ProductionPlugin {
         &self,
         context: &bmux_plugin_sdk::NativeServiceContext,
         authority: crate::runtime::plugin_kernel::AuthenticatedServiceInvocation,
-        kernel: Option<Arc<dyn bmux_plugin::InvocationKernelDispatch>>,
     ) -> bmux_plugin_sdk::Result<bmux_plugin_sdk::ServiceResponse> {
         let Backend::Scoped(execution) = &self.backend else {
             return authority.with_legacy_process_context(|| self.invoke_service_sync(context));
@@ -1046,7 +1047,7 @@ impl ProductionPlugin {
             provider = self.declaration.id.as_str(),
             interface = context.request.service.interface_id.as_str(),
             operation = context.request.operation.as_str(),
-            kernel_granted = kernel.is_some(),
+            kernel_granted = self.kernel_grant.is_some(),
             "scoped authenticated provider dispatch"
         );
         let invocation = execution.begin_invocation_scope().map_err(|error| failure(format!(
@@ -1055,6 +1056,7 @@ impl ProductionPlugin {
         )))?;
         let cancellation = authority.cancellation();
         let callback_parent = authority.callback_parent()?;
+        let kernel_authority = self.kernel_grant.as_ref().map(|_| authority.clone());
         let host = Arc::new(KernelServices {
             declaration: self.declaration.clone(),
             instance: execution.scope().id(),
@@ -1078,6 +1080,13 @@ impl ProductionPlugin {
         } else {
             execution.bind_root_callback(invocation.clone(), cancellation)?
         };
+        // Kernel requests made inside the author entry carry that entry as
+        // their call-chain parent, like the entered host route below.
+        let kernel = self
+            .kernel_grant
+            .as_ref()
+            .zip(kernel_authority)
+            .map(|(grant, authority)| grant.bind_context(authority, binding.clone()));
         let host = binding.host_dispatch(Arc::new(move |entry| {
             Ok(Arc::new((host).with_callback_parent(entry)))
         }));
@@ -1112,15 +1121,6 @@ impl ProductionPlugin {
             NativeOutcome::Service(response) => Ok(response),
             _ => Err(failure("unexpected authenticated service outcome")),
         }
-    }
-
-    pub(in crate::runtime) fn granted_kernel_dispatch(
-        &self,
-        authority: crate::runtime::plugin_kernel::AuthenticatedServiceInvocation,
-    ) -> Option<Arc<dyn bmux_plugin::InvocationKernelDispatch>> {
-        self.kernel_grant
-            .as_ref()
-            .map(|grant| grant.bind_context(authority))
     }
 
     pub(in crate::runtime) async fn invoke_service(

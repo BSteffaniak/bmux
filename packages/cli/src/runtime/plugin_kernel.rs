@@ -1190,8 +1190,7 @@ impl AuthenticatedServiceInvocation {
         let _cancel_on_observer_drop = CancelProviderOnDrop(self.cancellation.clone());
         let runtime = self.runtime.clone();
         Self::dispatch_host_callback(runtime, move || {
-            let kernel = provider.granted_kernel_dispatch(self.clone());
-            provider.invoke_service_authenticated_sync(&context, self.clone(), kernel)
+            provider.invoke_service_authenticated_sync(&context, self.clone())
         })
         .await
         .map_err(anyhow::Error::from)

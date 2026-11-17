@@ -291,19 +291,29 @@ pub(super) struct InstanceKernelGrant {
     authorize: KernelRequestAuthorizer,
 }
 impl InstanceKernelGrant {
+    /// Bind this grant to one invocation's server-authenticated authority.
+    ///
+    /// A request issued while the author holds `callback`'s entry carries that
+    /// entry as its call-chain parent, exactly like an entered host service
+    /// call, so anything the host re-enters to answer it (e.g. a provider
+    /// probe) is a descendant of this entry rather than unrelated work.
+    /// Requests made outside the entry keep the invocation's own ancestry.
     pub(super) fn bind_context(
         &self,
         authority: AuthenticatedServiceInvocation,
+        callback: bmux_plugin::CallbackBinding,
     ) -> Arc<dyn InvocationKernelDispatch> {
         Arc::new(GrantedInvocation {
             grant: self.clone(),
             authority,
+            callback,
         })
     }
 }
 struct GrantedInvocation {
     grant: InstanceKernelGrant,
     authority: AuthenticatedServiceInvocation,
+    callback: bmux_plugin::CallbackBinding,
 }
 impl InvocationKernelDispatch for GrantedInvocation {
     fn execute(&self, invocation: &InvocationScope, request: &[u8]) -> Result<Vec<u8>> {
@@ -318,6 +328,14 @@ impl InvocationKernelDispatch for GrantedInvocation {
             .try_admit()
             .map_err(|error| denied(error.to_string()))?;
         (self.grant.authorize)(request)?;
-        self.authority.execute(invocation, request)
+        self.callback.active_entry().ok().map_or_else(
+            || self.authority.execute(invocation, request),
+            |entry| {
+                self.authority
+                    .clone()
+                    .with_callback_parent(&entry)
+                    .execute(invocation, request)
+            },
+        )
     }
 }
