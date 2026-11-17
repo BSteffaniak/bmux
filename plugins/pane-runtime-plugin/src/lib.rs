@@ -395,17 +395,17 @@ impl RustPlugin for PaneRuntimePlugin {
         &mut self,
         context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
-        runtime::activate_managed_scope();
-        application_resurrection::activate(&context);
         // The host handles this activation received; every runtime, handler
         // and task reaches the host through them.
         let states = bmux_plugin::activation_state_registry(&context);
         let events = bmux_plugin::activation_event_bus(&context);
         self.host = runtime::PaneRuntimeHost::new(states, events);
         let host = &self.host;
+        runtime::activate_managed_scope(host);
+        application_resurrection::activate(host, &context);
         readiness::activate(host, &context);
-        runtime::supervisor::activate(&context);
-        runtime::reservations::activate(&context);
+        runtime::supervisor::activate(host, &context);
+        runtime::reservations::activate(host, &context);
         // Register the focus-state channel so subscribers (e.g.
         // the decoration plugin) can observe the focused pane per
         // session. Seeded empty — `publish_focus_state_snapshot`

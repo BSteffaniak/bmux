@@ -6,28 +6,31 @@ use std::fmt::Write as FmtWrite;
 #[cfg(test)]
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::OnceLock;
 
 #[cfg(test)]
 #[path = "supervisor_tests.rs"]
 mod tests;
 
-static INSTALLATION: OnceLock<Mutex<Option<Installation>>> = OnceLock::new();
-static SETTLED: OnceLock<Mutex<std::collections::BTreeSet<String>>> = OnceLock::new();
+/// One activation's supervisor installation and the executions it settled.
+#[derive(Default)]
+pub(crate) struct SupervisorAuthority {
+    installation: Mutex<Option<Installation>>,
+    settled: std::sync::Arc<Mutex<std::collections::BTreeSet<String>>>,
+}
 
 /// Retained locators not settled by this owner require explicit recovery.
-pub(crate) fn idle_blocker() -> Option<String> {
-    let installation = match INSTALLATION.get() {
-        Some(installation) => match installation.lock() {
-            Ok(installation) => installation,
-            Err(_) => return Some("supervisor installation authority poisoned".into()),
-        },
-        None => return Some("supervisor installation authority unavailable".into()),
+pub(crate) fn idle_blocker(host: &crate::runtime::PaneRuntimeHost) -> Option<String> {
+    let authority = host.supervisor();
+    let Ok(installation) = authority.installation.lock() else {
+        return Some("supervisor installation authority poisoned".into());
     };
     let Some(installation) = installation.as_ref() else {
         return Some("execution supervisor installation unavailable".into());
     };
-    let Ok(settled) = SETTLED.get_or_init(Mutex::default).lock() else {
+    let Ok(settled) = authority.settled.lock() else {
         return Some("supervisor settlement authority unavailable".into());
     };
     let entries = match std::fs::read_dir(&installation.root) {
@@ -67,7 +70,10 @@ mod backend;
 use backend::Lifetime;
 #[cfg(all(test, unix))]
 use backend::{StartupChild, negotiate_guardian, short_endpoint_directory};
-pub(crate) fn activate(context: &bmux_plugin_sdk::NativeLifecycleContext) {
+pub(crate) fn activate(
+    host: &crate::runtime::PaneRuntimeHost,
+    context: &bmux_plugin_sdk::NativeLifecycleContext,
+) {
     let resolved = context.auxiliary_executables.get("execution-supervisor");
     let installation = resolved
         .filter(|artifact| artifact.protocol_version == protocol::VERSION)
@@ -76,14 +82,15 @@ pub(crate) fn activate(context: &bmux_plugin_sdk::NativeLifecycleContext) {
             hash: artifact.artifact_sha256.clone(),
             root: PathBuf::from(&context.connection.runtime_dir),
         });
-    *INSTALLATION
-        .get_or_init(|| Mutex::new(None))
+    *host
+        .supervisor()
+        .installation
         .lock()
         .expect("supervisor installation lock") = installation;
 }
 
 #[cfg(test)]
-pub(super) fn install_test_artifact() -> anyhow::Result<()> {
+pub(super) fn install_test_artifact(host: &crate::runtime::PaneRuntimeHost) -> anyhow::Result<()> {
     static ROOT: OnceLock<tempfile::TempDir> = OnceLock::new();
     static ARTIFACT: OnceLock<(PathBuf, String)> = OnceLock::new();
     static FIXTURE_LOCK: Mutex<()> = Mutex::new(());
@@ -131,8 +138,9 @@ pub(super) fn install_test_artifact() -> anyhow::Result<()> {
         let _ = ARTIFACT.set((path, hash));
     }
     let (path, hash) = ARTIFACT.get().expect("fixture snapshot initialized");
-    *INSTALLATION
-        .get_or_init(|| Mutex::new(None))
+    *host
+        .supervisor()
+        .installation
         .lock()
         .map_err(|_| anyhow::anyhow!("supervisor installation lock poisoned"))? =
         Some(Installation {
@@ -158,6 +166,8 @@ pub(super) fn select_backend(
 
 pub(super) struct SupervisorControl {
     _admission: crate::runtime::managed_idle::Admission,
+    /// The owning activation's settlement record.
+    settled: std::sync::Arc<Mutex<std::collections::BTreeSet<String>>>,
     directory: PathBuf,
     token: String,
     authentication: String,
@@ -180,13 +190,14 @@ impl SupervisorControl {
         token: uuid::Uuid,
     ) -> anyhow::Result<(Self, bmux_pty::SpawnCommand)> {
         #[cfg(test)]
-        install_test_artifact()?;
-        super::reservations::check_authority()?;
-        let admission = super::managed_idle::admit()?;
+        install_test_artifact(host)?;
+        super::reservations::check_authority(host)?;
+        let admission = super::managed_idle::admit(host)?;
         crate::readiness::check_admission(host)?;
         let version = protocol::VERSION;
-        let installation = INSTALLATION
-            .get_or_init(|| Mutex::new(None))
+        let installation = host
+            .supervisor()
+            .installation
             .lock()
             .map_err(|_| anyhow::anyhow!("supervisor installation lock poisoned"))?;
         let installation = installation.as_ref().ok_or_else(|| {
@@ -241,6 +252,7 @@ impl SupervisorControl {
         Ok((
             Self {
                 _admission: admission,
+                settled: std::sync::Arc::clone(&host.supervisor().settled),
                 directory,
                 endpoint,
                 token: token.to_string(),
@@ -274,7 +286,7 @@ impl SupervisorControl {
         if response.terminal_session_ended == Some(true)
             && response.cleanup_error.is_none()
             && response.capture_error.is_none()
-            && let Ok(mut settled) = SETTLED.get_or_init(Mutex::default).lock()
+            && let Ok(mut settled) = self.settled.lock()
         {
             settled.insert(self.token.clone());
         }

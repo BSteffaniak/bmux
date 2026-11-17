@@ -325,9 +325,8 @@ fn build_pane_runtime_payload(
     }
 
     Ok(PaneRuntimeSnapshotV1 {
-        managed_target_identity: crate::runtime::managed_target_identity()
-            .map_err(anyhow::Error::msg)?
-            .map(str::to_owned),
+        managed_target_identity: crate::runtime::managed_target_identity(host)
+            .map_err(anyhow::Error::msg)?,
         sessions: out,
     })
 }
@@ -360,10 +359,15 @@ fn validate_resume_policy(payload: &PaneRuntimeSnapshotV1) -> anyhow::Result<()>
     Ok(())
 }
 
-fn validate_payload_restore(payload: &PaneRuntimeSnapshotV1) -> anyhow::Result<()> {
+fn validate_payload_restore(
+    host: &crate::runtime::PaneRuntimeHost,
+    payload: &PaneRuntimeSnapshotV1,
+) -> anyhow::Result<()> {
     validate_snapshot_owner(
         payload.managed_target_identity.as_deref(),
-        crate::runtime::managed_target_identity().map_err(anyhow::Error::msg)?,
+        crate::runtime::managed_target_identity(host)
+            .map_err(anyhow::Error::msg)?
+            .as_deref(),
     )?;
     validate_resume_policy(payload)
 }
@@ -372,7 +376,7 @@ fn apply_pane_runtime_payload(
     host: &crate::runtime::PaneRuntimeHost,
     payload: &PaneRuntimeSnapshotV1,
 ) -> anyhow::Result<()> {
-    validate_payload_restore(payload)?;
+    validate_payload_restore(host, payload)?;
     let session_manager = host.session_handle();
     let runtime_manager = host.session_runtime_handle();
     let padding_handle = host
@@ -524,18 +528,17 @@ impl StatefulPlugin for PaneRuntimeStateful {
 
     fn validate_snapshot(&self, snapshot: &StatefulPluginSnapshot) -> StatefulPluginResult<()> {
         let decoded = decode_pane_runtime_snapshot(snapshot)?;
-        let owner = crate::runtime::managed_target_identity().map_err(|details| {
+        let owner = crate::runtime::managed_target_identity(&self.host).map_err(|details| {
             StatefulPluginError::RestoreFailed {
                 plugin: PANE_RUNTIME_PLUGIN_SNAPSHOT_ID.as_str().to_string(),
                 details,
             }
         })?;
-        validate_snapshot_owner(decoded.managed_target_identity.as_deref(), owner).map_err(
-            |error| StatefulPluginError::RestoreFailed {
+        validate_snapshot_owner(decoded.managed_target_identity.as_deref(), owner.as_deref())
+            .map_err(|error| StatefulPluginError::RestoreFailed {
                 plugin: PANE_RUNTIME_PLUGIN_SNAPSHOT_ID.as_str().to_string(),
                 details: error.to_string(),
-            },
-        )
+            })
     }
 
     fn restore_snapshot(&self, snapshot: StatefulPluginSnapshot) -> StatefulPluginResult<()> {

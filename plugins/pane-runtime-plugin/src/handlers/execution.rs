@@ -380,7 +380,7 @@ mod tests {
         );
         ctx.caller_client_id = None;
         let session = bmux_session_models::SessionId(Uuid::new_v4());
-        let command = with_local(ctx.clone(), || {
+        let command = with_local(host, ctx.clone(), || {
             local_command(host, b"queued".to_vec(), session)
         });
         let crate::runtime::PaneRuntimeCommand::AuthorizedInput(bytes, authority) = command else {
@@ -430,7 +430,7 @@ mod tests {
                 .send(Err("partial write; do not replay".into()))
                 .unwrap();
         });
-        let result = with_local_settled(ctx, || {
+        let result = with_local_settled(host, ctx, || {
             let _manager = manager.lock().unwrap();
             assert!(
                 sender

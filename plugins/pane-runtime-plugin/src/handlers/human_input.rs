@@ -51,9 +51,10 @@ pub(crate) fn push(
 }
 
 pub(crate) fn close(
+    host: &crate::runtime::PaneRuntimeHost,
     ctx: &NativeServiceContext,
     stream: &HumanInputStream,
 ) -> Result<(), HumanInputError> {
     authorize(ctx, &stream.execution)?;
-    crate::runtime::human_input::close(stream)
+    crate::runtime::human_input::close(host, stream)
 }

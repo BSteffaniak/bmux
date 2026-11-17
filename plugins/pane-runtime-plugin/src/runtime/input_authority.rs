@@ -8,30 +8,85 @@ const MAX_PENDING_WRITES: usize = 64;
 const MAX_INPUT_BYTES: usize = 65_536;
 const WRITE_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(10);
 // Shared capacity only: caller authority is captured separately in each command.
+// Process-wide because it bounds OS PTY writer work across every activation.
 static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
-thread_local! {
-    // Receipts are collected only during synchronous route execution. Waiting
-    // happens after the handler releases its manager locks, but before the host
-    // closes the invocation that authorizes the queued PTY writes.
-    static WRITE_RECEIPTS: std::cell::RefCell<Option<Vec<Result<WriteReceipt, String>>>> = const { std::cell::RefCell::new(None) };
+/// Process-wide PTY write queue capacity. It bounds OS writer threads and
+/// memory across every activation, so it is a true process resource bound,
+/// not per-instance state.
+fn write_slots() -> Arc<tokio::sync::Semaphore> {
+    Arc::clone(SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_WRITES))))
+}
+
+/// The input invocation one thread is synchronously executing for this
+/// activation: the service context that authorizes local input and the PTY
+/// write receipts it must settle before the invocation closes.
+#[derive(Default)]
+struct InvocationScope {
+    context: Option<bmux_plugin_sdk::NativeServiceContext>,
+    receipts: Option<Vec<Result<WriteReceipt, String>>>,
+}
+
+/// One activation's synchronous input invocations, keyed by the thread
+/// executing each. Owned by the activation's host handle (never a
+/// thread-local or process static), so an invocation of one instance never
+/// authorizes or collects writes for another instance on the same thread.
+#[derive(Default)]
+pub(crate) struct InputScopes(
+    std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, InvocationScope>>,
+);
+
+impl InputScopes {
+    fn with<R>(&self, f: impl FnOnce(&mut InvocationScope) -> R) -> R {
+        let mut scopes = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let id = std::thread::current().id();
+        let scope = scopes.entry(id).or_default();
+        let result = f(scope);
+        if scope.context.is_none() && scope.receipts.is_none() {
+            scopes.remove(&id);
+        }
+        drop(scopes);
+        result
+    }
+
+    fn replace_context(
+        &self,
+        context: Option<bmux_plugin_sdk::NativeServiceContext>,
+    ) -> Option<bmux_plugin_sdk::NativeServiceContext> {
+        self.with(|scope| std::mem::replace(&mut scope.context, context))
+    }
+
+    fn replace_receipts(
+        &self,
+        receipts: Option<Vec<Result<WriteReceipt, String>>>,
+    ) -> Option<Vec<Result<WriteReceipt, String>>> {
+        self.with(|scope| std::mem::replace(&mut scope.receipts, receipts))
+    }
+
+    fn context(&self) -> Option<bmux_plugin_sdk::NativeServiceContext> {
+        self.with(|scope| scope.context.clone())
+    }
 }
 
 pub(crate) fn with_local_settled<T>(
+    host: &crate::runtime::PaneRuntimeHost,
     context: bmux_plugin_sdk::NativeServiceContext,
     effect: impl FnOnce() -> T,
 ) -> Result<T, String> {
-    struct Restore(Option<Vec<Result<WriteReceipt, String>>>);
-    impl Drop for Restore {
+    struct Restore<'a>(&'a InputScopes, Option<Vec<Result<WriteReceipt, String>>>);
+    impl Drop for Restore<'_> {
         fn drop(&mut self) {
-            WRITE_RECEIPTS.with(|slot| {
-                slot.replace(self.0.take());
-            });
+            self.0.replace_receipts(self.1.take());
         }
     }
-    let _restore = Restore(WRITE_RECEIPTS.with(|slot| slot.replace(Some(Vec::new()))));
-    let output = with_local(context.clone(), effect);
-    let receipts = WRITE_RECEIPTS.with(|slot| slot.borrow_mut().take().unwrap_or_default());
+    let scopes = host.input_scopes();
+    let restore = Restore(scopes, scopes.replace_receipts(Some(Vec::new())));
+    let output = with_local(host, context.clone(), effect);
+    let receipts = scopes.replace_receipts(None).unwrap_or_default();
+    drop(restore);
     let settlement = settle(receipts);
     drop(context);
     settlement?;
@@ -64,11 +119,12 @@ fn settle(receipts: Vec<Result<WriteReceipt, String>>) -> Result<(), String> {
 /// # Errors
 /// Fails outside a settled invocation or beyond the admission bound: an
 /// unsettled write would be re-authorized after its invocation closed.
-pub(crate) fn settlement_receipt() -> Result<std::sync::mpsc::SyncSender<Result<(), String>>, String>
-{
-    WRITE_RECEIPTS.with(|slot| {
-        let mut receipts = slot.borrow_mut();
-        let receipts = receipts
+pub(crate) fn settlement_receipt(
+    host: &crate::runtime::PaneRuntimeHost,
+) -> Result<std::sync::mpsc::SyncSender<Result<(), String>>, String> {
+    host.input_scopes().with(|scope| {
+        let receipts = scope
+            .receipts
             .as_mut()
             .ok_or_else(|| "PTY input settlement scope missing".to_string())?;
         if receipts.len() >= MAX_PENDING_WRITES - 1 {
@@ -85,36 +141,44 @@ pub(crate) fn settled_local_command(
     bytes: Vec<u8>,
     session: bmux_session_models::SessionId,
 ) -> Result<super::PaneRuntimeCommand, super::SessionRuntimeError> {
-    WRITE_RECEIPTS.with(|slot| {
-        let mut receipts = slot.borrow_mut();
-        let Some(receipts) = receipts.as_mut() else {
-            return Ok(local_command(host, bytes, session));
+    let scopes = host.input_scopes();
+    let (settling, pending, context) = scopes.with(|scope| {
+        (
+            scope.receipts.is_some(),
+            scope.receipts.as_ref().map_or(0, Vec::len),
+            scope.context.clone(),
+        )
+    });
+    if !settling {
+        return Ok(local_command(host, bytes, session));
+    }
+    let prepare = || {
+        if pending >= MAX_PENDING_WRITES - 1 || bytes.len() > MAX_INPUT_BYTES {
+            return Err("PTY input admission bound exceeded".to_string());
+        }
+        let permit = write_slots()
+            .try_acquire_owned()
+            .map_err(|_| "PTY input queue full".to_string())?;
+        // The outer clone keeps the service context alive through receipt
+        // settlement, not merely until command construction.
+        let authority = context
+            .as_ref()
+            .map(|context| {
+                crate::handlers::execution::local_input_authority(host, context, session.0)
+            })
+            .ok_or_else(|| "PTY input invocation missing".to_string())?;
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        Ok((
+            super::PaneRuntimeCommand::AdmittedInput(bytes, sender, permit, authority),
+            receiver,
+        ))
+    };
+    let prepared = prepare();
+    scopes.with(|scope| {
+        let Some(receipts) = scope.receipts.as_mut() else {
+            return Err(super::SessionRuntimeError::Closed);
         };
-        let prepare = || {
-            if receipts.len() >= MAX_PENDING_WRITES - 1 || bytes.len() > MAX_INPUT_BYTES {
-                return Err("PTY input admission bound exceeded".to_string());
-            }
-            let permit = SLOTS
-                .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_WRITES)))
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| "PTY input queue full".to_string())?;
-            // The outer clone keeps the service context alive through receipt
-            // settlement, not merely until command construction.
-            let authority = LOCAL_INPUT
-                .with(|slot| {
-                    slot.borrow().as_ref().map(|context| {
-                        crate::handlers::execution::local_input_authority(host, context, session.0)
-                    })
-                })
-                .ok_or_else(|| "PTY input invocation missing".to_string())?;
-            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-            Ok((
-                super::PaneRuntimeCommand::AdmittedInput(bytes, sender, permit, authority),
-                receiver,
-            ))
-        };
-        match prepare() {
+        match prepared {
             Ok((command, receiver)) => {
                 receipts.push(Ok(receiver));
                 Ok(command)
@@ -130,24 +194,22 @@ pub(crate) fn settled_local_command(
     })
 }
 
-thread_local! {
-    // Synchronous ingress only; copied into commands, never read by PTY workers.
-    static LOCAL_INPUT: std::cell::RefCell<Option<bmux_plugin_sdk::NativeServiceContext>> = const { std::cell::RefCell::new(None) };
-}
-
 pub(crate) fn with_local<T>(
+    host: &crate::runtime::PaneRuntimeHost,
     context: bmux_plugin_sdk::NativeServiceContext,
     effect: impl FnOnce() -> T,
 ) -> T {
-    struct Restore(Option<bmux_plugin_sdk::NativeServiceContext>);
-    impl Drop for Restore {
+    struct Restore<'a>(
+        &'a InputScopes,
+        Option<bmux_plugin_sdk::NativeServiceContext>,
+    );
+    impl Drop for Restore<'_> {
         fn drop(&mut self) {
-            LOCAL_INPUT.with(|slot| {
-                slot.replace(self.0.take());
-            });
+            self.0.replace_context(self.1.take());
         }
     }
-    let _restore = Restore(LOCAL_INPUT.with(|slot| slot.replace(Some(context))));
+    let scopes = host.input_scopes();
+    let _restore = Restore(scopes, scopes.replace_context(Some(context)));
     effect()
 }
 
@@ -156,15 +218,15 @@ pub(crate) fn local_command(
     bytes: Vec<u8>,
     session: bmux_session_models::SessionId,
 ) -> super::PaneRuntimeCommand {
-    LOCAL_INPUT.with(|slot| match slot.borrow().as_ref() {
+    match host.input_scopes().context() {
         Some(context) => super::PaneRuntimeCommand::AuthorizedInput(
             bytes,
-            crate::handlers::execution::local_input_authority(host, context, session.0),
+            crate::handlers::execution::local_input_authority(host, &context, session.0),
         ),
         // In-process local input has no remote service caller. Remote legacy
         // routes are rejected at ingress, independently of permissions plugins.
         None => super::PaneRuntimeCommand::Input(bytes),
-    })
+    }
 }
 
 /// A bound host context (including cancellation and admission ownership), not a
@@ -283,10 +345,11 @@ mod tests {
     fn execution_write_receipts_require_and_join_invocation_settlement() {
         // Outside a settled invocation the write would be re-authorized after
         // its invocation closed, so it is refused rather than queued unsettled.
-        assert!(settlement_receipt().is_err());
-        WRITE_RECEIPTS.with(|slot| slot.replace(Some(Vec::new())));
-        let completion = settlement_receipt().unwrap();
-        let receipts = WRITE_RECEIPTS.with(|slot| slot.borrow_mut().take().unwrap());
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        assert!(settlement_receipt(&host).is_err());
+        host.input_scopes().replace_receipts(Some(Vec::new()));
+        let completion = settlement_receipt(&host).unwrap();
+        let receipts = host.input_scopes().replace_receipts(None).unwrap();
         assert_eq!(receipts.len(), 1);
         completion
             .send(Err("authority denied at write".into()))

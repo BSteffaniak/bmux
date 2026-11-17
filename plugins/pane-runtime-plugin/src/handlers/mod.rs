@@ -66,7 +66,7 @@ pub fn route(
     if let Err(error) = execution::authorize_route(&context) {
         return error;
     }
-    match crate::runtime::input_authority::with_local_settled(context.clone(), || {
+    match crate::runtime::input_authority::with_local_settled(host, context.clone(), || {
         route_authorized(host, context)
     }) {
         Ok(response) => response,
@@ -86,7 +86,7 @@ fn route_authorized(
     bmux_plugin_sdk::route_service!(context, {
         "pane-runtime-environment-v1", "capabilities" => |_req: (), _ctx| { Ok::<_, ServiceResponse>(2_u32) },
         "pane-runtime-environment-v1", "reserve" => |req: bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::client::ReserveRequest, ctx| {
-            Ok::<_, ServiceResponse>(crate::runtime::reservations::reserve_environment(req.launch_mutation_id, req.options, req.environment, |id| spawn::authorize_creation(ctx, id, "session.create").map_err(|error| bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalRecoveryError::Denied { reason: format!("{error:?}") })))
+            Ok::<_, ServiceResponse>(crate::runtime::reservations::reserve_environment(host, req.launch_mutation_id, req.options, req.environment, |id| spawn::authorize_creation(ctx, id, "session.create").map_err(|error| bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalRecoveryError::Denied { reason: format!("{error:?}") })))
         },
         "pane-runtime-pointer-grid-v1", "capabilities" => |_req: (), _ctx| {
             Ok::<_, ServiceResponse>(bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::GridCapabilities { format_versions: vec![1] })
@@ -148,7 +148,7 @@ fn route_authorized(
             Ok::<_, ServiceResponse>(execution::authorize(ctx, &req.execution, "pane.resize").and_then(|()| crate::runtime::execution::resize_ordered(host, &req.execution, req.cols, req.rows)))
         },
         "pane-runtime-presentation-v1", "capture-events" => |req: bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::client::CaptureEventsRequest, ctx| {
-            Ok::<_, ServiceResponse>(spawn::authorize_session(ctx, req.execution.session_id, "read").map_err(|error| bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalRecoveryError::Denied { reason: format!("{error:?}") }).and_then(|()| crate::runtime::reservations::capture_events(&req.execution, req.format, req.offset, req.max_bytes)))
+            Ok::<_, ServiceResponse>(spawn::authorize_session(ctx, req.execution.session_id, "read").map_err(|error| bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalRecoveryError::Denied { reason: format!("{error:?}") }).and_then(|()| crate::runtime::reservations::capture_events(host, &req.execution, req.format, req.offset, req.max_bytes)))
         },
         "pane-runtime-presentation-v1", "present" => |req: bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::client::PresentRequest, ctx| {
             pointer_grid::legacy(execution::authorize(ctx, &req.execution, "read").and_then(|()| crate::runtime::execution::screen(host, &req.execution)))
@@ -167,16 +167,16 @@ fn route_authorized(
             Ok::<_, ServiceResponse>(spawn::authorize_session(ctx, req.execution.session_id, "pane.direct_input").map_err(|error| bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalRecoveryError::Denied { reason: format!("{error:?}") }).and_then(|()| crate::runtime::reservations::send_admitted(host, &req.execution, req.input_mutation_id, req.data, execution::input_authority(ctx, &req.execution).map_err(|error| bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalRecoveryError::Denied { reason: format!("{error:?}") })?)))
         },
         "pane-runtime-execution-v4", "input-receipt" => |req: bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::client::InputReceiptRequest, ctx| {
-            Ok::<_, ServiceResponse>(spawn::authorize_session(ctx, req.execution.session_id, "read").map_err(|error| bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalRecoveryError::Denied { reason: format!("{error:?}") }).and_then(|()| crate::runtime::reservations::input_receipt(&req.execution, req.input_mutation_id)))
+            Ok::<_, ServiceResponse>(spawn::authorize_session(ctx, req.execution.session_id, "read").map_err(|error| bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalRecoveryError::Denied { reason: format!("{error:?}") }).and_then(|()| crate::runtime::reservations::input_receipt(host, &req.execution, req.input_mutation_id)))
         },
         "pane-runtime-execution-v4", "resolve" => |req: bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::client::ResolveRequest, ctx| {
             Ok::<_, ServiceResponse>(spawn::authorize_session(ctx, req.execution.session_id, "pane.close").map_err(|error| bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalRecoveryError::Denied { reason: format!("{error:?}") }).and_then(|()| crate::runtime::reservations::resolve(host, &req.execution, req.resolution_mutation_id, req.expected_revision, req.action, req.input_mutation_id, req.grace_ms, ctx)))
         },
         "pane-runtime-execution-v4", "capture-resume" => |req: bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::client::CaptureResumeRequest, ctx| {
-            Ok::<_, ServiceResponse>(spawn::authorize_session(ctx, req.cursor.execution.session_id, "read").map_err(|error| bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalRecoveryError::Denied { reason: format!("{error:?}") }).and_then(|()| crate::runtime::reservations::capture(req.cursor, req.max_bytes)))
+            Ok::<_, ServiceResponse>(spawn::authorize_session(ctx, req.cursor.execution.session_id, "read").map_err(|error| bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalRecoveryError::Denied { reason: format!("{error:?}") }).and_then(|()| crate::runtime::reservations::capture(host, req.cursor, req.max_bytes)))
         },
         "pane-runtime-execution-v4", "retire" => |req: bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::client::RetireRequest, ctx| {
-            Ok::<_, ServiceResponse>(spawn::authorize_session(ctx, req.execution.session_id, "pane.close").map_err(|error| bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalRecoveryError::Denied { reason: format!("{error:?}") }).and_then(|()| crate::runtime::reservations::retire(&req.execution, req.retirement_mutation_id, req.expected_revision)))
+            Ok::<_, ServiceResponse>(spawn::authorize_session(ctx, req.execution.session_id, "pane.close").map_err(|error| bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalRecoveryError::Denied { reason: format!("{error:?}") }).and_then(|()| crate::runtime::reservations::retire(host, &req.execution, req.retirement_mutation_id, req.expected_revision)))
         },
         "pane-runtime-execution-v4", "new-program-session" => |req: bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::client::NewProgramSessionRequest, ctx| {
             let context = ctx.clone();
@@ -194,7 +194,7 @@ fn route_authorized(
             Ok::<_, ServiceResponse>(human_input::push(host, ctx, &req.stream, req.sequence, req.data))
         },
         "pane-runtime-human-input-v1", "close" => |req: bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::client::CloseRequest, ctx| {
-            Ok::<_, ServiceResponse>(human_input::close(ctx, &req.stream))
+            Ok::<_, ServiceResponse>(human_input::close(host, ctx, &req.stream))
         },
         "pane-runtime-execution-v4", "status" => |req: bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::client::StatusRequest, ctx| {
             Ok::<_, ServiceResponse>(execution::authorize(ctx, &req.execution, "read").and_then(|()| crate::runtime::execution::status(host, &req.execution)))

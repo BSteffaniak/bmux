@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 pub(super) fn prepare(root: &Path) -> Result<PathBuf> {
     // Prepare before the first pane. Later panes must not reopen build outputs
     // which may have been removed or replaced since this process started.
+    // Process-wide by design: it pins this process's own executable images.
     static IMAGES: std::sync::OnceLock<
         std::sync::Mutex<std::collections::BTreeMap<PathBuf, (PathBuf, String)>>,
     > = std::sync::OnceLock::new();

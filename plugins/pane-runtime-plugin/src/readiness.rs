@@ -256,11 +256,11 @@ pub(crate) fn snapshot(host: &crate::runtime::PaneRuntimeHost) -> Result<Runtime
         .lock()
         .map_err(|_| "readiness lock poisoned")?
         .clone();
-    state.fenced |= crate::runtime::managed_idle::is_fenced()?;
+    state.fenced |= crate::runtime::managed_idle::is_fenced(host)?;
     state.restart_blocker = blocker(host, &state);
     if state.helper_ready
         && let Err(error) =
-            crate::runtime::reservations::check_authority().and_then(|()| verify_helper(host))
+            crate::runtime::reservations::check_authority(host).and_then(|()| verify_helper(host))
     {
         state.helper_ready = false;
         state.helper_error = Some(error.to_string());

@@ -9,7 +9,7 @@ use bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::{
     HumanInputAck, HumanInputCapabilities, HumanInputError, HumanInputStream,
 };
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Mutex, OnceLock, TryLockError};
+use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -20,10 +20,11 @@ const DEDUP_WINDOW: usize = 32;
 // Expiry invalidates an idle epoch; clients must never replay its pending bytes.
 const IDLE_EXPIRY: Duration = Duration::from_mins(30);
 
-static STREAMS: OnceLock<Registry> = OnceLock::new();
+/// One activation's ephemeral HUMAN input epochs.
+pub(crate) type HumanInputStreams = Registry;
 
 #[derive(Default)]
-struct Registry {
+pub(crate) struct Registry {
     streams: Mutex<BTreeMap<Uuid, Arc<Mutex<StreamState>>>>,
 }
 
@@ -253,7 +254,7 @@ pub(crate) fn open(
     execution: TerminalExecutionRef,
 ) -> Result<HumanInputStream, HumanInputError> {
     validate_live(host, &execution)?;
-    STREAMS.get_or_init(Registry::default).open(execution)
+    host.human_input().open(execution)
 }
 
 pub(crate) fn push(
@@ -263,7 +264,7 @@ pub(crate) fn push(
     data: Vec<u8>,
     authority: super::input_authority::InputAuthority,
 ) -> Result<HumanInputAck, HumanInputError> {
-    let registry = STREAMS.get_or_init(Registry::default);
+    let registry = host.human_input();
     if let Err(error) = validate_live(host, &stream.execution) {
         // This is observation, not durable reconciliation. No disk I/O occurs.
         // Invalidity never authorizes replay, including retained duplicate keys.
@@ -287,8 +288,22 @@ pub(crate) fn push(
 }
 
 /// Closes only volatile input state; recording finalization must drain separately.
-pub(crate) fn close(stream: &HumanInputStream) -> Result<(), HumanInputError> {
-    STREAMS.get_or_init(Registry::default).close(stream)
+pub(crate) fn close(
+    host: &crate::runtime::PaneRuntimeHost,
+    stream: &HumanInputStream,
+) -> Result<(), HumanInputError> {
+    host.human_input().close(stream)
+}
+
+/// Number of live epochs this activation holds (test observation only).
+#[cfg(test)]
+pub(crate) fn open_unvalidated_for_test(
+    host: &crate::runtime::PaneRuntimeHost,
+    execution: TerminalExecutionRef,
+) -> Result<usize, HumanInputError> {
+    let registry = host.human_input();
+    registry.open(execution)?;
+    Ok(registry.streams.lock().map_or(0, |streams| streams.len()))
 }
 
 #[cfg(test)]

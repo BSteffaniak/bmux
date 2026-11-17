@@ -29,9 +29,11 @@ fn missing_helper_fails_closed_even_for_ordinary_shells() {
 
 #[test]
 fn selected_backend_retains_guardian_command_not_application_argv() {
+    let host = crate::runtime::PaneRuntimeHost::detached();
     let artifact = std::env::temp_dir().join("bmux-test-execution-supervisor");
     let control = super::SupervisorControl {
-        _admission: crate::runtime::managed_idle::admit().unwrap(),
+        _admission: crate::runtime::managed_idle::admit(&host).unwrap(),
+        settled: std::sync::Arc::default(),
         directory: std::path::PathBuf::new(),
         endpoint: std::path::PathBuf::new(),
         token: "test".into(),
@@ -79,8 +81,10 @@ fn pane_lifetime_close_is_idempotent_and_control_drop_closes_lease() {
     use std::io::Read;
     use std::os::unix::net::UnixStream;
     fn control(socket: UnixStream) -> super::SupervisorControl {
+        let host = crate::runtime::PaneRuntimeHost::detached();
         super::SupervisorControl {
-            _admission: crate::runtime::managed_idle::admit().unwrap(),
+            _admission: crate::runtime::managed_idle::admit(&host).unwrap(),
+            settled: std::sync::Arc::default(),
             directory: std::path::PathBuf::new(),
             endpoint: std::path::PathBuf::new(),
             token: "test".into(),

@@ -1,7 +1,7 @@
 //! Managed retirement and short-lived admission, serialized with the real manager.
 use super::{SessionRuntimeManager, reservations};
 use bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::ManagedIdleStatus;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Default)]
@@ -21,10 +21,9 @@ struct Preparation {
 const PREPARATION_TTL: Duration = Duration::from_mins(1);
 const MAX_PREPARATIONS: usize = 128;
 
-fn authority() -> &'static Arc<Mutex<State>> {
-    static STATE: OnceLock<Arc<Mutex<State>>> = OnceLock::new();
-    STATE.get_or_init(|| Arc::new(Mutex::new(State::default())))
-}
+/// One activation's idle/retirement admission authority.
+#[derive(Clone, Default)]
+pub(crate) struct IdleAuthority(Arc<Mutex<State>>);
 
 /// Owned by actual preparation/cleanup, never by a connection or daemon lifetime.
 pub(crate) struct Admission(Arc<Mutex<State>>);
@@ -68,8 +67,10 @@ pub(crate) fn preparation(
             "managed runtime unavailable or draining; preparation refused before effects".into(),
         );
     }
-    super::managed_scope::selected()?.ok_or("runtime is not a managed companion")?;
-    let mut state = authority()
+    super::managed_scope::selected(host)?.ok_or("runtime is not a managed companion")?;
+    let mut state = host
+        .idle()
+        .0
         .lock()
         .map_err(|_| "idle admission lock poisoned")?;
     preparation_on(
@@ -141,15 +142,16 @@ fn preparation_on(
     }))
 }
 
-pub(crate) fn is_fenced() -> Result<bool, String> {
-    authority()
+pub(crate) fn is_fenced(host: &crate::runtime::PaneRuntimeHost) -> Result<bool, String> {
+    host.idle()
+        .0
         .lock()
         .map(|state| state.fenced)
         .map_err(|_| "idle admission lock poisoned".into())
 }
 
-pub(crate) fn admit() -> anyhow::Result<Admission> {
-    admit_on(authority())
+pub(crate) fn admit(host: &crate::runtime::PaneRuntimeHost) -> anyhow::Result<Admission> {
+    admit_on(&host.idle().0)
 }
 
 fn admit_on(authority: &Arc<Mutex<State>>) -> anyhow::Result<Admission> {
@@ -184,9 +186,11 @@ pub(crate) fn configure(
     {
         return Err("runtime was not explicitly launched as a managed companion".into());
     }
-    super::managed_scope::selected()?.ok_or("managed execution target scope unavailable")?;
+    super::managed_scope::selected(host)?.ok_or("managed execution target scope unavailable")?;
     {
-        let mut state = authority()
+        let mut state = host
+            .idle()
+            .0
             .lock()
             .map_err(|_| "idle admission lock poisoned")?;
         if state.fenced {
@@ -221,13 +225,16 @@ pub(crate) fn inspect(
     // Durable checks happen before manager locking: existing recovery diagnostics
     // may read manager state while holding the store. A concurrent mutation is
     // covered by its admission owner and resets grace even if it finishes here.
-    let retained_blocker = reservations::idle_blocker().or_else(super::supervisor::idle_blocker);
+    let retained_blocker =
+        reservations::idle_blocker(host).or_else(|| super::supervisor::idle_blocker(host));
     let retained_authority = reservations::retained_authority(host);
     let manager = handle
         .0
         .lock()
         .map_err(|_| "execution manager lock poisoned")?;
-    let mut state = authority()
+    let mut state = host
+        .idle()
+        .0
         .lock()
         .map_err(|_| "idle admission lock poisoned")?;
     let now = Instant::now();
@@ -254,7 +261,7 @@ pub(crate) fn inspect(
             })
         })
         .or(retained_blocker)
-        .or_else(|| match super::pane_shutdown_owners().lock() {
+        .or_else(|| match host.pane_shutdown_owners().lock() {
             Ok(owners) if owners.values().any(|owner| !owner.is_finished()) => {
                 Some("pane cleanup owner is still settling".into())
             }
@@ -324,17 +331,18 @@ fn update(state: &mut State, blocker: Option<&str>, now: Instant) {
 }
 
 #[cfg(test)]
-pub(super) fn admissions_settled_for_test() -> bool {
-    authority().lock().unwrap().admissions == 0
+pub(super) fn admissions_settled_for_test(host: &crate::runtime::PaneRuntimeHost) -> bool {
+    host.idle().0.lock().unwrap().admissions == 0
 }
 
 #[cfg(test)]
 pub(super) fn preparation_for_test(
+    host: &crate::runtime::PaneRuntimeHost,
     owner: uuid::Uuid,
     lease_id: Option<uuid::Uuid>,
     release: bool,
 ) -> uuid::Uuid {
-    let mut state = authority().lock().unwrap();
+    let mut state = host.idle().0.lock().unwrap();
     preparation_on(
         &mut state,
         uuid::Uuid::nil(),
@@ -349,7 +357,7 @@ pub(super) fn preparation_for_test(
 
 #[cfg(test)]
 pub(super) fn fence_for_test(manager: &SessionRuntimeManager) -> bool {
-    let mut state = authority().lock().unwrap();
+    let mut state = manager.host.idle().0.lock().unwrap();
     state.policy = Some(900);
     state.idle_since = Some(
         Instant::now()

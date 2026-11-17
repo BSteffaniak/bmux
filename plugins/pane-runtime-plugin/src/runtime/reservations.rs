@@ -17,20 +17,34 @@ struct StoredReservation {
     environment:
         Option<Vec<bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry>>,
 }
-static STORE: OnceLock<Mutex<Result<ReservationStore, String>>> = OnceLock::new();
-static STORE_HEALTH: OnceLock<Result<(), String>> = OnceLock::new();
-pub(crate) fn activate(context: &bmux_plugin_sdk::NativeLifecycleContext) {
+/// One activation's durable reservation store and its open health.
+#[derive(Default)]
+pub(crate) struct ReservationAuthority {
+    store: OnceLock<Mutex<Result<ReservationStore, String>>>,
+    health: OnceLock<Result<(), String>>,
+}
+pub(crate) fn activate(
+    host: &crate::runtime::PaneRuntimeHost,
+    context: &bmux_plugin_sdk::NativeLifecycleContext,
+) {
     let opened = open_activation_store(
+        host,
         &PathBuf::from(&context.connection.state_dir).join("pane-executions-v4"),
     )
     .map_err(|error| format!("{error:?}"));
-    let _ = STORE_HEALTH.set(opened.as_ref().map(|_| ()).map_err(Clone::clone));
-    let _ = STORE.set(Mutex::new(opened));
+    let authority = host.reservations();
+    let _ = authority
+        .health
+        .set(opened.as_ref().map(|_| ()).map_err(Clone::clone));
+    let _ = authority.store.set(Mutex::new(opened));
 }
 fn with_store<T>(
+    host: &crate::runtime::PaneRuntimeHost,
     action: impl FnOnce(&ReservationStore) -> Result<T, RecoveryError>,
 ) -> Result<T, RecoveryError> {
-    let store = STORE
+    let store = host
+        .reservations()
+        .store
         .get()
         .ok_or_else(|| RecoveryError::Unavailable {
             reason: "execution authority not activated".into(),
@@ -50,11 +64,12 @@ pub(crate) fn reserve(
     options: ProgramOptions,
     authorize: impl Fn(uuid::Uuid) -> Result<(), RecoveryError>,
 ) -> Result<LaunchReservation, RecoveryError> {
-    let _admission = super::managed_idle::admit().map_err(failed)?;
+    let _admission = super::managed_idle::admit(host).map_err(failed)?;
     crate::readiness::check_admission(host).map_err(failed)?;
-    with_store(|store| store.reserve(mutation, options, authorize))
+    with_store(host, |store| store.reserve(mutation, options, authorize))
 }
 pub(crate) fn reserve_environment(
+    host: &crate::runtime::PaneRuntimeHost,
     mutation: uuid::Uuid,
     options: ProgramOptions,
     environment: Vec<bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry>,
@@ -67,7 +82,9 @@ pub(crate) fn reserve_environment(
             reason: "complete environment cannot include overlay".into(),
         });
     }
-    with_store(|store| store.reserve_environment(mutation, options, Some(environment), authorize))
+    with_store(host, |store| {
+        store.reserve_environment(mutation, options, Some(environment), authorize)
+    })
 }
 pub(crate) fn launch(
     host: &crate::runtime::PaneRuntimeHost,
@@ -82,10 +99,10 @@ pub(super) fn launch_named(
     name: Option<String>,
     authorize: impl Fn(uuid::Uuid) -> anyhow::Result<()> + Send + Sync + 'static,
 ) -> Result<LaunchReceipt, RecoveryError> {
-    let _admission = super::managed_idle::admit().map_err(failed)?;
+    let _admission = super::managed_idle::admit(host).map_err(failed)?;
     // Drop storage mutex before awaiting runtime work: capture callbacks must
     // be able to persist progress while launch waits for startup publication.
-    let admitted = with_store(|store| {
+    let admitted = with_store(host, |store| {
         let mut stored = store.read(reservation.launch_mutation_id)?;
         authorize(stored.receipt.reservation.execution.session_id).map_err(|error| {
             RecoveryError::Denied {
@@ -120,8 +137,9 @@ pub(super) fn launch_named(
         }
         return Ok(admitted.1);
     }
-    let environment =
-        with_store(|store| Ok(store.read(reservation.launch_mutation_id)?.environment))?;
+    let environment = with_store(host, |store| {
+        Ok(store.read(reservation.launch_mutation_id)?.environment)
+    })?;
     let result = if let Some(environment) = environment {
         super::execution::create_reserved_environment(
             host,
@@ -140,7 +158,7 @@ pub(super) fn launch_named(
             authorize,
         )
     };
-    with_store(|store| {
+    with_store(host, |store| {
         let mut stored = store.read(reservation.launch_mutation_id)?;
         stored.receipt.revision += 1;
         match result {
@@ -173,15 +191,26 @@ fn validate_authority_directory(directory: &Path) -> Result<(), RecoveryError> {
     }
 }
 
-fn open_activation_store(domain: &Path) -> Result<ReservationStore, RecoveryError> {
+fn open_activation_store(
+    host: &crate::runtime::PaneRuntimeHost,
+    domain: &Path,
+) -> Result<ReservationStore, RecoveryError> {
     // Validate only the owned domain and target components, not arbitrary
     // ancestors: macOS /tmp and /var are legitimate platform aliases.
     validate_authority_directory(domain)?;
-    if super::managed_scope::selected().map_err(failed)?.is_some() {
+    if super::managed_scope::selected(host)
+        .map_err(failed)?
+        .is_some()
+    {
         validate_authority_directory(&domain.join("targets"))?;
     }
-    let root = super::managed_scope::execution_root(domain).map_err(failed)?;
-    open_scoped_store(&root, super::managed_scope::selected().map_err(failed)?)
+    let root = super::managed_scope::execution_root(host, domain).map_err(failed)?;
+    open_scoped_store(
+        &root,
+        super::managed_scope::selected(host)
+            .map_err(failed)?
+            .as_ref(),
+    )
 }
 
 fn open_scoped_store(
@@ -247,7 +276,7 @@ fn verify_or_create_marker(marker: &Path, expected: &str) -> Result<(), Recovery
 
 /// Diagnostic-only inventory. No old/foreign authority is adopted or deleted.
 pub(crate) fn retained_authority(host: &crate::runtime::PaneRuntimeHost) -> Vec<String> {
-    let Ok(Some(scope)) = super::managed_scope::selected() else {
+    let Ok(Some(scope)) = super::managed_scope::selected(host) else {
         return Vec::new();
     };
     let Ok(readiness) = crate::readiness::snapshot(host) else {
@@ -292,12 +321,24 @@ pub(crate) fn retained_authority(host: &crate::runtime::PaneRuntimeHost) -> Vec<
     retained
 }
 
-pub(crate) fn check_authority() -> anyhow::Result<()> {
-    if super::managed_scope::selected()
+/// Open this activation's store at `domain` (test fixture only).
+#[cfg(test)]
+pub(crate) fn activate_at_for_test(host: &crate::runtime::PaneRuntimeHost, domain: &Path) {
+    let opened = open_activation_store(host, domain).map_err(|error| format!("{error:?}"));
+    let authority = host.reservations();
+    let _ = authority
+        .health
+        .set(opened.as_ref().map(|_| ()).map_err(Clone::clone));
+    let _ = authority.store.set(Mutex::new(opened));
+}
+
+pub(crate) fn check_authority(host: &crate::runtime::PaneRuntimeHost) -> anyhow::Result<()> {
+    if super::managed_scope::selected(host)
         .map_err(anyhow::Error::msg)?
         .is_some()
     {
-        STORE_HEALTH
+        host.reservations()
+            .health
             .get()
             .ok_or_else(|| anyhow::anyhow!("managed execution authority not activated"))?
             .as_ref()
@@ -308,8 +349,8 @@ pub(crate) fn check_authority() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn idle_blocker() -> Option<String> {
-    with_store(|store| {
+pub(crate) fn idle_blocker(host: &crate::runtime::PaneRuntimeHost) -> Option<String> {
+    with_store(host, |store| {
         for entry in std::fs::read_dir(&store.root).map_err(failed)? {
             let entry = entry.map_err(failed)?;
             let name = entry.file_name();
@@ -720,9 +761,10 @@ mod tests {
 }
 
 pub(super) fn create_capture(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &ExecutionRef,
 ) -> Result<super::durable_capture::DurableCapture, RecoveryError> {
-    with_store(|store| {
+    with_store(host, |store| {
         super::durable_capture::DurableCapture::create(
             &store
                 .root
@@ -768,7 +810,7 @@ pub(crate) fn reconcile(
         TerminalCaptureIntegrity, TerminalReconciliation, TerminalSessionEnd,
     };
     let current = super::execution::status(host, reference);
-    with_store(|store| {
+    with_store(host, |store| {
         let mut stored = find(store, reference)?;
         let root = store
             .root
@@ -853,6 +895,7 @@ pub(crate) fn reconcile(
     })
 }
 pub(crate) fn capture(
+    host: &crate::runtime::PaneRuntimeHost,
     cursor: CaptureCursor,
     max_bytes: u32,
 ) -> Result<
@@ -862,7 +905,7 @@ pub(crate) fn capture(
     use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::{
         TerminalCaptureBatch, TerminalCaptureGap, TerminalCaptureResponse,
     };
-    with_store(|store| {
+    with_store(host, |store| {
         let stored = find(store, &cursor.execution)?;
         let oldest = stored.receipt.reservation.initial_cursor;
         if cursor.spool_generation != oldest.spool_generation {
@@ -897,6 +940,7 @@ pub(crate) fn capture(
 }
 
 pub(crate) fn capture_events(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &ExecutionRef,
     _format: bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::TerminalCaptureFormat,
     offset: u64,
@@ -905,7 +949,7 @@ pub(crate) fn capture_events(
     bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::TerminalEventBatch,
     RecoveryError,
 > {
-    with_store(|store| {
+    with_store(host, |store| {
         find(store, reference)?;
         let root = store
             .root
@@ -933,13 +977,14 @@ struct StoredInput {
     receipt: bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalInputReceipt,
 }
 pub(crate) fn input_receipt(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &ExecutionRef,
     mutation: uuid::Uuid,
 ) -> Result<
     bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalInputReceipt,
     RecoveryError,
 > {
-    with_store(|store| {
+    with_store(host, |store| {
         find(store, reference)?;
         let bytes = std::fs::read(store.root.join(format!(
             "input-{}-{mutation}.json",
@@ -1032,13 +1077,13 @@ pub(crate) fn send_admitted(
     use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::{
         TerminalInputPhase, TerminalInputReceipt,
     };
-    let _admission = super::managed_idle::admit().map_err(failed)?;
+    let _admission = super::managed_idle::admit(host).map_err(failed)?;
     if data.len() > 65536 {
         return Err(RecoveryError::InvalidOptions {
             reason: "input exceeds 65536 bytes".into(),
         });
     }
-    let claim = with_store(|store| {
+    let claim = with_store(host, |store| {
         find(store, reference)?;
         let path = store.root.join(format!(
             "input-{}-{mutation}.json",
@@ -1097,7 +1142,7 @@ pub(crate) fn send_admitted(
         return Ok(claim.1.receipt);
     }
     let result = super::execution::send_acknowledged(host, reference, data, authority);
-    with_store(|store| {
+    with_store(host, |store| {
         let mut stored = claim.1;
         stored.receipt.revision += 1;
         match result {
@@ -1123,6 +1168,7 @@ pub(crate) fn send_admitted(
 }
 
 pub(crate) fn retire(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &ExecutionRef,
     mutation: uuid::Uuid,
     expected: u64,
@@ -1133,8 +1179,8 @@ pub(crate) fn retire(
     use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::{
         TerminalInputPhase, TerminalRetirementReceipt,
     };
-    let _admission = super::managed_idle::admit().map_err(failed)?;
-    with_store(|store| {
+    let _admission = super::managed_idle::admit(host).map_err(failed)?;
+    with_store(host, |store| {
         let path = store.root.join(format!(
             "retire-{}-{mutation}.json",
             reference.execution_token
@@ -1248,10 +1294,10 @@ pub(crate) fn resolve(
     use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::{
         TerminalResolutionAction, TerminalResolutionReceipt,
     };
-    let _admission = super::managed_idle::admit().map_err(failed)?;
+    let _admission = super::managed_idle::admit(host).map_err(failed)?;
     let request = serde_json::to_vec(&(reference, mutation, expected, &action, input, grace))
         .map_err(failed)?;
-    let claim = with_store(|store| {
+    let claim = with_store(host, |store| {
         let path = store.root.join(format!(
             "resolve-{}-{mutation}.json",
             reference.execution_token
@@ -1317,11 +1363,13 @@ pub(crate) fn resolve(
         }
     };
     settle_resolution(
-        reference, mutation, expected, action, input, request, effect,
+        host, reference, mutation, expected, action, input, request, effect,
     )
 }
 
+#[allow(clippy::too_many_arguments)] // One durable settlement record: its owner plus the request facts it commits.
 fn settle_resolution(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &ExecutionRef,
     mutation: uuid::Uuid,
     expected: u64,
@@ -1336,7 +1384,7 @@ fn settle_resolution(
     use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::{
         TerminalInputPhase, TerminalResolutionAction, TerminalResolutionReceipt,
     };
-    with_store(|store| {
+    with_store(host, |store| {
         let mut stored = find(store, reference)?;
         if stored.receipt.revision != expected {
             return Err(RecoveryError::RevisionConflict {

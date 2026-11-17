@@ -63,14 +63,17 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{trace, warn};
 
-pub(crate) fn managed_target_identity() -> Result<Option<&'static str>, String> {
-    managed_scope::selected().map(|scope| scope.map(|scope| scope.identity.as_str()))
+pub(crate) fn managed_target_identity(host: &PaneRuntimeHost) -> Result<Option<String>, String> {
+    managed_scope::selected(host).map(|scope| scope.map(|scope| scope.identity))
 }
 
-pub(crate) fn activate_managed_scope() {
-    managed_scope::activate();
+/// Capture this activation's managed-target scope from its launch markers.
+pub(crate) fn activate_managed_scope(host: &PaneRuntimeHost) {
+    managed_scope::activate(host);
 }
 
+// Process-wide diagnostic: counts OS threads blocked in pane I/O across every
+// activation in this process (a thread budget, not per-instance state).
 static PANE_BLOCKING_THREAD_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 struct PaneBlockingThreadGuard {
@@ -163,6 +166,22 @@ pub(crate) struct PaneRuntimeHost {
     private_input: Arc<crate::private_input::PrivateInputState>,
     /// This activation's read-only observer connections.
     observers: Arc<Mutex<crate::handlers::attach_commands::ObserverIdentities>>,
+    /// This activation's managed-target scope, captured once at activation.
+    managed_scope: Arc<managed_scope::ManagedScope>,
+    /// This activation's managed idle/retirement admission authority.
+    idle: managed_idle::IdleAuthority,
+    /// This activation's execution supervisor installation and settlements.
+    supervisor: Arc<supervisor::SupervisorAuthority>,
+    /// This activation's durable execution reservation store.
+    reservations: Arc<reservations::ReservationAuthority>,
+    /// This activation's ephemeral HUMAN input epochs.
+    human_input: Arc<human_input::HumanInputStreams>,
+    /// This activation's synchronous input-invocation scopes.
+    input_scopes: Arc<input_authority::InputScopes>,
+    /// This activation's application-resurrection client, when enabled.
+    resurrection: Arc<crate::application_resurrection::ResurrectionClient>,
+    /// Owned pane cleanup tasks still settling for this activation.
+    shutdown_owners: Arc<Mutex<BTreeMap<Uuid, PaneShutdownOwner>>>,
 }
 
 impl std::fmt::Debug for PaneRuntimeHost {
@@ -193,7 +212,47 @@ impl PaneRuntimeHost {
             readiness: Arc::default(),
             private_input: Arc::default(),
             observers: Arc::default(),
+            managed_scope: Arc::default(),
+            idle: managed_idle::IdleAuthority::default(),
+            supervisor: Arc::default(),
+            reservations: Arc::default(),
+            human_input: Arc::default(),
+            input_scopes: Arc::default(),
+            resurrection: Arc::default(),
+            shutdown_owners: Arc::default(),
         }
+    }
+
+    pub(crate) fn managed_scope(&self) -> &managed_scope::ManagedScope {
+        &self.managed_scope
+    }
+
+    pub(crate) const fn idle(&self) -> &managed_idle::IdleAuthority {
+        &self.idle
+    }
+
+    pub(crate) fn supervisor(&self) -> &Arc<supervisor::SupervisorAuthority> {
+        &self.supervisor
+    }
+
+    pub(crate) fn reservations(&self) -> &reservations::ReservationAuthority {
+        &self.reservations
+    }
+
+    pub(crate) fn human_input(&self) -> &human_input::HumanInputStreams {
+        &self.human_input
+    }
+
+    pub(crate) fn input_scopes(&self) -> &input_authority::InputScopes {
+        &self.input_scopes
+    }
+
+    pub(crate) fn resurrection(&self) -> &crate::application_resurrection::ResurrectionClient {
+        &self.resurrection
+    }
+
+    pub(crate) fn pane_shutdown_owners(&self) -> &Mutex<BTreeMap<Uuid, PaneShutdownOwner>> {
+        &self.shutdown_owners
     }
 
     /// A host with an empty private registry and no bus (no host supplied).
@@ -564,12 +623,6 @@ async fn shutdown_runtime_handle(host: &crate::runtime::PaneRuntimeHost, removed
 // Unlike a detached JoinHandle, this registry makes outstanding cleanup owned.
 type PaneShutdownOwner = JoinHandle<std::result::Result<(), String>>;
 
-fn pane_shutdown_owners() -> &'static Mutex<BTreeMap<Uuid, PaneShutdownOwner>> {
-    static OWNERS: std::sync::OnceLock<Mutex<BTreeMap<Uuid, PaneShutdownOwner>>> =
-        std::sync::OnceLock::new();
-    OWNERS.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
 async fn shutdown_panes(host: &crate::runtime::PaneRuntimeHost, panes: Vec<PaneRuntimeHandle>) {
     if let Err(error) = shutdown_panes_result(host, panes).await {
         warn!(%error, "pane shutdown failed; cleanup owner retained until settlement");
@@ -741,9 +794,9 @@ async fn shutdown_panes_owned(
     let id = Uuid::new_v4();
     let (begin, admission) = oneshot::channel();
     let (settled, settlement) = oneshot::channel();
-    let host = host.clone();
+    let task_host = host.clone();
     let owner = tokio::spawn(async move {
-        let host = &host;
+        let host = &task_host;
         if admission.await.is_err() {
             return Ok(());
         }
@@ -821,7 +874,7 @@ async fn shutdown_panes_owned(
             pane.lifetime.revoke();
         }
         drop(panes);
-        pane_shutdown_owners()
+        host.pane_shutdown_owners()
             .lock()
             .expect("pane shutdown owners lock")
             .remove(&id);
@@ -835,7 +888,7 @@ async fn shutdown_panes_owned(
         }
         result
     });
-    pane_shutdown_owners()
+    host.pane_shutdown_owners()
         .lock()
         .expect("pane shutdown owners lock")
         .insert(id, owner);
@@ -1157,6 +1210,8 @@ mod pointer_query_tests {
 /// replay marker read from a pane appends `S frame written_ns read_ns`, beside the attach client's
 /// lines for when the frame reached the host.
 fn note_replay_markers_read(bytes: &[u8]) {
+    // Process-wide debug log file opened from the process environment; a
+    // diagnostic sink, not per-instance state.
     static LOG: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
         std::sync::OnceLock::new();
     let Some(file) = LOG.get_or_init(|| {
@@ -1561,20 +1616,26 @@ struct PreparedCleanup {
 }
 
 impl PreparedCleanup {
-    fn reserve() -> Result<Arc<Self>> {
+    fn reserve(host: &PaneRuntimeHost) -> Result<Arc<Self>> {
+        // Process-wide bound on concurrent cleanup tasks: they hold OS
+        // resources (threads, PTYs) shared by every activation in this process.
         static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
-        Self::reserve_from(Arc::clone(
-            SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(64))),
-        ))
+        Self::reserve_from(
+            host,
+            Arc::clone(SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(64)))),
+        )
     }
 
-    fn reserve_from(slots: Arc<tokio::sync::Semaphore>) -> Result<Arc<Self>> {
+    fn reserve_from(
+        host: &PaneRuntimeHost,
+        slots: Arc<tokio::sync::Semaphore>,
+    ) -> Result<Arc<Self>> {
         let runtime = tokio::runtime::Handle::try_current()?;
         let permit = slots.try_acquire_owned().map_err(|_| {
             spawn_failure(bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError::Busy)
         })?;
         Ok(Arc::new(Self {
-            _admission: managed_idle::admit()?,
+            _admission: managed_idle::admit(host)?,
             runtime,
             _permit: permit,
         }))
@@ -6141,7 +6202,7 @@ impl SessionRuntimeManager {
     ) -> Result<(), SessionRuntimeError> {
         let host = self.host.clone();
         let host = &host;
-        let _admission = managed_idle::admit().map_err(|_| SessionRuntimeError::Closed)?;
+        let _admission = managed_idle::admit(host).map_err(|_| SessionRuntimeError::Closed)?;
         let runtime = self
             .runtimes
             .get_mut(&session)
@@ -6251,6 +6312,8 @@ fn layout_from_panes(panes: &[PaneRuntimeMeta]) -> Option<PaneLayoutNode> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ProcessStartIdentity(u64, u64);
 
+// Process-wide bound on in-flight OS process-identity probes: they occupy OS
+// threads shared by every activation in this process.
 static PROCESS_IDENTITY_PROBES: AtomicUsize = AtomicUsize::new(0);
 
 fn startup_stop_requested(stop: &mut oneshot::Receiver<()>) -> bool {
@@ -6659,13 +6722,13 @@ impl SessionRuntimeManager {
             &bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalExecutionRef,
         >,
     ) -> Result<PreparedFreshRuntime> {
-        reservations::check_authority()?;
+        reservations::check_authority(&self.host)?;
         validate_initial_shell_options(options.as_ref())?;
         if self.runtimes.contains_key(&session_id) {
             anyhow::bail!("runtime already exists for session {}", session_id.0);
         }
 
-        let cleanup = PreparedCleanup::reserve()?;
+        let cleanup = PreparedCleanup::reserve(&self.host)?;
         let first_pane_id = reserved.map_or_else(Uuid::new_v4, |reference| reference.pane_id);
         let managed_program = launch.is_some();
         let pane_meta = PaneRuntimeMeta {
@@ -6728,8 +6791,8 @@ impl SessionRuntimeManager {
         panes: &[PaneRuntimeMeta],
         request: RestoreRuntimeRequest,
     ) -> Result<()> {
-        reservations::check_authority()?;
-        let _admission = managed_idle::admit()?;
+        reservations::check_authority(&self.host)?;
+        let _admission = managed_idle::admit(&self.host)?;
         let RestoreRuntimeRequest {
             layout_root,
             focused_pane_id,
@@ -7161,6 +7224,7 @@ impl SessionRuntimeManager {
                 None
             } else {
                 match crate::application_resurrection::prepare(
+                    &host,
                     pane_id.to_string(),
                     restoring,
                     launch.is_none(),
@@ -8625,7 +8689,7 @@ impl SessionRuntimeManager {
             .lock()
             .map_err(|_| anyhow::anyhow!("split target metadata poisoned"))?
             .observation_execution;
-        let cleanup = PreparedCleanup::reserve()?;
+        let cleanup = PreparedCleanup::reserve(&self.host)?;
         let prefix = match direction {
             PaneSplitDirection::Vertical => "v",
             PaneSplitDirection::Horizontal => "h",
@@ -9004,8 +9068,8 @@ impl SessionRuntimeManager {
     ) -> Result<Uuid> {
         let host = self.host.clone();
         let host = &host;
-        let _admission = managed_idle::admit()?;
-        reservations::check_authority()?;
+        let _admission = managed_idle::admit(host)?;
+        reservations::check_authority(host)?;
         let (pane_meta, padding_override, padding_override_persistence) = {
             let session = self
                 .runtimes
@@ -9154,8 +9218,8 @@ impl SessionRuntimeManager {
         context_id: Option<Uuid>,
         client_id: Option<ClientId>,
     ) -> Result<FloatingPaneRuntimeSummary> {
-        let _admission = managed_idle::admit()?;
-        reservations::check_authority()?;
+        let _admission = managed_idle::admit(&self.host)?;
+        reservations::check_authority(&self.host)?;
         let (target_pane_id, next_pane_name, shell, client_ids) = {
             let session = self
                 .runtimes
@@ -9987,7 +10051,7 @@ impl SessionRuntimeManager {
     ) -> Result<(), SessionRuntimeError> {
         let host = self.host.clone();
         let host = &host;
-        let _admission = managed_idle::admit().map_err(|_| SessionRuntimeError::Closed)?;
+        let _admission = managed_idle::admit(host).map_err(|_| SessionRuntimeError::Closed)?;
         if crate::handlers::attach_commands::observer_identity(host, client_id) {
             return Err(SessionRuntimeError::NotAttached);
         }
@@ -12843,6 +12907,7 @@ pub(crate) fn observe_spawn_directory(
 
 // Timed-out OS calls retain their admission slot until they actually finish.
 // There is no queue: a stalled filesystem cannot accumulate detached workers.
+// Process-wide because the stalled OS threads it bounds are process-wide.
 static DIRECTORY_PROBES: AtomicUsize = AtomicUsize::new(0);
 const MAX_DIRECTORY_PROBES: usize = 4;
 
@@ -13146,6 +13211,8 @@ fn bounded_probe_output(
 ) -> std::io::Result<Vec<u8>> {
     use std::io::{Read, Seek};
     use std::process::Stdio;
+    // Process-wide bound on concurrent OS subprocess probes (threads and pipes
+    // shared by every activation in this process).
     static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     let permit = Arc::clone(SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4))))
         .try_acquire_owned()
@@ -13536,7 +13603,8 @@ impl bmux_plugin_runtime::shutdown::ShutdownParticipant for PaneRuntimeShutdown 
             // receipt while their tasks still own OS reapers. They also fence
             // unloading, even though their panes are no longer in the manager.
             let owners = {
-                let mut owners = pane_shutdown_owners()
+                let mut owners = host
+                    .pane_shutdown_owners()
                     .lock()
                     .map_err(|_| "pane shutdown owners lock poisoned".to_string())?;
                 std::mem::take(&mut *owners)
@@ -13747,6 +13815,39 @@ mod tests {
             SessionId(pane),
         );
         assert!(right.observers().lock().unwrap().is_empty());
+
+        // Each activation owns its reservation store and HUMAN input epochs.
+        let domain = tempfile::tempdir().expect("reservation domain");
+        reservations::activate_at_for_test(&left, domain.path());
+        assert_eq!(reservations::idle_blocker(&left), None);
+        assert!(
+            reservations::idle_blocker(&right)
+                .is_some_and(|blocker| blocker.contains("not activated")),
+            "an activation never reaches another activation's store"
+        );
+        let execution =
+            bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalExecutionRef {
+                session_id: Uuid::new_v4(),
+                pane_id: pane,
+                execution_token: Uuid::new_v4(),
+            };
+        assert_eq!(
+            human_input::open_unvalidated_for_test(&left, execution.clone()),
+            Ok(1)
+        );
+        assert_eq!(
+            human_input::open_unvalidated_for_test(&left, execution.clone()),
+            Ok(2)
+        );
+        assert_eq!(
+            human_input::open_unvalidated_for_test(&right, execution),
+            Ok(1)
+        );
+        // Idle authority is per activation too.
+        let admission = managed_idle::admit(&left).expect("left admission");
+        assert!(!managed_idle::admissions_settled_for_test(&left));
+        assert!(managed_idle::admissions_settled_for_test(&right));
+        drop(admission);
 
         for host in [&first, &second] {
             let removed = host
@@ -13984,13 +14085,14 @@ mod tests {
     #[cfg(windows)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn windows_program_startup_answers_conpty_query_then_captures_and_drains() {
-        supervisor::install_test_artifact()
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        supervisor::install_test_artifact(&host)
             .expect("explicit coordinator-built supervisor artifact");
         let session_id = SessionId(Uuid::new_v4());
         let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
         let program = std::env::var("COMSPEC").expect("Windows command interpreter");
         let mut manager = SessionRuntimeManager::new(
-            PaneRuntimeHost::detached(),
+            host.clone(),
             program.clone(),
             "xterm-256color".into(),
             protocol_profile_for_term("xterm-256color"),
@@ -14065,12 +14167,13 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn program_first_pane_captures_fast_literal_argv_and_drains() {
-        supervisor::install_test_artifact()
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        supervisor::install_test_artifact(&host)
             .expect("explicit coordinator-built supervisor artifact");
         let session_id = SessionId(Uuid::new_v4());
         let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager::new(
-            PaneRuntimeHost::detached(),
+            host.clone(),
             "/bin/sh".into(),
             "xterm-256color".into(),
             protocol_profile_for_term("xterm-256color"),
@@ -14122,14 +14225,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn initial_shell_uses_conventional_owner_preserves_cwd_and_natural_tail() {
         use std::os::unix::fs::PermissionsExt;
-        supervisor::install_test_artifact().unwrap();
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        supervisor::install_test_artifact(&host).unwrap();
         let root = tempfile::tempdir().unwrap();
         let shell = root.path().join("owned-shell");
         std::fs::write(&shell, "#!/bin/sh\npwd > witness\nprintf TAIL\n").unwrap();
         std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
         let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager::new(
-            PaneRuntimeHost::detached(),
+            host.clone(),
             shell.to_str().unwrap().into(),
             "xterm-256color".into(),
             protocol_profile_for_term("xterm-256color"),
@@ -14191,7 +14295,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn conventional_session_drains_startup_backpressure_and_retires_owner() {
-        supervisor::install_test_artifact()
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        supervisor::install_test_artifact(&host)
             .expect("explicit coordinator-built supervisor artifact");
         let session_id = SessionId(Uuid::new_v4());
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[Uuid::new_v4()]));
@@ -14269,7 +14374,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn supervised_fast_exit_drains_startup_backpressure_before_retirement() {
-        supervisor::install_test_artifact()
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        supervisor::install_test_artifact(&host)
             .expect("explicit coordinator-built supervisor artifact");
         let session_id = SessionId(Uuid::new_v4());
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[Uuid::new_v4()]));
@@ -14457,7 +14563,7 @@ exit 7"#
     async fn ended_terminal_preserves_escaped_descendant_without_late_signal_authority() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        supervisor::install_test_artifact()
+        supervisor::install_test_artifact(host)
             .expect("explicit coordinator-built supervisor artifact");
         let session_id = SessionId(Uuid::new_v4());
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[Uuid::new_v4()]));
@@ -14611,7 +14717,8 @@ exit 7"#
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn injected_reader_failure_cleans_live_process_and_acknowledges_threads() {
-        supervisor::install_test_artifact()
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        supervisor::install_test_artifact(&host)
             .expect("explicit coordinator-built supervisor artifact");
         let session_id = SessionId(Uuid::new_v4());
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[Uuid::new_v4()]));
@@ -16952,7 +17059,7 @@ exit 7"#
     async fn failed_sweep_revokes_open_slave_even_when_shutdown_waiter_is_cancelled() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        supervisor::install_test_artifact().unwrap();
+        supervisor::install_test_artifact(host).unwrap();
         let (control, child, pty, endpoint) = tokio::task::spawn_blocking(|| {
             let pty = bmux_pty::PtyPair::open(PtySize { rows: 24, cols: 80 }).unwrap();
             let (control, command) = supervisor::SupervisorControl::prepare(
@@ -22120,11 +22227,9 @@ exit 7"#
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn managed_idle_fence_serializes_real_prepare_attach_and_restore() {
         const CHILD: &str = "BMUX_TEST_MANAGED_IDLE_AUTHORITY_CHILD";
-        let host = crate::runtime::PaneRuntimeHost::detached();
-        let host = &host;
         if std::env::var_os(CHILD).is_none() {
-            // Exercise the real singleton admission authority in a fresh process;
-            // its sticky fence must not poison unrelated concurrently running tests.
+            // Exercise the real admission authority in a fresh process without
+            // inherited managed-target markers.
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -22143,6 +22248,9 @@ exit 7"#
         let client = ClientId(Uuid::new_v4());
         let pane = Uuid::new_v4();
         let mut manager = manager_with_runtime(session, runtime_with_panes(&[pane]));
+        // The idle authority under test is the manager's own activation's.
+        let manager_host = manager.host.clone();
+        let host = &manager_host;
         manager.begin_attach(session, client).unwrap();
         assert!(!managed_idle::fence_for_test(&manager));
         manager.end_attach(session, client);
@@ -22160,16 +22268,16 @@ exit 7"#
         )
         .await;
         let prepared_connection = Uuid::new_v4();
-        let lease = managed_idle::preparation_for_test(prepared_connection, None, false);
+        let lease = managed_idle::preparation_for_test(host, prepared_connection, None, false);
         assert!(
             !managed_idle::fence_for_test(&manager),
             "prepared connection blocks idle before any runtime exists"
         );
         assert_eq!(
-            managed_idle::preparation_for_test(prepared_connection, Some(lease), false),
+            managed_idle::preparation_for_test(host, prepared_connection, Some(lease), false),
             lease
         );
-        managed_idle::preparation_for_test(prepared_connection, Some(lease), true);
+        managed_idle::preparation_for_test(host, prepared_connection, Some(lease), true);
         let prepared = manager.prepare_fresh_runtime(session, None).unwrap();
         assert!(
             !managed_idle::fence_for_test(&manager),
@@ -22180,7 +22288,7 @@ exit 7"#
         // No spawned child exists in this preparation: the gated startup owner
         // wakes on cancellation. Wait boundedly for actual cleanup ownership.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !managed_idle::admissions_settled_for_test() {
+        while !managed_idle::admissions_settled_for_test(host) {
             assert!(
                 Instant::now() < deadline,
                 "startup cleanup failed to settle"
@@ -22232,12 +22340,13 @@ exit 7"#
 
     #[tokio::test]
     async fn failed_startup_watch_prevents_readiness() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
         let pane_id = Uuid::new_v4();
         let mut runtime = runtime_with_panes(&[pane_id]);
         let (ready, receiver) = watch::channel(Some(Err("injected startup failure".into())));
         runtime.panes.get_mut(&pane_id).unwrap().startup = receiver;
         let mut prepared = PreparedFreshRuntime {
-            cleanup: PreparedCleanup::reserve().unwrap(),
+            cleanup: PreparedCleanup::reserve(&host).unwrap(),
             runtime: Some(runtime),
             launch: None,
         };
@@ -22257,7 +22366,7 @@ exit 7"#
         let (ready, receiver) = watch::channel(None);
         runtime.panes.get_mut(&pane_id).unwrap().startup = receiver;
         let mut prepared = PreparedFreshRuntime {
-            cleanup: PreparedCleanup::reserve().unwrap(),
+            cleanup: PreparedCleanup::reserve(host).unwrap(),
             runtime: Some(runtime),
             launch: None,
         };
@@ -22326,7 +22435,7 @@ exit 7"#
     async fn preowner_launch_failure_retires_owned_guardian_without_inventing_exit() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        supervisor::install_test_artifact()
+        supervisor::install_test_artifact(host)
             .expect("explicit coordinator-built supervisor artifact");
         let execution = Arc::new(execution::ExecutionCapture::default());
         let runtime = tokio::runtime::Handle::current();
@@ -22454,15 +22563,16 @@ exit 7"#
 
     #[tokio::test]
     async fn prepared_cleanup_reservation_bounds_admission_and_releases_on_drop() {
+        let host = PaneRuntimeHost::detached();
         let slots = Arc::new(tokio::sync::Semaphore::new(1));
-        let reservation = PreparedCleanup::reserve_from(Arc::clone(&slots)).unwrap();
-        assert!(PreparedCleanup::reserve_from(Arc::clone(&slots)).is_err());
+        let reservation = PreparedCleanup::reserve_from(&host, Arc::clone(&slots)).unwrap();
+        assert!(PreparedCleanup::reserve_from(&host, Arc::clone(&slots)).is_err());
         let cleanup_owner = Arc::clone(&reservation);
         drop(reservation);
         assert_eq!(slots.available_permits(), 0);
         drop(cleanup_owner);
         assert_eq!(slots.available_permits(), 1);
-        assert!(PreparedCleanup::reserve_from(slots).is_ok());
+        assert!(PreparedCleanup::reserve_from(&host, slots).is_ok());
     }
 
     #[tokio::test]
@@ -22526,13 +22636,14 @@ exit 7"#
 
     #[tokio::test]
     async fn prepared_runtime_rejects_lost_launch_receiver() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
         let pane_id = Uuid::new_v4();
         let runtime = runtime_with_panes(&[pane_id]);
         let task = runtime.panes[&pane_id].task.abort_handle();
         let (launch, receiver) = oneshot::channel();
         drop(receiver);
         let prepared = PreparedFreshRuntime {
-            cleanup: PreparedCleanup::reserve().unwrap(),
+            cleanup: PreparedCleanup::reserve(&host).unwrap(),
             runtime: Some(runtime),
             launch: Some(launch),
         };
@@ -22551,6 +22662,7 @@ exit 7"#
 
     #[tokio::test]
     async fn abandoned_prepared_runtime_stops_all_owned_tasks() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
         let runtime = runtime_with_panes(&[first, second]);
@@ -22560,7 +22672,7 @@ exit 7"#
             .map(|pane| pane.task.abort_handle())
             .collect::<Vec<_>>();
         drop(PreparedFreshRuntime {
-            cleanup: PreparedCleanup::reserve().unwrap(),
+            cleanup: PreparedCleanup::reserve(&host).unwrap(),
             runtime: Some(runtime),
             launch: None,
         });

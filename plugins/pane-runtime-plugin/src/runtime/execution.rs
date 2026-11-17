@@ -831,7 +831,7 @@ pub(super) fn create_reserved_environment(
                 reserved,
             )
             .map_err(failed)?;
-        install_reserved_capture(&prepared, reserved)?;
+        install_reserved_capture(host, &prepared, reserved)?;
         install_environment(&prepared, environment)?;
         for pane in prepared
             .runtime
@@ -1021,7 +1021,7 @@ pub(crate) fn send(
         // The write's authority recheck runs on the PTY writer, but the host
         // answers it only while this invocation is retained: settle the write
         // before the invocation closes instead of re-authorizing afterwards.
-        let receipt = super::input_authority::settlement_receipt().map_err(failed)?;
+        let receipt = super::input_authority::settlement_receipt(host).map_err(failed)?;
         let recording = host.pane_input_recording_data(&data);
         pane.input_tx
             .send(PaneRuntimeCommand::AdmittedInput(
@@ -1549,11 +1549,12 @@ pub(super) fn send_acknowledged(
 }
 
 fn install_reserved_capture(
+    host: &crate::runtime::PaneRuntimeHost,
     prepared: &super::PreparedFreshRuntime,
     reserved: Option<&ExecutionRef>,
 ) -> Result<(), ExecutionError> {
     if let Some(reference) = reserved {
-        let capture = super::reservations::create_capture(reference)
+        let capture = super::reservations::create_capture(host, reference)
             .map_err(|error| failed(format!("{error:?}")))?;
         let pane = prepared
             .runtime

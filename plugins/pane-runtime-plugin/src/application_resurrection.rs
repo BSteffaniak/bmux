@@ -3,10 +3,15 @@ use bmux_application_resurrection_plugin_api::resurrection_launch_v1::client;
 use bmux_plugin::{ServiceCallerDispatchClient, TypedServiceCaller, block_on_typed_dispatch};
 use std::sync::{Arc, RwLock};
 
-static CALLER: RwLock<Option<Arc<TypedServiceCaller>>> = RwLock::new(None);
+/// One activation's client of the optional application-resurrection plugin.
+#[derive(Default)]
+pub(crate) struct ResurrectionClient(RwLock<Option<Arc<TypedServiceCaller>>>);
 
-pub fn activate(context: &bmux_plugin_sdk::NativeLifecycleContext) {
-    if let Ok(mut caller) = CALLER.write() {
+pub(crate) fn activate(
+    host: &crate::runtime::PaneRuntimeHost,
+    context: &bmux_plugin_sdk::NativeLifecycleContext,
+) {
+    if let Ok(mut caller) = host.resurrection().0.write() {
         *caller = context
             .enabled_plugins
             .iter()
@@ -23,14 +28,21 @@ pub struct Launch {
     pub invocation: String,
 }
 
-pub fn prepare(
+pub(crate) fn prepare(
+    host: &crate::runtime::PaneRuntimeHost,
     key: String,
     restored: bool,
     shell: bool,
     replay: bool,
     expected_invocation: Option<String>,
 ) -> Result<Option<Launch>, String> {
-    let Some(caller) = CALLER.read().map_err(|e| e.to_string())?.clone() else {
+    let Some(caller) = host
+        .resurrection()
+        .0
+        .read()
+        .map_err(|e| e.to_string())?
+        .clone()
+    else {
         return Ok(None);
     };
     let mut dispatch = ServiceCallerDispatchClient::new(caller.as_ref());

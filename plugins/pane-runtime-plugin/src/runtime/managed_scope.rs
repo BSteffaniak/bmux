@@ -2,15 +2,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+/// One activation's managed-target scope, captured from its launch markers.
+#[derive(Default)]
+pub(crate) struct ManagedScope(OnceLock<Result<Option<Scope>, String>>);
+
 #[derive(Clone)]
 pub(crate) struct Scope {
     pub(crate) target: String,
     pub(crate) identity: String,
 }
 
-static SCOPE: OnceLock<Result<Option<Scope>, String>> = OnceLock::new();
-
-pub(crate) fn activate() {
+pub(crate) fn activate(host: &crate::runtime::PaneRuntimeHost) {
     let identity = std::env::var("BMUX_MANAGED_TARGET_IDENTITY");
     let target = std::env::var("BMUX_MANAGED_TARGET_ID");
     let result = match (identity, target) {
@@ -20,7 +22,7 @@ pub(crate) fn activate() {
         }
         _ => Err("managed launch requires both target identity and target ID".into()),
     };
-    let _ = SCOPE.set(result);
+    let _ = host.managed_scope().0.set(result);
 }
 
 fn validate(identity: &str, target: &str) -> Result<(), String> {
@@ -42,14 +44,15 @@ fn validate(identity: &str, target: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub(crate) fn selected() -> Result<Option<&'static Scope>, String> {
-    SCOPE.get().map_or(Ok(None), |scope| {
-        scope.as_ref().map(Option::as_ref).map_err(Clone::clone)
-    })
+pub(crate) fn selected(host: &crate::runtime::PaneRuntimeHost) -> Result<Option<Scope>, String> {
+    host.managed_scope().0.get().map_or(Ok(None), Clone::clone)
 }
 
-pub(crate) fn execution_root(domain: &Path) -> Result<PathBuf, String> {
-    selected().map(|scope| {
+pub(crate) fn execution_root(
+    host: &crate::runtime::PaneRuntimeHost,
+    domain: &Path,
+) -> Result<PathBuf, String> {
+    selected(host).map(|scope| {
         scope.map_or_else(
             || domain.to_path_buf(),
             |scope| domain.join("targets").join(&scope.target),
