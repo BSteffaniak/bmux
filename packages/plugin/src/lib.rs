@@ -29,6 +29,7 @@ pub mod component_viewport;
 mod declaration;
 mod discovery;
 mod event_bus;
+mod extension_points;
 pub mod filesystem;
 mod host_builtins;
 mod host_runtime;
@@ -78,6 +79,7 @@ pub use event_bus::{
     activation_binder as event_bus_activation_binder, activation_event_bus,
     remote::subscribe_payloads as subscribe_event_payloads, take_activation_event_bus,
 };
+pub use extension_points::{Extension, ExtensionInvoker, ExtensionPoints, ExtensionSet};
 pub use host_builtins::InvocationHostBuiltins;
 pub use host_runtime::{
     HostRuntimeApi, InvocationKernelDispatch, InvocationKernelPort, ServiceCaller,

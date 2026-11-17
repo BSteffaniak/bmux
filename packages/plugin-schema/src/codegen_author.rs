@@ -689,9 +689,10 @@ impl<'a> Author<'a> {
             out.push_str("            },\n");
         }
         out.push_str("        }\n\n");
+        let conventions = point_conventions(point);
         let _ = writeln!(
             out,
-            "        /// Type-level handle for `{id}`.\n        pub struct Point;\n\n        impl {SDK}::author::ExtensionPoint for Point {{\n            const ID: &'static str = {id:?};\n            const VERSION: u32 = {};\n            type Data = Data;\n        }}\n",
+            "        /// Type-level handle for `{id}`.\n        pub struct Point;\n\n        impl {SDK}::author::ExtensionPoint for Point {{\n            const ID: &'static str = {id:?};\n            const VERSION: u32 = {};\n            type Data = Data;\n{conventions}        }}\n",
             point.version
         );
         let _ = writeln!(
@@ -720,6 +721,45 @@ impl<'a> Author<'a> {
             "                    }\n                })\n            }\n        }\n    }\n\n",
         );
     }
+}
+
+/// `ExtensionPoint::order`/`key` overrides from the data fields named
+/// `order` (an integer) and `id` (a string), by convention.
+fn point_conventions(point: &ExtensionPoint) -> String {
+    let mut conventions = String::new();
+    if let Some(order) = point.data.iter().find(|field| {
+        field.name == "order"
+            && matches!(
+                field.ty,
+                Type::Primitive(
+                    Primitive::U8
+                        | Primitive::U16
+                        | Primitive::U32
+                        | Primitive::I8
+                        | Primitive::I16
+                        | Primitive::I32
+                        | Primitive::I64
+                )
+            )
+    }) {
+        let _ = writeln!(
+            conventions,
+            "            fn order(data: &Data) -> i64 {{ i64::from(data.{}) }}",
+            field_name(order)
+        );
+    }
+    if let Some(key) = point
+        .data
+        .iter()
+        .find(|field| field.name == "id" && matches!(field.ty, Type::Primitive(Primitive::String)))
+    {
+        let _ = writeln!(
+            conventions,
+            "            fn key(data: &Data) -> Option<&str> {{ Some(&data.{}) }}",
+            field_name(key)
+        );
+    }
+    conventions
 }
 
 /// `#[allow(clippy::too_many_arguments)]` when `self`, `cx`, the BPDL

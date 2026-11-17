@@ -100,6 +100,14 @@ impl From<std::io::Error> for PluginCommandError {
     }
 }
 
+/// Host and transport failures (`crate::Result`) surfaced to author code, so
+/// handlers and tests `?` both error types.
+impl From<crate::PluginError> for PluginCommandError {
+    fn from(error: crate::PluginError) -> Self {
+        Self::failed(error.to_string())
+    }
+}
+
 impl From<serde_json::Error> for PluginCommandError {
     fn from(error: serde_json::Error) -> Self {
         Self::failed(error.to_string())

@@ -404,6 +404,21 @@ pub trait ExtensionPoint {
     const VERSION: u32;
     /// Declarative data every contribution supplies, readable before activation.
     type Data: serde::Serialize + serde::de::DeserializeOwned + Send + 'static;
+
+    /// Where a contribution sorts (ascending); hosts break ties on plugin
+    /// id. Generated from a data field named `order`.
+    fn order(data: &Self::Data) -> i64 {
+        let _ = data;
+        0
+    }
+
+    /// A contribution's identity within the point; hosts reject a second
+    /// contribution with the same key. Generated from a string data field
+    /// named `id`.
+    fn key(data: &Self::Data) -> Option<&str> {
+        let _ = data;
+        None
+    }
 }
 
 /// `B` implements the behavior of extension point `Self`.

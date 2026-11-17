@@ -369,7 +369,14 @@ impl<P: Send + Sync + 'static> Declarations<P> {
                 missing.name
             )));
         }
+        let mut points = BTreeSet::new();
         for contribution in &self.contributions {
+            if !points.insert(contribution.id) {
+                return Err(Error::failed(format!(
+                    "extension point '{}' is extended twice",
+                    contribution.id
+                )));
+            }
             if let Err(error) = &contribution.data {
                 return Err(Error::failed(format!(
                     "contribution data for '{}' does not encode: {error}",
@@ -828,7 +835,7 @@ impl<P: Plugin> PluginInstance for DeclaredInstance<P> {
 
     fn extension(
         &self,
-        _call: PluginCallContext,
+        call: PluginCallContext,
         contract: String,
         payload: Vec<u8>,
     ) -> PluginFuture<'_, PluginResult<Vec<u8>>> {
@@ -839,9 +846,27 @@ impl<P: Plugin> PluginInstance for DeclaredInstance<P> {
                 .iter()
                 .find(|contribution| contribution.id == contract)
                 .ok_or_else(|| Error::unavailable(format!("no contribution to '{contract}'")))?;
-            let cx = self.base_call();
+            let cx = Call::from_invocation(call).with_events(self.emitter());
             (contribution.dispatch)(&self.plugin, &cx, &payload).await
         })
+    }
+
+    /// Each `extend::<E>(data)` as an extension contribution: the host reads
+    /// the encoded data and routes behavior calls back through `extension`.
+    fn register_contributions(
+        &self,
+        registrar: &mut crate::ContributionRegistrar,
+    ) -> PluginResult<()> {
+        for (extension_point, data) in self.declarations.contributions() {
+            registrar
+                .register(crate::PluginContribution::Extension {
+                    id: format!("extension:{extension_point}"),
+                    extension_point: extension_point.to_owned(),
+                    payload: data.to_vec(),
+                })
+                .map_err(Error::failed)?;
+        }
+        Ok(())
     }
 
     fn portable_services(&self) -> PluginResult<Vec<Arc<dyn PortableServiceProvider>>> {
