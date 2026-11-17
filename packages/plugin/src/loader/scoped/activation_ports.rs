@@ -21,6 +21,9 @@ impl CallScope {
         // (both happen in the same settlement step). Wait out that bounded
         // transition instead of rejecting through the closed setup caller.
         let deadline = std::time::Instant::now() + SETTLEMENT_WAIT;
+        // Subscribed before the first state check, so the setup-to-active
+        // transition wakes this wait instead of being polled for.
+        let mut changes = activation.changes();
         while activation.state().map_err(scope_error)?
             == bmux_plugin_runtime::LifecycleState::Activating
         {
@@ -38,7 +41,7 @@ impl CallScope {
                 Err(bmux_plugin_runtime::ScopeError::Closed)
                     if std::time::Instant::now() < deadline =>
                 {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    changes.wait_blocking_until(deadline);
                 }
                 Err(error) => return Err(scope_error(error)),
             }

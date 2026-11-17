@@ -15,7 +15,7 @@ pub use identity::{
 pub use scope::{
     ActivationScope, AdmissionGuard, CallbackAdmission, CallbackCapability, HolderKind, HolderSite,
     InstanceScope, InvocationScope, LifecycleInvocationKind, LifecycleState, OutstandingHolder,
-    OutstandingHolders, ScopeError, ScopeKey, teardown_deadline, teardown_timeout,
+    OutstandingHolders, ScopeChanges, ScopeError, ScopeKey, teardown_deadline, teardown_timeout,
     unfinished_instances,
 };
 pub mod shutdown;

@@ -165,3 +165,30 @@ async fn closing_an_activation_cannot_be_bypassed_by_stale_activation_authority(
     instance.drain().await.unwrap();
     instance.finish().unwrap();
 }
+
+#[test]
+fn activation_change_wait_is_woken_by_the_transition_not_a_timer() {
+    let instance = InstanceScope::new(PluginRuntimeScopeId::new());
+    let activation = instance
+        .begin_activation(PluginConcurrencyConfig::Exclusive)
+        .unwrap();
+    // Nothing changes: the wait reports no change once its deadline passes.
+    let mut idle = activation.changes();
+    let soon = std::time::Instant::now() + std::time::Duration::from_millis(20);
+    assert!(!idle.wait_blocking_until(soon));
+    // Subscribe, then let another thread complete the activation. The wait
+    // returns on that notification, long before its generous deadline.
+    let mut changes = activation.changes();
+    let marker = activation.clone();
+    let (ready, go) = std::sync::mpsc::channel::<()>();
+    let completer = std::thread::spawn(move || {
+        go.recv().unwrap();
+        marker.mark_active().unwrap();
+    });
+    let started = std::time::Instant::now();
+    ready.send(()).unwrap();
+    assert!(changes.wait_blocking_until(started + std::time::Duration::from_secs(60)));
+    assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    completer.join().unwrap();
+    assert_eq!(activation.state().unwrap(), LifecycleState::Active);
+}

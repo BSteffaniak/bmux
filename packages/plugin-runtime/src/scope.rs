@@ -839,6 +839,45 @@ impl InstanceScope {
     }
 }
 
+/// A subscription to lifecycle changes of one instance's scope tree.
+pub struct ScopeChanges(watch::Receiver<()>);
+impl ScopeChanges {
+    /// Wait for the next change, or until the tree is gone.
+    pub async fn changed(&mut self) -> bool {
+        self.0.changed().await.is_ok()
+    }
+
+    /// Block the current thread until the next change or `deadline`, driven
+    /// by the change notification's waker (the thread parks; nothing polls on
+    /// a timer). Returns whether a change was observed. For synchronous host
+    /// paths that cannot await.
+    pub fn wait_blocking_until(&mut self, deadline: std::time::Instant) -> bool {
+        struct Unpark(std::thread::Thread);
+        impl std::task::Wake for Unpark {
+            fn wake(self: Arc<Self>) {
+                self.0.unpark();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.unpark();
+            }
+        }
+        let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut changed = std::pin::pin!(self.0.changed());
+        loop {
+            if let std::task::Poll::Ready(result) = changed.as_mut().poll(&mut context) {
+                return result.is_ok();
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            // Unparked by the waker; spurious unparks just re-check.
+            std::thread::park_timeout(deadline - now);
+        }
+    }
+}
+
 impl ActivationScope {
     #[must_use]
     pub fn id(&self) -> PluginActivationId {
@@ -871,7 +910,17 @@ impl ActivationScope {
             .ok_or(ScopeError::Closed)?
             .phase = LifecycleState::Active;
         nodes.get_mut(&self.0.key).ok_or(ScopeError::Closed)?.phase = LifecycleState::Active;
+        drop(nodes);
+        self.0.tree.changed.send_replace(());
         Ok(())
+    }
+
+    /// Observe later lifecycle changes of this instance's scope tree (phase
+    /// transitions, closures, drains). Subscribe before inspecting state: a
+    /// change after subscription is never missed.
+    #[must_use]
+    pub fn changes(&self) -> ScopeChanges {
+        ScopeChanges(self.0.tree.changed.subscribe())
     }
 
     /// Mint callback authority for one trusted host lifecycle operation, never
