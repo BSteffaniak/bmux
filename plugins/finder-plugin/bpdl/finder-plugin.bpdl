@@ -1,0 +1,10 @@
+// Contract surface of the `bmux.finder` plugin. The manifest's
+// services and capabilities are generated from this world.
+plugin bmux.finder version 1;
+
+/// What `bmux.finder` provides to and requires from the host and other plugins.
+world finder {
+    require capability bmux.tabs.read;
+    require capability bmux.workspaces.read;
+    require capability bmux.contexts.read;
+}

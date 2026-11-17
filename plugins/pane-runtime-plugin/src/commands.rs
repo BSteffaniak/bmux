@@ -1730,8 +1730,9 @@ enabled = true
 
     #[test]
     fn manifest_owns_nested_padding_commands_and_declares_arguments() {
-        let manifest = bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml"))
-            .expect("pane-runtime manifest parses");
+        let manifest =
+            bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
+                .expect("pane-runtime manifest parses");
         assert!(manifest.owns_namespaces.contains("pane-padding"));
         let commands = manifest
             .commands

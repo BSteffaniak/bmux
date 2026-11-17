@@ -13,6 +13,7 @@ version     = { workspace = true }
 bmux_attach_view_protocol = { workspace = true }
 bmux_keyboard = { workspace = true }
 bmux_plugin = { workspace = true, features = ["tui"] }
+bmux_plugin_schema_macros = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
 bmux_presentation_state = { workspace = true }
 bmux_tab_bar_plugin_api = { workspace = true }
@@ -43,6 +44,7 @@ tokio               = { workspace = true, features = ["macros", "rt-multi-thread
 fail-on-warnings = [
     "bmux_attach_view_protocol/fail-on-warnings",
     "bmux_plugin/fail-on-warnings",
+    "bmux_plugin_schema_macros/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
     "bmux_presentation_state/fail-on-warnings",
     "bmux_tab_bar_plugin_api/fail-on-warnings",

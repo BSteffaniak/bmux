@@ -1,17 +1,10 @@
-bundled_only = "uses block_in_place, Tokio tasks and timers directly instead of plug-rt"
-execution_class = "native_fast"
-id = "bmux.snapshot"
-name = "bmux Snapshot"
-owns_namespaces = []
-provided_capabilities = [
-    "bmux.snapshot.read",
-    "bmux.snapshot.write",
-    "bmux.snapshot.participant.read.v1",
-    "bmux.snapshot.participant.write.v1",
-]
+bundled_only      = "uses block_in_place, Tokio tasks and timers directly instead of plug-rt"
+execution_class   = "native_fast"
+id                = "bmux.snapshot"
+name              = "bmux Snapshot"
+owns_namespaces   = []
 provided_features = ["bmux.snapshot"]
-required_capabilities = []
-version = "0.0.1-alpha.0"
+version           = "0.0.1-alpha.0"
 
 [[dependencies]]
 plugin_id   = "bmux.clients"
@@ -25,45 +18,5 @@ version_req = ">=0.0.1-alpha.0"
 plugin_id   = "bmux.sessions"
 version_req = ">=0.0.1-alpha.0"
 
-[[services]]
-capability   = "bmux.snapshot.participant.read.v1"
-interface_id = "snapshot-participant-state-v1"
-kind         = "query"
-
-[[services]]
-capability   = "bmux.snapshot.participant.write.v1"
-interface_id = "snapshot-participant-commands-v1"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.snapshot.read"
-interface_id = "snapshot-state"
-kind         = "query"
-
-[[services]]
-capability   = "bmux.snapshot.write"
-interface_id = "snapshot-commands"
-kind         = "command"
-
 # Explicit immutable v1 contracts. Route IDs are wire identities, not version
 # syntax: retain legacy names and negotiate their major separately.
-
-[[contracts]]
-interface_id = "snapshot-participant-state-v1"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "snapshot-participant-commands-v1"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "snapshot-state"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "snapshot-commands"
-major        = 1
-minor        = 0

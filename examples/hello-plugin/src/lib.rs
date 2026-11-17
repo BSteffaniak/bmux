@@ -1,4 +1,12 @@
 //! One export-free implementation shared by bundled and dynamic packaging.
+
+/// Plugin declaration generated from the BPDL world and `plugin.toml`.
+pub mod declaration {
+    bmux_plugin_schema_macros::schema! {
+        source: "bpdl/hello-plugin.bpdl",
+        manifest: "plugin.toml",
+    }
+}
 use bmux_plugin_sdk::definition::{
     CommandOutcome, ComponentRole, PluginCallContext, PluginCreateContext, PluginFuture,
     PluginInstance, PluginMetadata, PluginResult,
@@ -38,7 +46,7 @@ bmux_plugin_sdk::define_plugin!(
         roles: vec![ComponentRole::Backend],
         required_capabilities: vec![],
         contracts: vec![],
-        manifest_toml: Some(include_str!("../plugin.toml").into()),
+        manifest_toml: Some(declaration::PLUGIN_MANIFEST.into()),
     },
 );
 

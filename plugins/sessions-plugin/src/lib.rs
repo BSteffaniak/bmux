@@ -13,6 +13,17 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+/// Plugin declaration generated from the BPDL world and `plugin.toml`.
+pub mod declaration {
+    bmux_plugin_schema_macros::plugin_manifest! {
+        package: {
+            schema: ::bmux_sessions_plugin_api::export_schema,
+            crate_path: ::bmux_sessions_plugin_api,
+        },
+        settings: "plugin.toml",
+    }
+}
+
 // `SessionManager` is owned and constructed by this plugin. Other
 // plugins and the server reach it through the domain-agnostic
 // `bmux_session_state::SessionManagerHandle` trait object registered
@@ -1072,7 +1083,7 @@ bmux_plugin_sdk::define_plugin!(
             >)
     },
     metadata = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<SessionsPlugin>(
-        include_str!("../plugin.toml"),
+        crate::declaration::PLUGIN_MANIFEST,
         vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
     )
     .expect("embedded foundational declaration must be valid")
@@ -1349,11 +1360,12 @@ mod definition_contract_tests {
     fn explicit_contract_versions_preserve_service_wire_routes() {
         let definition = super::plugin_definition();
         let manifest =
-            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+            bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
+                .unwrap();
         let canonical = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<
             super::SessionsPlugin,
         >(
-            include_str!("../plugin.toml"),
+            crate::declaration::PLUGIN_MANIFEST,
             vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
         )
         .unwrap();
@@ -1374,10 +1386,7 @@ mod definition_contract_tests {
             .map(|contract| (&contract.interface_id, contract.major, contract.minor))
             .collect();
         assert_eq!(embedded, declared);
-        let mut services = definition.declarations().unwrap().services;
-        services.extend(
-            <super::SessionsPlugin as bmux_plugin_sdk::RustPlugin>::declared_services().unwrap(),
-        );
+        let services = definition.declarations().unwrap().services;
         for service in services {
             let contract = definition
                 .metadata

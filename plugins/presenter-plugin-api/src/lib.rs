@@ -3,6 +3,7 @@
 
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/presenter-plugin.bpdl",
+    export: export_schema,
 }
 
 #[cfg(test)]

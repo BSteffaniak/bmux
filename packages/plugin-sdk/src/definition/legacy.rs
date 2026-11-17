@@ -264,10 +264,22 @@ fn legacy_factory<P: RustPlugin + Sync>(
 }
 
 // Routing aliases are not negotiation contracts. Only generated contract
-// evidence AND a canonical explicitly versioned interface may add a descriptor.
-fn embed_modeled_contracts<P: RustPlugin>(value: &mut toml::Value) -> PluginResult<()> {
+// evidence for a service the manifest declares may add a descriptor.
+fn embed_modeled_contracts<P: RustPlugin>(
+    value: &mut toml::Value,
+    services: &[crate::PluginService],
+) -> PluginResult<()> {
     let mut modeled = Vec::new();
     for descriptor in <P::Contract as crate::PluginContract>::service_contract_descriptors() {
+        // A contract crate may model interfaces this plugin does not provide;
+        // only the BPDL world's provided services carry evidence.
+        if !services.iter().any(|service| {
+            service.interface_id == descriptor.interface_id
+                && service.kind == descriptor.kind
+                && service.capability.as_str() == descriptor.capability
+        }) {
+            continue;
+        }
         // Generated enumeration includes unresolved imported wire closures.
         // Empty evidence is explicitly unavailable: retain routing declarations,
         // but never publish a negotiated identity or invent a digest for it.
@@ -313,7 +325,7 @@ fn embed_modeled_contracts<P: RustPlugin>(value: &mut toml::Value) -> PluginResu
 
 fn negotiation_contracts<P: RustPlugin>(
     manifest: &toml::Value,
-    generated: &[crate::PluginService],
+    services: &[crate::PluginService],
 ) -> PluginResult<Vec<ContractDescriptor>> {
     let mut contracts = manifest
         .get("contracts")
@@ -323,7 +335,7 @@ fn negotiation_contracts<P: RustPlugin>(
         .map_err(|error| PluginCommandError::failed(error.to_string()))?
         .unwrap_or_default();
     validate_contracts(&contracts)?;
-    for service in generated {
+    for service in services {
         let evidence = super::ContractEvidence::from_generated(
             <P::Contract as crate::PluginContract>::service_contract_for(&service.interface_id),
         )?;
@@ -408,8 +420,15 @@ impl PluginDefinition {
         };
         let plugin_id = string("id")?;
         let version = string("version")?;
-        let services = P::declared_services()
-            .map_err(|error| PluginCommandError::failed(error.to_string()))?;
+        // Services come from the manifest generated from the BPDL world; the
+        // definition never adds routes the declaration does not state.
+        let services = value
+            .get("services")
+            .cloned()
+            .map(toml::Value::try_into::<Vec<crate::PluginService>>)
+            .transpose()
+            .map_err(|error| PluginCommandError::failed(error.to_string()))?
+            .unwrap_or_default();
         let capabilities = value
             .get("required_capabilities")
             .and_then(toml::Value::as_array)
@@ -436,29 +455,8 @@ impl PluginDefinition {
                 ));
             }
         }
-        embed_modeled_contracts::<P>(&mut value)?;
+        embed_modeled_contracts::<P>(&mut value, &services)?;
         let contracts = negotiation_contracts::<P>(&value, &services)?;
-        // Embed generated declarations in the same manifest observed by static
-        // discovery and the native descriptor. This is not a second service list
-        // consumers must merge by implementation type.
-        let mut declared = value
-            .get("services")
-            .cloned()
-            .map(toml::Value::try_into::<Vec<crate::PluginService>>)
-            .transpose()
-            .map_err(|error| PluginCommandError::failed(error.to_string()))?
-            .unwrap_or_default();
-        for service in services {
-            crate::merge_service_declaration(&mut declared, service);
-        }
-        value
-            .as_table_mut()
-            .ok_or_else(|| PluginCommandError::failed("manifest must be a table"))?
-            .insert(
-                "services".into(),
-                toml::Value::try_from(&declared)
-                    .map_err(|error| PluginCommandError::failed(error.to_string()))?,
-            );
         let table = value
             .as_table_mut()
             .ok_or_else(|| PluginCommandError::failed("manifest must be a table"))?;
@@ -574,149 +572,6 @@ payload = [1, 2]
         );
         assert!(PluginDefinition::from_rust_plugin::<Hooks>(MANIFEST, vec![]).is_err());
     }
-    const BUNDLED_MANIFESTS: &[(&str, &str)] = &[
-        (
-            "plugins/application-resurrection-plugin/plugin.toml",
-            include_str!("../../../../plugins/application-resurrection-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/broadcast-plugin/plugin.toml",
-            include_str!("../../../../plugins/broadcast-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/clients-plugin/plugin.toml",
-            include_str!("../../../../plugins/clients-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/clipboard-plugin/plugin.toml",
-            include_str!("../../../../plugins/clipboard-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/cluster-plugin/plugin.toml",
-            include_str!("../../../../plugins/cluster-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/command-palette-plugin/plugin.toml",
-            include_str!("../../../../plugins/command-palette-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/connections-plugin/plugin.toml",
-            include_str!("../../../../plugins/connections-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/contexts-plugin/plugin.toml",
-            include_str!("../../../../plugins/contexts-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/control-catalog-plugin/plugin.toml",
-            include_str!("../../../../plugins/control-catalog-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/decoration-plugin/plugin.toml",
-            include_str!("../../../../plugins/decoration-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/finder-plugin/plugin.toml",
-            include_str!("../../../../plugins/finder-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/pane-runtime-plugin/plugin.toml",
-            include_str!("../../../../plugins/pane-runtime-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/performance-plugin/plugin.toml",
-            include_str!("../../../../plugins/performance-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/permissions-plugin/plugin.toml",
-            include_str!("../../../../plugins/permissions-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/playbook-plugin/plugin.toml",
-            include_str!("../../../../plugins/playbook-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/plugin-cli-plugin/plugin.toml",
-            include_str!("../../../../plugins/plugin-cli-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/presenter-plugin/plugin.toml",
-            include_str!("../../../../plugins/presenter-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/prompted-actions-plugin/plugin.toml",
-            include_str!("../../../../plugins/prompted-actions-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/recording-plugin/plugin.toml",
-            include_str!("../../../../plugins/recording-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/sessions-plugin/plugin.toml",
-            include_str!("../../../../plugins/sessions-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/sidebar-plugin/plugin.toml",
-            include_str!("../../../../plugins/sidebar-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/snapshot-plugin/plugin.toml",
-            include_str!("../../../../plugins/snapshot-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/tab-bar-plugin/plugin.toml",
-            include_str!("../../../../plugins/tab-bar-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/tabs-plugin/plugin.toml",
-            include_str!("../../../../plugins/tabs-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/theme-plugin/plugin.toml",
-            include_str!("../../../../plugins/theme-plugin/plugin.toml"),
-        ),
-        (
-            "plugins/workspaces-plugin/plugin.toml",
-            include_str!("../../../../plugins/workspaces-plugin/plugin.toml"),
-        ),
-    ];
-
-    #[test]
-    fn every_bundled_manifest_keeps_legacy_routes_without_inventing_contracts() {
-        for (path, manifest) in BUNDLED_MANIFESTS {
-            let input: toml::Value = toml::from_str(manifest).unwrap();
-            let roles = input
-                .get("component_roles")
-                .cloned()
-                .map(toml::Value::try_into::<Vec<ComponentRole>>)
-                .transpose()
-                .unwrap()
-                .unwrap_or_else(|| vec![ComponentRole::Backend]);
-            let definition = PluginDefinition::from_rust_plugin::<Hooks>(manifest, roles)
-                .unwrap_or_else(|error| panic!("{path}: {error}"));
-            definition.validate().unwrap();
-            let original = input
-                .get("services")
-                .cloned()
-                .map(toml::Value::try_into::<Vec<crate::PluginService>>)
-                .transpose()
-                .unwrap()
-                .unwrap_or_default();
-            assert_eq!(
-                definition.declarations().unwrap().services,
-                original,
-                "{path}"
-            );
-            let explicit = input
-                .get("contracts")
-                .cloned()
-                .map(toml::Value::try_into::<Vec<ContractDescriptor>>)
-                .transpose()
-                .unwrap()
-                .unwrap_or_default();
-            assert_eq!(definition.metadata.contracts, explicit, "{path}");
-        }
-    }
     #[test]
     fn invalid_explicit_contracts_are_rejected_not_rewritten() {
         for contracts in [
@@ -811,6 +666,14 @@ payload = [1, 2]
             Ok(vec![])
         }
     }
+    /// Services as a BPDL world would generate them into the manifest.
+    fn with_services(manifest: &str, interfaces: &[&str]) -> String {
+        interfaces.iter().fold(manifest.to_string(), |out, interface| {
+            out + "\n[[services]]\ncapability = 'example.read'\nkind = 'query'\ninterface_id = '"
+                + interface
+                + "'\n"
+        })
+    }
     #[derive(Default)]
     struct MalformedHooks;
     impl RustPlugin for MalformedHooks {
@@ -820,7 +683,7 @@ payload = [1, 2]
     fn nonempty_malformed_modeled_evidence_is_not_treated_as_unavailable() {
         assert!(
             PluginDefinition::from_rust_plugin::<MalformedHooks>(
-                MANIFEST,
+                &with_services(MANIFEST, &["malformed/v1"]),
                 vec![ComponentRole::Frontend]
             )
             .is_err()
@@ -833,8 +696,17 @@ payload = [1, 2]
     }
     #[test]
     fn generated_evidence_does_not_assign_versions_to_aliases() {
-        let definition = PluginDefinition::from_rust_plugin::<GeneratedHooks>(
+        let manifest = with_services(
             MANIFEST,
+            &[
+                "clients-state",
+                "generated-alias-v1",
+                "generated/v3",
+                "unresolved/v1",
+            ],
+        );
+        let definition = PluginDefinition::from_rust_plugin::<GeneratedHooks>(
+            &manifest,
             vec![ComponentRole::Frontend],
         )
         .unwrap();
@@ -845,7 +717,7 @@ payload = [1, 2]
         assert_eq!(modeled[0].capability, "example.read");
         assert_eq!(modeled[0].contract, vec![1; 32]);
         let conflicting_evidence = format!(
-            "{MANIFEST}\n[[modeled_service_contracts]]\ncapability = 'example.read'\nkind = 'query'\ninterface_id = 'generated-alias-v1'\ncontract = [1]\n"
+            "{manifest}\n[[modeled_service_contracts]]\ncapability = 'example.read'\nkind = 'query'\ninterface_id = 'generated-alias-v1'\ncontract = [1]\n"
         );
         assert!(
             PluginDefinition::from_rust_plugin::<GeneratedHooks>(
@@ -864,7 +736,7 @@ payload = [1, 2]
         );
         definition.validate().unwrap();
         let conflicting = format!(
-            "{MANIFEST}\n[[contracts]]\ninterface_id = 'generated/v3'\nmajor = 2\nminor = 0\n"
+            "{manifest}\n[[contracts]]\ninterface_id = 'generated/v3'\nmajor = 2\nminor = 0\n"
         );
         assert!(
             PluginDefinition::from_rust_plugin::<GeneratedHooks>(

@@ -361,12 +361,8 @@ impl ToTokens for SchemaArgs {
         }
         if let Some(package) = &self.package {
             let crate_path = &package.crate_path;
-            match &package.provider {
-                Some(provider) => {
-                    tokens.extend(quote!(package: { schema: #provider, crate_path: #crate_path },))
-                }
-                None => tokens.extend(quote!(package: { crate_path: #crate_path },)),
-            }
+            let schema = package.provider.iter();
+            tokens.extend(quote!(package: { #(schema: #schema,)* crate_path: #crate_path },));
         }
         let imports = &self.imports;
         tokens.extend(quote!(imports: { #(#imports,)* }));

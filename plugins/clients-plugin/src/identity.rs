@@ -364,7 +364,9 @@ mod tests {
             clients_identity::INTERFACE_ID.as_str(),
             "clients-identity/v1"
         );
-        assert!(include_str!("../plugin.toml").contains("interface_id = \"clients-identity/v1\""));
+        assert!(
+            crate::declaration::PLUGIN_MANIFEST.contains("interface_id = \"clients-identity/v1\"")
+        );
         let value = LocalPrincipal {
             principal_id: Uuid::from_u128(7),
         };

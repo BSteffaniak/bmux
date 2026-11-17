@@ -3,6 +3,17 @@
 #![allow(clippy::multiple_crate_versions)]
 #![allow(clippy::wildcard_imports)] // Focused private modules expose a crate-internal domain facade.
 
+/// Plugin declaration generated from the BPDL world and `plugin.toml`.
+pub mod declaration {
+    bmux_plugin_schema_macros::plugin_manifest! {
+        package: {
+            schema: ::bmux_cluster_plugin_api::export_schema,
+            crate_path: ::bmux_cluster_plugin_api,
+        },
+        settings: "plugin.toml",
+    }
+}
+
 mod admission;
 pub(crate) mod attach_state;
 pub mod capability_publication;
@@ -1042,7 +1053,7 @@ pub fn command_scoped_plugin_definition()
         ComponentRole, PluginCreateContext, PluginDefinition, PluginInstance, RustPluginAdapter,
     };
     let metadata = PluginDefinition::from_rust_plugin::<ClusterPlugin>(
-        include_str!("../plugin.toml"),
+        crate::declaration::PLUGIN_MANIFEST,
         // Mirrors `component_roles` in plugin.toml.
         vec![ComponentRole::Backend, ComponentRole::Frontend],
     )
@@ -1068,7 +1079,7 @@ pub fn command_scoped_plugin_definition()
 // fresh default author state per created instance.
 bmux_plugin_sdk::define_plugin!(
     rust_plugin = ClusterPlugin,
-    manifest = include_str!("../plugin.toml"),
+    manifest = crate::declaration::PLUGIN_MANIFEST,
     roles = vec![
         bmux_plugin_sdk::definition::ComponentRole::Backend,
         bmux_plugin_sdk::definition::ComponentRole::Frontend
@@ -3034,7 +3045,7 @@ mod tests {
     fn admitted_route_contributions_are_exact_proof_protocols() {
         let routes = admission::routes();
         assert_eq!(routes.len(), 11);
-        let declarations = ClusterPlugin::declared_services().unwrap();
+        let declarations = plugin_definition().declarations().unwrap().services;
         for route in routes {
             assert_eq!(route.kind, ServiceKind::Command);
             assert!(
@@ -4203,7 +4214,7 @@ mod tests {
 
 fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
     bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<ClusterPlugin>(
-        include_str!("../plugin.toml"),
+        crate::declaration::PLUGIN_MANIFEST,
         vec![
             bmux_plugin_sdk::definition::ComponentRole::Backend,
             bmux_plugin_sdk::definition::ComponentRole::Frontend,

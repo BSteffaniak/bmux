@@ -1,59 +1,14 @@
-bundled_only = "uses Tokio tasks and timers directly instead of plug-rt"
-component_roles = ["backend"]
-contracts = [
-    { interface_id = "decoration-view-v1", major = 1, minor = 0 },
-    { interface_id = "decoration-state", major = 1, minor = 0 },
-    { interface_id = "theme-extension", major = 1, minor = 0 },
-    { interface_id = "decoration-commands", major = 1, minor = 0 },
-    { interface_id = "decoration-input-hooks/v2", major = 2, minor = 0 },
-    { interface_id = "scene-protocol", major = 1, minor = 0 },
-]
-execution_class = "native_fast"
-id = "bmux.decoration"
-name = "bmux Decoration"
-provided_capabilities = ["bmux.decoration.read", "bmux.decoration.write"]
+bundled_only      = "uses Tokio tasks and timers directly instead of plug-rt"
+component_roles   = ["backend"]
+execution_class   = "native_fast"
+id                = "bmux.decoration"
+name              = "bmux Decoration"
 provided_features = ["bmux.decoration"]
-required_capabilities = ["bmux.events.subscribe"]
-version = "0.0.1-alpha.0"
+version           = "0.0.1-alpha.0"
 
 [[dependencies]]
 plugin_id   = "bmux.pane_runtime"
 version_req = ">=0.0.1-alpha.0"
-
-[[services]]
-capability   = "bmux.decoration.write"
-interface_id = "decoration-view-v1"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.decoration.read"
-interface_id = "decoration-state"
-kind         = "query"
-
-[[services]]
-capability   = "bmux.decoration.write"
-interface_id = "decoration-state"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.decoration.write"
-interface_id = "theme-extension"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.decoration.write"
-interface_id = "decoration-commands"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.decoration.write"
-interface_id = "decoration-input-hooks/v2"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.decoration.read"
-interface_id = "scene-protocol"
-kind         = "event"
 
 [[ready_signals]]
 description = "Initial DecorationScene has been published to the event bus."

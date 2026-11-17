@@ -11,13 +11,15 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_plugin     = { workspace = true }
-bmux_plugin_sdk = { workspace = true }
-serde           = { workspace = true, features = ["derive", "std"] }
-serde_json      = { workspace = true }
+bmux_plugin               = { workspace = true }
+bmux_plugin_schema_macros = { workspace = true }
+bmux_plugin_sdk           = { workspace = true }
+serde                     = { workspace = true, features = ["derive", "std"] }
+serde_json                = { workspace = true }
 
 [features]
 fail-on-warnings = [
     "bmux_plugin/fail-on-warnings",
+    "bmux_plugin_schema_macros/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
 ]

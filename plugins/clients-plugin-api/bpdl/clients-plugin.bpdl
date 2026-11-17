@@ -176,3 +176,17 @@ interface clients-events {
 
     events client-event;
 }
+
+/// What `bmux.clients` provides to and requires from the host and other plugins.
+world clients {
+    provide clients-identity;
+    provide clients-state;
+    provide clients-commands;
+    provide clients-events capability bmux.clients.read;
+    provide clients-selection-commands-v1;
+    provide clients-selection-state-v1;
+    require capability bmux.contexts.read;
+    require capability bmux.contexts.write;
+    require capability bmux.sessions.write;
+    require optional capability bmux.sessions.policy;
+}

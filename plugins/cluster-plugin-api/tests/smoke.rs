@@ -561,11 +561,18 @@ fn generated_contract_declares_all_services() {
             "missing generated service declaration {interface_id}"
         );
     }
-    let manifest = include_str!("../../cluster-plugin/plugin.toml");
-    assert!(manifest.contains("cluster-worker-command/v1"));
-    assert!(manifest.contains("cluster-attach-state/v1"));
-    assert!(manifest.contains("cluster-attach-command/v1"));
-    assert!(manifest.contains("cluster-worker-state/v1"));
+    // The package world, not a handwritten manifest, declares what is served.
+    let package = include_str!("../bpdl/cluster-plugin.bpdl");
+    for provided in [
+        "provide cluster-worker-command;",
+        "provide cluster-attach-state;",
+        "provide cluster-attach-command;",
+        "provide cluster-worker-state;",
+        "provide cluster-control-command@2;",
+        "provide cluster-control-state@2;",
+    ] {
+        assert!(package.contains(provided), "world must {provided}");
+    }
 }
 
 #[test]

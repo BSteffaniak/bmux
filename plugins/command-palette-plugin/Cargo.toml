@@ -11,11 +11,12 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_keybind    = { workspace = true }
-bmux_plugin     = { workspace = true }
-bmux_plugin_sdk = { workspace = true }
-tokio           = { workspace = true }
-tracing         = { workspace = true }
+bmux_keybind              = { workspace = true }
+bmux_plugin               = { workspace = true }
+bmux_plugin_schema_macros = { workspace = true }
+bmux_plugin_sdk           = { workspace = true }
+tokio                     = { workspace = true }
+tracing                   = { workspace = true }
 
 [dev-dependencies]
 bmux_plugin_runtime = { workspace = true }
@@ -23,6 +24,7 @@ bmux_plugin_runtime = { workspace = true }
 [features]
 fail-on-warnings = [
     "bmux_keybind/fail-on-warnings",
+    "bmux_plugin_schema_macros/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
     "bmux_plugin/fail-on-warnings",
 ]

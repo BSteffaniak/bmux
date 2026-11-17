@@ -739,20 +739,20 @@ need `bmux_plugin`.
 
 ### Top-Level Fields
 
-| Field                   | Type    | Required | Default    | Description                                                |
-| ----------------------- | ------- | -------- | ---------- | ---------------------------------------------------------- |
-| `id`                    | string  | **Yes**  | --         | Unique plugin identifier (e.g. `"bmux.clipboard"`)         |
-| `name`                  | string  | **Yes**  | --         | Human-readable display name                                |
-| `version`               | string  | **Yes**  | --         | Plugin version (semver)                                    |
-| `description`           | string  | No       | --         | Optional description                                       |
-| `homepage`              | string  | No       | --         | Optional URL                                               |
-| `runtime`               | string  | No       | `"native"` | Runtime type (only `"native"` supported)                   |
-| `bundled_only`          | string  | No       | --         | Why the plugin cannot load as a dynamic library            |
-| `entry`                 | path    | No       | --         | Path to `.dylib`/`.so` (only for external plugins)         |
-| `provider_priority`     | integer | No       | `0`        | Ordering when multiple plugins provide the same capability |
-| `required_capabilities` | list    | No       | `[]`       | Host capabilities this plugin needs                        |
-| `provided_capabilities` | list    | No       | `[]`       | Capabilities this plugin provides                          |
-| `provided_features`     | list    | No       | `[]`       | Feature flags this plugin provides                         |
+| Field                   | Type    | Required  | Default    | Description                                                |
+| ----------------------- | ------- | --------- | ---------- | ---------------------------------------------------------- |
+| `id`                    | string  | **Yes**   | --         | Unique plugin identifier (e.g. `"bmux.clipboard"`)         |
+| `name`                  | string  | **Yes**   | --         | Human-readable display name                                |
+| `version`               | string  | **Yes**   | --         | Plugin version (semver)                                    |
+| `description`           | string  | No        | --         | Optional description                                       |
+| `homepage`              | string  | No        | --         | Optional URL                                               |
+| `runtime`               | string  | No        | `"native"` | Runtime type (only `"native"` supported)                   |
+| `bundled_only`          | string  | No        | --         | Why the plugin cannot load as a dynamic library            |
+| `entry`                 | path    | No        | --         | Path to `.dylib`/`.so` (only for external plugins)         |
+| `provider_priority`     | integer | No        | `0`        | Ordering when multiple plugins provide the same capability |
+| `required_capabilities` | list    | Generated | `[]`       | From `require` entries of the BPDL world                   |
+| `provided_capabilities` | list    | Generated | `[]`       | From `provide` entries of the BPDL world                   |
+| `provided_features`     | list    | No        | `[]`       | Feature flags this plugin provides                         |
 
 ### Compatibility (optional)
 
@@ -797,14 +797,22 @@ value_name    = "TARGET"       # optional: displayed in help
 choice_values = ["a", "b"]    # for kind = "choice"
 ```
 
-### Services
+### Services, contracts and capabilities
 
-```toml
-[[services]]
-capability   = "bmux.clipboard.write"    # required -- host capability scope
-interface_id = "clipboard-write/v1"      # required -- service interface identifier
-kind         = "command"                 # required -- "command" or "query"
+`services`, `contracts`, `provided_capabilities`, `required_capabilities`
+and `optional_capabilities` are generated from the plugin package's BPDL
+`world` and must not appear in a handwritten `plugin.toml`:
+
+```bpdl
+world clipboard {
+    provide opaque clipboard-write@1: command capability bmux.clipboard.write;
+    require capability bmux.storage;
+}
 ```
+
+`schema! { source: ..., manifest: "plugin.toml" }` or `plugin_manifest!`
+emits the merged `PLUGIN_MANIFEST`; see `docs/bpdl-spec.md`
+("Manifest generation").
 
 ### Event Subscriptions
 

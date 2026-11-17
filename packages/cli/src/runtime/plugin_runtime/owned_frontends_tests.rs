@@ -70,11 +70,11 @@ fn register(role: &str) -> (bmux_plugin::PluginRegistry, String, Held) {
             roles,
             required_capabilities: Vec::new(),
             contracts: Vec::new(),
-            manifest_toml: Some(manifest.clone()),
+            manifest_toml: Some(manifest),
         },
         move |_| Ok(Arc::new(Probe(factory_held.clone())) as Arc<dyn PluginInstance>),
     );
-    let embedded = register_bundled_definition(&plugin_id, &manifest, definition).unwrap();
+    let embedded = register_bundled_definition(&plugin_id, definition).unwrap();
     let mut registry = bmux_plugin::PluginRegistry::new();
     registry.register_bundled_manifest(&embedded).unwrap();
     (registry, plugin_id, held)

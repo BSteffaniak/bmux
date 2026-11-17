@@ -61,6 +61,31 @@ pub enum TokenKind {
     Dot,
 }
 
+impl TokenKind {
+    /// The source spelling of a reserved keyword token.
+    #[must_use]
+    pub const fn keyword(&self) -> Option<&'static str> {
+        Some(match self {
+            Self::Plugin => "plugin",
+            Self::Version => "version",
+            Self::Interface => "interface",
+            Self::Import => "import",
+            Self::Record => "record",
+            Self::Variant => "variant",
+            Self::Enum => "enum",
+            Self::Query => "query",
+            Self::Command => "command",
+            Self::Emits => "emits",
+            Self::Events => "events",
+            Self::List => "list",
+            Self::Map => "map",
+            Self::Result => "result",
+            Self::Unit => "unit",
+            _ => return None,
+        })
+    }
+}
+
 /// Tokenize a BPDL source string into a list of [`Token`]s.
 ///
 /// # Errors

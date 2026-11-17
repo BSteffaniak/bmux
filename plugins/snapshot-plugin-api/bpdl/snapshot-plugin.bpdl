@@ -80,3 +80,11 @@ interface snapshot-commands {
     command save-now() -> result<snapshot-types.snapshot-save-result, snapshot-types.snapshot-error>;
     command restore-apply() -> result<snapshot-types.snapshot-apply-summary, snapshot-types.snapshot-error>;
 }
+
+/// What `bmux.snapshot` provides to and requires from the host and other plugins.
+world snapshot {
+    provide snapshot-participant-state-v1;
+    provide snapshot-participant-commands-v1;
+    provide snapshot-state;
+    provide snapshot-commands;
+}

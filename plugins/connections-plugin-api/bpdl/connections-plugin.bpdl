@@ -202,3 +202,19 @@ interface admission-provider-state {
 interface admission-provider-commands {
     command consume(@secret ticket: bytes) -> pairing-types.admission-binding;
 }
+
+/// What `bmux.connections` provides to and requires from the host and other plugins.
+world connections {
+    provide connections-state;
+    provide connections-commands;
+    provide pairing-commands;
+    provide pairing-state;
+    provide admission-provider-state;
+    provide admission-provider-commands;
+    provide pairing-session-commands;
+    provide pairing-peer-commands;
+    provide pairing-session-state;
+    require capability bmux.clients.read;
+    require capability bmux.commands;
+    require capability bmux.permissions.write;
+}

@@ -10,4 +10,5 @@
 
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/playbook-plugin.bpdl",
+    export: export_schema,
 }

@@ -1,0 +1,24 @@
+// Contract surface of the native example plugin. Its manifest's required
+// capabilities are generated from this world; `plugin.toml` keeps only the
+// remaining settings.
+plugin example.native version 1;
+
+import permissions = bmux.permissions;
+import tabs = bmux.tabs;
+import tabbar = bmux.tab_bar;
+
+/// What the example requires from the host and other plugins.
+world native {
+    require capability bmux.commands;
+    require capability bmux.config.read;
+    require capability bmux.events.subscribe;
+    require capability bmux.storage;
+    /// Interface requirements contribute the interface's capability.
+    require permissions.permissions-state;
+    require permissions.permissions-commands;
+    require tabs.tabs-state;
+    require tabs.tabs-commands;
+    require tabbar.notifications;
+    require tabbar.status-items-state;
+    require tabbar.status-items;
+}

@@ -104,3 +104,18 @@ interface session-policy-commands {
         context: string?,
     ) -> command-ack;
 }
+
+/// What `bmux.permissions` provides to and requires from the host and other plugins.
+world permissions {
+    provide permissions-state;
+    provide permissions-commands;
+    provide session-policy-state;
+    provide session-policy-commands;
+    require capability bmux.clients.read;
+    require capability bmux.commands;
+    require capability bmux.contexts.read;
+    require capability bmux.pane_runtime.write;
+    require capability bmux.sessions.read;
+    require capability bmux.storage;
+    require optional capability bmux.connections.pairing;
+}

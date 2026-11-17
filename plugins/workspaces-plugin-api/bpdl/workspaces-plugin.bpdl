@@ -97,3 +97,16 @@ interface workspaces-list {
 
     @state events workspace-list-snapshot;
 }
+
+/// What `bmux.workspaces` provides to and requires from the host and other plugins.
+world workspaces {
+    provide workspaces-state;
+    provide workspaces-commands;
+    provide workspaces-events capability bmux.workspaces.read;
+    provide workspaces-activation-v1;
+    require capability bmux.clients.read;
+    require capability bmux.contexts.read;
+    require capability bmux.contexts.write;
+    require capability bmux.storage;
+    require capability bmux.tabs.write;
+}

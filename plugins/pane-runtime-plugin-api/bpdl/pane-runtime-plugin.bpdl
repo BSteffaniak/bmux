@@ -1507,3 +1507,36 @@ interface pane-runtime-focus {
 
     @state events session-focus-state-map;
 }
+
+/// What `bmux.pane_runtime` provides to and requires from the host and other plugins.
+///
+/// Native terminal-session operations are implemented. Durable
+/// admission/recovery operations return explicit Unavailable until their
+/// separate authority milestone, and `pane-runtime-spawn-commands-v1` stays
+/// unexported: only its read-only queries are provided.
+world pane-runtime {
+    provide pane-runtime-view-size-v1;
+    provide pane-runtime-pointer-grid-v1;
+    provide pane-runtime-live-presentation-v1;
+    provide pane-runtime-human-input-v1;
+    provide pane-runtime-presentation-v1;
+    provide pane-runtime-presentation-wait-v1;
+    provide pane-runtime-execution-v4;
+    provide pane-runtime-readiness-v1;
+    provide pane-runtime-state;
+    provide pane-runtime-commands;
+    provide attach-runtime-commands;
+    provide attach-runtime-state;
+    provide pane-runtime-events capability bmux.pane_runtime.read;
+    provide pane-runtime-environment-v1;
+    provide pane-runtime-spawn-v1;
+    require capability bmux.clients.read;
+    require capability bmux.clients.write;
+    require capability bmux.contexts.read;
+    require capability bmux.contexts.write;
+    require capability bmux.sessions.read;
+    require capability bmux.sessions.write;
+    require optional capability bmux.application_resurrection.host;
+    require optional capability bmux.sessions.policy;
+    require optional capability bmux.tabs.read;
+}

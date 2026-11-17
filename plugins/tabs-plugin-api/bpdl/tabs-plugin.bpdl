@@ -412,3 +412,26 @@ interface tabs-list {
 
     @state events tab-list-snapshot;
 }
+
+/// What `bmux.tabs` provides to and requires from the host and other plugins.
+world tabs {
+    provide tabs-catalog-v1;
+    provide tabs-state;
+    provide tabs-commands;
+    provide tabs-events capability bmux.tabs.read;
+    provide tabs-placement-v1;
+    require capability bmux.commands;
+    require capability bmux.contexts.read;
+    require capability bmux.contexts.write;
+    require capability bmux.clients.read;
+    require capability bmux.pane_runtime.read;
+    require capability bmux.pane_runtime.write;
+    require capability bmux.panes.read;
+    require capability bmux.panes.write;
+    require capability bmux.sessions.read;
+    require capability bmux.sessions.write;
+    require capability bmux.workspaces.read;
+    require capability bmux.workspaces.write;
+    require capability bmux.storage;
+    require optional capability bmux.pane_runtime.spawn.v1;
+}

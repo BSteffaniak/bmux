@@ -1,0 +1,8 @@
+// Contract surface of the `bmux.plugin_cli` plugin. The manifest's
+// services and capabilities are generated from this world.
+plugin bmux.plugin_cli version 1;
+
+/// What `bmux.plugin_cli` provides to and requires from the host and other plugins.
+world plugin-cli {
+    require capability bmux.commands;
+}

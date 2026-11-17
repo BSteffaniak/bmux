@@ -9,9 +9,11 @@ This document is the normative grammar and semantics.
 
 ## File structure
 
-A BPDL source file represents **one plugin**. Each file has a header
-declaring the plugin identity, optional `import` directives referencing
-other plugins' schemas, followed by one or more interfaces.
+A BPDL source file represents **one plugin package**. Each file has a
+header declaring the package identity, optional `import` directives
+referencing other packages, capability constants, then interfaces and
+plugin-level declarations (worlds, commands, contributions, extension
+points) in any order.
 
 ```bpdl
 plugin bmux.tabs version 1;
@@ -27,28 +29,65 @@ interface tabs-events {
 
 ## Grammar (informal)
 
+`///` documentation lines may precede every declaration (plugin header,
+capability, interface, type, field, case, flag, method, operation, world
+entry, command, extension point). Plain `//` comments are ignored.
+
 ```
-schema     := plugin_header import* capability* interface*
+schema     := plugin_header import* capability* top_item*
 plugin_header
            := "plugin" dotted_ident "version" integer ";"
 import     := "import" ident "=" dotted_ident ";"
 capability := "capability" ident "=" dotted_ident ";"
-interface  := interface_annotation* "interface" ident "{" interface_item* "}"
-interface_annotation
-           := "@capability" "(" ident ")"
-            | "@interface-version" "(" integer ")"
+top_item   := annotation* ( interface | world | plugin_command
+                          | contribution | extension_point )
 
+annotation := "@" ident ( "(" ( ident | integer ) ")" )?
+              // interface: @capability(NAME) @interface-version(N) @major(N)
+              // items:     @reentrant (query) @state (events) @default (case)
+              // anywhere:  @since(N) @unstable(feature) @deprecated(N)
+
+interface  := "interface" ident "{" ( annotation* interface_item )* "}"
 interface_item
-           := record | variant | enum | ( "@reentrant" )? query | command | events
+           := record | variant | enum | flags | resource
+            | query | command | events
 
 record     := "record" ident "{" field_list? "}"
 variant    := "variant" ident "{" variant_case_list? "}"
 enum       := "enum" ident "{" enum_case_list? "}"
-query      := "query" ident "(" param_list? ")" "->" type ";"
-command    := "command" ident "(" param_list? ")" "->" type ";"
+flags      := "flags" ident "{" ident ( "," ident )* ","? "}"
+resource   := "resource" ident "{" resource_method* "}"
+resource_method
+           := "constructor" "(" param_list? ")" ";"
+            | "static"? ( "query" | "command" ) ident "(" param_list? ")" "->" type ";"
+query      := "query" ident "(" param_list? ")" "->" type ( "emits" type )? ";"
+command    := "command" ident "(" param_list? ")" "->" type ( "emits" type )? ";"
 events     := "events" type ";"
 
-field      := ident ":" type
+world      := "world" ident "{" world_item* "}"
+world_item := "provide" interface_ref ( "capability" dotted_ident )? ";"
+            | "provide" "opaque" ident ( "@" integer )? ":" service_kind
+                  "capability" dotted_ident ";"
+            | "provide" "capability" dotted_ident ";"
+            | "require" "optional"? interface_ref ";"
+            | "require" "optional"? "capability" dotted_ident ";"
+interface_ref
+           := ( ident "." )? ident ( "@" integer )?
+service_kind
+           := "query" | "command" | "events"
+
+plugin_command
+           := "command" ident "(" param_list? ")" ( "title" string )? ";"
+contribution
+           := "contribute" ( ident "." )? ident "@" integer
+                  "{" ( ident ":" literal ( "," ident ":" literal )* ","? )? "}"
+extension_point
+           := "extension-point" ident "version" integer "{"
+                  "data" "{" field_list? "}"
+                  ( "interface" "{" ( annotation* ( query | command ) )* "}" )?
+              "}"
+
+field      := "@secret"? ident ":" type
 variant_case
            := ( "@default" )? ident ( "{" field_list "}" )?
 enum_case  := ( "@default" )? ident
@@ -59,6 +98,11 @@ type       := primitive
             | "list" "<" type ">"
             | "map" "<" type "," type ">"
             | "result" "<" type "," type ">"
+            | "tuple" "<" type ( "," type )* ">"
+            | "stream" "<" type ">"
+            | "future" "<" type ">"
+            | "own" "<" ( named | qualified ) ">"
+            | "borrow" "<" ( named | qualified ) ">"
             | "unit"
             | type "?"
 
@@ -66,11 +110,74 @@ qualified  := ident "." ident           // alias.type-name
 
 primitive  := "bool" | "u8" | "u16" | "u32" | "u64"
             | "i8" | "i16" | "i32" | "i64"
-            | "f32" | "f64" | "string" | "bytes" | "uuid"
+            | "f32" | "f64" | "char" | "string" | "bytes" | "uuid"
 
+literal    := string | integer | "true" | "false" | "[" ( literal ( "," literal )* )? "]"
 ident          := [a-zA-Z_] [a-zA-Z0-9_\-]*
-dotted_ident   := ident ( "." ident )*
+dotted_ident   := ident ( "." ( ident | keyword ) )*
 integer        := [0-9]+
+string         := '"' ( [^"\\\n] | '\"' | '\\' | '\n' | '\t' )* '"'
+```
+
+`world`, `resource`, `flags`, `tuple`, `stream`, `future`, `own`, `borrow`,
+`provide`, `require`, `opaque`, `contribute`, `extension-point`, `data` and
+`title` are contextual: without their following syntax (for example a `<`
+after `stream`) they remain ordinary names, so existing schemas keep using
+them as field, type and interface names.
+
+### Example
+
+```bpdl
+/// Files exposed by an example host.
+plugin acme.files version 2;
+
+import clock = acme.clock;
+
+capability READ = acme.files.read;
+
+/// File access.
+@capability(READ)
+@since(1)
+interface files {
+    /// Permission bits.
+    flags mode { read, write, exec }
+
+    /// An open file handle.
+    resource file {
+        constructor(path: string);
+        query size() -> u64;
+        static query exists(path: string) -> bool;
+    }
+
+    record stat { pair: tuple<u64, char>, mode: mode, modified: clock.instant }
+
+    @deprecated(2) @since(1)
+    query stat(f: borrow<file>) -> stat;
+    query open(path: string) -> own<file>;
+    query lines(path: string) -> stream<string>;
+}
+
+interface changes {
+    @state events files.stat;
+}
+
+/// What the plugin provides and requires.
+world files-plugin {
+    provide files;
+    provide changes capability acme.files.read;
+    provide opaque legacy-files@2: command capability acme.files.write;
+    require clock.clock;
+    require optional capability acme.storage;
+}
+
+command cat(path: string, lines: u32?) title "Print a file";
+
+extension-point file-preview version 1 {
+    data { id: string, order: u32, label: string? }
+    interface { query render(width: u16) -> list<string>; }
+}
+
+contribute file-preview@1 { id: "text", order: 10 }
 ```
 
 ## Naming conventions
@@ -108,6 +215,7 @@ order is not significant.
 | `string`     | `String`         |
 | `bytes`      | `Vec<u8>`        |
 | `uuid`       | `::uuid::Uuid`   |
+| `char`       | `char`           |
 | `unit`       | `()`             |
 
 ### Containers
@@ -118,6 +226,7 @@ order is not significant.
 | `list<T>`      | `Vec<T>`                             |
 | `map<K, V>`    | `::std::collections::BTreeMap<K, V>` |
 | `result<T, E>` | `::std::result::Result<T, E>`        |
+| `tuple<A, B>`  | `(A, B)`                             |
 
 `map<K, V>` lowers to `BTreeMap` for deterministic JSON key order in
 RPC payloads. Keys must be one of `string`, `uuid`, or an integer
@@ -261,6 +370,219 @@ typed events via `PluginEvent::decode_typed(...)` on the plugin host.
 events pane-event;
 ```
 
+### `flags`
+
+A set of independent named booleans. Rust lowers a `flags` type to a
+transparent `u64` bit set (flag *i* is bit *i* in declaration order, so at
+most 64 flags), with `empty`, `all`, `contains`, `union` and
+`from_bits_truncate`.
+
+### `resource`
+
+A handle type with methods. Values of a resource type are handles:
+`own<R>` (or a bare `R`) transfers ownership, `borrow<R>` lends the handle
+for one call and is only legal in parameters. `query` methods are
+read-only, `command` methods mutate, `static` methods take no receiver and
+`constructor` returns a new owned handle.
+
+### `tuple`, `char`, `stream<T>`, `future<T>`
+
+`tuple<A, B, ...>` is a positional product (Rust tuple); `char` is a Unicode
+scalar value (Rust `char`). `stream<T>` delivers zero or more values and
+`future<T>` exactly one value asynchronously; both may appear in any type
+position.
+
+Resources, handles, `stream<T>` and `future<T>` are part of the language,
+the IR, contract identity and the WIT lowering. The Rust tier has no
+binding for them yet (they need the host handle table and stream
+transport): generated Rust fails with an explicit `compile_error!` naming
+the construct rather than degrading the contract.
+
+## Documentation and stability
+
+`///` lines document the declaration that follows them. Rust codegen keeps
+them on generated types, fields and cases; WIT keeps them as WIT docs.
+
+`@since(N)` and `@deprecated(N)` name package versions (at most the
+`plugin ... version` of the file; a deprecation needs an earlier or equal
+`@since`), and `@unstable(feature)` gates an item behind a named feature
+(and excludes `@since`/`@deprecated`). They lower to the WIT gates
+`@since(version = N.0.0)`, `@deprecated(version = N.0.0)` and
+`@unstable(feature = ...)`.
+
+Documentation and stability are metadata: neither enters contract
+identity.
+
+## Plugin declarations
+
+### `world`
+
+A world lists what the plugin provides (`provide`, WIT `export`) and what
+it requires (`require`, WIT `import`):
+
+- `provide iface;` serves a local or imported (`alias.iface`) service
+  interface. `@N` selects one member of a versioned family. The
+  capability comes from the interface's `@capability`; event interfaces,
+  which declare none, must name it: `provide iface capability <id>;`.
+- `provide opaque name[@N]: <kind> capability <id>;` routes a service whose
+  operations are not modeled in BPDL yet. It carries no contract identity
+  and no WIT lowering; every opaque entry is a modeling debt.
+- `provide capability <id>;` grants a capability that has no service.
+- `require [optional] iface;` and `require [optional] capability <id>;`
+  name what the plugin calls; an interface requirement contributes the
+  interface's capability.
+
+A plugin's package is the BPDL file whose `plugin` id equals the plugin
+id: the plugin API crate's schema when one exists, otherwise a
+`bpdl/<plugin>.bpdl` in the plugin crate. It declares exactly one world.
+
+### `command`
+
+A plugin-level `command name(params) title "..."` declares a CLI command.
+Parameters must be scalars, optional scalars or `list<string>`; they lower
+to long options (`string`, `integer`, `boolean`).
+
+### `extension-point` and `contribute`
+
+An extension point is a host- or plugin-declared contract: a `data`
+record every contribution supplies (readable before activation) and an
+optional `interface` of operations contributing plugins implement. Its id
+is `<package>.<name>/v<version>` and it has its own contract identity.
+`contribute name@N { field: literal, ... }` supplies data; validation
+checks field names, literal types and required (non-optional) fields.
+
+## Canonical IR and contract identity
+
+After validation the compiler lowers each file into a span-free,
+serializable IR (`bmux_plugin_schema::ir::Package`). Every backend reads
+the IR: contract identity, the WIT emitter, manifest generation and,
+later, other language SDKs. A `PackageSet` holds every package of a
+contract closure and resolves imports by package id, like a WIT
+`Resolve`. Rust codegen still walks the validated syntax tree.
+
+Interface identity (`SERVICE_CONTRACT`) is a SHA-256 computed from the
+IR with the canonical v2 byte scheme documented in
+`packages/plugin-schema/src/canonical.rs`. Every construct that existed
+before the IR hashes byte-for-byte as before, so all pinned repository
+identities (`packages/plugin-schema/tests/fixtures/contract-identities.txt`)
+are unchanged. New constructs (flags, resources, tuples, streams, futures,
+handles) use type and item tags no earlier schema could produce, which is
+why they extend v2 instead of requiring v3. `@major`, documentation and
+stability gates are not identity-bearing. Ambiguous or unresolved imported
+names produce empty evidence, never a guess.
+
+Contract evolution is exact identity plus multi-version adapters: a wire
+change is a new `@interface-version`, and providers serve each version
+they support. Additive compatibility is not inferred.
+
+`@major(N)` records the contract major of an interface whose wire id has
+no `/vN` suffix (legacy ids such as `presenter-view-v2`). Versioned
+interfaces use their version as their major; everything else is major 1.
+
+## WIT lowering
+
+`bmux_plugin_schema::wit::emit` lowers a package to WIT
+(`plugin a.b version N` becomes `package a:b@N.0.0`). Records, enums,
+flags and resources map directly; variant case payloads become
+`<variant>-<case>` records; `uuid` becomes `tuple<u64, u64>`, `bytes`
+`list<u8>`, `map<K, V>` `list<tuple<K, V>>`; streaming operations return
+`tuple<stream<E>, future<R>>`; `events T` becomes `subscribe: func() ->
+stream<T>`; worlds map `provide`/`require` to `export`/`import`;
+extension points become `<name>-vN` interfaces and plugin commands a
+`plugin-commands` interface. Capabilities, retained-state delivery and
+`@secret` survive as documentation; opaque services, bare capabilities
+and contributions as comments.
+
+WIT worlds cannot export an interface that other exports `use` types
+from, so an interface holding both types and operations lowers to
+`<name>-types` (its types) plus `<name>` (operations only, `use`-ing the
+types). Functions and types share one WIT namespace per interface, so
+name clashes resolve deterministically, never by renaming the wire-facing
+BPDL name:
+
+- In a split interface, a function keeps its BPDL name and a clashing
+  imported type is brought in under an alias prefixed with its owning
+  interface: `stat: func(...)` with `use files-types.{stat as files-stat}`.
+  The same alias rule applies to any `use` of a type whose name is
+  already taken locally.
+- In an unsplit interface (a type and a function declared together), the
+  function takes a `-fn` suffix (`stat-fn`).
+
+Lowering never affects contract identity, which is computed from the IR.
+
+`packages/plugin-schema/tests/repo_contracts.rs` lowers every repository
+contract schema and validates the result with the reference `wit-parser`.
+`cargo run -p bmux_plugin_schema --example emit -- --wit <file>` prints
+the lowering of a self-contained schema.
+
+## Manifest generation
+
+Plugin manifests are generated from the package world.
+`bmux_plugin_schema::manifest::generate` merges the plugin's `plugin.toml`
+settings with:
+
+| Key                     | Generated from                                                                 |
+| ----------------------- | ------------------------------------------------------------------------------ |
+| `services`              | `provide` entries (capability, kind, `@reentrant` operations)                  |
+| `contracts`             | each provided service: wire id, major (`@interface-version`, `@major`, else 1) |
+| `provided_capabilities` | provided services and `provide capability`                                     |
+| `required_capabilities` | `require` entries                                                              |
+| `optional_capabilities` | `require optional` entries                                                     |
+| `commands`              | plugin-level `command` declarations, when present                              |
+
+`plugin.toml` keeps only settings BPDL does not model: `id` (checked
+against the package id), `name`, `version`, `execution_class`,
+`component_roles`, `provided_features`, dependencies, owned namespaces,
+event publications, keybindings, `bundled_only` and — until they are
+declared in BPDL — CLI commands. Restating a generated key is a compile
+error.
+
+`bundled_only = "<reason>"` stays a `plugin.toml` setting rather than a
+BPDL declaration: it records how an implementation may be deployed (it
+uses host facilities plug-rt does not proxy into a dynamic library), not
+what it provides or requires, and it never affects contract identity or
+compatibility with consumers. The generator carries it into
+`PLUGIN_MANIFEST` verbatim, where `PluginDeclarations` reads it and the
+dynamic loader refuses the plugin with a typed error.
+
+A plugin crate generates its manifest at compile time:
+
+```rust
+// Package in a plugin API crate (which exports it with `export: export_schema`).
+pub mod declaration {
+    bmux_plugin_schema_macros::plugin_manifest! {
+        package: {
+            schema: ::bmux_tabs_plugin_api::export_schema,
+            crate_path: ::bmux_tabs_plugin_api,
+        },
+        settings: "plugin.toml",
+    }
+}
+
+// Package in the plugin crate itself.
+pub mod declaration {
+    bmux_plugin_schema_macros::schema! {
+        source: "bpdl/clipboard-plugin.bpdl",
+        manifest: "plugin.toml",
+    }
+}
+```
+
+Both emit `PLUGIN_ID`, `PLUGIN_MANIFEST` (passed to the plugin
+definition, embedded in dynamic artifacts and published by
+`scripts/package-plugin.py --install-root` as the sidecar `plugin.toml`,
+so the host reads it without running plugin code) and `provides`, which
+re-exports exactly the provided interfaces. Typed route tables name
+endpoints through it, so a route the world does not declare fails to
+compile:
+
+```rust
+use crate::declaration::provides::workspaces_state::client as state;
+bmux_plugin_sdk::route_service!(context, {
+    state::ListWorkspacesEndpoint => |(), ctx| list(ctx),
+})
+```
+
 ## Code generation
 
 The `bmux_plugin_schema_macros::schema!` proc macro takes a braced
@@ -367,12 +689,16 @@ missing operations, and operation signature disagreements.
 
 ## Future extensions (not yet supported)
 
-The grammar is intentionally small. Planned additions, each additive:
+Planned additions, each additive:
 
-- Resources (long-lived handles with methods).
-- Stream types beyond the single per-interface `events`.
+- Rust bindings for resources, handles, `stream<T>` and `future<T>` (needs
+  the host handle table and stream transport).
+- Rust codegen from the IR instead of the syntax tree.
+- CLI command annotations (aliases, short flags, value names, execution
+  kind) so every plugin's `[[commands]]` move into BPDL.
+- Contribution payload encoding into manifest `[[extensions]]` once
+  host extension points (`bmux-extpoints`) consume them.
 - Default values on record fields (with serde `#[serde(default)]`).
-- Inline documentation that survives into generated rustdoc.
 
 ## Example — windows plugin
 

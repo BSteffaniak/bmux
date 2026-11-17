@@ -2,8 +2,7 @@
 //! it per scoped instance through `define_plugin!(rust_plugin = ...)`.
 use crate::{
     NativeCommandContext, NativeLifecycleContext, NativeServiceContext,
-    NativeStreamingServiceContext, PluginEvent, PluginService, ServiceResponse,
-    TypedServiceRegistry,
+    NativeStreamingServiceContext, PluginEvent, ServiceResponse, TypedServiceRegistry,
 };
 use std::future::Future;
 use std::sync::Arc;
@@ -296,25 +295,6 @@ pub trait RustPlugin: Default + Send + 'static {
         _context: TypedServiceRegistrationContext<'_>,
         _registry: &mut TypedServiceRegistry,
     ) {
-    }
-
-    /// Return BPDL-generated services this plugin provides.
-    ///
-    /// Hosts merge these descriptors into the plugin declaration for native
-    /// bundled plugins, so BPDL service interfaces do not have to be repeated in
-    /// `plugin.toml`. Explicit manifest services remain supported for
-    /// non-BPDL surfaces, process plugins, dynamic compatibility, and override
-    /// use cases.
-    ///
-    /// # Errors
-    ///
-    /// Returns when generated descriptors cannot be converted into host service
-    /// declarations.
-    fn declared_services() -> crate::Result<Vec<PluginService>>
-    where
-        Self: Sized,
-    {
-        <Self::Contract as crate::PluginContract>::service_declarations()
     }
 
     /// Register activation-time contributions.

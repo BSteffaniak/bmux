@@ -72,6 +72,8 @@ pub struct Interface {
     pub name: String,
     /// Explicit wire version from `@interface-version(N)`.
     pub version: Option<u32>,
+    /// `@major(N)` for interfaces whose wire id has no `/vN` suffix.
+    pub contract_major: Option<u32>,
     /// Capability constant name guarding the service operations.
     pub capability: Option<String>,
     pub docs: Vec<String>,
@@ -110,10 +112,11 @@ impl Interface {
         )
     }
 
-    /// Contract major version: the explicit wire version, else 1.
+    /// Contract major version: the explicit wire version, else `@major`,
+    /// else 1.
     #[must_use]
     pub fn major(&self) -> u32 {
-        self.version.unwrap_or(1)
+        self.version.or(self.contract_major).unwrap_or(1)
     }
 
     /// The service kind implied by the interface's operations, if any.
@@ -692,6 +695,7 @@ impl Lowering<'_> {
         Interface {
             name: iface.name.clone(),
             version: iface.interface_version,
+            contract_major: iface.major,
             capability: iface.capability.clone(),
             docs: iface.docs.clone(),
             stability: stability(&iface.stability),

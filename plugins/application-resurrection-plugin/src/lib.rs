@@ -2,6 +2,17 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic)]
 
+/// Plugin declaration generated from the BPDL world and `plugin.toml`.
+pub mod declaration {
+    bmux_plugin_schema_macros::plugin_manifest! {
+        package: {
+            schema: ::bmux_application_resurrection_plugin_api::export_schema,
+            crate_path: ::bmux_application_resurrection_plugin_api,
+        },
+        settings: "plugin.toml",
+    }
+}
+
 pub mod execution;
 #[cfg(unix)]
 mod host;
@@ -188,7 +199,7 @@ bmux_plugin_sdk::define_plugin!(
     metadata = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<
         ApplicationResurrectionPlugin,
     >(
-        include_str!("../plugin.toml"),
+        crate::declaration::PLUGIN_MANIFEST,
         vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
     )
     .expect("resurrection declaration must be valid")

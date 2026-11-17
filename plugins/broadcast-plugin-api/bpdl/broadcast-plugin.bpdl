@@ -95,3 +95,14 @@ interface broadcast-diagnostics-v1 {
     // Oldest to newest, clamped to 256 entries. Zero returns no entries.
     command events(last: u32) -> list<event>;
 }
+
+/// What `bmux.broadcast` provides to and requires from the host and other plugins.
+world broadcast {
+    provide broadcast-control-v1;
+    provide broadcast-output-v1;
+    provide broadcast-turnkey-v1;
+    provide broadcast-presentation-v1;
+    provide broadcast-diagnostics-v1;
+    require optional capability bmux.sessions.read;
+    require optional capability bmux.pane_runtime.read;
+}

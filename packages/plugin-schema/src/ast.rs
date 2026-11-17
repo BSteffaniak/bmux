@@ -94,6 +94,10 @@ pub struct Interface {
     /// `@interface-version(1) interface foo` produces `foo/v1` while
     /// retaining `foo` as the source/module name.
     pub interface_version: Option<u32>,
+    /// `@major(N)`: contract major of an interface whose wire id carries no
+    /// `/vN` suffix (legacy ids such as `presenter-view-v2`). Negotiation
+    /// metadata only; it never enters wire identity.
+    pub major: Option<u32>,
     /// Capability constant required to invoke this service interface.
     /// Present only for query-only or command-only interfaces.
     pub capability: Option<String>,

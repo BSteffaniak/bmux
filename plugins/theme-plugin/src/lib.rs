@@ -24,8 +24,13 @@ mod appearance_wire;
 mod views;
 pub use views::ThemePlugin;
 
-mod control_contract {
-    bmux_plugin_schema_macros::schema! { source: "bpdl/theme-plugin.bpdl" }
+/// Theme contract bindings and the plugin declaration generated from its
+/// BPDL world and `plugin.toml`.
+pub mod control_contract {
+    bmux_plugin_schema_macros::schema! {
+        source: "bpdl/theme-plugin.bpdl",
+        manifest: "plugin.toml",
+    }
 }
 
 pub use control_contract::theme_state::SERVICE_CONTRACT;
@@ -4749,7 +4754,7 @@ mod tests {
     #[test]
     fn performance_provider_is_not_required_for_theme_activation() {
         let declaration: toml::Value =
-            toml::from_str(include_str!("../plugin.toml")).expect("valid manifest");
+            toml::from_str(crate::control_contract::PLUGIN_MANIFEST).expect("valid manifest");
         let required = declaration["required_capabilities"]
             .as_array()
             .expect("required capabilities");
@@ -6129,7 +6134,7 @@ bmux_plugin_sdk::define_plugin!(
     )
         as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
     metadata = {
-        let manifest_toml = include_str!("../plugin.toml");
+        let manifest_toml = crate::control_contract::PLUGIN_MANIFEST;
         let manifest = bmux_plugin::PluginManifest::from_toml_str(manifest_toml)
             .expect("embedded plugin declaration must be valid");
         bmux_plugin_sdk::definition::PluginMetadata {

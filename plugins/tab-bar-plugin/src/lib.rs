@@ -2,6 +2,17 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+/// Plugin declaration generated from the BPDL world and `plugin.toml`.
+pub mod declaration {
+    bmux_plugin_schema_macros::plugin_manifest! {
+        package: {
+            schema: ::bmux_tab_bar_plugin_api::export_schema,
+            crate_path: ::bmux_tab_bar_plugin_api,
+        },
+        settings: "plugin.toml",
+    }
+}
+
 use bmux_tab_bar_plugin_api as contract;
 
 /// Generated versioned contract for server-side presentation workflows.
@@ -547,7 +558,7 @@ bmux_plugin_sdk::define_plugin!(
     )
         as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
     metadata = {
-        let manifest_toml = include_str!("../plugin.toml");
+        let manifest_toml = crate::declaration::PLUGIN_MANIFEST;
         let manifest = bmux_plugin::PluginManifest::from_toml_str(manifest_toml)
             .expect("embedded plugin declaration must be valid");
         bmux_plugin_sdk::definition::PluginMetadata {
@@ -2256,7 +2267,8 @@ mod tests {
     fn shared_definition_preserves_contract_and_capability_requirements() {
         let definition = plugin_definition();
         let manifest =
-            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+            bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
+                .unwrap();
         assert_eq!(definition.metadata.plugin_id, manifest.id);
         assert_eq!(
             definition.metadata.required_capabilities,
@@ -2273,7 +2285,7 @@ mod tests {
         assert_eq!(definition.metadata.contracts[0].major, 2);
         assert_eq!(
             definition.metadata.manifest_toml.as_deref(),
-            Some(include_str!("../plugin.toml"))
+            Some(crate::declaration::PLUGIN_MANIFEST)
         );
     }
 
@@ -2421,7 +2433,7 @@ mod tests {
 
     #[test]
     fn manifest_declares_workspace_query_and_mutation_capabilities() {
-        let manifest: toml::Value = toml::from_str(include_str!("../plugin.toml")).unwrap();
+        let manifest: toml::Value = toml::from_str(crate::declaration::PLUGIN_MANIFEST).unwrap();
         let required = manifest["required_capabilities"].as_array().unwrap();
         for capability in [
             workspaces_state::client::ListWorkspacesEndpoint::CAPABILITY,
@@ -3234,7 +3246,7 @@ width = 60
     #[test]
     fn manifest_declares_external_services_and_forwarded_state() {
         use bmux_tab_bar_plugin_api::capabilities;
-        let manifest: toml::Value = toml::from_str(include_str!("../plugin.toml")).unwrap();
+        let manifest: toml::Value = toml::from_str(crate::declaration::PLUGIN_MANIFEST).unwrap();
         let provided = manifest["provided_capabilities"].as_array().unwrap();
         for capability in [
             capabilities::STATUS_READ,

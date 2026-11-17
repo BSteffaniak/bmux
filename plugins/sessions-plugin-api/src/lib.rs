@@ -23,6 +23,7 @@
 
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/sessions-plugin.bpdl",
+    export: export_schema,
 }
 
 #[cfg(test)]

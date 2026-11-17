@@ -1,37 +1,13 @@
-bundled_only = "uses a private executor, host sockets, child processes, Tokio tasks and timers directly instead of plug-rt"
-component_roles = ["backend", "frontend"]
-execution_class = "native_fast"
-id = "bmux.broadcast"
-name = "bmux Broadcast"
-optional_capabilities = ["bmux.sessions.read", "bmux.pane_runtime.read"]
-owns_namespaces = ["broadcast"]
-provided_capabilities = [
-    "bmux.broadcast.control.v1",
-    "bmux.broadcast.output.v1",
-    "bmux.broadcast.turnkey.v1",
-    "bmux.broadcast.presentation.v1",
-    "bmux.broadcast.diagnostics.v1",
-]
+bundled_only      = "uses a private executor, host sockets, child processes, Tokio tasks and timers directly instead of plug-rt"
+component_roles   = ["backend", "frontend"]
+execution_class   = "native_fast"
+id                = "bmux.broadcast"
+name              = "bmux Broadcast"
+owns_namespaces   = ["broadcast"]
 provided_features = ["bmux.broadcast"]
-version = "0.0.1-alpha.0"
+version           = "0.0.1-alpha.0"
 [native_abi]
 minimum = "1.1"
-[[services]]
-capability   = "bmux.broadcast.control.v1"
-interface_id = "broadcast-control-v1"
-kind         = "command"
-[[services]]
-capability   = "bmux.broadcast.output.v1"
-interface_id = "broadcast-output-v1"
-kind         = "command"
-[[services]]
-capability   = "bmux.broadcast.turnkey.v1"
-interface_id = "broadcast-turnkey-v1"
-kind         = "command"
-[[services]]
-capability   = "bmux.broadcast.presentation.v1"
-interface_id = "broadcast-presentation-v1"
-kind         = "command"
 [[commands]]
 execution     = "caller_process"
 expose_in_cli = true
@@ -87,8 +63,3 @@ expose_in_cli = false
 name          = "broadcast-doctor"
 path          = ["broadcast", "doctor"]
 summary       = "Broadcast doctor"
-
-[[services]]
-capability   = "bmux.broadcast.diagnostics.v1"
-interface_id = "broadcast-diagnostics-v1"
-kind         = "command"

@@ -4,4 +4,5 @@
 
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/application-resurrection.bpdl",
+    export: export_schema,
 }

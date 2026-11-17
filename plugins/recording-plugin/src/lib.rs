@@ -15,6 +15,17 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+/// Plugin declaration generated from the BPDL world and `plugin.toml`.
+pub mod declaration {
+    bmux_plugin_schema_macros::plugin_manifest! {
+        package: {
+            schema: ::bmux_recording_plugin_api::export_schema,
+            crate_path: ::bmux_recording_plugin_api,
+        },
+        settings: "plugin.toml",
+    }
+}
+
 mod activation_binding;
 pub use activation_binding::definition as plugin_definition_with_activation_configuration;
 
@@ -267,14 +278,6 @@ impl RecordingPlugin {
 
 impl RustPlugin for RecordingPlugin {
     type Contract = bmux_recording_plugin_api::Contract;
-
-    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
-        let services = <Self::Contract as bmux_plugin_sdk::PluginContract>::service_declarations()?;
-        // Schema availability is not runtime support. Keep recovery unexported
-        // until durable handlers and their required authority are coherent.
-
-        Ok(services)
-    }
 
     fn activate(
         &mut self,
@@ -2179,7 +2182,7 @@ impl RecordingHost for ActivationRecordingHost {
 // fresh default author state per created instance.
 bmux_plugin_sdk::define_plugin!(
     rust_plugin = RecordingPlugin,
-    manifest = include_str!("../plugin.toml"),
+    manifest = crate::declaration::PLUGIN_MANIFEST,
     roles = vec![
         bmux_plugin_sdk::definition::ComponentRole::Backend,
         bmux_plugin_sdk::definition::ComponentRole::Frontend
@@ -2631,7 +2634,7 @@ mod tests {
 
 fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
     bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<RecordingPlugin>(
-        include_str!("../plugin.toml"),
+        crate::declaration::PLUGIN_MANIFEST,
         vec![
             bmux_plugin_sdk::definition::ComponentRole::Backend,
             bmux_plugin_sdk::definition::ComponentRole::Frontend,

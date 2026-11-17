@@ -24,6 +24,7 @@ interface resurrection-launch-v1 {
 }
 
 @capability(RESURRECTION_HOST)
+@major(2)
 interface resurrection-launch-v2 {
     record prepared-launch {
         endpoint: string,
@@ -34,4 +35,11 @@ interface resurrection-launch-v2 {
         -> result<string, resurrection-launch-v1.host-error>;
     command prepare(key: string, restored: bool, shell: bool, replay: bool, expected-invocation: string?)
         -> result<prepared-launch, resurrection-launch-v1.host-error>;
+}
+
+/// What `bmux.application_resurrection` provides to and requires from the host and other plugins.
+world application-resurrection {
+    provide resurrection-host-v1;
+    provide resurrection-launch-v1;
+    provide resurrection-launch-v2;
 }

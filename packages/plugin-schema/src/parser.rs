@@ -267,6 +267,7 @@ impl Parser<'_> {
         let stability = take_stability(&mut annotations)?;
         let mut capability = None;
         let mut interface_version = None;
+        let mut major = None;
         for annotation in &annotations {
             match annotation.name.as_str() {
                 "capability" => {
@@ -311,11 +312,26 @@ impl Parser<'_> {
                         ));
                     }
                 }
+                "major" => {
+                    let value = annotation.int_arg()?;
+                    if value == 0 {
+                        return Err(parse_error(
+                            annotation.span,
+                            "contract major must be greater than zero",
+                        ));
+                    }
+                    if major.replace(value).is_some() {
+                        return Err(parse_error(
+                            annotation.span,
+                            "duplicate `@major` annotation",
+                        ));
+                    }
+                }
                 other => {
                     return Err(parse_error(
                         annotation.span,
                         format!(
-                            "unknown interface annotation `@{other}`; expected `@capability(NAME)`, `@interface-version(N)`, `@since(N)`, `@unstable(feature)`, or `@deprecated(N)`"
+                            "unknown interface annotation `@{other}`; expected `@capability(NAME)`, `@interface-version(N)`, `@major(N)`, `@since(N)`, `@unstable(feature)`, or `@deprecated(N)`"
                         ),
                     ));
                 }
@@ -330,11 +346,18 @@ impl Parser<'_> {
         }
         let _ = self.take_docs();
         self.expect(&TokenKind::RBrace, "expected `}` closing interface body")?;
+        if major.is_some() && interface_version.is_some() {
+            return Err(parse_error(
+                span,
+                "`@major` is only for interfaces without `@interface-version`, whose version is their major",
+            ));
+        }
         Ok(Interface {
             docs,
             stability,
             name,
             interface_version,
+            major,
             capability,
             items,
             span,
@@ -1312,7 +1335,14 @@ impl Parser<'_> {
         let mut out = self.expect_identifier(message)?;
         while self.check(&TokenKind::Dot) {
             self.advance();
-            let seg = self.expect_identifier("expected identifier after `.`")?;
+            // Id segments may spell keywords (`bmux.events.subscribe`).
+            let seg = match self.peek().and_then(|token| token.kind.keyword()) {
+                Some(keyword) => {
+                    self.advance();
+                    keyword.to_string()
+                }
+                None => self.expect_identifier("expected identifier after `.`")?,
+            };
             out.push('.');
             out.push_str(&seg);
         }

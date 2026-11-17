@@ -43,9 +43,18 @@
 //!     }
 //! }
 //!
+//! // `bpdl/my-plugin.bpdl` declares `plugin example.my version 1;` and a
+//! // `world`; `plugin.toml` holds the remaining settings.
+//! pub mod declaration {
+//!     bmux_plugin_schema_macros::schema! {
+//!         source: "bpdl/my-plugin.bpdl",
+//!         manifest: "plugin.toml",
+//!     }
+//! }
+//!
 //! bmux_plugin_sdk::define_plugin!(
 //!     rust_plugin = MyPlugin,
-//!     manifest = include_str!("../plugin.toml"),
+//!     manifest = declaration::PLUGIN_MANIFEST,
 //!     roles = vec![bmux_plugin_sdk::ComponentRole::Backend],
 //! );
 //! ```

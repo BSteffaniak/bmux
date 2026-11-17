@@ -477,7 +477,8 @@ mod tests {
     #[test]
     fn manifest_declares_generic_forward_capability() {
         let manifest =
-            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+            bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
+                .unwrap();
         assert!(
             manifest
                 .required_capabilities

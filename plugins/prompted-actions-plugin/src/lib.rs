@@ -43,6 +43,14 @@
 //! "ctrl+alt+r" = "plugin:bmux.prompted_actions:run recording-cut"
 //! ```
 
+/// Plugin declaration generated from the BPDL world and `plugin.toml`.
+pub mod declaration {
+    bmux_plugin_schema_macros::schema! {
+        source: "bpdl/prompted-actions-plugin.bpdl",
+        manifest: "plugin.toml",
+    }
+}
+
 mod config;
 mod sequence;
 
@@ -278,7 +286,7 @@ bmux_plugin_sdk::define_plugin!(
     })
         as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
     metadata = {
-        let manifest_toml = include_str!("../plugin.toml");
+        let manifest_toml = crate::declaration::PLUGIN_MANIFEST;
         let manifest = bmux_plugin::PluginManifest::from_toml_str(manifest_toml)
             .expect("embedded plugin declaration must be valid");
         bmux_plugin_sdk::definition::PluginMetadata {
@@ -302,11 +310,12 @@ mod definition_tests {
     fn definition_preserves_manifest_and_frontend_role() {
         let definition = super::plugin_definition();
         let manifest =
-            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+            bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
+                .unwrap();
         assert_eq!(definition.metadata.plugin_id, manifest.id);
         assert_eq!(
             definition.metadata.manifest_toml.as_deref(),
-            Some(include_str!("../plugin.toml"))
+            Some(crate::declaration::PLUGIN_MANIFEST)
         );
         assert_eq!(
             definition.metadata.roles,

@@ -160,3 +160,18 @@ interface sessions-events {
 
     events session-event;
 }
+
+/// What `bmux.sessions` provides to and requires from the host and other plugins.
+world sessions {
+    provide sessions-program-v1;
+    provide sessions-state;
+    provide sessions-commands;
+    provide sessions-events capability bmux.sessions.read;
+    provide sessions-spawn-v1;
+    require capability bmux.attach_runtime.write;
+    require capability bmux.clients.read;
+    require capability bmux.contexts.write;
+    require capability bmux.pane_runtime.write;
+    require optional capability bmux.pane_runtime.spawn.v1;
+    require optional capability bmux.pane_runtime.execution.v1;
+}

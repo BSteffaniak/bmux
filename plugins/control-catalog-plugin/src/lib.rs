@@ -13,6 +13,17 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+/// Plugin declaration generated from the BPDL world and `plugin.toml`.
+pub mod declaration {
+    bmux_plugin_schema_macros::plugin_manifest! {
+        package: {
+            schema: ::bmux_control_catalog_plugin_api::export_schema,
+            crate_path: ::bmux_control_catalog_plugin_api,
+        },
+        settings: "plugin.toml",
+    }
+}
+
 use bmux_clients_plugin_api::clients_events::{self, ClientEvent};
 use bmux_context_state::ContextStateHandle;
 use bmux_contexts_plugin_api::contexts_events::{self, ContextEvent};
@@ -167,8 +178,11 @@ impl ControlCatalogPlugin {
     }
 
     fn service(&self, context: &NativeServiceContext) -> ServiceResponse {
+        // The endpoint comes from the BPDL world's provided interfaces, so a
+        // route the world does not declare fails to compile.
+        use crate::declaration::provides::control_catalog_state::client as state;
         bmux_plugin_sdk::route_service!(context, {
-            "control-catalog-state", "snapshot" => |req: SnapshotArgs, _ctx| {
+            state::SnapshotEndpoint => |req, _ctx| {
                 self.build_snapshot(req.since_revision)
                     .map_err(|error| ServiceResponse::error("snapshot_failed", error))
             },
@@ -417,7 +431,7 @@ impl bmux_plugin_sdk::definition::PluginInstance for ControlCatalogPlugin {
 // fresh default author state per created instance.
 bmux_plugin_sdk::define_plugin!(
     rust_plugin = ControlCatalogPlugin,
-    manifest = include_str!("../plugin.toml"),
+    manifest = crate::declaration::PLUGIN_MANIFEST,
     roles = vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
 );
 
@@ -494,7 +508,7 @@ mod lifecycle_tests {
 
 fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
     bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<ControlCatalogPlugin>(
-        include_str!("../plugin.toml"),
+        crate::declaration::PLUGIN_MANIFEST,
         vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
     )
     .expect("plugin manifest must define valid canonical metadata")

@@ -1,0 +1,10 @@
+// Contract surface of the `bmux.sidebar` plugin. The manifest's
+// services and capabilities are generated from this world.
+plugin bmux.sidebar version 1;
+
+/// What `bmux.sidebar` provides to and requires from the host and other plugins.
+world sidebar {
+    provide opaque presentation-input: command capability bmux.sidebar.input;
+    require capability bmux.tabs.read;
+    require capability bmux.tabs.write;
+}

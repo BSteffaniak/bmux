@@ -194,3 +194,11 @@ interface metric-events {
 interface metrics-state {
     @state events performance-types.metrics-snapshot;
 }
+
+/// What `bmux.performance` provides to and requires from the host and other plugins.
+world performance {
+    provide performance-state;
+    provide performance-commands;
+    provide opaque performance-theme-settings: query capability bmux.theme.settings;
+    provide opaque performance-theme-settings: command capability bmux.theme.settings;
+}

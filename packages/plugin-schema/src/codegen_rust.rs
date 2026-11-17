@@ -600,9 +600,8 @@ fn emit_schema_service_declarations(schema: &Schema, imports: &ImportMap, out: &
 
     out.push_str("/// Service declarations generated from this BPDL schema.\n");
     out.push_str("///\n");
-    out.push_str("/// Native providers return this from `RustPlugin::declared_services` so\n");
-    out.push_str("/// the host can derive service routing from BPDL instead of duplicating\n");
-    out.push_str("/// capability/interface/kind tuples in plugin manifests.\n");
+    out.push_str("/// Every service interface this schema models. Plugin manifests route only\n");
+    out.push_str("/// the subset a package world provides; see `bmux_plugin_schema::manifest`.\n");
     out.push_str("///\n");
     out.push_str("/// # Errors\n");
     out.push_str("///\n");

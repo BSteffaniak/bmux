@@ -11,17 +11,19 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_playbook            = { workspace = true }
-bmux_playbook_plugin_api = { workspace = true }
-bmux_plugin_sdk          = { workspace = true }
-serde                    = { workspace = true, features = ["derive", "std"] }
-serde_json               = { workspace = true }
-tempfile                 = { workspace = true }
-uuid                     = { workspace = true, features = ["v4", "std", "serde"] }
+bmux_playbook             = { workspace = true }
+bmux_playbook_plugin_api  = { workspace = true }
+bmux_plugin_schema_macros = { workspace = true }
+bmux_plugin_sdk           = { workspace = true }
+serde                     = { workspace = true, features = ["derive", "std"] }
+serde_json                = { workspace = true }
+tempfile                  = { workspace = true }
+uuid                      = { workspace = true, features = ["v4", "std", "serde"] }
 
 [features]
 fail-on-warnings = [
     "bmux_playbook/fail-on-warnings",
     "bmux_playbook_plugin_api/fail-on-warnings",
+    "bmux_plugin_schema_macros/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
 ]

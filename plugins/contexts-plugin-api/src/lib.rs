@@ -15,4 +15,5 @@
 
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/contexts-plugin.bpdl",
+    export: export_schema,
 }

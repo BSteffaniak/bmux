@@ -1,37 +1,9 @@
-execution_class       = "native_fast"
-id                    = "bmux.contexts"
-name                  = "bmux Contexts"
-optional_capabilities = ["bmux.sessions.spawn.v1"]
-owns_namespaces       = []
-provided_capabilities = ["bmux.contexts.read", "bmux.contexts.write"]
-provided_features     = ["bmux.contexts"]
-required_capabilities = ["bmux.clients.read", "bmux.sessions.write"]
-version               = "0.0.1-alpha.0"
-
-[[services]]
-capability   = "bmux.contexts.read"
-interface_id = "contexts-visits-v1"
-kind         = "query"
-
-[[services]]
-capability   = "bmux.contexts.read"
-interface_id = "contexts-state"
-kind         = "query"
-
-[[services]]
-capability   = "bmux.contexts.write"
-interface_id = "contexts-commands"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.contexts.write"
-interface_id = "contexts-activation-v1"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.contexts.read"
-interface_id = "contexts-events"
-kind         = "event"
+execution_class   = "native_fast"
+id                = "bmux.contexts"
+name              = "bmux Contexts"
+owns_namespaces   = []
+provided_features = ["bmux.contexts"]
+version           = "0.0.1-alpha.0"
 
 # The contexts-events stream needs to reach streaming clients so the
 # attach pipeline can retarget on `Selected` /
@@ -42,40 +14,5 @@ kind         = "event"
 forward_to_streaming_clients = true
 kind                         = "bmux.contexts/contexts-events"
 
-[[services]]
-capability   = "bmux.contexts.write"
-interface_id = "contexts-spawn-v1"
-kind         = "command"
-
 # Explicit immutable v1 contracts. Route IDs are wire identities, not version
 # syntax: retain legacy names and negotiate their major separately.
-
-[[contracts]]
-interface_id = "contexts-visits-v1"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "contexts-state"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "contexts-commands"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "contexts-activation-v1"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "contexts-events"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "contexts-spawn-v1"
-major        = 1
-minor        = 0

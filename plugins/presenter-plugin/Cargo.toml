@@ -22,6 +22,7 @@ bmux_mermaid_render = { workspace = true }
 bmux_playbook = { workspace = true }
 bmux_playbook_plugin_api = { workspace = true }
 bmux_plugin = { workspace = true }
+bmux_plugin_schema_macros = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
 bmux_presenter = { workspace = true }
 bmux_presenter_plugin_api = { workspace = true }
@@ -104,6 +105,7 @@ fail-on-warnings = [
     "bmux_playbook/fail-on-warnings",
     "bmux_playbook_plugin_api/fail-on-warnings",
     "bmux_plugin/fail-on-warnings",
+    "bmux_plugin_schema_macros/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
     "bmux_presenter/fail-on-warnings",
     "bmux_presenter_plugin_api/fail-on-warnings",

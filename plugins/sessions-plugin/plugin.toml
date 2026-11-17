@@ -1,50 +1,9 @@
-execution_class = "native_fast"
-id = "bmux.sessions"
-name = "bmux Sessions"
-optional_capabilities = [
-    "bmux.pane_runtime.spawn.v1",
-    "bmux.pane_runtime.execution.v1",
-]
-owns_namespaces = ["new-session"]
-provided_capabilities = [
-    "bmux.sessions.program.v1",
-    "bmux.sessions.read",
-    "bmux.sessions.write",
-    "bmux.sessions.spawn.v1",
-]
+execution_class   = "native_fast"
+id                = "bmux.sessions"
+name              = "bmux Sessions"
+owns_namespaces   = ["new-session"]
 provided_features = ["bmux.sessions"]
-required_capabilities = [
-    "bmux.attach_runtime.write",
-    "bmux.clients.read",
-    "bmux.contexts.write",
-    "bmux.pane_runtime.write",
-]
-version = "0.0.1-alpha.0"
-
-[[services]]
-capability   = "bmux.sessions.program.v1"
-interface_id = "sessions-program-v1"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.sessions.read"
-interface_id = "sessions-state"
-kind         = "query"
-
-[[services]]
-capability   = "bmux.sessions.write"
-interface_id = "sessions-commands"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.sessions.read"
-interface_id = "sessions-events"
-kind         = "event"
-
-[[services]]
-capability   = "bmux.sessions.spawn.v1"
-interface_id = "sessions-spawn-v1"
-kind         = "command"
+version           = "0.0.1-alpha.0"
 
 [[event_publications]]
 delivery                     = "broadcast"
@@ -70,28 +29,3 @@ value_name = "NAME"
 
 # Explicit immutable v1 contracts. Route IDs are wire identities, not version
 # syntax: retain legacy names and negotiate their major separately.
-
-[[contracts]]
-interface_id = "sessions-program-v1"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "sessions-state"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "sessions-commands"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "sessions-events"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "sessions-spawn-v1"
-major        = 1
-minor        = 0

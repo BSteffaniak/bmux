@@ -60,3 +60,9 @@ interface playbook-commands {
     command stop(generation: u64) -> result<playbook-types.attempt, playbook-types.playbook-error>;
     command restart(generation: u64) -> result<playbook-types.attempt, playbook-types.playbook-error>;
 }
+
+/// What `bmux.playbook` provides to and requires from the host and other plugins.
+world playbook {
+    provide playbook-state;
+    provide playbook-commands;
+}

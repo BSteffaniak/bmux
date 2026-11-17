@@ -2,6 +2,14 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+/// Plugin declaration generated from the BPDL world and `plugin.toml`.
+pub mod declaration {
+    bmux_plugin_schema_macros::schema! {
+        source: "bpdl/clipboard-plugin.bpdl",
+        manifest: "plugin.toml",
+    }
+}
+
 use std::fs;
 use std::path::Path;
 
@@ -87,7 +95,7 @@ bmux_plugin_sdk::define_plugin!(
     factory = |_scope| Ok(std::sync::Arc::new(ClipboardPlugin)
         as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
     metadata = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<ClipboardPlugin>(
-        include_str!("../plugin.toml"),
+        crate::declaration::PLUGIN_MANIFEST,
         vec![
             bmux_plugin_sdk::definition::ComponentRole::Backend,
             bmux_plugin_sdk::definition::ComponentRole::Frontend
@@ -103,7 +111,16 @@ mod definition_tests {
     fn shared_definition_preserves_clipboard_contract_identity() {
         let definition = super::plugin_definition();
         assert_eq!(definition.metadata.plugin_id, "bmux.clipboard");
-        assert_eq!(definition.metadata.contracts.len(), 3);
+        // write/v1, read/v1, remote-sync/v1 and the routed remote-sync/v2.
+        assert_eq!(definition.metadata.contracts.len(), 4);
+        assert!(
+            definition
+                .declarations()
+                .unwrap()
+                .services
+                .iter()
+                .any(|service| service.interface_id == "clipboard-remote-sync/v2")
+        );
         definition
             .validate()
             .expect("embedded declaration must match metadata");

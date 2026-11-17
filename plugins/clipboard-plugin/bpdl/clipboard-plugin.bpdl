@@ -1,0 +1,11 @@
+// Contract surface of the `bmux.clipboard` plugin. The manifest's
+// services and capabilities are generated from this world.
+plugin bmux.clipboard version 1;
+
+/// What `bmux.clipboard` provides to and requires from the host and other plugins.
+world clipboard {
+    provide opaque clipboard-write@1: command capability bmux.clipboard.write;
+    provide opaque clipboard-read@1: query capability bmux.clipboard.read;
+    provide opaque clipboard-remote-sync@1: command capability bmux.clipboard.remote_sync;
+    provide opaque clipboard-remote-sync@2: command capability bmux.clipboard.remote_sync;
+}

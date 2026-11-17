@@ -1,0 +1,7 @@
+// Contract surface of the hello example. It provides and requires nothing,
+// so its world is empty; the generated manifest is `plugin.toml` plus the
+// world's (empty) services and capabilities.
+plugin example.hello version 1;
+
+/// The hello example has no contract surface beyond its CLI command.
+world hello {}

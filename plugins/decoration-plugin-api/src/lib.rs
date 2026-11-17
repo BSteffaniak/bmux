@@ -11,6 +11,7 @@
 
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/decoration-plugin.bpdl",
+    export: export_schema,
     imports: {
         layout: {
             schema: ::bmux_attach_layout_protocol::export_schema,

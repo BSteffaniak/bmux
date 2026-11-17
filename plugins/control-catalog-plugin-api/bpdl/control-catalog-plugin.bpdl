@@ -73,3 +73,9 @@ interface control-catalog-events {
 
     events catalog-event;
 }
+
+/// What `bmux.control_catalog` provides to and requires from the host and other plugins.
+world control-catalog {
+    provide control-catalog-state;
+    provide control-catalog-events capability bmux.control_catalog.read;
+}

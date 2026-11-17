@@ -1547,6 +1547,7 @@ name = "bmux_application_resurrection_plugin"
 version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_application_resurrection_plugin_api",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "libc",
  "serde",
@@ -1676,6 +1677,7 @@ dependencies = [
  "bmux_keyboard",
  "bmux_pane_runtime_plugin_api",
  "bmux_plugin",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_presentation_state",
  "bmux_sessions_plugin_api",
@@ -1894,6 +1896,7 @@ dependencies = [
  "bmux_permissions_plugin_api",
  "bmux_plugin",
  "bmux_plugin_runtime",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_session_models",
  "bmux_session_state",
@@ -1937,6 +1940,7 @@ name = "bmux_clipboard_plugin"
 version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_clipboard",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "serde",
  "tracing",
@@ -1957,6 +1961,7 @@ dependencies = [
  "bmux_pane_runtime_plugin_api",
  "bmux_pane_runtime_state",
  "bmux_plugin",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_sessions_plugin_api",
  "iroh",
@@ -2040,6 +2045,7 @@ dependencies = [
  "bmux_keybind",
  "bmux_plugin",
  "bmux_plugin_runtime",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "tokio",
  "tracing",
@@ -2108,6 +2114,7 @@ dependencies = [
  "bmux_permissions_plugin",
  "bmux_permissions_plugin_api",
  "bmux_plugin",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_server",
  "bmux_sessions_plugin",
@@ -2162,6 +2169,7 @@ dependencies = [
  "bmux_ipc",
  "bmux_plugin",
  "bmux_plugin_runtime",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_session_models",
  "bmux_sessions_plugin_api",
@@ -2194,6 +2202,7 @@ dependencies = [
  "bmux_contexts_plugin_api",
  "bmux_control_catalog_plugin_api",
  "bmux_plugin",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_session_state",
  "bmux_sessions_plugin_api",
@@ -2222,6 +2231,7 @@ dependencies = [
  "bmux_decoration_plugin_api",
  "bmux_pane_runtime_plugin_api",
  "bmux_plugin",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_scene_protocol",
  "bmux_tabs_plugin_api",
@@ -2338,8 +2348,10 @@ dependencies = [
  "bmux_cli_output",
  "bmux_permissions_plugin_api",
  "bmux_plugin",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_tab_bar_plugin_api",
+ "bmux_tabs_plugin_api",
  "serde",
  "serde_json",
  "uuid",
@@ -2352,6 +2364,7 @@ dependencies = [
  "bmux_contexts_plugin_api",
  "bmux_plugin",
  "bmux_plugin_runtime",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_tabs_plugin_api",
  "bmux_workspaces_plugin_api",
@@ -2385,6 +2398,7 @@ dependencies = [
 name = "bmux_hello_plugin"
 version = "0.0.1-alpha.4"
 dependencies = [
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
 ]
 
@@ -2530,6 +2544,7 @@ dependencies = [
  "bmux_permissions_plugin_api",
  "bmux_plugin",
  "bmux_plugin_runtime",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_presentation_state",
  "bmux_pty",
@@ -2618,6 +2633,7 @@ dependencies = [
  "bmux_performance_plugin_api",
  "bmux_performance_state",
  "bmux_plugin",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_presentation_state",
  "serde",
@@ -2663,6 +2679,7 @@ dependencies = [
  "bmux_permissions_plugin_api",
  "bmux_plugin",
  "bmux_plugin_runtime",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_sessions_plugin_api",
  "serde",
@@ -2729,6 +2746,7 @@ version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_playbook",
  "bmux_playbook_plugin_api",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "serde",
  "serde_json",
@@ -2780,6 +2798,7 @@ name = "bmux_plugin_cli_plugin"
 version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_plugin",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "serde",
  "serde_json",
@@ -2885,6 +2904,7 @@ dependencies = [
  "bmux_playbook",
  "bmux_playbook_plugin_api",
  "bmux_plugin",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_presenter",
  "bmux_presenter_plugin_api",
@@ -2986,6 +3006,7 @@ version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_plugin",
  "bmux_plugin_runtime",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "serde",
  "tokio",
@@ -3016,6 +3037,7 @@ dependencies = [
  "bmux_keyboard",
  "bmux_pane_runtime_plugin_api",
  "bmux_plugin",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_recording_plugin_api",
  "bmux_recording_protocol",
@@ -3169,6 +3191,7 @@ dependencies = [
  "bmux_pane_runtime_plugin_api",
  "bmux_plugin",
  "bmux_plugin_runtime",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_session_models",
  "bmux_session_state",
@@ -3196,6 +3219,7 @@ name = "bmux_sidebar_plugin"
 version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_plugin",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_presentation_state",
  "bmux_tabs_plugin_api",
@@ -3226,6 +3250,7 @@ version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_plugin",
  "bmux_plugin_runtime",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_snapshot_plugin_api",
  "bmux_snapshot_runtime",
@@ -3291,6 +3316,7 @@ dependencies = [
  "bmux_keyboard",
  "bmux_plugin",
  "bmux_plugin_runtime",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_presentation_state",
  "bmux_tab_bar_plugin_api",
@@ -3336,6 +3362,7 @@ dependencies = [
  "bmux_pane_runtime_plugin_api",
  "bmux_plugin",
  "bmux_plugin_runtime",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_session_models",
  "bmux_sessions_plugin_api",
@@ -3584,6 +3611,7 @@ dependencies = [
  "bmux_contexts_plugin_api",
  "bmux_ipc",
  "bmux_plugin",
+ "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_snapshot_runtime",
  "bmux_tabs_plugin_api",

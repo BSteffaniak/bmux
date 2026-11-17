@@ -17,6 +17,7 @@ bmux_config = { workspace = true }
 bmux_keyboard = { workspace = true }
 bmux_pane_runtime_plugin_api = { workspace = true }
 bmux_plugin = { workspace = true }
+bmux_plugin_schema_macros = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
 bmux_presentation_state = { workspace = true }
 bmux_sessions_plugin_api = { workspace = true }
@@ -64,6 +65,7 @@ fail-on-warnings = [
     "bmux_config/fail-on-warnings",
     "bmux_pane_runtime_plugin_api/fail-on-warnings",
     "bmux_plugin/fail-on-warnings",
+    "bmux_plugin_schema_macros/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
     "bmux_presentation_state/fail-on-warnings",
     "bmux_sessions_plugin_api/fail-on-warnings",

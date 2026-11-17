@@ -1,0 +1,7 @@
+// Contract surface of the `bmux.prompted_actions` plugin. The manifest's
+// services and capabilities are generated from this world.
+plugin bmux.prompted_actions version 1;
+
+/// What `bmux.prompted_actions` provides to and requires from the host and other plugins.
+world prompted-actions {
+}

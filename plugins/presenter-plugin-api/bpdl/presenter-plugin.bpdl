@@ -5,6 +5,7 @@ capability PRESENTER_MANAGE = bmux.presenter.manage.v1;
 capability PRESENTER_MANAGE_TRUSTED = bmux.presenter.manage.v2;
 
 @capability(PRESENTER_VIEW)
+@major(2)
 interface presenter-view-v2 {
     enum interaction-mode { receive-only, submit-only, shared, independent }
     record cursor { run_id: string, deck_revision: u64, revision: u64 }
@@ -52,6 +53,16 @@ interface presenter-host-v1 {
 
 // Explicit approval is a new versioned contract. V1 creation stays untrusted.
 @capability(PRESENTER_MANAGE_TRUSTED)
+@major(2)
 interface presenter-host-v2 {
     command start(source: string, public_read: bool, presenter_credential: string, audience_credential: string?, live_reload: bool, allow_playbooks: bool) -> result<presenter-host-v1.host-info, string>;
+}
+
+/// What `bmux.presenter` provides to and requires from the host and other plugins.
+world presenter {
+    provide presenter-view-v2;
+    provide presenter-host-v1;
+    provide presenter-host-v2;
+    require optional capability bmux.playbook.read;
+    require optional capability bmux.playbook.execute;
 }

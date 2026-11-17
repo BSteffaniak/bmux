@@ -854,3 +854,38 @@ interface cluster-raft-rpc {
 interface cluster-connection-events {
     query list() -> cluster-types.cluster-connection-event-list;
 }
+
+/// What `bmux.cluster` provides to and requires from the host and other plugins.
+world cluster {
+    provide cluster-peer-read;
+    provide cluster-raft-rpc@2;
+    provide cluster-raft-decoder;
+    provide cluster-capability-publication;
+    provide cluster-protocol-refresh;
+    provide cluster-principal-bootstrap;
+    provide cluster-query;
+    provide cluster-command;
+    provide cluster-attach-command;
+    provide cluster-attach-state;
+    provide cluster-worker-command;
+    provide cluster-worker-state;
+    provide cluster-peer-auth;
+    provide cluster-connection-events;
+    provide cluster-control-command@1;
+    provide cluster-control-command@2;
+    provide cluster-control-state@1;
+    provide cluster-control-state@2;
+    provide cluster-raft-rpc@1;
+    require capability bmux.attach_runtime.write;
+    require capability bmux.clients.read;
+    require capability bmux.commands;
+    require capability bmux.connections.invoke;
+    require capability bmux.contexts.read;
+    require capability bmux.contexts.write;
+    require capability bmux.pane_runtime.read;
+    require capability bmux.pane_runtime.write;
+    require capability bmux.panes.write;
+    require capability bmux.sessions.read;
+    require capability bmux.sessions.write;
+    require capability bmux.storage;
+}

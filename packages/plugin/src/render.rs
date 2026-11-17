@@ -1356,11 +1356,15 @@ impl RenderOp {
     #[must_use]
     pub fn painted_rects(&self) -> Vec<ExtensionRect> {
         match self {
-            Self::TextRun { x, y, text, .. } => vec![text_rect(*x, *y, render_text_width_u16(text))],
+            Self::TextRun { x, y, text, .. } => {
+                vec![text_rect(*x, *y, render_text_width_u16(text))]
+            }
             Self::StyledText { x, y, spans } => vec![text_rect(*x, *y, spans_width(spans))],
             Self::ClearRect { rect, .. } | Self::FillRect { rect, .. } => vec![*rect],
             Self::Border { rect, .. } => border_outline_rects(*rect),
-            Self::EraseRowSegment { x, y, width, .. } => vec![ExtensionRect::new(*x, *y, *width, 1)],
+            Self::EraseRowSegment { x, y, width, .. } => {
+                vec![ExtensionRect::new(*x, *y, *width, 1)]
+            }
             Self::CellGrid { x, y, rows } => vec![grid_rect(*x, *y, rows)],
         }
     }
@@ -1981,12 +1985,22 @@ mod tests {
         let pane = ExtensionRect::new(0, 0, 20, 10);
         let content = ExtensionRect::new(1, 1, 18, 8);
         let border = RenderOp::border(pane, BorderGlyphs::ascii(), RenderStyle::default());
-        assert!(!border.painted_rects().iter().any(|rect| rect.intersects(content)));
+        assert!(
+            !border
+                .painted_rects()
+                .iter()
+                .any(|rect| rect.intersects(content))
+        );
         assert_eq!(border_outline_rects(pane).len(), 4);
         let title = RenderOp::text_run(2, 0, "title", RenderStyle::default());
         assert_eq!(title.painted_rects(), [ExtensionRect::new(2, 0, 5, 1)]);
         let badge = RenderOp::text_run(3, 4, "!", RenderStyle::default());
-        assert!(badge.painted_rects().iter().any(|rect| rect.intersects(content)));
+        assert!(
+            badge
+                .painted_rects()
+                .iter()
+                .any(|rect| rect.intersects(content))
+        );
     }
 
     struct RecordingExtension {

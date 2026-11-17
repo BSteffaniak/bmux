@@ -11,6 +11,23 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+/// Plugin declaration generated from the BPDL world and `plugin.toml`.
+pub mod declaration {
+    bmux_plugin_schema_macros::plugin_manifest! {
+        package: {
+            schema: ::bmux_decoration_plugin_api::export_schema,
+            crate_path: ::bmux_decoration_plugin_api,
+        },
+        settings: "plugin.toml",
+        imports: {
+            scene: {
+                schema: ::bmux_scene_protocol::export_schema,
+                crate_path: ::bmux_scene_protocol,
+            },
+        },
+    }
+}
+
 mod engine;
 mod input;
 mod views;
@@ -4309,7 +4326,7 @@ bmux_plugin_sdk::define_plugin!(
     )
         as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
     metadata = {
-        let manifest_toml = include_str!("../plugin.toml");
+        let manifest_toml = crate::declaration::PLUGIN_MANIFEST;
         let manifest = bmux_plugin::PluginManifest::from_toml_str(manifest_toml)
             .expect("embedded plugin declaration must be valid");
         bmux_plugin_sdk::definition::PluginMetadata {

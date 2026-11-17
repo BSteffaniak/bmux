@@ -1,13 +1,10 @@
-component_roles       = ["backend"]
-contracts             = [{ interface_id = "control-catalog-state", major = 1, minor = 0 }]
-execution_class       = "native_fast"
-id                    = "bmux.control_catalog"
-name                  = "bmux Control Catalog"
-owns_namespaces       = []
-provided_capabilities = ["bmux.control_catalog.read"]
-provided_features     = ["bmux.control_catalog"]
-required_capabilities = []
-version               = "0.0.1-alpha.0"
+component_roles   = ["backend"]
+execution_class   = "native_fast"
+id                = "bmux.control_catalog"
+name              = "bmux Control Catalog"
+owns_namespaces   = []
+provided_features = ["bmux.control_catalog"]
+version           = "0.0.1-alpha.0"
 
 # control-catalog subscribes to typed events from these foundational
 # plugins, so they must activate first so their event channels are
@@ -23,16 +20,6 @@ version_req = ">=0.0.1-alpha.0"
 [[dependencies]]
 plugin_id   = "bmux.clients"
 version_req = ">=0.0.1-alpha.0"
-
-[[services]]
-capability   = "bmux.control_catalog.read"
-interface_id = "control-catalog-state"
-kind         = "query"
-
-[[services]]
-capability   = "bmux.control_catalog.read"
-interface_id = "control-catalog-events"
-kind         = "event"
 
 [[event_publications]]
 delivery                     = "broadcast"

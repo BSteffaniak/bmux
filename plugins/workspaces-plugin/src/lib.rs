@@ -4,6 +4,17 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+/// Plugin declaration generated from the BPDL world and `plugin.toml`.
+pub mod declaration {
+    bmux_plugin_schema_macros::plugin_manifest! {
+        package: {
+            schema: ::bmux_workspaces_plugin_api::export_schema,
+            crate_path: ::bmux_workspaces_plugin_api,
+        },
+        settings: "plugin.toml",
+    }
+}
+
 mod snapshot;
 
 use bmux_clients_plugin_api::clients_state;
@@ -181,62 +192,35 @@ impl RustPlugin for WorkspacesPlugin {
     }
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+        // Endpoints come from the BPDL world's provided interfaces, so a route
+        // the world does not declare fails to compile.
+        use crate::declaration::provides::{
+            workspaces_activation_v1::client as activation,
+            workspaces_commands::client as commands, workspaces_state::client as state,
+        };
         bmux_plugin_sdk::route_service!(context, {
-            "workspaces-state", "list-workspaces" => |_req: (), ctx| {
+            state::ListWorkspacesEndpoint => |(), ctx| {
                 list_workspaces(ctx).map_err(|error| ServiceResponse::error("list_failed", error))
             },
-            "workspaces-state", "get-workspace" => |req: SelectorArgs, ctx| {
-                Ok::<Result<WorkspaceSummary, WorkspaceQueryError>, ServiceResponse>(
-                    get_workspace(ctx, &req.selector)
-                )
-            },
-            "workspaces-state", "current-workspace" => |_req: (), ctx| {
+            state::GetWorkspaceEndpoint => |req, ctx| Ok(get_workspace(ctx, &req.selector)),
+            state::CurrentWorkspaceEndpoint => |(), ctx| {
                 current_workspace(ctx).map_err(|error| ServiceResponse::error("current_failed", error))
             },
-            "workspaces-commands", "new-workspace" => |req: NewWorkspaceArgs, ctx| {
-                Ok::<Result<WorkspaceAck, WorkspaceCommandError>, ServiceResponse>(
-                    new_workspace(&self.events, ctx, req.name)
-                )
+            commands::NewWorkspaceEndpoint => |req, ctx| Ok(new_workspace(&self.events, ctx, req.name)),
+            commands::RenameWorkspaceEndpoint => |req, ctx| {
+                Ok(rename_workspace(&self.events, ctx, &req.selector, req.name))
             },
-            "workspaces-commands", "rename-workspace" => |req: RenameWorkspaceArgs, ctx| {
-                Ok::<Result<WorkspaceAck, WorkspaceCommandError>, ServiceResponse>(
-                    rename_workspace(&self.events, ctx, &req.selector, req.name)
-                )
+            commands::KillWorkspaceEndpoint => |req, ctx| Ok(kill_workspace(&self.events, ctx, &req.selector)),
+            activation::ActivateTabEndpoint => |req, ctx| {
+                Ok(client_id(ctx.caller_client_id)
+                    .and_then(|id| activate_tab_for_client(&self.events, ctx, req.context_id, id)))
             },
-            "workspaces-commands", "kill-workspace" => |req: SelectorArgs, ctx| {
-                Ok::<Result<WorkspaceAck, WorkspaceCommandError>, ServiceResponse>(
-                    kill_workspace(&self.events, ctx, &req.selector)
-                )
-            },
-            "workspaces-activation-v1", "activate-tab" => |req: workspaces_activation_v1::client::ActivateTabRequest, ctx| {
-                Ok::<Result<WorkspaceAck, WorkspaceCommandError>, ServiceResponse>(
-                    client_id(ctx.caller_client_id).and_then(|id| activate_tab_for_client(&self.events, ctx, req.context_id, id))
-                )
-            },
-            "workspaces-commands", "switch-workspace" => |req: SelectorArgs, ctx| {
-                Ok::<Result<WorkspaceAck, WorkspaceCommandError>, ServiceResponse>(
-                    switch_workspace(&self.events, ctx, &req.selector)
-                )
-            },
-            "workspaces-commands", "next-workspace" => |_req: (), ctx| {
-                Ok::<Result<WorkspaceAck, WorkspaceCommandError>, ServiceResponse>(
-                    cycle_workspace(&self.events, ctx, 1)
-                )
-            },
-            "workspaces-commands", "prev-workspace" => |_req: (), ctx| {
-                Ok::<Result<WorkspaceAck, WorkspaceCommandError>, ServiceResponse>(
-                    cycle_workspace(&self.events, ctx, -1)
-                )
-            },
-            "workspaces-commands", "last-workspace" => |_req: (), ctx| {
-                Ok::<Result<WorkspaceAck, WorkspaceCommandError>, ServiceResponse>(
-                    last_workspace(&self.events, ctx)
-                )
-            },
-            "workspaces-commands", "move-tab-to-workspace" => |req: MoveTabArgs, ctx| {
-                Ok::<Result<WorkspaceAck, WorkspaceCommandError>, ServiceResponse>(
-                    move_tab(ctx, req.context_id, &req.workspace)
-                )
+            commands::SwitchWorkspaceEndpoint => |req, ctx| Ok(switch_workspace(&self.events, ctx, &req.selector)),
+            commands::NextWorkspaceEndpoint => |(), ctx| Ok(cycle_workspace(&self.events, ctx, 1)),
+            commands::PrevWorkspaceEndpoint => |(), ctx| Ok(cycle_workspace(&self.events, ctx, -1)),
+            commands::LastWorkspaceEndpoint => |(), ctx| Ok(last_workspace(&self.events, ctx)),
+            commands::MoveTabToWorkspaceEndpoint => |req, ctx| {
+                Ok(move_tab(ctx, req.context_id, &req.workspace))
             },
         })
     }
@@ -265,28 +249,6 @@ impl RustPlugin for WorkspacesPlugin {
         let _ = workspaces_state::register_provider(registry, state);
         let _ = workspaces_commands::register_provider(registry, commands);
     }
-}
-
-#[derive(Serialize, Deserialize)]
-struct SelectorArgs {
-    selector: WorkspaceSelector,
-}
-
-#[derive(Serialize, Deserialize)]
-struct NewWorkspaceArgs {
-    name: Option<String>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct RenameWorkspaceArgs {
-    selector: WorkspaceSelector,
-    name: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct MoveTabArgs {
-    context_id: Uuid,
-    workspace: WorkspaceSelector,
 }
 
 fn state() -> Result<Arc<RwLock<WorkspaceState>>, String> {
@@ -1305,7 +1267,7 @@ bmux_plugin_sdk::define_plugin!(
             >)
     },
     metadata = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<WorkspacesPlugin>(
-        include_str!("../plugin.toml"),
+        crate::declaration::PLUGIN_MANIFEST,
         vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
     )
     .expect("embedded foundational declaration must be valid")
@@ -1357,7 +1319,8 @@ mod tests {
     fn manifest_declares_tab_placement_capability() {
         use bmux_plugin_sdk::TypedServiceEndpoint;
         let manifest =
-            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+            bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
+                .unwrap();
         let capability =
             bmux_tabs_plugin_api::tabs_placement_v1::client::PlaceTabEndpoint::CAPABILITY;
         assert!(
@@ -2016,11 +1979,12 @@ mod definition_contract_tests {
     fn explicit_contract_versions_preserve_service_wire_routes() {
         let definition = super::plugin_definition();
         let manifest =
-            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+            bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
+                .unwrap();
         let canonical = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<
             super::WorkspacesPlugin,
         >(
-            include_str!("../plugin.toml"),
+            crate::declaration::PLUGIN_MANIFEST,
             vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
         )
         .unwrap();
@@ -2041,10 +2005,7 @@ mod definition_contract_tests {
             .map(|contract| (&contract.interface_id, contract.major, contract.minor))
             .collect();
         assert_eq!(embedded, declared);
-        let mut services = definition.declarations().unwrap().services;
-        services.extend(
-            <super::WorkspacesPlugin as bmux_plugin_sdk::RustPlugin>::declared_services().unwrap(),
-        );
+        let services = definition.declarations().unwrap().services;
         for service in services {
             let contract = definition
                 .metadata

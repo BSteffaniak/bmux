@@ -1,5 +1,16 @@
 //! Optional plugin-owned presentation commands and authoritative managed hosts.
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
+/// Plugin declaration generated from the BPDL world and `plugin.toml`.
+pub mod declaration {
+    bmux_plugin_schema_macros::plugin_manifest! {
+        package: {
+            schema: ::bmux_presenter_plugin_api::export_schema,
+            crate_path: ::bmux_presenter_plugin_api,
+        },
+        settings: "plugin.toml",
+    }
+}
+
 mod broadcast;
 mod cli;
 mod commands;
@@ -94,7 +105,7 @@ bmux_plugin_sdk::define_plugin!(
     )
         as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
     metadata = {
-        let manifest_toml = include_str!("../plugin.toml");
+        let manifest_toml = crate::declaration::PLUGIN_MANIFEST;
         let manifest = bmux_plugin::PluginManifest::from_toml_str(manifest_toml)
             .expect("embedded plugin declaration must be valid");
         bmux_plugin_sdk::definition::PluginMetadata {
@@ -117,7 +128,8 @@ mod tests {
     #[test]
     fn manifest_declares_packaged_mermaid_and_caller_owned_commands() {
         let manifest =
-            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+            bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
+                .unwrap();
         assert!(manifest.auxiliary_executables.is_empty());
         assert_eq!(manifest.commands.len(), 4);
         assert!(

@@ -2,6 +2,14 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+/// Plugin declaration generated from the BPDL world and `plugin.toml`.
+pub mod declaration {
+    bmux_plugin_schema_macros::schema! {
+        source: "bpdl/plugin-cli-plugin.bpdl",
+        manifest: "plugin.toml",
+    }
+}
+
 mod doctor;
 mod list_cmd;
 mod rebuild;
@@ -534,7 +542,7 @@ bmux_plugin_sdk::define_plugin!(
 
 fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
     bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<PluginCliPlugin>(
-        include_str!("../plugin.toml"),
+        crate::declaration::PLUGIN_MANIFEST,
         vec![bmux_plugin_sdk::definition::ComponentRole::Frontend],
     )
     .expect("plugin manifest must define valid canonical metadata")

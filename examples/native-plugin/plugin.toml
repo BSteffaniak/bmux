@@ -1,22 +1,9 @@
-entry = "libbmux_example_native_plugin.dylib"
-id = "example.native"
-name = "Example Native Plugin"
+entry             = "libbmux_example_native_plugin.dylib"
+id                = "example.native"
+name              = "Example Native Plugin"
 provided_features = ["example.native"]
-required_capabilities = [
-    "bmux.commands",
-    "bmux.config.read",
-    "bmux.events.subscribe",
-    "bmux.storage",
-    "bmux.permissions.read",
-    "bmux.permissions.write",
-    "bmux.tabs.read",
-    "bmux.tabs.write",
-    "bmux.tab_bar.notify",
-    "bmux.tab_bar.status.read",
-    "bmux.tab_bar.status.write",
-]
-runtime = "native"
-version = "0.0.1-alpha.0"
+runtime           = "native"
+version           = "0.0.1-alpha.0"
 
 # Commands are reached through `bmux plugin run example.native <command>`.
 # They are not exposed as top-level CLI paths: that would require claiming

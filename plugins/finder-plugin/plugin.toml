@@ -1,16 +1,10 @@
-bundled_only = "uses Tokio tasks and timers directly instead of plug-rt"
+bundled_only    = "uses Tokio tasks and timers directly instead of plug-rt"
 component_roles = ["frontend"]
-contracts = []
 execution_class = "native_fast"
-id = "bmux.finder"
-name = "bmux Finder"
+id              = "bmux.finder"
+name            = "bmux Finder"
 owns_namespaces = ["finder"]
-required_capabilities = [
-    "bmux.tabs.read",
-    "bmux.workspaces.read",
-    "bmux.contexts.read",
-]
-version = "0.0.1-alpha.0"
+version         = "0.0.1-alpha.0"
 
 [[commands]]
 execution     = "caller_process"

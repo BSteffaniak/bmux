@@ -473,6 +473,7 @@ pub fn extension_point_identity(
     let scope = Interface {
         name: String::new(),
         version: None,
+        contract_major: None,
         capability: None,
         docs: Vec::new(),
         stability: ir::Stability::default(),

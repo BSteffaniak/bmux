@@ -203,7 +203,7 @@ mod tests {
         let canonical = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<
             crate::SnapshotPlugin,
         >(
-            include_str!("../plugin.toml"),
+            crate::declaration::PLUGIN_MANIFEST,
             vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
         )
         .unwrap();

@@ -320,3 +320,22 @@ interface recording-commands {
 
     command prune(older_than_days: u64?) -> u64;
 }
+
+/// What `bmux.recording` provides to and requires from the host and other plugins.
+world recording {
+    provide recording-state;
+    provide recording-commands;
+    provide recording-process-v4;
+    provide recording-process-presentation-v1;
+    provide recording-process-live-presentation-v1;
+    provide recording-process-human-input-v1;
+    provide recording-process-presentation-wait-v1;
+    provide recording-process-environment-v1;
+    require capability bmux.pane_runtime.execution.v4;
+    require optional capability bmux.pane_runtime.environment.v1;
+    require optional capability bmux.pane_runtime.live.presentation.v1;
+    require optional capability bmux.pane_runtime.human.input.v1;
+    require optional capability bmux.pane_runtime.presentation.v1;
+    require optional capability bmux.pane_runtime.presentation.wait.v1;
+    require optional capability bmux.pane_runtime.pointer_grid.v1;
+}

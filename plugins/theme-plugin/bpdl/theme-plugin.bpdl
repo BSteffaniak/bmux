@@ -89,3 +89,13 @@ interface theme-control-v1 {
     command renew-preview(token: u64) -> result<unit, string>;
     command set-component-settings(expected-revision: u64, provider: string, json: list<u8>) -> result<snapshot, string>;
 }
+
+/// What `bmux.theme` provides to and requires from the host and other plugins.
+world theme {
+    provide theme-state;
+    provide theme-control-v1;
+    provide capability bmux.theme.settings;
+    require capability bmux.storage;
+    require capability bmux.decoration.write;
+    require optional capability bmux.performance.write;
+}

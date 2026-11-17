@@ -1,11 +1,21 @@
 //! Managed execution owner. The selected native BMUX executable is the actual
 //! executor, with a private generation-fenced control/snapshot channel. stdout
 //! is diagnostics only, never a display transport or lifecycle acknowledgement.
+/// Plugin declaration generated from the BPDL world and `plugin.toml`.
+pub mod declaration {
+    bmux_plugin_schema_macros::plugin_manifest! {
+        package: {
+            schema: ::bmux_playbook_plugin_api::export_schema,
+            crate_path: ::bmux_playbook_plugin_api,
+        },
+        settings: "plugin.toml",
+    }
+}
+
 mod runner;
 
 use std::sync::{Arc, Mutex};
 
-use bmux_playbook_plugin_api::{playbook_commands, playbook_state};
 use bmux_plugin_sdk::prelude::{
     NativeCommandContext, NativeLifecycleContext, NativeServiceContext, PluginCommandError,
     RustPlugin, ServiceResponse,
@@ -58,6 +68,9 @@ impl RustPlugin for PlaybookPlugin {
 
 impl PlaybookPlugin {
     fn service(&self, context: NativeServiceContext) -> ServiceResponse {
+        // Endpoints come from the BPDL world's provided interfaces, so a route
+        // the world does not declare fails to compile.
+        use crate::declaration::provides::{playbook_commands, playbook_state};
         bmux_plugin_sdk::route_service!(context, {
             playbook_commands::client::PrepareEndpoint => |req, _ctx| {
                 Ok(self.with_owner(|owner| owner.prepare(req.input)))
@@ -309,7 +322,7 @@ mod lifecycle_tests {
 
 fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
     bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<PlaybookPlugin>(
-        include_str!("../plugin.toml"),
+        crate::declaration::PLUGIN_MANIFEST,
         vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
     )
     .expect("plugin manifest must define valid canonical metadata")

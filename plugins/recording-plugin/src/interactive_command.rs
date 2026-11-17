@@ -378,7 +378,8 @@ mod tests {
     #[test]
     fn record_manifest_uses_generic_plugin_discovery() {
         let manifest =
-            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+            bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
+                .unwrap();
         let command = manifest
             .commands
             .iter()

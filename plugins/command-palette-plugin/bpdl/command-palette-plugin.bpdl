@@ -1,0 +1,7 @@
+// Contract surface of the `bmux.command_palette` plugin. The manifest's
+// services and capabilities are generated from this world.
+plugin bmux.command_palette version 1;
+
+/// What `bmux.command_palette` provides to and requires from the host and other plugins.
+world command-palette {
+}

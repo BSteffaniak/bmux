@@ -15,12 +15,12 @@ name = "bmux-pane-execution-supervisor"
 path = "src/bin/execution_supervisor.rs"
 
 [dependencies]
-bmux_bench = { workspace = true }
 anyhow = { workspace = true, features = ["std"] }
 bmux_application_resurrection_plugin_api = { workspace = true }
 bmux_attach_image_protocol = { workspace = true }
 bmux_attach_layout_protocol = { workspace = true }
 bmux_attach_token_state = { workspace = true }
+bmux_bench = { workspace = true }
 bmux_client = { workspace = true }
 bmux_client_state = { workspace = true }
 bmux_clients_plugin_api = { workspace = true }
@@ -33,6 +33,7 @@ bmux_pane_runtime_state = { workspace = true }
 bmux_permissions_plugin_api = { workspace = true }
 bmux_plugin = { workspace = true }
 bmux_plugin_runtime = { workspace = true }
+bmux_plugin_schema_macros = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
 bmux_presentation_state = { workspace = true }
 bmux_pty = { workspace = true }
@@ -70,6 +71,7 @@ fail-on-warnings = [
     "bmux_clients_plugin_api/fail-on-warnings",
     "bmux_ipc/fail-on-warnings",
     "bmux_plugin/fail-on-warnings",
+    "bmux_plugin_schema_macros/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
     "bmux_presentation_state/fail-on-warnings",
     "bmux_permissions_plugin_api/fail-on-warnings",

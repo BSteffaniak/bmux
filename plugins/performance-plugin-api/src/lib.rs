@@ -16,6 +16,7 @@ use bmux_plugin_sdk::{PluginEventKind, PromptRequest};
 
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/performance-plugin.bpdl",
+    export: export_schema,
 }
 
 pub use bmux_performance_state::{

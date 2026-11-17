@@ -1,20 +1,12 @@
-bundled_only          = "uses Tokio tasks and timers directly instead of plug-rt"
-component_roles       = ["backend"]
-contracts             = [{ interface_id = "presentation-input", major = 1, minor = 0 }]
-enabled_by_default    = false
-execution_class       = "native_fast"
-id                    = "bmux.sidebar"
-name                  = "bmux Sidebar"
-provided_capabilities = ["bmux.sidebar.input"]
-provided_features     = ["bmux.sidebar"]
-required_capabilities = ["bmux.tabs.read", "bmux.tabs.write"]
-version               = "0.0.1-alpha.0"
+bundled_only       = "uses Tokio tasks and timers directly instead of plug-rt"
+component_roles    = ["backend"]
+enabled_by_default = false
+execution_class    = "native_fast"
+id                 = "bmux.sidebar"
+name               = "bmux Sidebar"
+provided_features  = ["bmux.sidebar"]
+version            = "0.0.1-alpha.0"
 
 [[dependencies]]
 plugin_id   = "bmux.tabs"
 version_req = ">=0.0.1-alpha.0"
-
-[[services]]
-capability   = "bmux.sidebar.input"
-interface_id = "presentation-input"
-kind         = "command"

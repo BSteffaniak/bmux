@@ -231,7 +231,9 @@ fn full_schema_lowers_to_valid_wit() {
         "resource file",
         "constructor(path: string);",
         "exists: static func(path: string) -> bool;",
-        "stat-fn: func(f: borrow<file>) -> stat;",
+        // Split interfaces keep the BPDL function name and alias the clashing type.
+        "use files-types.{file, stat as files-stat};",
+        "stat: func(f: borrow<file>) -> files-stat;",
         "@unstable(feature = fast-path)",
         "@deprecated(version = 2.0.0)",
         "lines: func(path: string) -> stream<string>;",

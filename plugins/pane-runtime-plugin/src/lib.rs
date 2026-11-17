@@ -7,6 +7,17 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+/// Plugin declaration generated from the BPDL world and `plugin.toml`.
+pub mod declaration {
+    bmux_plugin_schema_macros::plugin_manifest! {
+        package: {
+            schema: ::bmux_pane_runtime_plugin_api::export_schema,
+            crate_path: ::bmux_pane_runtime_plugin_api,
+        },
+        settings: "plugin.toml",
+    }
+}
+
 use bmux_pane_runtime_plugin_api::{
     pane_runtime_events::{self, PaneEvent},
     pane_runtime_focus::{self, SessionFocusStateMap},
@@ -82,7 +93,7 @@ mod contract_tests {
             pointer_routes,
             std::collections::BTreeSet::from(["capabilities", "screen", "wait-present"])
         );
-        let services = super::PaneRuntimePlugin::declared_services().unwrap();
+        let services = super::PaneRuntimePlugin::provided_services().unwrap();
         let unique: std::collections::BTreeSet<_> = routes
             .iter()
             .map(|route| {
@@ -130,7 +141,7 @@ mod contract_tests {
     #[test]
     fn source_queries_are_discoverable_without_spawn_commands() {
         use bmux_plugin_sdk::RustPlugin as _;
-        let services = super::PaneRuntimePlugin::declared_services().unwrap();
+        let services = super::PaneRuntimePlugin::provided_services().unwrap();
         let source_services: Vec<_> = services
             .iter()
             .filter(|service| service.capability.as_str() == "bmux.pane_runtime.spawn.v1")
@@ -169,10 +180,10 @@ mod contract_tests {
 
     #[test]
     fn pointer_grid_exports_generated_command_interface() {
-        use bmux_plugin_sdk::RustPlugin as _;
-        let services = super::PaneRuntimePlugin::declared_services().unwrap();
+        let services = super::PaneRuntimePlugin::provided_services().unwrap();
         let manifest =
-            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+            bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
+                .unwrap();
         assert!(services.iter().any(|service| service.interface_id
             == "pane-runtime-pointer-grid-v1"
             && service.capability.as_str() == "bmux.pane_runtime.pointer_grid.v1"
@@ -185,7 +196,8 @@ mod contract_tests {
     #[test]
     fn manifest_declares_the_supervisor_protocol_the_code_speaks() {
         let manifest =
-            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+            bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
+                .unwrap();
         let supervisor = manifest
             .auxiliary_executables
             .iter()
@@ -199,15 +211,15 @@ mod contract_tests {
 
     #[test]
     fn readiness_commands_are_discoverable() {
-        use bmux_plugin_sdk::RustPlugin as _;
-        let services = super::PaneRuntimePlugin::declared_services().unwrap();
+        let services = super::PaneRuntimePlugin::provided_services().unwrap();
         assert!(services.iter().any(
             |service| service.interface_id == "pane-runtime-readiness-v1"
                 && service.capability.as_str() == "bmux.pane_runtime.write"
                 && service.kind == bmux_plugin_sdk::ServiceKind::Command
         ));
         let manifest =
-            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+            bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
+                .unwrap();
         assert!(
             manifest
                 .services
@@ -218,8 +230,7 @@ mod contract_tests {
 
     #[test]
     fn only_cohesive_execution_contract_is_discoverable() {
-        use bmux_plugin_sdk::RustPlugin;
-        let services = super::PaneRuntimePlugin::declared_services().unwrap();
+        let services = super::PaneRuntimePlugin::provided_services().unwrap();
         for version in [1, 2, 3] {
             assert!(services.iter().all(
                 |service| service.interface_id != format!("pane-runtime-execution-v{version}")
@@ -247,7 +258,7 @@ bmux_plugin_sdk::define_plugin!(
     },
     metadata =
         bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<PaneRuntimePlugin>(
-            include_str!("../plugin.toml"),
+            crate::declaration::PLUGIN_MANIFEST,
             vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
         )
         .expect("embedded foundational declaration must be valid")
@@ -256,6 +267,22 @@ bmux_plugin_sdk::define_plugin!(
 
 #[derive(Default)]
 pub struct PaneRuntimePlugin;
+
+impl PaneRuntimePlugin {
+    /// Services the generated manifest declares. The BPDL world provides the
+    /// read-only spawn queries but not the unsupported spawn commands.
+    fn provided_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
+        plugin_definition()
+            .declarations()
+            .map(|declarations| declarations.services)
+            .map_err(
+                |error| bmux_plugin_sdk::PluginError::InvalidNativeServiceOutput {
+                    plugin_id: declaration::PLUGIN_ID.into(),
+                    details: error.to_string(),
+                },
+            )
+    }
+}
 
 impl RustPlugin for PaneRuntimePlugin {
     type Contract = bmux_pane_runtime_plugin_api::Contract;
@@ -326,7 +353,7 @@ impl RustPlugin for PaneRuntimePlugin {
                 &["home-directory", "capture-source", "observe-directory"][..],
             ),
         ];
-        let services = Self::declared_services()?;
+        let services = Self::provided_services()?;
         let routes: Vec<StreamAdmittedRoute> = interfaces
             .into_iter()
             .flat_map(|(capability, kind, interface_id, operations)| {
@@ -359,19 +386,6 @@ impl RustPlugin for PaneRuntimePlugin {
                     details,
                 },
             )
-    }
-
-    fn declared_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
-        // Read-only source queries are implemented and required for fenced
-        // attachment projections. Keep unsupported spawn commands undiscoverable.
-        let mut services =
-            <Self::Contract as bmux_plugin_sdk::PluginContract>::service_declarations()?;
-        services.retain(|service| {
-            let capability = service.capability.as_str();
-            capability != bmux_pane_runtime_plugin_api::capabilities::PANE_RUNTIME_SPAWN_V1.as_str()
-                || service.kind == bmux_plugin_sdk::ServiceKind::Query
-        });
-        Ok(services)
     }
 
     fn activate(
@@ -472,7 +486,8 @@ mod definition_contract_tests {
     fn permissions_policy_is_declared_but_not_required_for_local_admission() {
         let definition = super::plugin_definition();
         let manifest =
-            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+            bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
+                .unwrap();
         assert!(
             manifest
                 .optional_capabilities
@@ -498,11 +513,12 @@ mod definition_contract_tests {
     fn explicit_contract_versions_preserve_service_wire_routes() {
         let definition = super::plugin_definition();
         let manifest =
-            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+            bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
+                .unwrap();
         let canonical = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<
             super::PaneRuntimePlugin,
         >(
-            include_str!("../plugin.toml"),
+            crate::declaration::PLUGIN_MANIFEST,
             vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
         )
         .unwrap();
@@ -524,9 +540,7 @@ mod definition_contract_tests {
             .collect();
         assert_eq!(embedded, declared);
         let mut services = definition.declarations().unwrap().services;
-        services.extend(
-            <super::PaneRuntimePlugin as bmux_plugin_sdk::RustPlugin>::declared_services().unwrap(),
-        );
+        services.extend(super::PaneRuntimePlugin::provided_services().unwrap());
         for service in services {
             let contract = definition
                 .metadata

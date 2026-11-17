@@ -3,8 +3,9 @@
 //! BPDL is the single source of truth for a plugin's contract surface. The
 //! handwritten `plugin.toml` keeps only settings BPDL does not model
 //! (display name, release version, execution class, component roles,
-//! dependencies, keybindings, event publications, owned namespaces and,
-//! until they move to BPDL declarations, CLI commands). This module merges
+//! dependencies, keybindings, event publications, owned namespaces, the
+//! `bundled_only` packaging constraint and, until they move to BPDL
+//! declarations, CLI commands). This module merges
 //! those settings with everything derived from the package's single
 //! `world`:
 //!
@@ -463,11 +464,13 @@ mod tests {
         let manifest = generate(
             &PackageSet::new(),
             &package(API),
-            "id = 'acme.files'\nname = 'Files'\nversion = '0.1.0'\n[keybindings.runtime]\nf = 'open'\n",
+            "id = 'acme.files'\nname = 'Files'\nversion = '0.1.0'\nbundled_only = 'opens sockets'\n[keybindings.runtime]\nf = 'open'\n",
         )
         .expect("manifest");
         let value: toml::Table = toml::from_str(&manifest).expect("valid TOML");
         assert_eq!(value["name"].as_str(), Some("Files"));
+        // Packaging constraints are settings, carried through verbatim.
+        assert_eq!(value["bundled_only"].as_str(), Some("opens sockets"));
         assert_eq!(
             value["provided_capabilities"],
             strings(&[

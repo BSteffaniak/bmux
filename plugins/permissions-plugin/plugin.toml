@@ -1,7 +1,6 @@
 execution_class = "native_fast"
 id = "bmux.permissions"
 name = "bmux Permissions"
-optional_capabilities = ["bmux.connections.pairing"]
 owns_namespaces = [
     "session",
     "permissions",
@@ -13,41 +12,8 @@ owns_namespaces = [
     "revoke-hot-path-override",
     "list-hot-path-overrides",
 ]
-provided_capabilities = [
-    "bmux.permissions.read",
-    "bmux.permissions.write",
-    "bmux.sessions.policy",
-]
 provided_features = ["bmux.permissions"]
-required_capabilities = [
-    "bmux.clients.read",
-    "bmux.commands",
-    "bmux.contexts.read",
-    "bmux.pane_runtime.write",
-    "bmux.sessions.read",
-    "bmux.storage",
-]
 version = "0.0.1-alpha.0"
-
-[[services]]
-capability   = "bmux.permissions.read"
-interface_id = "permissions-state"
-kind         = "query"
-
-[[services]]
-capability   = "bmux.permissions.write"
-interface_id = "permissions-commands"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.sessions.policy"
-interface_id = "session-policy-state"
-kind         = "query"
-
-[[services]]
-capability   = "bmux.sessions.policy"
-interface_id = "session-policy-commands"
-kind         = "command"
 
 [[commands]]
 aliases       = [["session", "permissions"]]
@@ -335,23 +301,3 @@ short = "j"
 
 # Explicit immutable v1 contracts. Route IDs are wire identities, not version
 # syntax: retain legacy names and negotiate their major separately.
-
-[[contracts]]
-interface_id = "permissions-state"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "permissions-commands"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "session-policy-state"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "session-policy-commands"
-major        = 1
-minor        = 0

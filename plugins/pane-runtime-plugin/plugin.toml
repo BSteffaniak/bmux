@@ -4,38 +4,9 @@ id              = "bmux.pane_runtime"
 name            = "bmux Pane Runtime"
 # Policy is enforced when permissions is selected; absence preserves local
 # single-user operation and must not prevent this provider from loading.
-optional_capabilities = [
-    "bmux.application_resurrection.host",
-    "bmux.sessions.policy",
-    # Current-window padding scope; absent tabs plugin hides that scope.
-    "bmux.tabs.read",
-]
-owns_namespaces = ["pane-padding"]
-provided_capabilities = [
-    "bmux.pane_runtime.spawn.v1",
-    "bmux.pane_runtime.view.size.v1",
-    "bmux.pane_runtime.environment.v1",
-    "bmux.pane_runtime.pointer_grid.v1",
-    "bmux.pane_runtime.live.presentation.v1",
-    "bmux.pane_runtime.human.input.v1",
-    "bmux.pane_runtime.presentation.wait.v1",
-    "bmux.pane_runtime.presentation.v1",
-    "bmux.pane_runtime.execution.v4",
-    "bmux.pane_runtime.read",
-    "bmux.pane_runtime.write",
-    "bmux.attach_runtime.read",
-    "bmux.attach_runtime.write",
-]
+owns_namespaces   = ["pane-padding"]
 provided_features = ["bmux.pane_runtime"]
-required_capabilities = [
-    "bmux.clients.read",
-    "bmux.clients.write",
-    "bmux.contexts.read",
-    "bmux.contexts.write",
-    "bmux.sessions.read",
-    "bmux.sessions.write",
-]
-version = "0.0.1-alpha.0"
+version           = "0.0.1-alpha.0"
 
 [native_abi]
 minimum = "1.1"
@@ -61,73 +32,6 @@ version_req = ">=0.0.1-alpha.0"
 [[dependencies]]
 plugin_id   = "bmux.sessions"
 version_req = ">=0.0.1-alpha.0"
-
-# Native terminal-session operations are implemented. Durable admission/recovery
-# operations return explicit Unavailable until their separate authority milestone.
-[[services]]
-capability   = "bmux.pane_runtime.view.size.v1"
-interface_id = "pane-runtime-view-size-v1"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.pane_runtime.pointer_grid.v1"
-interface_id = "pane-runtime-pointer-grid-v1"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.pane_runtime.live.presentation.v1"
-interface_id = "pane-runtime-live-presentation-v1"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.pane_runtime.human.input.v1"
-interface_id = "pane-runtime-human-input-v1"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.pane_runtime.presentation.v1"
-interface_id = "pane-runtime-presentation-v1"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.pane_runtime.presentation.wait.v1"
-interface_id = "pane-runtime-presentation-wait-v1"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.pane_runtime.execution.v4"
-interface_id = "pane-runtime-execution-v4"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.pane_runtime.write"
-interface_id = "pane-runtime-readiness-v1"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.pane_runtime.read"
-interface_id = "pane-runtime-state"
-kind         = "query"
-
-[[services]]
-capability   = "bmux.pane_runtime.write"
-interface_id = "pane-runtime-commands"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.attach_runtime.write"
-interface_id = "attach-runtime-commands"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.attach_runtime.read"
-interface_id = "attach-runtime-state"
-kind         = "query"
-
-[[services]]
-capability   = "bmux.pane_runtime.read"
-interface_id = "pane-runtime-events"
-kind         = "event"
 
 [[event_publications]]
 delivery                     = "broadcast"
@@ -271,94 +175,9 @@ long       = "pane-id"
 name       = "pane-id"
 value_name = "UUID"
 
-[[services]]
-capability   = "bmux.pane_runtime.environment.v1"
-interface_id = "pane-runtime-environment-v1"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.pane_runtime.spawn.v1"
-interface_id = "pane-runtime-spawn-v1"
-kind         = "query"
-
 # pane-runtime-spawn-commands-v1 is modeled but deliberately not advertised:
 # directory-aware creation must fail explicitly until the runtime declares
 # safe spawn support (see PaneRuntimePlugin::declared_services).
 
 # Explicit immutable v1 contracts. Route IDs are wire identities, not version
 # syntax: retain legacy names and negotiate their major separately.
-
-[[contracts]]
-interface_id = "pane-runtime-view-size-v1"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "pane-runtime-pointer-grid-v1"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "pane-runtime-live-presentation-v1"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "pane-runtime-human-input-v1"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "pane-runtime-presentation-v1"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "pane-runtime-presentation-wait-v1"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "pane-runtime-execution-v4"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "pane-runtime-readiness-v1"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "pane-runtime-state"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "pane-runtime-commands"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "attach-runtime-commands"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "attach-runtime-state"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "pane-runtime-events"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "pane-runtime-environment-v1"
-major        = 1
-minor        = 0
-
-[[contracts]]
-interface_id = "pane-runtime-spawn-v1"
-major        = 1
-minor        = 0

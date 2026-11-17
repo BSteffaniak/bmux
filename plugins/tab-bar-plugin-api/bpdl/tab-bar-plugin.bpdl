@@ -137,3 +137,18 @@ interface notifications {
     // Dismiss one of the caller's toasts; returns whether it was queued.
     command dismiss(id: uuid) -> bool;
 }
+
+/// What `bmux.tab_bar` provides to and requires from the host and other plugins.
+world tab-bar {
+    provide presentation-actions;
+    /// Plugin-contributed right-side status modules, namespaced by the
+    /// calling plugin id.
+    provide status-items;
+    provide status-items-state;
+    /// Plugin-raised attach toast notifications.
+    provide notifications;
+    require capability bmux.tabs.read;
+    require capability bmux.tabs.write;
+    require capability bmux.workspaces.read;
+    require capability bmux.workspaces.write;
+}

@@ -2,6 +2,28 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+/// Plugin declaration generated from the BPDL world and `plugin.toml`.
+pub mod declaration {
+    bmux_plugin_schema_macros::schema! {
+        source: "bpdl/native-plugin.bpdl",
+        manifest: "plugin.toml",
+        imports: {
+            permissions: {
+                schema: ::bmux_permissions_plugin_api::export_schema,
+                crate_path: ::bmux_permissions_plugin_api,
+            },
+            tabs: {
+                schema: ::bmux_tabs_plugin_api::export_schema,
+                crate_path: ::bmux_tabs_plugin_api,
+            },
+            tabbar: {
+                schema: ::bmux_tab_bar_plugin_api::export_schema,
+                crate_path: ::bmux_tab_bar_plugin_api,
+            },
+        },
+    }
+}
+
 use bmux_cli::attach::{
     self as attach_prompt, PromptOption, PromptRequest, PromptResponse, PromptSubmitError,
     PromptValue,
@@ -101,24 +123,16 @@ bmux_plugin_sdk::define_plugin!(
         plugin_id: "example.native".into(),
         version: "0.0.1-alpha.0".into(),
         roles: vec![bmux_plugin_sdk::ComponentRole::Backend],
-        required_capabilities: [
-            "bmux.commands",
-            "bmux.config.read",
-            "bmux.events.subscribe",
-            "bmux.storage",
-            "bmux.permissions.read",
-            "bmux.permissions.write",
-            "bmux.tabs.read",
-            "bmux.tabs.write",
-            "bmux.tab_bar.notify",
-            "bmux.tab_bar.status.read",
-            "bmux.tab_bar.status.write",
-        ]
-        .into_iter()
-        .map(str::to_owned)
+        required_capabilities: bmux_plugin::PluginManifest::from_toml_str(
+            declaration::PLUGIN_MANIFEST
+        )
+        .expect("generated manifest must parse")
+        .required_capabilities
+        .iter()
+        .map(|capability| capability.as_str().to_owned())
         .collect(),
         contracts: vec![],
-        manifest_toml: Some(include_str!("../plugin.toml").into()),
+        manifest_toml: Some(declaration::PLUGIN_MANIFEST.into()),
     },
 );
 
@@ -720,8 +734,9 @@ fn parse_role(value: &str) -> Option<SessionRole> {
 mod tests {
     #[test]
     fn manifest_parses_and_validates() {
-        let manifest = bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml"))
-            .expect("manifest should parse");
+        let manifest =
+            bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
+                .expect("manifest should parse");
         assert_eq!(manifest.id, "example.native");
         assert_eq!(manifest.commands.len(), 14);
         let declaration = manifest.to_declaration().expect("manifest should validate");

@@ -12,6 +12,7 @@ version     = { workspace = true }
 
 [dependencies]
 bmux_application_resurrection_plugin_api = { workspace = true }
+bmux_plugin_schema_macros                = { workspace = true }
 bmux_plugin_sdk                          = { workspace = true }
 libc                                     = { workspace = true }
 serde                                    = { workspace = true, features = ["derive", "std"] }
@@ -24,5 +25,6 @@ uuid                                     = { workspace = true, features = ["serd
 default = []
 fail-on-warnings = [
     "bmux_application_resurrection_plugin_api/fail-on-warnings",
+    "bmux_plugin_schema_macros/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
 ]

@@ -32,8 +32,8 @@ use std::fmt::Write as _;
 
 use crate::Error;
 use crate::ir::{
-    Delivery, Field, Function, Interface, Item, MethodKind, Package, PackageSet, Primitive,
-    RefScope, Stability, Type, TypeDef, TypeDefKind, TypeRef, WorldItem,
+    Delivery, ExtensionPoint, Field, Function, Interface, Item, MethodKind, Package, PackageSet,
+    Primitive, RefScope, Stability, Type, TypeDef, TypeDefKind, TypeRef, WorldItem,
 };
 
 /// WIT keywords that must be escaped with `%` when used as identifiers.
@@ -170,6 +170,34 @@ fn gates(out: &mut String, indent: &str, stability: &Stability) {
     }
 }
 
+/// The synthetic interface an extension point lowers to: its declarative
+/// `data` record followed by its functions.
+fn extension_point_interface(point: &ExtensionPoint, name: &str) -> Interface {
+    let data_name = if point.functions.iter().any(|f| label(&f.name) == "data") {
+        format!("{}-data", label(&point.name))
+    } else {
+        "data".to_string()
+    };
+    Interface {
+        name: name.to_string(),
+        version: None,
+        contract_major: None,
+        capability: None,
+        docs: point.docs.clone(),
+        stability: point.stability.clone(),
+        items: std::iter::once(Item::Type(TypeDef {
+            name: data_name,
+            docs: vec!["Declarative data supplied by every contribution.".to_string()],
+            stability: Stability::default(),
+            kind: TypeDefKind::Record {
+                fields: point.data.clone(),
+            },
+        }))
+        .chain(point.functions.iter().cloned().map(Item::Function))
+        .collect(),
+    }
+}
+
 /// Lower one package to WIT source, resolving imports through `set`.
 ///
 /// # Errors
@@ -200,38 +228,56 @@ pub fn emit(set: &PackageSet, package: &Package) -> Result<String, Error> {
     for iface in &package.interfaces {
         let name = claim(interface_name(iface))?;
         let mut header = Vec::new();
+        if let Some(major) = iface.contract_major {
+            header.push(format!("Contract major: {major}."));
+        }
         if let Some(capability) = &iface.capability
             && let Some(id) = package.capability_id(capability)
         {
             header.push(format!("Capability: `{id}`."));
         }
-        let mut lowering = InterfaceLowering::new(set, package, iface);
-        lowering.interface(&mut out, &name, &header)?;
+        if is_split(iface) {
+            // WIT worlds cannot export an interface that other exports `use`
+            // types from, so an interface with both types and operations
+            // lowers to `<name>-types` plus `<name>` (operations only).
+            let types_name = claim(format!("{name}-types"))?;
+            let types_part = Interface {
+                docs: vec![format!("Types of `{}`.", iface.wire_id())],
+                capability: None,
+                contract_major: None,
+                items: iface
+                    .items
+                    .iter()
+                    .filter(|item| matches!(item, Item::Type(_)))
+                    .cloned()
+                    .collect(),
+                ..iface.clone()
+            };
+            InterfaceLowering::new(set, package, &types_part).interface(
+                &mut out,
+                &types_name,
+                &[],
+            )?;
+            let operations = Interface {
+                items: iface
+                    .items
+                    .iter()
+                    .filter(|item| !matches!(item, Item::Type(_)))
+                    .cloned()
+                    .collect(),
+                ..iface.clone()
+            };
+            let mut lowering = InterfaceLowering::new(set, package, &operations);
+            lowering.local_owner = Some(iface);
+            lowering.interface(&mut out, &name, &header)?;
+        } else {
+            let mut lowering = InterfaceLowering::new(set, package, iface);
+            lowering.interface(&mut out, &name, &header)?;
+        }
     }
     for point in &package.extension_points {
         let name = claim(format!("{}-v{}", label(&point.name), point.version))?;
-        let data_name = if point.functions.iter().any(|f| label(&f.name) == "data") {
-            format!("{}-data", label(&point.name))
-        } else {
-            "data".to_string()
-        };
-        let synthetic = Interface {
-            name: name.clone(),
-            version: None,
-            capability: None,
-            docs: point.docs.clone(),
-            stability: point.stability.clone(),
-            items: std::iter::once(Item::Type(TypeDef {
-                name: data_name,
-                docs: vec!["Declarative data supplied by every contribution.".to_string()],
-                stability: Stability::default(),
-                kind: TypeDefKind::Record {
-                    fields: point.data.clone(),
-                },
-            }))
-            .chain(point.functions.iter().cloned().map(Item::Function))
-            .collect(),
-        };
+        let synthetic = extension_point_interface(point, &name);
         let header = vec![format!("Extension point `{}`.", point.id(&package.id))];
         let mut lowering = InterfaceLowering::new(set, package, &synthetic);
         lowering.interface(&mut out, &name, &header)?;
@@ -268,6 +314,7 @@ fn commands_interface(package: &Package, name: &str) -> Interface {
     Interface {
         name: name.to_string(),
         version: None,
+        contract_major: None,
         capability: None,
         docs: vec!["Plugin commands invocable from the command line and keymaps.".to_string()],
         stability: Stability::default(),
@@ -384,9 +431,31 @@ fn world_interface_path(
 }
 
 fn qualified_interface(package: &Package, iface: &Interface) -> String {
+    qualified_path(package, &interface_name(iface))
+}
+
+fn qualified_path(package: &Package, interface: &str) -> String {
     let name = package_name(&package.id, package.version);
     let (pkg, version) = name.split_once('@').unwrap_or((&name, ""));
-    format!("{pkg}/{}@{version}", interface_name(iface))
+    format!("{pkg}/{interface}@{version}")
+}
+
+/// Does this interface define types and also operations or events?
+fn is_split(iface: &Interface) -> bool {
+    iface.items.iter().any(|item| matches!(item, Item::Type(_)))
+        && iface
+            .items
+            .iter()
+            .any(|item| !matches!(item, Item::Type(_)))
+}
+
+/// WIT interface holding `iface`'s type definitions.
+fn type_interface_name(iface: &Interface) -> String {
+    if is_split(iface) {
+        format!("{}-types", interface_name(iface))
+    } else {
+        interface_name(iface)
+    }
 }
 
 /// Per-interface lowering state: local names and `use` imports.
@@ -394,6 +463,9 @@ struct InterfaceLowering<'a> {
     set: &'a PackageSet,
     package: &'a Package,
     iface: &'a Interface,
+    /// For the operations half of a split interface: the original interface,
+    /// whose local types now live in `<name>-types`.
+    local_owner: Option<&'a Interface>,
     /// WIT names already taken in this interface.
     taken: BTreeSet<String>,
     /// `(source path, type name) -> local WIT name` for `use` statements.
@@ -408,6 +480,7 @@ impl<'a> InterfaceLowering<'a> {
             set,
             package,
             iface,
+            local_owner: None,
             taken: BTreeSet::new(),
             uses: BTreeMap::new(),
             payloads: BTreeMap::new(),
@@ -719,6 +792,17 @@ impl<'a> InterfaceLowering<'a> {
     }
 
     fn reference(&mut self, reference: &TypeRef) -> Result<String, Error> {
+        if reference.scope == RefScope::Local
+            && let Some(owner) = self.local_owner
+        {
+            let def = owner.type_def(&reference.name).ok_or_else(|| {
+                wit_error(format!(
+                    "interface `{}` references unknown type `{}`",
+                    owner.name, reference.name
+                ))
+            })?;
+            return Ok(self.use_type(type_interface_name(owner), owner, def));
+        }
         if reference.scope == RefScope::Local {
             if self.iface.type_def(&reference.name).is_none() {
                 return Err(wit_error(format!(
@@ -762,13 +846,18 @@ impl<'a> InterfaceLowering<'a> {
                 ))
             })?;
         let path = if defining.id == self.package.id {
-            interface_name(owner)
+            type_interface_name(owner)
         } else {
-            qualified_interface(defining, owner)
+            qualified_path(defining, &type_interface_name(owner))
         };
+        Ok(self.use_type(path, owner, def))
+    }
+
+    /// Bring `def` from WIT interface `path` into scope via `use`.
+    fn use_type(&mut self, path: String, owner: &Interface, def: &TypeDef) -> String {
         let key = (path, def.name.clone());
         if let Some(local) = self.uses.get(&key) {
-            return Ok(ident(local));
+            return ident(local);
         }
         let preferred = label(&def.name);
         let local = if self.taken.contains(&preferred) {
@@ -778,7 +867,7 @@ impl<'a> InterfaceLowering<'a> {
             preferred
         };
         self.uses.insert(key, local.clone());
-        Ok(ident(&local))
+        ident(&local)
     }
 }
 

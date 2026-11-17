@@ -165,3 +165,16 @@ interface contexts-events {
 
     events context-event;
 }
+
+/// What `bmux.contexts` provides to and requires from the host and other plugins.
+world contexts {
+    provide contexts-visits-v1;
+    provide contexts-state;
+    provide contexts-commands;
+    provide contexts-activation-v1;
+    provide contexts-events capability bmux.contexts.read;
+    provide contexts-spawn-v1;
+    require capability bmux.clients.read;
+    require capability bmux.sessions.write;
+    require optional capability bmux.sessions.spawn.v1;
+}

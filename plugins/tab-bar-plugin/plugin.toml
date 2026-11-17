@@ -1,23 +1,10 @@
-bundled_only = "uses Tokio tasks and timers directly instead of plug-rt"
-component_roles = ["backend"]
-contracts = [{ interface_id = "presentation-actions/v2", major = 2, minor = 0 }]
-execution_class = "native_fast"
-id = "bmux.tab_bar"
-name = "bmux Tab Strip"
-provided_capabilities = [
-    "bmux.tab_bar.input",
-    "bmux.tab_bar.notify",
-    "bmux.tab_bar.status.read",
-    "bmux.tab_bar.status.write",
-]
+bundled_only      = "uses Tokio tasks and timers directly instead of plug-rt"
+component_roles   = ["backend"]
+execution_class   = "native_fast"
+id                = "bmux.tab_bar"
+name              = "bmux Tab Strip"
 provided_features = ["bmux.tab_bar"]
-required_capabilities = [
-    "bmux.tabs.read",
-    "bmux.tabs.write",
-    "bmux.workspaces.read",
-    "bmux.workspaces.write",
-]
-version = "0.0.1-alpha.0"
+version           = "0.0.1-alpha.0"
 
 [[dependencies]]
 plugin_id   = "bmux.tabs"
@@ -26,29 +13,6 @@ version_req = ">=0.0.1-alpha.0"
 [[dependencies]]
 plugin_id   = "bmux.workspaces"
 version_req = ">=0.0.1-alpha.0"
-
-[[services]]
-capability   = "bmux.tab_bar.input"
-interface_id = "presentation-actions/v2"
-kind         = "command"
-
-# Plugin-contributed right-side status modules (see README). Items are
-# namespaced by the calling plugin id.
-[[services]]
-capability   = "bmux.tab_bar.status.write"
-interface_id = "status-items"
-kind         = "command"
-
-[[services]]
-capability   = "bmux.tab_bar.status.read"
-interface_id = "status-items-state"
-kind         = "query"
-
-# Plugin-raised attach toast notifications.
-[[services]]
-capability   = "bmux.tab_bar.notify"
-interface_id = "notifications"
-kind         = "command"
 
 # Retained snapshots of contributed status items and queued toasts. The
 # server forwards each replacement to streaming attach clients, where the

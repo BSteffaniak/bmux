@@ -106,7 +106,6 @@ macro_rules! declare_bundled_plugins {
     ($(
         feature = $feature:literal,
         id = $plugin_id:literal,
-        manifest = $manifest:expr,
         definition = $definition:expr
         $(, kernel_policy = $kernel_policy:expr)?;
     )*) => {
@@ -125,7 +124,7 @@ macro_rules! declare_bundled_plugins {
             $(
                 #[cfg(feature = $feature)]
                 if !matches!(sources.get($plugin_id), Some(PluginSourceConfig::Dynamic { .. })) {
-                    let manifest = register_bundled_definition($plugin_id, $manifest, $definition)?;
+                    let manifest = register_bundled_definition($plugin_id, $definition)?;
                     registry.register_bundled_manifest(&manifest)
                         .with_context(|| format!("failed registering bundled plugin '{}'", $plugin_id))?;
                 }
@@ -175,7 +174,6 @@ macro_rules! declare_bundled_plugins {
 
 fn register_bundled_definition(
     plugin_id: &str,
-    manifest_toml: &str,
     definition: bmux_plugin_sdk::definition::PluginDefinition,
 ) -> Result<String> {
     anyhow::ensure!(
@@ -187,17 +185,8 @@ fn register_bundled_definition(
         .manifest_toml
         .as_deref()
         .context("bundled definition has no embedded manifest")?;
-    // Identical text needs no second parse; the registry parses it once more.
-    if embedded != manifest_toml {
-        let manifest = PluginManifest::from_toml_str(embedded)?;
-        let original = PluginManifest::from_toml_str(manifest_toml)?;
-        anyhow::ensure!(
-            manifest.id == original.id && manifest.version == original.version,
-            "bundled definition identity differs from declaration '{plugin_id}'"
-        );
-    }
-    // Preserve the exact author declaration used by dynamic packaging; the
-    // application may not repair or rewrite its contract/role metadata.
+    // The embedded manifest is generated from the plugin's BPDL world; the
+    // application registers it verbatim and never repairs contract metadata.
     let embedded = embedded.to_owned();
     if let Some(existing) = bmux_plugin::NativePluginLoader::registered_definition(plugin_id)? {
         anyhow::ensure!(
@@ -280,133 +269,107 @@ fn install_bundled_client_adapter(plugin_id: &str, paths: &ConfigPaths) {
 declare_bundled_plugins! {
     feature = "bundled-plugin-clients",
     id = "bmux.clients",
-    manifest = include_str!("../../../../plugins/clients-plugin/plugin.toml"),
     definition = bmux_clients_plugin::plugin_definition(),
     kernel_policy = bmux_clients_plugin::authorize_kernel_request;
 
     feature = "bundled-plugin-clipboard",
     id = "bmux.clipboard",
-    manifest = include_str!("../../../../plugins/clipboard-plugin/plugin.toml"),
     definition = bmux_clipboard_plugin::plugin_definition();
 
     feature = "bundled-plugin-cluster",
     id = "bmux.cluster",
-    manifest = include_str!("../../../../plugins/cluster-plugin/plugin.toml"),
     definition = bmux_cluster_plugin::plugin_definition();
 
     feature = "bundled-plugin-connections",
     id = "bmux.connections",
-    manifest = include_str!("../../../../plugins/connections-plugin/plugin.toml"),
     definition = bmux_connections_plugin::plugin_definition();
 
     feature = "bundled-plugin-command-palette",
     id = "bmux.command_palette",
-    manifest = include_str!("../../../../plugins/command-palette-plugin/plugin.toml"),
     definition = bmux_command_palette_plugin::plugin_definition();
 
     feature = "bundled-plugin-contexts",
     id = "bmux.contexts",
-    manifest = include_str!("../../../../plugins/contexts-plugin/plugin.toml"),
     definition = bmux_contexts_plugin::plugin_definition();
 
     feature = "bundled-plugin-control-catalog",
     id = "bmux.control_catalog",
-    manifest = include_str!("../../../../plugins/control-catalog-plugin/plugin.toml"),
     definition = bmux_control_catalog_plugin::plugin_definition();
 
     feature = "bundled-plugin-performance",
     id = "bmux.performance",
-    manifest = include_str!("../../../../plugins/performance-plugin/plugin.toml"),
     definition = bmux_performance_plugin::plugin_definition();
 
     feature = "bundled-plugin-permissions",
     id = "bmux.permissions",
-    manifest = include_str!("../../../../plugins/permissions-plugin/plugin.toml"),
     definition = bmux_permissions_plugin::plugin_definition();
 
     feature = "bundled-plugin-cli",
     id = "bmux.plugin_cli",
-    manifest = include_str!("../../../../plugins/plugin-cli-plugin/plugin.toml"),
     definition = bmux_plugin_cli_plugin::plugin_definition();
 
     feature = "bundled-plugin-prompted-actions",
     id = "bmux.prompted_actions",
-    manifest = include_str!("../../../../plugins/prompted-actions-plugin/plugin.toml"),
     definition = bmux_prompted_actions_plugin::plugin_definition();
 
     feature = "bundled-plugin-recording",
     id = "bmux.recording",
-    manifest = include_str!("../../../../plugins/recording-plugin/plugin.toml"),
     definition = recording_binding::unbound_definition();
 
     feature = "bundled-plugin-sessions",
     id = "bmux.sessions",
-    manifest = include_str!("../../../../plugins/sessions-plugin/plugin.toml"),
     definition = bmux_sessions_plugin::plugin_definition();
 
     feature = "bundled-plugin-playbook",
     id = "bmux.playbook",
-    manifest = include_str!("../../../../plugins/playbook-plugin/plugin.toml"),
     definition = bmux_playbook_plugin::plugin_definition();
 
     feature = "bundled-plugin-broadcast",
     id = "bmux.broadcast",
-    manifest = include_str!("../../../../plugins/broadcast-plugin/plugin.toml"),
     definition = bmux_broadcast_plugin::plugin_definition();
 
     feature = "bundled-plugin-presenter",
     id = "bmux.presenter",
-    manifest = include_str!("../../../../plugins/presenter-plugin/plugin.toml"),
     definition = bmux_presenter_plugin::plugin_definition();
 
     feature = "bundled-plugin-finder",
     id = "bmux.finder",
-    manifest = include_str!("../../../../plugins/finder-plugin/plugin.toml"),
     definition = bmux_finder_plugin::plugin_definition();
 
     feature = "bundled-plugin-pane-runtime",
     id = "bmux.pane_runtime",
-    manifest = include_str!("../../../../plugins/pane-runtime-plugin/plugin.toml"),
     definition = bmux_pane_runtime_plugin::plugin_definition();
 
     feature = "bundled-plugin-application-resurrection",
     id = "bmux.application_resurrection",
-    manifest = include_str!("../../../../plugins/application-resurrection-plugin/plugin.toml"),
     definition = bmux_application_resurrection_plugin::plugin_definition();
 
     feature = "bundled-plugin-snapshot",
     id = "bmux.snapshot",
-    manifest = include_str!("../../../../plugins/snapshot-plugin/plugin.toml"),
     definition = bmux_snapshot_plugin::plugin_definition();
 
     feature = "bundled-plugin-sidebar",
     id = "bmux.sidebar",
-    manifest = include_str!("../../../../plugins/sidebar-plugin/plugin.toml"),
     definition = bmux_sidebar_plugin::plugin_definition();
 
     feature = "bundled-plugin-tab-bar",
     id = "bmux.tab_bar",
-    manifest = include_str!("../../../../plugins/tab-bar-plugin/plugin.toml"),
     definition = bmux_tab_bar_plugin::plugin_definition();
 
     feature = "bundled-plugin-theme",
     id = "bmux.theme",
-    manifest = include_str!("../../../../plugins/theme-plugin/plugin.toml"),
     definition = bmux_theme_plugin::plugin_definition();
 
     feature = "bundled-plugin-windows",
     id = "bmux.tabs",
-    manifest = include_str!("../../../../plugins/tabs-plugin/plugin.toml"),
     definition = bmux_tabs_plugin::plugin_definition();
 
     feature = "bundled-plugin-workspaces",
     id = "bmux.workspaces",
-    manifest = include_str!("../../../../plugins/workspaces-plugin/plugin.toml"),
     definition = bmux_workspaces_plugin::plugin_definition();
 
     feature = "bundled-plugin-decoration",
     id = "bmux.decoration",
-    manifest = include_str!("../../../../plugins/decoration-plugin/plugin.toml"),
     definition = bmux_decoration_plugin::plugin_definition();
 }
 
@@ -1846,7 +1809,7 @@ fn ensure_typed_service_declared(
         return Ok(());
     }
     anyhow::bail!(
-        "plugin '{}' registered typed service capability='{}' kind='{kind:?}' interface='{}' but its effective declaration does not expose it; return the BPDL-generated service from RustPlugin::declared_services or declare an explicit manifest service",
+        "plugin '{}' registered typed service capability='{}' kind='{kind:?}' interface='{}' but its effective declaration does not expose it; provide the interface from the plugin's BPDL world",
         plugin.declaration.id.as_str(),
         capability.as_str(),
         interface_id.as_str(),
@@ -3953,7 +3916,7 @@ enabled_by_default = false
             "id='{plugin_id}'\nname='Dispatch probe'\nversion='1.0.0'\ncomponent_roles=['backend']\n"
         );
         let (definition, calls) = dispatch_probe_definition(&plugin_id, &manifest);
-        let embedded = register_bundled_definition(&plugin_id, &manifest, definition)
+        let embedded = register_bundled_definition(&plugin_id, definition)
             .expect("selected definition should register");
         assert!(
             bmux_plugin::NativePluginLoader::registered_definition(&plugin_id)

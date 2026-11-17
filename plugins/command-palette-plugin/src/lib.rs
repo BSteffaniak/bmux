@@ -2,6 +2,14 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+/// Plugin declaration generated from the BPDL world and `plugin.toml`.
+pub mod declaration {
+    bmux_plugin_schema_macros::schema! {
+        source: "bpdl/command-palette-plugin.bpdl",
+        manifest: "plugin.toml",
+    }
+}
+
 use bmux_keybind::{
     BindableActionArgument, RuntimeAction, action_to_config_name, bindable_action_catalog,
     parse_action,
@@ -660,7 +668,7 @@ bmux_plugin_sdk::define_plugin!(
     })
         as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
     metadata = {
-        let manifest_toml = include_str!("../plugin.toml");
+        let manifest_toml = crate::declaration::PLUGIN_MANIFEST;
         let manifest = bmux_plugin::PluginManifest::from_toml_str(manifest_toml)
             .expect("embedded plugin declaration must be valid");
         bmux_plugin_sdk::definition::PluginMetadata {

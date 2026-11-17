@@ -13,6 +13,17 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+/// Plugin declaration generated from the BPDL world and `plugin.toml`.
+pub mod declaration {
+    bmux_plugin_schema_macros::plugin_manifest! {
+        package: {
+            schema: ::bmux_performance_plugin_api::export_schema,
+            crate_path: ::bmux_performance_plugin_api,
+        },
+        settings: "plugin.toml",
+    }
+}
+
 use bmux_performance_plugin_api::{
     CpuPercentMode, EVENT_KIND, METRIC_EVENT_KIND, METRICS_STATE_KIND, MetricAccuracy,
     MetricCapability, MetricEvent, MetricTarget, MetricTargetKind, MetricWatch, MetricsSnapshot,
@@ -1196,7 +1207,7 @@ impl bmux_plugin_sdk::definition::PluginInstance for PerformancePlugin {
 // fresh default author state per created instance.
 bmux_plugin_sdk::define_plugin!(
     rust_plugin = PerformancePlugin,
-    manifest = include_str!("../plugin.toml"),
+    manifest = crate::declaration::PLUGIN_MANIFEST,
     roles = vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
 );
 
@@ -1362,7 +1373,7 @@ mod tests {
 
 fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
     bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<PerformancePlugin>(
-        include_str!("../plugin.toml"),
+        crate::declaration::PLUGIN_MANIFEST,
         vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
     )
     .expect("plugin manifest must define valid canonical metadata")

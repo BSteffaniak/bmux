@@ -10,4 +10,5 @@
 
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/connections-plugin.bpdl",
+    export: export_schema,
 }

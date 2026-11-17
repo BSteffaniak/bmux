@@ -41,6 +41,7 @@
 
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/tab-bar-plugin.bpdl",
+    export: export_schema,
     imports: {
         workspaces: {
             schema: ::bmux_workspaces_plugin_api::export_schema,

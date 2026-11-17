@@ -2,6 +2,17 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+/// Plugin declaration generated from the BPDL world and `plugin.toml`.
+pub mod declaration {
+    bmux_plugin_schema_macros::plugin_manifest! {
+        package: {
+            schema: ::bmux_connections_plugin_api::export_schema,
+            crate_path: ::bmux_connections_plugin_api,
+        },
+        settings: "plugin.toml",
+    }
+}
+
 mod admission;
 mod attach_provider;
 mod client_cli;
@@ -2293,7 +2304,7 @@ impl bmux_plugin_sdk::definition::PluginInstance for ConnectionsInstance {
 // fresh default author state per created instance.
 bmux_plugin_sdk::define_plugin!(
     rust_plugin = ConnectionsPlugin,
-    manifest = include_str!("../plugin.toml"),
+    manifest = crate::declaration::PLUGIN_MANIFEST,
     roles = vec![
         bmux_plugin_sdk::definition::ComponentRole::Backend,
         bmux_plugin_sdk::definition::ComponentRole::Frontend
@@ -2330,7 +2341,7 @@ mod scoped_instance_tests {
 
 fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
     bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<ConnectionsPlugin>(
-        include_str!("../plugin.toml"),
+        crate::declaration::PLUGIN_MANIFEST,
         vec![
             bmux_plugin_sdk::definition::ComponentRole::Backend,
             bmux_plugin_sdk::definition::ComponentRole::Frontend,

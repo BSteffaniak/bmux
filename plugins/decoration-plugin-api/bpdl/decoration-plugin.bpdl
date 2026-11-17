@@ -426,3 +426,15 @@ interface decoration-input-hooks {
     }
     command handle-input(event: input-event) -> input-result;
 }
+
+/// What `bmux.decoration` provides to and requires from the host and other plugins.
+world decoration {
+    provide decoration-view-v1;
+    provide decoration-state;
+    provide opaque decoration-state: command capability bmux.decoration.write;
+    provide opaque theme-extension: command capability bmux.decoration.write;
+    provide decoration-commands;
+    provide decoration-input-hooks;
+    provide scene.scene-protocol capability bmux.decoration.read;
+    require capability bmux.events.subscribe;
+}

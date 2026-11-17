@@ -11,4 +11,5 @@
 
 bmux_plugin_schema_macros::schema! {
     source: "bpdl/cluster-plugin.bpdl",
+    export: export_schema,
 }

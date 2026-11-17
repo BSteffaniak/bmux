@@ -1,40 +1,15 @@
-bundled_only = "uses a private executor, host sockets, Tokio tasks and timers directly instead of plug-rt"
-component_roles = ["backend", "frontend"]
-contracts = [
-    { interface_id = "presenter-view-v2", major = 2, minor = 0 },
-    { interface_id = "presenter-host-v1", major = 1, minor = 0 },
-    { interface_id = "presenter-host-v2", major = 2, minor = 0 },
-]
-execution_class = "native_fast"
-id = "bmux.presenter"
-name = "bmux Presenter"
-owns_namespaces = ["present"]
-provided_capabilities = [
-    "bmux.presenter.view.v2",
-    "bmux.presenter.manage.v1",
-    "bmux.presenter.manage.v2",
-]
+bundled_only      = "uses a private executor, host sockets, Tokio tasks and timers directly instead of plug-rt"
+component_roles   = ["backend", "frontend"]
+execution_class   = "native_fast"
+id                = "bmux.presenter"
+name              = "bmux Presenter"
+owns_namespaces   = ["present"]
 provided_features = ["bmux.presenter"]
 # Local playback owns its provider; managed playback checks the selected host.
-optional_capabilities = ["bmux.playbook.read", "bmux.playbook.execute"]
-required_capabilities = []
-version               = "0.0.1-alpha.0"
+version = "0.0.1-alpha.0"
 
 [native_abi]
 minimum = "1.1"
-
-[[services]]
-capability   = "bmux.presenter.view.v2"
-interface_id = "presenter-view-v2"
-kind         = "command"
-[[services]]
-capability   = "bmux.presenter.manage.v1"
-interface_id = "presenter-host-v1"
-kind         = "command"
-[[services]]
-capability   = "bmux.presenter.manage.v2"
-interface_id = "presenter-host-v2"
-kind         = "command"
 
 [[commands]]
 description   = "present play DECK [--presenter] [--no-playbooks] [--no-reload] [--broadcast [SOURCE_UUID]] [--broadcast-profile NAME] [--web] [--web-assets DIR] [--web-only] [--web-port PORT] [--web-auth none|token] [--web-host IP] [--web-public-host IP] [--web-allowed-hosts HOST,...]. Bare --broadcast publishes the default profile; --broadcast-profile NAME selects a named profile; explicit SOURCE_UUID registers only. No web assets/listener are required for broadcast. Web mirrors locally; web-only needs no terminal. Assets are prepared lazily unless overridden. Web-only holds a read-only audience view until Ctrl-C; browsers cannot navigate. Local arrow/space navigation; q exits. Presenter notes never enter audience frames."

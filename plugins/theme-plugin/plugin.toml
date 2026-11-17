@@ -1,36 +1,15 @@
-bundled_only = "uses Tokio tasks and timers directly instead of plug-rt"
-component_roles = ["backend", "frontend"]
-contracts = [
-    { interface_id = "theme-control-v1", major = 1, minor = 0 },
-    { interface_id = "theme-state", major = 1, minor = 0 },
-]
-execution_class = "native_fast"
-id = "bmux.theme"
-name = "bmux Theme"
-optional_capabilities = ["bmux.performance.write"]
-owns_namespaces = ["theme"]
-provided_capabilities = [
-    "bmux.theme.read",
-    "bmux.theme.write",
-    "bmux.theme.settings",
-]
+bundled_only      = "uses Tokio tasks and timers directly instead of plug-rt"
+component_roles   = ["backend", "frontend"]
+execution_class   = "native_fast"
+id                = "bmux.theme"
+name              = "bmux Theme"
+owns_namespaces   = ["theme"]
 provided_features = ["bmux.theme"]
-required_capabilities = ["bmux.storage", "bmux.decoration.write"]
-version = "0.0.1-alpha.0"
+version           = "0.0.1-alpha.0"
 
 [[dependencies]]
 plugin_id   = "bmux.decoration"
 version_req = ">=0.0.1-alpha.0"
-
-[[services]]
-capability   = "bmux.theme.read"
-interface_id = "theme-state"
-kind         = "query"
-
-[[services]]
-capability   = "bmux.theme.write"
-interface_id = "theme-control-v1"
-kind         = "command"
 
 [[event_publications]]
 delivery                     = "state"

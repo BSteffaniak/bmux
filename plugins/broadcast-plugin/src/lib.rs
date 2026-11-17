@@ -1,5 +1,16 @@
 //! Optional server-owned live publisher. CLI callers only invoke typed services.
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
+/// Plugin declaration generated from the BPDL world and `plugin.toml`.
+pub mod declaration {
+    bmux_plugin_schema_macros::plugin_manifest! {
+        package: {
+            schema: ::bmux_broadcast_plugin_api::export_schema,
+            crate_path: ::bmux_broadcast_plugin_api,
+        },
+        settings: "plugin.toml",
+    }
+}
+
 pub mod authorization;
 #[cfg(test)]
 #[path = "service_tests.rs"]
@@ -379,7 +390,7 @@ impl bmux_plugin_sdk::definition::PluginInstance for BroadcastPlugin {
 // fresh default author state per created instance.
 bmux_plugin_sdk::define_plugin!(
     rust_plugin = BroadcastPlugin,
-    manifest = include_str!("../plugin.toml"),
+    manifest = crate::declaration::PLUGIN_MANIFEST,
     roles = vec![
         bmux_plugin_sdk::definition::ComponentRole::Backend,
         bmux_plugin_sdk::definition::ComponentRole::Frontend
@@ -400,7 +411,7 @@ pub fn plugin_definition_with_indicator(
 
 fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
     bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<BroadcastPlugin>(
-        include_str!("../plugin.toml"),
+        crate::declaration::PLUGIN_MANIFEST,
         vec![
             bmux_plugin_sdk::definition::ComponentRole::Backend,
             bmux_plugin_sdk::definition::ComponentRole::Frontend,
