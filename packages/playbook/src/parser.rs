@@ -477,36 +477,43 @@ mod tests {
 
     #[test]
     fn resources_are_approved_frozen_and_resolved_relative_to_declaring_include() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::create_dir(root.path().join("nested")).unwrap();
-        let source = root.path().join("main.dsl");
+        let dir = tempfile::tempdir().unwrap();
+        // Resources resolve to canonical paths (a temporary directory may sit behind a symlink,
+        // as macOS's /var does), so expect them under the canonical root.
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir(root.as_path().join("nested")).unwrap();
+        let source = root.as_path().join("main.dsl");
         std::fs::write(&source, "@include nested/child.dsl\nnew-session\n").unwrap();
         std::fs::write(
-            root.path().join("nested/child.dsl"),
+            root.as_path().join("nested/child.dsl"),
             "@resource APP=game.py\n@env-from APP_TOKEN\n",
         )
         .unwrap();
-        std::fs::write(root.path().join("nested/game.py"), "approved bytes").unwrap();
-        let approved = source_closure_sha256(&source, root.path()).unwrap();
-        let frozen =
-            freeze_sources_verified(&source, root.path(), &root.path().join("frozen"), &approved)
-                .unwrap();
-        let parsed = parse_file_scoped(&frozen, Some(&root.path().join("frozen"))).unwrap();
+        std::fs::write(root.as_path().join("nested/game.py"), "approved bytes").unwrap();
+        let approved = source_closure_sha256(&source, root.as_path()).unwrap();
+        let frozen = freeze_sources_verified(
+            &source,
+            root.as_path(),
+            &root.as_path().join("frozen"),
+            &approved,
+        )
+        .unwrap();
+        let parsed = parse_file_scoped(&frozen, Some(&root.as_path().join("frozen"))).unwrap();
         assert_eq!(
             parsed.config.resources["APP"],
-            root.path().join("frozen/nested/game.py")
+            root.as_path().join("frozen/nested/game.py")
         );
         assert!(parsed.config.env_from.contains("APP_TOKEN"));
-        std::fs::write(root.path().join("nested/game.py"), "changed bytes").unwrap();
+        std::fs::write(root.as_path().join("nested/game.py"), "changed bytes").unwrap();
         assert_ne!(
             approved,
-            source_closure_sha256(&source, root.path()).unwrap()
+            source_closure_sha256(&source, root.as_path()).unwrap()
         );
         assert!(
             freeze_sources_verified(
                 &source,
-                root.path(),
-                &root.path().join("rejected"),
+                root.as_path(),
+                &root.as_path().join("rejected"),
                 &approved
             )
             .is_err()
