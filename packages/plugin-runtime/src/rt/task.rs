@@ -276,6 +276,34 @@ where
     }
 }
 
+/// Run blocking work that a host-admitted operation awaits (for example an
+/// adapter executing a synchronous author callback for that operation).
+///
+/// Unlike [`spawn_blocking`] it is owned by the operation, not admitted into
+/// the activation scope, so it still runs while that scope is closing for
+/// teardown: the host's own deactivation must be able to execute. The work
+/// still runs inside the current scope, so tasks it spawns join it.
+pub fn spawn_blocking_for_operation<F, T>(name: &str, work: F) -> JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    #[cfg(bmux_plugin_dylib)]
+    {
+        super::guest::installed().map_or_else(
+            || JoinHandle::failed(JoinError::unavailable(super::guest::NOT_INSTALLED)),
+            |client| {
+                client.spawn_blocking_for_operation(super::scope::current_remote(), name, work)
+            },
+        )
+    }
+    #[cfg(not(bmux_plugin_dylib))]
+    {
+        let _ = name;
+        bundled::spawn_blocking_for_operation(work)
+    }
+}
+
 /// Yield once to the scheduler. Runtime-agnostic.
 pub async fn yield_now() {
     let mut yielded = false;
@@ -330,6 +358,22 @@ mod bundled {
         let abort = handle.abort_handle();
         tasks.bind_abort(id, Box::new(move || abort.abort()));
         JoinHandle::tokio(handle)
+    }
+
+    pub(super) fn spawn_blocking_for_operation<F, T>(work: F) -> JoinHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let runtime = match runtime() {
+            Ok(runtime) => runtime,
+            Err(error) => return JoinHandle::failed(error),
+        };
+        let current = scope::current();
+        JoinHandle::tokio(runtime.spawn_blocking(move || {
+            let _scope = current.map(scope::enter);
+            work()
+        }))
     }
 
     pub(super) fn spawn_blocking<F, T>(name: &str, work: F) -> JoinHandle<T>

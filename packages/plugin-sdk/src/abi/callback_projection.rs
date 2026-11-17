@@ -393,16 +393,21 @@ impl PluginCallbackExecution for Executor {
             reserve(&jobs)?;
             let slot = JobSlot(jobs);
             // Blocking author code runs on the host's blocking pool through
-            // plug-rt, never on a thread created per callback.
-            let job = crate::rt::spawn_blocking_named("native-plugin-callback", move || {
-                let _slot = slot;
-                let result = entry.validate_for(&authority, instance).and_then(|()| {
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback))
-                        .unwrap_or_else(|_| Err(failure(PANICKED)))
+            // plug-rt, never on a thread created per callback. The callback
+            // belongs to the host operation awaiting it (activation,
+            // deactivation, a call), not to the activation's background
+            // scope, so a closing scope cannot refuse the host's own
+            // deactivation.
+            let job =
+                crate::rt::spawn_blocking_for_operation("native-plugin-callback", move || {
+                    let _slot = slot;
+                    let result = entry.validate_for(&authority, instance).and_then(|()| {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback))
+                            .unwrap_or_else(|_| Err(failure(PANICKED)))
+                    });
+                    drop(entry);
+                    result
                 });
-                drop(entry);
-                result
-            });
             job.await
                 .map_err(|error| PluginCommandError::failed(error.to_string()))?
         })

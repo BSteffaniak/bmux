@@ -32,7 +32,8 @@ mod waker;
 
 pub use scope::{ScopeGuard, enter_instance};
 pub use task::{
-    JoinError, JoinHandle, spawn, spawn_blocking, spawn_blocking_named, spawn_named, yield_now,
+    JoinError, JoinHandle, spawn, spawn_blocking, spawn_blocking_for_operation,
+    spawn_blocking_named, spawn_named, yield_now,
 };
 
 /// Whether the host runtime is reachable from the calling thread: inside a

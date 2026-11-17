@@ -167,6 +167,38 @@ impl Client {
         W: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
+        self.spawn_blocking_in(scope, scope, name, work)
+    }
+
+    /// Run blocking work that a host-admitted operation awaits. The operation
+    /// owns it, not the activation scope, so it is not refused while that
+    /// scope is closing for teardown (the host's own deactivation must still
+    /// run). The job still enters instance `scope`, so work it spawns joins
+    /// the activation as usual.
+    pub fn spawn_blocking_for_operation<W, T>(
+        &'static self,
+        scope: u64,
+        name: &str,
+        work: W,
+    ) -> JoinHandle<T>
+    where
+        W: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.spawn_blocking_in(0, scope, name, work)
+    }
+
+    fn spawn_blocking_in<W, T>(
+        &'static self,
+        owner: u64,
+        scope: u64,
+        name: &str,
+        work: W,
+    ) -> JoinHandle<T>
+    where
+        W: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
         let slot = Arc::new(Slot::new());
         let data = Box::into_raw(Box::new(GuestJob {
             work: Some(work),
@@ -180,7 +212,7 @@ impl Client {
         };
         let mut id = 0;
         let status = unsafe {
-            (self.table.spawn_blocking)(self.table.host, scope, job, RtStr::new(name), &raw mut id)
+            (self.table.spawn_blocking)(self.table.host, owner, job, RtStr::new(name), &raw mut id)
         };
         if status != RT_READY {
             slot.overwrite(Err(refused(status)));

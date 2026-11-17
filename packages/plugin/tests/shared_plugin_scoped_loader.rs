@@ -347,6 +347,10 @@ async fn runtime_parity(artifact: DefinitionArtifact) {
             .contains(&"orphan".to_string()),
         "plug-rt task joined the activation scope"
     );
+    // Server shutdown order: the activation's task scope stops admitting and
+    // drains first; the host's own deactivation must still run afterwards.
+    execution.cancel_background_tasks().unwrap();
+    execution.drain_background_tasks().await.unwrap();
     retire(&execution).await;
     // Teardown aborted the orphan and its future was dropped through the
     // plugin before its scope registration settled.

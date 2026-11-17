@@ -214,6 +214,43 @@ async fn dynamic_abort_panic_and_blocking() {
 }
 
 #[tokio::test]
+async fn closing_scope_refuses_plugin_work_but_runs_operation_owned_jobs() {
+    let (host, client) = dynamic(false);
+    let tasks = BackgroundTasks::new();
+    host.bind_scope(13, tasks.clone());
+    tasks.cancel().unwrap();
+    // Plugin-initiated work is refused once teardown began...
+    assert!(
+        client
+            .spawn_blocking(13, "late", || 1)
+            .await
+            .unwrap_err()
+            .is_closed()
+    );
+    assert!(
+        client
+            .spawn(13, "late", async {})
+            .await
+            .unwrap_err()
+            .is_closed()
+    );
+    // ...but blocking work a host operation awaits (a synchronous author
+    // callback of the host's own deactivation) still runs, inside the scope.
+    let scope = client
+        .spawn_blocking_for_operation(13, "deactivate-callback", super::scope::current_remote)
+        .await
+        .unwrap();
+    assert_eq!(scope, 13);
+    // Bundled: same contract.
+    let bundled = {
+        let _scope = tasks.enter();
+        super::spawn_blocking_for_operation("deactivate-callback", || 2)
+    };
+    assert_eq!(bundled.await.unwrap(), 2);
+    host.unbind_scope(13);
+}
+
+#[tokio::test]
 async fn dynamic_nested_spawns_inherit_the_scope() {
     let (host, client) = dynamic(false);
     let tasks = BackgroundTasks::new();
