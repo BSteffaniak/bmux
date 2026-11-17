@@ -28,7 +28,7 @@ use std::sync::Arc;
 mod plugin;
 pub use plugin::{
     Activation, CommandHandler, Deactivation, Declarations, DeclaredInstance, EventHandler,
-    NativeCommandHandler, Plugin, ServiceClient, definition, packaged,
+    NativeCommandHandler, Plugin, PluginCrate, ServiceClient, definition, packaged,
 };
 
 use crate::definition::{PluginCallContext, PluginHostServices};
@@ -142,6 +142,10 @@ impl Call {
 
     /// Publish a contract event on its generated channel.
     ///
+    /// The payload crosses as JSON, the host event bus's serialized form,
+    /// so subscribers in either packaging mode decode it with the
+    /// generated `subscribe_<event>()`.
+    ///
     /// # Errors
     /// Fails when no emitter is attached, the payload cannot be encoded, or
     /// the emitter rejects it.
@@ -154,8 +158,8 @@ impl Call {
                 E::KIND.as_str()
             ))
         })?;
-        let payload = crate::encode_service_message(&event)
-            .map_err(|error| Error::failed(error.to_string()))?;
+        let payload =
+            serde_json::to_vec(&event).map_err(|error| Error::failed(error.to_string()))?;
         events.emit(&E::KIND, E::DELIVERY, payload)
     }
 }
@@ -183,6 +187,109 @@ pub trait ContractEvent: serde::Serialize + Send + 'static {
     const KIND: PluginEventKind;
     /// Broadcast or retained state.
     const DELIVERY: EventDelivery;
+}
+
+/// Where typed subscriptions come from: the host's subscription route.
+///
+/// [`PluginHostServices`] implements it in both packaging modes (the
+/// subscription is owned by the activation those services belong to);
+/// tests can supply their own.
+pub trait EventSource {
+    /// Subscribe to one serialized event channel (`state` for retained state).
+    ///
+    /// # Errors
+    /// The host bound no route, the activation is closed, or the channel
+    /// cannot be observed.
+    fn subscribe_event(
+        &self,
+        kind: &str,
+        state: bool,
+    ) -> crate::Result<crate::HostEventSubscription>;
+}
+
+impl EventSource for PluginHostServices {
+    fn subscribe_event(
+        &self,
+        kind: &str,
+        state: bool,
+    ) -> crate::Result<crate::HostEventSubscription> {
+        Self::subscribe_event(self, kind, state)
+    }
+}
+
+/// A typed stream of one BPDL event channel, returned by a generated
+/// client's `subscribe_<event>()`.
+///
+/// Items arrive in order; a state channel yields its current value first
+/// (an unset state channel yields nothing until its first publication). The
+/// stream ends (`None`) when the owning activation is released or the
+/// channel goes away; dropping it releases the subscription. Waits are
+/// woken by the host in both packaging modes.
+pub struct Subscription<E> {
+    inner: crate::HostEventSubscription,
+    state: bool,
+    event: PhantomData<fn() -> E>,
+}
+
+impl<E> std::fmt::Debug for Subscription<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Subscription")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<E: serde::de::DeserializeOwned> Subscription<E> {
+    /// The next event, `Some(Err(..))` for a payload that does not decode as
+    /// `E` (the stream continues), or `None` once the stream ended.
+    pub async fn next(&mut self) -> Option<Result<E>> {
+        loop {
+            let payload = self.inner.next().await?;
+            if self.state && payload.as_slice() == b"null" {
+                // A registered state channel with no publication yet.
+                continue;
+            }
+            return Some(serde_json::from_slice(&payload).map_err(|error| {
+                Error::failed(format!(
+                    "event payload does not match its contract: {error}"
+                ))
+            }));
+        }
+    }
+}
+
+/// Subscribe to `kind` through `source`, decoding payloads as `E`. Generated
+/// `subscribe_<event>()` methods call this with their channel's constants.
+///
+/// # Errors
+/// As [`EventSource::subscribe_event`].
+pub fn subscribe<E: serde::de::DeserializeOwned>(
+    source: &impl EventSource,
+    kind: &PluginEventKind,
+    delivery: EventDelivery,
+) -> Result<Subscription<E>> {
+    let state = delivery == EventDelivery::State;
+    let inner = source
+        .subscribe_event(kind.as_str(), state)
+        .map_err(|error| Error::unavailable(error.to_string()))?;
+    Ok(Subscription {
+        inner,
+        state,
+        event: PhantomData,
+    })
+}
+
+/// A generated client for a BPDL events interface.
+///
+/// Declared with `Declarations::subscribe::<C>()` and obtained from
+/// `Activation::events::<C>()`.
+pub trait EventClient: Sized {
+    /// The interface's channel.
+    const KIND: PluginEventKind;
+    /// Broadcast or retained state.
+    const DELIVERY: EventDelivery;
+    /// Connect through the activation's host services.
+    fn connect(host: PluginHostServices) -> Self;
 }
 
 /// A BPDL service interface a plugin can provide. Implemented by the
@@ -553,8 +660,48 @@ mod tests {
         let (kind, delivery, payload) = recorder.0.lock().unwrap().remove(0);
         assert_eq!(kind, "acme.counter/counter");
         assert_eq!(delivery, EventDelivery::State);
-        let decoded: Changed = crate::decode_service_message(&payload).unwrap();
+        let decoded: Changed = serde_json::from_slice(&payload).unwrap();
         assert_eq!(decoded, Changed { value: 7 });
+    }
+
+    /// A host subscription over a fixed list of JSON payloads.
+    struct Fixed(std::collections::VecDeque<Vec<u8>>);
+    impl crate::HostEventStream for Fixed {
+        fn poll_next(
+            &mut self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Vec<u8>>> {
+            std::task::Poll::Ready(self.0.pop_front())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct Source(Arc<Mutex<Vec<(String, bool)>>>);
+    impl EventSource for Source {
+        fn subscribe_event(
+            &self,
+            kind: &str,
+            state: bool,
+        ) -> crate::Result<crate::HostEventSubscription> {
+            self.0.lock().unwrap().push((kind.to_owned(), state));
+            Ok(crate::HostEventSubscription::new(Fixed(
+                [b"null".to_vec(), br#"{"value":3}"#.to_vec(), b"{}".to_vec()].into(),
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn subscriptions_decode_typed_events_and_skip_unset_state() {
+        let source = Source::default();
+        let mut changes =
+            subscribe::<Changed>(&source, &Changed::KIND, EventDelivery::State).unwrap();
+        assert_eq!(
+            source.0.lock().unwrap().as_slice(),
+            [("acme.counter/counter".to_owned(), true)]
+        );
+        assert_eq!(changes.next().await.unwrap().unwrap(), Changed { value: 3 });
+        assert!(changes.next().await.unwrap().is_err(), "mismatch surfaces");
+        assert!(changes.next().await.is_none());
     }
 
     #[test]

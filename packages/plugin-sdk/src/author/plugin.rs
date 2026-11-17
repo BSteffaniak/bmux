@@ -12,8 +12,8 @@ use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use super::{
-    BoxFuture, Call, CommandArgs, CommandDecl, Error, EventDelivery, EventEmitter, Extends,
-    Provides, RequiredInterface, Result,
+    BoxFuture, Call, CommandArgs, CommandDecl, ContractEvent, Error, EventClient, EventDelivery,
+    EventEmitter, Extends, Provides, RequiredInterface, Result,
 };
 use crate::definition::{
     CommandOutcome, PluginCallContext, PluginCreateContext, PluginFuture, PluginHostServices,
@@ -54,6 +54,19 @@ pub trait Plugin: Send + Sync + 'static {
 pub trait ServiceClient: RequiredInterface + Sized {
     /// Connect through the activation's host services.
     fn connect(host: PluginHostServices) -> Self;
+
+    /// Call a bundled provider registered in a typed service handle
+    /// directly, with no serialization (the bundled fast path).
+    ///
+    /// # Errors
+    /// The handle holds a different provider type, or the client has no
+    /// direct path.
+    fn direct(handle: &crate::TypedServiceHandle) -> crate::Result<Self> {
+        let _ = handle;
+        Err(crate::PluginError::UnsupportedHostOperation {
+            operation: "direct typed client",
+        })
+    }
 }
 
 /// A command handler: `async fn(&self, &Call, Args) -> Result<()>`.
@@ -150,6 +163,8 @@ pub struct Declarations<P> {
     commands: Vec<Command<P>>,
     contributions: Vec<Contribution<P>>,
     events: Option<EventFn<P>>,
+    emitted: Vec<(PluginEventKind, EventDelivery)>,
+    subscribed: Vec<PluginEventKind>,
 }
 
 impl<P> Default for Declarations<P> {
@@ -160,6 +175,8 @@ impl<P> Default for Declarations<P> {
             commands: Vec::new(),
             contributions: Vec::new(),
             events: None,
+            emitted: Vec::new(),
+            subscribed: Vec::new(),
         }
     }
 }
@@ -228,6 +245,26 @@ impl<P: Send + Sync + 'static> Declarations<P> {
             data: crate::encode_service_message(&data).map_err(|error| error.to_string()),
             dispatch: <E as Extends<P>>::dispatch,
         });
+        self
+    }
+
+    /// Publish a BPDL contract event: `emits::<counter_events::v1::Changed>()`.
+    /// The host registers its channel for the activation before `activate`
+    /// runs, so consumers can subscribe before the first `Call::emit`.
+    pub fn emits<E: ContractEvent>(&mut self) -> &mut Self {
+        if !self.emitted.iter().any(|(kind, _)| *kind == E::KIND) {
+            self.emitted.push((E::KIND, E::DELIVERY));
+        }
+        self
+    }
+
+    /// Subscribe to a BPDL events interface:
+    /// `subscribe::<counter_events::v1::Client>()`. `Activation::events`
+    /// refuses undeclared subscriptions.
+    pub fn subscribe<C: EventClient>(&mut self) -> &mut Self {
+        if !self.subscribed.contains(&C::KIND) {
+            self.subscribed.push(C::KIND);
+        }
         self
     }
 
@@ -359,6 +396,18 @@ impl<P: Send + Sync + 'static> Declarations<P> {
     pub fn required(&self) -> &[ServiceInterfaceDescriptor] {
         &self.required
     }
+
+    /// Event channels this plugin publishes, with their delivery.
+    #[must_use]
+    pub fn emitted(&self) -> &[(PluginEventKind, EventDelivery)] {
+        &self.emitted
+    }
+
+    /// Event channels this plugin subscribes to.
+    #[must_use]
+    pub fn subscribed(&self) -> &[PluginEventKind] {
+        &self.subscribed
+    }
 }
 
 /// The activation context handed to [`Plugin::activate`].
@@ -366,7 +415,8 @@ pub struct Activation {
     context: PluginLifecycleContext,
     tasks: Option<crate::HostAsyncHandle>,
     required: Vec<ServiceInterfaceDescriptor>,
-    events: Arc<Mutex<Arc<dyn EventEmitter>>>,
+    subscribed: Vec<PluginEventKind>,
+    emitter: Arc<Mutex<Arc<dyn EventEmitter>>>,
 }
 
 impl Activation {
@@ -426,6 +476,22 @@ impl Activation {
         Ok(C::connect(self.host()?))
     }
 
+    /// A typed client for a declared event subscription; its
+    /// `subscribe_<event>()` streams are owned by this activation.
+    ///
+    /// # Errors
+    /// Fails for an events interface `declare()` did not subscribe to, or
+    /// without host services.
+    pub fn events<C: EventClient>(&self) -> Result<C> {
+        if !self.subscribed.contains(&C::KIND) {
+            return Err(Error::failed(format!(
+                "'{}' is not subscribed in declare()",
+                C::KIND.as_str()
+            )));
+        }
+        Ok(C::connect(self.host()?))
+    }
+
     /// Spawn work owned by this activation on the host runtime; the host
     /// cancels and drains it with the activation.
     ///
@@ -446,7 +512,7 @@ impl Activation {
 
     /// Bind the host event bus this plugin's `Call::emit` publishes through.
     pub fn bind_events(&self, events: Arc<dyn EventEmitter>) {
-        if let Ok(mut slot) = self.events.lock() {
+        if let Ok(mut slot) = self.emitter.lock() {
             *slot = events;
         }
     }
@@ -482,6 +548,83 @@ impl EventEmitter for Unbound {
             "event dropped: no host event bus is bound"
         );
         Ok(())
+    }
+}
+
+/// Publishes through the activation's host services: the host event bus in
+/// both packaging modes. Declared channels are registered at activation; a
+/// channel first emitted without a declaration is registered on first use.
+struct HostEvents {
+    host: PluginHostServices,
+    registered: Mutex<BTreeSet<String>>,
+}
+
+impl HostEvents {
+    /// Register every declared channel for the activation.
+    ///
+    /// Returns `None` when the host offers no publication route (events stay
+    /// unbound, as before).
+    fn bind(
+        host: PluginHostServices,
+        declared: &[(PluginEventKind, EventDelivery)],
+    ) -> Result<Option<Self>> {
+        if !host.publishes_events() {
+            return Ok(None);
+        }
+        let mut registered = BTreeSet::new();
+        for (kind, delivery) in declared {
+            match host.register_event_channel(kind.as_str(), *delivery == EventDelivery::State) {
+                Ok(()) => {
+                    registered.insert(kind.as_str().to_owned());
+                }
+                Err(crate::PluginError::UnsupportedHostOperation { .. }) => return Ok(None),
+                Err(error) => {
+                    return Err(Error::failed(format!(
+                        "registering event channel '{}': {error}",
+                        kind.as_str()
+                    )));
+                }
+            }
+        }
+        Ok(Some(Self {
+            host,
+            registered: Mutex::new(registered),
+        }))
+    }
+}
+
+impl EventEmitter for HostEvents {
+    fn emit(
+        &self,
+        kind: &PluginEventKind,
+        delivery: EventDelivery,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        let failed = |error: crate::PluginError| {
+            Error::failed(format!("publishing '{}': {error}", kind.as_str()))
+        };
+        {
+            let mut registered = self
+                .registered
+                .lock()
+                .map_err(|_| Error::failed("event registration lock poisoned"))?;
+            if !registered.contains(kind.as_str()) {
+                match self
+                    .host
+                    .register_event_channel(kind.as_str(), delivery == EventDelivery::State)
+                {
+                    Ok(()) => {}
+                    Err(crate::PluginError::UnsupportedHostOperation { .. }) => {
+                        return Unbound.emit(kind, delivery, payload);
+                    }
+                    Err(error) => return Err(failed(error)),
+                }
+                registered.insert(kind.as_str().to_owned());
+            }
+        }
+        self.host
+            .publish_event(kind.as_str(), &payload)
+            .map_err(failed)
     }
 }
 
@@ -559,12 +702,35 @@ impl<P: Plugin> DeclaredInstance<P> {
         &self,
         context: PluginLifecycleContext,
         tasks: Option<crate::HostAsyncHandle>,
-    ) -> Activation {
-        Activation {
+    ) -> Result<Activation> {
+        // Before the plugin's own activation runs: its declared channels
+        // exist, and every `Call::emit` reaches the host event bus.
+        if let Some(host) = context.native.host_service_port.clone()
+            && let Some(events) = HostEvents::bind(host, &self.declarations.emitted)?
+            && let Ok(mut slot) = self.events.lock()
+        {
+            *slot = Arc::new(events);
+        }
+        Ok(Activation {
             context,
             tasks,
             required: self.declarations.required.clone(),
-            events: self.events.clone(),
+            subscribed: self.declarations.subscribed.clone(),
+            emitter: self.events.clone(),
+        })
+    }
+
+    async fn run_activation(&self, mut cx: Activation) -> PluginResult<()> {
+        let result = self.plugin.activate(&mut cx).await;
+        if result.is_err() {
+            self.unbind_events();
+        }
+        result
+    }
+
+    fn unbind_events(&self) {
+        if let Ok(mut slot) = self.events.lock() {
+            *slot = Arc::new(Unbound);
         }
     }
 }
@@ -578,10 +744,7 @@ fn unsupported_interface(interface: &str) -> ServiceResponse {
 
 impl<P: Plugin> PluginInstance for DeclaredInstance<P> {
     fn activate(&self, context: PluginLifecycleContext) -> PluginFuture<'_, PluginResult<()>> {
-        Box::pin(async move {
-            let mut cx = self.activation(context, None);
-            self.plugin.activate(&mut cx).await
-        })
+        Box::pin(async move { self.run_activation(self.activation(context, None)?).await })
     }
 
     fn activate_with_async(
@@ -590,15 +753,18 @@ impl<P: Plugin> PluginInstance for DeclaredInstance<P> {
         runtime: crate::HostAsyncHandle,
     ) -> PluginFuture<'_, PluginResult<()>> {
         Box::pin(async move {
-            let mut cx = self.activation(context, Some(runtime));
-            self.plugin.activate(&mut cx).await
+            self.run_activation(self.activation(context, Some(runtime))?)
+                .await
         })
     }
 
     fn deactivate(&self, context: PluginLifecycleContext) -> PluginFuture<'_, PluginResult<()>> {
         Box::pin(async move {
             let mut cx = Deactivation { context };
-            self.plugin.deactivate(&mut cx).await
+            let result = self.plugin.deactivate(&mut cx).await;
+            // The activation's channels go with it.
+            self.unbind_events();
+            result
         })
     }
 
@@ -701,6 +867,40 @@ impl<P: Plugin> PluginInstance for DeclaredInstance<P> {
     }
 }
 
+/// A plugin crate as test harnesses load it, emitted by [`crate::plugin!`]
+/// as `plugin_crate()`: the bundled definition and the crate manifest the
+/// packager builds as a dynamic library (`dynamic-backend`).
+#[derive(Debug, Clone, Copy)]
+pub struct PluginCrate {
+    definition: fn() -> crate::definition::PluginDefinition,
+    manifest: &'static str,
+}
+
+impl PluginCrate {
+    #[must_use]
+    pub const fn new(
+        definition: fn() -> crate::definition::PluginDefinition,
+        manifest: &'static str,
+    ) -> Self {
+        Self {
+            definition,
+            manifest,
+        }
+    }
+
+    /// The bundled definition.
+    #[must_use]
+    pub fn definition(&self) -> crate::definition::PluginDefinition {
+        (self.definition)()
+    }
+
+    /// The crate's `Cargo.toml`.
+    #[must_use]
+    pub const fn manifest(&self) -> &'static str {
+        self.manifest
+    }
+}
+
 /// Build the definition [`crate::plugin!`] emits.
 ///
 /// # Errors
@@ -776,6 +976,15 @@ macro_rules! plugin {
                 $create,
             )
             .expect("generated manifest declares identity and roles")
+        }
+        /// This crate as a test harness loads it: its definition (bundled)
+        /// and the manifest the packager builds as a dynamic library.
+        #[must_use]
+        pub fn plugin_crate() -> $crate::author::PluginCrate {
+            $crate::author::PluginCrate::new(
+                plugin_definition,
+                ::core::concat!(::core::env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
+            )
         }
         $crate::__plugin_dylib_entry!();
     };

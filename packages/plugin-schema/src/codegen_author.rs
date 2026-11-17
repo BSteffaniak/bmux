@@ -175,6 +175,9 @@ impl<'a> Author<'a> {
         );
         if let Some(events) = event {
             self.contract_event(iface, events, out);
+            if !routable {
+                self.event_client(iface, events, scope, out);
+            }
         }
         if routable {
             self.provider_trait(iface, &trait_name, &functions, scope, out);
@@ -491,7 +494,7 @@ impl<'a> Author<'a> {
     fn markers(trait_name: &str, out: &mut String) {
         let _ = writeln!(
             out,
-            "        impl {SDK}::author::ProvidedInterface for dyn {trait_name} {{\n            const DESCRIPTOR: {SDK}::ServiceInterfaceDescriptor = super::SERVICE_DESCRIPTOR;\n        }}\n\n        impl<P: {trait_name}> {SDK}::author::Provides<P> for dyn {trait_name} {{\n            fn portable(provider: ::std::sync::Arc<P>, base: {SDK}::author::Call) -> ::std::sync::Arc<dyn {SDK}::PortableServiceProvider> {{ ::std::sync::Arc::new(Portable::new(provider, base)) }}\n            fn register(provider: ::std::sync::Arc<P>, base: {SDK}::author::Call, registry: &mut {SDK}::TypedServiceRegistry) -> {SDK}::Result<()> {{ register(provider, base, registry) }}\n            fn dispatch(provider: &P, call: {SDK}::author::Call, context: {SDK}::NativeServiceContext) -> {SDK}::author::BoxFuture<'_, {SDK}::author::Result<{SDK}::ServiceResponse>> {{ Box::pin(dispatch(provider, call, context)) }}\n            fn dispatch_streaming(provider: &P, call: {SDK}::author::Call, context: {SDK}::NativeStreamingServiceContext) -> {SDK}::author::BoxFuture<'_, {SDK}::author::Result<{SDK}::ServiceResponse>> {{ Box::pin(dispatch_streaming(provider, call, context)) }}\n        }}\n\n        impl<T> {SDK}::author::RequiredInterface for Client<T> {{\n            const DESCRIPTOR: {SDK}::ServiceInterfaceDescriptor = super::SERVICE_DESCRIPTOR;\n        }}\n\n        impl {SDK}::author::ServiceClient for Client<{SDK}::definition::PluginHostServices> {{\n            fn connect(host: {SDK}::definition::PluginHostServices) -> Self {{ Self::remote(host) }}\n        }}"
+            "        impl {SDK}::author::ProvidedInterface for dyn {trait_name} {{\n            const DESCRIPTOR: {SDK}::ServiceInterfaceDescriptor = super::SERVICE_DESCRIPTOR;\n        }}\n\n        impl<P: {trait_name}> {SDK}::author::Provides<P> for dyn {trait_name} {{\n            fn portable(provider: ::std::sync::Arc<P>, base: {SDK}::author::Call) -> ::std::sync::Arc<dyn {SDK}::PortableServiceProvider> {{ ::std::sync::Arc::new(Portable::new(provider, base)) }}\n            fn register(provider: ::std::sync::Arc<P>, base: {SDK}::author::Call, registry: &mut {SDK}::TypedServiceRegistry) -> {SDK}::Result<()> {{ register(provider, base, registry) }}\n            fn dispatch(provider: &P, call: {SDK}::author::Call, context: {SDK}::NativeServiceContext) -> {SDK}::author::BoxFuture<'_, {SDK}::author::Result<{SDK}::ServiceResponse>> {{ Box::pin(dispatch(provider, call, context)) }}\n            fn dispatch_streaming(provider: &P, call: {SDK}::author::Call, context: {SDK}::NativeStreamingServiceContext) -> {SDK}::author::BoxFuture<'_, {SDK}::author::Result<{SDK}::ServiceResponse>> {{ Box::pin(dispatch_streaming(provider, call, context)) }}\n        }}\n\n        impl<T> {SDK}::author::RequiredInterface for Client<T> {{\n            const DESCRIPTOR: {SDK}::ServiceInterfaceDescriptor = super::SERVICE_DESCRIPTOR;\n        }}\n\n        impl {SDK}::author::ServiceClient for Client<{SDK}::definition::PluginHostServices> {{\n            fn connect(host: {SDK}::definition::PluginHostServices) -> Self {{ Self::remote(host) }}\n            fn direct(handle: &{SDK}::TypedServiceHandle) -> {SDK}::Result<Self> {{ Self::from_handle(handle) }}\n        }}"
         );
     }
 
@@ -516,6 +519,32 @@ impl<'a> Author<'a> {
         let _ = writeln!(
             out,
             "        impl {SDK}::author::ContractEvent for {payload} {{\n            const KIND: {SDK}::PluginEventKind = super::{kind};\n            const DELIVERY: {SDK}::author::EventDelivery = {SDK}::author::EventDelivery::{delivery};\n        }}\n"
+        );
+    }
+
+    /// Typed subscription client of an events interface:
+    /// `Client::subscribe_<event>()` over any `author::EventSource` (the
+    /// activation's host services in both packaging modes).
+    fn event_client(
+        &self,
+        iface: &Interface,
+        events: &crate::ir::Events,
+        scope: Scope<'_>,
+        out: &mut String,
+    ) {
+        let payload = self.ty(&events.ty, scope);
+        let method = match &events.ty {
+            Type::Ref(reference) => format!("subscribe_{}", snake_case(&reference.name)),
+            _ => "subscribe".to_owned(),
+        };
+        let (kind, delivery) = match events.delivery {
+            Delivery::Broadcast => ("EVENT_KIND", "Broadcast"),
+            Delivery::State => ("STATE_KIND", "State"),
+        };
+        let wire = iface.wire_id();
+        let _ = writeln!(
+            out,
+            "        /// Typed subscriptions to `{wire}`. Obtain it with\n        /// `Activation::events::<Client>()` after `subscribe::<Client>()` in\n        /// `declare()`, or connect any `author::EventSource` with `remote`.\n        #[derive(Clone)]\n        pub struct Client<T = {SDK}::definition::PluginHostServices> {{ source: T }}\n\n        impl<T> Client<T> {{\n            /// Subscribe through `source`.\n            #[must_use]\n            pub const fn remote(source: T) -> Self {{ Self {{ source }} }}\n        }}\n\n        impl<T: {SDK}::author::EventSource + Sync> Client<T> {{\n            /// Stream `{wire}` events, owned by the activation the source belongs to.\n            ///\n            /// # Errors\n            /// The source cannot observe the channel (not registered, activation closed).\n            // Async keeps the signature transport neutral (a process transport awaits its handshake).\n            #[allow(clippy::unused_async)]\n            pub async fn {method}(&self) -> {SDK}::author::Result<{SDK}::author::Subscription<{payload}>> {{\n                {SDK}::author::subscribe(&self.source, &super::{kind}, {SDK}::author::EventDelivery::{delivery})\n            }}\n        }}\n\n        impl {SDK}::author::EventClient for Client<{SDK}::definition::PluginHostServices> {{\n            const KIND: {SDK}::PluginEventKind = super::{kind};\n            const DELIVERY: {SDK}::author::EventDelivery = {SDK}::author::EventDelivery::{delivery};\n            fn connect(host: {SDK}::definition::PluginHostServices) -> Self {{ Self::remote(host) }}\n        }}\n"
         );
     }
 
