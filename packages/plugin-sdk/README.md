@@ -213,13 +213,37 @@ continue to close at terminal settlement.
 
 `PluginInstance::activate_scoped_async` is the standard entry for an owned async
 activation, preserving the supplied host services and calling the same author
-`activate_with_async` implementation. Static hosts supply their selected runtime
-and activation-owned background scope. Negotiated native async activation uses
-a bounded library-local runtime: Rust runtime handles never cross the ABI.
-The host continues polling; the adapter enters its runtime when polling raw
-author futures, drains cooperative tasks before cleanup, and retains the
-instance/artifact until runtime shutdown is proven. Without negotiation, older
-activation behavior is unchanged; a negotiated unavailable runtime is an error.
+`activate_with_async` implementation. `HostAsyncHandle` is the activation's
+task scope, not a runtime handle: its spawns go through plug-rt and are torn
+down with the activation. Native adapters own no runtime; activation work runs
+on the host's runtime and cooperative tasks drain before cleanup.
+
+### plug-rt: one runtime per host process
+
+Plugins never build or reach a Tokio runtime. They spawn, run blocking work and
+use timers through `bmux_plugin_sdk::rt` (`spawn`, `spawn_named`,
+`spawn_blocking`, `JoinHandle`, `time::{sleep, timeout, interval, Instant}`).
+Runtime-agnostic primitives (`tokio::sync`, `select!`, `join!`) are used
+directly. Author source is identical in both packaging modes:
+
+- Bundled builds re-export Tokio. Work spawned while the host polls plugin code
+  joins the activation's task scope.
+- Dynamic builds (`--cfg bmux_plugin_dylib`, set by `scripts/package-plugin.py`
+  in the wrapper's own target directory, never a Cargo feature) route every
+  call through the `PlugRtV1` table the host installs through the wrapper's
+  `bmux_plug_rt_install_v1` export before creating instances. Plugin futures
+  cross as `{data, poll, drop}` with real host wakers; libraries are never
+  unloaded once installed.
+
+Teardown stops admitting work and cancels, drains cooperative tasks until the
+deadline, aborts what remains (dropping each future through its owner), waits
+for running blocking jobs, and reports stragglers by name.
+
+Net and process IO are not proxied into dynamic libraries yet. A plugin that
+needs them, or still calls Tokio's runtime APIs directly, declares
+`bundled_only = "<reason>"` in `plugin.toml`; the dynamic loader refuses it with
+`PluginError::BundledOnlyPlugin`. A library not built in dynamic mode is refused
+with `PluginError::DynamicRuntimeUnavailable`.
 
 `NativeInvocationPorts` version 2 remains frozen. For a selected kernel grant,
 the host supplies `NativeInvocationPortsV3 { base, kernel_begin }` through
@@ -336,9 +360,9 @@ export macro calls when migrating: declaration does not require legacy exports.
 
 The host must call the scoped/async activation and context-aware registration
 hooks. Scoped native ports carry authority via retain/release callback handles,
-never ambient globals. Async background runtime scheduling still needs a
-separate negotiated mechanism; event/host-service/live-cancellation capability
-bits do not claim to transport a Rust executor.
+never ambient globals. Async scheduling is negotiated separately through
+plug-rt (see above); event/host-service/live-cancellation capability bits do
+not claim to transport a Rust executor.
 
 ### Scoped callback ABI (source-stage v2 extension)
 
@@ -714,6 +738,7 @@ need `bmux_plugin`.
 | `description`           | string  | No       | --         | Optional description                                       |
 | `homepage`              | string  | No       | --         | Optional URL                                               |
 | `runtime`               | string  | No       | `"native"` | Runtime type (only `"native"` supported)                   |
+| `bundled_only`          | string  | No       | --         | Why the plugin cannot load as a dynamic library            |
 | `entry`                 | path    | No       | --         | Path to `.dylib`/`.so` (only for external plugins)         |
 | `provider_priority`     | integer | No       | `0`        | Ordering when multiple plugins provide the same capability |
 | `required_capabilities` | list    | No       | `[]`       | Host capabilities this plugin needs                        |
