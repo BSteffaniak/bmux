@@ -19,6 +19,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+#[path = "codegen_author.rs"]
+mod author;
+
 use crate::ast::{
     CapabilityDecl, DeliveryMode, EnumDef, Field, Interface, InterfaceItem, Operation, Primitive,
     RecordDef, Schema, TypeRef, VariantCase, VariantDef,
@@ -102,9 +105,15 @@ pub fn emit_with_imports(schema: &Schema, imports: &ImportMap) -> String {
     let own_types = own_type_map(schema);
     let non_eq_types = non_eq_type_set(schema);
     let module_counts = interface_module_counts(schema);
+    // Author bindings (provider traits, clients, commands, extension points)
+    // are generated from the canonical IR.
+    let package = crate::ir::lower(schema);
+    let author = author::Author::new(&package, imports, &own_types);
     out.push_str("// AUTO-GENERATED FROM BPDL. DO NOT EDIT BY HAND.\n\n");
     emit_capabilities(&schema.capabilities, &mut out);
-    for iface in &schema.interfaces {
+    for (iface, ir_iface) in schema.interfaces.iter().zip(&package.interfaces) {
+        let mut bindings = String::new();
+        author.interface(ir_iface, &mut bindings);
         emit_interface(
             schema,
             iface,
@@ -114,7 +123,11 @@ pub fn emit_with_imports(schema: &Schema, imports: &ImportMap) -> String {
             &non_eq_types,
             &mut out,
         );
+        out.push_str(&bindings);
+        out.push_str("}\n\n");
     }
+    author.commands(&mut out);
+    author.extension_points(&mut out);
     emit_versioned_interface_aliases(schema, &module_counts, &mut out);
     emit_schema_service_declarations(schema, imports, &mut out);
     out
@@ -278,8 +291,7 @@ fn emit_interface(
     // `PluginEventKind` constant plus a `EventPayload` type alias so
     // both producers and subscribers import from the same place.
     emit_event_bindings(plugin_id, iface, imports, own_types, out);
-
-    out.push_str("}\n\n");
+    // The caller appends the interface's author bindings and closes the module.
 }
 
 /// Never inspect secret values while formatting diagnostics.
@@ -1962,8 +1974,8 @@ mod tests {
         let rust = emit(&schema);
         assert_eq!(
             rust.matches("#[allow(clippy::too_many_arguments)]").count(),
-            3,
-            "service trait, typed forwarder, and transport client should each carry a targeted allow; got: {rust}"
+            6,
+            "service trait, typed forwarder, transport client, and the author provider trait, erased trait and client should each carry a targeted allow; got: {rust}"
         );
     }
 
@@ -2177,5 +2189,78 @@ mod tests {
             rust.contains("fn row<'a>(&'a self) -> ::std::pin::Pin<Box<dyn ::std::future::Future<Output = super::shared_types::SharedRow> + Send + 'a>>;"),
             "same-schema qualified type should resolve to sibling module path; got: {rust}"
         );
+    }
+
+    const AUTHOR_SCHEMA: &str = "plugin acme.counter version 1;\n\
+        capability WRITE = acme.counter.write;\n\
+        capability READ = acme.counter.read;\n\
+        @capability(WRITE) @interface-version(1)\n\
+        interface counter { record counter { n: u64 } command incr(by: u64) -> u64; command stream(n: u32) -> u32 emits u32; }\n\
+        interface changes { record changed { value: u64 } @state events changed; }\n\
+        command bump(by: u64?, loud: bool, tag: list<string>) title \"Bump\";\n\
+        extension-point display version 2 { data { label: string, blob: bytes } interface { query render(value: u64) -> string; } }\n\
+        world counter { provide counter; provide changes capability acme.counter.read; }";
+
+    #[test]
+    fn author_provider_traits_are_async_dyn_markers_with_adapters() {
+        let rust = emit(&compile(AUTHOR_SCHEMA).expect("valid"));
+        // The interface's own `counter` record keeps its name; the trait yields.
+        assert!(rust.contains("pub mod v1 {"), "{rust}");
+        assert!(
+            rust.contains("pub trait CounterProvider: Send + Sync + 'static {"),
+            "{rust}"
+        );
+        assert!(rust.contains("fn incr(&self, cx: &::bmux_plugin_sdk::author::Call, by: u64) -> impl ::std::future::Future<Output = ::bmux_plugin_sdk::author::Result<u64>> + Send where Self: Sized;"), "{rust}");
+        assert!(rust.contains("events: ::bmux_plugin_sdk::typed_dispatch::TypedServiceEventSink<u32>, cancellation: ::bmux_plugin_sdk::ServiceCancellation"));
+        assert!(rust.contains("pub async fn dispatch<P: CounterProvider>"));
+        assert!(rust.contains("\"streaming_required\""));
+        assert!(rust.contains(
+            "impl<P: CounterProvider> ::bmux_plugin_sdk::PortableServiceProvider for Portable<P>"
+        ));
+        assert!(rust.contains("fn supports_streaming(&self, operation: &str) -> bool { matches!(operation, \"stream\") }"));
+        assert!(
+            rust.contains(
+                "impl ::bmux_plugin_sdk::author::ProvidedInterface for dyn CounterProvider"
+            )
+        );
+        assert!(rust.contains("impl<P: CounterProvider> ::bmux_plugin_sdk::author::Provides<P> for dyn CounterProvider"));
+        assert!(
+            rust.contains("impl<T> ::bmux_plugin_sdk::author::RequiredInterface for Client<T>")
+        );
+        assert!(rust.contains("pub fn register<P: CounterProvider>"));
+        // Events-only interfaces get only their typed channel.
+        assert!(rust.contains(
+            "impl ::bmux_plugin_sdk::author::ContractEvent for super::super::changes::Changed"
+        ));
+        assert!(rust.contains("::bmux_plugin_sdk::author::EventDelivery::State"));
+    }
+
+    #[test]
+    fn author_commands_and_extension_points_come_from_the_package() {
+        let rust = emit(&compile(AUTHOR_SCHEMA).expect("valid"));
+        assert!(rust.contains("pub mod commands {"));
+        assert!(rust.contains("pub struct BumpArgs {"));
+        assert!(rust.contains("pub by: Option<u64>,"));
+        assert!(rust.contains("parser.optional(\"by\")?"));
+        assert!(rust.contains("parser.flag(\"loud\")?"));
+        assert!(rust.contains("parser.many(\"tag\")?"));
+        assert!(rust.contains("CommandArgParser::new(arguments, &[\"loud\"])?"));
+        assert!(rust.contains("pub const BUMP: ::bmux_plugin_sdk::author::CommandDecl<BumpArgs>"));
+        assert!(rust.contains("pub mod display_v2 {"));
+        assert!(rust.contains("const ID: &'static str = \"acme.counter.display/v2\";"));
+        assert!(rust.contains("#[serde(with = \"bmux_codec::serde_bytes_vec\")]"));
+        assert!(rust.contains("pub trait Behavior: Send + Sync + 'static {"));
+        assert!(rust.contains("Render {\n                value: u64,"));
+        assert!(rust.contains("impl<B: Behavior> ::bmux_plugin_sdk::author::Extends<B> for Point"));
+    }
+
+    #[test]
+    fn interfaces_without_capability_or_operations_get_no_provider() {
+        let rust = emit(
+            &compile("plugin p version 1;\ninterface shapes { record shape { n: u32 } }")
+                .expect("valid"),
+        );
+        assert!(!rust.contains("pub mod v1"), "{rust}");
+        assert!(!rust.contains("pub mod commands"), "{rust}");
     }
 }

@@ -60,6 +60,7 @@
 //! ```
 
 pub mod abi;
+pub mod author;
 pub mod definition;
 pub use definition::{
     ActivationId, CommandOutcome, ComponentRole, ContractDescriptor, ContractEvidence,

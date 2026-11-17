@@ -621,6 +621,25 @@ The macro expands to a module containing:
     `Pin<Box<dyn Future<...> + Send>>`. Consumers call through
     `&dyn Service`; providers `impl` the trait directly.
 
+  - For an interface with a capability and operations, a `v<N>` module of
+    author bindings generated from the canonical IR: an async provider
+    trait (`counter_commands::v1::CounterCommands`, methods taking
+    `&author::Call`), a typed `Client` (direct bundled calls or any
+    transport through the checked codec), a `dispatch` adapter for
+    `PluginInstance::invoke`, a `Portable<P>` checked adapter, `register`
+    for the typed registry, and `Provides`/`RequiredInterface` markers.
+    An `events` payload defined in the package implements
+    `author::ContractEvent`.
+- A `commands` module (typed `<Name>Args` and `CommandDecl` constants) for
+  plugin-level `command` declarations.
+- An `extension_points` module (`<name>_v<N>`: `Data`, `Behavior`,
+  `Request`, `Point`) for `extension-point` declarations.
+
+With `manifest:` (or `plugin_manifest!`) the macro also emits `PLUGIN_ID`,
+`PLUGIN_MANIFEST`, `SERVICE_CONTRACTS` and the `provides`/`requires`
+modules. See `docs/plugin-author-api.md` for how the author API consumes
+these items.
+
 Qualified type references are resolved against the `imports` table.
 For the example above, `windows.pane-state` emits as
 `::bmux_tabs_plugin_api::tabs_state::PaneState`.

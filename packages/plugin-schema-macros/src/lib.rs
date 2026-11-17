@@ -239,10 +239,19 @@ fn manifest_tokens(
     );
     let mut seen = BTreeMap::new();
     let mut reexports = Vec::new();
+    let mut required_modules = BTreeMap::new();
+    let mut requires = Vec::new();
+    let mut descriptors = Vec::new();
     for world in &package.worlds {
         for item in &world.items {
-            let bmux_plugin_schema::ir::WorldItem::Provide { interface, .. } = item else {
-                continue;
+            let (interface, seen, reexports) = match item {
+                bmux_plugin_schema::ir::WorldItem::Provide { interface, .. } => {
+                    (interface, &mut seen, &mut reexports)
+                }
+                bmux_plugin_schema::ir::WorldItem::Require { interface, .. } => {
+                    (interface, &mut required_modules, &mut requires)
+                }
+                _ => continue,
             };
             let (owner, root) = match &interface.import {
                 None => (&package, local_root.clone()),
@@ -261,12 +270,22 @@ fn manifest_tokens(
             let module = bmux_plugin_schema::codegen_rust::interface_module(owner, iface);
             if let Some(previous) = seen.insert(module.clone(), iface.wire_id()) {
                 return Err(format!(
-                    "provided interfaces `{previous}` and `{}` share the Rust module name `{module}`",
+                    "world interfaces `{previous}` and `{}` share the Rust module name `{module}`",
                     iface.wire_id()
                 ));
             }
             let module = format_ident!("{module}");
             reexports.push(quote!(pub use #root::#module;));
+            let routable = iface
+                .items
+                .iter()
+                .any(|item| !matches!(item, bmux_plugin_schema::ir::Item::Type(_)));
+            if matches!(item, bmux_plugin_schema::ir::WorldItem::Provide { .. })
+                && iface.capability.is_some()
+                && routable
+            {
+                descriptors.push(quote!(provides::#module::SERVICE_DESCRIPTOR));
+            }
         }
     }
     let id = literal(&package.id);
@@ -280,10 +299,20 @@ fn manifest_tokens(
         pub const PLUGIN_ID: &str = #id;
         #[doc = #doc]
         pub const PLUGIN_MANIFEST: &str = #manifest;
+        /// Generated descriptors (with contract identities) of the provided
+        /// interfaces; `bmux_plugin_sdk::author::metadata` embeds them as the
+        /// modeled-contract evidence hosts need to route checked frames.
+        pub const SERVICE_CONTRACTS: &[::bmux_plugin_sdk::ServiceInterfaceDescriptor] = &[#(#descriptors),*];
         /// Interfaces this plugin provides. Typed route tables name endpoints
         /// through this module, so an undeclared route does not compile.
         pub mod provides {
             #(#reexports)*
+        }
+        /// Interfaces this plugin requires. Their generated clients
+        /// (`requires::<interface>::v<N>::Client`) are reachable only here, so a
+        /// call to an undeclared dependency does not compile.
+        pub mod requires {
+            #(#requires)*
         }
     })
 }
