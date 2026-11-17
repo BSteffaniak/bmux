@@ -174,138 +174,44 @@ fn render_damage_trace_shape(damage: &RenderDamage) -> (u16, bool) {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum TerminalCommand {
-    MoveTo {
-        x: u16,
-        y: u16,
-    },
-    ApplyStyle(RenderStyle),
-    Print(String),
-    EraseCells {
-        x: u16,
-        y: u16,
-        width: u16,
-        style: RenderStyle,
-    },
-    ResetStyle,
+/// Where lowered render operations go: painted into a frame, or kept to replay later.
+trait LowerTarget {
+    /// `text` from column `x` of row `y`, each cell in exactly `style`.
+    fn text(&mut self, x: u16, y: u16, text: &str, style: RenderStyle);
+    /// `width` blank cells from column `x` of row `y`, in `style`.
+    fn fill(&mut self, x: u16, y: u16, width: u16, style: RenderStyle);
 }
 
-/// Paint planned terminal commands into the frame, as a terminal running them would show them.
-fn paint_terminal_commands(canvas: &mut Canvas<'_, '_, '_>, commands: &[TerminalCommand]) {
-    let mut x = 0_u16;
-    let mut y = 0_u16;
-    let mut style = RenderStyle::default();
-    for command in commands {
-        match command {
-            TerminalCommand::MoveTo {
-                x: next_x,
-                y: next_y,
-            } => {
-                x = *next_x;
-                y = *next_y;
-            }
-            TerminalCommand::ApplyStyle(next) => style = *next,
-            TerminalCommand::ResetStyle => style = RenderStyle::default(),
-            TerminalCommand::Print(text) => {
-                canvas.text(x, y, text, crate::projection::style(style));
-                x = x.saturating_add(render_text_width_u16(text));
-            }
-            TerminalCommand::EraseCells {
-                x: erase_x,
-                y: erase_y,
-                width,
-                style: erase_style,
-            } => {
-                canvas.fill(
-                    bmux_tui::geometry::Rect::new(*erase_x, *erase_y, *width, 1),
-                    crate::projection::style(*erase_style),
-                );
-                x = erase_x.saturating_add(*width);
-                y = *erase_y;
-                style = *erase_style;
-            }
-        }
+impl LowerTarget for Canvas<'_, '_, '_> {
+    fn text(&mut self, x: u16, y: u16, text: &str, style: RenderStyle) {
+        Canvas::text(self, x, y, text, crate::projection::style(style));
+    }
+
+    fn fill(&mut self, x: u16, y: u16, width: u16, style: RenderStyle) {
+        Canvas::fill(
+            self,
+            bmux_tui::geometry::Rect::new(x, y, width, 1),
+            crate::projection::style(style),
+        );
     }
 }
 
-fn terminal_command_operations(
-    commands: &[TerminalCommand],
-) -> Vec<crate::projection::PaintOperation> {
-    let bytes = commands
-        .iter()
-        .map(|command| match command {
-            TerminalCommand::Print(text) => text.len(),
-            _ => 0,
-        })
-        .fold(0_usize, usize::saturating_add);
-    if bytes > 16 * 1024 * 1024 {
-        return vec![crate::projection::PaintOperation::Rejected(
-            crate::projection::ProjectionFailure::Budget {
-                resource: "terminal text bytes",
-                used: bytes,
-                limit: 16 * 1024 * 1024,
-            },
-        )];
+impl LowerTarget for Vec<crate::projection::PaintOperation> {
+    fn text(&mut self, x: u16, y: u16, text: &str, style: RenderStyle) {
+        self.push(crate::projection::PaintOperation::Text {
+            x,
+            y,
+            text: text.to_owned(),
+            style: crate::projection::style(style),
+        });
     }
-    let mut operations = Vec::new();
-    let mut x = 0_u16;
-    let mut y = 0_u16;
-    let mut style = RenderStyle::default();
-    for command in commands {
-        if operations.len() >= 262_144 {
-            return vec![crate::projection::PaintOperation::Rejected(
-                crate::projection::ProjectionFailure::Budget {
-                    resource: "visible terminal operations",
-                    used: operations.len() + 1,
-                    limit: 262_144,
-                },
-            )];
-        }
-        match command {
-            TerminalCommand::MoveTo {
-                x: next_x,
-                y: next_y,
-            } => {
-                x = *next_x;
-                y = *next_y;
-            }
-            TerminalCommand::ApplyStyle(next) => style = *next,
-            TerminalCommand::ResetStyle => style = RenderStyle::default(),
-            TerminalCommand::Print(text) => {
-                operations.push(crate::projection::PaintOperation::Text {
-                    x,
-                    y,
-                    text: text.clone(),
-                    style: crate::projection::style(style),
-                });
-                x = x.saturating_add(render_text_width_u16(text));
-            }
-            TerminalCommand::EraseCells {
-                x: erase_x,
-                y: erase_y,
-                width,
-                style: erase_style,
-            } => {
-                operations.push(crate::projection::PaintOperation::Fill {
-                    rect: bmux_tui::geometry::Rect::new(*erase_x, *erase_y, *width, 1),
-                    style: crate::projection::style(*erase_style),
-                });
-                // Native delivery sets style, moves, and prints spaces. The
-                // optimizer can elide the next move/style based on these effects;
-                // neutral capture must carry exactly the same state forward.
-                x = erase_x.saturating_add(*width);
-                y = *erase_y;
-                style = *erase_style;
-            }
-        }
-    }
-    operations
-}
 
-fn queue_terminal_commands(canvas: &mut Canvas<'_, '_, '_>, commands: &[TerminalCommand]) -> bool {
-    paint_terminal_commands(canvas, commands);
-    !commands.is_empty()
+    fn fill(&mut self, x: u16, y: u16, width: u16, style: RenderStyle) {
+        self.push(crate::projection::PaintOperation::Fill {
+            rect: bmux_tui::geometry::Rect::new(x, y, width, 1),
+            style: crate::projection::style(style),
+        });
+    }
 }
 
 /// Queue declarative render operations clipped to `surface_rect` and `damage`.
@@ -533,14 +439,24 @@ pub fn queue_render_ops_with_capabilities(
     capabilities: TerminalRenderCapabilities,
 ) -> Result<bool> {
     let fallback_ops = render_ops_for_capabilities(ops, capabilities);
-    let plan = build_render_ops_output_plan(surface_rect, damage, &fallback_ops);
-    Ok(queue_terminal_commands(canvas, &plan.commands))
+    Ok(lower_render_ops(
+        canvas,
+        surface_rect,
+        damage,
+        &fallback_ops,
+    ))
 }
 
+/// `ops` as `capabilities` can show them: RGB colors as the ANSI 256-color cube without
+/// truecolor, Unicode borders as ASCII without box drawing. With both, they are shown as they
+/// are, and borrowed.
 fn render_ops_for_capabilities(
     ops: &[RenderOp],
     capabilities: TerminalRenderCapabilities,
-) -> Vec<RenderOp> {
+) -> std::borrow::Cow<'_, [RenderOp]> {
+    if capabilities.truecolor && capabilities.unicode_box_drawing {
+        return std::borrow::Cow::Borrowed(ops);
+    }
     ops.iter()
         .cloned()
         .map(|op| match op {
@@ -601,20 +517,15 @@ fn render_ops_for_capabilities(
                     .collect(),
             },
         })
-        .collect()
+        .collect::<Vec<_>>()
+        .into()
 }
 
+/// An extension's render operations lowered for this frame: painted now, and kept to replay
+/// while the extension is unchanged.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct RenderOpsOutputPlan {
-    commands: Vec<TerminalCommand>,
-}
-
-impl RenderOpsOutputPlan {
-    fn push_reset_if_needed(&mut self, wrote: bool) {
-        if wrote {
-            self.commands.push(TerminalCommand::ResetStyle);
-        }
-    }
+    operations: Vec<crate::projection::PaintOperation>,
 }
 
 fn build_render_ops_output_plan(
@@ -622,31 +533,34 @@ fn build_render_ops_output_plan(
     damage: &RenderDamage,
     ops: &[RenderOp],
 ) -> RenderOpsOutputPlan {
+    let mut operations = Vec::new();
+    lower_render_ops(&mut operations, surface_rect, damage, ops);
+    RenderOpsOutputPlan { operations }
+}
+
+/// Lower `ops`, clipped to `surface_rect` and to `damage`, into `target`. Returns whether
+/// anything was lowered.
+fn lower_render_ops(
+    target: &mut impl LowerTarget,
+    surface_rect: ExtensionRect,
+    damage: &RenderDamage,
+    ops: &[RenderOp],
+) -> bool {
     if render_ops_visible_segment_safe(ops) {
         let visible_segments = render_ops_to_visible_segments(surface_rect, damage, ops);
-        build_direct_render_ops_output_plan(
+        lower_render_ops_directly(
+            target,
             surface_rect,
             &RenderDamage::FullSurface,
             &visible_segments,
         )
     } else {
-        build_direct_render_ops_output_plan(surface_rect, damage, ops)
+        lower_render_ops_directly(target, surface_rect, damage, ops)
     }
 }
 
-fn build_direct_render_ops_output_plan(
-    surface_rect: ExtensionRect,
-    damage: &RenderDamage,
-    ops: &[RenderOp],
-) -> RenderOpsOutputPlan {
-    let mut plan = RenderOpsOutputPlan::default();
-    let wrote = append_render_ops_to_output_plan(&mut plan, surface_rect, damage, ops);
-    plan.push_reset_if_needed(wrote);
-    plan
-}
-
-fn append_render_ops_to_output_plan(
-    plan: &mut RenderOpsOutputPlan,
+fn lower_render_ops_directly(
+    target: &mut impl LowerTarget,
     surface_rect: ExtensionRect,
     damage: &RenderDamage,
     ops: &[RenderOp],
@@ -655,99 +569,56 @@ fn append_render_ops_to_output_plan(
     let mut pending_text_run = None;
     for op in ops {
         if !render_op_intersects_damage(op, damage) {
-            wrote |= flush_pending_text_run_to_commands(
-                &mut plan.commands,
-                surface_rect,
-                &mut pending_text_run,
-            );
+            wrote |= flush_pending_text_run(target, surface_rect, &mut pending_text_run);
             continue;
         }
-        match op {
-            RenderOp::TextRun { x, y, text, style } => {
-                if !merge_pending_text_run(&mut pending_text_run, *x, *y, text, *style) {
-                    wrote |= flush_pending_text_run_to_commands(
-                        &mut plan.commands,
-                        surface_rect,
-                        &mut pending_text_run,
-                    );
-                    pending_text_run = Some(PendingTextRun {
-                        x: *x,
-                        y: *y,
-                        text: text.clone(),
-                        style: *style,
-                    });
-                }
+        if let RenderOp::TextRun { x, y, text, style } = op {
+            if !merge_pending_text_run(&mut pending_text_run, *x, *y, text, *style) {
+                wrote |= flush_pending_text_run(target, surface_rect, &mut pending_text_run);
+                pending_text_run = Some(PendingTextRun {
+                    x: *x,
+                    y: *y,
+                    text: text.clone(),
+                    style: *style,
+                });
             }
+            continue;
+        }
+        wrote |= flush_pending_text_run(target, surface_rect, &mut pending_text_run);
+        wrote |= match op {
+            RenderOp::TextRun { .. } => false,
             RenderOp::StyledText { x, y, spans } => {
-                wrote |= flush_pending_text_run_to_commands(
-                    &mut plan.commands,
-                    surface_rect,
-                    &mut pending_text_run,
-                );
-                wrote |= lower_render_styled_text(&mut plan.commands, surface_rect, *x, *y, spans);
+                lower_render_styled_text(target, surface_rect, *x, *y, spans)
             }
             RenderOp::ClearRect { rect, style } => {
-                wrote |= flush_pending_text_run_to_commands(
-                    &mut plan.commands,
-                    surface_rect,
-                    &mut pending_text_run,
-                );
-                wrote |=
-                    lower_render_fill_rect(&mut plan.commands, surface_rect, *rect, ' ', *style);
+                lower_render_fill_rect(target, surface_rect, *rect, ' ', *style)
             }
-            RenderOp::EraseRowSegment { x, y, width, style } => {
-                wrote |= flush_pending_text_run_to_commands(
-                    &mut plan.commands,
-                    surface_rect,
-                    &mut pending_text_run,
-                );
-                wrote |= lower_render_fill_rect(
-                    &mut plan.commands,
-                    surface_rect,
-                    ExtensionRect {
-                        x: *x,
-                        y: *y,
-                        w: *width,
-                        h: 1,
-                    },
-                    ' ',
-                    *style,
-                );
-            }
+            RenderOp::EraseRowSegment { x, y, width, style } => lower_render_fill_rect(
+                target,
+                surface_rect,
+                ExtensionRect {
+                    x: *x,
+                    y: *y,
+                    w: *width,
+                    h: 1,
+                },
+                ' ',
+                *style,
+            ),
             RenderOp::FillRect { rect, ch, style } => {
-                wrote |= flush_pending_text_run_to_commands(
-                    &mut plan.commands,
-                    surface_rect,
-                    &mut pending_text_run,
-                );
-                wrote |=
-                    lower_render_fill_rect(&mut plan.commands, surface_rect, *rect, *ch, *style);
+                lower_render_fill_rect(target, surface_rect, *rect, *ch, *style)
             }
             RenderOp::Border {
                 rect,
                 glyphs,
                 style,
-            } => {
-                wrote |= flush_pending_text_run_to_commands(
-                    &mut plan.commands,
-                    surface_rect,
-                    &mut pending_text_run,
-                );
-                wrote |=
-                    lower_render_border(&mut plan.commands, surface_rect, *rect, *glyphs, *style);
-            }
+            } => lower_render_border(target, surface_rect, *rect, *glyphs, *style),
             RenderOp::CellGrid { x, y, rows } => {
-                wrote |= flush_pending_text_run_to_commands(
-                    &mut plan.commands,
-                    surface_rect,
-                    &mut pending_text_run,
-                );
-                wrote |= lower_render_cell_grid(&mut plan.commands, surface_rect, *x, *y, rows);
+                lower_render_cell_grid(target, surface_rect, *x, *y, rows)
             }
-        }
+        };
     }
-    wrote |=
-        flush_pending_text_run_to_commands(&mut plan.commands, surface_rect, &mut pending_text_run);
+    wrote |= flush_pending_text_run(target, surface_rect, &mut pending_text_run);
     wrote
 }
 
@@ -780,8 +651,8 @@ fn merge_pending_text_run(
     true
 }
 
-fn flush_pending_text_run_to_commands(
-    commands: &mut Vec<TerminalCommand>,
+fn flush_pending_text_run(
+    target: &mut impl LowerTarget,
     surface_rect: ExtensionRect,
     pending: &mut Option<PendingTextRun>,
 ) -> bool {
@@ -789,7 +660,7 @@ fn flush_pending_text_run_to_commands(
         return false;
     };
     lower_render_text_run(
-        commands,
+        target,
         surface_rect,
         pending.x,
         pending.y,
@@ -799,7 +670,7 @@ fn flush_pending_text_run_to_commands(
 }
 
 fn lower_render_text_run(
-    commands: &mut Vec<TerminalCommand>,
+    target: &mut impl LowerTarget,
     surface_rect: ExtensionRect,
     x: u16,
     y: u16,
@@ -812,14 +683,12 @@ fn lower_render_text_run(
     let Some((clipped_x, clipped)) = clip_render_text_run_to_rect(x, text, surface_rect) else {
         return false;
     };
-    commands.push(TerminalCommand::ApplyStyle(style));
-    commands.push(TerminalCommand::MoveTo { x: clipped_x, y });
-    commands.push(TerminalCommand::Print(clipped));
+    target.text(clipped_x, y, &clipped, style);
     true
 }
 
 fn lower_render_styled_text(
-    commands: &mut Vec<TerminalCommand>,
+    target: &mut impl LowerTarget,
     surface_rect: ExtensionRect,
     x: u16,
     y: u16,
@@ -831,14 +700,14 @@ fn lower_render_styled_text(
         if span.text.is_empty() {
             continue;
         }
-        wrote |= lower_render_text_run(commands, surface_rect, cursor, y, &span.text, span.style);
+        wrote |= lower_render_text_run(target, surface_rect, cursor, y, &span.text, span.style);
         cursor = cursor.saturating_add(render_text_width_u16(&span.text));
     }
     wrote
 }
 
 fn lower_render_fill_rect(
-    commands: &mut Vec<TerminalCommand>,
+    target: &mut impl LowerTarget,
     surface_rect: ExtensionRect,
     rect: ExtensionRect,
     ch: char,
@@ -852,26 +721,19 @@ fn lower_render_fill_rect(
     }
     if ch == ' ' {
         for y in rect.y..rect.bottom() {
-            commands.push(TerminalCommand::EraseCells {
-                x: rect.x,
-                y,
-                width: rect.w,
-                style,
-            });
+            target.fill(rect.x, y, rect.w, style);
         }
         return true;
     }
-    commands.push(TerminalCommand::ApplyStyle(style));
     let row = ch.to_string().repeat(usize::from(rect.w));
     for y in rect.y..rect.bottom() {
-        commands.push(TerminalCommand::MoveTo { x: rect.x, y });
-        commands.push(TerminalCommand::Print(row.clone()));
+        target.text(rect.x, y, &row, style);
     }
     true
 }
 
 fn lower_render_border(
-    commands: &mut Vec<TerminalCommand>,
+    target: &mut impl LowerTarget,
     surface_rect: ExtensionRect,
     rect: ExtensionRect,
     glyphs: bmux_plugin::BorderGlyphs,
@@ -883,60 +745,33 @@ fn lower_render_border(
     if rect.w == 0 || rect.h == 0 {
         return false;
     }
-    commands.push(TerminalCommand::ApplyStyle(style));
+    let vertical = glyphs.vertical.to_string();
     if rect.h == 1 {
         let row = glyphs.horizontal.to_string().repeat(usize::from(rect.w));
-        commands.push(TerminalCommand::MoveTo {
-            x: rect.x,
-            y: rect.y,
-        });
-        commands.push(TerminalCommand::Print(row));
+        target.text(rect.x, rect.y, &row, style);
         return true;
     }
     if rect.w == 1 {
         for y in rect.y..rect.bottom() {
-            commands.push(TerminalCommand::MoveTo { x: rect.x, y });
-            commands.push(TerminalCommand::Print(glyphs.vertical.to_string()));
+            target.text(rect.x, y, &vertical, style);
         }
         return true;
     }
     let inner_width = usize::from(rect.w.saturating_sub(2));
-    let top = format!(
-        "{}{}{}",
-        glyphs.top_left,
-        glyphs.horizontal.to_string().repeat(inner_width),
-        glyphs.top_right
-    );
-    let bottom = format!(
-        "{}{}{}",
-        glyphs.bottom_left,
-        glyphs.horizontal.to_string().repeat(inner_width),
-        glyphs.bottom_right
-    );
-    commands.push(TerminalCommand::MoveTo {
-        x: rect.x,
-        y: rect.y,
-    });
-    commands.push(TerminalCommand::Print(top));
+    let horizontal = glyphs.horizontal.to_string().repeat(inner_width);
+    let top = format!("{}{horizontal}{}", glyphs.top_left, glyphs.top_right);
+    let bottom = format!("{}{horizontal}{}", glyphs.bottom_left, glyphs.bottom_right);
+    target.text(rect.x, rect.y, &top, style);
     for y in rect.y.saturating_add(1)..rect.bottom().saturating_sub(1) {
-        commands.push(TerminalCommand::MoveTo { x: rect.x, y });
-        commands.push(TerminalCommand::Print(glyphs.vertical.to_string()));
-        commands.push(TerminalCommand::MoveTo {
-            x: rect.right().saturating_sub(1),
-            y,
-        });
-        commands.push(TerminalCommand::Print(glyphs.vertical.to_string()));
+        target.text(rect.x, y, &vertical, style);
+        target.text(rect.right().saturating_sub(1), y, &vertical, style);
     }
-    commands.push(TerminalCommand::MoveTo {
-        x: rect.x,
-        y: rect.bottom().saturating_sub(1),
-    });
-    commands.push(TerminalCommand::Print(bottom));
+    target.text(rect.x, rect.bottom().saturating_sub(1), &bottom, style);
     true
 }
 
 fn lower_render_cell_grid(
-    commands: &mut Vec<TerminalCommand>,
+    target: &mut impl LowerTarget,
     surface_rect: ExtensionRect,
     x: u16,
     y: u16,
@@ -962,12 +797,7 @@ fn lower_render_cell_grid(
             let Some(ch) = cell.ch else {
                 continue;
             };
-            commands.push(TerminalCommand::ApplyStyle(cell.style));
-            commands.push(TerminalCommand::MoveTo {
-                x: cell_x,
-                y: cell_y,
-            });
-            commands.push(TerminalCommand::Print(ch.to_string()));
+            target.text(cell_x, cell_y, ch.encode_utf8(&mut [0; 4]), cell.style);
             wrote = true;
         }
     }
@@ -4203,10 +4033,9 @@ fn cache_neutral_extension(
     plan: &AfterContentExtensionOutputPlan,
     output: &RenderOpsOutputPlan,
 ) {
-    buffer.extension_projection_cache.insert(
-        plan.cache_key.clone(),
-        terminal_command_operations(&output.commands),
-    );
+    buffer
+        .extension_projection_cache
+        .insert(plan.cache_key.clone(), output.operations.clone());
 }
 
 /// Replay an unchanged extension's retained output; until it has any, the cells under it keep
@@ -4279,7 +4108,7 @@ fn execute_after_content_extension_output_plan(
             }
         }
         AfterContentExtensionOutputAction::RenderOps { output_plan } => {
-            queue_terminal_commands(canvas, &output_plan.commands);
+            canvas.replay(&output_plan.operations);
             if let Some(revision) = snapshot.revision
                 && let Some(buffer) = pane_buffers.get_mut(&snapshot.pane_id)
             {
@@ -5595,13 +5424,13 @@ mod tests {
         DamageRect, ExtensionLayerSnapshot, FrameDamage, GridRowRenderContext,
         PaneContentDamagePlan, PaneSurfaceFramePlan, PreviousExtensionSnapshotCleanupQuery,
         RenderVisibleCell, RenderVisibleCellPlan, SurfaceOutputPlan, SurfaceOutputStage,
-        SurfaceOutputStages, TerminalCommand, append_pane_output,
-        build_after_content_extension_output_plan, build_before_content_extension_output_plan,
-        build_render_ops_output_plan, coalesce_render_damage,
-        commit_extension_layer_snapshots_for_surface, frame_damage_overlay_render_ops,
-        opaque_row_text, previous_extension_snapshot_cleanup_damage, queue_frame_damage_overlay,
-        queue_layer_fill, queue_render_ops, queue_render_ops_with_capabilities,
-        render_attach_scene, render_attach_scene_with_stats_and_trace,
+        SurfaceOutputStages, append_pane_output, build_after_content_extension_output_plan,
+        build_before_content_extension_output_plan, build_render_ops_output_plan,
+        coalesce_render_damage, commit_extension_layer_snapshots_for_surface,
+        frame_damage_overlay_render_ops, opaque_row_text,
+        previous_extension_snapshot_cleanup_damage, queue_frame_damage_overlay, queue_layer_fill,
+        queue_render_ops, queue_render_ops_with_capabilities, render_attach_scene,
+        render_attach_scene_with_stats_and_trace,
     };
     use crate::canvas::Canvas;
     use crate::frame_presenter::{FramePresenter, Presented};
@@ -6547,18 +6376,14 @@ mod tests {
             &ops,
         );
 
-        assert!(plan.commands.iter().any(|command| matches!(
-            command,
-            TerminalCommand::Print(text) if text == "HEAD"
+        assert!(plan.operations.iter().any(|operation| matches!(
+            operation,
+            crate::projection::PaintOperation::Text { text, .. } if text == "HEAD"
         )));
-        assert!(!plan.commands.iter().any(|command| matches!(
-            command,
-            TerminalCommand::Print(text) if text.contains('.')
+        assert!(!plan.operations.iter().any(|operation| matches!(
+            operation,
+            crate::projection::PaintOperation::Text { text, .. } if text.contains('.')
         )));
-        assert!(matches!(
-            plan.commands.last(),
-            Some(TerminalCommand::ResetStyle)
-        ));
     }
 
     #[test]
@@ -6794,9 +6619,9 @@ mod tests {
         let AfterContentExtensionOutputAction::RenderOps { output_plan } = plan.action else {
             panic!("expected declarative render ops output plan");
         };
-        assert!(output_plan.commands.iter().any(|command| matches!(
-            command,
-            TerminalCommand::Print(text) if text == "planned"
+        assert!(output_plan.operations.iter().any(|operation| matches!(
+            operation,
+            crate::projection::PaintOperation::Text { text, .. } if text == "planned"
         )));
     }
 
@@ -7278,19 +7103,21 @@ mod tests {
     }
 
     #[test]
-    fn dense_styled_terminal_commands_admit_visible_work_not_control_commands() {
-        let mut commands = Vec::new();
-        for y in 0..300 {
-            for x in 0..600 {
-                commands.push(TerminalCommand::MoveTo { x, y });
-                commands.push(TerminalCommand::ApplyStyle(RenderStyle::default()));
-                commands.push(TerminalCommand::Print("x".into()));
-            }
-        }
-        assert!(commands.len() > 131_072);
-        let ((), cells, output) = painted(600, 300, |canvas| {
-            super::paint_terminal_commands(canvas, &commands);
+    fn dense_render_ops_are_painted_in_full() {
+        let ops = (0..300)
+            .flat_map(|y| (0..600).map(move |x| RenderOp::text_run(x, y, "x", RenderStyle::new())))
+            .collect::<Vec<_>>();
+        assert!(ops.len() > 131_072);
+        let (wrote, cells, output) = painted(600, 300, |canvas| {
+            queue_render_ops(
+                canvas,
+                ExtensionRect::new(0, 0, 600, 300),
+                &RenderDamage::FullSurface,
+                &ops,
+            )
+            .expect("dense render ops")
         });
+        assert!(wrote);
         assert!(output.rejection().is_none(), "{:?}", output.rejection());
         let row = "x".repeat(600);
         for y in 0..300 {
