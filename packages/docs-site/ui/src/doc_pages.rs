@@ -393,6 +393,20 @@ pub static DOC_PAGES: &[DocPage] = &[
         nav_label: "BPDL Specification",
     },
     docs_markdown_page! {
+        source: "docs/plugin-author-api.md",
+        route: "/docs/plugin-author-api",
+        title: "Plugin Author API",
+        section: PLUGINS,
+        nav_label: "Plugin Author API",
+    },
+    docs_markdown_page! {
+        source: "docs/prompts.md",
+        route: "/docs/prompts",
+        title: "Prompts and Forms",
+        section: PLUGINS,
+        nav_label: "Prompts and Forms",
+    },
+    docs_markdown_page! {
         source: "packages/plugin-sdk/README.md",
         route: "/docs/plugin-sdk",
         title: "Plugin SDK",
