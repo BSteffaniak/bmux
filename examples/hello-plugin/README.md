@@ -1,44 +1,43 @@
 # Hello plugin: one implementation, two packages
 
-`src/lib.rs` is an export-free rlib. `plugin_definition()` is inert metadata
-plus a fresh scoped factory; bundled registration calls that same function.
-There is no static or dynamic feature: packaging never changes plugin behavior,
-and only the generated wrapper emits dynamic exports.
+`src/lib.rs` implements `Plugin` with one BPDL command (`hello --name <who>`)
+and calls `bmux_plugin_sdk::plugin!(Hello)`. `plugin_definition()` is inert
+metadata plus a fresh scoped factory; bundled registration calls that same
+function. Packaging never changes plugin behavior: the crate exports its
+dynamic entry only when the packager builds it with `--cfg bmux_plugin_dylib`
+and the `dynamic-backend` role feature.
 
-Dynamic packaging uses the shared generator from the repository root:
+Dynamic packaging uses the shared packager from the repository root:
 
 ```sh
 python3 scripts/package-plugin.py \
   --implementation-manifest examples/hello-plugin/Cargo.toml \
-  --sdk-manifest packages/plugin-sdk/Cargo.toml \
-  --output target/plugin-packaging/hello/backend \
-  --component backend
+  --component backend --build
 ```
 
-Without `--build` this only generates a thin standalone Cargo target. Add
-`--build` to compile it; add `--install-root <directory>` to publish an
-immutable artifact whose sidecar `plugin.toml` is the manifest embedded in the
-library (for BPDL-declared plugins, the one generated from the package world).
-Run build
-commands in the repository's Nix development environment. Python 3.11+ is
-needed.
-The generator follows workspace Cargo patches and Cargo's reported library path,
-including cross-target `.dll`, `.so`, or `.dylib` names, rather than guessing a
-host filename. Durable installation currently supports POSIX hosts only; Windows
-hosts fail explicitly before publication (cross-building a Windows artifact is
-still supported). Repeat `--feature` to select implementation features
-explicitly.
+The packager builds the crate itself with `cargo rustc --crate-type cdylib`
+in its own workspace and a target directory reserved for dylib builds; no
+wrapper crate is generated, and the SDK is the one the crate's dependency
+graph resolves. Add `--install-root <directory>` to publish an immutable
+artifact whose sidecar `plugin.toml` is the manifest embedded in the library
+(generated from the BPDL package). Add `--output <directory>` for a
+`packaging.json` receipt recording the SDK source, features and library. Run
+build commands in the repository's Nix development environment. Python 3.11+
+is needed.
+The packager uses Cargo's reported library path, including cross-target
+`.dll`, `.so`, or `.dylib` names, rather than guessing a host filename.
+Durable installation currently supports POSIX hosts only; Windows hosts fail
+explicitly before publication (cross-building a Windows artifact is still
+supported). Repeat `--feature` to select implementation features explicitly.
 
-The generated wrapper calls `export_plugin_entrypoint!(packaged_definition)`;
-it contains no command implementation. Only the requested component role is
-advertised. Install directories separate logical ID, component, library hash
-and declaration hash. `artifact.json` names the observed library/declaration;
-it is not proof of compatibility, a credential, or permission to activate.
-The published declaration is the artifact's embedded manifest, byte for byte,
-never a separately supplied or rewritten file. Installation does not overwrite
-older artifacts or active runtime
-selection. A loader must explicitly support this shared v2 descriptor and
-layout.
+Only the requested component role is advertised. Install directories separate
+logical ID, component, library hash and declaration hash. `artifact.json`
+names the observed library/declaration; it is not proof of compatibility, a
+credential, or permission to activate. The published declaration is the
+artifact's embedded manifest, byte for byte, never a separately supplied or
+rewritten file. Installation does not overwrite older artifacts or active
+runtime selection. A loader must explicitly support this shared v2 descriptor
+and layout.
 
 ## Later integration: real acceptance libraries
 
@@ -53,10 +52,11 @@ python3 scripts/package-plugin-acceptance.py \
 ```
 
 Add `--build` in the integration phase to build X2's exact
-`scoped_loader_native.rs` plus sibling `scoped_loader_definition.rs`, with
-shared
-SDK and workspace-selected serde_json. No fixture workspace member is checked
-in.
+`scoped_loader_native.rs` plus sibling `scoped_loader_definition.rs` as one
+generated package (no wrapper), with the shared SDK and workspace-selected
+serde_json, directly through `cargo rustc --crate-type cdylib`. No fixture
+workspace member is checked in. Hello packages itself; only bcode plugins not
+yet ported still get a legacy wrapper.
 The other artifact is the actual Bcode file-references implementation packaged
 through its public definition, never a fixture substituting its identity.
 `acceptance-artifacts.json` records Cargo-reported paths and the exact
@@ -94,4 +94,4 @@ to consume this layout; no legacy runtime declaration is reinterpreted.
 
 `--artifact-id` supplies an optional build label retained in the artifact bytes;
 it is not a descriptor credential or a substitute for the byte hash. Defaults to
-a fresh UUID. These source-stage changes have not been compiled or executed yet.
+a fresh UUID.

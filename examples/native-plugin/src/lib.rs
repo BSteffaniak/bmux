@@ -37,104 +37,135 @@ use bmux_permissions_plugin_api::permissions_state::client::ListPermissionsReque
 use bmux_permissions_plugin_api::permissions_state::{self, PermissionEntry as PermissionSummary};
 use bmux_permissions_plugin_api::{capabilities, permissions_commands};
 use bmux_plugin::ServiceCaller;
+use bmux_plugin_sdk::author::{self, Activation, Call, Deactivation, Declarations, Plugin};
 use bmux_plugin_sdk::{
-    EXIT_ERROR, EXIT_OK, EXIT_USAGE, NativeCommandContext, NativeLifecycleContext,
-    PluginCommandError, PluginEvent, RustPlugin, ServiceKind,
+    EXIT_ERROR, EXIT_OK, EXIT_USAGE, NativeCommandContext, PluginCommandError, PluginEvent,
+    ServiceKind,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 mod tab_bar;
 
 #[derive(Default)]
-struct ExamplePlugin {
+pub struct ExamplePlugin {
     /// Background work started by the current activation, if any.
-    background: Option<tab_bar::BackgroundStatus>,
+    background: Mutex<Option<tab_bar::BackgroundStatus>>,
 }
 
 const PROMPT_HOST_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
 const PROMPT_HOST_WAIT_POLL: Duration = Duration::from_millis(75);
 
-// The standard author API: `RustPluginAdapter` runs each command and
-// lifecycle hook inside the invocation's admitted callback entry, identically
-// for static bundling and the thin dynamic wrapper.
-impl RustPlugin for ExamplePlugin {
-    type Contract = bmux_plugin_sdk::NoPluginContract;
+/// Run one synchronous command body on the host's blocking pool. These
+/// commands still make blocking host calls through their context.
+async fn run_sync(
+    name: &'static str,
+    context: NativeCommandContext,
+    body: fn(&NativeCommandContext) -> i32,
+) -> author::Result<i32> {
+    author::blocking(name, move || body(&context)).await
+}
 
-    fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
-        bmux_plugin_sdk::route_command!(context, {
-            "permissions-list" => Ok(run_permissions_list(&context)),
-            "permissions-grant" => Ok(run_permissions_grant(&context)),
-            "permissions-revoke" => Ok(run_permissions_revoke(&context)),
-            "tabs-list" => Ok(run_windows_list(&context)),
-            "windows-new" => Ok(run_windows_new(&context)),
-            "settings-show" => Ok(run_settings_show(&context)),
-            "storage-put" => Ok(run_storage_put(&context)),
-            "storage-get" => Ok(run_storage_get(&context)),
-            "prompt-showcase" => Ok(run_prompt_showcase_command()),
-            "status-set" => Ok(tab_bar::run_status_set(&context)),
-            "status-clear" => Ok(tab_bar::run_status_clear(&context)),
-            "status-list" => Ok(tab_bar::run_status_list(&context)),
-            "notify" => Ok(tab_bar::run_notify(&context)),
-            "hello" => {
-                if context.arguments.is_empty() {
-                    println!("example.native: hello from bmux plugin");
-                } else {
-                    println!("example.native: hello {}", context.arguments.join(" "));
-                }
-                Ok(EXIT_OK)
-            },
-        })
+macro_rules! sync_command {
+    ($name:ident, $body:expr) => {
+        async fn $name(&self, _cx: &Call, context: NativeCommandContext) -> author::Result<i32> {
+            run_sync(stringify!($name), context, $body).await
+        }
+    };
+}
+
+impl ExamplePlugin {
+    sync_command!(permissions_list, run_permissions_list);
+    sync_command!(permissions_grant, run_permissions_grant);
+    sync_command!(permissions_revoke, run_permissions_revoke);
+    sync_command!(tabs_list, run_windows_list);
+    sync_command!(windows_new, run_windows_new);
+    sync_command!(settings_show, run_settings_show);
+    sync_command!(storage_put, run_storage_put);
+    sync_command!(storage_get, run_storage_get);
+    sync_command!(prompt_showcase, |_| run_prompt_showcase_command());
+    sync_command!(status_set, tab_bar::run_status_set);
+    sync_command!(status_clear, tab_bar::run_status_clear);
+    sync_command!(status_list, tab_bar::run_status_list);
+    sync_command!(notify, tab_bar::run_notify);
+
+    // Command and event handlers are `async fn(&self, ...)` by signature;
+    // these two have nothing to await.
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+    async fn hello(&self, _cx: &Call, context: NativeCommandContext) -> author::Result<i32> {
+        if context.arguments.is_empty() {
+            println!("example.native: hello from bmux plugin");
+        } else {
+            println!("example.native: hello {}", context.arguments.join(" "));
+        }
+        Ok(EXIT_OK)
+    }
+
+    #[allow(clippy::unused_async, clippy::unused_async_trait_impl)]
+    async fn observe(&self, event: PluginEvent) -> author::Result<()> {
+        println!("example.native: observed event {}", event.kind);
+        Ok(())
+    }
+}
+
+// Commands here are still declared by hand in `plugin.toml` (raw argv), so
+// they use `native_command`; BPDL commands would use typed `command`.
+impl Plugin for ExamplePlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        d.native_command("permissions-list", Self::permissions_list)
+            .native_command("permissions-grant", Self::permissions_grant)
+            .native_command("permissions-revoke", Self::permissions_revoke)
+            .native_command("tabs-list", Self::tabs_list)
+            .native_command("windows-new", Self::windows_new)
+            .native_command("settings-show", Self::settings_show)
+            .native_command("storage-put", Self::storage_put)
+            .native_command("storage-get", Self::storage_get)
+            .native_command("prompt-showcase", Self::prompt_showcase)
+            .native_command("status-set", Self::status_set)
+            .native_command("status-clear", Self::status_clear)
+            .native_command("status-list", Self::status_list)
+            .native_command("notify", Self::notify)
+            .native_command("hello", Self::hello)
+            .on_event(Self::observe);
     }
 
     // Lifecycle diagnostics go to stderr: a command-local activation runs
     // in the issuing CLI process, whose stdout is the command's output.
-    fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
-        eprintln!("example.native: activated {}", context.plugin_id);
+    async fn activate(&self, cx: &mut Activation) -> author::Result<()> {
+        eprintln!("example.native: activated {}", cx.plugin_id());
         // Hand the activation's own host services to background work
         // explicitly. They mint a fresh invocation per call and fail closed
         // once deactivation begins; nothing is ambient.
-        let services = context.host_service_port.clone();
-        self.background = tab_bar::start_background_status(&context, services);
-        Ok(EXIT_OK)
+        let native = cx.native().clone();
+        let services = native.host_service_port.clone();
+        let background = author::blocking("start-background-status", move || {
+            tab_bar::start_background_status(&native, services)
+        })
+        .await?;
+        *self
+            .background
+            .lock()
+            .map_err(|_| PluginCommandError::failed("state poisoned"))? = background;
+        Ok(())
     }
 
-    fn deactivate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
-        tab_bar::stop_background_status(self.background.take());
-        eprintln!("example.native: deactivated {}", context.plugin_id);
-        Ok(EXIT_OK)
-    }
-
-    fn handle_event(&mut self, event: PluginEvent) -> Result<i32, PluginCommandError> {
-        println!("example.native: observed event {}", event.kind);
-        Ok(EXIT_OK)
+    async fn deactivate(&self, cx: &mut Deactivation) -> author::Result<()> {
+        let background = self
+            .background
+            .lock()
+            .map_err(|_| PluginCommandError::failed("state poisoned"))?
+            .take();
+        author::blocking("stop-background-status", move || {
+            tab_bar::stop_background_status(background);
+        })
+        .await?;
+        eprintln!("example.native: deactivated {}", cx.plugin_id());
+        Ok(())
     }
 }
 
-bmux_plugin_sdk::define_plugin!(
-    factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| Ok(std::sync::Arc::new(
-        bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
-            ExamplePlugin::default(),
-            scope.instance
-        )
-    )
-        as std::sync::Arc<dyn bmux_plugin_sdk::PluginInstance>),
-    metadata = bmux_plugin_sdk::PluginMetadata {
-        plugin_id: "example.native".into(),
-        version: "0.0.1-alpha.0".into(),
-        roles: vec![bmux_plugin_sdk::ComponentRole::Backend],
-        required_capabilities: bmux_plugin::PluginManifest::from_toml_str(
-            declaration::PLUGIN_MANIFEST
-        )
-        .expect("generated manifest must parse")
-        .required_capabilities
-        .iter()
-        .map(|capability| capability.as_str().to_owned())
-        .collect(),
-        contracts: vec![],
-        manifest_toml: Some(declaration::PLUGIN_MANIFEST.into()),
-    },
-);
+bmux_plugin_sdk::plugin!(ExamplePlugin);
 
 fn run_permissions_list(context: &NativeCommandContext) -> i32 {
     let Some(session) = context.arguments.first() else {

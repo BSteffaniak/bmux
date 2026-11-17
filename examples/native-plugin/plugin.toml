@@ -1,3 +1,4 @@
+component_roles   = ["backend"]
 entry             = "libbmux_example_native_plugin.dylib"
 id                = "example.native"
 name              = "Example Native Plugin"

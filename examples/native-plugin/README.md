@@ -2,15 +2,15 @@
 
 This crate is an in-repo example native bmux plugin.
 
-It demonstrates shared-definition native plugin surfaces:
+It demonstrates the plugin author API on a larger plugin:
 
-- inert export-free definition (descriptor exports live in generated wrappers)
-- the standard `RustPlugin` author surface wrapped in `RustPluginAdapter`,
-  which runs each command and lifecycle hook inside the invocation's admitted
-  callback entry, identically for static bundling and dynamic packaging
-- activation and deactivation hooks
-- plugin commands
-- event subscriptions
+- one `Plugin` implementation for bundled and dynamic packaging; `plugin!`
+  emits the definition and, only when packaged, the dylib entry
+- commands still declared by hand in `plugin.toml`, handled with
+  `Declarations::native_command` (their synchronous bodies run on the host's
+  blocking pool through `author::blocking`)
+- activation and deactivation through `Plugin::activate`/`deactivate`
+- event delivery through `Declarations::on_event`
 - host-aware command execution through bmux IPC
 
 ## Build
@@ -21,19 +21,20 @@ cargo build -p bmux_example_native_plugin
 
 ## Install For Local Testing
 
-Generate and build the thin packaging target from the repository root:
+Build the dynamic library from the repository root. The crate packages
+itself (`plugin!` + the `dynamic-backend` feature); no wrapper is generated:
 
 ```bash
 python3 scripts/package-plugin.py \
   --implementation-manifest examples/native-plugin/Cargo.toml \
-  --sdk-manifest packages/plugin-sdk/Cargo.toml \
-  --output target/plugin-packaging/native/backend --component backend --build
+  --component backend --build
 ```
 
 Add `--install-root <directory>` for immutable publication; the sidecar
-`plugin.toml` is the manifest embedded in the library. See [hello-plugin](../hello-plugin/README.md) for
-artifact identity and loader integration constraints. The implementation build
-above produces only an rlib, not a loadable plugin.
+`plugin.toml` is the manifest embedded in the library. See
+[hello-plugin](../hello-plugin/README.md) for artifact identity and loader
+integration constraints. A plain `cargo build` produces only an rlib, not a
+loadable plugin.
 For a quick local run, point the declaration's `entry` at the library the
 generator built. `packages/cli/tests/native_plugin_identity_integration.rs`
 does exactly that against a sandboxed server.

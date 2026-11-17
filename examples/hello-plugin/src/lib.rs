@@ -1,70 +1,47 @@
-//! One export-free implementation shared by bundled and dynamic packaging.
+//! The smallest plugin: one BPDL command, one implementation for bundled and
+//! dynamic packaging.
 
-/// Plugin declaration generated from the BPDL world and `plugin.toml`.
+/// Plugin declaration generated from the BPDL package and `plugin.toml`.
 pub mod declaration {
     bmux_plugin_schema_macros::schema! {
         source: "bpdl/hello-plugin.bpdl",
         manifest: "plugin.toml",
     }
 }
-use bmux_plugin_sdk::definition::{
-    CommandOutcome, ComponentRole, PluginCallContext, PluginCreateContext, PluginFuture,
-    PluginInstance, PluginMetadata, PluginResult,
-};
-use bmux_plugin_sdk::{EXIT_OK, NativeCommandContext, PluginCommandError};
-use std::sync::Arc;
+
+use bmux_plugin_sdk::author::{self, Call, Declarations, Plugin};
+use declaration::commands::{HELLO, HelloArgs};
 
 #[derive(Default)]
-pub struct HelloPlugin;
+pub struct Hello;
 
-impl PluginInstance for HelloPlugin {
-    fn command(
-        &self,
-        _call: PluginCallContext,
-        context: NativeCommandContext,
-    ) -> PluginFuture<'_, CommandOutcome> {
-        Box::pin(async move {
-            if context.command != "hello" {
-                return Err(PluginCommandError::unknown_command(&context.command)).into();
-            }
-            let name = context.arguments.first().map_or("world", String::as_str);
-            println!("Hello, {name}!");
-            Ok(EXIT_OK).into()
-        })
+impl Hello {
+    async fn hello(&self, _cx: &Call, args: HelloArgs) -> author::Result<()> {
+        println!("Hello, {}!", args.name.as_deref().unwrap_or("world"));
+        Ok(())
     }
 }
 
-fn create(_context: PluginCreateContext) -> PluginResult<Arc<dyn PluginInstance>> {
-    Ok(Arc::new(HelloPlugin))
+impl Plugin for Hello {
+    fn declare(d: &mut Declarations<Self>) {
+        d.command(HELLO, Self::hello);
+    }
 }
 
-bmux_plugin_sdk::define_plugin!(
-    factory = create,
-    metadata = PluginMetadata {
-        plugin_id: "example.hello".into(),
-        version: "0.0.1".into(),
-        roles: vec![ComponentRole::Backend],
-        required_capabilities: vec![],
-        contracts: vec![],
-        manifest_toml: Some(declaration::PLUGIN_MANIFEST.into()),
-    },
-);
+bmux_plugin_sdk::plugin!(Hello);
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bmux_plugin_sdk::ComponentRole;
 
     #[test]
     fn definition_is_inert_and_backend_only() {
         let definition = plugin_definition();
         assert_eq!(definition.metadata.plugin_id, "example.hello");
         assert_eq!(definition.metadata.roles, vec![ComponentRole::Backend]);
-        assert!(
-            definition
-                .metadata
-                .manifest_toml
-                .unwrap()
-                .contains("example.hello")
-        );
+        let manifest = definition.metadata.manifest_toml.unwrap();
+        assert!(manifest.contains("name = \"hello\""));
+        assert!(manifest.contains("owns_paths = [[\"hello\"]]"));
     }
 }

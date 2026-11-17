@@ -1,8 +1,4 @@
-id      = "example.hello"
-name    = "Hello Plugin"
-version = "0.0.1"
-
-[[commands]]
-expose_in_cli = true
-name          = "hello"
-summary       = "Print a greeting"
+component_roles = ["backend"]
+id              = "example.hello"
+name            = "Hello Plugin"
+version         = "0.0.1"

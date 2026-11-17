@@ -1,7 +1,5 @@
 component_roles = ["backend"]
 id              = "example.watcher"
 name            = "Example Watcher"
-# BPDL commands are exposed in the CLI; the plugin owns their paths.
-owns_paths = [["watch"]]
-runtime    = "native"
-version    = "0.0.1"
+runtime         = "native"
+version         = "0.0.1"

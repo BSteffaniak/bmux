@@ -1,9 +1,10 @@
-//! Reference consumer for the generated plugin author API.
+//! Reference consumer for the plugin author API.
 //!
 //! The watcher reaches the counter only through `declaration::requires`,
-//! which re-exports exactly the interfaces its BPDL world requires: a call to
-//! an undeclared dependency does not compile. Its `watch` command uses the
-//! generated typed arguments and clients.
+//! which re-exports exactly the interfaces its BPDL world requires, and
+//! declares those requirements in [`Plugin::declare`]: a call to an
+//! undeclared dependency does not compile, and a `require` the world does not
+//! state is rejected when the definition is built.
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 
 /// Bindings and manifest generated from `bpdl/watcher.bpdl` and `plugin.toml`.
@@ -20,15 +21,9 @@ pub mod declaration {
     }
 }
 
-use std::sync::Arc;
-
-use bmux_plugin_sdk::author;
-use bmux_plugin_sdk::definition::{
-    CommandOutcome, PluginCallContext, PluginCreateContext, PluginFuture, PluginInstance,
-    PluginLifecycleContext, PluginResult,
-};
-use bmux_plugin_sdk::{EXIT_OK, NativeCommandContext, PluginCommandError, TypedDispatchClient};
-use declaration::commands::WATCH;
+use bmux_plugin_sdk::author::{self, Activation, Call, Declarations, Plugin};
+use bmux_plugin_sdk::{PluginCommandError, PluginHostServices, TypedDispatchClient};
+use declaration::commands::{WATCH, WatchArgs};
 use declaration::requires::{counter_commands, counter_state};
 
 /// Bump the counter by `by` and read it back through the generated clients.
@@ -47,75 +42,58 @@ pub async fn watch<T: TypedDispatchClient + Clone + Sync>(
     Ok((bumped, read))
 }
 
-/// Scoped plugin instance.
-#[derive(Default)]
-pub struct WatcherPlugin;
+/// The generated clients over the host's services: a typed dispatch
+/// transport in both packaging modes; inside a dylib, calls run as host
+/// tasks awaited with real wakers.
+fn clients(
+    host: &PluginHostServices,
+) -> (
+    counter_commands::v1::Client<PluginHostServices>,
+    counter_state::v1::Client<PluginHostServices>,
+) {
+    (
+        counter_commands::v1::Client::remote(host.clone()),
+        counter_state::v1::Client::remote(host.clone()),
+    )
+}
 
-impl PluginInstance for WatcherPlugin {
+/// The watcher plugin.
+#[derive(Default)]
+pub struct Watcher;
+
+impl Watcher {
+    async fn watch_command(&self, cx: &Call, args: WatchArgs) -> author::Result<()> {
+        let host = cx
+            .host()
+            .ok_or_else(|| PluginCommandError::unavailable("watch needs host services"))?;
+        let (commands, state) = clients(host);
+        let (bumped, read) = watch(&commands, &state, args.by.unwrap_or(1)).await?;
+        println!("watcher: bumped to {bumped}, read back {read}");
+        Ok(())
+    }
+}
+
+impl Plugin for Watcher {
+    fn declare(d: &mut Declarations<Self>) {
+        d.require::<counter_commands::v1::Client>()
+            .require::<counter_state::v1::Client>()
+            .command(WATCH, Self::watch_command);
+    }
+
     /// Exercise the counter once at activation; lifecycle diagnostics go to
     /// stderr (in a command-local activation, stdout is command output).
-    fn activate(&self, context: PluginLifecycleContext) -> PluginFuture<'_, PluginResult<()>> {
-        Box::pin(async move {
-            let Some(host) = context.native.host_service_port.clone() else {
-                eprintln!("watcher: activated without host services");
-                return Ok(());
-            };
-            // The host's services are a typed dispatch transport in both
-            // packaging modes; inside a dylib, calls run as host tasks
-            // awaited with real wakers.
-            let commands = counter_commands::v1::Client::remote(host.clone());
-            let state = counter_state::v1::Client::remote(host);
-            for by in [2, 3] {
-                match watch(&commands, &state, by).await {
-                    Ok((bumped, read)) => {
-                        eprintln!("watcher: activation bumped to {bumped}, read back {read}");
-                    }
-                    Err(error) => eprintln!("watcher: activation call failed: {}", error.message),
+    async fn activate(&self, cx: &mut Activation) -> author::Result<()> {
+        let (commands, state) = clients(&cx.host()?);
+        for by in [2, 3] {
+            match watch(&commands, &state, by).await {
+                Ok((bumped, read)) => {
+                    eprintln!("watcher: activation bumped to {bumped}, read back {read}");
                 }
+                Err(error) => eprintln!("watcher: activation call failed: {}", error.message),
             }
-            Ok(())
-        })
-    }
-
-    fn command(
-        &self,
-        call: PluginCallContext,
-        context: NativeCommandContext,
-    ) -> PluginFuture<'_, CommandOutcome> {
-        Box::pin(async move {
-            if context.command != WATCH.name() {
-                return Err(PluginCommandError::unknown_command(&context.command)).into();
-            }
-            let result = async {
-                let args = WATCH.parse(&context.arguments)?;
-                let host = call
-                    .host_services
-                    .clone()
-                    .ok_or_else(|| PluginCommandError::unavailable("watch needs host services"))?;
-                let (bumped, read) = watch(
-                    &counter_commands::v1::Client::remote(host.clone()),
-                    &counter_state::v1::Client::remote(host),
-                    args.by.unwrap_or(1),
-                )
-                .await?;
-                println!("watcher: bumped to {bumped}, read back {read}");
-                Ok(EXIT_OK)
-            };
-            let result: PluginResult<i32> = result.await;
-            if let Err(error) = &result {
-                eprintln!("watch failed: {}", error.message);
-            }
-            result.into()
-        })
+        }
+        Ok(())
     }
 }
 
-fn create(_context: PluginCreateContext) -> PluginResult<Arc<dyn PluginInstance>> {
-    Ok(Arc::new(WatcherPlugin))
-}
-
-bmux_plugin_sdk::define_plugin!(
-    factory = create,
-    metadata = author::metadata(declaration::PLUGIN_MANIFEST, declaration::SERVICE_CONTRACTS)
-        .expect("generated manifest declares identity and roles"),
-);
+bmux_plugin_sdk::plugin!(Watcher);

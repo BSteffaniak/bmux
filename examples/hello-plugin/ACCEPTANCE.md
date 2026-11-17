@@ -27,8 +27,10 @@ nix develop --command cargo test -p bmux_plugin --test shared_plugin_scoped_load
 
 The first loader command covers static definitions; the second explicitly runs
 all native fixture cases. Missing artifacts are errors, not successful skips.
-The generated native fixture links a separate export-free rlib containing the
-exact checked-in scoped-loader definition; its cdylib only exports that factory.
+The native fixture is one generated package holding the exact checked-in
+scoped-loader entry and definition files, built directly with
+`cargo rustc --crate-type cdylib` (no wrapper crate); it only exports that
+factory. BMUX hello packages itself the same way (`plugin!`).
 Cargo JSON selects library paths, never an assumed implementation dylib name.
 
 The identity driver checks BMUX hello and the real Bcode file-references wrapper

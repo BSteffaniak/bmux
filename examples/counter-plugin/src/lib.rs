@@ -1,10 +1,9 @@
-//! Reference provider for the generated plugin author API.
+//! Reference provider for the plugin author API.
 //!
 //! [`Counter`] implements the BPDL-generated provider traits with plain
-//! `async fn`. The [`PluginInstance`] glue below is what the Wave 2
-//! `Plugin`/`Declarations`/`plugin!` layer generates; it routes only through
-//! `declaration::provides`, so serving an interface the world does not
-//! declare does not compile. See `docs/plugin-author-api.md`.
+//! `async fn` and declares them in [`Plugin::declare`]; `plugin!` turns it
+//! into a plugin definition (and, when packaged, the dynamic-library entry).
+//! See `docs/plugin-author-api.md`.
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 
 /// Manifest generated from the counter package's world and `plugin.toml`.
@@ -18,62 +17,17 @@ pub mod declaration {
     }
 }
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bmux_example_counter_plugin_api::commands::BUMP;
-use bmux_plugin_sdk::author::{self, Call, EventDelivery, EventEmitter};
-use bmux_plugin_sdk::definition::{
-    CommandOutcome, PluginCallContext, PluginCreateContext, PluginFuture, PluginInstance,
-    PluginResult,
-};
-use bmux_plugin_sdk::{
-    EXIT_OK, NativeCommandContext, NativeServiceContext, PluginCommandError, PluginEventKind,
-    ServiceResponse, TypedServiceRegistry,
-};
+use bmux_example_counter_plugin_api::commands::{BUMP, BumpArgs};
+use bmux_plugin_sdk::PluginCommandError;
+use bmux_plugin_sdk::author::{self, Call, Declarations, Plugin};
 use declaration::provides::{counter_commands, counter_events, counter_state};
 
 /// The counter service.
+#[derive(Default)]
 pub struct Counter {
     value: AtomicU64,
-    events: Arc<dyn EventEmitter>,
-}
-
-impl Default for Counter {
-    fn default() -> Self {
-        Self::with_events(Arc::new(Unsubscribed))
-    }
-}
-
-impl Counter {
-    /// A counter publishing changes through `events`.
-    #[must_use]
-    pub fn with_events(events: Arc<dyn EventEmitter>) -> Self {
-        Self {
-            value: AtomicU64::new(0),
-            events,
-        }
-    }
-
-    /// Serve one host invocation of a provided interface.
-    async fn invoke(
-        &self,
-        call: Call,
-        context: NativeServiceContext,
-    ) -> author::Result<ServiceResponse> {
-        let call = call.with_events(self.events.clone());
-        let interface = context.request.service.interface_id.clone();
-        if interface == counter_commands::INTERFACE_ID.as_str() {
-            counter_commands::v1::dispatch(self, call, context).await
-        } else if interface == counter_state::INTERFACE_ID.as_str() {
-            counter_state::v1::dispatch(self, call, context).await
-        } else {
-            Ok(ServiceResponse::error(
-                "unsupported_service_interface",
-                format!("example.counter does not provide '{interface}'"),
-            ))
-        }
-    }
 }
 
 impl counter_commands::v1::CounterCommands for Counter {
@@ -94,91 +48,42 @@ impl counter_state::v1::CounterState for Counter {
     }
 }
 
-/// Drops changes until the host event bus is attached (Wave 2 wires it
-/// into every `Call`).
-struct Unsubscribed;
-
-impl EventEmitter for Unsubscribed {
-    fn emit(&self, _: &PluginEventKind, _: EventDelivery, _: Vec<u8>) -> author::Result<()> {
+impl Counter {
+    /// `bump`: commands run in the issuing CLI, so reach the server instance
+    /// through the host like any other consumer.
+    async fn bump(&self, cx: &Call, args: BumpArgs) -> author::Result<()> {
+        let host = cx
+            .host()
+            .cloned()
+            .ok_or_else(|| PluginCommandError::unavailable("bump needs host services"))?;
+        let value = counter_commands::v1::Client::remote(host)
+            .incr(args.by.unwrap_or(1))
+            .await?;
+        println!("counter: {value}");
         Ok(())
     }
 }
 
-/// Scoped plugin instance: a fresh [`Counter`] per host scope.
-#[derive(Default)]
-pub struct CounterPlugin(Arc<Counter>);
-
-impl PluginInstance for CounterPlugin {
-    fn invoke(
-        &self,
-        call: PluginCallContext,
-        context: NativeServiceContext,
-    ) -> PluginFuture<'_, PluginResult<ServiceResponse>> {
-        Box::pin(async move {
-            let call = Call::from_service(call, &context);
-            self.0.invoke(call, context).await
-        })
-    }
-
-    fn register_typed_services(&self, registry: &mut TypedServiceRegistry) -> PluginResult<()> {
-        let failed =
-            |error: bmux_plugin_sdk::PluginError| PluginCommandError::failed(error.to_string());
-        // Direct bundled calls carry no host invocation; they run with the
-        // counter's own event channel bound.
-        let base = Call::detached().with_events(self.0.events.clone());
-        counter_commands::v1::register(self.0.clone(), base.clone(), registry).map_err(failed)?;
-        counter_state::v1::register(self.0.clone(), base, registry).map_err(failed)
-    }
-
-    fn command(
-        &self,
-        call: PluginCallContext,
-        context: NativeCommandContext,
-    ) -> PluginFuture<'_, CommandOutcome> {
-        Box::pin(async move {
-            if context.command != BUMP.name() {
-                return Err(PluginCommandError::unknown_command(&context.command)).into();
-            }
-            // Commands run in the issuing CLI; reach the server instance
-            // through the host like any other consumer.
-            let result = async {
-                let args = BUMP.parse(&context.arguments)?;
-                let host = call
-                    .host_services
-                    .clone()
-                    .ok_or_else(|| PluginCommandError::unavailable("bump needs host services"))?;
-                let value = counter_commands::v1::Client::remote(host)
-                    .incr(args.by.unwrap_or(1))
-                    .await?;
-                println!("counter: {value}");
-                Ok(EXIT_OK)
-            };
-            let result: PluginResult<i32> = result.await;
-            if let Err(error) = &result {
-                eprintln!("bump failed: {}", error.message);
-            }
-            result.into()
-        })
+impl Plugin for Counter {
+    fn declare(d: &mut Declarations<Self>) {
+        d.provide::<dyn counter_commands::v1::CounterCommands>()
+            .provide::<dyn counter_state::v1::CounterState>()
+            .command(BUMP, Self::bump);
     }
 }
 
-fn create(_context: PluginCreateContext) -> PluginResult<Arc<dyn PluginInstance>> {
-    Ok(Arc::new(CounterPlugin::default()))
-}
-
-bmux_plugin_sdk::define_plugin!(
-    factory = create,
-    metadata = author::metadata(declaration::PLUGIN_MANIFEST, declaration::SERVICE_CONTRACTS)
-        .expect("generated manifest declares identity and roles"),
-);
+bmux_plugin_sdk::plugin!(Counter);
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use bmux_example_counter_plugin_api::extension_points::counter_display_v1 as display;
-    use bmux_plugin_sdk::author::{Extends, ExtensionPoint};
+    use bmux_plugin_sdk::PluginEventKind;
+    use bmux_plugin_sdk::author::{
+        DeclaredInstance, EventDelivery, EventEmitter, Extends, ExtensionPoint,
+    };
     use counter_commands::v1::CounterCommands;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
     struct Recorder(Mutex<Vec<(String, EventDelivery, Vec<u8>)>>);
@@ -201,15 +106,13 @@ mod tests {
     #[tokio::test]
     async fn increments_publish_retained_changes_on_the_generated_channel() {
         let recorder = Arc::new(Recorder::default());
-        let counter = Counter::with_events(recorder.clone());
         let call = Call::detached().with_events(recorder.clone());
-        assert_eq!(counter.incr(&call, 4).await.unwrap(), 4);
-        let events = recorder.0.lock().unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].0, counter_events::STATE_KIND.as_str());
-        assert_eq!(events[0].1, EventDelivery::State);
+        assert_eq!(Counter::default().incr(&call, 4).await.unwrap(), 4);
+        let (kind, delivery, payload) = recorder.0.lock().unwrap().remove(0);
+        assert_eq!(kind, counter_events::STATE_KIND.as_str());
+        assert_eq!(delivery, EventDelivery::State);
         let changed: counter_events::v1::Changed =
-            bmux_plugin_sdk::decode_service_message(&events[0].2).unwrap();
+            bmux_plugin_sdk::decode_service_message(&payload).unwrap();
         assert_eq!(changed.value, 4);
     }
 
@@ -257,10 +160,51 @@ mod tests {
             "{interfaces:?}"
         );
         assert!(interfaces.contains(&"counter-state/v1"), "{interfaces:?}");
+        assert_eq!(declarations.modeled_service_contracts.len(), 2);
         let manifest = definition.metadata.manifest_toml.as_deref().unwrap();
         assert!(manifest.contains("name = \"bump\""));
         let args = BUMP.parse(&["--by".to_owned(), "3".to_owned()]).unwrap();
         assert_eq!(args.by, Some(3));
         assert!(BUMP.parse(&["--nope".to_owned(), "1".to_owned()]).is_err());
+    }
+
+    /// Serves only one of the two interfaces its world provides.
+    #[derive(Default)]
+    struct HalfCounter(Counter);
+
+    impl counter_state::v1::CounterState for HalfCounter {
+        async fn get(&self, cx: &Call) -> author::Result<u64> {
+            counter_state::v1::CounterState::get(&self.0, cx).await
+        }
+    }
+
+    impl Plugin for HalfCounter {
+        fn declare(d: &mut Declarations<Self>) {
+            d.provide::<dyn counter_state::v1::CounterState>();
+        }
+    }
+
+    #[test]
+    fn declarations_must_match_the_world() {
+        let error = DeclaredInstance::new(
+            HalfCounter::default(),
+            declaration::PLUGIN_MANIFEST,
+            declaration::SERVICE_CONTRACTS,
+        )
+        .err()
+        .expect("missing provide is rejected");
+        assert!(
+            error.message.contains("counter-commands/v1"),
+            "{}",
+            error.message
+        );
+        assert!(
+            DeclaredInstance::new(
+                Counter::default(),
+                declaration::PLUGIN_MANIFEST,
+                declaration::SERVICE_CONTRACTS,
+            )
+            .is_ok()
+        );
     }
 }

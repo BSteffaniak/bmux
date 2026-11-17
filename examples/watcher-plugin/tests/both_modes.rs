@@ -9,10 +9,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use bmux_example_counter_plugin::CounterPlugin;
+use bmux_example_counter_plugin::{Counter, declaration as counter_declaration};
 use bmux_example_watcher_plugin::declaration::requires::{counter_commands, counter_state};
-use bmux_example_watcher_plugin::{WatcherPlugin, watch};
-use bmux_plugin_sdk::author::{CommandArgs, RequiredInterface};
+use bmux_example_watcher_plugin::{Watcher, watch};
+use bmux_plugin_sdk::author::{CommandArgs, DeclaredInstance, RequiredInterface};
 use bmux_plugin_sdk::definition::{PluginCallContext, PluginInstance};
 use bmux_plugin_sdk::{
     ApiVersion, CancellationToken, HostConnectionInfo, HostMetadata, HostScope,
@@ -24,7 +24,7 @@ use bmux_plugin_sdk::{
 /// Forwards encoded calls into a provider instance's `invoke`, as the host
 /// does for a dylib.
 #[derive(Clone)]
-struct HostLoopback(Arc<CounterPlugin>);
+struct HostLoopback(Arc<DeclaredInstance<Counter>>);
 
 impl TypedDispatchClient for HostLoopback {
     fn requires_service_contracts(&self) -> bool {
@@ -66,6 +66,16 @@ impl TypedDispatchClient for HostLoopback {
             None => Ok(response.payload),
         }
     }
+}
+
+/// A counter instance exactly as `plugin!` creates it for the host.
+fn counter() -> DeclaredInstance<Counter> {
+    DeclaredInstance::new(
+        Counter::default(),
+        counter_declaration::PLUGIN_MANIFEST,
+        counter_declaration::SERVICE_CONTRACTS,
+    )
+    .expect("counter declarations match its world")
 }
 
 fn service_context(
@@ -132,7 +142,7 @@ fn handle<R: RequiredInterface>(
 #[tokio::test]
 async fn watcher_sees_the_same_counter_bundled_and_through_the_dylib_codec() {
     // Bundled: direct typed calls through the registry.
-    let bundled = CounterPlugin::default();
+    let bundled = counter();
     let mut registry = TypedServiceRegistry::new();
     bundled.register_typed_services(&mut registry).unwrap();
     let commands = counter_commands::v1::Client::<HostLoopback>::from_handle(handle::<
@@ -149,7 +159,7 @@ async fn watcher_sees_the_same_counter_bundled_and_through_the_dylib_codec() {
     ];
 
     // Dylib: checked frames through `PluginInstance::invoke`.
-    let host = HostLoopback(Arc::new(CounterPlugin::default()));
+    let host = HostLoopback(Arc::new(counter()));
     let commands = counter_commands::v1::Client::remote(host.clone());
     let state = counter_state::v1::Client::remote(host);
     let codec = [
@@ -163,13 +173,13 @@ async fn watcher_sees_the_same_counter_bundled_and_through_the_dylib_codec() {
 
 #[tokio::test]
 async fn provider_failures_reach_the_consumer_in_both_modes() {
-    let host = HostLoopback(Arc::new(CounterPlugin::default()));
+    let host = HostLoopback(Arc::new(counter()));
     let commands = counter_commands::v1::Client::remote(host);
     commands.incr(u64::MAX).await.unwrap();
     let error = commands.incr(1).await.unwrap_err();
     assert!(error.message.contains("counter overflow"), "{error:?}");
 
-    let bundled = CounterPlugin::default();
+    let bundled = counter();
     let mut registry = TypedServiceRegistry::new();
     bundled.register_typed_services(&mut registry).unwrap();
     let commands = counter_commands::v1::Client::<HostLoopback>::from_handle(handle::<
@@ -203,5 +213,5 @@ fn watcher_declares_only_what_it_requires() {
     ])
     .unwrap();
     assert_eq!(args.by, Some(4));
-    let _ = WatcherPlugin;
+    let _ = Watcher;
 }
