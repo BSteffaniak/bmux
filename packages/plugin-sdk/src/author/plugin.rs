@@ -187,7 +187,7 @@ pub type BlockingDeactivateFn<P> = fn(&P, NativeLifecycleContext) -> Result<()>;
 /// Registers typed handles for interfaces whose providers are not generated
 /// author bindings, with the host's registration context.
 pub type TypedServicesFn<P> =
-    fn(&P, TypedServiceRegistrationContext<'_>, &mut TypedServiceRegistry);
+    fn(&P, TypedServiceRegistrationContext<'_>, &mut TypedServiceRegistry) -> Result<()>;
 /// Registers activation-time contributions.
 pub type RegistrationsFn<P> = fn(&P, &mut ContributionRegistrar) -> crate::Result<()>;
 
@@ -434,7 +434,7 @@ impl<P: Send + Sync + 'static> Declarations<P> {
     }
 
     /// Synchronous activation work, run on the host's blocking pool inside
-    /// the activation's callback entry before [`Plugin::activate`]. Its
+    /// the activation's callback entry after [`Plugin::activate`]. Its
     /// lifecycle context carries the activation's host-supplied capabilities.
     pub fn blocking_activate(&mut self, handler: BlockingActivateFn<P>) -> &mut Self {
         self.blocking_activate = Some(handler);
@@ -1013,14 +1013,21 @@ impl<P: Plugin> DeclaredInstance<P> {
         context: PluginLifecycleContext,
         tasks: Option<crate::HostAsyncHandle>,
     ) -> PluginResult<()> {
-        if let Some(activate) = self.declarations.blocking_activate {
+        let blocking = self.declarations.blocking_activate.map(|activate| {
             let runtime = tasks.clone();
             self.lifecycle(&context, move |plugin, native| {
                 activate(plugin, native, runtime)
             })
-            .await?;
+        });
+        self.run_activation(self.activation(context, tasks)?).await?;
+        let result = match blocking {
+            Some(work) => work.await,
+            None => Ok(()),
+        };
+        if result.is_err() {
+            self.unbind_events();
         }
-        self.run_activation(self.activation(context, tasks)?).await
+        result
     }
 
     /// The generated contract of a service served without generated bindings.
@@ -1314,10 +1321,10 @@ impl<P: Plugin> PluginInstance for DeclaredInstance<P> {
         registry: &mut TypedServiceRegistry,
     ) -> PluginResult<()> {
         self.register_typed_services(registry)?;
-        if let Some(register) = self.declarations.typed_services {
-            register(&self.plugin, context, registry);
+        match self.declarations.typed_services {
+            Some(register) => register(&self.plugin, context, registry),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     fn register_typed_services(&self, registry: &mut TypedServiceRegistry) -> PluginResult<()> {
