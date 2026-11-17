@@ -32,6 +32,7 @@ pub mod session_manager;
 pub use session_manager::SessionManager;
 
 use bmux_plugin::{EventBus, PluginStateRegistry, ServiceCaller, TypedServiceCaller};
+use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     PluginEventKind, StatefulPlugin, StatefulPluginError, StatefulPluginHandle,
@@ -334,31 +335,60 @@ impl SessionEvents {
 }
 
 pub struct SessionsPlugin {
-    events: SessionEvents,
+    events: RwLock<SessionEvents>,
     /// This activation's view of the host state registry; an empty private
     /// registry until activation supplies one.
-    states: Arc<PluginStateRegistry>,
+    states: RwLock<Arc<PluginStateRegistry>>,
 }
 
 impl Default for SessionsPlugin {
     fn default() -> Self {
         Self {
-            events: SessionEvents::default(),
-            states: Arc::new(PluginStateRegistry::new()),
+            events: RwLock::new(SessionEvents::default()),
+            states: RwLock::new(Arc::new(PluginStateRegistry::new())),
         }
     }
 }
 
-impl RustPlugin for SessionsPlugin {
-    type Contract = bmux_sessions_plugin_api::Contract;
+impl Plugin for SessionsPlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        d.blocking_activate(Self::activate)
+            .blocking_command("new-session", Self::run_command)
+            .blocking_services(Self::invoke_service, None)
+            .typed_services(Self::register_typed_services);
+    }
+}
+
+fn write<T>(
+    slot: &RwLock<T>,
+) -> std::result::Result<std::sync::RwLockWriteGuard<'_, T>, PluginCommandError> {
+    slot.write()
+        .map_err(|_| PluginCommandError::failed("sessions plugin state lock poisoned"))
+}
+
+impl SessionsPlugin {
+    fn events(&self) -> SessionEvents {
+        self.events
+            .read()
+            .map(|events| events.clone())
+            .unwrap_or_default()
+    }
+
+    fn states(&self) -> Arc<PluginStateRegistry> {
+        self.states.read().map_or_else(
+            |_| Arc::new(PluginStateRegistry::new()),
+            |states| Arc::clone(&states),
+        )
+    }
 
     fn activate(
-        &mut self,
+        &self,
         context: NativeLifecycleContext,
-    ) -> std::result::Result<i32, PluginCommandError> {
-        self.events = SessionEvents(bmux_plugin::activation_event_bus(&context));
-        self.states = bmux_plugin::activation_state_registry(&context);
-        let registry = Arc::clone(&self.states);
+        _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
+    ) -> std::result::Result<(), PluginCommandError> {
+        *write(&self.events)? = SessionEvents(bmux_plugin::activation_event_bus(&context));
+        *write(&self.states)? = bmux_plugin::activation_state_registry(&context);
+        let registry = self.states();
         let state: Arc<RwLock<SessionManager>> = Arc::new(RwLock::new(SessionManager::new()));
         registry.register::<SessionManager>(&state);
 
@@ -401,14 +431,14 @@ impl RustPlugin for SessionsPlugin {
             .expect("stateful plugin registry lock poisoned")
             .push(stateful);
 
-        if let Some(bus) = &self.events.0 {
+        if let Some(bus) = &self.events().0 {
             bus.register_channel::<SessionEvent>(sessions_events::EVENT_KIND);
         }
-        Ok(bmux_plugin_sdk::EXIT_OK)
+        Ok(())
     }
 
     fn run_command(
-        &mut self,
+        &self,
         context: NativeCommandContext,
     ) -> std::result::Result<i32, PluginCommandError> {
         match context.command.as_str() {
@@ -432,44 +462,45 @@ impl RustPlugin for SessionsPlugin {
     }
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+        let (events, states) = (self.events(), self.states());
         bmux_plugin_sdk::route_service!(context, {
             "sessions-state", "list-sessions" => |_req: (), _ctx| {
-                list_sessions_local(&self.states)
+                list_sessions_local(&states)
                     .map_err(|e| ServiceResponse::error("list_failed", e))
             },
             "sessions-state", "get-session" => |req: SelectorArgs, _ctx| {
-                get_session_local(&self.states, &req.selector)
+                get_session_local(&states, &req.selector)
                     .map_err(|e| ServiceResponse::error("get_failed", e))
             },
             "sessions-program-v1", "new-program-session" => |req: bmux_sessions_plugin_api::sessions_program_v1::client::NewProgramSessionRequest, ctx| {
-                Ok::<_, ServiceResponse>(new_program_session(&self.events, ctx, req.name, req.options))
+                Ok::<_, ServiceResponse>(new_program_session(&events, ctx, req.name, req.options))
             },
             "sessions-spawn-v1", "new-session" => |req: bmux_sessions_plugin_api::sessions_spawn_v1::client::NewSessionRequest, ctx| {
-                Ok::<_, ServiceResponse>(new_session_with_options(&self.events, ctx, req.name, req.options))
+                Ok::<_, ServiceResponse>(new_session_with_options(&events, ctx, req.name, req.options))
             },
             "sessions-commands", "new-session" => |req: NewSessionArgs, ctx| {
                 Ok::<Result<SessionAck, NewSessionError>, ServiceResponse>(
-                    new_session_via_ipc(&self.events, ctx, req.name)
+                    new_session_via_ipc(&events, ctx, req.name)
                 )
             },
             "sessions-commands", "kill-session" => |req: KillSessionArgs, ctx| {
                 Ok::<Result<SessionAck, KillSessionError>, ServiceResponse>(
-                    kill_session_via_ipc(&self.events, &self.states, ctx, &req.selector, req.force_local)
+                    kill_session_via_ipc(&events, &states, ctx, &req.selector, req.force_local)
                 )
             },
             "sessions-commands", "select-session" => |req: SelectorArgs, ctx| {
                 Ok::<Result<SessionAck, SelectSessionError>, ServiceResponse>(
-                    select_session_via_ipc(&self.events, ctx, &req.selector)
+                    select_session_via_ipc(&events, ctx, &req.selector)
                 )
             },
             "sessions-commands", "rename-session" => |req: RenameSessionArgs, _ctx| {
                 Ok::<Result<SessionAck, RenameSessionError>, ServiceResponse>(
-                    rename_session_local(&self.events, &self.states, &req.selector, &req.name)
+                    rename_session_local(&events, &states, &req.selector, &req.name)
                 )
             },
             "sessions-commands", "reconcile-client-membership" => |req: ReconcileArgs, _ctx| {
                 Ok::<Result<SessionAck, ReconcileError>, ServiceResponse>(
-                    reconcile_client_membership_local(&self.states, &req)
+                    reconcile_client_membership_local(&states, &req)
                 )
             },
         })
@@ -486,19 +517,16 @@ impl RustPlugin for SessionsPlugin {
             Arc::new(SessionsStateHandle::new(Arc::clone(&caller)));
         let _ = sessions_state::register_provider(registry, state);
 
-        let commands: Arc<dyn SessionsCommandsService + Send + Sync> =
-            Arc::new(SessionsCommandsHandle::new(
-                Arc::clone(&caller),
-                self.events.clone(),
-                Arc::clone(&self.states),
-            ));
+        let commands: Arc<dyn SessionsCommandsService + Send + Sync> = Arc::new(
+            SessionsCommandsHandle::new(Arc::clone(&caller), self.events(), self.states()),
+        );
         let _ = sessions_commands::register_provider(registry, commands);
         let spawn: Arc<
             dyn bmux_sessions_plugin_api::sessions_spawn_v1::SessionsSpawnV1Service + Send + Sync,
         > = Arc::new(SessionsCommandsHandle::new(
             caller,
-            self.events.clone(),
-            Arc::clone(&self.states),
+            self.events(),
+            self.states(),
         ));
         let _ = bmux_sessions_plugin_api::sessions_spawn_v1::register_provider(registry, spawn);
     }
@@ -1112,25 +1140,7 @@ fn option_value(arguments: &[String], long_name: &str) -> Option<String> {
         .find_map(|chunk| (chunk[0] == long_flag).then(|| chunk[1].clone()))
 }
 
-bmux_plugin_sdk::define_plugin!(
-    factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| {
-        Ok(std::sync::Arc::new(
-            bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
-                SessionsPlugin::default(),
-                scope.instance,
-            ),
-        )
-            as std::sync::Arc<
-                dyn bmux_plugin_sdk::definition::PluginInstance,
-            >)
-    },
-    metadata = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<SessionsPlugin>(
-        crate::declaration::PLUGIN_MANIFEST,
-        vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
-    )
-    .expect("embedded foundational declaration must be valid")
-    .metadata,
-);
+bmux_plugin_sdk::plugin!(SessionsPlugin);
 
 #[cfg(test)]
 mod tests {
@@ -1156,13 +1166,13 @@ mod tests {
         bmux_plugin::state_registry_activation_binder(Arc::clone(host))(&scope, &capabilities)
             .expect("bind state registry");
         context.capabilities = capabilities;
-        let mut plugin = SessionsPlugin::default();
-        plugin.activate(context).expect("activate");
+        let plugin = SessionsPlugin::default();
+        plugin.activate(context, None).expect("activate");
         plugin
     }
 
     fn session_names(plugin: &SessionsPlugin) -> Vec<Option<String>> {
-        list_sessions_local(&plugin.states)
+        list_sessions_local(&plugin.states())
             .expect("session state registered by activation")
             .into_iter()
             .map(|session| session.name)
@@ -1174,7 +1184,7 @@ mod tests {
         let first = activated_instance(&Arc::new(PluginStateRegistry::new()));
         let second = activated_instance(&Arc::new(PluginStateRegistry::new()));
         first
-            .states
+            .states()
             .get::<SessionManager>()
             .expect("first instance registered its manager")
             .write()
@@ -1470,15 +1480,7 @@ mod definition_contract_tests {
         let manifest =
             bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
                 .unwrap();
-        let canonical = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<
-            super::SessionsPlugin,
-        >(
-            crate::declaration::PLUGIN_MANIFEST,
-            vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
-        )
-        .unwrap();
         definition.validate().unwrap();
-        assert_eq!(definition.metadata, canonical.metadata);
         assert_eq!(definition.metadata.plugin_id, manifest.id);
         assert_eq!(definition.metadata.version, manifest.version);
         assert_eq!(definition.metadata.roles, manifest.component_roles);

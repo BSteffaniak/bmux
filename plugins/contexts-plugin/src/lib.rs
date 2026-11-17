@@ -45,6 +45,7 @@ use bmux_contexts_plugin_api::contexts_visits_v1::{self, ContextsVisitsV1Service
 use bmux_plugin::{
     EventBus, HostRuntimeApi, PluginStateRegistry, ServiceCaller, TypedServiceCaller,
 };
+use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     PluginEventKind, StatefulPlugin, StatefulPluginError, StatefulPluginHandle,
@@ -417,7 +418,7 @@ impl ContextEvents {
 
 #[derive(Default)]
 pub struct ContextsPlugin {
-    events: ContextEvents,
+    events: RwLock<ContextEvents>,
 }
 
 impl ContextsPlugin {
@@ -426,23 +427,44 @@ impl ContextsPlugin {
     #[must_use]
     pub const fn with_host_state(states: Arc<PluginStateRegistry>) -> Self {
         Self {
-            events: ContextEvents::new(None, states),
+            events: RwLock::new(ContextEvents::new(None, states)),
         }
+    }
+
+    fn events(&self) -> ContextEvents {
+        self.events
+            .read()
+            .map(|events| events.clone())
+            .unwrap_or_default()
     }
 }
 
-impl RustPlugin for ContextsPlugin {
-    type Contract = bmux_contexts_plugin_api::Contract;
+fn slot_mut<T>(
+    slot: &std::sync::RwLock<T>,
+) -> std::result::Result<std::sync::RwLockWriteGuard<'_, T>, bmux_plugin_sdk::PluginCommandError> {
+    slot.write()
+        .map_err(|_| bmux_plugin_sdk::PluginCommandError::failed("plugin state lock poisoned"))
+}
 
+impl Plugin for ContextsPlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        d.blocking_activate(Self::activate)
+            .blocking_services(Self::invoke_service, None)
+            .typed_services(Self::register_typed_services);
+    }
+}
+
+impl ContextsPlugin {
     fn activate(
-        &mut self,
+        &self,
         context: NativeLifecycleContext,
-    ) -> std::result::Result<i32, PluginCommandError> {
-        self.events = ContextEvents::new(
+        _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
+    ) -> std::result::Result<(), PluginCommandError> {
+        *slot_mut(&self.events)? = ContextEvents::new(
             bmux_plugin::activation_event_bus(&context),
             bmux_plugin::activation_state_registry(&context),
         );
-        let registry = Arc::clone(&self.events.states);
+        let registry = Arc::clone(&self.events().states);
         let state: Arc<RwLock<ContextState>> = Arc::new(RwLock::new(ContextState::default()));
         registry.register::<ContextState>(&state);
 
@@ -480,65 +502,58 @@ impl RustPlugin for ContextsPlugin {
 
         // Register the typed event channel for `contexts-events` on this
         // activation's bus; consumers subscribe through their own views.
-        if let Some(bus) = &self.events.bus {
+        if let Some(bus) = &self.events().bus {
             bus.register_channel::<ContextEvent>(contexts_events::EVENT_KIND);
         }
-        Ok(bmux_plugin_sdk::EXIT_OK)
-    }
-
-    fn run_command(
-        &mut self,
-        _context: NativeCommandContext,
-    ) -> std::result::Result<i32, PluginCommandError> {
-        Err(PluginCommandError::unknown_command(""))
+        Ok(())
     }
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "contexts-visits-v1", "list-visits" => |_req: (), ctx| {
-                Ok(list_visits_local(&self.events, ctx, ctx.caller_client_id))
+                Ok(list_visits_local(&self.events(), ctx, ctx.caller_client_id))
             },
             "contexts-state", "list-contexts" => |_req: (), ctx| {
-                list_contexts_local(&self.events, ctx)
+                list_contexts_local(&self.events(), ctx)
                     .map_err(|e| ServiceResponse::error("list_failed", e))
             },
             "contexts-state", "get-context" => |req: SelectorArgs, ctx| {
-                get_context_local(&self.events, ctx, &req.selector)
+                get_context_local(&self.events(), ctx, &req.selector)
                     .map_err(|e| ServiceResponse::error("get_failed", e))
             },
             "contexts-state", "current-context" => |_req: (), ctx| {
-                current_context_local(&self.events, ctx, ctx.caller_client_id)
+                current_context_local(&self.events(), ctx, ctx.caller_client_id)
                     .map_err(|e| ServiceResponse::error("current_failed", e))
             },
             "contexts-spawn-v1", "create-context" => |req: bmux_contexts_plugin_api::contexts_spawn_v1::client::CreateContextRequest, ctx| {
-                Ok::<_, ServiceResponse>(create_context_with_options(&self.events, ctx, ctx.caller_client_id, req.name, req.attributes, Some(req.options)))
+                Ok::<_, ServiceResponse>(create_context_with_options(&self.events(), ctx, ctx.caller_client_id, req.name, req.attributes, Some(req.options)))
             },
             "contexts-commands", "create-context" => |req: CreateContextArgs, ctx| {
                 Ok::<Result<ContextAck, CreateContextError>, ServiceResponse>(
-                    create_context_local(&self.events, ctx, ctx.caller_client_id, req.name, req.attributes)
+                    create_context_local(&self.events(), ctx, ctx.caller_client_id, req.name, req.attributes)
                 )
             },
             "contexts-activation-v1", "activate" => |req: contexts_activation_v1::client::ActivateRequest, ctx| {
-                Ok::<Result<ContextAck, SelectContextError>, ServiceResponse>(activate_context_exact(&self.events, ctx, ctx.caller_client_id, req.context_id))
+                Ok::<Result<ContextAck, SelectContextError>, ServiceResponse>(activate_context_exact(&self.events(), ctx, ctx.caller_client_id, req.context_id))
             },
             "contexts-commands", "select-context" => |req: SelectorArgs, ctx| {
                 Ok::<Result<ContextAck, SelectContextError>, ServiceResponse>(
-                    select_context_local(&self.events, ctx, ctx.caller_client_id, &req.selector)
+                    select_context_local(&self.events(), ctx, ctx.caller_client_id, &req.selector)
                 )
             },
             "contexts-commands", "close-context" => |req: CloseContextArgs, ctx| {
                 Ok::<Result<ContextAck, CloseContextError>, ServiceResponse>(
-                    close_context_local(&self.events, ctx, ctx.caller_client_id, &req.selector, req.force)
+                    close_context_local(&self.events(), ctx, ctx.caller_client_id, &req.selector, req.force)
                 )
             },
             "contexts-commands", "rename-context" => |req: RenameContextArgs, ctx| {
                 Ok::<Result<ContextAck, RenameContextError>, ServiceResponse>(
-                    rename_context_local(&self.events, ctx, &req.selector, &req.name)
+                    rename_context_local(&self.events(), ctx, &req.selector, &req.name)
                 )
             },
             "contexts-commands", "set-context-attributes" => |req: SetContextAttributesArgs, _ctx| {
                 Ok::<Result<ContextAck, SetContextAttributesError>, ServiceResponse>(
-                    set_context_attributes_local(&self.events, &req.selector, req.attributes)
+                    set_context_attributes_local(&self.events(), &req.selector, req.attributes)
                 )
             },
         })
@@ -552,27 +567,27 @@ impl RustPlugin for ContextsPlugin {
         let caller = Arc::new(TypedServiceCaller::from_registration_context(&context));
 
         let visits: Arc<dyn ContextsVisitsV1Service + Send + Sync> = Arc::new(
-            ContextsStateHandle::new(Arc::clone(&caller), self.events.clone()),
+            ContextsStateHandle::new(Arc::clone(&caller), self.events().clone()),
         );
         let _ = contexts_visits_v1::register_provider(registry, visits);
         let state: Arc<dyn ContextsStateService + Send + Sync> = Arc::new(
-            ContextsStateHandle::new(Arc::clone(&caller), self.events.clone()),
+            ContextsStateHandle::new(Arc::clone(&caller), self.events().clone()),
         );
         let _ = contexts_state::register_provider(registry, state);
 
         let activation: Arc<dyn ContextsActivationV1Service + Send + Sync> = Arc::new(
-            ContextsCommandsHandle::new(caller.clone(), self.events.clone()),
+            ContextsCommandsHandle::new(caller.clone(), self.events().clone()),
         );
         let _ = contexts_activation_v1::register_provider(registry, activation);
         let spawn: Arc<
             dyn bmux_contexts_plugin_api::contexts_spawn_v1::ContextsSpawnV1Service + Send + Sync,
         > = Arc::new(ContextsCommandsHandle::new(
             Arc::clone(&caller),
-            self.events.clone(),
+            self.events().clone(),
         ));
         let _ = bmux_contexts_plugin_api::contexts_spawn_v1::register_provider(registry, spawn);
         let commands: Arc<dyn ContextsCommandsService + Send + Sync> =
-            Arc::new(ContextsCommandsHandle::new(caller, self.events.clone()));
+            Arc::new(ContextsCommandsHandle::new(caller, self.events().clone()));
         let _ = contexts_commands::register_provider(registry, commands);
     }
 }
@@ -1647,25 +1662,7 @@ fn ipc_summary_to_typed(summary: PrimitiveContextSummary) -> ContextSummary {
     }
 }
 
-bmux_plugin_sdk::define_plugin!(
-    factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| {
-        Ok(std::sync::Arc::new(
-            bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
-                ContextsPlugin::default(),
-                scope.instance,
-            ),
-        )
-            as std::sync::Arc<
-                dyn bmux_plugin_sdk::definition::PluginInstance,
-            >)
-    },
-    metadata = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<ContextsPlugin>(
-        crate::declaration::PLUGIN_MANIFEST,
-        vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
-    )
-    .expect("embedded foundational declaration must be valid")
-    .metadata,
-);
+bmux_plugin_sdk::plugin!(ContextsPlugin);
 
 #[cfg(test)]
 mod tests {
@@ -2443,15 +2440,7 @@ mod definition_contract_tests {
         let manifest =
             bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
                 .unwrap();
-        let canonical = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<
-            super::ContextsPlugin,
-        >(
-            crate::declaration::PLUGIN_MANIFEST,
-            vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
-        )
-        .unwrap();
         definition.validate().unwrap();
-        assert_eq!(definition.metadata, canonical.metadata);
         assert_eq!(definition.metadata.plugin_id, manifest.id);
         assert_eq!(definition.metadata.version, manifest.version);
         assert_eq!(definition.metadata.roles, manifest.component_roles);

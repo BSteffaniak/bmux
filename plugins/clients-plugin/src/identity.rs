@@ -152,7 +152,6 @@ mod tests {
             request: bmux_plugin_sdk::HostServiceRequest<'_>,
         ) -> bmux_plugin_sdk::Result<Vec<u8>> {
             use bmux_clients_plugin_api::clients_identity;
-            use bmux_plugin_sdk::RustPlugin;
 
             assert_eq!(request.capability, "bmux.clients.read");
             assert_eq!(request.kind, bmux_plugin_sdk::ServiceKind::Query);

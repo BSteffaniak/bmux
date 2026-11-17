@@ -22,6 +22,7 @@ use bmux_contexts_plugin_api::{contexts_commands, contexts_state};
 use bmux_plugin::{
     EventBus, HostRuntimeApi, PluginStateRegistry, ServiceCaller, TypedServiceCaller,
 };
+use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     StorageGetRequest, StorageSetRequest, TypedServiceRegistrationContext, TypedServiceRegistry,
@@ -177,14 +178,50 @@ impl WorkspaceEvents {
 
 #[derive(Default)]
 pub struct WorkspacesPlugin {
-    events: WorkspaceEvents,
+    events: std::sync::RwLock<WorkspaceEvents>,
 }
 
-impl RustPlugin for WorkspacesPlugin {
-    type Contract = bmux_workspaces_plugin_api::Contract;
+impl WorkspacesPlugin {
+    fn events(&self) -> WorkspaceEvents {
+        self.events
+            .read()
+            .map(|events| events.clone())
+            .unwrap_or_default()
+    }
+}
 
-    fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
-        self.events = WorkspaceEvents::new(
+fn slot_mut<T>(
+    slot: &std::sync::RwLock<T>,
+) -> std::result::Result<std::sync::RwLockWriteGuard<'_, T>, bmux_plugin_sdk::PluginCommandError> {
+    slot.write()
+        .map_err(|_| bmux_plugin_sdk::PluginCommandError::failed("plugin state lock poisoned"))
+}
+
+impl Plugin for WorkspacesPlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        d.blocking_activate(Self::activate)
+            .blocking_command("activate-tab", Self::run_command)
+            .blocking_command("new-workspace", Self::run_command)
+            .blocking_command("list-workspaces", Self::run_command)
+            .blocking_command("switch-workspace", Self::run_command)
+            .blocking_command("rename-workspace", Self::run_command)
+            .blocking_command("kill-workspace", Self::run_command)
+            .blocking_command("move-tab-to-workspace", Self::run_command)
+            .blocking_command("next-workspace", Self::run_command)
+            .blocking_command("prev-workspace", Self::run_command)
+            .blocking_command("last-workspace", Self::run_command)
+            .blocking_services(Self::invoke_service, None)
+            .typed_services(Self::register_typed_services);
+    }
+}
+
+impl WorkspacesPlugin {
+    fn activate(
+        &self,
+        context: NativeLifecycleContext,
+        _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
+    ) -> std::result::Result<(), PluginCommandError> {
+        *slot_mut(&self.events)? = WorkspaceEvents::new(
             bmux_plugin::activation_event_bus(&context),
             bmux_plugin::activation_state_registry(&context),
         );
@@ -202,17 +239,17 @@ impl RustPlugin for WorkspacesPlugin {
         save_catalog(&context, &state.records)
             .map_err(|error| PluginCommandError::failed(format!("{error:?}")))?;
         let state = Arc::new(RwLock::new(state));
-        snapshot::register(&self.events.states, &context, Arc::clone(&state))
+        snapshot::register(&self.events().states, &context, Arc::clone(&state))
             .map_err(PluginCommandError::failed)?;
-        self.events.states.register::<WorkspaceState>(&state);
-        if let Some(bus) = &self.events.bus {
+        self.events().states.register::<WorkspaceState>(&state);
+        if let Some(bus) = &self.events().bus {
             bus.register_channel::<WorkspaceEvent>(workspaces_events::EVENT_KIND);
         }
-        Ok(EXIT_OK)
+        Ok(())
     }
 
-    fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
-        run_command(&self.events, &context).map_err(PluginCommandError::failed)?;
+    fn run_command(&self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
+        run_command(&self.events(), &context).map_err(PluginCommandError::failed)?;
         Ok(EXIT_OK)
     }
 
@@ -225,27 +262,27 @@ impl RustPlugin for WorkspacesPlugin {
         };
         bmux_plugin_sdk::route_service!(context, {
             state::ListWorkspacesEndpoint => |(), ctx| {
-                list_workspaces(&self.events, ctx).map_err(|error| ServiceResponse::error("list_failed", error))
+                list_workspaces(&self.events(), ctx).map_err(|error| ServiceResponse::error("list_failed", error))
             },
-            state::GetWorkspaceEndpoint => |req, ctx| Ok(get_workspace(&self.events, ctx, &req.selector)),
+            state::GetWorkspaceEndpoint => |req, ctx| Ok(get_workspace(&self.events(), ctx, &req.selector)),
             state::CurrentWorkspaceEndpoint => |(), ctx| {
-                current_workspace(&self.events, ctx).map_err(|error| ServiceResponse::error("current_failed", error))
+                current_workspace(&self.events(), ctx).map_err(|error| ServiceResponse::error("current_failed", error))
             },
-            commands::NewWorkspaceEndpoint => |req, ctx| Ok(new_workspace(&self.events, ctx, req.name)),
+            commands::NewWorkspaceEndpoint => |req, ctx| Ok(new_workspace(&self.events(), ctx, req.name)),
             commands::RenameWorkspaceEndpoint => |req, ctx| {
-                Ok(rename_workspace(&self.events, ctx, &req.selector, req.name))
+                Ok(rename_workspace(&self.events(), ctx, &req.selector, req.name))
             },
-            commands::KillWorkspaceEndpoint => |req, ctx| Ok(kill_workspace(&self.events, ctx, &req.selector)),
+            commands::KillWorkspaceEndpoint => |req, ctx| Ok(kill_workspace(&self.events(), ctx, &req.selector)),
             activation::ActivateTabEndpoint => |req, ctx| {
                 Ok(client_id(ctx.caller_client_id)
-                    .and_then(|id| activate_tab_for_client(&self.events, ctx, req.context_id, id)))
+                    .and_then(|id| activate_tab_for_client(&self.events(), ctx, req.context_id, id)))
             },
-            commands::SwitchWorkspaceEndpoint => |req, ctx| Ok(switch_workspace(&self.events, ctx, &req.selector)),
-            commands::NextWorkspaceEndpoint => |(), ctx| Ok(cycle_workspace(&self.events, ctx, 1)),
-            commands::PrevWorkspaceEndpoint => |(), ctx| Ok(cycle_workspace(&self.events, ctx, -1)),
-            commands::LastWorkspaceEndpoint => |(), ctx| Ok(last_workspace(&self.events, ctx)),
+            commands::SwitchWorkspaceEndpoint => |req, ctx| Ok(switch_workspace(&self.events(), ctx, &req.selector)),
+            commands::NextWorkspaceEndpoint => |(), ctx| Ok(cycle_workspace(&self.events(), ctx, 1)),
+            commands::PrevWorkspaceEndpoint => |(), ctx| Ok(cycle_workspace(&self.events(), ctx, -1)),
+            commands::LastWorkspaceEndpoint => |(), ctx| Ok(last_workspace(&self.events(), ctx)),
             commands::MoveTabToWorkspaceEndpoint => |req, ctx| {
-                Ok(move_tab(&self.events, ctx, req.context_id, &req.workspace))
+                Ok(move_tab(&self.events(), ctx, req.context_id, &req.workspace))
             },
         })
     }
@@ -259,18 +296,18 @@ impl RustPlugin for WorkspacesPlugin {
         let state: Arc<dyn WorkspacesStateService + Send + Sync> =
             Arc::new(WorkspacesStateHandle {
                 caller: Arc::clone(&caller),
-                events: self.events.clone(),
+                events: self.events().clone(),
             });
         let activation: Arc<dyn WorkspacesActivationV1Service + Send + Sync> =
             Arc::new(WorkspacesCommandsHandle {
                 caller: caller.clone(),
-                events: self.events.clone(),
+                events: self.events().clone(),
             });
         let _ = workspaces_activation_v1::register_provider(registry, activation);
         let commands: Arc<dyn WorkspacesCommandsService + Send + Sync> =
             Arc::new(WorkspacesCommandsHandle {
                 caller,
-                events: self.events.clone(),
+                events: self.events().clone(),
             });
         let _ = workspaces_state::register_provider(registry, state);
         let _ = workspaces_commands::register_provider(registry, commands);
@@ -1304,25 +1341,7 @@ impl WorkspacesCommandsService for WorkspacesCommandsHandle {
     }
 }
 
-bmux_plugin_sdk::define_plugin!(
-    factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| {
-        Ok(std::sync::Arc::new(
-            bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
-                WorkspacesPlugin::default(),
-                scope.instance,
-            ),
-        )
-            as std::sync::Arc<
-                dyn bmux_plugin_sdk::definition::PluginInstance,
-            >)
-    },
-    metadata = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<WorkspacesPlugin>(
-        crate::declaration::PLUGIN_MANIFEST,
-        vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
-    )
-    .expect("embedded foundational declaration must be valid")
-    .metadata,
-);
+bmux_plugin_sdk::plugin!(WorkspacesPlugin);
 
 #[cfg(test)]
 mod tests {
@@ -2048,15 +2067,7 @@ mod definition_contract_tests {
         let manifest =
             bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
                 .unwrap();
-        let canonical = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<
-            super::WorkspacesPlugin,
-        >(
-            crate::declaration::PLUGIN_MANIFEST,
-            vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
-        )
-        .unwrap();
         definition.validate().unwrap();
-        assert_eq!(definition.metadata, canonical.metadata);
         assert_eq!(definition.metadata.plugin_id, manifest.id);
         assert_eq!(definition.metadata.version, manifest.version);
         assert_eq!(definition.metadata.roles, manifest.component_roles);

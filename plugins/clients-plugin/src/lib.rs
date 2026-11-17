@@ -40,6 +40,7 @@ use bmux_clients_plugin_api::clients_state::{
 use bmux_contexts_plugin_api::contexts_commands;
 use bmux_contexts_plugin_api::contexts_state::ContextSelector;
 use bmux_plugin::{EventBus, PluginStateRegistry, ServiceCaller, TypedServiceCaller};
+use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     PluginEventKind, StatefulPlugin, StatefulPluginError, StatefulPluginHandle,
@@ -419,7 +420,14 @@ struct SetFollowingArgs {
 
 #[derive(Default)]
 pub struct ClientsPlugin {
-    events: ClientEvents,
+    events: std::sync::RwLock<ClientEvents>,
+}
+
+fn slot_mut<T>(
+    slot: &std::sync::RwLock<T>,
+) -> std::result::Result<std::sync::RwLockWriteGuard<'_, T>, bmux_plugin_sdk::PluginCommandError> {
+    slot.write()
+        .map_err(|_| bmux_plugin_sdk::PluginCommandError::failed("plugin state lock poisoned"))
 }
 
 impl ClientsPlugin {
@@ -428,23 +436,37 @@ impl ClientsPlugin {
     #[cfg(test)]
     const fn with_states(states: Arc<PluginStateRegistry>) -> Self {
         Self {
-            events: ClientEvents::new(None, states),
+            events: std::sync::RwLock::new(ClientEvents::new(None, states)),
         }
+    }
+
+    fn events(&self) -> ClientEvents {
+        self.events
+            .read()
+            .map(|events| events.clone())
+            .unwrap_or_default()
     }
 }
 
-impl RustPlugin for ClientsPlugin {
-    type Contract = bmux_clients_plugin_api::Contract;
+impl Plugin for ClientsPlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        d.blocking_activate(Self::activate)
+            .blocking_services(Self::invoke_service, None)
+            .typed_services(Self::register_typed_services);
+    }
+}
 
+impl ClientsPlugin {
     fn activate(
-        &mut self,
+        &self,
         context: NativeLifecycleContext,
-    ) -> std::result::Result<i32, PluginCommandError> {
-        self.events = ClientEvents::new(
+        _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
+    ) -> std::result::Result<(), PluginCommandError> {
+        *slot_mut(&self.events)? = ClientEvents::new(
             bmux_plugin::activation_event_bus(&context),
             bmux_plugin::activation_state_registry(&context),
         );
-        let registry = Arc::clone(&self.events.states);
+        let registry = Arc::clone(&self.events().states);
         // Register the follow-state handle on this activation's view of the
         // host registry; core server code and other plugins read it there.
         // Re-activation is a no-op: only the first `register` call
@@ -459,7 +481,7 @@ impl RustPlugin for ClientsPlugin {
         // surface without naming the concrete plugin-owned type.
         let adapter = FollowStateAdapter {
             inner: Arc::clone(&state),
-            events: self.events.clone(),
+            events: self.events().clone(),
         };
         let handle = Arc::new(RwLock::new(FollowStateHandle::new(adapter)));
         registry.register::<FollowStateHandle>(&handle);
@@ -487,32 +509,25 @@ impl RustPlugin for ClientsPlugin {
             .expect("stateful plugin registry lock poisoned")
             .push(stateful);
 
-        if let Some(bus) = &self.events.bus {
+        if let Some(bus) = &self.events().bus {
             bus.register_channel::<ClientEvent>(clients_events::EVENT_KIND);
         }
-        Ok(bmux_plugin_sdk::EXIT_OK)
-    }
-
-    fn run_command(
-        &mut self,
-        _context: NativeCommandContext,
-    ) -> std::result::Result<i32, PluginCommandError> {
-        Err(PluginCommandError::unknown_command(""))
+        Ok(())
     }
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "clients-selection-state-v1", "current" => |_req: (), ctx| {
-                Ok::<Result<Selection, SelectionError>, ServiceResponse>(selection_operation(&self.events, ctx.caller_client_id, |state, client| state.selection(client)))
+                Ok::<Result<Selection, SelectionError>, ServiceResponse>(selection_operation(&self.events(), ctx.caller_client_id, |state, client| state.selection(client)))
             },
             "clients-selection-commands-v1", "recover" => |req: clients_selection_commands_v1::client::RecoverRequest, ctx| {
-                Ok::<Result<Selection, SelectionError>, ServiceResponse>(selection_operation(&self.events, ctx.caller_client_id, |state, client| state.recover_selection(client, req.expected_revision)))
+                Ok::<Result<Selection, SelectionError>, ServiceResponse>(selection_operation(&self.events(), ctx.caller_client_id, |state, client| state.recover_selection(client, req.expected_revision)))
             },
             "clients-selection-commands-v1", "begin" => |req: clients_selection_commands_v1::client::BeginRequest, ctx| {
-                Ok::<Result<Selection, SelectionError>, ServiceResponse>(selection_operation(&self.events, ctx.caller_client_id, |state, client| state.begin_selection(client, req.expected_revision)))
+                Ok::<Result<Selection, SelectionError>, ServiceResponse>(selection_operation(&self.events(), ctx.caller_client_id, |state, client| state.begin_selection(client, req.expected_revision)))
             },
             "clients-selection-commands-v1", "commit" => |req: clients_selection_commands_v1::client::CommitRequest, ctx| {
-                Ok::<Result<Selection, SelectionError>, ServiceResponse>(commit_client_selection(&self.events, ctx, ctx.caller_client_id, &req))
+                Ok::<Result<Selection, SelectionError>, ServiceResponse>(commit_client_selection(&self.events(), ctx, ctx.caller_client_id, &req))
             },
             "clients-identity/v1", "stream-admission-backend" => |_req: (), ctx| {
                 Ok::<_, ServiceResponse>(identity::stream_admission_backend(ctx))
@@ -522,7 +537,7 @@ impl RustPlugin for ClientsPlugin {
             },
             "clients-identity/v1", "current-principal" => |_req: (), ctx| {
                 let identity = identity::CallerIdentity::new(
-                    Arc::clone(&self.events.states),
+                    Arc::clone(&self.events().states),
                     ctx.caller_client_id,
                 );
                 Ok::<_, ServiceResponse>(bmux_plugin::block_on_typed_dispatch(
@@ -530,22 +545,22 @@ impl RustPlugin for ClientsPlugin {
                 ))
             },
             "clients-state", "list-clients" => |_req: (), _ctx| {
-                list_clients_local(&self.events)
+                list_clients_local(&self.events())
                     .map_err(|e| ServiceResponse::error("list_failed", e))
             },
             "clients-state", "current-client" => |_req: (), ctx| {
                 Ok::<Result<ClientSummary, ClientQueryError>, ServiceResponse>(
-                    current_client_local(&self.events, ctx.caller_client_id)
+                    current_client_local(&self.events(), ctx.caller_client_id)
                 )
             },
             "clients-commands", "set-current-session" => |req: SetCurrentSessionArgs, ctx| {
                 Ok::<Result<ClientAck, SetCurrentSessionError>, ServiceResponse>(
-                    set_current_session_local(&self.events, ctx, ctx.caller_client_id, req.session_id)
+                    set_current_session_local(&self.events(), ctx, ctx.caller_client_id, req.session_id)
                 )
             },
             "clients-commands", "set-following" => |req: SetFollowingArgs, ctx| {
                 Ok::<Result<ClientAck, SetFollowingError>, ServiceResponse>(
-                    set_following_via_ipc(&self.events, ctx, ctx.caller_client_id, &req)
+                    set_following_via_ipc(&self.events(), ctx, ctx.caller_client_id, &req)
                 )
             },
         })
@@ -564,7 +579,7 @@ impl RustPlugin for ClientsPlugin {
 
         let selection = Arc::new(SelectionHandle {
             caller: caller.clone(),
-            events: self.events.clone(),
+            events: self.events(),
         });
         let _ = bmux_clients_plugin_api::clients_selection_state_v1::register_provider(
             registry,
@@ -572,7 +587,7 @@ impl RustPlugin for ClientsPlugin {
         );
         let _ = clients_selection_commands_v1::register_provider(registry, selection);
         let commands: Arc<dyn ClientsCommandsService + Send + Sync> =
-            Arc::new(ClientsCommandsHandle::new(caller, self.events.clone()));
+            Arc::new(ClientsCommandsHandle::new(caller, self.events()));
         let _ = clients_commands::register_provider(registry, commands);
     }
 }
@@ -1304,25 +1319,7 @@ const fn primitive_summary_to_typed(summary: &PrimitiveClientSummary) -> ClientS
     }
 }
 
-bmux_plugin_sdk::define_plugin!(
-    factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| {
-        Ok(std::sync::Arc::new(
-            bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
-                ClientsPlugin::default(),
-                scope.instance,
-            ),
-        )
-            as std::sync::Arc<
-                dyn bmux_plugin_sdk::definition::PluginInstance,
-            >)
-    },
-    metadata = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<ClientsPlugin>(
-        crate::declaration::PLUGIN_MANIFEST,
-        vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
-    )
-    .expect("embedded foundational declaration must be valid")
-    .metadata,
-);
+bmux_plugin_sdk::plugin!(ClientsPlugin);
 
 /// Request policy for this implementation's trusted application composition.
 ///
@@ -1376,15 +1373,7 @@ mod definition_contract_tests {
         let manifest =
             bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
                 .unwrap();
-        let canonical = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<
-            super::ClientsPlugin,
-        >(
-            crate::declaration::PLUGIN_MANIFEST,
-            vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
-        )
-        .unwrap();
         definition.validate().unwrap();
-        assert_eq!(definition.metadata, canonical.metadata);
         assert_eq!(definition.metadata.plugin_id, manifest.id);
         assert_eq!(definition.metadata.version, manifest.version);
         assert_eq!(definition.metadata.roles, manifest.component_roles);

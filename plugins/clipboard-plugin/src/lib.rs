@@ -14,21 +14,38 @@ use std::fs;
 use std::path::Path;
 
 use bmux_clipboard::{ClipboardError, ClipboardPayload};
+use bmux_plugin_sdk::author::{self, Call, Declarations, Plugin};
 use bmux_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Default)]
 pub struct ClipboardPlugin;
 
-impl RustPlugin for ClipboardPlugin {
-    type Contract = bmux_plugin_sdk::NoPluginContract;
-
-    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
-        Self::service(&context)
+impl Plugin for ClipboardPlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        // The clipboard interfaces are opaque in BPDL: their bodies are
+        // routed by hand.
+        d.native_services(Self::invoke);
     }
 }
 
 impl ClipboardPlugin {
+    async fn invoke(
+        &self,
+        cx: &Call,
+        context: NativeServiceContext,
+    ) -> author::Result<ServiceResponse> {
+        if cx
+            .cancellation()
+            .is_some_and(bmux_plugin_sdk::ServiceCancellation::is_cancelled)
+        {
+            return Err(PluginCommandError::unavailable(
+                "clipboard invocation cancelled",
+            ));
+        }
+        Ok(Self::service(&context))
+    }
+
     fn service(context: &NativeServiceContext) -> ServiceResponse {
         let span = tracing::debug_span!(
             "clipboard_plugin_service",
@@ -71,39 +88,7 @@ impl ClipboardPlugin {
     }
 }
 
-impl bmux_plugin_sdk::definition::PluginInstance for ClipboardPlugin {
-    fn invoke(
-        &self,
-        call: bmux_plugin_sdk::definition::PluginCallContext,
-        context: NativeServiceContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<
-        '_,
-        bmux_plugin_sdk::definition::PluginResult<ServiceResponse>,
-    > {
-        Box::pin(async move {
-            if call.cancellation.is_cancelled() {
-                return Err(PluginCommandError::unavailable(
-                    "clipboard invocation cancelled",
-                ));
-            }
-            Ok(Self::service(&context))
-        })
-    }
-}
-
-bmux_plugin_sdk::define_plugin!(
-    factory = |_scope| Ok(std::sync::Arc::new(ClipboardPlugin)
-        as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
-    metadata = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<ClipboardPlugin>(
-        crate::declaration::PLUGIN_MANIFEST,
-        vec![
-            bmux_plugin_sdk::definition::ComponentRole::Backend,
-            bmux_plugin_sdk::definition::ComponentRole::Frontend
-        ],
-    )
-    .expect("clipboard declaration must be valid")
-    .metadata,
-);
+bmux_plugin_sdk::plugin!(ClipboardPlugin);
 
 #[cfg(test)]
 mod definition_tests {
