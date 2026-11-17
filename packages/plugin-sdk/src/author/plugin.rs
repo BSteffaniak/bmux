@@ -698,6 +698,13 @@ impl Activation {
         Ok(())
     }
 
+    /// The whole host lifecycle context (scope, activation id, callback
+    /// execution), for plugins that bind host ports to this activation.
+    #[must_use]
+    pub const fn lifecycle(&self) -> &PluginLifecycleContext {
+        &self.context
+    }
+
     /// The activation's task scope, when the host provides one.
     #[must_use]
     pub const fn tasks(&self) -> Option<&crate::HostAsyncHandle> {
@@ -728,6 +735,12 @@ impl Deactivation {
     #[must_use]
     pub const fn native(&self) -> &NativeLifecycleContext {
         &self.context.native
+    }
+
+    /// The whole host lifecycle context of this deactivation.
+    #[must_use]
+    pub const fn lifecycle(&self) -> &PluginLifecycleContext {
+        &self.context
     }
 }
 
@@ -1358,7 +1371,7 @@ impl PluginCrate {
 pub fn definition<P: Plugin>(
     manifest: &'static str,
     services: &'static [ServiceInterfaceDescriptor],
-    create: fn(&PluginCreateContext) -> Result<P>,
+    create: impl Fn(&PluginCreateContext) -> Result<P> + Send + Sync + 'static,
 ) -> Result<crate::definition::PluginDefinition> {
     let metadata = super::metadata(manifest, services)?;
     let definition =
