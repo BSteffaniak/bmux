@@ -49,15 +49,11 @@ PNG fixture construction is outside the encoder timing.
 Encoder byte counts exclude terminal framing. Scene byte counts include framing.
 Scene workloads cover cold/warm, movement, crop, hide/reveal, resize,
 replacement,
-and deletion for each host protocol. Attach additionally exercises overlay
-occlusion, a fresh-ID legacy baseline, and retained versus deliberately
-invalidated upload state. The clipped attach path clones a candidate, begins a
-frame, renders, finishes, then commits only after successful `Vec` output.
-Decode/preparation counts come from `KittyHostState::work_counts`; preparation
-is
-not an independently measured scale count. Unsupported counters are zero (not
-proof of zero internal work). TUI scene reconciliation and fixture cloning are
-outside its render timing; attach candidate cloning is inside clipped timing.
+and deletion for each host protocol, plus a fresh-key baseline and retained
+versus deliberately invalidated upload state; the attach client renders through
+the same `TuiImageCompositor`. Unsupported counters are zero (not proof of zero
+internal work). Scene reconciliation, invalidation and fixture cloning are
+outside render timing; the repair output an invalidation causes is inside it.
 
 The attach benchmark calls public image compositor entry points, not the full
 CLI attach transport or PTY runtime. The TUI harness calls public scene and
@@ -93,8 +89,8 @@ selection was profile `sol`, provider `bcode.openai-compatible`, model
 Historical user-provided isolated Kitty debug baseline: 1280 × 720 redraw,
 approximately 4.96 MB, 1200 upload chunks, 75–84 ms, with fresh IDs causing
 reupload. This lane did not execute it or establish machine/profile identity.
-The harness provides `attach/kitty/fresh-id-baseline` and
-`attach/kitty/invalidated-upload-baseline` to remeasure rather than treating
+The harness provides `tui/kitty/fresh-key-baseline` and
+`tui/kitty/invalidated-upload-baseline` to remeasure rather than treating
 that
 observation as a universal target. Raw fixture size is 3,686,400 bytes; padded
 base64 payload is 4,915,200 bytes before headers/framing, split into 1200
@@ -152,11 +148,8 @@ lane. Suggestions require their owners' correctness review and measurements.
 
 A reported warm sample slower than cold is not yet attributed by measurement.
 The current source path is `TuiImageCompositor::render` → `render_candidate`
-→
-`render_pane_images_clipped`. The clipped cache retains encoded non-Kitty
-output;
-`cache.find` success skips `emit_from_pixels` and Sixel encoding, then writes
-the
+→ `render_image_clipped`. The clipped cache retains encoded non-Kitty output;
+`cache.find` success skips pixel preparation and Sixel encoding, then writes the
 cached encoded bytes. Repeated encoding is therefore expected on misses,
 eviction, or changed source/crop/size/protocol/cell metrics, not an ordinary
 hit.

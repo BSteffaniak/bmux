@@ -76,6 +76,70 @@ type ContainSignature = (
 );
 type RasterSignature = (u64, u16, u16, u16, u16, bmux_tui::image::ImageFit);
 
+/// The payload a pane image shows as: its decoded pixels when it carries them, otherwise its
+/// protocol bytes decoded (a completed Kitty transfer is PNG, an iTerm2 body carries its image
+/// file, Sixel is decoded to pixels).
+///
+/// # Errors
+/// Returns why the image cannot be shown: no bytes, malformed bytes, or a protocol this build
+/// does not decode.
+pub fn pane_image_payload(image: &PaneImage) -> Result<TuiImagePayload, &'static str> {
+    let png = |bytes: Vec<u8>| TuiImagePayload::Png {
+        bytes: bytes.into(),
+        width: image.pixel_size.width,
+        height: image.pixel_size.height,
+    };
+    if let Some(pixels) = &image.payload.pixels {
+        return Ok(match pixels.format {
+            PixelFormat::Rgb8 | PixelFormat::Rgba8 => pixel_payload(pixels.clone()),
+            PixelFormat::Png => png(pixels.data.clone()),
+        });
+    }
+    let raw = image.payload.raw.as_deref().ok_or("image has no bytes")?;
+    match image.protocol {
+        ImageProtocol::KittyGraphics => Ok(png(raw.to_vec())),
+        ImageProtocol::ITerm2 => {
+            #[cfg(feature = "iterm2")]
+            {
+                let (_, bytes) =
+                    crate::codec::iterm2::parse_body(raw).ok_or("invalid iTerm2 image")?;
+                Ok(png(bytes))
+            }
+            #[cfg(not(feature = "iterm2"))]
+            {
+                Err("iTerm2 decoding disabled")
+            }
+        }
+        ImageProtocol::Sixel => {
+            #[cfg(feature = "sixel")]
+            {
+                let pixels = crate::codec::sixel::decode(raw).ok_or("invalid Sixel image")?;
+                if pixels.format == PixelFormat::Png {
+                    return Err("unexpected Sixel PNG");
+                }
+                Ok(pixel_payload(pixels))
+            }
+            #[cfg(not(feature = "sixel"))]
+            {
+                Err("Sixel decoding disabled")
+            }
+        }
+    }
+}
+
+fn pixel_payload(pixels: PixelBuffer) -> TuiImagePayload {
+    TuiImagePayload::Pixels {
+        format: if pixels.format == PixelFormat::Rgb8 {
+            ImagePixelFormat::Rgb8
+        } else {
+            ImagePixelFormat::Rgba8
+        },
+        width: pixels.width,
+        height: pixels.height,
+        bytes: pixels.data.into(),
+    }
+}
+
 /// BMUX-owned adapter that assigns image IDs, validates payloads, clips
 /// placements, and delegates host protocol selection to the compositor.
 #[derive(Default, Clone)]

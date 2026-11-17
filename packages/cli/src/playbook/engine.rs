@@ -1614,34 +1614,54 @@ mod tests {
         assert!(state.shows_images());
     }
 
+    /// The recovered window's image, placed at its cells in a pane whose content starts at
+    /// column 5 of row 7 (as the attach client places it), is written there as Sixel.
     #[cfg(feature = "image-sixel")]
     fn assert_recovered_image_emits_at_viewport_origin(
         window: &bmux_attach_pipeline::PaneScrollbackWindow,
     ) {
-        let images = window
-            .images
-            .iter()
-            .map(bmux_image::PaneImage::from)
-            .collect::<Vec<_>>();
+        use bmux_tui::geometry::Rect;
+        let image = &window.images[0];
+        let payload =
+            bmux_image::tui::pane_image_payload(&bmux_image::PaneImage::from(image)).unwrap();
+        let destination = Rect::new(
+            5 + image.position_col,
+            7 + image.position_row,
+            image.cell_cols,
+            image.cell_rows,
+        );
+        let mut scene = bmux_tui::image_scene::ImageScene::default();
+        scene.reconcile(&[bmux_tui::image::ImageContribution::Present(
+            bmux_tui::image::ImagePlacement {
+                key: bmux_tui::image::ImageKey::new("recovered"),
+                payload,
+                destination,
+                fit: bmux_tui::image::ImageFit::Stretch,
+                allocation: None,
+                clip: Rect::new(5, 7, u16::try_from(window.projection_width).unwrap(), 1),
+                lifecycle: bmux_tui::image::ImageLifecycle::Frame,
+                z: 0,
+            },
+        )]);
         let mut output = Vec::new();
-        bmux_image::compositor::render_pane_images_clipped(
-            &mut output,
-            &images,
-            bmux_image::compositor::PaneRect {
-                x: 5,
-                y: 7,
-                w: u16::try_from(window.projection_width).unwrap(),
-                h: 1,
-            },
-            &[],
-            &bmux_image::host_caps::HostImageCapabilities {
-                sixel: true,
-                ..Default::default()
-            },
-            &mut bmux_image::compositor::KittyHostState::default(),
-        )
-        .unwrap();
-        let cursor = format!("\x1b[8;{}H", 6 + window.images[0].position_col);
+        bmux_image::tui::TuiImageCompositor::new()
+            .render(
+                &mut output,
+                &scene,
+                bmux_image::compositor::PaneRect {
+                    x: 0,
+                    y: 0,
+                    w: 200,
+                    h: 50,
+                },
+                &bmux_image::host_caps::HostImageCapabilities {
+                    sixel: true,
+                    ..Default::default()
+                },
+                &bmux_image::ImageConfig::default(),
+            )
+            .unwrap();
+        let cursor = format!("\x1b[8;{}H", 6 + image.position_col);
         assert!(
             output
                 .windows(cursor.len())

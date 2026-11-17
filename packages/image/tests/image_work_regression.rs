@@ -8,6 +8,11 @@ mod sixel_reference;
 
 use bmux_image::codec::base64::{base64_decode, base64_encode};
 
+/// The fixed palette fixture, `width` x `height`.
+fn pixels(width: u32, height: u32) -> bmux_image::model::PixelBuffer {
+    support::fixture(width, height, "palette").expect("known fixture")
+}
+
 #[test]
 fn fixture_selector_is_fixed_and_validated() {
     for kind in ["palette", "solid", "gradient", "transparent", "detailed"] {
@@ -59,7 +64,7 @@ fn base64_exact_lengths_and_roundtrip_at_chunk_boundaries() {
 
 #[test]
 fn fixture_has_fixed_dimensions_and_opaque_pixels() {
-    let pixels = support::pixels(17, 13);
+    let pixels = pixels(17, 13);
     assert_eq!(pixels.data.len(), 17 * 13 * 4);
     assert!(
         pixels
@@ -102,7 +107,7 @@ fn kitty_chunk_budget_final_marker_and_exact_payload() {
 #[test]
 fn iterm2_encoder_roundtrip_and_byte_count() {
     use bmux_image::codec::iterm2::{encode_body, parse_body};
-    let source = support::pixels(17, 13).data;
+    let source = pixels(17, 13).data;
     let encoded = encode_body(&source, true);
     assert_eq!(
         encoded.len(),
@@ -118,126 +123,110 @@ fn iterm2_encoder_roundtrip_and_byte_count() {
 fn sixel_palette_fixture_roundtrip_partial_bands() {
     use bmux_image::codec::sixel::{decode, encode};
     for (width, height) in [(1, 1), (17, 5), (17, 6), (17, 7), (17, 13)] {
-        let pixels = support::pixels(width, height);
+        let pixels = pixels(width, height);
         let encoded = encode(&pixels).expect("valid opaque fixture");
         assert_eq!(encoded, encode(&pixels).expect("deterministic encoding"));
         assert_eq!(decode(&encoded).expect("encoded fixture decodes"), pixels);
     }
 }
 
+/// One frame's scene: `pixels` placed under `key` at column `col` of row 1, 5x3 cells.
 #[cfg(feature = "kitty")]
-#[test]
-fn retained_attach_content_reuses_new_owner_and_uploads_changed_bytes() {
-    use bmux_image::HostImageCapabilities;
-    use bmux_image::compositor::{KittyHostState, PaneRect, render_pane_images};
-    use bmux_image::config::ImageDecodeMode;
-    use bmux_image::model::{
-        ImageCellSize, ImagePayload, ImagePixelSize, ImagePosition, ImageProtocol, PaneImage,
+fn scene_of(
+    key: &str,
+    col: u16,
+    pixels: &bmux_image::model::PixelBuffer,
+) -> bmux_tui::image_scene::ImageScene {
+    use bmux_tui::geometry::Rect;
+    use bmux_tui::image::{
+        ImageContribution, ImageFit, ImageKey, ImageLifecycle, ImagePayload, ImagePixelFormat,
+        ImagePlacement,
     };
-    let pixels = support::pixels(17, 13);
-    let mut image = PaneImage {
-        id: 7,
-        protocol: ImageProtocol::KittyGraphics,
-        payload: ImagePayload {
-            raw: None,
-            pixels: Some(pixels),
+    let destination = Rect::new(col, 1, 5, 3);
+    let mut scene = bmux_tui::image_scene::ImageScene::default();
+    scene.reconcile(&[ImageContribution::Present(ImagePlacement {
+        key: ImageKey::new(key),
+        payload: ImagePayload::Pixels {
+            bytes: pixels.data.clone().into(),
+            width: pixels.width,
+            height: pixels.height,
+            format: ImagePixelFormat::Rgba8,
         },
-        position: ImagePosition { row: 1, col: 2 },
-        cell_size: ImageCellSize { rows: 3, cols: 5 },
-        pixel_size: ImagePixelSize {
-            width: 17,
-            height: 13,
-        },
-    };
-    let caps = HostImageCapabilities {
-        kitty_graphics: true,
-        ..Default::default()
-    };
-    let pane = PaneRect {
-        x: 0,
-        y: 0,
-        w: 80,
-        h: 24,
-    };
-    let mut state = KittyHostState::default();
-    for (id, col, expected_uploads) in [(7, 2, 1), (7, 2, 0), (7, 3, 0), (8, 3, 0), (8, 4, 1)] {
-        if col == 4 {
-            image.payload.pixels.as_mut().unwrap().data[0] ^= 255;
-        }
-        image.id = id;
-        image.position.col = col;
-        let mut out = Vec::new();
-        render_pane_images(
-            &mut out,
-            std::slice::from_ref(&image),
-            pane,
-            &caps,
-            ImageDecodeMode::Server,
-            &mut state,
-        )
-        .expect("Vec output cannot fail");
-        assert_eq!(support::count_marker(&out, b"\x1b_Ga=t,"), expected_uploads);
-        assert_eq!(support::count_marker(&out, b"\x1b_Ga=p,"), 1);
-    }
-    let mut out = Vec::new();
-    state.reset(&mut out).expect("Vec cleanup cannot fail");
-    assert_eq!(support::count_marker(&out, b"\x1b_Ga=d,"), 2);
-    assert!(state.transmitted.is_empty());
+        destination,
+        fit: ImageFit::Stretch,
+        allocation: None,
+        clip: Rect::new(0, 0, 80, 24),
+        lifecycle: ImageLifecycle::Frame,
+        z: 0,
+    })]);
+    scene
 }
 
 #[cfg(feature = "kitty")]
-#[test]
-fn clipped_frames_reuse_decode_and_preparation_then_repair_uploads() {
-    use bmux_image::HostImageCapabilities;
-    use bmux_image::compositor::{KittyHostState, PaneRect, render_pane_images_clipped};
-    use bmux_image::model::{
-        ImageCellSize, ImagePayload, ImagePixelSize, ImagePosition, ImageProtocol, PaneImage,
-    };
-    let image = PaneImage {
-        id: 11,
-        protocol: ImageProtocol::KittyGraphics,
-        payload: ImagePayload {
-            raw: None,
-            pixels: Some(support::pixels(17, 13)),
-        },
-        position: ImagePosition { row: 1, col: 2 },
-        cell_size: ImageCellSize { rows: 3, cols: 5 },
-        pixel_size: ImagePixelSize {
-            width: 17,
-            height: 13,
-        },
-    };
-    let caps = HostImageCapabilities {
+const KITTY_TERMINAL: bmux_image::compositor::PaneRect = bmux_image::compositor::PaneRect {
+    x: 0,
+    y: 0,
+    w: 80,
+    h: 24,
+};
+
+#[cfg(feature = "kitty")]
+fn kitty_caps() -> bmux_image::HostImageCapabilities {
+    bmux_image::HostImageCapabilities {
         kitty_graphics: true,
         ..Default::default()
-    };
-    let pane = PaneRect {
-        x: 0,
-        y: 0,
-        w: 80,
-        h: 24,
-    };
-    let mut committed = KittyHostState::default();
-    for expected_uploads in [1, 0] {
-        let mut candidate = committed.clone();
-        candidate.begin_frame();
-        let mut out = Vec::new();
-        render_pane_images_clipped(
-            &mut out,
-            std::slice::from_ref(&image),
-            pane,
-            &[],
-            &caps,
-            &mut candidate,
-        )
-        .expect("valid fixture");
-        candidate
-            .finish_frame(&mut out)
-            .expect("Vec output cannot fail");
-        assert_eq!(support::count_marker(&out, b"\x1b_Ga=t,"), expected_uploads);
-        assert_eq!(candidate.work_counts(), (1, 1));
-        committed = candidate;
     }
+}
+
+/// The same content under a new key is placed without a new upload; changed bytes are
+/// uploaded; cleanup deletes what the compositor put on the host.
+#[cfg(feature = "kitty")]
+#[test]
+fn retained_attach_content_reuses_new_owner_and_uploads_changed_bytes() {
+    use bmux_image::tui::TuiImageCompositor;
+    let mut pixels = pixels(17, 13);
+    let mut compositor = TuiImageCompositor::new();
+    let config = bmux_image::ImageConfig::default();
+    for (key, col, expected_uploads) in [
+        ("seven", 2, 1),
+        ("seven", 2, 0),
+        ("seven", 3, 0),
+        ("eight", 3, 0),
+        ("eight", 4, 1),
+    ] {
+        if col == 4 {
+            pixels.data[0] ^= 255;
+        }
+        let mut out = Vec::new();
+        compositor
+            .render(
+                &mut out,
+                &scene_of(key, col, &pixels),
+                KITTY_TERMINAL,
+                &kitty_caps(),
+                &config,
+            )
+            .expect("Vec output cannot fail");
+        assert_eq!(
+            support::count_marker(&out, b"\x1b_Ga=t,"),
+            expected_uploads,
+            "{key} at {col}"
+        );
+        assert_eq!(support::count_marker(&out, b"\x1b_Ga=p,"), 1);
+    }
+    let mut out = Vec::new();
+    compositor
+        .cleanup(&mut out, &kitty_caps())
+        .expect("Vec cleanup cannot fail");
+    assert!(support::count_marker(&out, b"\x1b_Ga=d,") > 0);
+}
+
+/// Unchanged frames reuse the decode and preparation; a frame whose output fails publishes
+/// nothing, and the next one repairs by uploading again.
+#[cfg(feature = "kitty")]
+#[test]
+fn clipped_frames_reuse_decode_and_preparation_then_repair_uploads() {
+    use bmux_image::tui::TuiImageCompositor;
     struct FailAfter {
         remaining: usize,
     }
@@ -254,42 +243,34 @@ fn clipped_frames_reuse_decode_and_preparation_then_repair_uploads() {
             Ok(())
         }
     }
-    let mut uncertain = committed.clone();
-    uncertain.begin_frame();
+    let scene = scene_of("eleven", 2, &pixels(17, 13));
+    let config = bmux_image::ImageConfig::default();
+    let mut compositor = TuiImageCompositor::new();
+    let work = |compositor: &TuiImageCompositor| {
+        let (_, decodes, preparations) = compositor.work_counts();
+        (decodes, preparations)
+    };
+    for expected_uploads in [1, 0] {
+        let mut out = Vec::new();
+        compositor
+            .render(&mut out, &scene, KITTY_TERMINAL, &kitty_caps(), &config)
+            .expect("valid fixture");
+        assert_eq!(support::count_marker(&out, b"\x1b_Ga=t,"), expected_uploads);
+        assert_eq!(work(&compositor), (1, 1));
+    }
     let mut failing = FailAfter { remaining: 10 };
     assert!(
-        render_pane_images_clipped(
-            &mut failing,
-            std::slice::from_ref(&image),
-            pane,
-            &[],
-            &caps,
-            &mut uncertain,
-        )
-        .is_err()
+        compositor
+            .render(&mut failing, &scene, KITTY_TERMINAL, &kitty_caps(), &config)
+            .is_err()
     );
-    assert_eq!(committed.work_counts(), (1, 1));
-    committed.invalidate_after_failed_output(&uncertain);
-    let mut candidate = committed.clone();
-    candidate.begin_frame();
+    assert_eq!(work(&compositor), (1, 1));
     let mut out = Vec::new();
-    render_pane_images_clipped(
-        &mut out,
-        std::slice::from_ref(&image),
-        pane,
-        &[],
-        &caps,
-        &mut candidate,
-    )
-    .expect("repair fixture");
-    candidate
-        .finish_frame(&mut out)
-        .expect("Vec output cannot fail");
+    compositor
+        .render(&mut out, &scene, KITTY_TERMINAL, &kitty_caps(), &config)
+        .expect("repair fixture");
     assert_eq!(support::count_marker(&out, b"\x1b_Ga=t,"), 1);
     assert!(support::count_marker(&out, b"\x1b_Ga=d,") > 0);
-    assert_eq!(candidate.work_counts(), (1, 1));
-    // No candidate publication occurred until all frame bytes were accepted.
-    assert_eq!(committed.work_counts(), (1, 1));
 }
 
 #[cfg(feature = "kitty")]
@@ -308,7 +289,7 @@ fn tui_scene_warm_movement_hide_reveal_replacement_and_cleanup() {
         allocation: None,
         key: ImageKey::new("retained"),
         payload: ImagePayload::Pixels {
-            bytes: support::pixels(17, 13).data.into(),
+            bytes: pixels(17, 13).data.into(),
             width: 17,
             height: 13,
             format: ImagePixelFormat::Rgba8,

@@ -5532,7 +5532,6 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
             max_image_bytes: usize::try_from(images.max_image_bytes).unwrap_or(usize::MAX),
             max_images_per_pane: usize::try_from(images.max_images_per_pane)
                 .unwrap_or(usize::MAX),
-            ..bmux_image::ImageConfig::default()
         };
     }
 

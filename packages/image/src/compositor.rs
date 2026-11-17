@@ -16,7 +16,6 @@ use std::io::Write;
 #[cfg(feature = "iterm2")]
 use image::ImageEncoder;
 
-use crate::config::ImageDecodeMode;
 use crate::host_caps::HostImageCapabilities;
 use crate::model::PaneImage;
 
@@ -33,9 +32,10 @@ pub struct PaneRect {
 /// This enables transmit-once-place-many: only new images are transmitted,
 /// previously transmitted images are re-placed without re-sending data.
 #[derive(Clone, Debug, Default)]
-pub struct KittyHostState {
+pub(crate) struct KittyHostState {
     /// Maps bmux-internal image ID → host-side kitty image ID.
     /// Retained owner hints are bounded independently from content residency.
+    #[cfg(feature = "kitty")]
     pub transmitted: std::collections::HashMap<u64, u32>,
     // Canonical resources have their own accounting; public owner hints must
     // never determine content identity or cause duplicate resource deletion.
@@ -401,22 +401,6 @@ impl KittyHostState {
         )
     }
 
-    /// Hide all compositor-owned Kitty placements while retaining reusable content.
-    /// The caller must commit this candidate only after output and flush succeed.
-    pub fn clear_placements(&mut self, out: &mut impl Write) -> std::io::Result<()> {
-        #[cfg(feature = "kitty")]
-        for host_id in self.resources.values() {
-            out.write_all(b"\x1b_")?;
-            out.write_all(&crate::codec::kitty::encode_delete_image(*host_id))?;
-            out.write_all(b"\x1b\\")?;
-        }
-        #[cfg(not(feature = "kitty"))]
-        let _ = out;
-        #[cfg(feature = "kitty")]
-        self.placements.clear();
-        Ok(())
-    }
-
     /// Start one complete host frame (all panes), on a cloned candidate state.
     pub fn begin_frame(&mut self) {
         self.frame_seen.clear();
@@ -740,92 +724,6 @@ impl KittyHostState {
     }
 }
 
-/// Render images for a single pane as an overlay on the host terminal.
-///
-/// Images are emitted after the cell content has been drawn.  The cursor
-/// is assumed to be hidden (Fix 1) and the frame is inside a synchronized
-/// update (Fix 2).
-pub fn render_pane_images(
-    out: &mut impl Write,
-    images: &[PaneImage],
-    pane_rect: PaneRect,
-    host_caps: &HostImageCapabilities,
-    decode_mode: ImageDecodeMode,
-    kitty_state: &mut KittyHostState,
-) -> std::io::Result<()> {
-    kitty_state.select_protocol(out, host_caps.preferred_protocol())?;
-    if images.is_empty() {
-        return Ok(());
-    }
-
-    // `pane_rect` is the pane's **content rect** — the PTY interior, not
-    // the outer surface bounds. Callers are responsible for passing the
-    // `content_rect` from the scene so decoration thickness is handled by
-    // the scene producer once, not recomputed here.
-    let inner_x = pane_rect.x;
-    let inner_y = pane_rect.y;
-    let inner_w = pane_rect.w;
-    let inner_h = pane_rect.h;
-
-    for image in images {
-        // Skip images entirely outside the pane inner area.
-        if image.position.row >= inner_h || image.position.col >= inner_w {
-            continue;
-        }
-
-        // Allow partially-overlapping images: the pane border will
-        // visually clip the overflow.  Only skip fully-outside images.
-        let host_x = inner_x.saturating_add(image.position.col);
-        let host_y = inner_y.saturating_add(image.position.row);
-
-        match decode_mode {
-            ImageDecodeMode::Passthrough => {
-                emit_passthrough(out, image, host_x, host_y, host_caps, kitty_state)?;
-            }
-            ImageDecodeMode::Server => {
-                emit_from_pixels(out, image, host_x, host_y, host_caps, kitty_state)?;
-            }
-            ImageDecodeMode::Client => {
-                emit_client_decode(out, image, host_x, host_y, host_caps, kitty_state)?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Decode and render visible fragments using the host's selected protocol.
-pub fn render_pane_images_clipped(
-    out: &mut impl Write,
-    images: &[PaneImage],
-    pane: PaneRect,
-    covers: &[bmux_tui::geometry::Rect],
-    caps: &HostImageCapabilities,
-    state: &mut KittyHostState,
-) -> std::io::Result<()> {
-    use bmux_tui::geometry::Rect;
-    state.select_protocol(out, caps.preferred_protocol())?;
-    for image in images {
-        let destination = Rect::new(
-            pane.x.saturating_add(image.position.col),
-            pane.y.saturating_add(image.position.row),
-            image.cell_size.cols,
-            image.cell_size.rows,
-        );
-        render_image_clipped(
-            out,
-            image,
-            destination,
-            Rect::new(pane.x, pane.y, pane.w, pane.h),
-            covers,
-            caps,
-            state,
-            None,
-        )?;
-    }
-    Ok(())
-}
-
 /// Shared source entry point used by the TUI adapter; geometry is not content.
 #[allow(clippy::too_many_arguments)] // Placement and borrowed source remain separate from wire models.
 pub(crate) fn render_image_clipped(
@@ -972,76 +870,6 @@ pub(crate) fn render_image_clipped(
         }
     }
     Ok(())
-}
-
-/// Passthrough mode: re-emit raw protocol bytes at translated coordinates.
-#[allow(unused_variables)]
-fn emit_passthrough(
-    out: &mut impl Write,
-    image: &PaneImage,
-    host_x: u16,
-    host_y: u16,
-    _host_caps: &HostImageCapabilities,
-    kitty_state: &mut KittyHostState,
-) -> std::io::Result<()> {
-    let Some(raw) = &image.payload.raw else {
-        return Ok(());
-    };
-
-    // Move cursor to the image position.
-    write!(out, "\x1b[{};{}H", host_y + 1, host_x + 1)?;
-
-    match image.protocol {
-        #[cfg(feature = "sixel")]
-        crate::model::ImageProtocol::Sixel => {
-            // Re-emit the sixel DCS sequence.
-            out.write_all(b"\x1bPq")?;
-            out.write_all(raw)?;
-            out.write_all(b"\x1b\\")?;
-        }
-        #[cfg(feature = "kitty")]
-        crate::model::ImageProtocol::KittyGraphics => {
-            emit_kitty_data(
-                out,
-                image,
-                crate::model::KittyFormat::Png,
-                raw,
-                image.pixel_size.width,
-                image.pixel_size.height,
-                host_x,
-                host_y,
-                kitty_state,
-            )?;
-        }
-        #[cfg(feature = "iterm2")]
-        crate::model::ImageProtocol::ITerm2 => {
-            // Re-emit iTerm2 OSC 1337.
-            out.write_all(b"\x1b]1337;File=")?;
-            out.write_all(raw)?;
-            out.write_all(b"\x07")?;
-        }
-        #[allow(unreachable_patterns)]
-        _ => {}
-    }
-
-    Ok(())
-}
-
-/// Server-decode mode: encode decoded pixels for the host's preferred protocol.
-#[allow(unused_variables, unreachable_code)]
-fn emit_from_pixels(
-    out: &mut impl Write,
-    image: &PaneImage,
-    host_x: u16,
-    host_y: u16,
-    host_caps: &HostImageCapabilities,
-    kitty_state: &mut KittyHostState,
-) -> std::io::Result<()> {
-    let Some(pixels) = &image.payload.pixels else {
-        return emit_passthrough(out, image, host_x, host_y, host_caps, kitty_state);
-    };
-
-    emit_pixels(out, image, pixels, host_x, host_y, host_caps, kitty_state)
 }
 
 #[allow(unused_variables)]
@@ -1364,16 +1192,3 @@ fn pixels_as_png(pixels: &crate::model::PixelBuffer) -> std::io::Result<Vec<u8>>
     Ok(png)
 }
 
-/// Client-decode mode: decode raw bytes, then encode for host protocol.
-fn emit_client_decode(
-    out: &mut impl Write,
-    image: &PaneImage,
-    host_x: u16,
-    host_y: u16,
-    host_caps: &HostImageCapabilities,
-    kitty_state: &mut KittyHostState,
-) -> std::io::Result<()> {
-    // TODO: decode raw bytes to pixels, then delegate to emit_from_pixels.
-    // For now, fall back to passthrough.
-    emit_passthrough(out, image, host_x, host_y, host_caps, kitty_state)
-}

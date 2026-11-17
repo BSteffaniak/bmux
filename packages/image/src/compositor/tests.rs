@@ -824,14 +824,38 @@ fn compositor_hide_reveal_roundtrips_through_nested_registry() {
     };
     let first = frame(&mut host, &[image()], &[], &kitty());
     assert_eq!(apply(&first), 1);
+    // A frame without the image hides it.
     let mut hidden = Vec::new();
     host.begin_frame();
-    host.clear_placements(&mut hidden).unwrap();
     host.finish_frame(&mut hidden).unwrap();
     assert_eq!(apply(&hidden), 0);
     let revealed = frame(&mut host, &[image()], &[], &kitty());
     assert!(!String::from_utf8_lossy(&revealed).contains("a=t"));
     assert_eq!(apply(&revealed), 1);
+}
+
+/// Render each of a pane's images at its cells, clipped to the pane and outside `covers`.
+fn render_pane_images_clipped(
+    out: &mut Vec<u8>,
+    images: &[PaneImage],
+    pane: PaneRect,
+    covers: &[bmux_tui::geometry::Rect],
+    caps: &HostImageCapabilities,
+    state: &mut KittyHostState,
+) -> std::io::Result<()> {
+    use bmux_tui::geometry::Rect;
+    state.select_protocol(out, caps.preferred_protocol())?;
+    for image in images {
+        let destination = Rect::new(
+            pane.x.saturating_add(image.position.col),
+            pane.y.saturating_add(image.position.row),
+            image.cell_size.cols,
+            image.cell_size.rows,
+        );
+        let clip = Rect::new(pane.x, pane.y, pane.w, pane.h);
+        render_image_clipped(out, image, destination, clip, covers, caps, state, None)?;
+    }
+    Ok(())
 }
 
 fn frame(

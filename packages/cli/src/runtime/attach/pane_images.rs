@@ -243,7 +243,8 @@ fn payload_bytes(payload: &ImagePayload) -> usize {
     }
 }
 
-/// Decode a pane image's protocol bytes into a payload any host or observer can show.
+/// Decode a pane image's protocol bytes into a payload any host or observer can show, within
+/// the attach client's budgets.
 ///
 /// # Errors
 /// Returns why the image cannot be decoded: over budget, malformed, or of a protocol this build
@@ -254,71 +255,16 @@ fn payload_bytes(payload: &ImagePayload) -> usize {
     feature = "image-iterm2"
 ))]
 pub(super) fn image_payload(image: &AttachPaneImage) -> Result<ImagePayload, String> {
-    #[cfg(feature = "image-sixel")]
-    use bmux_tui::image::ImagePixelFormat;
-
     if image.raw_data.len() > 16 * 1024 * 1024 {
         return Err("encoded image budget exceeded".into());
     }
-    let native = bmux_image::PaneImage::from(image);
-    match image.protocol {
-        AttachImageProtocol::KittyGraphics => {
-            // The authoritative registry normalizes completed Kitty transfers to PNG.
-            Ok(ImagePayload::Png {
-                bytes: native.payload.raw.ok_or("missing Kitty image")?.into(),
-                width: image.pixel_width,
-                height: image.pixel_height,
-            })
-        }
-        AttachImageProtocol::ITerm2 => {
-            #[cfg(feature = "image-iterm2")]
-            {
-                let (_, bytes) = bmux_image::codec::iterm2::parse_body(
-                    native.payload.raw.as_deref().ok_or("missing iTerm image")?,
-                )
-                .ok_or("invalid iTerm image")?;
-                Ok(ImagePayload::Png {
-                    bytes: bytes.into(),
-                    width: image.pixel_width,
-                    height: image.pixel_height,
-                })
-            }
-            #[cfg(not(feature = "image-iterm2"))]
-            {
-                Err("iTerm decoding disabled".into())
-            }
-        }
-        AttachImageProtocol::Sixel => {
-            #[cfg(feature = "image-sixel")]
-            {
-                if u64::from(image.pixel_width) * u64::from(image.pixel_height)
-                    > bmux_attach_pipeline::projection_images::MAX_IMAGE_PIXELS
-                {
-                    return Err("sixel pixel budget exceeded".into());
-                }
-                let pixels = bmux_image::codec::sixel::decode(
-                    native.payload.raw.as_deref().ok_or("missing sixel image")?,
-                )
-                .ok_or("invalid sixel image")?;
-                Ok(ImagePayload::Pixels {
-                    bytes: pixels.data.into(),
-                    width: pixels.width,
-                    height: pixels.height,
-                    format: match pixels.format {
-                        bmux_image::model::PixelFormat::Rgb8 => ImagePixelFormat::Rgb8,
-                        bmux_image::model::PixelFormat::Rgba8 => ImagePixelFormat::Rgba8,
-                        bmux_image::model::PixelFormat::Png => {
-                            return Err("unexpected sixel PNG".into());
-                        }
-                    },
-                })
-            }
-            #[cfg(not(feature = "image-sixel"))]
-            {
-                Err("sixel decoding disabled".into())
-            }
-        }
+    if image.protocol == AttachImageProtocol::Sixel
+        && u64::from(image.pixel_width) * u64::from(image.pixel_height)
+            > bmux_attach_pipeline::projection_images::MAX_IMAGE_PIXELS
+    {
+        return Err("sixel pixel budget exceeded".into());
     }
+    bmux_image::tui::pane_image_payload(&bmux_image::PaneImage::from(image)).map_err(Into::into)
 }
 
 #[cfg(all(

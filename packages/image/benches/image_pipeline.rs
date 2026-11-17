@@ -9,12 +9,8 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use bmux_image::codec::{base64, iterm2, kitty, sixel};
-use bmux_image::compositor::{KittyHostState, PaneRect, render_pane_images};
-use bmux_image::config::ImageDecodeMode;
-use bmux_image::model::{
-    ImageCellSize, ImagePayload, ImagePixelSize, ImagePosition, ImageProtocol, KittyFormat,
-    PaneImage, PixelBuffer,
-};
+use bmux_image::compositor::PaneRect;
+use bmux_image::model::{KittyFormat, PixelBuffer};
 use bmux_image::tui::TuiImageCompositor;
 use bmux_image::{HostImageCapabilities, ImageConfig};
 use bmux_tui::geometry::Rect;
@@ -143,6 +139,8 @@ fn tui_cases(
         "cold",
         "warm",
         "movement",
+        "fresh-key-baseline",
+        "invalidated-upload-baseline",
         "crop",
         "hide",
         "reveal",
@@ -168,174 +166,30 @@ fn tui_cases(
             }
             _ => {}
         }
-        // Scene production is deliberately outside compositor timing.
-        let contributions = if phase == "delete" {
-            vec![ImageContribution::Remove(image.key.clone())]
-        } else {
-            vec![ImageContribution::Present(image.clone())]
+        // Scene production and invalidation are deliberately outside compositor timing; the
+        // repair output an invalidation causes is inside it.
+        let contributions = match phase {
+            "delete" => vec![ImageContribution::Remove(image.key.clone())],
+            "fresh-key-baseline" => {
+                let stale = image.key.clone();
+                image.key = ImageKey::new("fresh-image");
+                vec![
+                    ImageContribution::Remove(stale),
+                    ImageContribution::Present(image.clone()),
+                ]
+            }
+            _ => vec![ImageContribution::Present(image.clone())],
         };
+        if phase == "invalidated-upload-baseline" {
+            let uncertain = compositor.clone();
+            compositor.invalidate_after_failed_output(&uncertain);
+        }
         let delta = scene.reconcile(&contributions);
         compositor.apply_delta(&delta);
         record(samples, &format!("tui/{protocol}/{phase}"), || {
             let mut out = Vec::new();
             compositor.render(&mut out, black_box(&scene), terminal, caps, &config)?;
             Ok(output_counts(&out))
-        })?;
-    }
-    Ok(())
-}
-
-fn clipped_comparison(
-    samples: &mut Samples,
-    image: &PaneImage,
-    pane: PaneRect,
-    caps: &HostImageCapabilities,
-) -> Result<(), Box<dyn Error>> {
-    let mut committed = KittyHostState::default();
-    let mut warm_work = None;
-    for phase in [
-        "clipped-cold",
-        "retained-warm",
-        "invalidated-upload-baseline",
-    ] {
-        // Both warm candidates start from the exact same committed cold frame.
-        // Invalidation is outside timing; its repair output remains inside timing.
-        let mut base = committed.clone();
-        if phase == "invalidated-upload-baseline" {
-            base.invalidate_after_failed_output(&committed);
-        }
-        record(samples, &format!("attach/kitty/{phase}"), || {
-            let before = base.work_counts();
-            let mut candidate = base.clone();
-            candidate.begin_frame();
-            let mut out = Vec::new();
-            bmux_image::compositor::render_pane_images_clipped(
-                &mut out,
-                std::slice::from_ref(black_box(image)),
-                pane,
-                &[],
-                caps,
-                &mut candidate,
-            )?;
-            candidate.finish_frame(&mut out)?;
-            let after = candidate.work_counts();
-            let mut counts = output_counts(&out);
-            counts.3 = after.0.saturating_sub(before.0);
-            counts.4 = after.1.saturating_sub(before.1);
-            if phase == "retained-warm" {
-                warm_work = Some((counts.3, counts.4));
-            } else if phase == "invalidated-upload-baseline" {
-                assert_eq!(
-                    Some((counts.3, counts.4)),
-                    warm_work,
-                    "comparison cache work must match"
-                );
-            }
-            if phase == "clipped-cold" {
-                committed = candidate;
-            }
-            Ok(counts)
-        })?;
-    }
-    Ok(())
-}
-
-fn attach_cases(samples: &mut Samples, pixels: &PixelBuffer) -> Result<(), Box<dyn Error>> {
-    let mut state = KittyHostState::default();
-    let caps = HostImageCapabilities {
-        kitty_graphics: true,
-        ..Default::default()
-    };
-    let terminal = PaneRect {
-        x: 0,
-        y: 0,
-        w: 100,
-        h: 40,
-    };
-    let mut image = PaneImage {
-        id: 1,
-        protocol: ImageProtocol::KittyGraphics,
-        payload: ImagePayload {
-            raw: None,
-            pixels: Some(pixels.clone()),
-        },
-        position: ImagePosition { row: 2, col: 2 },
-        cell_size: ImageCellSize { rows: 24, cols: 80 },
-        pixel_size: ImagePixelSize {
-            width: pixels.width,
-            height: pixels.height,
-        },
-    };
-    let original = image.clone();
-    clipped_comparison(samples, &original, terminal, &caps)?;
-    for phase in ["cold", "warm", "movement", "fresh-id-baseline"] {
-        if phase == "movement" {
-            image.position.col += 1;
-        }
-        if phase == "fresh-id-baseline" {
-            image.id += 1;
-        }
-        record(samples, &format!("attach/kitty/{phase}"), || {
-            let mut out = Vec::new();
-            render_pane_images(
-                &mut out,
-                std::slice::from_ref(black_box(&image)),
-                terminal,
-                &caps,
-                ImageDecodeMode::Server,
-                &mut state,
-            )?;
-            Ok(output_counts(&out))
-        })?;
-    }
-    for phase in [
-        "crop",
-        "hide",
-        "reveal",
-        "resize",
-        "replacement",
-        "overlay-occlusion",
-        "delete",
-    ] {
-        let mut pane = terminal;
-        let mut covers = Vec::new();
-        match phase {
-            "crop" => pane.w = 40,
-            "hide" => image.position.col = 100,
-            "reveal" => image.position.col = 3,
-            "resize" => {
-                pane.w = 60;
-                image.cell_size.cols = 50;
-            }
-            "replacement" => {
-                image.id += 1;
-                image.payload.pixels = Some(support::pixels(17, 13));
-            }
-            "overlay-occlusion" => covers.push(Rect::new(10, 5, 10, 10)),
-            _ => {}
-        }
-        record(samples, &format!("attach/kitty/{phase}"), || {
-            let before = state.work_counts();
-            let mut candidate = state.clone();
-            candidate.begin_frame();
-            let mut out = Vec::new();
-            if phase != "delete" {
-                bmux_image::compositor::render_pane_images_clipped(
-                    &mut out,
-                    std::slice::from_ref(black_box(&image)),
-                    pane,
-                    &covers,
-                    &caps,
-                    &mut candidate,
-                )?;
-            }
-            candidate.finish_frame(&mut out)?;
-            let after = candidate.work_counts();
-            state = candidate;
-            let mut counts = output_counts(&out);
-            counts.3 = after.0.saturating_sub(before.0);
-            counts.4 = after.1.saturating_sub(before.1);
-            Ok(counts)
         })?;
     }
     Ok(())
@@ -438,7 +292,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut samples = Samples::new();
     for _ in 0..iterations {
         encoder_cases(&mut samples, &pixels, &png)?;
-        attach_cases(&mut samples, &pixels)?;
         for (protocol, caps) in [
             (
                 "kitty",

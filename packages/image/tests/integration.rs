@@ -7,6 +7,51 @@ mod pipeline {
     use bmux_image::model::*;
     use bmux_image::registry::ImageRegistry;
 
+    /// Write `image` through `compositor` as the attach client places a pane image: its payload
+    /// decoded, placed at its cells in an 80x24 pane at the origin.
+    fn render_pane_image(
+        compositor: &mut bmux_image::tui::TuiImageCompositor,
+        image: &PaneImage,
+        caps: &bmux_image::host_caps::HostImageCapabilities,
+    ) -> Vec<u8> {
+        use bmux_tui::geometry::Rect;
+        let destination = Rect::new(
+            image.position.col,
+            image.position.row,
+            image.cell_size.cols,
+            image.cell_size.rows,
+        );
+        let mut scene = bmux_tui::image_scene::ImageScene::default();
+        scene.reconcile(&[bmux_tui::image::ImageContribution::Present(
+            bmux_tui::image::ImagePlacement {
+                key: bmux_tui::image::ImageKey::new(format!("image-{}", image.id)),
+                payload: bmux_image::tui::pane_image_payload(image).expect("decodable image"),
+                destination,
+                fit: bmux_tui::image::ImageFit::Stretch,
+                allocation: None,
+                clip: Rect::new(0, 0, 80, 24),
+                lifecycle: bmux_tui::image::ImageLifecycle::Frame,
+                z: 0,
+            },
+        )]);
+        let mut output = Vec::new();
+        compositor
+            .render(
+                &mut output,
+                &scene,
+                bmux_image::compositor::PaneRect {
+                    x: 0,
+                    y: 0,
+                    w: 80,
+                    h: 24,
+                },
+                caps,
+                &bmux_image::ImageConfig::default(),
+            )
+            .expect("Vec output cannot fail");
+        output
+    }
+
     #[test]
     fn kitty_placement_replacement_and_deletion_remove_retained_images() {
         let mut registry = ImageRegistry::default();
@@ -546,21 +591,11 @@ mod pipeline {
                     cell_pixel_height: 20,
                     ..Default::default()
                 };
-                let mut output = Vec::new();
-                bmux_image::compositor::render_pane_images_clipped(
-                    &mut output,
-                    std::slice::from_ref(&restored),
-                    bmux_image::compositor::PaneRect {
-                        x: 0,
-                        y: 0,
-                        w: 80,
-                        h: 24,
-                    },
-                    &[],
+                let output = render_pane_image(
+                    &mut bmux_image::tui::TuiImageCompositor::new(),
+                    &restored,
                     &caps,
-                    &mut Default::default(),
-                )
-                .unwrap();
+                );
                 let mut decoded_registry = ImageRegistry::default();
                 for event in ImageInterceptor::new().process(&output).events {
                     decoded_registry.handle_event(event, 10, 20);
@@ -579,11 +614,11 @@ mod pipeline {
                     let decoded =
                         bmux_image::codec::sixel::decode(image.payload.raw.as_ref().unwrap())
                             .unwrap();
-                    let (width, height) = if source.protocol == ImageProtocol::Sixel {
-                        (2, 2)
-                    } else {
-                        (160, 160)
-                    };
+                    // Fitted to its cells at the host's 10x20-pixel cells.
+                    let (width, height) = (
+                        u32::from(source.cell_size.cols) * 10,
+                        u32::from(source.cell_size.rows) * 20,
+                    );
                     assert_eq!((decoded.width, decoded.height), (width, height));
                     for y in 0..height {
                         for x in 0..width {
@@ -608,7 +643,17 @@ mod pipeline {
                         rgba
                     );
                 } else {
-                    assert_eq!(image.payload.pixels.as_ref().unwrap().data, rgba);
+                    // A PNG source goes to Kitty as is; Kitty scales it to its cells.
+                    let pixels = image.payload.pixels.as_ref().unwrap();
+                    let data = if pixels.format == PixelFormat::Png {
+                        image::load_from_memory(&pixels.data)
+                            .unwrap()
+                            .to_rgba8()
+                            .into_raw()
+                    } else {
+                        pixels.data.clone()
+                    };
+                    assert_eq!(data, rgba);
                 }
             }
         }
@@ -776,31 +821,15 @@ mod pipeline {
             kitty_graphics: true,
             ..Default::default()
         };
-        for mode in [
-            bmux_image::config::ImageDecodeMode::Server,
-            bmux_image::config::ImageDecodeMode::Client,
-            bmux_image::config::ImageDecodeMode::Passthrough,
-        ] {
-            let mut output = Vec::new();
-            bmux_image::compositor::render_pane_images(
-                &mut output,
-                std::slice::from_ref(&restored),
-                bmux_image::compositor::PaneRect {
-                    x: 0,
-                    y: 0,
-                    w: 80,
-                    h: 24,
-                },
-                &caps,
-                mode,
-                &mut Default::default(),
-            )
-            .unwrap();
-            let text = String::from_utf8(output).unwrap();
-            assert!(text.contains("f=100"));
-            assert!(text.contains("c=16,r=8"));
-            assert!(text.contains("\x1b[4;6H"));
-        }
+        let output = render_pane_image(
+            &mut bmux_image::tui::TuiImageCompositor::new(),
+            &restored,
+            &caps,
+        );
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("f=100"), "{text:?}");
+        assert!(text.contains("c=16,r=8"), "{text:?}");
+        assert!(text.contains("\x1b[4;6H"), "{text:?}");
     }
 
     /// Full pipeline: sixel data flows from interceptor → registry → delta.
@@ -991,19 +1020,14 @@ mod pipeline {
         assert_eq!(img.position.col, 0);
     }
 
-    /// Compositor produces valid output for sixel passthrough.
+    /// A Sixel pane image on a Sixel host is written as Sixel.
     #[test]
-    fn compositor_sixel_passthrough() {
-        use bmux_image::compositor::{PaneRect, render_pane_images};
-        use bmux_image::config::ImageDecodeMode;
-        use bmux_image::host_caps::HostImageCapabilities;
-
-        let host_caps = HostImageCapabilities {
+    fn compositor_writes_sixel_pane_images() {
+        let host_caps = bmux_image::host_caps::HostImageCapabilities {
             sixel: true,
             ..Default::default()
         };
-
-        let images = vec![PaneImage {
+        let image = PaneImage {
             id: 1,
             protocol: ImageProtocol::Sixel,
             payload: ImagePayload {
@@ -1016,98 +1040,60 @@ mod pipeline {
                 width: 1,
                 height: 6,
             },
-        }];
-
-        let rect = PaneRect {
-            x: 0,
-            y: 0,
-            w: 80,
-            h: 24,
         };
-
-        let mut kitty_state = bmux_image::compositor::KittyHostState::default();
-        let mut output = Vec::new();
-        render_pane_images(
-            &mut output,
-            &images,
-            rect,
+        let output = render_pane_image(
+            &mut bmux_image::tui::TuiImageCompositor::new(),
+            &image,
             &host_caps,
-            ImageDecodeMode::Passthrough,
-            &mut kitty_state,
-        )
-        .unwrap();
-
-        // Output should contain the sixel DCS sequence.
-        let output_str = String::from_utf8_lossy(&output);
-        assert!(
-            output_str.contains("\x1bPq"),
-            "Should contain sixel DCS start"
         );
-        assert!(output_str.contains("\x1b\\"), "Should contain sixel ST");
+        let output = String::from_utf8_lossy(&output);
+        assert!(
+            output.contains("\x1bP"),
+            "Should contain a Sixel DCS: {output:?}"
+        );
+        assert!(output.contains("\x1b\\"), "Should contain the Sixel ST");
     }
 
-    /// Kitty transmit-once-place-many: second render doesn't re-transmit.
+    /// Kitty transmit-once-place-many: a second frame of the same image places it again
+    /// without transmitting it.
     #[test]
     fn kitty_transmit_once_place_many() {
-        use bmux_image::compositor::{KittyHostState, PaneRect, render_pane_images};
-        use bmux_image::config::ImageDecodeMode;
-        use bmux_image::host_caps::HostImageCapabilities;
-
-        let host_caps = HostImageCapabilities {
+        let host_caps = bmux_image::host_caps::HostImageCapabilities {
             kitty_graphics: true,
             ..Default::default()
         };
-        let rect = PaneRect {
-            x: 0,
-            y: 0,
-            w: 80,
-            h: 24,
-        };
-        let images = vec![PaneImage {
+        let image = PaneImage {
             id: 42,
             protocol: ImageProtocol::KittyGraphics,
             payload: ImagePayload {
-                raw: Some(b"IMAGEDATA".to_vec()),
-                pixels: None,
+                raw: None,
+                pixels: Some(PixelBuffer {
+                    width: 8,
+                    height: 8,
+                    format: PixelFormat::Rgba8,
+                    data: vec![200; 8 * 8 * 4],
+                }),
             },
             position: ImagePosition { row: 0, col: 0 },
             cell_size: ImageCellSize { rows: 5, cols: 10 },
             pixel_size: ImagePixelSize {
-                width: 80,
-                height: 80,
+                width: 8,
+                height: 8,
             },
-        }];
-
-        let mut kitty_state = KittyHostState::default();
-
-        // First render: should transmit.
-        let mut out1 = Vec::new();
-        render_pane_images(
-            &mut out1,
-            &images,
-            rect,
-            &host_caps,
-            ImageDecodeMode::Passthrough,
-            &mut kitty_state,
-        )
-        .unwrap();
-        let s1 = String::from_utf8_lossy(&out1);
-        assert!(s1.contains("a=t"), "First render should transmit");
-
-        // Second render: should only place, not re-transmit.
-        let mut out2 = Vec::new();
-        render_pane_images(
-            &mut out2,
-            &images,
-            rect,
-            &host_caps,
-            ImageDecodeMode::Passthrough,
-            &mut kitty_state,
-        )
-        .unwrap();
-        let s2 = String::from_utf8_lossy(&out2);
-        assert!(!s2.contains("a=t"), "Second render should NOT re-transmit");
-        assert!(s2.contains("a=p"), "Second render should place");
+        };
+        let mut compositor = bmux_image::tui::TuiImageCompositor::new();
+        let first =
+            String::from_utf8_lossy(&render_pane_image(&mut compositor, &image, &host_caps))
+                .into_owned();
+        assert!(first.contains("a=t"), "First render should transmit");
+        let second =
+            String::from_utf8_lossy(&render_pane_image(&mut compositor, &image, &host_caps))
+                .into_owned();
+        assert!(
+            !second.contains("a=t"),
+            "Second render should NOT re-transmit"
+        );
+        assert!(second.contains("a=p"), "Second render should place");
     }
 
     /// Disabled registry (zero capacity) drops everything.

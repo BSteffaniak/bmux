@@ -1,11 +1,6 @@
 //! Fixed generated fixtures shared by the opt-in harness and public-API tests.
 use bmux_image::model::{PixelBuffer, PixelFormat};
 
-/// Eight opaque colors exactly representable by the Sixel percentage palette.
-pub fn pixels(width: u32, height: u32) -> PixelBuffer {
-    fixture(width, height, "palette").expect("known fixture")
-}
-
 /// Fixed RGBA data: no RNG, files, host detection, or external decoder required.
 pub fn fixture(width: u32, height: u32, kind: &str) -> Result<PixelBuffer, &'static str> {
     if !["palette", "solid", "gradient", "transparent", "detailed"].contains(&kind) {
