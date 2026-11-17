@@ -121,8 +121,9 @@ dynamic-frontend = []
 def main() -> None:
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bcode-root", type=Path, required=True,
-                        help="approved Bcode worktree containing the real file-references implementation")
+    parser.add_argument("--bcode-root", type=Path,
+                        help="approved Bcode worktree whose plugin crates package themselves; "
+                             "without it only the BMUX artifacts are built")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--build", action="store_true")
     parser.add_argument("--release", action="store_true")
@@ -134,7 +135,6 @@ def main() -> None:
         parser.error("--run-acceptance requires --build")
     shared = runpy.run_path(str(root / "scripts/package-plugin.py"))
     output = args.output.resolve()
-    bcode = args.bcode_root.resolve()
     artifacts = []
     fixture = output / "scoped-loader"
 
@@ -151,13 +151,12 @@ def main() -> None:
          lambda: direct(fixture_package(root, fixture, shared))),
         ("example.hello", output / "hello",
          lambda: direct(root / "examples/hello-plugin/Cargo.toml")),
-        ("bcode.file-references", output / "file-references",
-         lambda: direct(bcode / "plugins/file-references-plugin/Cargo.toml")),
     ]
-    for domain in ("filesystem", "shell"):
-        directory = output / domain
-        specifications.append((f"bcode.{domain}", directory,
-            lambda domain=domain: direct(bcode / f"plugins/{domain}-plugin/Cargo.toml")))
+    if args.bcode_root:
+        bcode = args.bcode_root.resolve()
+        for domain in ("file-references", "filesystem", "shell"):
+            specifications.append((f"bcode.{domain}", output / domain,
+                lambda domain=domain: direct(bcode / f"plugins/{domain}-plugin/Cargo.toml")))
     for expected, directory, prepare in specifications:
         with shared["packaging_owner"](directory):
             build = prepare()
