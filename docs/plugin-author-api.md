@@ -208,11 +208,15 @@ their paths (`owns_paths`); `plugin.toml` may add paths, never remove them.
 - Inside a dylib, `PluginHostServices::call_service_async` runs each call as
   a host task owned by the instance's scope (plug-rt `rt::services`), awaited
   with real wakers; dropping the future cancels the call on the host. The
-  watcher example uses `Client::remote(host)` from its server-side and its
-  CLI command-local activation. A CLI *command* body still reaches the host
-  only through a live callback entry (the CLI's command route is entry
-  bound), and an entry held across an await is not supported yet, so
-  asynchronous generated clients do not work from a dylib command body.
+  watcher example uses `Client::remote(host)` from its server-side
+  activation, its CLI command-local activation, and its async `watch`
+  command body. A command body (or blocking work it awaits) runs outside
+  the author's callback entry; its calls take the host's selected dispatch
+  for that command's own invocation (same plugin attribution, declared
+  capability checks and issuing route), and calls made while an entry is
+  held keep the entry's ancestry. A nested plugin command
+  (`plugin_command_run`) still needs a live entry, and an entry cannot be
+  held across an await.
 - The generated `dispatch` serves unary operations; streaming operations need
   the `invoke_streaming` entry (`Portable<P>` already streams).
 - Clients do not yet generate `subscribe_<event>()`. The host subscription

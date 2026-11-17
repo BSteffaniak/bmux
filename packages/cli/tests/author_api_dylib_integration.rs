@@ -8,10 +8,10 @@
 //! the host's checked codec. The same contract runs bundled in
 //! `examples/watcher-plugin/tests/both_modes.rs`.
 #![cfg(unix)]
-#[allow(dead_code)] // Reuse isolated paths and binary selection only.
-mod support;
 #[path = "support/packaging.rs"]
 mod packaging;
+#[allow(dead_code)] // Reuse isolated paths and binary selection only.
+mod support;
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -210,10 +210,9 @@ fn generated_clients_reach_a_generated_provider_across_dylibs() {
     ]);
 
     // A CLI command-local activation of the dylib watcher in the CLI
-    // process: its activation also reaches the counter through
-    // `Client::remote(host)` on the asynchronous host route. (The `watch`
-    // command body itself is a callback-entry call path; see the known gaps
-    // in docs/plugin-author-api.md.)
+    // process: its activation and then its async `watch` command body both
+    // reach the counter through `Client::remote(host)` on the asynchronous
+    // host route, attributed to the watcher on the issuing connection.
     let watch = sandbox.run(&["plugin", "run", "example.watcher", "watch", "--by", "4"]);
     let stderr = String::from_utf8_lossy(&watch.stderr);
     let bumps = stderr.matches("watcher: activation bumped to").count();
@@ -224,4 +223,13 @@ fn generated_clients_reach_a_generated_provider_across_dylibs() {
         sandbox.evidence()
     );
     assert!(!stderr.contains("activation call failed"), "{stderr}");
+    // Server activation 2 + 3, CLI activation 2 + 3, then the command's 4.
+    support::assert_success(&watch, "watch command body");
+    let stdout = String::from_utf8_lossy(&watch.stdout);
+    assert!(
+        stdout.contains("watcher: bumped to 14, read back 14"),
+        "{}\n{}",
+        support::combined_output(&watch),
+        sandbox.evidence()
+    );
 }
