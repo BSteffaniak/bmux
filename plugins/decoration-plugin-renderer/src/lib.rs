@@ -32,7 +32,6 @@
 
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
-use std::io;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -52,9 +51,7 @@ use bmux_scene_protocol::scene_protocol::{
     Style as SceneStyle, SurfaceDecoration, VisualAdapterRequest,
 };
 use bmux_scene_protocol_render::capabilities::{SceneRenderCapabilities, capability_query_matches};
-use bmux_scene_protocol_render::paint::{
-    apply_paint_command_with_capabilities, apply_paint_commands, interpolate_style,
-};
+use bmux_scene_protocol_render::paint::interpolate_style;
 use uuid::Uuid;
 
 mod raster_border;
@@ -300,49 +297,6 @@ impl DecorationRenderExtension {
         Some(render_ops_to_under_cells(&ops))
     }
 
-    fn render_layer_surface_imperative(
-        &self,
-        stdout: &mut dyn io::Write,
-        surface_id: Uuid,
-        damage: &RenderDamage,
-        layer: RenderExtensionLayer,
-        capabilities: TerminalRenderCapabilities,
-    ) -> io::Result<bool> {
-        let Ok(mut cache) = self.cache.lock() else {
-            return Ok(false);
-        };
-        let Some(surface) = cache.surface(&surface_id) else {
-            cache.mark_layer_rendered(surface_id, layer);
-            return Ok(false);
-        };
-        if layer_paint_commands(surface, layer).is_empty() || damage.is_none() {
-            cache.mark_layer_rendered(surface_id, layer);
-            return Ok(false);
-        }
-        let rendered_surface = surface.clone();
-        let surface = filter_surface_layer_for_damage(surface, damage, layer);
-        let scene_capabilities = scene_capabilities_from_terminal(capabilities);
-        let mut ordered: Vec<(usize, &PaintCommand)> = layer_paint_commands(&surface, layer)
-            .iter()
-            .enumerate()
-            .collect();
-        ordered.sort_by_key(|(index, command)| paint_command_sort_key(*index, command));
-        let mut rendered = false;
-        let mut emitted_text_style = false;
-        for (_, command) in ordered {
-            let mut writer: &mut dyn io::Write = &mut *stdout;
-            let emitted =
-                apply_paint_command_with_capabilities(&mut writer, command, scene_capabilities)
-                    .map_err(|err| io::Error::other(err.to_string()))?;
-            emitted_text_style |= emitted;
-            rendered |= emitted;
-        }
-        if emitted_text_style {
-            stdout.write_all(b"\x1b[0m")?;
-        }
-        cache.mark_layer_rendered_snapshot(surface_id, layer, rendered_surface);
-        Ok(rendered)
-    }
 }
 
 impl AttachRenderExtension for DecorationRenderExtension {
@@ -435,43 +389,6 @@ impl AttachRenderExtension for DecorationRenderExtension {
         layer == RenderExtensionLayer::AfterPaneContent
     }
 
-    fn render_surface(
-        &self,
-        stdout: &mut dyn io::Write,
-        surface_id: Uuid,
-        _surface_rect: &ExtensionRect,
-        damage: &RenderDamage,
-    ) -> io::Result<bool> {
-        let Ok(mut cache) = self.cache.lock() else {
-            return Ok(false);
-        };
-        let Some(surface) = cache.surface(&surface_id) else {
-            cache.mark_rendered(surface_id);
-            return Ok(false);
-        };
-        if surface.paint_commands.is_empty() || damage.is_none() {
-            cache.mark_rendered(surface_id);
-            return Ok(false);
-        }
-        let rendered_surface = surface.clone();
-        let surface = filter_surface_for_damage(surface, damage);
-        if surface.paint_commands.is_empty() {
-            cache.mark_rendered_snapshot(surface_id, rendered_surface);
-            return Ok(false);
-        }
-        // `apply_paint_commands` is generic over `W: io::Write` and
-        // requires `Sized` because of the `bmux_terminal::queue!` macro's
-        // internals. Rebinding our `&mut dyn io::Write` to a local
-        // `&mut impl io::Write` (the reborrow `&mut *stdout` creates
-        // a fresh `&mut dyn io::Write`, which is itself Sized) lets
-        // the generic bound see a Sized writer.
-        let mut writer: &mut dyn io::Write = &mut *stdout;
-        let rendered = apply_paint_commands(&mut writer, &surface)
-            .map(|()| true)
-            .map_err(|err| io::Error::other(err.to_string()))?;
-        cache.mark_rendered_snapshot(surface_id, rendered_surface);
-        Ok(rendered)
-    }
 
     fn render_layer_ops(
         &self,
@@ -648,23 +565,6 @@ impl AttachRenderExtension for DecorationRenderExtension {
         )
     }
 
-    fn render_layer_surface_with_context(
-        &self,
-        stdout: &mut dyn io::Write,
-        surface_id: Uuid,
-        _surface_rect: &ExtensionRect,
-        damage: &RenderDamage,
-        layer: RenderExtensionLayer,
-        context: &RenderExtensionContext,
-    ) -> io::Result<bool> {
-        self.render_layer_surface_imperative(
-            stdout,
-            surface_id,
-            damage,
-            layer,
-            context.capabilities,
-        )
-    }
 
     fn render_ops(
         &self,

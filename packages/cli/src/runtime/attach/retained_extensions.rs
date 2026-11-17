@@ -154,24 +154,6 @@ impl AttachRenderExtension for RetainedExtension {
         self.layer(id, *rect, layer)
             .and_then(|value| value.ops.clone())
     }
-    fn render_surface(
-        &self,
-        _: &mut dyn std::io::Write,
-        _: Uuid,
-        _: &ExtensionRect,
-        _: &RenderDamage,
-    ) -> std::io::Result<bool> {
-        bmux_attach_pipeline::projection::record(
-            bmux_attach_pipeline::projection::PaintOperation::Rejected(
-                bmux_attach_pipeline::projection::ProjectionFailure::Unsupported {
-                    reason: "retained extension requested imperative rendering without neutral output",
-                },
-            ),
-        );
-        Err(std::io::Error::other(
-            "imperative presentation is unsupported by retained output",
-        ))
-    }
 }
 
 /// Sample complete intent outside the synchronous composition transaction.
@@ -337,15 +319,6 @@ mod tests {
             }
         }
 
-        fn render_surface(
-            &self,
-            _: &mut dyn std::io::Write,
-            _: Uuid,
-            _: &ExtensionRect,
-            _: &RenderDamage,
-        ) -> std::io::Result<bool> {
-            panic!("sampling must never invoke imperative drawing")
-        }
     }
 
     fn snapshot(representation: Representation) -> Arc<dyn AttachRenderExtension> {
@@ -471,17 +444,7 @@ mod tests {
     }
 
     #[test]
-    fn imperative_only_output_remains_rejected_without_touching_terminal() {
-        struct BlockedTerminal;
-        impl std::io::Write for BlockedTerminal {
-            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
-                panic!("representation rejection must not wait for a slow terminal")
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                panic!("representation rejection must not flush a slow terminal")
-            }
-        }
-
+    fn imperative_only_output_has_no_neutral_representation() {
         let retained = snapshot(Representation::ImperativeOnly);
         let id = Uuid::from_u128(1);
         let rect = ExtensionRect::new(2, 3, 38, 17);
@@ -502,13 +465,6 @@ mod tests {
                     &context
                 )
                 .is_none()
-        );
-        let error = retained
-            .render_surface(&mut BlockedTerminal, id, &rect, &RenderDamage::FullSurface)
-            .expect_err("unsupported output must not be silently treated as a no-op");
-        assert_eq!(
-            error.to_string(),
-            "imperative presentation is unsupported by retained output"
         );
     }
 }

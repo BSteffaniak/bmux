@@ -1980,7 +1980,7 @@ const ATTACH_OVERRENDER_CACHED_SKIP_RATIO_PERCENT: u64 = 90;
 const ATTACH_OVERRENDER_MIN_ROWS_EXAMINED: u64 = 10;
 const ATTACH_OVERRENDER_NON_FULL_FRAME_CELL_RATIO_PERCENT: u64 = 50;
 const ATTACH_OVERRENDER_EXTENSION_FULL_SURFACE_RATIO_PERCENT: u64 = 80;
-const ATTACH_OVERRENDER_EXTENSION_IMPERATIVE_OR_MISS_RATIO_PERCENT: u64 = 80;
+const ATTACH_OVERRENDER_EXTENSION_CACHE_MISS_RATIO_PERCENT: u64 = 80;
 const ATTACH_OVERRENDER_SLOW_TERMINAL_WRITE_MS_PER_KIB: u64 = 8;
 const DAMAGE_OVERLAY_SURFACE_ID: Uuid = Uuid::from_u128(4);
 
@@ -2727,7 +2727,7 @@ impl AttachRenderInefficiencyFlags {
     const LARGE_PARTIAL_FRAME: u16 = 1 << 2;
     const EXTENSION_FULL_SURFACE_EXCESSIVE: u16 = 1 << 3;
     const FULL_FRAME_FALLBACK: u16 = 1 << 4;
-    const EXTENSION_IMPERATIVE_OR_CACHE_MISS: u16 = 1 << 5;
+    const EXTENSION_CACHE_MISS: u16 = 1 << 5;
     const STATUS_OVERLAY_ONLY_EMITS_PANE_WORK: u16 = 1 << 6;
     const SLOW_TERMINAL_WRITE_PER_KIB: u16 = 1 << 7;
 
@@ -2784,13 +2784,10 @@ fn classify_attach_render_inefficiency(
         .extension_render_calls
         .saturating_sub(stats.scene_render.extension_cache_hits)
         .saturating_sub(stats.scene_render.retained_scene_calls);
-    let extension_imperative_or_cache_miss = percent_at_least(
-        stats
-            .scene_render
-            .extension_imperative_calls
-            .saturating_add(extension_cache_misses),
+    let extension_cache_miss = percent_at_least(
+        extension_cache_misses,
         stats.scene_render.extension_render_calls,
-        ATTACH_OVERRENDER_EXTENSION_IMPERATIVE_OR_MISS_RATIO_PERCENT,
+        ATTACH_OVERRENDER_EXTENSION_CACHE_MISS_RATIO_PERCENT,
     );
     let status_overlay_only_emits_pane_work = !stats.full_frame_fallback
         && stats.damage_rects == 0
@@ -2825,8 +2822,8 @@ fn classify_attach_render_inefficiency(
             stats.full_frame_fallback,
         )
         .with(
-            AttachRenderInefficiencyFlags::EXTENSION_IMPERATIVE_OR_CACHE_MISS,
-            extension_imperative_or_cache_miss,
+            AttachRenderInefficiencyFlags::EXTENSION_CACHE_MISS,
+            extension_cache_miss,
         )
         .with(
             AttachRenderInefficiencyFlags::STATUS_OVERLAY_ONLY_EMITS_PANE_WORK,
@@ -2950,7 +2947,6 @@ struct AttachPerfWindow {
     pane_cells_emitted: u64,
     extension_render_calls: u64,
     extension_render_op_calls: u64,
-    extension_imperative_calls: u64,
     extension_cache_hits: u64,
     extension_full_surface_calls: u64,
     retained_scene_calls: u64,
@@ -2982,7 +2978,7 @@ struct AttachPerfWindow {
     large_partial_frame_frames: u64,
     extension_full_surface_excessive_frames: u64,
     full_frame_fallback_flagged_frames: u64,
-    extension_imperative_or_cache_miss_frames: u64,
+    extension_cache_miss_frames: u64,
     status_overlay_only_emits_pane_work_frames: u64,
     slow_terminal_write_per_kib_frames: u64,
     event_burst_drained_events: u64,
@@ -3034,7 +3030,6 @@ impl AttachPerfWindow {
             pane_cells_emitted: 0,
             extension_render_calls: 0,
             extension_render_op_calls: 0,
-            extension_imperative_calls: 0,
             extension_cache_hits: 0,
             extension_full_surface_calls: 0,
             retained_scene_calls: 0,
@@ -3066,7 +3061,7 @@ impl AttachPerfWindow {
             large_partial_frame_frames: 0,
             extension_full_surface_excessive_frames: 0,
             full_frame_fallback_flagged_frames: 0,
-            extension_imperative_or_cache_miss_frames: 0,
+            extension_cache_miss_frames: 0,
             status_overlay_only_emits_pane_work_frames: 0,
             slow_terminal_write_per_kib_frames: 0,
             event_burst_drained_events: 0,
@@ -3183,9 +3178,6 @@ impl AttachPerfWindow {
         self.extension_render_op_calls = self
             .extension_render_op_calls
             .saturating_add(stats.extension_render_op_calls);
-        self.extension_imperative_calls = self
-            .extension_imperative_calls
-            .saturating_add(stats.extension_imperative_calls);
         self.extension_cache_hits = self
             .extension_cache_hits
             .saturating_add(stats.extension_cache_hits);
@@ -3282,10 +3274,10 @@ impl AttachPerfWindow {
                 self.full_frame_fallback_flagged_frames.saturating_add(1);
         }
         if inefficiency_flags
-            .contains(AttachRenderInefficiencyFlags::EXTENSION_IMPERATIVE_OR_CACHE_MISS)
+            .contains(AttachRenderInefficiencyFlags::EXTENSION_CACHE_MISS)
         {
-            self.extension_imperative_or_cache_miss_frames = self
-                .extension_imperative_or_cache_miss_frames
+            self.extension_cache_miss_frames = self
+                .extension_cache_miss_frames
                 .saturating_add(1);
         }
         if inefficiency_flags
@@ -3484,9 +3476,6 @@ fn aggregate_extension_render_stats(
         let entry = target.entry(name.clone()).or_default();
         entry.render_calls = entry.render_calls.saturating_add(stats.render_calls);
         entry.render_op_calls = entry.render_op_calls.saturating_add(stats.render_op_calls);
-        entry.imperative_calls = entry
-            .imperative_calls
-            .saturating_add(stats.imperative_calls);
         entry.cache_hits = entry.cache_hits.saturating_add(stats.cache_hits);
         entry.full_surface_calls = entry
             .full_surface_calls
@@ -3549,7 +3538,6 @@ fn extension_render_stats_payload(
                     serde_json::json!({
                         "render_calls": stats.render_calls,
                         "render_op_calls": stats.render_op_calls,
-                        "imperative_calls": stats.imperative_calls,
                         "cache_hits": stats.cache_hits,
                         "full_surface_calls": stats.full_surface_calls,
                         "region_count": stats.region_count,
@@ -3733,10 +3721,6 @@ fn insert_attach_extension_work_payload(
         window.extension_render_op_calls.into(),
     );
     object.insert(
-        "extension_imperative_calls".to_string(),
-        window.extension_imperative_calls.into(),
-    );
-    object.insert(
         "extension_cache_hits".to_string(),
         window.extension_cache_hits.into(),
     );
@@ -3825,8 +3809,8 @@ fn insert_attach_render_work_payload(
         window.full_frame_fallback_flagged_frames.into(),
     );
     object.insert(
-        "extension_imperative_or_cache_miss_frames".to_string(),
-        window.extension_imperative_or_cache_miss_frames.into(),
+        "extension_cache_miss_frames".to_string(),
+        window.extension_cache_miss_frames.into(),
     );
     object.insert(
         "status_overlay_only_emits_pane_work_frames".to_string(),
@@ -4004,7 +3988,7 @@ async fn maybe_emit_attach_perf_window(
             large_partial_frame_frames = window.large_partial_frame_frames,
             extension_full_surface_excessive_frames = window.extension_full_surface_excessive_frames,
             full_frame_fallback_flagged_frames = window.full_frame_fallback_flagged_frames,
-            extension_imperative_or_cache_miss_frames = window.extension_imperative_or_cache_miss_frames,
+            extension_cache_miss_frames = window.extension_cache_miss_frames,
             status_overlay_only_emits_pane_work_frames = window.status_overlay_only_emits_pane_work_frames,
             slow_terminal_write_per_kib_frames = window.slow_terminal_write_per_kib_frames,
             "attach.render.overrender.window"
@@ -4104,7 +4088,6 @@ fn attach_frame_trace_payload(
         "pane_cells_emitted": frame_stats.scene_render.pane_cells_emitted,
         "extension_render_calls": frame_stats.scene_render.extension_render_calls,
         "extension_render_op_calls": frame_stats.scene_render.extension_render_op_calls,
-        "extension_imperative_calls": frame_stats.scene_render.extension_imperative_calls,
         "extension_cache_hits": frame_stats.scene_render.extension_cache_hits,
         "extension_full_surface_calls": frame_stats.scene_render.extension_full_surface_calls,
         "extension_region_count": frame_stats.scene_render.extension_region_count,
@@ -20378,15 +20361,6 @@ mod tests {
             "test.retained-overlay"
         }
 
-        fn render_surface(
-            &self,
-            _stdout: &mut dyn Write,
-            _surface_id: Uuid,
-            _surface_rect: &ExtensionRect,
-            _damage: &RenderDamage,
-        ) -> io::Result<bool> {
-            Ok(false)
-        }
 
         fn render_layer_ops_with_context(
             &self,
@@ -21597,12 +21571,11 @@ mod tests {
             AttachSceneRenderStats {
                 extension_render_calls: 10,
                 extension_cache_hits: 1,
-                extension_imperative_calls: 1,
                 ..AttachSceneRenderStats::default()
             },
         ));
 
-        assert!(flags.contains(AttachRenderInefficiencyFlags::EXTENSION_IMPERATIVE_OR_CACHE_MISS));
+        assert!(flags.contains(AttachRenderInefficiencyFlags::EXTENSION_CACHE_MISS));
     }
 
     #[test]
@@ -22846,15 +22819,6 @@ mod tests {
         impl AttachRenderExtension for LocalExtension {
             fn name(&self) -> &'static str {
                 "test.local-codec"
-            }
-            fn render_surface(
-                &self,
-                _: &mut dyn Write,
-                _: Uuid,
-                _: &ExtensionRect,
-                _: &RenderDamage,
-            ) -> io::Result<bool> {
-                Ok(false)
             }
             fn input_codec(
                 &self,
@@ -24614,8 +24578,8 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn attach_mouse_forward_honors_render_extension_content_rect() {
-        use bmux_plugin::{AttachRenderExtension, ExtensionRect, RenderDamage};
-        use std::io;
+        use bmux_plugin::{AttachRenderExtension, ExtensionRect};
+        
         use std::sync::Arc;
 
         // Test-only render extension that reports a fixed
@@ -24631,15 +24595,6 @@ mod tests {
                 "test.fixed_inset"
             }
 
-            fn render_surface(
-                &self,
-                _stdout: &mut dyn io::Write,
-                _surface_id: Uuid,
-                _surface_rect: &ExtensionRect,
-                _damage: &RenderDamage,
-            ) -> io::Result<bool> {
-                Ok(false)
-            }
 
             fn content_rect_override(&self, surface_id: Uuid) -> Option<ExtensionRect> {
                 if surface_id == self.surface_id {

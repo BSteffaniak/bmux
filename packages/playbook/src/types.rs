@@ -490,11 +490,6 @@ pub enum PlaybookRenderTraceOp {
     ExtensionCachedReplay {
         surface: u32,
     },
-    ExtensionImperative {
-        surface: u32,
-        regions: u16,
-        full_surface: bool,
-    },
     StatusLine,
     HelpOverlay,
     PromptOverlay,
@@ -570,13 +565,6 @@ impl PlaybookRenderTraceOp {
             ["extension-cached-replay", surface] => Ok(Self::ExtensionCachedReplay {
                 surface: parse_trace_part(surface, "surface")?,
             }),
-            ["extension-imperative", surface, regions, full_surface] => {
-                Ok(Self::ExtensionImperative {
-                    surface: parse_trace_part(surface, "surface")?,
-                    regions: parse_trace_part(regions, "regions")?,
-                    full_surface: parse_trace_part(full_surface, "full_surface")?,
-                })
-            }
             ["damage-overlay", rects, cells] => Ok(Self::DamageOverlay {
                 rects: parse_trace_part(rects, "rects")?,
                 cells: parse_trace_part(cells, "cells")?,
@@ -1157,11 +1145,6 @@ pub fn render_trace_ops_to_dsl(ops: &[PlaybookRenderTraceOp]) -> String {
             PlaybookRenderTraceOp::ExtensionCachedReplay { surface } => {
                 format!("extension-cached-replay:{surface}")
             }
-            PlaybookRenderTraceOp::ExtensionImperative {
-                surface,
-                regions,
-                full_surface,
-            } => format!("extension-imperative:{surface}:{regions}:{full_surface}"),
             PlaybookRenderTraceOp::StatusLine => "status-line".to_string(),
             PlaybookRenderTraceOp::HelpOverlay => "help-overlay".to_string(),
             PlaybookRenderTraceOp::PromptOverlay => "prompt-overlay".to_string(),

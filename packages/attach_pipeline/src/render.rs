@@ -1877,7 +1877,6 @@ pub struct FrameDamageStats {
 pub struct ExtensionRenderStats {
     pub render_calls: u64,
     pub render_op_calls: u64,
-    pub imperative_calls: u64,
     pub cache_hits: u64,
     pub full_surface_calls: u64,
     pub region_count: u64,
@@ -1918,7 +1917,6 @@ pub struct AttachSceneRenderStats {
     pub vacated_cells_cleared: u64,
     pub extension_render_calls: u64,
     pub extension_render_op_calls: u64,
-    pub extension_imperative_calls: u64,
     pub extension_cache_hits: u64,
     pub extension_full_surface_calls: u64,
     pub extension_region_count: u64,
@@ -1974,12 +1972,6 @@ impl AttachSceneRenderStats {
         self.extension_render_op_calls = self.extension_render_op_calls.saturating_add(1);
         let stats = self.extension_entry(extension_name);
         stats.render_op_calls = stats.render_op_calls.saturating_add(1);
-    }
-
-    fn record_extension_imperative_call(&mut self, extension_name: &str) {
-        self.extension_imperative_calls = self.extension_imperative_calls.saturating_add(1);
-        let stats = self.extension_entry(extension_name);
-        stats.imperative_calls = stats.imperative_calls.saturating_add(1);
     }
 
     fn record_extension_cache_hit(&mut self, extension_name: &str) {
@@ -2175,11 +2167,6 @@ pub enum AttachRenderTraceOp {
     },
     ExtensionCachedReplay {
         surface_index: usize,
-    },
-    ExtensionImperative {
-        surface_index: usize,
-        regions: u16,
-        full_surface: bool,
     },
     StatusLine {
         row: u16,
@@ -4673,19 +4660,6 @@ fn record_after_content_extension_output_plan(
         AfterContentExtensionOutputAction::RenderOps { .. } => {
             record_after_content_extension_ops(plan, render_stats, render_trace);
         }
-        AfterContentExtensionOutputAction::Imperative => {
-            if let Some(stats) = render_stats.as_deref_mut() {
-                stats.record_extension_imperative_call(ext_name);
-            }
-            if let Some(trace) = render_trace.as_deref_mut() {
-                let (regions, full_surface) = render_damage_trace_shape(damage);
-                trace.push(AttachRenderTraceOp::ExtensionImperative {
-                    surface_index: plan.surface_index,
-                    regions,
-                    full_surface,
-                });
-            }
-        }
     }
 }
 
@@ -4708,33 +4682,6 @@ fn record_after_content_extension_ops(
             regions,
             full_surface,
         });
-    }
-}
-
-fn execute_imperative_extension<W: io::Write>(
-    stdout: &mut W,
-    plan: &AfterContentExtensionOutputPlan,
-    context: &RenderExtensionContext,
-) {
-    crate::projection::record(crate::projection::PaintOperation::Rejected(
-        crate::projection::ProjectionFailure::Unsupported {
-            reason: "imperative render extension has no neutral output",
-        },
-    ));
-    let snapshot = &plan.snapshot;
-    if !crate::projection::encoding_terminal() {
-        return;
-    }
-    let writer: &mut dyn io::Write = stdout;
-    if let Err(error) = snapshot.extension.render_layer_surface_with_context(
-        writer,
-        snapshot.surface_id,
-        &snapshot.surface_rect,
-        &snapshot.render_damage,
-        snapshot.layer,
-        context,
-    ) {
-        tracing::warn!(extension = snapshot.extension.name(), %error, "render extension render_surface failed");
     }
 }
 
@@ -4863,10 +4810,6 @@ fn execute_after_content_extension_output_plan<W: io::Write>(
                     );
                 }
             }
-            Ok(())
-        }
-        AfterContentExtensionOutputAction::Imperative => {
-            execute_imperative_extension(stdout, plan, render_context);
             Ok(())
         }
     }
@@ -6544,7 +6487,7 @@ mod tests {
     #[allow(clippy::too_many_lines)] // Retained before-content fixture exercises underlay composition through full render path.
     fn retained_before_content_underlay_appears_under_blank_content() {
         use bmux_plugin::AttachRenderExtension;
-        use std::io;
+
         use std::sync::Arc;
 
         struct RetainedBeforeUnderlay;
@@ -6582,16 +6525,6 @@ mod tests {
                         .text("under", 0, 0, 0, "U", RenderStyle::default())
                         .build(),
                 )
-            }
-
-            fn render_surface(
-                &self,
-                _stdout: &mut dyn io::Write,
-                _surface_id: Uuid,
-                _surface_rect: &ExtensionRect,
-                _damage: &RenderDamage,
-            ) -> io::Result<bool> {
-                Ok(false)
             }
         }
 
@@ -6633,7 +6566,7 @@ mod tests {
     #[allow(clippy::too_many_lines)] // Retained before-content fixture verifies pane text occludes underlays.
     fn retained_before_content_underlay_is_hidden_by_text_content() {
         use bmux_plugin::AttachRenderExtension;
-        use std::io;
+
         use std::sync::Arc;
 
         struct RetainedBeforeUnderlay;
@@ -6671,16 +6604,6 @@ mod tests {
                         .text("under", 0, 0, 0, "U", RenderStyle::default())
                         .build(),
                 )
-            }
-
-            fn render_surface(
-                &self,
-                _stdout: &mut dyn io::Write,
-                _surface_id: Uuid,
-                _surface_rect: &ExtensionRect,
-                _damage: &RenderDamage,
-            ) -> io::Result<bool> {
-                Ok(false)
             }
         }
 
@@ -6726,7 +6649,7 @@ mod tests {
     #[allow(clippy::too_many_lines)] // Retained before-content fixture verifies moves invalidate affected row segments.
     fn retained_before_content_move_repaints_affected_row_segments() {
         use bmux_plugin::AttachRenderExtension;
-        use std::io;
+
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -6770,16 +6693,6 @@ mod tests {
                         .text("under", 0, x, 0, "U", RenderStyle::default())
                         .build(),
                 )
-            }
-
-            fn render_surface(
-                &self,
-                _stdout: &mut dyn io::Write,
-                _surface_id: Uuid,
-                _surface_rect: &ExtensionRect,
-                _damage: &RenderDamage,
-            ) -> io::Result<bool> {
-                Ok(false)
             }
         }
 
@@ -7244,16 +7157,6 @@ mod tests {
                     },
                 )])
             }
-
-            fn render_surface(
-                &self,
-                _stdout: &mut dyn std::io::Write,
-                _surface_id: Uuid,
-                _surface_rect: &ExtensionRect,
-                _damage: &RenderDamage,
-            ) -> std::io::Result<bool> {
-                Ok(false)
-            }
         }
 
         let surface_id = Uuid::from_u128(90);
@@ -7334,16 +7237,6 @@ mod tests {
                     text: "planned".to_string(),
                     style: RenderStyle::default(),
                 }])
-            }
-
-            fn render_surface(
-                &self,
-                _stdout: &mut dyn std::io::Write,
-                _surface_id: Uuid,
-                _surface_rect: &ExtensionRect,
-                _damage: &RenderDamage,
-            ) -> std::io::Result<bool> {
-                Ok(false)
             }
         }
 
@@ -7427,16 +7320,6 @@ mod tests {
                 _layer: RenderExtensionLayer,
             ) -> Option<u64> {
                 Some(42)
-            }
-
-            fn render_surface(
-                &self,
-                _stdout: &mut dyn std::io::Write,
-                _surface_id: Uuid,
-                _surface_rect: &ExtensionRect,
-                _damage: &RenderDamage,
-            ) -> std::io::Result<bool> {
-                Ok(false)
             }
         }
 
@@ -7542,16 +7425,6 @@ mod tests {
             ) -> Option<u64> {
                 Some(self.revision)
             }
-
-            fn render_surface(
-                &self,
-                _stdout: &mut dyn std::io::Write,
-                _surface_id: Uuid,
-                _surface_rect: &ExtensionRect,
-                _damage: &RenderDamage,
-            ) -> std::io::Result<bool> {
-                Ok(false)
-            }
         }
 
         let surface_id = Uuid::from_u128(12);
@@ -7636,16 +7509,6 @@ mod tests {
                 _layer: RenderExtensionLayer,
             ) -> Option<u64> {
                 Some(1)
-            }
-
-            fn render_surface(
-                &self,
-                _stdout: &mut dyn std::io::Write,
-                _surface_id: Uuid,
-                _surface_rect: &ExtensionRect,
-                _damage: &RenderDamage,
-            ) -> std::io::Result<bool> {
-                Ok(false)
             }
         }
 
@@ -8139,16 +8002,6 @@ mod tests {
                     .terminal_graphic("semantic-border", -1, graphic)
                     .build(),
             )
-        }
-
-        fn render_surface(
-            &self,
-            _stdout: &mut dyn std::io::Write,
-            _surface_id: Uuid,
-            _surface_rect: &ExtensionRect,
-            _damage: &RenderDamage,
-        ) -> std::io::Result<bool> {
-            Ok(false)
         }
     }
 
@@ -8904,23 +8757,13 @@ mod tests {
     #[allow(clippy::too_many_lines)] // Fixture builds a complete frame to verify before-content graphics ordering.
     fn before_content_graphics_are_queued_before_pane_rows() {
         use bmux_plugin::AttachRenderExtension;
-        use std::{io, sync::Arc};
+        use std::sync::Arc;
 
         struct BeforeGraphicsExtension;
 
         impl AttachRenderExtension for BeforeGraphicsExtension {
             fn name(&self) -> &'static str {
                 "test.before.graphics"
-            }
-
-            fn render_surface(
-                &self,
-                _stdout: &mut dyn io::Write,
-                _surface_id: Uuid,
-                _surface_rect: &ExtensionRect,
-                _damage: &RenderDamage,
-            ) -> io::Result<bool> {
-                Ok(false)
             }
 
             fn render_layer_items_with_context(
@@ -9025,7 +8868,7 @@ mod tests {
     #[allow(clippy::too_many_lines)] // Fixture builds a two-pane scene to cover partial-damage graphics lifecycle.
     fn partial_damage_keeps_undamaged_surface_graphics_active() {
         use bmux_plugin::AttachRenderExtension;
-        use std::{io, sync::Arc};
+        use std::sync::Arc;
 
         struct GraphicsExtension;
 
@@ -9033,16 +8876,6 @@ mod tests {
             #[allow(clippy::unnecessary_literal_bound)]
             fn name(&self) -> &str {
                 "test.graphics"
-            }
-
-            fn render_surface(
-                &self,
-                _stdout: &mut dyn io::Write,
-                _surface_id: Uuid,
-                _surface_rect: &ExtensionRect,
-                _damage: &RenderDamage,
-            ) -> io::Result<bool> {
-                Ok(false)
             }
 
             fn render_layer_items_with_context(
@@ -9193,7 +9026,7 @@ mod tests {
     #[allow(clippy::too_many_lines)] // Regression fixture models a tab/window switch replacing the visible pane surface.
     fn tab_switch_deletes_stale_surface_kitty_graphics_before_new_graphics() {
         use bmux_plugin::AttachRenderExtension;
-        use std::{io, sync::Arc};
+        use std::sync::Arc;
 
         struct GraphicsExtension;
 
@@ -9201,16 +9034,6 @@ mod tests {
             #[allow(clippy::unnecessary_literal_bound)]
             fn name(&self) -> &str {
                 "test.tab_switch_graphics"
-            }
-
-            fn render_surface(
-                &self,
-                _stdout: &mut dyn io::Write,
-                _surface_id: Uuid,
-                _surface_rect: &ExtensionRect,
-                _damage: &RenderDamage,
-            ) -> io::Result<bool> {
-                Ok(false)
             }
 
             fn render_layer_items_with_context(
@@ -11134,16 +10957,6 @@ mod tests {
                 }
             }
 
-            fn render_surface(
-                &self,
-                _stdout: &mut dyn std::io::Write,
-                _surface_id: Uuid,
-                _surface_rect: &ExtensionRect,
-                _damage: &RenderDamage,
-            ) -> std::io::Result<bool> {
-                Ok(false)
-            }
-
             fn render_ops(
                 &self,
                 surface_id: Uuid,
@@ -11259,7 +11072,7 @@ mod tests {
     #[allow(clippy::too_many_lines)] // Regression fixture drives content damage through after-content replay.
     fn content_damage_replays_after_content_decorations() {
         use bmux_plugin::AttachRenderExtension;
-        use std::io;
+
         use std::sync::Arc;
 
         struct AfterContentOverlay;
@@ -11277,16 +11090,6 @@ mod tests {
                 _layer: RenderExtensionLayer,
             ) -> RenderDamage {
                 RenderDamage::None
-            }
-
-            fn render_surface(
-                &self,
-                _stdout: &mut dyn io::Write,
-                _surface_id: Uuid,
-                _surface_rect: &ExtensionRect,
-                _damage: &RenderDamage,
-            ) -> io::Result<bool> {
-                Ok(false)
             }
 
             fn render_ops(
@@ -11374,7 +11177,7 @@ mod tests {
     #[allow(clippy::too_many_lines)] // Regression fixture verifies stale after-content cells are cleared before content replay.
     fn stale_after_content_cells_are_cleared_before_content_repaint() {
         use bmux_plugin::AttachRenderExtension;
-        use std::io;
+
         use std::sync::Arc;
 
         struct StaleAfterContentCells;
@@ -11397,16 +11200,6 @@ mod tests {
                         RenderDamage::Regions(vec![ExtensionRect::new(1, 0, 3, 1)])
                     }
                 }
-            }
-
-            fn render_surface(
-                &self,
-                _stdout: &mut dyn io::Write,
-                _surface_id: Uuid,
-                _surface_rect: &ExtensionRect,
-                _damage: &RenderDamage,
-            ) -> io::Result<bool> {
-                Ok(false)
             }
 
             fn render_layer_ops(
@@ -11484,7 +11277,7 @@ mod tests {
     #[allow(clippy::too_many_lines)] // Retained scene fixture proves renderer-owned diffing avoids damage API fallbacks.
     fn retained_after_content_scene_updates_without_full_surface_cleanup() {
         use bmux_plugin::AttachRenderExtension;
-        use std::io;
+
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -11529,16 +11322,6 @@ mod tests {
                         .text("label", 0, 1, 0, text, RenderStyle::default())
                         .build(),
                 )
-            }
-
-            fn render_surface(
-                &self,
-                _stdout: &mut dyn io::Write,
-                _surface_id: Uuid,
-                _surface_rect: &ExtensionRect,
-                _damage: &RenderDamage,
-            ) -> io::Result<bool> {
-                panic!("retained scene extension should not use imperative fallback")
             }
         }
 
@@ -11616,7 +11399,7 @@ mod tests {
     #[allow(clippy::too_many_lines)] // Retained scene fixture verifies stale cleanup and content replay.
     fn retained_after_content_scene_removal_cleans_previous_cells_and_replays_content() {
         use bmux_plugin::AttachRenderExtension;
-        use std::io;
+
         use std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -11664,16 +11447,6 @@ mod tests {
                 } else {
                     Some(builder.build())
                 }
-            }
-
-            fn render_surface(
-                &self,
-                _stdout: &mut dyn io::Write,
-                _surface_id: Uuid,
-                _surface_rect: &ExtensionRect,
-                _damage: &RenderDamage,
-            ) -> io::Result<bool> {
-                panic!("retained scene extension should not use imperative fallback")
             }
         }
 
@@ -11745,7 +11518,7 @@ mod tests {
     #[allow(clippy::too_many_lines)] // Retained scene fixture verifies move cleanup, content replay, and repaint ordering.
     fn retained_after_content_scene_move_cleans_old_and_paints_new() {
         use bmux_plugin::AttachRenderExtension;
-        use std::io;
+
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -11789,16 +11562,6 @@ mod tests {
                         .text("paddle", 0, x, 0, "P", RenderStyle::default())
                         .build(),
                 )
-            }
-
-            fn render_surface(
-                &self,
-                _stdout: &mut dyn io::Write,
-                _surface_id: Uuid,
-                _surface_rect: &ExtensionRect,
-                _damage: &RenderDamage,
-            ) -> io::Result<bool> {
-                panic!("retained scene extension should not use imperative fallback")
             }
         }
 
@@ -11873,7 +11636,7 @@ mod tests {
     #[allow(clippy::too_many_lines)] // Retained scene fixture proves pane content damage replays unchanged overlays even when legacy damage also reports work.
     fn retained_after_content_scene_content_damage_replays_unchanged_item() {
         use bmux_plugin::AttachRenderExtension;
-        use std::io;
+
         use std::sync::Arc;
 
         struct ContentReplayRetainedTextExtension;
@@ -11911,16 +11674,6 @@ mod tests {
                         .text("badge", 0, 1, 0, "OV", RenderStyle::default())
                         .build(),
                 )
-            }
-
-            fn render_surface(
-                &self,
-                _stdout: &mut dyn io::Write,
-                _surface_id: Uuid,
-                _surface_rect: &ExtensionRect,
-                _damage: &RenderDamage,
-            ) -> io::Result<bool> {
-                panic!("retained scene extension should not use imperative fallback")
             }
         }
 
@@ -11990,7 +11743,7 @@ mod tests {
     #[allow(clippy::too_many_lines)] // Retained scene fixture verifies output ordering follows item z, not builder order.
     fn retained_after_content_scene_preserves_z_order_when_lower_item_changes() {
         use bmux_plugin::AttachRenderExtension;
-        use std::io;
+
         use std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -12039,16 +11792,6 @@ mod tests {
                         .text("lower", 0, 0, 1, lower, RenderStyle::default())
                         .build(),
                 )
-            }
-
-            fn render_surface(
-                &self,
-                _stdout: &mut dyn io::Write,
-                _surface_id: Uuid,
-                _surface_rect: &ExtensionRect,
-                _damage: &RenderDamage,
-            ) -> io::Result<bool> {
-                panic!("retained scene extension should not use imperative fallback")
             }
         }
 
@@ -12116,7 +11859,7 @@ mod tests {
     #[allow(clippy::too_many_lines)] // Regression fixture verifies snapshot diffs drive stale after-content cleanup.
     fn stale_after_content_cleanup_uses_previous_layer_snapshot() {
         use bmux_plugin::AttachRenderExtension;
-        use std::io;
+
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -12152,16 +11895,6 @@ mod tests {
                         Some(self.revision.load(Ordering::Relaxed) as u64)
                     }
                 }
-            }
-
-            fn render_surface(
-                &self,
-                _stdout: &mut dyn io::Write,
-                _surface_id: Uuid,
-                _surface_rect: &ExtensionRect,
-                _damage: &RenderDamage,
-            ) -> io::Result<bool> {
-                Ok(false)
             }
 
             fn render_layer_ops(
@@ -12261,7 +11994,7 @@ mod tests {
     #[allow(clippy::too_many_lines)] // Test covers render-op execution and cache replay in one fixture.
     fn render_attach_scene_prefers_declarative_render_extension_ops() {
         use bmux_plugin::AttachRenderExtension;
-        use std::io;
+
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -12309,16 +12042,6 @@ mod tests {
                     RenderExtensionLayer::BeforePaneContent => None,
                     RenderExtensionLayer::AfterPaneContent => self.render_revision(surface_id),
                 }
-            }
-
-            fn render_surface(
-                &self,
-                _stdout: &mut dyn io::Write,
-                _surface_id: Uuid,
-                _surface_rect: &ExtensionRect,
-                _damage: &RenderDamage,
-            ) -> io::Result<bool> {
-                panic!("imperative render_surface should not be called when render_ops is Some")
             }
 
             fn render_layer_ops(
@@ -12474,166 +12197,6 @@ mod tests {
             cached_trace
                 .ops()
                 .contains(&AttachRenderTraceOp::ExtensionCachedReplay { surface_index: 0 })
-        );
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)] // Test fixture builds a full scene + extension + assertions inline.
-    fn render_attach_scene_applies_render_extension_paint_commands() {
-        use bmux_plugin::AttachRenderExtension;
-        use bmux_scene_protocol::scene_protocol::{Color, NamedColor};
-        use std::io;
-        use std::sync::Arc;
-
-        // Test-only render extension that writes a fixed styled run
-        // onto the stream. This mirrors what the decoration renderer
-        // does in production; the exact paint commands aren't the
-        // point — the point is that render extensions are consulted
-        // at all.
-        struct StyledRunExtension;
-
-        impl AttachRenderExtension for StyledRunExtension {
-            #[allow(clippy::unnecessary_literal_bound)]
-            fn name(&self) -> &str {
-                "test.styled_run"
-            }
-
-            fn render_surface(
-                &self,
-                stdout: &mut dyn io::Write,
-                _surface_id: Uuid,
-                _surface_rect: &ExtensionRect,
-                _damage: &RenderDamage,
-            ) -> io::Result<bool> {
-                let style = bmux_scene_protocol::scene_protocol::Style {
-                    fg: Some(Color::Named {
-                        name: NamedColor::BrightYellow,
-                    }),
-                    bg: None,
-                    bold: true,
-                    underline: false,
-                    italic: false,
-                    reverse: false,
-                    dim: false,
-                    blink: false,
-                    strikethrough: false,
-                };
-                let surface = bmux_scene_protocol::scene_protocol::SurfaceDecoration {
-                    surface_id: Uuid::nil(),
-                    rect: bmux_scene_protocol::scene_protocol::Rect {
-                        x: 0,
-                        y: 1,
-                        w: 20,
-                        h: 5,
-                    },
-                    content_rect: bmux_scene_protocol::scene_protocol::Rect {
-                        x: 1,
-                        y: 2,
-                        w: 18,
-                        h: 3,
-                    },
-                    paint_commands: vec![bmux_scene_protocol::scene_protocol::PaintCommand::Text {
-                        col: 0,
-                        row: 1,
-                        z: 0,
-                        text: "DECO!".to_string(),
-                        style,
-                    }],
-                    before_content_paint_commands: Vec::new(),
-                    interactive_regions: Vec::new(),
-                };
-                let mut writer: &mut dyn io::Write = stdout;
-                bmux_scene_protocol_render::paint::apply_paint_commands(&mut writer, &surface)
-                    .map(|()| true)
-                    .map_err(|err| io::Error::other(err.to_string()))
-            }
-        }
-
-        let pane_id = Uuid::from_u128(71);
-        let scene = AttachScene {
-            session_id: Uuid::from_u128(72),
-            focus: AttachFocusTarget::Pane { pane_id },
-            surfaces: vec![AttachSurface {
-                id: pane_id,
-                kind: AttachSurfaceKind::Pane,
-                layer: SurfaceLayer::Pane,
-                z: 0,
-                rect: AttachRect {
-                    x: 0,
-                    y: 1,
-                    w: 20,
-                    h: 5,
-                },
-                content_rect: AttachRect {
-                    x: 1,
-                    y: 2,
-                    w: 18,
-                    h: 3,
-                },
-                interactive_regions: Vec::new(),
-                opaque: true,
-                visible: true,
-                accepts_input: true,
-                cursor_owner: true,
-                pane_id: Some(pane_id),
-            }],
-        };
-        let panes = vec![PaneSummary {
-            id: pane_id,
-            index: 1,
-            name: None,
-            focused: true,
-            state: PaneState::Running,
-            state_reason: None,
-        }];
-        let mut pane_buffers = BTreeMap::new();
-        pane_buffers.insert(pane_id, PaneRenderBuffer::default());
-
-        let extensions: Vec<Arc<dyn AttachRenderExtension>> =
-            vec![Arc::new(StyledRunExtension) as Arc<dyn AttachRenderExtension>];
-
-        let mut output = Vec::new();
-        let mut trace = AttachRenderTrace::new();
-        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
-            &mut output,
-            &scene,
-            &panes,
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            1,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (80, 24),
-            &bmux_appearance::RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-            Some(&mut trace),
-        )
-        .expect("render should succeed");
-
-        let rendered = String::from_utf8(output).expect("render output should be utf8");
-        assert!(
-            rendered.contains("DECO!"),
-            "render extension paint-command text should appear in render output"
-        );
-        assert!(
-            rendered.contains("\x1b[1;93m"),
-            "bright-yellow + bold SGR sequence should be emitted; got: {rendered:?}"
-        );
-        assert!(
-            rendered.contains("\x1b[0m"),
-            "style reset should terminate the paint command; got: {rendered:?}"
-        );
-        assert_eq!(stats.extension_imperative_calls, 1);
-        assert!(
-            trace
-                .ops()
-                .contains(&AttachRenderTraceOp::ExtensionImperative {
-                    surface_index: 0,
-                    regions: 0,
-                    full_surface: true,
-                })
         );
     }
 
@@ -12882,208 +12445,6 @@ mod tests {
         );
     }
 
-    // ─── PR 1: scene-protocol widening SGR snapshot tests ─────────────
-    //
-    // These exercise the new colour variants, style modifiers, and
-    // paint-command variants end-to-end through the same render path
-    // used in production.
-
-    use bmux_plugin::AttachRenderExtension;
-    use bmux_scene_protocol::scene_protocol::{
-        BorderGlyphs, Cell, Color, GradientAxis, NamedColor, PaintCommand, Rect as SceneRect,
-        Style, SurfaceDecoration,
-    };
-    use std::io;
-    use std::sync::{Arc, Mutex};
-
-    fn default_style() -> Style {
-        Style {
-            fg: None,
-            bg: None,
-            bold: false,
-            underline: false,
-            italic: false,
-            reverse: false,
-            dim: false,
-            blink: false,
-            strikethrough: false,
-        }
-    }
-
-    /// Test-only render extension that paints a single
-    /// [`SurfaceDecoration`] onto the stream for every surface the
-    /// renderer asks about. Used by the PR-1 vocabulary tests to
-    /// drive paint-command variants through the render path.
-    struct SingleSurfaceExtension {
-        surface: Mutex<SurfaceDecoration>,
-    }
-
-    impl AttachRenderExtension for SingleSurfaceExtension {
-        #[allow(clippy::unnecessary_literal_bound)]
-        fn name(&self) -> &str {
-            "test.single_surface"
-        }
-
-        fn render_surface(
-            &self,
-            stdout: &mut dyn io::Write,
-            _surface_id: Uuid,
-            _surface_rect: &ExtensionRect,
-            _damage: &RenderDamage,
-        ) -> io::Result<bool> {
-            let Ok(surface) = self.surface.lock() else {
-                return Ok(false);
-            };
-            let mut writer: &mut dyn io::Write = stdout;
-            bmux_scene_protocol_render::paint::apply_paint_commands(&mut writer, &surface)
-                .map(|()| true)
-                .map_err(|err| io::Error::other(err.to_string()))
-        }
-    }
-
-    fn render_with_single_surface_paint(paint_commands: Vec<PaintCommand>) -> String {
-        let pane_id = Uuid::from_u128(0xfeed);
-        let scene = AttachScene {
-            session_id: Uuid::from_u128(0xbeef),
-            focus: AttachFocusTarget::Pane { pane_id },
-            surfaces: vec![AttachSurface {
-                id: pane_id,
-                kind: AttachSurfaceKind::Pane,
-                layer: SurfaceLayer::Pane,
-                z: 0,
-                rect: AttachRect {
-                    x: 0,
-                    y: 0,
-                    w: 40,
-                    h: 6,
-                },
-                content_rect: AttachRect {
-                    x: 1,
-                    y: 1,
-                    w: 38,
-                    h: 4,
-                },
-                interactive_regions: Vec::new(),
-                opaque: true,
-                visible: true,
-                accepts_input: true,
-                cursor_owner: true,
-                pane_id: Some(pane_id),
-            }],
-        };
-        let panes = vec![PaneSummary {
-            id: pane_id,
-            index: 1,
-            name: None,
-            focused: true,
-            state: PaneState::Running,
-            state_reason: None,
-        }];
-        let mut pane_buffers = BTreeMap::new();
-        pane_buffers.insert(pane_id, PaneRenderBuffer::default());
-
-        let surface = SurfaceDecoration {
-            surface_id: pane_id,
-            rect: SceneRect {
-                x: 0,
-                y: 0,
-                w: 40,
-                h: 6,
-            },
-            content_rect: SceneRect {
-                x: 1,
-                y: 1,
-                w: 38,
-                h: 4,
-            },
-            paint_commands,
-            before_content_paint_commands: Vec::new(),
-            interactive_regions: Vec::new(),
-        };
-        let extensions: Vec<Arc<dyn AttachRenderExtension>> =
-            vec![Arc::new(SingleSurfaceExtension {
-                surface: Mutex::new(surface),
-            }) as Arc<dyn AttachRenderExtension>];
-
-        let mut output = Vec::new();
-        let _ = render_attach_scene(
-            &mut output,
-            &scene,
-            &panes,
-            &mut pane_buffers,
-            &FrameDamage::full_frame(),
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            (80, 24),
-            &bmux_appearance::RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &extensions,
-        )
-        .expect("render should succeed");
-        String::from_utf8(output).expect("render output should be utf8")
-    }
-
-    #[test]
-    fn truecolor_rgb_emits_24bit_fg_sgr() {
-        let mut style = default_style();
-        style.fg = Some(Color::Rgb {
-            r: 57,
-            g: 255,
-            b: 20,
-        });
-        let out = render_with_single_surface_paint(vec![PaintCommand::Text {
-            col: 2,
-            row: 0,
-            z: 0,
-            text: "LIME".to_string(),
-            style,
-        }]);
-        assert!(
-            out.contains("\x1b[38;2;57;255;20m"),
-            "expected 24-bit truecolor SGR; got: {out:?}"
-        );
-        assert!(out.contains("LIME"));
-    }
-
-    #[test]
-    fn indexed_color_emits_256_palette_sgr() {
-        let mut style = default_style();
-        style.fg = Some(Color::Indexed { index: 214 });
-        let out = render_with_single_surface_paint(vec![PaintCommand::Text {
-            col: 2,
-            row: 0,
-            z: 0,
-            text: "X".to_string(),
-            style,
-        }]);
-        assert!(
-            out.contains("\x1b[38;5;214m"),
-            "expected 256-indexed SGR; got: {out:?}"
-        );
-    }
-
-    #[test]
-    fn named_color_emits_legacy_palette_sgr() {
-        let mut style = default_style();
-        style.fg = Some(Color::Named {
-            name: NamedColor::BrightYellow,
-        });
-        style.bold = true;
-        let out = render_with_single_surface_paint(vec![PaintCommand::Text {
-            col: 2,
-            row: 0,
-            z: 0,
-            text: "Y".to_string(),
-            style,
-        }]);
-        assert!(
-            out.contains("\x1b[1;93m"),
-            "expected bold + bright-yellow SGR; got: {out:?}"
-        );
-    }
-
     #[test]
     fn grid_conceal_and_strike_survive_all_style_lowerings() {
         let mut stream = bmux_terminal_grid::TerminalGridStream::new(
@@ -13118,252 +12479,5 @@ mod tests {
             assert!(style.hidden);
             assert!(style.strike);
         }
-    }
-
-    #[test]
-    fn new_style_modifiers_emit_their_sgr_codes() {
-        let mut style = default_style();
-        style.dim = true;
-        style.blink = true;
-        style.strikethrough = true;
-        let out = render_with_single_surface_paint(vec![PaintCommand::Text {
-            col: 2,
-            row: 0,
-            z: 0,
-            text: "M".to_string(),
-            style,
-        }]);
-        // Dim=2, blink=5, strikethrough=9 all in the prelude.
-        assert!(
-            out.contains("\x1b[2;5;9m"),
-            "expected dim+blink+strike SGR; got: {out:?}"
-        );
-    }
-
-    #[test]
-    fn filled_rect_paints_every_row_with_glyph() {
-        let mut style = default_style();
-        style.fg = Some(Color::Rgb {
-            r: 255,
-            g: 0,
-            b: 128,
-        });
-        let out = render_with_single_surface_paint(vec![PaintCommand::FilledRect {
-            rect: SceneRect {
-                x: 2,
-                y: 0,
-                w: 4,
-                h: 2,
-            },
-            z: 0,
-            glyph: "#".to_string(),
-            style,
-        }]);
-        // Row should be "####" painted twice.
-        let count = out.matches("####").count();
-        assert!(
-            count >= 2,
-            "expected filled-rect to emit 2 rows of ####; got: {out:?}"
-        );
-    }
-
-    #[test]
-    fn gradient_run_interpolates_rgb_endpoints() {
-        let mut from = default_style();
-        from.fg = Some(Color::Rgb { r: 0, g: 0, b: 0 });
-        let mut to = default_style();
-        to.fg = Some(Color::Rgb {
-            r: 255,
-            g: 255,
-            b: 255,
-        });
-        let out = render_with_single_surface_paint(vec![PaintCommand::GradientRun {
-            col: 2,
-            row: 0,
-            z: 0,
-            text: "abcde".to_string(),
-            axis: GradientAxis::Horizontal,
-            from_style: from,
-            to_style: to,
-        }]);
-        // The first cell must emit the `from` endpoint; the last the
-        // `to` endpoint. Intermediate cells interpolate between them.
-        assert!(
-            out.contains("\x1b[38;2;0;0;0m"),
-            "expected gradient start rgb; got: {out:?}"
-        );
-        assert!(
-            out.contains("\x1b[38;2;255;255;255m"),
-            "expected gradient end rgb; got: {out:?}"
-        );
-    }
-
-    #[test]
-    fn cell_grid_paints_sparse_cells() {
-        let mut style = default_style();
-        style.fg = Some(Color::Indexed { index: 42 });
-        let cells = vec![
-            Cell {
-                glyph: "A".to_string(),
-                style: style.clone(),
-            },
-            Cell {
-                glyph: String::new(), // sparse — should be skipped
-                style: style.clone(),
-            },
-            Cell {
-                glyph: "B".to_string(),
-                style: style.clone(),
-            },
-            Cell {
-                glyph: "C".to_string(),
-                style,
-            },
-        ];
-        let out = render_with_single_surface_paint(vec![PaintCommand::CellGrid {
-            origin_col: 2,
-            origin_row: 0,
-            z: 0,
-            cols: 2,
-            cells,
-        }]);
-        assert!(out.contains('A'));
-        assert!(out.contains('B'));
-        assert!(out.contains('C'));
-    }
-
-    #[test]
-    fn box_border_paints_rounded_corners() {
-        let style = default_style();
-        let out = render_with_single_surface_paint(vec![PaintCommand::BoxBorder {
-            rect: SceneRect {
-                x: 0,
-                y: 0,
-                w: 6,
-                h: 3,
-            },
-            z: 0,
-            glyphs: BorderGlyphs::Rounded,
-            style,
-        }]);
-        assert!(out.contains('\u{256d}'), "top-left ╭ missing; got: {out:?}");
-        assert!(
-            out.contains('\u{256e}'),
-            "top-right ╮ missing; got: {out:?}"
-        );
-        assert!(out.contains('\u{2570}'), "bot-left ╰ missing; got: {out:?}");
-        assert!(
-            out.contains('\u{256f}'),
-            "bot-right ╯ missing; got: {out:?}"
-        );
-    }
-
-    #[test]
-    fn box_border_accepts_custom_six_rune_glyphs() {
-        let out = render_with_single_surface_paint(vec![PaintCommand::BoxBorder {
-            rect: SceneRect {
-                x: 0,
-                y: 0,
-                w: 6,
-                h: 3,
-            },
-            z: 0,
-            glyphs: BorderGlyphs::Custom {
-                top_left: "A".to_string(),
-                top_right: "B".to_string(),
-                bottom_left: "C".to_string(),
-                bottom_right: "D".to_string(),
-                horizontal: "h".to_string(),
-                vertical: "v".to_string(),
-            },
-            style: default_style(),
-        }]);
-        assert!(
-            out.contains("AhhhhB"),
-            "top row must be A + 4×h + B; got: {out:?}"
-        );
-        assert!(
-            out.contains("ChhhhD"),
-            "bot row must be C + 4×h + D; got: {out:?}"
-        );
-        assert!(out.contains('v'), "vertical must be emitted; got: {out:?}");
-    }
-
-    #[test]
-    fn paint_commands_respect_z_ordering() {
-        // Two Text commands at the same (col, row) — the one with the
-        // higher z must be visible (painted last).
-        let mut lo = default_style();
-        lo.fg = Some(Color::Rgb { r: 1, g: 1, b: 1 });
-        let mut hi = default_style();
-        hi.fg = Some(Color::Rgb {
-            r: 99,
-            g: 99,
-            b: 99,
-        });
-        let out = render_with_single_surface_paint(vec![
-            PaintCommand::Text {
-                col: 0,
-                row: 0,
-                z: 10,
-                text: "HIGH".to_string(),
-                style: hi,
-            },
-            PaintCommand::Text {
-                col: 0,
-                row: 0,
-                z: -5,
-                text: "LOW".to_string(),
-                style: lo,
-            },
-        ]);
-        // Both should appear in the byte stream (both were painted)
-        // but HIGH must appear *after* LOW in the stream so the
-        // terminal sees HIGH last.
-        let lo_pos = out.find("LOW").expect("LOW must appear");
-        let hi_pos = out.find("HIGH").expect("HIGH must appear");
-        assert!(
-            lo_pos < hi_pos,
-            "lower z must be painted first; got LOW at {lo_pos}, HIGH at {hi_pos}",
-        );
-    }
-
-    #[test]
-    fn surface_emits_single_trailing_reset() {
-        let mut style = default_style();
-        style.fg = Some(Color::Named {
-            name: NamedColor::BrightGreen,
-        });
-        let out = render_with_single_surface_paint(vec![
-            PaintCommand::Text {
-                col: 0,
-                row: 0,
-                z: 0,
-                text: "A".to_string(),
-                style: style.clone(),
-            },
-            PaintCommand::Text {
-                col: 0,
-                row: 1,
-                z: 0,
-                text: "B".to_string(),
-                style,
-            },
-        ]);
-        // The old path reset after every paint; the new path resets
-        // once at the end of the surface. Count resets between the
-        // last paint text and the end of the surface's decoration
-        // section — the PTY render path adds more resets afterwards
-        // but we only care that the decoration section emits exactly
-        // one.
-        let resets = out.matches("\x1b[0m").count();
-        // Exact count is noisy because the PTY row walker adds its
-        // own resets; the regression we guard against is "zero
-        // resets after the surface", so assert at least one reset
-        // shows up following the final paint text.
-        assert!(
-            resets >= 1,
-            "expected at least one SGR reset in output; got: {out:?}"
-        );
     }
 }

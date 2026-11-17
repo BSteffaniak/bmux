@@ -572,7 +572,6 @@ pub(super) enum AfterContentExtensionOutputAction {
     RenderOps {
         output_plan: RenderOpsOutputPlan,
     },
-    Imperative,
 }
 
 pub(super) fn build_after_content_surface_output_plan(
@@ -740,21 +739,21 @@ pub(super) fn build_after_content_extension_output_plan(
         render_context,
     ) {
         AfterContentExtensionOutputAction::RenderItems { items }
-    } else if let Some(ops) = snapshot.extension.render_layer_ops_with_context(
-        snapshot.surface_id,
-        &snapshot.surface_rect,
-        &damage,
-        snapshot.layer,
-        render_context,
-    ) {
+    } else {
+        // An extension with no neutral output paints nothing.
+        let ops = snapshot.extension.render_layer_ops_with_context(
+            snapshot.surface_id,
+            &snapshot.surface_rect,
+            &damage,
+            snapshot.layer,
+            render_context,
+        )?;
         if ops.is_empty() {
             return None;
         }
         AfterContentExtensionOutputAction::RenderOps {
             output_plan: build_render_ops_output_plan(snapshot.surface_rect, &damage, &ops),
         }
-    } else {
-        AfterContentExtensionOutputAction::Imperative
     };
     Some(AfterContentExtensionOutputPlan {
         surface_index,

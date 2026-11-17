@@ -22,8 +22,8 @@
 //!    diffing, stale cleanup, content replay, terminal graphics lifecycle, and
 //!    byte emission for retained scenes.
 //! 4. Older damage-oriented APIs such as [`AttachRenderExtension::render_ops`]
-//!    and [`AttachRenderExtension::render_surface`] remain available as
-//!    compatibility fallbacks.
+//!    remain available as compatibility fallbacks. Extensions describe what
+//!    they show; they never write terminal bytes themselves.
 //! 5. When a surface disappears (pane closed, layout recomputed without
 //!    it), the attach runtime calls
 //!    [`AttachRenderExtension::surface_removed`] so the extension can
@@ -91,7 +91,6 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::io;
 use std::sync::{Arc, OnceLock, RwLock};
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
@@ -1602,8 +1601,7 @@ pub trait AttachRenderExtension: Send + Sync {
     /// Return the currently-invalid region for a surface.
     ///
     /// This is a compatibility-oriented API for extensions that still render
-    /// from damage-driven methods such as [`Self::render_ops`] or
-    /// [`Self::render_surface`]. Extensions that implement
+    /// from damage-driven methods such as [`Self::render_ops`]. Extensions that implement
     /// [`Self::render_layer_scene_with_context`] can usually avoid custom
     /// damage tracking because the renderer diffs retained scene items.
     ///
@@ -1672,101 +1670,13 @@ pub trait AttachRenderExtension: Send + Sync {
         self.render_revision(surface_id)
     }
 
-    /// Paint per-surface output onto `stdout` for the damaged region
-    /// of `surface_rect`.
-    ///
-    /// This is the imperative compatibility escape hatch. Prefer
-    /// [`Self::render_layer_scene_with_context`] for new extensions so the
-    /// renderer can own diffing, cleanup, z-order, graphics lifecycle, and byte
-    /// emission. This method returns `Ok(true)` when any bytes were written, or
-    /// `Ok(false)` when the extension had nothing to paint.
-    ///
-    /// # Errors
-    ///
-    /// Returns any error from queueing bytes onto `stdout`.
-    fn render_surface(
-        &self,
-        stdout: &mut dyn io::Write,
-        surface_id: Uuid,
-        surface_rect: &ExtensionRect,
-        damage: &RenderDamage,
-    ) -> io::Result<bool>;
-
-    /// Paint per-surface output for one layer onto `stdout` for the damaged
-    /// region of `surface_rect`.
-    ///
-    /// This is the layered imperative compatibility escape hatch. Prefer
-    /// [`Self::render_layer_scene_with_context`] for new extensions. The default
-    /// delegates after-content rendering to [`Self::render_surface`] and emits
-    /// nothing for before-content rendering, preserving existing extension
-    /// behavior.
-    ///
-    /// # Errors
-    ///
-    /// Returns any error from queueing bytes onto `stdout`.
-    fn render_layer_surface(
-        &self,
-        stdout: &mut dyn io::Write,
-        surface_id: Uuid,
-        surface_rect: &ExtensionRect,
-        damage: &RenderDamage,
-        layer: RenderExtensionLayer,
-    ) -> io::Result<bool> {
-        match layer {
-            RenderExtensionLayer::BeforePaneContent => Ok(false),
-            RenderExtensionLayer::AfterPaneContent => {
-                self.render_surface(stdout, surface_id, surface_rect, damage)
-            }
-        }
-    }
-
-    /// Context-aware counterpart to [`Self::render_surface`]. The default
-    /// preserves existing extension behavior.
-    ///
-    /// # Errors
-    ///
-    /// Returns any error from queueing bytes onto `stdout`.
-    fn render_surface_with_context(
-        &self,
-        stdout: &mut dyn io::Write,
-        surface_id: Uuid,
-        surface_rect: &ExtensionRect,
-        damage: &RenderDamage,
-        _context: &RenderExtensionContext,
-    ) -> io::Result<bool> {
-        self.render_surface(stdout, surface_id, surface_rect, damage)
-    }
-
-    /// Context-aware counterpart to [`Self::render_layer_surface`].
-    ///
-    /// # Errors
-    ///
-    /// Returns any error from queueing bytes onto `stdout`.
-    fn render_layer_surface_with_context(
-        &self,
-        stdout: &mut dyn io::Write,
-        surface_id: Uuid,
-        surface_rect: &ExtensionRect,
-        damage: &RenderDamage,
-        layer: RenderExtensionLayer,
-        context: &RenderExtensionContext,
-    ) -> io::Result<bool> {
-        match layer {
-            RenderExtensionLayer::BeforePaneContent => Ok(false),
-            RenderExtensionLayer::AfterPaneContent => {
-                self.render_surface_with_context(stdout, surface_id, surface_rect, damage, context)
-            }
-        }
-    }
-
     /// Return declarative render operations for the damaged region of
     /// `surface_rect`.
     ///
     /// This is a damage-oriented compatibility API. Prefer
     /// [`Self::render_layer_scene_with_context`] for new extensions. Returning
-    /// `None` asks the host to call [`Self::render_surface`] as an imperative
-    /// escape hatch. Returning `Some(Vec::new())` means the extension is
-    /// declarative but has no operations for this damage.
+    /// `None` paints nothing; `Some(Vec::new())` means the extension has no
+    /// operations for this damage.
     fn render_ops(
         &self,
         _surface_id: Uuid,
@@ -1798,8 +1708,8 @@ pub trait AttachRenderExtension: Send + Sync {
     ///
     /// This is a damage-oriented compatibility API. Prefer retained scenes for
     /// new extensions. Returning `None` asks the host to fall back to
-    /// [`Self::render_layer_ops_with_context`] and then the imperative escape
-    /// hatch. The default preserves existing operation-only extensions.
+    /// [`Self::render_layer_ops_with_context`]. The default preserves existing
+    /// operation-only extensions.
     fn render_layer_items_with_context(
         &self,
         surface_id: Uuid,
@@ -1816,8 +1726,7 @@ pub trait AttachRenderExtension: Send + Sync {
     /// `surface_rect`.
     ///
     /// This is the layered damage-oriented compatibility API. Prefer retained
-    /// scenes for new extensions. Returning `None` asks the host to call
-    /// [`Self::render_layer_surface`] as an imperative escape hatch. The default
+    /// scenes for new extensions. Returning `None` paints nothing. The default
     /// delegates after-content rendering to [`Self::render_ops`] and emits no
     /// before-content operations.
     fn render_layer_ops(
@@ -2082,24 +1991,12 @@ mod tests {
 
     struct RecordingExtension {
         name: String,
-        applied: Mutex<Vec<Uuid>>,
         removed: Mutex<Vec<Uuid>>,
     }
 
     impl AttachRenderExtension for RecordingExtension {
         fn name(&self) -> &str {
             &self.name
-        }
-
-        fn render_surface(
-            &self,
-            _stdout: &mut dyn io::Write,
-            surface_id: Uuid,
-            _surface_rect: &ExtensionRect,
-            _damage: &RenderDamage,
-        ) -> io::Result<bool> {
-            self.applied.lock().unwrap().push(surface_id);
-            Ok(false)
         }
 
         fn surface_removed(&self, surface_id: Uuid) {
@@ -2287,7 +2184,6 @@ mod tests {
     fn render_extension_retained_scene_default_uses_fallback_path() {
         let ext = RecordingExtension {
             name: "x".to_string(),
-            applied: Mutex::new(Vec::new()),
             removed: Mutex::new(Vec::new()),
         };
 
@@ -2307,12 +2203,10 @@ mod tests {
         let registry = RenderExtensionRegistry::new();
         let a = Arc::new(RecordingExtension {
             name: "a".to_string(),
-            applied: Mutex::new(Vec::new()),
             removed: Mutex::new(Vec::new()),
         }) as Arc<dyn AttachRenderExtension>;
         let b = Arc::new(RecordingExtension {
             name: "b".to_string(),
-            applied: Mutex::new(Vec::new()),
             removed: Mutex::new(Vec::new()),
         }) as Arc<dyn AttachRenderExtension>;
         registry.register(a);
@@ -2335,7 +2229,6 @@ mod tests {
     fn extension_default_damage_is_full_surface() {
         let ext = RecordingExtension {
             name: "x".to_string(),
-            applied: Mutex::new(Vec::new()),
             removed: Mutex::new(Vec::new()),
         };
         assert_eq!(
@@ -2356,7 +2249,6 @@ mod tests {
     fn extension_default_content_rect_override_is_none() {
         let ext = RecordingExtension {
             name: "x".to_string(),
-            applied: Mutex::new(Vec::new()),
             removed: Mutex::new(Vec::new()),
         };
         assert!(ext.content_rect_override(Uuid::nil()).is_none());

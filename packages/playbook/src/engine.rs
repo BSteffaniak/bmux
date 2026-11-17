@@ -1072,15 +1072,6 @@ fn record_attach_trace_op(
                 surface: trace_surface_index(surface_index),
             }
         }
-        AttachTraceOp::ExtensionImperative {
-            surface_index,
-            regions,
-            full_surface,
-        } => PlaybookRenderTraceOp::ExtensionImperative {
-            surface: trace_surface_index(surface_index),
-            regions,
-            full_surface,
-        },
         AttachTraceOp::StatusLine { .. } => {
             summary.status_rendered_frames = 1;
             PlaybookRenderTraceOp::StatusLine
