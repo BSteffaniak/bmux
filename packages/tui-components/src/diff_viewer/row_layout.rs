@@ -48,6 +48,8 @@ pub struct DiffRowText<'a> {
     pub changed_ranges: &'a [ChangedRange],
     /// Caller-supplied styled ranges, sorted by `start` and disjoint.
     pub syntax: &'a [DiffSyntaxRange],
+    /// An adornment after the content on the first row, such as a badge.
+    pub trailing: Option<DiffRowTrailing<'a>>,
 }
 
 impl<'a> DiffRowText<'a> {
@@ -58,6 +60,7 @@ impl<'a> DiffRowText<'a> {
             text,
             changed_ranges: &[],
             syntax: &[],
+            trailing: None,
         }
     }
 
@@ -73,6 +76,64 @@ impl<'a> DiffRowText<'a> {
     pub const fn with_syntax(mut self, syntax: &'a [DiffSyntaxRange]) -> Self {
         self.syntax = syntax;
         self
+    }
+
+    /// Return this text with a trailing adornment on its first row.
+    #[must_use]
+    pub const fn with_trailing(mut self, trailing: DiffRowTrailing<'a>) -> Self {
+        self.trailing = Some(trailing);
+        self
+    }
+}
+
+/// Cells between a side's content and its trailing adornment.
+const TRAILING_GAP: usize = 1;
+
+/// How a trailing adornment ([`DiffRowTrailing`]) claims its cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiffTrailingFit {
+    /// Reserve the adornment's cells and a one-cell gap from the end of the side's content
+    /// area on every row, so content wraps, truncates, or scrolls before them. Under wrapping
+    /// the item can grow taller ([`diff_row_height`] measures the same geometry).
+    ///
+    /// When the content area cannot hold the adornment, the gap, and one content cell, nothing
+    /// is reserved and the adornment is omitted.
+    #[default]
+    Reserve,
+    /// Use only the cells the first row leaves blank after its content, so the content's
+    /// geometry is exactly as without the adornment. The adornment is omitted when that blank
+    /// run cannot hold it and a one-cell gap after any content (a truncated row has none).
+    IfRoom,
+}
+
+/// A caller adornment placed at the end of one side's content area on the item's first row,
+/// such as a citation badge.
+///
+/// The layout measures it with the same cell widths it paints with and reports where it
+/// landed ([`DiffRowLayout::trailing`]), so a caller registers interaction for exactly the
+/// cells painted and never measures the adornment itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiffRowTrailing<'a> {
+    /// Styled content, patched over the row's background.
+    pub spans: &'a [Span],
+    /// How it claims cells.
+    pub fit: DiffTrailingFit,
+}
+
+impl<'a> DiffRowTrailing<'a> {
+    /// An adornment of `spans` claiming cells as `fit` says.
+    #[must_use]
+    pub const fn new(spans: &'a [Span], fit: DiffTrailingFit) -> Self {
+        Self { spans, fit }
+    }
+
+    /// Cells the adornment paints in.
+    fn width(self) -> usize {
+        self.spans
+            .iter()
+            .flat_map(|span| span.content.graphemes(true))
+            .map(|grapheme| usize::from(painted_grapheme_width(grapheme)))
+            .sum()
     }
 }
 
@@ -380,6 +441,17 @@ pub struct DiffRowCells {
     pub cells: Range<usize>,
 }
 
+/// Cells a trailing adornment was painted in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffRowTrailingCells {
+    /// Side whose adornment it is.
+    pub side: DiffSourceSide,
+    /// Row within the item.
+    pub row: usize,
+    /// Covered cells.
+    pub cells: Range<usize>,
+}
+
 /// One grapheme placed into a cell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Placement {
@@ -398,6 +470,7 @@ pub struct DiffRowLayout {
     columns: Vec<DiffRowColumn>,
     segments: Vec<DiffRowSegment>,
     placements: Vec<Placement>,
+    trailing: Vec<DiffRowTrailingCells>,
 }
 
 impl DiffRowLayout {
@@ -435,6 +508,21 @@ impl DiffRowLayout {
     #[must_use]
     pub fn segments(&self) -> &[DiffRowSegment] {
         &self.segments
+    }
+
+    /// Cells of the trailing adornments painted, left to right. An adornment that did not fit
+    /// is absent.
+    #[must_use]
+    pub fn trailing(&self) -> &[DiffRowTrailingCells] {
+        &self.trailing
+    }
+
+    /// The trailing adornment painted under `column` on `row`, when one is.
+    #[must_use]
+    pub fn trailing_at(&self, row: usize, column: usize) -> Option<&DiffRowTrailingCells> {
+        self.trailing
+            .iter()
+            .find(|trailing| trailing.row == row && trailing.cells.contains(&column))
     }
 
     /// Resolve the source position under `column` on `row`.
@@ -578,6 +666,7 @@ pub fn layout_diff_row(
         columns: builder.columns,
         segments: builder.segments,
         placements: builder.placements,
+        trailing: builder.trailing,
     }
 }
 
@@ -592,7 +681,7 @@ pub fn diff_row_height(item: DiffRowItem<'_>, width: u16, options: DiffRowOption
     let width = usize::from(width);
     match item {
         DiffRowItem::Unified { text, .. } => {
-            cell_height(text.text, width, options.gutter.unified_width(), options).max(1)
+            cell_height(text, width, options.gutter.unified_width(), options).max(1)
         }
         DiffRowItem::SideBySide { old, new } => {
             if width == 0 {
@@ -601,7 +690,7 @@ pub fn diff_row_height(item: DiffRowItem<'_>, width: u16, options: DiffRowOption
             let (old_width, _, new_width) = split_widths(width, options.columns);
             let side = |cell: Option<DiffRowCell<'_>>, width| {
                 cell.map_or(1, |cell| {
-                    cell_height(cell.text.text, width, options.gutter.side_width(), options)
+                    cell_height(cell.text, width, options.gutter.side_width(), options)
                 })
             };
             side(old, old_width).max(side(new, new_width)).max(1)
@@ -610,16 +699,21 @@ pub fn diff_row_height(item: DiffRowItem<'_>, width: u16, options: DiffRowOption
 }
 
 /// Content rows of one present cell (zero when the cell has no cells at all).
-fn cell_height(text: &str, width: usize, gutter_width: usize, options: DiffRowOptions) -> usize {
+fn cell_height(
+    text: DiffRowText<'_>,
+    width: usize,
+    gutter_width: usize,
+    options: DiffRowOptions,
+) -> usize {
     let (mode, prefix) = gutter_mode(width, gutter_width);
     if mode == DiffGutterMode::Empty {
         return 0;
     }
-    let content_width = width - prefix;
+    let (content_width, _) = reserved_width(width - prefix, text.trailing);
     match options.overflow {
         DiffRowOverflow::Wrap if content_width > 0 => {
             let mut rows = 1;
-            wrap_walk(text, content_width, options.tab_width, |step| {
+            wrap_walk(text.text, content_width, options.tab_width, |step| {
                 if matches!(step, WrapStep::Break { .. }) {
                     rows += 1;
                 }
@@ -627,6 +721,23 @@ fn cell_height(text: &str, width: usize, gutter_width: usize, options: DiffRowOp
             rows
         }
         _ => 1,
+    }
+}
+
+/// Cells left to a side's text in a content area of `content_width` cells, and the cells of a
+/// reserved trailing adornment (zero when none is reserved). The single source of reserved
+/// geometry for both [`layout_diff_row`] and [`diff_row_height`].
+fn reserved_width(content_width: usize, trailing: Option<DiffRowTrailing<'_>>) -> (usize, usize) {
+    match trailing {
+        Some(trailing) if trailing.fit == DiffTrailingFit::Reserve => {
+            let cells = trailing.width();
+            if cells > 0 && content_width > cells + TRAILING_GAP {
+                (content_width - cells - TRAILING_GAP, cells)
+            } else {
+                (content_width, 0)
+            }
+        }
+        _ => (content_width, 0),
     }
 }
 
@@ -684,6 +795,7 @@ struct Builder {
     columns: Vec<DiffRowColumn>,
     segments: Vec<DiffRowSegment>,
     placements: Vec<Placement>,
+    trailing: Vec<DiffRowTrailingCells>,
 }
 
 #[allow(clippy::too_many_arguments)] // Private adapter of one public item variant.
@@ -714,6 +826,13 @@ fn layout_unified(
     };
     let laid = layout_cell(&cell, 0, style, &mut builder.placements);
     builder.columns.push(laid.column.clone());
+    if let Some(cells) = laid.trailing.clone() {
+        builder.trailing.push(DiffRowTrailingCells {
+            side,
+            row: 0,
+            cells,
+        });
+    }
     if laid.rows.is_empty() {
         builder.rows.push(Line::default());
         return;
@@ -757,6 +876,15 @@ fn layout_side_by_side(
     );
     builder.columns.push(old_laid.column.clone());
     builder.columns.push(new_laid.column.clone());
+    for laid in [&old_laid, &new_laid] {
+        if let Some(cells) = laid.trailing.clone() {
+            builder.trailing.push(DiffRowTrailingCells {
+                side: laid.column.side,
+                row: 0,
+                cells,
+            });
+        }
+    }
     if width == 0 {
         builder.rows.push(Line::default());
         return;
@@ -889,6 +1017,8 @@ struct LaidCell {
     column: DiffRowColumn,
     rows: Vec<CellRow>,
     filler: Filler,
+    /// Item cells of the trailing adornment on the first row, when it was painted.
+    trailing: Option<Range<usize>>,
 }
 
 impl LaidCell {
@@ -914,6 +1044,7 @@ impl LaidCell {
                 spans,
                 segment: None,
             },
+            trailing: None,
         }
     }
 }
@@ -966,15 +1097,23 @@ fn layout_cell(
                 spans: Vec::new(),
                 segment: None,
             },
+            trailing: None,
         };
     }
-    let content_rows = place_content(spec.text.text, content_width, spec.overflow, spec.tab_width);
+    let (text_width, reserved) = reserved_width(content_width, spec.text.trailing);
+    let content_rows = place_content(spec.text.text, text_width, spec.overflow, spec.tab_width);
+    let trailing = spec.text.trailing.and_then(|trailing| {
+        trailing_start(trailing, content_rows.first(), content_width, reserved)
+            .map(|start| (trailing, start))
+    });
     let styles = ContentStyles::new(spec, style);
     let mut rows = Vec::with_capacity(content_rows.len());
     for (index, content_row) in content_rows.iter().enumerate() {
         let mut spans = gutter_spans(spec, mode, index == 0, style);
         let first_placement = placements.len();
-        styles.push_content_spans(spec.text, content_row, content_width, &mut spans);
+        let row_trailing = trailing.filter(|_| index == 0);
+        let area = (text_width, content_width);
+        push_row_content(spec, &styles, content_row, area, row_trailing, &mut spans);
         placements.extend(content_row.placements.iter().map(|placement| Placement {
             column: placement.column + x + prefix,
             ..*placement
@@ -1026,7 +1165,67 @@ fn layout_cell(
         column,
         rows,
         filler,
+        trailing: trailing.map(|(trailing, start)| {
+            let at = x + prefix + start;
+            at..at + trailing.width()
+        }),
     }
+}
+
+/// Append one row's content cells: the text in `area.0` cells (or up to a trailing adornment
+/// painted on this row), then the adornment, or blanks over the reserved cells up to `area.1`
+/// (the whole content area).
+fn push_row_content(
+    spec: &CellSpec<'_>,
+    styles: &ContentStyles,
+    row: &ContentRow,
+    (text_width, content_width): (usize, usize),
+    trailing: Option<(DiffRowTrailing<'_>, usize)>,
+    spans: &mut Vec<Span>,
+) {
+    if let Some((trailing, start)) = trailing {
+        styles.push_content_spans(spec.text, row, start, spans);
+        spans.extend(
+            trailing
+                .spans
+                .iter()
+                .map(|span| Span::styled(span.content.clone(), spec.pad.patch(span.style))),
+        );
+    } else {
+        styles.push_content_spans(spec.text, row, text_width, spans);
+        spans.extend(blank_spans(content_width - text_width, spec.pad));
+    }
+}
+
+/// Content-area column where a trailing adornment starts on the first row, `first`, of a side
+/// whose content area is `content_width` cells and whose adornment `reserved` cells; `None` when
+/// it is not painted.
+fn trailing_start(
+    trailing: DiffRowTrailing<'_>,
+    first: Option<&ContentRow>,
+    content_width: usize,
+    reserved: usize,
+) -> Option<usize> {
+    let cells = trailing.width();
+    if cells == 0 {
+        return None;
+    }
+    if reserved > 0 {
+        return Some(content_width - cells);
+    }
+    if trailing.fit != DiffTrailingFit::IfRoom {
+        return None;
+    }
+    let first = first?;
+    if first.ellipsis.is_some() {
+        return None;
+    }
+    let used = first
+        .placements
+        .last()
+        .map_or(0, |placement| placement.column + placement.width);
+    let gap = if used > 0 { TRAILING_GAP } else { 0 };
+    (content_width >= used + gap + cells).then(|| content_width - cells)
 }
 
 fn gutter_spans(

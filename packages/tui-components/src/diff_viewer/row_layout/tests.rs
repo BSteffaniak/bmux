@@ -841,3 +841,221 @@ fn height_only_measurement_matches_the_laid_out_rows() {
         }
     }
 }
+
+/// Badges of different cell widths: ASCII, a wide CJK grapheme, and an emoji.
+fn badges() -> Vec<Vec<Span>> {
+    vec![
+        vec![Span::styled("[3]", Style::default().fg(Color::Yellow))],
+        vec![Span::raw("["), Span::raw("界"), Span::raw("]")],
+        vec![Span::raw("😀")],
+    ]
+}
+
+const FITS: [DiffTrailingFit; 2] = [DiffTrailingFit::Reserve, DiffTrailingFit::IfRoom];
+
+/// Items whose new side (and unified line) carry `trailing`.
+fn trailing_items<'a>(text: &'a str, trailing: DiffRowTrailing<'a>) -> Vec<DiffRowItem<'a>> {
+    vec![
+        unified(
+            DiffLineKind::Added,
+            DiffRowText::plain(text).with_trailing(trailing),
+        ),
+        DiffRowItem::SideBySide {
+            old: Some(DiffRowCell::new(
+                DiffLineKind::Removed,
+                Some(1),
+                DiffRowText::plain(text),
+            )),
+            new: Some(DiffRowCell::new(
+                DiffLineKind::Added,
+                Some(1),
+                DiffRowText::plain(text).with_trailing(trailing),
+            )),
+        },
+    ]
+}
+
+/// The same item without any trailing adornment.
+fn without_trailing(item: DiffRowItem<'_>) -> DiffRowItem<'_> {
+    fn strip(mut text: DiffRowText<'_>) -> DiffRowText<'_> {
+        text.trailing = None;
+        text
+    }
+    match item {
+        DiffRowItem::Unified {
+            kind,
+            old_line,
+            new_line,
+            text,
+        } => DiffRowItem::Unified {
+            kind,
+            old_line,
+            new_line,
+            text: strip(text),
+        },
+        DiffRowItem::SideBySide { old, new } => DiffRowItem::SideBySide {
+            old: old.map(|cell| DiffRowCell::new(cell.kind, cell.line, strip(cell.text))),
+            new: new.map(|cell| DiffRowCell::new(cell.kind, cell.line, strip(cell.text))),
+        },
+    }
+}
+
+#[test]
+fn trailing_adornments_are_painted_where_reported_and_never_under_content() {
+    for badge in badges() {
+        let expected: String = badge.iter().map(|span| span.content.clone()).collect();
+        for fit in FITS {
+            let trailing = DiffRowTrailing::new(&badge, fit);
+            for text in TEXTS {
+                for width in 0..48_u16 {
+                    for overflow in OVERFLOWS {
+                        let options = options(DiffGutterShape::LineNumbersThenMarker, overflow);
+                        for item in trailing_items(text, trailing) {
+                            let layout = layout_diff_row(item, width, options, &style());
+                            let context = format!("{text:?} {width} {overflow:?} {fit:?}");
+                            for row in layout.rows() {
+                                assert_eq!(painted_width(row), usize::from(width), "{context}");
+                            }
+                            assert_eq!(
+                                diff_row_height(item, width, options),
+                                layout.height(),
+                                "{context}"
+                            );
+                            assert!(layout.trailing().len() <= 1, "{context}");
+                            let buffer = paint(&layout);
+                            for trailing in layout.trailing() {
+                                assert_eq!(trailing.side, DiffSourceSide::New, "{context}");
+                                assert_eq!(trailing.row, 0, "{context}");
+                                assert!(trailing.cells.end <= usize::from(width), "{context}");
+                                let column = layout
+                                    .columns()
+                                    .iter()
+                                    .find(|column| column.side == DiffSourceSide::New)
+                                    .unwrap();
+                                assert!(
+                                    trailing.cells.start >= column.content.start
+                                        && trailing.cells.end == column.content.end,
+                                    "right-aligned in its column's content: {context}"
+                                );
+                                let painted =
+                                    row_text(&buffer, trailing.cells.clone(), 0).replace(' ', "");
+                                assert_eq!(painted, expected, "{context}");
+                                // No source grapheme is painted in the adornment's cells or
+                                // the gap before it.
+                                for segment in layout.segments().iter().filter(|segment| {
+                                    segment.row == 0 && segment.side == DiffSourceSide::New
+                                }) {
+                                    for cell in layout.selection_cells(segment) {
+                                        let end = usize::from(cell.x + cell.width);
+                                        assert!(end < trailing.cells.start, "{context}");
+                                    }
+                                }
+                                let middle = trailing.cells.start;
+                                assert_eq!(
+                                    layout.trailing_at(0, middle).map(|found| &found.cells),
+                                    Some(&trailing.cells),
+                                    "{context}"
+                                );
+                                assert_eq!(layout.trailing_at(1, middle), None, "{context}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn if_room_adornments_keep_the_content_geometry() {
+    for badge in badges() {
+        let trailing = DiffRowTrailing::new(&badge, DiffTrailingFit::IfRoom);
+        for text in TEXTS {
+            for width in 0..48_u16 {
+                for overflow in OVERFLOWS {
+                    let options = options(DiffGutterShape::MarkerThenLineNumber, overflow);
+                    for item in trailing_items(text, trailing) {
+                        let with = layout_diff_row(item, width, options, &style());
+                        let without =
+                            layout_diff_row(without_trailing(item), width, options, &style());
+                        assert_eq!(with.segments(), without.segments(), "{text:?} {width}");
+                        assert_eq!(with.height(), without.height(), "{text:?} {width}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn reserved_adornments_show_on_short_and_long_lines_and_degrade_when_narrow() {
+    let badge = [Span::raw("[12]")];
+    let trailing = DiffRowTrailing::new(&badge, DiffTrailingFit::Reserve);
+    let options = options(
+        DiffGutterShape::LineNumbersThenMarker,
+        DiffRowOverflow::Wrap,
+    );
+    let gutter = options.gutter.unified_width();
+    let long = "a long line of content that keeps going well past the badge";
+    for text in ["short", long] {
+        let item = unified(
+            DiffLineKind::Context,
+            DiffRowText::plain(text).with_trailing(trailing),
+        );
+        let layout = layout_diff_row(item, 40, options, &style());
+        assert_eq!(layout.trailing().len(), 1, "{text}");
+        assert_eq!(layout.trailing()[0].cells, 36..40, "{text}");
+        let buffer = paint(&layout);
+        assert_eq!(row_text(&buffer, 35..40, 0), " [12]", "{text}");
+    }
+    // A long line wraps before the badge, so it may take more rows than without it.
+    let item = unified(DiffLineKind::Context, DiffRowText::plain(long));
+    let reserved = unified(
+        DiffLineKind::Context,
+        DiffRowText::plain(long).with_trailing(trailing),
+    );
+    assert!(diff_row_height(reserved, 40, options) >= diff_row_height(item, 40, options));
+    // Too narrow for the badge, the gap and one content cell: nothing is reserved, and the row
+    // is exactly the row without the badge.
+    for width in 0..48_u16 {
+        let layout = layout_diff_row(reserved, width, options, &style());
+        let plain = layout_diff_row(item, width, options, &style());
+        let content = layout.columns()[0].content.len();
+        if content > 4 + 1 {
+            assert_eq!(layout.trailing().len(), 1, "{width}");
+        } else {
+            assert_eq!(layout.trailing(), [], "{width}");
+            assert_eq!(layout.rows(), plain.rows(), "{width}");
+        }
+    }
+    assert!(gutter > 5);
+}
+
+#[test]
+fn if_room_adornments_are_omitted_when_the_first_row_is_full() {
+    let badge = [Span::raw("[1]")];
+    let trailing = DiffRowTrailing::new(&badge, DiffTrailingFit::IfRoom);
+    let long = "a long line of content that keeps going well past the badge";
+    for overflow in [DiffRowOverflow::Wrap, DiffRowOverflow::Truncate] {
+        let options = options(DiffGutterShape::LineNumbersThenMarker, overflow);
+        let item = unified(
+            DiffLineKind::Added,
+            DiffRowText::plain(long).with_trailing(trailing),
+        );
+        assert_eq!(
+            layout_diff_row(item, 30, options, &style()).trailing(),
+            [],
+            "{overflow:?}"
+        );
+        let short = unified(
+            DiffLineKind::Added,
+            DiffRowText::plain("x").with_trailing(trailing),
+        );
+        assert_eq!(
+            layout_diff_row(short, 30, options, &style())
+                .trailing()
+                .len(),
+            1
+        );
+    }
+}

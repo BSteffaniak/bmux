@@ -17,8 +17,9 @@ pub use intraline::{IntralineChanges, intraline_changed_ranges};
 pub use row_layout::{
     DEFAULT_DIFF_TAB_WIDTH, DiffGutterMode, DiffGutterShape, DiffRowCell, DiffRowCells,
     DiffRowColumn, DiffRowGutter, DiffRowHit, DiffRowHitTarget, DiffRowItem, DiffRowLayout,
-    DiffRowOptions, DiffRowOverflow, DiffRowSegment, DiffRowText, DiffSplitColumns,
-    DiffSyntaxRange, diff_row_height, layout_diff_row,
+    DiffRowOptions, DiffRowOverflow, DiffRowSegment, DiffRowText, DiffRowTrailing,
+    DiffRowTrailingCells, DiffSplitColumns, DiffSyntaxRange, DiffTrailingFit, diff_row_height,
+    layout_diff_row,
 };
 
 /// Syntax-highlighted span content for diff lines.
