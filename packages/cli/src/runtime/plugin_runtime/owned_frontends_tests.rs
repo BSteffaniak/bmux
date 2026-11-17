@@ -268,3 +268,99 @@ fn missing_host_binding_fails_explicitly_and_backends_are_not_owned() {
         });
     });
 }
+
+const PROBE_STATE: bmux_plugin_sdk::PluginEventKind =
+    bmux_plugin_sdk::PluginEventKind::from_static("example.frontend/probe-state");
+
+/// Publishes into the bus its activation was handed and holds its registry.
+struct HandleProbe(Arc<Mutex<Option<Arc<bmux_plugin::PluginStateRegistry>>>>);
+impl PluginInstance for HandleProbe {
+    fn activate(&self, context: PluginLifecycleContext) -> PluginFuture<'_, PluginResult<()>> {
+        let held = self.0.clone();
+        Box::pin(async move {
+            let bus = bmux_plugin::take_activation_event_bus(&context.capabilities)?;
+            bus.publish_state(&PROBE_STATE, 7_u32).map_err(|error| {
+                bmux_plugin_sdk::PluginCommandError::unavailable(error.to_string())
+            })?;
+            let states = bmux_plugin::take_activation_state_registry(&context.capabilities)?;
+            *held.lock().unwrap() = Some(states);
+            Ok(())
+        })
+    }
+    fn command(
+        &self,
+        _: PluginCallContext,
+        _: bmux_plugin_sdk::NativeCommandContext,
+    ) -> PluginFuture<'_, CommandOutcome> {
+        Box::pin(async { CommandOutcome::from(PluginResult::Ok(0)) })
+    }
+}
+
+#[test]
+fn owner_offers_its_event_bus_and_state_registry_to_frontends() {
+    with_runtime(|owner, paths| {
+        let plugin_id = format!("example.frontend-{}", uuid::Uuid::new_v4());
+        let manifest = format!(
+            "id='{plugin_id}'\nname='Frontend probe'\nversion='1.0.0'\ncomponent_roles=['frontend']\n"
+        );
+        let held: Arc<Mutex<Option<Arc<bmux_plugin::PluginStateRegistry>>>> = Arc::default();
+        let factory_held = held.clone();
+        let definition = PluginDefinition::new(
+            PluginMetadata {
+                plugin_id: plugin_id.clone(),
+                version: "1.0.0".into(),
+                roles: vec![ComponentRole::Frontend],
+                required_capabilities: Vec::new(),
+                contracts: Vec::new(),
+                manifest_toml: Some(manifest),
+            },
+            move |_| Ok(Arc::new(HandleProbe(factory_held.clone())) as Arc<dyn PluginInstance>),
+        );
+        let embedded = register_bundled_definition(&plugin_id, definition).unwrap();
+        let mut registry = bmux_plugin::PluginRegistry::new();
+        registry.register_bundled_manifest(&embedded).unwrap();
+        let state = build_runtime_command_state(
+            BmuxConfig::default(),
+            paths,
+            Arc::new(registry),
+            Some(&owner),
+        )
+        .unwrap();
+
+        let events = Arc::new(bmux_plugin::EventBus::new());
+        let _channel = events.register_state_channel::<u32>(PROBE_STATE, 0);
+        let states = Arc::new(bmux_plugin::PluginStateRegistry::new());
+        let frontends = Arc::new(
+            OwnedFrontends::new(Arc::new(
+                |_: &ActivationScope, _: &ActivationCapabilities| Ok(()),
+            ))
+            .with_host_handles(events.clone(), states),
+        );
+        let worker_frontends = frontends.clone();
+        let worker_state = state.clone();
+        owner.handle().block_on(async move {
+            tokio::task::spawn_blocking(move || {
+                let _selected = SelectedCommandStateGuard::enter(&worker_state);
+                let plugin = worker_state.registry.get(&plugin_id).unwrap();
+                let context = command_context(&worker_state, plugin);
+                worker_frontends
+                    .instance(plugin, &worker_state, &context)
+                    .unwrap()
+                    .expect("frontend-only plugin is host-owned");
+            })
+            .await
+            .unwrap();
+        });
+        let (published, _) = events.subscribe_state::<u32>(&PROBE_STATE).unwrap();
+        assert_eq!(*published, 7, "frontend published on the owner's bus");
+        assert!(
+            held.lock().unwrap().is_some(),
+            "frontend received a state registry"
+        );
+
+        owner
+            .handle()
+            .block_on(frontends.deactivate_all(&state))
+            .unwrap();
+    });
+}

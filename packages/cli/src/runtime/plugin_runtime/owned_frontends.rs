@@ -22,7 +22,15 @@ use std::sync::{Arc, Mutex};
 
 pub struct OwnedFrontends {
     binder: Arc<bmux_plugin::ActivationBinder>,
+    host_handles: Option<HostHandles>,
     instances: Mutex<BTreeMap<String, ProductionPlugin>>,
+}
+
+/// The owner's event bus and plugin state registry, offered to each frontend
+/// activation as scoped views (as the server does for its plugins).
+struct HostHandles {
+    events: Arc<bmux_plugin::EventBus>,
+    states: Arc<bmux_plugin::PluginStateRegistry>,
 }
 
 impl OwnedFrontends {
@@ -30,8 +38,21 @@ impl OwnedFrontends {
     pub fn new(binder: Arc<bmux_plugin::ActivationBinder>) -> Self {
         Self {
             binder,
+            host_handles: None,
             instances: Mutex::new(BTreeMap::new()),
         }
+    }
+
+    /// Also offer each frontend activation scoped views of the owner's event
+    /// bus and plugin state registry.
+    #[must_use]
+    pub fn with_host_handles(
+        mut self,
+        events: Arc<bmux_plugin::EventBus>,
+        states: Arc<bmux_plugin::PluginStateRegistry>,
+    ) -> Self {
+        self.host_handles = Some(HostHandles { events, states });
+        self
     }
 
     /// The owner's activated instance of `plugin`, created on first use.
@@ -81,6 +102,13 @@ impl OwnedFrontends {
                      (only bundled in-process frontends can)"
                 )
             })?;
+        if let Some(handles) = &self.host_handles {
+            loaded
+                .bind_host_handles(&handles.events, &handles.states)
+                .with_context(|| {
+                    format!("frontend plugin '{id}' cannot receive this host's handles")
+                })?;
+        }
         if let Err(error) = loaded.activate_owned(context) {
             // Settle the failed activation's cleanup on this blocking worker so
             // it does not pin the runtime; report the activation failure.

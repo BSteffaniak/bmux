@@ -5307,8 +5307,14 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     let compatibility_hosts = embedder_frontend_bindings.is_none();
     let mut frontend_bindings = embedder_frontend_bindings.or_else(|| {
         let (registrar, bindings) = super::frontend_bindings::FrontendBindings::channel();
+        // Frontends see this attachment's presentation bus and their own
+        // state registry, never process-wide copies.
         view_state.owned_frontends = Some(std::sync::Arc::new(
-            crate::runtime::plugin_runtime::OwnedFrontends::new(registrar.activation_binder()),
+            crate::runtime::plugin_runtime::OwnedFrontends::new(registrar.activation_binder())
+                .with_host_handles(
+                    presentation_events.clone(),
+                    std::sync::Arc::new(bmux_plugin::PluginStateRegistry::new()),
+                ),
         ));
         Some(bindings)
     });
