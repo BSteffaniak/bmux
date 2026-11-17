@@ -111,7 +111,7 @@ fn placement(pixels: &PixelBuffer) -> ImagePlacement {
         allocation: None,
         key: ImageKey::new("fixed-image"),
         payload: TuiPayload::Pixels {
-            bytes: pixels.data.clone(),
+            bytes: pixels.data.clone().into(),
             width: pixels.width,
             height: pixels.height,
             format: ImagePixelFormat::Rgba8,
@@ -160,7 +160,9 @@ fn tui_cases(
             }
             "replacement" => {
                 if let TuiPayload::Pixels { bytes, .. } = &mut image.payload {
-                    bytes[0] ^= 255;
+                    let mut replaced = bytes.to_vec();
+                    replaced[0] ^= 255;
+                    *bytes = replaced.into();
                 }
             }
             _ => {}

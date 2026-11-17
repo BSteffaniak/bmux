@@ -48,13 +48,17 @@ pub enum ImagePixelFormat {
 }
 
 /// Protocol-neutral image payload.
+///
+/// The bytes are shared: a producer that contributes the same image every frame (and the scene
+/// that keeps it, and an observer's copy of that scene) holds one allocation, and comparing two
+/// placements of it compares pointers before bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ImagePayload {
     /// PNG-encoded image bytes and their decoded dimensions.
     Png {
         /// Encoded PNG bytes.
-        bytes: Vec<u8>,
+        bytes: std::sync::Arc<[u8]>,
         /// Decoded pixel width.
         width: u32,
         /// Decoded pixel height.
@@ -63,7 +67,7 @@ pub enum ImagePayload {
     /// Uncompressed pixels and their dimensions.
     Pixels {
         /// Pixel bytes in `format` order.
-        bytes: Vec<u8>,
+        bytes: std::sync::Arc<[u8]>,
         /// Pixel width.
         width: u32,
         /// Pixel height.
@@ -217,7 +221,7 @@ mod tests {
             allocation: None,
             key: ImageKey::new("default-fit"),
             payload: ImagePayload::Png {
-                bytes: vec![],
+                bytes: vec![].into(),
                 width: 100,
                 height: 100,
             },
@@ -240,7 +244,7 @@ mod tests {
             allocation: None,
             key: ImageKey::new("fit"),
             payload: ImagePayload::Pixels {
-                bytes: vec![],
+                bytes: vec![].into(),
                 width: 100,
                 height: 100,
                 format: super::ImagePixelFormat::Rgba8,
@@ -251,7 +255,7 @@ mod tests {
         };
         for (width, height) in [(100, 100), (1100, 350), (100, 800)] {
             placement.payload = ImagePayload::Png {
-                bytes: vec![],
+                bytes: vec![].into(),
                 width,
                 height,
             };
@@ -266,7 +270,7 @@ mod tests {
             }
         }
         placement.payload = ImagePayload::Png {
-            bytes: vec![],
+            bytes: vec![].into(),
             width: 100,
             height: 100,
         };
@@ -291,7 +295,7 @@ mod tests {
             allocation: None,
             key: ImageKey::new("diagram:turn-1"),
             payload: ImagePayload::Png {
-                bytes: vec![1, 2, 3],
+                bytes: vec![1, 2, 3].into(),
                 width: 320,
                 height: 200,
             },

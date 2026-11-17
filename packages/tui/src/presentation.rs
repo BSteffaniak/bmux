@@ -742,7 +742,7 @@ impl PreparedPresentation {
     }
 }
 
-const fn payload_bytes(payload: &ImagePayload) -> usize {
+fn payload_bytes(payload: &ImagePayload) -> usize {
     match payload {
         ImagePayload::Png { bytes, .. } | ImagePayload::Pixels { bytes, .. } => bytes.len(),
     }
@@ -1082,6 +1082,19 @@ impl PresentationState {
     pub(crate) fn install_painted_over(&mut self, buffer: Buffer, cursor: Option<Cursor>) {
         self.previous = Some(Arc::new(buffer));
         self.cursor = cursor;
+    }
+
+    /// Commit the image set a frame painted over the committed one declared, with the scene and
+    /// change it reconciles to.
+    pub(crate) fn install_painted_images(
+        &mut self,
+        images: Vec<ImageContribution>,
+        image_scene: ImageScene,
+        image_delta: ImageSceneDelta,
+    ) {
+        self.images = images;
+        self.image_scene = image_scene;
+        self.image_delta = image_delta;
     }
 
     /// The presentation clock frames paint with.
@@ -2288,7 +2301,7 @@ mod tests {
         let source = ImagePlacement {
             key: ImageKey::new("background"),
             payload: ImagePayload::Pixels {
-                bytes: vec![1, 2, 3],
+                bytes: vec![1, 2, 3].into(),
                 width: 1,
                 height: 1,
                 format: ImagePixelFormat::Rgb8,
@@ -2392,7 +2405,7 @@ mod tests {
         let source = ImagePlacement {
             key: ImageKey::new("persistent"),
             payload: ImagePayload::Pixels {
-                bytes: vec![1, 2, 3],
+                bytes: vec![1, 2, 3].into(),
                 width: 1,
                 height: 1,
                 format: ImagePixelFormat::Rgb8,

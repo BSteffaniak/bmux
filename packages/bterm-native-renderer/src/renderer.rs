@@ -806,7 +806,7 @@ mod tests {
         let placement = ImagePlacement {
             key: ImageKey::new("local"),
             payload: ImagePayload::Pixels {
-                bytes: vec![255; 16],
+                bytes: vec![255; 16].into(),
                 width: 2,
                 height: 2,
                 format: ImagePixelFormat::Rgba8,

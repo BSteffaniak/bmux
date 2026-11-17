@@ -237,12 +237,12 @@ impl ResourceRequirement {
         }
         let payload = match self.format {
             None => ImagePayload::Png {
-                bytes,
+                bytes: bytes.into(),
                 width: self.width,
                 height: self.height,
             },
             Some(format) => ImagePayload::Pixels {
-                bytes,
+                bytes: bytes.into(),
                 width: self.width,
                 height: self.height,
                 format,
@@ -753,7 +753,7 @@ pub fn decode_binary_with_resources(
                         bytes.clone()
                     }
                 };
-                let payload = image.resource.with_bytes(bytes)?.payload;
+                let payload = image.resource.with_bytes(bytes.to_vec())?.payload;
                 // Reconcile in one batch: frame-scoped images must not expire
                 // while reconstructing other placements in the same snapshot.
                 let placement = ImagePlacement {

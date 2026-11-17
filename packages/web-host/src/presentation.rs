@@ -130,7 +130,7 @@ impl BrowserPublisher {
                 (
                     resource.id,
                     Resource {
-                        bytes: bytes.into(),
+                        bytes,
                         mime_type: mime_type.to_owned(),
                     },
                 )

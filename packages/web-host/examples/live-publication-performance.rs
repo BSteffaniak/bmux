@@ -207,7 +207,7 @@ mod harness {
                     paint.push_image(ImageContribution::Present(ImagePlacement {
                         key: ImageKey::new("performance-owner/image"),
                         payload: ImagePayload::Pixels {
-                            bytes: vec![if changed { 192 } else { 64 }; 256 * 256 * 4],
+                            bytes: vec![if changed { 192 } else { 64 }; 256 * 256 * 4].into(),
                             width: 256,
                             height: 256,
                             format: ImagePixelFormat::Rgba8,

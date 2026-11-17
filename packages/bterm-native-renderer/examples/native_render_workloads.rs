@@ -58,7 +58,7 @@ fn prepare_png() -> Result<(), image::ImageError> {
         image::ExtendedColorType::Rgba8,
     )?;
     let _ = PNG_PAYLOAD.set(ImagePayload::Png {
-        bytes,
+        bytes: bytes.into(),
         width: 128,
         height: 128,
     });
@@ -99,7 +99,7 @@ fn install_local_grids(
         let image = Arc::new(ImagePlacement {
             key: ImageKey::new(id),
             payload: ImagePayload::Pixels {
-                bytes: [32, 180, 240, 255].repeat(16 * 16),
+                bytes: [32, 180, 240, 255].repeat(16 * 16).into(),
                 width: 16,
                 height: 16,
                 format: ImagePixelFormat::Rgba8,
@@ -166,7 +166,7 @@ fn paint(cx: &mut PaintCx<'_, '_>, case: &str, frame: usize) {
                     .clone()
             } else {
                 ImagePayload::Pixels {
-                    bytes: pixel.repeat(128 * 128),
+                    bytes: pixel.repeat(128 * 128).into(),
                     width: 128,
                     height: 128,
                     format: ImagePixelFormat::Rgba8,

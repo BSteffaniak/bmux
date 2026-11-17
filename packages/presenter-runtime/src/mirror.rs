@@ -233,7 +233,7 @@ impl MirrorFrame {
             }
             let payload = match payload {
                 WireImagePayload::Png { width, height, .. } => WireImagePayload::Png {
-                    bytes: payload_bytes.clone(),
+                    bytes: payload_bytes.to_vec(),
                     width,
                     height,
                 },
@@ -243,7 +243,7 @@ impl MirrorFrame {
                     rgba,
                     ..
                 } => WireImagePayload::Pixels {
-                    bytes: payload_bytes.clone(),
+                    bytes: payload_bytes.to_vec(),
                     width,
                     height,
                     rgba,
@@ -471,13 +471,19 @@ fn validate_images(
             bytes,
             width,
             height,
-        } => (bytes, *width, *height, 4_usize, true),
+        } => (bytes.as_slice(), *width, *height, 4_usize, true),
         WireImagePayload::Pixels {
             bytes,
             width,
             height,
             rgba,
-        } => (bytes, *width, *height, if *rgba { 4 } else { 3 }, false),
+        } => (
+            bytes.as_slice(),
+            *width,
+            *height,
+            if *rgba { 4 } else { 3 },
+            false,
+        ),
     });
     let terminal = frame.playbook.iter().flat_map(|playbook| {
         playbook
@@ -489,14 +495,14 @@ fn validate_images(
                     bytes,
                     width,
                     height,
-                } => (bytes, *width, *height, 4_usize, true),
+                } => (&**bytes, *width, *height, 4_usize, true),
                 ImagePayload::Pixels {
                     bytes,
                     width,
                     height,
                     format,
                 } => (
-                    bytes,
+                    &**bytes,
                     *width,
                     *height,
                     if *format == ImagePixelFormat::Rgba8 {
@@ -627,7 +633,7 @@ impl MirrorFrame {
                         width,
                         height,
                     } => ImagePayload::Png {
-                        bytes: bytes.clone(),
+                        bytes: bytes.clone().into(),
                         width: *width,
                         height: *height,
                     },
@@ -637,7 +643,7 @@ impl MirrorFrame {
                         height,
                         rgba,
                     } => ImagePayload::Pixels {
-                        bytes: bytes.clone(),
+                        bytes: bytes.clone().into(),
                         width: *width,
                         height: *height,
                         format: if *rgba {

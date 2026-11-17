@@ -537,7 +537,7 @@ mod audience_tests {
                 cx.push_image(ImageContribution::Present(ImagePlacement {
                     key: ImageKey::new("private-session-image"),
                     payload: ImagePayload::Pixels {
-                        bytes: vec![255, 0, 0, 255],
+                        bytes: vec![255, 0, 0, 255].into(),
                         width: 1,
                         height: 1,
                         format: bmux_tui::image::ImagePixelFormat::Rgba8,

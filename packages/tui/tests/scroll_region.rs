@@ -365,7 +365,7 @@ fn image_placements_disable_scroll_regions() {
         cx.push_image(ImageContribution::Present(ImagePlacement {
             key: ImageKey::new("picture"),
             payload: ImagePayload::Png {
-                bytes: Vec::new(),
+                bytes: Vec::new().into(),
                 width: 1,
                 height: 1,
             },
@@ -718,7 +718,7 @@ fn an_image_stops_only_the_scroll_it_overlaps() {
         cx.push_image(ImageContribution::Present(ImagePlacement {
             key: ImageKey::new("picture"),
             payload: ImagePayload::Png {
-                bytes: Vec::new(),
+                bytes: Vec::new().into(),
                 width: 1,
                 height: 1,
             },

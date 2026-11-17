@@ -229,7 +229,7 @@ impl AudienceRenderer {
             return Err("audience image pixel limit".into());
         }
         let payload = ImagePayload::Png {
-            bytes: bytes.to_vec(),
+            bytes: bytes.to_vec().into(),
             width: image.width(),
             height: image.height(),
         };
@@ -1361,7 +1361,7 @@ mod tests {
                 cx.push_image(ImageContribution::Present(ImagePlacement {
                     key: ImageKey::new("pixel"),
                     payload: ImagePayload::Pixels {
-                        bytes: vec![255; 4],
+                        bytes: vec![255; 4].into(),
                         width: 1,
                         height: 1,
                         format: ImagePixelFormat::Rgba8,
@@ -1459,7 +1459,7 @@ mod tests {
         let resource = Resource {
             bytes: vec![],
             image: ImagePayload::Png {
-                bytes: vec![0; 1024],
+                bytes: vec![0; 1024].into(),
                 width: 4096,
                 height: 4096,
             },
@@ -1476,7 +1476,7 @@ mod tests {
             Resource {
                 bytes: vec![],
                 image: ImagePayload::Png {
-                    bytes: vec![0; MAX_RESOURCE_BYTES],
+                    bytes: vec![0; MAX_RESOURCE_BYTES].into(),
                     width: 1,
                     height: 1,
                 },

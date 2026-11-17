@@ -974,7 +974,7 @@ fn place_graphic_overlay(
         return;
     }
     let raw = bmux_tui::image::ImagePayload::Pixels {
-        bytes: terminal_graphic_pixels(graphic),
+        bytes: terminal_graphic_pixels(graphic).into(),
         width: graphic.pixel_width,
         height: graphic.pixel_height,
         format: bmux_tui::image::ImagePixelFormat::Rgba8,

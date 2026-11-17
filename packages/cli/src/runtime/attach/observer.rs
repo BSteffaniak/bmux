@@ -938,7 +938,7 @@ pub(super) fn observed_image_payload(
         bmux_attach_image_protocol::AttachImageProtocol::KittyGraphics => {
             // The authoritative registry normalizes completed Kitty transfers to PNG.
             Ok(ImagePayload::Png {
-                bytes: native.payload.raw.ok_or("missing Kitty image")?,
+                bytes: native.payload.raw.ok_or("missing Kitty image")?.into(),
                 width: image.pixel_width,
                 height: image.pixel_height,
             })
@@ -951,7 +951,7 @@ pub(super) fn observed_image_payload(
                 )
                 .ok_or("invalid iTerm image")?;
                 Ok(ImagePayload::Png {
-                    bytes,
+                    bytes: bytes.into(),
                     width: image.pixel_width,
                     height: image.pixel_height,
                 })
@@ -974,7 +974,7 @@ pub(super) fn observed_image_payload(
                 )
                 .ok_or("invalid sixel image")?;
                 Ok(ImagePayload::Pixels {
-                    bytes: pixels.data,
+                    bytes: pixels.data.into(),
                     width: pixels.width,
                     height: pixels.height,
                     format: match pixels.format {
@@ -1309,7 +1309,7 @@ mod tests {
         };
         let mut cache = ImagePayloadCache::default();
         let payload = bmux_tui::image::ImagePayload::Png {
-            bytes: vec![4],
+            bytes: vec![4].into(),
             width: 1,
             height: 1,
         };

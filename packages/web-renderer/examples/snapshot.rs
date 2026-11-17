@@ -69,7 +69,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 payload: ImagePayload::Pixels {
                     bytes: vec![
                         255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 128,
-                    ],
+                    ]
+                    .into(),
                     width: 2,
                     height: 2,
                     format: ImagePixelFormat::Rgba8,

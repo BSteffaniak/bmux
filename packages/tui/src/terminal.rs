@@ -875,19 +875,21 @@ impl<W: Write> Terminal<W> {
                 .map_err(TryDrawError::Io);
         };
         let area = buffer.area();
-        let (outcome, mut changes, cursor) = {
+        let (outcome, mut changes, cursor, declared_images) = {
             let mut frame = Frame::new(&mut buffer);
             frame.set_clock(self.state.clock());
             frame.track_over(self.over_storage.take());
             let outcome = PresentationPhase::Paint
                 .measure(|| render(&mut PaintCx::new(&mut frame)), |_| true);
             let cursor = frame.cursor();
+            let declared_images = frame.images_declared().then(|| frame.take_images());
             (
                 outcome,
                 frame
                     .take_over()
                     .unwrap_or_else(|| OverChanges::empty(area)),
                 cursor,
+                declared_images,
             )
         };
         let extra_output = match outcome {
@@ -900,16 +902,30 @@ impl<W: Write> Terminal<W> {
                 return Err(TryDrawError::Rejected(rejection));
             }
         };
-        // Painting nothing, with the cursor where it was and nothing else to write, changes
-        // nothing.
+        // A frame that declared its image set replaces the scene with it; one that did not keeps
+        // the scene.
+        let images = declared_images.map(|(images, occlusions)| {
+            let mut scene = self.state.image_scene().clone();
+            let delta = scene.reconcile_occluded(&images, &occlusions);
+            (images, scene, delta)
+        });
+        let image_delta_empty = images
+            .as_ref()
+            .is_none_or(|(_, _, delta)| delta.upserted.is_empty() && delta.removed.is_empty());
+        // Painting nothing, with the cursor where it was, the images as they were and nothing
+        // else to write, changes nothing.
         if skip_unchanged
             && !extra_output
+            && image_delta_empty
             && changes.is_clean()
             && changes.moves.is_empty()
             && cursor == self.state.cursor()
         {
             self.over_storage = Some(changes);
             self.state.install_painted_over(buffer, cursor);
+            if let Some((images, scene, delta)) = images {
+                self.state.install_painted_images(images, scene, delta);
+            }
             self.committed_damage = Damage::None;
             self.applied_scrolls.clear();
             self.last_over = true;
@@ -920,6 +936,9 @@ impl<W: Write> Terminal<W> {
             let changed_cells = changes.marked_cells();
             self.over_storage = Some(changes);
             self.state.install_painted_over(buffer, cursor);
+            if let Some((images, scene, delta)) = images {
+                self.state.install_painted_images(images, scene, delta);
+            }
             self.committed_damage = Damage::Regions(Vec::new());
             self.applied_scrolls.clear();
             self.last_over = true;
@@ -928,7 +947,11 @@ impl<W: Write> Terminal<W> {
                 full_repaint: false,
             }));
         }
-        let scrolls = self.over_scrolls(&mut changes, area);
+        let scrolls = self.over_scrolls(
+            &mut changes,
+            area,
+            images.as_ref().map(|(_, scene, _)| scene),
+        );
         let position = self.pointer_position;
         let shape = match resolve_pointer_intent(
             self.state.hits(),
@@ -947,7 +970,11 @@ impl<W: Write> Terminal<W> {
         let synchronized = self.synchronized_output;
         let writer = &mut self.writer;
         let encoded = &mut self.encoded;
-        let image_scene = self.state.image_scene();
+        let no_delta = ImageSceneDelta::default();
+        let (image_scene, image_delta) = images.as_ref().map_or_else(
+            || (self.state.image_scene(), &no_delta),
+            |(_, scene, delta)| (scene, delta),
+        );
         let result = (|| -> io::Result<DrawStats> {
             let stats = write_synchronized(writer, synchronized, |writer| {
                 let repaint = before(writer)?;
@@ -963,7 +990,7 @@ impl<W: Write> Terminal<W> {
                     Result::is_ok,
                 )?;
                 writer.write_all(encoded)?;
-                overlay(writer, image_scene, &ImageSceneDelta::default())?;
+                overlay(writer, image_scene, image_delta)?;
                 if let Some(transaction) = &transaction {
                     writer.write_all(transaction.bytes())?;
                 }
@@ -979,6 +1006,9 @@ impl<W: Write> Terminal<W> {
         match result {
             Ok(stats) => {
                 self.state.install_painted_over(buffer, cursor);
+                if let Some((images, scene, delta)) = images {
+                    self.state.install_painted_images(images, scene, delta);
+                }
                 self.committed_damage = Damage::Regions(Vec::new());
                 self.applied_scrolls = scrolls;
                 self.last_over = true;
@@ -996,11 +1026,18 @@ impl<W: Write> Terminal<W> {
     /// The scrolls that show a frame's moves, all of them or none: a move the terminal cannot
     /// hold (an image under it, no left/right margins for a narrow area, a shift as tall as
     /// the area) leaves every moved area to be rewritten.
-    fn over_scrolls(&self, changes: &mut OverChanges, area: Rect) -> Vec<AppliedScroll> {
+    fn over_scrolls(
+        &self,
+        changes: &mut OverChanges,
+        area: Rect,
+        next_images: Option<&ImageScene>,
+    ) -> Vec<AppliedScroll> {
+        // Images shown now and images about to be shown alike.
         let images: Vec<Rect> = self
             .state
             .image_scene()
             .placements()
+            .chain(next_images.into_iter().flat_map(ImageScene::placements))
             .map(|placement| placement.destination.intersection(placement.clip))
             .collect();
         let shown = changes.moves.iter().all(|moved| {
@@ -1569,6 +1606,101 @@ mod tests {
                 .trim_end(),
             "there"
         );
+    }
+
+    /// A frame painted in place that declares its images replaces the image scene with them and
+    /// hands the change to the output hook; one that does not keeps the scene; an unchanged
+    /// image set writes nothing; images-only occlusion hides images without touching cells.
+    #[test]
+    fn frames_painted_over_carry_declared_images() {
+        let placement = |key: &str, x: u16| ImagePlacement {
+            key: ImageKey::new(key),
+            payload: ImagePayload::Png {
+                bytes: std::sync::Arc::from(&b"png"[..]),
+                width: 1,
+                height: 1,
+            },
+            destination: Rect::new(x, 0, 2, 1),
+            fit: crate::image::ImageFit::default(),
+            allocation: None,
+            clip: Rect::new(x, 0, 2, 1),
+            lifecycle: ImageLifecycle::Frame,
+        };
+        let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 10, 2));
+        terminal
+            .draw(|cx| cx.replace_cells(0, 1, sized("x")))
+            .unwrap();
+        let mut deltas = Vec::new();
+        let mut frame = |terminal: &mut Terminal<Vec<u8>>,
+                         images: Option<Vec<ImagePlacement>>,
+                         occlude: Option<Rect>| {
+            let mut seen = None;
+            let drawn = terminal
+                .try_draw_over_with_output_hooks(
+                    |cx| {
+                        if let Some(images) = images {
+                            cx.declare_images();
+                            for image in images {
+                                cx.push_image(ImageContribution::Present(image));
+                            }
+                        }
+                        if let Some(area) = occlude {
+                            cx.occlude_images(LocalRect::terminal(area));
+                        }
+                        Ok::<_, ()>(false)
+                    },
+                    |_| Ok(false),
+                    |_, _, delta| {
+                        seen = Some(delta.clone());
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            deltas.push(seen);
+            drawn
+        };
+        assert!(frame(&mut terminal, Some(vec![placement("a", 0)]), None).is_some());
+        assert_eq!(terminal.image_scene().placements().len(), 1);
+        assert!(
+            frame(&mut terminal, Some(vec![placement("a", 0)]), None).is_none(),
+            "an unchanged image set writes nothing"
+        );
+        assert!(frame(&mut terminal, None, None).is_none());
+        assert_eq!(
+            terminal.image_scene().placements().len(),
+            1,
+            "undeclared keeps"
+        );
+        assert!(frame(&mut terminal, Some(Vec::new()), None).is_some());
+        assert_eq!(
+            terminal.image_scene().placements().len(),
+            0,
+            "declared empty removes"
+        );
+        assert!(
+            frame(
+                &mut terminal,
+                Some(vec![placement("b", 4)]),
+                Some(Rect::new(0, 0, 10, 1))
+            )
+            .is_none(),
+            "a wholly occluded image shows nothing, so nothing changes"
+        );
+        assert_eq!(terminal.image_scene().placements().len(), 0);
+        assert_eq!(
+            terminal
+                .retained_buffer()
+                .unwrap()
+                .row_symbols(1)
+                .unwrap()
+                .trim_end(),
+            "x",
+            "images-only occlusion leaves cells alone"
+        );
+        let first = deltas[0].as_ref().expect("the first frame wrote");
+        assert_eq!(first.upserted.len(), 1);
+        let removal = deltas[3].as_ref().expect("the removal wrote");
+        assert_eq!(removal.removed, vec![ImageKey::new("a")]);
     }
 
     /// A frame painted in place writes the cells that change, not every cell it is given.
@@ -2153,7 +2285,7 @@ mod tests {
                     allocation: None,
                     key: ImageKey::new("committed"),
                     payload: ImagePayload::Pixels {
-                        bytes: vec![1, 2, 3, 4],
+                        bytes: vec![1, 2, 3, 4].into(),
                         width: 1,
                         height: 1,
                         format: crate::image::ImagePixelFormat::Rgba8,
@@ -2173,7 +2305,7 @@ mod tests {
                     allocation: None,
                     key: ImageKey::new("speculative"),
                     payload: ImagePayload::Pixels {
-                        bytes: vec![5, 6, 7, 8],
+                        bytes: vec![5, 6, 7, 8].into(),
                         width: 1,
                         height: 1,
                         format: crate::image::ImagePixelFormat::Rgba8,
@@ -2637,7 +2769,7 @@ mod tests {
             allocation: None,
             key: ImageKey::new("diagram"),
             payload: ImagePayload::Png {
-                bytes: vec![1, 2, 3],
+                bytes: vec![1, 2, 3].into(),
                 width: 1,
                 height: 1,
             },

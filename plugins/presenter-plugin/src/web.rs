@@ -463,7 +463,7 @@ fn audience_document(
             Ok(bmux_presenter_runtime::Asset {
                 id: id.clone(),
                 media_type: "image/png".into(),
-                bytes: bytes.clone(),
+                bytes: bytes.to_vec(),
             })
         })
         .collect::<Result<Vec<_>>>()?;

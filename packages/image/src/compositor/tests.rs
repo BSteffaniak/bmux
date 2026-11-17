@@ -1120,7 +1120,7 @@ fn frozen_native_png_matches_checked_wire_and_skips_only_warm_scans() {
     let mut placement = ImagePlacement {
         key: ImageKey::new("frozen-wire-reference"),
         payload: bmux_tui::image::ImagePayload::Png {
-            bytes: pixels.data.clone(),
+            bytes: pixels.data.clone().into(),
             width: 16,
             height: 16,
         },
@@ -1174,7 +1174,7 @@ fn native_png_warm_placement_scans_content_without_cloning_payload() {
         let placement = ImagePlacement {
             key: ImageKey::new("native-png-work"),
             payload: bmux_tui::image::ImagePayload::Png {
-                bytes: pixels.data.clone(),
+                bytes: pixels.data.clone().into(),
                 width: side,
                 height: side,
             },

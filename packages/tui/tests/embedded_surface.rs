@@ -175,7 +175,7 @@ fn native_image_validation_bounds_payloads_and_decoded_resources() {
     for (payload, expected) in [
         (
             ImagePayload::Pixels {
-                bytes: vec![0; 3],
+                bytes: vec![0; 3].into(),
                 width: 1,
                 height: 1,
                 format: ImagePixelFormat::Rgba8,
@@ -184,7 +184,7 @@ fn native_image_validation_bounds_payloads_and_decoded_resources() {
         ),
         (
             ImagePayload::Pixels {
-                bytes: vec![],
+                bytes: vec![].into(),
                 width: 4097,
                 height: 1,
                 format: ImagePixelFormat::Rgb8,
@@ -193,7 +193,7 @@ fn native_image_validation_bounds_payloads_and_decoded_resources() {
         ),
         (
             ImagePayload::Png {
-                bytes: vec![0; 10],
+                bytes: vec![0; 10].into(),
                 width: 1,
                 height: 1,
             },
@@ -253,7 +253,7 @@ fn valid_png_is_admitted_once_and_paints_from_the_retained_scene() {
         identity(1),
         Arc::new(Buffer::empty(Rect::new(0, 0, 2, 1))),
         Arc::new(image(ImagePayload::Png {
-            bytes,
+            bytes: bytes.into(),
             width: 1,
             height: 1,
         })),
@@ -273,7 +273,7 @@ fn valid_png_is_admitted_once_and_paints_from_the_retained_scene() {
 #[test]
 fn persistent_source_images_are_frame_scoped_in_the_embedding() {
     let images = Arc::new(image(ImagePayload::Pixels {
-        bytes: vec![0; 4],
+        bytes: vec![0; 4].into(),
         width: 1,
         height: 1,
         format: ImagePixelFormat::Rgba8,

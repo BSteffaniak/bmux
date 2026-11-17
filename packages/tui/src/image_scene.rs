@@ -321,7 +321,7 @@ mod tests {
             allocation: None,
             key: ImageKey::new(key),
             payload: ImagePayload::Png {
-                bytes: vec![1, 2, 3],
+                bytes: vec![1, 2, 3].into(),
                 width: 1,
                 height: 1,
             },
@@ -412,7 +412,7 @@ mod tests {
         for bytes in [4, 65_536] {
             let mut image = placement("warm", 0, ImageLifecycle::Persistent);
             image.payload = ImagePayload::Pixels {
-                bytes: vec![7; bytes],
+                bytes: vec![7; bytes].into(),
                 width: 1,
                 height: u32::try_from(bytes / 4).unwrap(),
                 format: crate::image::ImagePixelFormat::Rgba8,

@@ -966,7 +966,7 @@ fn decode_payload_cancellable(
             width,
             height,
             format,
-            data: bytes,
+            data: bytes.to_vec(),
         }),
     })
 }
@@ -1399,7 +1399,7 @@ mod tests {
             .write_image(&pixels, 8, 4, image::ColorType::Rgba8.into())
             .unwrap();
         ImagePayload::Png {
-            bytes,
+            bytes: bytes.into(),
             width: 8,
             height: 4,
         }
@@ -1828,7 +1828,7 @@ mod tests {
         );
         placed.fit = bmux_tui::image::ImageFit::Contain;
         placed.payload = ImagePayload::Png {
-            bytes: bytes.into_inner(),
+            bytes: bytes.into_inner().into(),
             width: 20,
             height: 20,
         };
@@ -1896,7 +1896,7 @@ mod tests {
             );
             placed.fit = bmux_tui::image::ImageFit::default();
             placed.payload = ImagePayload::Png {
-                bytes: bytes.to_vec(),
+                bytes: bytes.to_vec().into(),
                 width: decoded.width(),
                 height: decoded.height(),
             };
@@ -2247,7 +2247,7 @@ mod tests {
             .write_to(&mut png, image::ImageFormat::Png)
             .unwrap();
             placed.payload = ImagePayload::Png {
-                bytes: png.into_inner(),
+                bytes: png.into_inner().into(),
                 width: 8,
                 height: 4,
             };
@@ -2548,7 +2548,7 @@ mod tests {
         .write_to(&mut png, image::ImageFormat::Png)
         .unwrap();
         placed.payload = ImagePayload::Png {
-            bytes: png.into_inner(),
+            bytes: png.into_inner().into(),
             width: 400,
             height: 400,
         };
@@ -2717,7 +2717,7 @@ mod tests {
         .write_to(&mut png, image::ImageFormat::Png)
         .unwrap();
         ImagePayload::Png {
-            bytes: png.into_inner(),
+            bytes: png.into_inner().into(),
             width: 8,
             height: 4,
         }
@@ -2778,7 +2778,7 @@ mod tests {
             allocation: None,
             key: ImageKey::new(key),
             payload: ImagePayload::Pixels {
-                bytes: vec![value; 8 * 4 * 4],
+                bytes: vec![value; 8 * 4 * 4].into(),
                 width: 8,
                 height: 4,
                 format: ImagePixelFormat::Rgba8,
@@ -2966,7 +2966,7 @@ mod tests {
             allocation: None,
             key: ImageKey::new("diagram"),
             payload: ImagePayload::Pixels {
-                bytes,
+                bytes: bytes.into(),
                 width: 4,
                 height: 2,
                 format: ImagePixelFormat::Rgba8,
@@ -3340,7 +3340,7 @@ mod tests {
         let cases = [
             (
                 ImagePayload::Png {
-                    bytes: vec![0, 1, 2, 3],
+                    bytes: vec![0, 1, 2, 3].into(),
                     width: 1,
                     height: 1,
                 },
@@ -3348,7 +3348,7 @@ mod tests {
             ),
             (
                 ImagePayload::Pixels {
-                    bytes: vec![0; 16],
+                    bytes: vec![0; 16].into(),
                     width: 2,
                     height: 2,
                     format: ImagePixelFormat::Rgba8,

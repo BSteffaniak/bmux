@@ -86,7 +86,7 @@ fn corrupt_source_boundaries_geometry_and_image_payloads_are_rejected() {
         .push(ImageContribution::Present(ImagePlacement {
             key: ImageKey::new("image"),
             payload: ImagePayload::Pixels {
-                bytes: vec![0],
+                bytes: vec![0].into(),
                 width: 2,
                 height: 2,
                 format: ImagePixelFormat::Rgba8,

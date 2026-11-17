@@ -40,7 +40,7 @@ impl RichContent for AuthorizedAssets {
         Some(Element::new(ImageComponent::new(
             format!("demo/image/{}", block.id.as_str()),
             ImagePayload::Pixels {
-                bytes: vec![0, 128, 255, 255],
+                bytes: vec![0, 128, 255, 255].into(),
                 width: 1,
                 height: 1,
                 format: ImagePixelFormat::Rgba8,

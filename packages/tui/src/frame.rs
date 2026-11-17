@@ -70,6 +70,9 @@ pub struct Frame<'buffer> {
     focus_scope: Option<FocusScopeId>,
     images: Vec<ImageContribution>,
     occlusions: Vec<(usize, Rect)>,
+    /// This frame's image contributions are its complete image set (see
+    /// [`crate::paint::PaintCx::declare_images`]).
+    images_declared: bool,
     selection: SelectionScene,
     semantics: SemanticScene,
     damage: Vec<Rect>,
@@ -370,6 +373,7 @@ impl<'buffer> Frame<'buffer> {
             focus_scope: None,
             images: Vec::new(),
             occlusions: Vec::new(),
+            images_declared: false,
             selection: SelectionScene::new(),
             semantics: SemanticScene::new(),
             damage: Vec::new(),
@@ -523,6 +527,33 @@ impl<'buffer> Frame<'buffer> {
     #[must_use]
     pub fn occlusions(&self) -> &[(usize, Rect)] {
         &self.occlusions
+    }
+
+    /// Whether this frame's image contributions are its complete image set.
+    #[must_use]
+    pub const fn images_declared(&self) -> bool {
+        self.images_declared
+    }
+
+    pub(crate) const fn declare_images(&mut self) {
+        self.images_declared = true;
+    }
+
+    /// Occlude earlier image contributions by an already projected rectangle, leaving cells and
+    /// other metadata alone.
+    pub(crate) fn occlude_images(&mut self, area: Rect) {
+        let area = area.intersection(self.area());
+        if !area.is_empty() {
+            self.occlusions.push((self.images.len(), area));
+        }
+    }
+
+    /// Take this frame's image contributions and occlusions.
+    pub(crate) fn take_images(&mut self) -> (Vec<ImageContribution>, Vec<(usize, Rect)>) {
+        (
+            std::mem::take(&mut self.images),
+            std::mem::take(&mut self.occlusions),
+        )
     }
 
     /// Return selection metadata registered for this frame.

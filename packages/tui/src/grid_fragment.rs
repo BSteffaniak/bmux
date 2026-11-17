@@ -295,7 +295,7 @@ impl PreparedGridFragment {
     }
 }
 
-pub(crate) const fn image_payload_bytes(payload: &ImagePayload) -> usize {
+pub(crate) fn image_payload_bytes(payload: &ImagePayload) -> usize {
     match payload {
         ImagePayload::Png { bytes, .. } | ImagePayload::Pixels { bytes, .. } => bytes.len(),
     }
@@ -329,7 +329,7 @@ mod tests {
         let mut image = ImagePlacement {
             key: ImageKey::new("image"),
             payload: ImagePayload::Pixels {
-                bytes: vec![255; 4],
+                bytes: vec![255; 4].into(),
                 width: 1,
                 height: 1,
                 format: ImagePixelFormat::Rgba8,

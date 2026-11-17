@@ -259,7 +259,7 @@ fn image() -> ImagePlacement {
         clip: Rect::new(0, 0, 8, 3),
         lifecycle: ImageLifecycle::Persistent,
         payload: ImagePayload::Pixels {
-            bytes: vec![1, 2, 3, 255],
+            bytes: vec![1, 2, 3, 255].into(),
             width: 1,
             height: 1,
             format: ImagePixelFormat::Rgba8,

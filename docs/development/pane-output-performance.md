@@ -303,12 +303,30 @@ intermediate forms are only copies:
 5. **Cleanup and numbers.** Leftovers removed; `pipeline_bench`, observed and not, compared with
    phase 5.
 
-Steps 1, 2, 3 and 5 are implemented. Step 4 is not: `bmux_tui` models an image scene but encodes
-no protocol (bcode hands its scene's changes to `bmux_image` through an output hook), and the
-in-place frame does not carry an image scene yet. Moving attach images onto it means teaching
-in-place frames image scenes and making `bmux_image`'s encoder consume scene changes instead of
-driving its own Kitty host state (shared-memory transfer, caching, Sixel and iTerm2 repair): a
-change to working graphics for consistency rather than speed, left for a decision.
+Steps 1, 2, 3 and 5 are implemented. Step 4 replaces the attach client's three image paths
+(pane images through its own `KittyHostState`, extension overlays through a Kitty-only cache and
+writer, observer images through a separate conversion) with the one bcode uses: images are frame
+contributions, the terminal reconciles them into an image scene and its change, and
+`bmux_image::tui::TuiImageCompositor` alone encodes that change through the terminal's output
+hooks (its pre-frame hook's repaint answer carries Sixel and iTerm2 repair). Every pane image can
+take part: Sixel is decoded to pixels, iTerm2 carries a PNG/JPEG/GIF, and the registry keeps
+completed Kitty transfers as PNG; the attach client already decodes all of them. In order:
+
+1. `bmux_tui`: image payload bytes are shared (`Arc<[u8]>`), so contributing images every frame
+   copies nothing; frames painted in place carry image contributions, and the terminal commits
+   their scene and change with the cells.
+2. `FramePresenter` owns the compositor and encodes the scene's change through the hooks;
+   `Canvas::image` always contributes to the frame.
+3. Extension graphic overlays are image placements; the attach graphics cache and Kitty overlay
+   writer go (overlays gain Sixel and iTerm2).
+4. Pane images are image placements with stable keys, converted once per image; the attach
+   client's own Kitty host state and pane image path go.
+5. The CLI's raster repair (forced full frames and ED2), the observer's own image conversion and
+   the unused `images.decode_mode` setting go; observers mirror the terminal's image scene.
+
+Known limitation, unchanged: the Kitty intake accepts direct (inline) transmissions only; file,
+temporary-file and shared-memory media, zlib compression, Unicode placeholders and animation
+frames never reach the registry.
 
 ## Order
 

@@ -423,7 +423,7 @@ impl bmux_tui_runtime::Presenter<TuiBenchProgram> for TuiBenchPresenter {
                     allocation: None,
                     key: bmux_tui::image::ImageKey::new("benchmark.image"),
                     payload: bmux_tui::image::ImagePayload::Pixels {
-                        bytes: vec![0, 128, 255, 255],
+                        bytes: vec![0, 128, 255, 255].into(),
                         width: 1,
                         height: 1,
                         format: bmux_tui::image::ImagePixelFormat::Rgba8,

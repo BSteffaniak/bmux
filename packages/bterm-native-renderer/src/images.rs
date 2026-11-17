@@ -69,7 +69,7 @@ pub(crate) fn decode(payload: &ImagePayload) -> Result<(u32, u32, Vec<u8>), Rend
             bytes,
             format: ImagePixelFormat::Rgba8,
             ..
-        } => bytes.clone(),
+        } => bytes.to_vec(),
         ImagePayload::Pixels {
             bytes,
             format: ImagePixelFormat::Rgb8,
@@ -207,9 +207,7 @@ impl ImageCache {
         });
         let key = payload.clone();
         let key_bytes = match &key {
-            ImagePayload::Png { bytes, .. } | ImagePayload::Pixels { bytes, .. } => {
-                bytes.capacity()
-            }
+            ImagePayload::Png { bytes, .. } | ImagePayload::Pixels { bytes, .. } => bytes.len(),
         };
         self.0.insert(
             fingerprint,
@@ -226,7 +224,7 @@ mod tests {
     use super::*;
     fn pixel_payload(bytes: &[u8], width: u32, height: u32) -> ImagePayload {
         ImagePayload::Pixels {
-            bytes: bytes.to_vec(),
+            bytes: bytes.to_vec().into(),
             width,
             height,
             format: ImagePixelFormat::Rgba8,
@@ -298,7 +296,7 @@ mod tests {
         assert_eq!((wide.width, tall.width), (4, 1));
         assert!(!Arc::ptr_eq(&wide, &tall));
         let rgb = ImagePayload::Pixels {
-            bytes: vec![1; 12],
+            bytes: vec![1; 12].into(),
             width: 2,
             height: 2,
             format: ImagePixelFormat::Rgb8,
@@ -318,7 +316,7 @@ mod tests {
             pixel_payload(&[], u32::MAX, 1),
             pixel_payload(&[], 1, 1),
             ImagePayload::Png {
-                bytes: vec![1, 2, 3],
+                bytes: vec![1, 2, 3].into(),
                 width: 1,
                 height: 1,
             },
@@ -394,7 +392,7 @@ mod tests {
     fn damaged_png_after_valid_ihdr_does_not_admit_or_evict_warm_entry() {
         let bytes = png_fixture();
         let payload = ImagePayload::Png {
-            bytes: bytes.clone(),
+            bytes: bytes.clone().into(),
             width: 1,
             height: 1,
         };
@@ -412,7 +410,7 @@ mod tests {
         for damaged in [truncated, corrupt] {
             assert_eq!(&damaged[..33], &bytes[..33]);
             let bad = ImagePayload::Png {
-                bytes: damaged,
+                bytes: damaged.into(),
                 width: 1,
                 height: 1,
             };
@@ -434,14 +432,14 @@ mod tests {
         assert!(
             cache
                 .get(&ImagePayload::Png {
-                    bytes: bytes.clone(),
+                    bytes: bytes.clone().into(),
                     width: 2,
                     height: 1,
                 })
                 .is_err()
         );
         let payload = ImagePayload::Png {
-            bytes,
+            bytes: bytes.into(),
             width: 1,
             height: 1,
         };
@@ -456,7 +454,7 @@ mod tests {
     #[test]
     fn rgb_is_opaque_and_bad_lengths_rejected() {
         let payload = ImagePayload::Pixels {
-            bytes: vec![10, 20, 30],
+            bytes: vec![10, 20, 30].into(),
             width: 1,
             height: 1,
             format: ImagePixelFormat::Rgb8,
@@ -464,7 +462,7 @@ mod tests {
         assert_eq!(decode(&payload).unwrap().2, [10, 20, 30, 255]);
         assert!(
             decode(&ImagePayload::Pixels {
-                bytes: vec![],
+                bytes: vec![].into(),
                 width: 1,
                 height: 1,
                 format: ImagePixelFormat::Rgba8
@@ -476,7 +474,7 @@ mod tests {
     fn huge_declared_images_rejected_before_decode() {
         assert!(
             decode(&ImagePayload::Png {
-                bytes: vec![],
+                bytes: vec![].into(),
                 width: u32::MAX,
                 height: 1
             })

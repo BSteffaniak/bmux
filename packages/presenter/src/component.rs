@@ -885,7 +885,7 @@ mod tests {
             ImageComponent::new(
                 "image",
                 ImagePayload::Png {
-                    bytes: vec![],
+                    bytes: vec![].into(),
                     width,
                     height,
                 },
@@ -1289,7 +1289,7 @@ mod tests {
         let image = ImageComponent::new(
             "image",
             ImagePayload::Png {
-                bytes: vec![1, 2],
+                bytes: vec![1, 2].into(),
                 width: 1,
                 height: 1,
             },

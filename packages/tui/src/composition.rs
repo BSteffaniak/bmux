@@ -2642,7 +2642,7 @@ mod tests {
                 cx.push_image(ImageContribution::Present(ImagePlacement {
                     key: ImageKey::new("source"),
                     payload: ImagePayload::Pixels {
-                        bytes: vec![255, 0, 0],
+                        bytes: vec![255, 0, 0].into(),
                         width: 1,
                         height: 1,
                         format: crate::image::ImagePixelFormat::Rgb8,
@@ -2688,7 +2688,7 @@ mod tests {
             assert_eq!(
                 image.payload,
                 ImagePayload::Pixels {
-                    bytes: vec![255, 0, 0],
+                    bytes: vec![255, 0, 0].into(),
                     width: 1,
                     height: 1,
                     format: crate::image::ImagePixelFormat::Rgb8,

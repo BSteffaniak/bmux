@@ -58,7 +58,7 @@ pub fn compact_payload(
         return Ok(std::borrow::Cow::Borrowed(payload));
     }
     Ok(std::borrow::Cow::Owned(ImagePayload::Png {
-        bytes: png,
+        bytes: png.into(),
         width: *width,
         height: *height,
     }))
@@ -212,7 +212,7 @@ mod tests {
 
     fn tiny_payload() -> ImagePayload {
         ImagePayload::Pixels {
-            bytes: vec![255; 16],
+            bytes: vec![255; 16].into(),
             width: 2,
             height: 2,
             format: ImagePixelFormat::Rgba8,
@@ -297,7 +297,7 @@ mod tests {
     #[test]
     fn four_k_pixels_compact_losslessly_before_clip_expansion() {
         let original = ImagePayload::Pixels {
-            bytes: vec![255; 3840 * 2160 * 4],
+            bytes: vec![255; 3840 * 2160 * 4].into(),
             width: 3840,
             height: 2160,
             format: ImagePixelFormat::Rgba8,
@@ -339,7 +339,7 @@ mod tests {
             .is_err()
         );
         let large = ImagePayload::Pixels {
-            bytes: vec![255; 1024 * 1024 * 4],
+            bytes: vec![255; 1024 * 1024 * 4].into(),
             width: 1024,
             height: 1024,
             format: ImagePixelFormat::Rgba8,

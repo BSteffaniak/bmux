@@ -2800,7 +2800,7 @@ mod tests {
                 allocation: None,
                 key: ImageKey::new(format!("image:{}", self.id)),
                 payload: ImagePayload::Png {
-                    bytes: vec![1],
+                    bytes: vec![1].into(),
                     width: 1,
                     height: 1,
                 },

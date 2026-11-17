@@ -308,7 +308,7 @@ fn tui_scene_warm_movement_hide_reveal_replacement_and_cleanup() {
         allocation: None,
         key: ImageKey::new("retained"),
         payload: ImagePayload::Pixels {
-            bytes: support::pixels(17, 13).data,
+            bytes: support::pixels(17, 13).data.into(),
             width: 17,
             height: 13,
             format: ImagePixelFormat::Rgba8,
@@ -344,7 +344,9 @@ fn tui_scene_warm_movement_hide_reveal_replacement_and_cleanup() {
             "reveal" => placement.clip = Rect::new(0, 0, 80, 24),
             "replacement" => {
                 if let ImagePayload::Pixels { bytes, .. } = &mut placement.payload {
-                    bytes[0] ^= 255;
+                    let mut replaced = bytes.to_vec();
+                    replaced[0] ^= 255;
+                    *bytes = replaced.into();
                 }
             }
             _ => {}

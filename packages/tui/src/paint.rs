@@ -587,6 +587,22 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         }
     }
 
+    /// Occlude earlier image contributions by a local rectangle (after translation and
+    /// clipping), as an opaque surface painted over them does, without touching cells: their
+    /// visible parts are what the image scene keeps.
+    pub fn occlude_images(&mut self, area: LocalRect) {
+        if let Some(area) = self.project_rect(area) {
+            self.frame.occlude_images(area);
+        }
+    }
+
+    /// Declare this frame's image contributions its complete image set: a frame painted over the
+    /// last one replaces the image scene with them (images it no longer contributes are removed).
+    /// A frame painted over the last one that does not declare its images keeps the scene.
+    pub const fn declare_images(&mut self) {
+        self.frame.declare_images();
+    }
+
     /// Register local damage after translation and clipping.
     pub fn push_damage(&mut self, area: LocalRect) {
         if let Some(area) = self.project_rect(area) {
@@ -1266,7 +1282,7 @@ mod tests {
             allocation: None,
             key: ImageKey::new("offscreen"),
             payload: ImagePayload::Png {
-                bytes: vec![],
+                bytes: vec![].into(),
                 width: 1,
                 height: 1,
             },
@@ -1404,7 +1420,7 @@ mod tests {
                 allocation: None,
                 key: ImageKey::new("image"),
                 payload: ImagePayload::Png {
-                    bytes: vec![1],
+                    bytes: vec![1].into(),
                     width: 10,
                     height: 10,
                 },

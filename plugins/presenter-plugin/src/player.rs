@@ -3760,7 +3760,7 @@ mod tests {
             std::sync::Arc::make_mut(&mut player.rich.images).insert(
                 id.into(),
                 bmux_tui::image::ImagePayload::Pixels {
-                    bytes: vec![255, 0, 0, 255],
+                    bytes: vec![255, 0, 0, 255].into(),
                     width: 1,
                     height: 1,
                     format: bmux_tui::image::ImagePixelFormat::Rgba8,

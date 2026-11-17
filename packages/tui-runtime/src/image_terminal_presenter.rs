@@ -1214,8 +1214,8 @@ mod async_tests {
         reason = "fixture-local PTY writer and parsers stay beside their setup and never escape test"
     )]
     async fn pty_raw_managed_probe_ack_upload_pixels_timeout_and_cleanup() {
-        use bmux_tui::terminal_io::input::{RawInput, RawInputPacket};
         use bmux_tui::image::*;
+        use bmux_tui::terminal_io::input::{RawInput, RawInputPacket};
         use std::io::Read;
         use std::os::fd::{AsRawFd, FromRawFd};
         #[link(name = "util")]
@@ -1903,7 +1903,7 @@ mod tests {
                         allocation: None,
                         key: ImageKey::new("raster"),
                         payload: ImagePayload::Pixels {
-                            bytes: vec![255, 0, 0, 255],
+                            bytes: vec![255, 0, 0, 255].into(),
                             width: 1,
                             height: 1,
                             format: ImagePixelFormat::Rgba8,
@@ -1955,7 +1955,7 @@ mod tests {
                 allocation: None,
                 key: ImageKey::new("image"),
                 payload: ImagePayload::Pixels {
-                    bytes: vec![1, 2, 3, 4],
+                    bytes: vec![1, 2, 3, 4].into(),
                     width: 1,
                     height: 1,
                     format: ImagePixelFormat::Rgba8,
@@ -1994,7 +1994,7 @@ mod tests {
                 allocation: None,
                 key: ImageKey::new("image"),
                 payload: ImagePayload::Pixels {
-                    bytes: vec![1, 2, 3, 4],
+                    bytes: vec![1, 2, 3, 4].into(),
                     width: 1,
                     height: 1,
                     format: ImagePixelFormat::Rgba8,
@@ -2026,7 +2026,7 @@ mod tests {
                 allocation: None,
                 key: ImageKey::new("image"),
                 payload: ImagePayload::Pixels {
-                    bytes: vec![1, 2, 3, 4],
+                    bytes: vec![1, 2, 3, 4].into(),
                     width: 1,
                     height: 1,
                     format: ImagePixelFormat::Rgba8,
@@ -2061,7 +2061,7 @@ mod tests {
                 allocation: None,
                 key: ImageKey::new("image"),
                 payload: ImagePayload::Pixels {
-                    bytes: vec![1, 2, 3, 4],
+                    bytes: vec![1, 2, 3, 4].into(),
                     width: 1,
                     height: 1,
                     format: ImagePixelFormat::Rgba8,

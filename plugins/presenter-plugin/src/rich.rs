@@ -83,7 +83,7 @@ impl RichAssets {
                     &mut pixmap.as_mut(),
                 );
                 ImagePayload::Png {
-                    bytes: pixmap.encode_png()?,
+                    bytes: pixmap.encode_png()?.into(),
                     width: size.width(),
                     height: size.height(),
                 }
@@ -108,7 +108,7 @@ impl RichAssets {
                     encoded.into_inner()
                 };
                 ImagePayload::Png {
-                    bytes,
+                    bytes: bytes.into(),
                     width,
                     height,
                 }
@@ -440,7 +440,7 @@ mod tests {
         assert!(matches!(
             &rich.images["architecture"],
             ImagePayload::Png { bytes: retained, width: 640, height: 240 }
-                if retained.as_slice() == bytes
+                if &**retained == bytes
         ));
     }
 
@@ -492,7 +492,7 @@ mod tests {
         std::sync::Arc::make_mut(&mut rich.images).insert(
             "asset".into(),
             ImagePayload::Pixels {
-                bytes: vec![255; 4],
+                bytes: vec![255; 4].into(),
                 width: 1,
                 height: 1,
                 format: bmux_tui::image::ImagePixelFormat::Rgba8,
