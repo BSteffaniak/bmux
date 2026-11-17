@@ -658,8 +658,8 @@ async fn run_server_start_inner(
         if !plugin.bind_host_handles(&plugin_events, &plugin_states)? {
             tracing::info!(
                 plugin_id = plugin.declaration.id.as_str(),
-                "plugin backend cannot receive in-process activation values; \
-                 it activates without the host event bus or state registry"
+                "process-packaged plugin activates without the host event bus \
+                 or state registry"
             );
         }
     }

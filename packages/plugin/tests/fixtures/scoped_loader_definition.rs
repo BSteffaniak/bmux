@@ -1,16 +1,35 @@
 //! Shared implementation for loader tests and the explicit native fixture artifact.
 use bmux_plugin_sdk::definition::{
     ComponentRole, PluginCallContext, PluginCreateContext, PluginDefinition, PluginFuture,
-    PluginInstance, PluginMetadata, PluginResult,
+    PluginInstance, PluginLifecycleContext, PluginMetadata, PluginResult,
 };
 use bmux_plugin_sdk::rt;
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
+
+/// Channel the host owns and publishes on.
+pub const HOST_EVENTS: &str = "acceptance.events/host";
+/// Channel this plugin's activation registers and publishes on.
+pub const PLUGIN_EVENTS: &str = "acceptance.events/plugin";
+
+type JsonEvents = tokio::sync::broadcast::Receiver<Arc<bmux_plugin::JsonPluginEvent>>;
+
+/// The activation's event view (in-process or remote, same API) and a
+/// subscription kept across calls.
+#[derive(Default)]
+struct Events {
+    bus: Option<Arc<bmux_plugin::EventBus>>,
+    host: Option<JsonEvents>,
+}
+
+fn unavailable(error: impl std::fmt::Display) -> bmux_plugin_sdk::PluginCommandError {
+    bmux_plugin_sdk::PluginCommandError::unavailable(error.to_string())
+}
 
 /// Records that a plugin future was dropped (completed, aborted or torn down).
 struct DropGuard(Arc<AtomicBool>);
@@ -79,8 +98,77 @@ struct Counter {
     scope: PluginCreateContext,
     mutations: AtomicUsize,
     orphan_dropped: Arc<AtomicBool>,
+    events: Mutex<Events>,
+}
+impl Counter {
+    fn bus(&self) -> PluginResult<Arc<bmux_plugin::EventBus>> {
+        self.events
+            .lock()
+            .map_err(unavailable)?
+            .bus
+            .clone()
+            .ok_or_else(|| unavailable("activation has no event bus"))
+    }
+
+    /// Event behaviors with identical source in both packaging modes.
+    async fn event_behavior(&self, contract: &str) -> PluginResult<Option<Vec<u8>>> {
+        let reply: &[u8] = match contract {
+            "ev-register" => {
+                self.bus()?
+                    .register_json_channel(PLUGIN_EVENTS.into())
+                    .map_err(unavailable)?;
+                b"registered"
+            }
+            "ev-publish" => {
+                let published = self
+                    .bus()?
+                    .emit_json(
+                        &PLUGIN_EVENTS.into(),
+                        &serde_json::json!({"from": "plugin"}),
+                    )
+                    .map_err(unavailable)?;
+                if published { b"published" } else { b"dropped" }
+            }
+            "ev-subscribe" => {
+                let receiver = self
+                    .bus()?
+                    .subscribe_json(&HOST_EVENTS.into())
+                    .map_err(unavailable)?;
+                self.events.lock().map_err(unavailable)?.host = Some(receiver);
+                b"subscribed"
+            }
+            "ev-receive" => {
+                let mut receiver = self
+                    .events
+                    .lock()
+                    .map_err(unavailable)?
+                    .host
+                    .take()
+                    .ok_or_else(|| unavailable("not subscribed"))?;
+                let event = receiver.recv().await.map_err(unavailable)?;
+                return Ok(Some(event.payload.to_string().into_bytes()));
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(reply.to_vec()))
+    }
 }
 impl PluginInstance for Counter {
+    fn activate(&self, context: PluginLifecycleContext) -> PluginFuture<'_, PluginResult<()>> {
+        Box::pin(async move {
+            // Optional: hosts that bind no bus leave events disabled.
+            self.events.lock().map_err(unavailable)?.bus =
+                bmux_plugin::take_activation_event_bus(&context.capabilities).ok();
+            Ok(())
+        })
+    }
+    fn deactivate(&self, _context: PluginLifecycleContext) -> PluginFuture<'_, PluginResult<()>> {
+        Box::pin(async move {
+            // Release the view and its registrations with the activation.
+            *self.events.lock().map_err(unavailable)? = Events::default();
+            Ok(())
+        })
+    }
     fn invoke(
         &self,
         _call: PluginCallContext,
@@ -105,6 +193,9 @@ impl PluginInstance for Counter {
     ) -> PluginFuture<'_, PluginResult<Vec<u8>>> {
         Box::pin(async move {
             if let Some(reply) = runtime_behavior(&contract).await {
+                return Ok(reply);
+            }
+            if let Some(reply) = self.event_behavior(&contract).await? {
                 return Ok(reply);
             }
             match contract.as_str() {
@@ -161,6 +252,7 @@ pub fn plugin_definition() -> PluginDefinition {
                 scope,
                 mutations: AtomicUsize::new(0),
                 orphan_dropped: Arc::new(AtomicBool::new(false)),
+                events: Mutex::new(Events::default()),
             }) as Arc<dyn PluginInstance>)
         },
     )

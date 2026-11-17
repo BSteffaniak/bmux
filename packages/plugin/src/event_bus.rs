@@ -46,6 +46,22 @@
 //! activations (including two instances of one plugin) therefore never share
 //! ownership, and a dynamically loaded library cannot reach a bus it was not
 //! handed.
+//!
+//! # Dynamic plugins
+//!
+//! A dynamic library cannot receive the in-process view: its copy of every
+//! type is distinct. The host instead serves the same scoped view through a
+//! serialized port on the plug-rt table (see [`remote`]), and inside the
+//! library [`take_activation_event_bus`] returns a remote `EventBus` over it.
+//! The serialized surface works identically in both modes and is what
+//! portable plugin code uses: [`EventBus::register_json_channel`],
+//! [`EventBus::emit_json`], [`EventBus::emit_from_bytes`],
+//! [`EventBus::subscribe_json`] and [`EventBus::subscribe_state_json`].
+//! Typed `emit`/`publish_state`/`subscribe`/`subscribe_state` need an
+//! in-process bus and report [`EventBusError::RemoteSerializedOnly`] on a
+//! remote one; typed registrations on a remote bus stay plugin-local.
+
+pub mod remote;
 
 use bmux_plugin_runtime::{ActivationScope, AdmissionGuard};
 use bmux_plugin_sdk::PluginEventKind;
@@ -155,6 +171,14 @@ pub enum EventBusError {
     /// The activation scope that owns this bus view has closed; nothing is
     /// admitted through it any more.
     Closed,
+    /// A dynamic plugin's bus is remote: typed in-process values cannot
+    /// cross the library boundary. Use the serialized JSON surface.
+    RemoteSerializedOnly {
+        /// The interface id involved.
+        interface: String,
+    },
+    /// The host refused a serialized operation on a remote bus.
+    Remote(String),
 }
 
 impl std::fmt::Display for EventBusError {
@@ -186,6 +210,12 @@ impl std::fmt::Display for EventBusError {
                 "event channel for `{interface}` was registered without a JSON projection"
             ),
             Self::Closed => f.write_str("event bus view closed with its activation scope"),
+            Self::RemoteSerializedOnly { interface } => write!(
+                f,
+                "event channel `{interface}` is reached through a dynamic plugin's remote bus; \
+                 use the serialized JSON API"
+            ),
+            Self::Remote(reason) => write!(f, "remote event bus: {reason}"),
         }
     }
 }
@@ -293,6 +323,8 @@ struct ScopeOwner {
 pub struct EventBus {
     core: Arc<BusCore>,
     owner: Option<ScopeOwner>,
+    /// Set inside a dynamic plugin: the host's serialized event port.
+    remote: Option<bmux_plugin_runtime::rt::events::RemoteEvents>,
 }
 
 impl Default for EventBus {
@@ -325,7 +357,84 @@ impl EventBus {
         Self {
             core: Arc::default(),
             owner: None,
+            remote: None,
         }
+    }
+
+    /// A dynamic plugin's view of its activation's host bus, over the
+    /// serialized event port.
+    #[must_use]
+    pub fn remote(events: bmux_plugin_runtime::rt::events::RemoteEvents) -> Arc<Self> {
+        Arc::new(Self {
+            core: Arc::default(),
+            owner: None,
+            remote: Some(events),
+        })
+    }
+
+    /// Whether this bus reaches the host through the serialized port.
+    #[must_use]
+    pub const fn is_remote(&self) -> bool {
+        self.remote.is_some()
+    }
+
+    fn typed_on_remote(&self, interface: &PluginEventKind) -> EventBusResult<()> {
+        if self.remote.is_some() {
+            return Err(EventBusError::RemoteSerializedOnly {
+                interface: interface.as_str().to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Register a broadcast channel of JSON values, owned like any other
+    /// registration through this view. It accepts serialized input
+    /// ([`Self::emit_json`], [`Self::emit_from_bytes`]) and serves typed
+    /// (`serde_json::Value`) and JSON subscribers. Works on a remote bus.
+    ///
+    /// # Errors
+    /// The view's scope closed, or the host refused a remote registration.
+    pub fn register_json_channel(
+        self: &Arc<Self>,
+        interface: PluginEventKind,
+    ) -> EventBusResult<()> {
+        if let Some(remote) = &self.remote {
+            return remote
+                .register(interface.as_str())
+                .map_err(remote::port_error);
+        }
+        self.admit()?;
+        let kind = interface.clone();
+        self.register_channel_with_json_projection::<JsonValue>(interface);
+        let bus = Arc::downgrade(self);
+        let emit_kind = kind.clone();
+        let decoder: BytesDecoder = Arc::new(move |bytes: &[u8]| {
+            let bus = bus
+                .upgrade()
+                .ok_or_else(|| EventBusBytesError::Decode("event bus dropped".to_string()))?;
+            let value: JsonValue = serde_json::from_slice(bytes)
+                .map_err(|error| EventBusBytesError::Decode(error.to_string()))?;
+            bus.emit::<JsonValue>(&emit_kind, value)?;
+            Ok(())
+        });
+        self.set_bytes_decoder(&kind, decoder);
+        Ok(())
+    }
+
+    /// Publish a JSON payload on a channel that accepts serialized input
+    /// (a JSON channel, or a typed channel registered with a decoder).
+    /// Works on a remote bus.
+    ///
+    /// # Errors
+    /// As [`Self::emit_from_bytes`].
+    pub fn emit_json(
+        &self,
+        interface: &PluginEventKind,
+        payload: &JsonValue,
+    ) -> Result<bool, EventBusBytesError> {
+        let bytes = serde_json::to_vec(payload)
+            .map_err(|error| EventBusBytesError::Decode(error.to_string()))?;
+        self.emit_from_bytes(interface, &bytes)
     }
 
     /// A view of this bus owned by one plugin activation.
@@ -343,6 +452,7 @@ impl EventBus {
                 scope,
                 owned: Mutex::new(Vec::new()),
             }),
+            remote: None,
         })
     }
 
@@ -721,6 +831,9 @@ impl EventBus {
         interface: &PluginEventKind,
         payload: &[u8],
     ) -> Result<bool, EventBusBytesError> {
+        if let Some(remote) = &self.remote {
+            return remote::publish(remote, interface, payload);
+        }
         let _admission = self.admit()?;
         let decoder = self
             .core
@@ -758,6 +871,7 @@ impl EventBus {
     where
         E: Any + Send + Sync + 'static,
     {
+        self.typed_on_remote(interface)?;
         let _admission = self.admit()?;
         let sender = self.broadcast_sender::<E>(interface)?;
         let event = Arc::new(event);
@@ -788,6 +902,7 @@ impl EventBus {
     where
         T: Any + Send + Sync + 'static,
     {
+        self.typed_on_remote(interface)?;
         let _admission = self.admit()?;
         let sender = self.state_sender::<T>(interface)?;
         // `send_replace` always updates the retained value, even when
@@ -813,6 +928,7 @@ impl EventBus {
     where
         E: Any + Send + Sync + 'static,
     {
+        self.typed_on_remote(interface)?;
         let _admission = self.admit()?;
         let sender = self.broadcast_sender::<E>(interface)?;
         Ok(sender.subscribe())
@@ -838,6 +954,7 @@ impl EventBus {
     where
         T: Any + Send + Sync + 'static,
     {
+        self.typed_on_remote(interface)?;
         let _admission = self.admit()?;
         let sender = self.state_sender::<T>(interface)?;
         let rx = sender.subscribe();
@@ -860,6 +977,9 @@ impl EventBus {
         &self,
         interface: &PluginEventKind,
     ) -> EventBusResult<broadcast::Receiver<Arc<JsonPluginEvent>>> {
+        if let Some(remote) = &self.remote {
+            return remote::subscribe_json(remote, interface);
+        }
         let _admission = self.admit()?;
         let sender = {
             let guard = self.core.entries.read().expect("event bus lock poisoned");
@@ -902,6 +1022,9 @@ impl EventBus {
         &self,
         interface: &PluginEventKind,
     ) -> EventBusResult<(Arc<JsonPluginEvent>, watch::Receiver<Arc<JsonPluginEvent>>)> {
+        if let Some(remote) = &self.remote {
+            return remote::subscribe_state_json(remote, interface);
+        }
         let _admission = self.admit()?;
         let (sender, current) = {
             let guard = self.core.entries.read().expect("event bus lock poisoned");
@@ -1230,9 +1353,14 @@ pub struct ActivationEventBus(pub Arc<EventBus>);
 pub fn take_activation_event_bus(
     capabilities: &ActivationCapabilities,
 ) -> Result<Arc<EventBus>, bmux_plugin_sdk::PluginCommandError> {
-    capabilities
-        .take::<ActivationEventBus>()
-        .map(|ActivationEventBus(bus)| bus)
+    match capabilities.take::<ActivationEventBus>() {
+        Ok(ActivationEventBus(bus)) => Ok(bus),
+        // Inside a dynamic plugin the host serves this activation's view
+        // through the serialized port of the entered instance scope.
+        Err(error) => bmux_plugin_runtime::rt::events::RemoteEvents::current()
+            .map(EventBus::remote)
+            .ok_or(error),
+    }
 }
 
 #[cfg(test)]

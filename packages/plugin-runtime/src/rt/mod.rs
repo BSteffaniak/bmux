@@ -21,6 +21,7 @@
 //! plugin code.
 
 pub mod abi;
+pub mod events;
 pub mod guest;
 // Always compiled: host crates can appear in a dynamic plugin's dependency
 // graph, and the host side never depends on the packaging mode.

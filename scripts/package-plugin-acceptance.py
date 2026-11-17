@@ -25,6 +25,10 @@ def fixture_package(root: Path, output: Path, shared: dict) -> Path:
     if isinstance(serde, dict) and "path" in serde:
         serde = {**serde, "path": str((root / serde["path"]).resolve())}
     sdk = root / "packages/plugin-sdk"
+    # The fixture exercises the activation event bus through the host crate's
+    # `EventBus`, whose subscriptions are tokio broadcast receivers.
+    host = root / "packages/plugin"
+    tokio = {**workspace["workspace"]["dependencies"]["tokio"], "features": ["sync"]}
     cargo = f'''# Generated acceptance packaging; implementation remains X2-owned.
 [package]
 name = "bmux_acceptance_scoped_loader_native"
@@ -40,6 +44,8 @@ path = "src/scoped_loader_native.rs"
 
 [dependencies]
 bmux_plugin_sdk = {{ path = {shared['quote'](str(sdk))}, default-features = false }}
+bmux_plugin = {{ path = {shared['quote'](str(host))}, default-features = false }}
+tokio = {shared['toml_value'](tokio)}
 serde_json = {shared['toml_value'](serde)}
 '''
     implementation = output / "implementation"

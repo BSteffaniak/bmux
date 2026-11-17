@@ -278,3 +278,85 @@ fn install_refuses_bundled_builds_and_reports_identity() {
     assert_eq!(guest.build_fingerprint, super::abi::BUILD_FINGERPRINT);
     assert_eq!(guest.panic_unwind, 1);
 }
+
+// ---- Serialized activation events ------------------------------------------
+
+type FakeChannels =
+    std::sync::Mutex<std::collections::HashMap<String, tokio::sync::broadcast::Sender<Vec<u8>>>>;
+
+/// A host event port over one broadcast channel per kind.
+#[derive(Default)]
+struct FakeEvents {
+    channels: FakeChannels,
+}
+impl super::events::ScopeEvents for FakeEvents {
+    fn register(&self, kind: &str) -> Result<(), super::events::EventPortError> {
+        self.channels
+            .lock()
+            .unwrap()
+            .insert(kind.into(), tokio::sync::broadcast::channel(8).0);
+        Ok(())
+    }
+    fn publish(&self, kind: &str, payload: &[u8]) -> Result<(), super::events::EventPortError> {
+        let channels = self.channels.lock().unwrap();
+        let channel = channels
+            .get(kind)
+            .ok_or_else(|| super::events::EventPortError::Rejected("unknown".into()))?;
+        let _ = channel.send(payload.to_vec());
+        Ok(())
+    }
+    fn subscribe(
+        &self,
+        kind: &str,
+        _state: bool,
+    ) -> Result<Box<dyn super::events::EventStream>, super::events::EventPortError> {
+        let channels = self.channels.lock().unwrap();
+        let channel = channels
+            .get(kind)
+            .ok_or_else(|| super::events::EventPortError::Rejected("unknown".into()))?;
+        Ok(super::events::broadcast_stream(channel.subscribe(), Some))
+    }
+}
+
+#[tokio::test]
+async fn dynamic_events_publish_subscribe_with_wakes_and_release_with_the_scope() {
+    let (host, client) = dynamic(true);
+    let events = client.events(21);
+    // No port bound yet: an explicit unsupported error, never a fallback.
+    assert_eq!(
+        events.register("k").unwrap_err(),
+        super::events::EventPortError::Unsupported
+    );
+    host.bind_scope_events(21, Arc::new(FakeEvents::default()));
+    events.register("k").unwrap();
+    assert!(matches!(
+        events.publish("missing", b"{}"),
+        Err(super::events::EventPortError::Rejected(_))
+    ));
+    let mut subscription = events.subscribe("k", false).unwrap();
+    assert_eq!(host.event_subscription_count(), 1);
+    // The plugin waits with its waker; a publish wakes it, nothing repolls.
+    let (polls, next) = counted(async move {
+        let first = subscription.next().await;
+        let second = subscription.next().await;
+        (first, second, subscription)
+    });
+    let waiter = tokio::spawn(next);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(polls.load(Ordering::SeqCst) <= 1);
+    events.publish("k", b"{\"n\":1}").unwrap();
+    // Larger than the plugin's initial buffer: retained and copied after growth.
+    let large = vec![b'x'; 10_000];
+    events.publish("k", &large).unwrap();
+    let (first, second, mut subscription) = waiter.await.unwrap();
+    assert_eq!(first.as_deref(), Some(&b"{\"n\":1}"[..]));
+    assert_eq!(second.as_deref(), Some(&large[..]));
+    // Teardown releases the scope's subscriptions; the stream then ends.
+    host.unbind_scope(21);
+    assert_eq!(host.event_subscription_count(), 0);
+    assert_eq!(subscription.next().await, None);
+    assert_eq!(
+        events.register("k").unwrap_err(),
+        super::events::EventPortError::Unsupported
+    );
+}

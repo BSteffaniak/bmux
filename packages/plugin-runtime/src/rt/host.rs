@@ -8,8 +8,10 @@
 //! aborts and reports it like bundled work.
 use super::abi::{
     BUILD_FINGERPRINT, PLUG_RT_ABI_VERSION, PlugRtGuestV1, PlugRtInstallV1, PlugRtV1, RT_CLOSED,
-    RT_INVALID, RT_PANICKED, RT_PENDING, RT_READY, RtCx, RtJob, RtStatus, RtStr, RtTask, size_u32,
+    RT_INVALID, RT_PANICKED, RT_PENDING, RT_READY, RT_TOO_SMALL, RT_UNSUPPORTED, RtCx, RtJob,
+    RtStatus, RtStr, RtTask, size_u32,
 };
+use super::events::{EventPortError, EventStream, ScopeEvents};
 use super::waker;
 use crate::background::{BackgroundTasks, Ticket};
 use std::{
@@ -39,6 +41,14 @@ fn deadline(nanos: u64) -> tokio::time::Instant {
 
 type Timer = Arc<Mutex<Pin<Box<tokio::time::Sleep>>>>;
 
+/// One plugin subscription: the host stream plus an item the plugin's
+/// buffer could not hold yet.
+struct Subscription {
+    scope: u64,
+    stream: Box<dyn EventStream>,
+    pending: Option<Vec<u8>>,
+}
+
 /// Host state behind one library's table. Leaked on purpose: the library
 /// holding pointers to it is never unloaded.
 pub struct PlugRtHost {
@@ -49,6 +59,8 @@ pub struct PlugRtHost {
     scopes: Mutex<HashMap<u64, BackgroundTasks>>,
     tasks: Mutex<HashMap<u64, tokio::task::AbortHandle>>,
     timers: Mutex<HashMap<u64, Timer>>,
+    events: Mutex<HashMap<u64, Arc<dyn ScopeEvents>>>,
+    subscriptions: Mutex<HashMap<u64, Arc<Mutex<Subscription>>>>,
     next: AtomicU64,
 }
 impl std::fmt::Debug for PlugRtHost {
@@ -85,6 +97,11 @@ impl PlugRtHost {
                 timer_reset: host_timer_reset,
                 timer_poll: host_timer_poll,
                 timer_drop: host_timer_drop,
+                event_register: host_event_register,
+                event_publish: host_event_publish,
+                event_subscribe: host_event_subscribe,
+                event_poll: host_event_poll,
+                event_unsubscribe: host_event_unsubscribe,
             },
             label: label.into(),
             runtime,
@@ -92,6 +109,8 @@ impl PlugRtHost {
             scopes: Mutex::new(HashMap::new()),
             tasks: Mutex::new(HashMap::new()),
             timers: Mutex::new(HashMap::new()),
+            events: Mutex::new(HashMap::new()),
+            subscriptions: Mutex::new(HashMap::new()),
             next: AtomicU64::new(1),
         }));
         host.table.host = std::ptr::from_ref::<Self>(host).cast();
@@ -171,9 +190,42 @@ impl PlugRtHost {
         lock(&self.scopes).insert(handle, tasks);
     }
 
-    /// Stop resolving `handle`; later spawns from it are refused as closed.
+    /// Serve the serialized event port of plugin instance `handle`.
+    pub fn bind_scope_events(&self, handle: u64, events: Arc<dyn ScopeEvents>) {
+        lock(&self.events).insert(handle, events);
+    }
+
+    /// Stop resolving `handle`; later spawns from it are refused as closed,
+    /// and its event port and every subscription it holds are released.
     pub fn unbind_scope(&self, handle: u64) {
         lock(&self.scopes).remove(&handle);
+        lock(&self.events).remove(&handle);
+        let released: Vec<_> = {
+            let mut subscriptions = lock(&self.subscriptions);
+            let ids: Vec<u64> = subscriptions
+                .iter()
+                .filter(|(_, subscription)| lock(subscription).scope == handle)
+                .map(|(id, _)| *id)
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| subscriptions.remove(&id))
+                .collect()
+        };
+        // Host streams drop outside the registry lock.
+        drop(released);
+    }
+
+    /// Live plugin event subscriptions (diagnostics and teardown checks).
+    #[must_use]
+    pub fn event_subscription_count(&self) -> usize {
+        lock(&self.subscriptions).len()
+    }
+
+    fn scope_events(&self, scope: u64) -> Result<Arc<dyn ScopeEvents>, RtStatus> {
+        lock(&self.events)
+            .get(&scope)
+            .cloned()
+            .ok_or(RT_UNSUPPORTED)
     }
 
     fn id(&self) -> u64 {
@@ -435,5 +487,145 @@ unsafe extern "C" fn host_timer_drop(host: *const c_void, id: u64) {
         let host = unsafe { host_ref(host) };
         let timer = lock(&host.timers).remove(&id);
         drop(timer);
+    });
+}
+
+fn event_status(result: Result<(), EventPortError>) -> RtStatus {
+    match result {
+        Ok(()) => RT_READY,
+        Err(EventPortError::Closed) => RT_CLOSED,
+        Err(EventPortError::Unsupported) => RT_UNSUPPORTED,
+        Err(EventPortError::Rejected(reason)) => {
+            tracing::debug!(%reason, "plugin event port operation rejected");
+            RT_INVALID
+        }
+    }
+}
+
+unsafe extern "C" fn host_event_register(host: *const c_void, scope: u64, kind: RtStr) -> RtStatus {
+    catch_unwind(AssertUnwindSafe(|| {
+        let host = unsafe { host_ref(host) };
+        match host.scope_events(scope) {
+            Ok(events) => event_status(events.register(unsafe { kind.as_str() })),
+            Err(status) => status,
+        }
+    }))
+    .unwrap_or(RT_PANICKED)
+}
+
+unsafe extern "C" fn host_event_publish(
+    host: *const c_void,
+    scope: u64,
+    kind: RtStr,
+    payload: *const u8,
+    length: usize,
+) -> RtStatus {
+    catch_unwind(AssertUnwindSafe(|| {
+        if payload.is_null() && length != 0 {
+            return RT_INVALID;
+        }
+        let host = unsafe { host_ref(host) };
+        let payload = if length == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(payload, length) }
+        };
+        match host.scope_events(scope) {
+            Ok(events) => event_status(events.publish(unsafe { kind.as_str() }, payload)),
+            Err(status) => status,
+        }
+    }))
+    .unwrap_or(RT_PANICKED)
+}
+
+unsafe extern "C" fn host_event_subscribe(
+    host: *const c_void,
+    scope: u64,
+    kind: RtStr,
+    state: u32,
+    out: *mut u64,
+) -> RtStatus {
+    catch_unwind(AssertUnwindSafe(|| {
+        if out.is_null() {
+            return RT_INVALID;
+        }
+        let host = unsafe { host_ref(host) };
+        let events = match host.scope_events(scope) {
+            Ok(events) => events,
+            Err(status) => return status,
+        };
+        match events.subscribe(unsafe { kind.as_str() }, state == 1) {
+            Ok(stream) => {
+                let id = host.id();
+                lock(&host.subscriptions).insert(
+                    id,
+                    Arc::new(Mutex::new(Subscription {
+                        scope,
+                        stream,
+                        pending: None,
+                    })),
+                );
+                unsafe { out.write(id) };
+                RT_READY
+            }
+            Err(error) => event_status(Err(error)),
+        }
+    }))
+    .unwrap_or(RT_PANICKED)
+}
+
+unsafe extern "C" fn host_event_poll(
+    host: *const c_void,
+    id: u64,
+    cx: *const RtCx,
+    buffer: *mut u8,
+    capacity: usize,
+    length: *mut usize,
+) -> RtStatus {
+    catch_unwind(AssertUnwindSafe(|| {
+        if cx.is_null() || length.is_null() || (capacity > 0 && buffer.is_null()) {
+            return RT_INVALID;
+        }
+        let host = unsafe { host_ref(host) };
+        // A released subscription (plugin drop or scope teardown) has ended.
+        let Some(subscription) = lock(&host.subscriptions).get(&id).cloned() else {
+            return RT_CLOSED;
+        };
+        let mut subscription = lock(&subscription);
+        let item = match subscription.pending.take() {
+            Some(item) => item,
+            None => {
+                let polled = unsafe {
+                    waker::with_waker(cx, |waker| {
+                        subscription
+                            .stream
+                            .poll_next(&mut Context::from_waker(waker))
+                    })
+                };
+                match polled {
+                    Poll::Pending => return RT_PENDING,
+                    Poll::Ready(None) => return RT_CLOSED,
+                    Poll::Ready(Some(item)) => item,
+                }
+            }
+        };
+        unsafe { length.write(item.len()) };
+        if item.len() > capacity {
+            subscription.pending = Some(item);
+            return RT_TOO_SMALL;
+        }
+        if !item.is_empty() {
+            unsafe { std::ptr::copy_nonoverlapping(item.as_ptr(), buffer, item.len()) };
+        }
+        RT_READY
+    }))
+    .unwrap_or(RT_PANICKED)
+}
+
+unsafe extern "C" fn host_event_unsubscribe(host: *const c_void, id: u64) {
+    let _ = catch_unwind(|| {
+        let host = unsafe { host_ref(host) };
+        let released = lock(&host.subscriptions).remove(&id);
+        drop(released);
     });
 }

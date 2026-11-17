@@ -632,6 +632,7 @@ impl DefinitionArtifact {
         let verified_artifact = self.verified_for_context(&context);
         let execution = Arc::new(LoadedExecution {
             activation_binders: Mutex::new(Vec::new()),
+            remote_event_bus: Mutex::new(None),
             lifecycle_callback_factory: Mutex::new(None),
             callback_runtime: std::sync::OnceLock::new(),
             callback_runtime_owner: Mutex::new(None),
@@ -733,6 +734,9 @@ enum ExecutionBackend {
 /// Host-owned scoped execution. IDs are local lookup keys, never wire credentials.
 pub struct LoadedExecution {
     activation_binders: Mutex<Vec<Arc<ActivationBinder>>>,
+    /// Host bus whose activation-scoped view a dynamic instance reaches
+    /// through the serialized plug-rt event port.
+    remote_event_bus: Mutex<Option<Arc<crate::EventBus>>>,
     lifecycle_callback_factory: Mutex<Option<Arc<callbacks::LifecycleCallbackFactory>>>,
     callback_runtime: std::sync::OnceLock<tokio::runtime::Handle>,
     /// Code-pin view snapshotted by callback bindings. It wraps
@@ -990,10 +994,65 @@ impl LoadedExecution {
         Ok(())
     }
 
+    /// Give every activation of this instance a view of `bus` scoped to that
+    /// activation. In-process instances receive the view as an activation
+    /// capability; a dynamic instance reaches the same view through the
+    /// serialized plug-rt event port, so its authors use one `EventBus` API.
+    ///
+    /// # Errors
+    /// The instance already activated, or a dynamic artifact was loaded
+    /// without plug-rt (an in-process test descriptor).
+    pub fn bind_event_bus(&self, bus: &Arc<crate::EventBus>) -> Result<()> {
+        match &self.backend {
+            ExecutionBackend::Static(_) => {
+                self.bind_activation_binder(crate::event_bus_activation_binder(Arc::clone(bus)))
+            }
+            ExecutionBackend::Dynamic { artifact, .. } => {
+                let _control = self.control()?;
+                if artifact.plug_rt.is_none() {
+                    return Err(failure(
+                        "dynamic artifact has no plug-rt table to carry its event bus",
+                    ));
+                }
+                if self
+                    .state
+                    .lock()
+                    .map_err(|_| failure("execution state poisoned"))?
+                    .activation
+                    .is_some()
+                {
+                    return Err(failure("event bus must bind before activation"));
+                }
+                *self
+                    .remote_event_bus
+                    .lock()
+                    .map_err(|_| failure("remote event bus poisoned"))? = Some(Arc::clone(bus));
+                Ok(())
+            }
+        }
+    }
+
     fn bind_activation_capabilities(
         &self,
         activation: &ActivationScope,
     ) -> Result<bmux_plugin_sdk::definition::ActivationCapabilities> {
+        if let ExecutionBackend::Dynamic { artifact, handle } = &self.backend
+            && let Some(plug_rt) = artifact.plug_rt
+            && let Some(bus) = self
+                .remote_event_bus
+                .lock()
+                .map_err(|_| failure("remote event bus poisoned"))?
+                .clone()
+        {
+            // The view is owned by this activation: its registrations are
+            // released when the activation closes or the scope is unbound.
+            plug_rt.bind_scope_events(
+                *handle,
+                Arc::new(crate::event_bus::remote::BusScopeEvents(
+                    bus.scoped(activation.clone()),
+                )),
+            );
+        }
         let binders = self
             .activation_binders
             .lock()
@@ -1044,6 +1103,19 @@ impl LoadedExecution {
     #[must_use]
     pub const fn verified_artifact(&self) -> Option<&VerifiedArtifact> {
         self.verified_artifact.as_ref()
+    }
+
+    /// Serialized event subscriptions the host still holds for this
+    /// instance's library (always 0 for in-process instances). Diagnostics.
+    #[must_use]
+    pub fn event_port_subscriptions(&self) -> usize {
+        match &self.backend {
+            ExecutionBackend::Dynamic { artifact, .. } => artifact.plug_rt.map_or(
+                0,
+                bmux_plugin_runtime::rt::host::PlugRtHost::event_subscription_count,
+            ),
+            ExecutionBackend::Static(_) => 0,
+        }
     }
 
     /// Work the activation scope still owns: cooperative tasks, raw plug-rt

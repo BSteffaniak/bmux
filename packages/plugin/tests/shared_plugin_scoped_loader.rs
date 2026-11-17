@@ -45,9 +45,20 @@ async fn activate(
     runtime: PluginRuntimeScopeId,
     role: ComponentRole,
 ) -> Arc<LoadedExecution> {
+    activate_with(artifact, runtime, role, None).await
+}
+async fn activate_with(
+    artifact: &DefinitionArtifact,
+    runtime: PluginRuntimeScopeId,
+    role: ComponentRole,
+    events: Option<&Arc<bmux_plugin::EventBus>>,
+) -> Arc<LoadedExecution> {
     let execution = artifact
         .create(runtime, role, &["acceptance.allowed".into()])
         .unwrap();
+    if let Some(events) = events {
+        execution.bind_event_bus(events).unwrap();
+    }
     let id = execution
         .begin_activation(native_context(), PluginConcurrencyConfig::Concurrent)
         .unwrap();
@@ -367,4 +378,72 @@ async fn scoped_static_runtime_spawn_timer_cancel_panic_and_wake() {
 #[ignore = "requires explicitly built native fixture; run during integration with BMUX_ACCEPTANCE_NATIVE_ARTIFACT"]
 async fn scoped_dynamic_runtime_spawn_timer_cancel_panic_and_wake() {
     runtime_parity(dynamic_artifact()).await;
+}
+
+/// The activation's event bus has one author API in both modes: the host
+/// publishes and the plugin receives; the plugin registers and publishes and
+/// a host subscriber receives; teardown releases the plugin's channel and
+/// every host subscription it held.
+async fn event_parity(artifact: DefinitionArtifact) {
+    let bus = Arc::new(bmux_plugin::EventBus::new());
+    bus.register_json_channel(fixture::HOST_EVENTS.into())
+        .unwrap();
+    let execution = activate_with(
+        &artifact,
+        PluginRuntimeScopeId::new(),
+        ComponentRole::Backend,
+        Some(&bus),
+    )
+    .await;
+    // Plugin -> host.
+    assert_eq!(extension(&execution, "ev-register").await, b"registered");
+    let mut from_plugin = bus.subscribe_json(&fixture::PLUGIN_EVENTS.into()).unwrap();
+    assert_eq!(extension(&execution, "ev-publish").await, b"published");
+    let event = tokio::time::timeout(Duration::from_secs(10), from_plugin.recv())
+        .await
+        .expect("plugin event delivered")
+        .unwrap();
+    assert_eq!(event.payload, serde_json::json!({"from": "plugin"}));
+    // Host -> plugin, observed through the operation's waker only.
+    assert_eq!(extension(&execution, "ev-subscribe").await, b"subscribed");
+    let receive = begin(&execution, "ev-receive");
+    assert!(
+        bus.emit_json(
+            &fixture::HOST_EVENTS.into(),
+            &serde_json::json!({"from": "host"})
+        )
+        .unwrap()
+    );
+    let (outcome, polls) =
+        tokio::time::timeout(Duration::from_secs(10), observe(&execution, receive))
+            .await
+            .expect("host event delivered");
+    assert!(
+        matches!(&outcome, NativeOutcome::Bytes(bytes) if bytes == br#"{"from":"host"}"#),
+        "{outcome:?}"
+    );
+    assert!(polls <= 12, "observed {polls} polls");
+    execution.acknowledge(receive).await.unwrap();
+    // Teardown in server order releases the activation's channels.
+    execution.cancel_background_tasks().unwrap();
+    execution.drain_background_tasks().await.unwrap();
+    retire(&execution).await;
+    assert!(matches!(
+        bus.subscribe_json(&fixture::PLUGIN_EVENTS.into()),
+        Err(bmux_plugin::EventBusError::ChannelNotRegistered { .. })
+    ));
+    assert_eq!(execution.event_port_subscriptions(), 0);
+    assert_eq!(execution.pending_background_work(), Vec::<String>::new());
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scoped_static_event_bus_publish_subscribe_and_release() {
+    event_parity(DefinitionArtifact::from_definition(
+        fixture::plugin_definition(),
+    ))
+    .await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires explicitly built native fixture; run during integration with BMUX_ACCEPTANCE_NATIVE_ARTIFACT"]
+async fn scoped_dynamic_event_bus_publish_subscribe_and_release() {
+    event_parity(dynamic_artifact()).await;
 }

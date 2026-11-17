@@ -35,6 +35,9 @@ pub const RT_INVALID: RtStatus = 4;
 pub const RT_UNSUPPORTED: RtStatus = 5;
 /// Size, version, or panic-strategy mismatch.
 pub const RT_INCOMPATIBLE: RtStatus = 6;
+/// The output buffer is too small; the required length was written and the
+/// item is retained for the next call.
+pub const RT_TOO_SMALL: RtStatus = 7;
 
 /// Borrowed UTF-8 bytes, valid for one call.
 #[repr(C)]
@@ -131,6 +134,28 @@ pub struct PlugRtV1 {
     pub timer_reset: unsafe extern "C" fn(*const c_void, u64, u64) -> RtStatus,
     pub timer_poll: unsafe extern "C" fn(*const c_void, u64, *const RtCx) -> RtStatus,
     pub timer_drop: unsafe extern "C" fn(*const c_void, u64),
+    /// Serialized activation events (see `rt::events`). `scope` is the
+    /// instance handle; `RT_UNSUPPORTED` means the host bound no events.
+    /// Register a JSON channel owned by the scope's activation.
+    pub event_register: unsafe extern "C" fn(*const c_void, u64, RtStr) -> RtStatus,
+    /// Publish one JSON payload on a channel that accepts serialized input.
+    pub event_publish:
+        unsafe extern "C" fn(*const c_void, u64, RtStr, *const u8, usize) -> RtStatus,
+    /// Subscribe (`state` = 1 for a state channel); the subscription belongs
+    /// to the scope and is released with it.
+    pub event_subscribe: unsafe extern "C" fn(*const c_void, u64, RtStr, u32, *mut u64) -> RtStatus,
+    /// Copy the next item into `buf`: `RT_READY` (length written),
+    /// `RT_PENDING` (the waker in `cx` is woken on the next item),
+    /// `RT_TOO_SMALL` (length written, item retained) or `RT_CLOSED`.
+    pub event_poll: unsafe extern "C" fn(
+        *const c_void,
+        u64,
+        *const RtCx,
+        *mut u8,
+        usize,
+        *mut usize,
+    ) -> RtStatus,
+    pub event_unsubscribe: unsafe extern "C" fn(*const c_void, u64),
 }
 // SAFETY: the table is immutable after installation and its functions are
 // thread-safe; `host` is only interpreted by the host.

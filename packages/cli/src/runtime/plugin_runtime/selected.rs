@@ -580,27 +580,30 @@ impl ProductionPlugin {
     }
 
     /// Offer this instance's activations views of the host event bus and
-    /// plugin state registry, each scoped to the activation. Returns
-    /// `false`, binding nothing, when the backend cannot receive in-process
-    /// values (a dynamic artifact or a process plugin): that plugin then
-    /// activates without them and reports it, instead of reaching private
-    /// process-wide copies.
+    /// plugin state registry, each scoped to the activation. Dynamic
+    /// artifacts receive only the event bus. Returns `false`, binding
+    /// nothing, for a process plugin: it then activates without them and
+    /// reports it, instead of reaching private process-wide copies.
     pub(in crate::runtime) fn bind_host_handles(
         &self,
         bus: &Arc<bmux_plugin::EventBus>,
         states: &Arc<bmux_plugin::PluginStateRegistry>,
     ) -> bmux_plugin_sdk::Result<bool> {
         match &self.backend {
-            Backend::Scoped(execution) if execution.is_in_process() => {
-                execution.bind_activation_binder(bmux_plugin::event_bus_activation_binder(
-                    Arc::clone(bus),
-                ))?;
-                execution.bind_activation_binder(bmux_plugin::state_registry_activation_binder(
-                    Arc::clone(states),
-                ))?;
+            // In-process and dynamic instances both receive an
+            // activation-scoped event bus (dynamic ones over the serialized
+            // plug-rt port); the state registry carries in-process values
+            // only, so dynamic artifacts activate without it.
+            Backend::Scoped(execution) => {
+                execution.bind_event_bus(bus)?;
+                if execution.is_in_process() {
+                    execution.bind_activation_binder(
+                        bmux_plugin::state_registry_activation_binder(Arc::clone(states)),
+                    )?;
+                }
                 Ok(true)
             }
-            Backend::Scoped(_) | Backend::Process(_) => Ok(false),
+            Backend::Process(_) => Ok(false),
         }
     }
 

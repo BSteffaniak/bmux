@@ -221,6 +221,12 @@ impl Client {
         JoinHandle::remote(slot, None)
     }
 
+    /// The serialized event port of instance scope `scope`.
+    #[must_use]
+    pub fn events(&'static self, scope: u64) -> super::events::RemoteEvents {
+        super::events::RemoteEvents::new(self.table, scope, self.matched)
+    }
+
     /// The host clock.
     #[must_use]
     pub fn now(&'static self) -> time::Instant {
