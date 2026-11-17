@@ -14,7 +14,7 @@ use bmux_attach_layout_protocol::{PaneSelector, PaneSplitDirection};
 use bmux_attach_pipeline::render::render_attach_scene_with_stats_and_trace;
 use bmux_attach_pipeline::{
     AttachRenderTrace, AttachRenderTraceOp as AttachTraceOp, AttachSceneRenderStats,
-    DamageCoalescingPolicy, DamageRect, FrameDamage, PaneRenderBuffer,
+    DamageCoalescingPolicy, FrameDamage, PaneRenderBuffer,
 };
 use bmux_client::{AttachLayoutState, BmuxClient as RawClient};
 use bmux_config::BmuxConfig;
@@ -826,7 +826,6 @@ fn frame_damage_from_render_delta(
         .iter()
         .map(|pane| (pane.index, pane.id))
         .collect::<BTreeMap<_, _>>();
-    let pane_sizes = content_surface_sizes_by_pane(layout);
     let mut damage = FrameDamage::default();
     for pane in after {
         let Some(previous) = before_by_index.get(&pane.index) else {
@@ -835,36 +834,15 @@ fn frame_damage_from_render_delta(
         let Some(pane_id) = pane_ids_by_index.get(&pane.index).copied() else {
             continue;
         };
-        let (_, _, _, segments) =
+        let (rows, _, _, _) =
             changed_render_rows(pane.index, &previous.screen_text, &pane.screen_text);
-        let surface_size = pane_sizes
-            .get(&pane_id)
-            .copied()
-            .unwrap_or((u16::MAX, u16::MAX));
-        for segment in segments {
-            damage.mark_content_surface_rect(
-                pane_id,
-                DamageRect::new(segment.start_col, segment.row, segment.cells, 1),
-                surface_size,
-                DamageCoalescingPolicy::default(),
-            );
+        // As a live client does for pane output: the pane's content changed, and its grid says
+        // which rows.
+        if rows > 0 {
+            damage.mark_content_surface(pane_id);
         }
     }
     damage
-}
-
-fn content_surface_sizes_by_pane(layout: &AttachLayoutState) -> BTreeMap<Uuid, (u16, u16)> {
-    layout
-        .scene
-        .surfaces
-        .iter()
-        .filter_map(|surface| {
-            Some((
-                surface.pane_id?,
-                (surface.content_rect.w.max(1), surface.content_rect.h.max(1)),
-            ))
-        })
-        .collect()
 }
 
 fn summarize_playbook_render_delta(
@@ -965,7 +943,8 @@ pub fn summarize_attach_render_trace(
         damage_rects: u64::try_from(facts.damage_rects).unwrap_or(u64::MAX),
         damage_area_cells: facts.damage_area_cells,
         rows_emitted: stats.pane_rows_emitted,
-        row_segments_emitted: stats.pane_row_segments_emitted,
+        // The renderer draws whole rows (the host's terminal writes the cells that change).
+        row_segments_emitted: stats.pane_rows_emitted,
         cells_emitted: stats.pane_cells_emitted,
         frame_bytes: u64::try_from(facts.frame_bytes).unwrap_or(u64::MAX),
         status_rendered_frames: u64::from(facts.status_rendered),
@@ -1029,19 +1008,6 @@ fn record_attach_trace_op(
             surface_pane_indexes,
             surface_index,
             row,
-            cells,
-        ),
-        AttachTraceOp::PaneRowSegment {
-            surface_index,
-            row,
-            start_col,
-            cells,
-        } => record_attach_trace_pane_row_segment(
-            summary,
-            surface_pane_indexes,
-            surface_index,
-            row,
-            start_col,
             cells,
         ),
         AttachTraceOp::PaneRowCacheSkip { surface_index, row } => {
@@ -1127,34 +1093,6 @@ fn record_attach_trace_pane_row_full(
             cells,
         });
     PlaybookRenderTraceOp::PaneRowFull { pane, row, cells }
-}
-
-fn record_attach_trace_pane_row_segment(
-    summary: &mut PlaybookRenderSummary,
-    surface_pane_indexes: &BTreeMap<usize, u32>,
-    surface_index: usize,
-    row: u16,
-    start_col: u16,
-    cells: u16,
-) -> PlaybookRenderTraceOp {
-    let pane = trace_surface_pane(surface_pane_indexes, surface_index);
-    summary
-        .emitted_rows
-        .push(PlaybookRenderRowRef { pane, row });
-    summary
-        .emitted_row_segments
-        .push(PlaybookRenderRowSegmentRef {
-            pane,
-            row,
-            start_col,
-            cells,
-        });
-    PlaybookRenderTraceOp::PaneRowSegment {
-        pane,
-        row,
-        start_col,
-        cells,
-    }
 }
 
 fn trace_surface_pane(surface_pane_indexes: &BTreeMap<usize, u32>, surface_index: usize) -> u32 {
@@ -5415,10 +5353,9 @@ mod tests {
     fn attach_trace_summary_records_actual_semantic_ops() {
         let mut trace = AttachRenderTrace::new();
         trace.push(AttachTraceOp::StatusLine { row: 23, cells: 80 });
-        trace.push(AttachTraceOp::PaneRowSegment {
+        trace.push(AttachTraceOp::PaneRowFull {
             surface_index: 0,
             row: 2,
-            start_col: 4,
             cells: 6,
         });
         trace.push(AttachTraceOp::ExtensionCachedReplay { surface_index: 2 });
@@ -5434,7 +5371,7 @@ mod tests {
         surface_panes.insert(0, 1);
         let facts = PlaybookAttachRenderFrameFacts {
             scene_render: AttachSceneRenderStats {
-                pane_row_segments_emitted: 1,
+                pane_rows_emitted: 1,
                 pane_cells_emitted: 6,
                 extension_cache_hits: 1,
                 ..AttachSceneRenderStats::default()
@@ -5461,7 +5398,7 @@ mod tests {
             vec![PlaybookRenderRowSegmentRef {
                 pane: 1,
                 row: 2,
-                start_col: 4,
+                start_col: 0,
                 cells: 6,
             }]
         );
@@ -5469,10 +5406,9 @@ mod tests {
             summary.trace_ops,
             vec![
                 PlaybookRenderTraceOp::StatusLine,
-                PlaybookRenderTraceOp::PaneRowSegment {
+                PlaybookRenderTraceOp::PaneRowFull {
                     pane: 1,
                     row: 2,
-                    start_col: 4,
                     cells: 6,
                 },
                 PlaybookRenderTraceOp::ExtensionCachedReplay { surface: 2 },

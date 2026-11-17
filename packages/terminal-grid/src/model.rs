@@ -1890,6 +1890,46 @@ impl TerminalGrid {
         }
     }
 
+    /// Keep only the changes since `previous` was last drawn, for a grid rebuilt from a snapshot
+    /// of `previous`'s pane (which starts with every row changed): a viewport row that shows what
+    /// `previous`'s row at the same position shows (the same text, widths and resolved styles),
+    /// and whose change there was already taken, is no longer changed.
+    ///
+    /// Nothing is unmarked when the grids differ in size or mode, or `previous` has a move not
+    /// yet taken: its rows are not then where its drawn rows were. Otherwise the rebuild is not a
+    /// move of this grid's rows either.
+    pub fn keep_changes_since(&mut self, previous: &Self) {
+        if self.width != previous.width
+            || self.height != previous.height
+            || self.mode != previous.mode
+            || previous.viewport_scroll != ViewportScroll::None
+        {
+            return;
+        }
+        let palette = &self.palette;
+        let rows: &mut dyn Iterator<Item = &mut PhysicalRow> = match self.mode {
+            GridMode::Main => &mut self.main_rows.iter_mut(),
+            GridMode::Alternate => &mut self.alt_rows.iter_mut(),
+        };
+        for (index, row) in rows.take(self.height).enumerate() {
+            let Some(old) = previous.viewport_row_ref(index) else {
+                continue;
+            };
+            let same = row.cells.len() == old.cells.len()
+                && row.cells.iter().zip(&old.cells).all(|(cell, old_cell)| {
+                    cell.text == old_cell.text
+                        && cell.width == old_cell.width
+                        && cell.wide_continuation == old_cell.wide_continuation
+                        && palette.get(cell.style) == previous.palette.get(old_cell.style)
+                });
+            if same && !old.changed {
+                row.changed = false;
+            }
+        }
+        // The rebuilt rows are where `previous`'s were: rebuilding moved none.
+        self.viewport_scroll = ViewportScroll::None;
+    }
+
     #[must_use]
     /// Which viewport rows changed since the last call, top to bottom, clearing the record. Rows
     /// that only moved (scrolled) keep what they recorded; see

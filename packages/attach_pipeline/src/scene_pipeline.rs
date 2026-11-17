@@ -116,7 +116,15 @@ impl UndecoratedGridPresenter {
             ..PaneRenderBuffer::default()
         };
         if !full_frame && let Some(previous) = self.pane_buffers.get(&surface_id) {
-            pending_buffer.prev_rows.clone_from(&previous.prev_rows);
+            // The rebuilt grid changed only where it differs from the one drawn.
+            pending_buffer
+                .terminal_grid
+                .grid_mut()
+                .keep_changes_since(previous.terminal_grid.grid());
+            pending_buffer.rows_drawn = previous.rows_drawn;
+            pending_buffer
+                .drawn_appearance
+                .clone_from(&previous.drawn_appearance);
         }
         let mut pending_buffers = BTreeMap::from([(surface_id, pending_buffer)]);
         let mut pending_graphics = self.terminal_graphics_cache.clone();
@@ -342,7 +350,7 @@ impl AttachScenePipeline {
                 &pane_snapshot.snapshot.pending_bytes,
             );
             buffer.expected_stream_start = Some(pane_snapshot.stream_end);
-            buffer.prev_rows.clear();
+            buffer.forget_drawn_rows();
             sync_protocol_hints_from_buffer(
                 &mut self.pane_mouse_protocol_hints,
                 &mut self.pane_input_mode_hints,
@@ -577,7 +585,7 @@ impl AttachScenePipeline {
                 buffer
                     .protocol_tracker
                     .restore(protocol, alternate_screen, &batch.pending_bytes);
-                buffer.prev_rows.clear();
+                buffer.forget_drawn_rows();
                 sync_protocol_hints_from_buffer(
                     &mut self.pane_mouse_protocol_hints,
                     &mut self.pane_input_mode_hints,

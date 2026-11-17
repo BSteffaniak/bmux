@@ -533,6 +533,10 @@ impl ScreenInspector {
                 bmux_terminal_grid::GridLimits::default(),
             ) {
                 let _ = stream.resize(cols.max(1), rows.max(1));
+                // The rebuilt grid changed only where it differs from the one drawn.
+                stream
+                    .grid_mut()
+                    .keep_changes_since(buffer.terminal_grid.grid());
                 buffer.terminal_grid = stream;
                 buffer.visual_row_fingerprints.clear();
             }
@@ -959,7 +963,7 @@ mod tests {
 
         let mut buffers = BTreeMap::new();
         let mut buffer = PaneRenderBuffer {
-            prev_rows: vec![bmux_attach_pipeline::ShownRow::blank(10)],
+            rows_drawn: true,
             ..PaneRenderBuffer::default()
         };
         buffer.extension_render_cache.insert(
@@ -1036,10 +1040,7 @@ mod tests {
             terminal_grid_to_text(synced.terminal_grid.grid(), 3),
             "first\nsecond"
         );
-        assert_eq!(
-            synced.prev_rows,
-            vec![bmux_attach_pipeline::ShownRow::blank(10)]
-        );
+        assert!(synced.rows_drawn);
         assert_eq!(synced.extension_render_cache.len(), 1);
         assert_eq!(synced.expected_stream_start, Some(42));
         assert!(synced.sync_update_in_progress);

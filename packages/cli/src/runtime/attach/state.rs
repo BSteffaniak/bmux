@@ -104,8 +104,8 @@ pub struct AttachDirtyFlags {
     pub pane_dirty_ids: BTreeSet<Uuid>,
     pub full_pane_redraw: bool,
     /// Generic surface/plugin-render damage. This asks render
-    /// extensions to repaint their damaged regions without invalidating
-    /// pane content row caches.
+    /// extensions to repaint their damaged regions without drawing the
+    /// panes' rows again.
     pub extension_needs_redraw: bool,
     /// Precise frame damage computed by scene/layout reconciliation.
     pub precise_frame_damage: FrameDamage,

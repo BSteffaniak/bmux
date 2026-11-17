@@ -12,6 +12,7 @@
 //! * [`PaintCx::write_line_with_fallback_style`] fills its area first, then
 //!   writes; [`PaintCx::replace_cell`] replaces one cell's whole style.
 
+use crate::buffer::Buffer;
 use crate::component::{Component, Constraints, LayoutCx};
 use crate::focus::FocusScopeId;
 use crate::frame::{Cursor, Frame};
@@ -357,6 +358,11 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
             return;
         };
         let style = self.inherited_style;
+        // Painted in place over the last frame, a cell written as it was is not a change.
+        let mut changed = self
+            .frame
+            .reports_changes_only()
+            .then(crate::buffer::ChangedColumns::default);
         let buffer = self.frame.buffer_for_write();
         let mut cells = cells
             .into_iter()
@@ -377,20 +383,44 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
             if column >= i64::from(row.x) && end <= i64::from(row.right()) {
                 let point = Point::new(u16::try_from(column).unwrap_or(u16::MAX), row.y);
                 // Narrow cells over narrow cells, the bulk of a terminal grid, go straight in.
-                let set = buffer.put_narrow_run(point.x, row.right(), point.y, &mut cells);
+                let set = buffer.put_narrow_run(
+                    point.x,
+                    row.right(),
+                    point.y,
+                    &mut cells,
+                    changed.as_mut(),
+                );
                 if set > 0 {
                     column += i64::from(set);
                     continue;
+                }
+                if let Some(changed) = changed.as_mut()
+                    && !buffer.holds_symbol(point, symbol, width, cell_style)
+                {
+                    let span = width.min(row.right() - point.x);
+                    changed.note(point.x, point.x + span);
                 }
                 buffer.put_symbol(point, symbol, width, cell_style);
             } else if end > i64::from(row.x) {
                 // A wide grapheme with one column clipped: blank the visible one.
                 let visible = column.max(i64::from(row.x));
                 let point = Point::new(u16::try_from(visible).unwrap_or(u16::MAX), row.y);
+                if let Some(changed) = changed.as_mut()
+                    && !buffer.holds_symbol(point, " ", 1, cell_style)
+                {
+                    changed.note(point.x, point.x + 1);
+                }
                 buffer.put_symbol(point, " ", 1, cell_style);
             }
             cells.next();
             column = end;
+        }
+        if let Some(changed) = changed {
+            for run in changed.runs() {
+                self.frame
+                    .wrote(Rect::new(run.start, row.y, run.end - run.start, 1));
+            }
+            return;
         }
         // Report only the columns written: callers paint runs much shorter than the row.
         let start = projected_unclipped_x(self.origin_x, x).max(i64::from(row.x));
@@ -593,6 +623,45 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         if let Some(area) = self.project_rect(area) {
             self.frame.move_cells(area, rows);
         }
+    }
+
+    /// Set the cells of row `y`, columns `columns`, to `source`'s cells there: the frame's own
+    /// cells copied, not painted, for keeping a copy of a frame shown elsewhere (`source` covers
+    /// the frame's area). The run is widened to whole graphemes of both, so none is cut.
+    ///
+    /// The row and columns are local to this context and are copied at the cells it paints;
+    /// cells outside `source` or the clip are left as they are.
+    pub fn copy_cells(&mut self, source: &Buffer, y: u16, columns: std::ops::Range<u16>) {
+        let Some(area) = self.project_rect(LocalRect::new(
+            i32::from(columns.start),
+            i64::from(y),
+            columns.end.saturating_sub(columns.start),
+            1,
+        )) else {
+            return;
+        };
+        let buffer = self.frame.buffer_for_write();
+        if source.area() != buffer.area() {
+            return;
+        }
+        let continuation = |buffer: &Buffer, x: u16| {
+            buffer
+                .get(Point::new(x, area.y))
+                .is_some_and(crate::buffer::Cell::is_wide_continuation)
+        };
+        let (mut start, mut end) = (area.x, area.right());
+        while start > buffer.area().x
+            && (continuation(buffer, start) || continuation(source, start))
+        {
+            start -= 1;
+        }
+        while end < buffer.area().right()
+            && (continuation(buffer, end) || continuation(source, end))
+        {
+            end += 1;
+        }
+        buffer.copy_span_from(source, area.y, start..end);
+        self.frame.wrote(Rect::new(start, area.y, end - start, 1));
     }
 
     /// Register a local interaction region after translation and clipping.

@@ -617,3 +617,60 @@ fn snapshot_restore_must_not_reexecute_csi_embedded_linefeed() {
     assert_eq!(capture(&hydrated), capture(&source));
     assert_protocol(&source, &protocol);
 }
+
+/// A grid rebuilt from a snapshot changed only where it differs from the grid drawn before it,
+/// or where that grid had a change not yet drawn; rebuilding it is not a move.
+#[test]
+fn a_rebuilt_grid_keeps_only_the_changes_since_the_one_drawn() {
+    let mut drawn = stream();
+    drawn.process(b"one\r\ntwo\r\nthree");
+    let _ = drawn.grid_mut().take_viewport_scroll();
+    let _ = drawn.grid_mut().take_viewport_changes();
+
+    let mut rebuilt =
+        TerminalGridStream::from_snapshot(&capture(&drawn), GridLimits::default()).unwrap();
+    rebuilt.process(b"\x1b[2;1HTWO");
+    rebuilt.grid_mut().keep_changes_since(drawn.grid());
+    assert_eq!(
+        rebuilt.grid_mut().take_viewport_scroll(),
+        crate::ViewportScroll::None
+    );
+    assert_eq!(
+        rebuilt.grid_mut().take_viewport_changes(),
+        [false, true, false, false]
+    );
+
+    // A change the previous grid had not drawn yet stays a change.
+    let mut pending = stream();
+    pending.process(b"one\r\ntwo\r\nthree");
+    let _ = pending.grid_mut().take_viewport_scroll();
+    let _ = pending.grid_mut().take_viewport_changes();
+    pending.process(b"\x1b[3;1HTHREE");
+    let mut rebuilt =
+        TerminalGridStream::from_snapshot(&capture(&pending), GridLimits::default()).unwrap();
+    rebuilt.grid_mut().keep_changes_since(pending.grid());
+    assert_eq!(
+        rebuilt.grid_mut().take_viewport_changes(),
+        [false, false, true, false]
+    );
+
+    // A move the previous grid had not drawn leaves every row changed.
+    let mut scrolled = stream();
+    scrolled.process(b"one\r\ntwo\r\nthree");
+    let _ = scrolled.grid_mut().take_viewport_scroll();
+    let _ = scrolled.grid_mut().take_viewport_changes();
+    let before = scrolled.grid().viewport_scroll_revision();
+    scrolled.process(b"\r\nfour\r\nfive");
+    assert!(
+        scrolled.grid().viewport_scroll_revision() > before,
+        "five lines in four rows scroll"
+    );
+    let _ = scrolled.grid_mut().take_viewport_changes();
+    let mut rebuilt =
+        TerminalGridStream::from_snapshot(&capture(&scrolled), GridLimits::default()).unwrap();
+    rebuilt.grid_mut().keep_changes_since(scrolled.grid());
+    assert_eq!(
+        rebuilt.grid_mut().take_viewport_changes(),
+        [true, true, true, true]
+    );
+}

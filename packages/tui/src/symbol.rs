@@ -87,6 +87,24 @@ impl Symbol {
         }
     }
 
+    /// Whether the text is `text`, without making a `&str` of it.
+    #[must_use]
+    pub fn is(&self, text: &str) -> bool {
+        match &self.0 {
+            Repr::Inline { len, bytes } => {
+                let len = usize::from(*len);
+                // One byte, the bulk of a terminal grid, without a slice comparison.
+                len == text.len()
+                    && if len == 1 {
+                        bytes[0] == text.as_bytes()[0]
+                    } else {
+                        &bytes[..len] == text.as_bytes()
+                    }
+            }
+            Repr::Heap(heap) => **heap == *text,
+        }
+    }
+
     /// Whether the text is empty (a wide grapheme's continuation).
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -314,6 +332,8 @@ mod tests {
             let symbol = Symbol::new(text);
             assert_eq!(symbol.as_str(), text);
             assert_eq!(symbol.len(), text.len());
+            assert!(symbol.is(text));
+            assert!(!symbol.is("not this"));
             assert_eq!(symbol, text);
             assert_eq!(symbol, Symbol::from(text.to_owned()));
         }

@@ -1350,9 +1350,10 @@ impl PresentationState {
                     frame.fill(*region, " ", Style::new());
                 }
             } else if repair {
-                // What the frame paints over the committed cells is all that differs from them,
+                // What the frame changes in the committed cells is all that differs from them,
                 // which the next frame's start needs to know to update the spare grid.
                 frame.track_writes();
+                frame.paint_over_committed();
             }
             PresentationPhase::Paint.measure(|| render(&mut PaintCx::new(&mut frame)), |()| true);
             written = frame.take_written();

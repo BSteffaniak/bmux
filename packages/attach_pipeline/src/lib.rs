@@ -49,8 +49,8 @@ pub use mouse::{
 pub use pointer_shape::{PointerShapeInput, ResolvedPointerShape, resolve_pointer_shape};
 pub use render::{
     AttachRenderTrace, AttachRenderTraceOp, AttachSceneRenderStats, DamageCoalescingPolicy,
-    DamageRect, ExtensionRenderStats, FrameDamage, FrameDamageStats, ShownRow,
-    frame_damage_overlay_rects, frame_damage_overlay_render_ops, queue_frame_damage_overlay,
+    DamageRect, ExtensionRenderStats, FrameDamage, FrameDamageStats, frame_damage_overlay_rects,
+    frame_damage_overlay_render_ops, queue_frame_damage_overlay,
     queue_frame_damage_overlay_with_trace, queue_render_ops_with_capabilities,
 };
 pub use scene_pipeline::AttachScenePipeline;

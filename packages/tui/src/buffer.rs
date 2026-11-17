@@ -97,7 +97,7 @@ impl Cell {
 
     /// Install an already sanitized symbol of known width.
     fn assign(&mut self, symbol: &str, width: u8, style: Style) {
-        if self.symbol != symbol {
+        if !self.symbol.is(symbol) {
             self.symbol.set(symbol);
         }
         self.style = style;
@@ -132,6 +132,25 @@ impl Cell {
         self.style = style;
         self.width = 0;
         self.wide_continuation = true;
+    }
+}
+
+/// The columns of one row a write changed, as runs, left to right.
+#[derive(Debug, Default)]
+pub(crate) struct ChangedColumns(Vec<std::ops::Range<u16>>);
+
+impl ChangedColumns {
+    /// Note columns `start..end` changed; writes go left to right.
+    pub(crate) fn note(&mut self, start: u16, end: u16) {
+        match self.0.last_mut() {
+            Some(last) if last.end >= start => last.end = last.end.max(end),
+            _ => self.0.push(start..end),
+        }
+    }
+
+    /// The runs noted.
+    pub(crate) fn runs(&self) -> &[std::ops::Range<u16>] {
+        &self.0
     }
 }
 
@@ -457,12 +476,15 @@ impl Buffer {
     /// one per cell, until `cells` ends or the columns do. Returns how many were set: it stops at
     /// the first cell that is not narrow over a narrow cell, which the caller sets with
     /// [`Self::put_symbol`], as wide-span repair needs.
+    ///
+    /// With `changed`, the columns whose cells it changes are noted there.
     pub(crate) fn put_narrow_run<'symbol>(
         &mut self,
         x: u16,
         end: u16,
         y: u16,
         cells: &mut std::iter::Peekable<impl Iterator<Item = (&'symbol str, u16, Style)>>,
+        mut changed: Option<&mut ChangedColumns>,
     ) -> u16 {
         let Some(start) = self.index(Point::new(x, y)) else {
             return 0;
@@ -476,11 +498,45 @@ impl Buffer {
             if width != 1 || cell.width != 1 || cell.wide_continuation {
                 break;
             }
+            if let Some(changed) = changed.as_deref_mut()
+                && (cell.style != style || !cell.symbol.is(symbol))
+            {
+                let column = x + set;
+                changed.note(column, column + 1);
+            }
             cell.assign(symbol, 1, style);
             cells.next();
             set += 1;
         }
         set
+    }
+
+    /// Whether [`Self::put_symbol`] with these arguments would leave the cells as they are: a
+    /// narrow symbol over the same narrow cell, or a wide one over the same wide grapheme.
+    pub(crate) fn holds_symbol(
+        &self,
+        point: Point,
+        symbol: &str,
+        width: u16,
+        style: Style,
+    ) -> bool {
+        let Some(cell) = self.get(point) else {
+            return true;
+        };
+        let wide = width == 2 && point.x.saturating_add(1) < self.area.right();
+        if cell.wide_continuation
+            || cell.style != style
+            || u16::from(cell.width) != if wide { 2 } else { 1 }
+            || !cell
+                .symbol
+                .is(if width == 2 && !wide { " " } else { symbol })
+        {
+            return false;
+        }
+        !wide
+            || self
+                .get(Point::new(point.x + 1, point.y))
+                .is_some_and(|next| next.wide_continuation && next.style == style)
     }
 
     /// Set a cell to an already sanitized symbol of known grapheme width.

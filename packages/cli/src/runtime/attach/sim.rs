@@ -22,8 +22,7 @@ use bmux_client::{AttachLayoutState, AttachOpenInfo};
 use bmux_config::BmuxConfig;
 use bmux_keyboard::{KeyCode as BmuxKeyCode, KeyStroke};
 use bmux_terminal::event::{
-    Event as TermEvent, KeyCode as TermKeyCode, KeyEvent, KeyEventKind, KeyEventState,
-    KeyModifiers,
+    Event as TermEvent, KeyCode as TermKeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
 };
 use std::time::Instant;
 use uuid::Uuid;
@@ -773,7 +772,7 @@ fn append_sim_pane_output(buffer: &mut PaneRenderBuffer, bytes: &[u8]) {
         buffer.visual_row_fingerprints.clear();
     }
     if was_alternate != buffer.protocol_tracker.alternate_screen() {
-        buffer.prev_rows.clear();
+        buffer.forget_drawn_rows();
     }
 }
 

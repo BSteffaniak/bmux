@@ -289,8 +289,9 @@ impl Replay {
         }
     }
 
-    /// Prepare and publish `operations` as an observed client's observer does, when this replay
-    /// has one: repaired over the last frame, with its local grids installed (each staging
+    /// Prepare and publish the frame just presented as an observed client's observer does, when
+    /// this replay has one: repaired over the last frame with the change the host's terminal
+    /// made (`operations` when it has none), with its local grids installed (each staging
     /// rechecks the frame's limits).
     fn observe(&mut self, operations: &[crate::projection::PaintOperation]) {
         let size = self.size;
@@ -303,11 +304,19 @@ impl Replay {
             max_entries: 262_144,
             max_bytes: 32 * 1024 * 1024,
         };
+        // The host's change, copied from its terminal, or the operations when it has none.
+        let cells = self.presenter.retained_buffer();
+        let changes = self.presenter.last_changes();
         let mut grids = None;
         let mut prepared = observer
             .prepare_repaired_bounded(limits, |cx| {
-                grids =
-                    Some(crate::projection::paint_frame(cx, operations).expect("observed frame"));
+                grids = Some(match (cells, &changes) {
+                    (Some(cells), Some(changes)) => {
+                        crate::frame_presenter::paint_shown_changes(cx, cells, changes);
+                        Vec::new()
+                    }
+                    _ => crate::projection::paint_frame(cx, operations).expect("observed frame"),
+                });
             })
             .expect("prepared");
         prepared

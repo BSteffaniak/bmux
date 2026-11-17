@@ -241,6 +241,30 @@ fn write_painted_run(
 
 /// A simple ANSI terminal runtime backed by an arbitrary writer.
 ///
+/// What a frame painted in place over the last one changed: its cell moves, then the cells it
+/// changed (see [`Terminal::last_changes`]).
+pub struct FrameChanges<'terminal> {
+    changes: &'terminal OverChanges,
+}
+
+impl FrameChanges<'_> {
+    /// The frame's cell moves, in order: each area and the rows it moved by (positive up). A
+    /// move blanks the rows it exposes.
+    pub fn moves(&self) -> impl Iterator<Item = (Rect, i64)> + '_ {
+        self.changes
+            .moves
+            .iter()
+            .map(|moved| (moved.area, moved.rows))
+    }
+
+    /// The runs of cells the frame changed after its moves, by row: `(y, columns)`. A run may
+    /// cut a wide grapheme; the whole grapheme changed.
+    pub fn runs(&self) -> impl Iterator<Item = (u16, std::ops::Range<u16>)> + '_ {
+        let area = self.changes.area();
+        (area.y..area.bottom()).flat_map(move |y| self.changes.runs(y).map(move |run| (y, run)))
+    }
+}
+
 /// `Terminal` owns the previous frame buffer so repeated draws can use
 /// damage-aware flushing.
 pub struct Terminal<W> {
@@ -262,6 +286,9 @@ pub struct Terminal<W> {
     applied_scrolls: Vec<AppliedScroll>,
     /// Change tracking reused by frames painted over the last one.
     over_storage: Option<OverChanges>,
+    /// The last frame was painted in place over the one before, and `over_storage` holds what it
+    /// changed.
+    last_over: bool,
     /// Frames are wrapped in a synchronized update (DEC mode 2026).
     synchronized_output: bool,
 }
@@ -308,6 +335,7 @@ impl<W: Write> Terminal<W> {
             committed_damage: Damage::None,
             applied_scrolls: Vec::new(),
             over_storage: None,
+            last_over: false,
             synchronized_output: true,
         }
     }
@@ -330,6 +358,7 @@ impl<W: Write> Terminal<W> {
             committed_damage: self.committed_damage.clone(),
             applied_scrolls: self.applied_scrolls.clone(),
             over_storage: None,
+            last_over: false,
             synchronized_output: self.synchronized_output,
         }
     }
@@ -361,6 +390,7 @@ impl<W: Write> Terminal<W> {
             committed_damage: self.committed_damage.clone(),
             applied_scrolls: self.applied_scrolls.clone(),
             over_storage: None,
+            last_over: false,
             synchronized_output: self.synchronized_output,
         }
     }
@@ -424,6 +454,17 @@ impl<W: Write> Terminal<W> {
     #[must_use]
     pub fn applied_scrolls(&self) -> &[AppliedScroll] {
         &self.applied_scrolls
+    }
+
+    /// What the last frame changed when it was painted in place over the one before (see
+    /// [`Self::draw_over`]): applying its moves to that frame's cells, then setting its changed
+    /// runs from [`Self::retained_buffer`], gives the frame. `None` after any other frame.
+    #[must_use]
+    pub fn last_changes(&self) -> Option<FrameChanges<'_>> {
+        self.over_storage
+            .as_ref()
+            .filter(|_| self.last_over)
+            .map(|changes| FrameChanges { changes })
     }
 
     /// Color depth frames are reduced to when encoded.
@@ -583,6 +624,7 @@ impl<W: Write> Terminal<W> {
     /// route input against what is still visibly committed after an output
     /// failure or backend reset.
     pub fn reset(&mut self) {
+        self.last_over = false;
         self.state.reset();
     }
 
@@ -602,6 +644,9 @@ impl<W: Write> Terminal<W> {
 
     /// Resize the terminal area and force the next draw to repaint fully.
     pub fn resize(&mut self, area: Rect) {
+        if area != self.state.area() {
+            self.last_over = false;
+        }
         self.state.resize(area);
     }
 
@@ -751,6 +796,7 @@ impl<W: Write> Terminal<W> {
         overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
         skip_unchanged: bool,
     ) -> io::Result<DrawStats> {
+        self.last_over = false;
         let Some(mut buffer) = self.state.take_retained() else {
             return self.draw_damage_with_output_hooks(Damage::Full, render, before, overlay);
         };
@@ -778,6 +824,7 @@ impl<W: Write> Terminal<W> {
             self.state.install_painted_over(buffer, cursor);
             self.committed_damage = Damage::None;
             self.applied_scrolls.clear();
+            self.last_over = true;
             return Ok(DrawStats {
                 changed_cells: 0,
                 full_repaint: false,
@@ -835,6 +882,7 @@ impl<W: Write> Terminal<W> {
                 self.state.install_painted_over(buffer, cursor);
                 self.committed_damage = Damage::Regions(Vec::new());
                 self.applied_scrolls = scrolls;
+                self.last_over = true;
                 Ok(stats)
             }
             Err(error) => {
@@ -904,6 +952,7 @@ impl<W: Write> Terminal<W> {
         before: impl FnOnce(&mut W) -> io::Result<bool>,
         overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
     ) -> io::Result<DrawStats> {
+        self.last_over = false;
         let damage = prepared
             .as_ref()
             .map_or(Damage::None, |prepared| prepared.damage().clone());
@@ -1334,6 +1383,144 @@ mod tests {
             .unwrap();
         assert!(!terminal.writer().is_empty(), "a moved cursor is presented");
     }
+    fn sized(text: &str) -> Vec<crate::paint::SizedCell<'_>> {
+        text.char_indices()
+            .map(|(start, ch)| crate::paint::SizedCell {
+                symbol: &text[start..start + ch.len_utf8()],
+                width: u8::try_from(unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1))
+                    .unwrap_or(1),
+                style: Style::new(),
+            })
+            .collect()
+    }
+
+    /// A frame painted in place writes the cells that change, not every cell it is given.
+    #[test]
+    fn frames_painted_over_write_only_the_cells_that_change() {
+        let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 40, 2));
+        terminal
+            .draw(|cx| cx.replace_cells(0, 0, sized("hello brave new world")))
+            .unwrap();
+        terminal.writer_mut().clear();
+        let stats = terminal
+            .draw_over(|cx| cx.replace_cells(0, 0, sized("hello brave new world")))
+            .unwrap();
+        assert_eq!(stats.changed_cells, 0);
+        assert!(
+            terminal.writer().is_empty(),
+            "nothing changed, nothing written"
+        );
+
+        let stats = terminal
+            .draw_over(|cx| cx.replace_cells(0, 0, sized("hello brave NEW world")))
+            .unwrap();
+        let output = String::from_utf8_lossy(terminal.writer()).into_owned();
+        assert!(output.contains("NEW"), "{output:?}");
+        assert!(
+            !output.contains("hello") && !output.contains("world"),
+            "{output:?}"
+        );
+        assert!(stats.changed_cells <= 3, "{stats:?}");
+    }
+
+    /// Copied cells keep every grapheme whole: a run starting on the right half of a wide one in
+    /// the source, or ending inside one in the destination, takes all of it.
+    #[test]
+    fn copied_cells_keep_wide_graphemes_whole() {
+        let area = Rect::new(0, 0, 6, 1);
+        let mut source = crate::buffer::Buffer::empty(area);
+        let mut destination = crate::buffer::Buffer::empty(area);
+        {
+            let mut frame = crate::frame::Frame::new(&mut source);
+            PaintCx::new(&mut frame).replace_cells(0, 0, sized("a\u{754c}bcd"));
+        }
+        {
+            let mut frame = crate::frame::Frame::new(&mut destination);
+            PaintCx::new(&mut frame).replace_cells(0, 0, sized("vwx\u{754c}z"));
+        }
+        {
+            let mut frame = crate::frame::Frame::new(&mut destination);
+            let mut cx = PaintCx::new(&mut frame);
+            // Column 2 is the right half of the source's wide grapheme; column 4 is the right
+            // half of the destination's.
+            cx.copy_cells(&source, 0, 2..3);
+            cx.copy_cells(&source, 0, 4..5);
+        }
+        // Columns 1 through 4 are copied; the edges keep their own cells.
+        let mut expected = crate::buffer::Buffer::empty(area);
+        {
+            let mut frame = crate::frame::Frame::new(&mut expected);
+            PaintCx::new(&mut frame).replace_cells(0, 0, sized("v\u{754c}bcz"));
+        }
+        assert_eq!(destination, expected);
+    }
+
+    /// Applying a frame's moves to the frame before it, then copying its changed runs from the
+    /// cells it shows, gives the frame: what an observer's copy needs.
+    #[test]
+    fn last_changes_rebuild_a_frame_painted_over_the_last() {
+        let area = Rect::new(0, 0, 12, 5);
+        let mut seed = 0x51f1_5eed_u64;
+        let mut next = move |bound: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % bound
+        };
+        let texts = ["ab", "\u{754c}x", "zz\u{754c}", " ", "q\u{754c}\u{754c}"];
+        let mut terminal = Terminal::new(Vec::new(), area);
+        terminal.set_scroll_region_acceleration(super::ScrollRegionAcceleration::Auto);
+        terminal
+            .draw(|cx| cx.fill(LocalRect::terminal(area), "x", Style::new()))
+            .unwrap();
+        assert!(
+            terminal.last_changes().is_none(),
+            "a full frame has no in-place change"
+        );
+        for frame in 0..500 {
+            let mut copy = terminal.retained_buffer().unwrap().clone();
+            let ops: Vec<(u64, i32, i64, &str)> = (0..next(5))
+                .map(|_| {
+                    (
+                        next(4),
+                        i32::try_from(next(12)).unwrap(),
+                        i64::try_from(next(5)).unwrap(),
+                        texts[usize::try_from(next(5)).unwrap()],
+                    )
+                })
+                .collect();
+            terminal
+                .draw_over(|cx| {
+                    for &(kind, x, y, text) in &ops {
+                        match kind {
+                            0 => cx.move_cells(
+                                LocalRect::new(0, y.min(3), 12, 2),
+                                if x % 2 == 0 { 1 } else { -1 },
+                            ),
+                            1 => cx.fill(LocalRect::new(x, y, 2, 1), "f", Style::new()),
+                            _ => cx.replace_cells(x, y, sized(text)),
+                        }
+                    }
+                })
+                .unwrap();
+            let shown = terminal.retained_buffer().unwrap();
+            let changes = terminal
+                .last_changes()
+                .expect("a frame painted over the last has its change");
+            {
+                let mut frame = crate::frame::Frame::new(&mut copy);
+                let mut cx = PaintCx::new(&mut frame);
+                for (area, rows) in changes.moves() {
+                    cx.move_cells(LocalRect::terminal(area), rows);
+                }
+                for (y, run) in changes.runs() {
+                    cx.copy_cells(shown, y, run);
+                }
+            }
+            assert_eq!(&copy, shown, "frame {frame}: {ops:?}");
+        }
+    }
+
     #[test]
     fn frames_without_synchronized_output_do_not_ask_for_it() {
         let area = crate::geometry::Rect::new(0, 0, 8, 2);

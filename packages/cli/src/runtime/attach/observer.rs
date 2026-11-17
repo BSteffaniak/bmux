@@ -624,11 +624,28 @@ fn deliver_prepared_inner(
         super::metadata::project_with_sources(&view.retained_compositor, area, &source_metadata)?;
     let modal_scopes = merge_frontend_metadata(&frontends, &mut metadata.text)?;
     let zoom_grids = super::pane_zoom_native::fragments(view)?;
+    // A frame presented on the host is kept here by applying the change the host's terminal made
+    // (its moves and changed cells), so both show one frame; otherwise its operations are
+    // painted.
+    let shown = if view.presenting {
+        view.terminal_presenter.shown_changes()
+    } else {
+        bmux_attach_pipeline::frame_presenter::ShownChanges::Unknown
+    };
     let mut projected_grids = None;
     let mut prepared = view
         .presentation
         .prepare_repaired_bounded(limits, |cx| {
-            projected_grids = Some(bmux_attach_pipeline::projection::paint_frame(cx, operations));
+            projected_grids = Some(match &shown {
+                bmux_attach_pipeline::frame_presenter::ShownChanges::Changed { cells, changes } => {
+                    bmux_attach_pipeline::frame_presenter::paint_shown_changes(cx, cells, changes);
+                    Ok(Vec::new())
+                }
+                bmux_attach_pipeline::frame_presenter::ShownChanges::Unchanged => Ok(Vec::new()),
+                bmux_attach_pipeline::frame_presenter::ShownChanges::Unknown => {
+                    bmux_attach_pipeline::projection::paint_frame(cx, operations)
+                }
+            });
             // Root output owns chrome only in winning local-grid clips. Clear
             // retained uniform text there so scale reset/removal cannot expose
             // a second, stale copy of the source below the fragment.

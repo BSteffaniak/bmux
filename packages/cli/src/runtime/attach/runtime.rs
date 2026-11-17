@@ -2745,10 +2745,7 @@ const fn percent_at_least(part: u64, total: u64, threshold_percent: u64) -> bool
 fn classify_attach_render_inefficiency(
     stats: &AttachFrameRenderStats,
 ) -> AttachRenderInefficiencyFlags {
-    let emitted_units = stats
-        .scene_render
-        .pane_rows_emitted
-        .saturating_add(stats.scene_render.pane_row_segments_emitted);
+    let emitted_units = stats.scene_render.pane_rows_emitted;
     let dirty_no_visible_row_change = stats.dirty_event_count > 0
         && stats.scene_render.pane_rows_examined > 0
         && emitted_units == 0;
@@ -2931,7 +2928,6 @@ struct AttachPerfWindow {
     full_frame_fallbacks: u64,
     pane_rows_examined: u64,
     pane_rows_emitted: u64,
-    pane_row_segments_emitted: u64,
     pane_rows_cached_skipped: u64,
     pane_rows_sync_deferred: u64,
     pane_rows_scrolled: u64,
@@ -3014,7 +3010,6 @@ impl AttachPerfWindow {
             full_frame_fallbacks: 0,
             pane_rows_examined: 0,
             pane_rows_emitted: 0,
-            pane_row_segments_emitted: 0,
             pane_rows_cached_skipped: 0,
             pane_rows_sync_deferred: 0,
             pane_rows_scrolled: 0,
@@ -3143,9 +3138,6 @@ impl AttachPerfWindow {
         self.pane_rows_emitted = self
             .pane_rows_emitted
             .saturating_add(stats.pane_rows_emitted);
-        self.pane_row_segments_emitted = self
-            .pane_row_segments_emitted
-            .saturating_add(stats.pane_row_segments_emitted);
         self.pane_rows_cached_skipped = self
             .pane_rows_cached_skipped
             .saturating_add(stats.pane_rows_cached_skipped);
@@ -3737,10 +3729,6 @@ fn insert_attach_render_work_payload(
         window.pane_rows_emitted.into(),
     );
     object.insert(
-        "pane_row_segments_emitted".to_string(),
-        window.pane_row_segments_emitted.into(),
-    );
-    object.insert(
         "pane_rows_cached_skipped".to_string(),
         window.pane_rows_cached_skipped.into(),
     );
@@ -4070,7 +4058,6 @@ fn attach_frame_trace_payload(
         })).collect::<Vec<_>>(),
         "pane_rows_examined": frame_stats.scene_render.pane_rows_examined,
         "pane_rows_emitted": frame_stats.scene_render.pane_rows_emitted,
-        "pane_row_segments_emitted": frame_stats.scene_render.pane_row_segments_emitted,
         "pane_rows_cached_skipped": frame_stats.scene_render.pane_rows_cached_skipped,
         "pane_cells_emitted": frame_stats.scene_render.pane_cells_emitted,
         "extension_render_calls": frame_stats.scene_render.extension_render_calls,
@@ -11679,7 +11666,7 @@ fn render_attach_frame_inner(
                 super::presenter::Presented::Unsupported(reason) => {
                     // Nothing reached the host: the next frame repaints every row.
                     for buffer in view_state.pane_buffers.values_mut() {
-                        buffer.prev_rows.clear();
+                        buffer.forget_drawn_rows();
                     }
                     super::presenter::forget(view_state);
                     return Err(super::presenter::PresenterRejected(reason).into());
@@ -11734,7 +11721,7 @@ fn render_attach_frame_inner(
         // Encoding has advanced row baselines, but partial output is not a
         // presented frame. Repaint every row before using incremental diffs.
         for buffer in view_state.pane_buffers.values_mut() {
-            buffer.prev_rows.clear();
+            buffer.forget_drawn_rows();
         }
         super::presenter::forget(view_state);
         view_state
@@ -12530,7 +12517,7 @@ async fn apply_attach_structured_grid_deltas(
                 pane_applied = true;
             }
             if pane_applied {
-                buffer.prev_rows.clear();
+                buffer.forget_drawn_rows();
             }
         }
         if pane_applied {
@@ -12671,7 +12658,7 @@ pub(super) async fn hydrate_attach_structured_grid_snapshots(
         if !buffer.retained_screen_copy {
             buffer.scrollback_window = None;
         }
-        buffer.prev_rows.clear();
+        buffer.forget_drawn_rows();
         hydrated.insert(snapshot.pane_id);
     }
 
@@ -18798,6 +18785,44 @@ mod tests {
             .is_ok()
         );
         assert!(Arc::ptr_eq(&committed, &output.latest().unwrap()));
+    }
+
+    /// An observed client's observer keeps the frame its host terminal shows by applying the
+    /// change the terminal made: after a frame painted in place, both hold the same cells.
+    #[test]
+    fn an_observer_holds_the_cells_its_host_terminal_shows() {
+        let session_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let mut state = AttachViewState::with_private_presentation(AttachOpenInfo {
+            context_id: None,
+            session_id,
+            can_write: true,
+        });
+        let layout = retry_test_layout(&mut state, pane_id, session_id);
+        state.presentation_extensions = Arc::new(bmux_plugin::RenderExtensionRegistry::new());
+        let (publisher, observer) = super::super::observer::attach_observer_channel();
+        state.set_observer(publisher);
+        render_observed_test_frame(&mut state, &layout);
+        for output in [
+            &b"\r\nsecond line"[..],
+            b"\x1b[2;3Hedit",
+            b"\x1b[1;1H\x1b[2K",
+        ] {
+            append_pane_output(state.pane_buffers.get_mut(&pane_id).unwrap(), output);
+            state
+                .dirty
+                .mark_pane_dirty(pane_id, AttachDirtySource::PaneOutput);
+            render_observed_test_frame(&mut state, &layout);
+            assert!(matches!(
+                state.terminal_presenter.shown_changes(),
+                bmux_attach_pipeline::frame_presenter::ShownChanges::Changed { .. }
+            ));
+            assert_eq!(
+                Some(observer.latest().unwrap().prepared.buffer()),
+                state.terminal_presenter.shown_cells(),
+                "after {output:?}"
+            );
+        }
     }
 
     /// A synchronized update left open past its bound stops holding an observed frame back, as

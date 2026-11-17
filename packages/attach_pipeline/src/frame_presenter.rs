@@ -8,9 +8,11 @@
 
 use std::io::Write;
 
+use bmux_tui::buffer::Buffer;
 use bmux_tui::geometry::{Point, Rect};
+use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::pointer::PointerShapeCapability;
-use bmux_tui::terminal::{ScrollRegionAcceleration, Terminal};
+use bmux_tui::terminal::{FrameChanges, ScrollRegionAcceleration, Terminal};
 
 use crate::AttachCursorState;
 use crate::projection::{GraphicsOutput, PaintOperation, ProjectionFailure};
@@ -23,6 +25,33 @@ pub struct FramePresenter {
     /// A frame was presented since the presenter was made or last forgot: the next frame can be
     /// painted over it rather than over a blank screen.
     shown: bool,
+    /// What the last call to [`Self::present`] did to the frame shown before it.
+    last: Last,
+}
+
+/// What presenting a frame did to the frame shown before it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Last {
+    /// Nothing is known (nothing presented, a full frame, a frame not presented).
+    Unknown,
+    /// Nothing changed.
+    Unchanged,
+    /// It was painted in place over it: the terminal holds what changed.
+    Over,
+}
+
+/// What the last frame presented changed in the frame shown before it, so the same frame can be
+/// kept elsewhere (an observer's copy) by applying the change instead of painting it again.
+pub enum ShownChanges<'presenter> {
+    /// Unknown: paint the frame's operations instead.
+    Unknown,
+    /// Nothing changed.
+    Unchanged,
+    /// The frame's moves and changed cells, and the cells it shows.
+    Changed {
+        cells: &'presenter Buffer,
+        changes: FrameChanges<'presenter>,
+    },
 }
 
 impl Default for FramePresenter {
@@ -82,6 +111,7 @@ impl FramePresenter {
             terminal,
             cursor: None,
             shown: false,
+            last: Last::Unknown,
         }
     }
 
@@ -96,6 +126,7 @@ impl FramePresenter {
     /// The frame counts as shown once its bytes are returned; when they do not reach the host,
     /// [`Self::forget`] makes the next frame repaint in full.
     pub fn present(&mut self, frame: &CapturedFrame<'_>) -> Presented {
+        self.last = Last::Unknown;
         if let Some(failure) = unsupported(frame.operations) {
             return Presented::Unsupported(failure);
         }
@@ -111,6 +142,7 @@ impl FramePresenter {
             && !frame.full
             && !has_graphics
         {
+            self.last = Last::Unchanged;
             return Presented::Unchanged;
         }
         self.terminal
@@ -149,6 +181,9 @@ impl FramePresenter {
         if drawn.is_ok() {
             self.cursor = cursor;
             self.shown = true;
+            if self.terminal.last_changes().is_some() {
+                self.last = Last::Over;
+            }
             Presented::Frame(std::mem::take(self.terminal.writer_mut()))
         } else {
             self.forget();
@@ -162,6 +197,29 @@ impl FramePresenter {
         self.terminal.reset();
         self.cursor = None;
         self.shown = false;
+        self.last = Last::Unknown;
+    }
+
+    /// The cells of the last frame presented, unless forgotten.
+    #[must_use]
+    pub fn shown_cells(&self) -> Option<&Buffer> {
+        self.shown
+            .then(|| self.terminal.retained_buffer())
+            .flatten()
+    }
+
+    /// What the last frame presented changed in the one shown before it.
+    #[must_use]
+    pub fn shown_changes(&self) -> ShownChanges<'_> {
+        match (
+            self.last,
+            self.terminal.retained_buffer(),
+            self.terminal.last_changes(),
+        ) {
+            (Last::Unchanged, _, _) => ShownChanges::Unchanged,
+            (Last::Over, Some(cells), Some(changes)) => ShownChanges::Changed { cells, changes },
+            _ => ShownChanges::Unknown,
+        }
     }
 
     /// Whether a frame was presented since the presenter was made or last forgot. Until one is,
@@ -169,6 +227,17 @@ impl FramePresenter {
     #[must_use]
     pub const fn shown(&self) -> bool {
         self.shown
+    }
+}
+
+/// Paint over a copy of the frame shown before a frame was presented the change the frame made:
+/// its moves, then its changed cells copied from `cells`, the cells it shows.
+pub fn paint_shown_changes(cx: &mut PaintCx<'_, '_>, cells: &Buffer, changes: &FrameChanges<'_>) {
+    for (area, rows) in changes.moves() {
+        cx.move_cells(LocalRect::terminal(area), rows);
+    }
+    for (y, run) in changes.runs() {
+        cx.copy_cells(cells, y, run);
     }
 }
 

@@ -82,6 +82,8 @@ pub struct Frame<'buffer> {
     /// A move covered cells painted before it, which then left the painted spans.
     moved_painted: bool,
     over: Option<OverChanges>,
+    /// The buffer started as the committed cells: writes report only the cells they change.
+    over_committed: bool,
 }
 
 /// What a frame painted in place over the last one changed: the cells painted, carried along by
@@ -221,6 +223,11 @@ impl OverChanges {
         })
     }
 
+    /// The area the changes cover.
+    pub(crate) const fn area(&self) -> Rect {
+        self.area
+    }
+
     /// Whether nothing is marked.
     pub(crate) fn is_clean(&self) -> bool {
         self.rows
@@ -358,6 +365,7 @@ impl<'buffer> Frame<'buffer> {
             painted: None,
             moved_painted: false,
             over: None,
+            over_committed: false,
         }
     }
 
@@ -369,10 +377,24 @@ impl<'buffer> Frame<'buffer> {
 
     /// Record which cells change, for a frame painted in place over the last one.
     pub(crate) fn track_over(&mut self, storage: Option<OverChanges>) {
+        self.over_committed = true;
         let area = self.buffer.area();
         self.over =
             Some(storage.map_or_else(|| OverChanges::new(area), |storage| storage.reuse(area)));
         self.buffer.log_spill();
+    }
+
+    /// Whether writes report only the cells they change: a frame painted over the committed
+    /// cells (in place, or repaired from a copy of them) records what changed, and a cell written
+    /// as it already was did not change.
+    pub(crate) const fn reports_changes_only(&self) -> bool {
+        self.over_committed
+    }
+
+    /// The buffer starts as the committed cells, so writes report only what they change (see
+    /// [`Self::reports_changes_only`]).
+    pub(crate) const fn paint_over_committed(&mut self) {
+        self.over_committed = true;
     }
 
     /// The changes since [`Self::track_over`].

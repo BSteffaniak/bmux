@@ -244,11 +244,13 @@ pub struct PaneRenderBuffer {
     pub extension_projection_cache:
         BTreeMap<(String, Uuid), Vec<crate::projection::PaintOperation>>,
     pub protocol_tracker: TerminalProtocolTracker,
-    /// What the host terminal shows for each of the pane's rows, as last drawn.
-    pub prev_rows: Vec<crate::render::ShownRow>,
-    /// The appearance `prev_rows` were resolved with: rows the grid did not change may be skipped
-    /// only while it is the same.
-    pub prev_rows_appearance: Option<bmux_appearance::RuntimeAppearance>,
+    /// The host shows the pane's rows as they were last drawn from its grid, at its size: rows
+    /// the grid did not change since need not be drawn again. The host's terminal holds what
+    /// they show; the renderer keeps no copy.
+    pub rows_drawn: bool,
+    /// The appearance the drawn rows were resolved with: rows the grid did not change may be
+    /// skipped only while it is the same.
+    pub drawn_appearance: Option<bmux_appearance::RuntimeAppearance>,
     /// The pane's application is inside a synchronized update (DEC mode 2026) at the end of the
     /// output applied so far: it began a frame and has not finished it.
     pub sync_update_in_progress: bool,
@@ -650,6 +652,13 @@ impl PaneRenderBuffer {
 }
 
 impl PaneRenderBuffer {
+    /// Forget that the host shows the pane's rows as drawn, so the next frame that draws the
+    /// pane draws every row: after its output failed, after the host was changed some other way,
+    /// or when the rows no longer correspond (a resize, an alternate-screen switch).
+    pub const fn forget_drawn_rows(&mut self) {
+        self.rows_drawn = false;
+    }
+
     /// Note whether a synchronized update is open after the output applied so far.
     pub const fn set_sync_update(&mut self, open: bool, now: Instant) {
         if open && !self.sync_update_in_progress {
@@ -694,8 +703,8 @@ impl Default for PaneRenderBuffer {
             terminal_grid: TerminalGridStream::new(80, 24, GridLimits::default())
                 .expect("default pane render grid dimensions are valid"),
             protocol_tracker: TerminalProtocolTracker::new(),
-            prev_rows: Vec::new(),
-            prev_rows_appearance: None,
+            rows_drawn: false,
+            drawn_appearance: None,
             sync_update_in_progress: false,
             sync_update_since: None,
             expected_stream_start: None,

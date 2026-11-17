@@ -417,7 +417,7 @@ pub fn resize_attach_grids_for_scene_with_size_preserving(
             buffer.terminal_grid.grid().height(),
         );
         if next_grid_size != previous_grid_size {
-            buffer.prev_rows.clear();
+            buffer.forget_drawn_rows();
             if !buffer.retained_screen_copy {
                 buffer.scrollback_window = None;
             }
@@ -497,14 +497,11 @@ mod tests {
         )]);
         let mut pane_buffers: BTreeMap<Uuid, PaneRenderBuffer> = BTreeMap::new();
         let buffer = pane_buffers.entry(pane_id).or_default();
-        buffer.prev_rows.push(crate::render::ShownRow::blank(1));
+        buffer.rows_drawn = true;
 
         resize_attach_grids_for_scene_with_size(&mut pane_buffers, &test_scene, 10, 3);
 
-        assert_eq!(
-            pane_buffers[&pane_id].prev_rows,
-            Vec::<crate::render::ShownRow>::new()
-        );
+        assert!(!pane_buffers[&pane_id].rows_drawn);
     }
 
     #[test]
@@ -524,7 +521,7 @@ mod tests {
                 if alternate {
                     buffer.terminal_grid.process(b"\x1b[?1049halt");
                 }
-                buffer.prev_rows.push(crate::render::ShownRow::blank(1));
+                buffer.rows_drawn = true;
             }
             let before = buffers[&pane].terminal_grid.grid().snapshot(0, 5);
             resize_attach_grids_for_scene_with_size_preserving(
@@ -535,21 +532,12 @@ mod tests {
                 &BTreeSet::from([pane]),
             );
             assert_eq!(buffers[&pane].terminal_grid.grid().snapshot(0, 5), before);
-            assert_eq!(
-                buffers[&pane].prev_rows,
-                [crate::render::ShownRow::blank(1)]
-            );
+            assert!(buffers[&pane].rows_drawn);
             assert_ne!(buffers[&uniform].terminal_grid.grid().width(), 20);
-            assert_eq!(
-                buffers[&uniform].prev_rows,
-                Vec::<crate::render::ShownRow>::new()
-            );
+            assert!(!buffers[&uniform].rows_drawn);
             resize_attach_grids_for_scene_with_size(&mut buffers, &test_scene, 10, 3);
             assert_ne!(buffers[&pane].terminal_grid.grid().width(), 20);
-            assert_eq!(
-                buffers[&pane].prev_rows,
-                Vec::<crate::render::ShownRow>::new()
-            );
+            assert!(!buffers[&pane].rows_drawn);
         }
     }
 
