@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -439,10 +439,54 @@ fn gateway_effective_policy_values(definition: &ClusterGatewayDefinition) -> Gat
     values
 }
 
-static CLUSTER_GATEWAY_RUNTIME_STATE: OnceLock<
-    Mutex<BTreeMap<String, ClusterGatewayRuntimeState>>,
-> = OnceLock::new();
-static CLUSTER_GATEWAY_PATHS: OnceLock<ConfigPaths> = OnceLock::new();
+/// Gateway runtime state owned by one cluster plugin instance: where it
+/// persists, and the per-cluster breaker, cooldown and history state cached
+/// from there. Nothing is process-wide; two instances keep separate state.
+#[derive(Default)]
+pub struct GatewayRuntime {
+    paths: Mutex<Option<ConfigPaths>>,
+    states: Mutex<BTreeMap<String, ClusterGatewayRuntimeState>>,
+    #[cfg(test)]
+    _root: Option<tempfile::TempDir>,
+}
+
+impl GatewayRuntime {
+    /// Persist under `paths` from now on (the invoking command's host paths).
+    fn bind_paths(&self, paths: ConfigPaths) {
+        if let Ok(mut slot) = self.paths.lock() {
+            *slot = Some(paths);
+        }
+    }
+
+    fn paths(&self) -> ConfigPaths {
+        self.paths
+            .lock()
+            .ok()
+            .and_then(|paths| paths.clone())
+            .unwrap_or_default()
+    }
+
+    const fn state_map(&self) -> &Mutex<BTreeMap<String, ClusterGatewayRuntimeState>> {
+        &self.states
+    }
+
+    /// A runtime persisting under its own private directory.
+    #[cfg(test)]
+    fn for_tests() -> Self {
+        let root = tempfile::tempdir().expect("gateway test directory");
+        let paths = ConfigPaths::new(
+            root.path().join("config"),
+            root.path().join("runtime"),
+            root.path().join("data"),
+            root.path().join("state"),
+        );
+        Self {
+            paths: Mutex::new(Some(paths)),
+            states: Mutex::default(),
+            _root: Some(root),
+        }
+    }
+}
 
 impl Default for ClusterGatewayDefinition {
     fn default() -> Self {
@@ -812,6 +856,7 @@ fn clear_cluster_gateway_runtime_state(paths: &ConfigPaths) -> Result<bool> {
     }
 }
 pub async fn run_command(
+    runtime: &GatewayRuntime,
     caller: &NativeCommandContext,
     plugin_id: &str,
     command_name: &str,
@@ -828,7 +873,7 @@ pub async fn run_command(
         PathBuf::from(&caller.connection.data_dir),
         PathBuf::from(&caller.connection.state_dir),
     );
-    let _ = CLUSTER_GATEWAY_PATHS.set(paths);
+    runtime.bind_paths(paths);
     let config_path = caller
         .connection
         .probe_config_file("bmux.toml")
@@ -837,9 +882,9 @@ pub async fn run_command(
     let settings = cluster_gateway_settings_from_context(caller, &config)?;
 
     if let Some(code) = maybe_run_cluster_gateway_special_command(
+        runtime,
         caller,
         command_name,
-        &config,
         &settings,
         &overrides,
     )
@@ -853,6 +898,7 @@ pub async fn run_command(
     }
 
     run_cluster_gateway_routed_command(
+        runtime,
         caller,
         plugin_id,
         command_name,
@@ -863,19 +909,25 @@ pub async fn run_command(
     .await
 }
 
+#[allow(clippy::too_many_lines)] // One flat dispatch over the gateway subcommands.
 async fn maybe_run_cluster_gateway_special_command(
+    runtime: &GatewayRuntime,
     caller: &NativeCommandContext,
     command_name: &str,
-    config: &BmuxConfig,
     settings: &ClusterGatewaySettings,
     overrides: &GatewayCommandOverrides,
 ) -> Result<Option<u8>> {
     if command_name == "cluster-gateway-reset" {
-        return run_cluster_gateway_reset_command(settings, &overrides.passthrough_arguments)
-            .map(Some);
+        return run_cluster_gateway_reset_command(
+            runtime,
+            settings,
+            &overrides.passthrough_arguments,
+        )
+        .map(Some);
     }
     if command_name == "cluster-gateway-history-clear" {
         return run_cluster_gateway_history_clear_command(
+            runtime,
             settings,
             &overrides.passthrough_arguments,
         )
@@ -906,14 +958,20 @@ async fn maybe_run_cluster_gateway_special_command(
     let definition = apply_gateway_overrides(base_definition.clone(), overrides)?;
     if command_name == "cluster-gateway-status" {
         let output_format = parse_gateway_output_format(&overrides.passthrough_arguments)?;
-        print_cluster_gateway_status(&cluster_name, &definition, overrides, output_format)?;
+        print_cluster_gateway_status(
+            runtime,
+            &cluster_name,
+            &definition,
+            overrides,
+            output_format,
+        )?;
         return Ok(Some(0));
     }
     if command_name == "cluster-gateway-doctor" {
         let output_format = parse_gateway_output_format(&overrides.passthrough_arguments)?;
         return run_cluster_gateway_doctor(
+            runtime,
             caller,
-            config,
             &cluster_name,
             &definition,
             overrides,
@@ -925,6 +983,7 @@ async fn maybe_run_cluster_gateway_special_command(
     if command_name == "cluster-gateway-history" {
         let output_format = parse_gateway_output_format(&overrides.passthrough_arguments)?;
         return run_cluster_gateway_history_command(
+            runtime,
             &cluster_name,
             &definition,
             &overrides.passthrough_arguments,
@@ -934,6 +993,7 @@ async fn maybe_run_cluster_gateway_special_command(
     }
     if command_name == "cluster-gateway-history-export" {
         return run_cluster_gateway_history_export_command(
+            runtime,
             &cluster_name,
             &definition,
             &overrides.passthrough_arguments,
@@ -943,8 +1003,8 @@ async fn maybe_run_cluster_gateway_special_command(
     if command_name == "cluster-gateway-why" {
         let output_format = parse_gateway_output_format(&overrides.passthrough_arguments)?;
         return run_cluster_gateway_why_command(
+            runtime,
             caller,
-            config,
             &cluster_name,
             &definition,
             overrides,
@@ -956,8 +1016,8 @@ async fn maybe_run_cluster_gateway_special_command(
 
     let output_format = parse_gateway_output_format(&overrides.passthrough_arguments)?;
     run_cluster_gateway_explain(
+        runtime,
         caller,
-        config,
         &cluster_name,
         &definition,
         overrides,
@@ -967,6 +1027,7 @@ async fn maybe_run_cluster_gateway_special_command(
 }
 
 async fn run_cluster_gateway_routed_command(
+    runtime: &GatewayRuntime,
     caller: &NativeCommandContext,
     plugin_id: &str,
     command_name: &str,
@@ -986,6 +1047,7 @@ async fn run_cluster_gateway_routed_command(
     let definition = apply_gateway_overrides(base_definition.clone(), overrides)?;
 
     if let Some(code) = maybe_run_gateway_routed_dry_run(
+        runtime,
         caller,
         command_name,
         config,
@@ -1002,7 +1064,7 @@ async fn run_cluster_gateway_routed_command(
         return Ok(None);
     }
 
-    let candidates = ordered_gateway_candidates_for_cluster(&cluster_name, &definition)?;
+    let candidates = ordered_gateway_candidates_for_cluster(runtime, &cluster_name, &definition)?;
 
     tracing::info!(
         event = "cluster_gateway_selection_start",
@@ -1015,6 +1077,7 @@ async fn run_cluster_gateway_routed_command(
 
     let mut failures = Vec::new();
     let attempted = match run_gateway_candidate_batch(
+        runtime,
         GatewayBatchRequest {
             caller,
             cluster_name: &cluster_name,
@@ -1042,6 +1105,7 @@ async fn run_cluster_gateway_routed_command(
             "all gateway candidates were in cooldown; retrying immediately"
         );
         if let GatewayBatchOutcome::Success(code) = run_gateway_candidate_batch(
+            runtime,
             GatewayBatchRequest {
                 caller,
                 cluster_name: &cluster_name,
@@ -1071,6 +1135,7 @@ async fn run_cluster_gateway_routed_command(
 }
 
 async fn maybe_run_gateway_routed_dry_run(
+    runtime: &GatewayRuntime,
     caller: &NativeCommandContext,
     command_name: &str,
     _config: &BmuxConfig,
@@ -1092,18 +1157,21 @@ async fn maybe_run_gateway_routed_dry_run(
         )?;
         return Ok(Some(0));
     }
-    let candidates = ordered_gateway_candidates_for_cluster(cluster_name, definition)?;
-    let code = run_cluster_gateway_dry_run(GatewayDryRunRequest {
-        caller,
-        cluster_name,
-        definition,
-        command_name,
-        candidates: &candidates,
-        output_format,
-        respect_cooldown: definition.gateway_mode == ClusterGatewayMode::Auto,
-        no_failover: overrides.no_failover,
-        why: overrides.why,
-    })
+    let candidates = ordered_gateway_candidates_for_cluster(runtime, cluster_name, definition)?;
+    let code = run_cluster_gateway_dry_run(
+        runtime,
+        GatewayDryRunRequest {
+            caller,
+            cluster_name,
+            definition,
+            command_name,
+            candidates: &candidates,
+            output_format,
+            respect_cooldown: definition.gateway_mode == ClusterGatewayMode::Auto,
+            no_failover: overrides.no_failover,
+            why: overrides.why,
+        },
+    )
     .await?;
     Ok(Some(code))
 }
@@ -1184,21 +1252,27 @@ fn print_direct_gateway_dry_run(
     Ok(())
 }
 
-async fn run_cluster_gateway_dry_run(request: GatewayDryRunRequest<'_>) -> Result<u8> {
+async fn run_cluster_gateway_dry_run(
+    runtime: &GatewayRuntime,
+    request: GatewayDryRunRequest<'_>,
+) -> Result<u8> {
     let preferred = preferred_gateway_candidate(
+        runtime,
         request.cluster_name,
         gateway_success_ttl(request.definition),
     );
     let mut probes = Vec::with_capacity(request.candidates.len());
     for candidate in request.candidates {
-        let cooldown_ms = gateway_cooldown_remaining_ms(request.cluster_name, candidate);
+        let cooldown_ms = gateway_cooldown_remaining_ms(runtime, request.cluster_name, candidate);
         let health = gateway_effective_candidate_health(
+            runtime,
             request.cluster_name,
             candidate,
             request.definition,
             GatewayExecutionMode::Observational,
         );
         let skip_reason = gateway_candidate_skip_reason(
+            runtime,
             request.cluster_name,
             candidate,
             request.definition,
@@ -1346,12 +1420,14 @@ fn print_gateway_dry_run_text(
 
 #[allow(clippy::too_many_lines)] // Control flow is clearer as one selection loop.
 async fn run_gateway_candidate_batch(
+    runtime: &GatewayRuntime,
     request: GatewayBatchRequest<'_>,
     failures: &mut Vec<GatewayAttemptFailure>,
 ) -> Result<GatewayBatchOutcome> {
     let mut attempted = false;
     for candidate in request.candidates {
         if let Some(skip_reason) = gateway_candidate_skip_reason(
+            runtime,
             request.cluster_name,
             candidate,
             request.definition,
@@ -1387,12 +1463,14 @@ async fn run_gateway_candidate_batch(
             Ok(code) => {
                 if request.execution_mode == GatewayExecutionMode::Mutating {
                     record_gateway_success(
+                        runtime,
                         request.cluster_name,
                         candidate,
                         request.definition,
                         started.elapsed().as_millis(),
                     );
                     record_gateway_history_entry(
+                        runtime,
                         request.cluster_name,
                         request.definition,
                         &GatewayHistoryRecordInput {
@@ -1419,6 +1497,7 @@ async fn run_gateway_candidate_batch(
                 let classified = classify_gateway_error(&error);
                 if request.execution_mode == GatewayExecutionMode::Mutating {
                     record_gateway_failure(
+                        runtime,
                         request.cluster_name,
                         candidate,
                         request.definition,
@@ -1426,6 +1505,7 @@ async fn run_gateway_candidate_batch(
                         classified.0,
                     );
                     record_gateway_history_entry(
+                        runtime,
                         request.cluster_name,
                         request.definition,
                         &GatewayHistoryRecordInput {
@@ -1699,13 +1779,14 @@ fn gateway_probe_timeout_ms(definition: &ClusterGatewayDefinition) -> u64 {
 }
 
 fn gateway_effective_candidate_health(
+    runtime: &GatewayRuntime,
     cluster_name: &str,
     candidate: &str,
     _definition: &ClusterGatewayDefinition,
     execution_mode: GatewayExecutionMode,
 ) -> GatewayCandidateHealth {
-    ensure_gateway_runtime_state_loaded();
-    let Ok(mut state_map) = cluster_gateway_state_map().lock() else {
+    ensure_gateway_runtime_state_loaded(runtime);
+    let Ok(mut state_map) = runtime.state_map().lock() else {
         return GatewayCandidateHealth::default();
     };
     let (health, persist_needed) = gateway_effective_candidate_health_in_state(
@@ -1717,7 +1798,7 @@ fn gateway_effective_candidate_health(
     if persist_needed {
         let snapshot = state_map.clone();
         drop(state_map);
-        persist_gateway_runtime_state_snapshot(&snapshot);
+        persist_gateway_runtime_state_snapshot(runtime, &snapshot);
     }
     health
 }
@@ -1755,29 +1836,38 @@ fn gateway_effective_candidate_health_in_state(
 }
 
 fn gateway_candidate_skip_reason(
+    runtime: &GatewayRuntime,
     cluster_name: &str,
     candidate: &str,
     definition: &ClusterGatewayDefinition,
     respect_cooldown: bool,
     execution_mode: GatewayExecutionMode,
 ) -> Option<&'static str> {
-    let health =
-        gateway_effective_candidate_health(cluster_name, candidate, definition, execution_mode);
+    let health = gateway_effective_candidate_health(
+        runtime,
+        cluster_name,
+        candidate,
+        definition,
+        execution_mode,
+    );
     if health.breaker_state == GatewayBreakerState::Open {
         return Some("breaker_open");
     }
-    if respect_cooldown && gateway_cooldown_remaining_ms(cluster_name, candidate).is_some() {
+    if respect_cooldown && gateway_cooldown_remaining_ms(runtime, cluster_name, candidate).is_some()
+    {
         return Some("cooldown");
     }
     None
 }
 
 fn candidate_stability_score(
+    runtime: &GatewayRuntime,
     cluster_name: &str,
     candidate: &str,
     definition: &ClusterGatewayDefinition,
 ) -> u64 {
     gateway_effective_candidate_health(
+        runtime,
         cluster_name,
         candidate,
         definition,
@@ -1787,6 +1877,7 @@ fn candidate_stability_score(
 }
 
 fn ordered_gateway_candidates_for_cluster(
+    runtime: &GatewayRuntime,
     cluster_name: &str,
     definition: &ClusterGatewayDefinition,
 ) -> Result<Vec<String>> {
@@ -1795,11 +1886,13 @@ fn ordered_gateway_candidates_for_cluster(
         return Ok(candidates);
     }
 
-    let preferred = preferred_gateway_candidate(cluster_name, gateway_success_ttl(definition));
+    let preferred =
+        preferred_gateway_candidate(runtime, cluster_name, gateway_success_ttl(definition));
     let mut ordered = candidates;
     ordered.sort_by_key(|candidate| {
-        let stability = candidate_stability_score(cluster_name, candidate, definition);
+        let stability = candidate_stability_score(runtime, cluster_name, candidate, definition);
         let latency = gateway_effective_candidate_health(
+            runtime,
             cluster_name,
             candidate,
             definition,
@@ -1813,39 +1906,16 @@ fn ordered_gateway_candidates_for_cluster(
     Ok(ordered)
 }
 
-fn gateway_paths() -> &'static ConfigPaths {
-    CLUSTER_GATEWAY_PATHS.get_or_init(|| {
-        #[cfg(test)]
-        {
-            // Nextest runs tests in separate processes; serial_test only locks
-            // within one process. Never share persisted gateway state via HOME.
-            static ROOT: OnceLock<tempfile::TempDir> = OnceLock::new();
-            let root = ROOT.get_or_init(|| tempfile::tempdir().expect("gateway test directory"));
-            ConfigPaths::new(
-                root.path().join("config"),
-                root.path().join("runtime"),
-                root.path().join("data"),
-                root.path().join("state"),
-            )
-        }
-        #[cfg(not(test))]
-        ConfigPaths::default()
-    })
-}
-
-fn cluster_gateway_state_map() -> &'static Mutex<BTreeMap<String, ClusterGatewayRuntimeState>> {
-    CLUSTER_GATEWAY_RUNTIME_STATE.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-fn ensure_gateway_runtime_state_loaded() {
-    let should_load = cluster_gateway_state_map()
+fn ensure_gateway_runtime_state_loaded(runtime: &GatewayRuntime) {
+    let should_load = runtime
+        .state_map()
         .lock()
         .is_ok_and(|state_map| state_map.is_empty());
     if !should_load {
         return;
     }
 
-    let loaded = match load_cluster_gateway_runtime_state(gateway_paths()) {
+    let loaded = match load_cluster_gateway_runtime_state(&runtime.paths()) {
         Ok(loaded) => loaded,
         Err(error) => {
             tracing::warn!(
@@ -1860,7 +1930,7 @@ fn ensure_gateway_runtime_state_loaded() {
         return;
     }
 
-    if let Ok(mut state_map) = cluster_gateway_state_map().lock()
+    if let Ok(mut state_map) = runtime.state_map().lock()
         && state_map.is_empty()
     {
         *state_map = loaded;
@@ -1868,9 +1938,10 @@ fn ensure_gateway_runtime_state_loaded() {
 }
 
 fn persist_gateway_runtime_state_snapshot(
+    runtime: &GatewayRuntime,
     state_map: &BTreeMap<String, ClusterGatewayRuntimeState>,
 ) {
-    if let Err(error) = save_cluster_gateway_runtime_state(gateway_paths(), state_map) {
+    if let Err(error) = save_cluster_gateway_runtime_state(&runtime.paths(), state_map) {
         tracing::warn!(
             event = "cluster_gateway_state_save_failed",
             error = %error,
@@ -1879,21 +1950,25 @@ fn persist_gateway_runtime_state_snapshot(
     }
 }
 
-fn preferred_gateway_candidate(cluster_name: &str, success_ttl: Duration) -> Option<String> {
-    ensure_gateway_runtime_state_loaded();
+fn preferred_gateway_candidate(
+    runtime: &GatewayRuntime,
+    cluster_name: &str,
+    success_ttl: Duration,
+) -> Option<String> {
+    ensure_gateway_runtime_state_loaded(runtime);
     let state = {
-        let state_map = cluster_gateway_state_map().lock().ok()?;
+        let state_map = runtime.state_map().lock().ok()?;
         state_map.get(cluster_name)?.clone()
     };
     let last_good = state.last_good?;
     if last_good.observed_at.elapsed() > success_ttl {
-        if let Ok(mut state_map) = cluster_gateway_state_map().lock()
+        if let Ok(mut state_map) = runtime.state_map().lock()
             && let Some(cluster_state) = state_map.get_mut(cluster_name)
         {
             cluster_state.last_good = None;
             let snapshot = state_map.clone();
             drop(state_map);
-            persist_gateway_runtime_state_snapshot(&snapshot);
+            persist_gateway_runtime_state_snapshot(runtime, &snapshot);
         }
         None
     } else {
@@ -1902,13 +1977,14 @@ fn preferred_gateway_candidate(cluster_name: &str, success_ttl: Duration) -> Opt
 }
 
 fn record_gateway_success(
+    runtime: &GatewayRuntime,
     cluster_name: &str,
     candidate: &str,
     definition: &ClusterGatewayDefinition,
     latency_ms: u128,
 ) {
-    ensure_gateway_runtime_state_loaded();
-    if let Ok(mut state_map) = cluster_gateway_state_map().lock() {
+    ensure_gateway_runtime_state_loaded(runtime);
+    if let Ok(mut state_map) = runtime.state_map().lock() {
         record_gateway_success_in_state(
             &mut state_map,
             cluster_name,
@@ -1918,7 +1994,7 @@ fn record_gateway_success(
         );
         let snapshot = state_map.clone();
         drop(state_map);
-        persist_gateway_runtime_state_snapshot(&snapshot);
+        persist_gateway_runtime_state_snapshot(runtime, &snapshot);
     }
 }
 
@@ -1961,14 +2037,15 @@ fn record_gateway_success_in_state(
 }
 
 fn record_gateway_failure(
+    runtime: &GatewayRuntime,
     cluster_name: &str,
     candidate: &str,
     definition: &ClusterGatewayDefinition,
     latency_ms: u128,
     reason_code: &str,
 ) {
-    ensure_gateway_runtime_state_loaded();
-    if let Ok(mut state_map) = cluster_gateway_state_map().lock() {
+    ensure_gateway_runtime_state_loaded(runtime);
+    if let Ok(mut state_map) = runtime.state_map().lock() {
         record_gateway_failure_in_state(
             &mut state_map,
             cluster_name,
@@ -1979,7 +2056,7 @@ fn record_gateway_failure(
         );
         let snapshot = state_map.clone();
         drop(state_map);
-        persist_gateway_runtime_state_snapshot(&snapshot);
+        persist_gateway_runtime_state_snapshot(runtime, &snapshot);
     }
 }
 
@@ -2026,12 +2103,13 @@ fn record_gateway_failure_in_state(
 }
 
 fn record_gateway_history_entry(
+    runtime: &GatewayRuntime,
     cluster_name: &str,
     definition: &ClusterGatewayDefinition,
     input: &GatewayHistoryRecordInput<'_>,
 ) {
-    ensure_gateway_runtime_state_loaded();
-    if let Ok(mut state_map) = cluster_gateway_state_map().lock() {
+    ensure_gateway_runtime_state_loaded(runtime);
+    if let Ok(mut state_map) = runtime.state_map().lock() {
         let cluster_state = state_map.entry(cluster_name.to_string()).or_default();
         cluster_state.history.push(GatewayHistoryEntry {
             observed_at: Instant::now(),
@@ -2046,17 +2124,19 @@ fn record_gateway_history_entry(
         trim_gateway_history_entries(cluster_state, definition);
         let snapshot = state_map.clone();
         drop(state_map);
-        persist_gateway_runtime_state_snapshot(&snapshot);
+        persist_gateway_runtime_state_snapshot(runtime, &snapshot);
     }
 }
 
 fn gateway_history_entries(
+    runtime: &GatewayRuntime,
     cluster_name: &str,
     definition: &ClusterGatewayDefinition,
     query: &GatewayHistoryQuery,
 ) -> Vec<GatewayHistoryEntry> {
-    ensure_gateway_runtime_state_loaded();
-    let mut entries = cluster_gateway_state_map()
+    ensure_gateway_runtime_state_loaded(runtime);
+    let mut entries = runtime
+        .state_map()
         .lock()
         .ok()
         .and_then(|state_map| {
@@ -2303,20 +2383,21 @@ fn parse_gateway_reset_scope(arguments: &[String]) -> Result<GatewayResetScope> 
 }
 
 fn run_cluster_gateway_reset_command(
+    runtime: &GatewayRuntime,
     settings: &ClusterGatewaySettings,
     arguments: &[String],
 ) -> Result<u8> {
     let scope = parse_gateway_reset_scope(arguments)?;
     match scope {
         GatewayResetScope::All => {
-            let removed = clear_gateway_runtime_state_all()?;
+            let removed = clear_gateway_runtime_state_all(runtime)?;
             println!("cluster gateway reset: scope=all removed={removed}");
         }
         GatewayResetScope::Cluster(cluster_name) => {
             if !settings.clusters.contains_key(cluster_name.as_str()) {
                 anyhow::bail!("unknown cluster '{cluster_name}'");
             }
-            let removed = clear_gateway_runtime_state_cluster(cluster_name.as_str())?;
+            let removed = clear_gateway_runtime_state_cluster(runtime, cluster_name.as_str())?;
             println!(
                 "cluster gateway reset: scope=cluster cluster='{cluster_name}' removed={removed}"
             );
@@ -2326,13 +2407,14 @@ fn run_cluster_gateway_reset_command(
 }
 
 fn run_cluster_gateway_history_command(
+    runtime: &GatewayRuntime,
     cluster_name: &str,
     definition: &ClusterGatewayDefinition,
     arguments: &[String],
     output_format: GatewayOutputFormat,
 ) -> Result<u8> {
     let query = parse_gateway_history_query(arguments)?;
-    let entries = gateway_history_entries(cluster_name, definition, &query);
+    let entries = gateway_history_entries(runtime, cluster_name, definition, &query);
 
     if output_format == GatewayOutputFormat::Json {
         let payload_entries = entries
@@ -2396,12 +2478,13 @@ fn run_cluster_gateway_history_command(
 }
 
 fn run_cluster_gateway_history_export_command(
+    runtime: &GatewayRuntime,
     cluster_name: &str,
     definition: &ClusterGatewayDefinition,
     arguments: &[String],
 ) -> Result<u8> {
     let query = parse_gateway_history_query(arguments)?;
-    let entries = gateway_history_entries(cluster_name, definition, &query);
+    let entries = gateway_history_entries(runtime, cluster_name, definition, &query);
     let export_format = parse_gateway_export_format(arguments)?;
     match export_format {
         GatewayExportFormat::Json => {
@@ -2447,6 +2530,7 @@ fn run_cluster_gateway_history_export_command(
 }
 
 fn run_cluster_gateway_history_clear_command(
+    runtime: &GatewayRuntime,
     settings: &ClusterGatewaySettings,
     arguments: &[String],
 ) -> Result<u8> {
@@ -2476,9 +2560,9 @@ fn run_cluster_gateway_history_clear_command(
         );
     }
 
-    ensure_gateway_runtime_state_loaded();
+    ensure_gateway_runtime_state_loaded(runtime);
     let mut removed = 0usize;
-    if let Ok(mut state_map) = cluster_gateway_state_map().lock() {
+    if let Ok(mut state_map) = runtime.state_map().lock() {
         match scope {
             GatewayHistoryClearScope::All => {
                 for (cluster_name, state) in state_map.iter_mut() {
@@ -2517,7 +2601,7 @@ fn run_cluster_gateway_history_clear_command(
         }
         let snapshot = state_map.clone();
         drop(state_map);
-        persist_gateway_runtime_state_snapshot(&snapshot);
+        persist_gateway_runtime_state_snapshot(runtime, &snapshot);
     }
 
     println!("cluster gateway history clear: removed={removed}");
@@ -2561,31 +2645,36 @@ fn resolve_cluster_name_for_history(
     Ok(explicit.or_else(|| settings.clusters.keys().next().cloned()))
 }
 
-fn clear_gateway_runtime_state_all() -> Result<bool> {
-    ensure_gateway_runtime_state_loaded();
-    let had_entries = cluster_gateway_state_map()
+fn clear_gateway_runtime_state_all(runtime: &GatewayRuntime) -> Result<bool> {
+    ensure_gateway_runtime_state_loaded(runtime);
+    let had_entries = runtime
+        .state_map()
         .lock()
         .is_ok_and(|state_map| !state_map.is_empty());
-    if let Ok(mut state_map) = cluster_gateway_state_map().lock() {
+    if let Ok(mut state_map) = runtime.state_map().lock() {
         state_map.clear();
     }
 
-    let paths = gateway_paths();
+    let paths = &runtime.paths();
     let removed_file = clear_cluster_gateway_runtime_state(paths)?;
     Ok(had_entries || removed_file)
 }
 
-fn clear_gateway_runtime_state_cluster(cluster_name: &str) -> Result<bool> {
-    ensure_gateway_runtime_state_loaded();
+fn clear_gateway_runtime_state_cluster(
+    runtime: &GatewayRuntime,
+    cluster_name: &str,
+) -> Result<bool> {
+    ensure_gateway_runtime_state_loaded(runtime);
     let snapshot = {
-        let mut state_map = cluster_gateway_state_map()
+        let mut state_map = runtime
+            .state_map()
             .lock()
             .map_err(|_| anyhow::anyhow!("failed locking gateway runtime state"))?;
         let removed = state_map.remove(cluster_name).is_some();
         (removed, state_map.clone())
     };
 
-    let paths = gateway_paths();
+    let paths = &runtime.paths();
     if snapshot.1.is_empty() {
         let _ = clear_cluster_gateway_runtime_state(paths)?;
     } else {
@@ -2595,6 +2684,7 @@ fn clear_gateway_runtime_state_cluster(cluster_name: &str) -> Result<bool> {
 }
 
 fn status_selected_candidate(
+    runtime: &GatewayRuntime,
     cluster_name: &str,
     definition: &ClusterGatewayDefinition,
     ordered_candidates: &[String],
@@ -2606,6 +2696,7 @@ fn status_selected_candidate(
         .iter()
         .find(|candidate| {
             gateway_candidate_skip_reason(
+                runtime,
                 cluster_name,
                 candidate,
                 definition,
@@ -2807,16 +2898,24 @@ fn apply_gateway_overrides(
 }
 
 fn print_cluster_gateway_status(
+    runtime: &GatewayRuntime,
     cluster_name: &str,
     definition: &ClusterGatewayDefinition,
     overrides: &GatewayCommandOverrides,
     output_format: GatewayOutputFormat,
 ) -> Result<()> {
-    let candidates = ordered_gateway_candidates_for_cluster(cluster_name, definition)?;
-    let preferred = preferred_gateway_candidate(cluster_name, gateway_success_ttl(definition));
-    let candidate_rows =
-        gateway_status_candidate_rows(cluster_name, definition, preferred.as_ref(), &candidates);
-    let selected_candidate = status_selected_candidate(cluster_name, definition, &candidates);
+    let candidates = ordered_gateway_candidates_for_cluster(runtime, cluster_name, definition)?;
+    let preferred =
+        preferred_gateway_candidate(runtime, cluster_name, gateway_success_ttl(definition));
+    let candidate_rows = gateway_status_candidate_rows(
+        runtime,
+        cluster_name,
+        definition,
+        preferred.as_ref(),
+        &candidates,
+    );
+    let selected_candidate =
+        status_selected_candidate(runtime, cluster_name, definition, &candidates);
 
     if output_format == GatewayOutputFormat::Json {
         print_cluster_gateway_status_json(
@@ -2840,6 +2939,7 @@ fn print_cluster_gateway_status(
 }
 
 fn gateway_status_candidate_rows(
+    runtime: &GatewayRuntime,
     cluster_name: &str,
     definition: &ClusterGatewayDefinition,
     preferred: Option<&String>,
@@ -2849,14 +2949,16 @@ fn gateway_status_candidate_rows(
         .iter()
         .map(|candidate| {
             let preferred_marker = preferred.is_some_and(|value| value == candidate);
-            let cooldown = gateway_cooldown_remaining_ms(cluster_name, candidate);
+            let cooldown = gateway_cooldown_remaining_ms(runtime, cluster_name, candidate);
             let health = gateway_effective_candidate_health(
+                runtime,
                 cluster_name,
                 candidate,
                 definition,
                 GatewayExecutionMode::Observational,
             );
             let skip_reason = gateway_candidate_skip_reason(
+                runtime,
                 cluster_name,
                 candidate,
                 definition,
@@ -2995,15 +3097,16 @@ fn print_cluster_gateway_status_text(
 }
 
 async fn run_cluster_gateway_explain(
+    runtime: &GatewayRuntime,
     caller: &NativeCommandContext,
-    config: &BmuxConfig,
     cluster_name: &str,
     definition: &ClusterGatewayDefinition,
     overrides: &GatewayCommandOverrides,
     output_format: GatewayOutputFormat,
 ) -> Result<Option<u8>> {
-    let candidates = ordered_gateway_candidates_for_cluster(cluster_name, definition)?;
-    let preferred = preferred_gateway_candidate(cluster_name, gateway_success_ttl(definition));
+    let candidates = ordered_gateway_candidates_for_cluster(runtime, cluster_name, definition)?;
+    let preferred =
+        preferred_gateway_candidate(runtime, cluster_name, gateway_success_ttl(definition));
     if output_format == GatewayOutputFormat::Text {
         print_gateway_policy_header(
             "cluster gateway explain",
@@ -3015,8 +3118,8 @@ async fn run_cluster_gateway_explain(
     }
 
     let probes = collect_gateway_explain_probes(
+        runtime,
         caller,
-        config,
         cluster_name,
         definition,
         &candidates,
@@ -3111,18 +3214,19 @@ fn print_gateway_explain_text_result(
 }
 
 async fn run_cluster_gateway_doctor(
+    runtime: &GatewayRuntime,
     caller: &NativeCommandContext,
-    config: &BmuxConfig,
     cluster_name: &str,
     definition: &ClusterGatewayDefinition,
     overrides: &GatewayCommandOverrides,
     output_format: GatewayOutputFormat,
 ) -> Result<u8> {
-    let candidates = ordered_gateway_candidates_for_cluster(cluster_name, definition)?;
-    let preferred = preferred_gateway_candidate(cluster_name, gateway_success_ttl(definition));
+    let candidates = ordered_gateway_candidates_for_cluster(runtime, cluster_name, definition)?;
+    let preferred =
+        preferred_gateway_candidate(runtime, cluster_name, gateway_success_ttl(definition));
     let probes = collect_gateway_explain_probes(
+        runtime,
         caller,
-        config,
         cluster_name,
         definition,
         &candidates,
@@ -3132,7 +3236,7 @@ async fn run_cluster_gateway_doctor(
     .await;
     let mut findings = build_gateway_doctor_findings(cluster_name, &probes);
     findings.sort_by_key(|finding| finding.priority);
-    let slo = gateway_doctor_slo_snapshot(cluster_name, definition);
+    let slo = gateway_doctor_slo_snapshot(runtime, cluster_name, definition);
     let has_critical = findings
         .iter()
         .any(|finding| matches!(finding.severity, GatewayDoctorSeverity::Critical));
@@ -3204,19 +3308,21 @@ async fn run_cluster_gateway_doctor(
     Ok(u8::from(has_critical))
 }
 
+#[allow(clippy::too_many_lines)] // One report: candidate probes, decision, and rendering.
 async fn run_cluster_gateway_why_command(
+    runtime: &GatewayRuntime,
     caller: &NativeCommandContext,
-    config: &BmuxConfig,
     cluster_name: &str,
     definition: &ClusterGatewayDefinition,
     overrides: &GatewayCommandOverrides,
     output_format: GatewayOutputFormat,
 ) -> Result<u8> {
-    let candidates = ordered_gateway_candidates_for_cluster(cluster_name, definition)?;
-    let preferred = preferred_gateway_candidate(cluster_name, gateway_success_ttl(definition));
+    let candidates = ordered_gateway_candidates_for_cluster(runtime, cluster_name, definition)?;
+    let preferred =
+        preferred_gateway_candidate(runtime, cluster_name, gateway_success_ttl(definition));
     let probes = collect_gateway_explain_probes(
+        runtime,
         caller,
-        config,
         cluster_name,
         definition,
         &candidates,
@@ -3238,8 +3344,8 @@ async fn run_cluster_gateway_why_command(
         limit: Some(parse_gateway_history_limit(&overrides.passthrough_arguments)?.unwrap_or(5)),
         ..GatewayHistoryQuery::default()
     };
-    let history = gateway_history_entries(cluster_name, definition, &query);
-    let slo = gateway_doctor_slo_snapshot(cluster_name, definition);
+    let history = gateway_history_entries(runtime, cluster_name, definition, &query);
+    let slo = gateway_doctor_slo_snapshot(runtime, cluster_name, definition);
 
     if output_format == GatewayOutputFormat::Json {
         let payload = serde_json::json!({
@@ -3475,10 +3581,12 @@ fn gateway_reason_next_command(reason_code: &str, candidate: &str) -> String {
 }
 
 fn gateway_doctor_slo_snapshot(
+    runtime: &GatewayRuntime,
     cluster_name: &str,
     definition: &ClusterGatewayDefinition,
 ) -> GatewayDoctorSloSnapshot {
     let entries = gateway_history_entries(
+        runtime,
         cluster_name,
         definition,
         &GatewayHistoryQuery {
@@ -3525,11 +3633,12 @@ fn gateway_doctor_slo_snapshot(
     } else {
         (count_to_f64(failover) * 100.0) / count_to_f64(total)
     };
-    let ordered =
-        ordered_gateway_candidates_for_cluster(cluster_name, definition).unwrap_or_default();
+    let ordered = ordered_gateway_candidates_for_cluster(runtime, cluster_name, definition)
+        .unwrap_or_default();
     let mut open = 0usize;
     for candidate in &ordered {
         let health = gateway_effective_candidate_health(
+            runtime,
             cluster_name,
             candidate,
             definition,
@@ -3566,8 +3675,8 @@ const fn gateway_doctor_severity_label(severity: &GatewayDoctorSeverity) -> &'st
 }
 
 async fn collect_gateway_explain_probes(
+    runtime: &GatewayRuntime,
     caller: &NativeCommandContext,
-    _config: &BmuxConfig,
     cluster_name: &str,
     definition: &ClusterGatewayDefinition,
     candidates: &[String],
@@ -3576,14 +3685,16 @@ async fn collect_gateway_explain_probes(
 ) -> Vec<GatewayExplainCandidateProbe> {
     let mut probes = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        let cooldown = gateway_cooldown_remaining_ms(cluster_name, candidate);
+        let cooldown = gateway_cooldown_remaining_ms(runtime, cluster_name, candidate);
         let health = gateway_effective_candidate_health(
+            runtime,
             cluster_name,
             candidate,
             definition,
             GatewayExecutionMode::Observational,
         );
         let skip_reason = gateway_candidate_skip_reason(
+            runtime,
             cluster_name,
             candidate,
             definition,
@@ -4014,9 +4125,14 @@ async fn probe_gateway_candidate(
     }
 }
 
-fn gateway_cooldown_remaining_ms(cluster_name: &str, candidate: &str) -> Option<u128> {
-    ensure_gateway_runtime_state_loaded();
-    let until = cluster_gateway_state_map()
+fn gateway_cooldown_remaining_ms(
+    runtime: &GatewayRuntime,
+    cluster_name: &str,
+    candidate: &str,
+) -> Option<u128> {
+    ensure_gateway_runtime_state_loaded(runtime);
+    let until = runtime
+        .state_map()
         .lock()
         .ok()?
         .get(cluster_name)?
@@ -4031,11 +4147,11 @@ fn gateway_cooldown_remaining_ms(cluster_name: &str, candidate: &str) -> Option<
 }
 
 #[cfg(test)]
-fn clear_gateway_runtime_state_for_tests() {
-    if let Ok(mut state_map) = cluster_gateway_state_map().lock() {
+fn clear_gateway_runtime_state_for_tests(runtime: &GatewayRuntime) {
+    if let Ok(mut state_map) = runtime.state_map().lock() {
         state_map.clear();
     }
-    let _ = clear_cluster_gateway_runtime_state(gateway_paths());
+    let _ = clear_cluster_gateway_runtime_state(&runtime.paths());
 }
 
 fn gateway_candidates_for_cluster(
@@ -4634,15 +4750,16 @@ mod tests {
     #[test]
     #[serial]
     fn ordered_gateway_candidates_prioritizes_recent_success() {
-        clear_gateway_runtime_state_for_tests();
+        let runtime = &super::GatewayRuntime::for_tests();
+        clear_gateway_runtime_state_for_tests(runtime);
         let definition = ClusterGatewayDefinition {
             targets: vec!["db-a".to_string(), "db-b".to_string()],
             gateway_mode: ClusterGatewayMode::Auto,
             ..ClusterGatewayDefinition::default()
         };
-        record_gateway_success("prod", "db-b", &definition, 10);
+        record_gateway_success(runtime, "prod", "db-b", &definition, 10);
 
-        let ordered = ordered_gateway_candidates_for_cluster("prod", &definition)
+        let ordered = ordered_gateway_candidates_for_cluster(runtime, "prod", &definition)
             .expect("ordered candidates should resolve");
         assert_eq!(ordered, vec!["db-b".to_string(), "db-a".to_string()]);
     }
@@ -4770,8 +4887,10 @@ mod tests {
     #[test]
     #[serial]
     fn gateway_history_entries_respect_since_and_limit() {
-        clear_gateway_runtime_state_for_tests();
+        let runtime = &super::GatewayRuntime::for_tests();
+        clear_gateway_runtime_state_for_tests(runtime);
         record_gateway_history_entry(
+            runtime,
             "prod",
             &ClusterGatewayDefinition::default(),
             &GatewayHistoryRecordInput {
@@ -4785,6 +4904,7 @@ mod tests {
             },
         );
         record_gateway_history_entry(
+            runtime,
             "prod",
             &ClusterGatewayDefinition::default(),
             &GatewayHistoryRecordInput {
@@ -4797,7 +4917,7 @@ mod tests {
                 selected: true,
             },
         );
-        if let Ok(mut state_map) = cluster_gateway_state_map().lock()
+        if let Ok(mut state_map) = runtime.state_map().lock()
             && let Some(cluster_state) = state_map.get_mut("prod")
             && let Some(first) = cluster_state.history.first_mut()
         {
@@ -4807,6 +4927,7 @@ mod tests {
         }
 
         let recent = gateway_history_entries(
+            runtime,
             "prod",
             &ClusterGatewayDefinition::default(),
             &GatewayHistoryQuery {
@@ -4818,6 +4939,7 @@ mod tests {
         assert_eq!(recent[0].candidate.as_deref(), Some("db-b"));
 
         let limited = gateway_history_entries(
+            runtime,
             "prod",
             &ClusterGatewayDefinition::default(),
             &GatewayHistoryQuery {
@@ -4832,18 +4954,19 @@ mod tests {
     #[test]
     #[serial]
     fn ordered_gateway_candidates_prioritize_stability_before_latency() {
-        clear_gateway_runtime_state_for_tests();
+        let runtime = &super::GatewayRuntime::for_tests();
+        clear_gateway_runtime_state_for_tests(runtime);
         let definition = ClusterGatewayDefinition {
             targets: vec!["db-a".to_string(), "db-b".to_string()],
             gateway_mode: ClusterGatewayMode::Auto,
             ..ClusterGatewayDefinition::default()
         };
 
-        record_gateway_success("prod", "db-a", &definition, 120);
-        record_gateway_success("prod", "db-b", &definition, 10);
-        record_gateway_failure("prod", "db-b", &definition, 15, "timeout");
+        record_gateway_success(runtime, "prod", "db-a", &definition, 120);
+        record_gateway_success(runtime, "prod", "db-b", &definition, 10);
+        record_gateway_failure(runtime, "prod", "db-b", &definition, 15, "timeout");
 
-        let ordered = ordered_gateway_candidates_for_cluster("prod", &definition)
+        let ordered = ordered_gateway_candidates_for_cluster(runtime, "prod", &definition)
             .expect("ordered candidates should resolve");
         assert_eq!(ordered.first().map(String::as_str), Some("db-a"));
     }
@@ -4866,5 +4989,29 @@ mod tests {
         let candidates = gateway_candidates_for_cluster("prod", &definition)
             .expect("hosts entries should be valid candidates");
         assert_eq!(candidates, vec!["db-a".to_string(), "db-b".to_string()]);
+    }
+
+    #[test]
+    fn two_gateway_runtimes_share_no_state() {
+        let first = super::GatewayRuntime::for_tests();
+        let second = super::GatewayRuntime::for_tests();
+        let definition = ClusterGatewayDefinition::default();
+        record_gateway_success(&first, "prod", "db-a", &definition, 5);
+        assert_eq!(
+            preferred_gateway_candidate(&first, "prod", Duration::from_secs(60)).as_deref(),
+            Some("db-a")
+        );
+        assert!(preferred_gateway_candidate(&second, "prod", Duration::from_secs(60)).is_none());
+        assert!(second.state_map().lock().unwrap().is_empty());
+        // Persisted state follows each runtime's own paths, never a shared one.
+        let reloaded = super::GatewayRuntime::default();
+        reloaded.bind_paths(second.paths());
+        assert!(preferred_gateway_candidate(&reloaded, "prod", Duration::from_secs(60)).is_none());
+        let restored = super::GatewayRuntime::default();
+        restored.bind_paths(first.paths());
+        assert_eq!(
+            preferred_gateway_candidate(&restored, "prod", Duration::from_secs(60)).as_deref(),
+            Some("db-a")
+        );
     }
 }

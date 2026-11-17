@@ -48,6 +48,13 @@ fn test_crash_point(point: &str) {
 #[cfg(not(test))]
 const fn test_crash_point(_point: &str) {}
 
+/// Process-level bound on blocking storage work.
+///
+/// Every consensus store in this process shares the host runtime's one
+/// blocking thread pool, so the cap on concurrent blocking storage
+/// operations is a property of the OS process, not of a plugin instance or
+/// a store: two instances must not each be allowed the full budget. It holds
+/// no instance state, only the permit count.
 fn storage_blocking_permits() -> &'static Arc<tokio::sync::Semaphore> {
     static PERMITS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
     PERMITS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(STORAGE_BLOCKING_CONCURRENCY)))

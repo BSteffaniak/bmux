@@ -113,6 +113,8 @@ pub struct ClusterPlugin {
     /// consensus runtime (peer RPCs, reconciler) may outlive the request that
     /// started it. Never a request-scoped caller.
     activation_caller: Option<Arc<bmux_plugin::TypedServiceCaller>>,
+    /// This instance's gateway breaker, cooldown and history state.
+    gateway: Arc<gateway::GatewayRuntime>,
 }
 
 const NO_ACTIVATION: &str = "cluster consensus requires an active plugin activation";
@@ -476,6 +478,7 @@ impl RustPlugin for ClusterPlugin {
             })?;
             tokio::task::block_in_place(|| {
                 handle.block_on(gateway::run_command(
+                    &self.gateway,
                     &context,
                     "bmux.cluster",
                     &context.command,
