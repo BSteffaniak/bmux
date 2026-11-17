@@ -14,10 +14,8 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
-    task::{Wake, Waker},
-    thread::JoinHandle,
 };
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -36,9 +34,15 @@ struct State {
     entries: BTreeMap<u64, CallbackEntryLease>,
     subscriptions: BTreeMap<u64, Subscription>,
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Waiting,
+    Notifying,
+    Done,
+}
 struct Subscription {
-    stop: Arc<AtomicBool>,
-    thread: JoinHandle<()>,
+    phase: Arc<Mutex<Phase>>,
+    stop: Arc<tokio::sync::Notify>,
 }
 fn owner(handle: u64) -> Result<Arc<Owner>> {
     owners()
@@ -249,15 +253,6 @@ unsafe extern "C" fn leave(handle: u64, lease: u64) -> AbiStatus {
     });
     if result == abi::OK { status } else { result }
 }
-struct ThreadWake(std::thread::Thread);
-impl Wake for ThreadWake {
-    fn wake(self: Arc<Self>) {
-        self.0.unpark();
-    }
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.0.unpark();
-    }
-}
 unsafe extern "C" fn subscribe_cancel(
     handle: u64,
     notify: NativeCallbackCancelNotifyV1,
@@ -272,6 +267,10 @@ unsafe extern "C" fn subscribe_cancel(
     }
     guarded(|| {
         let owner = owner(handle)?;
+        let runtime = owner
+            .binding
+            .runtime()
+            .ok_or_else(|| failure("callback cancellation needs the selected callback runtime"))?;
         let mut state = owner
             .state
             .lock()
@@ -283,46 +282,48 @@ unsafe extern "C" fn subscribe_cancel(
         }
         let budget = owner.binding.subscription()?;
         let id = state.allocate()?;
-        let stop = Arc::new(AtomicBool::new(false));
-        let stopped = stop.clone();
-        let armed = Arc::new(AtomicBool::new(false));
-        let start = armed.clone();
-        let pinned = owner.clone();
-        let thread = std::thread::Builder::new()
-            .name("plugin-callback-cancel".into())
-            .spawn(move || {
-                let _budget = budget;
-                while !start.load(Ordering::Acquire) {
-                    std::thread::park();
-                }
-                let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
-                let mut context = std::task::Context::from_waker(&waker);
-                let mut cancellation = pinned.binding.context().cancelled();
-                while !stopped.load(Ordering::Acquire) {
-                    if cancellation.as_mut().poll(&mut context).is_ready() {
-                        // Unsubscribe fences this thread, including this external call.
-                        // Notification is exactly once; it never executes author work.
-                        if !stopped.load(Ordering::Acquire) {
-                            unsafe {
-                                notify(userdata);
-                            }
-                        }
-                        break;
-                    }
-                    std::thread::park();
-                }
-            })
-            .map_err(|e| failure(e.to_string()))?;
-        let worker = thread.thread().clone();
-        state
-            .subscriptions
-            .insert(id, Subscription { stop, thread });
+        let subscription = Subscription {
+            phase: Arc::new(Mutex::new(Phase::Waiting)),
+            stop: Arc::new(tokio::sync::Notify::new()),
+        };
+        let phase = Arc::clone(&subscription.phase);
+        let stop = Arc::clone(&subscription.stop);
+        state.subscriptions.insert(id, subscription);
         unsafe {
             output.write(id);
         }
         drop(state);
-        armed.store(true, Ordering::Release);
-        worker.unpark();
+        let cancelled = owner.binding.context().cancelled();
+        // A task on the selected host runtime, woken by the cancellation (or
+        // by unsubscribe), never a parked thread per subscription.
+        drop(runtime.spawn(async move {
+            let _budget = budget;
+            tokio::select! {
+                _ = cancelled => {}
+                () = stop.notified() => {}
+            }
+            // The phase decides under its lock, so unsubscribe either sees
+            // the notification in flight (BUSY) or prevents it entirely.
+            let notifying = {
+                let mut phase = phase
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let start = *phase == Phase::Waiting;
+                if start {
+                    *phase = Phase::Notifying;
+                }
+                start
+            };
+            if notifying {
+                // Exactly once; it never executes author work.
+                unsafe {
+                    notify(userdata);
+                }
+                *phase
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Phase::Done;
+            }
+        }));
         Ok(())
     })
 }
@@ -338,20 +339,29 @@ unsafe extern "C" fn unsubscribe_cancel(handle: u64, subscription: u64) -> AbiSt
             .subscriptions
             .get(&subscription)
             .ok_or_else(|| failure("unknown callback cancellation subscription"))?;
-        sub.stop.store(true, Ordering::Release);
-        sub.thread.thread().unpark();
-        if !sub.thread.is_finished() {
-            status = abi::BUSY;
-            return Ok(());
+        {
+            let mut phase = sub
+                .phase
+                .lock()
+                .map_err(|_| failure("callback cancellation notifier poisoned"))?;
+            match *phase {
+                // Fenced: the notifier can no longer start the external call.
+                Phase::Waiting => *phase = Phase::Done,
+                // The external call is running; the caller retries.
+                Phase::Notifying => {
+                    status = abi::BUSY;
+                    return Ok(());
+                }
+                Phase::Done => {}
+            }
         }
         let sub = state
             .subscriptions
             .remove(&subscription)
             .ok_or_else(|| failure("subscription disappeared"))?;
         drop(state);
-        sub.thread
-            .join()
-            .map_err(|_| failure("callback cancellation notifier panicked"))?;
+        // Let a still-waiting notifier task finish now.
+        sub.stop.notify_one();
         Ok(())
     });
     if result == abi::OK { status } else { result }

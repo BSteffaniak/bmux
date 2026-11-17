@@ -631,6 +631,10 @@ impl CallbackBinding {
         drop(admission);
         Ok(())
     }
+    /// The selected callback runtime of this binding's instance, if any.
+    pub(super) fn runtime(&self) -> Option<tokio::runtime::Handle> {
+        self.0.host.0.runtime.clone()
+    }
     /// Capture the actual active dependency for a selected nested dispatch.
     /// # Errors
     /// Missing or settled entries cannot establish ancestry.

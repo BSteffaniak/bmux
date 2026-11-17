@@ -76,8 +76,10 @@ fn native_entry_ports_pin_dependency_until_explicit_release() {
     HostPorts::retire(&table).unwrap();
 }
 
-#[test]
-fn native_cancel_subscription_is_fenced_before_release() {
+// The notifier is a task on the selected callback runtime (the fixture binds
+// this test runtime), woken by the cancellation itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_cancel_subscription_is_fenced_before_release() {
     let execution = fixture();
     let invocation = execution.activation().unwrap().begin_invocation().unwrap();
     let binding = execution
@@ -114,6 +116,49 @@ fn native_cancel_subscription_is_fenced_before_release() {
         std::thread::yield_now();
     }
     assert_eq!(NOTIFICATIONS.load(Ordering::Acquire), before + 1);
+    assert_eq!(unsafe { (authority.release)(authority.handle) }, abi::OK);
+    assert_eq!(unsafe { (table.release)(table.handle) }, abi::OK);
+    HostPorts::retire(&table).unwrap();
+}
+
+static FENCED: AtomicUsize = AtomicUsize::new(0);
+unsafe extern "C" fn fenced_notify(_: u64) {
+    FENCED.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Unsubscribing before the cancellation fences the notifier: once it
+/// returned OK the external notification can never run, even though the
+/// invocation is cancelled afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_cancel_unsubscribe_before_cancellation_never_notifies() {
+    let execution = fixture();
+    let invocation = execution.activation().unwrap().begin_invocation().unwrap();
+    let binding = execution
+        .bind_root_callback(invocation.clone(), ServiceCancellation::default())
+        .unwrap();
+    let port = HostPorts::new(invocation.clone(), None, None).with_callback(Some(binding));
+    let table = port.install_for(abi::ABI_VERSION, None).unwrap();
+    assert_eq!(unsafe { (table.retain)(table.handle) }, abi::OK);
+    let mut authority = std::mem::MaybeUninit::uninit();
+    assert_eq!(
+        unsafe { open(table.handle, 1, authority.as_mut_ptr()) },
+        abi::OK
+    );
+    let authority = unsafe { authority.assume_init() };
+    let mut subscription = 0;
+    assert_eq!(
+        unsafe {
+            (authority.subscribe_cancel)(authority.handle, fenced_notify, 0, &raw mut subscription)
+        },
+        abi::OK
+    );
+    assert_eq!(
+        unsafe { (authority.unsubscribe_cancel)(authority.handle, subscription) },
+        abi::OK
+    );
+    invocation.close().unwrap();
+    tokio::task::yield_now().await;
+    assert_eq!(FENCED.load(Ordering::Acquire), 0);
     assert_eq!(unsafe { (authority.release)(authority.handle) }, abi::OK);
     assert_eq!(unsafe { (table.release)(table.handle) }, abi::OK);
     HostPorts::retire(&table).unwrap();
