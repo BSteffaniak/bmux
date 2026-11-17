@@ -223,6 +223,9 @@ struct ServerState {
     admission_backend: Mutex<Option<Arc<SerializedAdmissionAuthority>>>,
     admitted_routes: Mutex<BTreeSet<ServiceRoute>>,
     plugin_states: Arc<bmux_plugin::PluginStateRegistry>,
+    /// The host's root plugin event bus. Plugins only ever receive scoped
+    /// views of it through their activation capabilities.
+    plugin_events: Arc<bmux_plugin::EventBus>,
     attach_tokens: Arc<Mutex<AttachTokenManager>>,
     performance_settings: PerformanceSettingsStore,
     operation_lock: AsyncMutex<()>,
@@ -1633,6 +1636,15 @@ impl BmuxServer {
     pub fn plugin_state_registry(&self) -> Arc<bmux_plugin::PluginStateRegistry> {
         Arc::clone(&self.state.plugin_states)
     }
+
+    /// The host's root plugin event bus.
+    ///
+    /// Host code subscribes and relays on it directly; plugin activations
+    /// receive scoped views through [`bmux_plugin::event_bus_activation_binder`].
+    #[must_use]
+    pub fn plugin_event_bus(&self) -> Arc<bmux_plugin::EventBus> {
+        Arc::clone(&self.state.plugin_events)
+    }
     fn new_with_snapshot(
         endpoint: IpcEndpoint,
         snapshot_manager: Option<()>,
@@ -1715,6 +1727,7 @@ impl BmuxServer {
                 private_admission_routes: Mutex::default(),
                 stream_provenance,
                 plugin_states,
+                plugin_events: Arc::new(bmux_plugin::EventBus::new()),
                 client_principals,
                 server_control_principal_id,
                 handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
@@ -2001,7 +2014,9 @@ impl BmuxServer {
         // The plugin registers the channel with the typed struct at
         // activation time; consumers (this forwarder included) must
         // pass the matching `T` for the bus to hand out receivers.
-        let mut rx = bmux_plugin::global_event_bus()
+        let mut rx = self
+            .state
+            .plugin_events
             .subscribe::<T>(kind)
             .map_err(|error| {
                 anyhow::anyhow!(
@@ -2068,7 +2083,9 @@ impl BmuxServer {
     where
         T: Clone + Send + Sync + 'static + serde::Serialize + serde::de::DeserializeOwned,
     {
-        let (_initial, mut rx) = bmux_plugin::global_event_bus()
+        let (_initial, mut rx) = self
+            .state
+            .plugin_events
             .subscribe_state::<T>(kind)
             .map_err(|error| {
                 anyhow::anyhow!(
@@ -2080,9 +2097,11 @@ impl BmuxServer {
         let state = Arc::downgrade(&self.state);
         let replay_kind = kind.clone();
         let replay_kind_string = kind_string.clone();
+        let replay_bus = Arc::downgrade(&self.state.plugin_events);
         if let Ok(mut replayers) = self.state.plugin_state_replayers.lock() {
             replayers.push(Arc::new(move || {
-                let (current, _rx) = bmux_plugin::global_event_bus()
+                let (current, _rx) = replay_bus
+                    .upgrade()?
                     .subscribe_state::<T>(&replay_kind)
                     .ok()?;
                 let encoded = match serde_json::to_vec(current.as_ref()) {
@@ -4146,7 +4165,7 @@ async fn handle_request(
             // silently drop the payload (returns `emitted: false`) so
             // early wire traffic from a client doesn't fail loudly.
             let event_kind = bmux_plugin_sdk::PluginEventKind::from_owned(kind);
-            match bmux_plugin::global_event_bus().emit_from_bytes(&event_kind, &payload) {
+            match state.plugin_events.emit_from_bytes(&event_kind, &payload) {
                 Ok(emitted) => Response::Ok(ResponsePayload::PluginBusEmitted { emitted }),
                 Err(error) => Response::Err(ErrorResponse {
                     code: ErrorCode::Internal,

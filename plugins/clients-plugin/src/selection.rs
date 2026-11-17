@@ -354,6 +354,7 @@ mod tests {
             let inner = std::sync::Arc::new(std::sync::RwLock::new(state));
             let adapter = crate::FollowStateAdapter {
                 inner: inner.clone(),
+                events: crate::ClientEvents::default(),
             };
             if clear_follow {
                 adapter.clear_all_follow_state();

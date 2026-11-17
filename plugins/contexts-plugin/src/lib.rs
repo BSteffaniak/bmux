@@ -32,8 +32,7 @@ use bmux_contexts_plugin_api::contexts_state::{
 };
 use bmux_contexts_plugin_api::contexts_visits_v1::{self, ContextsVisitsV1Service};
 use bmux_plugin::{
-    HostRuntimeApi, ServiceCaller, TypedServiceCaller, global_event_bus,
-    global_plugin_state_registry,
+    EventBus, HostRuntimeApi, ServiceCaller, TypedServiceCaller, global_plugin_state_registry,
 };
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
@@ -361,16 +360,33 @@ impl WireSelector {
 
 // ── Plugin entrypoint ────────────────────────────────────────────────
 
+/// This activation's context event publisher. Without a host-supplied bus
+/// (for example a dynamic artifact) events are dropped, never routed to a
+/// process-wide bus.
+#[derive(Clone, Default)]
+struct ContextEvents(Option<Arc<EventBus>>);
+
+impl ContextEvents {
+    fn emit(&self, event: ContextEvent) {
+        if let Some(bus) = &self.0 {
+            let _ = bus.emit(&contexts_events::EVENT_KIND, event);
+        }
+    }
+}
+
 #[derive(Default)]
-pub struct ContextsPlugin;
+pub struct ContextsPlugin {
+    events: ContextEvents,
+}
 
 impl RustPlugin for ContextsPlugin {
     type Contract = bmux_contexts_plugin_api::Contract;
 
     fn activate(
         &mut self,
-        _context: NativeLifecycleContext,
+        context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
+        self.events = ContextEvents(bmux_plugin::activation_event_bus(&context));
         let state: Arc<RwLock<ContextState>> = Arc::new(RwLock::new(ContextState::default()));
         global_plugin_state_registry().register::<ContextState>(&state);
 
@@ -407,10 +423,11 @@ impl RustPlugin for ContextsPlugin {
             .expect("stateful plugin registry lock poisoned")
             .push(stateful);
 
-        // Register the typed event channel for `contexts-events`.
-        // Consumers subscribe via
-        // `global_event_bus().subscribe::<ContextEvent>(&contexts_events::EVENT_KIND)`.
-        global_event_bus().register_channel::<ContextEvent>(contexts_events::EVENT_KIND);
+        // Register the typed event channel for `contexts-events` on this
+        // activation's bus; consumers subscribe through their own views.
+        if let Some(bus) = &self.events.0 {
+            bus.register_channel::<ContextEvent>(contexts_events::EVENT_KIND);
+        }
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 
@@ -439,29 +456,29 @@ impl RustPlugin for ContextsPlugin {
                     .map_err(|e| ServiceResponse::error("current_failed", e))
             },
             "contexts-spawn-v1", "create-context" => |req: bmux_contexts_plugin_api::contexts_spawn_v1::client::CreateContextRequest, ctx| {
-                Ok::<_, ServiceResponse>(create_context_with_options(ctx, ctx.caller_client_id, req.name, req.attributes, Some(req.options)))
+                Ok::<_, ServiceResponse>(create_context_with_options(&self.events, ctx, ctx.caller_client_id, req.name, req.attributes, Some(req.options)))
             },
             "contexts-commands", "create-context" => |req: CreateContextArgs, ctx| {
                 Ok::<Result<ContextAck, CreateContextError>, ServiceResponse>(
-                    create_context_local(ctx, ctx.caller_client_id, req.name, req.attributes)
+                    create_context_local(&self.events, ctx, ctx.caller_client_id, req.name, req.attributes)
                 )
             },
             "contexts-activation-v1", "activate" => |req: contexts_activation_v1::client::ActivateRequest, ctx| {
-                Ok::<Result<ContextAck, SelectContextError>, ServiceResponse>(activate_context_exact(ctx, ctx.caller_client_id, req.context_id))
+                Ok::<Result<ContextAck, SelectContextError>, ServiceResponse>(activate_context_exact(&self.events, ctx, ctx.caller_client_id, req.context_id))
             },
             "contexts-commands", "select-context" => |req: SelectorArgs, ctx| {
                 Ok::<Result<ContextAck, SelectContextError>, ServiceResponse>(
-                    select_context_local(ctx, ctx.caller_client_id, &req.selector)
+                    select_context_local(&self.events, ctx, ctx.caller_client_id, &req.selector)
                 )
             },
             "contexts-commands", "close-context" => |req: CloseContextArgs, ctx| {
                 Ok::<Result<ContextAck, CloseContextError>, ServiceResponse>(
-                    close_context_local(ctx, ctx.caller_client_id, &req.selector, req.force)
+                    close_context_local(&self.events, ctx, ctx.caller_client_id, &req.selector, req.force)
                 )
             },
             "contexts-commands", "rename-context" => |req: RenameContextArgs, ctx| {
                 Ok::<Result<ContextAck, RenameContextError>, ServiceResponse>(
-                    rename_context_local(ctx, &req.selector, &req.name)
+                    rename_context_local(&self.events, ctx, &req.selector, &req.name)
                 )
             },
             "contexts-commands", "set-context-attributes" => |req: SetContextAttributesArgs, _ctx| {
@@ -486,15 +503,19 @@ impl RustPlugin for ContextsPlugin {
             Arc::new(ContextsStateHandle::new(Arc::clone(&caller)));
         let _ = contexts_state::register_provider(registry, state);
 
-        let activation: Arc<dyn ContextsActivationV1Service + Send + Sync> =
-            Arc::new(ContextsCommandsHandle::new(caller.clone()));
+        let activation: Arc<dyn ContextsActivationV1Service + Send + Sync> = Arc::new(
+            ContextsCommandsHandle::new(caller.clone(), self.events.clone()),
+        );
         let _ = contexts_activation_v1::register_provider(registry, activation);
         let spawn: Arc<
             dyn bmux_contexts_plugin_api::contexts_spawn_v1::ContextsSpawnV1Service + Send + Sync,
-        > = Arc::new(ContextsCommandsHandle::new(Arc::clone(&caller)));
+        > = Arc::new(ContextsCommandsHandle::new(
+            Arc::clone(&caller),
+            self.events.clone(),
+        ));
         let _ = bmux_contexts_plugin_api::contexts_spawn_v1::register_provider(registry, spawn);
         let commands: Arc<dyn ContextsCommandsService + Send + Sync> =
-            Arc::new(ContextsCommandsHandle::new(caller));
+            Arc::new(ContextsCommandsHandle::new(caller, self.events.clone()));
         let _ = contexts_commands::register_provider(registry, commands);
     }
 }
@@ -616,15 +637,17 @@ fn current_context_local(
     ),
 )]
 fn create_context_local(
+    events: &ContextEvents,
     caller: &(impl ServiceCaller + Sync),
     caller_client_id: Option<::uuid::Uuid>,
     name: Option<String>,
     attributes: BTreeMap<String, String>,
 ) -> Result<ContextAck, CreateContextError> {
-    create_context_with_options(caller, caller_client_id, name, attributes, None)
+    create_context_with_options(events, caller, caller_client_id, name, attributes, None)
 }
 
 fn create_context_with_options(
+    events: &ContextEvents,
     caller: &(impl ServiceCaller + Sync),
     caller_client_id: Option<::uuid::Uuid>,
     name: Option<String>,
@@ -724,27 +747,18 @@ fn create_context_with_options(
     // `SessionActiveContextChanged` (multi-client focus broadcast
     // carrying enough context for attach runtimes to apply follow
     // policy).
-    let _ = global_event_bus().emit(
-        &contexts_events::EVENT_KIND,
-        ContextEvent::Created {
-            context_id: context_summary.id,
-            name,
-        },
-    );
-    let _ = global_event_bus().emit(
-        &contexts_events::EVENT_KIND,
-        ContextEvent::Selected {
-            context_id: context_summary.id,
-        },
-    );
-    let _ = global_event_bus().emit(
-        &contexts_events::EVENT_KIND,
-        ContextEvent::SessionActiveContextChanged {
-            session_id: session_id.0,
-            context_id: context_summary.id,
-            initiator_client_id: Some(client_id.0),
-        },
-    );
+    events.emit(ContextEvent::Created {
+        context_id: context_summary.id,
+        name,
+    });
+    events.emit(ContextEvent::Selected {
+        context_id: context_summary.id,
+    });
+    events.emit(ContextEvent::SessionActiveContextChanged {
+        session_id: session_id.0,
+        context_id: context_summary.id,
+        initiator_client_id: Some(client_id.0),
+    });
     Ok(ContextAck {
         id: context_summary.id,
         session_id: Some(session_id.0),
@@ -792,6 +806,7 @@ fn mutate_state_create(
     ),
 )]
 fn activate_context_exact(
+    events: &ContextEvents,
     caller: &(impl ServiceCaller + Sync),
     caller_client_id: Option<Uuid>,
     context_id: Uuid,
@@ -799,10 +814,11 @@ fn activate_context_exact(
     let client_id = resolve_caller_client_id(caller, caller_client_id)
         .map_err(|reason| SelectContextError::Denied { reason })?;
     let state = local_state().map_err(|reason| SelectContextError::Denied { reason })?;
-    activate_context_exact_in_state(caller, &state, client_id, context_id)
+    activate_context_exact_in_state(events, caller, &state, client_id, context_id)
 }
 
 fn activate_context_exact_in_state(
+    events: &ContextEvents,
     caller: &(impl ServiceCaller + Sync),
     state: &RwLock<ContextState>,
     client_id: ClientId,
@@ -843,18 +859,12 @@ fn activate_context_exact_in_state(
             .select_for_client(client_id, &PrimitiveContextSelector::ById(context_id))
             .map_err(|_| SelectContextError::NotFound)?;
     }
-    let _ = global_event_bus().emit(
-        &contexts_events::EVENT_KIND,
-        ContextEvent::Selected { context_id },
-    );
-    let _ = global_event_bus().emit(
-        &contexts_events::EVENT_KIND,
-        ContextEvent::SessionActiveContextChanged {
-            session_id: session_id.0,
-            context_id,
-            initiator_client_id: Some(client_id.0),
-        },
-    );
+    events.emit(ContextEvent::Selected { context_id });
+    events.emit(ContextEvent::SessionActiveContextChanged {
+        session_id: session_id.0,
+        context_id,
+        initiator_client_id: Some(client_id.0),
+    });
     Ok(ContextAck {
         id: context_id,
         session_id: Some(session_id.0),
@@ -862,6 +872,7 @@ fn activate_context_exact_in_state(
 }
 
 fn select_context_local(
+    events: &ContextEvents,
     caller: &(impl ServiceCaller + Sync),
     caller_client_id: Option<::uuid::Uuid>,
     selector: &WireSelector,
@@ -923,24 +934,18 @@ fn select_context_local(
             .select_for_client(client_id, &PrimitiveContextSelector::ById(context.id))
             .map_err(|_| SelectContextError::NotFound)?;
     }
-    let _ = global_event_bus().emit(
-        &contexts_events::EVENT_KIND,
-        ContextEvent::Selected {
-            context_id: context.id,
-        },
-    );
+    events.emit(ContextEvent::Selected {
+        context_id: context.id,
+    });
     // Multi-client retarget broadcast: carries the session id so
     // other clients attached to the same session can decide whether
     // to follow the selection based on their local follow policy.
     if let Some(session_id) = session_after_select {
-        let _ = global_event_bus().emit(
-            &contexts_events::EVENT_KIND,
-            ContextEvent::SessionActiveContextChanged {
-                session_id: session_id.0,
-                context_id: context.id,
-                initiator_client_id: Some(client_id.0),
-            },
-        );
+        events.emit(ContextEvent::SessionActiveContextChanged {
+            session_id: session_id.0,
+            context_id: context.id,
+            initiator_client_id: Some(client_id.0),
+        });
     }
     Ok(ContextAck {
         id: context.id,
@@ -983,6 +988,7 @@ fn resolve_selection_target(
     ),
 )]
 fn close_context_local(
+    events: &ContextEvents,
     caller: &(impl ServiceCaller + Sync),
     caller_client_id: Option<::uuid::Uuid>,
     selector: &WireSelector,
@@ -1022,12 +1028,9 @@ fn close_context_local(
         let _ = kill_session_via_sessions_plugin(caller, session_id);
     }
 
-    let _ = global_event_bus().emit(
-        &contexts_events::EVENT_KIND,
-        ContextEvent::Closed {
-            context_id: removed_id,
-        },
-    );
+    events.emit(ContextEvent::Closed {
+        context_id: removed_id,
+    });
 
     // Auto-focus-sibling: if the caller had this context selected and
     // a replacement was chosen by `ContextState::close`, mirror the
@@ -1047,21 +1050,15 @@ fn close_context_local(
                 target: Some("bmux.contexts".to_string()),
             });
         }
-        let _ = global_event_bus().emit(
-            &contexts_events::EVENT_KIND,
-            ContextEvent::Selected {
-                context_id: replacement_context_id,
-            },
-        );
+        events.emit(ContextEvent::Selected {
+            context_id: replacement_context_id,
+        });
         if let Some(session_id) = replacement_session_id {
-            let _ = global_event_bus().emit(
-                &contexts_events::EVENT_KIND,
-                ContextEvent::SessionActiveContextChanged {
-                    session_id: session_id.0,
-                    context_id: replacement_context_id,
-                    initiator_client_id: Some(client_id.0),
-                },
-            );
+            events.emit(ContextEvent::SessionActiveContextChanged {
+                session_id: session_id.0,
+                context_id: replacement_context_id,
+                initiator_client_id: Some(client_id.0),
+            });
         }
     }
 
@@ -1128,6 +1125,7 @@ fn set_context_attributes_local(
     ),
 )]
 fn rename_context_local(
+    events: &ContextEvents,
     caller: &(impl ServiceCaller + Sync),
     selector: &WireSelector,
     name: &str,
@@ -1153,10 +1151,7 @@ fn rename_context_local(
         }
     }
 
-    let _ = global_event_bus().emit(
-        &contexts_events::EVENT_KIND,
-        ContextEvent::Renamed { context_id, name },
-    );
+    events.emit(ContextEvent::Renamed { context_id, name });
 
     Ok(ContextAck {
         id: context_id,
@@ -1453,11 +1448,12 @@ impl ContextsStateService for ContextsStateHandle {
 
 pub struct ContextsCommandsHandle {
     caller: Arc<TypedServiceCaller>,
+    events: ContextEvents,
 }
 
 impl ContextsCommandsHandle {
-    const fn new(caller: Arc<TypedServiceCaller>) -> Self {
-        Self { caller }
+    const fn new(caller: Arc<TypedServiceCaller>, events: ContextEvents) -> Self {
+        Self { caller, events }
     }
 }
 
@@ -1466,7 +1462,9 @@ impl ContextsActivationV1Service for ContextsCommandsHandle {
         &'a self,
         context_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<ContextAck, SelectContextError>> + Send + 'a>> {
-        Box::pin(async move { activate_context_exact(self.caller.as_ref(), None, context_id) })
+        Box::pin(async move {
+            activate_context_exact(&self.events, self.caller.as_ref(), None, context_id)
+        })
     }
 }
 
@@ -1480,7 +1478,14 @@ impl bmux_contexts_plugin_api::contexts_spawn_v1::ContextsSpawnV1Service
         options: bmux_contexts_plugin_api::contexts_spawn_v1::InitialShellOptions,
     ) -> Pin<Box<dyn Future<Output = Result<ContextAck, CreateContextError>> + Send + 'a>> {
         Box::pin(async move {
-            create_context_with_options(self.caller.as_ref(), None, name, attributes, Some(options))
+            create_context_with_options(
+                &self.events,
+                self.caller.as_ref(),
+                None,
+                name,
+                attributes,
+                Some(options),
+            )
         })
     }
 }
@@ -1493,7 +1498,9 @@ impl ContextsCommandsService for ContextsCommandsHandle {
     ) -> Pin<
         Box<dyn Future<Output = std::result::Result<ContextAck, CreateContextError>> + Send + 'a>,
     > {
-        Box::pin(async move { create_context_local(self.caller.as_ref(), None, name, attributes) })
+        Box::pin(async move {
+            create_context_local(&self.events, self.caller.as_ref(), None, name, attributes)
+        })
     }
 
     fn select_context<'a>(
@@ -1507,7 +1514,7 @@ impl ContextsCommandsService for ContextsCommandsHandle {
                 id: selector.id,
                 name: selector.name,
             };
-            select_context_local(self.caller.as_ref(), None, &wire)
+            select_context_local(&self.events, self.caller.as_ref(), None, &wire)
         })
     }
 
@@ -1522,7 +1529,7 @@ impl ContextsCommandsService for ContextsCommandsHandle {
                 id: selector.id,
                 name: selector.name,
             };
-            close_context_local(self.caller.as_ref(), None, &wire, force)
+            close_context_local(&self.events, self.caller.as_ref(), None, &wire, force)
         })
     }
 
@@ -1538,7 +1545,7 @@ impl ContextsCommandsService for ContextsCommandsHandle {
                 id: selector.id,
                 name: selector.name,
             };
-            rename_context_local(self.caller.as_ref(), &wire, &name)
+            rename_context_local(&self.events, self.caller.as_ref(), &wire, &name)
         })
     }
 
@@ -1577,7 +1584,7 @@ bmux_plugin_sdk::define_plugin!(
     factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| {
         Ok(std::sync::Arc::new(
             bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
-                ContextsPlugin,
+                ContextsPlugin::default(),
                 scope.instance,
             ),
         )
@@ -1766,6 +1773,7 @@ mod tests {
             cleanup: std::sync::Mutex::new(Vec::new()),
         };
         let error = create_context_with_options(
+            &ContextEvents::default(),
             &caller,
             Some(Uuid::new_v4()),
             None,
@@ -1894,6 +1902,7 @@ mod tests {
         adapter.restore_snapshot(source_adapter.snapshot());
         assert_eq!(adapter.context_for_session(session), Some(target.id));
         let missing = activate_context_exact_in_state(
+            &ContextEvents::default(),
             &ExistingSession {
                 id: session,
                 available: false,
@@ -1905,6 +1914,7 @@ mod tests {
         assert!(missing.is_err());
         assert_eq!(adapter.current_for_client(client).unwrap().id, default.id);
         let ack = activate_context_exact_in_state(
+            &ContextEvents::default(),
             &ExistingSession {
                 id: session,
                 available: true,
@@ -2228,9 +2238,9 @@ mod tests {
 
     /// Subscribe to the contexts-events bus and collect emissions from
     /// the current thread for the duration of the test.
-    fn subscribe_events() -> std::sync::mpsc::Receiver<ContextEvent> {
+    fn subscribe_events(bus: &EventBus) -> std::sync::mpsc::Receiver<ContextEvent> {
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut bus_rx = bmux_plugin::global_event_bus()
+        let mut bus_rx = bus
             .subscribe::<ContextEvent>(&contexts_events::EVENT_KIND)
             .expect("event channel should be registered");
         std::thread::spawn(move || {
@@ -2271,20 +2281,19 @@ mod tests {
         // the plugin's `activate` normally does this during startup.
         let state_handle = std::sync::Arc::new(std::sync::RwLock::new(ContextState::default()));
         let _existing = global_plugin_state_registry().register::<ContextState>(&state_handle);
-        // The contexts-events bus channel is also registered during
-        // `activate`; outside of activate we may need to register it
-        // here. `register_channel` is idempotent in the sense that a
-        // second registration replaces the first with a fresh channel,
-        // which is fine for tests.
-        bmux_plugin::global_event_bus()
-            .register_channel::<ContextEvent>(contexts_events::EVENT_KIND);
+        // The contexts-events channel is registered during `activate` on
+        // the activation's bus; inject an explicit bus here instead.
+        let bus = Arc::new(EventBus::new());
+        bus.register_channel::<ContextEvent>(contexts_events::EVENT_KIND);
+        let events = ContextEvents(Some(Arc::clone(&bus)));
 
         let client_id = Uuid::new_v4();
         let router_guard = install_contexts_test_router(client_id);
-        let events_rx = subscribe_events();
+        let events_rx = subscribe_events(&bus);
         let ctx = test_service_context(&router_guard, client_id);
 
         let ack = create_context_local(
+            &events,
             &ctx,
             Some(client_id),
             Some("test-context".to_string()),

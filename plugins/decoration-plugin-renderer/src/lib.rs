@@ -9,10 +9,10 @@
 //!
 //! This crate consumes those relayed scenes on the client side:
 //!
-//! 1. [`install`] registers an
-//!    [`bmux_plugin::AttachRenderExtension`] and subscribes to the
-//!    client-side [`bmux_plugin::global_event_bus`] retained
-//!    `bmux.scene/scene-protocol` state.
+//! 1. [`renderer_for_bus`] creates an
+//!    [`bmux_plugin::AttachRenderExtension`] subscribed to the retained
+//!    `bmux.scene/scene-protocol` state on the attach runtime's own
+//!    presentation bus (there is no process-wide bus).
 //! 2. The retained scene state seeds the extension's cache immediately, and
 //!    every subsequent scene replacement is drained by
 //!    [`AttachRenderExtension::refresh_state`] before the next frame renders
@@ -32,7 +32,7 @@
 
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bmux_plugin::{
@@ -2304,9 +2304,8 @@ fn border_damage_rects(rect: &SceneRect) -> Vec<ExtensionRect> {
     ]
 }
 
-/// Process-wide handle to the installed extension's cache. `install` stores it
-/// on first call; the retained scene-state relay (living in the CLI's streaming
-/// loop) updates the local state channel that feeds this cache.
+/// Build a renderer whose cache is fed by `bus`'s retained scene state; the
+/// attach runtime's streaming loop relays scenes onto that bus.
 fn create_renderer(bus: &bmux_plugin::EventBus) -> DecorationRenderExtension {
     let cache = Arc::new(Mutex::new(DecorationRendererCache::default()));
     // Register only when absent: registration replaces an existing retained
@@ -2348,38 +2347,6 @@ pub fn renderer_for_bus(bus: &bmux_plugin::EventBus) -> Arc<dyn AttachRenderExte
     Arc::new(create_renderer(bus))
 }
 
-static INSTALLED_CACHE: OnceLock<Arc<Mutex<DecorationRendererCache>>> = OnceLock::new();
-
-/// Install the decoration render extension.
-///
-/// Idempotent: the first call registers an `AttachRenderExtension`
-/// with [`bmux_plugin::register_render_extension`] and remembers the
-/// installed cache handle; subsequent calls return immediately.
-///
-/// Call this once during CLI bootstrap when the decoration plugin is
-/// bundled. No `install` call means no decoration painting —
-/// deployments that don't bundle the decoration plugin can simply
-/// skip this crate.
-pub fn install() {
-    // SAFETY: `OnceLock` coordinates single-shot initialisation; repeat
-    // calls are no-ops after the first.
-    let _ = INSTALLED_CACHE.get_or_init(|| {
-        let extension = create_renderer(&bmux_plugin::global_event_bus());
-        let cache = extension.cache.clone();
-        bmux_plugin::register_render_extension(Arc::new(extension));
-        cache
-    });
-}
-
-/// Publish one transport-relayed scene into the decoration compatibility
-/// adapter's retained local channel.
-///
-/// The renderer owns channel creation and the empty compatibility snapshot so
-/// attach core only decodes and forwards the decoration plugin's typed payload.
-pub fn publish_relayed_scene(scene: DecorationScene) {
-    publish_relayed_scene_on(&bmux_plugin::global_event_bus(), scene);
-}
-
 /// Relay a scene only to the selected renderer bus.
 pub fn publish_relayed_scene_on(bus: &bmux_plugin::EventBus, scene: DecorationScene) {
     if bus.publish_state(&SCENE_STATE_KIND, scene.clone()).is_ok() {
@@ -2396,20 +2363,6 @@ pub fn publish_relayed_scene_on(bus: &bmux_plugin::EventBus, scene: DecorationSc
         },
     );
     let _ = bus.publish_state(&SCENE_STATE_KIND, scene);
-}
-
-/// Manual push path. Callers that receive scene payloads from a
-/// transport other than the local event bus (e.g. the CLI's
-/// streaming loop decoding IPC `PluginBusEvent`s) call this to
-/// update the cache directly.
-pub fn push_scene(scene: DecorationScene) -> bool {
-    let Some(cache) = INSTALLED_CACHE.get() else {
-        return false;
-    };
-    let Ok(mut guard) = cache.lock() else {
-        return false;
-    };
-    guard.replace_if_newer(scene)
 }
 
 #[cfg(test)]

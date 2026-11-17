@@ -21,8 +21,7 @@ use bmux_control_catalog_plugin_api::control_catalog_state::{
     self, ContextRow, ContextSessionBinding, SessionRow, Snapshot,
 };
 use bmux_plugin::{
-    EventBus, PluginStateRegistry, ServiceCaller, TypedServiceCaller, global_event_bus,
-    global_plugin_state_registry,
+    EventBus, PluginStateRegistry, ServiceCaller, TypedServiceCaller, global_plugin_state_registry,
 };
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
@@ -38,17 +37,40 @@ use std::sync::atomic::{AtomicU64, Ordering};
 struct CatalogState {
     revision: AtomicU64,
     stop: std::sync::atomic::AtomicBool,
-    events: Arc<EventBus>,
+    /// The bus this instance was composed with or its activation received.
+    /// `None` until activation supplies one; there is no process-wide bus.
+    events: std::sync::RwLock<Option<Arc<EventBus>>>,
+    /// Whether the host composed this instance with an explicit bus, which
+    /// activations never replace.
+    composed: bool,
     disconnected: std::sync::atomic::AtomicBool,
 }
 
 impl CatalogState {
+    fn events(&self) -> Option<Arc<EventBus>> {
+        self.events.read().ok().and_then(|events| events.clone())
+    }
+
+    /// Adopt this activation's bus (replacing a previous activation's)
+    /// unless the host composed this instance with an explicit one.
+    fn adopt_activation_bus(&self, take: impl FnOnce() -> Option<Arc<EventBus>>) {
+        if self.composed {
+            return;
+        }
+        if let Ok(mut events) = self.events.write() {
+            *events = take();
+        }
+    }
+
     fn bump(&self, scopes: Vec<CatalogScope>, full_resync: bool) {
         let revision = self
             .revision
             .fetch_add(1, Ordering::SeqCst)
             .saturating_add(1);
-        let _ = self.events.emit(
+        let Some(events) = self.events() else {
+            return;
+        };
+        let _ = events.emit(
             &control_catalog_events::EVENT_KIND,
             CatalogEvent::Changed {
                 revision,
@@ -74,7 +96,7 @@ pub struct ControlCatalogPlugin {
 
 impl Default for ControlCatalogPlugin {
     fn default() -> Self {
-        Self::with_host(global_event_bus(), global_plugin_state_registry())
+        Self::from_parts(None, global_plugin_state_registry())
     }
 }
 
@@ -83,8 +105,10 @@ impl RustPlugin for ControlCatalogPlugin {
 
     fn activate(
         &mut self,
-        _context: NativeLifecycleContext,
+        context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
+        self.catalog
+            .adopt_activation_bus(|| bmux_plugin::activation_event_bus(&context));
         self.start_subscriber()?;
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
@@ -125,12 +149,17 @@ impl ControlCatalogPlugin {
     /// Bind explicit host mechanisms. Shared/native adapters must use this
     /// constructor rather than the legacy process-global default.
     pub fn with_host(events: Arc<EventBus>, state: Arc<PluginStateRegistry>) -> Self {
+        Self::from_parts(Some(events), state)
+    }
+
+    fn from_parts(events: Option<Arc<EventBus>>, state: Arc<PluginStateRegistry>) -> Self {
         Self {
             catalog: Arc::new(CatalogState {
                 revision: AtomicU64::new(1),
                 stop: std::sync::atomic::AtomicBool::new(false),
                 disconnected: std::sync::atomic::AtomicBool::new(false),
-                events,
+                composed: events.is_some(),
+                events: std::sync::RwLock::new(events),
             }),
             state,
             subscriber: std::sync::Mutex::new(None),
@@ -154,7 +183,10 @@ impl ControlCatalogPlugin {
         if worker.is_some() {
             return Err(PluginCommandError::failed("catalog already active"));
         }
-        let events = &self.catalog.events;
+        let Some(events) = self.catalog.events() else {
+            // No host bus: snapshots still serve, revisions do not advance.
+            return Ok(());
+        };
         events.register_channel::<CatalogEvent>(control_catalog_events::EVENT_KIND);
         let mut sessions = events
             .subscribe::<SessionEvent>(&sessions_events::EVENT_KIND)
@@ -347,9 +379,12 @@ impl control_catalog_state::ControlCatalogStateService for ControlCatalogStateHa
 impl bmux_plugin_sdk::definition::PluginInstance for ControlCatalogPlugin {
     fn activate(
         &self,
-        _context: bmux_plugin_sdk::definition::PluginLifecycleContext,
+        context: bmux_plugin_sdk::definition::PluginLifecycleContext,
     ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
     {
+        self.catalog.adopt_activation_bus(|| {
+            bmux_plugin::take_activation_event_bus(&context.capabilities).ok()
+        });
         Box::pin(async move { self.start_subscriber() })
     }
     fn deactivate(

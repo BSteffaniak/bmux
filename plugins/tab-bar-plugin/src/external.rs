@@ -8,7 +8,7 @@
 //! where the tab-bar companion renders them.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use bmux_plugin_sdk::{NativeServiceContext, ServiceResponse};
 use bmux_tab_bar_plugin_api::{
@@ -269,9 +269,13 @@ pub fn now_unix_ms() -> u64 {
         })
 }
 
-fn store() -> &'static Mutex<ExternalPresentationStore> {
-    static STORE: OnceLock<Mutex<ExternalPresentationStore>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(ExternalPresentationStore::default()))
+/// One plugin instance's contributed items and toasts plus the bus its
+/// activation was handed. Nothing here is process-wide: two instances keep
+/// independent stores.
+#[derive(Default)]
+pub struct ExternalPresentation {
+    store: Mutex<ExternalPresentationStore>,
+    events: Mutex<Option<Arc<bmux_plugin::EventBus>>>,
 }
 
 /// The host-authenticated caller id used to namespace contributions.
@@ -285,104 +289,131 @@ fn caller_owner(context: &NativeServiceContext) -> &str {
     if owner.is_empty() { HOST_OWNER } else { owner }
 }
 
-/// Register the retained state channels this plugin publishes.
-///
-/// Called from activation so the server's streaming forwarders find the
-/// channels before any client connects.
-pub fn register_state_channels() {
-    let events = bmux_plugin::global_event_bus();
-    let (items, notifications) = store().lock().map_or_else(
-        |_| {
-            (
-                StatusItemSnapshot {
-                    items: Vec::new(),
-                    revision: 0,
+impl ExternalPresentation {
+    /// Bind this activation's bus and register the retained state channels
+    /// this plugin publishes on it.
+    ///
+    /// Called from activation so the server's streaming forwarders find the
+    /// channels before any client connects. Without a bus nothing is
+    /// published.
+    pub fn activate(&self, events: Option<Arc<bmux_plugin::EventBus>>) {
+        if let Some(events) = &events {
+            let (items, notifications) = self.store.lock().map_or_else(
+                |_| {
+                    (
+                        StatusItemSnapshot {
+                            items: Vec::new(),
+                            revision: 0,
+                        },
+                        NotificationSnapshot {
+                            notifications: Vec::new(),
+                            revision: 0,
+                        },
+                    )
                 },
-                NotificationSnapshot {
-                    notifications: Vec::new(),
-                    revision: 0,
-                },
+                |store| (store.item_snapshot(), store.notification_snapshot()),
+            );
+            events.register_state_channel(status_items_list::STATE_KIND, items);
+            events.register_state_channel(notifications_list::STATE_KIND, notifications);
+        }
+        if let Ok(mut slot) = self.events.lock() {
+            *slot = events;
+        }
+    }
+
+    // The store lock covers publication so concurrent mutations publish their
+    // snapshots in revision order.
+    #[allow(clippy::significant_drop_tightening)]
+    fn mutate<T>(
+        &self,
+        apply: impl FnOnce(&mut ExternalPresentationStore) -> T,
+    ) -> Result<T, ServiceResponse> {
+        let mut store = self.store.lock().map_err(|_| {
+            ServiceResponse::error("unavailable", "tab-bar status store lock poisoned")
+        })?;
+        let item_revision = store.item_revision;
+        let notification_revision = store.notification_revision;
+        let result = apply(&mut store);
+        let events = self.events.lock().ok().and_then(|events| events.clone());
+        let Some(events) = events else {
+            return Ok(result);
+        };
+        if store.item_revision != item_revision
+            && let Err(error) =
+                events.publish_state(&status_items_list::STATE_KIND, store.item_snapshot())
+        {
+            tracing::debug!(%error, "tab-bar status item snapshot not published");
+        }
+        if store.notification_revision != notification_revision
+            && let Err(error) = events.publish_state(
+                &notifications_list::STATE_KIND,
+                store.notification_snapshot(),
             )
-        },
-        |store| (store.item_snapshot(), store.notification_snapshot()),
-    );
-    events.register_state_channel(status_items_list::STATE_KIND, items);
-    events.register_state_channel(notifications_list::STATE_KIND, notifications);
-}
-
-// The store lock covers publication so concurrent mutations publish their
-// snapshots in revision order.
-#[allow(clippy::significant_drop_tightening)]
-fn mutate<T>(
-    apply: impl FnOnce(&mut ExternalPresentationStore) -> T,
-) -> Result<T, ServiceResponse> {
-    let mut store = store()
-        .lock()
-        .map_err(|_| ServiceResponse::error("unavailable", "tab-bar status store lock poisoned"))?;
-    let item_revision = store.item_revision;
-    let notification_revision = store.notification_revision;
-    let result = apply(&mut store);
-    let events = bmux_plugin::global_event_bus();
-    if store.item_revision != item_revision
-        && let Err(error) =
-            events.publish_state(&status_items_list::STATE_KIND, store.item_snapshot())
-    {
-        tracing::debug!(%error, "tab-bar status item snapshot not published");
+        {
+            tracing::debug!(%error, "tab-bar notification snapshot not published");
+        }
+        Ok(result)
     }
-    if store.notification_revision != notification_revision
-        && let Err(error) = events.publish_state(
-            &notifications_list::STATE_KIND,
-            store.notification_snapshot(),
-        )
-    {
-        tracing::debug!(%error, "tab-bar notification snapshot not published");
+
+    pub fn set_status_item(
+        &self,
+        request: SetStatusItemRequest,
+        context: &NativeServiceContext,
+    ) -> Result<Result<(), StatusItemError>, ServiceResponse> {
+        let owner = caller_owner(context).to_string();
+        self.mutate(|store| store.set_item(&owner, request))
     }
-    Ok(result)
-}
 
-pub fn set_status_item(
-    request: SetStatusItemRequest,
-    context: &NativeServiceContext,
-) -> Result<Result<(), StatusItemError>, ServiceResponse> {
-    let owner = caller_owner(context).to_string();
-    mutate(|store| store.set_item(&owner, request))
-}
+    pub fn clear_status_item(
+        &self,
+        id: &str,
+        context: &NativeServiceContext,
+    ) -> Result<bool, ServiceResponse> {
+        let owner = caller_owner(context).to_string();
+        self.mutate(|store| store.clear_item(&owner, id))
+    }
 
-pub fn clear_status_item(
-    id: &str,
-    context: &NativeServiceContext,
-) -> Result<bool, ServiceResponse> {
-    let owner = caller_owner(context).to_string();
-    mutate(|store| store.clear_item(&owner, id))
-}
+    pub fn clear_status_items(
+        &self,
+        context: &NativeServiceContext,
+    ) -> Result<u32, ServiceResponse> {
+        let owner = caller_owner(context).to_string();
+        self.mutate(|store| store.clear_owner(&owner))
+    }
 
-pub fn clear_status_items(context: &NativeServiceContext) -> Result<u32, ServiceResponse> {
-    let owner = caller_owner(context).to_string();
-    mutate(|store| store.clear_owner(&owner))
-}
+    pub fn list_status_items(
+        &self,
+        owner: Option<&str>,
+    ) -> Result<Vec<StatusItem>, ServiceResponse> {
+        self.store
+            .lock()
+            .map(|store| store.list_items(owner))
+            .map_err(|_| {
+                ServiceResponse::error("unavailable", "tab-bar status store lock poisoned")
+            })
+    }
 
-pub fn list_status_items(owner: Option<&str>) -> Result<Vec<StatusItem>, ServiceResponse> {
-    store()
-        .lock()
-        .map(|store| store.list_items(owner))
-        .map_err(|_| ServiceResponse::error("unavailable", "tab-bar status store lock poisoned"))
-}
+    pub fn notify(
+        &self,
+        request: NotifyRequest,
+        context: &NativeServiceContext,
+    ) -> Result<Result<Uuid, NotificationError>, ServiceResponse> {
+        let owner = caller_owner(context).to_string();
+        self.mutate(|store| store.notify(&owner, request, Uuid::new_v4(), now_unix_ms()))
+    }
 
-pub fn notify(
-    request: NotifyRequest,
-    context: &NativeServiceContext,
-) -> Result<Result<Uuid, NotificationError>, ServiceResponse> {
-    let owner = caller_owner(context).to_string();
-    mutate(|store| store.notify(&owner, request, Uuid::new_v4(), now_unix_ms()))
-}
-
-pub fn dismiss(id: Uuid, context: &NativeServiceContext) -> Result<bool, ServiceResponse> {
-    let owner = caller_owner(context).to_string();
-    mutate(|store| {
-        let removed = store.dismiss(&owner, id);
-        store.prune_expired(now_unix_ms());
-        removed
-    })
+    pub fn dismiss(
+        &self,
+        id: Uuid,
+        context: &NativeServiceContext,
+    ) -> Result<bool, ServiceResponse> {
+        let owner = caller_owner(context).to_string();
+        self.mutate(|store| {
+            let removed = store.dismiss(&owner, id);
+            store.prune_expired(now_unix_ms());
+            removed
+        })
+    }
 }
 
 #[cfg(test)]
@@ -631,7 +662,15 @@ mod tests {
         }
     }
 
+    fn activated_plugin() -> (crate::TabBarPlugin, Arc<bmux_plugin::EventBus>) {
+        let events = Arc::new(bmux_plugin::EventBus::new());
+        let plugin = crate::TabBarPlugin::default();
+        plugin.external.activate(Some(Arc::clone(&events)));
+        (plugin, events)
+    }
+
     fn invoke<Request: serde::Serialize, Response: serde::de::DeserializeOwned>(
+        plugin: &crate::TabBarPlugin,
         caller: &str,
         capability: &str,
         interface: &str,
@@ -640,7 +679,7 @@ mod tests {
     ) -> Response {
         use bmux_plugin_sdk::RustPlugin;
         let payload = bmux_plugin_sdk::encode_service_message(request).unwrap();
-        let response = crate::TabBarPlugin.invoke_service(service_context(
+        let response = plugin.invoke_service(service_context(
             caller, capability, interface, operation, payload,
         ));
         assert!(response.error.is_none(), "{:?}", response.error);
@@ -650,13 +689,14 @@ mod tests {
     #[test]
     fn services_namespace_by_host_caller_id_and_publish_snapshots() {
         use bmux_tab_bar_plugin_api::{notifications, status_items, status_items_state};
-        register_state_channels();
-        let (_, mut items_rx) = bmux_plugin::global_event_bus()
+        let (plugin, events) = activated_plugin();
+        let (_, mut items_rx) = events
             .subscribe_state::<StatusItemSnapshot>(&status_items_list::STATE_KIND)
             .unwrap();
         let write = "bmux.tab_bar.status.write";
         for caller in ["svc.alpha", "svc.beta"] {
             let result: Result<(), StatusItemError> = invoke(
+                &plugin,
                 caller,
                 write,
                 status_items::INTERFACE_ID.as_str(),
@@ -676,6 +716,7 @@ mod tests {
         assert_eq!(mine, [("svc.alpha", "svc.alpha"), ("svc.beta", "svc.beta")]);
 
         let listed: Vec<StatusItem> = invoke(
+            &plugin,
             "svc.reader",
             "bmux.tab_bar.status.read",
             status_items_state::INTERFACE_ID.as_str(),
@@ -687,6 +728,7 @@ mod tests {
         assert_eq!(listed.len(), 1);
 
         let removed: bool = invoke(
+            &plugin,
             "svc.alpha",
             write,
             status_items::INTERFACE_ID.as_str(),
@@ -697,6 +739,7 @@ mod tests {
         );
         assert!(removed);
         let cleared: u32 = invoke(
+            &plugin,
             "svc.beta",
             write,
             status_items::INTERFACE_ID.as_str(),
@@ -713,6 +756,7 @@ mod tests {
         );
 
         let id: Result<Uuid, NotificationError> = invoke(
+            &plugin,
             "svc.alpha",
             "bmux.tab_bar.notify",
             notifications::INTERFACE_ID.as_str(),
@@ -720,7 +764,7 @@ mod tests {
             &toast("Deploy finished", Some(10_000)),
         );
         let id = id.unwrap();
-        let (snapshot, _) = bmux_plugin::global_event_bus()
+        let (snapshot, _) = events
             .subscribe_state::<NotificationSnapshot>(&notifications_list::STATE_KIND)
             .unwrap();
         assert!(
@@ -730,6 +774,7 @@ mod tests {
                 .any(|toast| toast.id == id && toast.owner == "svc.alpha")
         );
         let dismissed: bool = invoke(
+            &plugin,
             "svc.beta",
             "bmux.tab_bar.notify",
             notifications::INTERFACE_ID.as_str(),
@@ -738,6 +783,7 @@ mod tests {
         );
         assert!(!dismissed, "another plugin must not dismiss the toast");
         let dismissed: bool = invoke(
+            &plugin,
             "svc.alpha",
             "bmux.tab_bar.notify",
             notifications::INTERFACE_ID.as_str(),

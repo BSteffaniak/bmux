@@ -106,8 +106,10 @@ impl std::fmt::Debug for ScriptComponentRuntime {
 /// In-memory state store.
 #[derive(Default)]
 struct State {
-    /// Private scenes never enter the process-global plugin bus.
+    /// Private scenes never enter the activation's plugin bus.
     recipient: Option<Uuid>,
+    /// The bus this activation was handed; `None` publishes nothing.
+    events: Option<Arc<bmux_plugin::EventBus>>,
     hook_scope: u64,
     /// Per-pane overrides. Panes without an override fall through to
     /// [`State::default_border`].
@@ -274,6 +276,8 @@ struct DecorationRuntime {
     command_tx: Mutex<Option<std::sync::mpsc::SyncSender<DecorationEngineCommand>>>,
     read_model: ArcSwap<DecorationReadModel>,
     host_async_handle: Mutex<Option<HostAsyncHandle>>,
+    /// This activation's event bus, set at activation.
+    events: Mutex<Option<Arc<bmux_plugin::EventBus>>>,
     recipient: Option<Uuid>,
     hook_scope: u64,
     stopped: tokio::sync::watch::Sender<bool>,
@@ -293,6 +297,7 @@ impl Default for DecorationRuntime {
             command_tx: Mutex::new(None),
             read_model: ArcSwap::from_pointee(DecorationReadModel::default()),
             host_async_handle: Mutex::new(None),
+            events: Mutex::new(None),
             recipient: None,
             hook_scope: next_hook_scope(),
             stopped: tokio::sync::watch::channel(false).0,
@@ -341,6 +346,20 @@ impl SharedState {
         if let Ok(mut guard) = self.runtime.host_async_handle.lock() {
             *guard = Some(handle);
         }
+    }
+
+    fn set_events(&self, events: Option<Arc<bmux_plugin::EventBus>>) {
+        if let Ok(mut guard) = self.runtime.events.lock() {
+            *guard = events;
+        }
+    }
+
+    fn events(&self) -> Option<Arc<bmux_plugin::EventBus>> {
+        self.runtime
+            .events
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     fn host_async_handle(&self) -> Option<HostAsyncHandle> {
@@ -1770,9 +1789,8 @@ fn publish_scene_if_changed(state: &mut State) -> bool {
         scene.revision = state.scene_revision;
         state.last_published_scene = Some(scene.clone());
         views::publish_scene(recipient, &scene);
-    } else {
-        let _ = bmux_plugin::global_event_bus()
-            .publish_state(&bmux_scene_protocol::scene_protocol::STATE_KIND, scene);
+    } else if let Some(bus) = &state.events {
+        let _ = bus.publish_state(&bmux_scene_protocol::scene_protocol::STATE_KIND, scene);
     }
     true
 }
@@ -2259,7 +2277,10 @@ fn spawn_script_state_subscription(
     generation: u64,
 ) {
     let event_kind = plugin_event_kind_from_string(kind.to_string());
-    let Ok((initial, mut rx)) = bmux_plugin::global_event_bus().subscribe_state_json(&event_kind)
+    let Some(Ok((initial, mut rx))) = state
+        .events
+        .as_ref()
+        .map(|bus| bus.subscribe_state_json(&event_kind))
     else {
         tracing::debug!(
             kind,
@@ -2308,7 +2329,7 @@ fn spawn_script_state_subscription(
 
 fn spawn_script_broadcast_subscription(shared: SharedState, kind: &str, generation: u64) {
     let event_kind = plugin_event_kind_from_string(kind.to_string());
-    let Ok(mut rx) = bmux_plugin::global_event_bus().subscribe_json(&event_kind) else {
+    let Some(Ok(mut rx)) = shared.events().map(|bus| bus.subscribe_json(&event_kind)) else {
         tracing::debug!(
             kind,
             "script event subscription skipped; channel unavailable"
@@ -3067,15 +3088,20 @@ impl DecorationPlugin {
                 timeout,
             );
         }
+        // Every channel below lives on the bus this activation was handed;
+        // without one the plugin decorates but publishes nothing.
+        self.state
+            .set_events(bmux_plugin::activation_event_bus(context));
+        let events = self.state.events();
         // Register the retained scene channel before any mutator (including
-        // the initial publication below) tries to publish. Failure is
-        // non-fatal — the channel may already exist from a prior load;
-        // scene publication tolerates a missing channel.
-        let _ = bmux_plugin::global_event_bus()
-            .register_state_channel::<bmux_scene_protocol::scene_protocol::DecorationScene>(
+        // the initial publication below) tries to publish. Scene publication
+        // tolerates a missing channel.
+        if let Some(bus) = &events {
+            bus.register_state_channel::<bmux_scene_protocol::scene_protocol::DecorationScene>(
                 bmux_scene_protocol::scene_protocol::STATE_KIND,
                 empty_scene(),
             );
+        }
         ensure_decoration_engine(&self.state);
         let summary_theme_loaded = self.state.read_model(|model| model.current_theme.is_some());
         let summary_script_loaded = false;
@@ -3107,8 +3133,8 @@ impl DecorationPlugin {
         // `Request::EmitOnPluginBus`. The decorator plugin lives in
         // the server process and relies on this to observe pane
         // geometry without any client-side hardcoded push helper.
-        let _ = bmux_plugin::global_event_bus()
-            .register_state_channel_with_decoder::<
+        if let Some(bus) = &events {
+            bus.register_state_channel_with_decoder::<
                 bmux_attach_layout_protocol::attach_layout_protocol::AttachLayoutSnapshot,
             >(
                 bmux_attach_layout_protocol::attach_layout_protocol::STATE_KIND,
@@ -3117,6 +3143,7 @@ impl DecorationPlugin {
                     revision: 0,
                 },
             );
+        }
         spawn_attach_layout_subscriber(self.state.clone());
         spawn_visual_projection_subscriber(self.state.clone());
     }
@@ -3662,16 +3689,16 @@ fn script_source_hash(path: &std::path::Path, source: &str) -> u64 {
 /// the decoration plugin — the bus does not buffer missed events).
 fn spawn_windows_pane_event_subscriber(state: SharedState) {
     // The bus channel is registered by the windows plugin's
-    // `activate()` via `global_event_bus().register_channel::<PaneEvent>(...)`.
+    // `activate()` on the shared host bus.
     // We tolerate "channel not registered yet" by just bailing out;
     // plugin load order will determine whether the subscriber sees
     // any events at all. Once the channel is registered, the
     // subscriber sees every subsequent event.
-    let Ok(mut rx) = bmux_plugin::global_event_bus()
-        .subscribe::<bmux_tabs_plugin_api::tabs_events::PaneEvent>(
+    let Some(Ok(mut rx)) = state.events().map(|bus| {
+        bus.subscribe::<bmux_tabs_plugin_api::tabs_events::PaneEvent>(
             &bmux_tabs_plugin_api::tabs_events::EVENT_KIND,
         )
-    else {
+    }) else {
         return;
     };
     let host_async_handle = state.host_async_handle();
@@ -3712,7 +3739,10 @@ fn spawn_windows_pane_event_subscriber(state: SharedState) {
 /// snapshot changes so downstream consumers (attach renderer) pick up
 /// the change.
 fn spawn_pane_runtime_focus_state_subscriber(state: SharedState) {
-    let subscribe_result = bmux_plugin::global_event_bus()
+    let Some(bus) = state.events() else {
+        return;
+    };
+    let subscribe_result = bus
         .subscribe_state::<bmux_pane_runtime_plugin_api::pane_runtime_focus::SessionFocusStateMap>(
         &bmux_pane_runtime_plugin_api::pane_runtime_focus::STATE_KIND,
     );
@@ -3823,7 +3853,10 @@ fn apply_focus_state_map(
 /// that disappeared from the new snapshot. Publishing after a change lets
 /// subscribers pick up the updated paint commands on the next frame.
 fn spawn_attach_layout_subscriber(state: SharedState) {
-    let subscribe_result = bmux_plugin::global_event_bus()
+    let Some(bus) = state.events() else {
+        return;
+    };
+    let subscribe_result = bus
         .subscribe_state::<
             bmux_attach_layout_protocol::attach_layout_protocol::AttachLayoutSnapshot,
         >(
@@ -3988,15 +4021,16 @@ fn read_visual_uuid(bytes: &[u8], offset: usize) -> Result<Uuid, bmux_plugin::Ev
 }
 
 fn spawn_visual_projection_subscriber(state: SharedState) {
+    let Some(bus) = state.events() else {
+        return;
+    };
     let event_kind = plugin_event_kind_from_string(DECORATION_VISUAL_PROJECTION_KIND.to_string());
-    let _ = bmux_plugin::global_event_bus().register_state_channel_with_bytes_decoder(
+    let _ = bus.register_state_channel_with_bytes_decoder(
         event_kind.clone(),
         VisualProjectionBatch::default(),
         decode_visual_projection_batch,
     );
-    let Ok((initial, mut rx)) =
-        bmux_plugin::global_event_bus().subscribe_state::<VisualProjectionBatch>(&event_kind)
-    else {
+    let Ok((initial, mut rx)) = bus.subscribe_state::<VisualProjectionBatch>(&event_kind) else {
         tracing::warn!(
             kind = DECORATION_VISUAL_PROJECTION_KIND,
             "visual projection subscribe failed"
@@ -4750,13 +4784,14 @@ mod tests {
     #[test]
     fn script_state_subscription_enqueues_json_snapshot() {
         let plugin = DecorationPlugin::new();
+        let bus = Arc::new(bmux_plugin::EventBus::new());
+        plugin.state.set_events(Some(Arc::clone(&bus)));
         let kind = format!("test.decoration/state-{}", Uuid::new_v4());
         let event_kind = plugin_event_kind_from_string(kind.clone());
-        bmux_plugin::global_event_bus()
-            .register_state_channel_with_json_projection::<serde_json::Value>(
-                event_kind,
-                json!({ "value": 42 }),
-            );
+        bus.register_state_channel_with_json_projection::<serde_json::Value>(
+            event_kind,
+            json!({ "value": 42 }),
+        );
         let seen = Arc::new(Mutex::new(Vec::new()));
         let shared = plugin.state.clone();
         let kind_for_subscription = kind.clone();
@@ -5441,10 +5476,11 @@ mod tests {
         };
         use bmux_tabs_plugin_api::tabs_events::PaneEvent as WindowsPaneEvent;
 
-        let bus = bmux_plugin::global_event_bus();
+        let bus = Arc::new(bmux_plugin::EventBus::new());
         bus.register_channel::<WindowsPaneEvent>(bmux_tabs_plugin_api::tabs_events::EVENT_KIND);
 
         let plugin = DecorationPlugin::new();
+        plugin.state.set_events(Some(Arc::clone(&bus)));
         spawn_windows_pane_event_subscriber(plugin.state.clone());
         let pane = Uuid::from_u128(701);
         plugin.state.with_state(move |state| {
@@ -5508,19 +5544,21 @@ mod tests {
     #[test]
     fn publish_scene_if_changed_publishes_retained_scene_when_channel_registered() {
         // Register the state channel first (as `activate()` would).
-        let _sender = bmux_plugin::global_event_bus()
+        let bus = Arc::new(bmux_plugin::EventBus::new());
+        let _sender = bus
             .register_state_channel::<bmux_scene_protocol::scene_protocol::DecorationScene>(
-            bmux_scene_protocol::scene_protocol::STATE_KIND,
-            empty_scene(),
-        );
+                bmux_scene_protocol::scene_protocol::STATE_KIND,
+                empty_scene(),
+            );
 
-        let (_initial, mut rx) = bmux_plugin::global_event_bus()
+        let (_initial, mut rx) = bus
             .subscribe_state::<bmux_scene_protocol::scene_protocol::DecorationScene>(
                 &bmux_scene_protocol::scene_protocol::STATE_KIND,
             )
             .expect("subscribe");
 
         let plugin = DecorationPlugin::new();
+        plugin.state.set_events(Some(bus));
         let handle = DecorationServiceHandle::new(plugin.state.clone());
         let pane = Uuid::from_u128(900);
         block_on(handle.set_pane_border(pane, BorderStyle::Single)).expect("set");

@@ -20,9 +20,7 @@
 pub mod session_manager;
 pub use session_manager::SessionManager;
 
-use bmux_plugin::{
-    ServiceCaller, TypedServiceCaller, global_event_bus, global_plugin_state_registry,
-};
+use bmux_plugin::{EventBus, ServiceCaller, TypedServiceCaller, global_plugin_state_registry};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     PluginEventKind, StatefulPlugin, StatefulPluginError, StatefulPluginHandle,
@@ -310,16 +308,33 @@ impl bmux_plugin_runtime::shutdown::ShutdownParticipant for SessionsShutdown {
     }
 }
 
+/// This activation's session event publisher. Without a host-supplied bus
+/// (for example a dynamic artifact) events are dropped, never routed to a
+/// process-wide bus.
+#[derive(Clone, Default)]
+struct SessionEvents(Option<Arc<EventBus>>);
+
+impl SessionEvents {
+    fn emit(&self, event: SessionEvent) {
+        if let Some(bus) = &self.0 {
+            let _ = bus.emit(&sessions_events::EVENT_KIND, event);
+        }
+    }
+}
+
 #[derive(Default)]
-pub struct SessionsPlugin;
+pub struct SessionsPlugin {
+    events: SessionEvents,
+}
 
 impl RustPlugin for SessionsPlugin {
     type Contract = bmux_sessions_plugin_api::Contract;
 
     fn activate(
         &mut self,
-        _context: NativeLifecycleContext,
+        context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
+        self.events = SessionEvents(bmux_plugin::activation_event_bus(&context));
         let state: Arc<RwLock<SessionManager>> = Arc::new(RwLock::new(SessionManager::new()));
         global_plugin_state_registry().register::<SessionManager>(&state);
 
@@ -363,7 +378,9 @@ impl RustPlugin for SessionsPlugin {
             .expect("stateful plugin registry lock poisoned")
             .push(stateful);
 
-        global_event_bus().register_channel::<SessionEvent>(sessions_events::EVENT_KIND);
+        if let Some(bus) = &self.events.0 {
+            bus.register_channel::<SessionEvent>(sessions_events::EVENT_KIND);
+        }
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 
@@ -402,29 +419,29 @@ impl RustPlugin for SessionsPlugin {
                     .map_err(|e| ServiceResponse::error("get_failed", e))
             },
             "sessions-program-v1", "new-program-session" => |req: bmux_sessions_plugin_api::sessions_program_v1::client::NewProgramSessionRequest, ctx| {
-                Ok::<_, ServiceResponse>(new_program_session(ctx, req.name, req.options))
+                Ok::<_, ServiceResponse>(new_program_session(&self.events, ctx, req.name, req.options))
             },
             "sessions-spawn-v1", "new-session" => |req: bmux_sessions_plugin_api::sessions_spawn_v1::client::NewSessionRequest, ctx| {
-                Ok::<_, ServiceResponse>(new_session_with_options(ctx, req.name, req.options))
+                Ok::<_, ServiceResponse>(new_session_with_options(&self.events, ctx, req.name, req.options))
             },
             "sessions-commands", "new-session" => |req: NewSessionArgs, ctx| {
                 Ok::<Result<SessionAck, NewSessionError>, ServiceResponse>(
-                    new_session_via_ipc(ctx, req.name)
+                    new_session_via_ipc(&self.events, ctx, req.name)
                 )
             },
             "sessions-commands", "kill-session" => |req: KillSessionArgs, ctx| {
                 Ok::<Result<SessionAck, KillSessionError>, ServiceResponse>(
-                    kill_session_via_ipc(ctx, &req.selector, req.force_local)
+                    kill_session_via_ipc(&self.events, ctx, &req.selector, req.force_local)
                 )
             },
             "sessions-commands", "select-session" => |req: SelectorArgs, ctx| {
                 Ok::<Result<SessionAck, SelectSessionError>, ServiceResponse>(
-                    select_session_via_ipc(ctx, &req.selector)
+                    select_session_via_ipc(&self.events, ctx, &req.selector)
                 )
             },
             "sessions-commands", "rename-session" => |req: RenameSessionArgs, _ctx| {
                 Ok::<Result<SessionAck, RenameSessionError>, ServiceResponse>(
-                    rename_session_local(&req.selector, &req.name)
+                    rename_session_local(&self.events, &req.selector, &req.name)
                 )
             },
             "sessions-commands", "reconcile-client-membership" => |req: ReconcileArgs, _ctx| {
@@ -446,12 +463,13 @@ impl RustPlugin for SessionsPlugin {
             Arc::new(SessionsStateHandle::new(Arc::clone(&caller)));
         let _ = sessions_state::register_provider(registry, state);
 
-        let commands: Arc<dyn SessionsCommandsService + Send + Sync> =
-            Arc::new(SessionsCommandsHandle::new(Arc::clone(&caller)));
+        let commands: Arc<dyn SessionsCommandsService + Send + Sync> = Arc::new(
+            SessionsCommandsHandle::new(Arc::clone(&caller), self.events.clone()),
+        );
         let _ = sessions_commands::register_provider(registry, commands);
         let spawn: Arc<
             dyn bmux_sessions_plugin_api::sessions_spawn_v1::SessionsSpawnV1Service + Send + Sync,
-        > = Arc::new(SessionsCommandsHandle::new(caller));
+        > = Arc::new(SessionsCommandsHandle::new(caller, self.events.clone()));
         let _ = bmux_sessions_plugin_api::sessions_spawn_v1::register_provider(registry, spawn);
     }
 }
@@ -578,6 +596,7 @@ fn record_selected_context_outcome(context_id: ::uuid::Uuid) {
 }
 
 fn new_program_session(
+    events: &SessionEvents,
     caller: &(impl ServiceCaller + Sync),
     name: Option<String>,
     options: bmux_sessions_plugin_api::sessions_program_v1::ProgramOptions,
@@ -613,13 +632,10 @@ fn new_program_session(
             reason: format!("{other:?}"),
         },
     })?;
-    let _ = global_event_bus().emit(
-        &sessions_events::EVENT_KIND,
-        SessionEvent::Created {
-            session_id: result.session_id,
-            name,
-        },
-    );
+    events.emit(SessionEvent::Created {
+        session_id: result.session_id,
+        name,
+    });
     Ok(ExecutionRef {
         session_id: result.session_id,
         pane_id: result.pane_id,
@@ -628,6 +644,7 @@ fn new_program_session(
 }
 
 fn new_session_with_options(
+    events: &SessionEvents,
     caller: &(impl ServiceCaller + Sync),
     name: Option<String>,
     options: bmux_sessions_plugin_api::sessions_spawn_v1::InitialShellOptions,
@@ -649,14 +666,12 @@ fn new_session_with_options(
         reason: format!("{error:?}"),
     })?;
     let session_id = result.session_id;
-    let _ = global_event_bus().emit(
-        &sessions_events::EVENT_KIND,
-        SessionEvent::Created { session_id, name },
-    );
+    events.emit(SessionEvent::Created { session_id, name });
     Ok(SessionAck { id: session_id })
 }
 
 fn new_session_via_ipc(
+    events: &SessionEvents,
     caller: &(impl ServiceCaller + Sync),
     name: Option<String>,
 ) -> Result<SessionAck, NewSessionError> {
@@ -670,10 +685,7 @@ fn new_session_via_ipc(
     match result {
         Ok(Ok(ack)) => {
             let session_id = ack.session_id;
-            let _ = global_event_bus().emit(
-                &sessions_events::EVENT_KIND,
-                SessionEvent::Created { session_id, name },
-            );
+            events.emit(SessionEvent::Created { session_id, name });
             Ok(SessionAck { id: session_id })
         }
         Ok(Err(err)) => Err(NewSessionError::Failed {
@@ -686,6 +698,7 @@ fn new_session_via_ipc(
 }
 
 fn kill_session_via_ipc(
+    events: &SessionEvents,
     caller: &impl ServiceCaller,
     selector: &WireSelector,
     force_local: bool,
@@ -745,10 +758,7 @@ fn kill_session_via_ipc(
     match result {
         Ok(Ok(ack)) => {
             let id = ack.session_id;
-            let _ = global_event_bus().emit(
-                &sessions_events::EVENT_KIND,
-                SessionEvent::Removed { session_id: id },
-            );
+            events.emit(SessionEvent::Removed { session_id: id });
             Ok(SessionAck { id })
         }
         Ok(Err(
@@ -791,6 +801,7 @@ fn validate_rename_name(name: &str) -> Result<String, String> {
 }
 
 fn rename_session_local(
+    events: &SessionEvents,
     selector: &WireSelector,
     name: &str,
 ) -> Result<SessionAck, RenameSessionError> {
@@ -824,13 +835,10 @@ fn rename_session_local(
         })?;
     drop(manager);
 
-    let _ = global_event_bus().emit(
-        &sessions_events::EVENT_KIND,
-        SessionEvent::Renamed {
-            session_id: session_id.0,
-            name,
-        },
-    );
+    events.emit(SessionEvent::Renamed {
+        session_id: session_id.0,
+        name,
+    });
     Ok(SessionAck { id: session_id.0 })
 }
 
@@ -848,6 +856,7 @@ fn map_attach_session_error(
 }
 
 fn select_session_via_ipc(
+    events: &SessionEvents,
     caller: &(impl ServiceCaller + Sync),
     selector: &WireSelector,
 ) -> Result<SessionAck, SelectSessionError> {
@@ -866,12 +875,9 @@ fn select_session_via_ipc(
     );
     match result {
         Ok(Ok(grant)) => {
-            let _ = global_event_bus().emit(
-                &sessions_events::EVENT_KIND,
-                SessionEvent::Selected {
-                    session_id: grant.session_id,
-                },
-            );
+            events.emit(SessionEvent::Selected {
+                session_id: grant.session_id,
+            });
             Ok(SessionAck {
                 id: grant.session_id,
             })
@@ -946,11 +952,12 @@ impl SessionsStateService for SessionsStateHandle {
 
 pub struct SessionsCommandsHandle {
     caller: Arc<TypedServiceCaller>,
+    events: SessionEvents,
 }
 
 impl SessionsCommandsHandle {
-    const fn new(caller: Arc<TypedServiceCaller>) -> Self {
-        Self { caller }
+    const fn new(caller: Arc<TypedServiceCaller>, events: SessionEvents) -> Self {
+        Self { caller, events }
     }
 }
 
@@ -962,7 +969,9 @@ impl bmux_sessions_plugin_api::sessions_spawn_v1::SessionsSpawnV1Service
         name: Option<String>,
         options: bmux_sessions_plugin_api::sessions_spawn_v1::InitialShellOptions,
     ) -> Pin<Box<dyn Future<Output = Result<SessionAck, NewSessionError>> + Send + 'a>> {
-        Box::pin(async move { new_session_with_options(self.caller.as_ref(), name, options) })
+        Box::pin(async move {
+            new_session_with_options(&self.events, self.caller.as_ref(), name, options)
+        })
     }
 }
 
@@ -972,7 +981,7 @@ impl SessionsCommandsService for SessionsCommandsHandle {
         name: Option<String>,
     ) -> Pin<Box<dyn Future<Output = std::result::Result<SessionAck, NewSessionError>> + Send + 'a>>
     {
-        Box::pin(async move { new_session_via_ipc(self.caller.as_ref(), name) })
+        Box::pin(async move { new_session_via_ipc(&self.events, self.caller.as_ref(), name) })
     }
 
     fn kill_session<'a>(
@@ -986,7 +995,7 @@ impl SessionsCommandsService for SessionsCommandsHandle {
                 id: selector.id,
                 name: selector.name,
             };
-            kill_session_via_ipc(self.caller.as_ref(), &wire, force_local)
+            kill_session_via_ipc(&self.events, self.caller.as_ref(), &wire, force_local)
         })
     }
 
@@ -1001,7 +1010,7 @@ impl SessionsCommandsService for SessionsCommandsHandle {
                 id: selector.id,
                 name: selector.name,
             };
-            select_session_via_ipc(self.caller.as_ref(), &wire)
+            select_session_via_ipc(&self.events, self.caller.as_ref(), &wire)
         })
     }
 
@@ -1017,7 +1026,7 @@ impl SessionsCommandsService for SessionsCommandsHandle {
                 id: selector.id,
                 name: selector.name,
             };
-            rename_session_local(&wire, &name)
+            rename_session_local(&self.events, &wire, &name)
         })
     }
 
@@ -1054,7 +1063,7 @@ bmux_plugin_sdk::define_plugin!(
     factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| {
         Ok(std::sync::Arc::new(
             bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
-                SessionsPlugin,
+                SessionsPlugin::default(),
                 scope.instance,
             ),
         )
@@ -1265,6 +1274,7 @@ mod tests {
             }
         }
         let error = new_session_with_options(
+            &SessionEvents::default(),
             &UnavailableSpawn,
             Some("fresh".into()),
             bmux_sessions_plugin_api::sessions_spawn_v1::InitialShellOptions {

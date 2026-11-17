@@ -705,11 +705,14 @@ pub fn install(settings: Option<&toml::Value>) -> Result<(), String> {
     Ok(())
 }
 
-/// Capture lifecycle callbacks for the current installation.
+/// Capture lifecycle callbacks for the current installation, subscribing it
+/// to `bus` (the host's authoritative state bus) when started.
 ///
 /// # Errors
 /// Returns an error if no presentation is installed or its lock is poisoned.
-pub fn installed_companion() -> Result<bmux_plugin::AttachCompanion, String> {
+pub fn installed_companion(
+    bus: std::sync::Arc<bmux_plugin::EventBus>,
+) -> Result<bmux_plugin::AttachCompanion, String> {
     let current = default_presentation()
         .lock()
         .map_err(|_| "sidebar presentation lock poisoned".to_string())?;
@@ -722,9 +725,7 @@ pub fn installed_companion() -> Result<bmux_plugin::AttachCompanion, String> {
     let start_owner = owner.clone();
     Ok(bmux_plugin::AttachCompanion::new(
         OWNER,
-        std::sync::Arc::new(move || {
-            start_for_installation(&start_owner, &bmux_plugin::global_event_bus())
-        }),
+        std::sync::Arc::new(move || start_for_installation(&start_owner, &bus)),
         std::sync::Arc::new(move || {
             let mut current = default_presentation()
                 .lock()
@@ -768,19 +769,19 @@ fn register_input_callbacks(
     );
 }
 
-/// Subscribe the configured companion to authoritative tab state.
+/// Subscribe the configured companion to authoritative tab state on `bus`.
 ///
 /// # Errors
 ///
 /// Returns an error when state subscription, initial publication, or task startup fails.
-pub fn start() -> Result<(), String> {
+pub fn start(bus: &bmux_plugin::EventBus) -> Result<(), String> {
     let current = default_presentation()
         .lock()
         .map_err(|_| "sidebar presentation lock poisoned".to_string())?;
     current
         .as_ref()
         .ok_or_else(|| "sidebar companion is not installed".to_string())?
-        .start(&bmux_plugin::global_event_bus())
+        .start(bus)
 }
 
 fn start_for_installation(
@@ -1636,7 +1637,8 @@ mod tests {
                 .revision,
             10
         );
-        let old_companion = installed_companion().unwrap();
+        let bus = std::sync::Arc::new(bmux_plugin::EventBus::new());
+        let old_companion = installed_companion(bus.clone()).unwrap();
         install(None).unwrap();
         let replacement = state();
         old_companion.stop().unwrap();
@@ -1647,7 +1649,7 @@ mod tests {
                 .iter()
                 .any(|request| request.id.owner_plugin_id == OWNER)
         );
-        installed_companion().unwrap().stop().unwrap();
+        installed_companion(bus).unwrap().stop().unwrap();
         assert!(replacement.lock().unwrap().is_none());
         uninstall();
     }

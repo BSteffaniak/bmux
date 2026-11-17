@@ -3,10 +3,10 @@
 mod capture_writer;
 mod durable_capture;
 mod environment;
-#[cfg(test)]
-mod ingest_bench;
 pub(crate) mod execution;
 pub(crate) mod human_input;
+#[cfg(test)]
+mod ingest_bench;
 pub(crate) mod input_authority;
 pub(crate) mod live_presentation;
 pub(crate) mod managed_idle;
@@ -342,10 +342,37 @@ fn validate_explicit_launch(launch: &PaneLaunchSpec) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The event bus this plugin's current activation received.
+///
+/// The pane runtime manager is shared by every activation in the process
+/// and reached through the plugin's runtime handles, so each activation
+/// installs its own bus here (see [`install_activation_events`]). Without one
+/// (for example a dynamic artifact) pane events are dropped; they are never
+/// routed to a process-wide bus.
+#[derive(Default)]
+struct PaneRuntimeEvents(Option<Arc<bmux_plugin::EventBus>>);
+
+/// Install the bus `activate` received, replacing a previous activation's.
+pub(crate) fn install_activation_events(bus: Option<Arc<bmux_plugin::EventBus>>) {
+    let slot =
+        bmux_plugin::global_plugin_state_registry().get_or_insert_with(PaneRuntimeEvents::default);
+    if let Ok(mut slot) = slot.write() {
+        slot.0 = bus;
+    }
+}
+
+/// The bus installed by the current activation, if any.
+pub(crate) fn activation_events() -> Option<Arc<bmux_plugin::EventBus>> {
+    bmux_plugin::global_plugin_state_registry()
+        .get::<PaneRuntimeEvents>()
+        .and_then(|slot| slot.read().ok().and_then(|slot| slot.0.clone()))
+}
+
 pub(crate) fn publish_pane_event(event: PaneEvent) {
-    if let Err(error) =
-        bmux_plugin::global_event_bus().emit(&pane_runtime_events::EVENT_KIND, event)
-    {
+    let Some(events) = activation_events() else {
+        return;
+    };
+    if let Err(error) = events.emit(&pane_runtime_events::EVENT_KIND, event) {
         warn!(%error, "failed publishing pane-runtime event");
     }
 }
@@ -13444,7 +13471,8 @@ pub fn activate_pane_runtime(
 mod tests {
     #[tokio::test]
     async fn activated_exit_consumer_survives_initialization_and_publishes_exit() {
-        let bus = bmux_plugin::global_event_bus();
+        let bus = Arc::new(bmux_plugin::EventBus::new());
+        install_activation_events(Some(Arc::clone(&bus)));
         bus.register_channel::<PaneEvent>(pane_runtime_events::EVENT_KIND);
         let mut events = bus
             .subscribe::<PaneEvent>(&pane_runtime_events::EVENT_KIND)
@@ -23138,9 +23166,15 @@ exit 7"#
         buf.push_chunk(b"\x1b[?2026hone\x1b[?2026l\x1b[?20");
         buf.push_chunk(b"26htwo");
         let first = buf.read_for_client(client, 3 + 8 + 8);
-        assert!(!buf.sync_update_open_at(first.stream_end), "frame one is complete");
+        assert!(
+            !buf.sync_update_open_at(first.stream_end),
+            "frame one is complete"
+        );
         let rest = buf.read_for_client(client, 1024);
-        assert!(buf.sync_update_open_at(rest.stream_end), "frame two is open");
+        assert!(
+            buf.sync_update_open_at(rest.stream_end),
+            "frame two is open"
+        );
         assert!(buf.sync_update_open_at(8), "inside frame one");
         // Evicted marks fold into the state before the retained stream.
         let mut small = OutputFanoutBuffer::new(8);

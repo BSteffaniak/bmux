@@ -19,10 +19,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod attach_commands;
 pub mod attach_state;
-pub(crate) mod output_push;
 pub(crate) mod execution;
 pub(crate) mod human_input;
 pub(crate) mod live_presentation;
+pub(crate) mod output_push;
 pub mod padding;
 pub mod pane_commands;
 pub mod pane_state;
@@ -540,5 +540,7 @@ pub(crate) fn publish_focus_state_snapshot() {
     // Ignore publish errors — the channel is registered in `activate`
     // before any mutation can run; a failure here means the plugin
     // was dropped, and there's nothing to do.
-    let _ = bmux_plugin::global_event_bus().publish_state(&FOCUS_STATE_KIND, payload);
+    if let Some(events) = crate::runtime::activation_events() {
+        let _ = events.publish_state(&FOCUS_STATE_KIND, payload);
+    }
 }

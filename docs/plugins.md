@@ -535,10 +535,35 @@ In-process event delivery goes through `bmux_plugin::EventBus`, a
 plugin that emits events calls `register_channel::<E>()` in its
 `activate` callback; publishers then call `emit::<E>(event)` and
 subscribers call `subscribe::<E>()` to receive an untagged
-`Receiver<Arc<E>>`. The global singleton is reachable via
-`bmux_plugin::global_event_bus()`. Zero-serialization fanout is used
-for in-process subscribers; cross-process subscribers bridge through
-the existing `bmux_ipc::Event` stream.
+`Receiver<Arc<E>>`. Zero-serialization fanout is used for in-process
+subscribers; cross-process subscribers bridge through the existing
+`bmux_ipc::Event` stream.
+
+There is no process-wide bus. The host owns one root bus and registers
+`bmux_plugin::event_bus_activation_binder` on each in-process plugin
+execution, which offers every activation its own view
+(`EventBus::scoped`). A plugin takes it while activating:
+
+```rust
+fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+    self.events = bmux_plugin::activation_event_bus(&context); // Option<Arc<EventBus>>
+    if let Some(bus) = &self.events {
+        bus.register_channel::<MyEvent>(my_events::EVENT_KIND);
+    }
+    Ok(EXIT_OK)
+}
+```
+
+`PluginInstance` implementors call
+`bmux_plugin::take_activation_event_bus(&context.capabilities)`. A view
+shares the root's channels but owns the channels registered through it:
+they are removed when the view drops or its activation scope closes, and
+every operation through a closed view fails with `EventBusError::Closed`.
+Keep the view in plugin instance state and pass it to the code that
+publishes or subscribes; never cache a bus in a `static`. A dynamically
+loaded artifact receives no bus (in-process values cannot cross the native
+ABI) and activates with its events disabled rather than reaching a
+private copy.
 
 ## Context model (canonical)
 

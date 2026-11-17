@@ -22,7 +22,7 @@ use bmux_performance_plugin_api::{
 use bmux_performance_state::{
     PerformanceCaptureSettings, PerformanceRuntimeSettings, PerformanceSettingsHandle,
 };
-use bmux_plugin::{global_event_bus, global_plugin_state_registry};
+use bmux_plugin::{EventBus, global_plugin_state_registry};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_presentation_state::{
@@ -93,6 +93,8 @@ pub struct PerformancePlugin {
     worker_error: Arc<Mutex<Option<String>>>,
     worker: Arc<Mutex<Option<MetricsWorker>>>,
     cleanup_pending: Arc<std::sync::atomic::AtomicBool>,
+    /// Set for the default composition: it receives the activation's bus.
+    activation_host: Option<Arc<ActivationPerformanceHost>>,
 }
 struct MetricsWorker {
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -100,7 +102,10 @@ struct MetricsWorker {
 }
 impl Default for PerformancePlugin {
     fn default() -> Self {
-        Self::with_host(Arc::new(LegacyPerformanceHost))
+        let host = Arc::new(ActivationPerformanceHost::default());
+        let mut plugin = Self::with_host(host.clone());
+        plugin.activation_host = Some(host);
+        plugin
     }
 }
 impl PerformancePlugin {
@@ -112,6 +117,15 @@ impl PerformancePlugin {
             worker_error: Arc::new(Mutex::new(None)),
             worker: Arc::new(Mutex::new(None)),
             cleanup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            activation_host: None,
+        }
+    }
+
+    fn adopt_activation_bus(&self, take: impl FnOnce() -> Option<Arc<EventBus>>) {
+        if let Some(host) = &self.activation_host
+            && let Ok(mut events) = host.events.write()
+        {
+            *events = take();
         }
     }
     fn activate_owner(&self) -> Result<(), PluginCommandError> {
@@ -173,8 +187,9 @@ impl RustPlugin for PerformancePlugin {
 
     fn activate(
         &mut self,
-        _context: NativeLifecycleContext,
+        context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
+        self.adopt_activation_bus(|| bmux_plugin::activation_event_bus(&context));
         self.activate_owner()?;
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
@@ -1018,10 +1033,23 @@ impl ProcessTree {
     }
 }
 
-struct LegacyPerformanceHost;
-impl PerformanceHost for LegacyPerformanceHost {
+/// Default composition: events go to the bus the current activation
+/// received. Without one (for example a dynamic artifact) events are dropped,
+/// never routed to a process-wide bus.
+#[derive(Default)]
+struct ActivationPerformanceHost {
+    events: std::sync::RwLock<Option<Arc<EventBus>>>,
+}
+impl ActivationPerformanceHost {
+    fn events(&self) -> Option<Arc<EventBus>> {
+        self.events.read().ok().and_then(|events| events.clone())
+    }
+}
+impl PerformanceHost for ActivationPerformanceHost {
     fn activate_channels(&self, initial: MetricsSnapshot) -> Result<(), String> {
-        let events = global_event_bus();
+        let Some(events) = self.events() else {
+            return Ok(());
+        };
         events.register_channel::<PerformanceEvent>(EVENT_KIND);
         events.register_channel::<MetricEvent>(METRIC_EVENT_KIND);
         events.register_state_channel_with_json_projection::<MetricsSnapshot>(
@@ -1056,12 +1084,14 @@ impl PerformanceHost for LegacyPerformanceHost {
             .map_err(|_| "performance settings poisoned")?
             .0
             .set(capture);
-        let _ = global_event_bus().emit(
-            &EVENT_KIND,
-            PerformanceEvent::SettingsUpdated {
-                settings: settings.clone().into(),
-            },
-        );
+        if let Some(events) = self.events() {
+            let _ = events.emit(
+                &EVENT_KIND,
+                PerformanceEvent::SettingsUpdated {
+                    settings: settings.clone().into(),
+                },
+            );
+        }
         Ok(settings)
     }
     fn pane_processes(&self) -> Result<Vec<bmux_pane_runtime_state::PaneProcessIdentity>, String> {
@@ -1076,10 +1106,13 @@ impl PerformanceHost for LegacyPerformanceHost {
         Ok(processes)
     }
     fn publish_metrics(&self, snapshot: &MetricsSnapshot) -> Result<(), String> {
-        global_event_bus()
+        let Some(events) = self.events() else {
+            return Ok(());
+        };
+        events
             .publish_state(&METRICS_STATE_KIND, snapshot.clone())
             .map_err(|error| error.to_string())?;
-        let _ = global_event_bus().emit(
+        let _ = events.emit(
             &METRIC_EVENT_KIND,
             MetricEvent::SnapshotUpdated {
                 sampled_at_epoch_ms: snapshot.sampled_at_epoch_ms,
@@ -1103,9 +1136,12 @@ impl bmux_plugin_sdk::definition::PluginInstance for PerformancePlugin {
 
     fn activate(
         &self,
-        _context: bmux_plugin_sdk::definition::PluginLifecycleContext,
+        context: bmux_plugin_sdk::definition::PluginLifecycleContext,
     ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
     {
+        self.adopt_activation_bus(|| {
+            bmux_plugin::take_activation_event_bus(&context.capabilities).ok()
+        });
         Box::pin(async move { self.activate_owner() })
     }
     fn deactivate(

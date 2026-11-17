@@ -579,6 +579,26 @@ impl ProductionPlugin {
             .map_err(|_| failure("lifecycle authority already bound"))
     }
 
+    /// Offer this instance's activations a view of the host event bus scoped
+    /// to each activation. Returns `false`, binding nothing, when the backend
+    /// cannot receive in-process values (a dynamic artifact or a process
+    /// plugin): that plugin then activates without a bus and reports it,
+    /// instead of reaching a private process-wide copy.
+    pub(in crate::runtime) fn bind_event_bus(
+        &self,
+        bus: &Arc<bmux_plugin::EventBus>,
+    ) -> bmux_plugin_sdk::Result<bool> {
+        match &self.backend {
+            Backend::Scoped(execution) if execution.is_in_process() => {
+                execution.bind_activation_binder(bmux_plugin::event_bus_activation_binder(
+                    Arc::clone(bus),
+                ))?;
+                Ok(true)
+            }
+            Backend::Scoped(_) | Backend::Process(_) => Ok(false),
+        }
+    }
+
     /// Register a trusted host activation binder before this instance activates.
     pub(in crate::runtime) fn bind_activation_binder(
         &self,

@@ -359,12 +359,13 @@ fn two_valid_versioned_input_scripts_have_independent_vm_and_hooks() {
 fn subscriptions_cancel_on_reapply_empty_clear_and_checkpoint_without_events() {
     use std::sync::atomic::Ordering;
     let shared = SharedState::default();
+    let bus = std::sync::Arc::new(bmux_plugin::EventBus::new());
+    shared.set_events(Some(std::sync::Arc::clone(&bus)));
     let kind = bmux_plugin_sdk::PluginEventKind::from_owned(format!(
         "test/view-cancel-{}",
         shared.runtime.hook_scope
     ));
-    let sender = bmux_plugin::global_event_bus()
-        .register_channel_with_json_projection::<String>(kind.clone());
+    let sender = bus.register_channel_with_json_projection::<String>(kind.clone());
     let access = crate::decoration_state::ScriptAccessSpec {
         state_channels: vec![],
         event_channels: vec![kind.as_str().into()],

@@ -388,15 +388,18 @@ impl RustPlugin for PaneRuntimePlugin {
         // session. Seeded empty — `publish_focus_state_snapshot`
         // republishes the full map on every session-mutating pane
         // command (via `handlers::publish_focus_state_snapshot`).
-        bmux_plugin::global_event_bus().register_state_channel::<SessionFocusStateMap>(
-            pane_runtime_focus::STATE_KIND,
-            SessionFocusStateMap {
-                entries: BTreeMap::new(),
-                revision: 0,
-            },
-        );
-        bmux_plugin::global_event_bus()
-            .register_channel::<PaneEvent>(pane_runtime_events::EVENT_KIND);
+        let events = bmux_plugin::activation_event_bus(&context);
+        if let Some(events) = &events {
+            events.register_state_channel::<SessionFocusStateMap>(
+                pane_runtime_focus::STATE_KIND,
+                SessionFocusStateMap {
+                    entries: BTreeMap::new(),
+                    revision: 0,
+                },
+            );
+            events.register_channel::<PaneEvent>(pane_runtime_events::EVENT_KIND);
+        }
+        runtime::install_activation_events(events);
         // Publish the initial snapshot so any already-registered
         // subscribers see the current focus state immediately (even
         // though the map is usually empty at activate time — sessions

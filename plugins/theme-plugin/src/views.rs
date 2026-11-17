@@ -183,10 +183,9 @@ impl ThemePlugin {
             return;
         };
         let views = Arc::clone(&self.views);
-        let bus = self
-            .events
-            .clone()
-            .unwrap_or_else(bmux_plugin::global_event_bus);
+        let Some(bus) = self.events.clone() else {
+            return;
+        };
         let sink = self.selected_sink();
         let mut events = bus
             .subscribe::<bmux_clients_plugin_api::clients_events::ClientEvent>(
@@ -452,7 +451,11 @@ impl RustPlugin for ThemePlugin {
     type Contract = control_contract::Contract;
 
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
-        // No lifecycle call applies theme/appearance globally.
+        // No lifecycle call applies theme/appearance globally. An explicit
+        // runtime bus wins; otherwise use the bus this activation was handed.
+        if self.events.is_none() {
+            self.events = bmux_plugin::activation_event_bus(&context);
+        }
         self.watch_detach(&context);
         Ok(EXIT_OK)
     }

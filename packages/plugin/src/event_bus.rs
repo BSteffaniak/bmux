@@ -1178,17 +1178,6 @@ impl EventBus {
     }
 }
 
-/// Process-wide shared event bus instance.
-///
-/// Plugins register channels into this singleton during `activate`;
-/// any code holding a reference to it can later emit or subscribe.
-#[must_use]
-pub fn global_event_bus() -> Arc<EventBus> {
-    use std::sync::OnceLock;
-    static GLOBAL: OnceLock<Arc<EventBus>> = OnceLock::new();
-    GLOBAL.get_or_init(|| Arc::new(EventBus::new())).clone()
-}
-
 /// Host activation binder that offers each activation a view of `bus`
 /// scoped to that activation (see [`EventBus::scoped`]).
 ///

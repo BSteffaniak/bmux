@@ -100,7 +100,10 @@ pub fn write(
     Ok(())
 }
 
-pub fn activate(context: &NativeLifecycleContext) -> Result<(), String> {
+pub fn activate(
+    context: &NativeLifecycleContext,
+    runtime_state: super::TabRuntimeStateHandle,
+) -> Result<(), String> {
     let caller = TypedServiceCaller::from_lifecycle_context(context);
     {
         let _guard = TAB_ORDER_MUTATION.lock()?;
@@ -150,7 +153,10 @@ pub fn activate(context: &NativeLifecycleContext) -> Result<(), String> {
     stateful
         .write()
         .map_err(|_| "stateful registry lock poisoned")?
-        .push(StatefulPluginHandle::new(Arrangements { caller }));
+        .push(StatefulPluginHandle::new(Arrangements {
+            caller,
+            runtime_state,
+        }));
     Ok(())
 }
 
@@ -167,6 +173,7 @@ fn snapshot_state(snapshot: &StatefulPluginSnapshot) -> Result<State, String> {
 
 struct Arrangements {
     caller: TypedServiceCaller,
+    runtime_state: super::TabRuntimeStateHandle,
 }
 
 impl StatefulPlugin for Arrangements {
@@ -220,10 +227,7 @@ impl StatefulPlugin for Arrangements {
             write_state(&self.caller, &snapshot_state(&snapshot)?)?;
             drop(guard);
             super::recover_tab_placements(&self.caller)?;
-            super::publish_tab_list_snapshot(
-                &self.caller,
-                &super::TabRuntimeStateHandle::default(),
-            );
+            super::publish_tab_list_snapshot(&self.caller, &self.runtime_state);
             Ok(())
         };
         restore().map_err(|details| StatefulPluginError::RestoreFailed {

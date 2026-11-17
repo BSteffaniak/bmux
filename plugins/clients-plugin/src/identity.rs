@@ -156,7 +156,7 @@ mod tests {
                 request.payload,
             )?
             .to_vec();
-            let response = crate::ClientsPlugin.invoke_service(invocation);
+            let response = crate::ClientsPlugin::default().invoke_service(invocation);
             assert!(response.error.is_none(), "{:?}", response.error);
             Ok(bmux_plugin_sdk::service_contract::encode_response(
                 &response.payload,

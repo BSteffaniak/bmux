@@ -14,7 +14,7 @@ use bmux_pane_runtime_plugin_api::attach_runtime_commands::{
     AttachCommandError, AttachGrant as AttachGrantRecord, AttachOutput as AttachOutputRecord,
     AttachReady, AttachRetargetReady, AttachViewportSet, ContextSelector, SessionSelector,
 };
-use bmux_pane_runtime_plugin_api::pane_runtime_events::{self, PaneEvent};
+use bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent;
 use bmux_pane_runtime_state::SessionRuntimeError;
 use bmux_plugin::global_plugin_state_registry;
 use bmux_plugin_sdk::NativeServiceContext;
@@ -347,7 +347,7 @@ fn session_write_allowed(
 }
 
 fn publish_pane_event(event: PaneEvent) {
-    let _ = bmux_plugin::global_event_bus().emit(&pane_runtime_events::EVENT_KIND, event);
+    crate::runtime::publish_pane_event(event);
 }
 
 #[allow(

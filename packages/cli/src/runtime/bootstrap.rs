@@ -591,7 +591,7 @@ async fn run_server_start_inner(
                 startup_recording.clone(),
             ),
             server.plugin_state_registry(),
-            bmux_plugin::global_event_bus(),
+            server.plugin_event_bus(),
         ),
     );
     #[cfg(feature = "bundled-plugin-snapshot")]
@@ -645,8 +645,16 @@ async fn run_server_start_inner(
     register_snapshot_plugin_config(&config, &paths);
     register_pane_runtime_plugin_config(&config, &paths, pane_shell_integration_override);
     super::dispatch::startup_future_marker("plugins.before_activate", 0);
+    let plugin_events = server.plugin_event_bus();
     for plugin in loaded_plugins.iter() {
         plugin.bind_lifecycle_authority(server.host_service_context())?;
+        if !plugin.bind_event_bus(&plugin_events)? {
+            tracing::info!(
+                plugin_id = plugin.declaration.id.as_str(),
+                "plugin backend cannot receive in-process activation values; \
+                 it activates without the host event bus"
+            );
+        }
     }
     // Route every declared provider before activation so a plugin's
     // `activate` (and work it starts there) reaches providers that are

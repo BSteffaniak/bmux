@@ -202,6 +202,7 @@ impl ViewRegistry {
             let state = SharedState {
                 runtime: Arc::new(DecorationRuntime {
                     recipient: Some(caller),
+                    events: Mutex::new(shared.events()),
                     ..DecorationRuntime::default()
                 }),
             };
@@ -383,9 +384,11 @@ impl ViewRegistry {
         entry.stop();
         entry.retired.push_back(lifetime);
         let host_async_handle = entry.state.host_async_handle();
+        let events = entry.state.events();
         entry.state = SharedState {
             runtime: Arc::new(DecorationRuntime {
                 recipient: Some(caller),
+                events: Mutex::new(events),
                 ..DecorationRuntime::default()
             }),
         };

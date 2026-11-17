@@ -12,7 +12,7 @@ use bmux_attach_layout_protocol::{
 use bmux_pane_runtime_plugin_api::pane_runtime_commands::{
     FloatingPaneAck, PaneAck, PaneCommandError, SessionAck, SessionRuntimeCommandError,
 };
-use bmux_pane_runtime_plugin_api::pane_runtime_events::{self, AttachViewComponent, PaneEvent};
+use bmux_pane_runtime_plugin_api::pane_runtime_events::{AttachViewComponent, PaneEvent};
 use bmux_pane_runtime_state::{
     FloatingPaneLayer, FloatingPaneScope, LayoutRect, PaneResizeDirection,
 };
@@ -352,7 +352,10 @@ fn target_selector(target: Option<Uuid>) -> Option<PaneSelector> {
 }
 
 fn publish_session_removed_event(session_id: SessionId) {
-    let _ = bmux_plugin::global_event_bus().emit(
+    let Some(events) = crate::runtime::activation_events() else {
+        return;
+    };
+    let _ = events.emit(
         &sessions_events::EVENT_KIND,
         SessionEvent::Removed {
             session_id: session_id.0,
@@ -361,7 +364,7 @@ fn publish_session_removed_event(session_id: SessionId) {
 }
 
 fn publish_pane_event(event: PaneEvent) {
-    let _ = bmux_plugin::global_event_bus().emit(&pane_runtime_events::EVENT_KIND, event);
+    crate::runtime::publish_pane_event(event);
 }
 
 static PANE_FACT_REVISION: AtomicU64 = AtomicU64::new(0);

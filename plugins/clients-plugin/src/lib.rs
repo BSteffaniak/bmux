@@ -28,9 +28,7 @@ use bmux_clients_plugin_api::clients_state::{
 };
 use bmux_contexts_plugin_api::contexts_commands;
 use bmux_contexts_plugin_api::contexts_state::ContextSelector;
-use bmux_plugin::{
-    ServiceCaller, TypedServiceCaller, global_event_bus, global_plugin_state_registry,
-};
+use bmux_plugin::{EventBus, ServiceCaller, TypedServiceCaller, global_plugin_state_registry};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     PluginEventKind, StatefulPlugin, StatefulPluginError, StatefulPluginHandle,
@@ -57,6 +55,21 @@ use uuid::Uuid;
 /// concrete plugin-owned type.
 struct FollowStateAdapter {
     inner: Arc<RwLock<FollowState>>,
+    events: ClientEvents,
+}
+
+/// This activation's client event publisher. Without a host-supplied bus
+/// (for example a dynamic artifact) events are dropped, never routed to a
+/// process-wide bus.
+#[derive(Clone, Default)]
+struct ClientEvents(Option<Arc<EventBus>>);
+
+impl ClientEvents {
+    fn emit(&self, event: ClientEvent) {
+        if let Some(bus) = &self.0 {
+            let _ = bus.emit(&clients_events::EVENT_KIND, event);
+        }
+    }
 }
 
 const fn dispatch_client<C: ServiceCaller + Sync + ?Sized>(
@@ -133,13 +146,10 @@ impl FollowStateWriter for FollowStateAdapter {
     fn disconnect_client(&self, client_id: ClientId) -> Vec<FollowTargetGoneUpdate> {
         let updates = self.with_write(|state| state.disconnect_client(client_id), Vec::new());
         for update in &updates {
-            let _ = global_event_bus().emit(
-                &clients_events::EVENT_KIND,
-                ClientEvent::FollowTargetGone {
-                    follower_client_id: update.follower_client_id.0,
-                    former_leader_client_id: update.former_leader_client_id.0,
-                },
-            );
+            self.events.emit(ClientEvent::FollowTargetGone {
+                follower_client_id: update.follower_client_id.0,
+                former_leader_client_id: update.former_leader_client_id.0,
+            });
         }
         updates
     }
@@ -382,15 +392,18 @@ struct SetFollowingArgs {
 }
 
 #[derive(Default)]
-pub struct ClientsPlugin;
+pub struct ClientsPlugin {
+    events: ClientEvents,
+}
 
 impl RustPlugin for ClientsPlugin {
     type Contract = bmux_clients_plugin_api::Contract;
 
     fn activate(
         &mut self,
-        _context: NativeLifecycleContext,
+        context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
+        self.events = ClientEvents(bmux_plugin::activation_event_bus(&context));
         // Register the global follow-state handle. Core server code
         // (and other plugins) access this via
         // `global_plugin_state_registry().expect_state::<FollowState>()`.
@@ -406,6 +419,7 @@ impl RustPlugin for ClientsPlugin {
         // surface without naming the concrete plugin-owned type.
         let adapter = FollowStateAdapter {
             inner: Arc::clone(&state),
+            events: self.events.clone(),
         };
         let handle = Arc::new(RwLock::new(FollowStateHandle::new(adapter)));
         global_plugin_state_registry().register::<FollowStateHandle>(&handle);
@@ -434,7 +448,9 @@ impl RustPlugin for ClientsPlugin {
             .expect("stateful plugin registry lock poisoned")
             .push(stateful);
 
-        global_event_bus().register_channel::<ClientEvent>(clients_events::EVENT_KIND);
+        if let Some(bus) = &self.events.0 {
+            bus.register_channel::<ClientEvent>(clients_events::EVENT_KIND);
+        }
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 
@@ -482,12 +498,12 @@ impl RustPlugin for ClientsPlugin {
             },
             "clients-commands", "set-current-session" => |req: SetCurrentSessionArgs, ctx| {
                 Ok::<Result<ClientAck, SetCurrentSessionError>, ServiceResponse>(
-                    set_current_session_local(ctx, ctx.caller_client_id, req.session_id)
+                    set_current_session_local(&self.events, ctx, ctx.caller_client_id, req.session_id)
                 )
             },
             "clients-commands", "set-following" => |req: SetFollowingArgs, ctx| {
                 Ok::<Result<ClientAck, SetFollowingError>, ServiceResponse>(
-                    set_following_via_ipc(ctx, ctx.caller_client_id, &req)
+                    set_following_via_ipc(&self.events, ctx, ctx.caller_client_id, &req)
                 )
             },
         })
@@ -513,7 +529,7 @@ impl RustPlugin for ClientsPlugin {
         );
         let _ = clients_selection_commands_v1::register_provider(registry, selection);
         let commands: Arc<dyn ClientsCommandsService + Send + Sync> =
-            Arc::new(ClientsCommandsHandle::new(caller));
+            Arc::new(ClientsCommandsHandle::new(caller, self.events.clone()));
         let _ = clients_commands::register_provider(registry, commands);
     }
 }
@@ -738,6 +754,7 @@ fn selection_operation(
 
 #[allow(clippy::too_many_lines)]
 fn set_current_session_local(
+    events: &ClientEvents,
     caller: &(impl ServiceCaller + Sync),
     caller_client_id: Option<Uuid>,
     session_id: Uuid,
@@ -848,13 +865,10 @@ fn set_current_session_local(
         })?
         .sync_followers_from_leader(self_client_id, None, Some(next_session));
 
-    let _ = global_event_bus().emit(
-        &clients_events::EVENT_KIND,
-        ClientEvent::SessionSelected {
-            client_id: self_id,
-            session_id,
-        },
-    );
+    events.emit(ClientEvent::SessionSelected {
+        client_id: self_id,
+        session_id,
+    });
 
     for update in follower_updates {
         if let Some(update_session) = update.session_id {
@@ -873,15 +887,12 @@ fn set_current_session_local(
                 );
             }
 
-            let _ = global_event_bus().emit(
-                &clients_events::EVENT_KIND,
-                ClientEvent::FollowTargetChanged {
-                    follower_client_id: update.follower_client_id.0,
-                    leader_client_id: update.leader_client_id.0,
-                    context_id: update.context_id,
-                    session_id: update_session.0,
-                },
-            );
+            events.emit(ClientEvent::FollowTargetChanged {
+                follower_client_id: update.follower_client_id.0,
+                leader_client_id: update.leader_client_id.0,
+                context_id: update.context_id,
+                session_id: update_session.0,
+            });
         }
     }
 
@@ -922,6 +933,7 @@ fn current_client_local(caller_client_id: Option<Uuid>) -> Result<ClientSummary,
 
 #[allow(clippy::too_many_lines)]
 fn set_following_via_ipc(
+    events: &ClientEvents,
     caller: &(impl ServiceCaller + Sync),
     caller_client_id: Option<Uuid>,
     req: &SetFollowingArgs,
@@ -961,20 +973,14 @@ fn set_following_via_ipc(
             follow_state.stop_follow(self_client_id)
         };
         if removed {
-            let _ = global_event_bus().emit(
-                &clients_events::EVENT_KIND,
-                ClientEvent::FollowChanged {
-                    client_id: self_id,
-                    target_client_id: None,
-                    global: false,
-                },
-            );
-            let _ = global_event_bus().emit(
-                &clients_events::EVENT_KIND,
-                ClientEvent::FollowStopped {
-                    follower_client_id: self_id,
-                },
-            );
+            events.emit(ClientEvent::FollowChanged {
+                client_id: self_id,
+                target_client_id: None,
+                global: false,
+            });
+            events.emit(ClientEvent::FollowStopped {
+                follower_client_id: self_id,
+            });
         }
         return Ok(ClientAck { client_id: self_id });
     }
@@ -1056,32 +1062,23 @@ fn set_following_via_ipc(
 
     // Emit event-bus events for plugin consumers and cross-process
     // attach-UI subscribers via the generic plugin-bus forwarder.
-    let _ = global_event_bus().emit(
-        &clients_events::EVENT_KIND,
-        ClientEvent::FollowChanged {
-            client_id: self_id,
-            target_client_id: Some(target_client_id),
-            global: req.global,
-        },
-    );
-    let _ = global_event_bus().emit(
-        &clients_events::EVENT_KIND,
-        ClientEvent::FollowStarted {
+    events.emit(ClientEvent::FollowChanged {
+        client_id: self_id,
+        target_client_id: Some(target_client_id),
+        global: req.global,
+    });
+    events.emit(ClientEvent::FollowStarted {
+        follower_client_id: self_id,
+        leader_client_id: target_client_id,
+        global: req.global,
+    });
+    if let Some(session_id) = initial_target_session {
+        events.emit(ClientEvent::FollowTargetChanged {
             follower_client_id: self_id,
             leader_client_id: target_client_id,
-            global: req.global,
-        },
-    );
-    if let Some(session_id) = initial_target_session {
-        let _ = global_event_bus().emit(
-            &clients_events::EVENT_KIND,
-            ClientEvent::FollowTargetChanged {
-                follower_client_id: self_id,
-                leader_client_id: target_client_id,
-                context_id: initial_target_context,
-                session_id: session_id.0,
-            },
-        );
+            context_id: initial_target_context,
+            session_id: session_id.0,
+        });
     }
 
     Ok(ClientAck { client_id: self_id })
@@ -1170,11 +1167,12 @@ impl ClientsStateService for ClientsStateHandle {
 
 pub struct ClientsCommandsHandle {
     caller: Arc<TypedServiceCaller>,
+    events: ClientEvents,
 }
 
 impl ClientsCommandsHandle {
-    const fn new(caller: Arc<TypedServiceCaller>) -> Self {
-        Self { caller }
+    const fn new(caller: Arc<TypedServiceCaller>, events: ClientEvents) -> Self {
+        Self { caller, events }
     }
 }
 
@@ -1189,7 +1187,12 @@ impl ClientsCommandsService for ClientsCommandsHandle {
     > {
         Box::pin(async move {
             let caller_client_id = current_client_id_for_typed_handle(self.caller.as_ref());
-            set_current_session_local(self.caller.as_ref(), caller_client_id, session_id)
+            set_current_session_local(
+                &self.events,
+                self.caller.as_ref(),
+                caller_client_id,
+                session_id,
+            )
         })
     }
 
@@ -1205,6 +1208,7 @@ impl ClientsCommandsService for ClientsCommandsHandle {
             // back to a typed `current-client` lookup to obtain it.
             let caller_client_id = current_client_id_for_typed_handle(self.caller.as_ref());
             set_following_via_ipc(
+                &self.events,
                 self.caller.as_ref(),
                 caller_client_id,
                 &SetFollowingArgs {
@@ -1245,7 +1249,7 @@ bmux_plugin_sdk::define_plugin!(
     factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| {
         Ok(std::sync::Arc::new(
             bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
-                ClientsPlugin,
+                ClientsPlugin::default(),
                 scope.instance,
             ),
         )

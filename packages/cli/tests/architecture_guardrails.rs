@@ -1328,8 +1328,8 @@ fn recording_plugin_exists() {
         "sink revocation must precede ownership release"
     );
     let legacy_host = plugin_lib
-        .split_once("impl RecordingHost for LegacyRecordingHost {")
-        .expect("legacy host adapter must retain real sink registration")
+        .split_once("impl RecordingHost for ActivationRecordingHost {")
+        .expect("default activation host adapter must retain real sink registration")
         .1
         .split_once("fn remove_sink(")
         .unwrap()

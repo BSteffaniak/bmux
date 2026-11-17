@@ -236,7 +236,12 @@ pub struct RecordingActivationConfiguration {
 }
 
 impl RecordingPlugin {
-    fn configuration(&self) -> Result<RecordingActivationConfiguration, PluginCommandError> {
+    /// `events` is consulted only for the default composition, which publishes
+    /// on the bus the activation received.
+    fn configuration(
+        &self,
+        events: impl FnOnce() -> Option<Arc<bmux_plugin::EventBus>>,
+    ) -> Result<RecordingActivationConfiguration, PluginCommandError> {
         if let Some(binding) = &self.binding {
             return binding
                 .read()
@@ -254,7 +259,7 @@ impl RecordingPlugin {
             .clone();
         Ok(RecordingActivationConfiguration {
             config,
-            host: Arc::new(LegacyRecordingHost),
+            host: Arc::new(ActivationRecordingHost { events: events() }),
             process_caller: None,
         })
     }
@@ -273,9 +278,9 @@ impl RustPlugin for RecordingPlugin {
 
     fn activate(
         &mut self,
-        _context: NativeLifecycleContext,
+        context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
-        let binding = self.configuration()?;
+        let binding = self.configuration(|| bmux_plugin::activation_event_bus(&context))?;
         let config = binding.config;
         let mut selected = self
             .owner
@@ -341,7 +346,9 @@ impl RustPlugin for RecordingPlugin {
         context: TypedServiceRegistrationContext<'_>,
         registry: &mut TypedServiceRegistry,
     ) {
-        let Ok(binding) = self.configuration() else {
+        // Activation already created the owner with its bus; a registration
+        // without a prior activation has no bus to publish on.
+        let Ok(binding) = self.configuration(|| None) else {
             return;
         };
         let config = binding.config;
@@ -2137,11 +2144,18 @@ fn empty_clear_report() -> RecordingRollingClearReport {
     }
 }
 
-struct LegacyRecordingHost;
-impl RecordingHost for LegacyRecordingHost {
+/// Default composition: publishes on the bus this activation received.
+/// Without one (for example a dynamic artifact) recording events are
+/// dropped, never routed to a process-wide bus.
+struct ActivationRecordingHost {
+    events: Option<Arc<bmux_plugin::EventBus>>,
+}
+impl RecordingHost for ActivationRecordingHost {
     fn install_sink(&self, sink: RecordingSinkHandle) -> Result<(), String> {
-        bmux_plugin::global_event_bus()
-            .register_channel::<recording_events::RecordingEvent>(recording_events::EVENT_KIND);
+        if let Some(events) = &self.events {
+            events
+                .register_channel::<recording_events::RecordingEvent>(recording_events::EVENT_KIND);
+        }
         global_plugin_state_registry().register(&Arc::new(RwLock::new(sink)));
         Ok(())
     }
@@ -2151,7 +2165,10 @@ impl RecordingHost for LegacyRecordingHost {
         Ok(())
     }
     fn publish(&self, event: recording_events::RecordingEvent) -> Result<(), String> {
-        bmux_plugin::global_event_bus()
+        let Some(events) = &self.events else {
+            return Ok(());
+        };
+        events
             .emit(&recording_events::EVENT_KIND, event)
             .map(|_| ())
             .map_err(|error| error.to_string())

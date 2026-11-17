@@ -155,6 +155,7 @@ impl DecorationEngine {
         Self {
             state: State {
                 recipient: shared.runtime.recipient,
+                events: shared.events(),
                 hook_scope: shared.runtime.hook_scope,
                 ..State::default()
             },
@@ -295,8 +296,10 @@ impl DecorationEngine {
 
     fn retire(&mut self) {
         let recipient = self.state.recipient;
+        let events = self.state.events.take();
         self.state = State {
             recipient,
+            events,
             hook_scope: self.shared.runtime.hook_scope,
             ..State::default()
         };

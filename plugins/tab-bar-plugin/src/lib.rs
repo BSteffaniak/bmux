@@ -19,13 +19,15 @@ mod workspace_rename;
 
 use bmux_attach_view_protocol::AttachLocalPresentationSnapshot;
 use bmux_plugin::RenderNamedColor;
+#[cfg(test)]
+use bmux_plugin::layout::global_plugin_layout_registry;
 use bmux_plugin::layout::{
     LayoutEdge, LayoutExtent, PluginLayoutId, PluginLayoutRequest, PluginLayoutSnapshot,
-    global_plugin_layout_registry,
 };
+#[cfg(test)]
+use bmux_plugin::surface::global_plugin_surface_registry;
 use bmux_plugin::surface::{
     PluginSurface, PluginSurfaceId, PluginSurfaceRegion, PluginSurfaceSnapshot,
-    global_plugin_surface_registry,
 };
 use bmux_plugin::{
     AttachInputEvent, AttachInputResult, AttachInputServiceInvocation, ExtensionRect, RenderOp,
@@ -40,8 +42,9 @@ use bmux_presentation_state::{
 use bmux_tab_bar_plugin_api::{notifications_list, status_items_list};
 use bmux_tabs_plugin_api::{tabs_commands, tabs_list};
 use bmux_workspaces_plugin_api::{workspaces_commands, workspaces_state};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -467,41 +470,43 @@ impl CompanionState {
 
 type CompanionHandle = std::sync::Arc<Mutex<Option<CompanionState>>>;
 
+#[cfg(test)]
 fn state() -> &'static CompanionHandle {
     static STATE: OnceLock<CompanionHandle> = OnceLock::new();
     STATE.get_or_init(|| std::sync::Arc::new(Mutex::new(None)))
 }
 
 #[derive(Default)]
-pub struct TabBarPlugin;
+pub struct TabBarPlugin {
+    external: std::sync::Arc<external::ExternalPresentation>,
+}
 
 impl RustPlugin for TabBarPlugin {
     type Contract = contract::Contract;
 
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
-        let settings = Settings::parse(context.settings.as_ref())?;
-        *state()
-            .lock()
-            .map_err(|_| PluginCommandError::failed("tab-bar state lock poisoned"))? =
-            Some(CompanionState::new(settings));
+        // Validate configuration up front. The backend owns no presentation:
+        // attach runtimes install their own `TabBarPresentation`.
+        Settings::parse(context.settings.as_ref())?;
         // Retained channels for plugin-contributed status items and toasts;
         // the server forwards them to attach clients (see plugin.toml).
-        external::register_state_channels();
+        self.external
+            .activate(bmux_plugin::activation_event_bus(&context));
         Ok(EXIT_OK)
     }
 
     fn deactivate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
-        uninstall();
+        self.external.activate(None);
         Ok(EXIT_OK)
     }
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
-        Self::service(&context)
+        self.service(&context)
     }
 }
 
 impl TabBarPlugin {
-    fn service(context: &NativeServiceContext) -> ServiceResponse {
+    fn service(&self, context: &NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "presentation-actions/v2", "move-selection" => |req: contract::presentation_actions::client::MoveSelectionRequest, ctx| {
                 group_actions::execute(req, ctx)
@@ -512,22 +517,22 @@ impl TabBarPlugin {
                     .map_err(|error| ServiceResponse::error("workspaces_unavailable", error.to_string()))
             },
             "status-items", "set-status-item" => |req: contract::status_items::client::SetStatusItemRequest, ctx| {
-                external::set_status_item(req, ctx)
+                self.external.set_status_item(req, ctx)
             },
             "status-items", "clear-status-item" => |req: contract::status_items::client::ClearStatusItemRequest, ctx| {
-                external::clear_status_item(&req.id, ctx)
+                self.external.clear_status_item(&req.id, ctx)
             },
             "status-items", "clear-status-items" => |(): (), ctx| {
-                external::clear_status_items(ctx)
+                self.external.clear_status_items(ctx)
             },
             "status-items-state", "list-status-items" => |req: contract::status_items_state::client::ListStatusItemsRequest, _ctx| {
-                external::list_status_items(req.owner.as_deref())
+                self.external.list_status_items(req.owner.as_deref())
             },
             "notifications", "notify" => |req: contract::notifications::client::NotifyRequest, ctx| {
-                external::notify(req, ctx)
+                self.external.notify(req, ctx)
             },
             "notifications", "dismiss" => |req: contract::notifications::client::DismissRequest, ctx| {
-                external::dismiss(req.id, ctx)
+                self.external.dismiss(req.id, ctx)
             },
         })
     }
@@ -535,7 +540,10 @@ impl TabBarPlugin {
 
 bmux_plugin_sdk::define_plugin!(
     factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| Ok(std::sync::Arc::new(
-        bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(TabBarPlugin, scope.instance)
+        bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
+            TabBarPlugin::default(),
+            scope.instance,
+        )
     )
         as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
     metadata = {
@@ -565,12 +573,10 @@ fn input_endpoint() -> bmux_plugin::AttachInputEndpoint {
     }
 }
 
-/// Configure this process-local attach companion.
-///
-/// # Errors
-///
-/// Returns an error for invalid settings or rejected retained publication.
-pub fn install(settings: Option<&toml::Value>) -> Result<(), String> {
+/// Configure a process-local attach companion (test fixture only; attach
+/// runtimes install an owned [`TabBarPresentation`]).
+#[cfg(test)]
+fn install(settings: Option<&toml::Value>) -> Result<(), String> {
     let settings = Settings::parse(settings).map_err(|error| error.to_string())?;
     let request = layout_request(&settings);
     let mut guard = state()
@@ -1017,93 +1023,8 @@ fn apply_presentation_update(
     result
 }
 
-static ATTACH_GENERATION: AtomicU64 = AtomicU64::new(0);
-
-/// Subscribe the configured companion to authoritative tab state.
-///
-/// # Errors
-///
-/// Returns an error when state subscription, initial publication, or task startup fails.
-pub fn start() -> Result<(), String> {
-    let generation = ATTACH_GENERATION
-        .fetch_add(1, Ordering::AcqRel)
-        .saturating_add(1);
-    let (initial, mut receiver) = bmux_plugin::global_event_bus()
-        .subscribe_state::<tabs_list::TabListSnapshot>(&tabs_list::STATE_KIND)
-        .map_err(|error| format!("subscribing to tabs list: {error}"))?;
-    let (initial_local_presentation, mut local_presentation_receiver) =
-        bmux_plugin::global_event_bus()
-            .subscribe_state::<AttachLocalPresentationSnapshot>(
-                &ATTACH_LOCAL_PRESENTATION_STATE_KIND,
-            )
-            .map_err(|error| format!("subscribing to attach-local presentation: {error}"))?;
-    let (initial_selection, mut selection_receiver) = bmux_plugin::global_event_bus()
-        .subscribe_state::<bmux_tabs_plugin_api::tabs_local_view::TabSelection>(
-            &bmux_tabs_plugin_api::tabs_local_view::STATE_KIND,
-        )
-        .map_err(|error| format!("subscribing to local selection: {error}"))?;
-    publish_selection(initial_selection.context_id)?;
-    publish(initial.as_ref().clone())?;
-    publish_local_presentation(initial_local_presentation.as_ref().clone())?;
-    let fact_registry = bmux_presentation_state::global_presentation_fact_host_service().registry();
-    let mut facts_rx = fact_registry.subscribe_changes();
-    apply_presentation_update(
-        state(),
-        PresentationUpdate::Indicator(live_indicator::read(fact_registry)),
-    )?;
-    let handle = tokio::runtime::Handle::try_current()
-        .map_err(|error| format!("tab-bar companion requires an async runtime: {error}"))?;
-    handle.spawn(async move {
-        while ATTACH_GENERATION.load(Ordering::Acquire) == generation
-            && facts_rx.changed().await.is_ok()
-        {
-            facts_rx.borrow_and_update();
-            if let Err(error) = apply_presentation_update(
-                state(),
-                PresentationUpdate::Indicator(live_indicator::read(fact_registry)),
-            ) {
-                tracing::warn!(%error, "tab-bar indicator publication failed");
-            }
-        }
-    });
-    handle.spawn(async move {
-        while ATTACH_GENERATION.load(Ordering::Acquire) == generation
-            && selection_receiver.changed().await.is_ok()
-        {
-            let selected = selection_receiver.borrow_and_update().context_id;
-            if let Err(error) = publish_selection(selected) {
-                tracing::warn!(%error, "tab-bar selection publication failed");
-            }
-        }
-    });
-    handle.spawn(async move {
-        while ATTACH_GENERATION.load(Ordering::Acquire) == generation
-            && receiver.changed().await.is_ok()
-        {
-            let snapshot = receiver.borrow_and_update().as_ref().clone();
-            if let Err(error) = publish(snapshot) {
-                tracing::warn!(%error, "tab-bar publication failed");
-            }
-        }
-    });
-    handle.spawn(async move {
-        while ATTACH_GENERATION.load(Ordering::Acquire) == generation
-            && local_presentation_receiver.changed().await.is_ok()
-        {
-            let snapshot = local_presentation_receiver
-                .borrow_and_update()
-                .as_ref()
-                .clone();
-            if let Err(error) = publish_local_presentation(snapshot) {
-                tracing::warn!(%error, "tab-bar local presentation publication failed");
-            }
-        }
-    });
-    Ok(())
-}
-
-pub fn uninstall() {
-    ATTACH_GENERATION.fetch_add(1, Ordering::AcqRel);
+#[cfg(test)]
+fn uninstall() {
     bmux_plugin::remove_attach_presentation_input_handler(&input_endpoint());
     let _ = global_plugin_layout_registry().remove_owner(OWNER);
     let _ = global_plugin_surface_registry().remove_owner(OWNER);
@@ -1126,6 +1047,7 @@ fn layout_request(settings: &Settings) -> PluginLayoutRequest {
 
 // The companion lock must cover registry publication so multiple retained-state
 // subscriber tasks cannot race the same owner revision.
+#[cfg(test)]
 #[allow(clippy::significant_drop_tightening)]
 fn publish(snapshot: tabs_list::TabListSnapshot) -> Result<(), String> {
     let mut guard = state()
@@ -1138,6 +1060,7 @@ fn publish(snapshot: tabs_list::TabListSnapshot) -> Result<(), String> {
     publish_companion(companion)
 }
 
+#[cfg(test)]
 #[allow(clippy::significant_drop_tightening)] // The state lock must cover projection so snapshot fields remain coherent.
 fn publish_local_presentation(snapshot: AttachLocalPresentationSnapshot) -> Result<(), String> {
     let mut guard = state()
@@ -1147,31 +1070,6 @@ fn publish_local_presentation(snapshot: AttachLocalPresentationSnapshot) -> Resu
         return Ok(());
     };
     companion.replace_local_presentation(snapshot);
-    publish_companion(companion)
-}
-
-#[allow(clippy::significant_drop_tightening)] // Serialize selection and surface publication with catalog updates.
-fn publish_selection(context_id: Option<Uuid>) -> Result<(), String> {
-    let mut guard = state()
-        .lock()
-        .map_err(|_| "tab-bar state lock poisoned".to_string())?;
-    let Some(companion) = guard.as_mut() else {
-        return Ok(());
-    };
-    if companion.selected_context_id == context_id {
-        return Ok(());
-    }
-    companion.selected_context_id = context_id;
-    companion.editing_workspace_id = None;
-    companion.last_workspace_click = None;
-    companion.edit_buffer.clear();
-    companion.hovered_tab_id = None;
-    companion.editing_tab_id = None;
-    companion.menu_tab_id = None;
-    companion.pointer_source = None;
-    companion.drag_target = None;
-    companion.scroll_anchor = None;
-    companion.replace_tabs(companion.catalog.clone());
     publish_companion(companion)
 }
 

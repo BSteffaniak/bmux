@@ -355,6 +355,7 @@ fn resolve_target_pane_id(
 
 fn focus_pane(
     caller: &(impl ServiceCaller + Sync),
+    runtime_state: &TabRuntimeStateHandle,
     session: Option<&Selector>,
     target: Option<&Selector>,
     direction: &str,
@@ -371,14 +372,18 @@ fn focus_pane(
         ))
         .map_err(|err| typed_service_error("pane-runtime-commands/focus-pane", err))?;
     let ack = result.map_err(|err| format!("focus-pane failed: {err:?}"))?;
-    emit_pane_event(bmux_tabs_plugin_api::tabs_events::PaneEvent::Focused {
-        pane_id: ack.pane_id,
-    });
+    emit_pane_event(
+        runtime_state,
+        bmux_tabs_plugin_api::tabs_events::PaneEvent::Focused {
+            pane_id: ack.pane_id,
+        },
+    );
     Ok(ack)
 }
 
 fn split_pane(
     caller: &(impl ServiceCaller + Sync),
+    runtime_state: &TabRuntimeStateHandle,
     session: Option<&Selector>,
     target: Option<&Selector>,
     direction: PaneDirection,
@@ -386,7 +391,15 @@ fn split_pane(
     settings: Option<&toml::Value>,
 ) -> Result<api_pane_runtime_commands::PaneAck, String> {
     let policy = cwd::CwdSettings::parse(settings)?.new_pane;
-    split_pane_with_policy(caller, session, target, direction, ratio_pct, &policy)
+    split_pane_with_policy(
+        caller,
+        runtime_state,
+        session,
+        target,
+        direction,
+        ratio_pct,
+        &policy,
+    )
 }
 
 fn validate_directory_split_target(selector: Option<&Selector>) -> Result<(), String> {
@@ -401,6 +414,7 @@ fn validate_directory_split_target(selector: Option<&Selector>) -> Result<(), St
 
 fn split_pane_with_policy(
     caller: &(impl ServiceCaller + Sync),
+    runtime_state: &TabRuntimeStateHandle,
     session: Option<&Selector>,
     target: Option<&Selector>,
     direction: PaneDirection,
@@ -442,15 +456,19 @@ fn split_pane_with_policy(
         .map_err(|err| typed_service_error("pane-runtime-spawn-commands-v1/split-shell", err))?
         .map_err(|err| format!("split-shell failed: {err:?}"))?
     };
-    emit_pane_event(bmux_tabs_plugin_api::tabs_events::PaneEvent::Opened {
-        pane_id: ack.pane_id,
-        session_id: ack.session_id,
-    });
+    emit_pane_event(
+        runtime_state,
+        bmux_tabs_plugin_api::tabs_events::PaneEvent::Opened {
+            pane_id: ack.pane_id,
+            session_id: ack.session_id,
+        },
+    );
     Ok(ack)
 }
 
 fn launch_pane(
     caller: &(impl ServiceCaller + Sync),
+    runtime_state: &TabRuntimeStateHandle,
     session: Option<&Selector>,
     target: Option<&Selector>,
     request: LaunchPaneRequest,
@@ -472,10 +490,13 @@ fn launch_pane(
         ))
         .map_err(|err| typed_service_error("pane-runtime-commands/launch-pane", err))?;
     let ack = result.map_err(|err| format!("launch-pane failed: {err:?}"))?;
-    emit_pane_event(bmux_tabs_plugin_api::tabs_events::PaneEvent::Opened {
-        pane_id: ack.pane_id,
-        session_id: ack.session_id,
-    });
+    emit_pane_event(
+        runtime_state,
+        bmux_tabs_plugin_api::tabs_events::PaneEvent::Opened {
+            pane_id: ack.pane_id,
+            session_id: ack.session_id,
+        },
+    );
     Ok(ack)
 }
 
@@ -503,6 +524,7 @@ fn resize_pane(
 
 fn close_pane(
     caller: &(impl ServiceCaller + Sync),
+    runtime_state: &TabRuntimeStateHandle,
     session: Option<&Selector>,
     target: Option<&Selector>,
 ) -> Result<api_pane_runtime_commands::PaneAck, String> {
@@ -514,9 +536,12 @@ fn close_pane(
     )
     .map_err(|err| typed_service_error("pane-runtime-commands/close-pane", err))?;
     let ack = result.map_err(|err| format!("close-pane failed: {err:?}"))?;
-    emit_pane_event(bmux_tabs_plugin_api::tabs_events::PaneEvent::Closed {
-        pane_id: ack.pane_id,
-    });
+    emit_pane_event(
+        runtime_state,
+        bmux_tabs_plugin_api::tabs_events::PaneEvent::Closed {
+            pane_id: ack.pane_id,
+        },
+    );
     Ok(ack)
 }
 
@@ -527,6 +552,7 @@ fn close_pane(
 /// disturbing the layout tree.
 fn restart_pane(
     caller: &(impl ServiceCaller + Sync),
+    runtime_state: &TabRuntimeStateHandle,
     session: Option<&Selector>,
     target: Option<&Selector>,
 ) -> Result<api_pane_runtime_commands::PaneAck, String> {
@@ -542,6 +568,7 @@ fn restart_pane(
     // `restarted` case; a respawned pane is a lifecycle transition back
     // to running, which is exactly what `status-changed` models.
     emit_pane_event(
+        runtime_state,
         bmux_tabs_plugin_api::tabs_events::PaneEvent::StatusChanged {
             pane_id: ack.pane_id,
         },
@@ -1098,6 +1125,7 @@ fn set_floating_pane_layer_command(
 
 fn zoom_pane(
     caller: &(impl ServiceCaller + Sync),
+    runtime_state: &TabRuntimeStateHandle,
     session: Option<&Selector>,
 ) -> Result<PaneZoomAck, String> {
     let session_id = resolve_session_id(caller, session)?;
@@ -1107,12 +1135,15 @@ fn zoom_pane(
     )
     .map_err(|err| typed_service_error("pane-runtime-commands/zoom-pane", err))?;
     let ack = result.map_err(|err| format!("zoom-pane failed: {err:?}"))?;
-    emit_pane_event(bmux_tabs_plugin_api::tabs_events::PaneEvent::Zoomed {
-        pane_id: ack.pane_id,
-    });
+    emit_pane_event(
+        runtime_state,
+        bmux_tabs_plugin_api::tabs_events::PaneEvent::Zoomed {
+            pane_id: ack.pane_id,
+        },
+    );
     Ok(PaneZoomAck {
         pane_id: ack.pane_id,
-        zoomed: zoomed_pane_id_for_session(session_id).is_some(),
+        zoomed: zoomed_pane_id_for_session(runtime_state, session_id).is_some(),
     })
 }
 
@@ -1154,9 +1185,13 @@ fn emit_tabs_plugin_phase_timing(payload: &serde_json::Value) {
     emit_phase_timing(PhaseChannel::Plugin, payload);
 }
 
-fn emit_pane_event(event: bmux_tabs_plugin_api::tabs_events::PaneEvent) {
-    let _ =
-        bmux_plugin::global_event_bus().emit(&bmux_tabs_plugin_api::tabs_events::EVENT_KIND, event);
+fn emit_pane_event(
+    runtime_state: &TabRuntimeStateHandle,
+    event: bmux_tabs_plugin_api::tabs_events::PaneEvent,
+) {
+    if let Some(events) = tab_events(runtime_state) {
+        let _ = events.emit(&bmux_tabs_plugin_api::tabs_events::EVENT_KIND, event);
+    }
 }
 
 /// Shared previous-tab history keyed by caller and workspace. Callers without
@@ -1173,9 +1208,19 @@ struct TabRuntimeState {
     #[cfg(test)]
     tab_order_dirty: bool,
     known_contexts: BTreeMap<Uuid, Option<String>>,
+    /// The bus this activation received. `None` (for example a dynamic
+    /// artifact) drops tab events; there is no process-wide bus.
+    events: Option<Arc<bmux_plugin::EventBus>>,
 }
 
 type TabRuntimeStateHandle = Arc<Mutex<TabRuntimeState>>;
+
+fn tab_events(runtime_state: &TabRuntimeStateHandle) -> Option<Arc<bmux_plugin::EventBus>> {
+    runtime_state
+        .lock()
+        .ok()
+        .and_then(|state| state.events.clone())
+}
 
 #[derive(Default)]
 pub struct TabsPlugin {
@@ -1197,16 +1242,23 @@ impl RustPlugin for TabsPlugin {
         storage_migration::migrate(std::path::Path::new(&context.connection.data_dir))
             .map_err(PluginCommandError::failed)?;
         drop(migration_guard);
-        arrangements::activate(&context).map_err(PluginCommandError::failed)?;
+        let events = bmux_plugin::activation_event_bus(&context);
+        self.runtime_state
+            .lock()
+            .map_err(|_| PluginCommandError::failed("tab runtime state poisoned"))?
+            .events
+            .clone_from(&events);
+        arrangements::activate(&context, self.runtime_state.clone())
+            .map_err(PluginCommandError::failed)?;
         // Register the typed event-bus channel for pane-event so
         // subscribers (decoration, future UI plugins) can wait on
-        // `global_event_bus().subscribe::<PaneEvent>(...)` without
-        // racing the first emit. Failure to register is non-fatal —
-        // the channel may already exist from a prior load.
-        let _ = bmux_plugin::global_event_bus()
-            .register_channel::<bmux_tabs_plugin_api::tabs_events::PaneEvent>(
-                bmux_tabs_plugin_api::tabs_events::EVENT_KIND,
-            );
+        // `subscribe::<PaneEvent>(...)` without racing the first emit.
+        let Some(events) = events else {
+            return Ok(EXIT_OK);
+        };
+        events.register_channel::<bmux_tabs_plugin_api::tabs_events::PaneEvent>(
+            bmux_tabs_plugin_api::tabs_events::EVENT_KIND,
+        );
 
         // Register the reactive state channel carrying the ordered
         // tab list. The attach tab bar subscribes via
@@ -1216,14 +1268,13 @@ impl RustPlugin for TabsPlugin {
         // (new-tab / switch-tab / …). If a consumer activates
         // before the first mutation they see an empty list, which
         // correctly reflects that no tabs exist yet.
-        bmux_plugin::global_event_bus()
-            .register_state_channel::<bmux_tabs_plugin_api::tabs_list::TabListSnapshot>(
-                bmux_tabs_plugin_api::tabs_list::STATE_KIND,
-                bmux_tabs_plugin_api::tabs_list::TabListSnapshot {
-                    tabs: Vec::new(),
-                    revision: 0,
-                },
-            );
+        events.register_state_channel::<bmux_tabs_plugin_api::tabs_list::TabListSnapshot>(
+            bmux_tabs_plugin_api::tabs_list::STATE_KIND,
+            bmux_tabs_plugin_api::tabs_list::TabListSnapshot {
+                tabs: Vec::new(),
+                revision: 0,
+            },
+        );
         Ok(EXIT_OK)
     }
 
@@ -1241,7 +1292,7 @@ impl RustPlugin for TabsPlugin {
         }
         bmux_plugin_sdk::route_service!(context, {
             "tabs-placement-v1", "place-tab" => |req: PlaceTabArgs, ctx| {
-                Ok(place_tab(ctx, req.context_id, req.workspace_id))
+                Ok(place_tab(ctx, &self.runtime_state, req.context_id, req.workspace_id))
             },
             "tabs-catalog-v1", "list-tabs" => |_req: (), ctx| {
                 Ok(list_catalog(ctx))
@@ -1294,28 +1345,28 @@ impl RustPlugin for TabsPlugin {
             },
             "tabs-commands", "focus-pane" => |req: FocusPaneArgs, ctx| {
                 let target = Selector { id: Some(req.id), name: None, index: None };
-                Ok::<_, ServiceResponse>(focus_pane(ctx, None, Some(&target), "")
+                Ok::<_, ServiceResponse>(focus_pane(ctx, &self.runtime_state, None, Some(&target), "")
                     .map(|_| ())
                     .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::FocusError::FocusDenied { reason }))
             },
             "tabs-commands", "close-pane" => |req: ClosePaneArgs, ctx| {
                 let target = Selector { id: Some(req.id), name: None, index: None };
-                Ok::<_, ServiceResponse>(close_pane(ctx, None, Some(&target))
+                Ok::<_, ServiceResponse>(close_pane(ctx, &self.runtime_state, None, Some(&target))
                     .map(|_| ())
                     .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::CloseError::CloseDenied { reason }))
             },
             "tabs-commands", "focus-pane-by-selector" => |req: FocusPaneBySelectorArgs, ctx| {
-                Ok::<_, ServiceResponse>(focus_pane(ctx, req.session.as_ref(), Some(&req.target), "")
+                Ok::<_, ServiceResponse>(focus_pane(ctx, &self.runtime_state, req.session.as_ref(), Some(&req.target), "")
                     .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
                     .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::PaneMutationError::Failed { reason }))
             },
             "tabs-commands", "close-pane-by-selector" => |req: ClosePaneBySelectorArgs, ctx| {
-                Ok::<_, ServiceResponse>(close_pane(ctx, req.session.as_ref(), Some(&req.target))
+                Ok::<_, ServiceResponse>(close_pane(ctx, &self.runtime_state, req.session.as_ref(), Some(&req.target))
                     .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
                     .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::PaneMutationError::Failed { reason }))
             },
             "tabs-commands", "close-active-pane" => |req: CloseActivePaneArgs, ctx| {
-                Ok::<_, ServiceResponse>(close_pane(ctx, req.session.as_ref(), None)
+                Ok::<_, ServiceResponse>(close_pane(ctx, &self.runtime_state, req.session.as_ref(), None)
                     .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
                     .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::PaneMutationError::Failed { reason }))
             },
@@ -1323,19 +1374,19 @@ impl RustPlugin for TabsPlugin {
                 let Some(focus_dir) = focus_direction_name(req.direction) else {
                     return Ok::<_, ServiceResponse>(Err(bmux_tabs_plugin_api::tabs_commands::PaneMutationError::InvalidArgument { reason: "direction must be left/right/up/down".into() }));
                 };
-                Ok::<_, ServiceResponse>(focus_pane(ctx, req.session.as_ref(), None, focus_dir)
+                Ok::<_, ServiceResponse>(focus_pane(ctx, &self.runtime_state, req.session.as_ref(), None, focus_dir)
                     .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
                     .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::PaneMutationError::Failed { reason }))
             },
             "tabs-commands", "split-pane" => |req: SplitPaneArgs, ctx| {
                 let result: Result<PaneAck, bmux_tabs_plugin_api::tabs_commands::PaneMutationError> =
-                    split_pane(ctx, req.session.as_ref(), req.target.as_ref(), req.direction, req.ratio_pct, ctx.settings.as_ref())
+                    split_pane(ctx, &self.runtime_state, req.session.as_ref(), req.target.as_ref(), req.direction, req.ratio_pct, ctx.settings.as_ref())
                         .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
                         .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::PaneMutationError::Failed { reason });
                 Ok::<_, ServiceResponse>(result)
             },
             "tabs-commands", "launch-pane" => |req: LaunchPaneArgs, ctx| {
-                Ok::<_, ServiceResponse>(launch_pane(ctx, req.session.as_ref(), req.target.as_ref(), LaunchPaneRequest {
+                Ok::<_, ServiceResponse>(launch_pane(ctx, &self.runtime_state, req.session.as_ref(), req.target.as_ref(), LaunchPaneRequest {
                     direction: req.direction,
                     name: req.name,
                     program: req.program,
@@ -1361,11 +1412,11 @@ impl RustPlugin for TabsPlugin {
                     .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::PaneMutationError::Failed { reason }))
             },
             "tabs-commands", "zoom-pane" => |req: ZoomPaneArgs, ctx| {
-                Ok::<_, ServiceResponse>(zoom_pane(ctx, req.session.as_ref())
+                Ok::<_, ServiceResponse>(zoom_pane(ctx, &self.runtime_state, req.session.as_ref())
                     .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::PaneMutationError::Failed { reason }))
             },
             "tabs-commands", "restart-pane" => |req: RestartPaneArgs, ctx| {
-                Ok::<_, ServiceResponse>(restart_pane(ctx, req.session.as_ref(), req.target.as_ref())
+                Ok::<_, ServiceResponse>(restart_pane(ctx, &self.runtime_state, req.session.as_ref(), req.target.as_ref())
                     .map(|ack| PaneAck { ok: true, pane_id: Some(ack.pane_id) })
                     .map_err(|reason| bmux_tabs_plugin_api::tabs_commands::PaneMutationError::Failed { reason }))
             },
@@ -1386,7 +1437,9 @@ impl RustPlugin for TabsPlugin {
         };
         let worker = async_handle.clone();
         async_handle.spawn_background("tabs-catalog-observer", move |mut cancellation| async move {
-            let bus = bmux_plugin::global_event_bus();
+            let Some(bus) = tab_events(&shared.runtime_state) else {
+                return Ok(());
+            };
             let mut contexts = None;
             let mut workspaces = None;
             loop {
@@ -1570,6 +1623,7 @@ struct PlaceTabArgs {
 
 fn place_tab(
     caller: &(impl HostRuntimeApi + Sync),
+    runtime_state: &TabRuntimeStateHandle,
     context_id: Uuid,
     workspace_id: Uuid,
 ) -> Result<(), String> {
@@ -1605,7 +1659,7 @@ fn place_tab(
         arrangements::write_state(caller, &state)?;
     }
     complete_tab_placement(caller, context_id, workspace_id)?;
-    publish_tab_list_snapshot(caller, &TabRuntimeStateHandle::default());
+    publish_tab_list_snapshot(caller, runtime_state);
     Ok(())
 }
 
@@ -2186,7 +2240,7 @@ fn handle_command(plugin: &TabsPlugin, context: &NativeCommandContext) -> Result
             let focus_dir = focus_direction_name(direction).ok_or_else(|| {
                 "direction must be left/right/up/down/next/prev (horizontal/vertical are split-only)".to_string()
             })?;
-            focus_pane(context, None, None, focus_dir)?;
+            focus_pane(context, &plugin.runtime_state, None, None, focus_dir)?;
             Ok(())
         }
         "split-pane" => {
@@ -2216,6 +2270,7 @@ fn handle_command(plugin: &TabsPlugin, context: &NativeCommandContext) -> Result
             };
             split_pane_with_policy(
                 context,
+                &plugin.runtime_state,
                 session.as_ref(),
                 target.as_ref(),
                 direction,
@@ -2234,7 +2289,7 @@ fn handle_command(plugin: &TabsPlugin, context: &NativeCommandContext) -> Result
             Ok(())
         }
         "zoom-pane" => {
-            zoom_pane(context, None)?;
+            zoom_pane(context, &plugin.runtime_state, None)?;
             Ok(())
         }
         "create-floating-pane" => {
@@ -2359,13 +2414,13 @@ fn handle_command(plugin: &TabsPlugin, context: &NativeCommandContext) -> Result
             Ok(())
         }
         "close-active-pane" => {
-            close_pane(context, None, None)?;
+            close_pane(context, &plugin.runtime_state, None, None)?;
             Ok(())
         }
         "restart-pane" => {
             // Mirrors `close-active-pane`: the active pane of the
             // caller's selected session is the target.
-            restart_pane(context, None, None)?;
+            restart_pane(context, &plugin.runtime_state, None, None)?;
             Ok(())
         }
         _ => Err(format!("unsupported command '{}'", context.command)),
@@ -2480,10 +2535,10 @@ fn publish_tab_list_snapshot(
     let Ok(entries) = list_tabs(caller, runtime_state, None) else {
         return;
     };
-    publish_tab_list_entries(entries);
+    publish_tab_list_entries(runtime_state, entries);
 }
 
-fn publish_tab_list_entries(entries: Vec<TabEntry>) {
+fn publish_tab_list_entries(runtime_state: &TabRuntimeStateHandle, entries: Vec<TabEntry>) {
     let tabs: Vec<bmux_tabs_plugin_api::tabs_list::TabListEntry> = entries
         .into_iter()
         .filter_map(|entry| {
@@ -2499,8 +2554,9 @@ fn publish_tab_list_entries(entries: Vec<TabEntry>) {
         .collect();
     let revision = TAB_LIST_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
     let snapshot = bmux_tabs_plugin_api::tabs_list::TabListSnapshot { tabs, revision };
-    let _ = bmux_plugin::global_event_bus()
-        .publish_state(&bmux_tabs_plugin_api::tabs_list::STATE_KIND, snapshot);
+    if let Some(events) = tab_events(runtime_state) {
+        let _ = events.publish_state(&bmux_tabs_plugin_api::tabs_list::STATE_KIND, snapshot);
+    }
 }
 
 /// Clear persisted `tabs.order` and rebuild deterministically from
@@ -3546,7 +3602,14 @@ impl bmux_tabs_plugin_api::tabs_placement_v1::TabsPlacementV1Service for TabsCom
         context_id: Uuid,
         workspace_id: Uuid,
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(async move { place_tab(self.shared.caller.as_ref(), context_id, workspace_id) })
+        Box::pin(async move {
+            place_tab(
+                self.shared.caller.as_ref(),
+                &self.shared.runtime_state,
+                context_id,
+                workspace_id,
+            )
+        })
     }
 }
 
@@ -3587,9 +3650,15 @@ impl TabsCommandsService for TabsCommandsHandle {
                 name: None,
                 index: None,
             };
-            focus_pane(&*caller, None, Some(&target), "")
-                .map(|_| ())
-                .map_err(|error| FocusError::FocusDenied { reason: error })
+            focus_pane(
+                &*caller,
+                &self.shared.runtime_state,
+                None,
+                Some(&target),
+                "",
+            )
+            .map(|_| ())
+            .map_err(|error| FocusError::FocusDenied { reason: error })
         })
     }
 
@@ -3604,7 +3673,7 @@ impl TabsCommandsService for TabsCommandsHandle {
                 name: None,
                 index: None,
             };
-            close_pane(&*caller, None, Some(&target))
+            close_pane(&*caller, &self.shared.runtime_state, None, Some(&target))
                 .map(|_| ())
                 .map_err(|error| CloseError::CloseDenied { reason: error })
         })
@@ -3617,12 +3686,18 @@ impl TabsCommandsService for TabsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            focus_pane(&*caller, session.as_ref(), Some(&target), "")
-                .map(|response| PaneAck {
-                    ok: true,
-                    pane_id: Some(response.pane_id),
-                })
-                .map_err(map_host_error)
+            focus_pane(
+                &*caller,
+                &self.shared.runtime_state,
+                session.as_ref(),
+                Some(&target),
+                "",
+            )
+            .map(|response| PaneAck {
+                ok: true,
+                pane_id: Some(response.pane_id),
+            })
+            .map_err(map_host_error)
         })
     }
 
@@ -3633,12 +3708,17 @@ impl TabsCommandsService for TabsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            close_pane(&*caller, session.as_ref(), Some(&target))
-                .map(|response| PaneAck {
-                    ok: true,
-                    pane_id: Some(response.pane_id),
-                })
-                .map_err(map_host_error)
+            close_pane(
+                &*caller,
+                &self.shared.runtime_state,
+                session.as_ref(),
+                Some(&target),
+            )
+            .map(|response| PaneAck {
+                ok: true,
+                pane_id: Some(response.pane_id),
+            })
+            .map_err(map_host_error)
         })
     }
 
@@ -3648,7 +3728,7 @@ impl TabsCommandsService for TabsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            close_pane(&*caller, session.as_ref(), None)
+            close_pane(&*caller, &self.shared.runtime_state, session.as_ref(), None)
                 .map(|response| PaneAck {
                     ok: true,
                     pane_id: Some(response.pane_id),
@@ -3669,12 +3749,18 @@ impl TabsCommandsService for TabsCommandsHandle {
                     reason: "direction must be left/right/up/down".into(),
                 });
             };
-            focus_pane(&*caller, session.as_ref(), None, focus_dir)
-                .map(|response| PaneAck {
-                    ok: true,
-                    pane_id: Some(response.pane_id),
-                })
-                .map_err(map_host_error)
+            focus_pane(
+                &*caller,
+                &self.shared.runtime_state,
+                session.as_ref(),
+                None,
+                focus_dir,
+            )
+            .map(|response| PaneAck {
+                ok: true,
+                pane_id: Some(response.pane_id),
+            })
+            .map_err(map_host_error)
         })
     }
 
@@ -3689,6 +3775,7 @@ impl TabsCommandsService for TabsCommandsHandle {
         Box::pin(async move {
             split_pane(
                 &*caller,
+                &self.shared.runtime_state,
                 session.as_ref(),
                 target.as_ref(),
                 direction,
@@ -3716,6 +3803,7 @@ impl TabsCommandsService for TabsCommandsHandle {
         Box::pin(async move {
             launch_pane(
                 &*caller,
+                &self.shared.runtime_state,
                 session.as_ref(),
                 target.as_ref(),
                 LaunchPaneRequest {
@@ -3763,7 +3851,10 @@ impl TabsCommandsService for TabsCommandsHandle {
         session: Option<Selector>,
     ) -> Pin<Box<dyn Future<Output = Result<PaneZoomAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
-        Box::pin(async move { zoom_pane(&*caller, session.as_ref()).map_err(map_host_error) })
+        Box::pin(async move {
+            zoom_pane(&*caller, &self.shared.runtime_state, session.as_ref())
+                .map_err(map_host_error)
+        })
     }
 
     fn restart_pane<'a>(
@@ -3773,12 +3864,17 @@ impl TabsCommandsService for TabsCommandsHandle {
     ) -> Pin<Box<dyn Future<Output = Result<PaneAck, PaneMutationError>> + Send + 'a>> {
         let caller = Arc::clone(&self.shared.caller);
         Box::pin(async move {
-            restart_pane(&*caller, session.as_ref(), target.as_ref())
-                .map(|response| PaneAck {
-                    ok: true,
-                    pane_id: Some(response.pane_id),
-                })
-                .map_err(map_host_error)
+            restart_pane(
+                &*caller,
+                &self.shared.runtime_state,
+                session.as_ref(),
+                target.as_ref(),
+            )
+            .map(|response| PaneAck {
+                ok: true,
+                pane_id: Some(response.pane_id),
+            })
+            .map_err(map_host_error)
         })
     }
 
@@ -4163,8 +4259,11 @@ impl TabsCommandsService for TabsCommandsHandle {
 /// available synchronously without a service round-trip. Returns `None`
 /// when the pane-runtime plugin hasn't registered the channel yet or
 /// the session isn't zoomed.
-fn zoomed_pane_id_for_session(session: Uuid) -> Option<Uuid> {
-    let (snapshot, _rx) = bmux_plugin::global_event_bus()
+fn zoomed_pane_id_for_session(
+    runtime_state: &TabRuntimeStateHandle,
+    session: Uuid,
+) -> Option<Uuid> {
+    let (snapshot, _rx) = tab_events(runtime_state)?
         .subscribe_state::<bmux_pane_runtime_plugin_api::pane_runtime_focus::SessionFocusStateMap>(
             &bmux_pane_runtime_plugin_api::pane_runtime_focus::STATE_KIND,
         )
@@ -4253,7 +4352,7 @@ impl TabsStateService for TabsStateHandle {
         &'a self,
         session: Uuid,
     ) -> Pin<Box<dyn Future<Output = Option<Uuid>> + Send + 'a>> {
-        Box::pin(async move { zoomed_pane_id_for_session(session) })
+        Box::pin(async move { zoomed_pane_id_for_session(&self.shared.runtime_state, session) })
     }
 
     fn list_panes<'a>(
@@ -4265,7 +4364,7 @@ impl TabsStateService for TabsStateHandle {
             let Ok(response) = list_panes(&*caller, Some(session)) else {
                 return Vec::new();
             };
-            let zoomed_pane_id = zoomed_pane_id_for_session(session);
+            let zoomed_pane_id = zoomed_pane_id_for_session(&self.shared.runtime_state, session);
             response
                 .panes
                 .into_iter()
@@ -5982,6 +6081,7 @@ mod tests {
         ] {
             let error = split_pane_with_policy(
                 &host,
+                &TabRuntimeStateHandle::default(),
                 Some(&session),
                 None,
                 PaneDirection::Horizontal,
@@ -6809,7 +6909,8 @@ mod tests {
                         service_test_context(None, interface, operation, payload, capability, kind);
                     context.plugin_id = "bmux.contexts".into();
                     context.caller_client_id = Some(client.0);
-                    let response = bmux_contexts_plugin::ContextsPlugin.invoke_service(context);
+                    let response =
+                        bmux_contexts_plugin::ContextsPlugin::default().invoke_service(context);
                     assert!(response.error.is_none(), "{:?}", response.error);
                     Ok(response.payload)
                 } else if interface == "storage-query/v1" {
@@ -6847,7 +6948,11 @@ mod tests {
         );
     }
 
-    async fn dispatch_tab_over_transport(router: &InvocationTestHost, payload: Vec<u8>) -> Vec<u8> {
+    async fn dispatch_tab_over_transport(
+        router: &InvocationTestHost,
+        events: &Arc<bmux_plugin::EventBus>,
+        payload: Vec<u8>,
+    ) -> Vec<u8> {
         use bmux_ipc::transport::ErasedIpcStream;
         use bmux_ipc::{Envelope, EnvelopeKind, Request, Response, ResponsePayload};
         let (client_stream, server_stream) = tokio::io::duplex(8192);
@@ -6890,7 +6995,9 @@ mod tests {
                     )
                     .expect("provider must accept the action contract before invocation")
                     .to_vec();
-                    let response = TabsPlugin::default().invoke_service(service_test_context(
+                    let plugin = TabsPlugin::default();
+                    plugin.runtime_state.lock().unwrap().events = Some(Arc::clone(events));
+                    let response = plugin.invoke_service(service_test_context(
                         Some(router),
                         &interface_id,
                         &operation,
@@ -6948,7 +7055,7 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let (router, context_state, [alpha, beta]) = real_context_router();
-            let events = bmux_plugin::global_event_bus();
+            let events = Arc::new(bmux_plugin::EventBus::new());
             events.register_state_channel(
                 bmux_tabs_plugin_api::tabs_list::STATE_KIND,
                 bmux_tabs_plugin_api::tabs_list::TabListSnapshot {
@@ -6982,6 +7089,7 @@ mod tests {
             for (target, expected_id) in [("alpha", alpha), ("beta", beta)] {
                 let response = dispatch_tab_over_transport(
                     &router,
+                    &events,
                     if expected_id == alpha {
                         let request = encode_service_message(
                             &bmux_tabs_plugin_api::tabs_commands::client::SwitchTabRequest {
