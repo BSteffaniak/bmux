@@ -1,7 +1,8 @@
 # Pane output performance plan
 
 Status: phases 0 through 5 are implemented; phase 4's single renderer landed as
-[Phase 5](#phase-5-one-renderer) (see [Progress](#progress)).
+[Phase 5](#phase-5-one-renderer). Phase 6 is implemented except its image step (see
+[Progress](#progress)).
 
 A full-screen application in a large pane (420×90, 37,800 cells) feels laggy inside bmux and
 smooth in the same terminal without it. The application is not the cost: a code review scrolled
@@ -263,11 +264,11 @@ application wrote:
 
 | Corpus | Renderer's bytes | Presenter, at the switch | Now | Now, observed |
 | --- | --- | --- | --- | --- |
-| SU scroll | 2.0M, x1.31 | 1.6M, x1.00 | 1.29M (0.65), x1.00 | 2.64M |
-| Plain stream | 1.9M, x1.41 | 1.6M, x1.10 | 1.39M (0.73), x1.10 | 2.68M |
-| Full repaint | 54M, x1.31 | 30M, x0.99 | 23.8M (0.44), x0.99 | 27.3M |
-| Review, unified | 15.9M, x1.01 | 14.8M, x0.68 | 13.36M (0.84), x0.68 | 15.08M |
-| Review, side by side | 16.6M, x0.96 | 14.9M, x0.61 | 13.66M (0.82), x0.61 | 15.40M |
+| SU scroll | 2.0M, x1.31 | 1.6M, x1.00 | 1.27M (0.63), x1.00 | 2.63M |
+| Plain stream | 1.9M, x1.41 | 1.6M, x1.10 | 1.35M (0.71), x1.10 | 2.64M |
+| Full repaint | 54M, x1.31 | 30M, x0.99 | 22.9M (0.42), x0.99 | 26.3M |
+| Review, unified | 15.9M, x1.01 | 14.8M, x0.68 | 12.71M (0.80), x0.68 | 14.45M |
+| Review, side by side | 16.6M, x0.96 | 14.9M, x0.61 | 12.99M (0.78), x0.61 | 14.76M |
 
 An observer used to add 4.8M a frame on a scroll and 6.1M on a review (two copies of the screen
 and a second paint); it now adds 1.3M to 1.7M (3.5M on a full repaint).
@@ -301,6 +302,13 @@ intermediate forms are only copies:
    attach renderer's own Kitty encoder.
 5. **Cleanup and numbers.** Leftovers removed; `pipeline_bench`, observed and not, compared with
    phase 5.
+
+Steps 1, 2, 3 and 5 are implemented. Step 4 is not: `bmux_tui` models an image scene but encodes
+no protocol (bcode hands its scene's changes to `bmux_image` through an output hook), and the
+in-place frame does not carry an image scene yet. Moving attach images onto it means teaching
+in-place frames image scenes and making `bmux_image`'s encoder consume scene changes instead of
+driving its own Kitty host state (shared-memory transfer, caching, Sixel and iTerm2 repair): a
+change to working graphics for consistency rather than speed, left for a decision.
 
 ## Order
 
@@ -357,6 +365,13 @@ Implemented, each with its numbers in its commit:
 
 At 420x90, SU scroll, the attach client renders in about 1 ms and writes 12 KB a frame (from
 2.9 ms and 169 KB); a review scroll writes about what the application wrote (x1.0, from x4.2).
+
+* Phase 6 (steps 1, 2, 3 and 5): the renderer paints straight into the terminal's frame through
+  a `Canvas` (no recorded operations, no per-frame copy of them); every client presents, a
+  headless one through a terminal that encodes nothing, and observers always mirror the
+  terminal's change; pane rows are painted from the grid without per-row allocations, and
+  render operations are lowered straight into the frame. Instructions per frame at 420x90: SU
+  scroll 1.27M, plain stream 1.35M, full repaint 22.9M, review 12.71M and 12.99M.
 
 `bmux perf` keeps its fields except `pane_row_segments_emitted`: rows are drawn whole and the
 host's terminal decides which cells to write, so `pane_rows_emitted` and `pane_cells_emitted`

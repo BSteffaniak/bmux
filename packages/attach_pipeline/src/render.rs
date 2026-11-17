@@ -2826,26 +2826,30 @@ fn paint_pane_row(
 }
 
 fn cell_style_to_tui(value: CellStyle) -> bmux_tui::style::Style {
+    use bmux_tui::style::{Color, Modifier, Style};
     let color = |value| match value {
-        CellColor::Default => Some(RenderColor::Default),
-        CellColor::Indexed(index) => Some(RenderColor::Indexed(index)),
-        CellColor::Rgb(r, g, b) => Some(RenderColor::Rgb { r, g, b }),
+        CellColor::Default => Color::Default,
+        CellColor::Indexed(index) => Color::Indexed(index),
+        CellColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
     };
-    let mut style = crate::projection::style(RenderStyle {
-        fg: color(value.fg),
-        bg: color(value.bg),
-        bold: value.bold,
-        dim: value.dim,
-        italic: value.italic,
-        underline: value.underline,
-        reverse: value.inverse,
-        strikethrough: value.strike,
-        ..RenderStyle::default()
-    });
-    if value.hidden {
-        style = style.add_modifier(bmux_tui::style::Modifier::HIDDEN);
+    let mut modifiers = Modifier::EMPTY;
+    for (enabled, flag) in [
+        (value.bold, Modifier::BOLD),
+        (value.dim, Modifier::DIM),
+        (value.italic, Modifier::ITALIC),
+        (value.underline, Modifier::UNDERLINE),
+        (value.inverse, Modifier::REVERSED),
+        (value.strike, Modifier::CROSSED_OUT),
+        (value.hidden, Modifier::HIDDEN),
+    ] {
+        if enabled {
+            modifiers = modifiers.union(flag);
+        }
     }
-    style
+    Style::new()
+        .fg(color(value.fg))
+        .bg(color(value.bg))
+        .add_modifier(modifiers)
 }
 
 fn before_content_row_cells(
@@ -2858,62 +2862,13 @@ fn before_content_row_cells(
         .collect()
 }
 
-fn damaged_grid_row_ranges(
-    row: &PhysicalRow,
-    row_index: u16,
-    width: u16,
-    rects: &[DamageRect],
-) -> Vec<(u16, u16)> {
-    let mut ranges = Vec::new();
-    for rect in rects {
-        if row_index < rect.y || row_index >= rect.bottom() {
-            continue;
-        }
-        let mut start = rect.x.min(width);
-        let mut end = rect.right().min(width);
-        if start >= end {
-            continue;
-        }
-        if start > 0
-            && row
-                .cells()
-                .get(usize::from(start))
-                .is_some_and(Cell::is_wide_continuation)
-        {
-            start = start.saturating_sub(1);
-        }
-        if end < width
-            && row
-                .cells()
-                .get(usize::from(end))
-                .is_some_and(Cell::is_wide_continuation)
-        {
-            end = end.saturating_add(1).min(width);
-        }
-        ranges.push((start, end));
-    }
-    merge_ranges(ranges)
-}
-
-fn merge_ranges(mut ranges: Vec<(u16, u16)>) -> Vec<(u16, u16)> {
-    let mut merged_ranges = Vec::new();
-    while let Some(range) = ranges.pop() {
-        let mut index = 0;
-        let mut merged = range;
-        while index < merged_ranges.len() {
-            let existing: (u16, u16) = merged_ranges[index];
-            if existing.0 <= merged.1 && merged.0 <= existing.1 {
-                merged = (existing.0.min(merged.0), existing.1.max(merged.1));
-                merged_ranges.swap_remove(index);
-                index = 0;
-            } else {
-                index += 1;
-            }
-        }
-        merged_ranges.push(merged);
-    }
-    merged_ranges.sort_unstable();
-    merged_ranges
+/// Whether any of `rects` covers a cell of row `row_index` within `width` columns.
+fn row_damaged(row_index: u16, width: u16, rects: &[DamageRect]) -> bool {
+    rects.iter().any(|rect| {
+        row_index >= rect.y
+            && row_index < rect.bottom()
+            && rect.x.min(width) < rect.right().min(width)
+    })
 }
 
 const fn cell_selected(
@@ -5258,13 +5213,7 @@ fn queue_pane_content_for_surface(
                     .as_ref()
                     .is_some_and(|unchanged| unchanged.get(row).copied().unwrap_or(false))
                     && !under_rows.contains(&y)
-                    && damaged_grid_row_ranges(
-                        grid_row,
-                        row_u16,
-                        inner_width,
-                        &effective_content_damage,
-                    )
-                    .is_empty()
+                    && !row_damaged(row_u16, inner_width, &effective_content_damage)
                 {
                     note_pane_row_skipped(stage.surface_index, row_u16, render_stats, render_trace);
                     continue;
