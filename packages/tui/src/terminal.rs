@@ -693,11 +693,12 @@ impl<W: Write> Terminal<W> {
         &mut self,
         render: impl FnOnce(&mut PaintCx<'_, '_>),
     ) -> io::Result<DrawStats> {
-        self.draw_over_with_output_hooks(render, |_| Ok(false), |_, _, _| Ok(()))
+        self.draw_over_inner(render, |_| Ok(false), |_, _, _| Ok(()), true)
     }
 
     /// [`Self::draw_over`] with the output hooks of
-    /// [`Self::draw_damage_with_output_hooks`]; `overlay` receives the committed image scene.
+    /// [`Self::draw_damage_with_output_hooks`]; `overlay` receives the committed image scene. The
+    /// frame is written even when it paints nothing, so the hooks always run.
     ///
     /// # Errors
     /// Returns output or hook errors without committing failed output.
@@ -706,6 +707,16 @@ impl<W: Write> Terminal<W> {
         render: impl FnOnce(&mut PaintCx<'_, '_>),
         before: impl FnOnce(&mut W) -> io::Result<bool>,
         overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
+    ) -> io::Result<DrawStats> {
+        self.draw_over_inner(render, before, overlay, false)
+    }
+
+    fn draw_over_inner(
+        &mut self,
+        render: impl FnOnce(&mut PaintCx<'_, '_>),
+        before: impl FnOnce(&mut W) -> io::Result<bool>,
+        overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
+        skip_unchanged: bool,
     ) -> io::Result<DrawStats> {
         let Some(mut buffer) = self.state.take_retained() else {
             return self.draw_damage_with_output_hooks(Damage::Full, render, before, overlay);
@@ -725,7 +736,11 @@ impl<W: Write> Terminal<W> {
             )
         };
         // Painting nothing, with the cursor where it was, changes nothing.
-        if changes.is_clean() && changes.moves.is_empty() && cursor == self.state.cursor() {
+        if skip_unchanged
+            && changes.is_clean()
+            && changes.moves.is_empty()
+            && cursor == self.state.cursor()
+        {
             self.over_storage = Some(changes);
             self.state.install_painted_over(buffer, cursor);
             self.committed_damage = Damage::None;

@@ -11355,6 +11355,10 @@ fn render_attach_frame_inner(
     let retained_repaint_by_id = frame_plan.retained.repaint_by_id();
 
     let mut frame_bytes = Vec::new();
+    // Graphics protocol bytes of a frame presented through the terminal presenter, written before
+    // and after its cells.
+    let mut images_before: Vec<u8> = Vec::new();
+    let mut images_after: Vec<u8> = Vec::new();
     #[cfg(any(
         feature = "image-sixel",
         feature = "image-kitty",
@@ -11378,16 +11382,19 @@ fn render_attach_frame_inner(
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    if bmux_attach_pipeline::projection::encoding_terminal() {
+    if bmux_attach_pipeline::projection::encoding_terminal() || view_state.presenting {
         // Capability changes release resources even on partial frames. Visibility
         // reconciliation, however, requires a complete image scene.
-        pending_kitty_state.select_protocol(
-            &mut frame_bytes,
-            view_state.host_image_caps.preferred_protocol(),
-        )?;
+        let out = if view_state.presenting {
+            &mut images_before
+        } else {
+            &mut frame_bytes
+        };
+        pending_kitty_state
+            .select_protocol(out, view_state.host_image_caps.preferred_protocol())?;
         if frame_plan.render_scene {
             pending_kitty_state.begin_frame();
-            pending_kitty_state.clear_placements(&mut frame_bytes)?;
+            pending_kitty_state.clear_placements(out)?;
         }
     }
     queue!(frame_bytes, SavePosition).context("failed queuing cursor save for attach frame")?;
@@ -11411,6 +11418,9 @@ fn render_attach_frame_inner(
         );
         queue!(frame_bytes, Clear(ClearType::All))
             .context("failed clearing previous image frame")?;
+        if view_state.presenting {
+            images_before.extend_from_slice(b"\x1b[2J");
+        }
     }
     // Reflect the forced-hide in tracked state so apply_attach_cursor_state
     // will re-emit Show if the cursor should be visible after the frame.
@@ -11515,7 +11525,11 @@ fn render_attach_frame_inner(
                     .collect::<Vec<_>>();
                 if !view_state.presentation_only {
                     bmux_image::compositor::render_pane_images_clipped(
-                        &mut frame_bytes,
+                        if view_state.presenting {
+                            &mut images_after
+                        } else {
+                            &mut frame_bytes
+                        },
                         &pane_images,
                         pane_rect,
                         &covers,
@@ -11710,8 +11724,14 @@ fn render_attach_frame_inner(
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    if frame_plan.render_scene && bmux_attach_pipeline::projection::encoding_terminal() {
-        pending_kitty_state.finish_frame(&mut frame_bytes)?;
+    if frame_plan.render_scene
+        && (bmux_attach_pipeline::projection::encoding_terminal() || view_state.presenting)
+    {
+        pending_kitty_state.finish_frame(if view_state.presenting {
+            &mut images_after
+        } else {
+            &mut frame_bytes
+        })?;
     }
 
     if frame_plan.use_synchronized_update {
@@ -11747,6 +11767,10 @@ fn render_attach_frame_inner(
             frame_damage.is_full_frame(),
             terminal_size,
             margins,
+            super::presenter::Graphics {
+                before: &images_before,
+                after: &images_after,
+            },
         ) {
             super::presenter::Presented::Frame(bytes) => {
                 frame_bytes = bytes;
@@ -19735,13 +19759,34 @@ mod tests {
     #[cfg(feature = "image-sixel")]
     #[test]
     fn historical_images_are_emitted_and_cleared_by_attachment_frames() {
+        historical_image_frames(false);
+    }
+
+    #[cfg(feature = "image-sixel")]
+    #[test]
+    fn raster_images_are_emitted_and_cleared_through_the_terminal_presenter() {
+        historical_image_frames(true);
+    }
+
+    #[cfg(feature = "image-sixel")]
+    fn historical_image_frames(presented: bool) {
         let session = Uuid::new_v4();
         let pane = Uuid::new_v4();
-        let mut state = AttachViewState::new(bmux_client::AttachOpenInfo {
+        // Presented frames use private registries: an extension another test registered
+        // globally could be one a terminal frame cannot show.
+        let info = bmux_client::AttachOpenInfo {
             session_id: session,
             context_id: None,
             can_write: true,
-        });
+        };
+        let mut state = if presented {
+            AttachViewState::with_private_presentation(info)
+        } else {
+            AttachViewState::new(info)
+        };
+        if presented {
+            state.terminal_presenter = Some(super::super::presenter::terminal());
+        }
         let layout = retry_test_layout(&mut state, pane, session);
         state.host_image_caps = bmux_image::host_caps::HostImageCapabilities {
             sixel: true,
@@ -19820,6 +19865,10 @@ mod tests {
                 assert!(begin < clear, "raster deletion must be inside the frame");
             }
             assert_eq!(state.pane_images_presented, visible);
+            assert_eq!(
+                state.presenting, presented,
+                "frames went through the presenter"
+            );
         }
     }
 
@@ -19862,13 +19911,34 @@ mod tests {
     #[cfg(feature = "image-kitty")]
     #[test]
     fn kitty_pane_images_survive_idle_redraw_and_slide_navigation_without_ed2() {
+        kitty_pane_image_frames(false);
+    }
+
+    #[cfg(feature = "image-kitty")]
+    #[test]
+    fn kitty_pane_images_are_placed_through_the_terminal_presenter() {
+        kitty_pane_image_frames(true);
+    }
+
+    #[cfg(feature = "image-kitty")]
+    fn kitty_pane_image_frames(presented: bool) {
         let session = Uuid::new_v4();
         let pane = Uuid::new_v4();
-        let mut state = AttachViewState::new(bmux_client::AttachOpenInfo {
+        // Presented frames use private registries: an extension another test registered
+        // globally could be one a terminal frame cannot show.
+        let info = bmux_client::AttachOpenInfo {
             session_id: session,
             context_id: None,
             can_write: true,
-        });
+        };
+        let mut state = if presented {
+            AttachViewState::with_private_presentation(info)
+        } else {
+            AttachViewState::new(info)
+        };
+        if presented {
+            state.terminal_presenter = Some(super::super::presenter::terminal());
+        }
         let layout = retry_test_layout(&mut state, pane, session);
         state.host_image_caps.kitty_graphics = true;
         let image = bmux_attach_image_protocol::AttachPaneImage {
@@ -19915,6 +19985,10 @@ mod tests {
             assert!(
                 !state.pane_images_presented,
                 "Kitty marked as raster footprint"
+            );
+            assert_eq!(
+                state.presenting, presented,
+                "frames went through the presenter"
             );
         }
     }
