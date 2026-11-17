@@ -5,6 +5,7 @@ use bmux_tui::geometry::Rect;
 /// Incremental RGBA PNG encoding. Each compression/filter input is at most one
 /// validated row (16 KiB); cancellation is checked between rows and before
 /// finalization. Native PNG passthrough never calls this function.
+#[cfg(any(feature = "kitty", feature = "iterm2"))]
 pub(crate) fn encode_rgba_png_cancellable(
     pixels: &PixelBuffer,
     mut cancelled: impl FnMut() -> bool,
@@ -81,7 +82,7 @@ pub(crate) fn encode_rgba_png_cancellable(
     Ok(bytes)
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(feature = "kitty", feature = "iterm2")))]
 mod png_cancellation_tests {
     use super::*;
 

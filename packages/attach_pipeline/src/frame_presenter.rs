@@ -64,29 +64,52 @@ struct ImageFrame<'images> {
 
 #[cfg(image_protocols)]
 impl ImageFrame<'_> {
-    /// Before the frame's cells: clear raster footprints; whether every cell must be repainted.
-    fn prepare_output(&self, writer: &mut Vec<u8>) -> std::io::Result<bool> {
-        if self.images.host.is_none() {
-            return Ok(false);
-        }
-        let mut compositor = self.images.compositor.clone();
-        let repaint = compositor.prepare_output(writer)?;
-        *self.staged.borrow_mut() = Some(compositor);
-        Ok(repaint)
+    /// The compositor this frame writes with, staged from the committed one on first use.
+    fn staged(&self) -> std::cell::RefMut<'_, bmux_image::tui::TuiImageCompositor> {
+        std::cell::RefMut::map(self.staged.borrow_mut(), |staged| {
+            staged.get_or_insert_with(|| self.images.compositor.clone())
+        })
     }
 
-    /// After the frame's cells: write the image scene, keeping the frame's cursor.
+    /// Before the frame's cells: when the image scene changed (or the frame is full), clear raster
+    /// footprints the change may leave; whether every cell must be repainted.
+    fn prepare_output(
+        &self,
+        writer: &mut Vec<u8>,
+        delta: Option<&bmux_tui::image_scene::ImageSceneDelta>,
+    ) -> std::io::Result<bool> {
+        if self.images.host.is_none() || delta.is_some_and(delta_is_empty) {
+            return Ok(false);
+        }
+        self.staged().prepare_output(writer)
+    }
+
+    /// After the frame's cells: write the image scene, keeping the frame's cursor. The scene is
+    /// written when the frame repainted every cell or changed the scene; otherwise only a raster
+    /// image the frame's cells were written over needs writing again (Kitty keeps placements
+    /// apart from the cells).
     fn render(
         &self,
         writer: &mut Vec<u8>,
         scene: &bmux_tui::image_scene::ImageScene,
+        delta: &bmux_tui::image_scene::ImageSceneDelta,
+        written: &bmux_tui::terminal::Written<'_>,
         (cols, rows): (u16, u16),
     ) -> std::io::Result<()> {
-        let mut staged = self.staged.borrow_mut();
-        let (Some((capabilities, config)), Some(compositor)) = (&self.images.host, staged.as_mut())
-        else {
+        let Some((capabilities, config)) = &self.images.host else {
             return Ok(());
         };
+        let raster = capabilities.preferred_protocol()
+            != Some(bmux_image::model::ImageProtocol::KittyGraphics);
+        let needed = matches!(written, bmux_tui::terminal::Written::All)
+            || !delta_is_empty(delta)
+            || (raster
+                && scene
+                    .placements()
+                    .any(|image| written.touches(image.destination.intersection(image.clip))));
+        if !needed {
+            return Ok(());
+        }
         let terminal = bmux_image::compositor::PaneRect {
             x: 0,
             y: 0,
@@ -94,11 +117,17 @@ impl ImageFrame<'_> {
             h: rows,
         };
         writer.write_all(b"\x1b7")?;
-        compositor
+        self.staged()
             .render(writer, scene, terminal, capabilities, config)
             .map_err(image_output_error)?;
         writer.write_all(b"\x1b8")
     }
+}
+
+/// Whether a frame changed no image.
+#[cfg(image_protocols)]
+const fn delta_is_empty(delta: &bmux_tui::image_scene::ImageSceneDelta) -> bool {
+    delta.upserted.is_empty() && delta.removed.is_empty()
 }
 
 #[cfg(image_protocols)]
@@ -282,17 +311,20 @@ impl FramePresenter {
                 }
                 Ok(output.has_graphics())
             },
-            |writer| {
+            |writer, delta| {
                 if let Some(graphics) = output.borrow().graphics() {
                     writer.write_all(&graphics.before)?;
                 }
                 // Raster images leave footprints only a cleared screen and a full repaint remove.
                 #[cfg(image_protocols)]
-                return images.prepare_output(writer);
+                return images.prepare_output(writer, delta);
                 #[cfg(not(image_protocols))]
-                Ok(false)
+                {
+                    let _ = delta;
+                    Ok(false)
+                }
             },
-            |writer, scene, _| {
+            |writer, scene, delta, written| {
                 // Placing images moves the cursor: keep the frame's.
                 if let Some(graphics) = output
                     .borrow()
@@ -304,9 +336,9 @@ impl FramePresenter {
                     writer.write_all(b"\x1b8")?;
                 }
                 #[cfg(image_protocols)]
-                images.render(writer, scene, (cols, rows))?;
+                images.render(writer, scene, delta, written, (cols, rows))?;
                 #[cfg(not(image_protocols))]
-                let _ = scene;
+                let _ = (scene, delta, written);
                 Ok(())
             },
         );
@@ -576,5 +608,128 @@ mod tests {
             "a failed render presents nothing"
         );
         assert!(!presenter.shown());
+    }
+}
+
+#[cfg(all(test, feature = "image-kitty", feature = "image-sixel"))]
+mod image_tests {
+    use super::{FramePresenter, FrameSpec, Presented};
+    use bmux_image::host_caps::HostImageCapabilities;
+    use bmux_tui::geometry::Rect;
+    use bmux_tui::image::{
+        ImageFit, ImageKey, ImageLifecycle, ImagePayload, ImagePixelFormat, ImagePlacement,
+    };
+    use bmux_tui::style::Style;
+
+    fn presenter(kitty: bool) -> FramePresenter {
+        let mut presenter = FramePresenter::new();
+        presenter.set_image_host(
+            HostImageCapabilities {
+                kitty_graphics: kitty,
+                sixel: !kitty,
+                cell_pixel_width: 2,
+                cell_pixel_height: 4,
+                ..HostImageCapabilities::default()
+            },
+            bmux_image::ImageConfig::default(),
+        );
+        presenter
+    }
+
+    fn image(destination: Rect) -> ImagePlacement {
+        ImagePlacement {
+            fit: ImageFit::Stretch,
+            allocation: None,
+            key: ImageKey::new("picture"),
+            payload: ImagePayload::Pixels {
+                bytes: vec![200; 8 * 8 * 4].into(),
+                width: 8,
+                height: 8,
+                format: ImagePixelFormat::Rgba8,
+            },
+            destination,
+            clip: destination,
+            lifecycle: ImageLifecycle::Frame,
+            z: 0,
+        }
+    }
+
+    /// Present a frame writing `text` at row `y`; with `images`, the frame declares that image set.
+    fn frame(
+        presenter: &mut FramePresenter,
+        text: Option<(u16, &str)>,
+        images: Option<&[ImagePlacement]>,
+    ) -> String {
+        let spec = FrameSpec {
+            full: !presenter.shown(),
+            size: (20, 6),
+            margins: false,
+            graphics: false,
+        };
+        let frame = presenter
+            .present(&spec, |canvas| {
+                if let Some((y, text)) = text {
+                    canvas.text(0, y, text, Style::new());
+                }
+                if let Some(images) = images {
+                    canvas.declare_images();
+                    for image in images {
+                        canvas.image(image.clone());
+                    }
+                }
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        match frame.presented {
+            Presented::Frame(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Presented::Unchanged => String::new(),
+            Presented::Unsupported(failure) => panic!("unsupported frame: {failure:?}"),
+        }
+    }
+
+    /// Kitty keeps placements apart from the cells: images are written when the scene changes,
+    /// not when cells do, and an image the scene drops is deleted.
+    #[test]
+    fn kitty_images_are_written_when_the_scene_changes() {
+        let mut presenter = presenter(true);
+        let picture = [image(Rect::new(2, 1, 4, 2))];
+        let first = frame(&mut presenter, Some((0, "hello")), Some(&picture));
+        assert!(first.contains("a=t") && first.contains("a=p"), "{first:?}");
+        let edit = frame(&mut presenter, Some((4, "world")), None);
+        assert!(
+            edit.contains("world") && !edit.contains("\u{1b}_G"),
+            "{edit:?}"
+        );
+        let over = frame(&mut presenter, Some((1, "under")), Some(&picture));
+        assert!(
+            over.contains("under") && !over.contains("\u{1b}_G"),
+            "{over:?}"
+        );
+        assert_eq!(frame(&mut presenter, None, Some(&picture)), "");
+        let gone = frame(&mut presenter, None, Some(&[]));
+        assert!(gone.contains("a=d"), "{gone:?}");
+    }
+
+    /// Raster images are part of the cells they cover: one is written again when the frame's
+    /// cells are written over it, and not when they are written elsewhere.
+    #[test]
+    fn raster_images_are_rewritten_when_cells_are_written_over_them() {
+        let mut presenter = presenter(false);
+        let picture = [image(Rect::new(2, 1, 4, 2))];
+        let first = frame(&mut presenter, Some((0, "hello")), Some(&picture));
+        assert!(
+            first.contains("\u{1b}P"),
+            "the picture is written as sixel: {first:?}"
+        );
+        let elsewhere = frame(&mut presenter, Some((4, "world")), None);
+        assert!(
+            elsewhere.contains("world") && !elsewhere.contains("\u{1b}P"),
+            "{elsewhere:?}"
+        );
+        let over = frame(&mut presenter, Some((1, "under")), None);
+        assert!(
+            over.contains("under") && over.contains("\u{1b}P"),
+            "{over:?}"
+        );
     }
 }

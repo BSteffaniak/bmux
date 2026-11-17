@@ -272,6 +272,36 @@ impl FrameChanges<'_> {
         let area = self.changes.area();
         (area.y..area.bottom()).flat_map(move |y| self.changes.runs(y).map(move |run| (y, run)))
     }
+
+    /// Whether the frame changed a cell of `rect`.
+    #[must_use]
+    pub fn touches(&self, rect: Rect) -> bool {
+        let rect = rect.intersection(self.changes.area());
+        (rect.y..rect.bottom()).any(|y| {
+            self.changes
+                .runs(y)
+                .any(|run| run.start < rect.right() && rect.x < run.end)
+        })
+    }
+}
+
+/// What a frame wrote of its cells, for the output that follows them (images placed over them).
+pub enum Written<'frame> {
+    /// Every cell: a full repaint.
+    All,
+    /// The cells a frame painted in place changed.
+    Changes(FrameChanges<'frame>),
+}
+
+impl Written<'_> {
+    /// Whether the frame wrote a cell of `rect`.
+    #[must_use]
+    pub fn touches(&self, rect: Rect) -> bool {
+        match self {
+            Self::All => !rect.is_empty(),
+            Self::Changes(changes) => changes.touches(rect),
+        }
+    }
 }
 
 /// `Terminal` owns the previous frame buffer so repeated draws can use
@@ -793,7 +823,7 @@ impl<W: Write> Terminal<W> {
         &mut self,
         render: impl FnOnce(&mut PaintCx<'_, '_>),
     ) -> io::Result<DrawStats> {
-        self.draw_over_inner(render, |_| Ok(false), |_, _, _| Ok(()), true)
+        self.draw_over_inner(render, |_, _| Ok(false), |_, _, _, _| Ok(()), true)
     }
 
     /// [`Self::draw_over_with_output_hooks`] for a render that may reject its frame, and that
@@ -809,23 +839,26 @@ impl<W: Write> Terminal<W> {
     pub fn try_draw_over_with_output_hooks<E>(
         &mut self,
         render: impl FnOnce(&mut PaintCx<'_, '_>) -> Result<bool, E>,
-        before: impl FnOnce(&mut W) -> io::Result<bool>,
-        overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
+        before: impl FnOnce(&mut W, Option<&ImageSceneDelta>) -> io::Result<bool>,
+        overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta, &Written<'_>) -> io::Result<()>,
     ) -> Result<Option<DrawStats>, TryDrawError<E>> {
         self.draw_over_core(render, before, overlay, true)
     }
 
-    /// [`Self::draw_over`] with the output hooks of
-    /// [`Self::draw_damage_with_output_hooks`]; `overlay` receives the committed image scene. The
-    /// frame is written even when it paints nothing, so the hooks always run.
+    /// [`Self::draw_over`] with output hooks around its cells. `before` receives the frame's
+    /// image delta, `None` for a full frame (nothing to paint over), and returns whether every
+    /// cell must be repainted; `overlay` follows the cells with the committed image scene, its
+    /// delta and the cells written ([`Written`]), so output placed over them (raster images) is
+    /// rewritten only where it needs to be. The frame is written even when it paints nothing,
+    /// so the hooks always run.
     ///
     /// # Errors
     /// Returns output or hook errors without committing failed output.
     pub fn draw_over_with_output_hooks(
         &mut self,
         render: impl FnOnce(&mut PaintCx<'_, '_>),
-        before: impl FnOnce(&mut W) -> io::Result<bool>,
-        overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
+        before: impl FnOnce(&mut W, Option<&ImageSceneDelta>) -> io::Result<bool>,
+        overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta, &Written<'_>) -> io::Result<()>,
     ) -> io::Result<DrawStats> {
         self.draw_over_inner(render, before, overlay, false)
     }
@@ -833,8 +866,8 @@ impl<W: Write> Terminal<W> {
     fn draw_over_inner(
         &mut self,
         render: impl FnOnce(&mut PaintCx<'_, '_>),
-        before: impl FnOnce(&mut W) -> io::Result<bool>,
-        overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
+        before: impl FnOnce(&mut W, Option<&ImageSceneDelta>) -> io::Result<bool>,
+        overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta, &Written<'_>) -> io::Result<()>,
         skip_unchanged: bool,
     ) -> io::Result<DrawStats> {
         let painted = |cx: &mut PaintCx<'_, '_>| {
@@ -855,8 +888,8 @@ impl<W: Write> Terminal<W> {
     fn draw_over_core<E>(
         &mut self,
         render: impl FnOnce(&mut PaintCx<'_, '_>) -> Result<bool, E>,
-        before: impl FnOnce(&mut W) -> io::Result<bool>,
-        overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
+        before: impl FnOnce(&mut W, Option<&ImageSceneDelta>) -> io::Result<bool>,
+        overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta, &Written<'_>) -> io::Result<()>,
         skip_unchanged: bool,
     ) -> Result<Option<DrawStats>, TryDrawError<E>> {
         self.last_over = false;
@@ -870,7 +903,11 @@ impl<W: Write> Terminal<W> {
                 return Err(TryDrawError::Rejected(rejection));
             }
             return self
-                .draw_prepared_with_output_hooks(prepared, before, overlay)
+                .draw_prepared_with_output_hooks(
+                    prepared,
+                    |writer| before(writer, None),
+                    |writer, scene, delta| overlay(writer, scene, delta, &Written::All),
+                )
                 .map(Some)
                 .map_err(TryDrawError::Io);
         };
@@ -977,7 +1014,7 @@ impl<W: Write> Terminal<W> {
         );
         let result = (|| -> io::Result<DrawStats> {
             let stats = write_synchronized(writer, synchronized, |writer| {
-                let repaint = before(writer)?;
+                let repaint = before(writer, Some(image_delta))?;
                 encoded.clear();
                 let stats = PresentationPhase::AnsiEncode.measure(
                     || -> io::Result<DrawStats> {
@@ -990,7 +1027,12 @@ impl<W: Write> Terminal<W> {
                     Result::is_ok,
                 )?;
                 writer.write_all(encoded)?;
-                overlay(writer, image_scene, image_delta)?;
+                let written = if repaint {
+                    Written::All
+                } else {
+                    Written::Changes(FrameChanges { changes: &changes })
+                };
+                overlay(writer, image_scene, image_delta, &written)?;
                 if let Some(transaction) = &transaction {
                     writer.write_all(transaction.bytes())?;
                 }
@@ -1541,8 +1583,8 @@ mod tests {
                     cx.replace_cells(0, 0, sized(text));
                     Ok::<_, &str>(false)
                 },
-                |_| Ok(false),
-                |_, _, _| Ok(()),
+                |_, _| Ok(false),
+                |_, _, _, _| Ok(()),
             )
         };
         assert!(matches!(shown(&mut terminal, "first"), Ok(Some(_))));
@@ -1555,8 +1597,8 @@ mod tests {
                 cx.replace_cells(0, 0, sized("half"));
                 Err::<bool, _>("rejected")
             },
-            |_| Ok(false),
-            |_, _, _| Ok(()),
+            |_, _| Ok(false),
+            |_, _, _, _| Ok(()),
         );
         assert!(matches!(
             rejected,
@@ -1573,8 +1615,8 @@ mod tests {
         terminal.writer_mut().clear();
         let extra = terminal.try_draw_over_with_output_hooks(
             |_| Ok::<_, &str>(true),
-            |writer| writer.write_all(b"<graphics>").map(|()| false),
-            |_, _, _| Ok(()),
+            |writer, _| writer.write_all(b"<graphics>").map(|()| false),
+            |_, _, _, _| Ok(()),
         );
         assert!(matches!(extra, Ok(Some(_))));
         assert!(String::from_utf8_lossy(terminal.writer()).contains("<graphics>"));
@@ -1605,6 +1647,56 @@ mod tests {
                 .unwrap()
                 .trim_end(),
             "there"
+        );
+    }
+
+    /// The hooks of a frame painted in place learn what it wrote: a full frame (nothing to
+    /// paint over) has no image delta and writes every cell; one painted over the last frame
+    /// hands over its delta and the cells it changed, unless `before` asks for a repaint.
+    #[test]
+    fn hooks_of_frames_painted_over_learn_what_was_written() {
+        let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 10, 3));
+        let frame = |terminal: &mut Terminal<Vec<u8>>, row: u16, repaint: bool| {
+            let mut seen = (None, Vec::new());
+            terminal
+                .try_draw_over_with_output_hooks(
+                    |cx| {
+                        cx.write_line(
+                            LocalRect::new(0, i64::from(row), 3, 1),
+                            &crate::text::Line::raw("abc"),
+                        );
+                        Ok::<_, ()>(false)
+                    },
+                    |_, delta| {
+                        seen.0 = Some(delta.is_some());
+                        Ok(repaint)
+                    },
+                    |_, _, _, written| {
+                        seen.1 = [
+                            Rect::new(0, 0, 10, 1),
+                            Rect::new(0, 1, 10, 1),
+                            Rect::new(5, 2, 5, 1),
+                        ]
+                        .into_iter()
+                        .map(|rect| written.touches(rect))
+                        .collect();
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            seen
+        };
+        assert_eq!(
+            frame(&mut terminal, 0, false),
+            (Some(false), vec![true, true, true])
+        );
+        assert_eq!(
+            frame(&mut terminal, 1, false),
+            (Some(true), vec![false, true, false])
+        );
+        assert_eq!(
+            frame(&mut terminal, 2, true),
+            (Some(true), vec![true, true, true])
         );
     }
 
@@ -1650,8 +1742,8 @@ mod tests {
                         }
                         Ok::<_, ()>(false)
                     },
-                    |_| Ok(false),
-                    |_, _, delta| {
+                    |_, _| Ok(false),
+                    |_, _, delta, _| {
                         seen = Some(delta.clone());
                         Ok(())
                     },
