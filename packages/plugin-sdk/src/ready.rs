@@ -14,7 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, Mutex};
 
 /// Declaration of a named readiness signal.
 ///
@@ -49,7 +49,14 @@ pub enum ReadyStatus {
 /// [`Self::is_ready`] / [`Self::await_ready`].
 #[derive(Debug, Clone, Default)]
 pub struct ReadyTracker {
-    inner: Arc<RwLock<BTreeMap<(String, String), ReadyStatus>>>,
+    inner: Arc<Signals>,
+}
+
+/// Signal states plus the notification [`ReadyTracker::await_ready`] waits on.
+#[derive(Debug, Default)]
+struct Signals {
+    states: Mutex<BTreeMap<(String, String), ReadyStatus>>,
+    changed: Condvar,
 }
 
 impl ReadyTracker {
@@ -68,7 +75,7 @@ impl ReadyTracker {
         if signals.is_empty() {
             return;
         }
-        if let Ok(mut map) = self.inner.write() {
+        if let Ok(mut map) = self.inner.states.lock() {
             for signal in signals {
                 map.entry((plugin_id.to_string(), signal.name.clone()))
                     .or_insert(ReadyStatus::Pending);
@@ -79,12 +86,13 @@ impl ReadyTracker {
     /// Mark a signal ready. Idempotent; calling multiple times has no
     /// effect.
     pub fn mark_ready(&self, plugin_id: &str, signal_name: &str) {
-        if let Ok(mut map) = self.inner.write() {
+        if let Ok(mut map) = self.inner.states.lock() {
             map.insert(
                 (plugin_id.to_string(), signal_name.to_string()),
                 ReadyStatus::Ready,
             );
         }
+        self.inner.changed.notify_all();
     }
 
     /// Whether the signal has been marked ready.
@@ -92,7 +100,7 @@ impl ReadyTracker {
     /// Returns `false` if the signal is unknown or still pending.
     #[must_use]
     pub fn is_ready(&self, plugin_id: &str, signal_name: &str) -> bool {
-        self.inner.read().is_ok_and(|map| {
+        self.inner.states.lock().is_ok_and(|map| {
             map.get(&(plugin_id.to_string(), signal_name.to_string()))
                 .copied()
                 .is_some_and(|status| status == ReadyStatus::Ready)
@@ -103,14 +111,14 @@ impl ReadyTracker {
     /// not been declared.
     #[must_use]
     pub fn status(&self, plugin_id: &str, signal_name: &str) -> Option<ReadyStatus> {
-        self.inner.read().ok().and_then(|map| {
+        self.inner.states.lock().ok().and_then(|map| {
             map.get(&(plugin_id.to_string(), signal_name.to_string()))
                 .copied()
         })
     }
 
-    /// Block (polling with a short sleep) until a signal is ready, or
-    /// until `timeout` elapses.
+    /// Block until a signal is ready, or until `timeout` elapses. The wait
+    /// is woken by [`Self::mark_ready`]; it never polls on a timer.
     ///
     /// Returns `true` if the signal became ready, `false` on timeout.
     ///
@@ -124,22 +132,26 @@ impl ReadyTracker {
         signal_name: &str,
         timeout: std::time::Duration,
     ) -> bool {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            if self.is_ready(plugin_id, signal_name) {
-                return true;
-            }
-            if std::time::Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        let key = (plugin_id.to_string(), signal_name.to_string());
+        let Ok(states) = self.inner.states.lock() else {
+            return false;
+        };
+        self.inner
+            .changed
+            .wait_timeout_while(states, timeout, |states| {
+                states.get(&key) != Some(&ReadyStatus::Ready)
+            })
+            .is_ok_and(|(states, _)| states.get(&key) == Some(&ReadyStatus::Ready))
     }
 
     /// Snapshot of all declared signals and their current status.
     #[must_use]
     pub fn snapshot(&self) -> BTreeMap<(String, String), ReadyStatus> {
-        self.inner.read().map(|map| map.clone()).unwrap_or_default()
+        self.inner
+            .states
+            .lock()
+            .map(|map| map.clone())
+            .unwrap_or_default()
     }
 }
 
