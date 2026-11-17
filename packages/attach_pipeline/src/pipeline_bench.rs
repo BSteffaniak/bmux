@@ -127,8 +127,8 @@ struct Replay {
     open: bool,
     frames: usize,
     margins: bool,
-    /// Present captured frames through a `bmux_tui` terminal instead of the renderer's own bytes.
-    presenter: Option<bmux_tui::terminal::Terminal<Vec<u8>>>,
+    /// Presents captured frames, as the attach client does.
+    presenter: bmux_tui::terminal::Terminal<Vec<u8>>,
 }
 
 struct Rendered {
@@ -159,26 +159,16 @@ impl Replay {
             open: false,
             frames: 0,
             margins: false,
-            presenter: None,
+            presenter: {
+                let mut terminal = bmux_tui::terminal::Terminal::new(
+                    Vec::new(),
+                    bmux_tui::geometry::Rect::new(0, 0, size.0, size.1),
+                );
+                terminal
+                    .set_pointer_capability(bmux_tui::pointer::PointerShapeCapability::Unsupported);
+                terminal
+            },
         }
-    }
-
-    /// Present each frame by capturing what the renderer draws and painting it over a `bmux_tui`
-    /// terminal's last frame, which encodes it (and moves rows) itself.
-    fn presented(mut self) -> Self {
-        let (cols, rows) = self.size;
-        let mut terminal = bmux_tui::terminal::Terminal::new(
-            Vec::new(),
-            bmux_tui::geometry::Rect::new(0, 0, cols, rows),
-        );
-        terminal.set_pointer_capability(bmux_tui::pointer::PointerShapeCapability::Unsupported);
-        terminal.set_scroll_region_acceleration(if self.margins {
-            bmux_tui::terminal::ScrollRegionAcceleration::AutoWithMargins
-        } else {
-            bmux_tui::terminal::ScrollRegionAcceleration::Auto
-        });
-        self.presenter = Some(terminal);
-        self
     }
 
     /// A pane inside a one-cell border, on a host with left/right margins: frames are written for
@@ -236,9 +226,8 @@ impl Replay {
             left_right_margins: self.margins,
             ..bmux_plugin::TerminalRenderCapabilities::default()
         };
-        let render = |output: &mut Vec<u8>, buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>| {
+        let render = |buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>| {
             render_attach_scene_with_stats_and_trace_with_capabilities_and_occluders(
-                output,
                 &self.scene,
                 &[],
                 buffers,
@@ -258,10 +247,15 @@ impl Replay {
             )
             .expect("render")
         };
-        let stats = if let Some(terminal) = self.presenter.as_mut() {
-            let mut encoded = Vec::new();
+        let stats = {
+            let terminal = &mut self.presenter;
+            terminal.set_scroll_region_acceleration(if self.margins {
+                bmux_tui::terminal::ScrollRegionAcceleration::AutoWithMargins
+            } else {
+                bmux_tui::terminal::ScrollRegionAcceleration::Auto
+            });
             let ((_, mut stats), operations) =
-                crate::projection::capture_neutral(|| render(&mut encoded, &mut self.buffers));
+                crate::projection::capture(|| render(&mut self.buffers));
             terminal.writer_mut().clear();
             terminal
                 .draw_over(|cx| {
@@ -277,8 +271,6 @@ impl Replay {
                 })
                 .sum();
             stats
-        } else {
-            render(output, &mut self.buffers).1
         };
         Rendered {
             apply: applied,
@@ -345,9 +337,7 @@ fn run_replay(name: &str, mut replay: Replay, frames: &[Frame]) {
         size.0,
         size.1,
         replay.chunk_size,
-        if replay.presenter.is_some() {
-            "terminal"
-        } else if scroll_passthrough {
+        if scroll_passthrough {
             "passthrough"
         } else {
             "no passthrough"
@@ -397,7 +387,7 @@ fn assert_host_matches(
 ) -> u64 {
     assert_replay_matches(
         name,
-        Replay::new(size, scroll_passthrough, chunk_size).presented(),
+        Replay::new(size, scroll_passthrough, chunk_size),
         frames,
     )
 }
@@ -427,9 +417,8 @@ fn assert_replay_matches(name: &str, mut replay: Replay, frames: &[Frame]) -> u6
                 assert_eq!(
                     shown(host.grid(), row, col),
                     shown(replay.pane(), row, col),
-                    "{name} (passthrough {scroll_passthrough}, presented {}) frame {index}: host \
-                     differs from the pane at row {row} column {col}",
-                    replay.presenter.is_some(),
+                    "{name} (passthrough {scroll_passthrough}) frame {index}: host differs \
+                     from the pane at row {row} column {col}",
                 );
             }
         }
@@ -500,11 +489,8 @@ fn the_host_screen_matches_the_pane_after_every_frame() {
 fn a_terminal_presenting_captured_frames_shows_the_pane_after_every_frame() {
     let size = (60, 16);
     for corpus in corpus::generated(size, 24) {
-        let scrolled = assert_replay_matches(
-            corpus.name,
-            Replay::new(size, true, 97).presented(),
-            &corpus.frames,
-        );
+        let scrolled =
+            assert_replay_matches(corpus.name, Replay::new(size, true, 97), &corpus.frames);
         let scrolls = matches!(
             corpus.name,
             "su-scroll" | "region-linefeed" | "plain-stream"
@@ -518,7 +504,7 @@ fn a_terminal_presenting_captured_frames_shows_the_pane_after_every_frame() {
     }
     assert_replay_matches(
         "scattered-edits",
-        Replay::new(size, true, 97).presented(),
+        Replay::new(size, true, 97),
         &scattered_edits(size, 200),
     );
 }
@@ -576,10 +562,17 @@ fn a_bordered_pane_scrolls_inside_margins_and_writes_about_what_the_application_
         if index > 0 {
             bytes_in += frame.len();
             bytes_out += output.len();
+            // Every frame moves the pane's rows instead of repainting them: all 14 but the row
+            // scrolled out and the new bottom row, which is painted anyway.
+            assert!(
+                rendered.stats.pane_rows_scrolled >= 12,
+                "frame {index} moved {} rows",
+                rendered.stats.pane_rows_scrolled
+            );
             scrolled += rendered.stats.pane_rows_scrolled;
         }
     }
-    assert_eq!(scrolled, 20 * 13);
+    assert!(scrolled >= 20 * 12, "{scrolled} rows moved");
     assert!(
         bytes_out < bytes_in * 3 / 2,
         "{bytes_out} bytes out for {bytes_in} in"
@@ -595,7 +588,7 @@ fn pipeline_bench() {
         run(corpus.name, corpus.size, &corpus.frames, true);
         run_replay(
             corpus.name,
-            Replay::new(corpus.size, true, delivery()).presented(),
+            Replay::new(corpus.size, true, delivery()),
             &corpus.frames,
         );
     }
@@ -608,11 +601,7 @@ fn pipeline_bench() {
                 .unwrap_or("captured");
             run(name, size, &frames, false);
             run(name, size, &frames, true);
-            run_replay(
-                name,
-                Replay::new(size, true, delivery()).presented(),
-                &frames,
-            );
+            run_replay(name, Replay::new(size, true, delivery()), &frames);
         }
     }
 }
@@ -625,8 +614,8 @@ fn pipeline_bench() {
 ///     --ignored --exact pipeline_bench::pipeline_bench_loop
 /// ```
 ///
-/// A corpus named `generated:NAME` is that generated corpus. `BMUX_BENCH_MODE` is `bytes` (the renderer's own output, with passthrough), `terminal`
-/// (presented through a `bmux_tui` terminal) or `apply` (applying only, to subtract). The first
+/// A corpus named `generated:NAME` is that generated corpus. `BMUX_BENCH_MODE` is `terminal`
+/// (rendered and presented, the default) or `apply` (applying only, to subtract). The first
 /// corpus in `BMUX_BENCH_CORPUS` is played `BMUX_BENCH_ROUNDS` times (5 by default).
 #[test]
 #[ignore = "instruction-count workload; run explicitly"]
@@ -647,10 +636,7 @@ fn pipeline_bench_loop() {
     let rounds =
         std::env::var("BMUX_BENCH_ROUNDS").map_or(5, |rounds| rounds.parse().expect("rounds"));
     for _ in 0..rounds {
-        let mut replay = match mode.as_str() {
-            "terminal" => Replay::new(size(), true, delivery()).presented(),
-            _ => Replay::new(size(), true, delivery()),
-        };
+        let mut replay = Replay::new(size(), true, delivery());
         let mut output = Vec::new();
         for frame in &frames {
             output.clear();

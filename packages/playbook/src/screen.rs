@@ -974,7 +974,6 @@ mod tests {
                 },
                 damage: RenderDamage::FullSurface,
                 revision: 7,
-                bytes: b"cached".to_vec(),
             },
         );
         buffers.insert(pane_id, buffer);

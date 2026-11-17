@@ -4585,7 +4585,6 @@ fn render_native_provider_scene<W: AttachTerminal>(
     let (rendered, operations, graphics) =
         bmux_attach_pipeline::frame_presenter::capture_frame(|| {
             render_attach_scene_with_stats_and_trace_with_capabilities(
-                &mut Vec::new(),
                 scene,
                 &panes,
                 pane_buffers,
@@ -10403,7 +10402,6 @@ fn clear_retained_background(damage: &RetainedDamage) {
 }
 
 fn queue_retained_render_ops(
-    stdout: &mut impl Write,
     surface: &RetainedSurface,
     repaint: &RetainedRepaintSurface,
     capabilities: bmux_plugin::TerminalRenderCapabilities,
@@ -10418,12 +10416,11 @@ fn queue_retained_render_ops(
         surface.rect.h,
     );
     let damage = render_damage_from_retained_damage_rects(&repaint.damage);
-    queue_render_ops_with_capabilities(stdout, surface_rect, &damage, ops, capabilities)
+    queue_render_ops_with_capabilities(surface_rect, &damage, ops, capabilities)
         .context("failed queueing retained render ops")
 }
 
 fn queue_retained_extension_ops(
-    stdout: &mut impl Write,
     surface: &RetainedSurface,
     repaint: &RetainedRepaintSurface,
     extensions: &[Arc<dyn bmux_plugin::AttachRenderExtension>],
@@ -10452,7 +10449,6 @@ fn queue_retained_extension_ops(
         ) {
             let items = plugin_scene_items_to_render_items(&scene);
             wrote |= queue_render_items_for_surface(
-                stdout,
                 surface.id,
                 surface_rect,
                 &damage,
@@ -10477,7 +10473,6 @@ fn queue_retained_extension_ops(
             &context,
         ) {
             wrote |= queue_render_items_for_surface(
-                stdout,
                 surface.id,
                 surface_rect,
                 &damage,
@@ -10503,7 +10498,7 @@ fn queue_retained_extension_ops(
         ) else {
             continue;
         };
-        wrote |= queue_render_ops(stdout, surface_rect, &damage, &ops)
+        wrote |= queue_render_ops(surface_rect, &damage, &ops)
             .with_context(|| format!("failed queueing retained extension {}", extension.name()))?;
     }
     Ok(wrote)
@@ -11091,7 +11086,7 @@ fn render_attach_frame_to_output(
     let previous_focus = view_state.plugin_focus.clone();
     super::presenter::begin_frame(view_state);
     let presenting = view_state.presenting;
-    let (result, _operations) = bmux_attach_pipeline::projection::capture_neutral(|| {
+    let (result, _operations) = bmux_attach_pipeline::projection::capture(|| {
         let render = || {
             render_attach_frame_inner(
                 terminal_writer,
@@ -11422,7 +11417,6 @@ fn render_attach_frame_inner(
         let terminal_render_capabilities = terminal_render_capabilities(view_state);
         let (cursor_state, stats) =
             render_attach_scene_with_stats_and_trace_with_capabilities_and_occluders(
-                &mut frame_bytes,
                 &layout_state.scene,
                 &layout_state.panes,
                 &mut view_state.pane_buffers,
@@ -11528,18 +11522,12 @@ fn render_attach_frame_inner(
             .collect::<Vec<_>>()
     };
     for (surface, repaint) in retained_plugin_repaints {
-        overlay_rendered |=
-            queue_retained_render_ops(&mut frame_bytes, &surface, &repaint, retained_capabilities)?;
+        overlay_rendered |= queue_retained_render_ops(&surface, &repaint, retained_capabilities)?;
     }
     let mut overlay_cursor_state = None;
     if let Some(help_surface) = frame_plan.retained.help_surface.as_ref()
         && let Some(repaint) = retained_repaint_by_id.get(&help_surface.id)
-        && queue_retained_render_ops(
-            &mut frame_bytes,
-            help_surface,
-            repaint,
-            retained_capabilities,
-        )?
+        && queue_retained_render_ops(help_surface, repaint, retained_capabilities)?
     {
         if let Some(trace) = render_trace.as_deref_mut() {
             trace.push(AttachRenderTraceOp::HelpOverlay {
@@ -11550,7 +11538,6 @@ fn render_attach_frame_inner(
         }
         overlay_rendered = true;
         overlay_rendered |= queue_retained_extension_ops(
-            &mut frame_bytes,
             help_surface,
             repaint,
             &retained_extensions,
@@ -11560,12 +11547,7 @@ fn render_attach_frame_inner(
     }
     if let Some(prompt_surface) = frame_plan.retained.prompt_surface.as_ref()
         && let Some(repaint) = retained_repaint_by_id.get(&prompt_surface.id)
-        && queue_retained_render_ops(
-            &mut frame_bytes,
-            prompt_surface,
-            repaint,
-            retained_capabilities,
-        )?
+        && queue_retained_render_ops(prompt_surface, repaint, retained_capabilities)?
     {
         overlay_cursor_state = frame_plan
             .retained
@@ -11581,7 +11563,6 @@ fn render_attach_frame_inner(
         }
         overlay_rendered = true;
         overlay_rendered |= queue_retained_extension_ops(
-            &mut frame_bytes,
             prompt_surface,
             repaint,
             &retained_extensions,
@@ -11605,12 +11586,7 @@ fn render_attach_frame_inner(
         )
     {
         let repaint = retained_full_surface_repaint(&damage_surface);
-        if queue_retained_render_ops(
-            &mut frame_bytes,
-            &damage_surface,
-            &repaint,
-            retained_capabilities,
-        )? {
+        if queue_retained_render_ops(&damage_surface, &repaint, retained_capabilities)? {
             let rects = frame_damage_overlay_rects(
                 &layout_state.scene,
                 &frame_damage,
@@ -18371,7 +18347,6 @@ mod tests {
         let ((), lines) = presented_lines((80, 24), || {
             for surface in state.retained_compositor.surfaces().values() {
                 queue_retained_render_ops(
-                    &mut Vec::new(),
                     surface,
                     &retained_full_surface_repaint(surface),
                     bmux_plugin::TerminalRenderCapabilities::default(),
@@ -20275,7 +20250,6 @@ mod tests {
 
         let ((), lines) = presented_lines((80, 30), || {
             queue_retained_render_ops(
-                &mut Vec::new(),
                 &surface,
                 &repaint,
                 bmux_plugin::TerminalRenderCapabilities::default(),
@@ -20299,7 +20273,6 @@ mod tests {
 
         let (wrote, lines) = presented_lines((20, 10), || {
             queue_retained_extension_ops(
-                &mut Vec::new(),
                 &surface,
                 &repaint,
                 &extensions,

@@ -15,7 +15,7 @@ fn fill() -> PaintOperation {
 
 #[test]
 fn capture_records_operations_and_returns_the_value() {
-    let (value, operations) = projection::capture_neutral(|| {
+    let (value, operations) = projection::capture(|| {
         projection::record(fill());
         42
     });
@@ -27,22 +27,22 @@ fn capture_records_operations_and_returns_the_value() {
 #[test]
 fn unwind_does_not_poison_the_next_output_capture() {
     let failure = std::panic::catch_unwind(|| {
-        projection::capture_neutral(|| {
+        projection::capture(|| {
             projection::record(fill());
             panic!("simulated composition failure");
         });
     });
     assert!(failure.is_err());
     assert!(!projection::capturing());
-    let (_, operations) = projection::capture_neutral(|| projection::record(fill()));
+    let (_, operations) = projection::capture(|| projection::record(fill()));
     assert_eq!(operations, vec![fill()]);
 }
 
 #[test]
 fn rejected_nested_capture_preserves_outer_capture() {
-    let (_, operations) = projection::capture_neutral(|| {
+    let (_, operations) = projection::capture(|| {
         projection::record(fill());
-        assert!(std::panic::catch_unwind(|| projection::capture_neutral(|| ())).is_err());
+        assert!(std::panic::catch_unwind(|| projection::capture(|| ())).is_err());
         assert!(projection::capturing());
         projection::record(fill());
     });
@@ -51,11 +51,11 @@ fn rejected_nested_capture_preserves_outer_capture() {
 
 #[test]
 fn capture_scope_does_not_leak_to_another_composition_thread() {
-    let (_, operations) = projection::capture_neutral(|| {
+    let (_, operations) = projection::capture(|| {
         std::thread::spawn(|| {
             assert!(!projection::capturing());
             projection::record(PaintOperation::Unsupported);
-            let (_, other) = projection::capture_neutral(|| projection::record(fill()));
+            let (_, other) = projection::capture(|| projection::record(fill()));
             assert_eq!(other, vec![fill()]);
         })
         .join()
@@ -67,7 +67,7 @@ fn capture_scope_does_not_leak_to_another_composition_thread() {
 
 #[test]
 fn over_budget_capture_discards_partial_scene_before_allocating_payload() {
-    let (_, operations) = projection::capture_neutral(|| {
+    let (_, operations) = projection::capture(|| {
         projection::record(fill());
         projection::record_with(usize::MAX, || {
             panic!("rejected payload must not be allocated")
@@ -78,7 +78,7 @@ fn over_budget_capture_discards_partial_scene_before_allocating_payload() {
         operations.as_slice(),
         [PaintOperation::Rejected(ProjectionFailure::Budget { .. })]
     ));
-    let (_, next) = projection::capture_neutral(|| projection::record(fill()));
+    let (_, next) = projection::capture(|| projection::record(fill()));
     assert_eq!(
         next,
         vec![fill()],

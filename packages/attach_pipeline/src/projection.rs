@@ -115,16 +115,6 @@ impl std::fmt::Display for ProjectionFailure {
     }
 }
 
-thread_local! {
-    static ENCODE_TERMINAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// Whether synchronous composition should lower terminal control bytes.
-#[must_use]
-pub fn encoding_terminal() -> bool {
-    ENCODE_TERMINAL.with(std::cell::Cell::get)
-}
-
 /// Graphics protocol bytes of a frame whose cells are captured, not encoded: removals, written
 /// before the frame's cells, and transmissions and placements, written after them.
 #[derive(Debug, Default)]
@@ -168,19 +158,15 @@ pub fn graphics_output() -> bool {
     GRAPHICS_OUTPUT.with(|slot| slot.borrow().is_some())
 }
 
-/// Write graphics protocol bytes: into `stdout` while encoding the terminal, otherwise into the
-/// open [`GraphicsOutput`] (`before` the frame's cells or after them), otherwise nowhere.
+/// Write graphics protocol bytes into the open [`GraphicsOutput`] (`before` the frame's cells or
+/// after them); without one, nothing is written.
 ///
 /// # Errors
 /// Returns what `write` returns.
-pub fn write_graphics<W: std::io::Write + ?Sized, T: Default>(
-    stdout: &mut W,
+pub fn write_graphics<T: Default>(
     before: bool,
     write: impl FnOnce(&mut dyn std::io::Write) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    if encoding_terminal() {
-        return write(&mut StdoutRef(stdout));
-    }
     GRAPHICS_OUTPUT.with(|slot| {
         let mut slot = slot.borrow_mut();
         let Some(output) = slot.as_mut() else {
@@ -203,40 +189,6 @@ pub fn take_graphics_output() -> GraphicsOutput {
             .map(std::mem::take)
             .unwrap_or_default()
     })
-}
-
-/// A sized writer over an unsized one, to pass as `&mut dyn Write`.
-struct StdoutRef<'writer, W: ?Sized>(&'writer mut W);
-
-impl<W: std::io::Write + ?Sized> std::io::Write for StdoutRef<'_, W> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.write(bytes)
-    }
-
-    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.0.write_all(bytes)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
-    }
-}
-
-/// Run the same lowering plans without invoking terminal encoders.
-///
-/// # Panics
-/// Panics if called inside another synchronous capture.
-pub fn capture_neutral<T>(run: impl FnOnce() -> T) -> (T, Vec<PaintOperation>) {
-    struct Reset(bool);
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            ENCODE_TERMINAL.with(|flag| flag.set(self.0));
-        }
-    }
-    let reset = Reset(ENCODE_TERMINAL.with(|flag| flag.replace(false)));
-    let result = capture(run);
-    drop(reset);
-    result
 }
 
 #[derive(Default)]
@@ -1076,7 +1028,7 @@ mod tests {
         )
         .unwrap();
         let ((), operations) =
-            capture_neutral(|| record(PaintOperation::Grid(std::sync::Arc::new(fragment.clone()))));
+            capture(|| record(PaintOperation::Grid(std::sync::Arc::new(fragment.clone()))));
         let state = PresentationState::new(Rect::new(0, 0, 2, 1));
         state
             .prepare(Damage::Full, |cx| {
@@ -1097,7 +1049,7 @@ mod tests {
         use bmux_tui::image::{
             ImageKey, ImageLifecycle, ImagePayload, ImagePixelFormat, ImagePlacement,
         };
-        let ((), operations) = capture_neutral(|| {
+        let ((), operations) = capture(|| {
             for y in 0..300 {
                 for x in 0..600 {
                     record(PaintOperation::Text {
@@ -1129,7 +1081,7 @@ mod tests {
             clip: Rect::new(0, 0, 10, 10),
             lifecycle: ImageLifecycle::Frame,
         });
-        let ((), operations) = capture_neutral(|| {
+        let ((), operations) = capture(|| {
             for _ in 0..8 {
                 record_borrowed(&PaintOperation::Image(std::sync::Arc::clone(&image)));
             }

@@ -3,7 +3,6 @@ use anyhow::Result;
 use bmux_attach_layout_protocol::{AttachScene, AttachSurfaceKind};
 use bmux_plugin::{TerminalGraphicOverlay, TerminalRenderCapabilities};
 use std::collections::BTreeSet;
-use std::io;
 use uuid::Uuid;
 
 use super::{
@@ -50,8 +49,7 @@ pub(super) struct TerminalGraphicsFrameResources {
 }
 
 impl TerminalGraphicsFrameResources {
-    pub(super) fn begin<W: io::Write>(
-        stdout: &mut W,
+    pub(super) fn begin(
         scene: &AttachScene,
         graphics_cache: &mut TerminalGraphicsCache,
         capabilities: TerminalRenderCapabilities,
@@ -63,7 +61,7 @@ impl TerminalGraphicsFrameResources {
             capabilities,
             &mut resources.active_graphics,
         );
-        resources.cleanup_stale(stdout, graphics_cache, capabilities)?;
+        resources.cleanup_stale(graphics_cache, capabilities)?;
         Ok(resources)
     }
 
@@ -71,9 +69,8 @@ impl TerminalGraphicsFrameResources {
         self.active_graphics.extend(current_graphics);
     }
 
-    pub(super) fn cleanup_stale_for_surface<W: io::Write>(
+    pub(super) fn cleanup_stale_for_surface(
         &mut self,
-        stdout: &mut W,
         pane_id: Uuid,
         surface_id: Uuid,
         current_graphics: &BTreeSet<u64>,
@@ -81,7 +78,6 @@ impl TerminalGraphicsFrameResources {
         capabilities: TerminalRenderCapabilities,
     ) -> Result<bool> {
         cleanup_stale_terminal_graphics_for_surface(
-            stdout,
             pane_id,
             surface_id,
             current_graphics,
@@ -92,9 +88,8 @@ impl TerminalGraphicsFrameResources {
     }
 
     #[allow(clippy::too_many_arguments)] // Centralizes terminal graphic reconciliation inputs at call sites.
-    pub(super) fn queue_graphic_overlay<W: io::Write>(
+    pub(super) fn queue_graphic_overlay(
         &mut self,
-        stdout: &mut W,
         pane_id: Uuid,
         surface_id: Uuid,
         instance_key: u64,
@@ -103,7 +98,6 @@ impl TerminalGraphicsFrameResources {
         capabilities: TerminalRenderCapabilities,
     ) -> Result<bool> {
         queue_terminal_graphic_overlay(
-            stdout,
             pane_id,
             surface_id,
             instance_key,
@@ -114,14 +108,12 @@ impl TerminalGraphicsFrameResources {
         )
     }
 
-    pub(super) fn cleanup_stale<W: io::Write>(
+    pub(super) fn cleanup_stale(
         &mut self,
-        stdout: &mut W,
         graphics_cache: &mut TerminalGraphicsCache,
         capabilities: TerminalRenderCapabilities,
     ) -> Result<bool> {
         cleanup_stale_terminal_graphics(
-            stdout,
             &self.active_graphics,
             graphics_cache,
             capabilities,
@@ -129,14 +121,13 @@ impl TerminalGraphicsFrameResources {
         )
     }
 
-    pub(super) fn finish<W: io::Write>(
+    pub(super) fn finish(
         &mut self,
-        stdout: &mut W,
         graphics_cache: &mut TerminalGraphicsCache,
         capabilities: TerminalRenderCapabilities,
         render_stats: Option<&mut AttachSceneRenderStats>,
     ) -> Result<()> {
-        self.cleanup_stale(stdout, graphics_cache, capabilities)?;
+        self.cleanup_stale(graphics_cache, capabilities)?;
         if let Some(stats) = render_stats {
             self.stats.apply_to(stats);
         }
@@ -144,21 +135,19 @@ impl TerminalGraphicsFrameResources {
     }
 }
 
-pub(super) fn begin_terminal_graphics_frame<W: io::Write>(
-    stdout: &mut W,
+pub(super) fn begin_terminal_graphics_frame(
     scene: &AttachScene,
     graphics_cache: &mut TerminalGraphicsCache,
     capabilities: TerminalRenderCapabilities,
 ) -> Result<TerminalGraphicsFrameResources> {
-    TerminalGraphicsFrameResources::begin(stdout, scene, graphics_cache, capabilities)
+    TerminalGraphicsFrameResources::begin(scene, graphics_cache, capabilities)
 }
 
-pub(super) fn finish_terminal_graphics_frame<W: io::Write>(
-    stdout: &mut W,
+pub(super) fn finish_terminal_graphics_frame(
     terminal_graphics: &mut TerminalGraphicsFrameResources,
     graphics_cache: &mut TerminalGraphicsCache,
     capabilities: TerminalRenderCapabilities,
     render_stats: Option<&mut AttachSceneRenderStats>,
 ) -> Result<()> {
-    terminal_graphics.finish(stdout, graphics_cache, capabilities, render_stats)
+    terminal_graphics.finish(graphics_cache, capabilities, render_stats)
 }

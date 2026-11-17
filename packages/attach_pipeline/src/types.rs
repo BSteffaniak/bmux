@@ -200,7 +200,6 @@ pub struct ExtensionRenderCacheEntry {
     pub surface_rect: ExtensionRect,
     pub damage: RenderDamage,
     pub revision: u64,
-    pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

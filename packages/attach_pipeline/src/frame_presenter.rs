@@ -200,7 +200,7 @@ pub fn unsupported(operations: &[PaintOperation]) -> Option<ProjectionFailure> {
 /// # Panics
 /// Panics if called inside another capture.
 pub fn capture_frame<T>(render: impl FnOnce() -> T) -> (T, Vec<PaintOperation>, GraphicsOutput) {
-    let ((result, graphics), operations) = crate::projection::capture_neutral(|| {
+    let ((result, graphics), operations) = crate::projection::capture(|| {
         crate::projection::with_graphics_output(|| {
             let result = render();
             (result, crate::projection::take_graphics_output())

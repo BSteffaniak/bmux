@@ -130,7 +130,6 @@ impl UndecoratedGridPresenter {
         };
         let (cursor, operations, graphics) = capture_frame(|| {
             render_attach_scene_with_terminal_graphics_cache(
-                &mut Vec::new(),
                 &scene,
                 &[],
                 &mut pending_buffers,
@@ -640,7 +639,6 @@ impl AttachScenePipeline {
         let viewport = self.viewport;
         let (cursor, operations, graphics) = capture_frame(|| {
             render_attach_scene_with_terminal_graphics_cache(
-                &mut Vec::new(),
                 &layout_state.scene,
                 &layout_state.panes,
                 pane_buffers,

@@ -563,9 +563,7 @@ pub(super) enum AfterContentExtensionOutputAction {
         output_damage: RenderDamage,
         output_items: Vec<RenderLayerItem>,
     },
-    CachedReplay {
-        bytes: Vec<u8>,
-    },
+    CachedReplay,
     RenderItems {
         items: Vec<RenderLayerItem>,
     },
@@ -728,9 +726,7 @@ pub(super) fn build_after_content_extension_output_plan(
         && entry.damage == damage
         && entry.revision == revision
     {
-        AfterContentExtensionOutputAction::CachedReplay {
-            bytes: entry.bytes.clone(),
-        }
+        AfterContentExtensionOutputAction::CachedReplay
     } else if let Some(items) = snapshot.extension.render_layer_items_with_context(
         snapshot.surface_id,
         &snapshot.surface_rect,

@@ -684,7 +684,6 @@ impl PlaybookRenderTraceState {
         let (rendered, operations, graphics) =
             bmux_attach_pipeline::frame_presenter::capture_frame(|| {
                 render_attach_scene_with_stats_and_trace(
-                    &mut Vec::new(),
                     &layout.scene,
                     &layout.panes,
                     buffers,
