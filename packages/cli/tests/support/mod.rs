@@ -19,6 +19,13 @@ fn test_tmp_root() -> PathBuf {
     std::env::var_os("BMUX_TEST_TMP_ROOT").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
 }
 
+/// 64 random bits: unique per run while keeping server socket paths under the
+/// 104-byte macOS `SUN_LEN` limit for long labels and relocated roots.
+fn short_unique_suffix() -> String {
+    let simple = uuid::Uuid::new_v4().simple().to_string();
+    simple[..16].to_owned()
+}
+
 #[derive(Debug)]
 pub struct TempDirGuard {
     path: PathBuf,
@@ -27,8 +34,7 @@ pub struct TempDirGuard {
 impl TempDirGuard {
     #[must_use]
     pub fn new(label: &str) -> Self {
-        let path =
-            test_tmp_root().join(format!("bmux-cp-{label}-{}", uuid::Uuid::new_v4().simple()));
+        let path = test_tmp_root().join(format!("bmux-cp-{label}-{}", short_unique_suffix()));
         std::fs::create_dir_all(&path).expect("create isolated process root");
         Self { path }
     }
