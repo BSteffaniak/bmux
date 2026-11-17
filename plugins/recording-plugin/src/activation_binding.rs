@@ -1,12 +1,9 @@
 //! Activation-time recording configuration, with no process-global lookup.
-use super::{RecordingActivationConfiguration, RecordingPlugin, definition_metadata};
+use super::{RecordingActivationConfiguration, RecordingPlugin};
+use bmux_plugin_sdk::PluginCommandError;
 use bmux_plugin_sdk::definition::{
-    CommandOutcome, PluginCallContext, PluginCreateContext, PluginDefinition, PluginFuture,
-    PluginHostServices, PluginInstance, PluginLifecycleContext, PluginResult, RustPluginAdapter,
-};
-use bmux_plugin_sdk::{
-    NativeCommandContext, NativeServiceContext, PluginCommandError, ServiceResponse,
-    TypedServiceRegistrationContext, TypedServiceRegistry,
+    ActivationId, PluginCreateContext, PluginDefinition, PluginHostServices,
+    PluginLifecycleContext, PluginResult,
 };
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -19,183 +16,142 @@ type Binder = Arc<
         + Sync,
 >;
 
-struct Instance {
+type Configuration = RwLock<Option<RecordingActivationConfiguration>>;
+
+/// The activation binding of a scoped recording instance: configuration is
+/// resolved through the actual activation's host services, and commands and
+/// services are refused until that activation completed.
+pub(super) struct Scoped {
     created: PluginCreateContext,
     bind: Binder,
-    configuration: Arc<RwLock<Option<RecordingActivationConfiguration>>>,
-    adapter: RustPluginAdapter<RecordingPlugin>,
     active: std::sync::atomic::AtomicBool,
-    activation: Mutex<Option<bmux_plugin_sdk::definition::ActivationId>>,
+    activation: Mutex<Option<ActivationId>>,
 }
 
-impl PluginInstance for Instance {
-    fn activate_scoped(
-        &self,
-        context: PluginLifecycleContext,
-        services: Option<PluginHostServices>,
-    ) -> PluginFuture<'_, PluginResult<()>> {
-        Box::pin(async move {
-            if context.scope != self.created {
-                return Err(PluginCommandError::unavailable(
-                    "recording activation scope mismatch",
-                ));
-            }
-            let services = services.ok_or_else(|| {
-                PluginCommandError::unavailable("recording activation host services not bound")
-            })?;
-            {
-                let mut activation = self
-                    .activation
-                    .lock()
-                    .map_err(|_| PluginCommandError::failed("recording activation poisoned"))?;
-                if activation.is_some() {
-                    return Err(PluginCommandError::unavailable(
-                        "recording activation already bound or cleanup required",
-                    ));
-                }
-                *activation = Some(context.activation);
-                drop(activation);
-            }
-            let configuration = (self.bind)(&context, &services)?;
-            if !configuration.config.recordings_dir.is_absolute()
-                || !configuration.config.rolling_recordings_dir.is_absolute()
-                || configuration.process_caller.is_none()
-            {
-                return Err(PluginCommandError::failed(
-                    "recording roots must be explicitly selected absolute paths",
-                ));
-            }
-            {
-                let mut slot = self
-                    .configuration
-                    .write()
-                    .map_err(|_| PluginCommandError::failed("recording configuration poisoned"))?;
-                if slot.is_some() {
-                    return Err(PluginCommandError::unavailable(
-                        "recording activation already bound or cleanup required",
-                    ));
-                }
-                *slot = Some(configuration);
-                drop(slot);
-            }
-            // Keep configuration on failure: partially initialized writers/sinks
-            // still require the same authority for cleanup. No silent reset.
-            self.adapter
-                .activate_scoped(context, Some(services))
-                .await?;
-            self.active
-                .store(true, std::sync::atomic::Ordering::Release);
-            Ok(())
-        })
-    }
+fn not_ready() -> PluginCommandError {
+    PluginCommandError::unavailable("recording activation is not ready or requires cleanup")
+}
 
-    fn activate(&self, _context: PluginLifecycleContext) -> PluginFuture<'_, PluginResult<()>> {
-        Box::pin(async {
-            Err(PluginCommandError::unavailable(
-                "recording requires scoped activation host services",
-            ))
-        })
-    }
-
-    fn deactivate(&self, context: PluginLifecycleContext) -> PluginFuture<'_, PluginResult<()>> {
-        self.deactivate_scoped(context, None)
-    }
-
-    fn deactivate_scoped(
+impl Scoped {
+    /// Bind this activation's configuration before the owner is activated.
+    pub(super) fn bind(
         &self,
-        context: PluginLifecycleContext,
-        services: Option<PluginHostServices>,
-    ) -> PluginFuture<'_, PluginResult<()>> {
-        Box::pin(async move {
-            if context.scope != self.created {
-                return Err(PluginCommandError::unavailable(
-                    "recording cleanup scope mismatch",
-                ));
-            }
-            if *self
-                .activation
-                .lock()
-                .map_err(|_| PluginCommandError::failed("recording activation poisoned"))?
-                != Some(context.activation)
-            {
-                return Err(PluginCommandError::unavailable(
-                    "recording cleanup activation mismatch",
-                ));
-            }
-            self.active
-                .store(false, std::sync::atomic::Ordering::Release);
-            self.adapter.deactivate_scoped(context, services).await?;
-            self.configuration
-                .write()
-                .map_err(|_| PluginCommandError::failed("recording configuration poisoned"))?
-                .take();
-            self.activation
-                .lock()
-                .map_err(|_| PluginCommandError::failed("recording activation poisoned"))?
-                .take();
-            Ok(())
-        })
-    }
-
-    fn command(
-        &self,
-        call: PluginCallContext,
-        context: NativeCommandContext,
-    ) -> PluginFuture<'_, CommandOutcome> {
-        if !self.active.load(std::sync::atomic::Ordering::Acquire) {
-            return Box::pin(async {
-                Err(PluginCommandError::unavailable(
-                    "recording activation is not ready or requires cleanup",
-                ))
-                .into()
-            });
-        }
-        self.adapter.command(call, context)
-    }
-    fn invoke(
-        &self,
-        call: PluginCallContext,
-        context: NativeServiceContext,
-    ) -> PluginFuture<'_, PluginResult<ServiceResponse>> {
-        if !self.active.load(std::sync::atomic::Ordering::Acquire) {
-            return Box::pin(async {
-                Err(PluginCommandError::unavailable(
-                    "recording activation is not ready or requires cleanup",
-                ))
-            });
-        }
-        self.adapter.invoke(call, context)
-    }
-    fn service_contract_for(&self, interface: &str) -> Option<&'static [u8]> {
-        self.adapter.service_contract_for(interface)
-    }
-    fn register_typed_services_with_context(
-        &self,
-        context: TypedServiceRegistrationContext<'_>,
-        registry: &mut TypedServiceRegistry,
+        context: &PluginLifecycleContext,
+        configuration: &Configuration,
     ) -> PluginResult<()> {
-        if self
-            .configuration
-            .read()
-            .map_err(|_| PluginCommandError::failed("recording configuration poisoned"))?
-            .is_none()
-        {
+        if context.scope != self.created {
             return Err(PluginCommandError::unavailable(
-                "recording service registration requires activation configuration",
+                "recording activation scope mismatch",
             ));
         }
-        self.adapter
-            .register_typed_services_with_context(context, registry)
+        let services = context.native.host_service_port.as_ref().ok_or_else(|| {
+            PluginCommandError::unavailable("recording activation host services not bound")
+        })?;
+        {
+            let mut activation = self
+                .activation
+                .lock()
+                .map_err(|_| PluginCommandError::failed("recording activation poisoned"))?;
+            if activation.is_some() {
+                return Err(PluginCommandError::unavailable(
+                    "recording activation already bound or cleanup required",
+                ));
+            }
+            *activation = Some(context.activation);
+        }
+        let selected = (self.bind)(context, services)?;
+        if !selected.config.recordings_dir.is_absolute()
+            || !selected.config.rolling_recordings_dir.is_absolute()
+            || selected.process_caller.is_none()
+        {
+            return Err(PluginCommandError::failed(
+                "recording roots must be explicitly selected absolute paths",
+            ));
+        }
+        let mut slot = configuration
+            .write()
+            .map_err(|_| PluginCommandError::failed("recording configuration poisoned"))?;
+        if slot.is_some() {
+            return Err(PluginCommandError::unavailable(
+                "recording activation already bound or cleanup required",
+            ));
+        }
+        // Kept on a later activation failure: partially initialized
+        // writers/sinks still require the same authority for cleanup.
+        *slot = Some(selected);
+        Ok(())
     }
-    fn portable_services(
-        &self,
-    ) -> PluginResult<Vec<Arc<dyn bmux_plugin_sdk::PortableServiceProvider>>> {
-        self.adapter.portable_services()
+
+    /// The owner activated: admit commands and services.
+    pub(super) fn mark_active(&self) {
+        self.active
+            .store(true, std::sync::atomic::Ordering::Release);
     }
+
+    /// Refuse work before activation completed or after cleanup began.
+    pub(super) fn ready(&self) -> PluginResult<()> {
+        if self.active.load(std::sync::atomic::Ordering::Acquire) {
+            Ok(())
+        } else {
+            Err(not_ready())
+        }
+    }
+
+    /// Start cleanup of exactly the bound activation.
+    pub(super) fn begin_cleanup(&self, context: &PluginLifecycleContext) -> PluginResult<()> {
+        if context.scope != self.created {
+            return Err(PluginCommandError::unavailable(
+                "recording cleanup scope mismatch",
+            ));
+        }
+        if *self
+            .activation
+            .lock()
+            .map_err(|_| PluginCommandError::failed("recording activation poisoned"))?
+            != Some(context.activation)
+        {
+            return Err(PluginCommandError::unavailable(
+                "recording cleanup activation mismatch",
+            ));
+        }
+        self.active
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// The owner deactivated: release the activation's configuration.
+    pub(super) fn finish_cleanup(&self, configuration: &Configuration) -> PluginResult<()> {
+        configuration
+            .write()
+            .map_err(|_| PluginCommandError::failed("recording configuration poisoned"))?
+            .take();
+        self.activation
+            .lock()
+            .map_err(|_| PluginCommandError::failed("recording activation poisoned"))?
+            .take();
+        Ok(())
+    }
+}
+
+/// Typed services need the activation's configuration.
+pub(super) fn require_configuration(configuration: &Configuration) -> PluginResult<()> {
+    if configuration
+        .read()
+        .map_err(|_| PluginCommandError::failed("recording configuration poisoned"))?
+        .is_none()
+    {
+        return Err(PluginCommandError::unavailable(
+            "recording service registration requires activation configuration",
+        ));
+    }
+    Ok(())
 }
 
 /// Create an inert recording definition, binding product configuration only when
 /// the loader supplies actual activation-scoped host services.
+///
+/// # Panics
+/// Panics if the embedded manifest is rejected.
 #[must_use]
 pub fn definition(
     bind: impl Fn(
@@ -207,32 +163,30 @@ pub fn definition(
     + 'static,
 ) -> PluginDefinition {
     let bind: Binder = Arc::new(bind);
-    PluginDefinition::new(
-        definition_metadata(),
-        move |created: PluginCreateContext| {
-            let configuration = Arc::new(RwLock::new(None));
-            let plugin = RecordingPlugin {
-                owner: RwLock::new(None),
-                binding: Some(configuration.clone()),
-                states: Arc::new(bmux_plugin::PluginStateRegistry::new()),
-            };
-            let instance = created.instance;
-            Ok(Arc::new(Instance {
-                created,
-                bind: bind.clone(),
-                configuration,
-                adapter: RustPluginAdapter::for_instance(plugin, instance),
-                active: std::sync::atomic::AtomicBool::new(false),
-                activation: Mutex::new(None),
-            }) as Arc<dyn PluginInstance>)
+    bmux_plugin_sdk::author::definition::<RecordingPlugin>(
+        crate::declaration::PLUGIN_MANIFEST,
+        crate::declaration::SERVICE_CONTRACTS,
+        move |created: &PluginCreateContext| {
+            Ok(RecordingPlugin {
+                binding: Some(Arc::new(RwLock::new(None))),
+                scoped: Some(Scoped {
+                    created: created.clone(),
+                    bind: bind.clone(),
+                    active: std::sync::atomic::AtomicBool::new(false),
+                    activation: Mutex::new(None),
+                }),
+                ..RecordingPlugin::default()
+            })
         },
     )
+    .expect("embedded recording declaration must be valid")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use bmux_plugin_sdk::NativeCommandInvocationSource;
+    use bmux_plugin_sdk::definition::PluginCallContext;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
@@ -272,7 +226,24 @@ mod tests {
             )
             .await;
         assert_ne!(result.exit_code, 0);
-        assert!(result.error.unwrap().contains("not ready"));
         assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn unbound_scoped_instance_refuses_work() {
+        let scoped = Scoped {
+            created: PluginCreateContext {
+                runtime_scope: bmux_plugin_sdk::definition::RuntimeScopeId::default(),
+                instance: bmux_plugin_sdk::definition::LoadedInstanceId::from_uuid(
+                    uuid::Uuid::from_u128(0x92),
+                ),
+                role: bmux_plugin_sdk::definition::ComponentRole::Backend,
+            },
+            bind: Arc::new(|_, _| Err(PluginCommandError::unavailable("unused"))),
+            active: std::sync::atomic::AtomicBool::new(false),
+            activation: Mutex::new(None),
+        };
+        assert!(scoped.ready().unwrap_err().message.contains("not ready"));
+        assert!(require_configuration(&RwLock::new(None)).is_err());
     }
 }

@@ -290,7 +290,10 @@ impl Plugin for PaneRuntimePlugin {
             .blocking_command("pane-padding-configure", Self::run_command)
             .blocking_command("pane-padding-reset", Self::run_command)
             .blocking_services(Self::invoke_service, None)
-            .typed_services(Self::register_typed_services)
+            .typed_services(|plugin, context, registry| {
+                plugin.register_typed_services(context, registry);
+                Ok(())
+            })
             .registrations(Self::register_contributions);
     }
 }

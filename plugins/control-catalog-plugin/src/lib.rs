@@ -117,7 +117,10 @@ impl Plugin for ControlCatalogPlugin {
         d.blocking_activate(Self::activate)
             .blocking_deactivate(Self::deactivate)
             .blocking_services(Self::invoke_service, None)
-            .typed_services(Self::register_typed_services);
+            .typed_services(|plugin, context, registry| {
+                plugin.register_typed_services(context, registry);
+                Ok(())
+            });
     }
 }
 

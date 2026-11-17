@@ -52,6 +52,7 @@ pub use recording_runtime::{
 };
 
 use bmux_plugin::PluginStateRegistry;
+use bmux_plugin_sdk::author::{self, Activation, Deactivation, Declarations, Plugin};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_recording_plugin_api::{
@@ -233,7 +234,10 @@ pub struct RecordingPlugin {
     binding: Option<Arc<RwLock<Option<RecordingActivationConfiguration>>>>,
     /// The activation's view of the host state registry (default
     /// composition only); an empty private one before activation.
-    states: Arc<PluginStateRegistry>,
+    states: RwLock<Arc<PluginStateRegistry>>,
+    /// The activation binding of a scoped definition; `None` for the default
+    /// composition.
+    scoped: Option<activation_binding::Scoped>,
 }
 
 impl Default for RecordingPlugin {
@@ -241,9 +245,17 @@ impl Default for RecordingPlugin {
         Self {
             owner: RwLock::new(None),
             binding: None,
-            states: Arc::new(PluginStateRegistry::new()),
+            states: RwLock::new(Arc::new(PluginStateRegistry::new())),
+            scoped: None,
         }
     }
+}
+
+fn slot_mut<T>(
+    slot: &std::sync::RwLock<T>,
+) -> std::result::Result<std::sync::RwLockWriteGuard<'_, T>, bmux_plugin_sdk::PluginCommandError> {
+    slot.write()
+        .map_err(|_| bmux_plugin_sdk::PluginCommandError::failed("plugin state lock poisoned"))
 }
 
 /// Product configuration selected through the actual lifecycle host port.
@@ -260,6 +272,13 @@ pub struct RecordingActivationConfiguration {
 }
 
 impl RecordingPlugin {
+    fn states(&self) -> Arc<PluginStateRegistry> {
+        self.states.read().map_or_else(
+            |_| Arc::new(PluginStateRegistry::new()),
+            |states| Arc::clone(&states),
+        )
+    }
+
     /// `events` is consulted only for the default composition, which publishes
     /// on the bus the activation received.
     fn configuration(
@@ -276,7 +295,7 @@ impl RecordingPlugin {
                 });
         }
         let config = self
-            .states
+            .states()
             .get::<RecordingPluginConfig>()
             .ok_or_else(|| PluginCommandError::unavailable("recording configuration missing"))?;
         let config = config
@@ -287,22 +306,76 @@ impl RecordingPlugin {
             config,
             host: Arc::new(ActivationRecordingHost {
                 events: events(),
-                states: Arc::clone(&self.states),
+                states: self.states(),
             }),
             process_caller: None,
         })
     }
 }
 
-impl RustPlugin for RecordingPlugin {
-    type Contract = bmux_recording_plugin_api::Contract;
+impl Plugin for RecordingPlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        d.blocking_activate(Self::activate)
+            .blocking_deactivate(Self::deactivate)
+            .blocking_command("record", Self::run_command)
+            .blocking_command("server-recording", Self::run_command)
+            .blocking_command("playbook-from-recording", Self::run_command)
+            .blocking_command("recording-start", Self::run_command)
+            .blocking_command("recording-stop", Self::run_command)
+            .blocking_command("recording-status", Self::run_command)
+            .blocking_command("recording-path", Self::run_command)
+            .blocking_command("recording-list", Self::run_command)
+            .blocking_command("recording-delete", Self::run_command)
+            .blocking_command("recording-delete-all", Self::run_command)
+            .blocking_command("recording-cut", Self::run_command)
+            .blocking_command("recording-inspect", Self::run_command)
+            .blocking_command("recording-analyze", Self::run_command)
+            .blocking_command("recording-replay", Self::run_command)
+            .blocking_command("recording-verify-smoke", Self::run_command)
+            .blocking_command("recording-export", Self::run_command)
+            .blocking_command("recording-prune", Self::run_command)
+            .blocking_command("recording-process-start", Self::run_command)
+            .blocking_command("recording-process-run", Self::run_command)
+            .blocking_command("recording-process-status", Self::run_command)
+            .blocking_command("recording-process-read", Self::run_command)
+            .blocking_command("recording-process-screen", Self::run_command)
+            .blocking_command("recording-process-send", Self::run_command)
+            .blocking_command("recording-process-wait", Self::run_command)
+            .blocking_command("recording-process-terminate", Self::run_command)
+            .blocking_command("recording-process-finish", Self::run_command)
+            .blocking_services(Self::invoke_service, None)
+            .typed_services(|plugin, context, registry| {
+                if let (Some(_), Some(configuration)) = (&plugin.scoped, &plugin.binding) {
+                    activation_binding::require_configuration(configuration)?;
+                }
+                plugin.register_typed_services(context, registry);
+                Ok(())
+            });
+    }
 
+    async fn activate(&self, cx: &mut Activation) -> author::Result<()> {
+        match (&self.scoped, &self.binding) {
+            (Some(scoped), Some(configuration)) => scoped.bind(cx.lifecycle(), configuration),
+            _ => Ok(()),
+        }
+    }
+
+    async fn deactivate(&self, cx: &mut Deactivation) -> author::Result<()> {
+        match &self.scoped {
+            Some(scoped) => scoped.begin_cleanup(cx.lifecycle()),
+            None => Ok(()),
+        }
+    }
+}
+
+impl RecordingPlugin {
     fn activate(
-        &mut self,
-        context: NativeLifecycleContext,
-    ) -> std::result::Result<i32, PluginCommandError> {
+        &self,
+        context: bmux_plugin_sdk::NativeLifecycleContext,
+        _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
+    ) -> std::result::Result<(), PluginCommandError> {
         if self.binding.is_none() {
-            self.states = bmux_plugin::activation_state_registry(&context);
+            *slot_mut(&self.states)? = bmux_plugin::activation_state_registry(&context);
         }
         let binding = self.configuration(|| bmux_plugin::activation_event_bus(&context))?;
         let config = binding.config;
@@ -312,9 +385,16 @@ impl RustPlugin for RecordingPlugin {
             .map_err(|_| PluginCommandError::failed("recording owner poisoned"))?;
         let owner = selected.get_or_insert_with(|| RecordingOwner::new(binding.host, config));
         owner.activate_owner()?;
-        Ok(bmux_plugin_sdk::EXIT_OK)
+        drop(selected);
+        if let Some(scoped) = &self.scoped {
+            scoped.mark_active();
+        }
+        Ok(())
     }
-    fn deactivate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+    fn deactivate(
+        &self,
+        _context: bmux_plugin_sdk::NativeLifecycleContext,
+    ) -> std::result::Result<(), PluginCommandError> {
         let mut owner = self
             .owner
             .write()
@@ -324,13 +404,20 @@ impl RustPlugin for RecordingPlugin {
             .ok_or_else(|| PluginCommandError::unavailable("recording inactive"))?
             .deactivate_owner()?;
         *owner = None;
-        Ok(bmux_plugin_sdk::EXIT_OK)
+        drop(owner);
+        if let (Some(scoped), Some(configuration)) = (&self.scoped, &self.binding) {
+            scoped.finish_cleanup(configuration)?;
+        }
+        Ok(())
     }
 
     fn run_command(
-        &mut self,
+        &self,
         context: NativeCommandContext,
     ) -> std::result::Result<i32, PluginCommandError> {
+        if let Some(scoped) = &self.scoped {
+            scoped.ready()?;
+        }
         if context.command == "record" {
             return Ok(interactive_command::run(&context));
         }
@@ -356,6 +443,9 @@ impl RustPlugin for RecordingPlugin {
     // auditable typed dispatch boundary; splitting the route obscures fallback.
     #[allow(clippy::too_many_lines)]
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+        if let Some(Err(error)) = self.scoped.as_ref().map(activation_binding::Scoped::ready) {
+            return ServiceResponse::error("recording_unavailable", error.message);
+        }
         match self.owner.read() {
             Ok(owner) => match owner.as_ref() {
                 Some(owner) => owner.service(&context),
@@ -2198,179 +2288,14 @@ impl RecordingHost for ActivationRecordingHost {
 
 // The one definition both bundling and generated dynamic packaging use:
 // fresh default author state per created instance.
-bmux_plugin_sdk::define_plugin!(
-    rust_plugin = RecordingPlugin,
-    manifest = crate::declaration::PLUGIN_MANIFEST,
-    roles = vec![
-        bmux_plugin_sdk::definition::ComponentRole::Backend,
-        bmux_plugin_sdk::definition::ComponentRole::Frontend
-    ],
-);
-
-/// Configuration and authenticated caller are selected explicitly by the host.
-/// The process runtime is real, uses this owner's writer, and never registers in
-/// a global singleton. Caller rebinding happens for every service invocation.
-pub fn plugin_definition_with_host(
-    host: Arc<dyn RecordingHost>,
-    config: RecordingPluginConfig,
-    caller: Arc<bmux_plugin::TypedServiceCaller>,
-    runtime_root: String,
-    isolated: bool,
-) -> bmux_plugin_sdk::definition::PluginDefinition {
-    use bmux_plugin_sdk::definition::{PluginDefinition, PluginInstance};
-    PluginDefinition::new(definition_metadata(), move |_scope| {
-        if !config.recordings_dir.is_absolute()
-            || !config.rolling_recordings_dir.is_absolute()
-            || !Path::new(&runtime_root).is_absolute()
-        {
-            return Err(PluginCommandError::failed(
-                "recording roots must be explicitly selected absolute paths",
-            ));
-        }
-        let owner = RecordingOwner::new(Arc::clone(&host), config.clone());
-        let process = Arc::new(process_runtime::ProcessService::new(
-            Arc::clone(&caller),
-            config.recordings_dir.clone(),
-            runtime_root.clone(),
-            isolated,
-            Arc::clone(&owner.manual),
-        ));
-        *owner
-            .process
-            .write()
-            .map_err(|_| PluginCommandError::failed("recording process owner poisoned"))? =
-            Some(process);
-        Ok(Arc::new(owner) as Arc<dyn PluginInstance>)
-    })
-}
-impl bmux_plugin_sdk::definition::PluginInstance for RecordingOwner {
-    fn portable_services(
-        &self,
-    ) -> bmux_plugin_sdk::definition::PluginResult<
-        Vec<Arc<dyn bmux_plugin_sdk::PortableServiceProvider>>,
-    > {
-        let process = self
-            .process
-            .read()
-            .map_err(|_| PluginCommandError::failed("recording process owner poisoned"))?
-            .clone()
-            .ok_or_else(|| PluginCommandError::unavailable("recording process service unbound"))?;
-        Ok(vec![
-            Arc::new(bmux_recording_plugin_api::recording_state::RecordingStateProviderAdapter::new(Arc::new(self.clone()))),
-            Arc::new(bmux_recording_plugin_api::recording_process_v4::RecordingProcessV4ProviderAdapter::new(process.clone())),
-            Arc::new(bmux_recording_plugin_api::recording_process_presentation_v1::RecordingProcessPresentationV1ProviderAdapter::new(process)),
-        ])
-    }
-
-    fn service_contract_for(&self, interface: &str) -> Option<&'static [u8]> {
-        <bmux_recording_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface)
-    }
-
-    fn activate(
-        &self,
-        _context: bmux_plugin_sdk::definition::PluginLifecycleContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
-    {
-        Box::pin(async move { self.activate_owner() })
-    }
-    fn deactivate(
-        &self,
-        _context: bmux_plugin_sdk::definition::PluginLifecycleContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
-    {
-        let owner = self.clone();
-        Box::pin(async move {
-            tokio::runtime::Handle::try_current().map_err(|_| {
-                PluginCommandError::unavailable("recording cleanup requires host async runtime")
-            })?;
-            tokio::task::spawn_blocking(move || owner.deactivate_owner())
-                .await
-                .map_err(|_| PluginCommandError::failed("recording cleanup task panicked"))?
-        })
-    }
-    fn invoke(
-        &self,
-        call: bmux_plugin_sdk::definition::PluginCallContext,
-        context: NativeServiceContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<
-        '_,
-        bmux_plugin_sdk::definition::PluginResult<ServiceResponse>,
-    > {
-        Box::pin(async move {
-            if call.cancellation.is_cancelled() {
-                return Err(PluginCommandError::unavailable(
-                    "recording invocation cancelled",
-                ));
-            }
-            Ok(self.service(&context))
-        })
-    }
-    fn register_typed_services(
-        &self,
-        registry: &mut TypedServiceRegistry,
-    ) -> bmux_plugin_sdk::definition::PluginResult<()> {
-        bmux_recording_plugin_api::recording_state::register_provider(
-            registry,
-            Arc::new(self.clone()),
-        )
-        .map_err(|error| PluginCommandError::failed(error.to_string()))?;
-        let process = self
-            .process
-            .read()
-            .map_err(|_| PluginCommandError::failed("recording process owner poisoned"))?
-            .clone()
-            .ok_or_else(|| PluginCommandError::unavailable("recording process service unbound"))?;
-        let presentation: Arc<dyn bmux_recording_plugin_api::recording_process_presentation_v1::RecordingProcessPresentationV1Service + Send + Sync> = process.clone();
-        bmux_recording_plugin_api::recording_process_presentation_v1::register_provider(
-            registry,
-            presentation,
-        )
-        .map_err(|error| PluginCommandError::failed(error.to_string()))?;
-        let provider: Arc<
-            dyn bmux_recording_plugin_api::recording_process_v4::RecordingProcessV4Service
-                + Send
-                + Sync,
-        > = process;
-        bmux_recording_plugin_api::recording_process_v4::register_provider(registry, provider)
-            .map_err(|error| PluginCommandError::failed(error.to_string()))?;
-        Ok(())
-    }
-    fn command(
-        &self,
-        call: bmux_plugin_sdk::definition::PluginCallContext,
-        context: NativeCommandContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::CommandOutcome>
-    {
-        Box::pin(async move {
-            if call.cancellation.is_cancelled() {
-                return Err(PluginCommandError::unavailable(
-                    "recording command cancelled",
-                ))
-                .into();
-            }
-            if context.command == "record" {
-                return Ok(interactive_command::run(&context)).into();
-            }
-            if context.command.starts_with("recording-process-") {
-                return Ok(process_commands::run(&context)).into();
-            }
-            if should_queue_recording_cut_for_non_cli(&context) {
-                return self.run_recording_cut_command_queued(&context).into();
-            }
-            if context.command == "recording-export" {
-                return self.run_recording_export_command(&context).into();
-            }
-            commands::run_recording_command(self, &context).into()
-        })
-    }
-}
+bmux_plugin_sdk::plugin!(RecordingPlugin);
 
 #[cfg(test)]
 mod tests {
     use super::{RecordingPlugin, auto_export_output_path};
     use bmux_plugin_sdk::{
         CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostConnectionInfo, HostMetadata,
-        NativeCommandContext, NativeCommandInvocationSource, RustPlugin,
+        NativeCommandContext, NativeCommandInvocationSource,
     };
     use std::collections::BTreeMap;
     use std::path::Path;
@@ -2455,8 +2380,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let plugin = RecordingPlugin {
             owner: std::sync::RwLock::new(Some(owner(root.path()))),
-            binding: None,
-            states: std::sync::Arc::new(bmux_plugin::PluginStateRegistry::new()),
+            ..RecordingPlugin::default()
         };
         let command = command_context(
             "recording-process-status",
@@ -2488,8 +2412,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let plugin = RecordingPlugin {
             owner: std::sync::RwLock::new(Some(owner(root.path()))),
-            binding: None,
-            states: std::sync::Arc::new(bmux_plugin::PluginStateRegistry::new()),
+            ..RecordingPlugin::default()
         };
         let command = command_context(
             "recording-process-status",
@@ -2564,7 +2487,7 @@ mod tests {
 
     #[test]
     fn non_cli_recording_cut_reports_queue_precondition_without_self_dispatch_deadlock() {
-        let mut plugin = RecordingPlugin::default();
+        let plugin = RecordingPlugin::default();
         let error = plugin
             .run_command(command_context(
                 "recording-cut",
@@ -2652,30 +2575,11 @@ mod tests {
     }
 }
 
-fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
-    bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<RecordingPlugin>(
-        crate::declaration::PLUGIN_MANIFEST,
-        vec![
-            bmux_plugin_sdk::definition::ComponentRole::Backend,
-            bmux_plugin_sdk::definition::ComponentRole::Frontend,
-        ],
-    )
-    .expect("plugin manifest must define valid canonical metadata")
-    .metadata
-}
-
 #[cfg(test)]
 mod canonical_metadata_tests {
     #[test]
     fn embedded_manifest_matches_definition_metadata() {
-        let definition = bmux_plugin_sdk::definition::PluginDefinition::new(
-            super::definition_metadata(),
-            |_scope| {
-                Err(bmux_plugin_sdk::PluginCommandError::unavailable(
-                    "metadata-only regression",
-                ))
-            },
-        );
+        let definition = super::plugin_definition();
         definition
             .validate()
             .expect("canonical embedded identity must validate");
