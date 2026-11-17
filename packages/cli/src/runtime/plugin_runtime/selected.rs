@@ -104,6 +104,24 @@ fn host_runtime(
 }
 
 impl KernelServices {
+    /// Host dispatch for one command operation bound to `binding`.
+    ///
+    /// An async command body (and blocking work it awaits) runs outside the
+    /// author's callback entry. Such calls take this command's own selected
+    /// dispatch: the same declaration, capability checks, authority and
+    /// issuing route, only without entry ancestry (so nested plugin commands
+    /// still require a live entry). Calls made inside the entry keep the
+    /// entry route.
+    fn command_dispatch(
+        self,
+        binding: &bmux_plugin::CallbackBinding,
+    ) -> Arc<dyn bmux_plugin_sdk::HostServiceDispatch> {
+        let instance = Arc::new(self.clone());
+        binding.entry_or_instance_dispatch(
+            Arc::new(move |entry| Ok(Arc::new(self.with_callback_parent(entry)))),
+            instance,
+        )
+    }
     fn with_callback_parent(&self, entry: &bmux_plugin::CallbackEntryLease) -> Self {
         Self {
             declaration: self.declaration.clone(),
@@ -944,23 +962,22 @@ impl ProductionPlugin {
                     .clone()
                     .and_then(|authority| self.granted_kernel_dispatch(authority));
                 let invocation = execution.begin_invocation_scope()?;
-                let dispatch = Arc::new(KernelServices {
+                let runtime = host_runtime(execution)?;
+                let binding = if let Some(parent) = callback_parent {
+                    execution.bind_child_callback(&parent, invocation.clone(), cancellation)?
+                } else {
+                    execution.bind_root_callback(invocation.clone(), cancellation)?
+                };
+                let dispatch = KernelServices {
                     declaration: self.declaration.clone(),
                     instance: execution.scope().id(),
                     authority: authority.or_else(|| self.lifecycle_authority.get().cloned()),
                     services: context.services.clone(),
                     builtins: Arc::clone(&self.builtins),
                     command_route: command_route.cloned(),
-                    runtime: host_runtime(execution)?,
-                });
-                let binding = if let Some(parent) = callback_parent {
-                    execution.bind_child_callback(&parent, invocation.clone(), cancellation)?
-                } else {
-                    execution.bind_root_callback(invocation.clone(), cancellation)?
-                };
-                let dispatch = binding.host_dispatch(Arc::new(move |entry| {
-                    Ok(Arc::new((dispatch).with_callback_parent(entry)))
-                }));
+                    runtime,
+                }
+                .command_dispatch(&binding);
                 let started = execution.begin_with_callback_dispatch(
                     NativeOperation::Command {
                         invocation_id: bmux_plugin_sdk::PluginInvocationId::new(),

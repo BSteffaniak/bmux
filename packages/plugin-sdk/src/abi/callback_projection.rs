@@ -31,6 +31,10 @@ struct Authority {
     table: NativeCallbackAuthorityV1,
     cancellation: ServiceCancellation,
     entry: Mutex<Option<EntryRecord>>,
+    /// The projected operation's own invocation ports, for calls made outside
+    /// a live author entry (an async handler body). Weak: the projection never
+    /// extends the operation's ports past the operation that owns them.
+    operation: std::sync::Weak<InvocationPorts>,
     subscriptions: Mutex<Vec<SubscriptionRecord>>,
     uncertain: AtomicBool,
 }
@@ -64,17 +68,26 @@ impl Authority {
             Err(failure(status))
         }
     }
+    /// Ports for one host call: the live author entry's ports while the
+    /// author holds its entry, so the call keeps the entry's ancestry;
+    /// otherwise the operation's own invocation ports. The host selects the
+    /// route for an entry-less call on that invocation (or rejects it); the
+    /// guest never chooses authority.
     fn ports(&self) -> crate::Result<Arc<InvocationPorts>> {
-        self.entry
+        let entered = self
+            .entry
             .lock()
             .map_err(|_| crate::PluginError::ServiceProtocol {
                 details: "native entry poisoned".into(),
             })?
             .as_ref()
-            .and_then(|entry| entry.ports.clone())
-            .ok_or(crate::PluginError::UnsupportedHostOperation {
+            .filter(|entry| !entry.retiring && !entry.unknown)
+            .and_then(|entry| entry.ports.clone());
+        entered.or_else(|| self.operation.upgrade()).ok_or(
+            crate::PluginError::UnsupportedHostOperation {
                 operation: "callback_entry_ports",
-            })
+            },
+        )
     }
     fn bind(self: &Arc<Self>, lease: u64) -> PluginResult<Arc<InvocationPorts>> {
         let mut output =
@@ -438,6 +451,7 @@ impl Executor {
             table,
             cancellation,
             entry: Mutex::new(None),
+            operation: Arc::downgrade(ports),
             subscriptions: Mutex::new(Vec::new()),
             uncertain: AtomicBool::new(false),
         });
@@ -466,8 +480,9 @@ fn services(owner: &Arc<Authority>) -> PluginHostServices {
     let subscriptions = Arc::clone(owner);
     PluginHostServices::new(move |request| invoke.ports()?.host_port().invoke(request))
         // Like the synchronous route, an asynchronous call is made through
-        // the live callback entry, resolved when the call starts; the entry's
-        // ports stay retained by the call until it settles or is dropped.
+        // the live callback entry when there is one (else the operation's
+        // ports), resolved when the call starts; those ports stay retained by
+        // the call until it settles or is dropped.
         .with_async(move |request| match asynchronous.ports() {
             Ok(ports) => ports.host_port().call_service_async(request),
             Err(error) => Box::pin(async move { Err(error) }),

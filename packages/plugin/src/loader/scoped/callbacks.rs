@@ -569,6 +569,26 @@ impl CallbackBinding {
         })
     }
 
+    /// Dispatch for an operation whose author body may call the host outside
+    /// its callback entry, such as an async command body (or blocking work it
+    /// awaits) running on the plugin's own runtime.
+    ///
+    /// Same route selection as an activation's retained services (see
+    /// [`ActivationDispatch`]): a call on this binding's invocation made while
+    /// the author holds its entry goes through `select`, keeping the entry's
+    /// ancestry; every other call goes through `instance`, the host's selected
+    /// dispatch for this exact invocation. Both are host-built for the same
+    /// admitted invocation, so attribution and authority do not depend on
+    /// the route, and a failed call is never retried on the other one.
+    #[must_use]
+    pub fn entry_or_instance_dispatch(
+        &self,
+        select: Arc<CallbackHostDispatchFactory>,
+        instance: Arc<dyn bmux_plugin_sdk::HostServiceDispatch>,
+    ) -> Arc<dyn bmux_plugin_sdk::HostServiceDispatch> {
+        self.activation_dispatch(self.host_dispatch(select), Some(instance))
+    }
+
     /// Bind dispatch to the actual live author entry, including native callbacks.
     /// The selector preserves authenticated runtime caller/origin semantics.
     #[must_use]

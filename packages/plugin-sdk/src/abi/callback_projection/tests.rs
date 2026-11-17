@@ -73,6 +73,7 @@ fn owner(host: &Host, executor: &Executor) -> Arc<Authority> {
         },
         cancellation: ServiceCancellation::new(),
         entry: Mutex::new(None),
+        operation: std::sync::Weak::new(),
         subscriptions: Mutex::new(Vec::new()),
         uncertain: AtomicBool::new(false),
     });

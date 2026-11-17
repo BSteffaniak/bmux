@@ -3865,12 +3865,16 @@ enabled_by_default = false
                     .expect("selected command must carry callback authority");
                 let ports = [call.host_services, context.host_service_port]
                     .map(|port| port.expect("selected command must have owned host services"));
-                // Host services are bound to the actual live author entry: a
-                // direct instance that has not entered its selected callback
-                // authority gets no host effect, never an ambient fallback.
+                // Outside the author entry a call takes this command's own
+                // selected dispatch (declaration, capability checks and
+                // authority), never an ambient fallback: the undeclared
+                // capability is refused there.
                 for port in &ports {
                     let error = probe(port);
-                    assert!(error.contains("no live author entry"), "{error}");
+                    assert!(
+                        error.contains("capability not declared by caller"),
+                        "{error}"
+                    );
                 }
                 let entry = execution
                     .enter_adapter_entry(self.1)

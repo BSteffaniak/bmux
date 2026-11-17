@@ -564,6 +564,51 @@ fn activation_dispatch_routes_by_admitted_invocation_and_live_entry() {
     assert!(unbound.invoke(&fresh, request()).is_err());
     assert!(unbound.invoke(&own, request()).is_err());
 }
+/// An operation body running outside its callback entry (an async command
+/// body) reaches the host through the host's instance dispatch for that
+/// invocation; while the author holds the entry, the entry-bound selection
+/// runs with that exact entry.
+#[test]
+fn entry_or_instance_dispatch_routes_entry_less_calls_to_the_instance_dispatch() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Tagged(u8);
+    impl bmux_plugin_sdk::HostServiceDispatch for Tagged {
+        fn invoke(
+            &self,
+            _: &InvocationScope,
+            _: bmux_plugin_sdk::HostServiceRequest<'_>,
+        ) -> super::super::Result<Vec<u8>> {
+            Ok(vec![self.0])
+        }
+    }
+    let request = || bmux_plugin_sdk::HostServiceRequest {
+        capability: "test",
+        kind: bmux_plugin_sdk::ServiceKind::Query,
+        interface: "test/v1",
+        operation: "read",
+        payload: &[],
+    };
+    let execution = crate::loader::scoped::tests::fixture();
+    let root = binding(&execution);
+    let own = root.invocation().clone();
+    let selections = Arc::new(AtomicUsize::new(0));
+    let observed = selections.clone();
+    let dispatch = root.entry_or_instance_dispatch(
+        Arc::new(move |_entry| {
+            observed.fetch_add(1, Ordering::AcqRel);
+            Ok(Arc::new(Tagged(1)))
+        }),
+        Arc::new(Tagged(2)),
+    );
+    assert_eq!(dispatch.invoke(&own, request()).unwrap(), vec![2]);
+    assert_eq!(selections.load(Ordering::Acquire), 0);
+    let entry = root.enter().unwrap();
+    assert_eq!(dispatch.invoke(&own, request()).unwrap(), vec![1]);
+    assert_eq!(selections.load(Ordering::Acquire), 1);
+    drop(entry);
+    assert_eq!(dispatch.invoke(&own, request()).unwrap(), vec![2]);
+    assert_eq!(selections.load(Ordering::Acquire), 1);
+}
 /// Deterministic interleaving of the race between background work using the
 /// activation services and the author leaving `activate`: the author entry
 /// ends after the route chose the entered dispatch but before that dispatch
