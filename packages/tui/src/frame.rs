@@ -90,6 +90,8 @@ pub struct Frame<'buffer> {
 pub(crate) struct OverChanges {
     area: Rect,
     dirty: Vec<bool>,
+    /// Per row, whether any of its cells may be marked (false only when none is).
+    rows: Vec<bool>,
     /// The moves, in order.
     pub(crate) moves: Vec<OverMove>,
 }
@@ -114,7 +116,24 @@ impl OverChanges {
         Self {
             area,
             dirty: vec![false; usize::from(area.width) * usize::from(area.height)],
+            rows: vec![false; usize::from(area.height)],
             moves: Vec::new(),
+        }
+    }
+
+    /// No changes over `area`, reusing this storage.
+    pub(crate) fn reuse(mut self, area: Rect) -> Self {
+        if self.area == area {
+            for (row, marked) in self.rows.iter_mut().enumerate() {
+                if std::mem::take(marked) {
+                    let start = row * usize::from(area.width);
+                    self.dirty[start..start + usize::from(area.width)].fill(false);
+                }
+            }
+            self.moves.clear();
+            self
+        } else {
+            Self::new(area)
         }
     }
 
@@ -128,6 +147,7 @@ impl OverChanges {
         for y in area.y..area.bottom() {
             let start = self.index(area.x, y);
             self.dirty[start..start + usize::from(area.width)].fill(true);
+            self.rows[usize::from(y - self.area.y)] = true;
         }
     }
 
@@ -136,7 +156,8 @@ impl OverChanges {
         let area = area.intersection(self.area);
         (area.y..area.bottom()).any(|y| {
             let start = self.index(area.x, y);
-            self.dirty[start..start + usize::from(area.width)].contains(&true)
+            self.rows[usize::from(y - self.area.y)]
+                && self.dirty[start..start + usize::from(area.width)].contains(&true)
         })
     }
 
@@ -154,10 +175,13 @@ impl OverChanges {
         }
         let (first, stride) = (self.index(band.x, band.y), usize::from(self.area.width));
         let row = |offset: usize| first + offset * stride;
+        let top = usize::from(band.y - self.area.y);
         if rows > 0 {
             for offset in 0..height - moved {
                 let (target, source) = (row(offset), row(offset + moved));
                 self.dirty.copy_within(source..source + columns, target);
+                // The row keeps its marks outside the band and gains the source's inside it.
+                self.rows[top + offset] |= self.rows[top + offset + moved];
             }
             for offset in height - moved..height {
                 self.dirty[row(offset)..row(offset) + columns].fill(false);
@@ -166,6 +190,7 @@ impl OverChanges {
             for offset in (moved..height).rev() {
                 let (target, source) = (row(offset), row(offset - moved));
                 self.dirty.copy_within(source..source + columns, target);
+                self.rows[top + offset] |= self.rows[top + offset - moved];
             }
             for offset in 0..moved {
                 self.dirty[row(offset)..row(offset) + columns].fill(false);
@@ -176,7 +201,11 @@ impl OverChanges {
     /// The marked runs of row `y`, left to right.
     pub(crate) fn runs(&self, y: u16) -> impl Iterator<Item = std::ops::Range<u16>> + '_ {
         let start = self.index(self.area.x, y);
-        let row = &self.dirty[start..start + usize::from(self.area.width)];
+        let row = if self.rows[usize::from(y - self.area.y)] {
+            &self.dirty[start..start + usize::from(self.area.width)]
+        } else {
+            &[][..]
+        };
         let x0 = self.area.x;
         let mut column = 0;
         std::iter::from_fn(move || {
@@ -194,7 +223,14 @@ impl OverChanges {
 
     /// Whether nothing is marked.
     pub(crate) fn is_clean(&self) -> bool {
-        !self.dirty.contains(&true)
+        self.rows
+            .iter()
+            .enumerate()
+            .filter(|(_, marked)| **marked)
+            .all(|(row, _)| {
+                let start = row * usize::from(self.area.width);
+                !self.dirty[start..start + usize::from(self.area.width)].contains(&true)
+            })
     }
 }
 
@@ -332,8 +368,10 @@ impl<'buffer> Frame<'buffer> {
     }
 
     /// Record which cells change, for a frame painted in place over the last one.
-    pub(crate) fn track_over(&mut self) {
-        self.over = Some(OverChanges::new(self.buffer.area()));
+    pub(crate) fn track_over(&mut self, storage: Option<OverChanges>) {
+        let area = self.buffer.area();
+        self.over =
+            Some(storage.map_or_else(|| OverChanges::new(area), |storage| storage.reuse(area)));
         self.buffer.log_spill();
     }
 

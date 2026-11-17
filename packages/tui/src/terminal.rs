@@ -260,6 +260,8 @@ pub struct Terminal<W> {
     scroll_acceleration: ScrollRegionAcceleration,
     committed_damage: Damage,
     applied_scrolls: Vec<AppliedScroll>,
+    /// Change tracking reused by frames painted over the last one.
+    over_storage: Option<OverChanges>,
 }
 
 impl<W: Write> Terminal<W> {
@@ -281,6 +283,7 @@ impl<W: Write> Terminal<W> {
             scroll_acceleration: ScrollRegionAcceleration::Off,
             committed_damage: Damage::None,
             applied_scrolls: Vec::new(),
+            over_storage: None,
         }
     }
 
@@ -301,6 +304,7 @@ impl<W: Write> Terminal<W> {
             scroll_acceleration: self.scroll_acceleration,
             committed_damage: self.committed_damage.clone(),
             applied_scrolls: self.applied_scrolls.clone(),
+            over_storage: None,
         }
     }
 
@@ -330,6 +334,7 @@ impl<W: Write> Terminal<W> {
             scroll_acceleration: self.scroll_acceleration,
             committed_damage: self.committed_damage.clone(),
             applied_scrolls: self.applied_scrolls.clone(),
+            over_storage: None,
         }
     }
 
@@ -709,7 +714,7 @@ impl<W: Write> Terminal<W> {
         let (mut changes, cursor) = {
             let mut frame = Frame::new(&mut buffer);
             frame.set_clock(self.state.clock());
-            frame.track_over();
+            frame.track_over(self.over_storage.take());
             PresentationPhase::Paint.measure(|| render(&mut PaintCx::new(&mut frame)), |()| true);
             let cursor = frame.cursor();
             (
@@ -721,6 +726,7 @@ impl<W: Write> Terminal<W> {
         };
         // Painting nothing, with the cursor where it was, changes nothing.
         if changes.is_clean() && changes.moves.is_empty() && cursor == self.state.cursor() {
+            self.over_storage = Some(changes);
             self.state.install_painted_over(buffer, cursor);
             self.committed_damage = Damage::None;
             self.applied_scrolls.clear();
@@ -778,6 +784,7 @@ impl<W: Write> Terminal<W> {
         if let Some(transaction) = transaction {
             self.pointer_output.complete(transaction, result.is_ok());
         }
+        self.over_storage = Some(changes);
         match result {
             Ok(stats) => {
                 self.state.install_painted_over(buffer, cursor);

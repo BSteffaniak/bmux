@@ -745,47 +745,12 @@ impl Buffer {
         Some(row)
     }
 
-    /// Model a terminal scroll region: move the full-width rows of `rows`
-    /// (`rows.y..rows.bottom()`) by `shift` rows toward row 0 (negative moves
-    /// them away from row 0) and blank the rows exposed at the other end.
-    ///
-    /// Rows outside the band are unchanged. A shift of at least the band
-    /// height blanks the whole band. Columns of `rows` are ignored: terminal
-    /// scroll regions always move complete rows.
-    pub(crate) fn shift_rows(&mut self, rows: Rect, shift: i64) {
-        let top = rows.y.max(self.area.y);
-        let bottom = rows.bottom().min(self.area.bottom());
-        if top >= bottom || shift == 0 {
-            return;
-        }
-        let width = usize::from(self.area.width);
-        let start = usize::from(top - self.area.y) * width;
-        let end = usize::from(bottom - self.area.y) * width;
-        let band = &mut self.cells[start..end];
-        let moved = usize::try_from(shift.unsigned_abs())
-            .unwrap_or(usize::MAX)
-            .saturating_mul(width)
-            .min(band.len());
-        if shift > 0 {
-            band.rotate_left(moved);
-            let blank = band.len() - moved;
-            band[blank..].iter_mut().for_each(Cell::reset);
-        } else {
-            band.rotate_right(moved);
-            band[..moved].iter_mut().for_each(Cell::reset);
-        }
-    }
-
     /// Move the cells of `band` by `shift` rows, as a terminal scroll inside
     /// margins does: positive moves content toward row 0. Rows the shift
     /// exposes become default cells; columns outside `band` do not move.
     pub(crate) fn shift_band(&mut self, band: Rect, shift: i64) {
         let band = self.area.intersection(band);
         if band.is_empty() || shift == 0 {
-            return;
-        }
-        if band.x == self.area.x && band.width == self.area.width {
-            self.shift_rows(band, shift);
             return;
         }
         let width = usize::from(self.area.width);
@@ -796,15 +761,18 @@ impl Buffer {
         let moved = usize::try_from(shift.unsigned_abs())
             .unwrap_or(usize::MAX)
             .min(height);
-        // Move each surviving row's cells into place by swapping (no copies), then
-        // blank the rows the shift exposes.
         let row = |offset: usize| (top + offset) * width + left;
+        // Swapping each target row with its source row, in order, carries every surviving row
+        // into place (the rows the shift exposes end up holding old rows, blanked below); row
+        // swaps move memory in bulk, where rotating the whole band swaps it in small blocks.
+        let mut swap = |target: usize, source: usize| {
+            let (low, high) = (target.min(source), target.max(source));
+            let (head, tail) = self.cells.split_at_mut(high);
+            head[low..low + columns].swap_with_slice(&mut tail[..columns]);
+        };
         if shift > 0 {
             for offset in 0..height - moved {
-                let (target, source) = (row(offset), row(offset + moved));
-                for column in 0..columns {
-                    self.cells.swap(target + column, source + column);
-                }
+                swap(row(offset), row(offset + moved));
             }
             for offset in height - moved..height {
                 self.cells[row(offset)..row(offset) + columns]
@@ -813,10 +781,7 @@ impl Buffer {
             }
         } else {
             for offset in (moved..height).rev() {
-                let (target, source) = (row(offset), row(offset - moved));
-                for column in 0..columns {
-                    self.cells.swap(target + column, source + column);
-                }
+                swap(row(offset), row(offset - moved));
             }
             for offset in 0..moved {
                 self.cells[row(offset)..row(offset) + columns]
