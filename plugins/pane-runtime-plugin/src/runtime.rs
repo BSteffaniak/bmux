@@ -56,7 +56,7 @@ use pty::Slave as _;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -143,29 +143,224 @@ fn admit_retained_pin(
     Ok(())
 }
 
-fn context_handle() -> ContextStateHandle {
-    bmux_plugin::global_plugin_state_registry()
-        .get::<ContextStateHandle>()
-        .and_then(|arc| arc.read().ok().map(|guard| guard.clone()))
-        .unwrap_or_else(ContextStateHandle::noop)
+/// The host handles one pane-runtime activation received: its view of the
+/// host plugin state registry and its event bus. Every runtime, handler and
+/// task reaches the host only through the instance it was given; there is no
+/// process-wide lookup.
+#[derive(Clone)]
+pub(crate) struct PaneRuntimeHost {
+    states: Arc<bmux_plugin::PluginStateRegistry>,
+    events: Option<Arc<bmux_plugin::EventBus>>,
+    /// Monotonic revision of this activation's focus-state publications.
+    focus_revision: Arc<AtomicU64>,
+    /// Monotonic revision of this activation's presentation-fact publications.
+    fact_revision: Arc<AtomicU64>,
+    /// This activation's output-push subscriptions.
+    output_push: Arc<crate::handlers::output_push::OutputPushState>,
+    /// This activation's readiness, published once at activation.
+    readiness: Arc<std::sync::OnceLock<crate::readiness::Readiness>>,
+    /// This activation's raw input capture barriers.
+    private_input: Arc<crate::private_input::PrivateInputState>,
+    /// This activation's read-only observer connections.
+    observers: Arc<Mutex<crate::handlers::attach_commands::ObserverIdentities>>,
 }
 
-pub(crate) fn session_handle() -> SessionManagerHandle {
-    bmux_plugin::global_plugin_state_registry()
-        .get::<SessionManagerHandle>()
-        .and_then(|arc| arc.read().ok().map(|guard| guard.clone()))
-        .unwrap_or_else(SessionManagerHandle::noop)
+impl std::fmt::Debug for PaneRuntimeHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PaneRuntimeHost")
+            .field("events", &self.events.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
-fn snapshot_dirty_flag() -> Arc<SnapshotDirtyFlag> {
-    bmux_plugin::global_plugin_state_registry()
-        .get::<SnapshotDirtyFlagHandle>()
-        .and_then(|arc| arc.read().ok().map(|guard| Arc::clone(&guard.0)))
-        .unwrap_or_else(|| Arc::new(SnapshotDirtyFlag::new()))
+impl Default for PaneRuntimeHost {
+    fn default() -> Self {
+        Self::detached()
+    }
 }
 
-fn mark_snapshot_dirty_flag() {
-    snapshot_dirty_flag().mark_dirty();
+impl PaneRuntimeHost {
+    pub(crate) fn new(
+        states: Arc<bmux_plugin::PluginStateRegistry>,
+        events: Option<Arc<bmux_plugin::EventBus>>,
+    ) -> Self {
+        Self {
+            states,
+            events,
+            focus_revision: Arc::new(AtomicU64::new(0)),
+            fact_revision: Arc::new(AtomicU64::new(0)),
+            output_push: Arc::default(),
+            readiness: Arc::default(),
+            private_input: Arc::default(),
+            observers: Arc::default(),
+        }
+    }
+
+    /// A host with an empty private registry and no bus (no host supplied).
+    pub(crate) fn detached() -> Self {
+        Self::new(Arc::new(bmux_plugin::PluginStateRegistry::new()), None)
+    }
+
+    pub(crate) fn states(&self) -> &Arc<bmux_plugin::PluginStateRegistry> {
+        &self.states
+    }
+
+    pub(crate) const fn events(&self) -> Option<&Arc<bmux_plugin::EventBus>> {
+        self.events.as_ref()
+    }
+
+    pub(crate) fn shutdown_progress(
+        &self,
+    ) -> bmux_plugin_runtime::shutdown_progress::ShutdownProgress {
+        self.states.shutdown_progress()
+    }
+
+    fn handle<T: Clone + Send + Sync + 'static>(&self) -> Option<T> {
+        self.states
+            .get::<T>()
+            .and_then(|arc| arc.read().ok().map(|guard| guard.clone()))
+    }
+
+    fn context_handle(&self) -> ContextStateHandle {
+        self.handle::<ContextStateHandle>()
+            .unwrap_or_else(ContextStateHandle::noop)
+    }
+
+    pub(crate) fn session_handle(&self) -> SessionManagerHandle {
+        self.handle::<SessionManagerHandle>()
+            .unwrap_or_else(SessionManagerHandle::noop)
+    }
+
+    fn snapshot_dirty_flag(&self) -> Arc<SnapshotDirtyFlag> {
+        self.handle::<SnapshotDirtyFlagHandle>()
+            .map_or_else(|| Arc::new(SnapshotDirtyFlag::new()), |handle| handle.0)
+    }
+
+    pub(crate) fn mark_snapshot_dirty(&self) {
+        self.snapshot_dirty_flag().mark_dirty();
+    }
+
+    pub(crate) fn publish_pane_event(&self, event: PaneEvent) {
+        let Some(events) = &self.events else {
+            return;
+        };
+        if let Err(error) = events.emit(&pane_runtime_events::EVENT_KIND, event) {
+            warn!(%error, "failed publishing pane-runtime event");
+        }
+    }
+
+    /// Record an event built by `payload` only when a recording would keep it: pane output is
+    /// copied for recording only while something records it.
+    fn record_lazily(
+        &self,
+        kind: RecordingEventKind,
+        meta: RecordMeta,
+        payload: impl FnOnce() -> RecordingPayload,
+    ) {
+        let Some(handle) = self.recording_sink() else {
+            return;
+        };
+        if handle.0.accepts(kind, meta) {
+            handle.0.record(kind, payload(), meta);
+        }
+    }
+
+    fn record(&self, kind: RecordingEventKind, payload: RecordingPayload, meta: RecordMeta) {
+        let Some(handle) = self.recording_sink() else {
+            return;
+        };
+        handle.0.record(kind, payload, meta);
+    }
+
+    pub(crate) fn recording_sink(&self) -> Option<RecordingSinkHandle> {
+        self.handle::<RecordingSinkHandle>()
+    }
+
+    pub(crate) fn pane_input_recording_data(
+        &self,
+        data: &[u8],
+    ) -> Option<(RecordingSinkHandle, Vec<u8>)> {
+        self.recording_sink().map(|handle| (handle, data.to_vec()))
+    }
+
+    fn current_context_id_for_session(&self, session_id: SessionId) -> Option<Uuid> {
+        self.context_handle().0.context_for_session(session_id)
+    }
+
+    pub(crate) fn emit_attach_view_changed_for_layout(&self, session_id: SessionId) {
+        let revision = self
+            .session_runtime_handle()
+            .0
+            .bump_attach_view_revision(session_id);
+        self.publish_pane_event(PaneEvent::AttachViewChanged {
+            context_id: self.current_context_id_for_session(session_id),
+            session_id: session_id.0,
+            revision: revision.unwrap_or(0),
+            components: vec![
+                AttachViewComponent::Scene,
+                AttachViewComponent::SurfaceContent,
+                AttachViewComponent::Layout,
+            ],
+        });
+    }
+
+    pub(crate) fn session_runtime_handle(
+        &self,
+    ) -> bmux_pane_runtime_state::SessionRuntimeManagerHandle {
+        self.handle::<bmux_pane_runtime_state::SessionRuntimeManagerHandle>()
+            .unwrap_or_else(bmux_pane_runtime_state::SessionRuntimeManagerHandle::noop)
+    }
+
+    /// The registered runtime manager, if any (no noop fallback).
+    pub(crate) fn registered_session_runtime(
+        &self,
+    ) -> Option<bmux_pane_runtime_state::SessionRuntimeManagerHandle> {
+        self.handle::<bmux_pane_runtime_state::SessionRuntimeManagerHandle>()
+    }
+
+    /// Next focus-state revision for this activation.
+    pub(crate) fn next_focus_revision(&self) -> u64 {
+        self.focus_revision.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    pub(crate) fn private_input(&self) -> &crate::private_input::PrivateInputState {
+        &self.private_input
+    }
+
+    pub(crate) fn observers(&self) -> &Mutex<crate::handlers::attach_commands::ObserverIdentities> {
+        &self.observers
+    }
+
+    pub(crate) fn readiness(&self) -> &std::sync::OnceLock<crate::readiness::Readiness> {
+        &self.readiness
+    }
+
+    pub(crate) fn output_push(&self) -> &crate::handlers::output_push::OutputPushState {
+        &self.output_push
+    }
+
+    /// Next presentation-fact revision for this activation.
+    pub(crate) fn next_fact_revision(&self) -> u64 {
+        self.fact_revision
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
+    }
+
+    /// The host's communal presentation fact service.
+    pub(crate) fn fact_service(
+        &self,
+    ) -> Arc<std::sync::RwLock<bmux_presentation_state::PresentationFactHostService>> {
+        self.states
+            .get_or_insert_with(bmux_presentation_state::PresentationFactHostService::new)
+    }
+
+    pub(crate) fn spawn_runtime_handle(&self) -> Option<SpawnRuntimeHandle> {
+        self.handle::<SpawnRuntimeHandle>()
+    }
+
+    fn pane_padding_handle(&self) -> Option<PanePaddingRuntimeHandle> {
+        self.handle::<PanePaddingRuntimeHandle>()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,76 +537,6 @@ fn validate_explicit_launch(launch: &PaneLaunchSpec) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The event bus this plugin's current activation received.
-///
-/// The pane runtime manager is shared by every activation in the process
-/// and reached through the plugin's runtime handles, so each activation
-/// installs its own bus here (see [`install_activation_events`]). Without one
-/// (for example a dynamic artifact) pane events are dropped; they are never
-/// routed to a process-wide bus.
-#[derive(Default)]
-struct PaneRuntimeEvents(Option<Arc<bmux_plugin::EventBus>>);
-
-/// Install the bus `activate` received, replacing a previous activation's.
-pub(crate) fn install_activation_events(bus: Option<Arc<bmux_plugin::EventBus>>) {
-    let slot =
-        bmux_plugin::global_plugin_state_registry().get_or_insert_with(PaneRuntimeEvents::default);
-    if let Ok(mut slot) = slot.write() {
-        slot.0 = bus;
-    }
-}
-
-/// The bus installed by the current activation, if any.
-pub(crate) fn activation_events() -> Option<Arc<bmux_plugin::EventBus>> {
-    bmux_plugin::global_plugin_state_registry()
-        .get::<PaneRuntimeEvents>()
-        .and_then(|slot| slot.read().ok().and_then(|slot| slot.0.clone()))
-}
-
-pub(crate) fn publish_pane_event(event: PaneEvent) {
-    let Some(events) = activation_events() else {
-        return;
-    };
-    if let Err(error) = events.emit(&pane_runtime_events::EVENT_KIND, event) {
-        warn!(%error, "failed publishing pane-runtime event");
-    }
-}
-
-/// Record an event built by `payload` only when a recording would keep it: pane output is
-/// copied for recording only while something records it.
-fn record_lazily_to_all_runtimes(
-    kind: RecordingEventKind,
-    meta: RecordMeta,
-    payload: impl FnOnce() -> RecordingPayload,
-) {
-    let Some(handle) = recording_sink() else {
-        return;
-    };
-    if handle.0.accepts(kind, meta) {
-        handle.0.record(kind, payload(), meta);
-    }
-}
-
-fn record_to_all_runtimes(kind: RecordingEventKind, payload: RecordingPayload, meta: RecordMeta) {
-    let Some(handle) = bmux_plugin::global_plugin_state_registry()
-        .get::<RecordingSinkHandle>()
-        .and_then(|arc| arc.read().ok().map(|guard| guard.clone()))
-    else {
-        return;
-    };
-    handle.0.record(kind, payload, meta);
-}
-
-fn recording_sink() -> Option<RecordingSinkHandle> {
-    bmux_plugin::global_plugin_state_registry()
-        .get::<RecordingSinkHandle>()
-        .and_then(|arc| arc.read().ok().map(|guard| guard.clone()))
-}
-
-fn pane_input_recording_data(data: &[u8]) -> Option<(RecordingSinkHandle, Vec<u8>)> {
-    recording_sink().map(|handle| (handle, data.to_vec()))
-}
-
 fn record_pane_input_raw(
     handle: &RecordingSinkHandle,
     data: Vec<u8>,
@@ -430,35 +555,8 @@ fn record_pane_input_raw(
     );
 }
 
-fn current_context_id_for_session(session_id: SessionId) -> Option<Uuid> {
-    context_handle().0.context_for_session(session_id)
-}
-
-pub(crate) fn emit_attach_view_changed_for_layout(session_id: SessionId) {
-    let revision = session_runtime_handle()
-        .0
-        .bump_attach_view_revision(session_id);
-    publish_pane_event(PaneEvent::AttachViewChanged {
-        context_id: current_context_id_for_session(session_id),
-        session_id: session_id.0,
-        revision: revision.unwrap_or(0),
-        components: vec![
-            AttachViewComponent::Scene,
-            AttachViewComponent::SurfaceContent,
-            AttachViewComponent::Layout,
-        ],
-    });
-}
-
-pub(crate) fn session_runtime_handle() -> bmux_pane_runtime_state::SessionRuntimeManagerHandle {
-    bmux_plugin::global_plugin_state_registry()
-        .get::<bmux_pane_runtime_state::SessionRuntimeManagerHandle>()
-        .and_then(|arc| arc.read().ok().map(|guard| guard.clone()))
-        .unwrap_or_else(bmux_pane_runtime_state::SessionRuntimeManagerHandle::noop)
-}
-
-async fn shutdown_runtime_handle(removed: RemovedRuntime) {
-    shutdown_panes(removed.handle.panes.into_values().collect()).await;
+async fn shutdown_runtime_handle(host: &crate::runtime::PaneRuntimeHost, removed: RemovedRuntime) {
+    shutdown_panes(host, removed.handle.panes.into_values().collect()).await;
 }
 
 // A cancelled service waiter must not cancel its cleanup owner. Retain every
@@ -472,14 +570,17 @@ fn pane_shutdown_owners() -> &'static Mutex<BTreeMap<Uuid, PaneShutdownOwner>> {
     OWNERS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-async fn shutdown_panes(panes: Vec<PaneRuntimeHandle>) {
-    if let Err(error) = shutdown_panes_result(panes).await {
+async fn shutdown_panes(host: &crate::runtime::PaneRuntimeHost, panes: Vec<PaneRuntimeHandle>) {
+    if let Err(error) = shutdown_panes_result(host, panes).await {
         warn!(%error, "pane shutdown failed; cleanup owner retained until settlement");
     }
 }
 
-async fn shutdown_panes_result(panes: Vec<PaneRuntimeHandle>) -> std::result::Result<(), String> {
-    shutdown_panes_owned(panes, false).await
+async fn shutdown_panes_result(
+    host: &crate::runtime::PaneRuntimeHost,
+    panes: Vec<PaneRuntimeHandle>,
+) -> std::result::Result<(), String> {
+    shutdown_panes_owned(host, panes, false).await
 }
 
 fn pane_cleanup_failure_summary(
@@ -523,12 +624,14 @@ fn pane_cleanup_failure_summary(
 }
 
 async fn await_pane_cleanup(
+    host: &crate::runtime::PaneRuntimeHost,
     panes: &mut [PaneRuntimeHandle],
     id: Uuid,
     wait_for_settlement: bool,
     settled: &mut Option<oneshot::Sender<std::result::Result<(), String>>>,
     errors: &mut Vec<String>,
 ) {
+    let progress = host.shutdown_progress();
     let prior_errors = errors.clone();
     // Cleanup acknowledgement can fail before the task exits: the task
     // still owns late OS reapers. Observe both independently, returning
@@ -569,9 +672,7 @@ async fn await_pane_cleanup(
                 match acknowledgements[index].as_mut().poll(cx) {
                     std::task::Poll::Ready(result) => {
                         acknowledged[index] = true;
-                        if let Err(error) = bmux_plugin::shutdown_progress()
-                            .advance("resource cleanup acknowledged")
-                        {
+                        if let Err(error) = progress.advance("resource cleanup acknowledged") {
                             warn!(%error, "shutdown progress publication failed");
                         }
                         if let Err(error) = result {
@@ -588,9 +689,7 @@ async fn await_pane_cleanup(
             match std::pin::Pin::new(&mut pane.task).poll(cx) {
                 std::task::Poll::Ready(result) => {
                     *pending = false;
-                    if let Err(error) =
-                        bmux_plugin::shutdown_progress().advance("resource cleanup task settled")
-                    {
+                    if let Err(error) = progress.advance("resource cleanup task settled") {
                         warn!(%error, "shutdown progress publication failed");
                     }
                     if let Err(error) = result {
@@ -635,13 +734,16 @@ async fn await_pane_cleanup(
 }
 
 async fn shutdown_panes_owned(
+    host: &crate::runtime::PaneRuntimeHost,
     mut panes: Vec<PaneRuntimeHandle>,
     wait_for_settlement: bool,
 ) -> std::result::Result<(), String> {
     let id = Uuid::new_v4();
     let (begin, admission) = oneshot::channel();
     let (settled, settlement) = oneshot::channel();
+    let host = host.clone();
     let owner = tokio::spawn(async move {
+        let host = &host;
         if admission.await.is_err() {
             return Ok(());
         }
@@ -671,7 +773,9 @@ async fn shutdown_panes_owned(
             .collect::<Vec<_>>();
         let mut revocations = Vec::with_capacity(lifetimes.len());
         for lifetime in lifetimes {
+            let worker_host = host.clone();
             revocations.push(tokio::task::spawn_blocking(move || {
+                let host = &worker_host;
                 let frozen = lifetime
                     .resurrection
                     .lock()
@@ -687,7 +791,7 @@ async fn shutdown_panes_owned(
                 // even when that operation failed or remained uncertain.
                 if let Err(error) = lifetime
                     .execution
-                    .signal_owned_group(native_process::StopAction::Force)
+                    .signal_owned_group(host, native_process::StopAction::Force)
                 {
                     lifetime
                         .execution
@@ -704,6 +808,7 @@ async fn shutdown_panes_owned(
             }
         }
         await_pane_cleanup(
+            host,
             &mut panes,
             id,
             wait_for_settlement,
@@ -809,8 +914,8 @@ async fn stop_unpublished_pane(pane: &mut PaneRuntimeHandle) -> Result<()> {
         .map_err(anyhow::Error::msg)
 }
 
-async fn shutdown_pane_handle(pane: PaneRuntimeHandle) {
-    shutdown_panes(vec![pane]).await;
+async fn shutdown_pane_handle(host: &crate::runtime::PaneRuntimeHost, pane: PaneRuntimeHandle) {
+    shutdown_panes(host, vec![pane]).await;
 }
 
 fn process_pane_output(
@@ -1082,6 +1187,7 @@ fn note_replay_markers_read(bytes: &[u8]) {
 }
 
 fn push_pane_runtime_notice(
+    host: &PaneRuntimeHost,
     session_id: SessionId,
     pane_id: Uuid,
     output_buffer: &Arc<std::sync::Mutex<OutputFanoutBuffer>>,
@@ -1094,11 +1200,11 @@ fn push_pane_runtime_notice(
         return;
     }
     output_dirty.store(true, Ordering::SeqCst);
-    publish_pane_event(PaneEvent::OutputAvailable {
+    host.publish_pane_event(PaneEvent::OutputAvailable {
         session_id: session_id.0,
         pane_id,
     });
-    crate::handlers::output_push::pane_output_available(session_id.0, pane_id);
+    crate::handlers::output_push::pane_output_available(host, session_id.0, pane_id);
 }
 
 struct PaneFailureTargets<'a> {
@@ -1113,6 +1219,7 @@ struct PaneFailureTargets<'a> {
 }
 
 fn mark_pane_startup_failed(
+    host: &PaneRuntimeHost,
     session_id: SessionId,
     pane_id: Uuid,
     reason: &str,
@@ -1129,6 +1236,7 @@ fn mark_pane_startup_failed(
     }
     targets.exited.store(true, Ordering::SeqCst);
     push_pane_runtime_notice(
+        host,
         session_id,
         pane_id,
         targets.output_buffer,
@@ -1141,7 +1249,7 @@ fn mark_pane_startup_failed(
         session_id,
         pane_id,
     });
-    mark_snapshot_dirty_flag();
+    host.mark_snapshot_dirty();
 }
 
 // Retains the actual child and its authenticated target authority together.
@@ -1151,6 +1259,7 @@ struct GuardianStartupChild {
     child: Box<dyn crate::runtime::pty::Child + Send + Sync>,
     execution: Arc<execution::ExecutionCapture>,
     launch_attempted: Arc<AtomicBool>,
+    host: PaneRuntimeHost,
 }
 
 impl std::fmt::Debug for GuardianStartupChild {
@@ -1165,9 +1274,10 @@ impl std::fmt::Debug for GuardianStartupChild {
 
 impl crate::runtime::pty::ChildKiller for GuardianStartupChild {
     fn kill(&mut self) -> std::io::Result<()> {
+        let host = &self.host;
         if self.launch_attempted.load(Ordering::SeqCst) {
             self.execution
-                .signal_owned_group(native_process::StopAction::Force)
+                .signal_owned_group(host, native_process::StopAction::Force)
                 .map_err(std::io::Error::other)?;
             if !self.execution.terminal_owner_retired.load(Ordering::SeqCst) {
                 return Err(std::io::Error::other(
@@ -1200,13 +1310,18 @@ impl crate::runtime::pty::Child for GuardianStartupChild {
 struct StartupChild {
     child: Option<Box<dyn crate::runtime::pty::Child + Send + Sync>>,
     runtime: tokio::runtime::Handle,
+    host: PaneRuntimeHost,
 }
 
 impl StartupChild {
-    fn new(child: Box<dyn crate::runtime::pty::Child + Send + Sync>) -> Self {
+    fn new(
+        host: &PaneRuntimeHost,
+        child: Box<dyn crate::runtime::pty::Child + Send + Sync>,
+    ) -> Self {
         Self {
             child: Some(child),
             runtime: tokio::runtime::Handle::current(),
+            host: host.clone(),
         }
     }
 
@@ -1232,10 +1347,12 @@ impl std::ops::DerefMut for StartupChild {
 
 impl Drop for StartupChild {
     fn drop(&mut self) {
+        let host = &self.host;
         if let Some(child) = self.child.take() {
             // The startup task may be aborted while awaiting native metadata,
             // or its waiter-thread closure may be dropped on thread failure.
             drop(cleanup_failed_startup_child_on(
+                host,
                 &self.runtime,
                 child,
                 "startup child owner dropped".into(),
@@ -1247,20 +1364,28 @@ impl Drop for StartupChild {
 
 #[cfg(all(test, unix))]
 fn cleanup_failed_startup_child(
+    host: &crate::runtime::PaneRuntimeHost,
     child: Box<dyn crate::runtime::pty::Child + Send + Sync>,
     failure: String,
 ) -> impl std::future::Future<Output = String> {
-    let cleanup =
-        cleanup_failed_startup_child_on(&tokio::runtime::Handle::current(), child, failure, None);
+    let cleanup = cleanup_failed_startup_child_on(
+        host,
+        &tokio::runtime::Handle::current(),
+        child,
+        failure,
+        None,
+    );
     async move { cleanup.await.0 }
 }
 
 fn cleanup_failed_startup_child_acknowledged(
+    host: &crate::runtime::PaneRuntimeHost,
     child: Box<dyn crate::runtime::pty::Child + Send + Sync>,
     failure: String,
     acknowledgement: &watch::Sender<Option<std::result::Result<(), String>>>,
 ) -> impl std::future::Future<Output = String> + use<> {
     let cleanup = cleanup_failed_startup_child_on(
+        host,
         &tokio::runtime::Handle::current(),
         child,
         failure,
@@ -1270,6 +1395,7 @@ fn cleanup_failed_startup_child_acknowledged(
 }
 
 fn cleanup_failed_startup_child_on(
+    host: &crate::runtime::PaneRuntimeHost,
     runtime: &tokio::runtime::Handle,
     mut child: Box<dyn crate::runtime::pty::Child + Send + Sync>,
     failure: String,
@@ -1278,7 +1404,9 @@ fn cleanup_failed_startup_child_on(
     // Transfer ownership before returning the waiter. Dropping the caller's
     // future must not drop the only reaper for this newly spawned process.
     let fallback = failure.clone();
+    let host = host.clone();
     let cleanup = runtime.spawn(async move {
+        let host = &host;
         let reaper = tokio::task::spawn_blocking(move || {
             let kill_error = child.kill().err();
             (child.wait(), kill_error)
@@ -1291,7 +1419,7 @@ fn cleanup_failed_startup_child_on(
             }
             Err(error) => Err(format!("child reaper failed: {error}")),
         };
-        if let Err(error) = bmux_plugin::shutdown_progress().advance("startup child reaped") {
+        if let Err(error) = host.shutdown_progress().advance("startup child reaped") {
             warn!(%error, "shutdown progress publication failed");
         }
         if let Some(acknowledgement) = acknowledgement {
@@ -1373,6 +1501,7 @@ struct SessionRuntimeManager {
     // Coalesced invalidations captured under the manager lock and published after unlock.
     pending_layout_revisions: BTreeMap<SessionId, u64>,
     pane_exit_tx: mpsc::UnboundedSender<PaneExitEvent>,
+    host: PaneRuntimeHost,
 }
 
 #[derive(Clone)]
@@ -1380,6 +1509,7 @@ struct PaneInputHandle {
     session_id: SessionId,
     input_tx: mpsc::UnboundedSender<PaneRuntimeCommand>,
     exited: Arc<AtomicBool>,
+    host: PaneRuntimeHost,
 }
 
 /// A fresh runtime's OS threads may start before its manager entry exists.
@@ -1978,6 +2108,7 @@ impl Drop for PaneLifetime {
 }
 
 struct PaneRuntimeHandle {
+    host: PaneRuntimeHost,
     lifetime: PaneLifetime,
     execution: Arc<execution::ExecutionCapture>,
     publication: Arc<StartupPublication>,
@@ -3767,11 +3898,13 @@ fn push_terminal_grid_delta(
 
 impl PaneInputHandle {
     fn send_input(&self, data: Vec<u8>) -> std::result::Result<(), SessionRuntimeError> {
+        let host = &self.host;
         if self.exited.load(Ordering::SeqCst) {
             return Err(SessionRuntimeError::Closed);
         }
         self.input_tx
             .send(input_authority::settled_local_command(
+                host,
                 data,
                 self.session_id,
             )?)
@@ -3785,6 +3918,7 @@ impl PaneRuntimeHandle {
             session_id,
             input_tx: self.input_tx.clone(),
             exited: Arc::clone(&self.exited),
+            host: self.host.clone(),
         }
     }
 
@@ -3793,8 +3927,12 @@ impl PaneRuntimeHandle {
         data: Vec<u8>,
         session_id: SessionId,
     ) -> std::result::Result<(), SessionRuntimeError> {
+        let host = self.host.clone();
+        let host = &host;
         self.input_tx
-            .send(input_authority::settled_local_command(data, session_id)?)
+            .send(input_authority::settled_local_command(
+                host, data, session_id,
+            )?)
             .map_err(|_| SessionRuntimeError::Closed)
     }
 
@@ -3884,7 +4022,7 @@ impl PaneRuntimeHandle {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
         {
-            publish_pane_event(PaneEvent::ImageAvailable {
+            self.host.publish_pane_event(PaneEvent::ImageAvailable {
                 session_id: self.session_id.0,
                 pane_id: self.meta.id,
             });
@@ -4554,7 +4692,7 @@ impl SessionRuntimeManager {
             pane.padding_override = Some(preview.spec);
             pane.padding_override_persistence = persistence;
         }
-        mark_snapshot_dirty_flag();
+        self.host.mark_snapshot_dirty();
         target_sessions
             .into_iter()
             .map(|(pane_id, session_id)| self.padding_state(session_id, Some(pane_id)))
@@ -4683,7 +4821,7 @@ impl SessionRuntimeManager {
             self.apply_padding_geometry_change(session_id, pane_id, &before, &after)?;
             states.push(after);
         }
-        mark_snapshot_dirty_flag();
+        self.host.mark_snapshot_dirty();
         Ok(states)
     }
 
@@ -4718,7 +4856,7 @@ impl SessionRuntimeManager {
         }
         let after = self.padding_state(session_id, Some(target))?;
         self.apply_padding_geometry_change(session_id, target, &before, &after)?;
-        mark_snapshot_dirty_flag();
+        self.host.mark_snapshot_dirty();
         Ok(after)
     }
 
@@ -5953,12 +6091,15 @@ fn pane_pty_size(
 /// Return shared geometry without taking sizing authority. Only an unset
 /// viewport may be seeded from the explicit detached fallback.
 pub(crate) fn observe_viewport(
+    host: &PaneRuntimeHost,
     session_id: SessionId,
     client_id: ClientId,
     cols: u16,
     rows: u16,
 ) -> Result<AttachViewport, SessionRuntimeError> {
-    let handle = pane_padding_handle().ok_or(SessionRuntimeError::NotFound)?;
+    let handle = host
+        .pane_padding_handle()
+        .ok_or(SessionRuntimeError::NotFound)?;
     let (result, seeded) = {
         let mut manager = handle.0.lock().map_err(|_| SessionRuntimeError::Closed)?;
         let unset = manager
@@ -5968,23 +6109,26 @@ pub(crate) fn observe_viewport(
         let result = manager.observe_viewport(session_id, client_id, cols, rows);
         let seeded = unset
             && result.is_ok()
-            && !crate::handlers::attach_commands::observer_identity(client_id);
+            && !crate::handlers::attach_commands::observer_identity(host, client_id);
         (result, seeded)
     };
     if seeded {
         // Notify after releasing the manager; this path is used only when no
         // authoritative geometry existed yet, never for ordinary observation.
-        emit_attach_view_changed_for_layout(session_id);
+        host.emit_attach_view_changed_for_layout(session_id);
     }
     result
 }
 
 /// Open an already-running output stream without selection or PTY sizing.
 pub(crate) fn begin_observer_attach(
+    host: &PaneRuntimeHost,
     session: SessionId,
     client: ClientId,
 ) -> Result<(), SessionRuntimeError> {
-    let handle = pane_padding_handle().ok_or(SessionRuntimeError::NotFound)?;
+    let handle = host
+        .pane_padding_handle()
+        .ok_or(SessionRuntimeError::NotFound)?;
     let mut manager = handle.0.lock().map_err(|_| SessionRuntimeError::Closed)?;
     manager.begin_observer_attach(session, client)
 }
@@ -5995,6 +6139,8 @@ impl SessionRuntimeManager {
         session: SessionId,
         client: ClientId,
     ) -> Result<(), SessionRuntimeError> {
+        let host = self.host.clone();
+        let host = &host;
         let _admission = managed_idle::admit().map_err(|_| SessionRuntimeError::Closed)?;
         let runtime = self
             .runtimes
@@ -6003,7 +6149,7 @@ impl SessionRuntimeManager {
         // Register readers before exposing attached membership. Never restart,
         // select a pane, mutate shared geometry or resize any PTY here.
         for pane in runtime.panes.values_mut() {
-            if !crate::private_input::register_producer(pane.meta.id, client.0) {
+            if !crate::private_input::register_producer(host, pane.meta.id, client.0) {
                 return Err(SessionRuntimeError::Closed);
             }
             pane.output_buffer
@@ -6025,6 +6171,8 @@ impl SessionRuntimeManager {
         cols: u16,
         rows: u16,
     ) -> Result<AttachViewport, SessionRuntimeError> {
+        let host = self.host.clone();
+        let host = &host;
         let runtime = self
             .runtimes
             .get_mut(&session_id)
@@ -6039,7 +6187,7 @@ impl SessionRuntimeManager {
             return Err(SessionRuntimeError::Closed);
         }
         let viewport = AttachViewport::normalized(cols, rows, 0, 0, 0, 0);
-        if crate::handlers::attach_commands::observer_identity(client_id) {
+        if crate::handlers::attach_commands::observer_identity(host, client_id) {
             // Detached fallback is a local projection, not sizing authority.
             return Ok(viewport);
         }
@@ -6293,6 +6441,7 @@ fn pane_launch_spec_from_command(command: PaneLaunchCommand) -> Result<PaneLaunc
 impl SessionRuntimeManager {
     #[allow(clippy::too_many_arguments)]
     fn new(
+        host: PaneRuntimeHost,
         shell: String,
         pane_term: String,
         protocol_profile: ProtocolProfile,
@@ -6322,6 +6471,7 @@ impl SessionRuntimeManager {
             padding_previews: BTreeMap::new(),
             pending_layout_revisions: BTreeMap::new(),
             pane_exit_tx,
+            host,
         }
     }
 
@@ -6763,6 +6913,9 @@ impl SessionRuntimeManager {
         >,
         launch_permit: Option<oneshot::Receiver<()>>,
     ) -> PaneRuntimeHandle {
+        let host = self.host.clone();
+        let host = &host;
+        let host = host.clone();
         let program_execution = pane_meta.launch.is_some();
         let execution = Arc::new(execution::ExecutionCapture::default());
         let execution_for_reader = Arc::clone(&execution);
@@ -6794,7 +6947,7 @@ impl SessionRuntimeManager {
             }
             apply_resolved_pane_launch(&mut pane_meta, resolved);
             if resolved.metadata_changed {
-                mark_snapshot_dirty_flag();
+                host.mark_snapshot_dirty();
             }
         }
         let (stop_tx, mut stop_rx) = oneshot::channel();
@@ -6907,7 +7060,9 @@ impl SessionRuntimeManager {
         let (startup_tx, startup) = watch::channel(None);
         let (cleanup_tx, cleanup) = watch::channel(None);
         let fence_input_for_reader = input_tx.clone();
+        let task_host = host.clone();
         let task = tokio::spawn(async move {
+            let host = task_host;
             let _publication_guard = PendingPublicationGuard(Arc::clone(&publication_for_task));
             if let Some(permit) = launch_permit {
                 tokio::select! {
@@ -6927,6 +7082,7 @@ impl SessionRuntimeManager {
                     }
                     startup_tx.send_replace(Some(Err(reason.clone())));
                     mark_pane_startup_failed(
+                        &host,
                         session_id,
                         pane_id,
                         &reason,
@@ -6974,10 +7130,10 @@ impl SessionRuntimeManager {
                     "execution supervisor helper artifact is unavailable"
                 ))
             } else {
-                supervisor::SupervisorControl::prepare(token)
+                supervisor::SupervisorControl::prepare(&host, token)
             };
             #[cfg(not(test))]
-            let preparation = supervisor::SupervisorControl::prepare(token);
+            let preparation = supervisor::SupervisorControl::prepare(&host, token);
             let (supervisor_control, guardian_command) =
                 match supervisor::select_backend(preparation, managed_program || program_execution)
                 {
@@ -7026,7 +7182,7 @@ impl SessionRuntimeManager {
                     state.launch = Some(resume.clone());
                     state.execution_token = Some(resume.invocation.clone());
                 }
-                mark_snapshot_dirty_flag();
+                host.mark_snapshot_dirty();
             }
             let mut replay_on_prompt = false;
 
@@ -7296,6 +7452,7 @@ impl SessionRuntimeManager {
                     {
                         writer.fail(&reason);
                         reason = startup_capture::acknowledge_cleanup(
+                            &host,
                             vec![owner.take()],
                             &cleanup_tx,
                             Some(Ok(())),
@@ -7319,7 +7476,7 @@ impl SessionRuntimeManager {
                     if let Some(writer) = &capture_writer { writer.fail("startup rejected before capture drain"); }
                     drop(reader);
                     drop(pty_pair);
-                    let reason = startup_capture::acknowledge_cleanup(capture_owner.take(), &cleanup_tx, previous, reason).await;
+                    let reason = startup_capture::acknowledge_cleanup(&host, capture_owner.take(), &cleanup_tx, previous, reason).await;
                     child_spawned = true; // Capture cleanup has supplied the actual acknowledgement.
                     fail_startup!(reason);
                 }};
@@ -7340,37 +7497,42 @@ impl SessionRuntimeManager {
                 // Windows pipe negotiation both happen behind this boundary.
                 #[cfg(all(windows, test))]
                 eprintln!("ConPTY startup pane={pane_id} stage=guardian-spawn-enter");
-                let (returned_pair, spawned) = match tokio::task::spawn_blocking(move || {
-                    #[cfg(windows)]
-                    let observed_slave = native_process::conpty_startup::ObservedSlave {
-                        slave: &pty_pair.slave,
-                        owner: pane_id,
-                    };
-                    #[cfg(windows)]
-                    let spawn_slave: &dyn crate::runtime::pty::Slave = &observed_slave;
-                    #[cfg(not(windows))]
-                    let spawn_slave = &pty_pair.slave;
-                    let spawned = control
-                        .spawn_terminal(
-                            &pty_pair.master,
-                            spawn_slave,
-                            guardian_command
-                                .expect("supervisor preparation retains guardian command"),
-                        )
-                        .map(|child| StartupChild {
-                            child: Some(Box::new(GuardianStartupChild {
-                                child,
-                                execution,
-                                launch_attempted,
-                            })),
-                            runtime,
-                        });
-                    #[cfg(all(windows, test))]
-                    eprintln!(
-                        "ConPTY startup pane={pane_id} stage=guardian-spawn-return ok={}",
-                        spawned.is_ok()
-                    );
-                    (pty_pair, spawned)
+                let (returned_pair, spawned) = match tokio::task::spawn_blocking({
+                    let host = host.clone();
+                    move || {
+                        #[cfg(windows)]
+                        let observed_slave = native_process::conpty_startup::ObservedSlave {
+                            slave: &pty_pair.slave,
+                            owner: pane_id,
+                        };
+                        #[cfg(windows)]
+                        let spawn_slave: &dyn crate::runtime::pty::Slave = &observed_slave;
+                        #[cfg(not(windows))]
+                        let spawn_slave = &pty_pair.slave;
+                        let spawned = control
+                            .spawn_terminal(
+                                &pty_pair.master,
+                                spawn_slave,
+                                guardian_command
+                                    .expect("supervisor preparation retains guardian command"),
+                            )
+                            .map(|child| StartupChild {
+                                child: Some(Box::new(GuardianStartupChild {
+                                    child,
+                                    execution,
+                                    launch_attempted,
+                                    host: host.clone(),
+                                })),
+                                runtime,
+                                host: host.clone(),
+                            });
+                        #[cfg(all(windows, test))]
+                        eprintln!(
+                            "ConPTY startup pane={pane_id} stage=guardian-spawn-return ok={}",
+                            spawned.is_ok()
+                        );
+                        (pty_pair, spawned)
+                    }
                 })
                 .await
                 {
@@ -7383,6 +7545,7 @@ impl SessionRuntimeManager {
                         }
                         drop(reader);
                         let reason = startup_capture::acknowledge_cleanup(
+                            &host,
                             capture_owner.take(),
                             &cleanup_tx,
                             Some(Err(
@@ -7405,7 +7568,7 @@ impl SessionRuntimeManager {
                         pty_pair
                             .slave
                             .spawn_command(command)
-                            .map(StartupChild::new)
+                            .map(|child| StartupChild::new(&host, child))
                             .map_err(anyhow::Error::from)
                     }
                     Err(error) => Err(error),
@@ -7479,6 +7642,7 @@ impl SessionRuntimeManager {
                         execution_for_task
                             .record_error(format!("supervisor target startup failed: {error}"));
                         let reason = cleanup_failed_startup_child_acknowledged(
+                            &host,
                             child.take(),
                             format!("supervisor target startup failed: {error}"),
                             &startup_cleanup_tx,
@@ -7499,6 +7663,7 @@ impl SessionRuntimeManager {
                     .and_then(|pid| resume.bind(pid));
                 if let Err(error) = result {
                     let reason = cleanup_failed_startup_child_acknowledged(
+                        &host,
                         child.take(),
                         format!("application resurrection bind failed: {error}"),
                         &startup_cleanup_tx,
@@ -7521,6 +7686,7 @@ impl SessionRuntimeManager {
             .await;
             let Ok(start_identity) = start_identity else {
                 let reason = cleanup_failed_startup_child_acknowledged(
+                    &host,
                     child.take(),
                     "pane startup cancelled".into(),
                     &startup_cleanup_tx,
@@ -7559,6 +7725,7 @@ impl SessionRuntimeManager {
                 Ok(writer) => Box::new(writer) as Box<dyn std::io::Write + Send>,
                 Err(error) => {
                     let reason = cleanup_failed_startup_child_acknowledged(
+                        &host,
                         child.take(),
                         format!("failed to open PTY writer: {error}"),
                         &startup_cleanup_tx,
@@ -7571,6 +7738,7 @@ impl SessionRuntimeManager {
                     drop(master);
                     let previous = startup_cleanup_tx.borrow().clone();
                     let reason = startup_capture::acknowledge_cleanup(
+                        &host,
                         capture_owner.take(),
                         &cleanup_tx,
                         previous,
@@ -7619,7 +7787,7 @@ impl SessionRuntimeManager {
             let publication_for_waiter = Arc::clone(&publication_for_task);
             let child_waiter = std::thread::Builder::new()
                 .name(format!("bmux-server-pane-{pane_id}-wait"))
-                .spawn(move || {
+                .spawn({ let host = host.clone(); move || {
                     let _thread_guard = PaneBlockingThreadGuard::new(pane_id, "waiter");
                     let _completion = SupervisionCompletion { done: Arc::clone(&child_waiter_done_for_thread), execution: Arc::clone(&execution_for_waiter) };
                     let wait_result = if let Some(control) = &supervisor_control {
@@ -7732,7 +7900,7 @@ impl SessionRuntimeManager {
                         return;
                     }
                     if !program_execution {
-                    push_pane_runtime_notice(
+                    push_pane_runtime_notice(&host,
                         session_id,
                         pane_id,
                         &output_buffer_for_waiter,
@@ -7750,7 +7918,7 @@ impl SessionRuntimeManager {
                     let _ = child_exit_tx.send(ExecutionExitNotice::OwnerExited);
                     child_waiter_done_for_thread.store(true, Ordering::SeqCst);
                         execution_for_waiter.notify();
-                })
+                } })
                 .ok();
             if child_waiter.is_none() {
                 child_waiter_done.store(true, Ordering::SeqCst);
@@ -7768,7 +7936,7 @@ impl SessionRuntimeManager {
             let resurrection_state_for_shutdown = Arc::clone(&resurrection_state_for_reader);
             let reader_thread = std::thread::Builder::new()
                 .name(format!("bmux-server-pane-{pane_id}"))
-                .spawn(move || {
+                .spawn({ let host = host.clone(); move || {
                     let _thread_guard = PaneBlockingThreadGuard::new(pane_id, "reader");
                     let _completion = SupervisionCompletion { done: Arc::clone(&reader_thread_done_for_thread), execution: Arc::clone(&execution_for_reader) };
                     if !publication_for_reader.wait() {
@@ -7839,7 +8007,7 @@ impl SessionRuntimeManager {
                                 let protocol_chunk = projected.as_ref();
                                 #[cfg(not(windows))]
                                 let protocol_chunk = &buffer[..bytes_read];
-                                let (capture_output, capture_reply) = capture_handshake.process_with_fence(protocol_chunk, pane_id, || {
+                                let (capture_output, capture_reply) = capture_handshake.process_with_fence(&host, protocol_chunk, pane_id, || {
                                     let (sent, received) = std::sync::mpsc::sync_channel(1);
                                     fence_input_for_reader.send(PaneRuntimeCommand::InputFence(sent)).is_ok()
                                         && received.recv_timeout(Duration::from_secs(2)).is_ok()
@@ -7850,7 +8018,7 @@ impl SessionRuntimeManager {
                                     } else { break; }
                                 }
                                 let chunk = capture_output.as_slice();
-                                record_lazily_to_all_runtimes(
+                                host.record_lazily(
                                     RecordingEventKind::PaneOutputRaw,
                                     RecordMeta { session_id: Some(session_id.0), pane_id: Some(pane_id), client_id: None },
                                     || RecordingPayload::Bytes { data: chunk.to_vec() },
@@ -7903,13 +8071,13 @@ impl SessionRuntimeManager {
                                             )
                                             .is_ok()
                                     {
-                                        publish_pane_event(PaneEvent::ImageAvailable {
+                                        host.publish_pane_event(PaneEvent::ImageAvailable {
                                             session_id: session_id.0,
                                             pane_id,
                                         });
                                     }
                                     for event in &result.events {
-                                        record_to_all_runtimes(
+                                        host.record(
                                             RecordingEventKind::PaneImage,
                                             image_event_to_recording_payload(event),
                                             RecordMeta {
@@ -7973,7 +8141,7 @@ impl SessionRuntimeManager {
                                 // Metadata callbacks can acquire the runtime manager. Never
                                 // invoke them while holding image/grid/output capture locks.
                                 if !metadata.events.is_empty() {
-                                    let padding_before = pane_padding_state(session_id, pane_id);
+                                    let padding_before = pane_padding_state(&host, session_id, pane_id);
                                     let mut replay_command = None;
                                     if let Ok(mut resurrection_state) =
                                         resurrection_state_for_reader.lock()
@@ -8016,9 +8184,9 @@ impl SessionRuntimeManager {
                                             let _ = writer.flush();
                                         }
                                     }
-                                    mark_snapshot_dirty_flag();
+                                    host.mark_snapshot_dirty();
                                     if let Some(before) = padding_before {
-                                        notify_pane_metadata_changed(session_id, pane_id, before);
+                                        notify_pane_metadata_changed(&host, session_id, pane_id, before);
                                     }
                                 }
                                 // Notify streaming clients that new output is available.
@@ -8033,11 +8201,11 @@ impl SessionRuntimeManager {
                                     )
                                     .is_ok()
                                 {
-                                    publish_pane_event(PaneEvent::OutputAvailable {
+                                    host.publish_pane_event(PaneEvent::OutputAvailable {
                                         session_id: session_id.0,
                                         pane_id,
                                     });
-                                    crate::handlers::output_push::pane_output_available(
+                                    crate::handlers::output_push::pane_output_available(&host,
                                         session_id.0,
                                         pane_id,
                                     );
@@ -8046,7 +8214,7 @@ impl SessionRuntimeManager {
                                 let mut reply = image_protocol_reply;
                                 reply.extend_from_slice(&pointer_reply);
                                 if !reply.is_empty() {
-                                    record_to_all_runtimes(
+                                    host.record(
                                         RecordingEventKind::ProtocolReplyRaw,
                                         RecordingPayload::Bytes {
                                             data: reply.clone(),
@@ -8074,7 +8242,7 @@ impl SessionRuntimeManager {
                     }
                     reader_thread_done_for_thread.store(true, Ordering::SeqCst);
                         execution_for_reader.notify();
-                })
+                } })
                 .ok();
             if reader_thread.is_none() {
                 reader_thread_done.store(true, Ordering::SeqCst);
@@ -8089,7 +8257,7 @@ impl SessionRuntimeManager {
                     "failed to start pane I/O supervision threads".into()
                 )));
                 if let Err(error) =
-                    execution_for_task.signal_owned_group(native_process::StopAction::Force)
+                    execution_for_task.signal_owned_group(&host, native_process::StopAction::Force)
                 {
                     execution_for_task.record_cleanup_error(format!(
                         "startup-thread group cleanup failed: {error}"
@@ -8157,12 +8325,12 @@ impl SessionRuntimeManager {
                                 execution: Arc::clone(&execution_for_task),
                                 resurrection: Arc::clone(&resurrection_state_for_shutdown),
                             };
-                            let cleanup = tokio::task::spawn_blocking(move || {
-                                if let Err(error) = lifetime.execution.signal_owned_group(native_process::StopAction::Force) {
+                            let cleanup = tokio::task::spawn_blocking({ let host = host.clone(); move || {
+                                if let Err(error) = lifetime.execution.signal_owned_group(&host, native_process::StopAction::Force) {
                                     lifetime.execution.record_cleanup_error(format!("reader-failure group cleanup failed: {error}"));
                                 }
                                 lifetime.revoke();
-                            }).await;
+                            } }).await;
                             if let Err(error) = cleanup {
                                 execution_for_task.record_cleanup_error(format!("reader cleanup worker failed: {error}"));
                             }
@@ -8176,19 +8344,19 @@ impl SessionRuntimeManager {
                         // Checkpoint/service IO and helper cleanup must not block
                         // executor workers, otherwise multipane shutdown is serial
                         // even when every pane received stop concurrently.
-                        let stopped = tokio::task::spawn_blocking(move || {
+                        let stopped = tokio::task::spawn_blocking({ let host = host.clone(); move || {
                             let frozen = resurrection.lock()
                                 .map_err(|_| anyhow::anyhow!("resurrection lock poisoned"))
                                 .and_then(|mut state| state.freeze());
                             if let Err(error) = frozen {
                                 execution.record_cleanup_error(format!("checkpoint freeze failed: {error}"));
                             }
-                            if let Err(error) = execution.signal_owned_group(native_process::StopAction::Force) {
+                            if let Err(error) = execution.signal_owned_group(&host, native_process::StopAction::Force) {
                                 execution.record_cleanup_error(format!("group stop failed: {error}"));
                             }
                             let lifetime = PaneLifetime { execution, resurrection };
                             lifetime.revoke();
-                        }).await;
+                        } }).await;
                         if let Err(error) = stopped {
                             execution_for_task.record_cleanup_error(format!("pane stop worker failed: {error}"));
                         }
@@ -8244,7 +8412,7 @@ impl SessionRuntimeManager {
                                     // Sweep while the live PTY/supervisor still
                                     // supplies group authority; killing its leader
                                     // first can strand descendants on direct paths.
-                                    if let Err(error) = execution_for_task.signal_owned_group(native_process::StopAction::Force) {
+                                    if let Err(error) = execution_for_task.signal_owned_group(&host, native_process::StopAction::Force) {
                                         execution_for_task.record_cleanup_error(format!("input-failure group cleanup failed: {error}"));
                                     }
                                     let _ = child_killer.kill();
@@ -8311,8 +8479,8 @@ impl SessionRuntimeManager {
                             .lock()
                             .is_ok_and(|outcome| outcome.2.is_some())
                     {
-                        if let Err(error) =
-                            execution_for_task.signal_owned_group(native_process::StopAction::Force)
+                        if let Err(error) = execution_for_task
+                            .signal_owned_group(&host, native_process::StopAction::Force)
                         {
                             execution_for_task.record_cleanup_error(format!(
                                 "failed-reader group cleanup failed: {error}"
@@ -8325,8 +8493,8 @@ impl SessionRuntimeManager {
                     }
                 }
                 if !execution_for_task.output_drained.load(Ordering::SeqCst) {
-                    if let Err(error) =
-                        execution_for_task.signal_owned_group(native_process::StopAction::Force)
+                    if let Err(error) = execution_for_task
+                        .signal_owned_group(&host, native_process::StopAction::Force)
                     {
                         execution_for_task.record_cleanup_error(format!(
                             "reader-failure group cleanup failed: {error}"
@@ -8392,6 +8560,7 @@ impl SessionRuntimeManager {
             .get(&(session_id, pane_meta.id))
             .copied();
         PaneRuntimeHandle {
+            host: host.clone(),
             lifetime: PaneLifetime {
                 execution: Arc::clone(&execution),
                 resurrection: Arc::clone(&resurrection_state),
@@ -8492,6 +8661,8 @@ impl SessionRuntimeManager {
         direction: PaneSplitDirection,
         ratio: f32,
     ) -> Result<Uuid> {
+        let host = self.host.clone();
+        let host = &host;
         let session = self
             .runtimes
             .get_mut(&session_id)
@@ -8531,7 +8702,7 @@ impl SessionRuntimeManager {
         let pane = prepared.pane.take().expect("prepared split owns pane");
         for client in &session.attached_clients {
             anyhow::ensure!(
-                crate::private_input::register_producer(pane_id, client.0),
+                crate::private_input::register_producer(host, pane_id, client.0),
                 "input producer budget exhausted"
             );
             if let Ok(mut output) = pane.output_buffer.lock() {
@@ -8583,6 +8754,8 @@ impl SessionRuntimeManager {
             bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions,
         >,
     ) -> Result<Uuid> {
+        let host = self.host.clone();
+        let host = &host;
         validate_initial_shell_options(initial_shell.as_ref())?;
         let (target_pane_id, next_pane_name, shell, client_ids) = {
             let session = self
@@ -8636,7 +8809,7 @@ impl SessionRuntimeManager {
         self.register_pane_input(session_id, &handle);
         for client_id in client_ids {
             anyhow::ensure!(
-                crate::private_input::register_producer(pane_id, client_id.0),
+                crate::private_input::register_producer(host, pane_id, client_id.0),
                 "input producer budget exhausted"
             );
             if let Ok(mut output) = handle.output_buffer.lock() {
@@ -8713,6 +8886,8 @@ impl SessionRuntimeManager {
         session_id: SessionId,
         target: Option<PaneSelector>,
     ) -> Result<(Uuid, Option<RemovedRuntime>)> {
+        let host = self.host.clone();
+        let host = &host;
         // Auto-unzoom on layout mutation.
         if let Some(session) = self.runtimes.get_mut(&session_id) {
             session.zoomed_pane_id = None;
@@ -8784,8 +8959,9 @@ impl SessionRuntimeManager {
                 if let Ok(mut index) = pane_input_index.write() {
                     index.remove(&floating_pane_id);
                 }
+                let shutdown_host = host.clone();
                 tokio::spawn(async move {
-                    shutdown_pane_handle(floating_pane).await;
+                    shutdown_pane_handle(&shutdown_host, floating_pane).await;
                 });
             }
         }
@@ -8813,8 +8989,9 @@ impl SessionRuntimeManager {
             }
         }
 
+        let shutdown_host = host.clone();
         tokio::spawn(async move {
-            shutdown_pane_handle(pane).await;
+            shutdown_pane_handle(&shutdown_host, pane).await;
         });
         self.apply_stored_attach_viewport(session_id);
         Ok((pane_id, None))
@@ -8825,6 +9002,8 @@ impl SessionRuntimeManager {
         session_id: SessionId,
         target: Option<PaneSelector>,
     ) -> Result<Uuid> {
+        let host = self.host.clone();
+        let host = &host;
         let _admission = managed_idle::admit()?;
         reservations::check_authority()?;
         let (pane_meta, padding_override, padding_override_persistence) = {
@@ -8873,8 +9052,9 @@ impl SessionRuntimeManager {
                 .ok_or_else(|| anyhow::anyhow!("target pane not found"))?
         };
         self.unregister_pane_input(pane_meta.id);
+        let shutdown_host = host.clone();
         tokio::spawn(async move {
-            shutdown_pane_handle(old_pane).await;
+            shutdown_pane_handle(&shutdown_host, old_pane).await;
         });
 
         let mut new_pane = self.spawn_pane_runtime(session_id, pane_meta, (24, 80));
@@ -8941,7 +9121,7 @@ impl SessionRuntimeManager {
         if session.zoomed_pane_id.is_some() {
             session.zoomed_pane_id = None;
             self.apply_stored_attach_viewport(session_id);
-            mark_snapshot_dirty_flag();
+            self.host.mark_snapshot_dirty();
             Ok((focused, false))
         } else {
             // Only zoom if there are at least 2 tiled panes (zooming a single pane is a no-op).
@@ -8951,7 +9131,7 @@ impl SessionRuntimeManager {
             }
             session.zoomed_pane_id = Some(focused);
             self.apply_stored_attach_viewport(session_id);
-            mark_snapshot_dirty_flag();
+            self.host.mark_snapshot_dirty();
             Ok((focused, true))
         }
     }
@@ -9018,7 +9198,9 @@ impl SessionRuntimeManager {
             anchor_pane_id: matches!(scope, FloatingPaneScope::PerPane)
                 .then_some(anchor_pane_id.unwrap_or(target_pane_id)),
             context_id: matches!(scope, FloatingPaneScope::PerWindow)
-                .then(|| context_id.or_else(|| current_context_id_for_session(session_id)))
+                .then(|| {
+                    context_id.or_else(|| self.host.current_context_id_for_session(session_id))
+                })
                 .flatten(),
             client_id: matches!(scope, FloatingPaneScope::ClientGlobal)
                 .then_some(client_id)
@@ -9269,7 +9451,7 @@ impl SessionRuntimeManager {
             .runtimes
             .get(&session_id)
             .ok_or(SessionRuntimeError::NotFound)?;
-        let context_id = current_context_id_for_session(session_id);
+        let context_id = self.host.current_context_id_for_session(session_id);
         let mut scene = build_attach_scene(
             session_id,
             session,
@@ -9803,8 +9985,10 @@ impl SessionRuntimeManager {
         session_id: SessionId,
         client_id: ClientId,
     ) -> Result<(), SessionRuntimeError> {
+        let host = self.host.clone();
+        let host = &host;
         let _admission = managed_idle::admit().map_err(|_| SessionRuntimeError::Closed)?;
-        if crate::handlers::attach_commands::observer_identity(client_id) {
+        if crate::handlers::attach_commands::observer_identity(host, client_id) {
             return Err(SessionRuntimeError::NotAttached);
         }
         let runtime = self
@@ -9829,7 +10013,7 @@ impl SessionRuntimeManager {
                     .map_err(|_| SessionRuntimeError::Closed)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if !crate::private_input::register_producers(&pane_ids, client_id.0) {
+        if !crate::private_input::register_producers(host, &pane_ids, client_id.0) {
             return Err(SessionRuntimeError::Closed);
         }
         runtime.attached_clients.insert(client_id);
@@ -9879,6 +10063,8 @@ impl SessionRuntimeManager {
     }
 
     fn end_attach(&mut self, session_id: SessionId, client_id: ClientId) {
+        let host = self.host.clone();
+        let host = &host;
         self.cancel_previews_for_client(client_id);
         if let Some(runtime) = self.runtimes.get_mut(&session_id) {
             let removed = runtime.attached_clients.remove(&client_id);
@@ -9887,7 +10073,7 @@ impl SessionRuntimeManager {
                     .scrollback_pins
                     .retain(|(pin_client_id, _), _| *pin_client_id != client_id);
                 for pane in runtime.panes.values_mut() {
-                    crate::private_input::unregister_producer(pane.meta.id, client_id.0);
+                    crate::private_input::unregister_producer(host, pane.meta.id, client_id.0);
                     if let Ok(mut output) = pane.output_buffer.lock() {
                         output.unregister_client(client_id);
                     }
@@ -9910,7 +10096,9 @@ impl SessionRuntimeManager {
         cell_pixel_width: u16,
         cell_pixel_height: u16,
     ) -> Result<(u16, u16, u16, u16, u16, u16), SessionRuntimeError> {
-        if crate::handlers::attach_commands::observer_identity(client_id) {
+        let host = self.host.clone();
+        let host = &host;
+        if crate::handlers::attach_commands::observer_identity(host, client_id) {
             return Err(SessionRuntimeError::NotAttached);
         }
         let runtime = self
@@ -9971,7 +10159,9 @@ impl SessionRuntimeManager {
         client_id: ClientId,
         data: Vec<u8>,
     ) -> Result<(usize, Uuid), SessionRuntimeError> {
-        if crate::handlers::attach_commands::observer_identity(client_id) {
+        let host = self.host.clone();
+        let host = &host;
+        if crate::handlers::attach_commands::observer_identity(host, client_id) {
             return Err(SessionRuntimeError::NotAttached);
         }
         let fallback_focused_pane_id = {
@@ -10007,15 +10197,19 @@ impl SessionRuntimeManager {
         // target. Cross-session surfaces need not belong to the attached runtime.
         // Registration still rejects new producers during an active private scope
         // and invalidates an in-flight barrier when membership changes.
-        if !crate::private_input::register_producer(focused_pane_id, client_id.0) {
+        if !crate::private_input::register_producer(host, focused_pane_id, client_id.0) {
             return Err(SessionRuntimeError::Closed);
         }
         let bytes = data.len();
-        let recording_data =
-            crate::private_input::with_producer_admission(focused_pane_id, client_id.0, || {
-                crate::private_input::with_capture_barrier(focused_pane_id, |capture| {
-                    let recording_data =
-                        capture.then(|| pane_input_recording_data(&data)).flatten();
+        let recording_data = crate::private_input::with_producer_admission(
+            host,
+            focused_pane_id,
+            client_id.0,
+            || {
+                crate::private_input::with_capture_barrier(host, focused_pane_id, |capture| {
+                    let recording_data = capture
+                        .then(|| self.host.pane_input_recording_data(&data))
+                        .flatten();
                     pane.send_input(data, owner_session_id)?;
                     if let Some((handle, data)) = recording_data {
                         record_pane_input_raw(
@@ -10028,8 +10222,9 @@ impl SessionRuntimeManager {
                     }
                     Ok::<(), SessionRuntimeError>(())
                 })
-            })
-            .flatten();
+            },
+        )
+        .flatten();
         match recording_data {
             Some(result) => result?,
             None => return Err(SessionRuntimeError::Closed),
@@ -10113,7 +10308,7 @@ fn pane_state_reason_for_handle(pane: &PaneRuntimeHandle) -> Option<String> {
 // Inline adapter implementing `SessionRuntimeManagerApi` over the
 // server's own `Arc<Mutex<SessionRuntimeManager>>`. Registered into
 // the plugin state registry during `BmuxServer::new` so
-// `session_runtime_handle()` lookups reach this single manager
+// `host.session_runtime_handle()` lookups reach this single manager
 // instance.
 //
 // Kept in `lib.rs` to access the many private fields/methods of
@@ -10130,6 +10325,7 @@ struct ManagerLockHolder {
 
 struct ServerSessionRuntimeAdapter {
     inner: Arc<Mutex<SessionRuntimeManager>>,
+    host: PaneRuntimeHost,
     pane_input_index: Arc<RwLock<BTreeMap<Uuid, PaneInputHandle>>>,
     client_write_permissions: Arc<RwLock<BTreeMap<SessionId, BTreeSet<ClientId>>>>,
     current_holder: Arc<Mutex<Option<ManagerLockHolder>>>,
@@ -10271,13 +10467,14 @@ impl ServerSessionRuntimeAdapter {
     }
 
     fn new(inner: Arc<Mutex<SessionRuntimeManager>>) -> Self {
-        let (pane_input_index, client_write_permissions, retained_pin_bytes) =
+        let (pane_input_index, client_write_permissions, retained_pin_bytes, host) =
             inner.lock().map_or_else(
                 |_| {
                     (
                         Arc::new(RwLock::new(BTreeMap::new())),
                         Arc::new(RwLock::new(BTreeMap::new())),
                         Arc::new(AtomicUsize::new(0)),
+                        PaneRuntimeHost::detached(),
                     )
                 },
                 |manager| {
@@ -10285,11 +10482,13 @@ impl ServerSessionRuntimeAdapter {
                         Arc::clone(&manager.pane_input_index),
                         Arc::clone(&manager.client_write_permissions),
                         Arc::clone(&manager.retained_pin_bytes),
+                        manager.host.clone(),
                     )
                 },
             );
         Self {
             inner,
+            host,
             pane_input_index,
             client_write_permissions,
             current_holder: Arc::new(Mutex::new(None)),
@@ -10353,7 +10552,7 @@ impl ServerSessionRuntimeAdapter {
         let hold = hold_started.elapsed();
         self.mark_holder_end();
         drop(guard);
-        publish_layout_revisions(revisions);
+        publish_layout_revisions(&self.host, revisions);
         if hold > Duration::from_millis(10) {
             warn!(
                 operation,
@@ -10790,7 +10989,8 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         pane_id: Uuid,
         data: Vec<u8>,
     ) -> Result<usize, SessionRuntimeError> {
-        if crate::handlers::attach_commands::observer_identity(client_id) {
+        let host = &self.host;
+        if crate::handlers::attach_commands::observer_identity(host, client_id) {
             return Err(SessionRuntimeError::NotAttached);
         }
         let lookup_started = std::time::Instant::now();
@@ -10820,16 +11020,17 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
 
         // Register only after the authorized visible target has been resolved.
         // The admission barrier below remains authoritative for every write.
-        if !crate::private_input::register_producer(pane_id, client_id.0) {
+        if !crate::private_input::register_producer(host, pane_id, client_id.0) {
             return Err(SessionRuntimeError::Closed);
         }
         let bytes = data.len();
         let send_started = std::time::Instant::now();
         let recording_data =
-            crate::private_input::with_producer_admission(pane_id, client_id.0, || {
-                crate::private_input::with_capture_barrier(pane_id, |capture| {
-                    let recording_data =
-                        capture.then(|| pane_input_recording_data(&data)).flatten();
+            crate::private_input::with_producer_admission(host, pane_id, client_id.0, || {
+                crate::private_input::with_capture_barrier(host, pane_id, |capture| {
+                    let recording_data = capture
+                        .then(|| self.host.pane_input_recording_data(&data))
+                        .flatten();
                     pane.send_input(data)?;
                     if let Some((handle, data)) = recording_data {
                         record_pane_input_raw(&handle, data, owner_session_id, pane_id, client_id);
@@ -10886,7 +11087,8 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         client_id: ClientId,
         allowed: bool,
     ) {
-        if allowed && crate::handlers::attach_commands::observer_identity(client_id) {
+        let host = &self.host;
+        if allowed && crate::handlers::attach_commands::observer_identity(host, client_id) {
             return;
         }
         if let Ok(mut permissions) = self.client_write_permissions.write() {
@@ -10900,7 +11102,8 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
     }
 
     fn client_can_write(&self, session_id: SessionId, client_id: ClientId) -> bool {
-        if crate::handlers::attach_commands::observer_identity(client_id) {
+        let host = &self.host;
+        if crate::handlers::attach_commands::observer_identity(host, client_id) {
             return false;
         }
         self.client_write_permissions
@@ -12112,15 +12315,19 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
     }
 
     fn shutdown_removed_runtime(&self, info: bmux_pane_runtime_state::RemovedRuntimeInfo) {
+        let host = &self.host;
         let Some(handle) = Self::take_shutdown_handle(&info) else {
             return;
         };
         if let Ok(rt) = tokio::runtime::Handle::try_current() {
             tokio::task::block_in_place(|| {
-                rt.block_on(shutdown_runtime_handle(RemovedRuntime {
-                    session_id: info.session_id,
-                    handle,
-                }));
+                rt.block_on(shutdown_runtime_handle(
+                    host,
+                    RemovedRuntime {
+                        session_id: info.session_id,
+                        handle,
+                    },
+                ));
             });
         } else {
             drop(handle);
@@ -12214,13 +12421,16 @@ struct PaneExitEvent {
 }
 
 pub(crate) fn captured_image_window_anchored(
+    host: &PaneRuntimeHost,
     request: &crate::handlers::attach_state::AnchoredHistoryImagesArgs,
     client: ClientId,
 ) -> Result<Vec<u8>, SessionRuntimeError> {
     if request.width == 0 || request.width > 4096 || request.rows == 0 || request.rows > 256 {
         return Err(SessionRuntimeError::ResponseBudgetExceeded);
     }
-    let handle = pane_padding_handle().ok_or(SessionRuntimeError::Closed)?;
+    let handle = host
+        .pane_padding_handle()
+        .ok_or(SessionRuntimeError::Closed)?;
     let pin = {
         let manager = handle.0.lock().map_err(|_| SessionRuntimeError::Closed)?;
         let runtime = manager
@@ -12295,20 +12505,23 @@ pub(crate) fn captured_image_window_anchored(
 }
 
 pub(crate) fn captured_image_window_reflowed(
+    host: &PaneRuntimeHost,
     request: &crate::handlers::attach_state::HistoryImagesArgs,
     client: ClientId,
 ) -> Result<Vec<u8>, SessionRuntimeError> {
-    captured_image_window_impl(request, client, true)
+    captured_image_window_impl(host, request, client, true)
 }
 
 pub(crate) fn captured_image_window(
+    host: &PaneRuntimeHost,
     request: &crate::handlers::attach_state::HistoryImagesArgs,
     client: ClientId,
 ) -> Result<Vec<u8>, SessionRuntimeError> {
-    captured_image_window_impl(request, client, false)
+    captured_image_window_impl(host, request, client, false)
 }
 
 fn captured_image_window_impl(
+    host: &PaneRuntimeHost,
     request: &crate::handlers::attach_state::HistoryImagesArgs,
     client: ClientId,
     reflow: bool,
@@ -12316,7 +12529,9 @@ fn captured_image_window_impl(
     if request.rows == 0 || request.rows > 256 {
         return Err(SessionRuntimeError::ResponseBudgetExceeded);
     }
-    let handle = pane_padding_handle().ok_or(SessionRuntimeError::Closed)?;
+    let handle = host
+        .pane_padding_handle()
+        .ok_or(SessionRuntimeError::Closed)?;
     let pin = {
         let manager = handle.0.lock().map_err(|_| SessionRuntimeError::Closed)?;
         let runtime = manager
@@ -12442,7 +12657,7 @@ fn encode_captured_image_window(
 }
 
 #[derive(Clone)]
-struct SpawnRuntimeHandle(Arc<Mutex<SessionRuntimeManager>>, tokio::runtime::Handle);
+pub(crate) struct SpawnRuntimeHandle(Arc<Mutex<SessionRuntimeManager>>, tokio::runtime::Handle);
 
 #[derive(Debug)]
 struct SpawnFailure(bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError);
@@ -12495,6 +12710,7 @@ pub(crate) fn spawn_wire_error(
 }
 
 pub(crate) fn new_session_v1(
+    host: &PaneRuntimeHost,
     request: bmux_pane_runtime_plugin_api::pane_runtime_spawn_commands_v1::client::NewSessionRequest,
     authorize: impl Fn(Uuid) -> Result<()>,
 ) -> Result<Uuid> {
@@ -12508,11 +12724,11 @@ pub(crate) fn new_session_v1(
             reason: error.to_string(),
         })
     })?;
-    let handle =
-        spawn_runtime_handle().ok_or_else(|| spawn_failure(SpawnError::SourceUnavailable))?;
-    let sessions = bmux_plugin::global_plugin_state_registry()
-        .get::<bmux_session_state::SessionManagerHandle>()
-        .and_then(|entry| entry.read().ok().map(|guard| guard.clone()))
+    let handle = host
+        .spawn_runtime_handle()
+        .ok_or_else(|| spawn_failure(SpawnError::SourceUnavailable))?;
+    let sessions = host
+        .handle::<bmux_session_state::SessionManagerHandle>()
         .ok_or_else(|| spawn_failure(SpawnError::SourceUnavailable))?;
     let runtime = tokio::runtime::Handle::try_current()?;
     anyhow::ensure!(
@@ -12547,6 +12763,7 @@ pub(crate) fn new_session_v1(
 }
 
 pub(crate) fn split_shell_v1(
+    host: &PaneRuntimeHost,
     request: bmux_pane_runtime_plugin_api::pane_runtime_spawn_commands_v1::client::SplitShellRequest,
     authorize: impl Fn() -> Result<()>,
 ) -> Result<Uuid> {
@@ -12570,7 +12787,7 @@ pub(crate) fn split_shell_v1(
             },
         )
     })?;
-    let handle = spawn_runtime_handle().ok_or_else(|| {
+    let handle = host.spawn_runtime_handle().ok_or_else(|| {
         spawn_failure(
             bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError::SourceUnavailable,
         )
@@ -12585,13 +12802,8 @@ pub(crate) fn split_shell_v1(
     )
 }
 
-fn spawn_runtime_handle() -> Option<SpawnRuntimeHandle> {
-    bmux_plugin::global_plugin_state_registry()
-        .get::<SpawnRuntimeHandle>()
-        .and_then(|entry| entry.read().ok().map(|guard| (*guard).clone()))
-}
-
 pub(crate) fn capture_spawn_source(
+    host: &PaneRuntimeHost,
     session_id: Uuid,
     pane_id: Uuid,
 ) -> std::result::Result<
@@ -12599,7 +12811,9 @@ pub(crate) fn capture_spawn_source(
     bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError,
 > {
     use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
-    let handle = spawn_runtime_handle().ok_or(SpawnError::SourceUnavailable)?;
+    let handle = host
+        .spawn_runtime_handle()
+        .ok_or(SpawnError::SourceUnavailable)?;
     handle
         .0
         .try_lock()
@@ -12611,12 +12825,13 @@ pub(crate) fn capture_spawn_source(
 }
 
 pub(crate) fn observe_spawn_directory(
+    host: &PaneRuntimeHost,
     source: &bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SourceExecution,
 ) -> std::result::Result<
     bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::DirectoryObservation,
     bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError,
 > {
-    let handle = spawn_runtime_handle().ok_or(
+    let handle = host.spawn_runtime_handle().ok_or(
         bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError::SourceUnavailable,
     )?;
     observe_spawn_directory_with(&handle.0, source, |pid, identity| {
@@ -12718,25 +12933,23 @@ fn observe_spawn_directory_with(
     })
 }
 
-fn pane_padding_handle() -> Option<PanePaddingRuntimeHandle> {
-    bmux_plugin::global_plugin_state_registry()
-        .get::<PanePaddingRuntimeHandle>()
-        .and_then(|entry| entry.read().ok().map(|guard| (*guard).clone()))
-}
-
 fn pane_padding_state(
+    host: &PaneRuntimeHost,
     session_id: SessionId,
     pane_id: Uuid,
 ) -> Option<crate::padding_api::RuntimePanePaddingState> {
-    pane_padding_handle()?.state(session_id, Some(pane_id)).ok()
+    host.pane_padding_handle()?
+        .state(session_id, Some(pane_id))
+        .ok()
 }
 
 fn notify_pane_metadata_changed(
+    host: &PaneRuntimeHost,
     session_id: SessionId,
     pane_id: Uuid,
     before: crate::padding_api::RuntimePanePaddingState,
 ) {
-    let Some(handle) = pane_padding_handle() else {
+    let Some(handle) = host.pane_padding_handle() else {
         return;
     };
     with_padding_manager(&handle.0, |manager| {
@@ -12750,6 +12963,10 @@ fn reap_exited_pane(
     session_id: SessionId,
     pane_id: Uuid,
 ) {
+    let Ok(host) = manager.lock().map(|manager| manager.host.clone()) else {
+        return;
+    };
+    let host = &host;
     let (state_reason, update_sessions) = manager.lock().map_or_else(
         |_| (None, vec![session_id]),
         |mut manager| {
@@ -12767,17 +12984,17 @@ fn reap_exited_pane(
             (state_reason, update_sessions)
         },
     );
-    publish_pane_event(PaneEvent::Exited {
+    host.publish_pane_event(PaneEvent::Exited {
         session_id: session_id.0,
         pane_id,
         reason: state_reason,
     });
     for session_id in update_sessions {
-        emit_attach_view_changed_for_layout(session_id);
+        host.emit_attach_view_changed_for_layout(session_id);
     }
-    crate::handlers::publish_focus_state_snapshot();
-    crate::handlers::pane_commands::publish_pane_lifecycle_facts();
-    mark_snapshot_dirty_flag();
+    crate::handlers::publish_focus_state_snapshot(host);
+    crate::handlers::pane_commands::publish_pane_lifecycle_facts(host);
+    host.mark_snapshot_dirty();
 }
 
 async fn process_pane_exit_events(
@@ -13047,24 +13264,25 @@ fn with_padding_manager<R>(
     manager: &Mutex<SessionRuntimeManager>,
     operation: impl FnOnce(&mut SessionRuntimeManager) -> Result<R, SessionRuntimeError>,
 ) -> Result<R, SessionRuntimeError> {
-    let (result, revisions) = {
+    let (result, revisions, host) = {
         let mut manager = manager.lock().map_err(|_| SessionRuntimeError::Closed)?;
         let result = operation(&mut manager);
         (
             result,
             std::mem::take(&mut manager.pending_layout_revisions),
+            manager.host.clone(),
         )
     };
     // Publish even after a partial failure: completed mutations still invalidate
     // their projections. Never re-enter the manager from a locked mutation.
-    publish_layout_revisions(revisions);
+    publish_layout_revisions(&host, revisions);
     result
 }
 
-fn publish_layout_revisions(revisions: BTreeMap<SessionId, u64>) {
+fn publish_layout_revisions(host: &PaneRuntimeHost, revisions: BTreeMap<SessionId, u64>) {
     for (session_id, revision) in revisions {
-        publish_pane_event(PaneEvent::AttachViewChanged {
-            context_id: current_context_id_for_session(session_id),
+        host.publish_pane_event(PaneEvent::AttachViewChanged {
+            context_id: host.current_context_id_for_session(session_id),
             session_id: session_id.0,
             revision,
             components: vec![
@@ -13286,7 +13504,10 @@ impl PanePaddingRuntimeHandle {
     }
 }
 
-struct PaneRuntimeShutdown(Arc<Mutex<SessionRuntimeManager>>);
+struct PaneRuntimeShutdown {
+    manager: Arc<Mutex<SessionRuntimeManager>>,
+    host: PaneRuntimeHost,
+}
 
 impl bmux_plugin_runtime::shutdown::ShutdownParticipant for PaneRuntimeShutdown {
     fn id(&self) -> &'static str {
@@ -13302,13 +13523,15 @@ impl bmux_plugin_runtime::shutdown::ShutdownParticipant for PaneRuntimeShutdown 
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = std::result::Result<(), String>> + Send + 'static>,
     > {
-        let manager = Arc::clone(&self.0);
+        let host = self.host.clone();
+        let manager = Arc::clone(&self.manager);
         Box::pin(async move {
+            let host = &host;
             let removed = manager
                 .lock()
                 .map_err(|_| "runtime lock poisoned".to_string())?
                 .remove_all_runtimes();
-            let result = shutdown_removed_runtimes(removed).await;
+            let result = shutdown_removed_runtimes(host, removed).await;
             // Earlier close/remove callers may already have received a failure
             // receipt while their tasks still own OS reapers. They also fence
             // unloading, even though their panes are no longer in the manager.
@@ -13346,6 +13569,7 @@ impl bmux_plugin_runtime::shutdown::ShutdownParticipant for PaneRuntimeShutdown 
 }
 
 async fn shutdown_removed_runtimes(
+    host: &crate::runtime::PaneRuntimeHost,
     removed: Vec<RemovedRuntime>,
 ) -> std::result::Result<(), String> {
     // One cleanup owner across sessions: no runtime can wait for another
@@ -13354,10 +13578,11 @@ async fn shutdown_removed_runtimes(
         .into_iter()
         .flat_map(|runtime| runtime.handle.panes.into_values())
         .collect();
-    shutdown_panes_owned(panes, true).await
+    shutdown_panes_owned(host, panes, true).await
 }
 
-pub fn activate_pane_runtime(
+pub(crate) fn activate_pane_runtime(
+    host: &PaneRuntimeHost,
     config: PaneRuntimePluginConfig,
     padding_config: PanePaddingConfig,
 ) -> std::result::Result<(), String> {
@@ -13369,16 +13594,14 @@ pub fn activate_pane_runtime(
     // activation in the same process (each caller-process command loads a
     // fresh command-local instance) adopts it instead of registering a
     // duplicate participant and a second manager.
-    if let Some(existing) = bmux_plugin::global_plugin_state_registry()
-        .get::<PanePaddingRuntimeHandle>()
-        .and_then(|handle| handle.read().ok().map(|guard| (*guard).clone()))
-    {
+    if let Some(existing) = host.pane_padding_handle() {
         return existing
             .replace_padding_config(padding_config)
             .map_err(|error| error.to_string());
     }
     let (pane_exit_tx, pane_exit_rx) = mpsc::unbounded_channel();
     let manager = Arc::new(Mutex::new(SessionRuntimeManager::new(
+        host.clone(),
         config.shell,
         config.pane_term.clone(),
         protocol_profile_for_term(&config.pane_term),
@@ -13387,30 +13610,34 @@ pub fn activate_pane_runtime(
         padding_config,
         pane_exit_tx,
     )));
-    let lifecycle = bmux_plugin::global_plugin_state_registry()
+    let lifecycle = host
+        .states()
         .get_or_insert_with(bmux_plugin_runtime::shutdown::ShutdownRegistry::default);
     let lifecycle = lifecycle
         .read()
         .map_err(|_| "shutdown registry lock poisoned".to_string())?
         .clone();
-    lifecycle.register(Arc::new(PaneRuntimeShutdown(Arc::clone(&manager))))?;
+    lifecycle.register(Arc::new(PaneRuntimeShutdown {
+        manager: Arc::clone(&manager),
+        host: host.clone(),
+    }))?;
     let runtime_handle = bmux_pane_runtime_state::SessionRuntimeManagerHandle::new(
         ServerSessionRuntimeAdapter::new(Arc::clone(&manager)),
     );
-    bmux_plugin::global_plugin_state_registry()
+    host.states()
         .register::<bmux_pane_runtime_state::SessionRuntimeManagerHandle>(&Arc::new(
             std::sync::RwLock::new(runtime_handle),
         ));
-    bmux_plugin::global_plugin_state_registry().register::<PanePaddingRuntimeHandle>(&Arc::new(
-        std::sync::RwLock::new(PanePaddingRuntimeHandle(Arc::clone(&manager))),
-    ));
+    host.states()
+        .register::<PanePaddingRuntimeHandle>(&Arc::new(std::sync::RwLock::new(
+            PanePaddingRuntimeHandle(Arc::clone(&manager)),
+        )));
 
-    bmux_plugin::global_plugin_state_registry().register::<SpawnRuntimeHandle>(&Arc::new(
-        std::sync::RwLock::new(SpawnRuntimeHandle(
+    host.states()
+        .register::<SpawnRuntimeHandle>(&Arc::new(std::sync::RwLock::new(SpawnRuntimeHandle(
             Arc::clone(&manager),
             tokio::runtime::Handle::current(),
-        )),
-    ));
+        ))));
     let expiry_manager = Arc::clone(&manager);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(PANE_PADDING_PREVIEW_SWEEP_INTERVAL);
@@ -13438,7 +13665,7 @@ pub fn activate_pane_runtime(
         process_pane_exit_events(exit_manager, pane_exit_rx, shutdown_rx).await;
     });
 
-    crate::snapshot::PaneRuntimeStateful::register(move || {
+    crate::snapshot::PaneRuntimeStateful::register(host, move || {
         let states = {
             let manager = manager
                 .lock()
@@ -13469,15 +13696,83 @@ pub fn activate_pane_runtime(
 
 #[cfg(test)]
 mod tests {
+    fn two_instance_config() -> PaneRuntimePluginConfig {
+        PaneRuntimePluginConfig {
+            shell: "/bin/sh".into(),
+            pane_term: "xterm-256color".into(),
+            bracketed_paste: true,
+            shell_integration_root: None,
+        }
+    }
+
+    /// Two pane-runtime instances never share runtime state: each activation
+    /// builds its own manager in the registry it was handed, and per-activation
+    /// state (capture barriers, observers, revisions) lives in that
+    /// activation's host handles, even when two activations share one host
+    /// registry root.
+    #[tokio::test]
+    async fn two_instances_keep_separate_runtime_and_activation_state() {
+        let first = PaneRuntimeHost::detached();
+        let second = PaneRuntimeHost::detached();
+        activate_pane_runtime(&first, two_instance_config(), PanePaddingConfig::default())
+            .expect("first activation");
+        activate_pane_runtime(&second, two_instance_config(), PanePaddingConfig::default())
+            .expect("second activation");
+        let first_manager = first.spawn_runtime_handle().expect("first manager").0;
+        let second_manager = second.spawn_runtime_handle().expect("second manager").0;
+        assert!(!Arc::ptr_eq(&first_manager, &second_manager));
+        assert!(!first.states().shares_entries_with(second.states()));
+
+        // Activations on one host root see the host's communal handles but
+        // keep their own capture barriers and revisions.
+        let root = Arc::new(bmux_plugin::PluginStateRegistry::new());
+        let left = PaneRuntimeHost::new(Arc::clone(&root), None);
+        let right = PaneRuntimeHost::new(Arc::clone(&root), None);
+        let pane = Uuid::new_v4();
+        assert!(crate::private_input::suppress(&left, pane));
+        assert_eq!(
+            crate::private_input::with_capture_barrier(&left, pane, |capture| capture),
+            Some(false)
+        );
+        assert_eq!(
+            crate::private_input::with_capture_barrier(&right, pane, |capture| capture),
+            Some(true)
+        );
+        assert_eq!(left.next_focus_revision(), 1);
+        assert_eq!(left.next_focus_revision(), 2);
+        assert_eq!(right.next_focus_revision(), 1);
+        crate::handlers::attach_commands::mark_test_observer(
+            &left,
+            ClientId(Uuid::new_v4()),
+            SessionId(pane),
+        );
+        assert!(right.observers().lock().unwrap().is_empty());
+
+        for host in [&first, &second] {
+            let removed = host
+                .spawn_runtime_handle()
+                .expect("manager")
+                .0
+                .lock()
+                .expect("manager lock")
+                .remove_all_runtimes();
+            shutdown_removed_runtimes(host, removed).await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn activated_exit_consumer_survives_initialization_and_publishes_exit() {
         let bus = Arc::new(bmux_plugin::EventBus::new());
-        install_activation_events(Some(Arc::clone(&bus)));
+        let host = PaneRuntimeHost::new(
+            Arc::new(bmux_plugin::PluginStateRegistry::new()),
+            Some(Arc::clone(&bus)),
+        );
         bus.register_channel::<PaneEvent>(pane_runtime_events::EVENT_KIND);
         let mut events = bus
             .subscribe::<PaneEvent>(&pane_runtime_events::EVENT_KIND)
             .unwrap();
         activate_pane_runtime(
+            &host,
             PaneRuntimePluginConfig {
                 shell: "/bin/sh".into(),
                 pane_term: "xterm-256color".into(),
@@ -13487,7 +13782,7 @@ mod tests {
             PanePaddingConfig::default(),
         )
         .expect("activate pane runtime");
-        let manager = spawn_runtime_handle().expect("activated runtime").0;
+        let manager = host.spawn_runtime_handle().expect("activated runtime").0;
         let session_id = SessionId(Uuid::new_v4());
         let pane_id = Uuid::new_v4();
         let reason = "activation exit regression";
@@ -13542,6 +13837,7 @@ mod tests {
     async fn missing_helper_rejects_an_ordinary_shell_before_spawn() {
         let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
         let manager = SessionRuntimeManager::new(
+            PaneRuntimeHost::detached(),
             "/bin/sh".into(),
             "xterm-256color".into(),
             protocol_profile_for_term("xterm-256color"),
@@ -13580,6 +13876,7 @@ mod tests {
     async fn missing_helper_rejects_managed_program_before_spawn() {
         let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
         let manager = SessionRuntimeManager::new(
+            PaneRuntimeHost::detached(),
             "/bin/sh".into(),
             "xterm-256color".into(),
             protocol_profile_for_term("xterm-256color"),
@@ -13624,8 +13921,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn owned_terminal_accepts_input_resize_and_explicit_shutdown() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager::new(
+            PaneRuntimeHost::detached(),
             "/bin/sh".into(),
             "xterm-256color".into(),
             protocol_profile_for_term("xterm-256color"),
@@ -13670,9 +13970,12 @@ mod tests {
             assert!(execution.supervisor.lock().unwrap().is_some());
             assert!(!pane.exited.load(Ordering::SeqCst));
             let removed = manager.remove_runtime(session_id).unwrap();
-            tokio::time::timeout(Duration::from_secs(5), shutdown_runtime_handle(removed))
-                .await
-                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                shutdown_runtime_handle(host, removed),
+            )
+            .await
+            .unwrap();
             assert!(execution.output_drained.load(Ordering::SeqCst));
             assert!(!execution.cleanup_failed.load(Ordering::SeqCst));
         }
@@ -13687,6 +13990,7 @@ mod tests {
         let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
         let program = std::env::var("COMSPEC").expect("Windows command interpreter");
         let mut manager = SessionRuntimeManager::new(
+            PaneRuntimeHost::detached(),
             program.clone(),
             "xterm-256color".into(),
             protocol_profile_for_term("xterm-256color"),
@@ -13766,6 +14070,7 @@ mod tests {
         let session_id = SessionId(Uuid::new_v4());
         let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager::new(
+            PaneRuntimeHost::detached(),
             "/bin/sh".into(),
             "xterm-256color".into(),
             protocol_profile_for_term("xterm-256color"),
@@ -13824,6 +14129,7 @@ mod tests {
         std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
         let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager::new(
+            PaneRuntimeHost::detached(),
             shell.to_str().unwrap().into(),
             "xterm-256color".into(),
             protocol_profile_for_term("xterm-256color"),
@@ -14058,10 +14364,15 @@ mod tests {
     struct ExecutionTestCleanup(Arc<execution::ExecutionCapture>);
     impl Drop for ExecutionTestCleanup {
         fn drop(&mut self) {
+            let host = crate::runtime::PaneRuntimeHost::detached();
+            let host = &host;
             if self.0.terminal_owner_retired.load(Ordering::SeqCst) {
                 return;
             }
-            if let Err(error) = self.0.signal_owned_group(native_process::StopAction::Force) {
+            if let Err(error) = self
+                .0
+                .signal_owned_group(host, native_process::StopAction::Force)
+            {
                 eprintln!("test process cleanup requires recovery: {error}");
             }
         }
@@ -14144,6 +14455,8 @@ exit 7"#
     // fixture; splitting it obscures which boundary each assertion observes.
     #[allow(clippy::too_many_lines)]
     async fn ended_terminal_preserves_escaped_descendant_without_late_signal_authority() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         supervisor::install_test_artifact()
             .expect("explicit coordinator-built supervisor artifact");
         let session_id = SessionId(Uuid::new_v4());
@@ -14222,13 +14535,13 @@ exit 7"#
         assert!(
             !pane
                 .execution
-                .signal_owned_group(native_process::StopAction::Cooperative)
+                .signal_owned_group(host, native_process::StopAction::Cooperative)
                 .unwrap()
         );
         assert!(
             !pane
                 .execution
-                .signal_owned_group(native_process::StopAction::Force)
+                .signal_owned_group(host, native_process::StopAction::Force)
                 .unwrap()
         );
         assert_eq!(process_start_identity_for_pid(descendant), Some(identity));
@@ -14624,6 +14937,8 @@ exit 7"#
 
     #[tokio::test]
     async fn begin_attach_registers_input_producer_before_accepting_input() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let session_id = SessionId(Uuid::new_v4());
         let client_id = ClientId(Uuid::new_v4());
         let pane_id = Uuid::new_v4();
@@ -14647,7 +14962,8 @@ exit 7"#
         );
         manager.end_attach(session_id, client_id);
         assert!(
-            crate::private_input::with_producer_admission(pane_id, client_id.0, || ()).is_none()
+            crate::private_input::with_producer_admission(host, pane_id, client_id.0, || ())
+                .is_none()
         );
         assert!(
             manager
@@ -14674,15 +14990,20 @@ exit 7"#
         let nonce = Uuid::new_v4();
         let runtime = runtime_with_panes(&[pane_id]);
         let mut manager = manager_with_runtime(session_id, runtime);
+        // The manager owns the activation host the test observes through.
+        let host = manager.host.clone();
+        let host = &host;
         assert!(crate::private_input::register_producer(
+            host,
             pane_id,
             existing_client
         ));
-        let generation = crate::private_input::begin_barrier(pane_id, nonce, true).unwrap();
+        let generation = crate::private_input::begin_barrier(host, pane_id, nonce, true).unwrap();
 
         // An in-flight barrier may admit membership only by invalidating its
         // proof; a completed private interval must reject a new producer.
         assert!(crate::private_input::acknowledge_producer(
+            host,
             pane_id,
             nonce,
             generation,
@@ -14690,7 +15011,7 @@ exit 7"#
             true
         ));
         assert!(crate::private_input::finish_barrier(
-            pane_id, nonce, generation
+            host, pane_id, nonce, generation
         ));
         assert_eq!(
             manager.begin_attach(session_id, client_id),
@@ -14814,6 +15135,9 @@ exit 7"#
         let mut runtime = runtime_with_panes(&[pane]);
         runtime.attached_clients.insert(owner);
         let mut manager = manager_with_runtime(session, runtime);
+        // The manager owns the activation host the test observes through.
+        let host = manager.host.clone();
+        let host = &host;
         manager
             .set_attach_viewport(session, owner, 120, 40, 2, 7, 3, 11, 0, 0)
             .unwrap();
@@ -14823,7 +15147,7 @@ exit 7"#
             .last_requested_size
             .lock()
             .unwrap();
-        mark_test_observer(observer, session);
+        mark_test_observer(host, observer, session);
         manager.begin_observer_attach(session, observer).unwrap();
         assert_eq!(manager.runtimes[&session].focused_pane_id, focus);
         assert_eq!(manager.runtimes[&session].attach_viewport, viewport);
@@ -14854,17 +15178,20 @@ exit 7"#
             "attach-set-viewport",
         ] {
             assert!(!observer_operation_allowed(
+                host,
                 observer,
                 "attach-runtime-commands",
                 operation
             ));
         }
         assert!(!observer_operation_allowed(
+            host,
             observer,
             "pane-runtime-commands",
             "focus-pane"
         ));
         assert!(!observer_operation_allowed(
+            host,
             observer,
             "pane-runtime-commands",
             "pane-direct-input"
@@ -14896,23 +15223,29 @@ exit 7"#
         let newcomer = ClientId(Uuid::new_v4());
         let panes = [Uuid::new_v4(), Uuid::new_v4()];
         let mut manager = manager_with_runtime(session, runtime_with_panes(&panes));
+        // The manager owns the activation host the test observes through.
+        let host = manager.host.clone();
+        let host = &host;
         manager.begin_attach(session, client).unwrap();
         for pane in panes {
             assert_eq!(
-                crate::private_input::with_producer_admission(pane, client.0, || true),
+                crate::private_input::with_producer_admission(host, pane, client.0, || true),
                 Some(true)
             );
         }
         let nonce = Uuid::new_v4();
-        let generation = crate::private_input::begin_barrier(panes[0], nonce, true).unwrap();
+        let generation = crate::private_input::begin_barrier(host, panes[0], nonce, true).unwrap();
         // Repeated admission/attachment does not clear the private transition.
         manager.begin_attach(session, client).unwrap();
-        assert!(crate::private_input::with_producer_admission(panes[0], client.0, || ()).is_none());
+        assert!(
+            crate::private_input::with_producer_admission(host, panes[0], client.0, || ())
+                .is_none()
+        );
         assert!(crate::private_input::acknowledge_producer(
-            panes[0], nonce, generation, client.0, true
+            host, panes[0], nonce, generation, client.0, true
         ));
         assert!(crate::private_input::finish_barrier(
-            panes[0], nonce, generation
+            host, panes[0], nonce, generation
         ));
         assert!(manager.begin_attach(session, newcomer).is_err());
         assert!(
@@ -14921,7 +15254,8 @@ exit 7"#
                 .contains(&newcomer)
         );
         assert!(
-            crate::private_input::with_producer_admission(panes[0], newcomer.0, || ()).is_none()
+            crate::private_input::with_producer_admission(host, panes[0], newcomer.0, || ())
+                .is_none()
         );
     }
 
@@ -16245,6 +16579,8 @@ exit 7"#
 
     #[tokio::test]
     async fn restart_preserves_padding_override_and_reapplies_its_size() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let session_id = SessionId(Uuid::new_v4());
         let pane_id = Uuid::new_v4();
         let runtime = runtime_with_panes(&[pane_id]);
@@ -16265,7 +16601,7 @@ exit 7"#
         assert_eq!(restarted.padding_override, Some(spec));
         assert_eq!(*restarted.last_requested_size.lock().unwrap(), (38, 40));
         let removed = manager.remove_runtime(session_id).expect("remove runtime");
-        shutdown_runtime_handle(removed).await;
+        shutdown_runtime_handle(host, removed).await;
     }
 
     #[tokio::test]
@@ -16449,6 +16785,8 @@ exit 7"#
 
     #[tokio::test]
     async fn pane_shutdown_pending_startup_keeps_cleanup_authority_with_startup_owner() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let mut pane = dummy_pane(Uuid::new_v4());
         pane.startup = watch::channel(None).1;
         // An external Sweep without a ready guardian would fail. Startup alone
@@ -16466,13 +16804,15 @@ exit 7"#
         let old = std::mem::replace(&mut pane.task, task);
         old.abort();
         let _ = old.await;
-        shutdown_panes_owned(vec![pane], true).await.unwrap();
+        shutdown_panes_owned(host, vec![pane], true).await.unwrap();
         assert!(!execution.cleanup_failed.load(Ordering::SeqCst));
         assert!(state.lock().unwrap().frozen);
     }
 
     #[tokio::test]
     async fn pane_shutdown_starts_every_runtime_before_waiting() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let barrier = Arc::new(tokio::sync::Barrier::new(3));
         let mut removed = Vec::new();
         for _ in 0..3 {
@@ -16494,14 +16834,19 @@ exit 7"#
                 handle: runtime,
             });
         }
-        tokio::time::timeout(Duration::from_secs(2), shutdown_removed_runtimes(removed))
-            .await
-            .expect("cross-runtime cleanup deadlocked")
-            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            shutdown_removed_runtimes(host, removed),
+        )
+        .await
+        .expect("cross-runtime cleanup deadlocked")
+        .unwrap();
     }
 
     #[tokio::test]
     async fn pane_shutdown_error_receipt_retains_owner_until_reaper_settles() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let mut pane = dummy_pane(Uuid::new_v4());
         let execution = Arc::downgrade(&pane.execution);
         let (cleanup, receiver) = watch::channel(None);
@@ -16514,10 +16859,13 @@ exit 7"#
         let old = std::mem::replace(&mut pane.task, task);
         old.abort();
         let _ = old.await;
-        let error = tokio::time::timeout(Duration::from_secs(2), shutdown_panes_result(vec![pane]))
-            .await
-            .expect("failure receipt waited for reaper")
-            .unwrap_err();
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            shutdown_panes_result(host, vec![pane]),
+        )
+        .await
+        .expect("failure receipt waited for reaper")
+        .unwrap_err();
         assert!(error.contains("injected acknowledgement failure"));
         assert!(
             execution.upgrade().is_some(),
@@ -16535,6 +16883,8 @@ exit 7"#
 
     #[tokio::test]
     async fn pane_shutdown_release_waits_for_failed_cleanup_owner() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let pane_id = Uuid::new_v4();
         let mut runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get_mut(&pane_id).unwrap();
@@ -16550,10 +16900,17 @@ exit 7"#
         let old = std::mem::replace(&mut pane.task, task);
         old.abort();
         let _ = old.await;
-        let mut release = tokio::spawn(shutdown_removed_runtimes(vec![RemovedRuntime {
-            session_id: SessionId(Uuid::new_v4()),
-            handle: runtime,
-        }]));
+        let release_host = host.clone();
+        let mut release = tokio::spawn(async move {
+            shutdown_removed_runtimes(
+                &release_host,
+                vec![RemovedRuntime {
+                    session_id: SessionId(Uuid::new_v4()),
+                    handle: runtime,
+                }],
+            )
+            .await
+        });
         acknowledgement.await.unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(20), &mut release)
@@ -16567,6 +16924,8 @@ exit 7"#
 
     #[tokio::test]
     async fn pane_shutdown_starts_every_pane_before_waiting() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let barrier = Arc::new(tokio::sync::Barrier::new(3));
         let mut panes = Vec::new();
         for _ in 0..3 {
@@ -16583,7 +16942,7 @@ exit 7"#
             let _ = old.await;
             panes.push(pane);
         }
-        tokio::time::timeout(Duration::from_secs(2), shutdown_panes(panes))
+        tokio::time::timeout(Duration::from_secs(2), shutdown_panes(host, panes))
             .await
             .expect("serial shutdown deadlocks at the pane barrier");
     }
@@ -16591,11 +16950,16 @@ exit 7"#
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_sweep_revokes_open_slave_even_when_shutdown_waiter_is_cancelled() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         supervisor::install_test_artifact().unwrap();
         let (control, child, pty, endpoint) = tokio::task::spawn_blocking(|| {
             let pty = bmux_pty::PtyPair::open(PtySize { rows: 24, cols: 80 }).unwrap();
-            let (control, command) =
-                supervisor::SupervisorControl::prepare(Uuid::new_v4()).unwrap();
+            let (control, command) = supervisor::SupervisorControl::prepare(
+                &crate::runtime::PaneRuntimeHost::detached(),
+                Uuid::new_v4(),
+            )
+            .unwrap();
             let endpoint = std::path::PathBuf::from(&command.argv()[3]);
             let child = control
                 .spawn_guardian(pty.master.tty_name().unwrap())
@@ -16651,7 +17015,8 @@ exit 7"#
         let old = std::mem::replace(&mut pane.task, task);
         old.abort();
         let _ = old.await;
-        let waiter = tokio::spawn(shutdown_pane_handle(pane));
+        let waiter_host = host.clone();
+        let waiter = tokio::spawn(async move { shutdown_pane_handle(&waiter_host, pane).await });
         start.await.unwrap();
         waiter.abort();
         let _ = waiter.await;
@@ -16690,6 +17055,8 @@ exit 7"#
 
     #[tokio::test]
     async fn cancelled_shutdown_waiter_retains_cleanup_and_freezes_before_release() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let mut pane = dummy_pane(Uuid::new_v4());
         let state = Arc::clone(&pane.resurrection_state);
         let execution = Arc::downgrade(&pane.execution);
@@ -16705,7 +17072,8 @@ exit 7"#
         let old = std::mem::replace(&mut pane.task, task);
         old.abort();
         let _ = old.await;
-        let waiter = tokio::spawn(shutdown_pane_handle(pane));
+        let waiter_host = host.clone();
+        let waiter = tokio::spawn(async move { shutdown_pane_handle(&waiter_host, pane).await });
         start.await.unwrap();
         waiter.abort();
         let _ = waiter.await;
@@ -16869,12 +17237,16 @@ exit 7"#
 
     #[tokio::test]
     async fn shutdown_reports_original_cleanup_cause_once_per_pane() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let id = Uuid::new_v4();
         let pane = dummy_pane(id);
         pane.execution.record_error("earlier reader failure".into());
         pane.execution
             .record_cleanup_error("group stop failed: supervisor disconnected".into());
-        let error = shutdown_panes_owned(vec![pane], true).await.unwrap_err();
+        let error = shutdown_panes_owned(host, vec![pane], true)
+            .await
+            .unwrap_err();
         assert!(error.contains(&id.to_string()));
         assert!(error.contains("cleanup failed for 1 pane(s)"));
         assert_eq!(error.matches("supervisor disconnected").count(), 1);
@@ -16891,6 +17263,7 @@ exit 7"#
         let resurrection_state =
             Arc::new(std::sync::Mutex::new(PaneResurrectionRuntime::default()));
         PaneRuntimeHandle {
+            host: crate::runtime::PaneRuntimeHost::detached(),
             lifetime: PaneLifetime {
                 execution: Arc::clone(&execution),
                 resurrection: Arc::clone(&resurrection_state),
@@ -17133,12 +17506,15 @@ exit 7"#
     #[cfg(unix)]
     #[tokio::test]
     async fn failed_startup_cleanup_reaps_spawned_child() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let pair = bmux_pty::PtyPair::open(PtySize { rows: 24, cols: 80 }).unwrap();
         let mut command = SpawnCommand::new("/bin/sh");
         command.args(["-c", "exec sleep 60"]);
         let child = pair.slave.spawn_command(command).unwrap();
         let pid = child.process_id().unwrap();
-        let reason = cleanup_failed_startup_child(child, "injected startup failure".into()).await;
+        let reason =
+            cleanup_failed_startup_child(host, child, "injected startup failure".into()).await;
         assert_eq!(reason, "injected startup failure");
         assert!(process_start_identity_for_pid(pid).is_none());
     }
@@ -17146,6 +17522,8 @@ exit 7"#
     #[cfg(unix)]
     #[tokio::test]
     async fn failed_startup_cleanup_survives_dropped_waiter() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let pair = bmux_pty::PtyPair::open(PtySize { rows: 24, cols: 80 }).unwrap();
         let mut command = SpawnCommand::new("/bin/sh");
         command.args(["-c", "exec sleep 60"]);
@@ -17154,6 +17532,7 @@ exit 7"#
         let identity = process_start_identity_for_pid(pid).unwrap();
         let (acknowledgement, mut cleanup) = watch::channel(None);
         drop(cleanup_failed_startup_child_acknowledged(
+            host,
             child,
             "cancelled request".into(),
             &acknowledgement,
@@ -17176,13 +17555,15 @@ exit 7"#
     #[cfg(unix)]
     #[tokio::test]
     async fn aborting_startup_owner_reaps_child() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let pair = bmux_pty::PtyPair::open(PtySize { rows: 24, cols: 80 }).unwrap();
         let mut command = SpawnCommand::new("/bin/sh");
         command.args(["-c", "exec sleep 60"]);
         let child = pair.slave.spawn_command(command).unwrap();
         let pid = child.process_id().unwrap();
         let identity = process_start_identity_for_pid(pid).unwrap();
-        let guard = StartupChild::new(child);
+        let guard = StartupChild::new(host, child);
         let (started, ready) = oneshot::channel();
         let task = tokio::spawn(async move {
             let _guard = guard;
@@ -17205,13 +17586,15 @@ exit 7"#
     #[cfg(unix)]
     #[tokio::test]
     async fn startup_child_drop_on_plain_thread_uses_owning_runtime() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let pair = bmux_pty::PtyPair::open(PtySize { rows: 24, cols: 80 }).unwrap();
         let mut command = SpawnCommand::new("/bin/sh");
         command.args(["-c", "exec sleep 60"]);
         let child = pair.slave.spawn_command(command).unwrap();
         let pid = child.process_id().unwrap();
         let identity = process_start_identity_for_pid(pid).unwrap();
-        let guard = StartupChild::new(child);
+        let guard = StartupChild::new(host, child);
         std::thread::spawn(move || drop(guard)).join().unwrap();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
         while process_start_identity_for_pid(pid) == Some(identity) {
@@ -17384,6 +17767,7 @@ exit 7"#
     ) -> SessionRuntimeManager {
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         SessionRuntimeManager {
+            host: crate::runtime::PaneRuntimeHost::detached(),
             padding_config: PanePaddingConfig::default(),
             restored_padding_overrides: BTreeMap::new(),
             padding_previews: BTreeMap::new(),
@@ -17491,6 +17875,8 @@ exit 7"#
 
     #[tokio::test]
     async fn pane_direct_input_resolves_visible_cross_session_owner() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let attach_session_id = SessionId(Uuid::new_v4());
         let owner_session_id = SessionId(Uuid::new_v4());
         let client_id = ClientId(Uuid::new_v4());
@@ -17509,6 +17895,7 @@ exit 7"#
         let pane_input_index = Arc::new(RwLock::new(BTreeMap::from([(
             owner_pane_id,
             PaneInputHandle {
+                host: crate::runtime::PaneRuntimeHost::detached(),
                 session_id: owner_session_id,
                 input_tx,
                 exited: Arc::new(AtomicBool::new(false)),
@@ -17516,6 +17903,7 @@ exit 7"#
         )])));
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let manager = SessionRuntimeManager {
+            host: crate::runtime::PaneRuntimeHost::detached(),
             padding_config: PanePaddingConfig::default(),
             restored_padding_overrides: BTreeMap::new(),
             padding_previews: BTreeMap::new(),
@@ -17540,6 +17928,7 @@ exit 7"#
         // attach path, so establish the same authenticated producer membership
         // before exercising its cross-session routing behavior.
         assert!(crate::private_input::register_producer(
+            host,
             owner_pane_id,
             client_id.0
         ));
@@ -18649,37 +19038,6 @@ exit 7"#
         assert_eq!(adapter.retained_pin_bytes.load(Ordering::Acquire), 0);
     }
 
-    struct HistoryRegistryRestore(
-        Option<Arc<std::sync::RwLock<bmux_pane_runtime_state::SessionRuntimeManagerHandle>>>,
-    );
-
-    impl Drop for HistoryRegistryRestore {
-        fn drop(&mut self) {
-            let registry = bmux_plugin::global_plugin_state_registry();
-            if let Some(previous) = self.0.take() {
-                registry.register(&previous);
-            } else {
-                // The process registry has no removal API. Release captured state
-                // by replacing our fixture with an empty manager.
-                let (tx, _rx) = mpsc::unbounded_channel();
-                let empty = SessionRuntimeManager::new(
-                    "sh".into(),
-                    "xterm-256color".into(),
-                    protocol_profile_for_term("xterm-256color"),
-                    false,
-                    None,
-                    PanePaddingConfig::default(),
-                    tx,
-                );
-                registry.register(&Arc::new(std::sync::RwLock::new(
-                    bmux_pane_runtime_state::SessionRuntimeManagerHandle::new(adapter_for_manager(
-                        empty,
-                    )),
-                )));
-            }
-        }
-    }
-
     fn history_fixture_origin() -> bmux_plugin_sdk::PluginHostServices {
         bmux_plugin_sdk::PluginHostServices::new(
             // The SDK callback contract returns PluginError by value.
@@ -18703,7 +19061,8 @@ exit 7"#
         )
     }
 
-    struct HistoryDispatch(Uuid);
+    /// Routes typed calls through this test's own host handles.
+    struct HistoryDispatch(Uuid, PaneRuntimeHost);
     impl bmux_plugin_sdk::TypedDispatchClient for HistoryDispatch {
         fn invoke_service_raw(
             &mut self,
@@ -18714,8 +19073,10 @@ exit 7"#
             payload: Vec<u8>,
         ) -> impl std::future::Future<Output = bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>>>
         {
+            let host = self.1.clone();
             let mut payload = Some(payload);
             std::future::poll_fn(move |_| {
+                let host = &host;
                 let payload = payload.take().expect("transport polled after completion");
                 std::task::Poll::Ready({
                     use bmux_plugin_sdk::{
@@ -18724,45 +19085,48 @@ exit 7"#
                         ServiceRequest,
                     };
                     assert_eq!(kind, bmux_ipc::InvokeServiceKind::Query);
-                    let response = crate::handlers::route(NativeServiceContext {
-                        host_service_port: Some(history_fixture_origin()),
-                        plugin_id: "bmux.pane-runtime".into(),
-                        request: ServiceRequest {
-                            caller_plugin_id: String::new(),
-                            service: RegisteredService {
-                                capability: HostScope::new(capability).unwrap(),
-                                kind: ServiceKind::Query,
-                                interface_id: interface_id.into(),
-                                provider: ProviderId::Plugin("bmux.pane-runtime".into()),
+                    let response = crate::handlers::route(
+                        host,
+                        NativeServiceContext {
+                            host_service_port: Some(history_fixture_origin()),
+                            plugin_id: "bmux.pane-runtime".into(),
+                            request: ServiceRequest {
+                                caller_plugin_id: String::new(),
+                                service: RegisteredService {
+                                    capability: HostScope::new(capability).unwrap(),
+                                    kind: ServiceKind::Query,
+                                    interface_id: interface_id.into(),
+                                    provider: ProviderId::Plugin("bmux.pane-runtime".into()),
+                                },
+                                operation: operation.into(),
+                                payload,
                             },
-                            operation: operation.into(),
-                            payload,
+                            required_capabilities: vec![],
+                            provided_capabilities: vec![],
+                            services: vec![],
+                            available_capabilities: vec![],
+                            enabled_plugins: vec![],
+                            plugin_search_roots: vec![],
+                            host: HostMetadata {
+                                product_name: "bmux".into(),
+                                product_version: env!("CARGO_PKG_VERSION").into(),
+                                plugin_api_version: ApiVersion::new(1, 0),
+                                plugin_abi_version: ApiVersion::new(1, 0),
+                            },
+                            connection: HostConnectionInfo {
+                                config_dir: String::new(),
+                                config_dir_candidates: vec![],
+                                runtime_dir: String::new(),
+                                data_dir: String::new(),
+                                state_dir: String::new(),
+                            },
+                            settings: None,
+                            plugin_settings_map: std::collections::BTreeMap::new(),
+                            caller_client_id: Some(self.0),
+                            cancellation: bmux_plugin_sdk::CancellationToken::default(),
+                            host_kernel_bridge: None,
                         },
-                        required_capabilities: vec![],
-                        provided_capabilities: vec![],
-                        services: vec![],
-                        available_capabilities: vec![],
-                        enabled_plugins: vec![],
-                        plugin_search_roots: vec![],
-                        host: HostMetadata {
-                            product_name: "bmux".into(),
-                            product_version: env!("CARGO_PKG_VERSION").into(),
-                            plugin_api_version: ApiVersion::new(1, 0),
-                            plugin_abi_version: ApiVersion::new(1, 0),
-                        },
-                        connection: HostConnectionInfo {
-                            config_dir: String::new(),
-                            config_dir_candidates: vec![],
-                            runtime_dir: String::new(),
-                            data_dir: String::new(),
-                            state_dir: String::new(),
-                        },
-                        settings: None,
-                        plugin_settings_map: std::collections::BTreeMap::new(),
-                        caller_client_id: Some(self.0),
-                        cancellation: bmux_plugin_sdk::CancellationToken::default(),
-                        host_kernel_bridge: None,
-                    });
+                    );
                     assert_eq!(response.error, None);
                     Ok(response.payload)
                 })
@@ -18773,19 +19137,6 @@ exit 7"#
     #[cfg(feature = "image-registry")]
     #[tokio::test]
     async fn generated_history_images_survive_live_reset_and_reject_stale_capture() {
-        struct RestorePadding {
-            previous: Option<Arc<std::sync::RwLock<PanePaddingRuntimeHandle>>>,
-            manager: Arc<Mutex<SessionRuntimeManager>>,
-        }
-        impl Drop for RestorePadding {
-            fn drop(&mut self) {
-                if let Some(previous) = self.previous.take() {
-                    bmux_plugin::global_plugin_state_registry().register(&previous);
-                } else {
-                    self.manager.lock().unwrap().runtimes.clear();
-                }
-            }
-        }
         use bmux_pane_runtime_plugin_api::attach_runtime_state::client;
 
         let session = SessionId(Uuid::new_v4());
@@ -18812,17 +19163,14 @@ exit 7"#
         let padding = Arc::new(std::sync::RwLock::new(PanePaddingRuntimeHandle(
             Arc::clone(&manager),
         )));
-        let _restore_padding = RestorePadding {
-            previous: bmux_plugin::global_plugin_state_registry().register(&padding),
-            manager: Arc::clone(&manager),
-        };
+        let host = PaneRuntimeHost::detached();
+        host.states().register(&padding);
         let adapter = ServerSessionRuntimeAdapter::new(manager);
         let handle = Arc::new(std::sync::RwLock::new(
             bmux_pane_runtime_state::SessionRuntimeManagerHandle::new(adapter),
         ));
-        let registry = bmux_plugin::global_plugin_state_registry();
-        let _restore = HistoryRegistryRestore(registry.register(&handle));
-        let mut dispatch = HistoryDispatch(caller.0);
+        host.states().register(&handle);
+        let mut dispatch = HistoryDispatch(caller.0, host.clone());
         let capture = client::attach_history_capture_v1(&mut dispatch, session.0, pane)
             .await
             .unwrap()
@@ -19044,9 +19392,9 @@ exit 7"#
         let handle = Arc::new(std::sync::RwLock::new(
             bmux_pane_runtime_state::SessionRuntimeManagerHandle::new(adapter),
         ));
-        let registry = bmux_plugin::global_plugin_state_registry();
-        let _restore = HistoryRegistryRestore(registry.register(&handle));
-        let mut dispatch = HistoryDispatch(caller.0);
+        let host = PaneRuntimeHost::detached();
+        host.states().register(&handle);
+        let mut dispatch = HistoryDispatch(caller.0, host);
         let capture = client::attach_history_capture_v1(&mut dispatch, session.0, pane)
             .await
             .unwrap()
@@ -20550,6 +20898,7 @@ exit 7"#
 
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let empty_manager = SessionRuntimeManager {
+            host: crate::runtime::PaneRuntimeHost::detached(),
             padding_config: PanePaddingConfig::default(),
             restored_padding_overrides: BTreeMap::new(),
             padding_previews: BTreeMap::new(),
@@ -20609,6 +20958,7 @@ exit 7"#
 
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let manager = SessionRuntimeManager {
+            host: crate::runtime::PaneRuntimeHost::detached(),
             padding_config: PanePaddingConfig::default(),
             restored_padding_overrides: BTreeMap::new(),
             padding_previews: BTreeMap::new(),
@@ -20663,6 +21013,7 @@ exit 7"#
 
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let manager = SessionRuntimeManager {
+            host: crate::runtime::PaneRuntimeHost::detached(),
             padding_config: PanePaddingConfig::default(),
             restored_padding_overrides: BTreeMap::new(),
             padding_previews: BTreeMap::new(),
@@ -20709,6 +21060,7 @@ exit 7"#
         )];
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager {
+            host: crate::runtime::PaneRuntimeHost::detached(),
             padding_config: PanePaddingConfig::default(),
             restored_padding_overrides: BTreeMap::new(),
             padding_previews: BTreeMap::new(),
@@ -20759,6 +21111,7 @@ exit 7"#
             .store(true, Ordering::SeqCst);
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager {
+            host: crate::runtime::PaneRuntimeHost::detached(),
             padding_config: PanePaddingConfig::default(),
             restored_padding_overrides: BTreeMap::new(),
             padding_previews: BTreeMap::new(),
@@ -20801,6 +21154,7 @@ exit 7"#
         )];
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager {
+            host: crate::runtime::PaneRuntimeHost::detached(),
             padding_config: PanePaddingConfig::default(),
             restored_padding_overrides: BTreeMap::new(),
             padding_previews: BTreeMap::new(),
@@ -21500,6 +21854,7 @@ exit 7"#
         let dirty = Arc::new(AtomicBool::new(false));
 
         push_pane_runtime_notice(
+            &PaneRuntimeHost::detached(),
             session_id,
             pane_id,
             &output,
@@ -21616,7 +21971,7 @@ exit 7"#
                 cwd: Some("relative-invalid-path".into()),
             },
         };
-        let result = split_shell_v1(request, || {
+        let result = split_shell_v1(&PaneRuntimeHost::detached(), request, || {
             Err(spawn_failure(SpawnError::Denied {
                 reason: "not authorized".into(),
             }))
@@ -21765,6 +22120,8 @@ exit 7"#
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn managed_idle_fence_serializes_real_prepare_attach_and_restore() {
         const CHILD: &str = "BMUX_TEST_MANAGED_IDLE_AUTHORITY_CHILD";
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         if std::env::var_os(CHILD).is_none() {
             // Exercise the real singleton admission authority in a fresh process;
             // its sticky fence must not poison unrelated concurrently running tests.
@@ -21794,10 +22151,13 @@ exit 7"#
             "detached quiet shell still owns work"
         );
         let runtime = manager.runtimes.remove(&session).unwrap();
-        shutdown_runtime_handle(RemovedRuntime {
-            session_id: session,
-            handle: runtime,
-        })
+        shutdown_runtime_handle(
+            host,
+            RemovedRuntime {
+                session_id: session,
+                handle: runtime,
+            },
+        )
         .await;
         let prepared_connection = Uuid::new_v4();
         let lease = managed_idle::preparation_for_test(prepared_connection, None, false);
@@ -21846,10 +22206,13 @@ exit 7"#
                 .is_err()
         );
         let runtime = manager.runtimes.remove(&session).unwrap();
-        shutdown_runtime_handle(RemovedRuntime {
-            session_id: session,
-            handle: runtime,
-        })
+        shutdown_runtime_handle(
+            host,
+            RemovedRuntime {
+                session_id: session,
+                handle: runtime,
+            },
+        )
         .await;
     }
 
@@ -21887,6 +22250,8 @@ exit 7"#
 
     #[tokio::test]
     async fn readiness_wait_retains_ownership_until_commit() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let pane_id = Uuid::new_v4();
         let mut runtime = runtime_with_panes(&[pane_id]);
         let (ready, receiver) = watch::channel(None);
@@ -21905,10 +22270,13 @@ exit 7"#
         ready.send_replace(Some(Ok(())));
         prepared.wait_until_ready().await.unwrap();
         assert!(prepared.runtime.is_some());
-        shutdown_runtime_handle(RemovedRuntime {
-            session_id: SessionId(Uuid::new_v4()),
-            handle: prepared.take().unwrap(),
-        })
+        shutdown_runtime_handle(
+            host,
+            RemovedRuntime {
+                session_id: SessionId(Uuid::new_v4()),
+                handle: prepared.take().unwrap(),
+            },
+        )
         .await;
     }
 
@@ -21956,13 +22324,19 @@ exit 7"#
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn preowner_launch_failure_retires_owned_guardian_without_inventing_exit() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         supervisor::install_test_artifact()
             .expect("explicit coordinator-built supervisor artifact");
         let execution = Arc::new(execution::ExecutionCapture::default());
         let runtime = tokio::runtime::Handle::current();
         let setup_execution = Arc::clone(&execution);
         let (child, launch_error) = tokio::task::spawn_blocking(move || {
-            let (control, _) = supervisor::SupervisorControl::prepare(Uuid::new_v4()).unwrap();
+            let (control, _) = supervisor::SupervisorControl::prepare(
+                &crate::runtime::PaneRuntimeHost::detached(),
+                Uuid::new_v4(),
+            )
+            .unwrap();
             let control = Arc::new(control);
             *setup_execution.supervisor.lock().unwrap() = Some(Arc::clone(&control));
             // The guardian now opens the slave before readiness. Remove only a
@@ -21978,8 +22352,10 @@ exit 7"#
                     child,
                     execution: Arc::clone(&setup_execution),
                     launch_attempted: Arc::new(AtomicBool::new(true)),
+                    host: PaneRuntimeHost::detached(),
                 })),
                 runtime,
+                host: PaneRuntimeHost::detached(),
             };
             let error = control
                 .start(
@@ -22006,6 +22382,7 @@ exit 7"#
         let (ack, mut acknowledged) = watch::channel(None);
         let mut child = child;
         let cleanup = cleanup_failed_startup_child_on(
+            host,
             &tokio::runtime::Handle::current(),
             child.take(),
             launch_error.clone(),
@@ -22028,6 +22405,8 @@ exit 7"#
 
     #[tokio::test]
     async fn failed_child_cleanup_retains_owner_until_observed_exit() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let exited = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let dropped = Arc::new(AtomicBool::new(false));
         let child = Box::new(DelayedCleanupChild {
@@ -22036,6 +22415,7 @@ exit 7"#
         });
         let (ack, mut observation) = watch::channel(None);
         let waiter = cleanup_failed_startup_child_on(
+            host,
             &tokio::runtime::Handle::current(),
             child,
             "injected startup failure".into(),
@@ -22234,6 +22614,8 @@ exit 7"#
 
     #[tokio::test]
     async fn preparing_fresh_runtime_does_not_register_input_or_manager_state() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let existing = SessionId(Uuid::new_v4());
         let pane_id = Uuid::new_v4();
         let manager = manager_with_runtime(existing, runtime_with_panes(&[pane_id]));
@@ -22249,10 +22631,13 @@ exit 7"#
         assert!(!manager.runtimes.contains_key(&created));
         assert!(manager.pane_input_index.read().unwrap().is_empty());
         assert_eq!(manager.runtimes[&existing].focused_pane_id, pane_id);
-        shutdown_runtime_handle(RemovedRuntime {
-            session_id: created,
-            handle: prepared.take().unwrap(),
-        })
+        shutdown_runtime_handle(
+            host,
+            RemovedRuntime {
+                session_id: created,
+                handle: prepared.take().unwrap(),
+            },
+        )
         .await;
     }
 
@@ -22308,10 +22693,13 @@ exit 7"#
     #[tokio::test]
     async fn fresh_shell_options_reach_pty_without_resurrection_metadata() {
         use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions;
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let directory = tempfile::tempdir().unwrap();
         let session_id = SessionId(Uuid::new_v4());
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager::new(
+            PaneRuntimeHost::detached(),
             "/bin/sh".into(),
             "xterm-256color".into(),
             ProtocolProfile::Bmux,
@@ -22352,8 +22740,8 @@ exit 7"#
             reported_shell_directory(&first_pane, directory.path()),
             reported_shell_directory(&pane, split_directory.path()),
         );
-        shutdown_pane_handle(first_pane).await;
-        shutdown_pane_handle(pane).await;
+        shutdown_pane_handle(host, first_pane).await;
+        shutdown_pane_handle(host, pane).await;
         assert_eq!(
             first_result.unwrap(),
             directory.path().canonicalize().unwrap()
@@ -22370,6 +22758,8 @@ exit 7"#
         use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::{
             InitialShellOptions, SpawnError,
         };
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let session = SessionId(Uuid::new_v4());
         let target = Uuid::new_v4();
         let manager = manager_with_runtime(session, runtime_with_panes(&[target]));
@@ -22428,9 +22818,9 @@ exit 7"#
         let mut panes = runtime.panes;
         let pane = panes.remove(&pane_id).unwrap();
         let reported = reported_shell_directory(&pane, directory.path()).await;
-        shutdown_pane_handle(pane).await;
+        shutdown_pane_handle(host, pane).await;
         for pane in panes.into_values() {
-            shutdown_pane_handle(pane).await;
+            shutdown_pane_handle(host, pane).await;
         }
         assert_eq!(reported.unwrap(), directory.path().canonicalize().unwrap());
     }
@@ -22507,6 +22897,8 @@ exit 7"#
     #[tokio::test]
     async fn fresh_session_options_reach_shell_and_recheck_authority() {
         use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions;
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let existing = SessionId(Uuid::new_v4());
         let target = Uuid::new_v4();
         let manager = manager_with_runtime(existing, runtime_with_panes(&[target]));
@@ -22537,7 +22929,7 @@ exit 7"#
             .unwrap();
         let pane = runtime.panes.into_values().next().unwrap();
         let reported = reported_shell_directory(&pane, directory.path()).await;
-        shutdown_pane_handle(pane).await;
+        shutdown_pane_handle(host, pane).await;
         assert_eq!(reported.unwrap(), directory.path().canonicalize().unwrap());
     }
 
@@ -22580,6 +22972,8 @@ exit 7"#
 
     #[tokio::test]
     async fn restored_shell_metadata_is_healed_before_padding_rule_initial_size() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let configured_shell = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
         let stale_shell = if cfg!(windows) {
             r"C:\definitely\missing\cmd.exe"
@@ -22594,6 +22988,7 @@ exit 7"#
         ))
         .expect("padding settings");
         let mut manager = SessionRuntimeManager::new(
+            PaneRuntimeHost::detached(),
             configured_shell.to_string(),
             "xterm-256color".to_string(),
             ProtocolProfile::Bmux,
@@ -22630,16 +23025,19 @@ exit 7"#
         assert_eq!(restored.meta.shell, configured_shell);
         assert_eq!(*restored.last_requested_size.lock().unwrap(), (38, 40));
         let removed = manager.remove_runtime(session_id).expect("remove runtime");
-        shutdown_runtime_handle(removed).await;
+        shutdown_runtime_handle(host, removed).await;
     }
 
     #[tokio::test]
     async fn restored_override_sets_initial_pty_size_before_runtime_is_available() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let configured_shell = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
         let session_id = SessionId(Uuid::new_v4());
         let pane_id = Uuid::new_v4();
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager::new(
+            PaneRuntimeHost::detached(),
             configured_shell.to_string(),
             "xterm-256color".to_string(),
             ProtocolProfile::Bmux,
@@ -22682,7 +23080,7 @@ exit 7"#
         assert_eq!(restored.padding_override, Some(override_spec));
         assert_eq!(*restored.last_requested_size.lock().unwrap(), (38, 40));
         let removed = manager.remove_runtime(session_id).expect("remove runtime");
-        shutdown_runtime_handle(removed).await;
+        shutdown_runtime_handle(host, removed).await;
     }
 
     #[tokio::test]
@@ -22695,6 +23093,7 @@ exit 7"#
         };
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager::new(
+            PaneRuntimeHost::detached(),
             configured_shell.to_string(),
             "xterm-256color".to_string(),
             ProtocolProfile::Bmux,
@@ -22752,7 +23151,7 @@ exit 7"#
 
         let removed = manager.lock().expect("manager lock").remove_all_runtimes();
         for runtime in removed {
-            shutdown_runtime_handle(runtime).await;
+            shutdown_runtime_handle(&crate::runtime::PaneRuntimeHost::detached(), runtime).await;
         }
     }
 
@@ -22760,6 +23159,7 @@ exit 7"#
     fn pane_input_handle_rejects_exited_pane() {
         let (input_tx, _input_rx) = mpsc::unbounded_channel();
         let handle = PaneInputHandle {
+            host: crate::runtime::PaneRuntimeHost::detached(),
             session_id: SessionId(Uuid::new_v4()),
             input_tx,
             exited: Arc::new(AtomicBool::new(true)),

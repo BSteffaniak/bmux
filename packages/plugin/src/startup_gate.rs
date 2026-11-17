@@ -23,7 +23,7 @@
 //! across multiple signals, and several plugins can gate against
 //! different signals concurrently.
 
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 /// A single registered startup gate. Plugins construct one per signal
@@ -77,6 +77,18 @@ impl StartupReadyGateRegistry {
         }
     }
 
+    /// The gate registry shared by everything holding `states` (one per
+    /// host runtime). Plugins register through their activation's view;
+    /// the host reads the same entry from its root.
+    #[must_use]
+    pub fn in_host(states: &crate::PluginStateRegistry) -> Arc<Self> {
+        states
+            .get_or_insert_with(|| Arc::new(Self::new()))
+            .read()
+            .map(|registry| Arc::clone(&registry))
+            .unwrap_or_default()
+    }
+
     /// Snapshot of currently-registered gates.
     #[must_use]
     pub fn snapshot(&self) -> Vec<StartupReadyGate> {
@@ -94,30 +106,6 @@ impl StartupReadyGateRegistry {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
-}
-
-/// Process-wide shared gate registry.
-#[must_use]
-pub fn global_startup_ready_gate_registry() -> Arc<StartupReadyGateRegistry> {
-    static GLOBAL: OnceLock<Arc<StartupReadyGateRegistry>> = OnceLock::new();
-    GLOBAL
-        .get_or_init(|| Arc::new(StartupReadyGateRegistry::new()))
-        .clone()
-}
-
-/// Register a startup gate on the process-wide registry.
-pub fn register_startup_ready_gate(plugin_id: &str, signal: &str, timeout: Duration) {
-    global_startup_ready_gate_registry().register(StartupReadyGate {
-        plugin_id: plugin_id.to_string(),
-        signal: signal.to_string(),
-        timeout,
-    });
-}
-
-/// Snapshot of currently-registered startup gates.
-#[must_use]
-pub fn registered_startup_ready_gates() -> Vec<StartupReadyGate> {
-    global_startup_ready_gate_registry().snapshot()
 }
 
 #[cfg(test)]

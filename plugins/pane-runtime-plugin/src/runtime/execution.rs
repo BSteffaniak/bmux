@@ -1,5 +1,5 @@
 //! Exact, generation-guarded program execution on the existing PTY runtime.
-use super::{PaneRuntimeCommand, PaneRuntimeHandle, spawn_runtime_handle};
+use super::{PaneRuntimeCommand, PaneRuntimeHandle};
 use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::{
     TerminalExecutionError as ExecutionError, TerminalExecutionPhase as ExecutionPhase,
     TerminalExecutionRef as ExecutionRef, TerminalExecutionScreen as ExecutionScreen,
@@ -257,7 +257,11 @@ impl ExecutionCapture {
     }
 
     #[allow(clippy::too_many_lines)] // Keep the authority lock, effect authorization, and retirement fences in one auditable flow.
-    pub(super) fn signal_owned_group(&self, action: StopAction) -> anyhow::Result<bool> {
+    pub(super) fn signal_owned_group(
+        &self,
+        host: &crate::runtime::PaneRuntimeHost,
+        action: StopAction,
+    ) -> anyhow::Result<bool> {
         // Serialize controls through their acknowledged consumption fence, so
         // concurrent cleanup callers cannot send Sweep after helper retirement.
         let supervisor_guard = self
@@ -295,7 +299,7 @@ impl ExecutionCapture {
             };
             let response = match operation {
                 crate::supervisor_protocol::Operation::RequestStop { mutation_id } => {
-                    match supervisor.stop_and_wait(&mutation_id) {
+                    match supervisor.stop_and_wait(host, &mutation_id) {
                         Ok(response) => response,
                         Err(error) if super::supervisor::transport_uncertain(&error) => {
                             // Revoke the owned lease, never signal a saved PID.
@@ -423,9 +427,12 @@ impl ExecutionCapture {
     }
 }
 
-pub(crate) fn managed_program_ids() -> anyhow::Result<std::collections::BTreeSet<uuid::Uuid>> {
-    let handle =
-        spawn_runtime_handle().ok_or_else(|| anyhow::anyhow!("execution runtime unavailable"))?;
+pub(crate) fn managed_program_ids(
+    host: &crate::runtime::PaneRuntimeHost,
+) -> anyhow::Result<std::collections::BTreeSet<uuid::Uuid>> {
+    let handle = host
+        .spawn_runtime_handle()
+        .ok_or_else(|| anyhow::anyhow!("execution runtime unavailable"))?;
     let manager = handle
         .0
         .lock()
@@ -453,10 +460,13 @@ fn validate_token(actual: uuid::Uuid, reference: &ExecutionRef) -> Result<(), Ex
 }
 
 pub(super) fn with_pane<T>(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &ExecutionRef,
     action: impl FnOnce(&PaneRuntimeHandle) -> Result<T, ExecutionError>,
 ) -> Result<T, ExecutionError> {
-    let handle = spawn_runtime_handle().ok_or(ExecutionError::Unavailable)?;
+    let handle = host
+        .spawn_runtime_handle()
+        .ok_or(ExecutionError::Unavailable)?;
     let manager = handle.0.lock().map_err(failed)?;
     let pane = manager
         .runtimes
@@ -472,8 +482,11 @@ pub(super) fn with_pane<T>(
     action(pane)
 }
 
-pub(crate) fn status(reference: &ExecutionRef) -> Result<ExecutionStatus, ExecutionError> {
-    with_pane(reference, |pane| {
+pub(crate) fn status(
+    host: &crate::runtime::PaneRuntimeHost,
+    reference: &ExecutionRef,
+) -> Result<ExecutionStatus, ExecutionError> {
+    with_pane(host, reference, |pane| {
         let outcome = pane.execution.outcome.lock().map_err(failed)?;
         let error = outcome
             .2
@@ -524,15 +537,19 @@ pub(crate) fn status(reference: &ExecutionRef) -> Result<ExecutionStatus, Execut
     })
 }
 
-pub(crate) fn screen(reference: &ExecutionRef) -> Result<ExecutionScreen, ExecutionError> {
-    screen_mode(reference, true)
+pub(crate) fn screen(
+    host: &crate::runtime::PaneRuntimeHost,
+    reference: &ExecutionRef,
+) -> Result<ExecutionScreen, ExecutionError> {
+    screen_mode(host, reference, true)
 }
 
 /// Only the explicitly negotiated live presentation interface may call this.
 pub(crate) fn live_screen(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &ExecutionRef,
 ) -> Result<(ExecutionScreen, LiveRevision), ExecutionError> {
-    capture_screen(reference, false)
+    capture_screen(host, reference, false)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -545,8 +562,11 @@ pub(crate) struct LiveRevision {
     pub(crate) capture_failure: Option<String>,
 }
 
-pub(crate) fn live_revision(reference: &ExecutionRef) -> Result<LiveRevision, ExecutionError> {
-    with_pane(reference, |pane| {
+pub(crate) fn live_revision(
+    host: &crate::runtime::PaneRuntimeHost,
+    reference: &ExecutionRef,
+) -> Result<LiveRevision, ExecutionError> {
+    with_pane(host, reference, |pane| {
         let _size = pane.last_requested_size.lock().map_err(failed)?;
         let grid = pane.terminal_grid.lock().map_err(failed)?;
         let durable_watermark = match pane.execution.writer().map_err(failed)? {
@@ -565,20 +585,26 @@ pub(crate) fn live_revision(reference: &ExecutionRef) -> Result<LiveRevision, Ex
 }
 
 pub(crate) fn subscribe(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &ExecutionRef,
 ) -> Result<tokio::sync::watch::Receiver<()>, ExecutionError> {
-    with_pane(reference, |pane| Ok(pane.execution.subscribe()))
+    with_pane(host, reference, |pane| Ok(pane.execution.subscribe()))
 }
 
-fn screen_mode(reference: &ExecutionRef, durable: bool) -> Result<ExecutionScreen, ExecutionError> {
-    capture_screen(reference, durable).map(|(screen, _)| screen)
+fn screen_mode(
+    host: &crate::runtime::PaneRuntimeHost,
+    reference: &ExecutionRef,
+    durable: bool,
+) -> Result<ExecutionScreen, ExecutionError> {
+    capture_screen(host, reference, durable).map(|(screen, _)| screen)
 }
 
 fn capture_screen(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &ExecutionRef,
     durable: bool,
 ) -> Result<(ExecutionScreen, LiveRevision), ExecutionError> {
-    let (snapshot, text, revision, barrier) = with_pane(reference, |pane| {
+    let (snapshot, text, revision, barrier) = with_pane(host, reference, |pane| {
         // Capture immutable grid and its cursor in ONE geometry/grid transaction.
         // Encoding after unlocking cannot invalidate this captured publication.
         let _size = pane.last_requested_size.lock().map_err(failed)?;
@@ -693,6 +719,7 @@ fn validate_size(cols: u16, rows: u16) -> Result<(), ExecutionError> {
 }
 
 pub(crate) fn create(
+    host: &crate::runtime::PaneRuntimeHost,
     name: Option<String>,
     options: ProgramOptions,
     authorize: impl Fn(uuid::Uuid) -> anyhow::Result<()> + Send + Sync + 'static,
@@ -702,7 +729,7 @@ pub(crate) fn create(
     authorize(uuid::Uuid::new_v4()).map_err(|error| ExecutionError::Denied {
         reason: error.to_string(),
     })?;
-    let reservation = super::reservations::reserve(uuid::Uuid::new_v4(), options, |id| {
+    let reservation = super::reservations::reserve(host, uuid::Uuid::new_v4(), options, |id| {
         authorize(id).map_err(|error| {
             bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalRecoveryError::Denied {
                 reason: error.to_string(),
@@ -716,7 +743,7 @@ pub(crate) fn create(
     let launch_authorize = Arc::clone(&authorize);
     // Name is presentation only; durable admission owns the identity.
     let receipt =
-        super::reservations::launch_named(&reservation, name, move |id| launch_authorize(id))
+        super::reservations::launch_named(host, &reservation, name, move |id| launch_authorize(id))
             .map_err(|error| failed(format!("{error:?}")))?;
     if receipt.error.is_some() {
         return Err(failed(format!(
@@ -728,12 +755,13 @@ pub(crate) fn create(
 }
 
 pub(super) fn create_reserved(
+    host: &crate::runtime::PaneRuntimeHost,
     name: Option<String>,
     options: ProgramOptions,
     reserved: Option<&ExecutionRef>,
     authorize: impl Fn(uuid::Uuid) -> anyhow::Result<()> + Send + Sync + 'static,
 ) -> Result<ExecutionRef, ExecutionError> {
-    create_reserved_environment(name, options, reserved, None, authorize)
+    create_reserved_environment(host, name, options, reserved, None, authorize)
 }
 
 fn install_environment(
@@ -757,6 +785,7 @@ fn install_environment(
 }
 
 pub(super) fn create_reserved_environment(
+    host: &crate::runtime::PaneRuntimeHost,
     name: Option<String>,
     options: ProgramOptions,
     reserved: Option<&ExecutionRef>,
@@ -775,9 +804,11 @@ pub(super) fn create_reserved_environment(
         reason: error.to_string(),
     })?;
     validate_options(&options)?;
-    let handle =
-        spawn_runtime_handle().ok_or_else(|| failed("pane execution runtime is not registered"))?;
-    let sessions = bmux_plugin::global_plugin_state_registry()
+    let handle = host
+        .spawn_runtime_handle()
+        .ok_or_else(|| failed("pane execution runtime is not registered"))?;
+    let sessions = host
+        .states()
         .get::<bmux_session_state::SessionManagerHandle>()
         .and_then(|entry| entry.read().ok().map(|guard| guard.clone()))
         .ok_or_else(|| failed("session manager is not registered for program creation"))?;
@@ -859,13 +890,17 @@ pub(super) fn create_reserved_environment(
 }
 
 /// Drive plugin-local asynchronous live reads on the persistent owner runtime.
-pub(crate) fn drive_live<F>(future: F) -> Result<F::Output, ExecutionError>
+pub(crate) fn drive_live<F>(
+    host: &crate::runtime::PaneRuntimeHost,
+    future: F,
+) -> Result<F::Output, ExecutionError>
 where
     F: std::future::Future + Send,
     F::Output: Send,
 {
-    let owner =
-        spawn_runtime_handle().ok_or_else(|| failed("pane execution runtime unavailable"))?;
+    let owner = host
+        .spawn_runtime_handle()
+        .ok_or_else(|| failed("pane execution runtime unavailable"))?;
     drive_startup(&owner.1, future)
 }
 
@@ -964,6 +999,7 @@ fn queued_input_authority(
 }
 
 pub(crate) fn send(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &ExecutionRef,
     data: Vec<u8>,
     authority: super::input_authority::InputAuthority,
@@ -974,7 +1010,7 @@ pub(crate) fn send(
             reason: "send exceeds 65536 bytes".into(),
         });
     }
-    with_pane(reference, |pane| {
+    with_pane(host, reference, |pane| {
         if pane.exited.load(Ordering::SeqCst) {
             return Err(failed("execution has exited"));
         }
@@ -986,7 +1022,7 @@ pub(crate) fn send(
         // answers it only while this invocation is retained: settle the write
         // before the invocation closes instead of re-authorizing afterwards.
         let receipt = super::input_authority::settlement_receipt().map_err(failed)?;
-        let recording = super::pane_input_recording_data(&data);
+        let recording = host.pane_input_recording_data(&data);
         pane.input_tx
             .send(PaneRuntimeCommand::AdmittedInput(
                 data, receipt, permit, authority,
@@ -1039,6 +1075,7 @@ fn validate_view_size(cols: u16, rows: u16) -> Result<(), ExecutionError> {
 /// Reserve and drain outside the manager, then revalidate identity and mode in
 /// the same geometry transaction that commits the resize.
 pub(crate) fn resize_alternate(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &ExecutionRef,
     expected_grid_revision: u64,
     cols: u16,
@@ -1047,7 +1084,7 @@ pub(crate) fn resize_alternate(
 ) -> Result<(), ExecutionError> {
     authorize()?;
     validate_view_size(cols, rows)?;
-    let execution = with_pane(reference, |pane| Ok(Arc::clone(&pane.execution)))?;
+    let execution = with_pane(host, reference, |pane| Ok(Arc::clone(&pane.execution)))?;
     let writer = execution.writer().map_err(failed)?;
     let reservation = writer
         .as_ref()
@@ -1073,7 +1110,7 @@ pub(crate) fn resize_alternate(
     }
     authorize()?;
     let mut ticket = None;
-    let result = with_pane(reference, |pane| {
+    let result = with_pane(host, reference, |pane| {
         if !Arc::ptr_eq(&execution, &pane.execution) {
             return Err(ExecutionError::StaleExecution);
         }
@@ -1111,11 +1148,12 @@ pub(crate) fn resize_alternate(
 }
 
 pub(crate) fn resize_ordered(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &ExecutionRef,
     cols: u16,
     rows: u16,
 ) -> Result<(), ExecutionError> {
-    with_pane(reference, |pane| {
+    with_pane(host, reference, |pane| {
         if pane.execution.writer().map_err(failed)?.is_none()
             && pane
                 .execution
@@ -1130,15 +1168,20 @@ pub(crate) fn resize_ordered(
         }
         Ok(())
     })?;
-    resize(reference, cols, rows)
+    resize(host, reference, cols, rows)
 }
 
-pub(crate) fn resize(reference: &ExecutionRef, cols: u16, rows: u16) -> Result<(), ExecutionError> {
+pub(crate) fn resize(
+    host: &crate::runtime::PaneRuntimeHost,
+    reference: &ExecutionRef,
+    cols: u16,
+    rows: u16,
+) -> Result<(), ExecutionError> {
     validate_size(cols, rows)?;
-    let execution = with_pane(reference, |pane| Ok(Arc::clone(&pane.execution)))?;
+    let execution = with_pane(host, reference, |pane| Ok(Arc::clone(&pane.execution)))?;
     let writer = execution.writer().map_err(failed)?;
     if writer.is_none() {
-        return with_pane(reference, |pane| {
+        return with_pane(host, reference, |pane| {
             if pane.exited.load(Ordering::SeqCst) {
                 return Err(failed("execution has exited"));
             }
@@ -1171,7 +1214,7 @@ pub(crate) fn resize(reference: &ExecutionRef, cols: u16, rows: u16) -> Result<(
             .map_err(failed)?;
     }
     let mut ticket = None;
-    let result = with_pane(reference, |pane| {
+    let result = with_pane(host, reference, |pane| {
         if pane.exited.load(Ordering::SeqCst) {
             return Err(failed("execution has exited"));
         }
@@ -1243,6 +1286,7 @@ fn presentation_revision(
 }
 
 pub(crate) fn wait_present(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &ExecutionRef,
     after: Option<&[u8]>,
     timeout_ms: u32,
@@ -1257,17 +1301,18 @@ pub(crate) fn wait_present(
     };
     validate_presentation_wait(after, timeout_ms, max_bytes)?;
     let authority = |error| WaitError::Authority { error };
-    let owner = spawn_runtime_handle()
+    let owner = host
+        .spawn_runtime_handle()
         .ok_or_else(|| authority(failed("pane execution runtime unavailable")))?;
     // This bounded wait owns no cursor or journal. Dropping the client request
     // cannot consume a frame; a retry supplies the same immutable token.
     drive_startup(&owner.1, async {
         let mut changes =
-            with_pane(reference, |pane| Ok(pane.execution.subscribe())).map_err(authority)?;
+            with_pane(host, reference, |pane| Ok(pane.execution.subscribe())).map_err(authority)?;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(timeout_ms));
         loop {
             authorize().map_err(authority)?;
-            let screen = screen(reference).map_err(|error| match error {
+            let screen = screen(host, reference).map_err(|error| match error {
                 ExecutionError::OperationFailed { ref reason }
                     if reason == "screen exceeds response budget" =>
                 {
@@ -1275,7 +1320,7 @@ pub(crate) fn wait_present(
                 }
                 error => authority(error),
             })?;
-            let state = status(reference).map_err(authority)?;
+            let state = status(host, reference).map_err(authority)?;
             let revision = presentation_revision(&screen, &state).map_err(authority)?;
             if after != Some(revision.as_slice()) {
                 let frame = PresentationFrame { revision, screen };
@@ -1301,6 +1346,7 @@ pub(crate) fn wait_present(
 }
 
 pub(crate) fn wait(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &ExecutionRef,
     timeout_ms: u32,
     authorize: impl Fn() -> Result<(), ExecutionError> + Sync,
@@ -1310,16 +1356,17 @@ pub(crate) fn wait(
             reason: "wait timeout exceeds 30000ms; poll again".into(),
         });
     }
-    let owner = spawn_runtime_handle()
+    let owner = host
+        .spawn_runtime_handle()
         .ok_or_else(|| failed("pane execution runtime is not registered for wait"))?;
     drive_startup(&owner.1, async {
         // Subscribe before inspecting authority: a change racing the initial
         // snapshot remains pending, even before changed() is first awaited.
-        let mut changes = with_pane(reference, |pane| Ok(pane.execution.subscribe()))?;
+        let mut changes = with_pane(host, reference, |pane| Ok(pane.execution.subscribe()))?;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(timeout_ms));
         loop {
             authorize()?;
-            let current = status(reference)?;
+            let current = status(host, reference)?;
             if current.error.is_some()
                 || (!matches!(current.phase, ExecutionPhase::Running)
                     && current.output_drained
@@ -1336,11 +1383,13 @@ pub(crate) fn wait(
 }
 
 pub(crate) fn terminate(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &ExecutionRef,
     grace_ms: u32,
     authorize: impl Fn() -> Result<(), ExecutionError> + Sync,
 ) -> Result<ExecutionStatus, ExecutionError> {
-    let owner = spawn_runtime_handle()
+    let owner = host
+        .spawn_runtime_handle()
         .ok_or_else(|| failed("pane execution runtime is not registered for termination"))?;
     drive_startup(&owner.1, async {
         if grace_ms > 30_000 {
@@ -1348,18 +1397,20 @@ pub(crate) fn terminate(
                 reason: "termination grace exceeds 30000ms".into(),
             });
         }
-        let mut changes = with_pane(reference, |pane| Ok(pane.execution.subscribe()))?;
+        let mut changes = with_pane(host, reference, |pane| Ok(pane.execution.subscribe()))?;
         let signal = |signal| {
             authorize()?;
-            with_pane(reference, |pane| {
-                pane.execution.signal_owned_group(signal).map_err(failed)
+            with_pane(host, reference, |pane| {
+                pane.execution
+                    .signal_owned_group(host, signal)
+                    .map_err(failed)
             })
         };
         signal(StopAction::Cooperative)?;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(grace_ms));
         loop {
             authorize()?;
-            let settled = with_pane(reference, |pane| {
+            let settled = with_pane(host, reference, |pane| {
                 Ok(pane.exited.load(Ordering::SeqCst)
                     && pane.execution.output_drained.load(Ordering::SeqCst))
             })?;
@@ -1372,22 +1423,23 @@ pub(crate) fn terminate(
         }
         // Failed phase is not evidence of process death.
         signal(StopAction::Force)?;
-        await_cleanup_acknowledgement(reference, &authorize).await?;
+        await_cleanup_acknowledgement(host, reference, &authorize).await?;
         authorize()?;
-        status(reference)
+        status(host, reference)
     })?
 }
 
 async fn await_cleanup_acknowledgement(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &ExecutionRef,
     authorize: impl Fn() -> Result<(), ExecutionError>,
 ) -> Result<(), ExecutionError> {
-    let mut cleanup = with_pane(reference, |pane| Ok(pane.cleanup.clone()))?;
+    let mut cleanup = with_pane(host, reference, |pane| Ok(pane.cleanup.clone()))?;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         authorize()?;
         // Revalidate the generation and session after every wake.
-        with_pane(reference, |_| Ok(()))?;
+        with_pane(host, reference, |_| Ok(()))?;
         match cleanup.borrow_and_update().clone() {
             Some(Ok(())) => return Ok(()),
             Some(Err(error)) => return Err(failed(error)),
@@ -1416,12 +1468,15 @@ async fn await_cleanup_acknowledgement(
 /// application consumption. Admission is bounded and the manager lock is released
 /// before waiting. A timeout is uncertain and must not trigger an automatic retry.
 pub(super) fn send_human_recorded_acknowledged(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &ExecutionRef,
     data: Vec<u8>,
     authority: super::input_authority::InputAuthority,
 ) -> Result<(), ExecutionError> {
-    let sink = super::recording_sink().ok_or_else(|| failed("recording sink unavailable"))?;
-    send_human_acknowledged(reference, data.clone(), authority)?;
+    let sink = host
+        .recording_sink()
+        .ok_or_else(|| failed("recording sink unavailable"))?;
+    send_human_acknowledged(host, reference, data.clone(), authority)?;
     // Fresh-effect caller owns deduplication. This enqueue is volatile; failure
     // after PTY write is uncertain and must close the epoch, never replay input.
     let result = sink.0.record_checked(
@@ -1434,7 +1489,7 @@ pub(super) fn send_human_recorded_acknowledged(
         },
     );
     if let Err(error) = result {
-        with_pane(reference, |pane| {
+        with_pane(host, reference, |pane| {
             pane.execution
                 .fail_capture(&format!("human input recording failed: {error}"));
             Ok(())
@@ -1445,6 +1500,7 @@ pub(super) fn send_human_recorded_acknowledged(
 }
 
 pub(super) fn send_human_acknowledged(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &ExecutionRef,
     data: Vec<u8>,
     authority: super::input_authority::InputAuthority,
@@ -1454,17 +1510,18 @@ pub(super) fn send_human_acknowledged(
             reason: "human input must contain 1..=16384 bytes".into(),
         });
     }
-    send_acknowledged(reference, data, authority)
+    send_acknowledged(host, reference, data, authority)
 }
 
 pub(super) fn send_acknowledged(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &ExecutionRef,
     data: Vec<u8>,
     authority: super::input_authority::InputAuthority,
 ) -> Result<(), ExecutionError> {
     authority.check().map_err(failed)?;
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    with_pane(reference, |pane| {
+    with_pane(host, reference, |pane| {
         if pane.exited.load(Ordering::SeqCst)
             || pane.execution.terminal_session_ended.load(Ordering::SeqCst)
             || pane.execution.capture_failure().is_some()
@@ -1548,13 +1605,15 @@ mod tests {
 
     #[test]
     fn alternate_resize_authorization_precedes_runtime_access() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let execution = super::ExecutionRef {
             session_id: uuid::Uuid::new_v4(),
             pane_id: uuid::Uuid::new_v4(),
             execution_token: uuid::Uuid::new_v4(),
         };
         assert!(matches!(
-            super::resize_alternate(&execution, 0, 80, 24, || {
+            super::resize_alternate(host, &execution, 0, 80, 24, || {
                 Err(super::ExecutionError::Denied {
                     reason: "revoked".into(),
                 })
@@ -1806,14 +1865,20 @@ mod tests {
 
     #[test]
     fn concurrent_termination_after_natural_session_end_does_not_dispatch() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let capture = std::sync::Arc::new(super::ExecutionCapture::default());
         // A missing PTY would be a recovery error if signaling fell through.
         capture.managed_program.store(true, super::Ordering::SeqCst);
         let fence = capture.supervisor.lock().unwrap();
         let first = std::sync::Arc::clone(&capture);
         let second = std::sync::Arc::clone(&capture);
-        let a = std::thread::spawn(move || first.signal_owned_group(StopAction::Force));
-        let b = std::thread::spawn(move || second.signal_owned_group(StopAction::Cooperative));
+        let (first_host, second_host) = (host.clone(), host.clone());
+        let a =
+            std::thread::spawn(move || first.signal_owned_group(&first_host, StopAction::Force));
+        let b = std::thread::spawn(move || {
+            second.signal_owned_group(&second_host, StopAction::Cooperative)
+        });
         capture
             .terminal_session_ended
             .store(true, super::Ordering::SeqCst);
@@ -1830,12 +1895,18 @@ mod tests {
 
     #[test]
     fn concurrent_termination_after_natural_retirement_does_not_dispatch() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let capture = std::sync::Arc::new(super::ExecutionCapture::default());
         let fence = capture.supervisor.lock().unwrap();
         let first = std::sync::Arc::clone(&capture);
         let second = std::sync::Arc::clone(&capture);
-        let a = std::thread::spawn(move || first.signal_owned_group(StopAction::Force));
-        let b = std::thread::spawn(move || second.signal_owned_group(StopAction::Cooperative));
+        let (first_host, second_host) = (host.clone(), host.clone());
+        let a =
+            std::thread::spawn(move || first.signal_owned_group(&first_host, StopAction::Force));
+        let b = std::thread::spawn(move || {
+            second.signal_owned_group(&second_host, StopAction::Cooperative)
+        });
         // Same fence used by natural retirement and side-effect authorization.
         capture
             .terminal_owner_retired
@@ -2000,6 +2071,8 @@ mod tests {
 
     #[test]
     fn program_denial_precedes_filesystem_and_runtime_observation() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let options = ProgramOptions {
             program: String::new(),
             args: Vec::new(),
@@ -2009,7 +2082,7 @@ mod tests {
             rows: 0,
         };
         assert!(matches!(
-            create(None, options, |_| Err(anyhow::anyhow!("denied"))),
+            create(host, None, options, |_| Err(anyhow::anyhow!("denied"))),
             Err(ExecutionError::Denied { .. })
         ));
     }

@@ -81,13 +81,14 @@ pub(crate) fn settlement_receipt() -> Result<std::sync::mpsc::SyncSender<Result<
 }
 
 pub(crate) fn settled_local_command(
+    host: &crate::runtime::PaneRuntimeHost,
     bytes: Vec<u8>,
     session: bmux_session_models::SessionId,
 ) -> Result<super::PaneRuntimeCommand, super::SessionRuntimeError> {
     WRITE_RECEIPTS.with(|slot| {
         let mut receipts = slot.borrow_mut();
         let Some(receipts) = receipts.as_mut() else {
-            return Ok(local_command(bytes, session));
+            return Ok(local_command(host, bytes, session));
         };
         let prepare = || {
             if receipts.len() >= MAX_PENDING_WRITES - 1 || bytes.len() > MAX_INPUT_BYTES {
@@ -103,7 +104,7 @@ pub(crate) fn settled_local_command(
             let authority = LOCAL_INPUT
                 .with(|slot| {
                     slot.borrow().as_ref().map(|context| {
-                        crate::handlers::execution::local_input_authority(context, session.0)
+                        crate::handlers::execution::local_input_authority(host, context, session.0)
                     })
                 })
                 .ok_or_else(|| "PTY input invocation missing".to_string())?;
@@ -151,13 +152,14 @@ pub(crate) fn with_local<T>(
 }
 
 pub(crate) fn local_command(
+    host: &crate::runtime::PaneRuntimeHost,
     bytes: Vec<u8>,
     session: bmux_session_models::SessionId,
 ) -> super::PaneRuntimeCommand {
     LOCAL_INPUT.with(|slot| match slot.borrow().as_ref() {
         Some(context) => super::PaneRuntimeCommand::AuthorizedInput(
             bytes,
-            crate::handlers::execution::local_input_authority(context, session.0),
+            crate::handlers::execution::local_input_authority(host, context, session.0),
         ),
         // In-process local input has no remote service caller. Remote legacy
         // routes are rejected at ingress, independently of permissions plugins.

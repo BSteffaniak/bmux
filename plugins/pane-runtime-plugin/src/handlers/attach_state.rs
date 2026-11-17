@@ -36,6 +36,7 @@ pub struct HistorySliceArgs {
 }
 
 pub fn history_slice(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &HistorySliceArgs,
     ctx: &NativeServiceContext,
 ) -> Result<
@@ -43,9 +44,11 @@ pub fn history_slice(
     bmux_pane_runtime_plugin_api::attach_runtime_state::HistoryFetchError,
 > {
     use bmux_pane_runtime_plugin_api::attach_runtime_state::{HistoryEnd, HistoryFetchError};
-    let handle = super::session_runtime_handle().ok_or_else(|| HistoryFetchError::Runtime {
-        error: failed("runtime unavailable"),
-    })?;
+    let handle = host
+        .registered_session_runtime()
+        .ok_or_else(|| HistoryFetchError::Runtime {
+            error: failed("runtime unavailable"),
+        })?;
     let (encoded, next_cell_offset, end_kind) = handle
         .0
         .attach_history_slice(
@@ -90,6 +93,7 @@ pub fn history_slice(
 }
 
 pub fn main_row_slice(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &HistorySliceArgs,
     ctx: &NativeServiceContext,
 ) -> Result<
@@ -97,9 +101,11 @@ pub fn main_row_slice(
     bmux_pane_runtime_plugin_api::attach_runtime_state::HistoryFetchError,
 > {
     use bmux_pane_runtime_plugin_api::attach_runtime_state::{HistoryEnd, HistoryFetchError};
-    let handle = super::session_runtime_handle().ok_or_else(|| HistoryFetchError::Runtime {
-        error: failed("runtime unavailable"),
-    })?;
+    let handle = host
+        .registered_session_runtime()
+        .ok_or_else(|| HistoryFetchError::Runtime {
+            error: failed("runtime unavailable"),
+        })?;
     let (encoded, next_cell_offset, end_kind) = handle
         .0
         .attach_main_row_slice(
@@ -282,10 +288,12 @@ struct LayoutPayload {
 }
 
 pub fn attach_layout_state(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &AttachLayoutArgs,
     ctx: &NativeServiceContext,
 ) -> Result<AttachLayoutRecord, AttachStateError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
     let state = handle
         .0
@@ -315,10 +323,12 @@ struct SnapshotLayoutPayload {
 }
 
 pub fn attach_snapshot_state(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &AttachSnapshotArgs,
     ctx: &NativeServiceContext,
 ) -> Result<AttachSnapshotRecord, AttachStateError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
     let state = handle
         .0
@@ -356,10 +366,12 @@ pub fn attach_snapshot_state(
 }
 
 pub fn attach_pane_snapshot_state(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &AttachPaneSnapshotArgs,
     ctx: &NativeServiceContext,
 ) -> Result<AttachPaneSnapshotRecord, AttachStateError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
     let state = handle
         .0
@@ -386,10 +398,12 @@ pub fn attach_pane_snapshot_state(
 }
 
 pub fn attach_pane_output_batch(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &AttachPaneOutputBatchArgs,
     ctx: &NativeServiceContext,
 ) -> Result<AttachPaneOutputBatch, AttachStateError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
     let (chunks, output_still_pending) = handle.0.attach_pane_output_batch_with_dirty_check(
         SessionId(req.session_id),
@@ -413,14 +427,14 @@ pub struct AttachPaneOutputPushArgs {
 
 /// Push the caller's output for the panes instead of it reading them (see `output_push`).
 pub fn attach_pane_output_push(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &AttachPaneOutputPushArgs,
     ctx: &NativeServiceContext,
 ) -> Result<AttachPaneOutputPush, AttachStateError> {
-    let client = ctx
-        .caller_client_id
-        .ok_or(AttachStateError::NotAttached)?;
+    let client = ctx.caller_client_id.ok_or(AttachStateError::NotAttached)?;
     Ok(AttachPaneOutputPush {
         enabled: super::output_push::subscribe(
+            host,
             client,
             req.session_id,
             req.pane_ids.clone(),
@@ -430,9 +444,11 @@ pub fn attach_pane_output_push(
 }
 
 pub fn pane_output_cursor_state(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &PaneOutputCursorArgs,
 ) -> Result<PaneOutputCursorRead, AttachStateError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
     let read = handle
         .0
@@ -454,9 +470,11 @@ pub fn pane_output_cursor_state(
 }
 
 pub fn pane_grid_snapshot_state(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &PaneGridSnapshotArgs,
 ) -> Result<PaneGridSnapshot, AttachStateError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
     let state = handle
         .0
@@ -480,10 +498,12 @@ pub fn pane_grid_snapshot_state(
 }
 
 pub fn attach_pane_grid_snapshot_state(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &AttachPaneGridSnapshotArgs,
     ctx: &NativeServiceContext,
 ) -> Result<AttachPaneGridSnapshot, AttachStateError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
     let state = handle
         .0
@@ -508,10 +528,12 @@ pub fn attach_pane_grid_snapshot_state(
 }
 
 pub fn attach_pane_grid_window_state(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &AttachPaneGridWindowArgs,
     ctx: &NativeServiceContext,
 ) -> Result<AttachPaneGridWindow, AttachStateError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
     let windows = req
         .windows
@@ -550,10 +572,12 @@ pub fn attach_pane_grid_window_state(
 }
 
 pub fn attach_pane_scrollback_pin(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &AttachPaneScrollbackPinArgs,
     ctx: &NativeServiceContext,
 ) -> Result<PaneScrollbackPin, AttachStateError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
     let pin = handle
         .0
@@ -573,11 +597,14 @@ pub fn attach_pane_scrollback_pin(
 }
 
 pub fn history_capture(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &AttachPaneScrollbackPinArgs,
     ctx: &NativeServiceContext,
 ) -> Result<bmux_pane_runtime_plugin_api::attach_runtime_state::HistoryCaptureV1, AttachStateError>
 {
-    let handle = super::session_runtime_handle().ok_or_else(|| failed("runtime unavailable"))?;
+    let handle = host
+        .registered_session_runtime()
+        .ok_or_else(|| failed("runtime unavailable"))?;
     let captured = handle
         .0
         .attach_scrollback_pin(
@@ -606,10 +633,12 @@ pub fn history_capture(
 }
 
 pub fn attach_pane_scrollback_unpin(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &AttachPaneScrollbackUnpinArgs,
     ctx: &NativeServiceContext,
 ) -> Result<PaneScrollbackUnpinAck, AttachStateError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
     let ack = handle
         .0
@@ -630,10 +659,12 @@ pub fn attach_pane_scrollback_unpin(
 /// `attach-pane-grid-delta-state` delivers revisioned structured grid
 /// deltas serialized as JSON (`Vec<GridDeltaBatch>`) per pane.
 pub fn attach_pane_grid_delta_state(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &AttachPaneGridDeltaArgs,
     ctx: &NativeServiceContext,
 ) -> Result<AttachPaneGridDelta, AttachStateError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
     let state = handle
         .0
@@ -684,10 +715,11 @@ pub struct AnchoredHistoryImagesArgs {
 }
 
 pub fn history_images_anchored(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &AnchoredHistoryImagesArgs,
     ctx: &NativeServiceContext,
 ) -> Result<bmux_pane_runtime_plugin_api::attach_runtime_state::HistoryImagesV1, AttachStateError> {
-    let encoded = crate::runtime::captured_image_window_anchored(req, caller_client_id(ctx))
+    let encoded = crate::runtime::captured_image_window_anchored(host, req, caller_client_id(ctx))
         .map_err(|error| failed(error.to_string()))?;
     Ok(
         bmux_pane_runtime_plugin_api::attach_runtime_state::HistoryImagesV1 {
@@ -698,10 +730,11 @@ pub fn history_images_anchored(
 }
 
 pub fn history_images(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &HistoryImagesArgs,
     ctx: &NativeServiceContext,
 ) -> Result<bmux_pane_runtime_plugin_api::attach_runtime_state::HistoryImagesV1, AttachStateError> {
-    let encoded = crate::runtime::captured_image_window(req, caller_client_id(ctx))
+    let encoded = crate::runtime::captured_image_window(host, req, caller_client_id(ctx))
         .map_err(|error| failed(error.to_string()))?;
     Ok(
         bmux_pane_runtime_plugin_api::attach_runtime_state::HistoryImagesV1 {
@@ -712,10 +745,11 @@ pub fn history_images(
 }
 
 pub fn history_images_reflowed(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &HistoryImagesArgs,
     ctx: &NativeServiceContext,
 ) -> Result<bmux_pane_runtime_plugin_api::attach_runtime_state::HistoryImagesV1, AttachStateError> {
-    let encoded = crate::runtime::captured_image_window_reflowed(req, caller_client_id(ctx))
+    let encoded = crate::runtime::captured_image_window_reflowed(host, req, caller_client_id(ctx))
         .map_err(|error| failed(error.to_string()))?;
     Ok(
         bmux_pane_runtime_plugin_api::attach_runtime_state::HistoryImagesV1 {
@@ -726,10 +760,12 @@ pub fn history_images_reflowed(
 }
 
 pub fn attach_pane_images(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &AttachPaneImagesArgs,
     _ctx: &NativeServiceContext,
 ) -> Result<AttachPaneImages, AttachStateError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
     let deltas = handle.0.attach_pane_image_deltas(
         SessionId(req.session_id),

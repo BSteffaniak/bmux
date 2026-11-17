@@ -58,11 +58,14 @@ fn validate(
     Ok(())
 }
 
-fn cursor(reference: &TerminalExecutionRef) -> Result<LiveCursor, LiveError> {
-    let revision = execution::live_revision(reference).map_err(authority)?;
+fn cursor(
+    host: &crate::runtime::PaneRuntimeHost,
+    reference: &TerminalExecutionRef,
+) -> Result<LiveCursor, LiveError> {
+    let revision = execution::live_revision(host, reference).map_err(authority)?;
     // Durable status is deliberately sampled separately. It is not the grid's
     // projected watermark, nor a claim that every displayed byte is persisted.
-    let status = execution::status(reference).map_err(authority)?;
+    let status = execution::status(host, reference).map_err(authority)?;
     Ok(LiveCursor {
         execution: reference.clone(),
         source_epoch: reference.execution_token,
@@ -97,6 +100,7 @@ fn same_cursor(a: &LiveCursor, b: &LiveCursor) -> bool {
 }
 
 fn read_current(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &TerminalExecutionRef,
     after: Option<&LiveCursor>,
     max_bytes: u32,
@@ -104,8 +108,8 @@ fn read_current(
     read_current_with(
         after,
         max_bytes,
-        || cursor(reference),
-        || execution::live_screen(reference),
+        || cursor(host, reference),
+        || execution::live_screen(host, reference),
     )
 }
 
@@ -164,12 +168,13 @@ fn read_current_with(
 /// # Errors
 /// Returns authorization, coherence, budget or runtime-bridge failures.
 pub(crate) fn read(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &TerminalExecutionRef,
     after: Option<&LiveCursor>,
     max_bytes: u32,
     authorize: impl Fn() -> Result<(), TerminalExecutionError> + Sync,
 ) -> Result<Option<LiveFrame>, LiveError> {
-    wait_present(reference, after, 0, max_bytes, authorize)
+    wait_present(host, reference, after, 0, max_bytes, authorize)
 }
 
 /// Wait on the persistent pane owner runtime, never a transient request runtime.
@@ -178,6 +183,7 @@ pub(crate) fn read(
 /// Returns authorization, invalid cursor/budget, incoherent capture, oversized
 /// response, subscription or owner-runtime failures. Busy is safely retryable.
 pub(crate) fn wait_present(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &TerminalExecutionRef,
     after: Option<&LiveCursor>,
     timeout_ms: u32,
@@ -186,13 +192,15 @@ pub(crate) fn wait_present(
 ) -> Result<Option<LiveFrame>, LiveError> {
     validate(reference, after, timeout_ms, max_bytes)?;
     authorize().map_err(authority)?;
-    execution::drive_live(wait_on_owner(
-        reference, after, timeout_ms, max_bytes, &authorize,
-    ))
+    execution::drive_live(
+        host,
+        wait_on_owner(host, reference, after, timeout_ms, max_bytes, &authorize),
+    )
     .map_err(authority)?
 }
 
 async fn wait_on_owner(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &TerminalExecutionRef,
     after: Option<&LiveCursor>,
     timeout_ms: u32,
@@ -201,11 +209,11 @@ async fn wait_on_owner(
 ) -> Result<Option<LiveFrame>, LiveError> {
     // Subscribe before checking state; changes committed during reads remain
     // observable. Cancellation never advances server-side delivery state.
-    let mut changes = execution::subscribe(reference).map_err(authority)?;
+    let mut changes = execution::subscribe(host, reference).map_err(authority)?;
     let deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(timeout_ms));
     loop {
         authorize().map_err(authority)?;
-        if let Some(frame) = read_current(reference, after, max_bytes)? {
+        if let Some(frame) = read_current(host, reference, after, max_bytes)? {
             authorize().map_err(authority)?;
             return Ok(Some(frame));
         }

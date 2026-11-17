@@ -229,8 +229,11 @@ pub(crate) fn capabilities() -> HumanInputCapabilities {
     }
 }
 
-fn validate_live(execution: &TerminalExecutionRef) -> Result<(), HumanInputError> {
-    let status = super::execution::status(execution)
+fn validate_live(
+    host: &crate::runtime::PaneRuntimeHost,
+    execution: &TerminalExecutionRef,
+) -> Result<(), HumanInputError> {
+    let status = super::execution::status(host, execution)
         .map_err(|error| HumanInputError::Authority { error })?;
     if !matches!(status.phase, TerminalExecutionPhase::Running)
         || status.terminal_session_ended
@@ -245,19 +248,23 @@ fn validate_live(execution: &TerminalExecutionRef) -> Result<(), HumanInputError
     Ok(())
 }
 
-pub(crate) fn open(execution: TerminalExecutionRef) -> Result<HumanInputStream, HumanInputError> {
-    validate_live(&execution)?;
+pub(crate) fn open(
+    host: &crate::runtime::PaneRuntimeHost,
+    execution: TerminalExecutionRef,
+) -> Result<HumanInputStream, HumanInputError> {
+    validate_live(host, &execution)?;
     STREAMS.get_or_init(Registry::default).open(execution)
 }
 
 pub(crate) fn push(
+    host: &crate::runtime::PaneRuntimeHost,
     stream: &HumanInputStream,
     sequence: u64,
     data: Vec<u8>,
     authority: super::input_authority::InputAuthority,
 ) -> Result<HumanInputAck, HumanInputError> {
     let registry = STREAMS.get_or_init(Registry::default);
-    if let Err(error) = validate_live(&stream.execution) {
+    if let Err(error) = validate_live(host, &stream.execution) {
         // This is observation, not durable reconciliation. No disk I/O occurs.
         // Invalidity never authorizes replay, including retained duplicate keys.
         if let Ok(entry) = registry.lookup(stream.stream_id)
@@ -274,7 +281,7 @@ pub(crate) fn push(
         // This closure runs only for a fresh sequence, never retained outcomes.
         // Its error may follow a PTY effect or failed capture enqueue: close the
         // epoch as uncertain instead of retrying either write or input capture.
-        super::execution::send_human_recorded_acknowledged(execution, bytes, authority)
+        super::execution::send_human_recorded_acknowledged(host, execution, bytes, authority)
             .map_err(|error| format!("{error:?}"))
     })
 }

@@ -41,8 +41,8 @@ use bmux_plugin::{
     AttachVisualProjectionUpdate, BorderGlyphs as RenderBorderGlyphs, ExtensionRect, RenderCell,
     RenderColor, RenderDamage, RenderExtensionContext, RenderExtensionLayer, RenderLayerItem,
     RenderLayerScene, RenderNamedColor, RenderOp, RenderSceneItem, RenderSceneItemKey, RenderStyle,
-    RenderUnderCell, TerminalRenderCapabilities, registered_visual_adapter,
-    render_single_display_cell_char, render_text_width_u16,
+    RenderUnderCell, TerminalRenderCapabilities, render_single_display_cell_char,
+    render_text_width_u16,
 };
 use bmux_scene_protocol::glyphs::border_glyphs_corners_or_custom;
 use bmux_scene_protocol::scene_protocol::{
@@ -74,6 +74,8 @@ struct DecorationRendererCache {
     visual_last_payload_hash: BTreeMap<String, u64>,
     visual_adapter_cache: BTreeMap<String, Box<dyn std::any::Any + Send>>,
     visual_stats: BTreeMap<String, VisualProjectionStats>,
+    /// The attach runtime's visual adapters this renderer may project with.
+    visual_adapters: Arc<bmux_plugin::VisualAdapterRegistry>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -757,7 +759,7 @@ fn observe_visual_request(
     {
         return;
     }
-    let Some(adapter) = registered_visual_adapter(&request.adapter) else {
+    let Some(adapter) = cache.visual_adapters.get(&request.adapter) else {
         return;
     };
     let request_started = Instant::now();
@@ -2306,8 +2308,14 @@ fn border_damage_rects(rect: &SceneRect) -> Vec<ExtensionRect> {
 
 /// Build a renderer whose cache is fed by `bus`'s retained scene state; the
 /// attach runtime's streaming loop relays scenes onto that bus.
-fn create_renderer(bus: &bmux_plugin::EventBus) -> DecorationRenderExtension {
-    let cache = Arc::new(Mutex::new(DecorationRendererCache::default()));
+fn create_renderer(
+    bus: &bmux_plugin::EventBus,
+    visual_adapters: Arc<bmux_plugin::VisualAdapterRegistry>,
+) -> DecorationRenderExtension {
+    let cache = Arc::new(Mutex::new(DecorationRendererCache {
+        visual_adapters,
+        ..DecorationRendererCache::default()
+    }));
     // Register only when absent: registration replaces an existing retained
     // value, which would erase the latest scene on renderer restart.
     if bus
@@ -2339,12 +2347,16 @@ fn create_renderer(bus: &bmux_plugin::EventBus) -> DecorationRenderExtension {
     }
 }
 
-/// Create an independent renderer subscribed to the supplied retained scene bus.
-/// Dropping the extension releases its cache and receiver; no background task or
-/// process-wide registration is installed.
+/// Create an independent renderer subscribed to the supplied retained scene bus
+/// that projects visual requests only with the attach runtime's
+/// `visual_adapters`. Dropping the extension releases its cache and receiver;
+/// no background task or process-wide registration is installed.
 #[must_use]
-pub fn renderer_for_bus(bus: &bmux_plugin::EventBus) -> Arc<dyn AttachRenderExtension> {
-    Arc::new(create_renderer(bus))
+pub fn renderer_for_bus(
+    bus: &bmux_plugin::EventBus,
+    visual_adapters: Arc<bmux_plugin::VisualAdapterRegistry>,
+) -> Arc<dyn AttachRenderExtension> {
+    Arc::new(create_renderer(bus, visual_adapters))
 }
 
 /// Relay a scene only to the selected renderer bus.
@@ -2376,7 +2388,10 @@ mod tests {
             operation: "handle-input".into(),
         };
         assert!(registry.input_codec(&endpoint).is_none());
-        registry.register(super::renderer_for_bus(&bmux_plugin::EventBus::new()));
+        registry.register(super::renderer_for_bus(
+            &bmux_plugin::EventBus::new(),
+            Arc::default(),
+        ));
         let codec = registry
             .input_codec(&endpoint)
             .expect("renderer supplies checked codec");
@@ -2476,10 +2491,11 @@ mod tests {
         }
     }
 
-    fn install_test_visual_adapter() {
-        static INSTALL: std::sync::Once = std::sync::Once::new();
-        INSTALL.call_once(|| bmux_plugin::register_visual_adapter(Arc::new(TestVisualAdapter)));
+    fn test_visual_adapters() -> Arc<bmux_plugin::VisualAdapterRegistry> {
+        let adapters = Arc::new(bmux_plugin::VisualAdapterRegistry::new());
+        adapters.register(Arc::new(TestVisualAdapter));
         TEST_VISUAL_ADAPTER_CALLS.store(0, Ordering::SeqCst);
+        adapters
     }
 
     fn visual_request() -> VisualAdapterRequest {
@@ -2509,7 +2525,10 @@ mod tests {
             visual_adapters: vec![visual_request()],
         };
         let (_tx, rx) = tokio::sync::watch::channel(Arc::new(scene));
-        let cache = Arc::new(Mutex::new(DecorationRendererCache::default()));
+        let cache = Arc::new(Mutex::new(DecorationRendererCache {
+            visual_adapters: test_visual_adapters(),
+            ..DecorationRendererCache::default()
+        }));
         cache.lock().expect("cache lock").set_scene_receiver(rx);
         let extension = DecorationRenderExtension {
             name: "test.decoration.renderer".to_string(),
@@ -2661,6 +2680,7 @@ mod tests {
             visual_last_payload_hash: BTreeMap::new(),
             visual_adapter_cache: BTreeMap::new(),
             visual_stats: BTreeMap::new(),
+            visual_adapters: Arc::default(),
         }));
         let extension = DecorationRenderExtension {
             name: "test.decoration.renderer".to_string(),
@@ -2744,6 +2764,7 @@ mod tests {
             visual_last_payload_hash: BTreeMap::new(),
             visual_adapter_cache: BTreeMap::new(),
             visual_stats: BTreeMap::new(),
+            visual_adapters: Arc::default(),
         }));
         let extension = DecorationRenderExtension {
             name: "test.decoration.renderer".to_string(),
@@ -2828,6 +2849,7 @@ mod tests {
             visual_last_payload_hash: BTreeMap::new(),
             visual_adapter_cache: BTreeMap::new(),
             visual_stats: BTreeMap::new(),
+            visual_adapters: Arc::default(),
         }));
         let extension = DecorationRenderExtension {
             name: "test.decoration.renderer".to_string(),
@@ -3094,8 +3116,27 @@ mod tests {
     }
 
     #[test]
+    fn renderer_projects_only_with_its_own_runtimes_adapters() {
+        // Same scene, two runtimes: only the one whose registry holds the
+        // adapter projects; nothing is looked up process-wide.
+        let (with_adapter, _) = extension_with_visual_request();
+        let (without_adapter, cache) = extension_with_visual_request();
+        cache.lock().expect("cache lock").visual_adapters = Arc::default();
+        let frame = TestVisualFrame {
+            surface: TestVisualSurface {
+                surface_id: Uuid::from_u128(9),
+                content_revision: 1,
+            },
+        };
+        let mut updates = Vec::new();
+        without_adapter.observe_visual_frame(&frame, &mut updates);
+        assert_eq!(updates.len(), 0);
+        with_adapter.observe_visual_frame(&frame, &mut updates);
+        assert_eq!(updates.len(), 1);
+    }
+
+    #[test]
     fn visual_adapter_dirty_only_uses_content_revision_and_suppresses_unchanged_payload() {
-        install_test_visual_adapter();
         let (extension, cache) = extension_with_visual_request();
         let surface_id = Uuid::from_u128(7);
         let mut updates = Vec::new();
@@ -3153,8 +3194,8 @@ mod tests {
     fn scoped_renderers_retain_independent_scenes_and_release_receivers() {
         let first_bus = bmux_plugin::EventBus::new();
         let second_bus = bmux_plugin::EventBus::new();
-        let first = create_renderer(&first_bus);
-        let second = create_renderer(&second_bus);
+        let first = create_renderer(&first_bus, Arc::default());
+        let second = create_renderer(&second_bus, Arc::default());
         let scene = |revision| DecorationScene {
             revision,
             surfaces: BTreeMap::new(),
@@ -3180,7 +3221,7 @@ mod tests {
             .unwrap();
         second.refresh_state();
         assert_eq!(second.cache.lock().unwrap().revision, 3);
-        let restarted = create_renderer(&first_bus);
+        let restarted = create_renderer(&first_bus, Arc::default());
         assert_eq!(restarted.cache.lock().unwrap().revision, 7);
     }
 
@@ -3592,6 +3633,7 @@ mod tests {
             visual_last_payload_hash: BTreeMap::new(),
             visual_adapter_cache: BTreeMap::new(),
             visual_stats: BTreeMap::new(),
+            visual_adapters: Arc::default(),
         }));
         let extension = DecorationRenderExtension {
             name: "test.decoration.renderer".to_string(),
@@ -3643,6 +3685,7 @@ mod tests {
             visual_last_payload_hash: BTreeMap::new(),
             visual_adapter_cache: BTreeMap::new(),
             visual_stats: BTreeMap::new(),
+            visual_adapters: Arc::default(),
         }));
         let extension = DecorationRenderExtension {
             name: "test.decoration.renderer".to_string(),

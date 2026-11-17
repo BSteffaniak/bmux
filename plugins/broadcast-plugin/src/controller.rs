@@ -119,18 +119,6 @@ pub trait IndicatorPort: Send + Sync {
     fn remove(&self);
     fn status(&self) -> bmux_broadcast_plugin_api::broadcast_presentation_v1::Indicator;
 }
-pub struct LegacyIndicator;
-impl IndicatorPort for LegacyIndicator {
-    fn update(&self, local: &str, remote: &str) {
-        crate::indicator::update(local, remote);
-    }
-    fn remove(&self) {
-        crate::indicator::remove();
-    }
-    fn status(&self) -> bmux_broadcast_plugin_api::broadcast_presentation_v1::Indicator {
-        crate::indicator::status()
-    }
-}
 pub struct Controller {
     indicator: Arc<dyn IndicatorPort>,
     state: Arc<Mutex<State>>,
@@ -144,7 +132,7 @@ pub struct Controller {
 impl Controller {
     #[cfg(test)]
     pub fn new() -> Result<Self, &'static str> {
-        Self::with_indicator(Arc::new(LegacyIndicator))
+        Self::with_indicator(Arc::new(crate::indicator::FactIndicator::default()))
     }
     pub fn with_indicator(indicator: Arc<dyn IndicatorPort>) -> Result<Self, &'static str> {
         let state = Arc::new(Mutex::new(State::default()));

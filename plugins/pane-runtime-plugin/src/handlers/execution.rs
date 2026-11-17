@@ -81,10 +81,12 @@ pub(super) fn authorize_route(ctx: &NativeServiceContext) -> Result<(), ServiceR
 }
 
 pub(crate) fn local_input_authority(
+    host: &crate::runtime::PaneRuntimeHost,
     ctx: &NativeServiceContext,
     session_id: uuid::Uuid,
 ) -> crate::runtime::input_authority::InputAuthority {
     let ctx = ctx.clone();
+    let host = host.clone();
     crate::runtime::input_authority::InputAuthority::new(move || {
         if ctx.cancellation.is_cancelled() {
             return Err("local input cancelled".into());
@@ -93,7 +95,8 @@ pub(crate) fn local_input_authority(
         super::spawn::authorize_session(&ctx, session_id, "pane.direct_input")
             .map_err(|error| format!("{error:?}"))?;
         if let Some(client) = ctx.caller_client_id {
-            let runtime = super::session_runtime_handle()
+            let runtime = host
+                .registered_session_runtime()
                 .ok_or_else(|| "input runtime unavailable".to_string())?;
             if !runtime.0.client_can_write(
                 bmux_session_models::SessionId(session_id),
@@ -364,6 +367,8 @@ mod tests {
     #[test]
     fn legacy_local_queue_keeps_authority_after_ingress_scope() {
         use crate::runtime::input_authority::{local_command, with_local};
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let origin = Arc::new(Mutex::new(StreamProvenance::Local));
         TEST_ORIGIN.with(|current| *current.borrow_mut() = origin.clone());
         let cancellation = bmux_plugin_sdk::ServiceCancellation::new();
@@ -375,7 +380,9 @@ mod tests {
         );
         ctx.caller_client_id = None;
         let session = bmux_session_models::SessionId(Uuid::new_v4());
-        let command = with_local(ctx.clone(), || local_command(b"queued".to_vec(), session));
+        let command = with_local(ctx.clone(), || {
+            local_command(host, b"queued".to_vec(), session)
+        });
         let crate::runtime::PaneRuntimeCommand::AuthorizedInput(bytes, authority) = command else {
             panic!("service input lost authority");
         };
@@ -387,7 +394,7 @@ mod tests {
         assert_eq!(output, b"queued");
         // Scope restoration keeps ordinary in-process terminal input unchanged.
         assert!(matches!(
-            local_command(b"local".to_vec(), session),
+            local_command(host, b"local".to_vec(), session),
             crate::runtime::PaneRuntimeCommand::Input(_)
         ));
     }
@@ -395,6 +402,8 @@ mod tests {
     #[test]
     fn local_route_waits_after_handler_unlock_and_propagates_write_failure() {
         use crate::runtime::input_authority::{settled_local_command, with_local_settled};
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let origin = Arc::new(Mutex::new(StreamProvenance::Local));
         TEST_ORIGIN.with(|current| *current.borrow_mut() = origin);
         let mut ctx = context("attach-runtime-commands", "attach-input", Vec::new());
@@ -425,7 +434,7 @@ mod tests {
             let _manager = manager.lock().unwrap();
             assert!(
                 sender
-                    .send(settled_local_command(b"literal\r".to_vec(), session).unwrap())
+                    .send(settled_local_command(host, b"literal\r".to_vec(), session).unwrap())
                     .is_ok()
             );
             "enqueue is not success"
@@ -437,6 +446,8 @@ mod tests {
     #[test]
     #[allow(clippy::result_large_err)] // Test router must return the SDK's fixed error type.
     fn service_boundary_denies_legacy_remote_and_rechecks_migrated_mutations() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let origin = Arc::new(Mutex::new(StreamProvenance::Admitted {
             subject_id: Uuid::new_v4(),
             lease_id: Uuid::new_v4(),
@@ -449,7 +460,7 @@ mod tests {
             ("pane-runtime-readiness-v1", "fence-unhealthy"),
             ("pane-runtime-execution-v4", "future-mutation"),
         ] {
-            let response = super::super::route(context(interface, operation, Vec::new()));
+            let response = super::super::route(host, context(interface, operation, Vec::new()));
             assert_eq!(response.error.unwrap().code, "authorization_denied");
         }
         let execution = ExecutionRef {
@@ -476,31 +487,30 @@ mod tests {
             },
         )
         .unwrap();
-        let response = super::super::route(context("pane-runtime-execution-v4", "send", payload));
+        let response =
+            super::super::route(host, context("pane-runtime-execution-v4", "send", payload));
         assert!(response.error.is_none());
         let result: Result<(), ExecutionError> =
             bmux_plugin_sdk::decode_service_message(&response.payload).unwrap();
         assert!(matches!(result, Err(ExecutionError::Denied { .. })));
         *origin.lock().unwrap() = StreamProvenance::Invalid;
-        let response = super::super::route(context(
-            "pane-runtime-presentation-v1",
-            "capabilities",
-            Vec::new(),
-        ));
+        let response = super::super::route(
+            host,
+            context("pane-runtime-presentation-v1", "capabilities", Vec::new()),
+        );
         assert_eq!(response.error.unwrap().code, "authorization_denied");
         *origin.lock().unwrap() = StreamProvenance::HostInternal;
         assert!(
-            super::super::route(context(
-                "pane-runtime-presentation-v1",
-                "capabilities",
-                Vec::new()
-            ))
+            super::super::route(
+                host,
+                context("pane-runtime-presentation-v1", "capabilities", Vec::new())
+            )
             .error
             .is_some()
         );
         let mut unbound = context("pane-runtime-presentation-v1", "capabilities", Vec::new());
         unbound.host_kernel_bridge = None;
-        assert!(super::super::route(unbound).error.is_some());
+        assert!(super::super::route(host, unbound).error.is_some());
         *origin.lock().unwrap() = StreamProvenance::Local;
         // No clients, connections, permissions, or other domain services exist.
         assert!(ctx.enabled_plugins.is_empty() && ctx.services.is_empty());
@@ -508,11 +518,14 @@ mod tests {
             super::super::spawn::authorize_session(&ctx, Uuid::new_v4(), "pane.direct_input")
                 .is_ok()
         );
-        let response = super::super::route(context(
-            "pane-runtime-presentation-v1",
-            "capabilities",
-            encode_service_message(&()).unwrap(),
-        ));
+        let response = super::super::route(
+            host,
+            context(
+                "pane-runtime-presentation-v1",
+                "capabilities",
+                encode_service_message(&()).unwrap(),
+            ),
+        );
         assert!(response.error.is_none());
     }
 }

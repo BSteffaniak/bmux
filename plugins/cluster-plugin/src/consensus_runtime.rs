@@ -2347,7 +2347,7 @@ pub(crate) mod tests {
         let service = crate::consensus_network::ControlServiceHandle::new(
             Arc::new(FailingCaller),
             id,
-            crate::consensus_network::global_consensus_nodes(),
+            crate::consensus_network::ConsensusNodeRegistry::default(),
         );
         assert!(matches!(
             service.active(),

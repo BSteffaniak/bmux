@@ -211,27 +211,36 @@ fn register_bundled_definition(
 fn install_bundled_client_adapter(plugin_id: &str, paths: &ConfigPaths) {
     #[cfg(feature = "bundled-plugin-connections")]
     if plugin_id == "bmux.connections" {
-        bmux_connections_plugin::install_client_adapter(paths);
+        crate::runtime::attach::provider::register_plugin_provider(
+            bmux_connections_plugin::client_attach_provider(paths),
+        );
     }
     #[cfg(feature = "bundled-plugin-pane-runtime")]
     if plugin_id == "bmux.pane_runtime" {
-        bmux_pane_runtime_plugin::observation::install();
+        crate::runtime::attach::provider::register_plugin_provider(
+            bmux_pane_runtime_plugin::observation::provider(),
+        );
     }
     #[cfg(feature = "bundled-plugin-broadcast")]
     if plugin_id == "bmux.broadcast" {
         let paths = paths.clone();
         bmux_plugin::register_attach_companion(bmux_plugin::AttachCompanion::from_factory(
             plugin_id,
-            std::sync::Arc::new(move |_resources| {
+            std::sync::Arc::new(move |resources| {
                 Ok(Box::new(
-                    bmux_broadcast_plugin::BroadcastPresentation::install(paths.clone())?,
+                    bmux_broadcast_plugin::BroadcastPresentation::install(
+                        paths.clone(),
+                        resources.states.clone(),
+                    )?,
                 ))
             }),
         ));
     }
     #[cfg(feature = "bundled-plugin-cluster")]
     if plugin_id == "bmux.cluster" {
-        bmux_cluster_plugin_client::install();
+        crate::runtime::attach::provider::register_plugin_provider(
+            bmux_cluster_plugin_client::attach_provider(),
+        );
     }
     #[cfg(feature = "bundled-plugin-tab-bar")]
     if plugin_id == "bmux.tab_bar" {
@@ -2115,6 +2124,7 @@ pub(super) async fn deactivate_loaded_plugins(
     loaded_plugins: &[ProductionPlugin],
     config: &BmuxConfig,
     paths: &ConfigPaths,
+    host_states: &bmux_plugin::PluginStateRegistry,
 ) -> Result<()> {
     let connection_info = HostConnectionInfo {
         config_dir: paths.config_dir.to_string_lossy().into_owned(),
@@ -2155,7 +2165,7 @@ pub(super) async fn deactivate_loaded_plugins(
     let drains = loaded_plugins.iter().map(|plugin| async move {
         tracing::info!(plugin_id = plugin.declaration.id.as_str(), "shutdown background drain started");
         let result = plugin.drain_background_tasks().await;
-        if let Err(error) = bmux_plugin::shutdown_progress().advance("plugin background scope drained") { tracing::warn!(%error, "shutdown progress publication failed"); }
+        if let Err(error) = host_states.shutdown_progress().advance("plugin background scope drained") { tracing::warn!(%error, "shutdown progress publication failed"); }
         tracing::info!(plugin_id = plugin.declaration.id.as_str(), error = ?result.as_ref().err(), "shutdown background drain completed");
         result
     });
@@ -2200,7 +2210,10 @@ pub(super) async fn deactivate_loaded_plugins(
                 plugin.declaration.id.as_str()
             )
         })?;
-        if let Err(error) = bmux_plugin::shutdown_progress().advance("plugin deactivated") {
+        if let Err(error) = host_states
+            .shutdown_progress()
+            .advance("plugin deactivated")
+        {
             tracing::warn!(%error, "shutdown progress publication failed");
         }
     }
@@ -3403,7 +3416,7 @@ mod tests {
         assert!(!dirs.contains(&"cluster-plugin"));
         crate::runtime::attach::provider::install();
         assert!(matches!(
-            bmux_client::global_attach_provider_registry()
+            crate::runtime::attach::provider::host_registry()
                 .resolve(&bmux_client::AttachTarget::parse("cluster://prod/main")),
             Err(bmux_client::AttachProviderResolutionError::NoProvider { .. })
         ));

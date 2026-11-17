@@ -1399,23 +1399,23 @@ fn epoch_millis_now() -> u64 {
 // domain-agnostic `FollowStateHandle` registered by the clients
 // plugin's `activate` (or a no-op fallback registered by the server
 // at startup when the plugin is absent). The helper below looks up
-// the handle from the global plugin state registry.
-fn follow_handle() -> FollowStateHandle {
-    bmux_plugin::global_plugin_state_registry()
+// the handle from the host's plugin state registry.
+fn follow_handle(registry: &bmux_plugin::PluginStateRegistry) -> FollowStateHandle {
+    registry
         .get::<FollowStateHandle>()
         .and_then(|arc| arc.read().ok().map(|guard| guard.clone()))
         .unwrap_or_else(FollowStateHandle::noop)
 }
 
-fn context_handle() -> ContextStateHandle {
-    bmux_plugin::global_plugin_state_registry()
+fn context_handle(registry: &bmux_plugin::PluginStateRegistry) -> ContextStateHandle {
+    registry
         .get::<ContextStateHandle>()
         .and_then(|arc| arc.read().ok().map(|guard| guard.clone()))
         .unwrap_or_else(ContextStateHandle::noop)
 }
 
-fn session_handle() -> SessionManagerHandle {
-    bmux_plugin::global_plugin_state_registry()
+fn session_handle(registry: &bmux_plugin::PluginStateRegistry) -> SessionManagerHandle {
+    registry
         .get::<SessionManagerHandle>()
         .and_then(|arc| arc.read().ok().map(|guard| guard.clone()))
         .unwrap_or_else(SessionManagerHandle::noop)
@@ -1424,8 +1424,10 @@ fn session_handle() -> SessionManagerHandle {
 /// Look up the pane-runtime manager handle from the plugin state
 /// registry. Returns the noop manager when the pane-runtime plugin
 /// isn't loaded or its handle isn't registered yet.
-fn session_runtime_handle() -> bmux_pane_runtime_state::SessionRuntimeManagerHandle {
-    bmux_plugin::global_plugin_state_registry()
+fn session_runtime_handle(
+    registry: &bmux_plugin::PluginStateRegistry,
+) -> bmux_pane_runtime_state::SessionRuntimeManagerHandle {
+    registry
         .get::<bmux_pane_runtime_state::SessionRuntimeManagerHandle>()
         .and_then(|arc| arc.read().ok().map(|guard| guard.clone()))
         .unwrap_or_else(bmux_pane_runtime_state::SessionRuntimeManagerHandle::noop)
@@ -1434,8 +1436,10 @@ fn session_runtime_handle() -> bmux_pane_runtime_state::SessionRuntimeManagerHan
 /// Look up the snapshot orchestrator handle from the plugin state
 /// registry. Returns the noop orchestrator when the snapshot plugin
 /// isn't loaded or its handle isn't registered yet.
-fn snapshot_orchestrator_handle() -> bmux_snapshot_runtime::SnapshotOrchestratorHandle {
-    bmux_plugin::global_plugin_state_registry()
+fn snapshot_orchestrator_handle(
+    registry: &bmux_plugin::PluginStateRegistry,
+) -> bmux_snapshot_runtime::SnapshotOrchestratorHandle {
+    registry
         .get::<bmux_snapshot_runtime::SnapshotOrchestratorHandle>()
         .and_then(|arc| arc.read().ok().map(|guard| guard.clone()))
         .unwrap_or_else(bmux_snapshot_runtime::SnapshotOrchestratorHandle::noop)
@@ -1445,9 +1449,11 @@ fn snapshot_orchestrator_handle() -> bmux_snapshot_runtime::SnapshotOrchestrator
 /// registry. Returns a fresh detached flag when the snapshot plugin
 /// isn't loaded or hasn't registered one yet — flipping it is a
 /// harmless no-op in that case.
-fn snapshot_dirty_flag() -> std::sync::Arc<bmux_snapshot_runtime::SnapshotDirtyFlag> {
+fn snapshot_dirty_flag(
+    registry: &bmux_plugin::PluginStateRegistry,
+) -> std::sync::Arc<bmux_snapshot_runtime::SnapshotDirtyFlag> {
     use bmux_snapshot_runtime::{SnapshotDirtyFlag, SnapshotDirtyFlagHandle};
-    bmux_plugin::global_plugin_state_registry()
+    registry
         .get::<SnapshotDirtyFlagHandle>()
         .and_then(|arc| arc.read().ok().map(|guard| std::sync::Arc::clone(&guard.0)))
         .unwrap_or_else(|| std::sync::Arc::new(SnapshotDirtyFlag::new()))
@@ -1456,7 +1462,7 @@ fn snapshot_dirty_flag() -> std::sync::Arc<bmux_snapshot_runtime::SnapshotDirtyF
 // `ContextState` / `RuntimeContext` are owned by the contexts plugin.
 // The types live in
 // `bmux_contexts_plugin::context_state`; the runtime handle is
-// registered into `bmux_plugin::global_plugin_state_registry()` by
+// registered into the host's plugin state registry by
 // `bmux_contexts_plugin::ContextsPlugin::activate`. Server code
 // accesses the shared handle through `ServerState::context_state`,
 // which is an `Arc<RwLock<ContextState>>` obtained from the plugin
@@ -1467,7 +1473,9 @@ fn current_context_session_for_client(
     client_id: ClientId,
 ) -> Option<SessionId> {
     let _ = state;
-    context_handle().0.current_session_for_client(client_id)
+    context_handle(&state.plugin_states)
+        .0
+        .current_session_for_client(client_id)
 }
 
 /// Register a no-op `FollowStateHandle` in the plugin state registry
@@ -1475,41 +1483,32 @@ fn current_context_session_for_client(
 /// typically registers its real adapter during `activate` (which
 /// happens before server construction), so this fallback only fires
 /// in tests or headless scenarios where the plugin is absent.
-fn register_noop_follow_state_handle() {
-    if bmux_plugin::global_plugin_state_registry()
-        .get::<FollowStateHandle>()
-        .is_some()
-    {
+fn register_noop_follow_state_handle(registry: &bmux_plugin::PluginStateRegistry) {
+    if registry.get::<FollowStateHandle>().is_some() {
         return;
     }
     let handle = Arc::new(std::sync::RwLock::new(FollowStateHandle::noop()));
-    bmux_plugin::global_plugin_state_registry().register::<FollowStateHandle>(&handle);
+    registry.register::<FollowStateHandle>(&handle);
 }
 
 /// Register a no-op `ContextStateHandle` in the plugin state registry
 /// only if the contexts plugin hasn't already registered its adapter.
-fn register_noop_context_state_handle() {
-    if bmux_plugin::global_plugin_state_registry()
-        .get::<ContextStateHandle>()
-        .is_some()
-    {
+fn register_noop_context_state_handle(registry: &bmux_plugin::PluginStateRegistry) {
+    if registry.get::<ContextStateHandle>().is_some() {
         return;
     }
     let handle = Arc::new(std::sync::RwLock::new(ContextStateHandle::noop()));
-    bmux_plugin::global_plugin_state_registry().register::<ContextStateHandle>(&handle);
+    registry.register::<ContextStateHandle>(&handle);
 }
 
 /// Register a no-op `SessionManagerHandle` in the plugin state registry
 /// only if the sessions plugin hasn't already registered its adapter.
-fn register_noop_session_manager_handle() {
-    if bmux_plugin::global_plugin_state_registry()
-        .get::<SessionManagerHandle>()
-        .is_some()
-    {
+fn register_noop_session_manager_handle(registry: &bmux_plugin::PluginStateRegistry) {
+    if registry.get::<SessionManagerHandle>().is_some() {
         return;
     }
     let handle = Arc::new(std::sync::RwLock::new(SessionManagerHandle::noop()));
-    bmux_plugin::global_plugin_state_registry().register::<SessionManagerHandle>(&handle);
+    registry.register::<SessionManagerHandle>(&handle);
 }
 
 /// Register the performance plugin's settings handle into the global
@@ -1520,12 +1519,15 @@ fn register_noop_session_manager_handle() {
 ///
 /// Returns the `PerformanceSettingsStore` so `ServerState` can hold a
 /// clone directly for hot-path reads.
-fn register_performance_plugin_state(config: &BmuxConfig) -> PerformanceSettingsStore {
+fn register_performance_plugin_state(
+    registry: &bmux_plugin::PluginStateRegistry,
+    config: &BmuxConfig,
+) -> PerformanceSettingsStore {
     let store = PerformanceSettingsStore::from_config(config);
     let handle = Arc::new(std::sync::RwLock::new(PerformanceSettingsHandle::from_arc(
         Arc::new(store.clone()),
     )));
-    bmux_plugin::global_plugin_state_registry().register::<PerformanceSettingsHandle>(&handle);
+    registry.register::<PerformanceSettingsHandle>(&handle);
     store
 }
 
@@ -1670,20 +1672,22 @@ impl BmuxServer {
         // plugin state registry. Server's event-push rate limiter
         // reads the registered handle, and the performance plugin's
         // `SetSettings` handler writes into it.
-        let performance_settings = register_performance_plugin_state(&config);
+        // The host's root plugin state registry. Plugins only ever receive
+        // views of it through their activation capabilities.
+        let plugin_states = Arc::new(bmux_plugin::PluginStateRegistry::new());
+        let performance_settings = register_performance_plugin_state(&plugin_states, &config);
 
         // Register a no-op FollowStateHandle so server's handle
         // lookups always succeed. The clients plugin overwrites this
         // during `activate`.
-        register_noop_follow_state_handle();
-        register_noop_context_state_handle();
-        register_noop_session_manager_handle();
+        register_noop_follow_state_handle(&plugin_states);
+        register_noop_context_state_handle(&plugin_states);
+        register_noop_session_manager_handle(&plugin_states);
 
         let (event_broadcast_tx, _) =
             tokio::sync::broadcast::channel::<Event>(EVENT_PUSH_CHANNEL_CAPACITY);
 
         let attach_tokens = Arc::new(Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)));
-        let plugin_states = bmux_plugin::global_plugin_state_registry();
         let stream_provenance = bmux_plugin::stream_admission::StreamProvenanceRegistry::default();
         plugin_states.register(&Arc::new(std::sync::RwLock::new(stream_provenance.clone())));
         let client_principals: Arc<Mutex<BTreeMap<ClientId, Uuid>>> =
@@ -1695,8 +1699,7 @@ impl BmuxServer {
         let attach_token_handle = bmux_attach_token_state::AttachTokenManagerHandle::new(
             ServerAttachTokenAdapter::new(Arc::clone(&attach_tokens)),
         );
-        bmux_plugin::global_plugin_state_registry()
-            .register::<bmux_attach_token_state::AttachTokenManagerHandle>(&Arc::new(
+        plugin_states.register::<bmux_attach_token_state::AttachTokenManagerHandle>(&Arc::new(
             std::sync::RwLock::new(attach_token_handle),
         ));
 
@@ -1706,10 +1709,9 @@ impl BmuxServer {
         let principal_handle = bmux_client_state::ClientPrincipalHandle::new(
             ServerClientPrincipalAdapter::new(Arc::clone(&client_principals)),
         );
-        bmux_plugin::global_plugin_state_registry()
-            .register::<bmux_client_state::ClientPrincipalHandle>(&Arc::new(
-                std::sync::RwLock::new(principal_handle),
-            ));
+        plugin_states.register::<bmux_client_state::ClientPrincipalHandle>(&Arc::new(
+            std::sync::RwLock::new(principal_handle),
+        ));
 
         Self {
             endpoint,
@@ -2232,7 +2234,7 @@ impl BmuxServer {
         // callbacks), ask the snapshot plugin
         // to restore the previous session's state if a snapshot file
         // exists on disk.
-        let restore_handle = snapshot_orchestrator_handle();
+        let restore_handle = snapshot_orchestrator_handle(&self.state.plugin_states);
         match restore_handle.as_dyn().restore_if_present_boxed().await {
             Ok(Some(summary)) => {
                 info!(
@@ -2310,7 +2312,7 @@ impl BmuxServer {
             self.endpoint
         );
 
-        let progress = bmux_plugin::shutdown_progress();
+        let progress = self.state.plugin_states.shutdown_progress();
         if let Err(error) = progress.begin() {
             warn!(%error, "shutdown progress publication failed");
         }
@@ -2334,7 +2336,9 @@ impl BmuxServer {
 
         // The host drives only neutral participants. Persistence and resource
         // policy, including ordering, belong to their owning plugins.
-        let lifecycle = bmux_plugin::global_plugin_state_registry()
+        let lifecycle = self
+            .state
+            .plugin_states
             .get::<bmux_plugin_runtime::shutdown::ShutdownRegistry>()
             .map(|entry| {
                 entry
@@ -3055,7 +3059,9 @@ async fn handle_connection(
     let _provenance = state
         .stream_provenance
         .record(client_id.0, admitted_stream.as_ref())?;
-    follow_handle().0.connect_client(client_id);
+    follow_handle(&state.plugin_states)
+        .0
+        .connect_client(client_id);
     {
         let mut principals = state
             .client_principals
@@ -3541,7 +3547,7 @@ async fn handle_connection(
         &mut selected_session,
         &mut attached_stream_session,
     );
-    disconnect_follow_state(client_id);
+    disconnect_follow_state(&state, client_id);
     {
         let mut principals = state
             .client_principals
@@ -3601,7 +3607,7 @@ async fn finish_writer(mut task: tokio::task::JoinHandle<()>, timeout: std::time
 
 async fn select_device_seal_broker_client(state: &Arc<ServerState>) -> Option<ClientId> {
     let event_push_clients = state.event_push_clients.lock().await.clone();
-    let snapshot = follow_handle().0.snapshot();
+    let snapshot = follow_handle(&state.plugin_states).0.snapshot();
     let selected =
         snapshot
             .attached_stream_sessions
@@ -3724,7 +3730,7 @@ fn register_wire_event_sink(state: &Arc<ServerState>) {
             state: Arc::clone(state),
         },
     )));
-    bmux_plugin::global_plugin_state_registry().register::<WireEventSinkHandle>(&sink);
+    state.plugin_states.register::<WireEventSinkHandle>(&sink);
 }
 
 fn encode_event_frame(
@@ -3783,11 +3789,13 @@ fn sync_selected_target_from_follow_state(
     client_id: ClientId,
     selected_session: &mut Option<SessionId>,
 ) -> Result<()> {
-    let follow_selected = follow_handle().0.selected_target(client_id);
+    let follow_selected = follow_handle(&state.plugin_states)
+        .0
+        .selected_target(client_id);
 
     if let Some((follow_selected_context, follow_selected_session)) = follow_selected {
         if let Some(context_id) = follow_selected_context {
-            let _ = context_handle()
+            let _ = context_handle(&state.plugin_states)
                 .0
                 .select_for_client(client_id, &ContextSelector::ById(context_id));
         }
@@ -3800,7 +3808,7 @@ fn sync_selected_target_from_follow_state(
 
 #[allow(clippy::unnecessary_wraps)]
 fn reconcile_selected_session_membership(
-    _state: &Arc<ServerState>,
+    state: &Arc<ServerState>,
     client_id: ClientId,
     previous: Option<SessionId>,
     next: Option<SessionId>,
@@ -3809,7 +3817,7 @@ fn reconcile_selected_session_membership(
         return Ok(());
     }
 
-    let manager = session_handle();
+    let manager = session_handle(&state.plugin_states);
 
     if let Some(previous_session) = previous {
         manager.0.remove_client(previous_session, &client_id);
@@ -3822,13 +3830,14 @@ fn reconcile_selected_session_membership(
     Ok(())
 }
 
-fn disconnect_follow_state(client_id: ClientId) {
-    let _ = follow_handle().0.disconnect_client(client_id);
+fn disconnect_follow_state(state: &ServerState, client_id: ClientId) {
+    let _ = follow_handle(&state.plugin_states)
+        .0
+        .disconnect_client(client_id);
 }
 
 fn mark_snapshot_dirty(state: &Arc<ServerState>) {
-    let _ = state;
-    snapshot_dirty_flag().mark_dirty();
+    snapshot_dirty_flag(&state.plugin_states).mark_dirty();
 }
 
 /// Opportunistic snapshot flush. The snapshot plugin's debounce
@@ -3844,7 +3853,7 @@ fn maybe_flush_snapshot(state: &Arc<ServerState>, force: bool) -> Result<()> {
     if !force {
         return Ok(());
     }
-    let handle = snapshot_orchestrator_handle();
+    let handle = snapshot_orchestrator_handle(&state.plugin_states);
     if let Ok(rt) = tokio::runtime::Handle::try_current() {
         if let Err(error) = tokio::task::block_in_place(|| {
             rt.block_on(async move { handle.as_dyn().save_now_boxed().await })
@@ -3854,7 +3863,7 @@ fn maybe_flush_snapshot(state: &Arc<ServerState>, force: bool) -> Result<()> {
     } else {
         // Headless / test path without a tokio runtime: just flip
         // the dirty flag; nothing else can drive the async path.
-        snapshot_dirty_flag().mark_dirty();
+        snapshot_dirty_flag(&state.plugin_states).mark_dirty();
     }
     Ok(())
 }
@@ -4593,7 +4602,7 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
 }
 
 fn detach_client_state_on_disconnect(
-    _state: &Arc<ServerState>,
+    state: &Arc<ServerState>,
     client_id: ClientId,
     selected_session: &mut Option<SessionId>,
     attached_stream_session: &mut Option<SessionId>,
@@ -4601,18 +4610,22 @@ fn detach_client_state_on_disconnect(
     let previous_selected = selected_session.take();
     let previous_stream = attached_stream_session.take();
 
-    context_handle().0.disconnect_client(client_id);
+    context_handle(&state.plugin_states)
+        .0
+        .disconnect_client(client_id);
 
     if previous_selected.is_none() && previous_stream.is_none() {
         return;
     }
 
     if let Some(session_id) = previous_selected {
-        session_handle().0.remove_client(session_id, &client_id);
+        session_handle(&state.plugin_states)
+            .0
+            .remove_client(session_id, &client_id);
     }
 
     if let Some(stream_session_id) = previous_stream {
-        session_runtime_handle()
+        session_runtime_handle(&state.plugin_states)
             .0
             .end_attach(stream_session_id, client_id);
     }

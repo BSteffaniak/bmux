@@ -1,9 +1,9 @@
 //! Plugin-owned non-sizing observation for the legacy local attach backend.
 use bmux_client::{
     AttachProvider, AttachProviderBackend, AttachProviderError, AttachProviderFuture,
-    AttachProviderRegistration, AttachProviderSession, AttachTarget, ResolvedAttachTarget,
+    AttachProviderSession, AttachTarget, ResolvedAttachTarget,
 };
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 #[derive(Debug)]
 struct ObservationProvider;
@@ -107,15 +107,9 @@ impl ObservationProvider {
         }
     }
 }
-/// Install the local provider adapter. Domain selection stays out of the host.
-///
-/// # Panics
-/// Panics if another adapter registered the same provider identity.
-pub fn install() {
-    static REGISTRATION: OnceLock<AttachProviderRegistration> = OnceLock::new();
-    REGISTRATION.get_or_init(|| {
-        bmux_client::global_attach_provider_registry()
-            .register(Arc::new(ObservationProvider))
-            .expect("unique local observation adapter")
-    });
+/// The local observation provider; the host registers it into its own
+/// attach-provider registry. Domain selection stays out of the host.
+#[must_use]
+pub fn provider() -> Arc<dyn bmux_client::AttachProvider> {
+    Arc::new(ObservationProvider)
 }

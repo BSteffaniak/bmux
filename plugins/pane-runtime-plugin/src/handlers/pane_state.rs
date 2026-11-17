@@ -6,7 +6,6 @@ use bmux_pane_runtime_plugin_api::pane_runtime_state::{
     PaneSummary, SessionPaneList,
 };
 use bmux_pane_runtime_state::{FloatingPaneLayer, FloatingPaneScope};
-use bmux_plugin::global_plugin_state_registry;
 use bmux_plugin_sdk::NativeServiceContext;
 use bmux_session_models::{ClientId, SessionId};
 use serde::{Deserialize, Serialize};
@@ -58,6 +57,7 @@ const fn floating_layer_name(layer: FloatingPaneLayer) -> &'static str {
 
 /// Resolve a caller-optional session id to a concrete session.
 fn resolve_session_id(
+    host: &crate::runtime::PaneRuntimeHost,
     explicit: Option<Uuid>,
     caller_client_id: Option<Uuid>,
 ) -> Result<SessionId, PaneStateError> {
@@ -65,7 +65,8 @@ fn resolve_session_id(
         return Ok(SessionId(id));
     }
     let client_id = caller_client_id.ok_or(PaneStateError::SessionNotFound)?;
-    let follow = global_plugin_state_registry()
+    let follow = host
+        .states()
         .get::<FollowStateHandle>()
         .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
         .ok_or(PaneStateError::SessionNotFound)?;
@@ -76,11 +77,14 @@ fn resolve_session_id(
 }
 
 pub fn list_panes(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &ListPanesArgs,
     ctx: &NativeServiceContext,
 ) -> Result<SessionPaneList, PaneStateError> {
-    let handle = super::session_runtime_handle().ok_or(PaneStateError::SessionNotFound)?;
-    let session_id = resolve_session_id(req.session_id, ctx.caller_client_id)?;
+    let handle = host
+        .registered_session_runtime()
+        .ok_or(PaneStateError::SessionNotFound)?;
+    let session_id = resolve_session_id(host, req.session_id, ctx.caller_client_id)?;
     let summaries = handle
         .0
         .list_panes(session_id)
@@ -107,9 +111,12 @@ pub fn list_panes(
 }
 
 pub fn list_floating_panes(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &ListFloatingPanesArgs,
 ) -> Result<FloatingPaneList, PaneStateError> {
-    let handle = super::session_runtime_handle().ok_or(PaneStateError::SessionNotFound)?;
+    let handle = host
+        .registered_session_runtime()
+        .ok_or(PaneStateError::SessionNotFound)?;
     let session_id = SessionId(req.session_id);
     let panes = handle
         .0
@@ -142,10 +149,12 @@ pub fn list_floating_panes(
 }
 
 pub fn get_pane(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &GetPaneArgs,
     ctx: &NativeServiceContext,
 ) -> Result<PaneSummary, PaneStateError> {
     let list = list_panes(
+        host,
         &ListPanesArgs {
             session_id: Some(req.session_id),
         },
@@ -157,8 +166,12 @@ pub fn get_pane(
         .ok_or(PaneStateError::PaneNotFound)
 }
 
-pub fn list_pane_processes() -> Result<PaneProcessList, PaneStateError> {
-    let handle = super::session_runtime_handle().ok_or(PaneStateError::SessionNotFound)?;
+pub fn list_pane_processes(
+    host: &crate::runtime::PaneRuntimeHost,
+) -> Result<PaneProcessList, PaneStateError> {
+    let handle = host
+        .registered_session_runtime()
+        .ok_or(PaneStateError::SessionNotFound)?;
     Ok(PaneProcessList {
         panes: handle
             .0
@@ -169,8 +182,13 @@ pub fn list_pane_processes() -> Result<PaneProcessList, PaneStateError> {
     })
 }
 
-pub fn get_pane_process(req: &GetPaneProcessArgs) -> Result<PaneProcessIdentity, PaneStateError> {
-    let handle = super::session_runtime_handle().ok_or(PaneStateError::SessionNotFound)?;
+pub fn get_pane_process(
+    host: &crate::runtime::PaneRuntimeHost,
+    req: &GetPaneProcessArgs,
+) -> Result<PaneProcessIdentity, PaneStateError> {
+    let handle = host
+        .registered_session_runtime()
+        .ok_or(PaneStateError::SessionNotFound)?;
     handle
         .0
         .pane_process_identity(SessionId(req.session_id), req.pane_id)

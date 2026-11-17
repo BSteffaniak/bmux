@@ -156,6 +156,8 @@ impl DecorationEngine {
             state: State {
                 recipient: shared.runtime.recipient,
                 events: shared.events(),
+                states: shared.states(),
+                scene_revisions: std::sync::Arc::clone(&shared.runtime.scene_revisions),
                 hook_scope: shared.runtime.hook_scope,
                 ..State::default()
             },
@@ -297,9 +299,13 @@ impl DecorationEngine {
     fn retire(&mut self) {
         let recipient = self.state.recipient;
         let events = self.state.events.take();
+        let states = self.state.states.take();
+        let scene_revisions = std::sync::Arc::clone(&self.state.scene_revisions);
         self.state = State {
             recipient,
             events,
+            states,
+            scene_revisions,
             hook_scope: self.shared.runtime.hook_scope,
             ..State::default()
         };

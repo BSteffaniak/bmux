@@ -309,7 +309,14 @@ mod tests {
                     calls: AtomicUsize::new(0),
                 };
                 assert_eq!(
-                    crate::authorize_selection(&host, client, None, session).is_ok(),
+                    crate::authorize_selection(
+                        &crate::ClientEvents::default(),
+                        &host,
+                        client,
+                        None,
+                        session
+                    )
+                    .is_ok(),
                     allowed,
                 );
                 assert_eq!(host.calls.load(Ordering::SeqCst), calls);

@@ -28,12 +28,6 @@ mod presentation;
 mod profiles;
 pub use controller::{DeliveryCounters, IndicatorPort};
 pub use presentation::BroadcastPresentation;
-
-/// In-process diagnostics only: no terminal writes and no controller startup.
-pub fn delivery_counters() -> Option<DeliveryCounters> {
-    let registry = LEGACY.get()?.registry.lock().ok()?;
-    registry.controller.as_ref()?.delivery_counters().ok()
-}
 mod guided;
 mod identity;
 mod inline_ui;
@@ -48,7 +42,7 @@ use bmux_broadcast_plugin_api::{
 use bmux_plugin_sdk::{
     NativeCommandContext, NativeServiceContext, PluginCommandError, RustPlugin, ServiceResponse,
 };
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 struct Registry {
     controller: Option<Arc<controller::Controller>>,
@@ -62,10 +56,6 @@ impl Default for Registry {
         }
     }
 }
-static LEGACY: OnceLock<BroadcastPlugin> = OnceLock::new();
-fn legacy() -> &'static BroadcastPlugin {
-    LEGACY.get_or_init(|| BroadcastPlugin::with_indicator(Arc::new(controller::LegacyIndicator)))
-}
 fn error(code: &'static str) -> ServiceResponse {
     ServiceResponse::error(code, "broadcast operation rejected")
 }
@@ -74,10 +64,15 @@ pub struct BroadcastPlugin {
     registry: Arc<Mutex<Registry>>,
     authorization: Arc<authorization::Authorization>,
     indicator: Arc<dyn IndicatorPort>,
+    /// Set for the default composition: bound to the activation's fact host.
+    activation_indicator: Option<Arc<indicator::FactIndicator>>,
 }
 impl Default for BroadcastPlugin {
     fn default() -> Self {
-        legacy().clone()
+        let indicator = Arc::new(indicator::FactIndicator::default());
+        let mut plugin = Self::with_indicator(indicator.clone());
+        plugin.activation_indicator = Some(indicator);
+        plugin
     }
 }
 impl BroadcastPlugin {
@@ -98,6 +93,7 @@ impl BroadcastPlugin {
             registry: Arc::new(Mutex::new(Registry::default())),
             authorization: Arc::new(authorization::Authorization::default()),
             indicator,
+            activation_indicator: None,
         }
     }
     fn controller(&self) -> Result<Arc<controller::Controller>, ServiceResponse> {
@@ -165,8 +161,12 @@ impl RustPlugin for BroadcastPlugin {
     type Contract = bmux_broadcast_plugin_api::Contract;
     fn activate(
         &mut self,
-        _context: bmux_plugin_sdk::NativeLifecycleContext,
+        context: bmux_plugin_sdk::NativeLifecycleContext,
     ) -> Result<i32, PluginCommandError> {
+        if let Some(indicator) = &self.activation_indicator {
+            let states = bmux_plugin::activation_state_registry(&context);
+            indicator.bind(Some(indicator::fact_host(&states)));
+        }
         self.activate_owner()?;
         Ok(bmux_plugin_sdk::EXIT_OK)
     }

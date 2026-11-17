@@ -1,5 +1,5 @@
 //! Managed retirement and short-lived admission, serialized with the real manager.
-use super::{SessionRuntimeManager, reservations, spawn_runtime_handle};
+use super::{SessionRuntimeManager, reservations};
 use bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::ManagedIdleStatus;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -49,6 +49,7 @@ fn prune_preparations(state: &mut State, now: Instant) {
 }
 
 pub(crate) fn preparation(
+    host: &crate::runtime::PaneRuntimeHost,
     instance: uuid::Uuid,
     owner: Option<uuid::Uuid>,
     lease_id: Option<uuid::Uuid>,
@@ -58,7 +59,7 @@ pub(crate) fn preparation(
     String,
 > {
     let owner = owner.ok_or("managed preparation requires a connected client")?;
-    let readiness = crate::readiness::snapshot()?;
+    let readiness = crate::readiness::snapshot(host)?;
     if readiness.instance != instance {
         return Err("runtime instance changed; preparation has no effect authority".into());
     }
@@ -165,10 +166,11 @@ fn admit_on(authority: &Arc<Mutex<State>>) -> anyhow::Result<Admission> {
 }
 
 pub(crate) fn configure(
+    host: &crate::runtime::PaneRuntimeHost,
     instance: uuid::Uuid,
     grace_seconds: u64,
 ) -> Result<ManagedIdleStatus, String> {
-    let readiness = crate::readiness::snapshot()?;
+    let readiness = crate::readiness::snapshot(host)?;
     if readiness.instance != instance {
         return Err("runtime instance changed".into());
     }
@@ -201,24 +203,26 @@ pub(crate) fn configure(
             }
         }
     }
-    inspect(Some(instance), false)
+    inspect(host, Some(instance), false)
 }
 
 pub(crate) fn inspect(
+    host: &crate::runtime::PaneRuntimeHost,
     instance: Option<uuid::Uuid>,
     fence: bool,
 ) -> Result<ManagedIdleStatus, String> {
-    let readiness = crate::readiness::snapshot()?;
+    let readiness = crate::readiness::snapshot(host)?;
     if instance.is_some_and(|instance| instance != readiness.instance) {
         return Err("runtime instance changed".into());
     }
-    let handle =
-        spawn_runtime_handle().ok_or("execution manager unavailable; idle safety unknown")?;
+    let handle = host
+        .spawn_runtime_handle()
+        .ok_or("execution manager unavailable; idle safety unknown")?;
     // Durable checks happen before manager locking: existing recovery diagnostics
     // may read manager state while holding the store. A concurrent mutation is
     // covered by its admission owner and resets grace even if it finishes here.
     let retained_blocker = reservations::idle_blocker().or_else(super::supervisor::idle_blocker);
-    let retained_authority = reservations::retained_authority();
+    let retained_authority = reservations::retained_authority(host);
     let manager = handle
         .0
         .lock()

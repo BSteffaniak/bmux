@@ -45,12 +45,13 @@ fn with_store<T>(
     action(store)
 }
 pub(crate) fn reserve(
+    host: &crate::runtime::PaneRuntimeHost,
     mutation: uuid::Uuid,
     options: ProgramOptions,
     authorize: impl Fn(uuid::Uuid) -> Result<(), RecoveryError>,
 ) -> Result<LaunchReservation, RecoveryError> {
     let _admission = super::managed_idle::admit().map_err(failed)?;
-    crate::readiness::check_admission().map_err(failed)?;
+    crate::readiness::check_admission(host).map_err(failed)?;
     with_store(|store| store.reserve(mutation, options, authorize))
 }
 pub(crate) fn reserve_environment(
@@ -69,12 +70,14 @@ pub(crate) fn reserve_environment(
     with_store(|store| store.reserve_environment(mutation, options, Some(environment), authorize))
 }
 pub(crate) fn launch(
+    host: &crate::runtime::PaneRuntimeHost,
     reservation: &LaunchReservation,
     authorize: impl Fn(uuid::Uuid) -> anyhow::Result<()> + Send + Sync + 'static,
 ) -> Result<LaunchReceipt, RecoveryError> {
-    launch_named(reservation, None, authorize)
+    launch_named(host, reservation, None, authorize)
 }
 pub(super) fn launch_named(
+    host: &crate::runtime::PaneRuntimeHost,
     reservation: &LaunchReservation,
     name: Option<String>,
     authorize: impl Fn(uuid::Uuid) -> anyhow::Result<()> + Send + Sync + 'static,
@@ -121,6 +124,7 @@ pub(super) fn launch_named(
         with_store(|store| Ok(store.read(reservation.launch_mutation_id)?.environment))?;
     let result = if let Some(environment) = environment {
         super::execution::create_reserved_environment(
+            host,
             name,
             reservation.options.clone(),
             Some(&reservation.execution),
@@ -129,6 +133,7 @@ pub(super) fn launch_named(
         )
     } else {
         super::execution::create_reserved(
+            host,
             name,
             reservation.options.clone(),
             Some(&reservation.execution),
@@ -241,11 +246,11 @@ fn verify_or_create_marker(marker: &Path, expected: &str) -> Result<(), Recovery
 }
 
 /// Diagnostic-only inventory. No old/foreign authority is adopted or deleted.
-pub(crate) fn retained_authority() -> Vec<String> {
+pub(crate) fn retained_authority(host: &crate::runtime::PaneRuntimeHost) -> Vec<String> {
     let Ok(Some(scope)) = super::managed_scope::selected() else {
         return Vec::new();
     };
-    let Ok(readiness) = crate::readiness::snapshot() else {
+    let Ok(readiness) = crate::readiness::snapshot(host) else {
         return vec!["execution scope unavailable".into()];
     };
     let domain = PathBuf::from(readiness.state_dir).join("pane-executions-v4");
@@ -753,6 +758,7 @@ fn find(
     })
 }
 pub(crate) fn reconcile(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &ExecutionRef,
 ) -> Result<
     bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalReconciliation,
@@ -761,7 +767,7 @@ pub(crate) fn reconcile(
     use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::{
         TerminalCaptureIntegrity, TerminalReconciliation, TerminalSessionEnd,
     };
-    let current = super::execution::status(reference);
+    let current = super::execution::status(host, reference);
     with_store(|store| {
         let mut stored = find(store, reference)?;
         let root = store
@@ -983,6 +989,7 @@ fn validate_input_authority(
 }
 
 fn validate_fresh_input(
+    host: &crate::runtime::PaneRuntimeHost,
     store: &ReservationStore,
     reference: &ExecutionRef,
 ) -> Result<(), RecoveryError> {
@@ -991,10 +998,11 @@ fn validate_fresh_input(
     // without mutating reconciliation state. Existing receipts
     // still replay unchanged before this fresh-effect check.
     let launch = find(store, reference)?;
-    let state =
-        super::execution::status(reference).map_err(|error| RecoveryError::RecoveryRequired {
+    let state = super::execution::status(host, reference).map_err(|error| {
+        RecoveryError::RecoveryRequired {
             reason: format!("input authority unavailable: {error:?}"),
-        })?;
+        }
+    })?;
     let capture_root = store
         .root
         .join(format!("capture-{}", reference.execution_token));
@@ -1012,6 +1020,7 @@ fn validate_fresh_input(
 }
 
 pub(crate) fn send_admitted(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &ExecutionRef,
     mutation: uuid::Uuid,
     data: Vec<u8>,
@@ -1051,7 +1060,7 @@ pub(crate) fn send_admitted(
                 Ok((false, stored))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                validate_fresh_input(store, reference)?;
+                validate_fresh_input(host, store, reference)?;
                 let count = std::fs::read_dir(&store.root)
                     .map_err(failed)?
                     .collect::<Result<Vec<_>, _>>()
@@ -1087,7 +1096,7 @@ pub(crate) fn send_admitted(
     if !claim.0 {
         return Ok(claim.1.receipt);
     }
-    let result = super::execution::send_acknowledged(reference, data, authority);
+    let result = super::execution::send_acknowledged(host, reference, data, authority);
     with_store(|store| {
         let mut stored = claim.1;
         stored.receipt.revision += 1;
@@ -1219,7 +1228,12 @@ pub(crate) fn retire(
     })
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the activation's host handles travel explicitly beside the resolution facts"
+)]
 pub(crate) fn resolve(
+    host: &crate::runtime::PaneRuntimeHost,
     reference: &ExecutionRef,
     mutation: uuid::Uuid,
     expected: u64,
@@ -1287,7 +1301,7 @@ pub(crate) fn resolve(
     }
     let effect = match &action {
         TerminalResolutionAction::TerminateOwnedExecution => {
-            super::execution::terminate(reference, grace, || {
+            super::execution::terminate(host, reference, grace, || {
                 crate::handlers::execution::authorize(ctx, reference, "pane.close")
             })
             .map(|_| ())

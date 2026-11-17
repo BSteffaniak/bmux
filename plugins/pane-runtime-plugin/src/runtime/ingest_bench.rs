@@ -47,12 +47,14 @@ fn summary(mut samples: Vec<Duration>) -> String {
 }
 
 fn run(name: &str, (cols, rows): (u16, u16), frames: &[Frame]) {
-    let grid = Mutex::new(TerminalGridStream::new(cols, rows, GridLimits::default()).expect("grid"));
+    let grid =
+        Mutex::new(TerminalGridStream::new(cols, rows, GridLimits::default()).expect("grid"));
     let output = Mutex::new(OutputFanoutBuffer::new(1 << 20));
     let mut modes = PaneTerminalModeTracker::default();
     let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
     let mut tracker = PaneCursorTracker::new(rows, cols);
-    let (mut mode, mut parse, mut replies, mut total) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let (mut mode, mut parse, mut replies, mut total) =
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut bytes = 0usize;
     for (index, frame) in frames.iter().enumerate() {
         let (mut frame_mode, mut frame_parse, mut frame_replies) =

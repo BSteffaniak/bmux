@@ -13,7 +13,6 @@ pub use attach_provider::{
     AttachProviderError, AttachProviderFuture, AttachProviderOpenContext,
     AttachProviderRegistration, AttachProviderRegistrationError, AttachProviderRegistry,
     AttachProviderResolutionError, AttachProviderSession, AttachTarget, ResolvedAttachTarget,
-    global_attach_provider_registry,
 };
 
 pub use attach_session::{

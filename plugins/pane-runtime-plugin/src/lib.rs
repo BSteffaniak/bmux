@@ -57,7 +57,7 @@ mod contract_tests {
     fn admitted_route_contribution_is_exact_and_matches_boundary_guard() {
         use bmux_plugin_sdk::RustPlugin;
         let mut registrar = bmux_plugin_sdk::ContributionRegistrar::new();
-        super::PaneRuntimePlugin
+        super::PaneRuntimePlugin::default()
             .register_contributions(&mut registrar)
             .unwrap();
         let contributions = registrar.into_contributions();
@@ -152,7 +152,7 @@ mod contract_tests {
                 && service.interface_id == "pane-runtime-spawn-v1"
         }));
         let mut registrar = bmux_plugin_sdk::ContributionRegistrar::new();
-        super::PaneRuntimePlugin
+        super::PaneRuntimePlugin::default()
             .register_contributions(&mut registrar)
             .unwrap();
         let contributions = registrar.into_contributions();
@@ -248,7 +248,7 @@ bmux_plugin_sdk::define_plugin!(
     factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| {
         Ok(std::sync::Arc::new(
             bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
-                PaneRuntimePlugin,
+                PaneRuntimePlugin::default(),
                 scope.instance,
             ),
         )
@@ -266,7 +266,10 @@ bmux_plugin_sdk::define_plugin!(
 );
 
 #[derive(Default)]
-pub struct PaneRuntimePlugin;
+pub struct PaneRuntimePlugin {
+    /// The host handles this instance's activation received.
+    host: runtime::PaneRuntimeHost,
+}
 
 impl PaneRuntimePlugin {
     /// Services the generated manifest declares. The BPDL world provides the
@@ -394,7 +397,13 @@ impl RustPlugin for PaneRuntimePlugin {
     ) -> std::result::Result<i32, PluginCommandError> {
         runtime::activate_managed_scope();
         application_resurrection::activate(&context);
-        readiness::activate(&context);
+        // The host handles this activation received; every runtime, handler
+        // and task reaches the host through them.
+        let states = bmux_plugin::activation_state_registry(&context);
+        let events = bmux_plugin::activation_event_bus(&context);
+        self.host = runtime::PaneRuntimeHost::new(states, events);
+        let host = &self.host;
+        readiness::activate(host, &context);
         runtime::supervisor::activate(&context);
         runtime::reservations::activate(&context);
         // Register the focus-state channel so subscribers (e.g.
@@ -402,8 +411,7 @@ impl RustPlugin for PaneRuntimePlugin {
         // session. Seeded empty — `publish_focus_state_snapshot`
         // republishes the full map on every session-mutating pane
         // command (via `handlers::publish_focus_state_snapshot`).
-        let events = bmux_plugin::activation_event_bus(&context);
-        if let Some(events) = &events {
+        if let Some(events) = host.events() {
             events.register_state_channel::<SessionFocusStateMap>(
                 pane_runtime_focus::STATE_KIND,
                 SessionFocusStateMap {
@@ -413,15 +421,15 @@ impl RustPlugin for PaneRuntimePlugin {
             );
             events.register_channel::<PaneEvent>(pane_runtime_events::EVENT_KIND);
         }
-        runtime::install_activation_events(events);
         // Publish the initial snapshot so any already-registered
         // subscribers see the current focus state immediately (even
         // though the map is usually empty at activate time — sessions
         // are created later).
-        handlers::publish_focus_state_snapshot();
-        handlers::pane_commands::publish_pane_lifecycle_facts();
+        handlers::publish_focus_state_snapshot(host);
+        handlers::pane_commands::publish_pane_lifecycle_facts(host);
 
-        let config = bmux_plugin::global_plugin_state_registry()
+        let config = host
+            .states()
             .get::<bmux_pane_runtime_plugin_api::PaneRuntimePluginConfig>()
             .and_then(|handle| handle.read().ok().map(|guard| (*guard).clone()))
             .unwrap_or_else(|| bmux_pane_runtime_plugin_api::PaneRuntimePluginConfig {
@@ -437,7 +445,7 @@ impl RustPlugin for PaneRuntimePlugin {
             });
         let padding_config = padding::PanePaddingConfig::parse(context.settings.as_ref())
             .map_err(PluginCommandError::invalid_arguments)?;
-        runtime::activate_pane_runtime(config, padding_config)
+        runtime::activate_pane_runtime(host, config, padding_config)
             .map_err(PluginCommandError::failed)?;
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
@@ -446,7 +454,9 @@ impl RustPlugin for PaneRuntimePlugin {
         &mut self,
         _context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
-        if let Some(handle) = bmux_plugin::global_plugin_state_registry()
+        let host = &self.host;
+        if let Some(handle) = host
+            .states()
             .get::<runtime::PanePaddingRuntimeHandle>()
             .and_then(|handle| handle.read().ok().map(|guard| guard.clone()))
         {
@@ -454,9 +464,9 @@ impl RustPlugin for PaneRuntimePlugin {
                 .cancel_all_previews()
                 .map_err(|error| PluginCommandError::failed(error.to_string()))?;
         }
-        bmux_presentation_state::global_presentation_fact_host_service()
-            .registry()
-            .remove_producer("bmux.pane_runtime");
+        if let Ok(service) = host.fact_service().read() {
+            service.registry().remove_producer("bmux.pane_runtime");
+        }
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 
@@ -464,12 +474,12 @@ impl RustPlugin for PaneRuntimePlugin {
         &mut self,
         context: NativeCommandContext,
     ) -> std::result::Result<i32, PluginCommandError> {
-        commands::run(&context)?;
+        commands::run(&self.host, &context)?;
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
-        handlers::route(context)
+        handlers::route(&self.host, context)
     }
 
     fn register_typed_services(

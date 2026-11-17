@@ -937,9 +937,13 @@ fn invoke_service_with_pool(
 }
 
 /// Install plugin-owned client attachment without activating a local server.
-pub fn install_client_adapter(paths: &bmux_config::ConfigPaths) {
-    attach_provider::set_paths(paths.clone());
-    attach_provider::install();
+/// The client-side attach provider for paired terminals; the host
+/// registers it into its own attach-provider registry.
+#[must_use]
+pub fn client_attach_provider(
+    paths: &bmux_config::ConfigPaths,
+) -> std::sync::Arc<dyn bmux_client::AttachProvider> {
+    attach_provider::provider(paths.clone())
 }
 
 /// Resolve an owner-paired display name without exposing private device credentials.

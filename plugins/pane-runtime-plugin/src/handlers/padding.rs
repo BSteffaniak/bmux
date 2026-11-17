@@ -63,6 +63,7 @@ fn preview_state(
 }
 
 pub fn begin_preview(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &BeginPanePaddingPreviewArgs,
     context: &bmux_plugin_sdk::NativeServiceContext,
 ) -> Result<
@@ -70,7 +71,7 @@ pub fn begin_preview(
     PaneCommandError,
 > {
     let spec = spec_from_api(&req.padding).map_err(|reason| PaneCommandError::Failed { reason })?;
-    let handle = handle().ok_or(PaneCommandError::SessionNotFound)?;
+    let handle = handle(host).ok_or(PaneCommandError::SessionNotFound)?;
     let owner = owner_client_id(context)?;
     handle
         .begin_preview(owner, req.pane_ids.clone(), spec)
@@ -81,6 +82,7 @@ pub fn begin_preview(
 }
 
 pub fn update_preview(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &UpdatePanePaddingPreviewArgs,
     context: &bmux_plugin_sdk::NativeServiceContext,
 ) -> Result<
@@ -88,7 +90,7 @@ pub fn update_preview(
     PaneCommandError,
 > {
     let spec = spec_from_api(&req.padding).map_err(|reason| PaneCommandError::Failed { reason })?;
-    let handle = handle().ok_or(PaneCommandError::SessionNotFound)?;
+    let handle = handle(host).ok_or(PaneCommandError::SessionNotFound)?;
     let owner = owner_client_id(context)?;
     handle
         .update_preview(owner, req.token, req.pane_ids.clone(), spec)
@@ -99,13 +101,14 @@ pub fn update_preview(
 }
 
 pub fn cancel_preview(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &PreviewTokenArgs,
     context: &bmux_plugin_sdk::NativeServiceContext,
 ) -> Result<
     bmux_pane_runtime_plugin_api::pane_runtime_commands::PanePaddingPreviewToken,
     PaneCommandError,
 > {
-    let handle = handle().ok_or(PaneCommandError::SessionNotFound)?;
+    let handle = handle(host).ok_or(PaneCommandError::SessionNotFound)?;
     handle
         .cancel_preview(owner_client_id(context)?, req.token)
         .map(
@@ -119,6 +122,7 @@ pub fn cancel_preview(
 }
 
 pub fn commit_preview(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &CommitPanePaddingPreviewArgs,
     context: &bmux_plugin_sdk::NativeServiceContext,
 ) -> Result<Vec<PanePaddingState>, PaneCommandError> {
@@ -130,7 +134,7 @@ pub fn commit_preview(
             crate::runtime::PanePaddingOverridePersistence::Snapshot
         }
     };
-    let handle = handle().ok_or(PaneCommandError::SessionNotFound)?;
+    let handle = handle(host).ok_or(PaneCommandError::SessionNotFound)?;
     handle
         .commit_preview(owner_client_id(context)?, req.token, persistence)
         .map(|panes| {
@@ -159,8 +163,8 @@ pub struct SetPanePaddingArgs {
     pub padding: PanePaddingSpec,
 }
 
-fn handle() -> Option<PanePaddingRuntimeHandle> {
-    bmux_plugin::global_plugin_state_registry()
+fn handle(host: &crate::runtime::PaneRuntimeHost) -> Option<PanePaddingRuntimeHandle> {
+    host.states()
         .get::<PanePaddingRuntimeHandle>()
         .and_then(|entry| entry.read().ok().map(|guard| (*guard).clone()))
 }
@@ -184,8 +188,11 @@ fn map_state_error(
     }
 }
 
-pub fn get(req: &PanePaddingArgs) -> Result<PanePaddingState, PanePaddingStateError> {
-    let handle = handle().ok_or(PanePaddingStateError::SessionNotFound)?;
+pub fn get(
+    host: &crate::runtime::PaneRuntimeHost,
+    req: &PanePaddingArgs,
+) -> Result<PanePaddingState, PanePaddingStateError> {
+    let handle = handle(host).ok_or(PanePaddingStateError::SessionNotFound)?;
     let session_id = SessionId(req.session_id);
     handle
         .state(session_id, req.pane_id)
@@ -193,9 +200,12 @@ pub fn get(req: &PanePaddingArgs) -> Result<PanePaddingState, PanePaddingStateEr
         .map_err(|_| map_state_error(&handle, session_id))
 }
 
-pub fn set(req: &SetPanePaddingArgs) -> Result<PanePaddingState, PaneCommandError> {
+pub fn set(
+    host: &crate::runtime::PaneRuntimeHost,
+    req: &SetPanePaddingArgs,
+) -> Result<PanePaddingState, PaneCommandError> {
     let spec = spec_from_api(&req.padding).map_err(|reason| PaneCommandError::Failed { reason })?;
-    let handle = handle().ok_or(PaneCommandError::SessionNotFound)?;
+    let handle = handle(host).ok_or(PaneCommandError::SessionNotFound)?;
     let session_id = SessionId(req.session_id);
     handle
         .set_override(session_id, req.pane_id, Some(spec))
@@ -203,8 +213,11 @@ pub fn set(req: &SetPanePaddingArgs) -> Result<PanePaddingState, PaneCommandErro
         .map_err(|_| map_command_error(&handle, session_id))
 }
 
-pub fn clear(req: &PanePaddingArgs) -> Result<PanePaddingState, PaneCommandError> {
-    let handle = handle().ok_or(PaneCommandError::SessionNotFound)?;
+pub fn clear(
+    host: &crate::runtime::PaneRuntimeHost,
+    req: &PanePaddingArgs,
+) -> Result<PanePaddingState, PaneCommandError> {
+    let handle = handle(host).ok_or(PaneCommandError::SessionNotFound)?;
     let session_id = SessionId(req.session_id);
     handle
         .set_override(session_id, req.pane_id, None)
@@ -218,8 +231,11 @@ pub struct PaddingTargetPanesArgs {
     pub session_id: Option<Uuid>,
 }
 
-pub fn target_panes(req: &PaddingTargetPanesArgs) -> Result<Vec<Uuid>, PanePaddingStateError> {
-    let handle = handle().ok_or(PanePaddingStateError::SessionNotFound)?;
+pub fn target_panes(
+    host: &crate::runtime::PaneRuntimeHost,
+    req: &PaddingTargetPanesArgs,
+) -> Result<Vec<Uuid>, PanePaddingStateError> {
+    let handle = handle(host).ok_or(PanePaddingStateError::SessionNotFound)?;
     match req.session_id {
         Some(session_id) => handle
             .pane_ids(SessionId(session_id))
@@ -235,8 +251,11 @@ pub struct ClearPanePaddingOverridesArgs {
     pub pane_ids: Vec<Uuid>,
 }
 
-pub fn clear_overrides(req: &ClearPanePaddingOverridesArgs) -> Result<Vec<Uuid>, PaneCommandError> {
-    let handle = handle().ok_or(PaneCommandError::SessionNotFound)?;
+pub fn clear_overrides(
+    host: &crate::runtime::PaneRuntimeHost,
+    req: &ClearPanePaddingOverridesArgs,
+) -> Result<Vec<Uuid>, PaneCommandError> {
+    let handle = handle(host).ok_or(PaneCommandError::SessionNotFound)?;
     handle
         .clear_overrides(&req.pane_ids)
         .map(|_| req.pane_ids.clone())
@@ -250,9 +269,12 @@ pub struct SetGlobalPanePaddingArgs {
     pub padding: PanePaddingSpec,
 }
 
-pub fn set_global(req: &SetGlobalPanePaddingArgs) -> Result<(), PaneCommandError> {
+pub fn set_global(
+    host: &crate::runtime::PaneRuntimeHost,
+    req: &SetGlobalPanePaddingArgs,
+) -> Result<(), PaneCommandError> {
     let spec = spec_from_api(&req.padding).map_err(|reason| PaneCommandError::Failed { reason })?;
-    let handle = handle().ok_or(PaneCommandError::SessionNotFound)?;
+    let handle = handle(host).ok_or(PaneCommandError::SessionNotFound)?;
     handle
         .replace_padding_defaults(spec)
         .map_err(|error| PaneCommandError::Failed {

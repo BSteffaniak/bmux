@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock, RwLock, Weak};
+use std::sync::{Arc, RwLock, Weak};
 
 use crate::BmuxClient;
 
@@ -390,13 +390,6 @@ impl Drop for AttachProviderRegistration {
             .providers
             .remove(&id);
     }
-}
-
-/// Process-wide attach-provider registry.
-#[must_use]
-pub fn global_attach_provider_registry() -> Arc<AttachProviderRegistry> {
-    static REGISTRY: OnceLock<Arc<AttachProviderRegistry>> = OnceLock::new();
-    Arc::clone(REGISTRY.get_or_init(|| Arc::new(AttachProviderRegistry::new())))
 }
 
 #[cfg(test)]

@@ -30,13 +30,9 @@ mod workspace_rename;
 
 use bmux_attach_view_protocol::AttachLocalPresentationSnapshot;
 use bmux_plugin::RenderNamedColor;
-#[cfg(test)]
-use bmux_plugin::layout::global_plugin_layout_registry;
 use bmux_plugin::layout::{
     LayoutEdge, LayoutExtent, PluginLayoutId, PluginLayoutRequest, PluginLayoutSnapshot,
 };
-#[cfg(test)]
-use bmux_plugin::surface::global_plugin_surface_registry;
 use bmux_plugin::surface::{
     PluginSurface, PluginSurfaceId, PluginSurfaceRegion, PluginSurfaceSnapshot,
 };
@@ -47,15 +43,12 @@ use bmux_plugin::{
 use bmux_plugin_sdk::{TypedServiceEndpoint, prelude::*};
 #[cfg(test)]
 use bmux_presentation_state::{
-    PresentationEntityRef, PresentationFact, PresentationFactRole,
-    global_presentation_fact_host_service,
+    PresentationEntityRef, PresentationFact, PresentationFactRegistry, PresentationFactRole,
 };
 use bmux_tab_bar_plugin_api::{notifications_list, status_items_list};
 use bmux_tabs_plugin_api::{tabs_commands, tabs_list};
 use bmux_workspaces_plugin_api::{workspaces_commands, workspaces_state};
 use std::sync::Mutex;
-#[cfg(test)]
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -328,8 +321,9 @@ impl CompanionState {
 
     fn new(settings: Settings) -> Self {
         Self {
-            surfaces: bmux_plugin::surface::global_plugin_surface_registry_handle(),
-            layouts: bmux_plugin::layout::global_plugin_layout_registry_handle(),
+            // Private until an installation hands over its runtime's registries.
+            surfaces: std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(64)),
+            layouts: std::sync::Arc::new(bmux_plugin::layout::PluginLayoutRegistry::new(64)),
             settings,
             revision: 0,
             snapshot: tabs_list::TabListSnapshot {
@@ -481,12 +475,6 @@ impl CompanionState {
 
 type CompanionHandle = std::sync::Arc<Mutex<Option<CompanionState>>>;
 
-#[cfg(test)]
-fn state() -> &'static CompanionHandle {
-    static STATE: OnceLock<CompanionHandle> = OnceLock::new();
-    STATE.get_or_init(|| std::sync::Arc::new(Mutex::new(None)))
-}
-
 #[derive(Default)]
 pub struct TabBarPlugin {
     external: std::sync::Arc<external::ExternalPresentation>,
@@ -584,34 +572,68 @@ fn input_endpoint() -> bmux_plugin::AttachInputEndpoint {
     }
 }
 
-/// Configure a process-local attach companion (test fixture only; attach
-/// runtimes install an owned [`TabBarPresentation`]).
+/// A test-owned companion installed into its own presentation resources,
+/// standing in for an attach runtime.
 #[cfg(test)]
-fn install(settings: Option<&toml::Value>) -> Result<(), String> {
-    let settings = Settings::parse(settings).map_err(|error| error.to_string())?;
-    let request = layout_request(&settings);
-    let mut guard = state()
-        .lock()
-        .map_err(|_| "tab-bar state lock poisoned".to_string())?;
-    *guard = Some(CompanionState::new(settings));
-    drop(guard);
+struct Fixture {
+    resources: bmux_plugin::AttachPresentationResources,
+    handle: CompanionHandle,
+}
 
-    let _ = global_plugin_layout_registry().remove_owner(OWNER);
-    let _ = global_plugin_surface_registry().remove_owner(OWNER);
-    global_plugin_layout_registry()
-        .publish(
-            OWNER,
-            PluginLayoutSnapshot {
-                revision: 1,
-                requests: vec![request],
-            },
-        )
-        .map_err(|error| format!("publishing tab-bar layout: {error:?}"))?;
-    register_presentation_input(
-        bmux_plugin::global_attach_presentation_input_registry(),
-        state(),
-    );
-    Ok(())
+#[cfg(test)]
+impl Fixture {
+    fn install(settings: Option<&toml::Value>) -> Result<Self, String> {
+        let settings = Settings::parse(settings).map_err(|error| error.to_string())?;
+        let request = layout_request(&settings);
+        let resources = bmux_plugin::AttachPresentationResources::isolated(64);
+        let mut companion = CompanionState::new(settings);
+        companion.surfaces = resources.surfaces.clone();
+        companion.layouts = resources.layouts.clone();
+        let handle = std::sync::Arc::new(Mutex::new(Some(companion)));
+        resources
+            .layouts
+            .publish(
+                OWNER,
+                PluginLayoutSnapshot {
+                    revision: 1,
+                    requests: vec![request],
+                },
+            )
+            .map_err(|error| format!("publishing tab-bar layout: {error:?}"))?;
+        register_presentation_input(&resources.input, &handle);
+        Ok(Self { resources, handle })
+    }
+
+    // The companion lock must cover registry publication so multiple
+    // retained-state subscriber tasks cannot race the same owner revision.
+    #[allow(clippy::significant_drop_tightening)]
+    fn publish(&self, snapshot: tabs_list::TabListSnapshot) -> Result<(), String> {
+        let mut guard = self
+            .handle
+            .lock()
+            .map_err(|_| "tab-bar state lock poisoned".to_string())?;
+        let Some(companion) = guard.as_mut() else {
+            return Ok(());
+        };
+        companion.replace_tabs(snapshot);
+        publish_companion(companion)
+    }
+
+    #[allow(clippy::significant_drop_tightening)] // The state lock must cover projection so snapshot fields remain coherent.
+    fn publish_local_presentation(
+        &self,
+        snapshot: AttachLocalPresentationSnapshot,
+    ) -> Result<(), String> {
+        let mut guard = self
+            .handle
+            .lock()
+            .map_err(|_| "tab-bar state lock poisoned".to_string())?;
+        let Some(companion) = guard.as_mut() else {
+            return Ok(());
+        };
+        companion.replace_local_presentation(snapshot);
+        publish_companion(companion)
+    }
 }
 
 fn register_presentation_input(
@@ -710,6 +732,38 @@ pub struct TabBarPresentation {
     task: tokio::task::JoinHandle<()>,
 }
 
+/// Where a presentation reads semantic facts from.
+enum FactSource {
+    /// A registry shared explicitly with this runtime's producers.
+    Registry(std::sync::Arc<bmux_presentation_state::PresentationFactRegistry>),
+    /// The fact host in this runtime's shared state registry.
+    Host(std::sync::Arc<std::sync::RwLock<bmux_presentation_state::PresentationFactHostService>>),
+}
+
+impl FactSource {
+    fn with<R>(
+        &self,
+        read: impl FnOnce(&bmux_presentation_state::PresentationFactRegistry) -> R,
+    ) -> Option<R> {
+        match self {
+            Self::Registry(registry) => Some(read(registry)),
+            Self::Host(host) => host.read().ok().map(|host| read(host.registry())),
+        }
+    }
+
+    fn subscribe(
+        &self,
+    ) -> Result<tokio::sync::watch::Receiver<bmux_presentation_state::PresentationFactChange>, String>
+    {
+        self.with(bmux_presentation_state::PresentationFactRegistry::subscribe_changes)
+            .ok_or_else(|| "presentation facts unavailable".to_string())
+    }
+
+    fn indicator(&self) -> Option<live_indicator::LiveIndicator> {
+        self.with(live_indicator::read).flatten()
+    }
+}
+
 impl TabBarPresentation {
     /// Install and subscribe using the invoking runtime's resources.
     ///
@@ -719,11 +773,12 @@ impl TabBarPresentation {
         settings: Option<&toml::Value>,
         resources: &bmux_plugin::AttachPresentationResources,
     ) -> Result<Self, String> {
-        Self::install_with_facts(
-            settings,
-            resources,
-            bmux_presentation_state::global_presentation_fact_host_service().registry(),
-        )
+        // Facts live in the fact host of this runtime's shared registry, where
+        // other companions of the same runtime publish them.
+        let host = resources
+            .states
+            .get_or_insert_with(bmux_presentation_state::PresentationFactHostService::new);
+        Self::install_with_facts(settings, resources, FactSource::Host(host))
     }
 
     /// Install using facts owned by the same runtime as the presentation.
@@ -739,20 +794,14 @@ impl TabBarPresentation {
         resources: &bmux_plugin::AttachPresentationResources,
         facts: std::sync::Arc<bmux_presentation_state::PresentationFactRegistry>,
     ) -> Result<Self, String> {
-        Self::install_with_facts(settings, resources, facts)
+        Self::install_with_facts(settings, resources, FactSource::Registry(facts))
     }
 
-    fn install_with_facts<F>(
+    fn install_with_facts(
         settings: Option<&toml::Value>,
         resources: &bmux_plugin::AttachPresentationResources,
-        fact_registry: F,
-    ) -> Result<Self, String>
-    where
-        F: std::ops::Deref<Target = bmux_presentation_state::PresentationFactRegistry>
-            + Send
-            + Sync
-            + 'static,
-    {
+        fact_registry: FactSource,
+    ) -> Result<Self, String> {
         let settings = Settings::parse(settings).map_err(|error| error.to_string())?;
         let request = layout_request(&settings);
         let handle = tokio::runtime::Handle::try_current().map_err(|error| error.to_string())?;
@@ -778,10 +827,10 @@ impl TabBarPresentation {
                 &bmux_workspaces_plugin_api::workspaces_list::STATE_KIND,
             )
             .ok();
-        let mut facts_rx = fact_registry.subscribe_changes();
+        let mut facts_rx = fact_registry.subscribe()?;
         let mut companion = CompanionState::new(settings);
         let mut external_feeds = ExternalFeeds::subscribe(&resources.events, &mut companion)?;
-        companion.live_indicator = live_indicator::read(&fact_registry);
+        companion.live_indicator = fact_registry.indicator();
         let mut workspaces_rx = workspace_subscription.map(|(snapshot, rx)| {
             companion.workspace_choices.clone_from(&snapshot.workspaces);
             rx
@@ -814,7 +863,7 @@ impl TabBarPresentation {
                     result = facts_rx.changed() => {
                         if result.is_err() { break; }
                         facts_rx.borrow_and_update();
-                        PresentationUpdate::Indicator(live_indicator::read(&fact_registry))
+                        PresentationUpdate::Indicator(fact_registry.indicator())
                     }
                     result = async {
                         match &mut workspaces_rx {
@@ -1034,16 +1083,6 @@ fn apply_presentation_update(
     result
 }
 
-#[cfg(test)]
-fn uninstall() {
-    bmux_plugin::remove_attach_presentation_input_handler(&input_endpoint());
-    let _ = global_plugin_layout_registry().remove_owner(OWNER);
-    let _ = global_plugin_surface_registry().remove_owner(OWNER);
-    if let Ok(mut guard) = state().lock() {
-        *guard = None;
-    }
-}
-
 fn layout_request(settings: &Settings) -> PluginLayoutRequest {
     PluginLayoutRequest::split(
         PluginLayoutId::new(OWNER, LAYOUT_ID),
@@ -1054,34 +1093,6 @@ fn layout_request(settings: &Settings) -> PluginLayoutRequest {
         },
         LayoutExtent::Cells(settings.height),
     )
-}
-
-// The companion lock must cover registry publication so multiple retained-state
-// subscriber tasks cannot race the same owner revision.
-#[cfg(test)]
-#[allow(clippy::significant_drop_tightening)]
-fn publish(snapshot: tabs_list::TabListSnapshot) -> Result<(), String> {
-    let mut guard = state()
-        .lock()
-        .map_err(|_| "tab-bar state lock poisoned".to_string())?;
-    let Some(companion) = guard.as_mut() else {
-        return Ok(());
-    };
-    companion.replace_tabs(snapshot);
-    publish_companion(companion)
-}
-
-#[cfg(test)]
-#[allow(clippy::significant_drop_tightening)] // The state lock must cover projection so snapshot fields remain coherent.
-fn publish_local_presentation(snapshot: AttachLocalPresentationSnapshot) -> Result<(), String> {
-    let mut guard = state()
-        .lock()
-        .map_err(|_| "tab-bar state lock poisoned".to_string())?;
-    let Some(companion) = guard.as_mut() else {
-        return Ok(());
-    };
-    companion.replace_local_presentation(snapshot);
-    publish_companion(companion)
 }
 
 fn publish_surface(
@@ -1154,10 +1165,12 @@ fn companion_surfaces(companion: &CompanionState, revision: u64) -> Vec<PluginSu
 }
 
 #[cfg(test)]
-fn compact_fact(tab: &tabs_list::TabListEntry) -> Option<PresentationFact> {
+fn compact_fact(
+    facts: &PresentationFactRegistry,
+    tab: &tabs_list::TabListEntry,
+) -> Option<PresentationFact> {
     let entity = PresentationEntityRef::new("bmux.tabs", tab.id.to_string());
-    global_presentation_fact_host_service()
-        .registry()
+    facts
         .facts_for_entity(&entity)
         .into_iter()
         .map(|(_, fact)| fact)
@@ -1216,7 +1229,12 @@ fn truncate_to_width(value: &str, maximum: usize) -> String {
 }
 
 #[cfg(test)]
-fn tab_label(settings: &Settings, tab: &tabs_list::TabListEntry, index: usize) -> String {
+fn tab_label(
+    facts: &PresentationFactRegistry,
+    settings: &Settings,
+    tab: &tabs_list::TabListEntry,
+    index: usize,
+) -> String {
     const INDEX_TOKEN: &str = concat!("{", "index}");
     const INDEX0_TOKEN: &str = concat!("{", "index0}");
     const SESSION_TOKEN: &str = concat!("{", "session}");
@@ -1228,7 +1246,7 @@ fn tab_label(settings: &Settings, tab: &tabs_list::TabListEntry, index: usize) -
     let session = "";
     let fact = settings
         .show_compact_facts
-        .then(|| compact_fact(tab))
+        .then(|| compact_fact(facts, tab))
         .flatten();
     let label = settings
         .label_template
@@ -2472,6 +2490,7 @@ mod tests {
             surfaces: std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(64)),
             input: std::sync::Arc::new(bmux_plugin::AttachPresentationInputRegistry::new()),
             events,
+            states: std::sync::Arc::new(bmux_plugin::PluginStateRegistry::new()),
             plugin_settings: std::sync::Arc::default(),
         }
     }
@@ -3368,15 +3387,18 @@ width = 60
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // One retained-revision scenario: republish, foreign owner, replacement.
     fn republish_advances_past_retained_owner_revision() {
-        uninstall();
-        install(None).expect("install tab bar");
-        publish(tabs_list::TabListSnapshot {
-            tabs: Vec::new(),
-            revision: 0,
-        })
-        .expect("initial publish");
-        global_plugin_surface_registry()
+        let fixture = Fixture::install(None).expect("install tab bar");
+        fixture
+            .publish(tabs_list::TabListSnapshot {
+                tabs: Vec::new(),
+                revision: 0,
+            })
+            .expect("initial publish");
+        fixture
+            .resources
+            .surfaces
             .publish(
                 OWNER,
                 PluginSurfaceSnapshot {
@@ -3386,13 +3408,16 @@ width = 60
             )
             .expect("seed higher owner revision");
 
-        publish(tabs_list::TabListSnapshot {
-            tabs: Vec::new(),
-            revision: 1,
-        })
-        .expect("republish above retained revision");
+        fixture
+            .publish(tabs_list::TabListSnapshot {
+                tabs: Vec::new(),
+                revision: 1,
+            })
+            .expect("republish above retained revision");
         assert_eq!(
-            global_plugin_surface_registry()
+            fixture
+                .resources
+                .surfaces
                 .owner_snapshot(OWNER)
                 .expect("owner snapshot")
                 .revision,
@@ -3400,23 +3425,25 @@ width = 60
         );
         // Exercise the registered local route, not just projection helpers.
         let id = Uuid::from_u128(7);
-        publish(tabs_list::TabListSnapshot {
-            revision: 2,
-            tabs: vec![tabs_list::TabListEntry {
-                id,
-                name: "original".to_string(),
-                active: true,
-                workspace: "default".to_string(),
-                workspace_id: Uuid::nil(),
-            }],
-        })
-        .unwrap();
-        publish_local_presentation(AttachLocalPresentationSnapshot {
-            viewport_cols: 80,
-            viewport_rows: 24,
-            ..AttachLocalPresentationSnapshot::initial()
-        })
-        .unwrap();
+        fixture
+            .publish(tabs_list::TabListSnapshot {
+                revision: 2,
+                tabs: vec![tabs_list::TabListEntry {
+                    id,
+                    name: "original".to_string(),
+                    active: true,
+                    workspace: "default".to_string(),
+                    workspace_id: Uuid::nil(),
+                }],
+            })
+            .unwrap();
+        fixture
+            .publish_local_presentation(AttachLocalPresentationSnapshot {
+                viewport_cols: 80,
+                viewport_rows: 24,
+                ..AttachLocalPresentationSnapshot::initial()
+            })
+            .unwrap();
         let mut event = AttachInputEvent {
             hook_id: format!("bmux.tab_bar:strip:tab:{id}"),
             event_kind: "pointer".to_string(),
@@ -3430,47 +3457,50 @@ width = 60
             focused_pane: None,
             hovered_pane: None,
         };
-        let opened =
-            bmux_plugin::invoke_attach_presentation_input_handler(&input_endpoint(), &event)
-                .unwrap();
+        let opened = fixture
+            .resources
+            .input
+            .invoke(&input_endpoint(), &event)
+            .unwrap();
         assert!(opened.consumed && opened.dirty && opened.service_invocation.is_none());
         assert_eq!(
-            global_plugin_surface_registry()
+            fixture
+                .resources
+                .surfaces
                 .owner_snapshot(OWNER)
                 .unwrap()
                 .surfaces
                 .len(),
             3
         );
-        point_at_rename(&mut event);
+        point_at_rename(&fixture, &mut event);
         assert!(
-            handle_local_input(state(), &event)
+            handle_local_input(&fixture.handle, &event)
                 .unwrap()
                 .service_invocation
                 .is_none()
         );
         event.phase = "up".to_string();
-        let rename = handle_local_input(state(), &event).unwrap();
+        let rename = handle_local_input(&fixture.handle, &event).unwrap();
         assert!(!rename.release_capture);
         event.event_kind = "key".to_string();
         event.phase = "press".to_string();
         event.key = Some("enter".to_string());
-        let submitted = handle_local_input(state(), &event).unwrap();
+        let submitted = handle_local_input(&fixture.handle, &event).unwrap();
         assert!(submitted.release_capture);
         assert!(submitted.service_invocation.is_some());
         event.key = Some("ctrl-a".to_string());
-        assert!(handle_local_input(state(), &event).is_none());
+        assert!(handle_local_input(&fixture.handle, &event).is_none());
         event.key = Some("x".to_string());
-        assert!(handle_local_input(state(), &event).is_none());
-        exercise_workspace_editor(event);
-        uninstall();
+        assert!(handle_local_input(&fixture.handle, &event).is_none());
+        exercise_workspace_editor(&fixture, event);
     }
 
-    fn point_at_rename(event: &mut AttachInputEvent) {
-        let snapshot = global_plugin_surface_registry()
-            .owner_snapshot(OWNER)
-            .unwrap();
-        bmux_plugin::global_attach_presentation_input_registry()
+    fn point_at_rename(fixture: &Fixture, event: &mut AttachInputEvent) {
+        let snapshot = fixture.resources.surfaces.owner_snapshot(OWNER).unwrap();
+        fixture
+            .resources
+            .input
             .committed(&input_endpoint(), snapshot.revision);
         let popup = snapshot
             .surfaces
@@ -3488,12 +3518,13 @@ width = 60
         event.hook_id = "bmux.tab_bar:menu:item.1".to_string();
     }
 
-    fn exercise_workspace_editor(mut event: AttachInputEvent) {
+    fn exercise_workspace_editor(fixture: &Fixture, mut event: AttachInputEvent) {
         event.event_kind = "pointer".to_string();
         event.phase = "down".to_string();
         event.button = Some("left".to_string());
         event.hook_id = format!("bmux.tab_bar:strip:workspace:{}", Uuid::nil());
-        state()
+        fixture
+            .handle
             .lock()
             .unwrap()
             .as_mut()
@@ -3501,38 +3532,50 @@ width = 60
             .local_presentation
             .double_click_ms = 500;
         assert_eq!(
-            handle_local_input(state(), &event)
+            handle_local_input(&fixture.handle, &event)
                 .unwrap()
                 .capture_keyboard,
             [] as [std::string::String; 0]
         );
         assert_eq!(
-            handle_local_input(state(), &event)
+            handle_local_input(&fixture.handle, &event)
                 .unwrap()
                 .capture_keyboard,
             vec!["*"]
         );
-        let revision = global_plugin_surface_registry()
+        let revision = fixture
+            .resources
+            .surfaces
             .owner_snapshot(OWNER)
             .unwrap()
             .revision;
-        bmux_plugin::global_attach_presentation_input_registry()
+        fixture
+            .resources
+            .input
             .committed(&input_endpoint(), revision);
         event.event_kind = "key".to_string();
         event.phase = "press".to_string();
         event.key = Some("backspace".to_string());
-        assert!(handle_local_input(state(), &event).unwrap().consumed);
+        assert!(
+            handle_local_input(&fixture.handle, &event)
+                .unwrap()
+                .consumed
+        );
         event.key = Some("enter".to_string());
-        let empty = handle_local_input(state(), &event).unwrap();
+        let empty = handle_local_input(&fixture.handle, &event).unwrap();
         assert_eq!(
             empty.status_message.as_deref(),
             Some("workspace name must not be empty")
         );
         assert!(!empty.release_capture);
         event.key = Some("界".to_string());
-        assert!(handle_local_input(state(), &event).unwrap().consumed);
+        assert!(
+            handle_local_input(&fixture.handle, &event)
+                .unwrap()
+                .consumed
+        );
         event.key = Some("enter".to_string());
-        let submitted = handle_local_input(state(), &event).unwrap();
+        let submitted = handle_local_input(&fixture.handle, &event).unwrap();
         assert!(submitted.release_capture);
         let request: workspaces_commands::client::RenameWorkspaceRequest =
             decode_action_payload(&submitted.service_invocation.unwrap()).unwrap();
@@ -3540,7 +3583,8 @@ width = 60
         assert_eq!(request.name, "界");
         // The catalog, not the submitted edit, remains label authority.
         assert_eq!(
-            state()
+            fixture
+                .handle
                 .lock()
                 .unwrap()
                 .as_ref()
@@ -3551,12 +3595,12 @@ width = 60
         );
         event.event_kind = "pointer".to_string();
         event.phase = "down".to_string();
-        handle_local_input(state(), &event).unwrap();
-        handle_local_input(state(), &event).unwrap();
+        handle_local_input(&fixture.handle, &event).unwrap();
+        handle_local_input(&fixture.handle, &event).unwrap();
         event.event_kind = "key".to_string();
         event.phase = "press".to_string();
         event.key = Some("esc".to_string());
-        let canceled = handle_local_input(state(), &event).unwrap();
+        let canceled = handle_local_input(&fixture.handle, &event).unwrap();
         assert!(canceled.release_capture && canceled.service_invocation.is_none());
     }
 
@@ -3644,7 +3688,10 @@ bar_bg = "#112233"
             maximum_label_width: Some(5),
             ..Settings::default()
         };
-        assert_eq!(tab_label(&settings, &tab, 0), "1:界");
+        assert_eq!(
+            tab_label(&PresentationFactRegistry::new(), &settings, &tab, 0),
+            "1:界"
+        );
     }
 
     #[test]

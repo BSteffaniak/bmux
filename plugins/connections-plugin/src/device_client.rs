@@ -591,7 +591,13 @@ mod tests {
         endpoint.close().await;
     }
 
-    fn activate_execution_fixture(paths: &bmux_config::ConfigPaths) {
+    /// Activate sessions and pane-runtime against the fixture server's own
+    /// host state and bus, as the CLI host's activation binders would, and
+    /// hand back the activated pane-runtime instance for its services.
+    fn activate_execution_fixture(
+        server: &bmux_server::BmuxServer,
+        paths: &bmux_config::ConfigPaths,
+    ) -> Arc<bmux_pane_runtime_plugin::PaneRuntimePlugin> {
         use bmux_plugin_sdk::RustPlugin;
         use sha2::Digest;
         use std::fmt::Write as _;
@@ -649,12 +655,28 @@ mod tests {
             capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
             auxiliary_executable_errors: std::collections::BTreeMap::new(),
         };
+        let host_values = || {
+            let capabilities = bmux_plugin_sdk::definition::ActivationCapabilities::default();
+            capabilities
+                .insert(bmux_plugin::ActivationStateRegistry(
+                    server.plugin_state_registry(),
+                ))
+                .unwrap();
+            capabilities
+                .insert(bmux_plugin::ActivationEventBus(server.plugin_event_bus()))
+                .unwrap();
+            capabilities
+        };
+        let mut sessions_context = context.clone();
+        sessions_context.capabilities = host_values();
         bmux_sessions_plugin::SessionsPlugin::default()
-            .activate(context.clone())
+            .activate(sessions_context)
             .unwrap();
-        bmux_pane_runtime_plugin::PaneRuntimePlugin
-            .activate(context)
-            .unwrap();
+        let mut pane_runtime = bmux_pane_runtime_plugin::PaneRuntimePlugin::default();
+        let mut context = context;
+        context.capabilities = host_values();
+        pane_runtime.activate(context).unwrap();
+        Arc::new(pane_runtime)
     }
 
     type FixtureContexts =
@@ -854,6 +876,7 @@ mod tests {
         server: &bmux_server::BmuxServer,
         paths: &bmux_config::ConfigPaths,
         pairing: &Arc<PairingAuthority>,
+        pane_runtime: &Arc<bmux_pane_runtime_plugin::PaneRuntimePlugin>,
     ) {
         use bmux_plugin_sdk::RustPlugin;
         let storage = Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::<
@@ -864,6 +887,7 @@ mod tests {
             let paths = paths.clone();
             let pairing = Arc::clone(pairing);
             let storage = Arc::clone(&storage);
+            let pane_runtime = Arc::clone(pane_runtime);
             let route = bmux_server::ServiceRoute {
                 capability: capability.into(),
                 kind,
@@ -883,6 +907,7 @@ mod tests {
                         let paths = paths.clone();
                         let pairing = Arc::clone(&pairing);
                         let storage = Arc::clone(&storage);
+                        let pane_runtime = Arc::clone(&pane_runtime);
                         async move {
                             tokio::task::spawn_blocking(move || {
                                 let payload = bmux_plugin_sdk::service_contract::decode_for(
@@ -899,8 +924,7 @@ mod tests {
                                     selected_caller,
                                 ));
                                 let response = if interface.starts_with("pane-runtime") {
-                                    bmux_pane_runtime_plugin::PaneRuntimePlugin
-                                        .invoke_service(context)
+                                    pane_runtime.invoke_service(context)
                                 } else {
                                     bmux_permissions_plugin::PermissionsPlugin::default()
                                         .invoke_service(context)
@@ -1515,9 +1539,8 @@ mod tests {
         let backend = bmux_ipc::IpcEndpoint::unix_socket(paths.server_socket());
         let server = Arc::new(BmuxServer::new(backend.clone()));
         install_provider_fixture(&server, &authority);
-        install_resource_fixture(&server, &paths, &pairing);
-        activate_execution_fixture(&paths);
-        bmux_plugin::global_service_locations().mark_remote("bmux.permissions");
+        let pane_runtime = activate_execution_fixture(&server, &paths);
+        install_resource_fixture(&server, &paths, &pairing, &pane_runtime);
         let running = Arc::clone(&server);
         let task = tokio::spawn(async move { running.run().await });
         let mut listener = Listener::start(

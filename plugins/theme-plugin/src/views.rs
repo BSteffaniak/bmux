@@ -18,6 +18,10 @@ pub struct ThemePlugin {
     preview_sequence: Arc<std::sync::atomic::AtomicU64>,
     events: Option<Arc<bmux_plugin::EventBus>>,
     sink: Option<Arc<dyn bmux_plugin_sdk::WireEventSink>>,
+    /// The activation's view of the host state registry, consulted for the
+    /// host's wire sink when no explicit runtime sink was composed. `None`
+    /// before activation; never a process-wide registry.
+    states: Option<Arc<bmux_plugin::PluginStateRegistry>>,
 }
 
 struct View {
@@ -26,6 +30,7 @@ struct View {
     state: ThemeView,
     context: NativeServiceContext,
     sink: Option<Arc<dyn bmux_plugin_sdk::WireEventSink>>,
+    states: Option<Arc<bmux_plugin::PluginStateRegistry>>,
     closed: std::sync::atomic::AtomicBool,
     published: Mutex<Option<super::RuntimeAppearance>>,
     explicit: std::sync::atomic::AtomicBool,
@@ -48,15 +53,14 @@ impl ThemePlugin {
             preview_sequence: Arc::default(),
             events: Some(events),
             sink: Some(sink),
+            states: None,
         }
     }
 
     fn selected_sink(&self) -> Option<Arc<dyn bmux_plugin_sdk::WireEventSink>> {
-        self.sink.clone().or_else(|| {
-            bmux_plugin::global_plugin_state_registry()
-                .get::<bmux_plugin_sdk::WireEventSinkHandle>()
-                .and_then(|sink| sink.read().ok().map(|sink| sink.0.clone()))
-        })
+        self.sink
+            .clone()
+            .or_else(|| host_wire_sink(self.states.as_deref()))
     }
 
     pub(super) fn command_impl(context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
@@ -98,6 +102,7 @@ impl ThemePlugin {
                 },
                 context: context.clone(),
                 sink: self.selected_sink(),
+                states: self.states.clone(),
                 closed: std::sync::atomic::AtomicBool::new(false),
                 published: Mutex::new(None),
                 explicit: std::sync::atomic::AtomicBool::new(false),
@@ -264,13 +269,20 @@ fn retire_disconnected(
     retired
 }
 
+/// The host wire sink published on an activation's registry view, if any.
+fn host_wire_sink(
+    states: Option<&bmux_plugin::PluginStateRegistry>,
+) -> Option<Arc<dyn bmux_plugin_sdk::WireEventSink>> {
+    states?
+        .get::<bmux_plugin_sdk::WireEventSinkHandle>()
+        .and_then(|sink| sink.read().ok().map(|sink| sink.0.clone()))
+}
+
 impl View {
     fn selected_sink(&self) -> Option<Arc<dyn bmux_plugin_sdk::WireEventSink>> {
-        self.sink.clone().or_else(|| {
-            bmux_plugin::global_plugin_state_registry()
-                .get::<bmux_plugin_sdk::WireEventSinkHandle>()
-                .and_then(|sink| sink.read().ok().map(|sink| sink.0.clone()))
-        })
+        self.sink
+            .clone()
+            .or_else(|| host_wire_sink(self.states.as_deref()))
     }
     fn publish(&self) {
         if self.closed.load(std::sync::atomic::Ordering::Acquire) {
@@ -455,6 +467,9 @@ impl RustPlugin for ThemePlugin {
         // runtime bus wins; otherwise use the bus this activation was handed.
         if self.events.is_none() {
             self.events = bmux_plugin::activation_event_bus(&context);
+        }
+        if self.sink.is_none() {
+            self.states = Some(bmux_plugin::activation_state_registry(&context));
         }
         self.watch_detach(&context);
         Ok(EXIT_OK)

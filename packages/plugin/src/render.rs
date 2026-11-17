@@ -10,12 +10,11 @@
 //!
 //! # Lifecycle
 //!
-//! 1. During the plugin's activation (or later, whenever the plugin
-//!    decides it has something to render), it calls
-//!    [`register_render_extension`] with an `Arc<dyn AttachRenderExtension>`.
-//! 2. The attach runtime reads the current registry via
-//!    [`registered_render_extensions`] on every frame and queries each
-//!    extension for each visible surface.
+//! 1. The plugin exposes a constructor; the attach runtime registers the
+//!    resulting `Arc<dyn AttachRenderExtension>` into its own
+//!    [`RenderExtensionRegistry`] (there is no process-wide registry).
+//! 2. The attach runtime reads that registry on every frame and queries
+//!    each extension for each visible surface.
 //! 3. Extensions should prefer
 //!    [`AttachRenderExtension::render_layer_scene_with_context`], which returns
 //!    a retained description of the current visual intent. The renderer owns
@@ -91,7 +90,7 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
@@ -179,15 +178,6 @@ pub trait AttachInputCodec: Send + Sync {
     /// # Errors
     /// Rejects unsupported response framing or malformed generated results.
     fn decode_result(&self, payload: &[u8]) -> Result<AttachInputResult, String>;
-}
-
-/// Resolve a wire contract through installed render extensions. Absence is
-/// unsupported, not a fallback to a host-local serialization layout.
-#[must_use]
-pub fn registered_input_codec(endpoint: &AttachInputEndpoint) -> Option<Arc<dyn AttachInputCodec>> {
-    registered_render_extensions()
-        .into_iter()
-        .find_map(|extension| extension.input_codec(endpoint))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
@@ -1930,49 +1920,6 @@ impl VisualAdapterRegistry {
     pub fn get(&self, id: &str) -> Option<Arc<dyn AttachVisualAdapter>> {
         self.entries.read().ok()?.get(id).cloned()
     }
-}
-
-#[must_use]
-pub fn global_visual_adapter_registry() -> Arc<VisualAdapterRegistry> {
-    static GLOBAL: OnceLock<Arc<VisualAdapterRegistry>> = OnceLock::new();
-    GLOBAL
-        .get_or_init(|| Arc::new(VisualAdapterRegistry::new()))
-        .clone()
-}
-
-pub fn register_visual_adapter(adapter: Arc<dyn AttachVisualAdapter>) {
-    global_visual_adapter_registry().register(adapter);
-}
-
-#[must_use]
-pub fn registered_visual_adapter(id: &str) -> Option<Arc<dyn AttachVisualAdapter>> {
-    global_visual_adapter_registry().get(id)
-}
-
-/// Process-wide shared extension registry.
-///
-/// Used by plugins whose activation callback does not carry a
-/// registry handle in its context. Core code reading extensions and
-/// plugins registering them both go through this singleton.
-#[must_use]
-pub fn global_render_extension_registry() -> Arc<RenderExtensionRegistry> {
-    static GLOBAL: OnceLock<Arc<RenderExtensionRegistry>> = OnceLock::new();
-    GLOBAL
-        .get_or_init(|| Arc::new(RenderExtensionRegistry::new()))
-        .clone()
-}
-
-/// Register a render extension on the process-wide registry. Shortcut
-/// for `global_render_extension_registry().register(ext)`.
-pub fn register_render_extension(ext: Arc<dyn AttachRenderExtension>) {
-    global_render_extension_registry().register(ext);
-}
-
-/// Snapshot of currently-registered render extensions. Shortcut for
-/// `global_render_extension_registry().snapshot()`.
-#[must_use]
-pub fn registered_render_extensions() -> Vec<Arc<dyn AttachRenderExtension>> {
-    global_render_extension_registry().snapshot()
 }
 
 #[cfg(test)]

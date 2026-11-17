@@ -31,9 +31,7 @@ use bmux_control_catalog_plugin_api::control_catalog_events::{self, CatalogEvent
 use bmux_control_catalog_plugin_api::control_catalog_state::{
     self, ContextRow, ContextSessionBinding, SessionRow, Snapshot,
 };
-use bmux_plugin::{
-    EventBus, PluginStateRegistry, ServiceCaller, TypedServiceCaller, global_plugin_state_registry,
-};
+use bmux_plugin::{EventBus, PluginStateRegistry, ServiceCaller, TypedServiceCaller};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_session_state::SessionManagerHandle;
@@ -101,13 +99,15 @@ struct SnapshotArgs {
 
 pub struct ControlCatalogPlugin {
     catalog: Arc<CatalogState>,
-    state: Arc<PluginStateRegistry>,
+    /// The registry this instance was composed with or its activation
+    /// received; an empty private one before activation.
+    state: std::sync::RwLock<Arc<PluginStateRegistry>>,
     subscriber: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl Default for ControlCatalogPlugin {
     fn default() -> Self {
-        Self::from_parts(None, global_plugin_state_registry())
+        Self::from_parts(None, Arc::new(PluginStateRegistry::new()))
     }
 }
 
@@ -120,6 +120,7 @@ impl RustPlugin for ControlCatalogPlugin {
     ) -> std::result::Result<i32, PluginCommandError> {
         self.catalog
             .adopt_activation_bus(|| bmux_plugin::activation_event_bus(&context));
+        self.adopt_activation_states(|| Some(bmux_plugin::activation_state_registry(&context)));
         self.start_subscriber()?;
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
@@ -172,8 +173,28 @@ impl ControlCatalogPlugin {
                 composed: events.is_some(),
                 events: std::sync::RwLock::new(events),
             }),
-            state,
+            state: std::sync::RwLock::new(state),
             subscriber: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn states(&self) -> Arc<PluginStateRegistry> {
+        self.state.read().map_or_else(
+            |_| Arc::new(PluginStateRegistry::new()),
+            |state| Arc::clone(&state),
+        )
+    }
+
+    /// Adopt this activation's registry view unless the host composed this
+    /// instance with an explicit one.
+    fn adopt_activation_states(&self, take: impl FnOnce() -> Option<Arc<PluginStateRegistry>>) {
+        if self.catalog.composed {
+            return;
+        }
+        if let Some(states) = take()
+            && let Ok(mut state) = self.state.write()
+        {
+            *state = states;
         }
     }
 
@@ -274,9 +295,10 @@ impl ControlCatalogPlugin {
             return Err("catalog event source disconnected; reactivation required".into());
         }
         let revision = self.catalog.revision.load(Ordering::SeqCst);
-        let sessions = read_sessions(&self.state)?;
-        let contexts = read_contexts(&self.state)?;
-        let context_session_bindings = read_bindings(&self.state)?;
+        let states = self.states();
+        let sessions = read_sessions(&states)?;
+        let contexts = read_contexts(&states)?;
+        let context_session_bindings = read_bindings(&states)?;
         Ok(Snapshot {
             revision,
             sessions,
@@ -398,6 +420,9 @@ impl bmux_plugin_sdk::definition::PluginInstance for ControlCatalogPlugin {
     {
         self.catalog.adopt_activation_bus(|| {
             bmux_plugin::take_activation_event_bus(&context.capabilities).ok()
+        });
+        self.adopt_activation_states(|| {
+            bmux_plugin::take_activation_state_registry(&context.capabilities).ok()
         });
         Box::pin(async move { self.start_subscriber() })
     }

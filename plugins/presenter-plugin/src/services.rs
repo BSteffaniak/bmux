@@ -12,7 +12,7 @@ use bmux_presenter_runtime::{
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::{Arc, Mutex, OnceLock, Weak},
+    sync::{Arc, Mutex, Weak},
     time::{Duration, Instant},
 };
 
@@ -29,8 +29,28 @@ type HostMap = Mutex<BTreeMap<String, Managed>>;
 #[derive(Default)]
 pub(crate) struct ManagedHosts {
     hosts: Arc<HostMap>,
+    /// The host's runtime, captured at activation. Plugins never build one.
+    runtime: Mutex<Option<tokio::runtime::Handle>>,
 }
 impl ManagedHosts {
+    /// Bind the runtime the host activated this instance on.
+    pub(crate) fn bind_runtime(&self, runtime: Option<tokio::runtime::Handle>) {
+        if let Ok(mut slot) = self.runtime.lock() {
+            *slot = runtime;
+        }
+    }
+
+    /// The host runtime demo work runs on: the one bound at activation, or
+    /// the runtime the current call is running on.
+    fn runtime(&self) -> anyhow::Result<tokio::runtime::Handle> {
+        self.runtime
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+            .or_else(|| tokio::runtime::Handle::try_current().ok())
+            .ok_or_else(|| anyhow::anyhow!("host runtime unavailable for demo execution"))
+    }
+
     pub(crate) fn admit_retirement(&self) -> Result<(), bmux_plugin_sdk::PluginCommandError> {
         let hosts = self.hosts.lock().map_err(|_| {
             bmux_plugin_sdk::PluginCommandError::unavailable(
@@ -47,20 +67,6 @@ impl ManagedHosts {
     }
 }
 
-fn demo_runtime() -> anyhow::Result<&'static tokio::runtime::Runtime> {
-    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    if let Some(runtime) = RUNTIME.get() {
-        return Ok(runtime);
-    }
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()?;
-    let _ = RUNTIME.set(runtime);
-    RUNTIME
-        .get()
-        .ok_or_else(|| anyhow::anyhow!("demo executor unavailable"))
-}
 fn advance_managed(hosts: Weak<HostMap>, id: String) {
     std::thread::spawn(move || {
         loop {
@@ -244,7 +250,7 @@ pub(crate) fn invoke(registry: &ManagedHosts, context: NativeServiceContext) -> 
                     let paths = bmux_config::ConfigPaths::new(ctx.connection.config_dir.clone().into(), ctx.connection.runtime_dir.clone().into(), ctx.connection.data_dir.clone().into(), ctx.connection.state_dir.clone().into());
                     let attempts_root = paths.state_dir.join("presenter-playbooks");
                     std::fs::create_dir_all(&attempts_root)?;
-                    let environment = crate::playbook_live::DemoEnvironment { paths, approval, executable: std::env::current_exe()?, attempts_root, runtime: demo_runtime()?.handle().clone() };
+                    let environment = crate::playbook_live::DemoEnvironment { paths, approval, executable: std::env::current_exe()?, attempts_root, runtime: registry.runtime()? };
                     build_trusted(&source, r.public_read, secret.clone(), r.audience_credential, environment)?
                 } else { build(&source, r.public_read, secret.clone(), r.audience_credential)? };
                 let participant = host.authenticate(PROTOCOL_VERSION, Some(&secret), InteractionMode::ReceiveOnly)?;
@@ -296,7 +302,7 @@ pub(crate) fn invoke(registry: &ManagedHosts, context: NativeServiceContext) -> 
         },
         "presenter-host-v1", "stop" => |r: manage::client::StopRequest, _ctx| {
             let result = (|| -> Result<(), String> {
-                let runtime = demo_runtime().map_err(|error| error.to_string())?;
+                let runtime = registry.runtime().map_err(|error| error.to_string())?;
                 let mut managed = hosts().lock().map_err(|error| error.to_string())?
                     .remove(&r.host_id).ok_or("host not found")?;
                 // Release the registry lock before any await. This lifecycle
@@ -458,6 +464,19 @@ mod definition_tests {
         assert!(!std::sync::Arc::ptr_eq(&first.hosts, &second.hosts));
         assert!(first.admit_retirement().is_ok());
         assert!(second.admit_retirement().is_ok());
+    }
+
+    #[test]
+    fn each_instance_uses_only_the_runtime_it_was_activated_on() {
+        let host = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let first = super::ManagedHosts::default();
+        let second = super::ManagedHosts::default();
+        first.bind_runtime(Some(host.handle().clone()));
+        assert!(first.runtime().is_ok());
+        // No process-wide executor stands in for an unbound instance.
+        assert!(second.runtime().is_err());
     }
 }
 

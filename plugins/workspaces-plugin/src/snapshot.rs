@@ -1,6 +1,6 @@
 //! Workspace catalog snapshot participant. Attachment navigation is excluded.
 use super::{WorkspaceRecord, WorkspaceState, load_catalog, save_catalog};
-use bmux_plugin::{TypedServiceCaller, global_plugin_state_registry};
+use bmux_plugin::{PluginStateRegistry, TypedServiceCaller};
 use bmux_plugin_sdk::{
     NativeLifecycleContext, PluginEventKind, StatefulPlugin, StatefulPluginError,
     StatefulPluginHandle, StatefulPluginResult, StatefulPluginSnapshot,
@@ -10,14 +10,14 @@ use std::sync::{Arc, RwLock};
 
 const ID: PluginEventKind = PluginEventKind::from_static("bmux.workspaces/catalog");
 pub fn register(
+    registry: &PluginStateRegistry,
     context: &NativeLifecycleContext,
     state: Arc<RwLock<WorkspaceState>>,
 ) -> Result<(), String> {
-    let registry = global_plugin_state_registry();
     let participants = bmux_snapshot_runtime::get_or_init_stateful_registry(
         || registry.get::<StatefulPluginRegistry>(),
         |fresh| {
-            registry.register::<StatefulPluginRegistry>(fresh);
+            registry.register_communal::<StatefulPluginRegistry>(fresh);
         },
     );
     participants

@@ -16,7 +16,7 @@ use bmux_cluster_plugin_api::{
     cluster_attach_command, cluster_attach_state, cluster_control_state,
 };
 use std::any::Any;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 const CLUSTER_PROVIDER_ID: &str = "bmux.cluster";
 
@@ -1904,22 +1904,11 @@ const fn provider_reason(reason: String) -> AttachSessionError {
     AttachSessionError::Provider { reason }
 }
 
-/// Register the plugin-owned cluster attach adapter in the generic process registry.
-///
-/// Registration is process-global and idempotent. Callers must invoke this only
-/// when the cluster plugin is enabled for the current CLI process.
-///
-/// # Panics
-///
-/// Panics if another provider has already registered the reserved
-/// `bmux.cluster` provider identifier.
-pub fn install() {
-    static REGISTRATION: OnceLock<bmux_client::AttachProviderRegistration> = OnceLock::new();
-    REGISTRATION.get_or_init(|| {
-        bmux_client::global_attach_provider_registry()
-            .register(Arc::new(ClusterAttachProvider))
-            .expect("cluster attach provider ID must be unique")
-    });
+/// The plugin-owned cluster attach adapter. The host registers it into its
+/// own attach-provider registry only when the cluster plugin is enabled.
+#[must_use]
+pub fn attach_provider() -> Arc<dyn bmux_client::AttachProvider> {
+    Arc::new(ClusterAttachProvider)
 }
 
 #[cfg(test)]

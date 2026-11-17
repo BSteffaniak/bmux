@@ -2,7 +2,7 @@
 //! Capture the owner storage, not a live-context projection: temporarily absent
 //! resources must survive export and partial restore.
 use super::{TAB_ORDER_MUTATION, parse_stored_tab_order_value};
-use bmux_plugin::{HostRuntimeApi, TypedServiceCaller, global_plugin_state_registry};
+use bmux_plugin::{HostRuntimeApi, PluginStateRegistry, TypedServiceCaller};
 use bmux_plugin_sdk::{
     NativeLifecycleContext, PluginEventKind, StatefulPlugin, StatefulPluginError,
     StatefulPluginHandle, StatefulPluginResult, StatefulPluginSnapshot, StorageGetRequest,
@@ -83,15 +83,14 @@ fn decode(bytes: &[u8]) -> Result<BTreeMap<uuid::Uuid, Vec<uuid::Uuid>>, String>
 }
 
 pub fn write(
+    states: &PluginStateRegistry,
     caller: &impl HostRuntimeApi,
     orders: &BTreeMap<uuid::Uuid, Vec<uuid::Uuid>>,
 ) -> Result<(), String> {
     let mut state = read_state(caller)?.unwrap_or_default();
     state.orders = orders.clone();
     write_state(caller, &state)?;
-    if let Some(flag) =
-        global_plugin_state_registry().get::<bmux_snapshot_runtime::SnapshotDirtyFlagHandle>()
-    {
+    if let Some(flag) = states.get::<bmux_snapshot_runtime::SnapshotDirtyFlagHandle>() {
         flag.read()
             .map_err(|_| "snapshot dirty flag lock poisoned")?
             .0
@@ -105,6 +104,7 @@ pub fn activate(
     runtime_state: super::TabRuntimeStateHandle,
 ) -> Result<(), String> {
     let caller = TypedServiceCaller::from_lifecycle_context(context);
+    let registry = super::tab_states(&runtime_state);
     {
         let _guard = TAB_ORDER_MUTATION.lock()?;
         if read(&caller)?.is_none() {
@@ -140,14 +140,13 @@ pub fn activate(
             }
             // One commit switches authority. Old files remain untouched for
             // interruption recovery and are never consulted after this commit.
-            write(&caller, &orders)?;
+            write(&registry, &caller, &orders)?;
         }
     }
-    let registry = global_plugin_state_registry();
     let stateful = bmux_snapshot_runtime::get_or_init_stateful_registry(
         || registry.get::<StatefulPluginRegistry>(),
         |fresh| {
-            registry.register::<StatefulPluginRegistry>(fresh);
+            registry.register_communal::<StatefulPluginRegistry>(fresh);
         },
     );
     stateful
@@ -226,7 +225,7 @@ impl StatefulPlugin for Arrangements {
             let guard = TAB_ORDER_MUTATION.lock()?;
             write_state(&self.caller, &snapshot_state(&snapshot)?)?;
             drop(guard);
-            super::recover_tab_placements(&self.caller)?;
+            super::recover_tab_placements(&super::tab_states(&self.runtime_state), &self.caller)?;
             super::publish_tab_list_snapshot(&self.caller, &self.runtime_state);
             Ok(())
         };

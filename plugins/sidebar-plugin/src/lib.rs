@@ -12,23 +12,18 @@ pub mod declaration {
 
 use bmux_plugin::layout::{
     LayoutEdge, LayoutExtent, PluginLayoutId, PluginLayoutRequest, PluginLayoutSnapshot,
-    global_plugin_layout_registry,
 };
 use bmux_plugin::surface::{
     PluginSurface, PluginSurfaceId, PluginSurfaceRegion, PluginSurfaceSnapshot,
-    global_plugin_surface_registry,
 };
 use bmux_plugin::{
     AttachInputEvent, AttachInputResult, BorderGlyphs, ExtensionRect, RenderNamedColor, RenderOp,
     RenderStyle, ServiceCallerDispatchClient, block_on_typed_dispatch,
 };
 use bmux_plugin_sdk::prelude::*;
-use bmux_presentation_state::{
-    PresentationEntityRef, PresentationFact, PresentationFactRole,
-    global_presentation_fact_host_service,
-};
+use bmux_presentation_state::{PresentationEntityRef, PresentationFact, PresentationFactRole};
 use bmux_tabs_plugin_api::{tabs_commands, tabs_list};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use uuid::Uuid;
 
 const OWNER: &str = "bmux.sidebar";
@@ -438,31 +433,6 @@ impl CompanionState {
 
 type CompanionHandle = std::sync::Arc<Mutex<Option<CompanionState>>>;
 
-fn installations() -> &'static Mutex<CompanionHandle> {
-    static STATE: OnceLock<Mutex<CompanionHandle>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(std::sync::Arc::new(Mutex::new(None))))
-}
-
-fn state() -> CompanionHandle {
-    installations()
-        .lock()
-        .expect("sidebar installation lock poisoned")
-        .clone()
-}
-
-fn replace_installation(settings: Settings) -> Result<CompanionHandle, String> {
-    let next = std::sync::Arc::new(Mutex::new(Some(CompanionState::new(settings))));
-    let mut current = installations()
-        .lock()
-        .map_err(|_| "sidebar installation lock poisoned".to_string())?;
-    *current
-        .lock()
-        .map_err(|_| "sidebar state lock poisoned".to_string())? = None;
-    *current = next.clone();
-    drop(current);
-    Ok(next)
-}
-
 #[derive(Default)]
 pub struct SidebarPlugin;
 
@@ -470,13 +440,9 @@ impl RustPlugin for SidebarPlugin {
     type Contract = bmux_plugin_sdk::NoPluginContract;
 
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
-        let settings = Settings::parse(context.settings.as_ref())?;
-        replace_installation(settings).map_err(PluginCommandError::failed)?;
-        Ok(EXIT_OK)
-    }
-
-    fn deactivate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
-        uninstall();
+        // Validate configuration up front. The backend owns no presentation:
+        // attach runtimes install their own `SidebarPresentation`.
+        Settings::parse(context.settings.as_ref())?;
         Ok(EXIT_OK)
     }
 
@@ -677,80 +643,6 @@ impl Drop for SidebarPresentation {
     }
 }
 
-fn default_presentation() -> &'static Mutex<Option<SidebarPresentation>> {
-    static PRESENTATION: OnceLock<Mutex<Option<SidebarPresentation>>> = OnceLock::new();
-    PRESENTATION.get_or_init(|| Mutex::new(None))
-}
-
-/// Install the default process-local presentation.
-///
-/// # Errors
-/// Returns configuration, registry publication, or lock errors.
-pub fn install(settings: Option<&toml::Value>) -> Result<(), String> {
-    // Reject invalid configuration before tearing down a working installation.
-    Settings::parse(settings).map_err(|error| error.to_string())?;
-    let mut current = default_presentation()
-        .lock()
-        .map_err(|_| "sidebar presentation lock poisoned".to_string())?;
-    *current = None;
-    let presentation = SidebarPresentation::install(
-        settings,
-        bmux_plugin::layout::global_plugin_layout_registry_handle(),
-        bmux_plugin::layout::global_allocation_registry_handle(),
-        bmux_plugin::global_attach_presentation_input_registry_handle(),
-        bmux_plugin::surface::global_plugin_surface_registry_handle(),
-    )?;
-    let mut installed = installations()
-        .lock()
-        .map_err(|_| "sidebar installation lock poisoned".to_string())?;
-    *installed
-        .lock()
-        .map_err(|_| "sidebar state lock poisoned".to_string())? = None;
-    *installed = presentation.owner.clone();
-    drop(installed);
-    *current = Some(presentation);
-    drop(current);
-    Ok(())
-}
-
-/// Capture lifecycle callbacks for the current installation, subscribing it
-/// to `bus` (the host's authoritative state bus) when started.
-///
-/// # Errors
-/// Returns an error if no presentation is installed or its lock is poisoned.
-pub fn installed_companion(
-    bus: std::sync::Arc<bmux_plugin::EventBus>,
-) -> Result<bmux_plugin::AttachCompanion, String> {
-    let current = default_presentation()
-        .lock()
-        .map_err(|_| "sidebar presentation lock poisoned".to_string())?;
-    let owner = current
-        .as_ref()
-        .ok_or_else(|| "sidebar companion is not installed".to_string())?
-        .owner
-        .clone();
-    drop(current);
-    let start_owner = owner.clone();
-    Ok(bmux_plugin::AttachCompanion::new(
-        OWNER,
-        std::sync::Arc::new(move || start_for_installation(&start_owner, &bus)),
-        std::sync::Arc::new(move || {
-            let mut current = default_presentation()
-                .lock()
-                .map_err(|_| "sidebar presentation lock poisoned".to_string())?;
-            // A stale runtime must not remove a newer installation's registrations.
-            if current
-                .as_ref()
-                .is_some_and(|presentation| std::sync::Arc::ptr_eq(&presentation.owner, &owner))
-            {
-                *current = None;
-            }
-            drop(current);
-            Ok(())
-        }),
-    ))
-}
-
 fn register_input_callbacks(
     owner: &CompanionHandle,
     allocation: &dyn Fn(PluginLayoutId, bmux_plugin::layout::AllocationHandler),
@@ -775,21 +667,6 @@ fn register_input_callbacks(
         input_endpoint(),
         std::sync::Arc::new(move |event| handle_local_input(&owner, event)),
     );
-}
-
-/// Subscribe the configured companion to authoritative tab state on `bus`.
-///
-/// # Errors
-///
-/// Returns an error when state subscription, initial publication, or task startup fails.
-pub fn start(bus: &bmux_plugin::EventBus) -> Result<(), String> {
-    let current = default_presentation()
-        .lock()
-        .map_err(|_| "sidebar presentation lock poisoned".to_string())?;
-    current
-        .as_ref()
-        .ok_or_else(|| "sidebar companion is not installed".to_string())?
-        .start(bus)
 }
 
 fn start_for_installation(
@@ -827,19 +704,6 @@ fn start_for_installation(
     Ok(())
 }
 
-pub fn uninstall() {
-    if let Ok(mut current) = default_presentation().lock() {
-        *current = None;
-    }
-    bmux_plugin::layout::remove_allocation_handler(&PluginLayoutId::new(OWNER, LAYOUT_ID));
-    bmux_plugin::remove_attach_presentation_input_handler(&input_endpoint());
-    let _ = global_plugin_layout_registry().remove_owner(OWNER);
-    let _ = global_plugin_surface_registry().remove_owner(OWNER);
-    if let Ok(mut guard) = state().lock() {
-        *guard = None;
-    }
-}
-
 fn layout_request(settings: &Settings) -> PluginLayoutRequest {
     PluginLayoutRequest::split(
         PluginLayoutId::new(OWNER, LAYOUT_ID),
@@ -854,11 +718,6 @@ fn layout_request(settings: &Settings) -> PluginLayoutRequest {
             collapse_below: settings.collapse_below_width,
         },
     )
-}
-
-#[cfg(test)]
-fn publish(snapshot: tabs_list::TabListSnapshot) -> Result<(), String> {
-    publish_for_installation(&state(), snapshot)
 }
 
 fn publish_for_installation(
@@ -897,10 +756,11 @@ fn publish_surface(
 fn publish_companion(companion: &CompanionState) -> Result<(), String> {
     let revision = companion.revision.max(1);
     let surface = build_surface(companion, revision);
-    let registry = companion
-        .surfaces
-        .as_deref()
-        .unwrap_or_else(|| global_plugin_surface_registry());
+    // A companion publishes only into the registry of the runtime that
+    // installed it; an uninstalled one has nowhere to publish.
+    let Some(registry) = companion.surfaces.as_deref() else {
+        return Ok(());
+    };
     publish_surface(registry, revision, &surface)?;
     companion.presentation_pending.set(false);
     Ok(())
@@ -927,8 +787,7 @@ fn tab_fact(
     facts: Option<&bmux_presentation_state::PresentationFactRegistry>,
 ) -> Option<PresentationFact> {
     let entity = PresentationEntityRef::new("bmux.tabs", tab.id.to_string());
-    facts
-        .unwrap_or_else(|| global_presentation_fact_host_service().registry())
+    facts?
         .facts_for_entity(&entity)
         .into_iter()
         .map(|(_, fact)| fact)
@@ -1600,14 +1459,23 @@ mod tests {
 
     #[test]
     fn republish_advances_past_retained_owner_revision() {
-        uninstall();
-        install(None).expect("install sidebar");
-        publish(tabs_list::TabListSnapshot {
-            tabs: Vec::new(),
-            revision: 0,
-        })
-        .expect("initial publish");
-        global_plugin_surface_registry()
+        let resources = bmux_plugin::AttachPresentationResources::isolated(64);
+        let presentation = SidebarPresentation::install(
+            None,
+            resources.layouts.clone(),
+            resources.allocations.clone(),
+            resources.input.clone(),
+            resources.surfaces.clone(),
+        )
+        .expect("install sidebar");
+        presentation
+            .publish(tabs_list::TabListSnapshot {
+                tabs: Vec::new(),
+                revision: 0,
+            })
+            .expect("initial publish");
+        resources
+            .surfaces
             .publish(
                 OWNER,
                 PluginSurfaceSnapshot {
@@ -1616,19 +1484,20 @@ mod tests {
                 },
             )
             .expect("seed higher owner revision");
-
-        publish(tabs_list::TabListSnapshot {
-            tabs: Vec::new(),
-            revision: 1,
-        })
-        .expect("republish above retained revision");
-        assert_eq!(
-            global_plugin_surface_registry()
+        presentation
+            .publish(tabs_list::TabListSnapshot {
+                tabs: Vec::new(),
+                revision: 1,
+            })
+            .expect("republish above retained revision");
+        let revision = || {
+            resources
+                .surfaces
                 .owner_snapshot(OWNER)
                 .expect("owner snapshot")
-                .revision,
-            10
-        );
+                .revision
+        };
+        assert_eq!(revision(), 10);
         let foreign_identity = std::sync::Arc::new(Mutex::new(None));
         publish_for_installation(
             &foreign_identity,
@@ -1638,28 +1507,60 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(
-            global_plugin_surface_registry()
-                .owner_snapshot(OWNER)
-                .unwrap()
-                .revision,
-            10
-        );
-        let bus = std::sync::Arc::new(bmux_plugin::EventBus::new());
-        let old_companion = installed_companion(bus.clone()).unwrap();
-        install(None).unwrap();
-        let replacement = state();
-        old_companion.stop().unwrap();
-        assert!(replacement.lock().unwrap().is_some());
+        assert_eq!(revision(), 10);
         assert!(
-            global_plugin_layout_registry()
+            resources
+                .layouts
                 .requests()
                 .iter()
                 .any(|request| request.id.owner_plugin_id == OWNER)
         );
-        installed_companion(bus).unwrap().stop().unwrap();
-        assert!(replacement.lock().unwrap().is_none());
-        uninstall();
+        // Dropping the presentation removes only its own runtime's entries.
+        drop(presentation);
+        assert!(
+            !resources
+                .layouts
+                .requests()
+                .iter()
+                .any(|request| request.id.owner_plugin_id == OWNER)
+        );
+    }
+
+    #[test]
+    fn two_runtimes_keep_independent_sidebars() {
+        let install = |resources: &bmux_plugin::AttachPresentationResources| {
+            SidebarPresentation::install(
+                None,
+                resources.layouts.clone(),
+                resources.allocations.clone(),
+                resources.input.clone(),
+                resources.surfaces.clone(),
+            )
+            .unwrap()
+        };
+        let (first_resources, second_resources) = (
+            bmux_plugin::AttachPresentationResources::isolated(64),
+            bmux_plugin::AttachPresentationResources::isolated(64),
+        );
+        let first = install(&first_resources);
+        let second = install(&second_resources);
+        first
+            .publish(tabs_list::TabListSnapshot {
+                tabs: Vec::new(),
+                revision: 1,
+            })
+            .unwrap();
+        assert!(first_resources.surfaces.owner_snapshot(OWNER).is_some());
+        assert!(second_resources.surfaces.owner_snapshot(OWNER).is_none());
+        drop(first);
+        assert!(
+            second_resources
+                .layouts
+                .requests()
+                .iter()
+                .any(|request| request.id.owner_plugin_id == OWNER)
+        );
+        drop(second);
     }
 
     #[test]
@@ -2232,7 +2133,9 @@ mod tests {
         let producer = format!("sidebar-test-{}", Uuid::from_u128(30));
         let first = Uuid::from_u128(31);
         let second = Uuid::from_u128(32);
+        let facts = std::sync::Arc::new(bmux_presentation_state::PresentationFactRegistry::new());
         let mut state = CompanionState::new(Settings::default());
+        state.facts = Some(facts.clone());
         state.replace_tabs(tabs_list::TabListSnapshot {
             tabs: vec![
                 tabs_list::TabListEntry {
@@ -2253,8 +2156,7 @@ mod tests {
             revision: 1,
         });
         let before = build_surface(&state, 1);
-        global_presentation_fact_host_service()
-            .registry()
+        facts
             .publish(
                 &producer,
                 bmux_presentation_state::PresentationFactSnapshot {
@@ -2274,11 +2176,7 @@ mod tests {
         let after = build_surface(&state, 2);
         assert_eq!(before.ops[3], after.ops[3]);
         assert_ne!(before.ops[4], after.ops[4]);
-        assert!(
-            global_presentation_fact_host_service()
-                .registry()
-                .remove_producer(&producer)
-        );
+        assert!(facts.remove_producer(&producer));
     }
 
     #[test]

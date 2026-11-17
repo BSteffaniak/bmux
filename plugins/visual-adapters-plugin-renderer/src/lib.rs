@@ -10,11 +10,11 @@
 
 use std::any::Any;
 use std::hash::{Hash, Hasher};
-use std::sync::{Arc, Once};
+use std::sync::Arc;
 
 use bmux_plugin::{
     AttachVisualAdapter, AttachVisualAdapterOutput, AttachVisualAdapterRequest,
-    AttachVisualProjectionResult, AttachVisualSurfaceView, register_visual_adapter,
+    AttachVisualProjectionResult, AttachVisualSurfaceView, VisualAdapterRegistry,
 };
 
 const PRESENCE_BITSET_ADAPTER_ID: &str = "bmux.visual.presence-bitset";
@@ -337,16 +337,14 @@ impl AttachVisualAdapter for PresenceBitsetAdapter {
     }
 }
 
-/// Register bundled visual adapters. Idempotent.
-pub fn install() {
-    static INSTALL: Once = Once::new();
-    INSTALL.call_once(|| {
-        register_visual_adapter(Arc::new(PresenceBitsetAdapter));
-        tracing::debug!(
-            adapter = PRESENCE_BITSET_ADAPTER_ID,
-            "registered visual adapter"
-        );
-    });
+/// Register the bundled visual adapters into an attach runtime's own
+/// registry. Nothing is registered process-wide.
+pub fn register_into(registry: &VisualAdapterRegistry) {
+    registry.register(Arc::new(PresenceBitsetAdapter));
+    tracing::debug!(
+        adapter = PRESENCE_BITSET_ADAPTER_ID,
+        "registered visual adapter"
+    );
 }
 
 #[cfg(test)]

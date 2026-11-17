@@ -5,9 +5,14 @@ use sha2::{Digest as _, Sha256};
 use std::fmt::Write as _;
 use std::sync::{Mutex, OnceLock};
 
-static STATE: OnceLock<Mutex<RuntimeReadiness>> = OnceLock::new();
-static HELPER: OnceLock<Option<(std::path::PathBuf, String)>> = OnceLock::new();
-static EXECUTABLE: OnceLock<ExecutableIdentity> = OnceLock::new();
+/// One activation's readiness: published once by `activate`, owned by that
+/// activation's host handles (never process-wide).
+pub(crate) struct Readiness {
+    state: Mutex<RuntimeReadiness>,
+    helper: Option<(std::path::PathBuf, String)>,
+    // Retained so the executable handle captured at activation stays pinned.
+    _executable: ExecutableIdentity,
+}
 
 /// Capture and cache executable identity during activation, before serving IPC.
 /// Readiness requests must never trigger a cold executable hash.
@@ -146,19 +151,17 @@ pub(crate) fn running_executable_sha256() -> Option<String> {
         })
 }
 
-pub(crate) fn activate(context: &NativeLifecycleContext) {
+pub(crate) fn activate(host: &crate::runtime::PaneRuntimeHost, context: &NativeLifecycleContext) {
     let mut error = helper_error(context);
-    let _ = HELPER.set(
-        context
-            .auxiliary_executables
-            .get("execution-supervisor")
-            .map(|artifact| {
-                (
-                    std::path::PathBuf::from(&artifact.path),
-                    artifact.artifact_sha256.clone(),
-                )
-            }),
-    );
+    let helper = context
+        .auxiliary_executables
+        .get("execution-supervisor")
+        .map(|artifact| {
+            (
+                std::path::PathBuf::from(&artifact.path),
+                artifact.artifact_sha256.clone(),
+            )
+        });
     let identity = ExecutableIdentity::capture();
     let verified = identity.get();
     let executable_sha256 = verified.as_ref().ok().cloned();
@@ -170,8 +173,7 @@ pub(crate) fn activate(context: &NativeLifecycleContext) {
     {
         error.get_or_insert(reason);
     }
-    let _ = EXECUTABLE.set(identity);
-    let _ = STATE.set(Mutex::new(RuntimeReadiness {
+    let state = Mutex::new(RuntimeReadiness {
         instance: uuid::Uuid::new_v4(),
         process_id: std::process::id(),
         executable_sha256,
@@ -184,15 +186,20 @@ pub(crate) fn activate(context: &NativeLifecycleContext) {
         helper_error: error,
         restart_blocker: None,
         fenced: false,
-    }));
+    });
+    let _ = host.readiness().set(Readiness {
+        state,
+        helper,
+        _executable: identity,
+    });
 }
 
-fn blocker(state: &RuntimeReadiness) -> Option<String> {
+fn blocker(host: &crate::runtime::PaneRuntimeHost, state: &RuntimeReadiness) -> Option<String> {
     // Only an activation that could never spawn may be recovered automatically.
     if state.helper_ready {
         return Some("healthy activation cannot be fenced for automatic restart".into());
     }
-    let Some(handle) = crate::handlers::session_runtime_handle() else {
+    let Some(handle) = host.registered_session_runtime() else {
         return Some("execution manager unavailable; restart safety unknown".into());
     };
     if !handle.0.list_session_ids().is_empty() {
@@ -239,19 +246,21 @@ fn blocker(state: &RuntimeReadiness) -> Option<String> {
     None
 }
 
-pub(crate) fn snapshot() -> Result<RuntimeReadiness, String> {
+pub(crate) fn snapshot(host: &crate::runtime::PaneRuntimeHost) -> Result<RuntimeReadiness, String> {
     // Identity verification completed before activation published STATE.
-    let mut state = STATE
+    let mut state = host
+        .readiness()
         .get()
         .ok_or("readiness not activated")?
+        .state
         .lock()
         .map_err(|_| "readiness lock poisoned")?
         .clone();
     state.fenced |= crate::runtime::managed_idle::is_fenced()?;
-    state.restart_blocker = blocker(&state);
+    state.restart_blocker = blocker(host, &state);
     if state.helper_ready
         && let Err(error) =
-            crate::runtime::reservations::check_authority().and_then(|()| verify_helper())
+            crate::runtime::reservations::check_authority().and_then(|()| verify_helper(host))
     {
         state.helper_ready = false;
         state.helper_error = Some(error.to_string());
@@ -259,13 +268,18 @@ pub(crate) fn snapshot() -> Result<RuntimeReadiness, String> {
     Ok(state)
 }
 
-pub(crate) fn fence(instance: uuid::Uuid) -> Result<RuntimeReadiness, String> {
+pub(crate) fn fence(
+    host: &crate::runtime::PaneRuntimeHost,
+    instance: uuid::Uuid,
+) -> Result<RuntimeReadiness, String> {
     // Never take the execution-manager lock while holding the admission lock:
     // ordinary spawn holds the manager lock before checking admission.
-    let observed = snapshot()?;
-    let mut state = STATE
+    let observed = snapshot(host)?;
+    let mut state = host
+        .readiness()
         .get()
         .ok_or("readiness not activated")?
+        .state
         .lock()
         .map_err(|_| "readiness lock poisoned")?;
     apply_fence(&mut state, instance, observed.restart_blocker)?;
@@ -290,10 +304,11 @@ fn apply_fence(
     Ok(())
 }
 
-fn verify_helper() -> anyhow::Result<()> {
-    let (path, expected) = HELPER
+fn verify_helper(host: &crate::runtime::PaneRuntimeHost) -> anyhow::Result<()> {
+    let (path, expected) = host
+        .readiness()
         .get()
-        .and_then(Option::as_ref)
+        .and_then(|readiness| readiness.helper.as_ref())
         .ok_or_else(|| anyhow::anyhow!("activation helper identity is unavailable"))?;
     let metadata = std::fs::symlink_metadata(path)?;
     anyhow::ensure!(
@@ -316,9 +331,10 @@ fn verify_helper() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub(crate) fn check_admission() -> anyhow::Result<()> {
-    if let Some(state) = STATE.get() {
-        let state = state
+pub(crate) fn check_admission(host: &crate::runtime::PaneRuntimeHost) -> anyhow::Result<()> {
+    if let Some(readiness) = host.readiness().get() {
+        let state = readiness
+            .state
             .lock()
             .map_err(|_| anyhow::anyhow!("readiness lock poisoned"))?;
         anyhow::ensure!(!state.fenced, "runtime fenced for graceful recovery");

@@ -424,13 +424,6 @@ where
     }
 }
 
-static CONSENSUS_NODES: std::sync::OnceLock<ConsensusNodeRegistry> = std::sync::OnceLock::new();
-
-#[must_use]
-pub fn global_consensus_nodes() -> ConsensusNodeRegistry {
-    CONSENSUS_NODES.get_or_init(Default::default).clone()
-}
-
 #[derive(Clone, Default)]
 pub struct ConsensusNodeRegistry {
     nodes: Arc<std::sync::RwLock<std::collections::BTreeMap<NodeId, ConsensusNode>>>,

@@ -9,7 +9,7 @@
 //! not know what a window, pane, session, agent, or client is.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{OnceLock, RwLock};
+use std::sync::RwLock;
 
 pub const DEFAULT_MAXIMUM_PRODUCERS: usize = 64;
 pub const DEFAULT_MAXIMUM_FACTS_PER_PRODUCER: usize = 1_024;
@@ -21,14 +21,6 @@ pub const DEFAULT_MAXIMUM_ICON_ID_BYTES: usize = 128;
 pub const PRESENTATION_FACTS_PUBLISH_CAPABILITY: &str = "bmux.presentation_facts.publish";
 /// Stable typed interface name for producer snapshot replacement/removal.
 pub const PRESENTATION_FACTS_INTERFACE: &str = "presentation-facts";
-
-static GLOBAL_PRESENTATION_FACT_HOST_SERVICE: OnceLock<PresentationFactHostService> =
-    OnceLock::new();
-
-#[must_use]
-pub fn global_presentation_fact_host_service() -> &'static PresentationFactHostService {
-    GLOBAL_PRESENTATION_FACT_HOST_SERVICE.get_or_init(PresentationFactHostService::new)
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PublishPresentationFactsRequest {
@@ -930,14 +922,6 @@ mod tests {
             consumer.facts_for_entity(&entity),
             [] as [(std::string::String, PresentationFact); 0]
         );
-    }
-
-    #[test]
-    fn global_host_service_is_stable() {
-        assert!(std::ptr::eq(
-            global_presentation_fact_host_service(),
-            global_presentation_fact_host_service()
-        ));
     }
 
     #[test]

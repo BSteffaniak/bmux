@@ -2,23 +2,15 @@
 use anyhow::{Context, Result, ensure};
 use bmux_client::{
     AttachProvider, AttachProviderBackend, AttachProviderError, AttachProviderFuture,
-    AttachProviderRegistration, AttachProviderSession, AttachTarget, ResolvedAttachTarget,
-    global_attach_provider_registry,
+    AttachProviderSession, AttachTarget, ResolvedAttachTarget,
 };
-use std::{
-    any::Any,
-    sync::{Arc, OnceLock},
-};
-static PATHS: OnceLock<std::sync::RwLock<Option<bmux_config::ConfigPaths>>> = OnceLock::new();
-pub fn set_paths(paths: bmux_config::ConfigPaths) {
-    *PATHS
-        .get_or_init(|| std::sync::RwLock::new(None))
-        .write()
-        .expect("attach paths lock poisoned") = Some(paths);
-}
+use std::{any::Any, sync::Arc};
 const ID: &str = "bmux.connections";
+/// The paired-terminal provider, owned by whichever host registers it.
 #[derive(Debug)]
-struct PairedProvider;
+struct PairedProvider {
+    paths: Option<bmux_config::ConfigPaths>,
+}
 #[derive(Debug)]
 struct PairedTarget {
     host: String,
@@ -83,9 +75,9 @@ impl AttachProvider for PairedProvider {
                     provider_id: ID.into(),
                     reason: "invalid resolved target".into(),
                 })?;
-            let paths = PATHS
-                .get()
-                .and_then(|paths| paths.read().ok()?.clone())
+            let paths = self
+                .paths
+                .clone()
                 .ok_or_else(|| AttachProviderError::OpenFailed {
                     provider_id: ID.into(),
                     reason: "client paths were not initialized".into(),
@@ -107,13 +99,10 @@ impl AttachProvider for PairedProvider {
         })
     }
 }
-pub fn install() {
-    static REGISTRATION: OnceLock<AttachProviderRegistration> = OnceLock::new();
-    REGISTRATION.get_or_init(|| {
-        global_attach_provider_registry()
-            .register(Arc::new(PairedProvider))
-            .expect("connections attach provider ID must be unique")
-    });
+/// The provider a host registers into its own attach-provider registry.
+#[must_use]
+pub fn provider(paths: bmux_config::ConfigPaths) -> Arc<dyn AttachProvider> {
+    Arc::new(PairedProvider { paths: Some(paths) })
 }
 #[cfg(test)]
 mod tests {
@@ -129,6 +118,6 @@ mod tests {
         ] {
             assert!(parse(target).is_err());
         }
-        assert!(!PairedProvider.requires_fallback_client());
+        assert!(!PairedProvider { paths: None }.requires_fallback_client());
     }
 }

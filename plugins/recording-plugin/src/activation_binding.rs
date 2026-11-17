@@ -214,6 +214,7 @@ pub fn definition(
             let plugin = RecordingPlugin {
                 owner: RwLock::new(None),
                 binding: Some(configuration.clone()),
+                states: Arc::new(bmux_plugin::PluginStateRegistry::new()),
             };
             let instance = created.instance;
             Ok(Arc::new(Instance {

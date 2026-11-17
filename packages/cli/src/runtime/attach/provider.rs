@@ -1,11 +1,33 @@
 use anyhow::Result;
 use bmux_client::{
     AttachProvider, AttachProviderBackend, AttachProviderError, AttachProviderFuture,
-    AttachProviderRegistration, AttachProviderSession, AttachTarget, ResolvedAttachTarget,
-    global_attach_provider_registry,
+    AttachProviderRegistration, AttachProviderRegistrationError, AttachProviderRegistry,
+    AttachProviderSession, AttachTarget, ResolvedAttachTarget,
 };
 use std::any::Any;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// This CLI process's attach-provider registry. Host-private: plugins hand
+/// the host a provider constructor and never reach the registry.
+pub(in crate::runtime) fn host_registry() -> Arc<AttachProviderRegistry> {
+    static REGISTRY: OnceLock<Arc<AttachProviderRegistry>> = OnceLock::new();
+    Arc::clone(REGISTRY.get_or_init(|| Arc::new(AttachProviderRegistry::new())))
+}
+
+/// Keep a plugin-supplied provider registered for this process's lifetime.
+/// A provider whose identity is already registered keeps the first one.
+pub(in crate::runtime) fn register_plugin_provider(provider: Arc<dyn AttachProvider>) {
+    static KEPT: OnceLock<Mutex<Vec<AttachProviderRegistration>>> = OnceLock::new();
+    match host_registry().register(provider) {
+        Ok(registration) => {
+            if let Ok(mut kept) = KEPT.get_or_init(Mutex::default).lock() {
+                kept.push(registration);
+            }
+        }
+        Err(AttachProviderRegistrationError::DuplicateId { .. }) => {}
+        Err(error) => tracing::warn!(%error, "plugin attach provider rejected"),
+    }
+}
 
 const PROVIDER_ID: &str = "bmux.pane-runtime";
 
@@ -121,7 +143,7 @@ impl ResolvedProviderAttach {
 pub fn resolve(target: Option<&str>) -> Result<ResolvedProviderAttach> {
     install();
     let target = AttachTarget::parse(target.unwrap_or_default());
-    let provider = global_attach_provider_registry()
+    let provider = host_registry()
         .resolve(&target)
         .map_err(anyhow::Error::from)?;
     let resolved = provider.resolve(&target).map_err(anyhow::Error::from)?;
@@ -132,7 +154,7 @@ pub fn resolve(target: Option<&str>) -> Result<ResolvedProviderAttach> {
 pub fn install() {
     static REGISTRATION: OnceLock<AttachProviderRegistration> = OnceLock::new();
     REGISTRATION.get_or_init(|| {
-        global_attach_provider_registry()
+        host_registry()
             .register(Arc::new(PaneRuntimeAttachProvider))
             .expect("pane-runtime attach provider ID must be unique")
     });
@@ -488,7 +510,7 @@ mod tests {
     async fn synthetic_provider_runs_through_domain_neutral_cli_path() {
         install();
         let state = Arc::new(Mutex::new(SyntheticState::default()));
-        let registration = global_attach_provider_registry()
+        let registration = host_registry()
             .register(Arc::new(SyntheticProvider {
                 state: Arc::clone(&state),
             }))

@@ -43,7 +43,7 @@ use bmux_contexts_plugin_api::contexts_state::{
 };
 use bmux_contexts_plugin_api::contexts_visits_v1::{self, ContextsVisitsV1Service};
 use bmux_plugin::{
-    EventBus, HostRuntimeApi, ServiceCaller, TypedServiceCaller, global_plugin_state_registry,
+    EventBus, HostRuntimeApi, PluginStateRegistry, ServiceCaller, TypedServiceCaller,
 };
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
@@ -371,23 +371,64 @@ impl WireSelector {
 
 // ── Plugin entrypoint ────────────────────────────────────────────────
 
-/// This activation's context event publisher. Without a host-supplied bus
-/// (for example a dynamic artifact) events are dropped, never routed to a
-/// process-wide bus.
-#[derive(Clone, Default)]
-struct ContextEvents(Option<Arc<EventBus>>);
+/// This activation's host handles: its context event publisher and its view
+/// of the host state registry. Without a host-supplied bus (for example a
+/// dynamic artifact) events are dropped; without a host registry the plugin
+/// works against an empty private one. Neither ever falls back to
+/// process-wide state.
+#[derive(Clone)]
+struct ContextEvents {
+    bus: Option<Arc<EventBus>>,
+    states: Arc<PluginStateRegistry>,
+}
+
+impl Default for ContextEvents {
+    fn default() -> Self {
+        Self::new(None, Arc::new(PluginStateRegistry::new()))
+    }
+}
 
 impl ContextEvents {
+    const fn new(bus: Option<Arc<EventBus>>, states: Arc<PluginStateRegistry>) -> Self {
+        Self { bus, states }
+    }
+
     fn emit(&self, event: ContextEvent) {
-        if let Some(bus) = &self.0 {
+        if let Some(bus) = &self.bus {
             let _ = bus.emit(&contexts_events::EVENT_KIND, event);
         }
+    }
+
+    /// Retrieve the plugin-owned `ContextState` handle.
+    ///
+    /// Returns `Err` rather than panicking when no state has been
+    /// registered: the typical cause is a handler firing on an instance
+    /// whose `activate` did not run (typed dispatch should forward to the
+    /// activated provider).
+    fn local_state(&self) -> Result<Arc<RwLock<ContextState>>, String> {
+        self.states.get::<ContextState>().ok_or_else(|| {
+            "contexts-plugin: ContextState not registered for this activation \
+             (activate did not run here; typed dispatch should forward to the \
+             activated provider)"
+                .to_string()
+        })
     }
 }
 
 #[derive(Default)]
 pub struct ContextsPlugin {
     events: ContextEvents,
+}
+
+impl ContextsPlugin {
+    /// An instance bound to an explicit host state registry, for hosts and
+    /// tests that compose the plugin directly rather than through activation.
+    #[must_use]
+    pub const fn with_host_state(states: Arc<PluginStateRegistry>) -> Self {
+        Self {
+            events: ContextEvents::new(None, states),
+        }
+    }
 }
 
 impl RustPlugin for ContextsPlugin {
@@ -397,9 +438,13 @@ impl RustPlugin for ContextsPlugin {
         &mut self,
         context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
-        self.events = ContextEvents(bmux_plugin::activation_event_bus(&context));
+        self.events = ContextEvents::new(
+            bmux_plugin::activation_event_bus(&context),
+            bmux_plugin::activation_state_registry(&context),
+        );
+        let registry = Arc::clone(&self.events.states);
         let state: Arc<RwLock<ContextState>> = Arc::new(RwLock::new(ContextState::default()));
-        global_plugin_state_registry().register::<ContextState>(&state);
+        registry.register::<ContextState>(&state);
 
         // Register the trait-object handle so consumers can reach
         // context state through the domain-agnostic reader/writer
@@ -408,7 +453,7 @@ impl RustPlugin for ContextsPlugin {
             inner: Arc::clone(&state),
         };
         let handle = Arc::new(RwLock::new(ContextStateHandle::new(adapter)));
-        global_plugin_state_registry().register::<ContextStateHandle>(&handle);
+        registry.register::<ContextStateHandle>(&handle);
 
         // Register this plugin as a persistence participant so the
         // snapshot-orchestration plugin can drive save/restore over
@@ -422,11 +467,10 @@ impl RustPlugin for ContextsPlugin {
         let stateful = StatefulPluginHandle::new(ContextsStatefulPlugin {
             writer: writer_for_snapshot,
         });
-        let registry = global_plugin_state_registry();
         let stateful_registry = bmux_snapshot_runtime::get_or_init_stateful_registry(
             || registry.get::<StatefulPluginRegistry>(),
             |fresh| {
-                registry.register::<StatefulPluginRegistry>(fresh);
+                registry.register_communal::<StatefulPluginRegistry>(fresh);
             },
         );
         stateful_registry
@@ -436,7 +480,7 @@ impl RustPlugin for ContextsPlugin {
 
         // Register the typed event channel for `contexts-events` on this
         // activation's bus; consumers subscribe through their own views.
-        if let Some(bus) = &self.events.0 {
+        if let Some(bus) = &self.events.bus {
             bus.register_channel::<ContextEvent>(contexts_events::EVENT_KIND);
         }
         Ok(bmux_plugin_sdk::EXIT_OK)
@@ -452,18 +496,18 @@ impl RustPlugin for ContextsPlugin {
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "contexts-visits-v1", "list-visits" => |_req: (), ctx| {
-                Ok(list_visits_local(ctx, ctx.caller_client_id))
+                Ok(list_visits_local(&self.events, ctx, ctx.caller_client_id))
             },
             "contexts-state", "list-contexts" => |_req: (), ctx| {
-                list_contexts_local(ctx)
+                list_contexts_local(&self.events, ctx)
                     .map_err(|e| ServiceResponse::error("list_failed", e))
             },
             "contexts-state", "get-context" => |req: SelectorArgs, ctx| {
-                get_context_local(ctx, &req.selector)
+                get_context_local(&self.events, ctx, &req.selector)
                     .map_err(|e| ServiceResponse::error("get_failed", e))
             },
             "contexts-state", "current-context" => |_req: (), ctx| {
-                current_context_local(ctx, ctx.caller_client_id)
+                current_context_local(&self.events, ctx, ctx.caller_client_id)
                     .map_err(|e| ServiceResponse::error("current_failed", e))
             },
             "contexts-spawn-v1", "create-context" => |req: bmux_contexts_plugin_api::contexts_spawn_v1::client::CreateContextRequest, ctx| {
@@ -494,7 +538,7 @@ impl RustPlugin for ContextsPlugin {
             },
             "contexts-commands", "set-context-attributes" => |req: SetContextAttributesArgs, _ctx| {
                 Ok::<Result<ContextAck, SetContextAttributesError>, ServiceResponse>(
-                    set_context_attributes_local(&req.selector, req.attributes)
+                    set_context_attributes_local(&self.events, &req.selector, req.attributes)
                 )
             },
         })
@@ -507,11 +551,13 @@ impl RustPlugin for ContextsPlugin {
     ) {
         let caller = Arc::new(TypedServiceCaller::from_registration_context(&context));
 
-        let visits: Arc<dyn ContextsVisitsV1Service + Send + Sync> =
-            Arc::new(ContextsStateHandle::new(Arc::clone(&caller)));
+        let visits: Arc<dyn ContextsVisitsV1Service + Send + Sync> = Arc::new(
+            ContextsStateHandle::new(Arc::clone(&caller), self.events.clone()),
+        );
         let _ = contexts_visits_v1::register_provider(registry, visits);
-        let state: Arc<dyn ContextsStateService + Send + Sync> =
-            Arc::new(ContextsStateHandle::new(Arc::clone(&caller)));
+        let state: Arc<dyn ContextsStateService + Send + Sync> = Arc::new(
+            ContextsStateHandle::new(Arc::clone(&caller), self.events.clone()),
+        );
         let _ = contexts_state::register_provider(registry, state);
 
         let activation: Arc<dyn ContextsActivationV1Service + Send + Sync> = Arc::new(
@@ -532,28 +578,6 @@ impl RustPlugin for ContextsPlugin {
 }
 
 // ── Plugin-local state helpers ───────────────────────────────────────
-
-/// Retrieve the plugin-owned `ContextState` handle.
-///
-/// Returns `Err` rather than panicking when no state has been
-/// registered. The typical cause is a handler firing in a process
-/// where `ContextsPlugin::activate` has not run (for example, an
-/// attach client that loaded the plugin crate in-process but is
-/// expected to reach the activated instance via
-/// `Request::InvokeService`). The service-location dispatch layer in
-/// `bmux_plugin::loader::call_service_raw` normally routes such
-/// callers to the server-side provider before this function runs, so
-/// a non-routed reach here indicates a bootstrap ordering issue.
-fn local_state() -> Result<Arc<RwLock<ContextState>>, String> {
-    global_plugin_state_registry()
-        .get::<ContextState>()
-        .ok_or_else(|| {
-            "contexts-plugin: ContextState not registered in this process \
-             (activate did not run here; typed dispatch should forward to the \
-             process that owns the activated provider)"
-                .to_string()
-        })
-}
 
 const fn dispatch_client<C: ServiceCaller + Sync + ?Sized>(
     caller: &C,
@@ -587,8 +611,11 @@ fn resolve_caller_client_id(
 
 // ── Read handlers (state-local) ──────────────────────────────────────
 
-fn list_contexts_local(_caller: &impl ServiceCaller) -> Result<Vec<ContextSummary>, String> {
-    let state = local_state()?;
+fn list_contexts_local(
+    events: &ContextEvents,
+    _caller: &impl ServiceCaller,
+) -> Result<Vec<ContextSummary>, String> {
+    let state = events.local_state()?;
     let guard = state
         .read()
         .map_err(|_| "context state lock poisoned".to_string())?;
@@ -597,6 +624,7 @@ fn list_contexts_local(_caller: &impl ServiceCaller) -> Result<Vec<ContextSummar
 
 #[allow(clippy::significant_drop_tightening)]
 fn get_context_local(
+    events: &ContextEvents,
     _caller: &impl ServiceCaller,
     selector: &WireSelector,
 ) -> Result<Result<ContextSummary, ContextQueryError>, String> {
@@ -605,7 +633,7 @@ fn get_context_local(
             reason: "selector must specify either id or name".to_string(),
         }));
     };
-    let state = local_state()?;
+    let state = events.local_state()?;
     let guard = state
         .read()
         .map_err(|_| "context state lock poisoned".to_string())?;
@@ -621,11 +649,12 @@ fn get_context_local(
 }
 
 fn current_context_local(
+    events: &ContextEvents,
     caller: &impl ServiceCaller,
     caller_client_id: Option<::uuid::Uuid>,
 ) -> Result<Option<ContextSummary>, String> {
     let client_id = resolve_caller_client_id(caller, caller_client_id)?;
-    let state = local_state()?;
+    let state = events.local_state()?;
     let guard = state
         .read()
         .map_err(|_| "context state lock poisoned".to_string())?;
@@ -723,8 +752,9 @@ fn create_context_with_options(
 
     // Local state mutation: construct the context, bind it to the
     // freshly-created session, and emit the lifecycle event.
-    let context_summary = mutate_state_create(client_id, name.clone(), attributes, session_id)
-        .map_err(|error| compensate_created_session(caller, session_id, error))?;
+    let context_summary =
+        mutate_state_create(events, client_id, name.clone(), attributes, session_id)
+            .map_err(|error| compensate_created_session(caller, session_id, error))?;
 
     // Cross-plugin orchestration: atomic create-and-select. The
     // sessions-plugin tracks each client's selected session
@@ -792,12 +822,15 @@ fn compensate_created_session(
 }
 
 fn mutate_state_create(
+    events: &ContextEvents,
     client_id: ClientId,
     name: Option<String>,
     attributes: BTreeMap<String, String>,
     session_id: SessionId,
 ) -> Result<PrimitiveContextSummary, CreateContextError> {
-    let state = local_state().map_err(|reason| CreateContextError::Failed { reason })?;
+    let state = events
+        .local_state()
+        .map_err(|reason| CreateContextError::Failed { reason })?;
     let mut guard = state.write().map_err(|_| CreateContextError::Failed {
         reason: "context state lock poisoned".to_string(),
     })?;
@@ -824,7 +857,9 @@ fn activate_context_exact(
 ) -> Result<ContextAck, SelectContextError> {
     let client_id = resolve_caller_client_id(caller, caller_client_id)
         .map_err(|reason| SelectContextError::Denied { reason })?;
-    let state = local_state().map_err(|reason| SelectContextError::Denied { reason })?;
+    let state = events
+        .local_state()
+        .map_err(|reason| SelectContextError::Denied { reason })?;
     activate_context_exact_in_state(events, caller, &state, client_id, context_id)
 }
 
@@ -896,7 +931,7 @@ fn select_context_local(
     let client_id = resolve_caller_client_id(caller, caller_client_id)
         .map_err(|reason| SelectContextError::Denied { reason })?;
 
-    let (context, mut session_after_select) = resolve_selection_target(&context_selector)?;
+    let (context, mut session_after_select) = resolve_selection_target(events, &context_selector)?;
 
     tracing::Span::current().record("context_id", tracing::field::display(context.id));
     if let Some(session_id) = session_after_select {
@@ -915,7 +950,7 @@ fn select_context_local(
             Ok(false) => {
                 let replacement_session_id =
                     create_session_for_select_repair(caller, context.name.clone())?;
-                bind_context_session_for_select_repair(context.id, replacement_session_id)?;
+                bind_context_session_for_select_repair(events, context.id, replacement_session_id)?;
                 try_select_session_via_sessions_plugin(caller, replacement_session_id)
                     .map_err(|reason| SelectContextError::Denied { reason })?;
                 session_after_select = Some(replacement_session_id);
@@ -937,7 +972,9 @@ fn select_context_local(
     }
 
     {
-        let state = local_state().map_err(|reason| SelectContextError::Denied { reason })?;
+        let state = events
+            .local_state()
+            .map_err(|reason| SelectContextError::Denied { reason })?;
         let mut guard = state.write().map_err(|_| SelectContextError::Denied {
             reason: "context state lock poisoned".into(),
         })?;
@@ -966,9 +1003,12 @@ fn select_context_local(
 
 #[allow(clippy::significant_drop_tightening)]
 fn resolve_selection_target(
+    events: &ContextEvents,
     context_selector: &PrimitiveContextSelector,
 ) -> Result<(PrimitiveContextSummary, Option<SessionId>), SelectContextError> {
-    let state = local_state().map_err(|reason| SelectContextError::Denied { reason })?;
+    let state = events
+        .local_state()
+        .map_err(|reason| SelectContextError::Denied { reason })?;
     let guard = state.read().map_err(|_| SelectContextError::Denied {
         reason: "context state lock poisoned".to_string(),
     })?;
@@ -1017,7 +1057,7 @@ fn close_context_local(
         removed_id,
         bound_session_id,
         replacement,
-    } = mutate_state_close(client_id, &context_selector, force)?;
+    } = mutate_state_close(events, client_id, &context_selector, force)?;
 
     tracing::Span::current().record("removed_id", tracing::field::display(removed_id));
     if let Some((replacement_context_id, replacement_session_id)) = replacement {
@@ -1100,6 +1140,7 @@ fn validate_context_rename_name(name: &str) -> Result<String, RenameContextError
 }
 
 fn set_context_attributes_local(
+    events: &ContextEvents,
     selector: &WireSelector,
     attributes: BTreeMap<String, String>,
 ) -> Result<ContextAck, SetContextAttributesError> {
@@ -1108,7 +1149,9 @@ fn set_context_attributes_local(
             reason: "selector must specify either id or name".to_string(),
         });
     };
-    let state = local_state().map_err(|reason| SetContextAttributesError::Failed { reason })?;
+    let state = events
+        .local_state()
+        .map_err(|reason| SetContextAttributesError::Failed { reason })?;
     let mut guard = state
         .write()
         .map_err(|_| SetContextAttributesError::Failed {
@@ -1151,13 +1194,13 @@ fn rename_context_local(
         context_id,
         old_name,
         session_id,
-    } = mutate_state_rename(&context_selector, name.clone())?;
+    } = mutate_state_rename(events, &context_selector, name.clone())?;
 
     tracing::Span::current().record("context_id", tracing::field::display(context_id));
     if let Some(session_id) = session_id {
         tracing::Span::current().record("session_id", tracing::field::display(session_id.0));
         if let Err(reason) = rename_session_via_sessions_plugin(caller, session_id, name.clone()) {
-            rollback_context_rename(context_id, old_name);
+            rollback_context_rename(events, context_id, old_name);
             return Err(RenameContextError::Failed { reason });
         }
     }
@@ -1178,10 +1221,13 @@ struct RenameContextMutation {
 
 #[allow(clippy::significant_drop_tightening)]
 fn mutate_state_rename(
+    events: &ContextEvents,
     context_selector: &PrimitiveContextSelector,
     name: String,
 ) -> Result<RenameContextMutation, RenameContextError> {
-    let state = local_state().map_err(|reason| RenameContextError::Failed { reason })?;
+    let state = events
+        .local_state()
+        .map_err(|reason| RenameContextError::Failed { reason })?;
     let mut guard = state.write().map_err(|_| RenameContextError::Failed {
         reason: "context state lock poisoned".to_string(),
     })?;
@@ -1201,8 +1247,8 @@ fn mutate_state_rename(
     })
 }
 
-fn rollback_context_rename(context_id: Uuid, old_name: Option<String>) {
-    let Ok(state) = local_state() else {
+fn rollback_context_rename(events: &ContextEvents, context_id: Uuid, old_name: Option<String>) {
+    let Ok(state) = events.local_state() else {
         return;
     };
     let Ok(mut guard) = state.write() else {
@@ -1239,11 +1285,14 @@ fn rename_session_via_sessions_plugin(
 
 #[allow(clippy::significant_drop_tightening)]
 fn mutate_state_close(
+    events: &ContextEvents,
     client_id: ClientId,
     context_selector: &PrimitiveContextSelector,
     force: bool,
 ) -> Result<CloseOutcome, CloseContextError> {
-    let state = local_state().map_err(|reason| CloseContextError::Failed { reason })?;
+    let state = events
+        .local_state()
+        .map_err(|reason| CloseContextError::Failed { reason })?;
     let mut guard = state.write().map_err(|_| CloseContextError::Failed {
         reason: "context state lock poisoned".to_string(),
     })?;
@@ -1355,10 +1404,13 @@ fn create_session_for_select_repair(
 }
 
 fn bind_context_session_for_select_repair(
+    events: &ContextEvents,
     context_id: Uuid,
     session_id: SessionId,
 ) -> Result<(), SelectContextError> {
-    let state = local_state().map_err(|reason| SelectContextError::Denied { reason })?;
+    let state = events
+        .local_state()
+        .map_err(|reason| SelectContextError::Denied { reason })?;
     let mut guard = state.write().map_err(|_| SelectContextError::Denied {
         reason: "context state lock poisoned".to_string(),
     })?;
@@ -1388,20 +1440,22 @@ fn select_session_via_sessions_plugin(
 
 pub struct ContextsStateHandle {
     caller: Arc<TypedServiceCaller>,
+    events: ContextEvents,
 }
 
 impl ContextsStateHandle {
-    const fn new(caller: Arc<TypedServiceCaller>) -> Self {
-        Self { caller }
+    const fn new(caller: Arc<TypedServiceCaller>, events: ContextEvents) -> Self {
+        Self { caller, events }
     }
 }
 
 fn list_visits_local(
+    events: &ContextEvents,
     caller: &(impl ServiceCaller + Sync),
     caller_client_id: Option<Uuid>,
 ) -> Result<Vec<Uuid>, String> {
     let client = resolve_caller_client_id(caller, caller_client_id)?;
-    let state = local_state()?;
+    let state = events.local_state()?;
     let guard = state.read().map_err(|_| "context state lock poisoned")?;
     Ok(guard
         .visited_by_client
@@ -1413,7 +1467,7 @@ impl ContextsVisitsV1Service for ContextsStateHandle {
     fn list_visits<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Uuid>, String>> + Send + 'a>> {
-        Box::pin(async move { list_visits_local(self.caller.as_ref(), None) })
+        Box::pin(async move { list_visits_local(&self.events, self.caller.as_ref(), None) })
     }
 }
 
@@ -1421,7 +1475,9 @@ impl ContextsStateService for ContextsStateHandle {
     fn list_contexts<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Vec<ContextSummary>> + Send + 'a>> {
-        Box::pin(async move { list_contexts_local(self.caller.as_ref()).unwrap_or_default() })
+        Box::pin(async move {
+            list_contexts_local(&self.events, self.caller.as_ref()).unwrap_or_default()
+        })
     }
 
     fn get_context<'a>(
@@ -1437,7 +1493,7 @@ impl ContextsStateService for ContextsStateHandle {
                 id: selector.id,
                 name: selector.name,
             };
-            match get_context_local(self.caller.as_ref(), &wire) {
+            match get_context_local(&self.events, self.caller.as_ref(), &wire) {
                 Ok(result) => result,
                 Err(reason) => Err(ContextQueryError::InvalidSelector { reason }),
             }
@@ -1448,7 +1504,7 @@ impl ContextsStateService for ContextsStateHandle {
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Option<ContextSummary>> + Send + 'a>> {
         Box::pin(async move {
-            current_context_local(self.caller.as_ref(), None)
+            current_context_local(&self.events, self.caller.as_ref(), None)
                 .ok()
                 .flatten()
         })
@@ -1576,7 +1632,7 @@ impl ContextsCommandsService for ContextsCommandsHandle {
                 id: selector.id,
                 name: selector.name,
             };
-            set_context_attributes_local(&wire, attributes)
+            set_context_attributes_local(&self.events, &wire, attributes)
         })
     }
 }
@@ -2291,12 +2347,13 @@ mod tests {
         // Ensure `ContextState` is registered for this test thread;
         // the plugin's `activate` normally does this during startup.
         let state_handle = std::sync::Arc::new(std::sync::RwLock::new(ContextState::default()));
-        let _existing = global_plugin_state_registry().register::<ContextState>(&state_handle);
+        let states = Arc::new(PluginStateRegistry::new());
+        let _existing = states.register::<ContextState>(&state_handle);
         // The contexts-events channel is registered during `activate` on
         // the activation's bus; inject an explicit bus here instead.
         let bus = Arc::new(EventBus::new());
         bus.register_channel::<ContextEvent>(contexts_events::EVENT_KIND);
-        let events = ContextEvents(Some(Arc::clone(&bus)));
+        let events = ContextEvents::new(Some(Arc::clone(&bus)), states);
 
         let client_id = Uuid::new_v4();
         let router_guard = install_contexts_test_router(client_id);

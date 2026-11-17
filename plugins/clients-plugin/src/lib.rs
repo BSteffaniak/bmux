@@ -39,7 +39,7 @@ use bmux_clients_plugin_api::clients_state::{
 };
 use bmux_contexts_plugin_api::contexts_commands;
 use bmux_contexts_plugin_api::contexts_state::ContextSelector;
-use bmux_plugin::{EventBus, ServiceCaller, TypedServiceCaller, global_plugin_state_registry};
+use bmux_plugin::{EventBus, PluginStateRegistry, ServiceCaller, TypedServiceCaller};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     PluginEventKind, StatefulPlugin, StatefulPluginError, StatefulPluginHandle,
@@ -72,12 +72,27 @@ struct FollowStateAdapter {
 /// This activation's client event publisher. Without a host-supplied bus
 /// (for example a dynamic artifact) events are dropped, never routed to a
 /// process-wide bus.
-#[derive(Clone, Default)]
-struct ClientEvents(Option<Arc<EventBus>>);
+#[derive(Clone)]
+struct ClientEvents {
+    bus: Option<Arc<EventBus>>,
+    /// This activation's view of the host state registry; an empty private
+    /// registry until activation supplies one, never a process-wide one.
+    states: Arc<PluginStateRegistry>,
+}
+
+impl Default for ClientEvents {
+    fn default() -> Self {
+        Self::new(None, Arc::new(PluginStateRegistry::new()))
+    }
+}
 
 impl ClientEvents {
+    const fn new(bus: Option<Arc<EventBus>>, states: Arc<PluginStateRegistry>) -> Self {
+        Self { bus, states }
+    }
+
     fn emit(&self, event: ClientEvent) {
-        if let Some(bus) = &self.0 {
+        if let Some(bus) = &self.bus {
             let _ = bus.emit(&clients_events::EVENT_KIND, event);
         }
     }
@@ -407,6 +422,17 @@ pub struct ClientsPlugin {
     events: ClientEvents,
 }
 
+impl ClientsPlugin {
+    /// An instance bound to an explicit host state registry, as activation
+    /// would bind it.
+    #[cfg(test)]
+    const fn with_states(states: Arc<PluginStateRegistry>) -> Self {
+        Self {
+            events: ClientEvents::new(None, states),
+        }
+    }
+}
+
 impl RustPlugin for ClientsPlugin {
     type Contract = bmux_clients_plugin_api::Contract;
 
@@ -414,16 +440,19 @@ impl RustPlugin for ClientsPlugin {
         &mut self,
         context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
-        self.events = ClientEvents(bmux_plugin::activation_event_bus(&context));
-        // Register the global follow-state handle. Core server code
-        // (and other plugins) access this via
-        // `global_plugin_state_registry().expect_state::<FollowState>()`.
+        self.events = ClientEvents::new(
+            bmux_plugin::activation_event_bus(&context),
+            bmux_plugin::activation_state_registry(&context),
+        );
+        let registry = Arc::clone(&self.events.states);
+        // Register the follow-state handle on this activation's view of the
+        // host registry; core server code and other plugins read it there.
         // Re-activation is a no-op: only the first `register` call
         // installs the handle; subsequent calls replace it (which is
         // fine because we create a fresh default state in each case
         // and there is exactly one bundled clients plugin per host).
         let state: Arc<RwLock<FollowState>> = Arc::new(RwLock::new(FollowState::default()));
-        global_plugin_state_registry().register::<FollowState>(&state);
+        registry.register::<FollowState>(&state);
 
         // Register the trait-object handle so consumers can reach
         // follow state through the domain-agnostic reader/writer
@@ -433,7 +462,7 @@ impl RustPlugin for ClientsPlugin {
             events: self.events.clone(),
         };
         let handle = Arc::new(RwLock::new(FollowStateHandle::new(adapter)));
-        global_plugin_state_registry().register::<FollowStateHandle>(&handle);
+        registry.register::<FollowStateHandle>(&handle);
 
         // Register this plugin as a persistence participant so the
         // snapshot-orchestration plugin can drive save/restore over
@@ -447,11 +476,10 @@ impl RustPlugin for ClientsPlugin {
         let stateful = StatefulPluginHandle::new(ClientsStatefulPlugin {
             writer: writer_for_snapshot,
         });
-        let registry = global_plugin_state_registry();
         let stateful_registry = bmux_snapshot_runtime::get_or_init_stateful_registry(
             || registry.get::<StatefulPluginRegistry>(),
             |fresh| {
-                registry.register::<StatefulPluginRegistry>(fresh);
+                registry.register_communal::<StatefulPluginRegistry>(fresh);
             },
         );
         stateful_registry
@@ -459,7 +487,7 @@ impl RustPlugin for ClientsPlugin {
             .expect("stateful plugin registry lock poisoned")
             .push(stateful);
 
-        if let Some(bus) = &self.events.0 {
+        if let Some(bus) = &self.events.bus {
             bus.register_channel::<ClientEvent>(clients_events::EVENT_KIND);
         }
         Ok(bmux_plugin_sdk::EXIT_OK)
@@ -475,16 +503,16 @@ impl RustPlugin for ClientsPlugin {
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "clients-selection-state-v1", "current" => |_req: (), ctx| {
-                Ok::<Result<Selection, SelectionError>, ServiceResponse>(selection_operation(ctx.caller_client_id, |state, client| state.selection(client)))
+                Ok::<Result<Selection, SelectionError>, ServiceResponse>(selection_operation(&self.events, ctx.caller_client_id, |state, client| state.selection(client)))
             },
             "clients-selection-commands-v1", "recover" => |req: clients_selection_commands_v1::client::RecoverRequest, ctx| {
-                Ok::<Result<Selection, SelectionError>, ServiceResponse>(selection_operation(ctx.caller_client_id, |state, client| state.recover_selection(client, req.expected_revision)))
+                Ok::<Result<Selection, SelectionError>, ServiceResponse>(selection_operation(&self.events, ctx.caller_client_id, |state, client| state.recover_selection(client, req.expected_revision)))
             },
             "clients-selection-commands-v1", "begin" => |req: clients_selection_commands_v1::client::BeginRequest, ctx| {
-                Ok::<Result<Selection, SelectionError>, ServiceResponse>(selection_operation(ctx.caller_client_id, |state, client| state.begin_selection(client, req.expected_revision)))
+                Ok::<Result<Selection, SelectionError>, ServiceResponse>(selection_operation(&self.events, ctx.caller_client_id, |state, client| state.begin_selection(client, req.expected_revision)))
             },
             "clients-selection-commands-v1", "commit" => |req: clients_selection_commands_v1::client::CommitRequest, ctx| {
-                Ok::<Result<Selection, SelectionError>, ServiceResponse>(commit_client_selection(ctx, ctx.caller_client_id, &req))
+                Ok::<Result<Selection, SelectionError>, ServiceResponse>(commit_client_selection(&self.events, ctx, ctx.caller_client_id, &req))
             },
             "clients-identity/v1", "stream-admission-backend" => |_req: (), ctx| {
                 Ok::<_, ServiceResponse>(identity::stream_admission_backend(ctx))
@@ -493,18 +521,21 @@ impl RustPlugin for ClientsPlugin {
                 Ok::<_, ServiceResponse>(identity::current_stream_provenance(ctx))
             },
             "clients-identity/v1", "current-principal" => |_req: (), ctx| {
-                let identity = identity::CallerIdentity::new(ctx.caller_client_id);
+                let identity = identity::CallerIdentity::new(
+                    Arc::clone(&self.events.states),
+                    ctx.caller_client_id,
+                );
                 Ok::<_, ServiceResponse>(bmux_plugin::block_on_typed_dispatch(
                     bmux_clients_plugin_api::clients_identity::ClientsIdentityService::current_principal(&identity),
                 ))
             },
             "clients-state", "list-clients" => |_req: (), _ctx| {
-                list_clients_local()
+                list_clients_local(&self.events)
                     .map_err(|e| ServiceResponse::error("list_failed", e))
             },
             "clients-state", "current-client" => |_req: (), ctx| {
                 Ok::<Result<ClientSummary, ClientQueryError>, ServiceResponse>(
-                    current_client_local(ctx.caller_client_id)
+                    current_client_local(&self.events, ctx.caller_client_id)
                 )
             },
             "clients-commands", "set-current-session" => |req: SetCurrentSessionArgs, ctx| {
@@ -533,6 +564,7 @@ impl RustPlugin for ClientsPlugin {
 
         let selection = Arc::new(SelectionHandle {
             caller: caller.clone(),
+            events: self.events.clone(),
         });
         let _ = bmux_clients_plugin_api::clients_selection_state_v1::register_provider(
             registry,
@@ -547,6 +579,7 @@ impl RustPlugin for ClientsPlugin {
 
 struct SelectionHandle {
     caller: Arc<TypedServiceCaller>,
+    events: ClientEvents,
 }
 
 impl bmux_clients_plugin_api::clients_selection_state_v1::ClientsSelectionStateV1Service
@@ -557,6 +590,7 @@ impl bmux_clients_plugin_api::clients_selection_state_v1::ClientsSelectionStateV
     ) -> Pin<Box<dyn Future<Output = Result<Selection, SelectionError>> + Send + 'a>> {
         Box::pin(async move {
             selection_operation(
+                &self.events,
                 current_client_id_for_typed_handle(&self.caller),
                 |state, client| state.selection(client),
             )
@@ -571,6 +605,7 @@ impl clients_selection_commands_v1::ClientsSelectionCommandsV1Service for Select
     ) -> Pin<Box<dyn Future<Output = Result<Selection, SelectionError>> + Send + 'a>> {
         Box::pin(async move {
             selection_operation(
+                &self.events,
                 current_client_id_for_typed_handle(&self.caller),
                 |state, client| state.begin_selection(client, expected_revision),
             )
@@ -582,6 +617,7 @@ impl clients_selection_commands_v1::ClientsSelectionCommandsV1Service for Select
     ) -> Pin<Box<dyn Future<Output = Result<Selection, SelectionError>> + Send + 'a>> {
         Box::pin(async move {
             selection_operation(
+                &self.events,
                 current_client_id_for_typed_handle(&self.caller),
                 |state, client| state.recover_selection(client, expected_revision),
             )
@@ -595,6 +631,7 @@ impl clients_selection_commands_v1::ClientsSelectionCommandsV1Service for Select
     ) -> Pin<Box<dyn Future<Output = Result<Selection, SelectionError>> + Send + 'a>> {
         Box::pin(async move {
             commit_client_selection(
+                &self.events,
                 self.caller.as_ref(),
                 current_client_id_for_typed_handle(&self.caller),
                 &clients_selection_commands_v1::client::CommitRequest {
@@ -608,14 +645,16 @@ impl clients_selection_commands_v1::ClientsSelectionCommandsV1Service for Select
 }
 
 fn commit_client_selection(
+    events: &ClientEvents,
     caller: &(impl ServiceCaller + Sync),
     client: Option<Uuid>,
     req: &clients_selection_commands_v1::client::CommitRequest,
 ) -> Result<Selection, SelectionError> {
     let client_id = client.ok_or(SelectionError::NoCurrentClient)?;
     if let Some(session) = req.session_id {
-        authorize_selection(caller, client_id, req.context_id, session)?;
-        let manager = global_plugin_state_registry()
+        authorize_selection(events, caller, client_id, req.context_id, session)?;
+        let manager = events
+            .states
             .get::<SessionManagerHandle>()
             .ok_or(SelectionError::InvalidTarget)?;
         if !manager
@@ -630,7 +669,8 @@ fn commit_client_selection(
     if let Some(context_id) = req.context_id {
         // Read the published reader contract directly. Re-entering contexts
         // service dispatch here can deadlock behind a waiting plugin writer.
-        let handle = global_plugin_state_registry()
+        let handle = events
+            .states
             .get::<bmux_context_state::ContextStateHandle>()
             .ok_or(SelectionError::InvalidTarget)?;
         let handle = handle
@@ -650,7 +690,7 @@ fn commit_client_selection(
         };
         validate_selection_binding(context_id, req.session_id, &context)?;
     }
-    selection_operation(client, |state, client| {
+    selection_operation(events, client, |state, client| {
         state.commit_selection(
             client,
             req.expected_revision,
@@ -661,6 +701,7 @@ fn commit_client_selection(
 }
 
 fn authorize_selection(
+    events: &ClientEvents,
     caller: &(impl ServiceCaller + Sync),
     client: Uuid,
     context: Option<Uuid>,
@@ -694,7 +735,8 @@ fn authorize_selection(
             }),
         };
     }
-    let principal = global_plugin_state_registry()
+    let principal = events
+        .states
         .get::<bmux_client_state::ClientPrincipalHandle>()
         .and_then(|handle| handle.read().ok().map(|value| value.clone()))
         .and_then(|handle| handle.0.get(ClientId(client)))
@@ -746,11 +788,13 @@ fn validate_selection_binding(
 }
 
 fn selection_operation(
+    events: &ClientEvents,
     client: Option<Uuid>,
     operation: impl FnOnce(&mut FollowState, ClientId) -> Result<Selection, SelectionError>,
 ) -> Result<Selection, SelectionError> {
     let client = ClientId(client.ok_or(SelectionError::NoCurrentClient)?);
-    let state = global_plugin_state_registry()
+    let state = events
+        .states
         .get::<FollowState>()
         .ok_or_else(|| SelectionError::Failed {
             reason: "clients state unavailable".into(),
@@ -778,7 +822,7 @@ fn set_current_session_local(
     let self_client_id = ClientId(self_id);
     let next_session = SessionId(session_id);
 
-    let Some(sessions) = global_plugin_state_registry().get::<SessionManagerHandle>() else {
+    let Some(sessions) = events.states.get::<SessionManagerHandle>() else {
         return Err(SetCurrentSessionError::Denied {
             reason: "sessions plugin state not registered".to_string(),
         });
@@ -793,7 +837,7 @@ fn set_current_session_local(
     }
     drop(sessions);
 
-    let Some(state_handle) = global_plugin_state_registry().get::<FollowState>() else {
+    let Some(state_handle) = events.states.get::<FollowState>() else {
         return Err(SetCurrentSessionError::Denied {
             reason: "clients plugin state not registered".to_string(),
         });
@@ -858,6 +902,7 @@ fn set_current_session_local(
     }
 
     commit_client_selection(
+        events,
         caller,
         Some(self_id),
         &clients_selection_commands_v1::client::CommitRequest {
@@ -910,8 +955,8 @@ fn set_current_session_local(
     Ok(ClientAck { client_id: self_id })
 }
 
-fn list_clients_local() -> Result<Vec<ClientSummary>, String> {
-    let Some(state) = global_plugin_state_registry().get::<FollowState>() else {
+fn list_clients_local(events: &ClientEvents) -> Result<Vec<ClientSummary>, String> {
+    let Some(state) = events.states.get::<FollowState>() else {
         return Err("clients plugin state not registered".to_string());
     };
     let follow_state = state
@@ -924,11 +969,14 @@ fn list_clients_local() -> Result<Vec<ClientSummary>, String> {
         .collect())
 }
 
-fn current_client_local(caller_client_id: Option<Uuid>) -> Result<ClientSummary, ClientQueryError> {
+fn current_client_local(
+    events: &ClientEvents,
+    caller_client_id: Option<Uuid>,
+) -> Result<ClientSummary, ClientQueryError> {
     let Some(self_id) = caller_client_id else {
         return Err(ClientQueryError::NoCurrentClient);
     };
-    let Some(state) = global_plugin_state_registry().get::<FollowState>() else {
+    let Some(state) = events.states.get::<FollowState>() else {
         return Err(ClientQueryError::NoCurrentClient);
     };
     let follow_state = state
@@ -967,7 +1015,7 @@ fn set_following_via_ipc(
     }
 
     // Acquire plugin-owned FollowState.
-    let Some(state_handle) = global_plugin_state_registry().get::<FollowState>() else {
+    let Some(state_handle) = events.states.get::<FollowState>() else {
         return Err(SetFollowingError::Denied {
             reason: "clients plugin state not registered".to_string(),
         });

@@ -14,12 +14,18 @@ pub(crate) struct CaptureHandshake {
 impl CaptureHandshake {
     /// Strip only complete, versioned control requests; ordinary output is preserved.
     #[cfg(test)]
-    pub(crate) fn process(&mut self, bytes: &[u8], pane_id: Uuid) -> (Vec<u8>, Vec<u8>) {
-        self.process_with_fence(bytes, pane_id, || false)
+    pub(crate) fn process(
+        &mut self,
+        host: &crate::runtime::PaneRuntimeHost,
+        bytes: &[u8],
+        pane_id: Uuid,
+    ) -> (Vec<u8>, Vec<u8>) {
+        self.process_with_fence(host, bytes, pane_id, || false)
     }
 
     pub(crate) fn process_with_fence(
         &mut self,
+        host: &crate::runtime::PaneRuntimeHost,
         bytes: &[u8],
         pane_id: Uuid,
         mut settle_writes: impl FnMut() -> bool,
@@ -48,17 +54,19 @@ impl CaptureHandshake {
                     && let Ok(nonce) = Uuid::parse_str(nonce)
                 {
                     let entering = phase == "enter-v2";
-                    let generation = super::private_input::begin_barrier(pane_id, nonce, entering);
+                    let generation =
+                        super::private_input::begin_barrier(host, pane_id, nonce, entering);
                     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
                     let mut accepted = false;
                     if let Some(generation) = generation {
                         loop {
                             // Producer acknowledgments precede the FIFO fence. This
                             // never acknowledges bytes still queued for the PTY writer.
-                            if super::private_input::barrier_ready(pane_id, nonce, generation) {
+                            if super::private_input::barrier_ready(host, pane_id, nonce, generation)
+                            {
                                 accepted = settle_writes()
                                     && super::private_input::finish_barrier(
-                                        pane_id, nonce, generation,
+                                        host, pane_id, nonce, generation,
                                     );
                                 break;
                             }
@@ -85,7 +93,7 @@ impl CaptureHandshake {
                     let ack = InputCaptureAckV1 {
                         nonce,
                         pane_id,
-                        recording_suppressed: super::private_input::suppress(pane_id),
+                        recording_suppressed: super::private_input::suppress(host, pane_id),
                     };
                     if let Ok(json) = serde_json::to_vec(&ack) {
                         // Wrapped as bracketed paste so the local private ingress can
@@ -109,6 +117,8 @@ mod tests {
     use super::*;
     #[test]
     fn fragmented_owning_pty_request_returns_typed_nonce_ack_after_barrier() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let nonce = Uuid::new_v4();
         let pane = Uuid::new_v4();
         let request = format!("\x1b]633;bmux-input-capture-v1;{nonce}\x07");
@@ -116,7 +126,7 @@ mod tests {
         let mut output = Vec::new();
         let mut replies = Vec::new();
         for byte in request.bytes() {
-            let (public, reply) = parser.process(&[byte], pane);
+            let (public, reply) = parser.process(host, &[byte], pane);
             output.extend(public);
             replies.extend(reply);
         }
@@ -131,23 +141,25 @@ mod tests {
         assert_eq!(ack.pane_id, pane);
         assert!(ack.recording_suppressed);
         assert_eq!(
-            super::super::private_input::with_capture_barrier(pane, |capture| capture),
+            super::super::private_input::with_capture_barrier(host, pane, |capture| capture),
             Some(false)
         );
     }
     #[test]
     fn unknown_and_oversized_requests_preserve_output_without_suppression() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let pane = Uuid::new_v4();
         for bytes in [
             b"ordinary\x1b[31mtext".to_vec(),
             format!("\x1b]633;bmux-input-capture-v1;{}\x07", "x".repeat(200)).into_bytes(),
         ] {
-            let (output, replies) = CaptureHandshake::default().process(&bytes, pane);
+            let (output, replies) = CaptureHandshake::default().process(host, &bytes, pane);
             assert_eq!(output, bytes);
             assert_eq!(replies, [] as [u8; 0]);
         }
         assert_eq!(
-            super::super::private_input::with_capture_barrier(pane, |capture| capture),
+            super::super::private_input::with_capture_barrier(host, pane, |capture| capture),
             Some(true)
         );
     }

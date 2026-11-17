@@ -33,12 +33,12 @@ use bmux_performance_plugin_api::{
 use bmux_performance_state::{
     PerformanceCaptureSettings, PerformanceRuntimeSettings, PerformanceSettingsHandle,
 };
-use bmux_plugin::{EventBus, global_plugin_state_registry};
+use bmux_plugin::{EventBus, PluginStateRegistry};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_presentation_state::{
-    PresentationEntityRef, PresentationFact, PresentationFactRole, PresentationFactSnapshot,
-    global_presentation_fact_host_service,
+    PresentationEntityRef, PresentationFact, PresentationFactHostService, PresentationFactRole,
+    PresentationFactSnapshot,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -139,6 +139,15 @@ impl PerformancePlugin {
             *events = take();
         }
     }
+
+    fn adopt_activation_states(&self, take: impl FnOnce() -> Option<Arc<PluginStateRegistry>>) {
+        if let Some(host) = &self.activation_host
+            && let Some(states) = take()
+            && let Ok(mut slot) = host.states.write()
+        {
+            *slot = states;
+        }
+    }
     fn activate_owner(&self) -> Result<(), PluginCommandError> {
         if self
             .cleanup_pending
@@ -201,6 +210,7 @@ impl RustPlugin for PerformancePlugin {
         context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
         self.adopt_activation_bus(|| bmux_plugin::activation_event_bus(&context));
+        self.adopt_activation_states(|| Some(bmux_plugin::activation_state_registry(&context)));
         self.activate_owner()?;
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
@@ -1047,13 +1057,29 @@ impl ProcessTree {
 /// Default composition: events go to the bus the current activation
 /// received. Without one (for example a dynamic artifact) events are dropped,
 /// never routed to a process-wide bus.
-#[derive(Default)]
 struct ActivationPerformanceHost {
     events: std::sync::RwLock<Option<Arc<EventBus>>>,
+    /// The activation's view of the host state registry; an empty private
+    /// one before activation, never a process-wide one.
+    states: std::sync::RwLock<Arc<PluginStateRegistry>>,
+}
+impl Default for ActivationPerformanceHost {
+    fn default() -> Self {
+        Self {
+            events: std::sync::RwLock::new(None),
+            states: std::sync::RwLock::new(Arc::new(PluginStateRegistry::new())),
+        }
+    }
 }
 impl ActivationPerformanceHost {
     fn events(&self) -> Option<Arc<EventBus>> {
         self.events.read().ok().and_then(|events| events.clone())
+    }
+    fn states(&self) -> Arc<PluginStateRegistry> {
+        self.states.read().map_or_else(
+            |_| Arc::new(PluginStateRegistry::new()),
+            |states| Arc::clone(&states),
+        )
     }
 }
 impl PerformanceHost for ActivationPerformanceHost {
@@ -1070,7 +1096,8 @@ impl PerformanceHost for ActivationPerformanceHost {
         Ok(())
     }
     fn settings(&self) -> Result<PerformanceRuntimeSettings, String> {
-        let handle = global_plugin_state_registry()
+        let handle = self
+            .states()
             .get::<PerformanceSettingsHandle>()
             .ok_or("performance settings missing")?;
         let settings = handle
@@ -1087,7 +1114,8 @@ impl PerformanceHost for ActivationPerformanceHost {
     ) -> Result<PerformanceRuntimeSettings, String> {
         let capture = PerformanceCaptureSettings::from_runtime_settings(requested);
         let settings = capture.to_runtime_settings();
-        let handle = global_plugin_state_registry()
+        let handle = self
+            .states()
             .get::<PerformanceSettingsHandle>()
             .ok_or("performance settings missing")?;
         handle
@@ -1106,7 +1134,8 @@ impl PerformanceHost for ActivationPerformanceHost {
         Ok(settings)
     }
     fn pane_processes(&self) -> Result<Vec<bmux_pane_runtime_state::PaneProcessIdentity>, String> {
-        let handle = global_plugin_state_registry()
+        let handle = self
+            .states()
             .get::<bmux_pane_runtime_state::SessionRuntimeManagerHandle>()
             .ok_or("pane process source missing")?;
         let processes = handle
@@ -1132,7 +1161,13 @@ impl PerformanceHost for ActivationPerformanceHost {
         Ok(())
     }
     fn publish_facts(&self, snapshot: PresentationFactSnapshot) -> Result<(), String> {
-        global_presentation_fact_host_service()
+        // Facts are communal per host: every producer and consumer of this
+        // host shares one service on its registry.
+        let facts = self
+            .states()
+            .get_or_insert_with(PresentationFactHostService::new);
+        let facts = facts.read().map_err(|_| "presentation facts poisoned")?;
+        facts
             .registry()
             .publish_authorized("bmux.performance", "bmux.performance", snapshot)
             .map(|_| ())
@@ -1152,6 +1187,9 @@ impl bmux_plugin_sdk::definition::PluginInstance for PerformancePlugin {
     {
         self.adopt_activation_bus(|| {
             bmux_plugin::take_activation_event_bus(&context.capabilities).ok()
+        });
+        self.adopt_activation_states(|| {
+            bmux_plugin::take_activation_state_registry(&context.capabilities).ok()
         });
         Box::pin(async move { self.activate_owner() })
     }

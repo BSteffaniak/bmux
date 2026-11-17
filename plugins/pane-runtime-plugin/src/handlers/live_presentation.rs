@@ -15,12 +15,13 @@ pub(crate) fn capabilities() -> LiveCapabilities {
 /// # Errors
 /// Returns authorization, budget, coherence or owner-runtime failures.
 pub(crate) fn read(
+    host: &crate::runtime::PaneRuntimeHost,
     ctx: &NativeServiceContext,
     execution: &TerminalExecutionRef,
     after: Option<&LiveCursor>,
     max_bytes: u32,
 ) -> Result<Option<LiveFrame>, LiveError> {
-    crate::runtime::live_presentation::read(execution, after, max_bytes, || {
+    crate::runtime::live_presentation::read(host, execution, after, max_bytes, || {
         super::execution::authorize(ctx, execution, "read")
     })
 }
@@ -30,13 +31,19 @@ pub(crate) fn read(
 /// # Errors
 /// Returns authorization, subscription, budget, coherence or runtime failures.
 pub(crate) fn wait_present(
+    host: &crate::runtime::PaneRuntimeHost,
     ctx: &NativeServiceContext,
     execution: &TerminalExecutionRef,
     after: Option<&LiveCursor>,
     timeout_ms: u32,
     max_bytes: u32,
 ) -> Result<Option<LiveFrame>, LiveError> {
-    crate::runtime::live_presentation::wait_present(execution, after, timeout_ms, max_bytes, || {
-        super::execution::authorize(ctx, execution, "read")
-    })
+    crate::runtime::live_presentation::wait_present(
+        host,
+        execution,
+        after,
+        timeout_ms,
+        max_bytes,
+        || super::execution::authorize(ctx, execution, "read"),
+    )
 }

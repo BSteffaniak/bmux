@@ -16,7 +16,6 @@ use bmux_pane_runtime_plugin_api::attach_runtime_commands::{
 };
 use bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent;
 use bmux_pane_runtime_state::SessionRuntimeError;
-use bmux_plugin::global_plugin_state_registry;
 use bmux_plugin_sdk::NativeServiceContext;
 use bmux_session_models::{ClientId, SessionId};
 use serde::{Deserialize, Serialize};
@@ -26,11 +25,16 @@ use uuid::Uuid;
 // including after detach. Only verified disconnected UUIDs (never reused by the
 // transport) may be reclaimed; missing lifecycle authority preserves the bound.
 #[derive(Default)]
-struct ObserverIdentities {
+pub(crate) struct ObserverIdentities {
     clients: std::collections::BTreeMap<ClientId, (Uuid, SessionId)>,
     pending_expiry: std::collections::BTreeMap<ClientId, u64>,
 }
 impl ObserverIdentities {
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.clients.is_empty()
+    }
+
     fn reclaim_disconnected(
         &mut self,
         connected: Option<&dyn bmux_client_state::FollowStateReader>,
@@ -83,32 +87,32 @@ fn epoch_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
-static OBSERVERS: std::sync::OnceLock<std::sync::Mutex<ObserverIdentities>> =
-    std::sync::OnceLock::new();
-
 #[cfg(test)]
-pub(crate) fn mark_test_observer(client: ClientId, session: SessionId) {
-    OBSERVERS
-        .get_or_init(Default::default)
+pub(crate) fn mark_test_observer(
+    host: &crate::runtime::PaneRuntimeHost,
+    client: ClientId,
+    session: SessionId,
+) {
+    host.observers()
         .lock()
         .unwrap()
         .clients
         .insert(client, (Uuid::nil(), session));
 }
 
-pub(crate) fn observer_identity(client: ClientId) -> bool {
-    OBSERVERS
-        .get_or_init(Default::default)
+pub(crate) fn observer_identity(host: &crate::runtime::PaneRuntimeHost, client: ClientId) -> bool {
+    host.observers()
         .lock()
         .map_or(true, |state| state.clients.contains_key(&client))
 }
 
 pub(crate) fn observer_operation_allowed(
+    host: &crate::runtime::PaneRuntimeHost,
     client: ClientId,
     interface: &str,
     operation: &str,
 ) -> bool {
-    if !observer_identity(client) {
+    if !observer_identity(host, client) {
         return true;
     }
     match interface {
@@ -131,14 +135,15 @@ pub struct ObserverGrantArgs {
 }
 
 pub fn observer_grant(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &ObserverGrantArgs,
     ctx: &NativeServiceContext,
 ) -> Result<AttachGrantRecord, AttachCommandError> {
     let client = caller_client_id(ctx)?;
-    let manager = session_manager()?;
-    let follow = follow_state()?;
-    if OBSERVERS
-        .get_or_init(Default::default)
+    let manager = session_manager(host)?;
+    let follow = follow_state(host)?;
+    if host
+        .observers()
         .lock()
         .map_err(|_| failed("observer identities unavailable"))?
         .clients
@@ -154,9 +159,9 @@ pub fn observer_grant(
     }
     let session = resolve_session_by_selector(&*manager.0, &req.selector)
         .ok_or(AttachCommandError::SessionNotFound)?;
-    let tokens = attach_token_handle()?;
-    let mut observers = OBSERVERS
-        .get_or_init(Default::default)
+    let tokens = attach_token_handle(host)?;
+    let mut observers = host
+        .observers()
         .lock()
         .map_err(|_| failed("observer identities unavailable"))?;
     observers.reclaim_disconnected(Some(&*follow.0));
@@ -183,14 +188,15 @@ pub fn observer_grant(
 }
 
 pub fn observer_open(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &AttachOpenArgs,
     ctx: &NativeServiceContext,
 ) -> Result<AttachReady, AttachCommandError> {
     let client = caller_client_id(ctx)?;
     let session = SessionId(req.session_id);
-    let tokens = attach_token_handle()?;
-    let mut observers = OBSERVERS
-        .get_or_init(Default::default)
+    let tokens = attach_token_handle(host)?;
+    let mut observers = host
+        .observers()
         .lock()
         .map_err(|_| failed("observer identities unavailable"))?;
     if observers
@@ -206,10 +212,12 @@ pub fn observer_open(
     })?;
     // Keep the absorbing identity fence but destroy the grant binding on use.
     drop(observers);
-    crate::runtime::begin_observer_attach(session, client)
+    crate::runtime::begin_observer_attach(host, session, client)
         .map_err(|error| failed(format!("observer open failed: {error:?}")))?;
     // Deliberately no selection, membership, follow, focus, or layout events.
-    let runtime = super::session_runtime_handle().ok_or_else(|| failed("runtime unavailable"))?;
+    let runtime = host
+        .registered_session_runtime()
+        .ok_or_else(|| failed("runtime unavailable"))?;
     runtime
         .0
         .set_client_write_permission(session, client, false);
@@ -310,6 +318,7 @@ fn caller_client_id(ctx: &NativeServiceContext) -> Result<ClientId, AttachComman
 }
 
 fn session_write_allowed(
+    host: &crate::runtime::PaneRuntimeHost,
     ctx: &NativeServiceContext,
     session_id: SessionId,
     client_id: ClientId,
@@ -321,7 +330,8 @@ fn session_write_allowed(
     {
         return Ok(true);
     }
-    let principal_id = bmux_plugin::global_plugin_state_registry()
+    let principal_id = host
+        .states()
         .get::<bmux_client_state::ClientPrincipalHandle>()
         .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
         .and_then(|handle| handle.0.get(client_id))
@@ -346,15 +356,12 @@ fn session_write_allowed(
     }
 }
 
-fn publish_pane_event(event: PaneEvent) {
-    crate::runtime::publish_pane_event(event);
-}
-
 #[allow(
     clippy::too_many_arguments,
     reason = "handler forwards the wire retarget request's viewport dimensions to the runtime atomically"
 )]
 fn retarget_attach_stream(
+    host: &crate::runtime::PaneRuntimeHost,
     runtime: &bmux_pane_runtime_state::SessionRuntimeManagerHandle,
     follow: &bmux_client_state::FollowStateHandle,
     client_id: ClientId,
@@ -429,19 +436,19 @@ fn retarget_attach_stream(
                 runtime
                     .0
                     .set_client_write_permission(prev, client_id, false);
-                publish_pane_event(PaneEvent::ClientDetached { session_id: prev.0 });
+                host.publish_pane_event(PaneEvent::ClientDetached { session_id: prev.0 });
             }
             follow
                 .0
                 .set_attached_stream_session(client_id, Some(next_session_id));
-            publish_pane_event(PaneEvent::ClientAttached {
+            host.publish_pane_event(PaneEvent::ClientAttached {
                 session_id: next_session_id.0,
             });
             // Retargeting changes which session's focused pane is relevant to
             // attach-local consumers (decoration, status bars). Republish the
             // full focus snapshot even when the pane focus itself did not
             // mutate so subscribers can reconcile after tab/window switches.
-            super::publish_focus_state_snapshot();
+            super::publish_focus_state_snapshot(host);
             Ok(viewport)
         }
         Err(SessionRuntimeError::NotFound | SessionRuntimeError::Closed) => {
@@ -451,30 +458,37 @@ fn retarget_attach_stream(
     }
 }
 
-fn session_manager() -> Result<bmux_session_state::SessionManagerHandle, AttachCommandError> {
-    global_plugin_state_registry()
+fn session_manager(
+    host: &crate::runtime::PaneRuntimeHost,
+) -> Result<bmux_session_state::SessionManagerHandle, AttachCommandError> {
+    host.states()
         .get::<bmux_session_state::SessionManagerHandle>()
         .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
         .ok_or_else(|| failed("session manager handle not registered"))
 }
 
-fn context_state() -> Result<bmux_context_state::ContextStateHandle, AttachCommandError> {
-    global_plugin_state_registry()
+fn context_state(
+    host: &crate::runtime::PaneRuntimeHost,
+) -> Result<bmux_context_state::ContextStateHandle, AttachCommandError> {
+    host.states()
         .get::<bmux_context_state::ContextStateHandle>()
         .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
         .ok_or_else(|| failed("context state handle not registered"))
 }
 
-fn follow_state() -> Result<bmux_client_state::FollowStateHandle, AttachCommandError> {
-    global_plugin_state_registry()
+fn follow_state(
+    host: &crate::runtime::PaneRuntimeHost,
+) -> Result<bmux_client_state::FollowStateHandle, AttachCommandError> {
+    host.states()
         .get::<bmux_client_state::FollowStateHandle>()
         .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
         .ok_or_else(|| failed("follow state handle not registered"))
 }
 
-fn attach_token_handle()
--> Result<bmux_attach_token_state::AttachTokenManagerHandle, AttachCommandError> {
-    global_plugin_state_registry()
+fn attach_token_handle(
+    host: &crate::runtime::PaneRuntimeHost,
+) -> Result<bmux_attach_token_state::AttachTokenManagerHandle, AttachCommandError> {
+    host.states()
         .get::<bmux_attach_token_state::AttachTokenManagerHandle>()
         .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
         .ok_or_else(|| failed("attach-token manager handle not registered"))
@@ -593,15 +607,16 @@ fn commit_selection(
 }
 
 pub fn attach_session(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &AttachSessionArgs,
     ctx: &NativeServiceContext,
 ) -> Result<AttachGrantRecord, AttachCommandError> {
     let client_id = caller_client_id(ctx)?;
-    if observer_identity(client_id) {
+    if observer_identity(host, client_id) {
         return Err(failed("observer connection is read-only"));
     }
-    let manager = session_manager()?;
-    let follow = follow_state()?;
+    let manager = session_manager(host)?;
+    let follow = follow_state(host)?;
 
     let Some(next_session_id) = resolve_session_by_selector(&*manager.0, &req.selector) else {
         return Err(AttachCommandError::SessionNotFound);
@@ -610,8 +625,8 @@ pub fn attach_session(
     // Resolve every fallible dependency before changing membership or selection.
     // Missing runtime state is a recovery condition, not permission to delete
     // durable context mappings.
-    let contexts = context_state()?;
-    let tokens = attach_token_handle()?;
+    let contexts = context_state(host)?;
+    let tokens = attach_token_handle(host)?;
     if !manager.0.contains(next_session_id) {
         return Err(AttachCommandError::SessionNotFound);
     }
@@ -631,13 +646,14 @@ pub fn attach_session(
 }
 
 pub fn attach_context(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &AttachContextArgs,
     ctx: &NativeServiceContext,
 ) -> Result<AttachGrantRecord, AttachCommandError> {
     let client_id = caller_client_id(ctx)?;
-    let manager = session_manager()?;
-    let contexts = context_state()?;
-    let follow = follow_state()?;
+    let manager = session_manager(host)?;
+    let contexts = context_state(host)?;
+    let follow = follow_state(host)?;
 
     let context_id = contexts
         .0
@@ -647,7 +663,7 @@ pub fn attach_context(
     let Some(next_session_id) = snapshot.session_by_context.get(&context_id).copied() else {
         return Err(failed("context has no attached runtime"));
     };
-    let tokens = attach_token_handle()?;
+    let tokens = attach_token_handle(host)?;
     if !manager.0.contains(next_session_id) {
         return Err(AttachCommandError::SessionNotFound);
     }
@@ -676,19 +692,21 @@ pub fn attach_context(
 }
 
 pub fn attach_open(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &AttachOpenArgs,
     ctx: &NativeServiceContext,
 ) -> Result<AttachReady, AttachCommandError> {
     let client_id = caller_client_id(ctx)?;
-    if observer_identity(client_id) {
+    if observer_identity(host, client_id) {
         return Err(failed("observer connection is read-only"));
     }
     let session_id = SessionId(req.session_id);
-    let runtime = super::session_runtime_handle()
+    let runtime = host
+        .registered_session_runtime()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
-    let tokens = attach_token_handle()?;
-    if OBSERVERS
-        .get_or_init(Default::default)
+    let tokens = attach_token_handle(host)?;
+    if host
+        .observers()
         .lock()
         .map_err(|_| failed("observer identities unavailable"))?
         .clients
@@ -697,11 +715,11 @@ pub fn attach_open(
     {
         return Err(AttachCommandError::InvalidGrant);
     }
-    let follow = follow_state()?;
+    let follow = follow_state(host)?;
 
     // Ensure the session runtime exists (start it if the session
     // manager has the entry but the runtime is missing).
-    let manager = session_manager()?;
+    let manager = session_manager(host)?;
     if !manager.0.contains(session_id) {
         return Err(AttachCommandError::SessionNotFound);
     }
@@ -733,7 +751,7 @@ pub fn attach_open(
         runtime
             .0
             .set_client_write_permission(prev, client_id, false);
-        publish_pane_event(PaneEvent::ClientDetached { session_id: prev.0 });
+        host.publish_pane_event(PaneEvent::ClientDetached { session_id: prev.0 });
     }
 
     // Begin attach with restart-on-NotFound/Closed semantics.
@@ -756,24 +774,24 @@ pub fn attach_open(
     match begin_result {
         Err(error @ SessionRuntimeError::ResponseBudgetExceeded) => Err(failed(error.to_string())),
         Ok(()) => {
-            let can_write = session_write_allowed(ctx, session_id, client_id)?;
+            let can_write = session_write_allowed(host, ctx, session_id, client_id)?;
             runtime
                 .0
                 .set_client_write_permission(session_id, client_id, can_write);
             follow
                 .0
                 .set_attached_stream_session(client_id, Some(session_id));
-            let context_id = context_state()?
+            let context_id = context_state(host)?
                 .0
                 .current_for_client(client_id)
                 .map(|c| c.id);
-            publish_pane_event(PaneEvent::ClientAttached {
+            host.publish_pane_event(PaneEvent::ClientAttached {
                 session_id: session_id.0,
             });
             // Publish focus state so the newly-attached client's
             // consumers (decoration, future status plugins) observe
             // the current focused pane without an extra round-trip.
-            super::publish_focus_state_snapshot();
+            super::publish_focus_state_snapshot(host);
             Ok(AttachReady {
                 session_id: session_id.0,
                 context_id,
@@ -800,13 +818,14 @@ fn validate_input_selection(
 }
 
 pub fn input_producer_barriers(
+    host: &crate::runtime::PaneRuntimeHost,
     ctx: &NativeServiceContext,
 ) -> Result<
     Vec<bmux_pane_runtime_plugin_api::attach_runtime_commands::InputProducerBarrierV2>,
     AttachCommandError,
 > {
     let client = caller_client_id(ctx)?;
-    Ok(crate::private_input::pending_barriers(client.0))
+    Ok(crate::private_input::pending_barriers(host, client.0))
 }
 
 #[derive(Deserialize)]
@@ -818,11 +837,13 @@ pub struct AcknowledgeInputProducerBarrierArgs {
 }
 
 pub fn acknowledge_input_producer_barrier(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &AcknowledgeInputProducerBarrierArgs,
     ctx: &NativeServiceContext,
 ) -> Result<bool, AttachCommandError> {
     let client = caller_client_id(ctx)?;
     Ok(crate::private_input::acknowledge_producer(
+        host,
         req.pane_id,
         req.nonce,
         req.generation,
@@ -840,14 +861,19 @@ pub struct SuppressPaneInputCaptureArgs {
 
 /// Acknowledge recording suppression under authenticated attach write ownership.
 pub fn suppress_pane_input_capture(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &SuppressPaneInputCaptureArgs,
     ctx: &NativeServiceContext,
 ) -> Result<bool, AttachCommandError> {
     let client_id = caller_client_id(ctx)?;
     let session_id = SessionId(req.session_id);
-    let runtime = super::session_runtime_handle()
+    let runtime = host
+        .registered_session_runtime()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
-    validate_input_selection(follow_state()?.0.selected_session(client_id), session_id)?;
+    validate_input_selection(
+        follow_state(host)?.0.selected_session(client_id),
+        session_id,
+    )?;
     if !runtime.0.client_can_write(session_id, client_id) {
         return Err(AttachCommandError::Denied {
             reason: "capture suppression requires attach write ownership".into(),
@@ -860,13 +886,14 @@ pub fn suppress_pane_input_capture(
     if !panes.iter().any(|pane| pane.id == req.pane_id) {
         return Err(AttachCommandError::SessionNotFound);
     }
-    if !crate::private_input::suppress(req.pane_id) {
+    if !crate::private_input::suppress(host, req.pane_id) {
         return Err(failed("capture suppression barrier unavailable"));
     }
     Ok(true)
 }
 
 pub fn attach_input(
+    host: &crate::runtime::PaneRuntimeHost,
     req: AttachInputArgs,
     ctx: &NativeServiceContext,
 ) -> Result<
@@ -875,9 +902,13 @@ pub fn attach_input(
 > {
     let client_id = caller_client_id(ctx)?;
     let session_id = SessionId(req.session_id);
-    let runtime = super::session_runtime_handle()
+    let runtime = host
+        .registered_session_runtime()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
-    validate_input_selection(follow_state()?.0.selected_session(client_id), session_id)?;
+    validate_input_selection(
+        follow_state(host)?.0.selected_session(client_id),
+        session_id,
+    )?;
     if !runtime.0.client_can_write(session_id, client_id) {
         return Err(AttachCommandError::Denied {
             reason: "client does not have write permission for this attach stream".to_string(),
@@ -902,12 +933,14 @@ pub fn attach_input(
 }
 
 pub fn attach_output(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &AttachOutputArgs,
     ctx: &NativeServiceContext,
 ) -> Result<AttachOutputRecord, AttachCommandError> {
     let client_id = caller_client_id(ctx)?;
     let session_id = SessionId(req.session_id);
-    let runtime = super::session_runtime_handle()
+    let runtime = host
+        .registered_session_runtime()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
     match runtime
         .0
@@ -932,13 +965,19 @@ pub struct ObserveViewportArgs {
 }
 
 pub fn observe_viewport(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &ObserveViewportArgs,
     ctx: &NativeServiceContext,
 ) -> Result<AttachViewportSet, AttachCommandError> {
     let client_id = caller_client_id(ctx)?;
-    let viewport =
-        crate::runtime::observe_viewport(SessionId(req.session_id), client_id, req.cols, req.rows)
-            .map_err(|error| failed(format!("viewport observation failed: {error:?}")))?;
+    let viewport = crate::runtime::observe_viewport(
+        host,
+        SessionId(req.session_id),
+        client_id,
+        req.cols,
+        req.rows,
+    )
+    .map_err(|error| failed(format!("viewport observation failed: {error:?}")))?;
     Ok(AttachViewportSet {
         session_id: req.session_id,
         cols: viewport.cols,
@@ -947,7 +986,7 @@ pub fn observe_viewport(
         right_inset: viewport.right_inset,
         bottom_inset: viewport.bottom_inset,
         left_inset: viewport.left_inset,
-        context_id: context_state()?
+        context_id: context_state(host)?
             .0
             .current_for_client(client_id)
             .map(|context| context.id),
@@ -955,12 +994,14 @@ pub fn observe_viewport(
 }
 
 pub fn attach_set_viewport(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &AttachSetViewportArgs,
     ctx: &NativeServiceContext,
 ) -> Result<AttachViewportSet, AttachCommandError> {
     let client_id = caller_client_id(ctx)?;
     let session_id = SessionId(req.session_id);
-    let runtime = super::session_runtime_handle()
+    let runtime = host
+        .registered_session_runtime()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
     let (cols, rows, top, right, bottom, left) = runtime
         .0
@@ -977,11 +1018,11 @@ pub fn attach_set_viewport(
             req.cell_pixel_height,
         )
         .map_err(|e| failed(format!("failed setting attach viewport: {e:?}")))?;
-    let context_id = context_state()?
+    let context_id = context_state(host)?
         .0
         .current_for_client(client_id)
         .map(|c| c.id);
-    crate::runtime::emit_attach_view_changed_for_layout(session_id);
+    host.emit_attach_view_changed_for_layout(session_id);
     Ok(AttachViewportSet {
         session_id: req.session_id,
         cols,
@@ -1010,15 +1051,17 @@ fn restore_context_selection(
 }
 
 pub fn attach_retarget_context(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &AttachRetargetContextArgs,
     ctx: &NativeServiceContext,
 ) -> Result<AttachRetargetReady, AttachCommandError> {
     let client_id = caller_client_id(ctx)?;
 
-    let manager = session_manager()?;
-    let contexts = context_state()?;
-    let follow = follow_state()?;
-    let runtime = super::session_runtime_handle()
+    let manager = session_manager(host)?;
+    let contexts = context_state(host)?;
+    let follow = follow_state(host)?;
+    let runtime = host
+        .registered_session_runtime()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
 
     let selected_target = follow.0.selected_target(client_id);
@@ -1054,7 +1097,7 @@ pub fn attach_retarget_context(
     }
 
     let previous_session = selected_target.and_then(|(_, session_id)| session_id);
-    let can_write = match session_write_allowed(ctx, next_session_id, client_id) {
+    let can_write = match session_write_allowed(host, ctx, next_session_id, client_id) {
         Ok(allowed) => req.can_write && allowed,
         Err(error) => {
             if !selection_already_applied {
@@ -1066,6 +1109,7 @@ pub fn attach_retarget_context(
 
     let reservation = reserve_selection(ctx)?;
     let retargeted = match retarget_attach_stream(
+        host,
         &runtime,
         &follow,
         client_id,
@@ -1098,7 +1142,7 @@ pub fn attach_retarget_context(
     runtime
         .0
         .set_client_write_permission(next_session_id, client_id, can_write);
-    crate::runtime::emit_attach_view_changed_for_layout(next_session_id);
+    host.emit_attach_view_changed_for_layout(next_session_id);
 
     Ok(AttachRetargetReady {
         session_id: next_session_id.0,
@@ -1114,38 +1158,44 @@ pub fn attach_retarget_context(
 }
 
 pub fn set_client_attach_policy(
+    host: &crate::runtime::PaneRuntimeHost,
     req: SetClientAttachPolicyArgs,
     ctx: &NativeServiceContext,
 ) -> Result<u8, AttachCommandError> {
     let client_id = caller_client_id(ctx)?;
-    follow_state()?
+    follow_state(host)?
         .0
         .set_attach_detach_allowed(client_id, req.allow_detach);
     Ok(u8::from(req.allow_detach))
 }
 
-pub fn detach(ctx: &NativeServiceContext) -> Result<u8, AttachCommandError> {
+pub fn detach(
+    host: &crate::runtime::PaneRuntimeHost,
+    ctx: &NativeServiceContext,
+) -> Result<u8, AttachCommandError> {
     let client_id = caller_client_id(ctx)?;
-    if observer_identity(client_id) {
-        let session = OBSERVERS
-            .get_or_init(Default::default)
+    if observer_identity(host, client_id) {
+        let session = host
+            .observers()
             .lock()
             .map_err(|_| failed("observer identities unavailable"))?
             .clients
             .get(&client_id)
             .map(|(_, session)| *session);
         if let Some(session) = session {
-            let runtime =
-                super::session_runtime_handle().ok_or_else(|| failed("runtime unavailable"))?;
+            let runtime = host
+                .registered_session_runtime()
+                .ok_or_else(|| failed("runtime unavailable"))?;
             runtime.0.end_attach(session, client_id);
         }
         return Ok(0);
     }
-    let follow = follow_state()?;
+    let follow = follow_state(host)?;
     if !follow.0.attach_detach_allowed(client_id) {
         return Err(failed("detach is disabled for this connection"));
     }
-    let runtime = super::session_runtime_handle()
+    let runtime = host
+        .registered_session_runtime()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
     if let Some(stream_session) = follow.0.attached_stream_session(client_id) {
         runtime.0.end_attach(stream_session, client_id);
@@ -1153,14 +1203,14 @@ pub fn detach(ctx: &NativeServiceContext) -> Result<u8, AttachCommandError> {
             .0
             .set_client_write_permission(stream_session, client_id, false);
         follow.0.set_attached_stream_session(client_id, None);
-        publish_pane_event(PaneEvent::ClientDetached {
+        host.publish_pane_event(PaneEvent::ClientDetached {
             session_id: stream_session.0,
         });
     }
     // Clear the selected session so future follow-state lookups see
     // the detach.
     if let Some(selected) = follow.0.selected_session(client_id) {
-        let manager = session_manager()?;
+        let manager = session_manager(host)?;
         manager.0.remove_client(selected, &client_id);
         follow.0.set_selected_target(client_id, None, None);
     }
@@ -1303,9 +1353,11 @@ mod selection_tests {
 
     #[test]
     fn observer_route_fence_is_absorbing_and_owner_specific() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let observer = ClientId(Uuid::new_v4());
         let ordinary = ClientId(Uuid::new_v4());
-        mark_test_observer(observer, SessionId(Uuid::new_v4()));
+        mark_test_observer(host, observer, SessionId(Uuid::new_v4()));
         for (interface, operation) in [
             ("attach-runtime-commands", "attach-input"),
             ("attach-runtime-commands", "attach-set-viewport"),
@@ -1316,26 +1368,33 @@ mod selection_tests {
             ("pane-runtime-commands", "focus-pane"),
             ("pane-runtime-commands", "pane-set-pty-size"),
         ] {
-            assert!(!observer_operation_allowed(observer, interface, operation));
-            assert!(observer_operation_allowed(ordinary, interface, operation));
+            assert!(!observer_operation_allowed(
+                host, observer, interface, operation
+            ));
+            assert!(observer_operation_allowed(
+                host, ordinary, interface, operation
+            ));
         }
         assert!(observer_operation_allowed(
+            host,
             observer,
             "attach-runtime-state",
             "attach-snapshot"
         ));
         assert!(observer_operation_allowed(
+            host,
             observer,
             "attach-runtime-commands",
             "observe-viewport"
         ));
         assert!(observer_operation_allowed(
+            host,
             observer,
             "attach-runtime-commands",
             "detach"
         ));
         // Detach/grant consumption must not erase the connection's fence.
-        assert!(observer_identity(observer));
+        assert!(observer_identity(host, observer));
     }
 
     #[test]
@@ -1344,6 +1403,8 @@ mod selection_tests {
             ApiVersion, HostConnectionInfo, HostMetadata, HostScope, ProviderId, RegisteredService,
             ServiceKind, ServiceRequest,
         };
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let mut context = NativeServiceContext {
             host_service_port: None,
             plugin_id: "bmux.pane_runtime".into(),
@@ -1385,9 +1446,9 @@ mod selection_tests {
         };
         let session = SessionId(Uuid::new_v4());
         let client = ClientId(Uuid::new_v4());
-        assert!(session_write_allowed(&context, session, client).unwrap());
+        assert!(session_write_allowed(host, &context, session, client).unwrap());
         context.enabled_plugins.push("bmux.permissions".into());
-        assert!(session_write_allowed(&context, session, client).is_err());
+        assert!(session_write_allowed(host, &context, session, client).is_err());
     }
 
     #[test]

@@ -47,12 +47,16 @@ pub fn stream_admission_backend(
 
 /// Bound only at invocation entry, never from a registration-time fallback connection.
 pub struct CallerIdentity {
+    states: std::sync::Arc<bmux_plugin::PluginStateRegistry>,
     caller: Option<Uuid>,
 }
 
 impl CallerIdentity {
-    pub const fn new(caller: Option<Uuid>) -> Self {
-        Self { caller }
+    pub const fn new(
+        states: std::sync::Arc<bmux_plugin::PluginStateRegistry>,
+        caller: Option<Uuid>,
+    ) -> Self {
+        Self { states, caller }
     }
 }
 
@@ -77,13 +81,15 @@ impl ClientsIdentityService for CallerIdentity {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<LocalPrincipal, IdentityError>> + Send + 'a>,
     > {
-        Box::pin(async move { current_principal(self.caller) })
+        Box::pin(async move { current_principal(&self.states, self.caller) })
     }
 }
 
-pub fn current_principal(caller_client_id: Option<Uuid>) -> Result<LocalPrincipal, IdentityError> {
+pub fn current_principal(
+    registry: &bmux_plugin::PluginStateRegistry,
+    caller_client_id: Option<Uuid>,
+) -> Result<LocalPrincipal, IdentityError> {
     let caller = caller_client_id.ok_or(IdentityError::NoCurrentClient)?;
-    let registry = bmux_plugin::global_plugin_state_registry();
     let handle = registry
         .get::<ClientPrincipalHandle>()
         .ok_or(IdentityError::UnsupportedContext)?;
@@ -132,7 +138,10 @@ mod tests {
 
     // The fixture is the trusted host: caller provenance is captured here, not
     // recovered from a consumer's serializable NativeServiceContext fields.
-    struct IdentityHostDispatch(bmux_plugin_sdk::NativeServiceContext);
+    struct IdentityHostDispatch(
+        bmux_plugin_sdk::NativeServiceContext,
+        std::sync::Arc<bmux_plugin::PluginStateRegistry>,
+    );
 
     impl bmux_plugin_sdk::HostServiceDispatch for IdentityHostDispatch {
         // HostServiceDispatch fixes this return type to the SDK's PluginError.
@@ -156,7 +165,8 @@ mod tests {
                 request.payload,
             )?
             .to_vec();
-            let response = crate::ClientsPlugin::default().invoke_service(invocation);
+            let response = crate::ClientsPlugin::with_states(std::sync::Arc::clone(&self.1))
+                .invoke_service(invocation);
             assert!(response.error.is_none(), "{:?}", response.error);
             Ok(bmux_plugin_sdk::service_contract::encode_response(
                 &response.payload,
@@ -225,7 +235,8 @@ mod tests {
         lookup.0.set(ClientId(first), owner);
         lookup.0.set(ClientId(second), other_owner);
         let state = Arc::new(RwLock::new(lookup.clone()));
-        bmux_plugin::global_plugin_state_registry().register(&state);
+        let states = Arc::new(bmux_plugin::PluginStateRegistry::new());
+        states.register(&state);
         let context = identity_service_context(first);
         let instance = bmux_plugin_runtime::InstanceScope::new(
             bmux_plugin_runtime::PluginRuntimeScopeId::from_uuid(Uuid::from_u128(105)),
@@ -240,7 +251,7 @@ mod tests {
             target.caller_client_id = Some(caller);
             let port = bmux_plugin_sdk::BoundHostServicePort::new(
                 invocation.clone(),
-                Arc::new(IdentityHostDispatch(target)),
+                Arc::new(IdentityHostDispatch(target, Arc::clone(&states))),
             );
             (
                 invocation,
@@ -380,7 +391,10 @@ mod tests {
 
     #[test]
     fn missing_caller_is_not_a_default_owner() {
-        assert_eq!(current_principal(None), Err(IdentityError::NoCurrentClient));
+        assert_eq!(
+            current_principal(&bmux_plugin::PluginStateRegistry::new(), None),
+            Err(IdentityError::NoCurrentClient)
+        );
     }
 
     #[test]

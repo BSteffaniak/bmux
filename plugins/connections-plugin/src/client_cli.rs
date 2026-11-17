@@ -166,8 +166,8 @@ pub fn run(context: &NativeCommandContext) -> Result<Option<i32>> {
             );
             let terminal = positions.get(1).cloned().unwrap_or_else(|| "main".into());
             preferences::name_valid(&terminal)?;
-            crate::attach_provider::install();
-            crate::attach_provider::set_paths(paths);
+            // The host registers this plugin's paired-terminal provider
+            // with its own paths; the forwarded attach resolves through it.
             forward(
                 context,
                 "attach",

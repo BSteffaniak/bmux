@@ -20,7 +20,7 @@ mod snapshot;
 use bmux_clients_plugin_api::clients_state;
 use bmux_contexts_plugin_api::{contexts_commands, contexts_state};
 use bmux_plugin::{
-    EventBus, HostRuntimeApi, ServiceCaller, TypedServiceCaller, global_plugin_state_registry,
+    EventBus, HostRuntimeApi, PluginStateRegistry, ServiceCaller, TypedServiceCaller,
 };
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
@@ -143,12 +143,33 @@ impl WorkspaceState {
 /// This activation's workspace event publisher. Without a host-supplied bus
 /// (for example a dynamic artifact) events are dropped, never routed to a
 /// process-wide bus.
-#[derive(Clone, Default)]
-struct WorkspaceEvents(Option<Arc<EventBus>>);
+#[derive(Clone)]
+struct WorkspaceEvents {
+    bus: Option<Arc<EventBus>>,
+    /// This activation's view of the host state registry; an empty private
+    /// registry until activation supplies one, never a process-wide one.
+    states: Arc<PluginStateRegistry>,
+}
+
+impl Default for WorkspaceEvents {
+    fn default() -> Self {
+        Self::new(None, Arc::new(PluginStateRegistry::new()))
+    }
+}
 
 impl WorkspaceEvents {
+    const fn new(bus: Option<Arc<EventBus>>, states: Arc<PluginStateRegistry>) -> Self {
+        Self { bus, states }
+    }
+
+    fn state(&self) -> Result<Arc<RwLock<WorkspaceState>>, String> {
+        self.states
+            .get::<WorkspaceState>()
+            .ok_or_else(|| "workspace state is not active".to_string())
+    }
+
     fn emit(&self, event: WorkspaceEvent) {
-        if let Some(bus) = &self.0 {
+        if let Some(bus) = &self.bus {
             let _ = bus.emit(&workspaces_events::EVENT_KIND, event);
         }
     }
@@ -163,7 +184,10 @@ impl RustPlugin for WorkspacesPlugin {
     type Contract = bmux_workspaces_plugin_api::Contract;
 
     fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
-        self.events = WorkspaceEvents(bmux_plugin::activation_event_bus(&context));
+        self.events = WorkspaceEvents::new(
+            bmux_plugin::activation_event_bus(&context),
+            bmux_plugin::activation_state_registry(&context),
+        );
         let records = load_catalog(&context).map_err(PluginCommandError::failed)?;
         let history = load_navigation_history(&context).map_err(PluginCommandError::failed)?;
         let active_by_client = history.active_by_client;
@@ -178,9 +202,10 @@ impl RustPlugin for WorkspacesPlugin {
         save_catalog(&context, &state.records)
             .map_err(|error| PluginCommandError::failed(format!("{error:?}")))?;
         let state = Arc::new(RwLock::new(state));
-        snapshot::register(&context, Arc::clone(&state)).map_err(PluginCommandError::failed)?;
-        global_plugin_state_registry().register::<WorkspaceState>(&state);
-        if let Some(bus) = &self.events.0 {
+        snapshot::register(&self.events.states, &context, Arc::clone(&state))
+            .map_err(PluginCommandError::failed)?;
+        self.events.states.register::<WorkspaceState>(&state);
+        if let Some(bus) = &self.events.bus {
             bus.register_channel::<WorkspaceEvent>(workspaces_events::EVENT_KIND);
         }
         Ok(EXIT_OK)
@@ -200,11 +225,11 @@ impl RustPlugin for WorkspacesPlugin {
         };
         bmux_plugin_sdk::route_service!(context, {
             state::ListWorkspacesEndpoint => |(), ctx| {
-                list_workspaces(ctx).map_err(|error| ServiceResponse::error("list_failed", error))
+                list_workspaces(&self.events, ctx).map_err(|error| ServiceResponse::error("list_failed", error))
             },
-            state::GetWorkspaceEndpoint => |req, ctx| Ok(get_workspace(ctx, &req.selector)),
+            state::GetWorkspaceEndpoint => |req, ctx| Ok(get_workspace(&self.events, ctx, &req.selector)),
             state::CurrentWorkspaceEndpoint => |(), ctx| {
-                current_workspace(ctx).map_err(|error| ServiceResponse::error("current_failed", error))
+                current_workspace(&self.events, ctx).map_err(|error| ServiceResponse::error("current_failed", error))
             },
             commands::NewWorkspaceEndpoint => |req, ctx| Ok(new_workspace(&self.events, ctx, req.name)),
             commands::RenameWorkspaceEndpoint => |req, ctx| {
@@ -220,7 +245,7 @@ impl RustPlugin for WorkspacesPlugin {
             commands::PrevWorkspaceEndpoint => |(), ctx| Ok(cycle_workspace(&self.events, ctx, -1)),
             commands::LastWorkspaceEndpoint => |(), ctx| Ok(last_workspace(&self.events, ctx)),
             commands::MoveTabToWorkspaceEndpoint => |req, ctx| {
-                Ok(move_tab(ctx, req.context_id, &req.workspace))
+                Ok(move_tab(&self.events, ctx, req.context_id, &req.workspace))
             },
         })
     }
@@ -234,6 +259,7 @@ impl RustPlugin for WorkspacesPlugin {
         let state: Arc<dyn WorkspacesStateService + Send + Sync> =
             Arc::new(WorkspacesStateHandle {
                 caller: Arc::clone(&caller),
+                events: self.events.clone(),
             });
         let activation: Arc<dyn WorkspacesActivationV1Service + Send + Sync> =
             Arc::new(WorkspacesCommandsHandle {
@@ -249,12 +275,6 @@ impl RustPlugin for WorkspacesPlugin {
         let _ = workspaces_state::register_provider(registry, state);
         let _ = workspaces_commands::register_provider(registry, commands);
     }
-}
-
-fn state() -> Result<Arc<RwLock<WorkspaceState>>, String> {
-    global_plugin_state_registry()
-        .get::<WorkspaceState>()
-        .ok_or_else(|| "workspace state is not active".to_string())
 }
 
 const fn dispatch_client<C: ServiceCaller + Sync + ?Sized>(
@@ -404,8 +424,11 @@ fn selected_workspace(
     effective_workspace(summary.selected_context_id, contexts, history)
 }
 
-fn list_workspaces(caller: &(impl ServiceCaller + Sync)) -> Result<Vec<WorkspaceSummary>, String> {
-    list_workspaces_for_client(caller, resolve_client_id(caller))
+fn list_workspaces(
+    events: &WorkspaceEvents,
+    caller: &(impl ServiceCaller + Sync),
+) -> Result<Vec<WorkspaceSummary>, String> {
+    list_workspaces_for_client(events, caller, resolve_client_id(caller))
 }
 
 fn resolve_client_id(caller: &(impl ServiceCaller + Sync)) -> Option<Uuid> {
@@ -417,11 +440,12 @@ fn resolve_client_id(caller: &(impl ServiceCaller + Sync)) -> Option<Uuid> {
 }
 
 fn list_workspaces_for_client(
+    events: &WorkspaceEvents,
     caller: &(impl ServiceCaller + Sync),
     caller_client_id: Option<Uuid>,
 ) -> Result<Vec<WorkspaceSummary>, String> {
     let contexts = list_contexts(caller)?;
-    let state = state()?;
+    let state = events.state()?;
     let (records, history) = {
         let guard = state
             .read()
@@ -451,10 +475,11 @@ fn list_workspaces_for_client(
 }
 
 fn get_workspace(
+    events: &WorkspaceEvents,
     caller: &(impl ServiceCaller + Sync),
     selector: &WorkspaceSelector,
 ) -> Result<WorkspaceSummary, WorkspaceQueryError> {
-    list_workspaces(caller)
+    list_workspaces(events, caller)
         .map_err(|reason| WorkspaceQueryError::InvalidSelector { reason })?
         .into_iter()
         .find(|workspace| {
@@ -465,9 +490,10 @@ fn get_workspace(
 }
 
 fn current_workspace(
+    events: &WorkspaceEvents,
     caller: &(impl ServiceCaller + Sync),
 ) -> Result<Option<WorkspaceSummary>, String> {
-    Ok(list_workspaces(caller)?
+    Ok(list_workspaces(events, caller)?
         .into_iter()
         .find(|workspace| workspace.active))
 }
@@ -487,7 +513,9 @@ fn new_workspace_for_client(
     name: Option<String>,
     client_id: Uuid,
 ) -> Result<WorkspaceAck, WorkspaceCommandError> {
-    let state = state().map_err(|reason| WorkspaceCommandError::Failed { reason })?;
+    let state = events
+        .state()
+        .map_err(|reason| WorkspaceCommandError::Failed { reason })?;
     let record = {
         let mut guard = state.write().map_err(|_| WorkspaceCommandError::Failed {
             reason: "workspace state lock poisoned".to_string(),
@@ -522,7 +550,9 @@ fn rename_workspace(
     selector: &WorkspaceSelector,
     name: String,
 ) -> Result<WorkspaceAck, WorkspaceCommandError> {
-    let state = state().map_err(|reason| WorkspaceCommandError::Failed { reason })?;
+    let state = events
+        .state()
+        .map_err(|reason| WorkspaceCommandError::Failed { reason })?;
     let (id, name, records) = {
         let mut guard = state.write().map_err(|_| WorkspaceCommandError::Failed {
             reason: "workspace state lock poisoned".to_string(),
@@ -558,7 +588,9 @@ fn kill_workspace(
 ) -> Result<WorkspaceAck, WorkspaceCommandError> {
     let contexts =
         list_contexts(caller).map_err(|reason| WorkspaceCommandError::Failed { reason })?;
-    let state = state().map_err(|reason| WorkspaceCommandError::Failed { reason })?;
+    let state = events
+        .state()
+        .map_err(|reason| WorkspaceCommandError::Failed { reason })?;
     let (id, fallback_id, records) = {
         let mut guard = state.write().map_err(|_| WorkspaceCommandError::Failed {
             reason: "workspace state lock poisoned".to_string(),
@@ -664,7 +696,9 @@ fn select_workspace_target(
 ) -> Result<WorkspaceAck, WorkspaceCommandError> {
     let contexts =
         list_contexts(caller).map_err(|reason| WorkspaceCommandError::Failed { reason })?;
-    let state = state().map_err(|reason| WorkspaceCommandError::Failed { reason })?;
+    let state = events
+        .state()
+        .map_err(|reason| WorkspaceCommandError::Failed { reason })?;
     let mut context_client = dispatch_client(caller);
     let current_context = bmux_plugin::block_on_typed_dispatch(
         contexts_state::client::current_context(&mut context_client),
@@ -756,7 +790,9 @@ fn cycle_workspace(
     offset: isize,
 ) -> Result<WorkspaceAck, WorkspaceCommandError> {
     let client_id = client_id(resolve_client_id(caller))?;
-    let state = state().map_err(|reason| WorkspaceCommandError::Failed { reason })?;
+    let state = events
+        .state()
+        .map_err(|reason| WorkspaceCommandError::Failed { reason })?;
     let target = {
         let guard = state.read().map_err(|_| WorkspaceCommandError::Failed {
             reason: "workspace state lock poisoned".to_string(),
@@ -793,7 +829,9 @@ fn last_workspace(
     caller: &(impl HostRuntimeApi + Sync),
 ) -> Result<WorkspaceAck, WorkspaceCommandError> {
     let client_id = client_id(resolve_client_id(caller))?;
-    let state = state().map_err(|reason| WorkspaceCommandError::Failed { reason })?;
+    let state = events
+        .state()
+        .map_err(|reason| WorkspaceCommandError::Failed { reason })?;
     let previous = state
         .read()
         .map_err(|_| WorkspaceCommandError::Failed {
@@ -815,12 +853,15 @@ fn last_workspace(
 }
 
 fn move_tab(
+    events: &WorkspaceEvents,
     caller: &(impl HostRuntimeApi + Sync),
     context_id: Uuid,
     selector: &WorkspaceSelector,
 ) -> Result<WorkspaceAck, WorkspaceCommandError> {
     let workspace_id = {
-        let state = state().map_err(|reason| WorkspaceCommandError::Failed { reason })?;
+        let state = events
+            .state()
+            .map_err(|reason| WorkspaceCommandError::Failed { reason })?;
         let guard = state.read().map_err(|_| WorkspaceCommandError::Failed {
             reason: "workspace state lock poisoned".to_string(),
         })?;
@@ -982,7 +1023,8 @@ fn positional_value_at(arguments: &[String], target_index: usize) -> Option<Stri
 fn run_command(events: &WorkspaceEvents, context: &NativeCommandContext) -> Result<(), String> {
     match context.command.as_str() {
         "list-workspaces" => {
-            for workspace in list_workspaces_for_client(context, context.caller_client_id)? {
+            for workspace in list_workspaces_for_client(events, context, context.caller_client_id)?
+            {
                 println!("{}\t{}", workspace.id, workspace.name);
             }
             Ok(())
@@ -1033,8 +1075,8 @@ fn run_command(events: &WorkspaceEvents, context: &NativeCommandContext) -> Resu
                 .ok_or_else(|| "missing CONTEXT_ID".to_string())
                 .and_then(|value| Uuid::parse_str(&value).map_err(|error| error.to_string()))?;
             let selector = parse_selector_argument(context, 1)?;
-            let ack =
-                move_tab(context, context_id, &selector).map_err(|error| format!("{error:?}"))?;
+            let ack = move_tab(events, context, context_id, &selector)
+                .map_err(|error| format!("{error:?}"))?;
             record_outcome(&ack);
             Ok(())
         }
@@ -1076,7 +1118,7 @@ fn command_cycle(
         .caller_client_id
         .ok_or_else(|| "workspace operation requires caller client id".to_string())?;
     let target = {
-        let state = state()?;
+        let state = events.state()?;
         let guard = state
             .read()
             .map_err(|_| "workspace state lock poisoned".to_string())?;
@@ -1110,7 +1152,8 @@ fn command_last(events: &WorkspaceEvents, context: &NativeCommandContext) -> Res
     let client_id = context
         .caller_client_id
         .ok_or_else(|| "workspace operation requires caller client id".to_string())?;
-    let previous = state()?
+    let previous = events
+        .state()?
         .read()
         .map_err(|_| "workspace state lock poisoned".to_string())?
         .previous_by_client
@@ -1156,24 +1199,29 @@ fn record_outcome(ack: &WorkspaceAck) {
 
 struct WorkspacesStateHandle {
     caller: Arc<TypedServiceCaller>,
+    events: WorkspaceEvents,
 }
 impl WorkspacesStateService for WorkspacesStateHandle {
     fn list_workspaces<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Vec<WorkspaceSummary>> + Send + 'a>> {
-        Box::pin(async move { list_workspaces(self.caller.as_ref()).unwrap_or_default() })
+        Box::pin(
+            async move { list_workspaces(&self.events, self.caller.as_ref()).unwrap_or_default() },
+        )
     }
     fn get_workspace<'a>(
         &'a self,
         selector: WorkspaceSelector,
     ) -> Pin<Box<dyn Future<Output = Result<WorkspaceSummary, WorkspaceQueryError>> + Send + 'a>>
     {
-        Box::pin(async move { get_workspace(self.caller.as_ref(), &selector) })
+        Box::pin(async move { get_workspace(&self.events, self.caller.as_ref(), &selector) })
     }
     fn current_workspace<'a>(
         &'a self,
     ) -> Pin<Box<dyn Future<Output = Option<WorkspaceSummary>> + Send + 'a>> {
-        Box::pin(async move { current_workspace(self.caller.as_ref()).unwrap_or(None) })
+        Box::pin(
+            async move { current_workspace(&self.events, self.caller.as_ref()).unwrap_or(None) },
+        )
     }
 }
 
@@ -1250,7 +1298,9 @@ impl WorkspacesCommandsService for WorkspacesCommandsHandle {
         workspace: WorkspaceSelector,
     ) -> Pin<Box<dyn Future<Output = Result<WorkspaceAck, WorkspaceCommandError>> + Send + 'a>>
     {
-        Box::pin(async move { move_tab(self.caller.as_ref(), context_id, &workspace) })
+        Box::pin(
+            async move { move_tab(&self.events, self.caller.as_ref(), context_id, &workspace) },
+        )
     }
 }
 
@@ -1549,8 +1599,8 @@ mod tests {
         }
     }
 
-    fn install_workspace_state(state: WorkspaceState) {
-        global_plugin_state_registry().register::<WorkspaceState>(&Arc::new(RwLock::new(state)));
+    fn install_workspace_state(states: &PluginStateRegistry, state: WorkspaceState) {
+        states.register::<WorkspaceState>(&Arc::new(RwLock::new(state)));
     }
 
     #[test]
@@ -1758,25 +1808,29 @@ mod tests {
                 context(103, other),
             ],
         ));
-        install_workspace_state(WorkspaceState {
-            records: vec![
-                WorkspaceRecord {
-                    id: Uuid::nil(),
-                    name: "default".into(),
-                },
-                WorkspaceRecord {
-                    id: other,
-                    name: "workspace-4".into(),
-                },
-            ],
-            selected_context_by_client_workspace: HashMap::from([(
-                (client, other),
-                Uuid::from_u128(103),
-            )]),
-            ..WorkspaceState::default()
-        });
+        let workspace_states = Arc::new(PluginStateRegistry::new());
+        install_workspace_state(
+            &workspace_states,
+            WorkspaceState {
+                records: vec![
+                    WorkspaceRecord {
+                        id: Uuid::nil(),
+                        name: "default".into(),
+                    },
+                    WorkspaceRecord {
+                        id: other,
+                        name: "workspace-4".into(),
+                    },
+                ],
+                selected_context_by_client_workspace: HashMap::from([(
+                    (client, other),
+                    Uuid::from_u128(103),
+                )]),
+                ..WorkspaceState::default()
+            },
+        );
         let ack = activate_tab_for_client(
-            &WorkspaceEvents::default(),
+            &WorkspaceEvents::new(None, Arc::clone(&workspace_states)),
             host.as_ref(),
             target.id,
             client,
@@ -1791,7 +1845,7 @@ mod tests {
             .retain(|context| context.id != target.id);
         assert_eq!(
             activate_tab_for_client(
-                &WorkspaceEvents::default(),
+                &WorkspaceEvents::new(None, Arc::clone(&workspace_states)),
                 host.as_ref(),
                 target.id,
                 client
@@ -1816,24 +1870,28 @@ mod tests {
             first_client,
             vec![first_context.clone(), second_context.clone()],
         ));
-        install_workspace_state(WorkspaceState {
-            records: vec![
-                WorkspaceRecord {
-                    id: first_workspace,
-                    name: DEFAULT_WORKSPACE_NAME.to_string(),
-                },
-                WorkspaceRecord {
-                    id: second_workspace,
-                    name: "second".to_string(),
-                },
-            ],
-            active_by_client: HashMap::new(),
-            previous_by_client: HashMap::new(),
-            selected_context_by_client_workspace: HashMap::new(),
-        });
+        let workspace_states = Arc::new(PluginStateRegistry::new());
+        install_workspace_state(
+            &workspace_states,
+            WorkspaceState {
+                records: vec![
+                    WorkspaceRecord {
+                        id: first_workspace,
+                        name: DEFAULT_WORKSPACE_NAME.to_string(),
+                    },
+                    WorkspaceRecord {
+                        id: second_workspace,
+                        name: "second".to_string(),
+                    },
+                ],
+                active_by_client: HashMap::new(),
+                previous_by_client: HashMap::new(),
+                selected_context_by_client_workspace: HashMap::new(),
+            },
+        );
 
         let first_ack = switch_workspace(
-            &WorkspaceEvents::default(),
+            &WorkspaceEvents::new(None, Arc::clone(&workspace_states)),
             host.as_ref(),
             &WorkspaceSelector {
                 id: Some(second_workspace),
@@ -1843,7 +1901,7 @@ mod tests {
         .expect("first client should switch");
         host.set_current_client(second_client);
         let second_ack = switch_workspace(
-            &WorkspaceEvents::default(),
+            &WorkspaceEvents::new(None, Arc::clone(&workspace_states)),
             host.as_ref(),
             &WorkspaceSelector {
                 id: Some(first_workspace),
@@ -1854,7 +1912,9 @@ mod tests {
 
         assert_eq!(first_ack.selected_context_id, Some(second_context.id));
         assert_eq!(second_ack.selected_context_id, Some(first_context.id));
-        let state = state().expect("workspace state should exist");
+        let state = workspace_states
+            .get::<WorkspaceState>()
+            .expect("workspace state should exist");
         let guard = state.read().expect("workspace state lock should succeed");
         assert_eq!(guard.active_id(first_client), second_workspace);
         assert_eq!(guard.active_id(second_client), first_workspace);
@@ -1889,31 +1949,36 @@ mod tests {
         ));
         let bus = Arc::new(EventBus::new());
         bus.register_channel::<WorkspaceEvent>(workspaces_events::EVENT_KIND);
-        let kill_events = WorkspaceEvents(Some(Arc::clone(&bus)));
+        let workspace_states = Arc::new(PluginStateRegistry::new());
+        let kill_events =
+            WorkspaceEvents::new(Some(Arc::clone(&bus)), Arc::clone(&workspace_states));
         let mut events = bus
             .subscribe::<WorkspaceEvent>(&workspaces_events::EVENT_KIND)
             .expect("workspace event subscription should succeed");
-        install_workspace_state(WorkspaceState {
-            records: vec![
-                WorkspaceRecord {
-                    id: fallback_workspace,
-                    name: DEFAULT_WORKSPACE_NAME.to_string(),
-                },
-                WorkspaceRecord {
-                    id: removed_workspace,
-                    name: "removed".to_string(),
-                },
-            ],
-            active_by_client: HashMap::from([
-                (deleting_client, fallback_workspace),
-                (viewing_client, removed_workspace),
-            ]),
-            previous_by_client: HashMap::from([
-                (deleting_client, removed_workspace),
-                (viewing_client, fallback_workspace),
-            ]),
-            selected_context_by_client_workspace: HashMap::new(),
-        });
+        install_workspace_state(
+            &workspace_states,
+            WorkspaceState {
+                records: vec![
+                    WorkspaceRecord {
+                        id: fallback_workspace,
+                        name: DEFAULT_WORKSPACE_NAME.to_string(),
+                    },
+                    WorkspaceRecord {
+                        id: removed_workspace,
+                        name: "removed".to_string(),
+                    },
+                ],
+                active_by_client: HashMap::from([
+                    (deleting_client, fallback_workspace),
+                    (viewing_client, removed_workspace),
+                ]),
+                previous_by_client: HashMap::from([
+                    (deleting_client, removed_workspace),
+                    (viewing_client, fallback_workspace),
+                ]),
+                selected_context_by_client_workspace: HashMap::new(),
+            },
+        );
 
         let ack = kill_workspace(
             &kill_events,
@@ -1935,7 +2000,9 @@ mod tests {
                 workspace_id: removed_workspace,
             }
         );
-        let state = state().expect("workspace state should exist");
+        let state = workspace_states
+            .get::<WorkspaceState>()
+            .expect("workspace state should exist");
         let guard = state.read().expect("workspace state lock should succeed");
         assert_eq!(guard.active_id(deleting_client), fallback_workspace);
         assert_eq!(guard.active_id(viewing_client), fallback_workspace);

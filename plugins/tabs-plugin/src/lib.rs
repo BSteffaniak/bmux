@@ -1222,9 +1222,19 @@ struct TabRuntimeState {
     /// The bus this activation received. `None` (for example a dynamic
     /// artifact) drops tab events; there is no process-wide bus.
     events: Option<Arc<bmux_plugin::EventBus>>,
+    /// This activation's view of the host state registry; an empty private
+    /// one before activation, never a process-wide one.
+    states: Arc<bmux_plugin::PluginStateRegistry>,
 }
 
 type TabRuntimeStateHandle = Arc<Mutex<TabRuntimeState>>;
+
+fn tab_states(runtime_state: &TabRuntimeStateHandle) -> Arc<bmux_plugin::PluginStateRegistry> {
+    runtime_state.lock().map_or_else(
+        |_| Arc::new(bmux_plugin::PluginStateRegistry::new()),
+        |state| Arc::clone(&state.states),
+    )
+}
 
 fn tab_events(runtime_state: &TabRuntimeStateHandle) -> Option<Arc<bmux_plugin::EventBus>> {
     runtime_state
@@ -1254,11 +1264,14 @@ impl RustPlugin for TabsPlugin {
             .map_err(PluginCommandError::failed)?;
         drop(migration_guard);
         let events = bmux_plugin::activation_event_bus(&context);
-        self.runtime_state
-            .lock()
-            .map_err(|_| PluginCommandError::failed("tab runtime state poisoned"))?
-            .events
-            .clone_from(&events);
+        {
+            let mut runtime_state = self
+                .runtime_state
+                .lock()
+                .map_err(|_| PluginCommandError::failed("tab runtime state poisoned"))?;
+            runtime_state.events.clone_from(&events);
+            runtime_state.states = bmux_plugin::activation_state_registry(&context);
+        }
         arrangements::activate(&context, self.runtime_state.clone())
             .map_err(PluginCommandError::failed)?;
         // Register the typed event-bus channel for pane-event so
@@ -1486,7 +1499,10 @@ impl RustPlugin for TabsPlugin {
                 // Serialize effects and await blocking work even during shutdown:
                 // cancellation cannot make an in-flight service call disappear.
                 worker.spawn_blocking(move || {
-                    if let Err(error) = recover_tab_placements(shared.caller.as_ref()) {
+                    if let Err(error) = recover_tab_placements(
+                        &tab_states(&shared.runtime_state),
+                        shared.caller.as_ref(),
+                    ) {
                         log_tab_rename_error(shared.caller.as_ref(), format!("tab placement recovery required: {error}"));
                     }
                     if let Some(event) = event { handle_context_event(&shared, &event); }
@@ -1599,11 +1615,20 @@ fn handle_context_event(
                         .find(|context| context.id == *context_id)
                 })
                 .map_or_else(Uuid::nil, |context| context_workspace_id(&context));
-            let _ = append_context_to_workspace_order(caller, workspace_id, *context_id);
+            let _ = append_context_to_workspace_order(
+                &tab_states(&shared.runtime_state),
+                caller,
+                workspace_id,
+                *context_id,
+            );
         }
         ContextEvent::Closed { context_id } => {
             remove_known_context(&shared.runtime_state, *context_id);
-            let _ = remove_context_from_all_workspace_orders(caller, *context_id);
+            let _ = remove_context_from_all_workspace_orders(
+                &tab_states(&shared.runtime_state),
+                caller,
+                *context_id,
+            );
             publish_tab_list_snapshot(caller, &shared.runtime_state);
         }
         ContextEvent::Selected { context_id } => {
@@ -1669,7 +1694,7 @@ fn place_tab(
         state.pending.insert(context_id, workspace_id);
         arrangements::write_state(caller, &state)?;
     }
-    complete_tab_placement(caller, context_id, workspace_id)?;
+    complete_tab_placement(&tab_states(runtime_state), caller, context_id, workspace_id)?;
     publish_tab_list_snapshot(caller, runtime_state);
     Ok(())
 }
@@ -1678,11 +1703,12 @@ static TAB_TRANSFER_MUTATION: durable_storage::ArrangementMutation =
     durable_storage::ArrangementMutation::transfer();
 
 fn complete_tab_placement(
+    states: &bmux_plugin::PluginStateRegistry,
     caller: &(impl HostRuntimeApi + Sync),
     context_id: Uuid,
     workspace_id: Uuid,
 ) -> Result<(), String> {
-    append_context_to_workspace_order(caller, workspace_id, context_id)?;
+    append_context_to_workspace_order(states, caller, workspace_id, context_id)?;
     let mut client = dispatch_client(caller);
     // Re-read after the durable append: a retry must preserve unrelated
     // attributes updated since the transfer began.
@@ -1706,7 +1732,10 @@ fn complete_tab_placement(
     Ok(())
 }
 
-fn recover_tab_placements(caller: &(impl HostRuntimeApi + Sync)) -> Result<(), String> {
+fn recover_tab_placements(
+    states: &bmux_plugin::PluginStateRegistry,
+    caller: &(impl HostRuntimeApi + Sync),
+) -> Result<(), String> {
     let _transfer = TAB_TRANSFER_MUTATION
         .lock()
         .map_err(|_| "tab transfer lock poisoned")?;
@@ -1717,7 +1746,7 @@ fn recover_tab_placements(caller: &(impl HostRuntimeApi + Sync)) -> Result<(), S
     for (context_id, workspace_id) in state.pending {
         // An incomplete restore is not evidence that the resource was deleted.
         if contexts.iter().any(|context| context.id == context_id) {
-            complete_tab_placement(caller, context_id, workspace_id)?;
+            complete_tab_placement(states, caller, context_id, workspace_id)?;
         }
     }
     Ok(())
@@ -1729,6 +1758,7 @@ static TAB_ORDER_MUTATION: durable_storage::ArrangementMutation =
     durable_storage::ArrangementMutation::new();
 
 fn append_context_to_workspace_order(
+    states: &bmux_plugin::PluginStateRegistry,
     caller: &(impl HostRuntimeApi + Sync),
     workspace_id: Uuid,
     context_id: Uuid,
@@ -1750,11 +1780,12 @@ fn append_context_to_workspace_order(
     if !order.contains(&context_id) {
         order.push(context_id);
     }
-    set_stored_tab_order_ids_for_workspace(caller, workspace_id, &order)?;
+    set_stored_tab_order_ids_for_workspace(states, caller, workspace_id, &order)?;
     Ok(())
 }
 
 fn remove_context_from_all_workspace_orders(
+    states: &bmux_plugin::PluginStateRegistry,
     caller: &(impl HostRuntimeApi + Sync),
     context_id: Uuid,
 ) -> Result<(), String> {
@@ -1778,7 +1809,7 @@ fn remove_context_from_all_workspace_orders(
         let original_len = order.len();
         order.retain(|id| *id != context_id);
         if order.len() != original_len {
-            set_stored_tab_order_ids_for_workspace(caller, workspace.id, &order)?;
+            set_stored_tab_order_ids_for_workspace(states, caller, workspace.id, &order)?;
         }
     }
     Ok(())
@@ -2589,7 +2620,12 @@ fn reset_tab_order(
     let contexts = list_contexts_in_active_workspace(caller)?;
     let mut ids: Vec<Uuid> = contexts.iter().map(|context| context.id).collect();
     ids.sort_by_key(uuid::Uuid::as_u128);
-    set_stored_tab_order_ids_for_workspace(caller, active_workspace_id(caller), &ids)?;
+    set_stored_tab_order_ids_for_workspace(
+        &tab_states(runtime_state),
+        caller,
+        active_workspace_id(caller),
+        &ids,
+    )?;
     publish_tab_list_snapshot(caller, runtime_state);
     Ok(ids.len())
 }
@@ -2679,7 +2715,12 @@ fn create_tab_with_policy(
     };
     let context_id = context.id;
     cache_known_context(runtime_state, context_id, context.name.clone());
-    append_context_to_workspace_order(caller, context_workspace_id(&context), context_id)?;
+    append_context_to_workspace_order(
+        &tab_states(runtime_state),
+        caller,
+        context_workspace_id(&context),
+        context_id,
+    )?;
     mark_context_active_cached(runtime_state, previous_context, context_id);
     publish_tab_list_snapshot(caller, runtime_state);
     Ok(TabAck {
@@ -2996,7 +3037,12 @@ fn move_tab(
     };
     order_ids.insert(insert_index.min(order_ids.len()), source_id);
 
-    set_stored_tab_order_ids_for_workspace(caller, active_workspace_id(caller), &order_ids)?;
+    set_stored_tab_order_ids_for_workspace(
+        &tab_states(runtime_state),
+        caller,
+        active_workspace_id(caller),
+        &order_ids,
+    )?;
     publish_tab_list_snapshot(caller, runtime_state);
     Ok(TabAck {
         ok: true,
@@ -3514,13 +3560,14 @@ fn parse_stored_tab_order_value(value: Vec<u8>) -> Result<Vec<Uuid>, String> {
 }
 
 fn set_stored_tab_order_ids_for_workspace(
+    states: &bmux_plugin::PluginStateRegistry,
     caller: &impl HostRuntimeApi,
     workspace_id: Uuid,
     order_ids: &[Uuid],
 ) -> Result<(), String> {
     if let Some(mut orders) = arrangements::read(caller)? {
         orders.insert(workspace_id, order_ids.to_vec());
-        return arrangements::write(caller, &orders);
+        return arrangements::write(states, caller, &orders);
     }
     caller
         .storage_set(&StorageSetRequest::new(
@@ -5775,7 +5822,13 @@ mod tests {
             original
         );
         let reversed: Vec<_> = original.into_iter().rev().collect();
-        set_stored_tab_order_ids_for_workspace(&host, Uuid::nil(), &reversed).unwrap();
+        set_stored_tab_order_ids_for_workspace(
+            &bmux_plugin::PluginStateRegistry::new(),
+            &host,
+            Uuid::nil(),
+            &reversed,
+        )
+        .unwrap();
         assert_eq!(
             resolve_tab_order_ids(&host, &runtime, &contexts).unwrap(),
             reversed
@@ -5793,8 +5846,20 @@ mod tests {
         let first = contexts[0].id;
         let second = contexts[1].id;
         let third = contexts[2].id;
-        set_stored_tab_order_ids_for_workspace(&host, Uuid::nil(), &[third, first]).unwrap();
-        set_stored_tab_order_ids_for_workspace(&host, workspace, &[second]).unwrap();
+        set_stored_tab_order_ids_for_workspace(
+            &bmux_plugin::PluginStateRegistry::new(),
+            &host,
+            Uuid::nil(),
+            &[third, first],
+        )
+        .unwrap();
+        set_stored_tab_order_ids_for_workspace(
+            &bmux_plugin::PluginStateRegistry::new(),
+            &host,
+            workspace,
+            &[second],
+        )
+        .unwrap();
         let runtime = runtime_state();
         contexts.reverse();
         assert_eq!(
@@ -5816,7 +5881,13 @@ mod tests {
         let sessions = sample_sessions_three();
         let host = MockHost::with_sessions(sessions.clone());
         let ids: Vec<_> = sessions.iter().rev().map(|session| session.id).collect();
-        set_stored_tab_order_ids_for_workspace(&host, Uuid::nil(), &ids).unwrap();
+        set_stored_tab_order_ids_for_workspace(
+            &bmux_plugin::PluginStateRegistry::new(),
+            &host,
+            Uuid::nil(),
+            &ids,
+        )
+        .unwrap();
         let ack = create_tab(&host, &runtime_state(), Some("new".to_string())).unwrap();
         let new_id = Uuid::parse_str(ack.id.as_deref().unwrap()).unwrap();
         let mut expected = ids;
@@ -5833,7 +5904,7 @@ mod tests {
         let absent = Uuid::from_u128(999);
         let workspace = Uuid::from_u128(42);
         let orders = BTreeMap::from([(workspace, vec![absent]), (Uuid::nil(), vec![])]);
-        arrangements::write(&host, &orders).unwrap();
+        arrangements::write(&bmux_plugin::PluginStateRegistry::new(), &host, &orders).unwrap();
         set_stored_tab_order_ids(&host, &[Uuid::from_u128(1)]).unwrap();
         assert_eq!(
             get_stored_tab_order_ids_for_workspace(&host, Uuid::nil()).unwrap(),
@@ -5841,7 +5912,12 @@ mod tests {
         );
         assert_eq!(arrangements::read(&host).unwrap(), Some(orders));
         let replacement = BTreeMap::from([(workspace, vec![Uuid::from_u128(1000), absent])]);
-        arrangements::write(&host, &replacement).unwrap();
+        arrangements::write(
+            &bmux_plugin::PluginStateRegistry::new(),
+            &host,
+            &replacement,
+        )
+        .unwrap();
         assert_eq!(arrangements::read(&host).unwrap(), Some(replacement));
     }
 
@@ -5855,12 +5931,18 @@ mod tests {
             pending: BTreeMap::from([(context, workspace)]),
         };
         arrangements::write_state(&host, &state).unwrap();
-        set_stored_tab_order_ids_for_workspace(&host, Uuid::nil(), &[]).unwrap();
+        set_stored_tab_order_ids_for_workspace(
+            &bmux_plugin::PluginStateRegistry::new(),
+            &host,
+            Uuid::nil(),
+            &[],
+        )
+        .unwrap();
         let restored = arrangements::read_state(&host).unwrap().unwrap();
         assert_eq!(restored.pending, state.pending);
         assert_eq!(restored.orders[&workspace], vec![context]);
         // Missing resources during restore leave durable intent untouched.
-        recover_tab_placements(&host).unwrap();
+        recover_tab_placements(&bmux_plugin::PluginStateRegistry::new(), &host).unwrap();
         assert_eq!(
             arrangements::read_state(&host).unwrap().unwrap().pending,
             state.pending
@@ -5871,8 +5953,18 @@ mod tests {
     fn canonical_close_removes_references_from_unlisted_workspaces() {
         let host = MockHost::with_sessions(sample_sessions());
         let id = Uuid::from_u128(99);
-        arrangements::write(&host, &BTreeMap::from([(Uuid::from_u128(42), vec![id])])).unwrap();
-        remove_context_from_all_workspace_orders(&host, id).unwrap();
+        arrangements::write(
+            &bmux_plugin::PluginStateRegistry::new(),
+            &host,
+            &BTreeMap::from([(Uuid::from_u128(42), vec![id])]),
+        )
+        .unwrap();
+        remove_context_from_all_workspace_orders(
+            &bmux_plugin::PluginStateRegistry::new(),
+            &host,
+            id,
+        )
+        .unwrap();
         assert_eq!(
             arrangements::read(&host).unwrap().unwrap()[&Uuid::from_u128(42)],
             Vec::<Uuid>::new()
@@ -6912,7 +7004,8 @@ mod tests {
             .create(client, Some("beta".into()), BTreeMap::new())
             .id;
         let state = Arc::new(std::sync::RwLock::new(state));
-        bmux_plugin::global_plugin_state_registry().register(&state);
+        let context_states = Arc::new(bmux_plugin::PluginStateRegistry::new());
+        context_states.register(&state);
         let router = InvocationTestHost(checked_test_router(Arc::new(
             move |_, _, capability, kind, interface, operation, payload| {
                 if interface.starts_with("contexts-") {
@@ -6920,8 +7013,10 @@ mod tests {
                         service_test_context(None, interface, operation, payload, capability, kind);
                     context.plugin_id = "bmux.contexts".into();
                     context.caller_client_id = Some(client.0);
-                    let response =
-                        bmux_contexts_plugin::ContextsPlugin::default().invoke_service(context);
+                    let response = bmux_contexts_plugin::ContextsPlugin::with_host_state(
+                        Arc::clone(&context_states),
+                    )
+                    .invoke_service(context);
                     assert!(response.error.is_none(), "{:?}", response.error);
                     Ok(response.payload)
                 } else if interface == "storage-query/v1" {
@@ -7093,6 +7188,7 @@ mod tests {
                 surfaces: Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(64)),
                 input: Arc::new(bmux_plugin::AttachPresentationInputRegistry::new()),
                 plugin_settings: Arc::default(),
+                states: Arc::new(bmux_plugin::PluginStateRegistry::new()),
             };
             let settings: toml::Value = toml::from_str("preset = 'classic'\ntab_template = '{name}'").unwrap();
             let _installation =
@@ -7650,8 +7746,13 @@ mod tests {
             .expect("default workspace order should migrate");
         assert_eq!(migrated, legacy);
 
-        set_stored_tab_order_ids_for_workspace(&host, Uuid::nil(), &migrated)
-            .expect("explicit mutation should commit legacy order");
+        set_stored_tab_order_ids_for_workspace(
+            &bmux_plugin::PluginStateRegistry::new(),
+            &host,
+            Uuid::nil(),
+            &migrated,
+        )
+        .expect("explicit mutation should commit legacy order");
         set_stored_tab_order_ids(&host, &[]).expect("legacy order should clear");
         let persisted = get_stored_tab_order_ids_for_workspace(&host, Uuid::nil())
             .expect("migrated order should remain");
@@ -7665,10 +7766,20 @@ mod tests {
         let second_workspace = Uuid::from_u128(2);
         let first_order = [Uuid::from_u128(10), Uuid::from_u128(11)];
         let second_order = [Uuid::from_u128(20)];
-        set_stored_tab_order_ids_for_workspace(&host, first_workspace, &first_order)
-            .expect("first workspace order should persist");
-        set_stored_tab_order_ids_for_workspace(&host, second_workspace, &second_order)
-            .expect("second workspace order should persist");
+        set_stored_tab_order_ids_for_workspace(
+            &bmux_plugin::PluginStateRegistry::new(),
+            &host,
+            first_workspace,
+            &first_order,
+        )
+        .expect("first workspace order should persist");
+        set_stored_tab_order_ids_for_workspace(
+            &bmux_plugin::PluginStateRegistry::new(),
+            &host,
+            second_workspace,
+            &second_order,
+        )
+        .expect("second workspace order should persist");
 
         assert_eq!(
             get_stored_tab_order_ids_for_workspace(&host, first_workspace).unwrap(),

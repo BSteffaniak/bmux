@@ -175,12 +175,15 @@ impl SupervisorControl {
             .revoke();
         Ok(())
     }
-    pub(super) fn prepare(token: uuid::Uuid) -> anyhow::Result<(Self, bmux_pty::SpawnCommand)> {
+    pub(super) fn prepare(
+        host: &crate::runtime::PaneRuntimeHost,
+        token: uuid::Uuid,
+    ) -> anyhow::Result<(Self, bmux_pty::SpawnCommand)> {
         #[cfg(test)]
         install_test_artifact()?;
         super::reservations::check_authority()?;
         let admission = super::managed_idle::admit()?;
-        crate::readiness::check_admission()?;
+        crate::readiness::check_admission(host)?;
         let version = protocol::VERSION;
         let installation = INSTALLATION
             .get_or_init(|| Mutex::new(None))
@@ -353,7 +356,11 @@ impl SupervisorControl {
 
     /// V9 stop acceptance is distinct from terminal retirement. Keep the
     /// lifetime lease while observing; a quiet owner is not failed cleanup.
-    pub(super) fn stop_and_wait(&self, mutation_id: &str) -> anyhow::Result<Response> {
+    pub(super) fn stop_and_wait(
+        &self,
+        host: &crate::runtime::PaneRuntimeHost,
+        mutation_id: &str,
+    ) -> anyhow::Result<Response> {
         let mut watcher = self.observe_retained_stop()?;
         let mut accepted = None;
         for attempt in 0..3 {
@@ -386,7 +393,7 @@ impl SupervisorControl {
             if watcher.current.revision > published_revision {
                 if let Some(stage) = watcher.current.stage.as_deref() {
                     tracing::debug!(execution_token = %self.token, %stage, revision = watcher.current.revision, "observing terminal retirement");
-                    if let Err(error) = bmux_plugin::shutdown_progress().advance(stage) {
+                    if let Err(error) = host.shutdown_progress().advance(stage) {
                         tracing::warn!(%error, "terminal shutdown progress publication failed");
                     }
                 }

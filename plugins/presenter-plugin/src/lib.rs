@@ -49,6 +49,14 @@ pub struct PresenterPlugin {
 }
 impl RustPlugin for PresenterPlugin {
     type Contract = bmux_presenter_plugin_api::Contract;
+    fn activate(
+        &mut self,
+        _context: bmux_plugin_sdk::NativeLifecycleContext,
+    ) -> Result<i32, PluginCommandError> {
+        self.managed
+            .bind_runtime(tokio::runtime::Handle::try_current().ok());
+        Ok(bmux_plugin_sdk::EXIT_OK)
+    }
     fn deactivate(
         &mut self,
         _context: bmux_plugin_sdk::NativeLifecycleContext,

@@ -5,16 +5,27 @@ use std::time::Duration;
 /// Owned by the invoking attach runtime; dropping removes the local indicator.
 pub struct BroadcastPresentation {
     task: tokio::task::JoinHandle<()>,
+    indicator: std::sync::Arc<crate::indicator::FactIndicator>,
 }
 impl BroadcastPresentation {
-    /// Start with the explicitly selected runtime paths (never default discovery).
+    /// Start with the explicitly selected runtime paths (never default
+    /// discovery), publishing the indicator into the fact host of `states`,
+    /// the invoking attach runtime's registry.
     ///
     /// # Errors
     /// Returns an error when no asynchronous runtime is available.
-    pub fn install(paths: ConfigPaths) -> Result<Self, String> {
+    pub fn install(
+        paths: ConfigPaths,
+        states: std::sync::Arc<bmux_plugin::PluginStateRegistry>,
+    ) -> Result<Self, String> {
         let runtime = tokio::runtime::Handle::try_current()
             .map_err(|_| "broadcast mirror needs runtime".to_owned())?;
+        let indicator = std::sync::Arc::new(crate::indicator::FactIndicator::bound(
+            crate::indicator::fact_host(&states),
+        ));
+        let task_indicator = std::sync::Arc::clone(&indicator);
         let task = runtime.spawn(async move {
+            let indicator = task_indicator;
             let mut client = None;
             let mut mirror = crate::mirror::Mirror::default();
             let mut tick = tokio::time::interval(Duration::from_millis(250));
@@ -34,9 +45,9 @@ impl BroadcastPresentation {
                         }
                         _ => {
                             if mirror.established {
-                                crate::indicator::update("unavailable", "unknown");
+                                indicator.update("unavailable", "unknown");
                             } else {
-                                crate::indicator::remove();
+                                indicator.remove();
                             }
                             continue;
                         }
@@ -56,39 +67,39 @@ impl BroadcastPresentation {
                             if !["live", "paused", "offline", "unavailable"]
                                 .contains(&status.state.as_str())
                             {
-                                crate::indicator::update("unavailable", "unknown");
+                                indicator.update("unavailable", "unknown");
                                 client = None;
                             }
                             continue;
                         }
                         match status.state.as_str() {
-                            "live" => crate::indicator::update("running", "live"),
-                            "paused" => crate::indicator::update("paused", "paused"),
-                            "offline" => crate::indicator::update("stopped", "offline"),
-                            "unavailable" => crate::indicator::update("unavailable", "unknown"),
+                            "live" => indicator.update("running", "live"),
+                            "paused" => indicator.update("paused", "paused"),
+                            "offline" => indicator.update("stopped", "offline"),
+                            "unavailable" => indicator.update("unavailable", "unknown"),
                             _ => {
-                                crate::indicator::update("unavailable", "unknown");
+                                indicator.update("unavailable", "unknown");
                                 client = None;
                             }
                         }
                     }
                     _ => {
                         if mirror.established {
-                            crate::indicator::update("unavailable", "unknown");
+                            indicator.update("unavailable", "unknown");
                         } else {
-                            crate::indicator::remove();
+                            indicator.remove();
                         }
                         client = None;
                     }
                 }
             }
         });
-        Ok(Self { task })
+        Ok(Self { task, indicator })
     }
 }
 impl Drop for BroadcastPresentation {
     fn drop(&mut self) {
         self.task.abort();
-        crate::indicator::remove();
+        self.indicator.remove();
     }
 }

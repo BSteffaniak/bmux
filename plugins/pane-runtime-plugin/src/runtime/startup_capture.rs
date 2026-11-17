@@ -273,6 +273,7 @@ pub(super) fn start_ordered(
 }
 
 pub(super) async fn acknowledge_cleanup(
+    host: &crate::runtime::PaneRuntimeHost,
     threads: Vec<JoinHandle<()>>,
     cleanup: &tokio::sync::watch::Sender<Option<Result<(), String>>>,
     previous: Option<Result<(), String>>,
@@ -284,7 +285,7 @@ pub(super) async fn acknowledge_cleanup(
         .await
         .map_err(|error| format!("startup capture join failed: {error}"))
         .and_then(std::convert::identity);
-    if let Err(error) = bmux_plugin::shutdown_progress().advance("startup capture settled") {
+    if let Err(error) = host.shutdown_progress().advance("startup capture settled") {
         tracing::warn!(%error, "shutdown progress publication failed");
     }
     let result = match (previous.unwrap_or(Ok(())), capture_result) {
@@ -432,9 +433,12 @@ mod tests {
 
     #[tokio::test]
     async fn capture_cleanup_preserves_prior_failure_after_real_join() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let thread = std::thread::spawn(|| {});
         let (cleanup, mut acknowledged) = tokio::sync::watch::channel(None);
         let reason = super::acknowledge_cleanup(
+            host,
             vec![thread],
             &cleanup,
             Some(Err("process cleanup failed".into())),

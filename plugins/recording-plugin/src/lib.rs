@@ -51,7 +51,7 @@ pub use recording_runtime::{
     prune_old_recordings,
 };
 
-use bmux_plugin::global_plugin_state_registry;
+use bmux_plugin::PluginStateRegistry;
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_recording_plugin_api::{
@@ -225,12 +225,25 @@ impl RecordingSink for DualRuntimeSink {
     }
 }
 
-#[derive(Default)]
 pub struct RecordingPlugin {
     owner: RwLock<Option<RecordingOwner>>,
-    // A selected scoped definition supplies this slot. None is legacy wiring;
-    // Some(empty) is explicitly unbound and must never select global state.
+    // A selected scoped definition supplies this slot. None is the default
+    // composition, which reads the activation's registry; Some(empty) is
+    // explicitly unbound.
     binding: Option<Arc<RwLock<Option<RecordingActivationConfiguration>>>>,
+    /// The activation's view of the host state registry (default
+    /// composition only); an empty private one before activation.
+    states: Arc<PluginStateRegistry>,
+}
+
+impl Default for RecordingPlugin {
+    fn default() -> Self {
+        Self {
+            owner: RwLock::new(None),
+            binding: None,
+            states: Arc::new(PluginStateRegistry::new()),
+        }
+    }
 }
 
 /// Product configuration selected through the actual lifecycle host port.
@@ -262,7 +275,9 @@ impl RecordingPlugin {
                     PluginCommandError::unavailable("recording activation configuration not bound")
                 });
         }
-        let config = config_handle()
+        let config = self
+            .states
+            .get::<RecordingPluginConfig>()
             .ok_or_else(|| PluginCommandError::unavailable("recording configuration missing"))?;
         let config = config
             .read()
@@ -270,7 +285,10 @@ impl RecordingPlugin {
             .clone();
         Ok(RecordingActivationConfiguration {
             config,
-            host: Arc::new(ActivationRecordingHost { events: events() }),
+            host: Arc::new(ActivationRecordingHost {
+                events: events(),
+                states: Arc::clone(&self.states),
+            }),
             process_caller: None,
         })
     }
@@ -283,6 +301,9 @@ impl RustPlugin for RecordingPlugin {
         &mut self,
         context: NativeLifecycleContext,
     ) -> std::result::Result<i32, PluginCommandError> {
+        if self.binding.is_none() {
+            self.states = bmux_plugin::activation_state_registry(&context);
+        }
         let binding = self.configuration(|| bmux_plugin::activation_event_bus(&context))?;
         let config = binding.config;
         let mut selected = self
@@ -1977,10 +1998,6 @@ pub(crate) fn auto_export_output_path(
 // Registry lookup helpers
 // ────────────────────────────────────────────────────────────────────
 
-fn config_handle() -> Option<Arc<RwLock<RecordingPluginConfig>>> {
-    global_plugin_state_registry().get::<RecordingPluginConfig>()
-}
-
 // ────────────────────────────────────────────────────────────────────
 // Simple operations against the manual runtime
 // ────────────────────────────────────────────────────────────────────
@@ -2152,6 +2169,7 @@ fn empty_clear_report() -> RecordingRollingClearReport {
 /// dropped, never routed to a process-wide bus.
 struct ActivationRecordingHost {
     events: Option<Arc<bmux_plugin::EventBus>>,
+    states: Arc<PluginStateRegistry>,
 }
 impl RecordingHost for ActivationRecordingHost {
     fn install_sink(&self, sink: RecordingSinkHandle) -> Result<(), String> {
@@ -2159,7 +2177,7 @@ impl RecordingHost for ActivationRecordingHost {
             events
                 .register_channel::<recording_events::RecordingEvent>(recording_events::EVENT_KIND);
         }
-        global_plugin_state_registry().register(&Arc::new(RwLock::new(sink)));
+        self.states.register(&Arc::new(RwLock::new(sink)));
         Ok(())
     }
     fn remove_sink(&self) -> Result<(), String> {
@@ -2438,6 +2456,7 @@ mod tests {
         let plugin = RecordingPlugin {
             owner: std::sync::RwLock::new(Some(owner(root.path()))),
             binding: None,
+            states: std::sync::Arc::new(bmux_plugin::PluginStateRegistry::new()),
         };
         let command = command_context(
             "recording-process-status",
@@ -2470,6 +2489,7 @@ mod tests {
         let plugin = RecordingPlugin {
             owner: std::sync::RwLock::new(Some(owner(root.path()))),
             binding: None,
+            states: std::sync::Arc::new(bmux_plugin::PluginStateRegistry::new()),
         };
         let command = command_context(
             "recording-process-status",

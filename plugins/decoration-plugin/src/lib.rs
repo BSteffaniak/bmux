@@ -127,6 +127,12 @@ struct State {
     recipient: Option<Uuid>,
     /// The bus this activation was handed; `None` publishes nothing.
     events: Option<Arc<bmux_plugin::EventBus>>,
+    /// The activation's view of the host state registry (for the host wire
+    /// sink that delivers private scenes); `None` before activation.
+    states: Option<Arc<bmux_plugin::PluginStateRegistry>>,
+    /// Revision source shared by every view runtime of one plugin instance,
+    /// so a connection's replacement lifetime never reuses a revision.
+    scene_revisions: Arc<std::sync::atomic::AtomicU64>,
     hook_scope: u64,
     /// Per-pane overrides. Panes without an override fall through to
     /// [`State::default_border`].
@@ -295,6 +301,10 @@ struct DecorationRuntime {
     host_async_handle: Mutex<Option<HostAsyncHandle>>,
     /// This activation's event bus, set at activation.
     events: Mutex<Option<Arc<bmux_plugin::EventBus>>>,
+    /// This activation's view of the host state registry, set at activation.
+    states: Mutex<Option<Arc<bmux_plugin::PluginStateRegistry>>>,
+    /// Private-scene revision source shared with this instance's views.
+    scene_revisions: Arc<std::sync::atomic::AtomicU64>,
     recipient: Option<Uuid>,
     hook_scope: u64,
     stopped: tokio::sync::watch::Sender<bool>,
@@ -303,9 +313,10 @@ struct DecorationRuntime {
     active_subscriptions: std::sync::atomic::AtomicUsize,
 }
 
+/// A fresh namespace for one runtime's input hook ids. Only uniqueness
+/// matters, so it is drawn at random rather than from a process counter.
 fn next_hook_scope() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    Uuid::new_v4().as_u64_pair().0
 }
 
 impl Default for DecorationRuntime {
@@ -315,6 +326,8 @@ impl Default for DecorationRuntime {
             read_model: ArcSwap::from_pointee(DecorationReadModel::default()),
             host_async_handle: Mutex::new(None),
             events: Mutex::new(None),
+            states: Mutex::new(None),
+            scene_revisions: Arc::default(),
             recipient: None,
             hook_scope: next_hook_scope(),
             stopped: tokio::sync::watch::channel(false).0,
@@ -369,6 +382,20 @@ impl SharedState {
         if let Ok(mut guard) = self.runtime.events.lock() {
             *guard = events;
         }
+    }
+
+    fn set_states(&self, states: Option<Arc<bmux_plugin::PluginStateRegistry>>) {
+        if let Ok(mut guard) = self.runtime.states.lock() {
+            *guard = states;
+        }
+    }
+
+    fn states(&self) -> Option<Arc<bmux_plugin::PluginStateRegistry>> {
+        self.runtime
+            .states
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     fn events(&self) -> Option<Arc<bmux_plugin::EventBus>> {
@@ -1800,12 +1827,14 @@ fn publish_scene_if_changed(state: &mut State) -> bool {
     scene.revision = state.scene_revision;
     state.last_published_scene = Some(scene.clone());
     if let Some(recipient) = state.recipient {
-        // Process-wide monotonicity also fences retired lifetimes on one connection.
-        static REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        state.scene_revision = REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        // Instance-wide monotonicity also fences retired lifetimes on one connection.
+        state.scene_revision = state
+            .scene_revisions
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
         scene.revision = state.scene_revision;
         state.last_published_scene = Some(scene.clone());
-        views::publish_scene(recipient, &scene);
+        views::publish_scene(state.states.as_deref(), recipient, &scene);
     } else if let Some(bus) = &state.events {
         let _ = bus.publish_state(&bmux_scene_protocol::scene_protocol::STATE_KIND, scene);
     }
@@ -3098,13 +3127,18 @@ fn resolve_decoration_script(
 
 impl DecorationPlugin {
     fn activate_instance(&self, context: &NativeLifecycleContext) {
+        let states = bmux_plugin::activation_state_registry(context);
         if let Some(timeout) = startup_ready_gate_timeout(context.settings.as_ref()) {
-            bmux_plugin::register_startup_ready_gate(
-                &context.plugin_id,
-                SCENE_PUBLISHED_SIGNAL,
-                timeout,
+            bmux_plugin::StartupReadyGateRegistry::in_host(&states).register(
+                bmux_plugin::StartupReadyGate {
+                    plugin_id: context.plugin_id.clone(),
+                    signal: SCENE_PUBLISHED_SIGNAL.to_string(),
+                    timeout,
+                },
             );
         }
+        self.views.bind_states(Arc::clone(&states));
+        self.state.set_states(Some(states));
         // Every channel below lives on the bus this activation was handed;
         // without one the plugin decorates but publishes nothing.
         self.state

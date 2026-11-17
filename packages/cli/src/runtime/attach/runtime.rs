@@ -4162,13 +4162,18 @@ async fn maybe_emit_attach_frame_perf(
 /// Construct bundled render extensions for this attach's selected bus.
 fn install_bundled_render_extensions(view_state: &mut AttachViewState) {
     let registry = std::sync::Arc::new(bmux_plugin::RenderExtensionRegistry::new());
+    // This runtime's own visual adapters; renderers project only with them.
+    let adapters = std::sync::Arc::new(bmux_plugin::VisualAdapterRegistry::new());
+    #[cfg(feature = "bundled-visual-adapters")]
+    bmux_visual_adapters_plugin_renderer::register_into(&adapters);
     #[cfg(feature = "bundled-plugin-decoration")]
     registry.register(bmux_decoration_plugin_renderer::renderer_for_bus(
         &view_state.presentation_events,
+        adapters,
     ));
+    #[cfg(not(feature = "bundled-plugin-decoration"))]
+    drop(adapters);
     view_state.presentation_extensions = registry;
-    #[cfg(feature = "bundled-visual-adapters")]
-    bmux_visual_adapters_plugin_renderer::install();
 }
 
 pub async fn run_session_attach_with_client(
@@ -5400,6 +5405,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         surfaces: view_state.presentation_surfaces.clone(),
         input: view_state.presentation_input.clone(),
         events: view_state.presentation_events.clone(),
+        states: std::sync::Arc::new(bmux_plugin::PluginStateRegistry::new()),
         plugin_settings: std::sync::Arc::new(attach_config.plugins.settings.clone()),
     };
     let mut started_companions = Vec::new();
@@ -5413,13 +5419,14 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         }
     }
 
-    // Honour any startup gates plugins have self-registered via
-    // `bmux_plugin::register_startup_ready_gate`. Attach startup
-    // blocks briefly for each gate so subsystems like the
-    // decoration renderer have a chance to publish their initial
-    // scene before the first frame is painted.
+    // Honour any startup gates plugins in this runtime registered in its
+    // shared state. Attach startup blocks briefly for each gate so
+    // subsystems like the decoration renderer have a chance to publish
+    // their initial scene before the first frame is painted.
     let ready_tracker = super::super::plugin_runtime::ready_tracker_snapshot();
-    for gate in bmux_plugin::registered_startup_ready_gates() {
+    let startup_gates =
+        bmux_plugin::StartupReadyGateRegistry::in_host(&presentation_resources.states).snapshot();
+    for gate in startup_gates {
         if ready_tracker
             .status(&gate.plugin_id, &gate.signal)
             .is_some()
@@ -18273,6 +18280,7 @@ mod tests {
             allocations: std::sync::Arc::new(bmux_plugin::layout::AllocationRegistry::default()),
             surfaces: std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(64)),
             input: std::sync::Arc::new(bmux_plugin::AttachPresentationInputRegistry::new()),
+            states: std::sync::Arc::new(bmux_plugin::PluginStateRegistry::new()),
             plugin_settings: std::sync::Arc::default(),
         };
         let installation =
@@ -24599,10 +24607,12 @@ mod tests {
             w: 36,
             h: 6,
         };
-        bmux_plugin::register_render_extension(Arc::new(FixedInsetExtension {
-            surface_id,
-            override_rect: plugin_content,
-        }));
+        view_state
+            .presentation_extensions
+            .register(Arc::new(FixedInsetExtension {
+                surface_id,
+                override_rect: plugin_content,
+            }));
 
         let buffer = view_state
             .pane_buffers

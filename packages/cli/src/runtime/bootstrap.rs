@@ -596,7 +596,7 @@ async fn run_server_start_inner(
     );
     #[cfg(feature = "bundled-plugin-snapshot")]
     let snapshot_runtime = {
-        register_snapshot_plugin_config(&config, &paths);
+        register_snapshot_plugin_config(&server.plugin_state_registry(), &config, &paths);
         let managed = match (
             std::env::var("BMUX_MANAGED_TARGET_ID"),
             std::env::var("BMUX_MANAGED_TARGET_IDENTITY"),
@@ -636,23 +636,30 @@ async fn run_server_start_inner(
         "server.startup.plugins.load.complete"
     );
     register_recording_plugin_config(
+        &server.plugin_state_registry(),
         &config,
         &paths,
         effective_rolling_enabled,
         &effective_rolling_settings,
         startup_recording,
     );
-    register_snapshot_plugin_config(&config, &paths);
-    register_pane_runtime_plugin_config(&config, &paths, pane_shell_integration_override);
+    register_snapshot_plugin_config(&server.plugin_state_registry(), &config, &paths);
+    register_pane_runtime_plugin_config(
+        &server.plugin_state_registry(),
+        &config,
+        &paths,
+        pane_shell_integration_override,
+    );
     super::dispatch::startup_future_marker("plugins.before_activate", 0);
     let plugin_events = server.plugin_event_bus();
+    let plugin_states = server.plugin_state_registry();
     for plugin in loaded_plugins.iter() {
         plugin.bind_lifecycle_authority(server.host_service_context())?;
-        if !plugin.bind_event_bus(&plugin_events)? {
+        if !plugin.bind_host_handles(&plugin_events, &plugin_states)? {
             tracing::info!(
                 plugin_id = plugin.declaration.id.as_str(),
                 "plugin backend cannot receive in-process activation values; \
-                 it activates without the host event bus"
+                 it activates without the host event bus or state registry"
             );
         }
     }
@@ -897,7 +904,9 @@ async fn run_server_start_inner(
     write_server_runtime_metadata(std::process::id())?;
     let server_identity = crate::connection::read_server_runtime_metadata()?
         .context("server metadata missing after publication")?;
-    bmux_plugin::shutdown_progress()
+    server
+        .plugin_state_registry()
+        .shutdown_progress()
         .configure(
             paths.runtime_dir.join("shutdown-progress.json"),
             server_identity.pid,
@@ -1020,8 +1029,13 @@ async fn run_server_start_inner(
         warn!("failed delivering server_stopping plugin event: {error}");
     }
     tracing::info!("shutdown plugin teardown started");
-    let shutdown_result =
-        Box::pin(deactivate_loaded_plugins(&loaded_plugins, &config, &paths)).await;
+    let shutdown_result = Box::pin(deactivate_loaded_plugins(
+        &loaded_plugins,
+        &config,
+        &paths,
+        &server.plugin_state_registry(),
+    ))
+    .await;
     #[cfg(feature = "bundled-plugin-snapshot")]
     {
         *snapshot_runtime
@@ -1047,7 +1061,9 @@ async fn run_server_start_inner(
     if crate::connection::read_server_runtime_metadata()?.as_ref() == Some(&server_identity) {
         remove_server_pid_file()?;
     }
-    if let Err(error) = bmux_plugin::shutdown_progress()
+    if let Err(error) = server
+        .plugin_state_registry()
+        .shutdown_progress()
         .advance("cleanup result published; waiting for process exit")
     {
         tracing::warn!(%error, "shutdown progress publication failed");
@@ -1064,6 +1080,7 @@ async fn run_server_start_inner(
 /// its own `RecordingRuntime` instances without depending on
 /// `packages/server`.
 fn register_recording_plugin_config(
+    registry: &bmux_plugin::PluginStateRegistry,
     config: &BmuxConfig,
     paths: &ConfigPaths,
     rolling_auto_start: bool,
@@ -1078,8 +1095,7 @@ fn register_recording_plugin_config(
         startup_recording,
     );
     let handle = std::sync::Arc::new(std::sync::RwLock::new(plugin_config));
-    bmux_plugin::global_plugin_state_registry()
-        .register::<bmux_recording_plugin_api::RecordingPluginConfig>(&handle);
+    registry.register::<bmux_recording_plugin_api::RecordingPluginConfig>(&handle);
 }
 
 fn recording_plugin_config(
@@ -1133,7 +1149,11 @@ fn startup_recording_from_env() -> Result<Option<ManualRecordingStartOptions>> {
 /// older monolithic snapshot. Managed targets keep this legacy locator visible
 /// while the snapshot plugin coordinates exact-target entries in a shared durable
 /// catalog beside it; they never restore another target's retained runtime.
-fn register_snapshot_plugin_config(config: &BmuxConfig, paths: &ConfigPaths) {
+fn register_snapshot_plugin_config(
+    registry: &bmux_plugin::PluginStateRegistry,
+    config: &BmuxConfig,
+    paths: &ConfigPaths,
+) {
     use bmux_snapshot_plugin_api::SnapshotPluginConfig;
     if !config.behavior.restore_last_layout {
         return;
@@ -1143,10 +1163,11 @@ fn register_snapshot_plugin_config(config: &BmuxConfig, paths: &ConfigPaths) {
         debounce_ms: 1_000,
     };
     let handle = std::sync::Arc::new(std::sync::RwLock::new(plugin_config));
-    bmux_plugin::global_plugin_state_registry().register::<SnapshotPluginConfig>(&handle);
+    registry.register::<SnapshotPluginConfig>(&handle);
 }
 
 fn register_pane_runtime_plugin_config(
+    registry: &bmux_plugin::PluginStateRegistry,
     config: &BmuxConfig,
     paths: &ConfigPaths,
     pane_shell_integration_override: Option<bool>,
@@ -1163,7 +1184,7 @@ fn register_pane_runtime_plugin_config(
             .then(|| paths.state_dir().join("runtime").join("shell-integration")),
     };
     let handle = std::sync::Arc::new(std::sync::RwLock::new(plugin_config));
-    bmux_plugin::global_plugin_state_registry().register::<PaneRuntimePluginConfig>(&handle);
+    registry.register::<PaneRuntimePluginConfig>(&handle);
 }
 
 fn resolve_pane_runtime_shell(config: &BmuxConfig) -> String {

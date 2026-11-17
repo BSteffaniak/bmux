@@ -103,7 +103,10 @@ fn session_selector(
     }))
 }
 
-fn selected_session(context: &NativeCommandContext) -> Result<SessionId, PluginCommandError> {
+fn selected_session(
+    host: &crate::runtime::PaneRuntimeHost,
+    context: &NativeCommandContext,
+) -> Result<SessionId, PluginCommandError> {
     let mut client = ServiceCallerDispatchClient::new(context);
     if let Some(selector) = session_selector(&context.arguments)? {
         let result = bmux_plugin::block_on_typed_dispatch(sessions_state::client::get_session(
@@ -126,7 +129,7 @@ fn selected_session(context: &NativeCommandContext) -> Result<SessionId, PluginC
         return Ok(session_id);
     }
     if let Some(client_id) = context.caller_client_id
-        && let Ok(session_id) = handle()?.session_for_client(ClientId(client_id))
+        && let Ok(session_id) = handle(host)?.session_for_client(ClientId(client_id))
     {
         return Ok(session_id);
     }
@@ -135,8 +138,10 @@ fn selected_session(context: &NativeCommandContext) -> Result<SessionId, PluginC
     ))
 }
 
-fn handle() -> Result<PanePaddingRuntimeHandle, PluginCommandError> {
-    bmux_plugin::global_plugin_state_registry()
+fn handle(
+    host: &crate::runtime::PaneRuntimeHost,
+) -> Result<PanePaddingRuntimeHandle, PluginCommandError> {
+    host.states()
         .get::<PanePaddingRuntimeHandle>()
         .and_then(|entry| entry.read().ok().map(|guard| (*guard).clone()))
         .ok_or_else(|| PluginCommandError::unavailable("pane runtime unavailable"))
@@ -249,15 +254,18 @@ fn set_spec(
     Ok(spec)
 }
 
-pub(crate) fn run(context: &NativeCommandContext) -> Result<(), PluginCommandError> {
+pub(crate) fn run(
+    host: &crate::runtime::PaneRuntimeHost,
+    context: &NativeCommandContext,
+) -> Result<(), PluginCommandError> {
     if context.command == "pane-padding-configure" {
         // Runs in the caller process: it reaches the pane runtime only through
         // typed services, never this process's local runtime handle.
-        return configure(context);
+        return configure(host, context);
     }
-    let session_id = selected_session(context)?;
+    let session_id = selected_session(host, context)?;
     let pane_id = target_pane(&context.arguments)?;
-    let handle = handle()?;
+    let handle = handle(host)?;
     match context.command.as_str() {
         "pane-padding-show" => {
             let state = handle
@@ -963,7 +971,10 @@ fn rect_size(rect: Option<&pane_runtime_state::PanePaddingRect>) -> String {
 /// gathered here while this command's host route is live; the transaction then
 /// holds only the captured async route, so it never blocks on a route the
 /// attach loop serves only while a command runs, and it outlives the command.
-fn configure(context: &NativeCommandContext) -> Result<(), PluginCommandError> {
+fn configure(
+    host: &crate::runtime::PaneRuntimeHost,
+    context: &NativeCommandContext,
+) -> Result<(), PluginCommandError> {
     let route = bmux_plugin::capture_async_command_route(bmux_plugin::ASYNC_SERVICE_ROUTE_V1)
         .map_err(|error| {
             PluginCommandError::unavailable(format!(
@@ -974,7 +985,7 @@ fn configure(context: &NativeCommandContext) -> Result<(), PluginCommandError> {
     let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
         PluginCommandError::unavailable("pane padding configurator requires the attach runtime")
     })?;
-    let session_id = selected_session(context)?;
+    let session_id = selected_session(host, context)?;
     let explicit_pane = target_pane(&context.arguments)?;
     let mut client = ServiceCallerDispatchClient::new(context);
     let current = bmux_plugin::block_on_typed_dispatch(pane_runtime_state::client::pane_padding(

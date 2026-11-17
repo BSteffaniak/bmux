@@ -234,7 +234,7 @@ impl RustPlugin for SnapshotPlugin {
         let dirty_handle_entry = bmux_snapshot_runtime::get_or_init_stateful_dirty_flag(
             || registry.get(),
             |fresh| {
-                registry.register::<SnapshotDirtyFlagHandle>(fresh);
+                registry.register_communal::<SnapshotDirtyFlagHandle>(fresh);
             },
         );
         let dirty_flag_arc = {
@@ -250,7 +250,7 @@ impl RustPlugin for SnapshotPlugin {
         let stateful_registry = bmux_snapshot_runtime::get_or_init_stateful_registry(
             || registry.get::<StatefulPluginRegistry>(),
             |fresh| {
-                registry.register::<StatefulPluginRegistry>(fresh);
+                registry.register_communal::<StatefulPluginRegistry>(fresh);
             },
         );
 

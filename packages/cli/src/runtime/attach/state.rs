@@ -697,7 +697,9 @@ impl AttachViewState {
             decoration_lifetime: Uuid::new_v4(),
             decoration_layout_revision: 0,
             presentation_events: std::sync::Arc::new(bmux_plugin::EventBus::new()),
-            presentation_extensions: bmux_plugin::global_render_extension_registry(),
+            presentation_extensions: std::sync::Arc::new(
+                bmux_plugin::RenderExtensionRegistry::new(),
+            ),
             presentation_layouts: bmux_plugin::layout::global_plugin_layout_registry_handle(),
             presentation_allocations: bmux_plugin::layout::global_allocation_registry_handle(),
             presentation_surfaces: bmux_plugin::surface::global_plugin_surface_registry_handle(),

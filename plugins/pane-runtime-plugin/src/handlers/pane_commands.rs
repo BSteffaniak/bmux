@@ -3,7 +3,7 @@
 //! Each handler decodes its `...Args` wire struct, dispatches through
 //! the registered `SessionRuntimeManagerHandle`, and serializes the
 //! BPDL result type. When the manager handle is not registered
-//! (`session_runtime_handle()` returns `None`), the handler reports a
+//! (`host.registered_session_runtime()` returns `None`), the handler reports a
 //! `PaneCommandError::Failed { reason }` / `SessionRuntimeCommandError::Failed`.
 
 use bmux_attach_layout_protocol::{
@@ -18,12 +18,11 @@ use bmux_pane_runtime_state::{
 };
 use bmux_presentation_state::{
     PresentationEntityRef, PresentationFact, PresentationFactRole, PresentationFactSnapshot,
-    global_presentation_fact_host_service,
 };
 use bmux_session_models::{ClientId, SessionId};
 use bmux_sessions_plugin_api::sessions_events::{self, SessionEvent};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU64, Ordering};
+
 use tracing::warn;
 use uuid::Uuid;
 
@@ -351,8 +350,8 @@ fn target_selector(target: Option<Uuid>) -> Option<PaneSelector> {
     target.map(PaneSelector::ById)
 }
 
-fn publish_session_removed_event(session_id: SessionId) {
-    let Some(events) = crate::runtime::activation_events() else {
+fn publish_session_removed_event(host: &crate::runtime::PaneRuntimeHost, session_id: SessionId) {
+    let Some(events) = host.events().cloned() else {
         return;
     };
     let _ = events.emit(
@@ -363,14 +362,8 @@ fn publish_session_removed_event(session_id: SessionId) {
     );
 }
 
-fn publish_pane_event(event: PaneEvent) {
-    crate::runtime::publish_pane_event(event);
-}
-
-static PANE_FACT_REVISION: AtomicU64 = AtomicU64::new(0);
-
-pub(crate) fn publish_pane_lifecycle_facts() {
-    let Some(handle) = super::session_runtime_handle() else {
+pub(crate) fn publish_pane_lifecycle_facts(host: &crate::runtime::PaneRuntimeHost) {
+    let Some(handle) = host.registered_session_runtime() else {
         return;
     };
     let facts = handle
@@ -403,18 +396,18 @@ pub(crate) fn publish_pane_lifecycle_facts() {
             priority: 100,
         })
         .collect();
-    let _ = global_presentation_fact_host_service()
-        .registry()
-        .publish_authorized(
-            "bmux.pane_runtime",
-            "bmux.pane_runtime",
-            PresentationFactSnapshot {
-                revision: PANE_FACT_REVISION
-                    .fetch_add(1, Ordering::Relaxed)
-                    .wrapping_add(1),
-                facts,
-            },
-        );
+    let service = host.fact_service();
+    let Ok(service) = service.read() else {
+        return;
+    };
+    let _ = service.registry().publish_authorized(
+        "bmux.pane_runtime",
+        "bmux.pane_runtime",
+        PresentationFactSnapshot {
+            revision: host.next_fact_revision(),
+            facts,
+        },
+    );
 }
 
 /// Bump a session's attach-view revision and publish the scene
@@ -425,37 +418,39 @@ pub(crate) fn publish_pane_lifecycle_facts() {
 /// Also republishes the pane-runtime-focus state channel so
 /// subscribers (decoration plugin, future status bars) see the
 /// current focused pane without polling.
-fn emit_attach_view_changed_scene(session_id: SessionId) {
-    let Some(handle) = super::session_runtime_handle() else {
+fn emit_attach_view_changed_scene(host: &crate::runtime::PaneRuntimeHost, session_id: SessionId) {
+    let Some(handle) = host.registered_session_runtime() else {
         return;
     };
     let Some(revision) = handle.0.bump_attach_view_revision(session_id) else {
         return;
     };
-    publish_pane_event(PaneEvent::AttachViewChanged {
+    host.publish_pane_event(PaneEvent::AttachViewChanged {
         context_id: None,
         session_id: session_id.0,
         revision,
         components: vec![AttachViewComponent::Scene],
     });
-    super::publish_focus_state_snapshot();
-    publish_pane_lifecycle_facts();
+    super::publish_focus_state_snapshot(host);
+    publish_pane_lifecycle_facts(host);
 }
 
-fn emit_attach_view_changed_scene_all() {
-    let Some(handle) = super::session_runtime_handle() else {
+fn emit_attach_view_changed_scene_all(host: &crate::runtime::PaneRuntimeHost) {
+    let Some(handle) = host.registered_session_runtime() else {
         return;
     };
     for session_id in handle.0.active_session_ids() {
-        emit_attach_view_changed_scene(session_id);
+        emit_attach_view_changed_scene(host, session_id);
     }
 }
 
 pub fn split_pane(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &SplitPaneArgs,
     ctx: &bmux_plugin_sdk::NativeServiceContext,
 ) -> Result<PaneAck, PaneCommandError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     let direction = parse_split_direction(&req.direction)?;
     let session_id = SessionId(req.session_id);
@@ -464,7 +459,7 @@ pub fn split_pane(
         .0
         .split_pane(session_id, target_selector(req.target), direction)
         .map_err(|e| failed_command(e.to_string()))?;
-    emit_attach_view_changed_scene(session_id);
+    emit_attach_view_changed_scene(host, session_id);
     Ok(PaneAck {
         session_id: req.session_id,
         pane_id,
@@ -472,10 +467,12 @@ pub fn split_pane(
 }
 
 pub fn launch_pane(
+    host: &crate::runtime::PaneRuntimeHost,
     req: LaunchPaneArgs,
     ctx: &bmux_plugin_sdk::NativeServiceContext,
 ) -> Result<PaneAck, PaneCommandError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     let direction = parse_split_direction(&req.direction)?;
     let command = PaneLaunchCommand {
@@ -496,7 +493,7 @@ pub fn launch_pane(
             command,
         )
         .map_err(|e| failed_command(e.to_string()))?;
-    emit_attach_view_changed_scene(session_id);
+    emit_attach_view_changed_scene(host, session_id);
     Ok(PaneAck {
         session_id: req.session_id,
         pane_id,
@@ -504,10 +501,12 @@ pub fn launch_pane(
 }
 
 pub fn focus_pane(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &FocusPaneArgs,
     ctx: &bmux_plugin_sdk::NativeServiceContext,
 ) -> Result<PaneAck, PaneCommandError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     let session_id = SessionId(req.session_id);
     ensure_session_mutation_allowed(ctx, session_id, "pane.focus")?;
@@ -526,7 +525,7 @@ pub fn focus_pane(
         }
     }
     .map_err(|e| failed_command(e.to_string()))?;
-    emit_attach_view_changed_scene(session_id);
+    emit_attach_view_changed_scene(host, session_id);
     Ok(PaneAck {
         session_id: req.session_id,
         pane_id,
@@ -534,10 +533,12 @@ pub fn focus_pane(
 }
 
 pub fn resize_pane(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &ResizePaneArgs,
     ctx: &bmux_plugin_sdk::NativeServiceContext,
 ) -> Result<SessionAck, PaneCommandError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     let session_id = SessionId(req.session_id);
     ensure_session_mutation_allowed(ctx, session_id, "pane.resize")?;
@@ -551,19 +552,19 @@ pub fn resize_pane(
             req.cells.max(1),
         )
         .map_err(|e| failed_command(e.to_string()))?;
-    emit_attach_view_changed_scene(session_id);
+    emit_attach_view_changed_scene(host, session_id);
     Ok(SessionAck {
         session_id: req.session_id,
     })
 }
 
 pub fn close_pane(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &ClosePaneArgs,
     ctx: &bmux_plugin_sdk::NativeServiceContext,
 ) -> Result<PaneAck, PaneCommandError> {
-    use bmux_plugin::global_plugin_state_registry;
-
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     let session_id = SessionId(req.session_id);
     ensure_session_mutation_allowed(ctx, session_id, "pane.close")?;
@@ -594,25 +595,29 @@ pub fn close_pane(
         let had_attached_clients = !removed.attached_clients.is_empty();
         handle.0.shutdown_removed_runtime(removed);
 
-        if let Some(session_handle) = global_plugin_state_registry()
+        if let Some(session_handle) = host
+            .states()
             .get::<bmux_session_state::SessionManagerHandle>()
             .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
         {
             let _ = session_handle.0.remove_session(session_id);
         }
-        if let Some(context_handle) = global_plugin_state_registry()
+        if let Some(context_handle) = host
+            .states()
             .get::<bmux_context_state::ContextStateHandle>()
             .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
         {
             let _ = context_handle.0.remove_contexts_for_session(session_id);
         }
-        if let Some(follow_handle) = global_plugin_state_registry()
+        if let Some(follow_handle) = host
+            .states()
             .get::<bmux_client_state::FollowStateHandle>()
             .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
         {
             follow_handle.0.clear_selections_for_session(session_id);
         }
-        if let Some(attach_tokens) = global_plugin_state_registry()
+        if let Some(attach_tokens) = host
+            .states()
             .get::<bmux_attach_token_state::AttachTokenManagerHandle>()
             .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
         {
@@ -620,15 +625,15 @@ pub fn close_pane(
         }
 
         if had_attached_clients {
-            publish_pane_event(PaneEvent::ClientDetached {
+            host.publish_pane_event(PaneEvent::ClientDetached {
                 session_id: session_id.0,
             });
         }
-        publish_session_removed_event(session_id);
+        publish_session_removed_event(host, session_id);
     }
 
     if !session_closed {
-        emit_attach_view_changed_scene(session_id);
+        emit_attach_view_changed_scene(host, session_id);
     }
 
     Ok(PaneAck {
@@ -638,10 +643,12 @@ pub fn close_pane(
 }
 
 pub fn restart_pane(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &RestartPaneArgs,
     ctx: &bmux_plugin_sdk::NativeServiceContext,
 ) -> Result<PaneAck, PaneCommandError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     let session_id = SessionId(req.session_id);
     ensure_session_mutation_allowed(ctx, session_id, "pane.restart")?;
@@ -649,11 +656,11 @@ pub fn restart_pane(
         .0
         .restart_pane(session_id, target_selector(req.target))
         .map_err(|e| failed_command(e.to_string()))?;
-    publish_pane_event(PaneEvent::Restarted {
+    host.publish_pane_event(PaneEvent::Restarted {
         session_id: session_id.0,
         pane_id,
     });
-    emit_attach_view_changed_scene(session_id);
+    emit_attach_view_changed_scene(host, session_id);
     Ok(PaneAck {
         session_id: req.session_id,
         pane_id,
@@ -661,10 +668,12 @@ pub fn restart_pane(
 }
 
 pub fn zoom_pane(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &ZoomPaneArgs,
     ctx: &bmux_plugin_sdk::NativeServiceContext,
 ) -> Result<PaneAck, PaneCommandError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     let session_id = SessionId(req.session_id);
     ensure_session_mutation_allowed(ctx, session_id, "pane.zoom")?;
@@ -672,7 +681,7 @@ pub fn zoom_pane(
         .0
         .toggle_zoom(session_id)
         .map_err(|e| failed_command(e.to_string()))?;
-    emit_attach_view_changed_scene(session_id);
+    emit_attach_view_changed_scene(host, session_id);
     Ok(PaneAck {
         session_id: req.session_id,
         pane_id,
@@ -680,10 +689,12 @@ pub fn zoom_pane(
 }
 
 pub fn create_floating_pane(
+    host: &crate::runtime::PaneRuntimeHost,
     req: CreateFloatingPaneArgs,
     ctx: &bmux_plugin_sdk::NativeServiceContext,
 ) -> Result<FloatingPaneAck, PaneCommandError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     let session_id = SessionId(req.session_id);
     ensure_session_mutation_allowed(ctx, session_id, "pane.floating.create")?;
@@ -714,15 +725,17 @@ pub fn create_floating_pane(
             req.client_id.or(ctx.caller_client_id).map(ClientId),
         )
         .map_err(|e| failed_command(e.to_string()))?;
-    emit_attach_view_changed_scene_all();
+    emit_attach_view_changed_scene_all(host);
     Ok(floating_ack(session_id, summary))
 }
 
 pub fn move_floating_pane(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &MoveFloatingPaneArgs,
     ctx: &bmux_plugin_sdk::NativeServiceContext,
 ) -> Result<FloatingPaneAck, PaneCommandError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     let session_id = SessionId(req.session_id);
     ensure_session_mutation_allowed(ctx, session_id, "pane.floating.move")?;
@@ -730,15 +743,17 @@ pub fn move_floating_pane(
         .0
         .move_floating_pane(session_id, req.pane_id, req.x, req.y)
         .map_err(|e| failed_command(e.to_string()))?;
-    emit_attach_view_changed_scene_all();
+    emit_attach_view_changed_scene_all(host);
     Ok(floating_ack(session_id, summary))
 }
 
 pub fn resize_floating_pane(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &ResizeFloatingPaneArgs,
     ctx: &bmux_plugin_sdk::NativeServiceContext,
 ) -> Result<FloatingPaneAck, PaneCommandError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     let session_id = SessionId(req.session_id);
     ensure_session_mutation_allowed(ctx, session_id, "pane.floating.resize")?;
@@ -746,11 +761,12 @@ pub fn resize_floating_pane(
         .0
         .resize_floating_pane(session_id, req.pane_id, req.w.max(1), req.h.max(1))
         .map_err(|e| failed_command(e.to_string()))?;
-    emit_attach_view_changed_scene_all();
+    emit_attach_view_changed_scene_all(host);
     Ok(floating_ack(session_id, summary))
 }
 
 fn mutate_floating_target(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &FloatingPaneTargetArgs,
     ctx: &bmux_plugin_sdk::NativeServiceContext,
     action: &str,
@@ -760,21 +776,24 @@ fn mutate_floating_target(
         Uuid,
     ) -> anyhow::Result<bmux_pane_runtime_state::FloatingPaneRuntimeSummary>,
 ) -> Result<FloatingPaneAck, PaneCommandError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     let session_id = SessionId(req.session_id);
     ensure_session_mutation_allowed(ctx, session_id, action)?;
     let summary =
         mutate(&handle, session_id, req.pane_id).map_err(|e| failed_command(e.to_string()))?;
-    emit_attach_view_changed_scene_all();
+    emit_attach_view_changed_scene_all(host);
     Ok(floating_ack(session_id, summary))
 }
 
 pub fn focus_floating_pane(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &FloatingPaneTargetArgs,
     ctx: &bmux_plugin_sdk::NativeServiceContext,
 ) -> Result<FloatingPaneAck, PaneCommandError> {
     mutate_floating_target(
+        host,
         req,
         ctx,
         "pane.floating.focus",
@@ -783,10 +802,12 @@ pub fn focus_floating_pane(
 }
 
 pub fn raise_floating_pane(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &FloatingPaneTargetArgs,
     ctx: &bmux_plugin_sdk::NativeServiceContext,
 ) -> Result<FloatingPaneAck, PaneCommandError> {
     mutate_floating_target(
+        host,
         req,
         ctx,
         "pane.floating.raise",
@@ -795,10 +816,12 @@ pub fn raise_floating_pane(
 }
 
 pub fn lower_floating_pane(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &FloatingPaneTargetArgs,
     ctx: &bmux_plugin_sdk::NativeServiceContext,
 ) -> Result<FloatingPaneAck, PaneCommandError> {
     mutate_floating_target(
+        host,
         req,
         ctx,
         "pane.floating.lower",
@@ -807,10 +830,12 @@ pub fn lower_floating_pane(
 }
 
 pub fn set_floating_pane_z(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &SetFloatingPaneZArgs,
     ctx: &bmux_plugin_sdk::NativeServiceContext,
 ) -> Result<FloatingPaneAck, PaneCommandError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     let session_id = SessionId(req.session_id);
     ensure_session_mutation_allowed(ctx, session_id, "pane.floating.set_z")?;
@@ -818,15 +843,17 @@ pub fn set_floating_pane_z(
         .0
         .set_floating_pane_z(session_id, req.pane_id, req.z)
         .map_err(|e| failed_command(e.to_string()))?;
-    emit_attach_view_changed_scene_all();
+    emit_attach_view_changed_scene_all(host);
     Ok(floating_ack(session_id, summary))
 }
 
 pub fn set_floating_pane_layer(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &SetFloatingPaneLayerArgs,
     ctx: &bmux_plugin_sdk::NativeServiceContext,
 ) -> Result<FloatingPaneAck, PaneCommandError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     let session_id = SessionId(req.session_id);
     ensure_session_mutation_allowed(ctx, session_id, "pane.floating.set_layer")?;
@@ -838,22 +865,24 @@ pub fn set_floating_pane_layer(
             parse_floating_layer(Some(&req.layer))?,
         )
         .map_err(|e| failed_command(e.to_string()))?;
-    emit_attach_view_changed_scene_all();
+    emit_attach_view_changed_scene_all(host);
     Ok(floating_ack(session_id, summary))
 }
 
 pub fn close_floating_pane(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &FloatingPaneTargetArgs,
     ctx: &bmux_plugin_sdk::NativeServiceContext,
 ) -> Result<FloatingPaneAck, PaneCommandError> {
     let ack = close_pane(
+        host,
         &ClosePaneArgs {
             session_id: req.session_id,
             target: Some(req.pane_id),
         },
         ctx,
     )?;
-    emit_attach_view_changed_scene_all();
+    emit_attach_view_changed_scene_all(host);
     Ok(FloatingPaneAck {
         session_id: ack.session_id,
         pane_id: ack.pane_id,
@@ -862,10 +891,12 @@ pub fn close_floating_pane(
 }
 
 pub fn pane_direct_input(
+    host: &crate::runtime::PaneRuntimeHost,
     req: PaneDirectInputArgs,
     ctx: &bmux_plugin_sdk::NativeServiceContext,
 ) -> Result<PaneAck, PaneCommandError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     let session_id = SessionId(req.session_id);
     let client_id = ctx
@@ -901,8 +932,12 @@ pub fn pane_direct_input(
     })
 }
 
-pub fn execution_pane_input(req: ExecutionPaneInputArgs) -> Result<PaneAck, PaneCommandError> {
-    let handle = super::session_runtime_handle()
+pub fn execution_pane_input(
+    host: &crate::runtime::PaneRuntimeHost,
+    req: ExecutionPaneInputArgs,
+) -> Result<PaneAck, PaneCommandError> {
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     handle
         .0
@@ -919,8 +954,12 @@ pub fn execution_pane_input(req: ExecutionPaneInputArgs) -> Result<PaneAck, Pane
     })
 }
 
-pub fn destroy_execution_pane(req: &ExecutionPaneTargetArgs) -> Result<PaneAck, PaneCommandError> {
-    let handle = super::session_runtime_handle()
+pub fn destroy_execution_pane(
+    host: &crate::runtime::PaneRuntimeHost,
+    req: &ExecutionPaneTargetArgs,
+) -> Result<PaneAck, PaneCommandError> {
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     let session_id = SessionId(req.session_id);
     if handle
@@ -941,8 +980,12 @@ pub fn destroy_execution_pane(req: &ExecutionPaneTargetArgs) -> Result<PaneAck, 
     })
 }
 
-pub fn ensure_execution_pane(req: EnsureExecutionPaneArgs) -> Result<PaneAck, PaneCommandError> {
-    let handle = super::session_runtime_handle()
+pub fn ensure_execution_pane(
+    host: &crate::runtime::PaneRuntimeHost,
+    req: EnsureExecutionPaneArgs,
+) -> Result<PaneAck, PaneCommandError> {
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     if req.rows == 0 || req.cols == 0 || req.program.trim().is_empty() {
         return Err(failed_command(
@@ -1000,8 +1043,12 @@ pub fn ensure_execution_pane(req: EnsureExecutionPaneArgs) -> Result<PaneAck, Pa
     })
 }
 
-pub fn pane_set_pty_size(req: &PaneSetPtySizeArgs) -> Result<PaneAck, PaneCommandError> {
-    let handle = super::session_runtime_handle()
+pub fn pane_set_pty_size(
+    host: &crate::runtime::PaneRuntimeHost,
+    req: &PaneSetPtySizeArgs,
+) -> Result<PaneAck, PaneCommandError> {
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     handle
         .0
@@ -1013,8 +1060,12 @@ pub fn pane_set_pty_size(req: &PaneSetPtySizeArgs) -> Result<PaneAck, PaneComman
     })
 }
 
-pub fn pane_signal(req: &PaneSignalArgs) -> Result<PaneAck, PaneCommandError> {
-    let handle = super::session_runtime_handle()
+pub fn pane_signal(
+    host: &crate::runtime::PaneRuntimeHost,
+    req: &PaneSignalArgs,
+) -> Result<PaneAck, PaneCommandError> {
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     let signal = match req.signal {
         bmux_pane_runtime_plugin_api::pane_runtime_commands::PaneProcessSignal::Interrupt => {
@@ -1041,9 +1092,11 @@ pub fn pane_signal(req: &PaneSignalArgs) -> Result<PaneAck, PaneCommandError> {
 }
 
 pub fn set_client_write_permission(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &SetClientWritePermissionArgs,
 ) -> Result<u8, PaneCommandError> {
-    let handle = super::session_runtime_handle()
+    let handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed_command("pane-runtime manager handle not registered"))?;
     handle.0.set_client_write_permission(
         SessionId(req.session_id),
@@ -1054,13 +1107,14 @@ pub fn set_client_write_permission(
 }
 
 pub fn new_session_with_runtime(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &NewSessionArgs,
 ) -> Result<SessionAck, SessionRuntimeCommandError> {
-    use bmux_plugin::global_plugin_state_registry;
-
-    let runtime_handle = super::session_runtime_handle()
+    let runtime_handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed_session("pane-runtime manager handle not registered"))?;
-    let session_handle = global_plugin_state_registry()
+    let session_handle = host
+        .states()
         .get::<bmux_session_state::SessionManagerHandle>()
         .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
         .ok_or_else(|| failed_session("session manager handle not registered"))?;
@@ -1117,25 +1171,29 @@ fn runtime_creation_failure(
 }
 
 pub fn kill_session_runtime(
+    host: &crate::runtime::PaneRuntimeHost,
     req: &KillSessionArgs,
 ) -> Result<SessionAck, SessionRuntimeCommandError> {
-    use bmux_plugin::global_plugin_state_registry;
-
-    let runtime_handle = super::session_runtime_handle()
+    let runtime_handle = host
+        .registered_session_runtime()
         .ok_or_else(|| failed_session("pane-runtime manager handle not registered"))?;
-    let session_handle = global_plugin_state_registry()
+    let session_handle = host
+        .states()
         .get::<bmux_session_state::SessionManagerHandle>()
         .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
         .ok_or_else(|| failed_session("session manager handle not registered"))?;
-    let context_handle = global_plugin_state_registry()
+    let context_handle = host
+        .states()
         .get::<bmux_context_state::ContextStateHandle>()
         .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
         .ok_or_else(|| failed_session("context state handle not registered"))?;
-    let attach_token_handle = global_plugin_state_registry()
+    let attach_token_handle = host
+        .states()
         .get::<bmux_attach_token_state::AttachTokenManagerHandle>()
         .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
         .ok_or_else(|| failed_session("attach-token manager handle not registered"))?;
-    let follow_handle = global_plugin_state_registry()
+    let follow_handle = host
+        .states()
         .get::<bmux_client_state::FollowStateHandle>()
         .and_then(|arc| arc.read().ok().map(|g| (*g).clone()))
         .ok_or_else(|| failed_session("follow state handle not registered"))?;
@@ -1161,12 +1219,12 @@ pub fn kill_session_runtime(
     attach_token_handle.0.remove_for_session(session_id);
 
     if had_attached_clients {
-        publish_pane_event(PaneEvent::ClientDetached {
+        host.publish_pane_event(PaneEvent::ClientDetached {
             session_id: session_id.0,
         });
     }
 
-    publish_session_removed_event(session_id);
+    publish_session_removed_event(host, session_id);
 
     Ok(SessionAck {
         session_id: req.session_id,

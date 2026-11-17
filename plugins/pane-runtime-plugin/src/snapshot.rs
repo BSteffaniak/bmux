@@ -18,7 +18,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::padding::PanePaddingSpec;
-use crate::runtime::{PanePaddingRuntimeHandle, session_handle, session_runtime_handle};
+use crate::runtime::PanePaddingRuntimeHandle;
 use bmux_pane_runtime_state::{
     AttachViewport, FloatingPaneLayer, FloatingPaneScope, FloatingSurfaceRuntime, LayoutRect,
     PaneCommandSource, PaneLaunchSpec, PaneLayoutNode, PaneResurrectionSnapshot, PaneRuntimeMeta,
@@ -202,6 +202,7 @@ fn layout_from_snapshot(node: &PaneRuntimeSnapshotV1Layout) -> PaneLayoutNode {
 /// runtime into a [`PaneRuntimeSnapshotV1`].
 pub struct PaneRuntimeStateful {
     freeze: Box<dyn Fn() -> anyhow::Result<()> + Send + Sync>,
+    host: crate::runtime::PaneRuntimeHost,
 }
 
 impl PaneRuntimeStateful {
@@ -209,16 +210,20 @@ impl PaneRuntimeStateful {
     /// the process-wide stateful-plugin registry (creating the
     /// registry slot if absent). Intended to be called once from
     /// pane-runtime plugin activation after the manager has been constructed.
-    pub fn register(freeze: impl Fn() -> anyhow::Result<()> + Send + Sync + 'static) {
+    pub(crate) fn register(
+        host: &crate::runtime::PaneRuntimeHost,
+        freeze: impl Fn() -> anyhow::Result<()> + Send + Sync + 'static,
+    ) {
         let participant = Self {
             freeze: Box::new(freeze),
+            host: host.clone(),
         };
         let handle = StatefulPluginHandle::new(participant);
-        let registry = bmux_plugin::global_plugin_state_registry();
+        let registry = host.states();
         let stateful_registry = bmux_snapshot_runtime::get_or_init_stateful_registry(
             || registry.get::<StatefulPluginRegistry>(),
             |fresh| {
-                registry.register::<StatefulPluginRegistry>(fresh);
+                registry.register_communal::<StatefulPluginRegistry>(fresh);
             },
         );
         if let Ok(mut guard) = stateful_registry.write() {
@@ -229,11 +234,14 @@ impl PaneRuntimeStateful {
 
 /// Walk the registered session-runtime handle and produce a real
 /// pane-runtime payload for persistence.
-fn build_pane_runtime_payload() -> anyhow::Result<PaneRuntimeSnapshotV1> {
-    let managed_programs = crate::runtime::execution::managed_program_ids()?;
-    let sessions = session_handle().0.list_sessions();
-    let runtime_manager = session_runtime_handle();
-    let padding_overrides = bmux_plugin::global_plugin_state_registry()
+fn build_pane_runtime_payload(
+    host: &crate::runtime::PaneRuntimeHost,
+) -> anyhow::Result<PaneRuntimeSnapshotV1> {
+    let managed_programs = crate::runtime::execution::managed_program_ids(host)?;
+    let sessions = host.session_handle().0.list_sessions();
+    let runtime_manager = host.session_runtime_handle();
+    let padding_overrides = host
+        .states()
         .get::<PanePaddingRuntimeHandle>()
         .and_then(|entry| entry.read().ok().map(|guard| (*guard).clone()))
         .and_then(|handle| handle.overrides_for_snapshot().ok())
@@ -360,11 +368,15 @@ fn validate_payload_restore(payload: &PaneRuntimeSnapshotV1) -> anyhow::Result<(
     validate_resume_policy(payload)
 }
 
-fn apply_pane_runtime_payload(payload: &PaneRuntimeSnapshotV1) -> anyhow::Result<()> {
+fn apply_pane_runtime_payload(
+    host: &crate::runtime::PaneRuntimeHost,
+    payload: &PaneRuntimeSnapshotV1,
+) -> anyhow::Result<()> {
     validate_payload_restore(payload)?;
-    let session_manager = session_handle();
-    let runtime_manager = session_runtime_handle();
-    let padding_handle = bmux_plugin::global_plugin_state_registry()
+    let session_manager = host.session_handle();
+    let runtime_manager = host.session_runtime_handle();
+    let padding_handle = host
+        .states()
         .get::<PanePaddingRuntimeHandle>()
         .and_then(|entry| entry.read().ok().map(|guard| (*guard).clone()));
 
@@ -491,11 +503,13 @@ impl StatefulPlugin for PaneRuntimeStateful {
     }
 
     fn snapshot(&self) -> StatefulPluginResult<StatefulPluginSnapshot> {
-        let payload =
-            build_pane_runtime_payload().map_err(|err| StatefulPluginError::SnapshotFailed {
+        let host = &self.host;
+        let payload = build_pane_runtime_payload(host).map_err(|err| {
+            StatefulPluginError::SnapshotFailed {
                 plugin: PANE_RUNTIME_PLUGIN_SNAPSHOT_ID.as_str().to_string(),
                 details: format!("{err:#}"),
-            })?;
+            }
+        })?;
         let bytes =
             serde_json::to_vec(&payload).map_err(|err| StatefulPluginError::SnapshotFailed {
                 plugin: PANE_RUNTIME_PLUGIN_SNAPSHOT_ID.as_str().to_string(),
@@ -525,8 +539,9 @@ impl StatefulPlugin for PaneRuntimeStateful {
     }
 
     fn restore_snapshot(&self, snapshot: StatefulPluginSnapshot) -> StatefulPluginResult<()> {
+        let host = &self.host;
         let decoded = decode_pane_runtime_snapshot(&snapshot)?;
-        apply_pane_runtime_payload(&decoded).map_err(|error| {
+        apply_pane_runtime_payload(host, &decoded).map_err(|error| {
             StatefulPluginError::RestoreFailed {
                 plugin: PANE_RUNTIME_PLUGIN_SNAPSHOT_ID.as_str().to_string(),
                 details: format!("{error:#}"),
@@ -885,6 +900,8 @@ mod tests {
 
     #[test]
     fn nonresumable_restore_rejects_before_any_argv_launch() {
+        let host = crate::runtime::PaneRuntimeHost::detached();
+        let host = &host;
         let pane_id = Uuid::new_v4();
         let payload: super::PaneRuntimeSnapshotV1 = serde_json::from_value(serde_json::json!({
             "sessions": [{ "session_id": Uuid::new_v4(), "panes": [{
@@ -894,7 +911,7 @@ mod tests {
         }))
         .unwrap();
         // No manager is needed: validation precedes all restore side effects.
-        let error = super::apply_pane_runtime_payload(&payload).unwrap_err();
+        let error = super::apply_pane_runtime_payload(host, &payload).unwrap_err();
         assert!(error.to_string().contains("nonresumable"));
         assert!(error.to_string().contains(&pane_id.to_string()));
     }

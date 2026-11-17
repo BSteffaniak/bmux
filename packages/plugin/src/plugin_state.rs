@@ -30,32 +30,81 @@
 //! downcast on lookup. Registering the same `TypeId` twice replaces
 //! the earlier entry; callers should coordinate to avoid that.
 //!
-//! # Global accessor
+//! # Ownership
 //!
-//! For convenience when wiring FFI bundled plugins whose `initialize`
-//! callback does not carry a registry reference in its context,
-//! [`global_registry`] returns a process-wide shared instance. Core
-//! code constructing the server and plugins registering state both
-//! reference the same singleton.
+//! There is no process-wide registry. The host program constructs one root
+//! registry and hands each plugin activation a view from
+//! [`PluginStateRegistry::scoped`] through the activation's capabilities
+//! (see [`activation_binder`]). A view shares the root's entries. Handles a
+//! view [`PluginStateRegistry::register`]s belong to its activation and are
+//! removed when the view drops (unless replaced since); once the
+//! activation scope closes the view admits no new registration. Shared
+//! neutral state created with [`PluginStateRegistry::get_or_insert_with`] is
+//! communal and never owned by the activation that happened to create it.
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 
-/// Shared-state registry keyed by concrete type.
+type StateEntry = Arc<dyn Any + Send + Sync>;
+
+/// Entries shared by a root registry and every view scoped from it.
+#[derive(Default)]
+struct StateCore {
+    registrations: ActivationRegistrationRegistry,
+    entries: RwLock<HashMap<TypeId, StateEntry>>,
+}
+
+/// The activation that owns a scoped view, and the handles it registered.
+struct StateOwner {
+    scope: ActivationScope,
+    owned: Mutex<Vec<(TypeId, StateEntry)>>,
+}
+
+/// Shared-state registry keyed by concrete type: a host-owned root or an
+/// activation-scoped view of one.
 ///
 /// See module docs for the intended usage pattern.
-#[derive(Default)]
 pub struct PluginStateRegistry {
-    registrations: ActivationRegistrationRegistry,
-    entries: RwLock<HashMap<TypeId, Arc<dyn Any + Send + Sync>>>,
+    core: Arc<StateCore>,
+    owner: Option<StateOwner>,
+}
+
+impl Default for PluginStateRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for PluginStateRegistry {
+    fn drop(&mut self) {
+        let Some(owner) = &self.owner else {
+            return;
+        };
+        let released = owner
+            .owned
+            .lock()
+            .map(|mut registrations| std::mem::take(&mut *registrations))
+            .unwrap_or_default();
+        if let Ok(mut entries) = self.core.entries.write() {
+            for (type_id, entry) in released {
+                if entries
+                    .get(&type_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &entry))
+                {
+                    entries.remove(&type_id);
+                }
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for PluginStateRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let count = self.entries.read().map_or(0, |g| g.len());
+        let count = self.core.entries.read().map_or(0, |g| g.len());
         f.debug_struct("PluginStateRegistry")
             .field("entries", &count)
+            .field("scoped", &self.owner.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -64,14 +113,49 @@ impl PluginStateRegistry {
     /// Explicit per-host activation authority. All consumers of this host state
     /// share this registry rather than independently creating optional globals.
     #[must_use]
-    pub const fn registrations(&self) -> &ActivationRegistrationRegistry {
-        &self.registrations
+    pub fn registrations(&self) -> &ActivationRegistrationRegistry {
+        &self.core.registrations
     }
 
-    /// Create an empty registry.
+    /// Create an empty root registry. The host program owns it and hands
+    /// plugins scoped views; nothing else can reach it.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            core: Arc::default(),
+            owner: None,
+        }
+    }
+
+    /// A view of this registry owned by one plugin activation. See the
+    /// module docs for what the activation owns.
+    #[must_use]
+    pub fn scoped(self: &Arc<Self>, scope: ActivationScope) -> Arc<Self> {
+        Arc::new(Self {
+            core: Arc::clone(&self.core),
+            owner: Some(StateOwner {
+                scope,
+                owned: Mutex::new(Vec::new()),
+            }),
+        })
+    }
+
+    /// Whether `self` and `other` see the same entries.
+    #[must_use]
+    pub fn shares_entries_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.core, &other.core)
+    }
+
+    /// Shared observational lifecycle counter for this host registry.
+    ///
+    /// # Panics
+    /// Panics if the registry lock is poisoned.
+    #[must_use]
+    pub fn shutdown_progress(&self) -> bmux_plugin_runtime::shutdown_progress::ShutdownProgress {
+        self.get_or_insert_with(bmux_plugin_runtime::shutdown_progress::ShutdownProgress::default)
+            .read()
+            .expect("shutdown progress registry lock poisoned")
+            .clone()
     }
 
     /// Register a state handle keyed by concrete type `T`.
@@ -82,22 +166,74 @@ impl PluginStateRegistry {
     /// # Panics
     ///
     /// Panics if the registry's internal lock is poisoned.
+    ///
+    /// Through a scoped view the handle belongs to the view's activation;
+    /// once that activation scope has closed nothing is registered and
+    /// `None` is returned.
     pub fn register<T>(&self, state: &Arc<RwLock<T>>) -> Option<Arc<RwLock<T>>>
     where
         T: Any + Send + Sync,
     {
+        let _admission = match &self.owner {
+            Some(owner) => Some(owner.scope.try_admit().ok()?),
+            None => None,
+        };
+        let type_id = TypeId::of::<Arc<RwLock<T>>>();
+        let boxed: StateEntry = Arc::new(state.clone());
+        if let Some(owner) = &self.owner
+            && let Ok(mut owned) = owner.owned.lock()
+        {
+            owned.push((type_id, Arc::clone(&boxed)));
+        }
         let mut guard = self
+            .core
             .entries
             .write()
             .expect("plugin state registry lock poisoned");
-        let boxed: Arc<dyn Any + Send + Sync> = Arc::new(state.clone());
-        let previous = guard.insert(TypeId::of::<Arc<RwLock<T>>>(), boxed);
+        let previous = guard.insert(type_id, boxed);
         drop(guard);
         previous.and_then(|arc| {
             arc.downcast::<Arc<RwLock<T>>>()
                 .ok()
                 .map(|boxed| (*boxed).clone())
         })
+    }
+
+    /// Publish shared neutral state that no activation owns, unless an entry
+    /// of the same type already exists. Returns the entry now registered.
+    ///
+    /// Use this (or [`Self::get_or_insert_with`]) for communal state several
+    /// plugins contribute to; [`Self::register`] would tie it to the
+    /// registering activation.
+    ///
+    /// # Panics
+    /// Panics if the registry lock is poisoned.
+    pub fn register_communal<T>(&self, state: &Arc<RwLock<T>>) -> Arc<RwLock<T>>
+    where
+        T: Any + Send + Sync,
+    {
+        let shared = Arc::clone(state);
+        self.get_or_insert_entry(move || shared)
+    }
+
+    fn get_or_insert_entry<T>(&self, initialize: impl FnOnce() -> Arc<RwLock<T>>) -> Arc<RwLock<T>>
+    where
+        T: Any + Send + Sync,
+    {
+        let mut entries = self
+            .core
+            .entries
+            .write()
+            .expect("plugin state registry lock poisoned");
+        let entry = entries
+            .entry(TypeId::of::<Arc<RwLock<T>>>())
+            .or_insert_with(|| Arc::new(initialize()));
+        let handle = entry
+            .downcast_ref::<Arc<RwLock<T>>>()
+            .expect("registered state type")
+            .clone();
+        drop(entries);
+        handle
     }
 
     /// Retrieve or atomically initialize shared neutral state.
@@ -109,19 +245,7 @@ impl PluginStateRegistry {
     where
         T: Any + Send + Sync,
     {
-        let mut entries = self
-            .entries
-            .write()
-            .expect("plugin state registry lock poisoned");
-        let entry = entries
-            .entry(TypeId::of::<Arc<RwLock<T>>>())
-            .or_insert_with(|| Arc::new(Arc::new(RwLock::new(initialize()))));
-        let handle = entry
-            .downcast_ref::<Arc<RwLock<T>>>()
-            .expect("registered state type")
-            .clone();
-        drop(entries);
-        handle
+        self.get_or_insert_entry(|| Arc::new(RwLock::new(initialize())))
     }
 
     /// Retrieve the registered state for concrete type `T` if any.
@@ -135,6 +259,7 @@ impl PluginStateRegistry {
         T: Any + Send + Sync,
     {
         let guard = self
+            .core
             .entries
             .read()
             .expect("plugin state registry lock poisoned");
@@ -172,7 +297,7 @@ impl PluginStateRegistry {
     /// Number of distinct state types currently registered.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.read().map_or(0, |guard| guard.len())
+        self.core.entries.read().map_or(0, |guard| guard.len())
     }
 
     /// `true` when no state is registered.
@@ -182,26 +307,54 @@ impl PluginStateRegistry {
     }
 }
 
-/// Shared observational lifecycle counter for this host registry.
-///
-/// # Panics
-/// Panics if the host state registry lock is poisoned.
+/// Host activation binder that offers each activation a view of `registry`
+/// scoped to that activation (see [`PluginStateRegistry::scoped`]).
 #[must_use]
-pub fn shutdown_progress() -> bmux_plugin_runtime::shutdown_progress::ShutdownProgress {
-    global_registry()
-        .get_or_insert_with(bmux_plugin_runtime::shutdown_progress::ShutdownProgress::default)
-        .read()
-        .expect("shutdown progress registry lock poisoned")
-        .clone()
+pub fn activation_binder(registry: Arc<PluginStateRegistry>) -> Arc<crate::ActivationBinder> {
+    Arc::new(
+        move |scope: &ActivationScope,
+              capabilities: &bmux_plugin_sdk::definition::ActivationCapabilities| {
+            capabilities
+                .insert(ActivationStateRegistry(registry.scoped(scope.clone())))
+                .map_err(|error| bmux_plugin_sdk::PluginError::ServiceProtocol {
+                    details: error.message,
+                })
+        },
+    )
 }
 
-/// Process-wide shared registry instance.
+/// The activation-scoped registry a host offers through [`activation_binder`].
+pub struct ActivationStateRegistry(pub Arc<PluginStateRegistry>);
+
+/// Take the state registry view the host supplied for this activation.
+///
+/// # Errors
+/// Returns an explicit unavailable error when the host supplied none (for
+/// example a dynamically loaded artifact) or it was already taken. There is
+/// no process-wide fallback.
+pub fn take_activation_state_registry(
+    capabilities: &bmux_plugin_sdk::definition::ActivationCapabilities,
+) -> Result<Arc<PluginStateRegistry>, bmux_plugin_sdk::PluginCommandError> {
+    capabilities
+        .take::<ActivationStateRegistry>()
+        .map(|ActivationStateRegistry(registry)| registry)
+}
+
+/// Take a legacy author's activation registry, reporting at activation
+/// time when the host supplied none. The plugin then works against an
+/// empty registry of its own, never a process-wide one.
 #[must_use]
-pub fn global_registry() -> Arc<PluginStateRegistry> {
-    static GLOBAL: OnceLock<Arc<PluginStateRegistry>> = OnceLock::new();
-    GLOBAL
-        .get_or_init(|| Arc::new(PluginStateRegistry::new()))
-        .clone()
+pub fn activation_state_registry(
+    context: &bmux_plugin_sdk::NativeLifecycleContext,
+) -> Arc<PluginStateRegistry> {
+    take_activation_state_registry(&context.capabilities).unwrap_or_else(|error| {
+        tracing::warn!(
+            plugin_id = %context.plugin_id,
+            error = %error.message,
+            "activation has no host state registry; using an empty private one"
+        );
+        Arc::new(PluginStateRegistry::new())
+    })
 }
 
 // Explicit per-host registration ports. Unlike the legacy typemap above, these
@@ -1421,7 +1574,10 @@ mod activation_registration_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{PluginStateRegistry, global_registry};
+    use super::{
+        ActivationStateRegistry, PluginStateRegistry, activation_binder,
+        take_activation_state_registry,
+    };
     use std::sync::{Arc, RwLock};
 
     #[derive(Debug, Default, PartialEq, Eq)]
@@ -1510,24 +1666,75 @@ mod tests {
         assert_eq!(final_value, 8 * 1000);
     }
 
-    /// A state type only used by the global-registry smoke test so it
-    /// doesn't collide with other tests' `Counter`.
-    #[derive(Debug, Default)]
-    struct GlobalRegistrySentinel {
-        value: u32,
+    fn activation() -> bmux_plugin_runtime::ActivationScope {
+        bmux_plugin_runtime::InstanceScope::new(
+            bmux_plugin_runtime::PluginRuntimeScopeId::from_uuid(uuid::Uuid::new_v4()),
+        )
+        .begin_activation(bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent)
+        .expect("activation")
     }
 
     #[test]
-    fn global_registry_returns_same_instance() {
-        let a = global_registry();
-        let b = global_registry();
-        // Same Arc target.
-        assert!(Arc::ptr_eq(&a, &b));
+    fn independent_roots_never_share_entries() {
+        let a = PluginStateRegistry::new();
+        let b = PluginStateRegistry::new();
+        assert!(!a.shares_entries_with(&b));
+        a.register(&Arc::new(RwLock::new(Counter { value: 1 })));
+        assert!(b.get::<Counter>().is_none());
+    }
 
-        let sentinel = Arc::new(RwLock::new(GlobalRegistrySentinel { value: 13 }));
-        a.register(&sentinel);
+    #[test]
+    fn view_owns_registrations_but_not_communal_state() {
+        let root = Arc::new(PluginStateRegistry::new());
+        let view = root.scoped(activation());
+        assert!(view.shares_entries_with(&root));
+        view.register(&Arc::new(RwLock::new(Counter { value: 7 })));
+        let communal = view.get_or_insert_with(Other::default);
+        communal.write().unwrap().flag = true;
+        let shared = view.register_communal(&Arc::new(RwLock::new(0_u64)));
+        *shared.write().unwrap() = 3;
+        assert_eq!(root.get::<Counter>().unwrap().read().unwrap().value, 7);
+        drop(view);
+        assert!(
+            root.get::<Counter>().is_none(),
+            "owned entry leaves with its view"
+        );
+        assert!(root.get::<Other>().unwrap().read().unwrap().flag);
+        assert_eq!(*root.get::<u64>().unwrap().read().unwrap(), 3);
+    }
 
-        let retrieved = b.get::<GlobalRegistrySentinel>().expect("not found");
-        assert_eq!(retrieved.read().unwrap().value, 13);
+    #[test]
+    fn view_never_removes_a_newer_registration_and_closed_view_registers_nothing() {
+        let root = Arc::new(PluginStateRegistry::new());
+        let first = root.scoped(activation());
+        let scope = activation();
+        let second = root.scoped(scope.clone());
+        first.register(&Arc::new(RwLock::new(Counter { value: 1 })));
+        second.register(&Arc::new(RwLock::new(Counter { value: 2 })));
+        drop(first);
+        assert_eq!(root.get::<Counter>().unwrap().read().unwrap().value, 2);
+        scope.close().unwrap();
+        assert!(
+            second
+                .register(&Arc::new(RwLock::new(Other::default())))
+                .is_none()
+        );
+        assert!(root.get::<Other>().is_none());
+    }
+
+    #[test]
+    fn activation_binder_offers_each_activation_its_own_view() {
+        let root = Arc::new(PluginStateRegistry::new());
+        let binder = activation_binder(Arc::clone(&root));
+        let take = || {
+            let capabilities = bmux_plugin_sdk::definition::ActivationCapabilities::default();
+            binder(&activation(), &capabilities).unwrap();
+            let view = take_activation_state_registry(&capabilities).unwrap();
+            assert!(capabilities.take::<ActivationStateRegistry>().is_err());
+            view
+        };
+        let (a, b) = (take(), take());
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert!(a.shares_entries_with(&root) && b.shares_entries_with(&root));
     }
 }

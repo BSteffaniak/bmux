@@ -16,6 +16,9 @@ pub struct AttachPresentationResources {
     pub surfaces: Arc<crate::surface::PluginSurfaceRegistry>,
     pub input: Arc<crate::AttachPresentationInputRegistry>,
     pub events: Arc<crate::EventBus>,
+    /// This runtime's shared typed host state. Companions that cooperate
+    /// within one runtime meet here instead of in process-wide statics.
+    pub states: Arc<crate::PluginStateRegistry>,
     /// Per-plugin settings from the invoking runtime's effective config,
     /// keyed by plugin id. Companions read their settings here at start so
     /// a runtime with its own config (for example a sandbox) is honored
@@ -38,6 +41,7 @@ impl AttachPresentationResources {
             )),
             input: Arc::new(crate::AttachPresentationInputRegistry::new()),
             events: Arc::new(crate::EventBus::new()),
+            states: Arc::new(crate::PluginStateRegistry::new()),
             plugin_settings: Arc::new(BTreeMap::new()),
         }
     }

@@ -3,7 +3,7 @@ use std::{
     collections::BTreeMap,
     io::Write,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::Mutex,
     time::{Duration, Instant},
 };
 use uuid::Uuid;
@@ -17,22 +17,6 @@ struct Grants {
 #[derive(Default)]
 pub struct Authorization {
     grants: Mutex<Option<Grants>>,
-}
-static GRANTS: OnceLock<Authorization> = OnceLock::new();
-fn legacy() -> &'static Authorization {
-    GRANTS.get_or_init(Authorization::default)
-}
-pub fn initialize(runtime: &Path) -> Result<(), &'static str> {
-    legacy().initialize(runtime)
-}
-pub fn authorize(caller: Uuid, proof: &[u8]) -> Result<bool, &'static str> {
-    legacy().authorize(caller, proof)
-}
-pub fn check(caller: Uuid) -> Result<Uuid, &'static str> {
-    legacy().check(caller)
-}
-pub fn revoke() {
-    let _ = legacy().revoke();
 }
 impl Authorization {
     pub fn initialize(&self, runtime: &Path) -> Result<(), &'static str> {
@@ -193,15 +177,18 @@ mod tests {
     #[test]
     fn unproven_remote_uuid_cannot_authorize_and_grants_bind_exact_caller() {
         let directory = tempfile::tempdir().unwrap();
-        initialize(directory.path()).unwrap();
+        let grants = Authorization::default();
+        grants.initialize(directory.path()).unwrap();
         let caller = Uuid::new_v4();
         let remote = Uuid::new_v4();
-        assert!(check(remote).is_err());
-        assert!(authorize(remote, &[0; 32]).is_err());
-        authorize(caller, &local_proof(directory.path()).unwrap()).unwrap();
-        assert_eq!(check(caller).unwrap(), caller);
-        assert!(check(remote).is_err());
-        revoke();
-        assert!(check(caller).is_err());
+        assert!(grants.check(remote).is_err());
+        assert!(grants.authorize(remote, &[0; 32]).is_err());
+        grants
+            .authorize(caller, &local_proof(directory.path()).unwrap())
+            .unwrap();
+        assert_eq!(grants.check(caller).unwrap(), caller);
+        assert!(grants.check(remote).is_err());
+        grants.revoke().unwrap();
+        assert!(grants.check(caller).is_err());
     }
 }

@@ -98,11 +98,12 @@ pub use manifest::{
     PluginManifest, PluginManifestCompatibility, PluginManifestExtension,
     PluginManifestKeybindings, PluginRuntime,
 };
-pub use plugin_state::global_registry as global_plugin_state_registry;
 pub use plugin_state::{
-    ActivationRegistrationPort, ActivationRegistrationRegistry, AdmittedRegistration,
-    PluginStateRegistry, RegistrationError, RegistrationSnapshot, RegistrationSubscription,
-    RegistrationUpdate, RegistrationUpdateBatch, shutdown_progress,
+    ActivationRegistrationPort, ActivationRegistrationRegistry, ActivationStateRegistry,
+    AdmittedRegistration, PluginStateRegistry, RegistrationError, RegistrationSnapshot,
+    RegistrationSubscription, RegistrationUpdate, RegistrationUpdateBatch,
+    activation_binder as state_registry_activation_binder, activation_state_registry,
+    take_activation_state_registry,
 };
 pub use registry::{
     CapabilityProvider, PluginCandidate, PluginCandidateInventory, PluginCandidatePreference,
@@ -121,19 +122,13 @@ pub use render::{
     RenderSceneItemKey, RenderSceneItemKind, RenderStyle, RenderSurfaceChrome, RenderSurfaceRole,
     RenderTextSpan, RenderUnderCell, TerminalGraphicFill, TerminalGraphicOverlay,
     TerminalRenderCapabilities, TerminalRgba, VisualAdapterRegistry, clip_render_text_run_to_rect,
-    global_render_extension_registry, global_visual_adapter_registry, register_render_extension,
-    register_visual_adapter, registered_input_codec, registered_render_extensions,
-    registered_visual_adapter, render_char_display_width_u16, render_single_display_cell_char,
-    render_text_width_u16,
+    render_char_display_width_u16, render_single_display_cell_char, render_text_width_u16,
 };
 pub use service_location::{
     ServiceEndpoint, ServiceEndpointError, ServiceLocation, ServiceLocationMap,
     global_service_locations,
 };
-pub use startup_gate::{
-    StartupReadyGate, StartupReadyGateRegistry, global_startup_ready_gate_registry,
-    register_startup_ready_gate, registered_startup_ready_gates,
-};
+pub use startup_gate::{StartupReadyGate, StartupReadyGateRegistry};
 pub use typed_dispatch_bridge::{
     ASYNC_SERVICE_ROUTE_V1, AsyncCommandRouteGuard, AsyncServiceClient, AsyncServiceRequest,
     ServiceCallerDispatchClient, block_on_typed_dispatch, capture_async_command_route,

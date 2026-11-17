@@ -38,26 +38,37 @@ impl Entry {
             DecorationEngineCommand::Retire { reply }
         });
         self.state.runtime.stopped.send_replace(true);
-        clear_scene(self.state.runtime.recipient.expect("view recipient"));
+        clear_scene(
+            self.state.states().as_deref(),
+            self.state.runtime.recipient.expect("view recipient"),
+        );
     }
 }
 
 pub(super) struct ViewRegistry {
     entries: Arc<Mutex<BTreeMap<Uuid, Arc<Mutex<Entry>>>>>,
+    /// The activation's view of the host state registry, through which the
+    /// reaper finds the host wire sink; unset before activation.
+    states: Arc<Mutex<Option<Arc<bmux_plugin::PluginStateRegistry>>>>,
 }
 
 impl Default for ViewRegistry {
     fn default() -> Self {
         let entries = Arc::new(Mutex::new(BTreeMap::<Uuid, Arc<Mutex<Entry>>>::new()));
         let weak = Arc::downgrade(&entries);
+        let states = Arc::new(Mutex::new(None::<Arc<bmux_plugin::PluginStateRegistry>>));
+        let reaper_states = Arc::clone(&states);
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_secs(5));
                 let Some(entries) = weak.upgrade() else {
                     break;
                 };
-                let Some(handle) =
-                    bmux_plugin::global_plugin_state_registry().get::<WireEventSinkHandle>()
+                let Some(handle) = reaper_states
+                    .lock()
+                    .ok()
+                    .and_then(|states| states.clone())
+                    .and_then(|states| states.get::<WireEventSinkHandle>())
                 else {
                     continue;
                 };
@@ -68,7 +79,16 @@ impl Default for ViewRegistry {
                 reap_disconnected(&entries, |recipient| sink.is_connected(recipient));
             }
         });
-        Self { entries }
+        Self { entries, states }
+    }
+}
+
+impl ViewRegistry {
+    /// Bind the activation's registry view, used to reach the host wire sink.
+    pub(super) fn bind_states(&self, states: Arc<bmux_plugin::PluginStateRegistry>) {
+        if let Ok(mut slot) = self.states.lock() {
+            *slot = Some(states);
+        }
     }
 }
 
@@ -123,14 +143,15 @@ impl Drop for ViewRegistry {
 }
 
 pub(super) fn publish_scene(
+    states: Option<&bmux_plugin::PluginStateRegistry>,
     recipient: Uuid,
     scene: &bmux_scene_protocol::scene_protocol::DecorationScene,
 ) {
     let result = serde_json::to_vec(scene)
         .map_err(|error| error.to_string())
         .and_then(|payload| {
-            let sink = bmux_plugin::global_plugin_state_registry()
-                .get::<WireEventSinkHandle>()
+            let sink = states
+                .and_then(bmux_plugin::PluginStateRegistry::get::<WireEventSinkHandle>)
                 .ok_or_else(|| "targeted scene delivery unavailable".to_string())?;
             let sink = sink.read().map_err(|_| "scene sink poisoned".to_string())?;
             sink.0
@@ -148,8 +169,9 @@ pub(super) fn publish_scene(
     }
 }
 
-fn clear_scene(recipient: Uuid) {
-    if let Some(sink) = bmux_plugin::global_plugin_state_registry().get::<WireEventSinkHandle>()
+fn clear_scene(states: Option<&bmux_plugin::PluginStateRegistry>, recipient: Uuid) {
+    if let Some(sink) =
+        states.and_then(bmux_plugin::PluginStateRegistry::get::<WireEventSinkHandle>)
         && let Ok(sink) = sink.read()
         && let Err(error) = sink.0.clear_retained_to(
             recipient,
@@ -203,6 +225,8 @@ impl ViewRegistry {
                 runtime: Arc::new(DecorationRuntime {
                     recipient: Some(caller),
                     events: Mutex::new(shared.events()),
+                    states: Mutex::new(shared.states()),
+                    scene_revisions: Arc::clone(&shared.runtime.scene_revisions),
                     ..DecorationRuntime::default()
                 }),
             };
@@ -385,10 +409,14 @@ impl ViewRegistry {
         entry.retired.push_back(lifetime);
         let host_async_handle = entry.state.host_async_handle();
         let events = entry.state.events();
+        let states = entry.state.states();
+        let scene_revisions = Arc::clone(&entry.state.runtime.scene_revisions);
         entry.state = SharedState {
             runtime: Arc::new(DecorationRuntime {
                 recipient: Some(caller),
                 events: Mutex::new(events),
+                states: Mutex::new(states),
+                scene_revisions,
                 ..DecorationRuntime::default()
             }),
         };

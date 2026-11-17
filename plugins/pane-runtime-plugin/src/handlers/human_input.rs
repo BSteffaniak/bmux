@@ -24,14 +24,16 @@ fn authorize(
 }
 
 pub(crate) fn open(
+    host: &crate::runtime::PaneRuntimeHost,
     ctx: &NativeServiceContext,
     execution: TerminalExecutionRef,
 ) -> Result<HumanInputStream, HumanInputError> {
     authorize(ctx, &execution)?;
-    crate::runtime::human_input::open(execution)
+    crate::runtime::human_input::open(host, execution)
 }
 
 pub(crate) fn push(
+    host: &crate::runtime::PaneRuntimeHost,
     ctx: &NativeServiceContext,
     stream: &HumanInputStream,
     sequence: u64,
@@ -39,6 +41,7 @@ pub(crate) fn push(
 ) -> Result<HumanInputAck, HumanInputError> {
     authorize(ctx, &stream.execution)?;
     crate::runtime::human_input::push(
+        host,
         stream,
         sequence,
         data,
