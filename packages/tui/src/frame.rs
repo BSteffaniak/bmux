@@ -1,6 +1,6 @@
 //! Frame render context.
 
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, Cell};
 use crate::damage::{Damage, DamagePolicy};
 use crate::focus::FocusScopeId;
 use crate::geometry::{Point, Rect};
@@ -430,8 +430,19 @@ impl<'buffer> Frame<'buffer> {
         self.note_moved(area);
         // Wide graphemes the edges cut are blanked: painted, not moved.
         if let Some(painted) = self.painted.as_mut() {
-            for column in [area.x, area.right().saturating_sub(1)] {
-                painted.note(Rect::new(column, area.y, 1, area.height));
+            for y in area.y..area.bottom() {
+                let left = Point::new(area.x, y);
+                let right = Point::new(area.right().saturating_sub(1), y);
+                if self
+                    .buffer
+                    .get(left)
+                    .is_some_and(Cell::is_wide_continuation)
+                {
+                    painted.note(Rect::new(left.x, y, 1, 1));
+                }
+                if self.buffer.get(right).is_some_and(Cell::is_wide_leader) {
+                    painted.note(Rect::new(right.x, y, 1, 1));
+                }
             }
         }
         self.buffer.move_band(area, rows);

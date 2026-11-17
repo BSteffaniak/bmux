@@ -616,7 +616,12 @@ impl<W: Write> Terminal<W> {
         before: impl FnOnce(&mut W) -> io::Result<bool>,
         overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta) -> io::Result<()>,
     ) -> io::Result<DrawStats> {
-        let prepared = self.state.prepare_over(render);
+        // Painting nothing over the last frame, with the cursor where it was, changes nothing.
+        let prepared = self.state.prepare_over(render).filter(|prepared| {
+            !prepared.damage().retained_regions().is_empty()
+                || !prepared.damage().is_regional()
+                || prepared.cursor() != self.state.cursor()
+        });
         self.draw_prepared_with_output_hooks(prepared, before, overlay)
     }
 
@@ -1050,6 +1055,27 @@ mod tests {
     use crate::style::Style;
     use std::io::{self, Write};
 
+    #[test]
+    fn painting_nothing_over_the_last_frame_writes_nothing() {
+        let area = crate::geometry::Rect::new(0, 0, 8, 2);
+        let mut terminal = Terminal::new(Vec::new(), area);
+        terminal
+            .draw(|cx| cx.set_cursor(crate::geometry::Point::new(1, 1), true))
+            .unwrap();
+        terminal.writer_mut().clear();
+        terminal
+            .draw_over(|cx| cx.set_cursor(crate::geometry::Point::new(1, 1), true))
+            .unwrap();
+        assert!(
+            terminal.writer().is_empty(),
+            "{:?}",
+            String::from_utf8_lossy(terminal.writer())
+        );
+        terminal
+            .draw_over(|cx| cx.set_cursor(crate::geometry::Point::new(2, 1), true))
+            .unwrap();
+        assert!(!terminal.writer().is_empty(), "a moved cursor is presented");
+    }
     #[test]
     fn uniform_terminal_rejects_fragments_before_output_or_hooks() {
         use crate::buffer::Buffer;
