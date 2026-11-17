@@ -69,6 +69,23 @@ fn interface_module_name(iface: &Interface, duplicate_name: bool) -> String {
     }
 }
 
+/// Rust module path segment generated for an IR interface: the snake-case
+/// name, suffixed `_vN` when the package declares a versioned family under
+/// that name. Matches the modules [`emit_with_imports`] produces.
+#[must_use]
+pub fn interface_module(package: &crate::ir::Package, iface: &crate::ir::Interface) -> String {
+    let duplicate = package
+        .interfaces
+        .iter()
+        .filter(|candidate| candidate.name == iface.name)
+        .count()
+        > 1;
+    match (duplicate, iface.version) {
+        (true, Some(version)) => format!("{}_v{version}", snake_case(&iface.name)),
+        _ => snake_case(&iface.name),
+    }
+}
+
 /// Emit a Rust module for the entire schema with no imports resolved.
 ///
 /// Suitable for schemas that do not use qualified type references.

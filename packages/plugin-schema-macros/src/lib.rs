@@ -1,4 +1,5 @@
-//! Compile-time BPDL bindings and dependency-owned schema exports.
+//! Compile-time BPDL bindings, dependency-owned schema exports, and plugin
+//! manifests generated from BPDL worlds.
 //!
 //! File sources are relative to the invoking crate's manifest directory.
 //! Cross-crate imports should use a dependency's exported schema macro:
@@ -15,6 +16,14 @@
 //!     },
 //! }
 //! ```
+//!
+//! A plugin whose package (and `world`) lives in its own crate adds
+//! `manifest: "plugin.toml"` to `schema!`. A plugin whose package lives in
+//! a contract crate generates its manifest with [`plugin_manifest!`]. Both
+//! emit `PLUGIN_ID`, `PLUGIN_MANIFEST` (the complete manifest TOML the host
+//! reads without running plugin code) and a `provides` module re-exporting
+//! exactly the provided interfaces, so typed route tables can only name
+//! declared routes.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic)]
@@ -24,7 +33,7 @@ use std::path::PathBuf;
 
 use bmux_plugin_schema::codegen_rust::{ImportInfo, ImportMap};
 use proc_macro::TokenStream;
-use quote::{ToTokens, quote};
+use quote::{ToTokens, format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{Ident, LitStr, Path, Token, braced, parse_macro_input};
 
@@ -35,14 +44,52 @@ pub fn schema(input: TokenStream) -> TokenStream {
     result_tokens(expand(args))
 }
 
+/// Generate a plugin manifest from the `world` of a package that lives in a
+/// dependency (a plugin API crate) plus the plugin's own settings file:
+///
+/// ```ignore
+/// pub mod declaration {
+///     bmux_plugin_schema_macros::plugin_manifest! {
+///         package: {
+///             schema: ::bmux_tabs_plugin_api::export_schema,
+///             crate_path: ::bmux_tabs_plugin_api,
+///         },
+///         settings: "plugin.toml",
+///     }
+/// }
+/// ```
+#[proc_macro]
+pub fn plugin_manifest(input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(input as ManifestArgs);
+    result_tokens(expand(args.0))
+}
+
 /// Continue expansion after a dependency supplies its literal schema text.
 /// This is an implementation detail of `schema!`, not a stable entry point.
 #[doc(hidden)]
 #[proc_macro]
 pub fn __schema_import(input: TokenStream) -> TokenStream {
-    let continuation = parse_macro_input!(input as ImportContinuation);
+    let continuation = parse_macro_input!(input as Continuation);
     let mut args = continuation.args;
-    args.imports[continuation.index].source = ImportSource::Inline(continuation.source);
+    let Some(entry) = args.imports.get_mut(continuation.index) else {
+        return result_tokens(Err("invalid schema import continuation index".into()));
+    };
+    entry.source = ImportSource::Inline(continuation.source);
+    result_tokens(expand_resolved(&args))
+}
+
+/// Continue expansion after a dependency supplies the root package text.
+/// This is an implementation detail of `plugin_manifest!`.
+#[doc(hidden)]
+#[proc_macro]
+pub fn __schema_package(input: TokenStream) -> TokenStream {
+    let continuation = parse_macro_input!(input as Continuation);
+    let mut args = continuation.args;
+    let Some(package) = args.package.as_mut() else {
+        return result_tokens(Err("package continuation without a package".into()));
+    };
+    package.provider = None;
+    args.source = continuation.source;
     result_tokens(expand_resolved(&args))
 }
 
@@ -77,7 +124,7 @@ fn expand(mut args: SchemaArgs) -> Result<proc_macro2::TokenStream, String> {
     let mut read = |source: &str| {
         let path = root.join(source);
         let text = std::fs::read_to_string(&path)
-            .map_err(|err| format!("failed to read BPDL schema `{}`: {err}", path.display()))?;
+            .map_err(|err| format!("failed to read `{}`: {err}", path.display()))?;
         let path = literal(&path.to_string_lossy());
         // File reads performed by a proc macro alone are not tracked by rustc.
         tracking.extend(quote!(
@@ -85,7 +132,12 @@ fn expand(mut args: SchemaArgs) -> Result<proc_macro2::TokenStream, String> {
         ));
         Ok::<_, String>(text)
     };
-    args.source = read(&args.source)?;
+    if args.package.is_none() {
+        args.source = read(&args.source)?;
+    }
+    if let Some(manifest) = &args.manifest {
+        args.manifest = Some(read(manifest)?);
+    }
     for import in &mut args.imports {
         if let ImportSource::File(path) = &import.source {
             import.source = ImportSource::Inline(read(path)?);
@@ -98,17 +150,19 @@ fn expand(mut args: SchemaArgs) -> Result<proc_macro2::TokenStream, String> {
 fn expand_resolved(args: &SchemaArgs) -> Result<proc_macro2::TokenStream, String> {
     // Rust expands the provider macro before invoking our continuation, giving
     // us literal data without locating the dependency's source directory.
+    if let Some(PackageRoot {
+        provider: Some(provider),
+        ..
+    }) = &args.package
+    {
+        return Ok(quote! {
+            #provider! { ::bmux_plugin_schema_macros::__schema_package, { #args }, 0 }
+        });
+    }
     for (index, import) in args.imports.iter().enumerate() {
         if let ImportSource::Dependency(provider) = &import.source {
-            let source = literal(&args.source);
-            let export = args.export.iter().map(|name| quote!(export: #name,));
-            let imports = &args.imports;
             return Ok(quote! {
-                #provider! {
-                    ::bmux_plugin_schema_macros::__schema_import,
-                    { source: #source, #(#export)* imports: { #(#imports,)* } },
-                    #index
-                }
+                #provider! { ::bmux_plugin_schema_macros::__schema_import, { #args }, #index }
             });
         }
     }
@@ -126,21 +180,30 @@ fn expand_resolved(args: &SchemaArgs) -> Result<proc_macro2::TokenStream, String
         imports.insert(
             alias,
             ImportInfo {
-                crate_path: import
-                    .crate_path
-                    .to_token_stream()
-                    .to_string()
-                    .replace(' ', ""),
+                crate_path: path_string(&import.crate_path),
                 schema,
             },
         );
     }
-    let schema = bmux_plugin_schema::compile_with_imports(&args.source, &schemas)
-        .map_err(|err| err.to_string())?;
-    let generated: proc_macro2::TokenStream =
+    let schema = if args.package.is_some() {
+        // A dependency's package was validated by its own crate; its own
+        // imports are not needed to read the world's interface surface.
+        bmux_plugin_schema::compile(&args.source)
+    } else {
+        bmux_plugin_schema::compile_with_imports(&args.source, &schemas)
+    }
+    .map_err(|err| err.to_string())?;
+    let generated: proc_macro2::TokenStream = if args.package.is_some() {
+        proc_macro2::TokenStream::new()
+    } else {
         bmux_plugin_schema::codegen_rust::emit_with_imports(&schema, &imports)
             .parse()
-            .map_err(|err| format!("bmux_plugin_schema codegen produced invalid Rust: {err}"))?;
+            .map_err(|err| format!("bmux_plugin_schema codegen produced invalid Rust: {err}"))?
+    };
+    let manifest = match &args.manifest {
+        Some(settings) => manifest_tokens(args, &schema, &imports, settings)?,
+        None => proc_macro2::TokenStream::new(),
+    };
     let export = args.export.iter().map(|name| {
         let source = literal(&args.source);
         quote! {
@@ -153,26 +216,105 @@ fn expand_resolved(args: &SchemaArgs) -> Result<proc_macro2::TokenStream, String
             }
         }
     });
-    Ok(quote!(#(#export)* #generated))
+    Ok(quote!(#(#export)* #generated #manifest))
 }
 
-struct ImportContinuation {
+fn path_string(path: &Path) -> String {
+    path.to_token_stream().to_string().replace(' ', "")
+}
+
+/// `PLUGIN_ID`, `PLUGIN_MANIFEST` and the `provides` route module.
+fn manifest_tokens(
+    args: &SchemaArgs,
+    schema: &bmux_plugin_schema::ast::Schema,
+    imports: &ImportMap,
+    settings: &str,
+) -> Result<proc_macro2::TokenStream, String> {
+    let (package, set) = bmux_plugin_schema::canonical::package_set(schema, imports);
+    let manifest = bmux_plugin_schema::manifest::generate(&set, &package, settings)
+        .map_err(|err| format!("plugin manifest generation failed: {err}"))?;
+    let local_root = args.package.as_ref().map_or_else(
+        || quote!(super),
+        |package| package.crate_path.to_token_stream(),
+    );
+    let mut seen = BTreeMap::new();
+    let mut reexports = Vec::new();
+    for world in &package.worlds {
+        for item in &world.items {
+            let bmux_plugin_schema::ir::WorldItem::Provide { interface, .. } = item else {
+                continue;
+            };
+            let (owner, root) = match &interface.import {
+                None => (&package, local_root.clone()),
+                Some(alias) => {
+                    let owner = set
+                        .imported(&package, alias)
+                        .ok_or_else(|| format!("unresolved world import `{alias}`"))?;
+                    let crate_path: Path = syn::parse_str(&imports[alias].crate_path)
+                        .map_err(|err| format!("invalid crate path for `{alias}`: {err}"))?;
+                    (owner, crate_path.to_token_stream())
+                }
+            };
+            let iface = owner
+                .find_interface(&interface.name, interface.version)
+                .ok_or_else(|| format!("world names unknown interface `{}`", interface.name))?;
+            let module = bmux_plugin_schema::codegen_rust::interface_module(owner, iface);
+            if let Some(previous) = seen.insert(module.clone(), iface.wire_id()) {
+                return Err(format!(
+                    "provided interfaces `{previous}` and `{}` share the Rust module name `{module}`",
+                    iface.wire_id()
+                ));
+            }
+            let module = format_ident!("{module}");
+            reexports.push(quote!(pub use #root::#module;));
+        }
+    }
+    let id = literal(&package.id);
+    let manifest = literal(&manifest);
+    let doc = literal(&format!(
+        " Complete manifest of `{}`, generated from its BPDL world and plugin settings.",
+        package.id
+    ));
+    Ok(quote! {
+        /// Plugin id declared by the BPDL package.
+        pub const PLUGIN_ID: &str = #id;
+        #[doc = #doc]
+        pub const PLUGIN_MANIFEST: &str = #manifest;
+        /// Interfaces this plugin provides. Typed route tables name endpoints
+        /// through this module, so an undeclared route does not compile.
+        pub mod provides {
+            #(#reexports)*
+        }
+    })
+}
+
+/// Continuation payload: `{ args } index, "source"`.
+struct Continuation {
     args: SchemaArgs,
     index: usize,
     source: String,
 }
 
-impl Parse for ImportContinuation {
+impl Parse for Continuation {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let content;
         braced!(content in input);
         let args: SchemaArgs = content.parse()?;
         let index: syn::LitInt = input.parse()?;
         let value = index.base10_parse::<usize>()?;
-        if !matches!(
+        let pending_package = matches!(
+            &args.package,
+            Some(PackageRoot {
+                provider: Some(_),
+                ..
+            })
+        );
+        let pending_import = matches!(
             args.imports.get(value).map(|entry| &entry.source),
             Some(ImportSource::Dependency(_))
-        ) {
+        );
+        let valid = (pending_package && value == 0) || pending_import;
+        if !valid {
             return Err(syn::Error::new(
                 index.span(),
                 "invalid schema import continuation index",
@@ -188,9 +330,47 @@ impl Parse for ImportContinuation {
 }
 
 struct SchemaArgs {
+    /// A path before files are read; schema text afterwards. Empty while a
+    /// dependency package is pending.
     source: String,
     export: Option<Ident>,
+    /// A settings path before files are read; settings text afterwards.
+    manifest: Option<String>,
+    /// Root package supplied by a dependency (`plugin_manifest!`). Present
+    /// packages generate no bindings: the dependency already owns them.
+    package: Option<PackageRoot>,
     imports: Vec<ImportEntry>,
+}
+
+struct PackageRoot {
+    /// Export macro still to expand, or `None` once `source` holds the text.
+    provider: Option<Path>,
+    crate_path: Path,
+}
+
+impl ToTokens for SchemaArgs {
+    fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
+        let source = literal(&self.source);
+        tokens.extend(quote!(source: #source,));
+        if let Some(export) = &self.export {
+            tokens.extend(quote!(export: #export,));
+        }
+        if let Some(manifest) = &self.manifest {
+            let manifest = literal(manifest);
+            tokens.extend(quote!(manifest: #manifest,));
+        }
+        if let Some(package) = &self.package {
+            let crate_path = &package.crate_path;
+            match &package.provider {
+                Some(provider) => {
+                    tokens.extend(quote!(package: { schema: #provider, crate_path: #crate_path },))
+                }
+                None => tokens.extend(quote!(package: { crate_path: #crate_path },)),
+            }
+        }
+        let imports = &self.imports;
+        tokens.extend(quote!(imports: { #(#imports,)* }));
+    }
 }
 
 enum ImportSource {
@@ -278,10 +458,63 @@ impl Parse for ImportEntry {
     }
 }
 
+impl Parse for PackageRoot {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let body;
+        braced!(body in input);
+        let mut provider = None;
+        let mut crate_path = None;
+        while !body.is_empty() {
+            let field: Ident = body.parse()?;
+            body.parse::<Token![:]>()?;
+            match field.to_string().as_str() {
+                "schema" if provider.is_none() => provider = Some(body.parse()?),
+                "crate_path" if crate_path.is_none() => crate_path = Some(body.parse()?),
+                _ => {
+                    return Err(syn::Error::new(
+                        field.span(),
+                        "expected one `schema` and one `crate_path`",
+                    ));
+                }
+            }
+            if !body.is_empty() {
+                body.parse::<Token![,]>()?;
+            }
+        }
+        Ok(Self {
+            provider,
+            crate_path: crate_path
+                .ok_or_else(|| syn::Error::new(body.span(), "package missing `crate_path`"))?,
+        })
+    }
+}
+
+fn parse_imports(input: ParseStream<'_>) -> syn::Result<Vec<ImportEntry>> {
+    let content;
+    braced!(content in input);
+    let mut entries: Vec<ImportEntry> = Vec::new();
+    while !content.is_empty() {
+        let entry: ImportEntry = content.parse()?;
+        if entries.iter().any(|previous| previous.alias == entry.alias) {
+            return Err(syn::Error::new(
+                entry.alias.span(),
+                "duplicate import alias",
+            ));
+        }
+        entries.push(entry);
+        if !content.is_empty() {
+            content.parse::<Token![,]>()?;
+        }
+    }
+    Ok(entries)
+}
+
 impl Parse for SchemaArgs {
     fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
         let mut source = None;
         let mut export = None;
+        let mut manifest = None;
+        let mut package = None;
         let mut imports = None;
         while !input.is_empty() {
             let key: Ident = input.parse()?;
@@ -289,29 +522,16 @@ impl Parse for SchemaArgs {
             match key.to_string().as_str() {
                 "source" if source.is_none() => source = Some(input.parse::<LitStr>()?.value()),
                 "export" if export.is_none() => export = Some(input.parse()?),
-                "imports" if imports.is_none() => {
-                    let content;
-                    braced!(content in input);
-                    let mut entries: Vec<ImportEntry> = Vec::new();
-                    while !content.is_empty() {
-                        let entry: ImportEntry = content.parse()?;
-                        if entries.iter().any(|previous| previous.alias == entry.alias) {
-                            return Err(syn::Error::new(
-                                entry.alias.span(),
-                                "duplicate import alias",
-                            ));
-                        }
-                        entries.push(entry);
-                        if !content.is_empty() {
-                            content.parse::<Token![,]>()?;
-                        }
-                    }
-                    imports = Some(entries);
+                "manifest" if manifest.is_none() => {
+                    manifest = Some(input.parse::<LitStr>()?.value());
                 }
+                // Internal: continuation state of `plugin_manifest!`.
+                "package" if package.is_none() => package = Some(input.parse()?),
+                "imports" if imports.is_none() => imports = Some(parse_imports(input)?),
                 _ => {
                     return Err(syn::Error::new(
                         key.span(),
-                        "unknown or duplicate schema argument; expected `source`, `export`, or `imports`",
+                        "unknown or duplicate schema argument; expected `source`, `export`, `manifest`, or `imports`",
                     ));
                 }
             }
@@ -324,8 +544,61 @@ impl Parse for SchemaArgs {
                 syn::Error::new(input.span(), "schema! requires a `source:` field")
             })?,
             export,
+            manifest,
+            package,
             imports: imports.unwrap_or_default(),
         })
+    }
+}
+
+/// `plugin_manifest!` arguments, normalized into [`SchemaArgs`].
+struct ManifestArgs(SchemaArgs);
+
+impl Parse for ManifestArgs {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        let mut package: Option<PackageRoot> = None;
+        let mut settings = None;
+        let mut imports = None;
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![:]>()?;
+            match key.to_string().as_str() {
+                "package" if package.is_none() => {
+                    let root: PackageRoot = input.parse()?;
+                    if root.provider.is_none() {
+                        return Err(syn::Error::new(
+                            key.span(),
+                            "`package` requires `schema: <dependency export macro>`",
+                        ));
+                    }
+                    package = Some(root);
+                }
+                "settings" if settings.is_none() => {
+                    settings = Some(input.parse::<LitStr>()?.value());
+                }
+                "imports" if imports.is_none() => imports = Some(parse_imports(input)?),
+                _ => {
+                    return Err(syn::Error::new(
+                        key.span(),
+                        "unknown or duplicate argument; expected `package`, `settings`, or `imports`",
+                    ));
+                }
+            }
+            if !input.is_empty() {
+                input.parse::<Token![,]>()?;
+            }
+        }
+        Ok(Self(SchemaArgs {
+            source: String::new(),
+            export: None,
+            manifest: Some(settings.ok_or_else(|| {
+                syn::Error::new(input.span(), "plugin_manifest! requires `settings:`")
+            })?),
+            package: Some(package.ok_or_else(|| {
+                syn::Error::new(input.span(), "plugin_manifest! requires `package:`")
+            })?),
+            imports: imports.unwrap_or_default(),
+        }))
     }
 }
 
@@ -386,8 +659,34 @@ mod tests {
             .is_err()
         );
         assert!(
-            syn::parse_str::<ImportContinuation>(
+            syn::parse_str::<Continuation>(
                 r#"{ source: "plugin p version 1;" } 0, "plugin q version 1;""#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn plugin_manifest_args_round_trip_through_continuations() {
+        let ManifestArgs(args) = syn::parse_str(
+            r#"
+            package: { schema: ::api::export_schema, crate_path: ::api },
+            settings: "plugin.toml",
+        "#,
+        )
+        .unwrap();
+        assert!(args.package.as_ref().unwrap().provider.is_some());
+        let tokens = args.to_token_stream().to_string();
+        let reparsed: SchemaArgs = syn::parse_str(&tokens).unwrap();
+        assert_eq!(reparsed.manifest.as_deref(), Some("plugin.toml"));
+        assert!(reparsed.package.unwrap().provider.is_some());
+        let continuation: Continuation =
+            syn::parse_str(&format!("{{ {tokens} }} 0, \"plugin p version 1;\"")).unwrap();
+        assert_eq!(continuation.source, "plugin p version 1;");
+        assert!(syn::parse_str::<ManifestArgs>(r#"settings: "plugin.toml""#).is_err());
+        assert!(
+            syn::parse_str::<ManifestArgs>(
+                r#"package: { crate_path: ::api }, settings: "plugin.toml""#
             )
             .is_err()
         );

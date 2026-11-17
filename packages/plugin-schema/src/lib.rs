@@ -22,7 +22,8 @@
 //!   plugin host to check consumer/provider compatibility.
 //! - The [`ir`] module: the language-neutral canonical contract IR every
 //!   backend consumes. [`canonical`] hashes contract identity from it and
-//!   [`wit`] lowers it to WIT.
+//!   [`wit`] lowers it to WIT; [`manifest`] generates plugin manifests from
+//!   its worlds.
 //!
 //! # Example schema
 //!
@@ -55,6 +56,7 @@ pub mod canonical;
 pub mod codegen_rust;
 pub mod ir;
 pub mod lexer;
+pub mod manifest;
 pub mod parser;
 pub mod registry;
 pub mod validator;
