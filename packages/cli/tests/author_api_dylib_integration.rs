@@ -239,4 +239,18 @@ fn generated_clients_reach_a_generated_provider_across_dylibs() {
     // publishes on the host bus and the watcher's activation-owned task (a
     // dylib) receives it, including the change the CLI caused.
     sandbox.wait_for_log(&["watcher: observed 14"]);
+
+    // A command-local activation of the counter in the CLI declares its
+    // channel where no event bus is bound: it activates with events unbound
+    // and its `bump` reaches the server's counter, whose change the server
+    // watcher observes.
+    let bump = sandbox.run(&["plugin", "run", "example.counter", "bump", "--by", "1"]);
+    support::assert_success(&bump, "counter bump");
+    assert!(
+        String::from_utf8_lossy(&bump.stdout).contains("counter: 15"),
+        "{}\n{}",
+        support::combined_output(&bump),
+        sandbox.evidence()
+    );
+    sandbox.wait_for_log(&["watcher: observed 15"]);
 }

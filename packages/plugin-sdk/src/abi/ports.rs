@@ -189,9 +189,18 @@ impl Drop for Admission {
 fn event_port_error(error: bmux_plugin_runtime::rt::events::EventPortError) -> PluginError {
     match error {
         bmux_plugin_runtime::rt::events::EventPortError::Closed => PluginError::InvocationCancelled,
-        other => PluginError::ServiceProtocol {
-            details: other.to_string(),
-        },
+        // The host bound no event bus to this instance (a CLI command-local
+        // activation): the same answer as an in-process host without one.
+        bmux_plugin_runtime::rt::events::EventPortError::Unsupported => {
+            PluginError::UnsupportedHostOperation {
+                operation: "activation events",
+            }
+        }
+        rejected @ bmux_plugin_runtime::rt::events::EventPortError::Rejected(_) => {
+            PluginError::ServiceProtocol {
+                details: rejected.to_string(),
+            }
+        }
     }
 }
 
