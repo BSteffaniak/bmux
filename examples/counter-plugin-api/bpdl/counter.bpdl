@@ -1,0 +1,45 @@
+// Reference contract for the generated author API: a counter service, its
+// retained change events, a plugin command and an extension point. The
+// counter plugin implements it; the watcher plugin consumes it.
+plugin example.counter version 1;
+
+capability COUNTER_READ = example.counter.read;
+capability COUNTER_WRITE = example.counter.write;
+
+/// Change the counter.
+@capability(COUNTER_WRITE)
+@interface-version(1)
+interface counter-commands {
+    /// Add `by` and return the new value.
+    command incr(by: u64) -> u64;
+}
+
+/// Read the counter.
+@capability(COUNTER_READ)
+@interface-version(1)
+interface counter-state {
+    /// The current value.
+    query get() -> u64;
+}
+
+/// Retained counter changes.
+interface counter-events {
+    record changed { value: u64 }
+    @state
+    events changed;
+}
+
+/// Increment the counter from the command line.
+command bump(by: u64?) title "Increment the counter";
+
+/// How a contributor renders the counter.
+extension-point counter-display version 1 {
+    data { label: string, order: u32 }
+    interface { query render(value: u64) -> string; }
+}
+
+world counter {
+    provide counter-commands;
+    provide counter-state;
+    provide counter-events capability example.counter.read;
+}

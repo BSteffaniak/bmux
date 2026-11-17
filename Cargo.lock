@@ -2342,6 +2342,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_example_counter_plugin"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_example_counter_plugin_api",
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "tokio",
+]
+
+[[package]]
+name = "bmux_example_counter_plugin_api"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_codec",
+ "bmux_ipc",
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "serde",
+]
+
+[[package]]
 name = "bmux_example_native_plugin"
 version = "0.0.1-alpha.4"
 dependencies = [
@@ -2356,6 +2377,18 @@ dependencies = [
  "serde",
  "serde_json",
  "uuid",
+]
+
+[[package]]
+name = "bmux_example_watcher_plugin"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_example_counter_plugin",
+ "bmux_example_counter_plugin_api",
+ "bmux_ipc",
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "tokio",
 ]
 
 [[package]]

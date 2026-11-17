@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "xtask",
+    "examples/counter-plugin",
+    "examples/counter-plugin-api",
     "examples/hello-plugin",
     "examples/native-plugin",
     "examples/prompt-showcase",
@@ -9,6 +11,7 @@ members = [
     "examples/tui-components-inputs",
     "examples/tui-components-navigation",
     "examples/tui-components-layout-playground",
+    "examples/watcher-plugin",
     "packages/attach-image-protocol",
     "packages/appearance",
     "packages/attach-token-state",
@@ -256,7 +259,10 @@ bmux_context_state = { version = "0.0.1-alpha.4", default-features = false, path
 bmux_diagnostic_log = { version = "0.0.1-alpha.4", default-features = false, path = "packages/diagnostic-log" }
 bmux_env = { version = "0.0.1-alpha.4", default-features = false, path = "packages/bmux-env" }
 bmux_event_models = { version = "0.0.1-alpha.4", default-features = false, path = "packages/event/models" }
+bmux_example_counter_plugin = { version = "0.0.1-alpha.4", default-features = false, path = "examples/counter-plugin" }
+bmux_example_counter_plugin_api = { version = "0.0.1-alpha.4", default-features = false, path = "examples/counter-plugin-api" }
 bmux_example_native_plugin = { version = "0.0.1-alpha.4", default-features = false, path = "examples/native-plugin" }
+bmux_example_watcher_plugin = { version = "0.0.1-alpha.4", default-features = false, path = "examples/watcher-plugin" }
 bmux_fonts = { version = "0.0.1-alpha.4", default-features = false, path = "packages/fonts" }
 bmux_image = { version = "0.0.1-alpha.4", default-features = false, path = "packages/image" }
 bmux_ipc = { version = "0.0.1-alpha.4", default-features = false, path = "packages/ipc" }

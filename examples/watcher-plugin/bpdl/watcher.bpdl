@@ -1,0 +1,13 @@
+// Consumer side of the reference author API: it requires the counter's
+// interfaces and calls them through generated clients.
+plugin example.watcher version 1;
+
+import counter = example.counter;
+
+/// Bump the counter through its service and read the value back.
+command watch(by: u64?) title "Bump the counter and read it back";
+
+world watcher {
+    require counter.counter-commands;
+    require counter.counter-state;
+}

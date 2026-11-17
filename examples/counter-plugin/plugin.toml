@@ -1,0 +1,7 @@
+component_roles = ["backend"]
+id              = "example.counter"
+name            = "Example Counter"
+# BPDL commands are exposed in the CLI; the plugin owns their paths.
+owns_paths = [["bump"]]
+runtime    = "native"
+version    = "0.0.1"
