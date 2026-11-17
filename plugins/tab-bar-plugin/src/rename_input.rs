@@ -126,14 +126,13 @@ pub fn paint(
         return (Vec::new(), None);
     }
     let content_width =
-        u64::try_from(unicode_width::UnicodeWidthStr::width(input.text()).saturating_add(1))
+        u64::try_from(bmux_cell_geometry::display_width(input.text()).saturating_add(1))
             .unwrap_or(u64::MAX)
             .max(u64::from(width));
     let selected_all = input
         .selection()
         .is_some_and(|range| range.start == 0 && range.end == input.text().len());
-    let cursor_col =
-        unicode_width::UnicodeWidthStr::width(&input.text()[..input.cursor_byte_index()]);
+    let cursor_col = bmux_cell_geometry::display_width(&input.text()[..input.cursor_byte_index()]);
     let content = LayoutNode::leaf("rename".into(), LogicalSize::new(content_width, 1));
     let layout = LayoutNode::with_children(
         "rename.viewport".into(),
@@ -147,7 +146,7 @@ pub fn paint(
     let mut offset = usize::try_from(scroll.horizontal_offset()).unwrap_or(usize::MAX);
     let mut boundary = 0;
     for grapheme in unicode_segmentation::UnicodeSegmentation::graphemes(input.text(), true) {
-        let next = boundary + unicode_width::UnicodeWidthStr::width(grapheme);
+        let next = boundary + bmux_cell_geometry::grapheme_width(grapheme);
         if next > offset {
             offset = boundary;
             break;
@@ -173,7 +172,7 @@ pub fn paint(
             continue;
         };
         if cell.is_wide_continuation()
-            || usize::from(col) + unicode_width::UnicodeWidthStr::width(cell.symbol.as_str())
+            || usize::from(col) + bmux_cell_geometry::display_width(cell.symbol.as_str())
                 > usize::from(width)
         {
             continue;
@@ -242,6 +241,16 @@ mod tests {
     fn mouse(input: &mut RenameInput, kind: MouseEventKind, col: u16) {
         input.dispatch(&Event::Mouse(MouseEvent::new(kind, Point::new(col, 0))));
         refresh(input);
+    }
+
+    #[test]
+    fn rename_cursor_scrolls_to_the_painted_cell_after_lam_alef() {
+        let input = TextEditBuffer::from_text("لا").into();
+        let (ops, _) = paint(&input, 2, 7, 0, bmux_plugin::RenderStyle::default());
+        assert!(ops.iter().any(
+            |op| matches!(op, bmux_plugin::RenderOp::TextRun { x: 7, text, .. } if text == "ا")
+        ));
+        assert!(ops.iter().any(|op| matches!(op, bmux_plugin::RenderOp::TextRun { x: 8, text, style, .. } if text == " " && style.reverse)));
     }
 
     #[test]

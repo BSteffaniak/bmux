@@ -2,7 +2,6 @@
 
 use bmux_tui::prelude::{Line, Span, Style};
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 /// Render a title and metadata, wrapping metadata onto indented continuation rows as needed.
 #[must_use]
@@ -21,8 +20,8 @@ pub fn header_rows(
         }
         let separator = Span::styled(" · ", separator_style);
         let current_width = line_width(&current);
-        let added_width = UnicodeWidthStr::width(separator.content.as_str())
-            + UnicodeWidthStr::width(item.content.as_str());
+        let added_width = bmux_cell_geometry::display_width(separator.content.as_str())
+            + bmux_cell_geometry::display_width(item.content.as_str());
         if current_width + added_width <= usize::from(width) {
             current.spans.push(separator);
             current.spans.push(item);
@@ -38,7 +37,7 @@ pub fn header_rows(
 /// Truncate text to a terminal-cell width while preserving grapheme boundaries.
 #[must_use]
 pub fn truncate_width(value: &str, width: usize) -> String {
-    if UnicodeWidthStr::width(value) <= width {
+    if bmux_cell_geometry::display_width(value) <= width {
         return value.to_owned();
     }
     if width == 0 {
@@ -48,7 +47,7 @@ pub fn truncate_width(value: &str, width: usize) -> String {
     let mut output = String::new();
     let mut used = 0_usize;
     for grapheme in value.graphemes(true) {
-        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        let grapheme_width = bmux_cell_geometry::grapheme_width(grapheme);
         if used.saturating_add(grapheme_width) > target {
             break;
         }
@@ -85,7 +84,7 @@ pub fn format_bytes(value: u64) -> String {
 fn line_width(line: &Line) -> usize {
     line.spans
         .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_str()))
+        .map(|span| bmux_cell_geometry::display_width(span.content.as_str()))
         .sum()
 }
 
@@ -114,7 +113,7 @@ mod tests {
     fn remains_bounded_for_large_input() {
         let value = "🙂".repeat(1_000_000);
         let truncated = truncate_width(&value, 12);
-        assert!(UnicodeWidthStr::width(truncated.as_str()) <= 12);
+        assert!(bmux_cell_geometry::display_width(truncated.as_str()) <= 12);
         assert!(truncated.len() < 64);
     }
 

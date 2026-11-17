@@ -14,7 +14,6 @@ use bmux_tui::{
     semantic::SemanticScene,
 };
 use serde::{Deserialize, Serialize};
-use unicode_width::UnicodeWidthStr;
 
 /// Full-snapshot wire version. Unknown versions are never guessed.
 pub const WIRE_VERSION: u32 = 3;
@@ -426,7 +425,7 @@ impl BrowserFrame {
                     return Err(DecodeError::Invalid("wide continuation"));
                 }
             } else {
-                let width = UnicodeWidthStr::width(cell.symbol.as_str()).clamp(1, 2);
+                let width = bmux_cell_geometry::display_width(cell.symbol.as_str()).clamp(1, 2);
                 if usize::from(cell.width()) != width {
                     return Err(DecodeError::Invalid("cell width"));
                 }

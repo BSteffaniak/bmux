@@ -91,7 +91,6 @@
 use std::any::Any;
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
-use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 /// Minimal rectangle used by render extensions to report content-rect
@@ -432,7 +431,7 @@ pub trait AttachVisualAdapter: Send + Sync {
 /// host do not duplicate subtly different width calculations.
 #[must_use]
 pub fn render_text_width_u16(text: &str) -> u16 {
-    u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX)
+    u16::try_from(bmux_cell_geometry::display_width(text)).unwrap_or(u16::MAX)
 }
 
 /// Return the Unicode display-cell width of a single scalar value.

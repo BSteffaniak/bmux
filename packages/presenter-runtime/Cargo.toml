@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bmux_cell_geometry = { workspace = true }
 bmux_mermaid_render = { workspace = true }
 bmux_presenter = { workspace = true }
 bmux_tui = { workspace = true, features = ["serde"] }
@@ -31,7 +32,6 @@ tokio = { workspace = true, features = [
 ] }
 tokio-rustls = { workspace = true }
 unicode-segmentation = { workspace = true }
-unicode-width = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]

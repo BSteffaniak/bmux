@@ -5,7 +5,6 @@ use bmux_markdown::{
     render_markdown_lines, resolve_markdown_destination,
 };
 use bmux_tui::prelude::{Color, Line, Modifier, Style};
-use unicode_width::UnicodeWidthStr;
 
 const ALERTS: &str = include_str!("fixtures/alerts.md");
 const ALERTS_STREAMING: &str = include_str!("fixtures/alerts_streaming.md");
@@ -1431,7 +1430,7 @@ fn unicode_table_preserves_consistent_edges_and_display_width() {
         .collect::<Vec<_>>();
     let widths = visible
         .iter()
-        .map(|line| UnicodeWidthStr::width(line.as_str()))
+        .map(|line| bmux_cell_geometry::display_width(line.as_str()))
         .collect::<Vec<_>>();
 
     assert!(!visible.is_empty());
@@ -1457,7 +1456,7 @@ fn rendered_lines_respect_requested_width_for_wrappable_text() {
                 .map(|span| span.content.as_str())
                 .collect::<String>();
             assert!(
-                UnicodeWidthStr::width(text.as_str()) <= usize::from(width.max(1)),
+                bmux_cell_geometry::display_width(text.as_str()) <= usize::from(width.max(1)),
                 "line exceeds width {width}: {text:?}"
             );
         }
@@ -1490,7 +1489,7 @@ fn bordered_table_lines_have_consistent_display_width() {
                 .iter()
                 .map(|span| span.content.as_str())
                 .collect::<String>();
-            UnicodeWidthStr::width(text.as_str())
+            bmux_cell_geometry::display_width(text.as_str())
         })
         .collect::<Vec<_>>();
 

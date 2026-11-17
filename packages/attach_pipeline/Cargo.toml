@@ -31,12 +31,12 @@ image = { workspace = true, default-features = false, features = [
     "bmp",
 ] }
 
-anyhow        = { workspace = true, features = ["std"] }
-futures-util  = { workspace = true, features = ["std"] }
-tokio         = { workspace = true, features = ["sync", "time"] }
-tracing       = { workspace = true, features = ["std"] }
-unicode-width = { workspace = true }
-uuid          = { workspace = true, features = ["std"] }
+anyhow             = { workspace = true, features = ["std"] }
+bmux_cell_geometry = { workspace = true }
+futures-util       = { workspace = true, features = ["std"] }
+tokio              = { workspace = true, features = ["sync", "time"] }
+tracing            = { workspace = true, features = ["std"] }
+uuid               = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 bmux_bench = { workspace = true }

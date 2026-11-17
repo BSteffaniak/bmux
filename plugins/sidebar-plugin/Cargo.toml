@@ -10,6 +10,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bmux_cell_geometry        = { workspace = true }
 bmux_plugin               = { workspace = true, features = ["tui"] }
 bmux_plugin_schema_macros = { workspace = true }
 bmux_plugin_sdk           = { workspace = true }
@@ -21,7 +22,6 @@ tokio                     = { workspace = true, features = ["rt", "sync"] }
 toml                      = { workspace = true }
 tracing                   = { workspace = true }
 unicode-segmentation      = { workspace = true }
-unicode-width             = { workspace = true }
 uuid                      = { workspace = true, features = ["std"] }
 
 [features]

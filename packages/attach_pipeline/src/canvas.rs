@@ -108,8 +108,7 @@ impl<'canvas, 'frame, 'buffer> Canvas<'canvas, 'frame, 'buffer> {
                 i64::from(y),
                 text.char_indices().map(|(start, ch)| SizedCell {
                     symbol: &text[start..start + ch.len_utf8()],
-                    width: u8::try_from(unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1))
-                        .unwrap_or(1),
+                    width: u8::try_from(bmux_cell_geometry::scalar_width(ch)).unwrap_or(1),
                     style,
                 }),
             );
@@ -209,7 +208,7 @@ impl<'canvas, 'frame, 'buffer> Canvas<'canvas, 'frame, 'buffer> {
 /// a neighbour into one grapheme (regional indicators, emoji skin-tone modifiers).
 fn standalone_char(ch: char) -> bool {
     !matches!(ch, '\u{1f1e6}'..='\u{1f1ff}' | '\u{1f3fb}'..='\u{1f3ff}')
-        && matches!(unicode_width::UnicodeWidthChar::width(ch), Some(1 | 2))
+        && matches!(bmux_cell_geometry::scalar_width(ch), 1 | 2)
 }
 
 /// Paint into `buffer` through a canvas (a frame painted over what `buffer` holds), for callers

@@ -24,8 +24,8 @@ unicode-segmentation         = { workspace = true }
 url                          = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
-insta         = { workspace = true }
-unicode-width = { workspace = true }
+bmux_cell_geometry = { workspace = true }
+insta              = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 hyperchad_markdown = { workspace = true, features = ["syntax-highlighting"] }

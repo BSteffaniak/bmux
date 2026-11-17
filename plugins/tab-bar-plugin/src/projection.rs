@@ -4,7 +4,6 @@ use bmux_tui::composition::{Row, TextBlock};
 use bmux_tui::measured_list::MeasuredListIndex;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
-use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 use super::{
@@ -459,7 +458,7 @@ pub fn project_bar(
         workspace_name.map_or_else(String::new, |name| truncate_cells(name, workspace_budget));
     let show_workspace = workspace_name.is_some() && workspace_budget > 0;
     let tab_budget = width
-        .saturating_sub(UnicodeWidthStr::width(workspace_label.as_str()))
+        .saturating_sub(bmux_cell_geometry::display_width(workspace_label.as_str()))
         .saturating_sub(if show_workspace { 3 } else { 0 })
         .saturating_sub(right_width)
         .saturating_sub(usize::from(!right.is_empty()))
@@ -475,7 +474,7 @@ pub fn project_bar(
             let label = render_tab_template(settings, draft.as_ref().unwrap_or(tab), index, local);
             let text = style.tab(&label, tab.active);
             TabToken {
-                width: UnicodeWidthStr::width(text.as_str()),
+                width: bmux_cell_geometry::display_width(text.as_str()),
                 text,
                 active: tab.active,
                 hovered: settings.hover_highlight && hovered_tab_id == Some(tab.id),
@@ -686,11 +685,11 @@ fn wrapped_ranges(
             let row_start = next;
             let available = if row == 0 { first_budget } else { budget };
             // Leave room for boundary overflow chrome, but never sacrifice the anchor.
-            let chrome = UnicodeWidthStr::width(
+            let chrome = bmux_cell_geometry::display_width(
                 style
                     .overflow(tokens.len(), settings.overflow_style)
                     .as_str(),
-            ) + UnicodeWidthStr::width(style.tab_separator.as_str());
+            ) + bmux_cell_geometry::display_width(style.tab_separator.as_str());
             let available = if (row == 0 && start > 0) || row + 1 == rows {
                 available.saturating_sub(chrome).max(1)
             } else {
@@ -701,7 +700,7 @@ fn wrapped_ranges(
                 let gap = if next == row_start {
                     0
                 } else {
-                    UnicodeWidthStr::width(style.tab_separator.as_str())
+                    bmux_cell_geometry::display_width(style.tab_separator.as_str())
                 };
                 let size = tokens[next].width.min(available);
                 if next > row_start && used.saturating_add(gap).saturating_add(size) > available {
@@ -798,12 +797,14 @@ fn append_tabs(
     let hidden_right = tokens.len().saturating_sub(tab.end);
     // Chrome must not consume the anchor's entire budget on narrow resizes.
     // Keep the marker only when it leaves room for the first tab's label.
-    let leading_width = UnicodeWidthStr::width(
+    let leading_width = bmux_cell_geometry::display_width(
         style
             .overflow(hidden_left, settings.overflow_style)
             .as_str(),
     )
-    .saturating_add(UnicodeWidthStr::width(style.tab_separator.as_str()));
+    .saturating_add(bmux_cell_geometry::display_width(
+        style.tab_separator.as_str(),
+    ));
     let anchor_width = tokens.get(tab.start).map_or(0, |token| token.width);
     if hidden_left > 0 && leading_width.saturating_add(anchor_width) <= budget {
         output.push(ProjectedSegment {
@@ -926,12 +927,12 @@ fn status_item_segments(
     }
     let mut ordered = items.iter().collect::<Vec<_>>();
     ordered.sort_by_key(|item| std::cmp::Reverse(item.priority));
-    let separator_width = UnicodeWidthStr::width(style.module_separator.as_str());
+    let separator_width = bmux_cell_geometry::display_width(style.module_separator.as_str());
     let mut result = Vec::new();
     let mut used = 0_usize;
     for item in ordered.into_iter().take(policy.max_items) {
         let text = style.badge(&ellipsize_cells(&item.text, policy.max_item_width));
-        let width = UnicodeWidthStr::width(text.as_str());
+        let width = bmux_cell_geometry::display_width(text.as_str());
         let separator = if result.is_empty() && !trailing_separator {
             0
         } else {
@@ -969,7 +970,7 @@ const fn status_kind(severity: status_items_list::Severity) -> SegmentKind {
 
 /// Truncate to `maximum` cells, marking elision with `…`.
 fn ellipsize_cells(value: &str, maximum: usize) -> String {
-    if UnicodeWidthStr::width(value) <= maximum {
+    if bmux_cell_geometry::display_width(value) <= maximum {
         return value.to_string();
     }
     let mut output = truncate_cells(value, maximum.saturating_sub(1));
@@ -1020,7 +1021,7 @@ fn visible_tabs_for_layout(
     }
     // Index the horizontal main axis with the shared measured extent index.
     // Whole-tab admission and overflow chrome remain presentation policy here.
-    let gap = UnicodeWidthStr::width(style.tab_separator.as_str()) as u64;
+    let gap = bmux_cell_geometry::display_width(style.tab_separator.as_str()) as u64;
     if measurements.gap() != gap {
         *measurements = MeasuredListIndex::new(gap);
     }
@@ -1079,13 +1080,13 @@ fn overflow_width(
     style: &RenderStyle,
     overflow_style: OverflowStyle,
 ) -> u64 {
-    let separator = UnicodeWidthStr::width(style.tab_separator.as_str()) as u64;
+    let separator = bmux_cell_geometry::display_width(style.tab_separator.as_str()) as u64;
     [range.start, count.saturating_sub(range.end)]
         .into_iter()
         .filter(|hidden| *hidden > 0)
         .fold(0_u64, |width, hidden| {
             width
-                .saturating_add(UnicodeWidthStr::width(
+                .saturating_add(bmux_cell_geometry::display_width(
                     style.overflow(hidden, overflow_style).as_str(),
                 ) as u64)
                 .saturating_add(separator)
@@ -1106,10 +1107,10 @@ fn tab_window_width(
         .unwrap_or(0)
         .saturating_add(measurements.item(last).map_or(0, |item| item.height));
     let mut width = end.saturating_sub(start);
-    let separator = UnicodeWidthStr::width(style.tab_separator.as_str()) as u64;
+    let separator = bmux_cell_geometry::display_width(style.tab_separator.as_str()) as u64;
     if tab.start > 0 {
         width = width
-            .saturating_add(UnicodeWidthStr::width(
+            .saturating_add(bmux_cell_geometry::display_width(
                 style.overflow(tab.start, overflow_style).as_str(),
             ) as u64)
             .saturating_add(separator);
@@ -1117,7 +1118,7 @@ fn tab_window_width(
     let hidden_right = measurements.len().saturating_sub(tab.end);
     if hidden_right > 0 {
         width = width
-            .saturating_add(UnicodeWidthStr::width(
+            .saturating_add(bmux_cell_geometry::display_width(
                 style.overflow(hidden_right, overflow_style).as_str(),
             ) as u64)
             .saturating_add(separator);
@@ -1162,7 +1163,7 @@ pub fn name_ranges(
     } else {
         style.inactive_prefix
     };
-    let offset = UnicodeWidthStr::width(prefix);
+    let offset = bmux_cell_geometry::display_width(prefix);
     render_tab_template_ranges(settings, tab, index, local)
         .1
         .into_iter()
@@ -1217,8 +1218,8 @@ fn render_tab_template_ranges(
                 if terminated && let Some(value) = value {
                     if placeholder == "name" {
                         ranges.push((
-                            UnicodeWidthStr::width(output.as_str()),
-                            UnicodeWidthStr::width(value.as_str()),
+                            bmux_cell_geometry::display_width(output.as_str()),
+                            bmux_cell_geometry::display_width(value.as_str()),
                         ));
                     }
                     output.push_str(&value);
@@ -1240,7 +1241,7 @@ fn truncate_cells(value: &str, maximum: usize) -> String {
     let mut output = String::new();
     let mut width = 0_usize;
     for grapheme in unicode_segmentation::UnicodeSegmentation::graphemes(value, true) {
-        let character_width = UnicodeWidthStr::width(grapheme);
+        let character_width = bmux_cell_geometry::grapheme_width(grapheme);
         if width.saturating_add(character_width) > maximum {
             break;
         }
@@ -1257,11 +1258,12 @@ fn truncate_segments(segments: &mut Vec<ProjectedSegment>, maximum: usize) {
         if remaining == 0 {
             break;
         }
-        let width = UnicodeWidthStr::width(segment.text.as_str());
+        let width = bmux_cell_geometry::display_width(segment.text.as_str());
         if width > remaining {
             segment.text = truncate_cells(&segment.text, remaining);
         }
-        remaining = remaining.saturating_sub(UnicodeWidthStr::width(segment.text.as_str()));
+        remaining =
+            remaining.saturating_sub(bmux_cell_geometry::display_width(segment.text.as_str()));
         if !segment.text.is_empty() {
             retained.push(segment);
         }
@@ -1272,7 +1274,7 @@ fn truncate_segments(segments: &mut Vec<ProjectedSegment>, maximum: usize) {
 fn segments_width(segments: &[ProjectedSegment]) -> usize {
     segments
         .iter()
-        .map(|segment| UnicodeWidthStr::width(segment.text.as_str()))
+        .map(|segment| bmux_cell_geometry::display_width(segment.text.as_str()))
         .sum()
 }
 
@@ -1397,7 +1399,7 @@ mod tests {
     fn measured_tab_windows_preserve_gaps_and_overflow_at_wide_offsets() {
         let settings = Settings::default();
         let style = RenderStyle::from_settings(&settings);
-        let gap = UnicodeWidthStr::width(style.tab_separator.as_str()) as u64;
+        let gap = bmux_cell_geometry::display_width(style.tab_separator.as_str()) as u64;
         let mut measurements = MeasuredListIndex::new(gap);
         measurements.sync((1..=3).map(|key| (Uuid::from_u128(key), 0)), 0, 0, |_| {
             70_000
@@ -1408,7 +1410,7 @@ mod tests {
                 let mut expected = count * 70_000 + (count - 1) * gap;
                 for hidden in [start, 3 - end] {
                     if hidden > 0 {
-                        expected += UnicodeWidthStr::width(
+                        expected += bmux_cell_geometry::display_width(
                             style.overflow(hidden, settings.overflow_style).as_str(),
                         ) as u64
                             + gap;
@@ -1576,7 +1578,7 @@ mod tests {
                 },
             );
             let text = projected.plain_text();
-            assert!(UnicodeWidthStr::width(text.as_str()) <= usize::from(width));
+            assert!(bmux_cell_geometry::display_width(text.as_str()) <= usize::from(width));
             assert!(
                 !projected.tab_ranges().is_empty(),
                 "width {width}: {text:?}"
@@ -1611,7 +1613,7 @@ mod tests {
                 projected.plain_text()
             );
             assert_eq!(
-                UnicodeWidthStr::width(projected.plain_text().as_str()),
+                bmux_cell_geometry::display_width(projected.plain_text().as_str()),
                 usize::from(width)
             );
         }
@@ -1645,7 +1647,7 @@ mod tests {
                 projected.plain_text()
             );
             assert_eq!(
-                UnicodeWidthStr::width(projected.plain_text().as_str()),
+                bmux_cell_geometry::display_width(projected.plain_text().as_str()),
                 usize::from(width)
             );
         }
@@ -1685,7 +1687,7 @@ mod tests {
             &ProjectionInteraction::default(),
         );
         let text = projected.plain_text();
-        assert_eq!(UnicodeWidthStr::width(text.as_str()), 40);
+        assert_eq!(bmux_cell_geometry::display_width(text.as_str()), 40);
         assert!(text.contains(" main "));
         assert!(text.contains(" NORMAL "));
         assert!(text.contains(" write "));
@@ -1717,7 +1719,10 @@ mod tests {
                 &ProjectionInteraction::default(),
             );
             let text = projected.plain_text();
-            assert_eq!(UnicodeWidthStr::width(text.as_str()), usize::from(width));
+            assert_eq!(
+                bmux_cell_geometry::display_width(text.as_str()),
+                usize::from(width)
+            );
             if width == 100 {
                 assert!(text.contains(name));
             }
@@ -1888,7 +1893,7 @@ mod tests {
             &ProjectionInteraction::default(),
         );
         let text = projected.plain_text();
-        assert_eq!(UnicodeWidthStr::width(text.as_str()), 50);
+        assert_eq!(bmux_cell_geometry::display_width(text.as_str()), 50);
         assert!(text.contains("default"));
         assert!(text.contains("tab-7"));
         assert!(text.contains('◀'));
@@ -1908,7 +1913,10 @@ mod tests {
                 &ProjectionInteraction::default(),
             );
             let text = projected.plain_text();
-            assert_eq!(UnicodeWidthStr::width(text.as_str()), usize::from(width));
+            assert_eq!(
+                bmux_cell_geometry::display_width(text.as_str()),
+                usize::from(width)
+            );
             assert!(text.contains("NORMAL"), "width {width}: {text:?}");
             if width >= 40 {
                 assert!(text.contains("write"), "width {width}: {text:?}");
@@ -2168,11 +2176,12 @@ mod tests {
                     .iter()
                     .find(|segment| segment.kind == kind)
                     .unwrap();
-                widths.push(UnicodeWidthStr::width(segment.text.as_str()));
+                widths.push(bmux_cell_geometry::display_width(segment.text.as_str()));
                 for width in [1, 8, 25] {
                     let narrow = project_bar(&settings, &tabs, &local(width), None, &interaction);
                     assert!(
-                        UnicodeWidthStr::width(narrow.plain_text().as_str()) <= usize::from(width)
+                        bmux_cell_geometry::display_width(narrow.plain_text().as_str())
+                            <= usize::from(width)
                     );
                 }
             }

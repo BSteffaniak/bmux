@@ -8,7 +8,6 @@ use bmux_tui::geometry::Rect;
 use bmux_tui::paint::PaintCx;
 use bmux_tui::prelude::{Color, Line, Modifier, Span, Style};
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 mod intraline;
 mod row_layout;
@@ -1297,7 +1296,7 @@ fn wrapped_source_chunks(source: &str, width: usize) -> Vec<(usize, &str)> {
     let mut start = 0_usize;
     let mut display_width = 0_usize;
     for (offset, grapheme) in source.grapheme_indices(true) {
-        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        let grapheme_width = bmux_cell_geometry::grapheme_width(grapheme);
         if display_width > 0 && display_width.saturating_add(grapheme_width) > width {
             output.push((start, &source[start..offset]));
             start = offset;
@@ -1348,7 +1347,7 @@ fn inline_preview(lines: &[DiffLine], max_rows: usize) -> Vec<PreviewRow<'_>> {
 fn side_by_side_content_widths(preview: &[PreviewRow<'_>]) -> (usize, usize) {
     preview.iter().fold((0, 0), |(old, new), row| match row {
         PreviewRow::Line(line) => {
-            let width = UnicodeWidthStr::width(line.content.as_str());
+            let width = bmux_cell_geometry::display_width(line.content.as_str());
             match line.kind {
                 DiffLineKind::Removed => (old.max(width), new),
                 DiffLineKind::Added => (old, new.max(width)),
@@ -1544,7 +1543,7 @@ fn split_hidden_row_with_style(
     if old_count > 0 && new_count > 0 {
         let inner_width = usize::from(width).saturating_sub(2);
         let clipped = truncate_to_display_width(&text, inner_width);
-        let text_width = UnicodeWidthStr::width(clipped.as_str());
+        let text_width = bmux_cell_geometry::display_width(clipped.as_str());
         let left_padding = inner_width.saturating_sub(text_width) / 2;
         let right_padding = inner_width
             .saturating_sub(text_width)
@@ -1580,7 +1579,7 @@ fn split_hidden_row_with_style(
 
 fn centered_hidden_cell(text: Option<&str>, width: usize, style: Style) -> Vec<Span> {
     let clipped = truncate_to_display_width(text.unwrap_or_default(), width);
-    let text_width = UnicodeWidthStr::width(clipped.as_str());
+    let text_width = bmux_cell_geometry::display_width(clipped.as_str());
     let left_padding = width.saturating_sub(text_width) / 2;
     let right_padding = width
         .saturating_sub(text_width)
@@ -1746,9 +1745,9 @@ fn card_width_with_gutter(
     let content_width = preview
         .iter()
         .map(|row| match row {
-            PreviewRow::Line(line) => UnicodeWidthStr::width(line.content.as_str()),
+            PreviewRow::Line(line) => bmux_cell_geometry::display_width(line.content.as_str()),
             PreviewRow::Hidden { count, .. } => {
-                UnicodeWidthStr::width(hidden_text(*count).as_str())
+                bmux_cell_geometry::display_width(hidden_text(*count).as_str())
             }
         })
         .max()
@@ -1781,7 +1780,7 @@ fn hidden_row_with_style(count: usize, width: u16, style: DiffViewerStyle) -> Li
     let text = hidden_text(count);
     let inner_width = usize::from(width.saturating_sub(4));
     let clipped = truncate_to_display_width(&text, inner_width);
-    let clipped_width = UnicodeWidthStr::width(clipped.as_str());
+    let clipped_width = bmux_cell_geometry::display_width(clipped.as_str());
     let padding = inner_width.saturating_sub(clipped_width);
     let left_padding = padding / 2;
     let right_padding = padding.saturating_sub(left_padding);
@@ -1802,7 +1801,7 @@ fn truncate_to_display_width(text: &str, width: usize) -> String {
     let mut output = String::new();
     let mut output_width = 0usize;
     for grapheme in text.graphemes(true) {
-        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        let grapheme_width = bmux_cell_geometry::grapheme_width(grapheme);
         if output_width.saturating_add(grapheme_width) > width {
             break;
         }
@@ -2103,7 +2102,7 @@ mod tests {
         let rendered_width: usize = row
             .spans
             .iter()
-            .map(|span| UnicodeWidthStr::width(span.content.as_ref() as &str))
+            .map(|span| bmux_cell_geometry::display_width(span.content.as_ref() as &str))
             .sum();
         assert_eq!(rendered_width, usize::from(width) + 2);
         let text_index = row
@@ -2111,8 +2110,10 @@ mod tests {
             .iter()
             .position(|span| span.content.contains("rows omitted"))
             .expect("omission text");
-        let left_padding = UnicodeWidthStr::width(row.spans[text_index - 1].content.as_str());
-        let right_padding = UnicodeWidthStr::width(row.spans[text_index + 1].content.as_str());
+        let left_padding =
+            bmux_cell_geometry::display_width(row.spans[text_index - 1].content.as_str());
+        let right_padding =
+            bmux_cell_geometry::display_width(row.spans[text_index + 1].content.as_str());
         assert!(left_padding.abs_diff(right_padding) <= 1);
     }
 
@@ -2588,7 +2589,7 @@ mod tests {
     fn line_width(line: &Line) -> usize {
         line.spans
             .iter()
-            .map(|span| UnicodeWidthStr::width(span.content.as_ref() as &str))
+            .map(|span| bmux_cell_geometry::display_width(span.content.as_ref() as &str))
             .sum()
     }
 

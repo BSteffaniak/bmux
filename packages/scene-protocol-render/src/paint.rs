@@ -22,7 +22,6 @@ use bmux_terminal::cursor::MoveTo;
 use bmux_terminal::queue;
 use bmux_terminal::style::Print;
 use std::io;
-use unicode_width::UnicodeWidthStr;
 
 use crate::capabilities::{SceneRenderCapabilities, capability_query_matches};
 use crate::glyphs::border_glyphs_corners_or_custom;
@@ -219,13 +218,15 @@ fn queue_gradient_run<W: io::Write>(
     from_style: &Style,
     to_style: &Style,
 ) -> Result<()> {
-    let graphemes: Vec<&str> = grapheme_iter(text).collect();
+    let graphemes: Vec<&str> = bmux_cell_geometry::graphemes(text)
+        .filter(|g| bmux_cell_geometry::grapheme_width(g) != 0)
+        .collect();
     let n = graphemes.len();
     if n == 0 {
         return Ok(());
     }
     if n == 1 {
-        queue_styled_text(stdout, col, row, text, from_style)?;
+        queue_styled_text(stdout, col, row, graphemes[0], from_style)?;
         return Ok(());
     }
     let mut offset: u16 = 0;
@@ -238,8 +239,9 @@ fn queue_gradient_run<W: io::Write>(
         match axis {
             GradientAxis::Horizontal => {
                 queue_styled_text(stdout, col.saturating_add(offset), row, grapheme, &style)?;
-                offset =
-                    offset.saturating_add(u16::try_from(grapheme_width(grapheme)).unwrap_or(1));
+                offset = offset.saturating_add(
+                    u16::try_from(bmux_cell_geometry::grapheme_width(grapheme)).unwrap_or(1),
+                );
             }
             GradientAxis::Vertical => {
                 queue_styled_text(stdout, col, row.saturating_add(offset), grapheme, &style)?;
@@ -398,22 +400,6 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     let b = f32::from(b);
     let v = a + (b - a) * t.clamp(0.0, 1.0);
     v.round().clamp(0.0, 255.0) as u8
-}
-
-/// Grapheme iterator that walks `text` one Unicode scalar at a time.
-/// Adequate for border glyphs and ASCII art; complex graphemes (emoji
-/// clusters) will paint one scalar per position.
-fn grapheme_iter(text: &str) -> impl Iterator<Item = &str> {
-    let mut chars = text.char_indices().peekable();
-    std::iter::from_fn(move || {
-        let (start, _) = chars.next()?;
-        let end = chars.peek().map_or(text.len(), |(i, _)| *i);
-        Some(&text[start..end])
-    })
-}
-
-fn grapheme_width(g: &str) -> usize {
-    UnicodeWidthStr::width(g).max(1)
 }
 
 /// Compose a horizontal border row: `left` corner, `mid` repeated

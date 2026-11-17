@@ -9,7 +9,6 @@ use crate::selection::{
     ComponentSelectionOutcome, ComponentSelectionPolicy, ComponentSelectionState,
     paint_component_scope,
 };
-use unicode_width::UnicodeWidthStr;
 
 /// Input used to render a source viewer card.
 #[derive(Debug, Clone, Copy)]
@@ -301,8 +300,8 @@ fn source_card_width(
     let available = usize::from(available_width.max(1));
     let content_width = lines
         .iter()
-        .map(|line| UnicodeWidthStr::width(*line))
-        .chain(truncated_message.map(UnicodeWidthStr::width))
+        .map(|line| bmux_cell_geometry::display_width(line))
+        .chain(truncated_message.map(bmux_cell_geometry::display_width))
         .max()
         .unwrap_or(0);
     let desired = content_width.saturating_add(source_card_chrome_width(number_width));
@@ -366,7 +365,7 @@ pub(crate) fn pad_card_spans(spans: &mut Vec<Span>, target_width: usize, style: 
 fn spans_width(spans: &[Span]) -> usize {
     spans
         .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_str()))
+        .map(|span| bmux_cell_geometry::display_width(span.content.as_str()))
         .sum()
 }
 
@@ -548,7 +547,7 @@ mod tests {
                 .iter()
                 .map(|span| span.content.as_str())
                 .collect::<String>();
-            assert!(UnicodeWidthStr::width(text.as_str()) <= usize::from(width));
+            assert!(bmux_cell_geometry::display_width(text.as_str()) <= usize::from(width));
             assert!(text.ends_with('│') || text.ends_with('┐') || text.ends_with('┘'));
         }
     }
@@ -614,7 +613,7 @@ mod tests {
     fn line_width(line: &Line) -> usize {
         line.spans
             .iter()
-            .map(|span| UnicodeWidthStr::width(span.content.as_str()))
+            .map(|span| bmux_cell_geometry::display_width(span.content.as_str()))
             .sum()
     }
 

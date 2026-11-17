@@ -16,6 +16,7 @@ bmux_plugin_sdk = { workspace = true }
 
 bmux_plugin_runtime = { workspace = true }
 # External dependencies (host-side only)
+bmux_cell_geometry  = { workspace = true }
 bmux_codec          = { workspace = true }
 bmux_ipc            = { workspace = true }
 bmux_keyboard       = { workspace = true, optional = true }
@@ -31,7 +32,6 @@ thiserror           = { workspace = true }
 tokio               = { workspace = true, features = ["rt", "sync", "time"] }
 toml                = { workspace = true, features = ["parse"] }
 tracing             = { workspace = true, features = ["std"] }
-unicode-width       = { workspace = true }
 uuid                = { workspace = true, features = ["serde", "std"] }
 
 [target.'cfg(unix)'.dependencies]

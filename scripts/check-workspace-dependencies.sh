@@ -43,6 +43,8 @@ def check(path, table, section=()):
             for name, dependency in value.items():
                 spec = dependency if isinstance(dependency, dict) else {}
                 location = f"{path} [{'.'.join(current)}] {name}"
+                if spec.get("package", name) == "unicode-width" and path != "packages/cell-geometry/Cargo.toml":
+                    errors.append(f"{location}: measure terminal cells through bmux_cell_geometry")
                 inherited = spec.get("workspace") is True
                 if "path" in spec:
                     errors.append(f"{location}: define paths in workspace.dependencies only")

@@ -23,6 +23,7 @@ name              = "virtual_list_motion"
 required-features = ["virtual-list"]
 
 [dependencies]
+bmux_cell_geometry = { workspace = true, optional = true }
 bmux_color = { workspace = true }
 bmux_keyboard = { workspace = true, optional = true }
 bmux_terminal_grid = { workspace = true, optional = true }
@@ -35,13 +36,12 @@ chrono = { workspace = true, features = ["serde"], optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 unicode-segmentation = { workspace = true, optional = true }
-unicode-width = { workspace = true, optional = true }
 
 [dev-dependencies]
 bmux_keyboard = { workspace = true }
 # `terminal-io` serves the standalone `virtual_list_chat` example's terminal input.
 bmux_tui_runtime = { workspace = true, features = ["terminal-io", "testing"] }
-tokio = { workspace = true, features = ["rt", "time"] }
+tokio            = { workspace = true, features = ["rt", "time"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-time = { workspace = true }
@@ -66,11 +66,15 @@ canvas = []
 card = []
 chart = ["dep:unicode-segmentation"]
 checkbox = ["keyboard-input"]
-compact = ["dep:unicode-segmentation", "dep:unicode-width"]
+compact = ["dep:unicode-segmentation", "dep:bmux_cell_geometry"]
 completion = ["text-input", "selectable-list", "picker-frame"]
 date-picker = ["keyboard-input", "dep:bmux_text_edit", "dep:chrono"]
 dialog = ["action-row", "modal-frame"]
-diff-viewer = ["source-viewer", "dep:unicode-segmentation", "dep:unicode-width"]
+diff-viewer = [
+    "source-viewer",
+    "dep:unicode-segmentation",
+    "dep:bmux_cell_geometry",
+]
 disclosure = []
 empty-state = []
 form = ["keyboard-input"]
@@ -89,7 +93,7 @@ scroll-view = ["keyboard-input", "scrollbar"]
 scrollbar = []
 select-dropdown = ["selectable-list"]
 selectable-list = ["keyboard-input", "scroll-view"]
-source-viewer = ["dep:unicode-segmentation", "dep:unicode-width"]
+source-viewer = ["dep:unicode-segmentation", "dep:bmux_cell_geometry"]
 sparkline = []
 spinner = []
 split-button = ["button", "menu"]

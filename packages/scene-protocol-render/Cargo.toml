@@ -12,9 +12,9 @@ version     = { workspace = true }
 
 [dependencies]
 anyhow              = { workspace = true }
+bmux_cell_geometry  = { workspace = true }
 bmux_scene_protocol = { workspace = true }
 bmux_terminal       = { workspace = true }
-unicode-width       = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["serde", "std"] }

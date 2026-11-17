@@ -30,5 +30,10 @@ pub fn display_width(text: &str) -> usize {
     if text.bytes().all(|byte| matches!(byte, b' '..=b'~')) {
         return text.len();
     }
-    text.graphemes(true).map(grapheme_width).sum()
+    graphemes(text).map(grapheme_width).sum()
+}
+
+/// Extended graphemes in the order in which a terminal row paints them.
+pub fn graphemes(text: &str) -> impl DoubleEndedIterator<Item = &str> + Clone {
+    text.graphemes(true)
 }
