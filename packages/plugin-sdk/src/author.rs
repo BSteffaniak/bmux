@@ -539,8 +539,11 @@ fn identity_metadata(manifest: &str) -> Result<crate::definition::PluginMetadata
         #[serde(default)]
         contracts: Vec<crate::definition::ContractDescriptor>,
     }
-    let identity: Identity =
+    let mut identity: Identity =
         toml::from_str(manifest).map_err(|error| Error::failed(error.to_string()))?;
+    // Capabilities are a set; hosts read them in canonical (sorted) order.
+    identity.required_capabilities.sort();
+    identity.required_capabilities.dedup();
     if identity.component_roles.is_empty() {
         return Err(Error::failed(
             "manifest must declare component_roles explicitly",

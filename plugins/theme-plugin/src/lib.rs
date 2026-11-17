@@ -6209,17 +6209,12 @@ mod embedded_declaration_identity_tests {
         assert_eq!(definition.metadata.roles, manifest.component_roles);
         assert_eq!(definition.metadata.contracts, manifest.contracts);
         assert_eq!(
-            definition
-                .metadata
-                .required_capabilities
-                .iter()
-                .cloned()
-                .collect::<std::collections::BTreeSet<_>>(),
+            definition.metadata.required_capabilities,
             manifest
                 .required_capabilities
                 .iter()
                 .map(ToString::to_string)
-                .collect::<std::collections::BTreeSet<_>>()
+                .collect::<Vec<_>>()
         );
 
         // Deterministic verifier fixtures, not claims about built executable bytes.
