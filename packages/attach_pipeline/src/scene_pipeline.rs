@@ -1,4 +1,4 @@
-use crate::cursor::apply_attach_cursor_state;
+use crate::frame_presenter::{CapturedFrame, FramePresenter, Presented, capture_frame};
 use crate::reconcile::{
     apply_attach_output_chunk_with, attach_layout_pane_id_set,
     attach_layout_requires_snapshot_hydration, attach_scene_revealed_pane_ids,
@@ -23,9 +23,6 @@ use bmux_attach_pipeline_models::{
 use bmux_attach_view_protocol::AttachViewComponent;
 use bmux_client::{AttachLayoutState, AttachPaneSnapshotState, AttachSnapshotState};
 use bmux_terminal_grid::{GridDeltaBatch, GridLimits, GridMode, GridSnapshot, TerminalGridStream};
-use bmux_terminal::cursor::{Hide, SavePosition};
-use bmux_terminal::queue;
-use bmux_terminal::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -54,6 +51,7 @@ pub struct AttachScenePipeline {
     dirty_pane_ids: BTreeSet<Uuid>,
     full_pane_redraw: bool,
     last_cursor_state: Option<AttachCursorState>,
+    presenter: FramePresenter,
     diagnostics: VecDeque<AttachPipelineDiagnosticEvent>,
     next_diagnostic_sequence: u64,
     max_diagnostics: usize,
@@ -71,11 +69,12 @@ pub struct UndecoratedGridPresenter {
     terminal_graphics_cache: TerminalGraphicsCache,
     last_cursor_state: Option<AttachCursorState>,
     synchronized_updates: bool,
+    presenter: FramePresenter,
 }
 
 impl UndecoratedGridPresenter {
     #[must_use]
-    pub const fn new(cols: u16, rows: u16) -> Self {
+    pub fn new(cols: u16, rows: u16) -> Self {
         Self {
             dimensions: (cols, rows),
             snapshot: None,
@@ -83,6 +82,7 @@ impl UndecoratedGridPresenter {
             terminal_graphics_cache: TerminalGraphicsCache::new(),
             last_cursor_state: None,
             synchronized_updates: false,
+            presenter: FramePresenter::new(),
         }
     }
 
@@ -120,7 +120,6 @@ impl UndecoratedGridPresenter {
         }
         let mut pending_buffers = BTreeMap::from([(surface_id, pending_buffer)]);
         let mut pending_graphics = self.terminal_graphics_cache.clone();
-        let mut pending_cursor = self.last_cursor_state;
         let scene = undecorated_scene(dimensions);
         let frame_damage = if full_frame {
             FrameDamage::full_frame()
@@ -129,39 +128,45 @@ impl UndecoratedGridPresenter {
             damage.mark_content_surface(surface_id);
             damage
         };
-        let mut frame_bytes = Vec::new();
-        if self.synchronized_updates {
-            queue!(frame_bytes, BeginSynchronizedUpdate)?;
-        }
-        queue!(frame_bytes, SavePosition, Hide)?;
-        // Hide is encoded, not committed. Ensure cursor visibility is restored
-        // even when its desired state matches the previously displayed frame.
-        if let Some(cursor) = &mut pending_cursor {
-            cursor.visible = false;
-        }
-        let cursor = render_attach_scene_with_terminal_graphics_cache(
-            &mut frame_bytes,
-            &scene,
-            &[],
-            &mut pending_buffers,
-            &mut pending_graphics,
-            &frame_damage,
-            0,
-            0,
-            &PaneScrollbackViews::new(),
-            false,
-            dimensions,
-            &bmux_appearance::RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &[],
-        )?;
-        apply_attach_cursor_state(&mut frame_bytes, cursor, &mut pending_cursor, false)?;
-        if self.synchronized_updates {
-            queue!(frame_bytes, EndSynchronizedUpdate)?;
-        }
+        let (cursor, operations, graphics) = capture_frame(|| {
+            render_attach_scene_with_terminal_graphics_cache(
+                &mut Vec::new(),
+                &scene,
+                &[],
+                &mut pending_buffers,
+                &mut pending_graphics,
+                &frame_damage,
+                0,
+                0,
+                &PaneScrollbackViews::new(),
+                false,
+                dimensions,
+                &bmux_appearance::RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &[],
+            )
+        });
+        let pending_cursor = cursor?;
+        self.presenter
+            .set_synchronized_output(self.synchronized_updates);
+        let frame_bytes = match self.presenter.present(&CapturedFrame {
+            operations: &operations,
+            cursor: pending_cursor,
+            full: full_frame,
+            size: dimensions,
+            margins: false,
+            graphics: (&graphics).into(),
+        }) {
+            Presented::Frame(bytes) => bytes,
+            Presented::Unchanged => Vec::new(),
+            Presented::Unsupported(reason) => {
+                anyhow::bail!("authoritative grid frame cannot be presented: {reason}")
+            }
+        };
         if let Err(error) = crate::terminal::write_frame(writer, &frame_bytes) {
             // A partial frame is never the new baseline. Repair the next frame
             // in full, including cursor and any retained graphics.
+            self.presenter.forget();
             self.snapshot = None;
             self.pane_buffers.clear();
             self.terminal_graphics_cache.clear();
@@ -223,6 +228,7 @@ impl AttachScenePipeline {
             dirty_pane_ids: BTreeSet::new(),
             full_pane_redraw: true,
             last_cursor_state: None,
+            presenter: FramePresenter::new(),
             diagnostics: VecDeque::new(),
             next_diagnostic_sequence: 1,
             max_diagnostics: 256,
@@ -629,33 +635,46 @@ impl AttachScenePipeline {
             damage
         };
 
-        let mut frame_bytes = Vec::new();
-        queue!(frame_bytes, BeginSynchronizedUpdate, SavePosition, Hide)?;
-        let cursor_state = render_attach_scene_with_terminal_graphics_cache(
-            &mut frame_bytes,
-            &layout_state.scene,
-            &layout_state.panes,
-            &mut self.pane_buffers,
-            &mut self.terminal_graphics_cache,
-            &frame_damage,
-            self.viewport.top_inset,
-            self.viewport.bottom_inset,
-            // Snapshot-mode scene pipeline renders live pane output only; it has
-            // no per-pane scrollback views.
-            &PaneScrollbackViews::new(),
-            layout_state.zoomed,
-            (self.viewport.cols, self.viewport.rows),
-            &bmux_appearance::RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &[],
-        )?;
-        apply_attach_cursor_state(
-            &mut frame_bytes,
-            cursor_state,
-            &mut self.last_cursor_state,
-            false,
-        )?;
-        queue!(frame_bytes, EndSynchronizedUpdate)?;
+        let pane_buffers = &mut self.pane_buffers;
+        let graphics_cache = &mut self.terminal_graphics_cache;
+        let viewport = self.viewport;
+        let (cursor, operations, graphics) = capture_frame(|| {
+            render_attach_scene_with_terminal_graphics_cache(
+                &mut Vec::new(),
+                &layout_state.scene,
+                &layout_state.panes,
+                pane_buffers,
+                graphics_cache,
+                &frame_damage,
+                viewport.top_inset,
+                viewport.bottom_inset,
+                // Snapshot-mode scene pipeline renders live pane output only; it has
+                // no per-pane scrollback views.
+                &PaneScrollbackViews::new(),
+                layout_state.zoomed,
+                (viewport.cols, viewport.rows),
+                &bmux_appearance::RuntimeAppearance::default(),
+                DamageCoalescingPolicy::default(),
+                &[],
+            )
+        });
+        let cursor_state = cursor?;
+        // The caller delivers the frame; it counts as shown once returned.
+        let frame_bytes = match self.presenter.present(&CapturedFrame {
+            operations: &operations,
+            cursor: cursor_state,
+            full: self.full_pane_redraw,
+            size: (viewport.cols, viewport.rows),
+            margins: false,
+            graphics: (&graphics).into(),
+        }) {
+            Presented::Frame(bytes) => bytes,
+            Presented::Unchanged => Vec::new(),
+            Presented::Unsupported(reason) => {
+                anyhow::bail!("attach scene frame cannot be presented: {reason}")
+            }
+        };
+        self.last_cursor_state = cursor_state;
 
         self.full_pane_redraw = false;
         self.dirty_pane_ids.clear();

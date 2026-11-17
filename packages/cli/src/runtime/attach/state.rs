@@ -259,7 +259,7 @@ pub struct AttachViewState {
     pub(super) replay_log: super::replay_log::ReplayLog,
     /// Present frames on the host through a `bmux_tui` terminal from what the renderer captures,
     /// instead of the renderer's own bytes; `None` with `BMUX_ATTACH_PRESENTER=bytes`.
-    pub(super) terminal_presenter: Option<bmux_tui::terminal::Terminal<Vec<u8>>>,
+    pub(super) terminal_presenter: Option<bmux_attach_pipeline::frame_presenter::FramePresenter>,
     /// The frame being rendered is presented through `terminal_presenter`.
     pub(super) presenting: bool,
     /// Frames use the renderer's own bytes until graphics a terminal frame cannot hold yet

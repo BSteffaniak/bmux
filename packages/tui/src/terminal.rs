@@ -262,6 +262,30 @@ pub struct Terminal<W> {
     applied_scrolls: Vec<AppliedScroll>,
     /// Change tracking reused by frames painted over the last one.
     over_storage: Option<OverChanges>,
+    /// Frames are wrapped in a synchronized update (DEC mode 2026).
+    synchronized_output: bool,
+}
+
+/// Write a frame with `frame`, inside a synchronized update (DEC mode 2026) when `synchronized`.
+/// The update is ended even when the frame fails, so the host does not stay frozen; the frame's
+/// error comes first.
+fn write_synchronized<W: Write>(
+    writer: &mut W,
+    synchronized: bool,
+    frame: impl FnOnce(&mut W) -> io::Result<DrawStats>,
+) -> io::Result<DrawStats> {
+    if synchronized {
+        writer.write_all(b"\x1b[?2026h")?;
+    }
+    let output = frame(writer);
+    let end = if synchronized {
+        writer.write_all(b"\x1b[?2026l")
+    } else {
+        Ok(())
+    };
+    let stats = output?;
+    end?;
+    Ok(stats)
 }
 
 impl<W: Write> Terminal<W> {
@@ -284,6 +308,7 @@ impl<W: Write> Terminal<W> {
             committed_damage: Damage::None,
             applied_scrolls: Vec::new(),
             over_storage: None,
+            synchronized_output: true,
         }
     }
 
@@ -305,6 +330,7 @@ impl<W: Write> Terminal<W> {
             committed_damage: self.committed_damage.clone(),
             applied_scrolls: self.applied_scrolls.clone(),
             over_storage: None,
+            synchronized_output: self.synchronized_output,
         }
     }
 
@@ -335,6 +361,7 @@ impl<W: Write> Terminal<W> {
             committed_damage: self.committed_damage.clone(),
             applied_scrolls: self.applied_scrolls.clone(),
             over_storage: None,
+            synchronized_output: self.synchronized_output,
         }
     }
 
@@ -365,6 +392,12 @@ impl<W: Write> Terminal<W> {
     #[must_use]
     pub const fn scroll_region_acceleration(&self) -> ScrollRegionAcceleration {
         self.scroll_acceleration
+    }
+
+    /// Select whether frames are wrapped in a synchronized update (DEC mode 2026), for a host
+    /// known to support it or one whose support is unknown and harmless to ask (the default).
+    pub const fn set_synchronized_output(&mut self, enabled: bool) {
+        self.synchronized_output = enabled;
     }
 
     /// Select whether scroll damage may use terminal scroll regions.
@@ -765,12 +798,12 @@ impl<W: Write> Terminal<W> {
             .pointer_output
             .begin_present(self.pointer_capability, shape)?;
         let depth = self.color_depth;
+        let synchronized = self.synchronized_output;
         let writer = &mut self.writer;
         let encoded = &mut self.encoded;
         let image_scene = self.state.image_scene();
         let result = (|| -> io::Result<DrawStats> {
-            writer.write_all(b"\x1b[?2026h")?;
-            let output = (|| -> io::Result<DrawStats> {
+            let stats = write_synchronized(writer, synchronized, |writer| {
                 let repaint = before(writer)?;
                 encoded.clear();
                 let stats = PresentationPhase::AnsiEncode.measure(
@@ -789,10 +822,7 @@ impl<W: Write> Terminal<W> {
                     writer.write_all(transaction.bytes())?;
                 }
                 Ok(stats)
-            })();
-            let end = writer.write_all(b"\x1b[?2026l");
-            let stats = output?;
-            end?;
+            })?;
             PresentationPhase::WriterFlush.measure(|| writer.flush(), Result::is_ok)?;
             Ok(stats)
         })();
@@ -908,6 +938,7 @@ impl<W: Write> Terminal<W> {
         let encoded = &mut self.encoded;
         let scroll_model = &mut self.scroll_model;
         let depth = self.color_depth;
+        let synchronized = self.synchronized_output;
         let mut applied = Vec::new();
         let result = self
             .state
@@ -928,8 +959,7 @@ impl<W: Write> Terminal<W> {
                 };
                 let transaction = pointer_output.begin_present(capability, shape)?;
                 let result = (|| {
-                    writer.write_all(b"\x1b[?2026h")?;
-                    let output: io::Result<DrawStats> = (|| {
+                    let stats = write_synchronized(writer, synchronized, |writer| {
                         let repaint = before(writer)?;
                         encoded.clear();
                         let stats = PresentationPhase::AnsiEncode.measure(
@@ -953,10 +983,7 @@ impl<W: Write> Terminal<W> {
                             writer.write_all(transaction.bytes())?;
                         }
                         Ok(stats)
-                    })();
-                    let end_result = writer.write_all(b"\x1b[?2026l");
-                    let stats = output?;
-                    end_result?;
+                    })?;
                     PresentationPhase::WriterFlush.measure(|| writer.flush(), Result::is_ok)?;
                     Ok(stats)
                 })();
@@ -1307,6 +1334,33 @@ mod tests {
             .unwrap();
         assert!(!terminal.writer().is_empty(), "a moved cursor is presented");
     }
+    #[test]
+    fn frames_without_synchronized_output_do_not_ask_for_it() {
+        let area = crate::geometry::Rect::new(0, 0, 8, 2);
+        for synchronized in [true, false] {
+            let mut terminal = Terminal::new(Vec::new(), area);
+            terminal.set_synchronized_output(synchronized);
+            terminal
+                .draw(|cx| {
+                    cx.write_line(LocalRect::new(0, 0, 4, 1), &crate::text::Line::raw("full"))
+                })
+                .unwrap();
+            terminal
+                .draw_over(|cx| {
+                    cx.write_line(LocalRect::new(0, 1, 4, 1), &crate::text::Line::raw("over"))
+                })
+                .unwrap();
+            let output = String::from_utf8_lossy(terminal.writer()).into_owned();
+            for mode in ["\u{1b}[?2026h", "\u{1b}[?2026l"] {
+                assert_eq!(
+                    output.matches(mode).count(),
+                    if synchronized { 2 } else { 0 }
+                );
+            }
+            assert!(output.contains("over"), "{output:?}");
+        }
+    }
+
     #[test]
     fn uniform_terminal_rejects_fragments_before_output_or_hooks() {
         use crate::buffer::Buffer;

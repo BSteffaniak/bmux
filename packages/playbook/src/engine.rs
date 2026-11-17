@@ -36,8 +36,7 @@ use bmux_session_models::SessionSelector;
 use bmux_sessions_plugin_api::{sessions_commands, sessions_state};
 use bmux_tabs_plugin_api::tabs_commands;
 use bmux_terminal::event::{
-    Event as TermEvent, KeyCode as TermKeyCode, KeyEvent, KeyEventKind, KeyEventState,
-    KeyModifiers,
+    Event as TermEvent, KeyCode as TermKeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
 };
 use regex::Regex;
 use std::sync::Arc;
@@ -594,6 +593,8 @@ struct PlaybookRenderTraceState {
     marks: std::collections::BTreeMap<String, usize>,
     summaries: Vec<PlaybookRenderSummary>,
     attach_render_buffers: BTreeMap<Uuid, PaneRenderBuffer>,
+    /// Presents the traced frames as the attach client does, for their byte counts.
+    attach_presenter: bmux_attach_pipeline::frame_presenter::FramePresenter,
 }
 
 struct PlaybookRenderRecordContext<'a> {
@@ -605,12 +606,13 @@ struct PlaybookRenderRecordContext<'a> {
 }
 
 impl PlaybookRenderTraceState {
-    const fn new(enabled: bool) -> Self {
+    fn new(enabled: bool) -> Self {
         Self {
             enabled,
             marks: std::collections::BTreeMap::new(),
             summaries: Vec::new(),
             attach_render_buffers: BTreeMap::new(),
+            attach_presenter: bmux_attach_pipeline::frame_presenter::FramePresenter::new(),
         }
     }
 
@@ -677,24 +679,45 @@ impl PlaybookRenderTraceState {
         }
         let damage_stats = damage.stats();
         let mut trace = AttachRenderTrace::new();
-        let mut bytes = Vec::new();
-        let (_cursor, stats) = render_attach_scene_with_stats_and_trace(
-            &mut bytes,
-            &layout.scene,
-            &layout.panes,
-            &mut self.attach_render_buffers,
-            &damage,
-            0,
-            0,
-            // Playbook render facts capture live pane content.
-            &bmux_attach_pipeline::PaneScrollbackViews::new(),
-            layout.zoomed,
-            viewport,
-            &RuntimeAppearance::default(),
-            DamageCoalescingPolicy::default(),
-            &[],
-            Some(&mut trace),
-        )?;
+        let buffers = &mut self.attach_render_buffers;
+        let trace_ref = &mut trace;
+        let (rendered, operations, graphics) =
+            bmux_attach_pipeline::frame_presenter::capture_frame(|| {
+                render_attach_scene_with_stats_and_trace(
+                    &mut Vec::new(),
+                    &layout.scene,
+                    &layout.panes,
+                    buffers,
+                    &damage,
+                    0,
+                    0,
+                    // Playbook render facts capture live pane content.
+                    &bmux_attach_pipeline::PaneScrollbackViews::new(),
+                    layout.zoomed,
+                    viewport,
+                    &RuntimeAppearance::default(),
+                    DamageCoalescingPolicy::default(),
+                    &[],
+                    Some(trace_ref),
+                )
+            });
+        let (cursor, stats) = rendered?;
+        let bytes = match self.attach_presenter.present(
+            &bmux_attach_pipeline::frame_presenter::CapturedFrame {
+                operations: &operations,
+                cursor,
+                full: damage.is_full_frame(),
+                size: viewport,
+                margins: false,
+                graphics: (&graphics).into(),
+            },
+        ) {
+            bmux_attach_pipeline::frame_presenter::Presented::Frame(bytes) => bytes,
+            bmux_attach_pipeline::frame_presenter::Presented::Unchanged => Vec::new(),
+            bmux_attach_pipeline::frame_presenter::Presented::Unsupported(reason) => {
+                anyhow::bail!("traced attach frame cannot be presented: {reason}")
+            }
+        };
         let facts = PlaybookAttachRenderFrameFacts {
             scene_render: stats,
             frame_bytes: bytes.len(),
@@ -5563,10 +5586,7 @@ mod tests {
             Some(VisualControlAction::PromptDsl)
         );
         assert_eq!(
-            parse_visual_control_action(make_key(
-                TermKeyCode::Char('c'),
-                KeyModifiers::CONTROL
-            )),
+            parse_visual_control_action(make_key(TermKeyCode::Char('c'), KeyModifiers::CONTROL)),
             Some(VisualControlAction::Abort)
         );
     }

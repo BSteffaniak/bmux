@@ -11792,14 +11792,16 @@ fn render_attach_frame_inner(
         images_after.extend_from_slice(&graphics.after);
         match super::presenter::present(
             view_state,
-            &operations,
-            pending_cursor_state,
-            frame_damage.is_full_frame(),
-            terminal_size,
-            margins,
-            super::presenter::Graphics {
-                before: &images_before,
-                after: &images_after,
+            &super::presenter::CapturedFrame {
+                operations: &operations,
+                cursor: pending_cursor_state,
+                full: frame_damage.is_full_frame(),
+                size: terminal_size,
+                margins,
+                graphics: super::presenter::Graphics {
+                    before: &images_before,
+                    after: &images_after,
+                },
             },
         ) {
             super::presenter::Presented::Frame(bytes) => {

@@ -1449,8 +1449,11 @@ fn write_kitty_graphic_overlay(
     let needs_place = previous_placement != Some(placement);
     if needs_place {
         let mut writer = &mut *stdout;
-        queue!(&mut writer, MoveTo(graphic.cell_rect.x, graphic.cell_rect.y))
-            .context("failed moving cursor for kitty graphic placement")?;
+        queue!(
+            &mut writer,
+            MoveTo(graphic.cell_rect.x, graphic.cell_rect.y)
+        )
+        .context("failed moving cursor for kitty graphic placement")?;
         stdout.write_all(b"\x1b_")?;
         stdout.write_all(&bmux_image::codec::kitty::encode_place_with_z_and_cells(
             host_image_id,
