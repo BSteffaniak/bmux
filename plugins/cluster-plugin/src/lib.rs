@@ -278,10 +278,10 @@ impl Plugin for ClusterPlugin {
             .blocking_command("cluster-pane-retry", Self::run_command)
             .blocking_services(Self::invoke_service, None)
             .typed_services(|plugin, context, registry| {
-                plugin.register_typed_services(context, registry);
+                plugin.register_typed_services(&context, registry);
                 Ok(())
             })
-            .registrations(Self::register_contributions);
+            .registrations(|_, a0| Self::register_contributions(a0));
     }
 }
 
@@ -291,17 +291,17 @@ impl ClusterPlugin {
 
     fn activate(
         &self,
-        context: bmux_plugin_sdk::NativeLifecycleContext,
+        context: &bmux_plugin_sdk::NativeLifecycleContext,
         _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
     ) -> std::result::Result<(), PluginCommandError> {
         durable_storage::configure(&context.connection.data_dir)
             .map_err(PluginCommandError::failed)?;
-        let node_identity = load_or_create_node_identity(&context).map_err(|error| {
+        let node_identity = load_or_create_node_identity(context).map_err(|error| {
             PluginCommandError::failed(format!(
                 "failed initializing cluster node identity: {error}"
             ))
         })?;
-        let cluster_id = load_cluster_id(&context).map_err(|error| {
+        let cluster_id = load_cluster_id(context).map_err(|error| {
             PluginCommandError::failed(format!("failed loading cluster identity: {error}"))
         })?;
         tracing::info!(
@@ -312,12 +312,12 @@ impl ClusterPlugin {
         *slot_mut(&self.node_identity)? = Some(node_identity);
         *slot_mut(&self.cluster_id)? = cluster_id;
         *slot_mut(&self.activation_caller)? = Some(Arc::new(
-            bmux_plugin::TypedServiceCaller::from_lifecycle_context(&context),
+            bmux_plugin::TypedServiceCaller::from_lifecycle_context(context),
         ));
         let configured_endpoint = configured_consensus_endpoint(context.settings.as_ref())
             .map_err(PluginCommandError::failed)?;
         if let Err(error) =
-            configure_local_consensus_endpoint(&context, configured_endpoint.as_deref())
+            configure_local_consensus_endpoint(context, configured_endpoint.as_deref())
         {
             // A different companion scope is not a new cluster identity. Keep
             // baseline terminal operation available without stealing the
@@ -329,10 +329,10 @@ impl ClusterPlugin {
 
     fn activate_with_async(
         &self,
-        context: NativeLifecycleContext,
+        context: &NativeLifecycleContext,
         async_handle: Option<bmux_plugin_sdk::HostAsyncHandle>,
     ) -> std::result::Result<(), PluginCommandError> {
-        self.activate(context.clone(), None)?;
+        self.activate(&context.clone(), None)?;
         let Some(async_handle) = async_handle else {
             return Ok(());
         };
@@ -357,7 +357,7 @@ impl ClusterPlugin {
 
     fn deactivate(
         &self,
-        _context: bmux_plugin_sdk::NativeLifecycleContext,
+        _context: &bmux_plugin_sdk::NativeLifecycleContext,
     ) -> std::result::Result<(), PluginCommandError> {
         *slot_mut(&self.activation_caller)? = None;
         if let Some(identity) = self.node_identity().as_ref() {
@@ -384,7 +384,7 @@ impl ClusterPlugin {
     #[allow(clippy::too_many_lines)] // Registration keeps generated service wiring auditable in one place.
     fn register_typed_services(
         &self,
-        context: bmux_plugin_sdk::TypedServiceRegistrationContext<'_>,
+        context: &bmux_plugin_sdk::TypedServiceRegistrationContext<'_>,
         registry: &mut bmux_plugin_sdk::TypedServiceRegistry,
     ) {
         if let Err(error) = durable_storage::configure(&context.connection.data_dir) {
@@ -392,7 +392,7 @@ impl ClusterPlugin {
             return;
         }
         let caller = Arc::new(bmux_plugin::TypedServiceCaller::from_registration_context(
-            &context,
+            context,
         ));
         let Ok(identity) = load_or_create_node_identity(caller.as_ref()) else {
             return;
@@ -529,7 +529,7 @@ impl ClusterPlugin {
         );
     }
 
-    fn run_command(&self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
+    fn run_command(&self, context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
         durable_storage::configure(&context.connection.data_dir)
             .map_err(PluginCommandError::failed)?;
         let gateway_result = if context.command.starts_with("cluster-") {
@@ -541,7 +541,7 @@ impl ClusterPlugin {
             tokio::task::block_in_place(|| {
                 handle.block_on(gateway::run_command(
                     &self.gateway,
-                    &context,
+                    context,
                     "bmux.cluster",
                     &context.command,
                     &context.arguments,
@@ -556,28 +556,27 @@ impl ClusterPlugin {
         }
 
         bmux_plugin_sdk::route_command!(context, {
-            "cluster-init" => run_cluster_init(&context).map_err(PluginCommandError::from),
-            "cluster-enrollment-token-create" => run_cluster_enrollment_token_create(&context).map_err(PluginCommandError::from),
-            "cluster-enrollment-list" => run_cluster_enrollment_list(&context).map_err(PluginCommandError::from),
-            "cluster-enrollment-revoke" => run_cluster_enrollment_revoke(&context).map_err(PluginCommandError::from),
-            "cluster-credential-rotate" => run_cluster_credential_rotate(&context).map_err(PluginCommandError::from),
-            "cluster-member-revoke" => run_cluster_member_revoke(&context).map_err(PluginCommandError::from),
-            "cluster-join" => run_cluster_join(&context).map_err(PluginCommandError::from),
-            "cluster-leave" => run_cluster_leave(&context).map_err(PluginCommandError::from),
-            "cluster-members" => run_cluster_members(&context).map_err(PluginCommandError::from),
-            "cluster-hosts" => run_cluster_hosts(&context).map_err(PluginCommandError::from),
-            "cluster-status" => run_cluster_status(&context).map_err(PluginCommandError::from),
-            "cluster-doctor" => run_cluster_doctor(&context).map_err(PluginCommandError::from),
-            "cluster-events" => run_cluster_events(&context).map_err(PluginCommandError::from),
-            "cluster-up" => run_cluster_up(&context).map_err(PluginCommandError::from),
-            "cluster-pane-new" => run_cluster_pane_new(&context).map_err(PluginCommandError::from),
-            "cluster-pane-move" => run_cluster_pane_move(&context).map_err(PluginCommandError::from),
-            "cluster-pane-retry" => run_cluster_pane_retry(&context).map_err(PluginCommandError::from)
+            "cluster-init" => run_cluster_init(context).map_err(PluginCommandError::from),
+            "cluster-enrollment-token-create" => run_cluster_enrollment_token_create(context).map_err(PluginCommandError::from),
+            "cluster-enrollment-list" => run_cluster_enrollment_list(context).map_err(PluginCommandError::from),
+            "cluster-enrollment-revoke" => run_cluster_enrollment_revoke(context).map_err(PluginCommandError::from),
+            "cluster-credential-rotate" => run_cluster_credential_rotate(context).map_err(PluginCommandError::from),
+            "cluster-member-revoke" => run_cluster_member_revoke(context).map_err(PluginCommandError::from),
+            "cluster-join" => run_cluster_join(context).map_err(PluginCommandError::from),
+            "cluster-leave" => run_cluster_leave(context).map_err(PluginCommandError::from),
+            "cluster-members" => run_cluster_members(context).map_err(PluginCommandError::from),
+            "cluster-hosts" => run_cluster_hosts(context).map_err(PluginCommandError::from),
+            "cluster-status" => run_cluster_status(context).map_err(PluginCommandError::from),
+            "cluster-doctor" => run_cluster_doctor(context).map_err(PluginCommandError::from),
+            "cluster-events" => run_cluster_events(context).map_err(PluginCommandError::from),
+            "cluster-up" => run_cluster_up(context).map_err(PluginCommandError::from),
+            "cluster-pane-new" => run_cluster_pane_new(context).map_err(PluginCommandError::from),
+            "cluster-pane-move" => run_cluster_pane_move(context).map_err(PluginCommandError::from),
+            "cluster-pane-retry" => run_cluster_pane_retry(context).map_err(PluginCommandError::from)
         })
     }
 
     fn register_contributions(
-        &self,
         registrar: &mut bmux_plugin_sdk::ContributionRegistrar,
     ) -> bmux_plugin_sdk::Result<()> {
         registrar
@@ -595,19 +594,19 @@ impl ClusterPlugin {
             )
     }
 
-    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
-        if let Err(response) = admission::authorize(&context) {
+    fn invoke_service(&self, context: &NativeServiceContext) -> ServiceResponse {
+        if let Err(response) = admission::authorize(context) {
             return response;
         }
         if let Err(error) = durable_storage::configure(&context.connection.data_dir) {
             return ServiceResponse::error("storage_authority_unavailable", error);
         }
-        if let Some(response) = invoke_native_consensus_service(&context, &self.nodes) {
+        if let Some(response) = invoke_native_consensus_service(context, &self.nodes) {
             return response;
         }
-        if is_cluster_lifecycle_service(&context) {
+        if is_cluster_lifecycle_service(context) {
             return invoke_cluster_lifecycle_service(
-                &context,
+                context,
                 &self.nodes,
                 &self.bootstrap,
                 self.activation_caller().ok().as_ref(),
@@ -1135,6 +1134,8 @@ bmux_plugin_sdk::plugin!(ClusterPlugin);
 
 /// Constructor-injected consensus authority. The supplied registry must belong
 /// to this runtime scope; it is not reconstructed from a logical plugin ID.
+/// # Panics
+/// Panics if the embedded plugin declaration is rejected.
 #[must_use]
 pub fn plugin_definition_with_nodes(
     nodes: consensus_network::ConsensusNodeRegistry,
@@ -1681,7 +1682,7 @@ mod tests {
                 request,
                 Some(cluster_settings_value()),
             );
-            self.plugin.invoke_service(context)
+            self.plugin.invoke_service(&context)
         }
 
         fn expect_error_code<T: Serialize>(
@@ -2854,7 +2855,7 @@ mod tests {
             let context = service_test_context("/unused", interface, operation, &(), None);
             assert_eq!(
                 ClusterPlugin::default()
-                    .invoke_service(context)
+                    .invoke_service(&context)
                     .error
                     .unwrap()
                     .code,
@@ -2934,7 +2935,7 @@ mod tests {
         );
         assert!(admission::authorize(&context).is_ok());
         for _ in 0..2 {
-            let response = ClusterPlugin::default().invoke_service(context.clone());
+            let response = ClusterPlugin::default().invoke_service(&context.clone());
             assert_eq!(response.error.unwrap().code, "redeem_enrollment_failed");
         }
         let request = ClusterCommandAcceptLeaveRequest {
@@ -2953,7 +2954,7 @@ mod tests {
         assert!(admission::authorize(&context).is_ok());
         assert_eq!(
             ClusterPlugin::default()
-                .invoke_service(context)
+                .invoke_service(&context)
                 .error
                 .unwrap()
                 .code,

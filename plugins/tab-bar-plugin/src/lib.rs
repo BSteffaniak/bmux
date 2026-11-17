@@ -484,7 +484,10 @@ pub struct TabBarPlugin {
 impl Plugin for TabBarPlugin {
     fn declare(d: &mut Declarations<Self>) {
         d.blocking_activate(Self::activate)
-            .blocking_deactivate(Self::deactivate)
+            .blocking_deactivate(|plugin, _| {
+                plugin.deactivate();
+                Ok(())
+            })
             .blocking_services(Self::invoke_service, None);
     }
 }
@@ -492,7 +495,7 @@ impl Plugin for TabBarPlugin {
 impl TabBarPlugin {
     fn activate(
         &self,
-        context: NativeLifecycleContext,
+        context: &NativeLifecycleContext,
         _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
     ) -> std::result::Result<(), PluginCommandError> {
         // Validate configuration up front. The backend owns no presentation:
@@ -501,20 +504,16 @@ impl TabBarPlugin {
         // Retained channels for plugin-contributed status items and toasts;
         // the server forwards them to attach clients (see plugin.toml).
         self.external
-            .activate(bmux_plugin::activation_event_bus(&context));
+            .activate(bmux_plugin::activation_event_bus(context));
         Ok(())
     }
 
-    fn deactivate(
-        &self,
-        _context: NativeLifecycleContext,
-    ) -> std::result::Result<(), PluginCommandError> {
+    fn deactivate(&self) {
         self.external.activate(None);
-        Ok(())
     }
 
-    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
-        self.service(&context)
+    fn invoke_service(&self, context: &NativeServiceContext) -> ServiceResponse {
+        self.service(context)
     }
 }
 

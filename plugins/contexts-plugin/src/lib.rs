@@ -451,7 +451,7 @@ impl Plugin for ContextsPlugin {
         d.blocking_activate(Self::activate)
             .blocking_services(Self::invoke_service, None)
             .typed_services(|plugin, context, registry| {
-                plugin.register_typed_services(context, registry);
+                plugin.register_typed_services(&context, registry);
                 Ok(())
             });
     }
@@ -460,12 +460,12 @@ impl Plugin for ContextsPlugin {
 impl ContextsPlugin {
     fn activate(
         &self,
-        context: NativeLifecycleContext,
+        context: &NativeLifecycleContext,
         _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
     ) -> std::result::Result<(), PluginCommandError> {
         *slot_mut(&self.events)? = ContextEvents::new(
-            bmux_plugin::activation_event_bus(&context),
-            bmux_plugin::activation_state_registry(&context),
+            bmux_plugin::activation_event_bus(context),
+            bmux_plugin::activation_state_registry(context),
         );
         let registry = Arc::clone(&self.events().states);
         let state: Arc<RwLock<ContextState>> = Arc::new(RwLock::new(ContextState::default()));
@@ -512,7 +512,7 @@ impl ContextsPlugin {
     }
 
     /// Serve one hand-routed service invocation (synchronous body).
-    pub fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+    pub fn invoke_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "contexts-visits-v1", "list-visits" => |_req: (), ctx| {
                 Ok(list_visits_local(&self.events(), ctx, ctx.caller_client_id))
@@ -565,33 +565,30 @@ impl ContextsPlugin {
 
     fn register_typed_services(
         &self,
-        context: TypedServiceRegistrationContext<'_>,
+        context: &TypedServiceRegistrationContext<'_>,
         registry: &mut TypedServiceRegistry,
     ) {
-        let caller = Arc::new(TypedServiceCaller::from_registration_context(&context));
+        let caller = Arc::new(TypedServiceCaller::from_registration_context(context));
 
-        let visits: Arc<dyn ContextsVisitsV1Service + Send + Sync> = Arc::new(
-            ContextsStateHandle::new(Arc::clone(&caller), self.events().clone()),
-        );
+        let visits: Arc<dyn ContextsVisitsV1Service + Send + Sync> =
+            Arc::new(ContextsStateHandle::new(Arc::clone(&caller), self.events()));
         let _ = contexts_visits_v1::register_provider(registry, visits);
-        let state: Arc<dyn ContextsStateService + Send + Sync> = Arc::new(
-            ContextsStateHandle::new(Arc::clone(&caller), self.events().clone()),
-        );
+        let state: Arc<dyn ContextsStateService + Send + Sync> =
+            Arc::new(ContextsStateHandle::new(Arc::clone(&caller), self.events()));
         let _ = contexts_state::register_provider(registry, state);
 
-        let activation: Arc<dyn ContextsActivationV1Service + Send + Sync> = Arc::new(
-            ContextsCommandsHandle::new(caller.clone(), self.events().clone()),
-        );
+        let activation: Arc<dyn ContextsActivationV1Service + Send + Sync> =
+            Arc::new(ContextsCommandsHandle::new(caller.clone(), self.events()));
         let _ = contexts_activation_v1::register_provider(registry, activation);
         let spawn: Arc<
             dyn bmux_contexts_plugin_api::contexts_spawn_v1::ContextsSpawnV1Service + Send + Sync,
         > = Arc::new(ContextsCommandsHandle::new(
             Arc::clone(&caller),
-            self.events().clone(),
+            self.events(),
         ));
         let _ = bmux_contexts_plugin_api::contexts_spawn_v1::register_provider(registry, spawn);
         let commands: Arc<dyn ContextsCommandsService + Send + Sync> =
-            Arc::new(ContextsCommandsHandle::new(caller, self.events().clone()));
+            Arc::new(ContextsCommandsHandle::new(caller, self.events()));
         let _ = contexts_commands::register_provider(registry, commands);
     }
 }

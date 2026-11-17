@@ -163,22 +163,22 @@ impl PermissionsPlugin {
 
 impl Plugin for PermissionsPlugin {
     fn declare(d: &mut Declarations<Self>) {
-        d.blocking_command("permissions", Self::run_command)
-            .blocking_command("hot-path-policy", Self::run_command)
-            .blocking_command("permissions-current", Self::run_command)
-            .blocking_command("grant", Self::run_command)
-            .blocking_command("revoke", Self::run_command)
-            .blocking_command("grant-hot-path-override", Self::run_command)
-            .blocking_command("revoke-hot-path-override", Self::run_command)
-            .blocking_command("list-hot-path-overrides", Self::run_command)
+        d.blocking_command("permissions", |_, a0| Self::run_command(a0))
+            .blocking_command("hot-path-policy", |_, a0| Self::run_command(a0))
+            .blocking_command("permissions-current", |_, a0| Self::run_command(a0))
+            .blocking_command("grant", |_, a0| Self::run_command(a0))
+            .blocking_command("revoke", |_, a0| Self::run_command(a0))
+            .blocking_command("grant-hot-path-override", |_, a0| Self::run_command(a0))
+            .blocking_command("revoke-hot-path-override", |_, a0| Self::run_command(a0))
+            .blocking_command("list-hot-path-overrides", |_, a0| Self::run_command(a0))
             .blocking_services(Self::invoke_service, None)
-            .registrations(Self::register_contributions);
+            .registrations(|_, a0| Self::register_contributions(a0));
     }
 }
 
 impl PermissionsPlugin {
-    fn run_command(&self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
-        handle_command(&context)?;
+    fn run_command(context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
+        handle_command(context)?;
         Ok(EXIT_OK)
     }
 
@@ -188,7 +188,6 @@ impl PermissionsPlugin {
     /// host-recorded origin and the device grant, never from request fields.
     /// Every other permissions route stays local-only.
     fn register_contributions(
-        &self,
         registrar: &mut bmux_plugin_sdk::ContributionRegistrar,
     ) -> bmux_plugin_sdk::Result<()> {
         use bmux_permissions_plugin_api::session_policy_state;
@@ -216,7 +215,8 @@ impl PermissionsPlugin {
     }
 
     /// Serve one hand-routed service invocation (synchronous body).
-    pub fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+    #[must_use]
+    pub fn invoke_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "permissions-state", "list-permissions" => |req: ListPermissionsRequest, ctx| {
                 let entries = list_entries(ctx, &req.session)
@@ -1432,6 +1432,8 @@ bmux_plugin_sdk::plugin!(
 
 /// Hosts loading multiple artifacts against one authority must inject the same
 /// serialization port rather than each artifact constructing an independent lock.
+/// # Panics
+/// Panics if the embedded plugin declaration is rejected.
 #[must_use]
 pub fn plugin_definition_with_mutation_port(
     port: Arc<std::sync::Mutex<()>>,
@@ -2418,28 +2420,33 @@ mod tests {
         )
         };
         // A grant to a forged/different subject never grants the admitted subject.
-        assert!(plugin.invoke_service(grant(Uuid::new_v4())).error.is_none());
+        assert!(
+            plugin
+                .invoke_service(&grant(Uuid::new_v4()))
+                .error
+                .is_none()
+        );
         *origin.lock().unwrap() = StreamProvenance::Admitted {
             subject_id: subject,
             lease_id: Uuid::new_v4(),
         };
-        let response = plugin.invoke_service(policy());
+        let response = plugin.invoke_service(&policy());
         assert_resource_policy_decision(&response, false);
         assert_eq!(
-            plugin.invoke_service(grant(subject)).error.unwrap().code,
+            plugin.invoke_service(&grant(subject)).error.unwrap().code,
             "admin_denied"
         );
         *origin.lock().unwrap() = StreamProvenance::Local;
-        assert!(plugin.invoke_service(grant(subject)).error.is_none());
+        assert!(plugin.invoke_service(&grant(subject)).error.is_none());
         *origin.lock().unwrap() = StreamProvenance::Admitted {
             subject_id: subject,
             lease_id: Uuid::new_v4(),
         };
-        let response = plugin.invoke_service(policy());
+        let response = plugin.invoke_service(&policy());
         assert_resource_policy_decision(&response, true);
         // Device revocation wins even while the resource grant remains durable.
         *access.lock().unwrap() = bmux_connections_plugin_api::pairing_types::DeviceAccess::Denied;
-        assert!(plugin.invoke_service(policy()).error.is_some());
+        assert!(plugin.invoke_service(&policy()).error.is_some());
         *access.lock().unwrap() =
             bmux_connections_plugin_api::pairing_types::DeviceAccess::FullLocalRuntime;
         *origin.lock().unwrap() = StreamProvenance::Local;
@@ -2458,15 +2465,15 @@ mod tests {
             ServiceKind::Command,
             &data_dir,
         );
-        assert!(plugin.invoke_service(revoke).error.is_none());
+        assert!(plugin.invoke_service(&revoke).error.is_none());
         *origin.lock().unwrap() = StreamProvenance::Admitted {
             subject_id: subject,
             lease_id: Uuid::new_v4(),
         };
-        let response = plugin.invoke_service(policy());
+        let response = plugin.invoke_service(&policy());
         assert_resource_policy_decision(&response, false);
         *origin.lock().unwrap() = StreamProvenance::Invalid;
-        assert!(plugin.invoke_service(policy()).error.is_some());
+        assert!(plugin.invoke_service(&policy()).error.is_some());
     }
 
     #[test]
@@ -2785,7 +2792,7 @@ mod tests {
             ServiceKind::Command,
             &data_dir,
         );
-        let grant = plugin.invoke_service(grant_context);
+        let grant = plugin.invoke_service(&grant_context);
         assert!(
             grant.error.is_none(),
             "unexpected grant error: {:?}",
@@ -2804,7 +2811,7 @@ mod tests {
             ServiceKind::Query,
             &data_dir,
         );
-        let listed = plugin.invoke_service(list_context);
+        let listed = plugin.invoke_service(&list_context);
         assert!(
             listed.error.is_none(),
             "unexpected list error: {:?}",
@@ -2829,7 +2836,7 @@ mod tests {
             ServiceKind::Command,
             &data_dir,
         );
-        let revoke = plugin.invoke_service(revoke_context);
+        let revoke = plugin.invoke_service(&revoke_context);
         assert!(
             revoke.error.is_none(),
             "unexpected revoke error: {:?}",
@@ -2848,7 +2855,7 @@ mod tests {
             ServiceKind::Query,
             &data_dir,
         );
-        let relisted = plugin.invoke_service(relist_context);
+        let relisted = plugin.invoke_service(&relist_context);
         assert!(
             relisted.error.is_none(),
             "unexpected relist error: {:?}",
@@ -2882,7 +2889,7 @@ mod tests {
             ServiceKind::Command,
             &data_dir,
         );
-        let grant = plugin.invoke_service(grant_context);
+        let grant = plugin.invoke_service(&grant_context);
         assert!(
             grant.error.is_none(),
             "unexpected grant error: {:?}",
@@ -2908,7 +2915,7 @@ mod tests {
             ServiceKind::Query,
             &data_dir,
         );
-        let policy = plugin.invoke_service(policy_context);
+        let policy = plugin.invoke_service(&policy_context);
         assert!(
             policy.error.is_none(),
             "unexpected policy error: {:?}",
@@ -2940,7 +2947,7 @@ mod tests {
             &data_dir,
         );
 
-        let response = plugin.invoke_service(context);
+        let response = plugin.invoke_service(&context);
         let error = response.error.expect("expected grant failure");
         assert_eq!(error.code, "grant_failed");
         assert!(error.message.contains("invalid role"));
@@ -2961,7 +2968,7 @@ mod tests {
             &data_dir,
         );
 
-        let response = plugin.invoke_service(context);
+        let response = plugin.invoke_service(&context);
         let error = response.error.expect("expected invalid request error");
         assert_eq!(error.code, "invalid_request");
     }
@@ -2984,7 +2991,7 @@ mod tests {
             &data_dir,
         );
 
-        let response = plugin.invoke_service(context);
+        let response = plugin.invoke_service(&context);
         let error = response.error.expect("expected list failure");
         assert_eq!(error.code, "list_failed");
         assert!(error.message.contains("not found"));
@@ -3015,7 +3022,7 @@ mod tests {
             &data_dir,
         );
 
-        let response = plugin.invoke_service(context);
+        let response = plugin.invoke_service(&context);
         assert!(
             response.error.is_none(),
             "unexpected policy error: {:?}",
@@ -3042,7 +3049,7 @@ mod tests {
             &data_dir,
         );
 
-        let response = plugin.invoke_service(context);
+        let response = plugin.invoke_service(&context);
         let error = response.error.expect("expected invalid request");
         assert_eq!(error.code, "invalid_request");
     }
@@ -3062,7 +3069,7 @@ mod tests {
             &data_dir,
         );
 
-        let response = plugin.invoke_service(context);
+        let response = plugin.invoke_service(&context);
         let error = response
             .error
             .expect("expected unsupported operation error");
@@ -3112,7 +3119,7 @@ mod tests {
             ServiceKind::Command,
             &data_dir,
         );
-        let grant = plugin.invoke_service(grant_context);
+        let grant = plugin.invoke_service(&grant_context);
         assert!(
             grant.error.is_none(),
             "unexpected grant error: {:?}",
@@ -3139,7 +3146,7 @@ mod tests {
             &data_dir,
         );
 
-        let response = plugin.invoke_service(context);
+        let response = plugin.invoke_service(&context);
         assert!(
             response.error.is_none(),
             "unexpected policy error: {:?}",

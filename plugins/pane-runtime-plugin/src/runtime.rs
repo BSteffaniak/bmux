@@ -19194,7 +19194,7 @@ exit 7"#
                     assert_eq!(kind, bmux_ipc::InvokeServiceKind::Query);
                     let response = crate::handlers::route(
                         host,
-                        NativeServiceContext {
+                        &NativeServiceContext {
                             host_service_port: Some(history_fixture_origin()),
                             plugin_id: "bmux.pane-runtime".into(),
                             request: ServiceRequest {

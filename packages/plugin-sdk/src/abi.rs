@@ -1275,10 +1275,11 @@ const unsafe fn copy_output(
     OK
 }
 
-/// Used only in a thin cdylib packaging target. Implementation crates use
+/// Export the plugin entry descriptor of a packaged dylib.
 ///
-/// `define_plugin!` and emit no global symbols. The returned descriptor is
-/// borrowed immutable library memory, valid until the library is unloaded.
+/// Emitted only by `plugin!` in a packaged dylib build; workspace and bundled
+/// builds export no global symbols. The returned descriptor is borrowed
+/// immutable library memory, valid until the library is unloaded.
 #[macro_export]
 macro_rules! export_plugin_entrypoint {
     ($definition:path $(,)?) => {

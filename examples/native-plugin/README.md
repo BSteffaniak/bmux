@@ -92,8 +92,9 @@ remove the items the server's long-lived activation published. Use
 
 The `status-set` and `status-clear` commands also record a
 `COMMAND_OUTCOME_STATUS_MESSAGE_KEY` outcome, so binding them to a key shows
-the message in the attach status line. `RustPluginAdapter` runs the command
-body inside `CommandOutcome::capture`, so the metadata comes back as part of the
+the message in the attach status line. They are declared with
+`Declarations::blocking_command`, which runs the command body inside
+`CommandOutcome::capture`, so the metadata comes back as part of the
 returned command outcome on both static and dynamic packaging (there is no
 exported outcome slot).
 

@@ -53,7 +53,7 @@ impl Plugin for PlaybookPlugin {
 }
 
 impl PlaybookPlugin {
-    fn service(&self, context: NativeServiceContext) -> ServiceResponse {
+    fn service(&self, context: &NativeServiceContext) -> ServiceResponse {
         // Endpoints come from the BPDL world's provided interfaces, so a route
         // the world does not declare fails to compile.
         use crate::declaration::provides::{playbook_commands, playbook_state};

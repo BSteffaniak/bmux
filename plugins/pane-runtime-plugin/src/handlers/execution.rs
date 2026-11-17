@@ -460,7 +460,7 @@ mod tests {
             ("pane-runtime-readiness-v1", "fence-unhealthy"),
             ("pane-runtime-execution-v4", "future-mutation"),
         ] {
-            let response = super::super::route(host, context(interface, operation, Vec::new()));
+            let response = super::super::route(host, &context(interface, operation, Vec::new()));
             assert_eq!(response.error.unwrap().code, "authorization_denied");
         }
         let execution = ExecutionRef {
@@ -488,7 +488,7 @@ mod tests {
         )
         .unwrap();
         let response =
-            super::super::route(host, context("pane-runtime-execution-v4", "send", payload));
+            super::super::route(host, &context("pane-runtime-execution-v4", "send", payload));
         assert!(response.error.is_none());
         let result: Result<(), ExecutionError> =
             bmux_plugin_sdk::decode_service_message(&response.payload).unwrap();
@@ -496,21 +496,21 @@ mod tests {
         *origin.lock().unwrap() = StreamProvenance::Invalid;
         let response = super::super::route(
             host,
-            context("pane-runtime-presentation-v1", "capabilities", Vec::new()),
+            &context("pane-runtime-presentation-v1", "capabilities", Vec::new()),
         );
         assert_eq!(response.error.unwrap().code, "authorization_denied");
         *origin.lock().unwrap() = StreamProvenance::HostInternal;
         assert!(
             super::super::route(
                 host,
-                context("pane-runtime-presentation-v1", "capabilities", Vec::new())
+                &context("pane-runtime-presentation-v1", "capabilities", Vec::new())
             )
             .error
             .is_some()
         );
         let mut unbound = context("pane-runtime-presentation-v1", "capabilities", Vec::new());
         unbound.host_kernel_bridge = None;
-        assert!(super::super::route(host, unbound).error.is_some());
+        assert!(super::super::route(host, &unbound).error.is_some());
         *origin.lock().unwrap() = StreamProvenance::Local;
         // No clients, connections, permissions, or other domain services exist.
         assert!(ctx.enabled_plugins.is_empty() && ctx.services.is_empty());
@@ -520,7 +520,7 @@ mod tests {
         );
         let response = super::super::route(
             host,
-            context(
+            &context(
                 "pane-runtime-presentation-v1",
                 "capabilities",
                 encode_service_message(&()).unwrap(),

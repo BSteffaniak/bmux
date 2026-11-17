@@ -228,7 +228,7 @@ fn access<T>(
     operation(&mut managed.host).map_err(error)
 }
 
-pub(crate) fn invoke(registry: &ManagedHosts, context: NativeServiceContext) -> ServiceResponse {
+pub(crate) fn invoke(registry: &ManagedHosts, context: &NativeServiceContext) -> ServiceResponse {
     let hosts = || registry.hosts.as_ref();
     let watch_source = |id, source| watch_source(Arc::downgrade(&registry.hosts), id, source);
     bmux_plugin_sdk::route_service!(context, {

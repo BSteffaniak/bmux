@@ -9,7 +9,7 @@
 //! machinery that the bmux runtime uses to manage plugins.
 //!
 //! **Plugin authors** should depend on [`bmux_plugin_sdk`] instead — it
-//! provides the [`RustPlugin`](bmux_plugin_sdk::RustPlugin) trait, context
+//! provides the [`Plugin`](bmux_plugin_sdk::author::Plugin) trait, context
 //! types, macros, and everything needed to write a plugin without pulling
 //! in the host-side dependencies.
 

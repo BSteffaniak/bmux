@@ -492,11 +492,19 @@ async fn handle_response(
 
 impl Plugin for FinderPlugin {
     fn declare(d: &mut Declarations<Self>) {
-        d.native_command("show", Self::command);
+        d.native_command(
+            "show",
+            |plugin: &Self, cx: &Call, context: NativeCommandContext| {
+                std::future::ready(plugin.command_now(cx, &context))
+            },
+        );
     }
 
-    async fn activate(&self, cx: &mut Activation) -> author::Result<()> {
-        self.binding.activate(cx.lifecycle())
+    fn activate(
+        &self,
+        cx: &mut Activation,
+    ) -> impl std::future::Future<Output = author::Result<()>> + Send {
+        std::future::ready(self.binding.activate(cx.lifecycle()))
     }
 
     async fn deactivate(&self, cx: &mut Deactivation) -> author::Result<()> {
@@ -514,7 +522,7 @@ impl Plugin for FinderPlugin {
 }
 
 impl FinderPlugin {
-    async fn command(&self, cx: &Call, context: NativeCommandContext) -> author::Result<i32> {
+    fn command_now(&self, cx: &Call, context: &NativeCommandContext) -> author::Result<i32> {
         if cx
             .cancellation()
             .is_some_and(bmux_plugin_sdk::ServiceCancellation::is_cancelled)
@@ -527,7 +535,7 @@ impl FinderPlugin {
             cx.invocation()
                 .and_then(|call| call.callback_execution.as_ref()),
         )?;
-        let result = self.show(&context);
+        let result = self.show(context);
         drop(entry);
         result
     }
@@ -537,6 +545,8 @@ impl FinderPlugin {
 ///
 /// The trusted host must create both ports from the activation belonging to
 /// this lifecycle context, retain its inboxes, and never select global channels.
+/// # Panics
+/// Panics if the embedded plugin declaration is rejected.
 #[must_use]
 pub fn plugin_definition_with_activation_ports(
     bind: impl Fn(

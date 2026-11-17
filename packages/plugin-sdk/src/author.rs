@@ -25,6 +25,8 @@
 use std::marker::PhantomData;
 use std::sync::Arc;
 
+#[cfg(test)]
+mod blocking_tests;
 mod plugin;
 pub use plugin::{
     Activation, BlockingActivateFn, BlockingCommandFn, BlockingDeactivateFn, BlockingEventFn,

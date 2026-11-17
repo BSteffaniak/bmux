@@ -85,8 +85,6 @@ impl ExamplePlugin {
     sync_command!(storage_put, run_storage_put);
     sync_command!(storage_get, run_storage_get);
     sync_command!(prompt_showcase, |_| run_prompt_showcase_command());
-    sync_command!(status_set, tab_bar::run_status_set);
-    sync_command!(status_clear, tab_bar::run_status_clear);
     sync_command!(status_list, tab_bar::run_status_list);
     sync_command!(notify, tab_bar::run_notify);
 
@@ -122,8 +120,14 @@ impl Plugin for ExamplePlugin {
             .native_command("storage-put", Self::storage_put)
             .native_command("storage-get", Self::storage_get)
             .native_command("prompt-showcase", Self::prompt_showcase)
-            .native_command("status-set", Self::status_set)
-            .native_command("status-clear", Self::status_clear)
+            // Blocking bodies return the status message they record with
+            // the command outcome.
+            .blocking_command("status-set", |_, context| {
+                Ok(tab_bar::run_status_set(context))
+            })
+            .blocking_command("status-clear", |_, context| {
+                Ok(tab_bar::run_status_clear(context))
+            })
             .native_command("status-list", Self::status_list)
             .native_command("notify", Self::notify)
             .native_command("hello", Self::hello)

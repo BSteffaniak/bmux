@@ -348,36 +348,42 @@ impl Plugin for RecordingPlugin {
                 if let (Some(_), Some(configuration)) = (&plugin.scoped, &plugin.binding) {
                     activation_binding::require_configuration(configuration)?;
                 }
-                plugin.register_typed_services(context, registry);
+                plugin.register_typed_services(&context, registry);
                 Ok(())
             });
     }
 
-    async fn activate(&self, cx: &mut Activation) -> author::Result<()> {
-        match (&self.scoped, &self.binding) {
+    fn activate(
+        &self,
+        cx: &mut Activation,
+    ) -> impl std::future::Future<Output = author::Result<()>> + Send {
+        std::future::ready(match (&self.scoped, &self.binding) {
             (Some(scoped), Some(configuration)) => scoped.bind(cx.lifecycle(), configuration),
             _ => Ok(()),
-        }
+        })
     }
 
-    async fn deactivate(&self, cx: &mut Deactivation) -> author::Result<()> {
-        match &self.scoped {
+    fn deactivate(
+        &self,
+        cx: &mut Deactivation,
+    ) -> impl std::future::Future<Output = author::Result<()>> + Send {
+        std::future::ready(match &self.scoped {
             Some(scoped) => scoped.begin_cleanup(cx.lifecycle()),
             None => Ok(()),
-        }
+        })
     }
 }
 
 impl RecordingPlugin {
     fn activate(
         &self,
-        context: bmux_plugin_sdk::NativeLifecycleContext,
+        context: &bmux_plugin_sdk::NativeLifecycleContext,
         _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
     ) -> std::result::Result<(), PluginCommandError> {
         if self.binding.is_none() {
-            *slot_mut(&self.states)? = bmux_plugin::activation_state_registry(&context);
+            *slot_mut(&self.states)? = bmux_plugin::activation_state_registry(context);
         }
-        let binding = self.configuration(|| bmux_plugin::activation_event_bus(&context))?;
+        let binding = self.configuration(|| bmux_plugin::activation_event_bus(context))?;
         let config = binding.config;
         let mut selected = self
             .owner
@@ -393,7 +399,7 @@ impl RecordingPlugin {
     }
     fn deactivate(
         &self,
-        _context: bmux_plugin_sdk::NativeLifecycleContext,
+        _context: &bmux_plugin_sdk::NativeLifecycleContext,
     ) -> std::result::Result<(), PluginCommandError> {
         let mut owner = self
             .owner
@@ -413,16 +419,16 @@ impl RecordingPlugin {
 
     fn run_command(
         &self,
-        context: NativeCommandContext,
+        context: &NativeCommandContext,
     ) -> std::result::Result<i32, PluginCommandError> {
         if let Some(scoped) = &self.scoped {
             scoped.ready()?;
         }
         if context.command == "record" {
-            return Ok(interactive_command::run(&context));
+            return Ok(interactive_command::run(context));
         }
         if context.command.starts_with("recording-process-") {
-            return Ok(process_commands::run(&context));
+            return Ok(process_commands::run(context));
         }
         let owner = self
             .owner
@@ -430,25 +436,25 @@ impl RecordingPlugin {
             .map_err(|_| PluginCommandError::failed("recording owner poisoned"))?
             .clone()
             .ok_or_else(|| PluginCommandError::unavailable("recording inactive"))?;
-        if should_queue_recording_cut_for_non_cli(&context) {
-            return owner.run_recording_cut_command_queued(&context);
+        if should_queue_recording_cut_for_non_cli(context) {
+            return owner.run_recording_cut_command_queued(context);
         }
         if context.command == "recording-export" {
-            return owner.run_recording_export_command(&context);
+            return owner.run_recording_export_command(context);
         }
-        commands::run_recording_command(&owner, &context)
+        commands::run_recording_command(&owner, context)
     }
 
     // Keep generated interface routing together so each operation retains one
     // auditable typed dispatch boundary; splitting the route obscures fallback.
     #[allow(clippy::too_many_lines)]
-    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         if let Some(Err(error)) = self.scoped.as_ref().map(activation_binding::Scoped::ready) {
             return ServiceResponse::error("recording_unavailable", error.message);
         }
         match self.owner.read() {
             Ok(owner) => match owner.as_ref() {
-                Some(owner) => owner.service(&context),
+                Some(owner) => owner.service(context),
                 None => ServiceResponse::error("recording_unavailable", "recording inactive"),
             },
             Err(_) => ServiceResponse::error("recording_unavailable", "recording owner poisoned"),
@@ -457,7 +463,7 @@ impl RecordingPlugin {
 
     fn register_typed_services(
         &self,
-        context: TypedServiceRegistrationContext<'_>,
+        context: &TypedServiceRegistrationContext<'_>,
         registry: &mut TypedServiceRegistry,
     ) {
         // Activation already created the owner with its bus; a registration
@@ -493,7 +499,7 @@ impl RecordingPlugin {
             match binding.process_caller {
                 Some(caller) => caller,
                 None if self.binding.is_none() => Arc::new(
-                    bmux_plugin::TypedServiceCaller::from_registration_context(&context),
+                    bmux_plugin::TypedServiceCaller::from_registration_context(context),
                 ),
                 None => return,
             },
@@ -2397,7 +2403,7 @@ mod tests {
             context.request.operation = "start".into();
             // Invalid bytes must never be decoded as v4 or routed to an alias.
             context.request.payload = vec![255];
-            let response = plugin.invoke_service(context);
+            let response = plugin.invoke_service(&context);
             assert_eq!(response.payload, [] as [u8; 0]);
             let error = response
                 .error
@@ -2424,7 +2430,7 @@ mod tests {
             bmux_recording_plugin_api::recording_process_v4::INTERFACE_ID.into();
         context.request.operation = "start".into();
         context.request.payload = vec![255];
-        let response = plugin.invoke_service(context);
+        let response = plugin.invoke_service(&context);
         let error = response
             .error
             .expect("malformed v4 request must reject before effect");
@@ -2489,7 +2495,7 @@ mod tests {
     fn non_cli_recording_cut_reports_queue_precondition_without_self_dispatch_deadlock() {
         let plugin = RecordingPlugin::default();
         let error = plugin
-            .run_command(command_context(
+            .run_command(&command_context(
                 "recording-cut",
                 &["--last-seconds", "30", "--export-fps", "12"],
                 NativeCommandInvocationSource::AttachKeybinding,

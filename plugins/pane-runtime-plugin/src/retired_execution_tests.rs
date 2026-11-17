@@ -10,7 +10,7 @@ fn retired_execution_interfaces_reject_before_payload_decode() {
     for version in [1, 2, 3] {
         let response = crate::handlers::route(
             host,
-            NativeServiceContext {
+            &NativeServiceContext {
                 host_service_port: None,
                 plugin_id: "bmux.pane_runtime".into(),
                 request: ServiceRequest {

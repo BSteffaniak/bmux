@@ -25,16 +25,14 @@ impl Plugin for ClipboardPlugin {
     fn declare(d: &mut Declarations<Self>) {
         // The clipboard interfaces are opaque in BPDL: their bodies are
         // routed by hand.
-        d.native_services(Self::invoke);
+        d.native_services(|_: &Self, cx: &Call, context: NativeServiceContext| {
+            std::future::ready(Self::invoke_now(cx, &context))
+        });
     }
 }
 
 impl ClipboardPlugin {
-    async fn invoke(
-        &self,
-        cx: &Call,
-        context: NativeServiceContext,
-    ) -> author::Result<ServiceResponse> {
+    fn invoke_now(cx: &Call, context: &NativeServiceContext) -> author::Result<ServiceResponse> {
         if cx
             .cancellation()
             .is_some_and(bmux_plugin_sdk::ServiceCancellation::is_cancelled)
@@ -43,7 +41,7 @@ impl ClipboardPlugin {
                 "clipboard invocation cancelled",
             ));
         }
-        Ok(Self::service(&context))
+        Ok(Self::service(context))
     }
 
     fn service(context: &NativeServiceContext) -> ServiceResponse {

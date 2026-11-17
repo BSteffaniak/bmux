@@ -669,12 +669,12 @@ mod tests {
         let mut sessions_context = context.clone();
         sessions_context.capabilities = host_values();
         bmux_sessions_plugin::SessionsPlugin::default()
-            .activate(sessions_context, None)
+            .activate(&sessions_context, None)
             .unwrap();
         let pane_runtime = bmux_pane_runtime_plugin::PaneRuntimePlugin::default();
         let mut context = context;
         context.capabilities = host_values();
-        pane_runtime.activate(context, None).unwrap();
+        pane_runtime.activate(&context, None).unwrap();
         Arc::new(pane_runtime)
     }
 
@@ -922,10 +922,10 @@ mod tests {
                                     selected_caller,
                                 ));
                                 let response = if interface.starts_with("pane-runtime") {
-                                    pane_runtime.invoke_service(context)
+                                    pane_runtime.invoke_service(&context)
                                 } else {
                                     bmux_permissions_plugin::PermissionsPlugin::default()
-                                        .invoke_service(context)
+                                        .invoke_service(&context)
                                 };
                                 anyhow::ensure!(
                                     response.error.is_none(),

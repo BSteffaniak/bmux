@@ -453,7 +453,7 @@ impl Plugin for ClientsPlugin {
         d.blocking_activate(Self::activate)
             .blocking_services(Self::invoke_service, None)
             .typed_services(|plugin, context, registry| {
-                plugin.register_typed_services(context, registry);
+                plugin.register_typed_services(&context, registry);
                 Ok(())
             });
     }
@@ -462,12 +462,12 @@ impl Plugin for ClientsPlugin {
 impl ClientsPlugin {
     fn activate(
         &self,
-        context: NativeLifecycleContext,
+        context: &NativeLifecycleContext,
         _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
     ) -> std::result::Result<(), PluginCommandError> {
         *slot_mut(&self.events)? = ClientEvents::new(
-            bmux_plugin::activation_event_bus(&context),
-            bmux_plugin::activation_state_registry(&context),
+            bmux_plugin::activation_event_bus(context),
+            bmux_plugin::activation_state_registry(context),
         );
         let registry = Arc::clone(&self.events().states);
         // Register the follow-state handle on this activation's view of the
@@ -484,7 +484,7 @@ impl ClientsPlugin {
         // surface without naming the concrete plugin-owned type.
         let adapter = FollowStateAdapter {
             inner: Arc::clone(&state),
-            events: self.events().clone(),
+            events: self.events(),
         };
         let handle = Arc::new(RwLock::new(FollowStateHandle::new(adapter)));
         registry.register::<FollowStateHandle>(&handle);
@@ -518,7 +518,7 @@ impl ClientsPlugin {
         Ok(())
     }
 
-    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "clients-selection-state-v1", "current" => |_req: (), ctx| {
                 Ok::<Result<Selection, SelectionError>, ServiceResponse>(selection_operation(&self.events(), ctx.caller_client_id, |state, client| state.selection(client)))
@@ -571,10 +571,10 @@ impl ClientsPlugin {
 
     fn register_typed_services(
         &self,
-        context: TypedServiceRegistrationContext<'_>,
+        context: &TypedServiceRegistrationContext<'_>,
         registry: &mut TypedServiceRegistry,
     ) {
-        let caller = Arc::new(TypedServiceCaller::from_registration_context(&context));
+        let caller = Arc::new(TypedServiceCaller::from_registration_context(context));
 
         let state: Arc<dyn ClientsStateService + Send + Sync> =
             Arc::new(ClientsStateHandle::new(Arc::clone(&caller)));

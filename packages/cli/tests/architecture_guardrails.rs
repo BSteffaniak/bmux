@@ -1851,7 +1851,7 @@ fn snapshot_plugin_exists() {
     assert!(
         plugin_lib.contains("pub struct SnapshotPlugin"),
         "plugins/snapshot-plugin/src/lib.rs must export a \
-         `SnapshotPlugin` type implementing `RustPlugin`",
+         `SnapshotPlugin` type implementing `Plugin`",
     );
     assert!(
         plugin_lib.contains("register::<SnapshotOrchestratorHandle>"),
@@ -2524,7 +2524,7 @@ fn plugin_api_crates_do_not_expose_handwritten_transport_clients() {
 #[test]
 fn plugin_api_crates_do_not_own_runtime_implementation() {
     const FORBIDDEN_RUNTIME_MARKERS: &[&str] = &[
-        "impl RustPlugin",
+        "impl Plugin for",
         "NativeLifecycleContext",
         "TypedServiceRegistry",
         "global_event_bus()",
@@ -3643,4 +3643,114 @@ fn plugin_surface_paint_contract_excludes_graphics_payloads() {
         !surface_source.contains("TerminalGraphic"),
         "plugin surface snapshots must not embed terminal graphics payloads",
     );
+}
+
+/// Plugins have one author model: the `Plugin` trait, `Declarations` and
+/// `plugin!`, packaged wrapper-free. The legacy author trait, its adapter,
+/// the export-free definition macro and the generated-wrapper packager are
+/// deleted and must not come back.
+#[test]
+fn legacy_plugin_author_and_wrapper_packaging_paths_are_absent() {
+    // Spelled in pieces so this guard does not match itself.
+    let legacy_markers = [
+        ["Rust", "Plugin"].concat(),
+        ["from_rust", "_plugin"].concat(),
+        ["define", "_plugin!"].concat(),
+        ["macro_rules! define", "_plugin"].concat(),
+        ["export", "_plugin!"].concat(),
+    ];
+    let this_file = std::path::Path::new(file!())
+        .file_name()
+        .expect("guard file name");
+    let mut offenders = Vec::new();
+    for root in ["packages", "plugins", "examples"] {
+        for path in rust_source_files_under(&repo_root().join(root)) {
+            if path.file_name() == Some(this_file) {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+            for marker in &legacy_markers {
+                if source.contains(marker.as_str()) {
+                    offenders.push(format!("{}: {marker}", path.display()));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "the legacy plugin author path must not return; use the Plugin trait, \
+         Declarations and plugin!: {offenders:#?}",
+    );
+    assert!(
+        !repo_root()
+            .join("packages/plugin-sdk/src/definition/legacy.rs")
+            .exists(),
+        "the legacy definition adapter module must not return",
+    );
+
+    let sdk_manifest_flag = ["--sdk", "-manifest"].concat();
+    for (path, forbidden) in [
+        ("scripts/package-plugin.py", sdk_manifest_flag.as_str()),
+        ("scripts/package-plugin.py", "def generate("),
+        ("scripts/package-plugin.py", "def wrapper_target_dir("),
+        (
+            "scripts/package-plugin-acceptance.py",
+            "shared[\"generate\"]",
+        ),
+        (
+            "plugins/plugin-cli-plugin/src/rebuild.rs",
+            sdk_manifest_flag.as_str(),
+        ),
+    ] {
+        let source = std::fs::read_to_string(repo_root().join(path))
+            .unwrap_or_else(|error| panic!("reading {path}: {error}"));
+        assert!(
+            !source.contains(forbidden),
+            "{path} must package plugin crates directly, never through a generated wrapper \
+             (found `{forbidden}`)",
+        );
+    }
+}
+
+/// Every workspace plugin implementation is a `plugin!` crate that declares
+/// both role features, so `bmux plugin rebuild` packages it wrapper-free.
+#[test]
+fn every_workspace_plugin_packages_itself() {
+    let implementations = iter_plugin_crate_dirs()
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with("-plugin"))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !implementations.is_empty(),
+        "no plugin implementations found"
+    );
+    for plugin_dir in implementations {
+        let manifest = std::fs::read_to_string(plugin_dir.join("Cargo.toml"))
+            .unwrap_or_else(|error| panic!("reading {}: {error}", plugin_dir.display()));
+        for role in ["dynamic-backend", "dynamic-frontend"] {
+            assert!(
+                manifest
+                    .lines()
+                    .any(|line| line.split('=').next().map(str::trim) == Some(role)),
+                "{} must declare the `{role}` role feature",
+                plugin_dir.display(),
+            );
+        }
+        let defines = rust_source_files_under(&plugin_dir.join("src"))
+            .into_iter()
+            .any(|path| {
+                std::fs::read_to_string(&path)
+                    .is_ok_and(|source| source.contains("bmux_plugin_sdk::plugin!("))
+            });
+        assert!(
+            defines,
+            "{} must define its plugin with bmux_plugin_sdk::plugin!",
+            plugin_dir.display(),
+        );
+    }
 }

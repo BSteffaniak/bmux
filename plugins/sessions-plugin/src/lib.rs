@@ -353,10 +353,10 @@ impl Default for SessionsPlugin {
 impl Plugin for SessionsPlugin {
     fn declare(d: &mut Declarations<Self>) {
         d.blocking_activate(Self::activate)
-            .blocking_command("new-session", Self::run_command)
+            .blocking_command("new-session", |_, a0| Self::run_command(a0))
             .blocking_services(Self::invoke_service, None)
             .typed_services(|plugin, context, registry| {
-                plugin.register_typed_services(context, registry);
+                plugin.register_typed_services(&context, registry);
                 Ok(())
             });
     }
@@ -385,13 +385,19 @@ impl SessionsPlugin {
     }
 
     /// Activate this instance (synchronous body).
+    ///
+    /// # Errors
+    /// Returns the failure the synchronous body reports.
+    ///
+    /// # Panics
+    /// Panics if the freshly created session-manager lock is poisoned.
     pub fn activate(
         &self,
-        context: NativeLifecycleContext,
+        context: &NativeLifecycleContext,
         _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
     ) -> std::result::Result<(), PluginCommandError> {
-        *write(&self.events)? = SessionEvents(bmux_plugin::activation_event_bus(&context));
-        *write(&self.states)? = bmux_plugin::activation_state_registry(&context);
+        *write(&self.events)? = SessionEvents(bmux_plugin::activation_event_bus(context));
+        *write(&self.states)? = bmux_plugin::activation_state_registry(context);
         let registry = self.states();
         let state: Arc<RwLock<SessionManager>> = Arc::new(RwLock::new(SessionManager::new()));
         registry.register::<SessionManager>(&state);
@@ -441,14 +447,11 @@ impl SessionsPlugin {
         Ok(())
     }
 
-    fn run_command(
-        &self,
-        context: NativeCommandContext,
-    ) -> std::result::Result<i32, PluginCommandError> {
+    fn run_command(context: &NativeCommandContext) -> std::result::Result<i32, PluginCommandError> {
         match context.command.as_str() {
             "new-session" => {
                 let name = option_value(&context.arguments, "name");
-                match new_session_with_context(&context, name) {
+                match new_session_with_context(context, name) {
                     Ok(ack) => {
                         record_selected_context_outcome(ack.id);
                         if context.invocation_source.is_cli() {
@@ -466,7 +469,7 @@ impl SessionsPlugin {
     }
 
     /// Serve one hand-routed service invocation (synchronous body).
-    pub fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+    pub fn invoke_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         let (events, states) = (self.events(), self.states());
         bmux_plugin_sdk::route_service!(context, {
             "sessions-state", "list-sessions" => |_req: (), _ctx| {
@@ -513,10 +516,10 @@ impl SessionsPlugin {
 
     fn register_typed_services(
         &self,
-        context: TypedServiceRegistrationContext<'_>,
+        context: &TypedServiceRegistrationContext<'_>,
         registry: &mut TypedServiceRegistry,
     ) {
-        let caller = Arc::new(TypedServiceCaller::from_registration_context(&context));
+        let caller = Arc::new(TypedServiceCaller::from_registration_context(context));
 
         let state: Arc<dyn SessionsStateService + Send + Sync> =
             Arc::new(SessionsStateHandle::new(Arc::clone(&caller)));
@@ -1172,7 +1175,7 @@ mod tests {
             .expect("bind state registry");
         context.capabilities = capabilities;
         let plugin = SessionsPlugin::default();
-        plugin.activate(context, None).expect("activate");
+        plugin.activate(&context, None).expect("activate");
         plugin
     }
 

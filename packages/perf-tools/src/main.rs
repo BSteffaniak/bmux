@@ -2699,6 +2699,7 @@ fn load_performance_plugin() -> Result<StaticNoopService, String> {
 id = "bmux.perf-tools.noop"
 name = "bmux Perf Tools Noop"
 version = "0.0.1-alpha.0"
+component_roles = ["backend"]
 execution_class = "native_fast"
 provided_capabilities = ["bmux.perf_tools.noop"]
 required_capabilities = []
@@ -2710,18 +2711,13 @@ kind = "query"
 "#;
 
     use bmux_plugin_sdk::definition::{
-        ComponentRole, LoadedInstanceId, PluginCreateContext, PluginDefinition, PluginInstance,
-        RuntimeScopeId,
+        ComponentRole, LoadedInstanceId, PluginCreateContext, RuntimeScopeId,
     };
-    let metadata = PluginDefinition::from_rust_plugin::<PerfNoopPlugin>(
-        NOOP_MANIFEST,
-        vec![ComponentRole::Backend],
-    )
-    .map_err(|error| format!("invalid noop definition: {}", error.message))?
-    .metadata;
-    let definition = PluginDefinition::new(metadata, |_scope| {
-        Ok(std::sync::Arc::new(PerfNoopPlugin) as std::sync::Arc<dyn PluginInstance>)
-    });
+    let definition =
+        bmux_plugin_sdk::author::definition::<PerfNoopPlugin>(NOOP_MANIFEST, &[], |_| {
+            Ok(PerfNoopPlugin)
+        })
+        .map_err(|error| format!("invalid noop definition: {}", error.message))?;
     let instance = definition
         .create(PluginCreateContext {
             runtime_scope: RuntimeScopeId::new(),
@@ -2811,28 +2807,19 @@ impl PerfNoopPlugin {
     }
 }
 
-// Declares the noop's (empty) service contract for definition metadata.
-impl bmux_plugin_sdk::RustPlugin for PerfNoopPlugin {
-    type Contract = bmux_plugin_sdk::NoPluginContract;
-
-    fn invoke_service(
-        &self,
-        context: bmux_plugin_sdk::NativeServiceContext,
-    ) -> bmux_plugin_sdk::ServiceResponse {
-        Self::route(context)
+impl bmux_plugin_sdk::author::Plugin for PerfNoopPlugin {
+    fn declare(d: &mut bmux_plugin_sdk::author::Declarations<Self>) {
+        d.native_services(Self::invoke);
     }
 }
 
-impl bmux_plugin_sdk::definition::PluginInstance for PerfNoopPlugin {
-    fn invoke(
+impl PerfNoopPlugin {
+    async fn invoke(
         &self,
-        _call: bmux_plugin_sdk::definition::PluginCallContext,
+        _cx: &bmux_plugin_sdk::author::Call,
         context: bmux_plugin_sdk::NativeServiceContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<
-        '_,
-        bmux_plugin_sdk::definition::PluginResult<bmux_plugin_sdk::ServiceResponse>,
-    > {
-        Box::pin(async move { Ok(Self::route(context)) })
+    ) -> bmux_plugin_sdk::author::Result<bmux_plugin_sdk::ServiceResponse> {
+        Ok(Self::route(context))
     }
 }
 

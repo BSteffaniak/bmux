@@ -208,8 +208,8 @@ impl Plugin for PerformancePlugin {
         d.blocking_activate(Self::activate)
             .blocking_deactivate(Self::deactivate)
             .blocking_services(Self::invoke_service, None)
-            .typed_services(|plugin, context, registry| {
-                plugin.register_typed_services(context, registry);
+            .typed_services(|_, context, registry| {
+                Self::register_typed_services(&context, registry);
                 Ok(())
             });
     }
@@ -218,30 +218,29 @@ impl Plugin for PerformancePlugin {
 impl PerformancePlugin {
     fn activate(
         &self,
-        context: bmux_plugin_sdk::NativeLifecycleContext,
+        context: &bmux_plugin_sdk::NativeLifecycleContext,
         _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
     ) -> std::result::Result<(), PluginCommandError> {
-        self.adopt_activation_bus(|| bmux_plugin::activation_event_bus(&context));
-        self.adopt_activation_states(|| Some(bmux_plugin::activation_state_registry(&context)));
+        self.adopt_activation_bus(|| bmux_plugin::activation_event_bus(context));
+        self.adopt_activation_states(|| Some(bmux_plugin::activation_state_registry(context)));
         self.activate_owner()?;
         Ok(())
     }
 
     fn deactivate(
         &self,
-        _context: bmux_plugin_sdk::NativeLifecycleContext,
+        _context: &bmux_plugin_sdk::NativeLifecycleContext,
     ) -> std::result::Result<(), PluginCommandError> {
         self.stop_worker()?;
         Ok(())
     }
 
-    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
-        self.service(&context)
+    fn invoke_service(&self, context: &NativeServiceContext) -> ServiceResponse {
+        self.service(context)
     }
 
     fn register_typed_services(
-        &self,
-        _context: TypedServiceRegistrationContext<'_>,
+        _context: &TypedServiceRegistrationContext<'_>,
         _registry: &mut TypedServiceRegistry,
     ) {
         // No typed Arc<dyn Trait> surface today — performance operations
@@ -1187,6 +1186,8 @@ impl PerformanceHost for ActivationPerformanceHost {
 // fresh default author state per created instance.
 bmux_plugin_sdk::plugin!(PerformancePlugin);
 
+/// # Panics
+/// Panics if the embedded plugin declaration is rejected.
 pub fn plugin_definition_with_host(
     host: Arc<dyn PerformanceHost>,
 ) -> bmux_plugin_sdk::definition::PluginDefinition {

@@ -584,22 +584,24 @@ fn abi_guard_contains_unwinding_panics() {
 }
 
 mod author_declaration {
-    crate::define_plugin!(
-        factory = |_context| {
-            Ok(Arc::new(Echo {
-                effects: Arc::new(AtomicUsize::new(0)),
-            }) as Arc<dyn PluginInstance>)
-        },
-        metadata = PluginMetadata {
-            plugin_id: "example.declaration".into(),
-            version: "1".into(),
-            roles: vec![ComponentRole::Backend],
-            required_capabilities: vec![],
-            contracts: vec![],
-            manifest_toml: None,
-        }
-    );
     use super::*;
+    pub fn plugin_definition() -> crate::definition::PluginDefinition {
+        crate::definition::PluginDefinition::new(
+            PluginMetadata {
+                plugin_id: "example.declaration".into(),
+                version: "1".into(),
+                roles: vec![ComponentRole::Backend],
+                required_capabilities: vec![],
+                contracts: vec![],
+                manifest_toml: None,
+            },
+            |_context| {
+                Ok(Arc::new(Echo {
+                    effects: Arc::new(AtomicUsize::new(0)),
+                }) as Arc<dyn PluginInstance>)
+            },
+        )
+    }
 }
 // Exercise descriptor generation in exactly one packaging module. Author modules
 // can coexist in an rlib without exporting colliding entrypoint symbols.

@@ -85,7 +85,7 @@ impl Plugin for CountedDecoration {
 }
 
 impl CountedDecoration {
-    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         if context.request.operation == "apply-view-theme-extension" {
             self.effects.fetch_add(1, Ordering::SeqCst);
         }

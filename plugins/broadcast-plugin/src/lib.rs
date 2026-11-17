@@ -176,11 +176,11 @@ impl Plugin for BroadcastPlugin {
 impl BroadcastPlugin {
     fn activate(
         &self,
-        context: bmux_plugin_sdk::NativeLifecycleContext,
+        context: &bmux_plugin_sdk::NativeLifecycleContext,
         _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
     ) -> std::result::Result<(), PluginCommandError> {
         if let Some(indicator) = &self.activation_indicator {
-            let states = bmux_plugin::activation_state_registry(&context);
+            let states = bmux_plugin::activation_state_registry(context);
             indicator.bind(Some(indicator::fact_host(&states)));
         }
         self.activate_owner()?;
@@ -188,15 +188,17 @@ impl BroadcastPlugin {
     }
     fn deactivate(
         &self,
-        _context: bmux_plugin_sdk::NativeLifecycleContext,
+        _context: &bmux_plugin_sdk::NativeLifecycleContext,
     ) -> std::result::Result<(), PluginCommandError> {
         self.deactivate_owner()?;
         Ok(())
     }
-    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         self.service(context)
     }
-    fn run_command(&self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
+    fn run_command(&self, context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
+        // The workflow runs on its own thread or blocking task.
+        let context = context.clone();
         if context.invocation_source
             == bmux_plugin_sdk::NativeCommandInvocationSource::AttachKeybinding
         {
@@ -228,7 +230,7 @@ impl BroadcastPlugin {
     }
 }
 impl BroadcastPlugin {
-    fn service(&self, context: NativeServiceContext) -> ServiceResponse {
+    fn service(&self, context: &NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "broadcast-diagnostics-v1", "status" => |_r: (), ctx| { self.authenticated(ctx)?; self.controller()?.diagnostics().map_err(error) },
             "broadcast-diagnostics-v1", "events" => |r: bmux_broadcast_plugin_api::broadcast_diagnostics_v1::client::EventsRequest, ctx| { self.authenticated(ctx)?; self.controller()?.events(r.last).map_err(error) },

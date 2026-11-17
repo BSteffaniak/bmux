@@ -1292,7 +1292,7 @@ impl Plugin for TabsPlugin {
             .blocking_command("restart-pane", Self::run_command)
             .blocking_services(Self::invoke_service, None)
             .typed_services(|plugin, context, registry| {
-                plugin.register_typed_services(context, registry);
+                plugin.register_typed_services(&context, registry);
                 Ok(())
             });
     }
@@ -1301,7 +1301,7 @@ impl Plugin for TabsPlugin {
 impl TabsPlugin {
     fn activate(
         &self,
-        context: NativeLifecycleContext,
+        context: &NativeLifecycleContext,
         _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
     ) -> std::result::Result<(), PluginCommandError> {
         cwd::CwdSettings::parse(context.settings.as_ref())
@@ -1314,16 +1314,16 @@ impl TabsPlugin {
         storage_migration::migrate(std::path::Path::new(&context.connection.data_dir))
             .map_err(PluginCommandError::failed)?;
         drop(migration_guard);
-        let events = bmux_plugin::activation_event_bus(&context);
+        let events = bmux_plugin::activation_event_bus(context);
         {
             let mut runtime_state = self
                 .runtime_state
                 .lock()
                 .map_err(|_| PluginCommandError::failed("tab runtime state poisoned"))?;
             runtime_state.events.clone_from(&events);
-            runtime_state.states = bmux_plugin::activation_state_registry(&context);
+            runtime_state.states = bmux_plugin::activation_state_registry(context);
         }
-        arrangements::activate(&context, self.runtime_state.clone())
+        arrangements::activate(context, self.runtime_state.clone())
             .map_err(PluginCommandError::failed)?;
         // Register the typed event-bus channel for pane-event so
         // subscribers (decoration, future UI plugins) can wait on
@@ -1353,15 +1353,15 @@ impl TabsPlugin {
         Ok(())
     }
 
-    fn run_command(&self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
+    fn run_command(&self, context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
         durable_storage::configure(&context.connection.data_dir)
             .map_err(PluginCommandError::failed)?;
-        handle_command(self, &context)?;
+        handle_command(self, context)?;
         Ok(EXIT_OK)
     }
 
     #[allow(clippy::too_many_lines)] // route_service! covers every tabs-commands op; the block is naturally long.
-    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         if let Err(error) = durable_storage::configure(&context.connection.data_dir) {
             return ServiceResponse::error("storage_authority_unavailable", error);
         }
@@ -1500,15 +1500,15 @@ impl TabsPlugin {
 
     fn activate_with_async(
         &self,
-        context: NativeLifecycleContext,
+        context: &NativeLifecycleContext,
         async_handle: Option<bmux_plugin_sdk::HostAsyncHandle>,
     ) -> std::result::Result<(), PluginCommandError> {
-        self.activate(context.clone(), None)?;
+        self.activate(&context.clone(), None)?;
         let Some(async_handle) = async_handle else {
             return Ok(());
         };
         let shared = TabsSharedState {
-            caller: Arc::new(TypedServiceCaller::from_lifecycle_context(&context)),
+            caller: Arc::new(TypedServiceCaller::from_lifecycle_context(context)),
             settings: context.settings.clone(),
             last_selected_by_client: self.last_selected_by_client.clone(),
             runtime_state: self.runtime_state.clone(),
@@ -1569,7 +1569,7 @@ impl TabsPlugin {
 
     fn register_typed_services(
         &self,
-        context: TypedServiceRegistrationContext<'_>,
+        context: &TypedServiceRegistrationContext<'_>,
         registry: &mut TypedServiceRegistry,
     ) {
         let total_started = Instant::now();
@@ -1581,7 +1581,7 @@ impl TabsPlugin {
         // as the byte-encoded path on `TabsPlugin` so state stays
         // consistent between transports.
         let shared = TabsSharedState {
-            caller: Arc::new(TypedServiceCaller::from_registration_context(&context)),
+            caller: Arc::new(TypedServiceCaller::from_registration_context(context)),
             settings: context.plugin_settings_map.get("bmux.tabs").cloned(),
             last_selected_by_client: self.last_selected_by_client.clone(),
             runtime_state: self.runtime_state.clone(),
@@ -6880,7 +6880,7 @@ mod tests {
             ServiceKind::Command,
         );
 
-        let response = plugin.invoke_service(context);
+        let response = plugin.invoke_service(&context);
         assert!(
             response.error.is_none(),
             "unexpected error: {:?}",
@@ -6912,7 +6912,7 @@ mod tests {
             toml::from_str("[cwd.new_tab]\nsource = 'path'\npath = '/execution/project'\n")
                 .unwrap(),
         );
-        let response = plugin.invoke_service(context);
+        let response = plugin.invoke_service(&context);
         assert!(response.error.is_none(), "{:?}", response.error);
         let result: Result<TabAck, TabError> = decode_service_message(&response.payload).unwrap();
         assert!(
@@ -6936,7 +6936,7 @@ mod tests {
             ServiceKind::Command,
         );
 
-        let response = plugin.invoke_service(context);
+        let response = plugin.invoke_service(&context);
         assert!(response.error.is_none());
         let result: Result<TabAck, TabError> =
             decode_service_message(&response.payload).expect("result should decode");
@@ -6962,7 +6962,7 @@ mod tests {
             ServiceKind::Command,
         );
 
-        let response = plugin.invoke_service(context);
+        let response = plugin.invoke_service(&context);
         assert!(
             response.error.is_none(),
             "unexpected error: {:?}",
@@ -7052,7 +7052,7 @@ mod tests {
                     let response = bmux_contexts_plugin::ContextsPlugin::with_host_state(
                         Arc::clone(&context_states),
                     )
-                    .invoke_service(context);
+                    .invoke_service(&context);
                     assert!(response.error.is_none(), "{:?}", response.error);
                     Ok(response.payload)
                 } else if interface == "storage-query/v1" {
@@ -7139,7 +7139,7 @@ mod tests {
                     .to_vec();
                     let plugin = TabsPlugin::default();
                     plugin.runtime_state.lock().unwrap().events = Some(Arc::clone(events));
-                    let response = plugin.invoke_service(service_test_context(
+                    let response = plugin.invoke_service(&service_test_context(
                         Some(router),
                         &interface_id,
                         &operation,
@@ -7317,7 +7317,7 @@ mod tests {
             ServiceKind::Command,
         );
 
-        let response = plugin.invoke_service(context);
+        let response = plugin.invoke_service(&context);
         let error = response.error.expect("expected service error");
         assert_eq!(error.code, "invalid_request");
     }
@@ -7335,7 +7335,7 @@ mod tests {
             ServiceKind::Command,
         );
 
-        let response = plugin.invoke_service(context);
+        let response = plugin.invoke_service(&context);
         let error = response.error.expect("expected invalid request");
         assert_eq!(error.code, "invalid_request");
     }
@@ -7362,7 +7362,7 @@ mod tests {
             ServiceKind::Command,
         );
 
-        let response = plugin.invoke_service(context);
+        let response = plugin.invoke_service(&context);
         assert!(
             response.error.is_none(),
             "modeled failures must use the BPDL result"
@@ -7389,7 +7389,7 @@ mod tests {
             ServiceKind::Command,
         );
 
-        let response = plugin.invoke_service(context);
+        let response = plugin.invoke_service(&context);
         assert!(response.error.is_none());
         let result: Result<TabAck, TabError> =
             decode_service_message(&response.payload).expect("result should decode");
@@ -7412,7 +7412,7 @@ mod tests {
             ServiceKind::Command,
         );
 
-        let response = plugin.invoke_service(context);
+        let response = plugin.invoke_service(&context);
         let error = response
             .error
             .expect("expected unsupported operation error");
@@ -7688,7 +7688,7 @@ mod tests {
             connection: &host_connection,
             plugin_settings_map: &settings,
         };
-        plugin.register_typed_services(context, &mut registry);
+        plugin.register_typed_services(&context, &mut registry);
 
         let read_cap = HostScope::new("bmux.tabs.read").expect("read capability");
         let write_cap = HostScope::new("bmux.tabs.write").expect("write capability");

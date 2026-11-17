@@ -97,14 +97,15 @@ use typed invocation services for static calls and encode only in dynamic
 adapters. Existing plugin traits may be adapted during migration but must not
 become a permanent second runtime.
 
-Expose one author macro `define_plugin!` producing a module-local
-`plugin_definition()` factory. It never emits global no-mangle symbols in the
-implementation crate. A separate `export_plugin_entrypoint!` in a thin dynamic
-packaging target exports the common versioned descriptor/operations ABI.
-Implementation crates are export-free rlibs with no static/dynamic features;
-`scripts/package-plugin.py` generates every dynamic wrapper, and hosts bundle
-the
-same `plugin_definition()` through the shared definition registry. The former
+Expose one author macro, `plugin!`, producing a module-local
+`plugin_definition()` factory for a type implementing the `Plugin` trait. It
+emits the common versioned descriptor/operations entry only when the packager
+builds the crate as a dynamic library (`--cfg bmux_plugin_dylib` plus one
+`dynamic-<role>` feature), never in workspace or bundled builds.
+`scripts/package-plugin.py` builds the crate itself; there is no generated
+wrapper. Hosts bundle the same `plugin_definition()` through the shared
+definition registry. The legacy `RustPlugin` trait, `RustPluginAdapter`,
+`define_plugin!` and the generated-wrapper packager are deleted. The former
 native v1 exports (`export_plugin!`, `export_concurrent_plugin!`, the
 `bundled_*_vtable!` macros and `StaticPluginVtable`) are deleted, with no
 compatibility path. X1 owns concrete thin packaging targets or
@@ -200,8 +201,8 @@ attach commands. No output or command errors depend on shared SDK TLS.
 
 ## Ownership map
 
-M1: BMUX SDK `lib.rs`, `rust_plugin.rs` (the `RustPlugin` author trait and its
-supporting types, formerly `native_exports.rs`), `context.rs`, `error.rs`,
+M1: BMUX SDK `lib.rs`, `plugin_support.rs` (command errors, exit codes and
+registration/task types), `author.rs`/`author/**`, `context.rs`, `error.rs`,
 `definition.rs`/`definition/**`, `abi.rs`/`abi/**`, and SDK README. Excludes M4
 dispatch/contracts and M6 host/event/state/readiness modules.
 M2: BMUX `packages/plugin-runtime/**`, including its module root/manifests

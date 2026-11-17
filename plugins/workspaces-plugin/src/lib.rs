@@ -212,7 +212,7 @@ impl Plugin for WorkspacesPlugin {
             .blocking_command("last-workspace", Self::run_command)
             .blocking_services(Self::invoke_service, None)
             .typed_services(|plugin, context, registry| {
-                plugin.register_typed_services(context, registry);
+                plugin.register_typed_services(&context, registry);
                 Ok(())
             });
     }
@@ -221,15 +221,15 @@ impl Plugin for WorkspacesPlugin {
 impl WorkspacesPlugin {
     fn activate(
         &self,
-        context: NativeLifecycleContext,
+        context: &NativeLifecycleContext,
         _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
     ) -> std::result::Result<(), PluginCommandError> {
         *slot_mut(&self.events)? = WorkspaceEvents::new(
-            bmux_plugin::activation_event_bus(&context),
-            bmux_plugin::activation_state_registry(&context),
+            bmux_plugin::activation_event_bus(context),
+            bmux_plugin::activation_state_registry(context),
         );
-        let records = load_catalog(&context).map_err(PluginCommandError::failed)?;
-        let history = load_navigation_history(&context).map_err(PluginCommandError::failed)?;
+        let records = load_catalog(context).map_err(PluginCommandError::failed)?;
+        let history = load_navigation_history(context).map_err(PluginCommandError::failed)?;
         let active_by_client = history.active_by_client;
         let previous_by_client = history.previous_by_client;
         let mut state = WorkspaceState {
@@ -239,10 +239,10 @@ impl WorkspacesPlugin {
             selected_context_by_client_workspace: HashMap::new(),
         };
         state.ensure_default();
-        save_catalog(&context, &state.records)
+        save_catalog(context, &state.records)
             .map_err(|error| PluginCommandError::failed(format!("{error:?}")))?;
         let state = Arc::new(RwLock::new(state));
-        snapshot::register(&self.events().states, &context, Arc::clone(&state))
+        snapshot::register(&self.events().states, context, Arc::clone(&state))
             .map_err(PluginCommandError::failed)?;
         self.events().states.register::<WorkspaceState>(&state);
         if let Some(bus) = &self.events().bus {
@@ -251,12 +251,12 @@ impl WorkspacesPlugin {
         Ok(())
     }
 
-    fn run_command(&self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
-        run_command(&self.events(), &context).map_err(PluginCommandError::failed)?;
+    fn run_command(&self, context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
+        run_command(&self.events(), context).map_err(PluginCommandError::failed)?;
         Ok(EXIT_OK)
     }
 
-    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         // Endpoints come from the BPDL world's provided interfaces, so a route
         // the world does not declare fails to compile.
         use crate::declaration::provides::{
@@ -292,25 +292,25 @@ impl WorkspacesPlugin {
 
     fn register_typed_services(
         &self,
-        context: TypedServiceRegistrationContext<'_>,
+        context: &TypedServiceRegistrationContext<'_>,
         registry: &mut TypedServiceRegistry,
     ) {
-        let caller = Arc::new(TypedServiceCaller::from_registration_context(&context));
+        let caller = Arc::new(TypedServiceCaller::from_registration_context(context));
         let state: Arc<dyn WorkspacesStateService + Send + Sync> =
             Arc::new(WorkspacesStateHandle {
                 caller: Arc::clone(&caller),
-                events: self.events().clone(),
+                events: self.events(),
             });
         let activation: Arc<dyn WorkspacesActivationV1Service + Send + Sync> =
             Arc::new(WorkspacesCommandsHandle {
                 caller: caller.clone(),
-                events: self.events().clone(),
+                events: self.events(),
             });
         let _ = workspaces_activation_v1::register_provider(registry, activation);
         let commands: Arc<dyn WorkspacesCommandsService + Send + Sync> =
             Arc::new(WorkspacesCommandsHandle {
                 caller,
-                events: self.events().clone(),
+                events: self.events(),
             });
         let _ = workspaces_state::register_provider(registry, state);
         let _ = workspaces_commands::register_provider(registry, commands);

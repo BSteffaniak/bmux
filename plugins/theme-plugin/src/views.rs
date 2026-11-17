@@ -118,7 +118,7 @@ impl ThemePlugin {
                 },
                 context: context.clone(),
                 sink: self.selected_sink(),
-                states: self.states().clone(),
+                states: self.states(),
                 closed: std::sync::atomic::AtomicBool::new(false),
                 published: Mutex::new(None),
                 explicit: std::sync::atomic::AtomicBool::new(false),
@@ -204,7 +204,7 @@ impl ThemePlugin {
             return;
         };
         let views = Arc::clone(&self.views);
-        let Some(bus) = self.events().clone() else {
+        let Some(bus) = self.events() else {
             return;
         };
         let sink = self.selected_sink();
@@ -478,9 +478,9 @@ impl View {
 impl Plugin for ThemePlugin {
     fn declare(d: &mut Declarations<Self>) {
         d.blocking_activate(Self::activate)
-            .blocking_command("pick-theme", Self::run_command)
-            .blocking_command("show-theme", Self::run_command)
-            .blocking_command("refresh-theme", Self::run_command)
+            .blocking_command("pick-theme", |_, a0| Self::run_command(a0))
+            .blocking_command("show-theme", |_, a0| Self::run_command(a0))
+            .blocking_command("refresh-theme", |_, a0| Self::run_command(a0))
             .blocking_services(Self::invoke_service, None);
     }
 }
@@ -488,26 +488,26 @@ impl Plugin for ThemePlugin {
 impl ThemePlugin {
     fn activate(
         &self,
-        context: bmux_plugin_sdk::NativeLifecycleContext,
+        context: &bmux_plugin_sdk::NativeLifecycleContext,
         _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
     ) -> std::result::Result<(), PluginCommandError> {
         // No lifecycle call applies theme/appearance globally. An explicit
         // runtime bus wins; otherwise use the bus this activation was handed.
         if self.events().is_none() {
-            *slot_mut(&self.events)? = bmux_plugin::activation_event_bus(&context);
+            *slot_mut(&self.events)? = bmux_plugin::activation_event_bus(context);
         }
         if self.sink.is_none() {
-            *slot_mut(&self.states)? = Some(bmux_plugin::activation_state_registry(&context));
+            *slot_mut(&self.states)? = Some(bmux_plugin::activation_state_registry(context));
         }
-        self.watch_detach(&context);
+        self.watch_detach(context);
         Ok(())
     }
 
-    fn run_command(&self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
-        Self::command_impl(&context)
+    fn run_command(context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
+        Self::command_impl(context)
     }
 
-    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         if context.request.service.interface_id == "theme-control-v1"
             && matches!(
                 context.request.operation.as_str(),
@@ -526,9 +526,9 @@ impl ThemePlugin {
         if context.request.service.interface_id == "theme-state"
             && context.caller_client_id.is_none()
         {
-            return baseline_appearance(&context);
+            return baseline_appearance(context);
         }
-        let view = match self.view(&context) {
+        let view = match self.view(context) {
             Ok(view) => view,
             Err(error) => return error,
         };
@@ -539,11 +539,11 @@ impl ThemePlugin {
             return ServiceResponse::error("attachment_closed", "theme view is closed");
         }
         view.expire();
-        let target = match appearance_scope(&context) {
+        let target = match appearance_scope(context) {
             Ok(target) => target,
             Err(error) => return error,
         };
-        if let Err(error) = view.initialize(&context, target) {
+        if let Err(error) = view.initialize(context, target) {
             return ServiceResponse::error("theme_not_found", error);
         }
         if context.request.service.interface_id == "theme-state" {

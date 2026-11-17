@@ -1,61 +1,52 @@
 # bmux Plugin SDK
 
-## Unified scoped author API (source-stage migration)
+## Author API: `Plugin`, `Declarations` and `plugin!`
 
-Implement one `PluginInstance` and provide a factory. Definitions are inert:
-reading metadata does not initialize an instance, activate it, or register work.
-The implementation library is an ordinary export-free Rust library:
+A plugin implements the single `author::Plugin` trait. `declare` lists what it
+provides, requires, handles and contributes, checked against the bindings BPDL
+generates; `activate`/`deactivate` own its runtime work. `plugin!` turns the
+type into an inert `plugin_definition()` that creates a fresh instance per host
+scope:
 
 ```rust,ignore
-use std::sync::Arc;
-use bmux_plugin_sdk::{CommandOutcome, ComponentRole, NativeCommandContext,
-    PluginCallContext, PluginCreateContext, PluginFuture, PluginInstance,
-    PluginMetadata, PluginResult};
+use bmux_plugin_sdk::author::{self, Call, Declarations, Plugin};
+use bmux_plugin_sdk::NativeCommandContext;
 
-struct Hello;
-impl PluginInstance for Hello {
-    fn command(&self, call: PluginCallContext, context: NativeCommandContext)
-        -> PluginFuture<'_, CommandOutcome>
-    {
-        Box::pin(async move {
-            if call.cancellation.is_cancelled() {
-                return CommandOutcome { exit_code: 1, error: Some("cancelled".into()) };
-            }
-            CommandOutcome { exit_code: 0, error: None }
-        })
+#[derive(Default)]
+pub struct Hello;
+
+impl Plugin for Hello {
+    fn declare(d: &mut Declarations<Self>) {
+        d.native_command("hello", Self::hello);
     }
 }
 
-bmux_plugin_sdk::define_plugin!(
-    factory = |_scope: PluginCreateContext| -> PluginResult<Arc<dyn PluginInstance>> {
-        Ok(Arc::new(Hello))
-    },
-    metadata = PluginMetadata {
-        plugin_id: "example.hello".into(), version: "0.1.0".into(),
-        roles: vec![ComponentRole::Backend], required_capabilities: vec![],
-        contracts: vec![], manifest_toml: None,
-    },
-);
+impl Hello {
+    async fn hello(&self, _cx: &Call, _context: NativeCommandContext) -> author::Result<i32> {
+        println!("Hello!");
+        Ok(bmux_plugin_sdk::EXIT_OK)
+    }
+}
+
+bmux_plugin_sdk::plugin!(Hello);
 ```
 
-`define_plugin!` generates only `pub fn plugin_definition() ->
-PluginDefinition`.
 A static host calls `plugin_definition().create(host_context)` directly and
-registers generated BPDL adapters through
-`instance.register_typed_services(&mut activation_registry)`. The generated
-service traits remain the typed fast path: static calls do not serialize.
-Factories must create fresh scoped state without starting activation effects.
-Shared factory configuration is fine; accidental singleton product state is not.
+registers generated BPDL adapters through the instance; static calls do not
+serialize. The crate exports no native symbols in workspace or bundled builds.
+`scripts/package-plugin.py --implementation-manifest <crate>/Cargo.toml
+--component backend --build` builds the crate itself as a dynamic library
+(role feature `dynamic-backend`/`dynamic-frontend` plus `--cfg
+bmux_plugin_dylib`), and only then does `plugin!` export the entry. There is
+no generated wrapper crate.
 
-A **separate thin packaging cdylib** explicitly exports the descriptor:
-
-```rust,ignore
-bmux_plugin_sdk::export_plugin_entrypoint!(my_implementation::plugin_definition);
-```
-
-Do not invoke that macro in implementation crates. Packaging target generation
-and installation remain host tooling responsibilities. No build mode feature
-switch selects different behavior in the implementation.
+Surfaces whose bodies are not generated providers yet are declared too:
+`native_services`/`native_command` take async raw-context handlers, and
+`blocking_services`, `blocking_command`, `blocking_events`,
+`blocking_activate` and `blocking_deactivate` run synchronous bodies on the
+host's blocking pool inside the call's callback entry. `typed_services` and
+`registrations` register typed handles and activation-time contributions. See
+`docs/plugin-author-api.md` for the full contract.
 
 ### Exact author interfaces
 
@@ -346,26 +337,8 @@ protocol.
 Readiness contracts remain activation-owned; global `ReadyTracker` is not a
 substitute for owner-scoped publication.
 
-For migration, an existing trait implementation can declare:
-
-```rust,ignore
-bmux_plugin_sdk::define_plugin!(
-    rust_plugin = ExistingImplementation,
-    manifest = include_str!("../plugin.toml"),
-    roles = vec![bmux_plugin_sdk::ComponentRole::Backend],
-);
-```
-
-This delegates **all existing author hooks** through `RustPluginAdapter<P>` to
-one freshly created object, including async activation and host-context typed
-registration. Generated services are merged into the single embedded manifest.
-The direct factory form remains preferable for fully migrated implementations.
-The bridge rejects busy mutable callbacks instead of deadlocking on reentrant
-calls, and never uses process-global legacy instance cells. It requires `Sync`;
-implementations that cannot satisfy this must migrate their state explicitly.
-New optional legacy hooks for `portable_services`, `registration_contracts` and
-`stateful_participants` delegate through the same instance. Remove old native
-export macro calls when migrating: declaration does not require legacy exports.
+`DeclaredInstance` implements these entry points from the plugin's
+declarations; plugin crates do not implement `PluginInstance` themselves.
 
 The host must call the scoped/async activation and context-aware registration
 hooks. Scoped native ports carry authority via retain/release callback handles,
@@ -437,86 +410,20 @@ Full host-side wiring and source validation are pending; capability bits
 describe
 implemented adapter mechanisms, not evidence of tested production parity.
 
-## Legacy SDK migration reference
+## Plugin crate layout
 
-Everything you need to write a bmux plugin.
-
-## Quick Start
-
-A bmux plugin is a Rust crate with three files: a manifest, a library, and a
-`Cargo.toml`.
-
-### 1. `plugin.toml`
+A bmux plugin is a Rust crate with a BPDL package (or `schema!` source), a
+`plugin.toml` with the remaining settings, a library defining the plugin with
+`plugin!`, and a `Cargo.toml` that declares the packaging role features:
 
 ```toml
-id      = "example.hello"
-name    = "Hello Plugin"
-version = "0.1.0"
-
-[[commands]]
-name          = "hello"
-summary       = "Print a greeting"
-expose_in_cli = true
+[features]
+dynamic-backend = []
+dynamic-frontend = []
 ```
 
-### 2. `src/lib.rs`
-
-```rust
-use bmux_plugin_sdk::prelude::*;
-
-#[derive(Default)]
-pub struct HelloPlugin;
-
-impl RustPlugin for HelloPlugin {
-    fn run_command(&mut self, ctx: NativeCommandContext) -> Result<i32, PluginCommandError> {
-        bmux_plugin_sdk::route_command!(ctx, {
-            "hello" => {
-                let name = ctx.arguments.first().map_or("world", String::as_str);
-                println!("Hello, {name}!");
-                Ok(EXIT_OK)
-            },
-        })
-    }
-}
-
-bmux_plugin_sdk::define_plugin!(
-    rust_plugin = HelloPlugin,
-    manifest = include_str!("../plugin.toml"),
-    roles = vec![bmux_plugin_sdk::ComponentRole::Backend],
-);
-```
-
-### 3. `Cargo.toml`
-
-```toml
-[package]
-name    = "my_plugin"
-edition = "2024"
-version = "0.1.0"
-
-[dependencies]
-bmux_plugin_sdk = { version = "..." }
-```
-
-The implementation is a plain export-free `rlib` with no static or dynamic
-features. Hosts bundle it by calling `plugin_definition()`; dynamic artifacts
-come only from the thin wrapper `scripts/package-plugin.py` generates.
-
-## The `RustPlugin` Trait
-
-Every plugin implements `RustPlugin`. All five methods have default
-implementations -- override only what your plugin needs:
-
-| Method           | Return type                       | When to override                          |
-| ---------------- | --------------------------------- | ----------------------------------------- |
-| `run_command`    | `Result<i32, PluginCommandError>` | Plugin provides CLI commands              |
-| `invoke_service` | `ServiceResponse`                 | Plugin provides services to other plugins |
-| `activate`       | `Result<i32, PluginCommandError>` | Plugin needs setup on activation          |
-| `deactivate`     | `Result<i32, PluginCommandError>` | Plugin needs cleanup on deactivation      |
-| `handle_event`   | `Result<i32, PluginCommandError>` | Plugin subscribes to system events        |
-
-The trait requires `Default + Send + 'static`. Use `#[derive(Default)]` on your
-struct.
+Hosts bundle the crate by calling `plugin_definition()`; dynamic artifacts are
+built from the crate itself by `scripts/package-plugin.py`.
 
 ## Retained attach presentations
 
@@ -599,7 +506,8 @@ Use `route_command!` to match on the command name and auto-generate the
 unknown-command fallback:
 
 ```rust
-fn run_command(&mut self, ctx: NativeCommandContext) -> Result<i32, PluginCommandError> {
+// Declared with `d.blocking_command("list", Self::run_command)` (one per name).
+fn run_command(&self, ctx: NativeCommandContext) -> Result<i32, PluginCommandError> {
     bmux_plugin_sdk::route_command!(ctx, {
         "list"   => handle_list(&ctx),
         "create" => handle_create(&ctx),
@@ -659,7 +567,8 @@ Use `route_service!` to match on `(interface_id, operation)` pairs. Each handler
 receives a typed request and returns a typed response:
 
 ```rust
-fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+// Declared with `d.blocking_services(Self::invoke_service, None)`.
+fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
     bmux_plugin_sdk::route_service!(context, {
         "my-service/v1", "do_thing" => |req: DoThingRequest, _ctx| {
             let result = do_the_thing(&req.input)?;
@@ -704,7 +613,7 @@ handle_service(&context, |req: MyRequest, ctx| {
 
 `use bmux_plugin_sdk::prelude::*` imports the ~16 items most plugins need:
 
-- **Trait:** `RustPlugin`
+- **Trait:** `author::Plugin`
 - **Context types:** `NativeCommandContext`, `NativeLifecycleContext`, `NativeServiceContext`
 - **Error type:** `PluginCommandError`
 - **Exit codes:** `EXIT_OK`, `EXIT_ERROR`, `EXIT_USAGE`, `EXIT_UNAVAILABLE`

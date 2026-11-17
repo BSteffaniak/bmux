@@ -117,8 +117,8 @@ impl Plugin for ControlCatalogPlugin {
         d.blocking_activate(Self::activate)
             .blocking_deactivate(Self::deactivate)
             .blocking_services(Self::invoke_service, None)
-            .typed_services(|plugin, context, registry| {
-                plugin.register_typed_services(context, registry);
+            .typed_services(|_, context, registry| {
+                Self::register_typed_services(&context, registry);
                 Ok(())
             });
     }
@@ -127,34 +127,33 @@ impl Plugin for ControlCatalogPlugin {
 impl ControlCatalogPlugin {
     fn activate(
         &self,
-        context: bmux_plugin_sdk::NativeLifecycleContext,
+        context: &bmux_plugin_sdk::NativeLifecycleContext,
         _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
     ) -> std::result::Result<(), PluginCommandError> {
         self.catalog
-            .adopt_activation_bus(|| bmux_plugin::activation_event_bus(&context));
-        self.adopt_activation_states(|| Some(bmux_plugin::activation_state_registry(&context)));
+            .adopt_activation_bus(|| bmux_plugin::activation_event_bus(context));
+        self.adopt_activation_states(|| Some(bmux_plugin::activation_state_registry(context)));
         self.start_subscriber()?;
         Ok(())
     }
 
     fn deactivate(
         &self,
-        _context: bmux_plugin_sdk::NativeLifecycleContext,
+        _context: &bmux_plugin_sdk::NativeLifecycleContext,
     ) -> std::result::Result<(), PluginCommandError> {
         self.stop_subscriber()?;
         Ok(())
     }
 
-    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
-        self.service(&context)
+    fn invoke_service(&self, context: &NativeServiceContext) -> ServiceResponse {
+        self.service(context)
     }
 
     fn register_typed_services(
-        &self,
-        context: TypedServiceRegistrationContext<'_>,
+        context: &TypedServiceRegistrationContext<'_>,
         registry: &mut TypedServiceRegistry,
     ) {
-        let caller = Arc::new(TypedServiceCaller::from_registration_context(&context));
+        let caller = Arc::new(TypedServiceCaller::from_registration_context(context));
 
         let state: Arc<dyn control_catalog_state::ControlCatalogStateService + Send + Sync> =
             Arc::new(ControlCatalogStateHandle::new(caller));
@@ -424,6 +423,9 @@ bmux_plugin_sdk::plugin!(ControlCatalogPlugin);
 /// Bind one host's neutral mechanisms before creating instances. The portable
 /// adapter must translate its host handles into these same mechanisms; it must
 /// not select the legacy global registry.
+///
+/// # Panics
+/// Panics if the embedded plugin declaration is rejected.
 pub fn plugin_definition_with_host(
     events: Arc<EventBus>,
     state: Arc<PluginStateRegistry>,

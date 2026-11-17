@@ -5184,28 +5184,24 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn selected_factory_instance_binds_adapter_lifecycle_before_author_effects() {
-        #[derive(Default)]
+    async fn selected_factory_instance_binds_blocking_lifecycle_before_author_effects() {
         struct Author(Arc<AtomicUsize>);
-        impl bmux_plugin_sdk::RustPlugin for Author {
-            type Contract = bmux_plugin_sdk::NoPluginContract;
-            fn activate(
-                &mut self,
-                _: NativeLifecycleContext,
-            ) -> std::result::Result<i32, bmux_plugin_sdk::PluginCommandError> {
-                assert_blocking_pool();
-                self.0.fetch_add(1, Ordering::AcqRel);
-                Ok(0)
-            }
-            fn deactivate(
-                &mut self,
-                _: NativeLifecycleContext,
-            ) -> std::result::Result<i32, bmux_plugin_sdk::PluginCommandError> {
-                assert_blocking_pool();
-                self.0.fetch_add(1, Ordering::AcqRel);
-                Ok(0)
+        impl bmux_plugin_sdk::author::Plugin for Author {
+            fn declare(d: &mut bmux_plugin_sdk::author::Declarations<Self>) {
+                d.blocking_activate(|author, _, _| {
+                    assert_blocking_pool();
+                    author.0.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                })
+                .blocking_deactivate(|author, _| {
+                    assert_blocking_pool();
+                    author.0.fetch_add(1, Ordering::AcqRel);
+                    Ok(())
+                });
             }
         }
+        const MANIFEST: &str =
+            "id = \"test.safety\"\nversion = \"1\"\ncomponent_roles = [\"backend\"]\n";
         OBSERVER.with(|observer| observer.set(true));
         for bound in [false, true] {
             let effects = Arc::new(AtomicUsize::new(0));
@@ -5216,16 +5212,17 @@ mod tests {
                 fixture_artifact().metadata.clone(),
                 move |context: PluginCreateContext| {
                     *factory_observed.lock().unwrap() = Some(context.instance);
-                    let author = Author(author_effects.clone());
-                    let adapter = if bound {
-                        bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
-                            author,
-                            context.instance,
-                        )
+                    let instance = bmux_plugin_sdk::author::DeclaredInstance::new(
+                        Author(author_effects.clone()),
+                        MANIFEST,
+                        &[],
+                    )?;
+                    let instance = if bound {
+                        instance.for_instance(context.instance)
                     } else {
-                        bmux_plugin_sdk::definition::RustPluginAdapter::new(author)
+                        instance
                     };
-                    Ok(Arc::new(adapter) as Arc<dyn PluginInstance>)
+                    Ok(Arc::new(instance) as Arc<dyn PluginInstance>)
                 },
             ));
             let execution = artifact

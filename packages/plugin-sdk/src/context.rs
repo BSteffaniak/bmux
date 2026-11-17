@@ -125,7 +125,7 @@ pub struct ResolvedAuxiliaryExecutable {
     pub artifact_sha256: String,
 }
 
-/// Context passed to [`RustPlugin::activate`] and [`RustPlugin::deactivate`].
+/// Native lifecycle context of an activation or deactivation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeLifecycleContext {
     /// The plugin's own ID (e.g. `"bmux.clipboard"`).
@@ -225,7 +225,7 @@ impl NativeLifecycleContext {
     }
 }
 
-/// Context passed to [`RustPlugin::run_command`].
+/// Context of one plugin command invocation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeCommandContext {
     /// The plugin's own ID (e.g. `"bmux.clipboard"`).
@@ -352,7 +352,7 @@ impl NativeCommandInvocationSource {
     }
 }
 
-/// Context passed to [`RustPlugin::invoke_service`].
+/// Context of one service invocation.
 ///
 /// Equality includes all wire fields and live service-port allocation identity.
 /// A clone preserves port identity. Independently bound ports compare unequal;

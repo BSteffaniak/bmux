@@ -68,7 +68,7 @@ fn invoke<T: serde::Serialize, R: serde::de::DeserializeOwned>(
     context.request.service.interface_id = interface.into();
     context.request.operation = operation.into();
     context.request.payload = encode_service_message(request).expect("request");
-    let response = plugin.invoke_service(context);
+    let response = plugin.invoke_service(&context);
     assert!(response.error.is_none(), "{:?}", response.error);
     decode_service_message(&response.payload).expect("response")
 }

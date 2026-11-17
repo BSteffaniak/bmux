@@ -14,34 +14,22 @@
 //! loading.  The host-side machinery lives in the full `bmux_plugin` crate,
 //! which re-exports everything from this SDK.
 //!
-//! # Unified author API
+//! # Author API
 //!
-//! Implement [`PluginInstance`] once, declare an inert definition with
-//! [`define_plugin!`], and create one instance per host scope. Implementation
-//! libraries export no native symbols. A separate thin cdylib calls
-//! [`export_plugin_entrypoint!`] to expose the explicitly selected v2 ABI.
-//! Typed static BPDL adapters register through the same scoped implementation.
-//! Existing `RustPlugin` implementations are adapted per scoped instance by
-//! `define_plugin!(rust_plugin = ...)`; there is no other export path.
+//! Implement [`author::Plugin`] once: `declare` lists what the plugin
+//! provides, requires, handles and contributes, checked against the bindings
+//! BPDL generates, and [`plugin!`] turns the type into an inert
+//! `plugin_definition()` that creates one instance per host scope. Plugin
+//! crates export no native symbols in workspace or bundled builds; the
+//! packager builds a crate as a dynamic library with its role feature and
+//! `--cfg bmux_plugin_dylib`, and only then does `plugin!` export the entry.
+//! See `docs/plugin-author-api.md`.
 //!
 //! # Quick start
 //!
 //! ```ignore
-//! use bmux_plugin_sdk::prelude::*;
-//!
-//! #[derive(Default)]
-//! pub struct MyPlugin;
-//!
-//! impl RustPlugin for MyPlugin {
-//!     type Contract = bmux_plugin_sdk::NoPluginContract;
-//!
-//!     fn run_command(&mut self, ctx: NativeCommandContext) -> Result<i32, PluginCommandError> {
-//!         match ctx.command.as_str() {
-//!             "hello" => { println!("Hello!"); Ok(EXIT_OK) }
-//!             _ => Err(PluginCommandError::unknown_command(&ctx.command)),
-//!         }
-//!     }
-//! }
+//! use bmux_plugin_sdk::author::{self, Call, Declarations, Plugin};
+//! use bmux_plugin_sdk::NativeCommandContext;
 //!
 //! // `bpdl/my-plugin.bpdl` declares `plugin example.my version 1;` and a
 //! // `world`; `plugin.toml` holds the remaining settings.
@@ -52,11 +40,23 @@
 //!     }
 //! }
 //!
-//! bmux_plugin_sdk::define_plugin!(
-//!     rust_plugin = MyPlugin,
-//!     manifest = declaration::PLUGIN_MANIFEST,
-//!     roles = vec![bmux_plugin_sdk::ComponentRole::Backend],
-//! );
+//! #[derive(Default)]
+//! pub struct MyPlugin;
+//!
+//! impl Plugin for MyPlugin {
+//!     fn declare(d: &mut Declarations<Self>) {
+//!         d.native_command("hello", Self::hello);
+//!     }
+//! }
+//!
+//! impl MyPlugin {
+//!     async fn hello(&self, _cx: &Call, _context: NativeCommandContext) -> author::Result<i32> {
+//!         println!("Hello!");
+//!         Ok(bmux_plugin_sdk::EXIT_OK)
+//!     }
+//! }
+//!
+//! bmux_plugin_sdk::plugin!(MyPlugin);
 //! ```
 
 pub mod abi;
@@ -87,10 +87,10 @@ mod event;
 mod host;
 mod host_services;
 mod ident;
+mod plugin_support;
 mod process_runtime;
 pub mod prompt;
 mod ready;
-mod rust_plugin;
 mod service;
 extern crate self as bmux_plugin_sdk;
 
@@ -166,6 +166,10 @@ macro_rules! storage_key {
         $crate::StorageKey::from_validated_literal($key)
     }};
 }
+pub use plugin_support::{
+    EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, EXIT_USAGE, HostAsyncHandle, PluginCommandError,
+    TypedServiceRegistrationContext,
+};
 pub use process_runtime::{
     PROCESS_RUNTIME_ENV_PERSISTENT_WORKER, PROCESS_RUNTIME_ENV_PLUGIN_ID,
     PROCESS_RUNTIME_ENV_PROTOCOL, PROCESS_RUNTIME_MAGIC_V1, PROCESS_RUNTIME_PROTOCOL_V1,
@@ -175,10 +179,6 @@ pub use process_runtime::{
     encode_process_runtime_frame,
 };
 pub use ready::{ReadySignalDecl, ReadyStatus, ReadyTracker};
-pub use rust_plugin::{
-    EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, EXIT_USAGE, HostAsyncHandle, PluginCommandError,
-    RustPlugin, TypedServiceRegistrationContext,
-};
 pub use service::{
     BoundedServiceEventSink, CURRENT_SERVICE_PROTOCOL_VERSION, NoPluginContract, PluginContract,
     PluginService, ProviderId, RegisteredService, ServiceEnvelope, ServiceEnvelopeKind,
@@ -403,7 +403,6 @@ pub mod prelude {
         PromptValidation,
         PromptValue,
         PromptWidth,
-        RustPlugin,
         // Service types
         ServiceKind,
         ServiceResponse,

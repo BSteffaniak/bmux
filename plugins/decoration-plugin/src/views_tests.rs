@@ -89,7 +89,7 @@ fn call<T: serde::Serialize>(
     operation: &str,
     payload: &T,
 ) -> ServiceResponse {
-    plugin.invoke_service(context(
+    plugin.invoke_service(&context(
         Some(caller),
         interface,
         operation,
@@ -129,7 +129,7 @@ fn caller_layout_focus_theme_checkpoint_and_lifetime_are_isolated() {
     let pane = id(803);
     let life_a = id(804);
     let life_b = id(805);
-    let missing = plugin.invoke_service(context(
+    let missing = plugin.invoke_service(&context(
         None,
         "decoration-view-v1",
         "scene",

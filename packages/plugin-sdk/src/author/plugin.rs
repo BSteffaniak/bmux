@@ -171,19 +171,19 @@ type NativeStreamingFn<P> = Box<
         + Sync,
 >;
 /// A synchronous service body: the raw context in, the response out.
-pub type BlockingServiceFn<P> = fn(&P, NativeServiceContext) -> ServiceResponse;
+pub type BlockingServiceFn<P> = fn(&P, &NativeServiceContext) -> ServiceResponse;
 /// A synchronous streaming service body.
-pub type BlockingStreamingFn<P> = fn(&P, NativeStreamingServiceContext) -> ServiceResponse;
+pub type BlockingStreamingFn<P> = fn(&P, &NativeStreamingServiceContext) -> ServiceResponse;
 /// A synchronous command body returning its exit code.
-pub type BlockingCommandFn<P> = fn(&P, NativeCommandContext) -> Result<i32>;
+pub type BlockingCommandFn<P> = fn(&P, &NativeCommandContext) -> Result<i32>;
 /// A synchronous host-event body.
-pub type BlockingEventFn<P> = fn(&P, PluginEvent) -> Result<()>;
+pub type BlockingEventFn<P> = fn(&P, &PluginEvent) -> Result<()>;
 /// A synchronous activation body, with the activation's task scope when the
 /// host provides one.
 pub type BlockingActivateFn<P> =
-    fn(&P, NativeLifecycleContext, Option<HostAsyncHandle>) -> Result<()>;
+    fn(&P, &NativeLifecycleContext, Option<HostAsyncHandle>) -> Result<()>;
 /// A synchronous deactivation body.
-pub type BlockingDeactivateFn<P> = fn(&P, NativeLifecycleContext) -> Result<()>;
+pub type BlockingDeactivateFn<P> = fn(&P, &NativeLifecycleContext) -> Result<()>;
 /// Registers typed handles for interfaces whose providers are not generated
 /// author bindings, with the host's registration context.
 pub type TypedServicesFn<P> =
@@ -999,12 +999,12 @@ impl<P: Plugin> DeclaredInstance<P> {
     fn lifecycle(
         &self,
         context: &PluginLifecycleContext,
-        work: impl FnOnce(&P, NativeLifecycleContext) -> Result<()> + Send + 'static,
+        work: impl FnOnce(&P, &NativeLifecycleContext) -> Result<()> + Send + 'static,
     ) -> PluginFuture<'static, Result<()>> {
         let mut native = context.native.clone();
         native.capabilities = context.capabilities.clone();
         self.entered(context.callback_execution.clone(), move |plugin| {
-            work(plugin, native)
+            work(plugin, &native)
         })
     }
 
@@ -1146,7 +1146,7 @@ impl<P: Plugin> PluginInstance for DeclaredInstance<P> {
                     }
                     let run = *run;
                     self.entered(call.callback_execution, move |plugin| {
-                        Ok(CommandOutcome::capture(|| run(plugin, context)))
+                        Ok(CommandOutcome::capture(|| run(plugin, &context)))
                     })
                     .await
                     .unwrap_or_else(|error| Err(error).into())
@@ -1177,7 +1177,7 @@ impl<P: Plugin> PluginInstance for DeclaredInstance<P> {
                     let (context, checked) = self.checked(context)?;
                     let unary = *unary;
                     self.entered(call.callback_execution, move |plugin| {
-                        Ok(checked_response(unary(plugin, context), checked))
+                        Ok(checked_response(unary(plugin, &context), checked))
                     })
                     .await
                 }
@@ -1212,10 +1212,11 @@ impl<P: Plugin> PluginInstance for DeclaredInstance<P> {
                     let (unary, streaming) = (*unary, *streaming);
                     self.entered(call.callback_execution, move |plugin| {
                         let response = match streaming {
-                            Some(streaming) => {
-                                streaming(plugin, NativeStreamingServiceContext { service, events })
-                            }
-                            None => unary(plugin, service),
+                            Some(streaming) => streaming(
+                                plugin,
+                                &NativeStreamingServiceContext { service, events },
+                            ),
+                            None => unary(plugin, &service),
                         };
                         Ok(checked_response(response, checked))
                     })
@@ -1236,7 +1237,7 @@ impl<P: Plugin> PluginInstance for DeclaredInstance<P> {
                 Some(Events::Blocking(handler)) => {
                     let handler = *handler;
                     self.entered(call.callback_execution, move |plugin| {
-                        handler(plugin, event)
+                        handler(plugin, &event)
                     })
                     .await
                 }
@@ -1290,12 +1291,9 @@ impl<P: Plugin> PluginInstance for DeclaredInstance<P> {
                 })
                 .map_err(Error::failed)?;
         }
-        match self.declarations.registrations {
-            Some(register) => {
-                register(&self.plugin, registrar).map_err(|error| Error::failed(error.to_string()))
-            }
-            None => Ok(()),
-        }
+        self.declarations.registrations.map_or(Ok(()), |register| {
+            register(&self.plugin, registrar).map_err(|error| Error::failed(error.to_string()))
+        })
     }
 
     fn portable_services(&self) -> PluginResult<Vec<Arc<dyn PortableServiceProvider>>> {
@@ -1321,10 +1319,9 @@ impl<P: Plugin> PluginInstance for DeclaredInstance<P> {
         registry: &mut TypedServiceRegistry,
     ) -> PluginResult<()> {
         self.register_typed_services(registry)?;
-        match self.declarations.typed_services {
-            Some(register) => register(&self.plugin, context, registry),
-            None => Ok(()),
-        }
+        self.declarations
+            .typed_services
+            .map_or(Ok(()), |register| register(&self.plugin, context, registry))
     }
 
     fn register_typed_services(&self, registry: &mut TypedServiceRegistry) -> PluginResult<()> {

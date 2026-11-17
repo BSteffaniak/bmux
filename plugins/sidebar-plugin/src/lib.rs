@@ -439,15 +439,14 @@ pub struct SidebarPlugin;
 
 impl Plugin for SidebarPlugin {
     fn declare(d: &mut Declarations<Self>) {
-        d.blocking_activate(Self::activate)
-            .blocking_services(Self::invoke_service, None);
+        d.blocking_activate(|_, a0, a1| Self::activate(a0, a1))
+            .blocking_services(|_, a0| Self::invoke_service(a0), None);
     }
 }
 
 impl SidebarPlugin {
     fn activate(
-        &self,
-        context: NativeLifecycleContext,
+        context: &NativeLifecycleContext,
         _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
     ) -> std::result::Result<(), PluginCommandError> {
         // Validate configuration up front. The backend owns no presentation:
@@ -456,7 +455,7 @@ impl SidebarPlugin {
         Ok(())
     }
 
-    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_service(context: &NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "presentation-input", "handle-input" => |event: AttachInputEvent, ctx| {
                 Ok::<_, ServiceResponse>(handle_input(ctx, &event))

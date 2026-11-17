@@ -63,7 +63,7 @@ impl Plugin for PresenterPlugin {
 impl PresenterPlugin {
     fn activate(
         &self,
-        _context: bmux_plugin_sdk::NativeLifecycleContext,
+        _context: &bmux_plugin_sdk::NativeLifecycleContext,
         _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
     ) -> std::result::Result<(), PluginCommandError> {
         self.managed
@@ -72,16 +72,16 @@ impl PresenterPlugin {
     }
     fn deactivate(
         &self,
-        _context: bmux_plugin_sdk::NativeLifecycleContext,
+        _context: &bmux_plugin_sdk::NativeLifecycleContext,
     ) -> std::result::Result<(), PluginCommandError> {
         self.managed.admit_retirement()?;
         Ok(())
     }
 
-    fn run_command(&self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
-        self.run(context)
+    fn run_command(&self, context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
+        self.run(context.clone())
     }
-    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         services::invoke(&self.managed, context)
     }
 }

@@ -678,7 +678,7 @@ mod tests {
         request: &Request,
     ) -> Response {
         let payload = bmux_plugin_sdk::encode_service_message(request).unwrap();
-        let response = plugin.invoke_service(service_context(
+        let response = plugin.invoke_service(&service_context(
             caller, capability, interface, operation, payload,
         ));
         assert!(response.error.is_none(), "{:?}", response.error);

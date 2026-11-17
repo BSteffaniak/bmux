@@ -5,12 +5,9 @@
 //! dropping an observer is not permission to destroy a running implementation.
 
 mod activation_capabilities;
-mod callback_gate;
-mod legacy;
 #[cfg(test)]
 mod retained_opener_tests;
 pub use activation_capabilities::ActivationCapabilities;
-pub use legacy::RustPluginAdapter;
 
 use crate::{
     NativeCommandContext, NativeLifecycleContext, NativeServiceContext,
@@ -973,12 +970,12 @@ impl PluginDefinition {
     /// Validate explicit embedded identity against the author metadata.
     ///
     /// Legacy manifests may omit identity fields; when supplied they must agree
-    /// exactly. The legacy converter always embeds both roles and contracts.
+    /// exactly.
     /// # Errors
     /// Rejects malformed declarations, duplicate contracts and identity conflicts.
     pub fn validate(&self) -> PluginResult<()> {
         self.declarations()?;
-        legacy::validate_contracts(&self.metadata.contracts)?;
+        validate_contracts(&self.metadata.contracts)?;
         if let Some(manifest) = &self.metadata.manifest_toml {
             let value: toml::Value = toml::from_str(manifest)
                 .map_err(|error| PluginCommandError::failed(error.to_string()))?;
@@ -1001,7 +998,7 @@ impl PluginDefinition {
                         .map_err(|error: toml::de::Error| {
                             PluginCommandError::failed(error.to_string())
                         })?;
-                legacy::validate_contracts(&contracts)?;
+                validate_contracts(&contracts)?;
                 if contracts != self.metadata.contracts {
                     return Err(PluginCommandError::failed(
                         "embedded contracts conflict with metadata",
@@ -1025,21 +1022,19 @@ impl PluginDefinition {
     }
 }
 
-/// Declare an export-free implementation. The generated function is also the
-/// static adapter: hosts call `plugin_definition().create(host_scope)` directly.
-#[macro_export]
-macro_rules! define_plugin {
-    (rust_plugin = $plugin:ty, manifest = $manifest:expr, roles = $roles:expr $(,)?) => {
-        pub fn plugin_definition() -> $crate::definition::PluginDefinition {
-            $crate::definition::PluginDefinition::from_rust_plugin::<$plugin>($manifest, $roles)
-                .expect("embedded plugin declaration must be valid")
+fn validate_contracts(contracts: &[ContractDescriptor]) -> PluginResult<()> {
+    let mut ids = std::collections::BTreeSet::new();
+    for contract in contracts {
+        if contract.interface_id.trim().is_empty()
+            || contract.major == 0
+            || !ids.insert(&contract.interface_id)
+        {
+            return Err(PluginCommandError::failed(
+                "empty, duplicate, or zero-version contract declaration",
+            ));
         }
-    };
-    (factory = $factory:expr, metadata = $metadata:expr $(,)?) => {
-        pub fn plugin_definition() -> $crate::definition::PluginDefinition {
-            $crate::definition::PluginDefinition::new($metadata, $factory)
-        }
-    };
+    }
+    Ok(())
 }
 
 #[cfg(test)]

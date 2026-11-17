@@ -217,8 +217,8 @@ impl Plugin for SnapshotPlugin {
         d.blocking_activate(Self::activate)
             .blocking_deactivate(Self::deactivate)
             .blocking_services(Self::invoke_service, None)
-            .typed_services(|plugin, context, registry| {
-                plugin.register_typed_services(context, registry);
+            .typed_services(|_, context, registry| {
+                Self::register_typed_services(&context, registry);
                 Ok(())
             });
     }
@@ -227,7 +227,7 @@ impl Plugin for SnapshotPlugin {
 impl SnapshotPlugin {
     fn activate(
         &self,
-        _context: NativeLifecycleContext,
+        _context: &NativeLifecycleContext,
         _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
     ) -> std::result::Result<(), PluginCommandError> {
         if !self.bound || self.orchestrator().is_some() {
@@ -337,7 +337,7 @@ impl SnapshotPlugin {
 
     fn deactivate(
         &self,
-        _context: NativeLifecycleContext,
+        _context: &NativeLifecycleContext,
     ) -> std::result::Result<(), PluginCommandError> {
         if let Some(orchestrator) = &self.orchestrator() {
             orchestrator
@@ -348,12 +348,12 @@ impl SnapshotPlugin {
         Ok(())
     }
 
-    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         if matches!(
             context.request.service.interface_id.as_str(),
             "snapshot-participant-state-v1" | "snapshot-participant-commands-v1"
         ) {
-            return self.invoke_participant(&context);
+            return self.invoke_participant(context);
         }
         bmux_plugin_sdk::route_service!(context, {
             bmux_snapshot_plugin_api::snapshot_state::client::StatusEndpoint => |_req, _ctx| {
@@ -372,8 +372,7 @@ impl SnapshotPlugin {
     }
 
     fn register_typed_services(
-        &self,
-        _context: TypedServiceRegistrationContext<'_>,
+        _context: &TypedServiceRegistrationContext<'_>,
         _registry: &mut TypedServiceRegistry,
     ) {
         // No typed Arc<dyn Trait> surface today — generated snapshot

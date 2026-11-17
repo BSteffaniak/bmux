@@ -682,7 +682,7 @@ impl ThemeView {
 }
 
 impl ThemeView {
-    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         if self
             .recovery_required
             .load(std::sync::atomic::Ordering::Acquire)
@@ -3096,7 +3096,7 @@ mod tests {
     }
 
     impl CountedTheme {
-        fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+        fn invoke_service(&self, context: &NativeServiceContext) -> ServiceResponse {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.plugin.invoke_service(context)
         }
@@ -3529,7 +3529,7 @@ mod tests {
             .map_err(|error| error.to_string())?
             .to_vec();
         }
-        let mut response = plugin.invoke_service(context);
+        let mut response = plugin.invoke_service(&context);
         if checked && response.error.is_none() {
             response.payload = service_contract::encode_response(&response.payload);
         }
@@ -3866,10 +3866,10 @@ mod tests {
             service_context(Some(toml::from_str("theme = 'hacker'").expect("settings")));
         context.request.service.interface_id = "theme-control-v1".to_string();
         context.request.operation = "current".to_string();
-        let first = plugin.invoke_service(context.clone());
+        let first = plugin.invoke_service(&context);
         assert!(first.error.is_none());
         context.settings = Some(toml::from_str("theme = 'minimal'").expect("settings"));
-        let second = plugin.invoke_service(context);
+        let second = plugin.invoke_service(&context);
         assert!(second.error.is_none());
         assert_eq!(first.payload, second.payload);
         let state: control_contract::theme_control_v1::Snapshot =
@@ -4103,7 +4103,7 @@ mod tests {
         );
         context.request.service.interface_id = "theme-control-v1".into();
         context.request.operation = "current".into();
-        assert!(plugin.invoke_service(context.clone()).error.is_none());
+        assert!(plugin.invoke_service(&context).error.is_none());
         let token = plugin.begin_preview(&context, 0).expect("preview");
         assert!(plugin.begin_preview(&context, 0).is_err());
         assert!(
@@ -4142,7 +4142,7 @@ mod tests {
         );
         context.request.service.interface_id = "theme-control-v1".into();
         context.request.operation = "current".into();
-        assert!(plugin.invoke_service(context.clone()).error.is_none());
+        assert!(plugin.invoke_service(&context).error.is_none());
         let token = plugin.begin_preview(&context, 0).expect("preview");
         let router: TestServiceRouter = Arc::new(|_, _, capability, _, _, _, _| {
             assert_eq!(capability, "bmux.decoration.write");
@@ -4219,7 +4219,7 @@ mod tests {
         );
         context.request.service.interface_id = "theme-control-v1".into();
         context.request.operation = "current".into();
-        assert!(plugin.invoke_service(context.clone()).error.is_none());
+        assert!(plugin.invoke_service(&context).error.is_none());
         let checkpoint_router =
             install_test_service_router(checked_test_router(Arc::new(|_, _, _, _, _, _, _| {
                 encode_service_message(&Ok::<(), String>(()))
@@ -4240,7 +4240,7 @@ mod tests {
                 .recovery_required
                 .load(std::sync::atomic::Ordering::Acquire)
         );
-        assert!(plugin.invoke_service(context).error.is_some());
+        assert!(plugin.invoke_service(&context).error.is_some());
     }
 
     #[test]
@@ -4256,7 +4256,7 @@ mod tests {
         );
         context.request.service.interface_id = "theme-control-v1".into();
         context.request.operation = "current".into();
-        assert!(plugin.invoke_service(context.clone()).error.is_none());
+        assert!(plugin.invoke_service(&context).error.is_none());
         let checkpoint_router =
             install_test_service_router(checked_test_router(Arc::new(|_, _, _, _, _, _, _| {
                 encode_service_message(&Ok::<(), String>(()))
@@ -4323,7 +4323,7 @@ mod tests {
         ));
         context.request.service.interface_id = "theme-control-v1".into();
         context.request.operation = "current".into();
-        assert!(plugin.invoke_service(context).error.is_some());
+        assert!(plugin.invoke_service(&context).error.is_some());
         assert!(plugin.selection.lock().expect("selection").is_none());
         assert!(try_parse_settings(Some(&toml::Value::String("bad".into()))).is_err());
         assert!(try_parse_settings(None).is_ok());
@@ -4337,7 +4337,7 @@ mod tests {
         ));
         context.request.service.interface_id = "theme-control-v1".into();
         context.request.operation = "current".into();
-        assert!(plugin.invoke_service(context.clone()).error.is_none());
+        assert!(plugin.invoke_service(&context).error.is_none());
         assert_eq!(
             plugin
                 .set_component_settings(&context, 7, "performance", b"{}")
@@ -4643,7 +4643,7 @@ mod tests {
             >(()))
         });
         let _router = install_test_service_router(checked_test_router(router));
-        assert!(plugin.invoke_service(context.clone()).error.is_none());
+        assert!(plugin.invoke_service(&context).error.is_none());
         let token = plugin.begin_preview(&context, 0).expect("begin");
         assert!(
             plugin
@@ -4716,7 +4716,7 @@ mod tests {
             },
         );
         let _router = install_test_service_router(checked_test_router(router));
-        assert!(plugin.invoke_service(context.clone()).error.is_none());
+        assert!(plugin.invoke_service(&context).error.is_none());
         let token = plugin.begin_preview(&context, 0).expect("begin");
         assert!(
             plugin
@@ -4894,7 +4894,7 @@ mod tests {
             config_dir_candidates: vec![],
         })
         .expect("request");
-        let response = plugin.invoke_service(context);
+        let response = plugin.invoke_service(&context);
         assert!(response.error.is_none(), "{response:?}");
         let result: Result<(), bmux_decoration_plugin_api::decoration_state::ValidationResult> =
             decode_service_message(&response.payload).expect("response");
@@ -4909,7 +4909,7 @@ mod tests {
             toml::Value::String("rainbow-snake".to_string()),
         )]))));
 
-        let response = plugin.invoke_service(context);
+        let response = plugin.invoke_service(&context);
 
         assert!(response.error.is_none(), "unexpected error: {response:?}");
         let appearance: RuntimeAppearance =
@@ -4926,7 +4926,7 @@ mod tests {
             toml::from_str("persistence = 'persist_between_connects'").expect("settings"),
         ));
         assert!(configured_theme(&context).is_none());
-        let response = ThemePlugin::default().invoke_service(context);
+        let response = ThemePlugin::default().invoke_service(&context);
         assert!(response.error.is_some());
     }
 
@@ -4968,7 +4968,7 @@ mod tests {
             ),
         ]))));
 
-        let response = plugin.invoke_service(context);
+        let response = plugin.invoke_service(&context);
 
         assert!(response.error.is_none(), "unexpected error: {response:?}");
         let appearance: RuntimeAppearance =
@@ -6176,6 +6176,8 @@ mod tests {
 
 /// Select this runtime's event bus and recipient sink for each theme instance.
 /// No explicit runtime binding falls back to a different host's registries.
+/// # Panics
+/// Panics if the embedded plugin declaration is rejected.
 #[must_use]
 pub fn plugin_definition_with_runtime(
     events: std::sync::Arc<bmux_plugin::EventBus>,

@@ -445,7 +445,6 @@ impl ConnectionsPlugin {
 
 impl ConnectionsPlugin {
     fn register_contributions(
-        &self,
         registrar: &mut bmux_plugin_sdk::ContributionRegistrar,
     ) -> bmux_plugin_sdk::Result<()> {
         use bmux_connections_plugin_api::pairing_state;
@@ -534,7 +533,7 @@ impl ConnectionsPlugin {
             )
     }
 
-    fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+    fn activate(&mut self, context: &NativeLifecycleContext) -> Result<i32, PluginCommandError> {
         if self.local_runtime.is_some() || self.listener.get_mut().is_some() {
             return Err(PluginCommandError::failed(
                 "connections already active; deactivate before replacement",
@@ -639,7 +638,7 @@ impl ConnectionsPlugin {
     // Keep the explicit generated-operation routing table and authorization
     // together rather than splitting a single service dispatch.
     #[allow(clippy::too_many_lines)]
-    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+    fn invoke_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "pairing-state", "local-device-identity" => |(): (), ctx| {
                 Self::local_device_identity(ctx)
@@ -1165,14 +1164,14 @@ mod tests {
             "settings": serde_json::to_string(&toml::from_str::<toml::Value>("[remote]\nstartup_wait_ms = 1234\n[remote.relay]\nmode = 'disabled'").unwrap()).unwrap()
         })).unwrap();
         let mut plugin = ConnectionsPlugin::default();
-        plugin.activate(context.clone()).unwrap();
+        plugin.activate(&context.clone()).unwrap();
         let first = plugin.local_status().unwrap();
         assert_eq!(first.relay_mode, "disabled");
         assert_eq!(first.startup_wait_ms, 1234);
         assert!(!first.listener_enabled);
         plugin.deactivate(context.clone()).unwrap();
         assert!(plugin.local_status().is_none());
-        plugin.activate(context).unwrap();
+        plugin.activate(&context).unwrap();
         assert_eq!(plugin.local_status().unwrap(), first);
     }
 
@@ -1194,7 +1193,7 @@ mod tests {
             "settings": serde_json::to_string(&toml::from_str::<toml::Value>(&settings).unwrap()).unwrap()
         })).unwrap();
         let mut plugin = ConnectionsPlugin::default();
-        assert_eq!(plugin.activate(context.clone()).unwrap(), EXIT_OK);
+        assert_eq!(plugin.activate(&context).unwrap(), EXIT_OK);
         assert!(plugin.admission_handle().is_some());
         assert!(plugin.local_status().is_some());
         let status = plugin.listener_status().unwrap();
@@ -1263,7 +1262,7 @@ mod tests {
             "settings": serde_json::to_string(&toml::from_str::<toml::Value>(&settings).unwrap()).unwrap()
         })).unwrap();
         let mut plugin = ConnectionsPlugin::default();
-        plugin.activate(context.clone()).unwrap();
+        plugin.activate(&context).unwrap();
         let first = plugin.listener_status().unwrap();
         assert!(first.enabled);
         let _router = trusted_local_router();
@@ -1285,7 +1284,7 @@ mod tests {
                 .contains(&format!("device://{}?addr={address}", first.endpoint_id))
         );
         plugin.deactivate(context.clone()).unwrap();
-        plugin.activate(context.clone()).unwrap();
+        plugin.activate(&context).unwrap();
         assert_eq!(
             plugin
                 .start_listener(&owner_start)
@@ -1318,7 +1317,7 @@ mod tests {
         );
         context.request.service.interface_id = "pairing-state".into();
         assert_eq!(
-            plugin.invoke_service(context).error.unwrap().code,
+            plugin.invoke_service(&context).error.unwrap().code,
             "owner_required"
         );
         let invitation = bmux_connections_plugin_api::pairing_types::Invitation {
@@ -1341,7 +1340,7 @@ mod tests {
         );
         context.request.service.interface_id = "pairing-commands".into();
         assert_eq!(
-            plugin.invoke_service(context).error.unwrap().code,
+            plugin.invoke_service(&context).error.unwrap().code,
             "owner_required"
         );
     }
@@ -1452,9 +1451,7 @@ mod tests {
             StreamAdmissionProviderDeclaration,
         };
         let mut registrar = bmux_plugin_sdk::ContributionRegistrar::new();
-        ConnectionsPlugin::default()
-            .register_contributions(&mut registrar)
-            .unwrap();
+        ConnectionsPlugin::register_contributions(&mut registrar).unwrap();
         let contributions = registrar.into_contributions();
         let [
             bmux_plugin_sdk::PluginContribution::Extension {
@@ -1706,7 +1703,7 @@ mod tests {
             bmux_plugin_sdk::encode_service_message(&()).unwrap(),
         );
         context.request.service.interface_id = "admission-provider-state".into();
-        assert!(plugin.invoke_service(context.clone()).error.is_some());
+        assert!(plugin.invoke_service(&context).error.is_some());
         for origin in [
             Origin::Local,
             Origin::Invalid,
@@ -1716,10 +1713,10 @@ mod tests {
             },
         ] {
             let _router = provenance_router(origin);
-            assert!(plugin.invoke_service(context.clone()).error.is_some());
+            assert!(plugin.invoke_service(&context.clone()).error.is_some());
         }
         let _router = provenance_router(Origin::HostInternal);
-        let response = plugin.invoke_service(context);
+        let response = plugin.invoke_service(&context);
         assert!(response.error.is_none());
         assert_eq!(
             bmux_plugin_sdk::decode_service_message::<uuid::Uuid>(&response.payload).unwrap(),
@@ -1763,9 +1760,9 @@ mod tests {
         );
         context.request.service.interface_id = "pairing-commands".into();
         // Missing provenance is not local. Supplying a client ID is not proof either.
-        assert!(plugin.invoke_service(context.clone()).error.is_some());
+        assert!(plugin.invoke_service(&context).error.is_some());
         context.caller_client_id = Some(uuid::Uuid::new_v4());
-        assert!(plugin.invoke_service(context).error.is_some());
+        assert!(plugin.invoke_service(&context).error.is_some());
         let _router = trusted_local_router();
         let mut trusted = service_context(
             &paths,
@@ -1773,7 +1770,7 @@ mod tests {
             bmux_plugin_sdk::encode_service_message(&request).unwrap(),
         );
         trusted.request.service.interface_id = "pairing-commands".into();
-        assert!(plugin.invoke_service(trusted).error.is_none());
+        assert!(plugin.invoke_service(&trusted).error.is_none());
         let key = iroh::SecretKey::generate();
         let owner = pairing::LocalOwner::from_trusted_local_owner();
         let invitation = pairing
@@ -1795,7 +1792,7 @@ mod tests {
             bmux_plugin_sdk::encode_service_message(&request).unwrap(),
         );
         context.request.service.interface_id = "pairing-commands".into();
-        let response = plugin.invoke_service(context);
+        let response = plugin.invoke_service(&context);
         assert!(response.error.is_none());
         let device: bmux_connections_plugin_api::pairing_types::Device =
             bmux_plugin_sdk::decode_service_message(&response.payload).unwrap();
@@ -1809,13 +1806,13 @@ mod tests {
             bmux_plugin_sdk::encode_service_message(&request).unwrap(),
         );
         context.request.service.interface_id = "pairing-state".into();
-        let response = plugin.invoke_service(context.clone());
+        let response = plugin.invoke_service(&context);
         assert!(response.error.is_none());
         let check: DeviceAccessCheck =
             bmux_plugin_sdk::decode_service_message(&response.payload).unwrap();
         assert_eq!(check.access, DeviceAccess::FullLocalRuntime);
         pairing.revoke(&owner, &device.device_id).unwrap();
-        let response = plugin.invoke_service(context);
+        let response = plugin.invoke_service(&context);
         let check: DeviceAccessCheck =
             bmux_plugin_sdk::decode_service_message(&response.payload).unwrap();
         assert_eq!(check.access, DeviceAccess::Denied);
@@ -1865,7 +1862,7 @@ mod tests {
         };
         let resolve_payload =
             bmux_plugin_sdk::encode_service_message(&resolve).expect("encode resolve");
-        let response = ConnectionsPlugin::default().invoke_service(service_context(
+        let response = ConnectionsPlugin::default().invoke_service(&service_context(
             &paths,
             "resolve",
             resolve_payload,
@@ -1889,7 +1886,7 @@ mod tests {
             },
         };
         let payload = bmux_plugin_sdk::encode_service_message(&request).expect("encode invoke");
-        let response = ConnectionsPlugin::default().invoke_service(service_context(
+        let response = ConnectionsPlugin::default().invoke_service(&service_context(
             &paths,
             "invoke-service",
             payload,
@@ -2183,37 +2180,31 @@ impl Plugin for ConnectionsInstance {
     fn declare(d: &mut Declarations<Self>) {
         d.blocking_activate(|instance, context, _| instance.write()?.activate(context).map(|_| ()))
             .blocking_deactivate(|instance, context| {
-                instance.write()?.deactivate(context).map(|_| ())
+                instance.write()?.deactivate(context.clone()).map(|_| ())
             })
-            .blocking_command("remote-enable", Self::run_command)
-            .blocking_command("remote-disable", Self::run_command)
-            .blocking_command("remote-pair-request", Self::run_command)
-            .blocking_command("remote-approve", Self::run_command)
-            .blocking_command("remote-pair", Self::run_command)
-            .blocking_command("remote-list", Self::run_command)
-            .blocking_command("remote-status", Self::run_command)
-            .blocking_command("remote-revoke", Self::run_command)
-            .blocking_command("connect", Self::run_command)
-            .blocking_command("remote-rename", Self::run_command)
-            .blocking_command("remote-forget", Self::run_command)
+            .blocking_command("remote-enable", |_, a0| Self::run_command(a0))
+            .blocking_command("remote-disable", |_, a0| Self::run_command(a0))
+            .blocking_command("remote-pair-request", |_, a0| Self::run_command(a0))
+            .blocking_command("remote-approve", |_, a0| Self::run_command(a0))
+            .blocking_command("remote-pair", |_, a0| Self::run_command(a0))
+            .blocking_command("remote-list", |_, a0| Self::run_command(a0))
+            .blocking_command("remote-status", |_, a0| Self::run_command(a0))
+            .blocking_command("remote-revoke", |_, a0| Self::run_command(a0))
+            .blocking_command("connect", |_, a0| Self::run_command(a0))
+            .blocking_command("remote-rename", |_, a0| Self::run_command(a0))
+            .blocking_command("remote-forget", |_, a0| Self::run_command(a0))
             .blocking_services(
-                |instance, context| match instance.plugin.read() {
-                    Ok(plugin) => plugin.invoke_service(context),
-                    Err(_) => {
-                        ServiceResponse::error("unavailable", "connections owner lock poisoned")
-                    }
+                |instance, context| {
+                    instance.plugin.read().map_or_else(
+                        |_| {
+                            ServiceResponse::error("unavailable", "connections owner lock poisoned")
+                        },
+                        |plugin| plugin.invoke_service(context),
+                    )
                 },
                 None,
             )
-            .registrations(|instance, registrar| {
-                instance
-                    .plugin
-                    .read()
-                    .map_err(|_| bmux_plugin_sdk::PluginError::ServiceProtocol {
-                        details: "connections owner lock poisoned".into(),
-                    })?
-                    .register_contributions(registrar)
-            });
+            .registrations(|_, registrar| ConnectionsPlugin::register_contributions(registrar));
     }
 }
 
@@ -2226,8 +2217,8 @@ impl ConnectionsInstance {
             .map_err(|_| PluginCommandError::failed("connections owner lock poisoned"))
     }
 
-    fn run_command(&self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
-        remote_cli::run(&context).map_err(|e| PluginCommandError::failed(e.to_string()))
+    fn run_command(context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
+        remote_cli::run(context).map_err(|e| PluginCommandError::failed(e.to_string()))
     }
 }
 
@@ -2242,6 +2233,8 @@ bmux_plugin_sdk::plugin!(
 
 /// Pools are runtime-owned ports. The factory requires one explicitly rather
 /// than silently sharing the legacy process pool across independent runtimes.
+/// # Panics
+/// Panics if the embedded plugin declaration is rejected.
 #[must_use]
 pub fn plugin_definition_with_pool(
     pool: Arc<EndpointConnectionPool<BmuxClient>>,

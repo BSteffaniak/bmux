@@ -42,12 +42,18 @@ impl Plugin for ApplicationResurrectionPlugin {
         d.native_services(Self::invoke);
     }
 
-    async fn activate(&self, cx: &mut Activation) -> author::Result<()> {
-        self.activate_host(cx.native())
+    fn activate(
+        &self,
+        cx: &mut Activation,
+    ) -> impl std::future::Future<Output = author::Result<()>> + Send {
+        std::future::ready(self.activate_host(cx.native()))
     }
 
-    async fn deactivate(&self, _cx: &mut Deactivation) -> author::Result<()> {
-        self.deactivate_host()
+    fn deactivate(
+        &self,
+        _cx: &mut Deactivation,
+    ) -> impl std::future::Future<Output = author::Result<()>> + Send {
+        std::future::ready(self.deactivate_host())
     }
 }
 
@@ -148,7 +154,15 @@ fn host_error(message: String) -> resurrection_launch_v1::HostError {
 impl ApplicationResurrectionPlugin {
     /// Every resurrection call is checked: the generated contract frames the
     /// request and the response around the hand-routed body.
-    async fn invoke(
+    fn invoke(
+        &self,
+        cx: &Call,
+        context: NativeServiceContext,
+    ) -> std::future::Ready<author::Result<ServiceResponse>> {
+        std::future::ready(self.invoke_now(cx, context))
+    }
+
+    fn invoke_now(
         &self,
         cx: &Call,
         context: NativeServiceContext,

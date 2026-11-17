@@ -55,7 +55,7 @@ impl Plugin for PluginCliPlugin {
             "playbook-diff",
             "playbook-cleanup",
         ] {
-            d.blocking_command(name, |_, context| Self::command(&context));
+            d.blocking_command(name, |_, context| Self::command(context));
         }
     }
 }

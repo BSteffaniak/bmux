@@ -36,7 +36,7 @@ mod spawn;
 )]
 pub fn route(
     host: &crate::runtime::PaneRuntimeHost,
-    context: NativeServiceContext,
+    context: &NativeServiceContext,
 ) -> ServiceResponse {
     if context.caller_client_id.is_some()
         && context.request.service.interface_id == "pane-runtime-readiness-v1"
@@ -63,7 +63,7 @@ pub fn route(
             "observer connection cannot mutate pane runtime",
         );
     }
-    if let Err(error) = execution::authorize_route(&context) {
+    if let Err(error) = execution::authorize_route(context) {
         return error;
     }
     match crate::runtime::input_authority::with_local_settled(host, context.clone(), || {
@@ -81,7 +81,7 @@ pub fn route(
 )]
 fn route_authorized(
     host: &crate::runtime::PaneRuntimeHost,
-    context: NativeServiceContext,
+    context: &NativeServiceContext,
 ) -> ServiceResponse {
     bmux_plugin_sdk::route_service!(context, {
         "pane-runtime-environment-v1", "capabilities" => |_req: (), _ctx| { Ok::<_, ServiceResponse>(2_u32) },

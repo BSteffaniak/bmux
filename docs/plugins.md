@@ -294,26 +294,32 @@ generated clients for one plugin's own workflow.
 ## Host state registry
 
 Foundational state types are owned by their respective plugin crates.
-Each plugin's `activate` callback constructs its default state and
-registers it with the process-wide \[`bmux_plugin::PluginStateRegistry`\]:
+Each plugin's activation constructs its default state and registers it
+with the activation's view of the host
+\[`bmux_plugin::PluginStateRegistry`\]:
 
 ```rust,ignore
-use bmux_plugin::global_plugin_state_registry;
 use bmux_clients_plugin::FollowState;
 use std::sync::{Arc, RwLock};
 
-impl RustPlugin for ClientsPlugin {
-    fn activate(&mut self, _ctx: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+impl ClientsPlugin {
+    // Declared with `d.blocking_activate(Self::activate)`.
+    fn activate(
+        &self,
+        context: NativeLifecycleContext,
+        _tasks: Option<HostAsyncHandle>,
+    ) -> Result<(), PluginCommandError> {
+        let states = bmux_plugin::activation_state_registry(&context);
         let state = Arc::new(RwLock::new(FollowState::default()));
-        global_plugin_state_registry().register::<FollowState>(&state);
-        Ok(EXIT_OK)
+        states.register::<FollowState>(&state);
+        Ok(())
     }
 }
 ```
 
 The registry is a `TypeId`-keyed typemap holding
 `Arc<dyn Any + Send + Sync>` entries. Consumers resolve by concrete
-type: `global_plugin_state_registry().get::<FollowState>()`.
+type: `states.get::<FollowState>()`.
 
 **Server state ownership model.** Each plugin's `activate` constructs
 an `Arc<RwLock<T>>` holding its concrete state (`FollowState`,
@@ -638,8 +644,8 @@ text and a generic metadata map, and the shared ABI returns it as data for
 statically bundled and dynamically loaded packaging alike. A synchronous
 command body is wrapped in `CommandOutcome::capture(|| ...)`, which brackets
 the recording in the plugin's own SDK copy and returns the map with the
-outcome (`RustPluginAdapter` does this for legacy `run_command`
-implementations). There is no exported "take last outcome" symbol and no
+outcome (`Declarations::blocking_command` does this around its body). There is
+no exported "take last outcome" symbol and no
 cross-call thread-local slot. Keys are host-interpreted; the SDK attaches no
 domain meaning to them.
 

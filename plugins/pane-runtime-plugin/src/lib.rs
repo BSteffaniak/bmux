@@ -57,9 +57,7 @@ mod contract_tests {
     #[test]
     fn admitted_route_contribution_is_exact_and_matches_boundary_guard() {
         let mut registrar = bmux_plugin_sdk::ContributionRegistrar::new();
-        super::PaneRuntimePlugin::default()
-            .register_contributions(&mut registrar)
-            .unwrap();
+        super::PaneRuntimePlugin::register_contributions(&mut registrar).unwrap();
         let contributions = registrar.into_contributions();
         let [
             bmux_plugin_sdk::PluginContribution::Extension {
@@ -151,9 +149,7 @@ mod contract_tests {
                 && service.interface_id == "pane-runtime-spawn-v1"
         }));
         let mut registrar = bmux_plugin_sdk::ContributionRegistrar::new();
-        super::PaneRuntimePlugin::default()
-            .register_contributions(&mut registrar)
-            .unwrap();
+        super::PaneRuntimePlugin::register_contributions(&mut registrar).unwrap();
         let contributions = registrar.into_contributions();
         let [bmux_plugin_sdk::PluginContribution::Extension { payload, .. }] =
             contributions.as_slice()
@@ -290,17 +286,16 @@ impl Plugin for PaneRuntimePlugin {
             .blocking_command("pane-padding-configure", Self::run_command)
             .blocking_command("pane-padding-reset", Self::run_command)
             .blocking_services(Self::invoke_service, None)
-            .typed_services(|plugin, context, registry| {
-                plugin.register_typed_services(context, registry);
+            .typed_services(|_, context, registry| {
+                Self::register_typed_services(&context, registry);
                 Ok(())
             })
-            .registrations(Self::register_contributions);
+            .registrations(|_, a0| Self::register_contributions(a0));
     }
 }
 
 impl PaneRuntimePlugin {
     fn register_contributions(
-        &self,
         registrar: &mut bmux_plugin_sdk::ContributionRegistrar,
     ) -> bmux_plugin_sdk::Result<()> {
         use bmux_plugin::stream_admission::{
@@ -401,22 +396,25 @@ impl PaneRuntimePlugin {
     }
 
     /// Activate this instance's runtime (synchronous body).
+    ///
+    /// # Errors
+    /// Returns the failure the synchronous body reports.
     pub fn activate(
         &self,
-        context: NativeLifecycleContext,
+        context: &NativeLifecycleContext,
         _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
     ) -> std::result::Result<(), PluginCommandError> {
         // The host handles this activation received; every runtime, handler
         // and task reaches the host through them.
-        let states = bmux_plugin::activation_state_registry(&context);
-        let events = bmux_plugin::activation_event_bus(&context);
+        let states = bmux_plugin::activation_state_registry(context);
+        let events = bmux_plugin::activation_event_bus(context);
         *slot_mut(&self.host)? = runtime::PaneRuntimeHost::new(states, events);
         let host = &self.host();
         runtime::activate_managed_scope(host);
-        application_resurrection::activate(host, &context);
-        readiness::activate(host, &context);
-        runtime::supervisor::activate(host, &context);
-        runtime::reservations::activate(host, &context);
+        application_resurrection::activate(host, context);
+        readiness::activate(host, context);
+        runtime::supervisor::activate(host, context);
+        runtime::reservations::activate(host, context);
         // Register the focus-state channel so subscribers (e.g.
         // the decoration plugin) can observe the focused pane per
         // session. Seeded empty — `publish_focus_state_snapshot`
@@ -463,7 +461,7 @@ impl PaneRuntimePlugin {
 
     fn deactivate(
         &self,
-        _context: NativeLifecycleContext,
+        _context: &NativeLifecycleContext,
     ) -> std::result::Result<(), PluginCommandError> {
         let host = &self.host();
         if let Some(handle) = host
@@ -483,20 +481,19 @@ impl PaneRuntimePlugin {
 
     fn run_command(
         &self,
-        context: NativeCommandContext,
+        context: &NativeCommandContext,
     ) -> std::result::Result<i32, PluginCommandError> {
-        commands::run(&self.host(), &context)?;
+        commands::run(&self.host(), context)?;
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 
     /// Serve one hand-routed service invocation (synchronous body).
-    pub fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+    pub fn invoke_service(&self, context: &NativeServiceContext) -> ServiceResponse {
         handlers::route(&self.host(), context)
     }
 
     fn register_typed_services(
-        &self,
-        _context: TypedServiceRegistrationContext<'_>,
+        _context: &TypedServiceRegistrationContext<'_>,
         _registry: &mut TypedServiceRegistry,
     ) {
     }

@@ -54,7 +54,7 @@ mod tests {
             host_kernel_bridge: None,
             host_service_port: None,
         };
-        let response = plugin.invoke_service(context.clone());
+        let response = plugin.invoke_service(&context.clone());
         assert_eq!(response.error.unwrap().code, "local_authorization_required");
         for operation in [
             "pause-publication",
@@ -73,7 +73,7 @@ mod tests {
                 bmux_codec::to_typed_vec(&()).unwrap()
             };
             assert_eq!(
-                plugin.invoke_service(operator).error.unwrap().code,
+                plugin.invoke_service(&operator).error.unwrap().code,
                 "local_authorization_required",
                 "{operation} must require local proof before mutation"
             );
@@ -95,7 +95,7 @@ mod tests {
                 bmux_codec::to_typed_vec(&()).unwrap()
             };
             assert_eq!(
-                plugin.invoke_service(diagnostic).error.unwrap().code,
+                plugin.invoke_service(&diagnostic).error.unwrap().code,
                 "local_authorization_required"
             );
         }
@@ -110,7 +110,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            plugin.invoke_service(explicit).error.unwrap().code,
+            plugin.invoke_service(&explicit).error.unwrap().code,
             "local_authorization_required"
         );
         let mut profile = context.clone();
@@ -124,7 +124,7 @@ mod tests {
         for operation in ["start-profile", "start-profile-publication"] {
             profile.request.operation = operation.into();
             assert_eq!(
-                plugin.invoke_service(profile.clone()).error.unwrap().code,
+                plugin.invoke_service(&profile.clone()).error.unwrap().code,
                 "local_authorization_required"
             );
         }
@@ -136,7 +136,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(
-            plugin.invoke_service(register).error.unwrap().code,
+            plugin.invoke_service(&register).error.unwrap().code,
             "local_authorization_required"
         );
     }

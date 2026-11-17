@@ -312,7 +312,7 @@ pub struct LogWriteRequest {
 pub struct PluginCommandOutcome {
     /// Error message from the plugin command's `Err` return, if any.
     ///
-    /// Populated by the SDK's FFI boundary when a `RustPlugin`
+    /// Populated by the SDK's FFI boundary when a plugin
     /// command returns `Err(PluginCommandError)`. Hosts use this to
     /// log the error and render a user-facing indicator, instead of
     /// relying on the plugin's stderr (which would corrupt attach

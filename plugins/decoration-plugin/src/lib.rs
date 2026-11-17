@@ -3203,41 +3203,30 @@ impl DecorationPlugin {
 
 impl Plugin for DecorationPlugin {
     fn declare(d: &mut Declarations<Self>) {
-        d.blocking_activate(Self::activate_with_async)
-            .blocking_services(Self::invoke_service, None)
-            .typed_services(|plugin, context, registry| {
-                plugin.register_typed_services(context, registry);
-                Ok(())
-            });
+        d.blocking_activate(|plugin, context, tasks| {
+            plugin.activate(context, tasks);
+            Ok(())
+        })
+        .blocking_services(Self::invoke_service, None)
+        .typed_services(|plugin, context, registry| {
+            plugin.register_typed_services(&context, registry);
+            Ok(())
+        });
     }
 }
 
 impl DecorationPlugin {
-    fn activate(
-        &self,
-        context: NativeLifecycleContext,
-        _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
-    ) -> std::result::Result<(), PluginCommandError> {
-        self.activate_instance(&context);
-        Ok(())
-    }
-
-    fn activate_with_async(
-        &self,
-        context: NativeLifecycleContext,
-        async_handle: Option<bmux_plugin_sdk::HostAsyncHandle>,
-    ) -> std::result::Result<(), PluginCommandError> {
-        let Some(async_handle) = async_handle else {
-            return self.activate(context, None);
-        };
-        self.state.set_host_async_handle(async_handle);
-        self.activate_instance(&context);
-        Ok(())
+    /// Activation, with the activation's task scope when the host provides one.
+    fn activate(&self, context: &NativeLifecycleContext, tasks: Option<HostAsyncHandle>) {
+        if let Some(tasks) = tasks {
+            self.state.set_host_async_handle(tasks);
+        }
+        self.activate_instance(context);
     }
 
     fn register_typed_services(
         &self,
-        _context: TypedServiceRegistrationContext<'_>,
+        _context: &TypedServiceRegistrationContext<'_>,
         registry: &mut TypedServiceRegistry,
     ) {
         let handle = Arc::new(DecorationServiceHandle::new(self.state.clone()));
@@ -3255,11 +3244,12 @@ impl DecorationPlugin {
 
     /// Serve one hand-routed service invocation (synchronous body).
     #[allow(clippy::too_many_lines)] // route_service! naturally spans every typed op; splitting hurts readability.
+    #[must_use]
     pub fn invoke_service(
         &self,
-        context: bmux_plugin_sdk::NativeServiceContext,
+        context: &bmux_plugin_sdk::NativeServiceContext,
     ) -> bmux_plugin_sdk::ServiceResponse {
-        if let Some(response) = self.views.dispatch(&context, &self.state) {
+        if let Some(response) = self.views.dispatch(context, &self.state) {
             return response;
         }
         // IPC-level dispatch for every typed op declared in the
@@ -5224,7 +5214,7 @@ mod tests {
             connection: &host_connection,
             plugin_settings_map: &settings,
         };
-        plugin.register_typed_services(context, &mut registry);
+        plugin.register_typed_services(&context, &mut registry);
         let cap = bmux_plugin_sdk::HostScope::new("bmux.decoration.read").expect("cap");
         let handle = registry
             .get(

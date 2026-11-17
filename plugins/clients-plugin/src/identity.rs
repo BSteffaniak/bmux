@@ -165,7 +165,7 @@ mod tests {
             )?
             .to_vec();
             let response = crate::ClientsPlugin::with_states(std::sync::Arc::clone(&self.1))
-                .invoke_service(invocation);
+                .invoke_service(&invocation);
             assert!(response.error.is_none(), "{:?}", response.error);
             Ok(bmux_plugin_sdk::service_contract::encode_response(
                 &response.payload,

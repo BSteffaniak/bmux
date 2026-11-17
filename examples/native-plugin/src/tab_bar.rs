@@ -32,7 +32,7 @@ fn parse_severity(value: &str) -> Option<Severity> {
 
 /// Report a short status line to the attach UI when this command was run
 /// from a keybinding. It travels back as part of the returned command
-/// outcome (`RustPluginAdapter` captures it around `run_command`).
+/// outcome: `Declarations::blocking_command` captures it around the body.
 fn report(message: impl Into<String>) {
     record_command_outcome_metadata(
         COMMAND_OUTCOME_STATUS_MESSAGE_KEY,

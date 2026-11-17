@@ -18,7 +18,8 @@ plugins, each tested bundled and as a real dylib under `TestHost`:
 | `examples/clock-plugin`   | a contribution to a host-declared extension point (`bmux_extpoints`)                            |
 
 `examples/native-plugin` covers hand-declared (`native_command`) commands.
-BMUX's own workspace plugins move to it in Wave 2.
+Every BMUX workspace plugin is defined this way; the legacy author trait,
+its adapter and the generated-wrapper packager are gone.
 
 ## What BPDL generates today
 
@@ -113,6 +114,13 @@ markers; nothing in it is product specific:
 | `emits::<E>()`                  | A contract event `P` publishes: its channel is registered for the activation before `activate` runs.                                      |
 | `subscribe::<C>()`              | An events interface `P` follows; `Activation::events::<C>()` refuses undeclared subscriptions.                                            |
 | `on_event(handler)`             | Host events delivered to the plugin.                                                                                                      |
+| `native_services(handler)`                  | One async handler over the raw service context for every manifest service not `provide`d with generated bindings (opaque or hand-routed interfaces). It owns checked framing. |
+| `blocking_services(unary, streaming)`       | The same with synchronous bodies, run on the host's blocking pool inside the call's callback entry; checked frames are decoded with the generated contract and re-framed.     |
+| `blocking_command(name, handler)`           | A hand-declared command with a synchronous body run inside its callback entry; command-outcome metadata it records is returned.                                               |
+| `blocking_events(handler)`                  | Host events with a synchronous body run inside the event's entry.                                                                                                             |
+| `blocking_activate` / `blocking_deactivate` | Synchronous lifecycle bodies run inside the lifecycle entry, after `Plugin::activate` / `Plugin::deactivate`.                                                                 |
+| `typed_services(register)`                  | Context-aware registration of typed handles that are not generated providers; may refuse.                                                                                     |
+| `registrations(register)`                   | Activation-time contributions (state, readiness, frontend extensions).                                                                                                        |
 
 `DeclaredInstance::new` validates the declarations against the generated
 manifest before any instance runs: every interface the world provides with
@@ -182,8 +190,10 @@ packaging modes:
 
 ## `plugin!`
 
-`bmux_plugin_sdk::plugin!(Counter)` (optionally `create = path` for a
-`fn(&PluginCreateContext) -> Result<Counter>`, and `declaration = path` when
+`bmux_plugin_sdk::plugin!(Counter)` (optionally `create = expr` for a
+`Fn(&PluginCreateContext) -> Result<Counter>`, evaluated once per
+`plugin_definition()` so it may capture per-definition ports, and
+`declaration = path` when
 the generated module is not `crate::declaration`) emits
 `plugin_definition()`:
 
@@ -356,10 +366,10 @@ A plugin crate builds its own dynamic library; nothing is generated.
 - The sidecar `plugin.toml` stays the artifact's embedded manifest
   (`package-plugin.py --declaration-of`).
 
-Crates without the role features (BMUX workspace plugins until they are
-ported, and bcode plugins) still package through the legacy generated
-wrapper (`--sdk-manifest`, `--output`); `bmux plugin rebuild` picks the path
-per crate.
+Every BMUX workspace plugin declares the role features and is packaged this
+way by `bmux plugin rebuild`; there is no generated-wrapper path. A crate
+without the role feature for a component cannot be packaged as that component
+(bcode plugins gain the features as they move to `plugin!`).
 
 BPDL commands are exposed in the CLI, so the generated manifest also claims
 their paths (`owns_paths`); `plugin.toml` may add paths, never remove them.
