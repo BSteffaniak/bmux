@@ -1,13 +1,26 @@
 // Consumer side of the reference author API: it requires the counter's
-// interfaces and calls them through generated clients.
+// interfaces, calls them through generated clients and follows the
+// counter's change events.
 plugin example.watcher version 1;
 
 import counter = example.counter;
+
+capability WATCHER_READ = example.watcher.read;
+
+/// What the watcher has observed.
+@capability(WATCHER_READ)
+@interface-version(1)
+interface watcher-state {
+    /// The last counter value the watcher's subscription delivered.
+    query observed() -> u64;
+}
 
 /// Bump the counter through its service and read the value back.
 command watch(by: u64?) title "Bump the counter and read it back";
 
 world watcher {
+    provide watcher-state;
     require counter.counter-commands;
     require counter.counter-state;
+    require counter.counter-events;
 }

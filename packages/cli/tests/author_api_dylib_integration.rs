@@ -5,8 +5,9 @@
 //! generated clients) as dynamic libraries straight from their own crates (no
 //! wrapper), loads both into one isolated
 //! server, and checks that the watcher's typed calls reach the counter through
-//! the host's checked codec. The same contract runs bundled in
-//! `examples/watcher-plugin/tests/both_modes.rs`.
+//! the host's checked codec, and that the watcher's event subscription sees
+//! the counter's changes. The same contract runs bundled and as dylibs under
+//! `TestHost` in `examples/watcher-plugin/tests/both_modes.rs`.
 #![cfg(unix)]
 #[path = "support/packaging.rs"]
 mod packaging;
@@ -232,4 +233,10 @@ fn generated_clients_reach_a_generated_provider_across_dylibs() {
         support::combined_output(&watch),
         sandbox.evidence()
     );
+
+    // The server-side watcher follows the counter's retained change channel
+    // through its generated `subscribe_changed()`: the counter (a dylib)
+    // publishes on the host bus and the watcher's activation-owned task (a
+    // dylib) receives it, including the change the CLI caused.
+    sandbox.wait_for_log(&["watcher: observed 14"]);
 }

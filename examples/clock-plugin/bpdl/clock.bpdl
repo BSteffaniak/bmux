@@ -1,0 +1,7 @@
+// Reference contributor to a host-declared extension point: the clock
+// extends BMUX's `status-item` (bmux-extpoints) in `declare()` and provides
+// nothing else, so its world is empty.
+plugin example.clock version 1;
+
+/// The clock contributes to the host's status line only.
+world clock {}

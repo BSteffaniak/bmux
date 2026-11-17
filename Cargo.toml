@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "xtask",
+    "examples/clock-plugin",
     "examples/counter-plugin",
     "examples/counter-plugin-api",
     "examples/hello-plugin",
@@ -43,6 +44,7 @@ members = [
     "packages/context-state",
     "packages/diagnostic-log",
     "packages/event/models",
+    "packages/extpoints",
     "packages/ipc",
     "packages/markdown",
     "packages/syntax-render",
@@ -66,6 +68,7 @@ members = [
     "packages/plugin-schema",
     "packages/plugin-schema-macros",
     "packages/plugin-sdk",
+    "packages/plugin-test",
     "packages/perf-tools",
     "packages/pane-runtime-state",
     "packages/recording-protocol",
@@ -259,10 +262,12 @@ bmux_context_state = { version = "0.0.1-alpha.4", default-features = false, path
 bmux_diagnostic_log = { version = "0.0.1-alpha.4", default-features = false, path = "packages/diagnostic-log" }
 bmux_env = { version = "0.0.1-alpha.4", default-features = false, path = "packages/bmux-env" }
 bmux_event_models = { version = "0.0.1-alpha.4", default-features = false, path = "packages/event/models" }
+bmux_example_clock_plugin = { version = "0.0.1-alpha.4", default-features = false, path = "examples/clock-plugin" }
 bmux_example_counter_plugin = { version = "0.0.1-alpha.4", default-features = false, path = "examples/counter-plugin" }
 bmux_example_counter_plugin_api = { version = "0.0.1-alpha.4", default-features = false, path = "examples/counter-plugin-api" }
 bmux_example_native_plugin = { version = "0.0.1-alpha.4", default-features = false, path = "examples/native-plugin" }
 bmux_example_watcher_plugin = { version = "0.0.1-alpha.4", default-features = false, path = "examples/watcher-plugin" }
+bmux_extpoints = { version = "0.0.1-alpha.4", default-features = false, path = "packages/extpoints" }
 bmux_fonts = { version = "0.0.1-alpha.4", default-features = false, path = "packages/fonts" }
 bmux_image = { version = "0.0.1-alpha.4", default-features = false, path = "packages/image" }
 bmux_ipc = { version = "0.0.1-alpha.4", default-features = false, path = "packages/ipc" }
@@ -283,6 +288,7 @@ bmux_plugin_runtime = { version = "0.0.1-alpha.4", default-features = false, pat
 bmux_plugin_schema = { version = "0.0.1-alpha.4", default-features = false, path = "packages/plugin-schema" }
 bmux_plugin_schema_macros = { version = "0.0.1-alpha.4", default-features = false, path = "packages/plugin-schema-macros" }
 bmux_plugin_sdk = { version = "0.0.1-alpha.4", default-features = false, path = "packages/plugin-sdk" }
+bmux_plugin_test = { version = "0.0.1-alpha.4", default-features = false, path = "packages/plugin-test" }
 bmux_presentation_state = { version = "0.0.1-alpha.4", default-features = false, path = "packages/presentation-state" }
 bmux_presenter = { version = "0.0.1-alpha.4", default-features = false, path = "packages/presenter" }
 bmux_presenter_plugin = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/presenter-plugin" }

@@ -18,6 +18,10 @@ crate-type = ["rlib"]
 bmux_plugin_schema_macros = { workspace = true }
 bmux_plugin_sdk           = { workspace = true }
 
+[dev-dependencies]
+bmux_plugin_test = { workspace = true }
+tokio            = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
 [features]
 # Package this crate as a dynamic library for one component. Only the
 # plugin packager enables these, together with `--cfg bmux_plugin_dylib`.

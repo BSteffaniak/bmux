@@ -15,13 +15,18 @@ crate-type = ["rlib"]
 
 [dependencies]
 bmux_example_counter_plugin_api = { workspace = true }
+bmux_ipc                        = { workspace = true }
 bmux_plugin_schema_macros       = { workspace = true }
 bmux_plugin_sdk                 = { workspace = true }
 
+[package.metadata.cargo-machete]
+# Referenced by the BPDL-generated provider bindings, not handwritten source.
+ignored = ["bmux_ipc"]
+
 [dev-dependencies]
 bmux_example_counter_plugin = { workspace = true }
-bmux_ipc                    = { workspace = true }
-tokio                       = { workspace = true, features = ["macros", "rt"] }
+bmux_plugin_test            = { workspace = true }
+tokio                       = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [features]
 # Package this crate as a dynamic library for one component. Only the
@@ -30,6 +35,7 @@ dynamic-backend = []
 dynamic-frontend = []
 fail-on-warnings = [
     "bmux_example_counter_plugin_api/fail-on-warnings",
+    "bmux_ipc/fail-on-warnings",
     "bmux_plugin_schema_macros/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
 ]

@@ -21,10 +21,14 @@ pub mod declaration {
     }
 }
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use bmux_plugin_sdk::author::{self, Activation, Call, Declarations, Plugin};
 use bmux_plugin_sdk::{PluginCommandError, PluginHostServices, TypedDispatchClient};
 use declaration::commands::{WATCH, WatchArgs};
-use declaration::requires::{counter_commands, counter_state};
+use declaration::provides::watcher_state;
+use declaration::requires::{counter_commands, counter_events, counter_state};
 
 /// Bump the counter by `by` and read it back through the generated clients.
 ///
@@ -57,9 +61,38 @@ fn clients(
     )
 }
 
+/// Subscribe to the counter's retained changes and record each one from a
+/// task the activation owns: the host cancels it and releases the
+/// subscription when the activation ends, in both packaging modes.
+async fn observe_changes(cx: &Activation, observed: Arc<AtomicU64>) -> author::Result<()> {
+    let mut changes = cx
+        .events::<counter_events::v1::Client>()?
+        .subscribe_changed()
+        .await?;
+    cx.spawn("observe-changes", async move {
+        while let Some(change) = changes.next().await {
+            match change {
+                Ok(change) => {
+                    observed.store(change.value, Ordering::SeqCst);
+                    eprintln!("watcher: observed {}", change.value);
+                }
+                Err(error) => eprintln!("watcher: unreadable change: {}", error.message),
+            }
+        }
+    })
+}
+
 /// The watcher plugin.
 #[derive(Default)]
-pub struct Watcher;
+pub struct Watcher {
+    observed: Arc<AtomicU64>,
+}
+
+impl watcher_state::v1::WatcherState for Watcher {
+    async fn observed(&self, _cx: &Call) -> author::Result<u64> {
+        Ok(self.observed.load(Ordering::SeqCst))
+    }
+}
 
 impl Watcher {
     async fn watch_command(&self, cx: &Call, args: WatchArgs) -> author::Result<()> {
@@ -75,14 +108,21 @@ impl Watcher {
 
 impl Plugin for Watcher {
     fn declare(d: &mut Declarations<Self>) {
-        d.require::<counter_commands::v1::Client>()
+        d.provide::<dyn watcher_state::v1::WatcherState>()
+            .require::<counter_commands::v1::Client>()
             .require::<counter_state::v1::Client>()
+            .subscribe::<counter_events::v1::Client>()
             .command(WATCH, Self::watch_command);
     }
 
-    /// Exercise the counter once at activation; lifecycle diagnostics go to
-    /// stderr (in a command-local activation, stdout is command output).
+    /// Follow the counter's changes for the activation's lifetime, then
+    /// exercise it once; lifecycle diagnostics go to stderr (in a
+    /// command-local activation, stdout is command output).
     async fn activate(&self, cx: &mut Activation) -> author::Result<()> {
+        if let Err(error) = observe_changes(cx, self.observed.clone()).await {
+            // Hosts without an event bus (a CLI command-local activation).
+            eprintln!("watcher: not observing changes: {}", error.message);
+        }
         let (commands, state) = clients(&cx.host()?);
         for by in [2, 3] {
             match watch(&commands, &state, by).await {

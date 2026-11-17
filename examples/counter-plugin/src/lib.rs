@@ -32,11 +32,14 @@ pub struct Counter {
 
 impl counter_commands::v1::CounterCommands for Counter {
     async fn incr(&self, cx: &Call, by: u64) -> author::Result<u64> {
+        // A failed increment leaves the counter unchanged.
         let value = self
             .value
-            .fetch_add(by, Ordering::SeqCst)
-            .checked_add(by)
-            .ok_or_else(|| PluginCommandError::invalid_arguments("counter overflow"))?;
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                value.checked_add(by)
+            })
+            .map_err(|_| PluginCommandError::invalid_arguments("counter overflow"))?
+            + by;
         cx.emit(counter_events::v1::Changed { value })?;
         Ok(value)
     }
@@ -68,6 +71,7 @@ impl Plugin for Counter {
     fn declare(d: &mut Declarations<Self>) {
         d.provide::<dyn counter_commands::v1::CounterCommands>()
             .provide::<dyn counter_state::v1::CounterState>()
+            .emits::<counter_events::v1::Changed>()
             .command(BUMP, Self::bump);
     }
 }
@@ -111,8 +115,7 @@ mod tests {
         let (kind, delivery, payload) = recorder.0.lock().unwrap().remove(0);
         assert_eq!(kind, counter_events::STATE_KIND.as_str());
         assert_eq!(delivery, EventDelivery::State);
-        let changed: counter_events::v1::Changed =
-            bmux_plugin_sdk::decode_service_message(&payload).unwrap();
+        let changed: counter_events::v1::Changed = serde_json::from_slice(&payload).unwrap();
         assert_eq!(changed.value, 4);
     }
 
