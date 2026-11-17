@@ -13,6 +13,7 @@ pub mod declaration {
 mod activation_ports;
 
 use bmux_plugin::{action_dispatch, prompt};
+use bmux_plugin_sdk::author::{self, Activation, Call, Deactivation, Declarations, Plugin};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::prompt::{PromptOrderedMatchMode, PromptSearchOrder};
 use bmux_plugin_sdk::{
@@ -78,16 +79,6 @@ impl FinderPlugin {
     fn show(&self, context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
         let (prompt, actions) = self.binding.ports()?;
         show_finder(context, &self.tasks, &prompt, actions)
-    }
-}
-
-impl RustPlugin for FinderPlugin {
-    type Contract = bmux_plugin_sdk::NoPluginContract;
-
-    fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
-        bmux_plugin_sdk::route_command!(context, {
-            "show" => self.show(&context),
-        })
     }
 }
 
@@ -499,57 +490,46 @@ async fn handle_response(
     }
 }
 
-impl bmux_plugin_sdk::definition::PluginInstance for FinderPlugin {
-    fn activate(
-        &self,
-        context: bmux_plugin_sdk::definition::PluginLifecycleContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
-    {
-        Box::pin(async move { self.binding.activate(&context) })
+impl Plugin for FinderPlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        d.native_command("show", Self::command);
     }
 
-    fn command(
-        &self,
-        call: bmux_plugin_sdk::definition::PluginCallContext,
-        context: NativeCommandContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::CommandOutcome>
-    {
-        Box::pin(async move {
-            if call.cancellation.is_cancelled() {
-                return Err(PluginCommandError::unavailable(
-                    "finder invocation cancelled",
-                ))
-                .into();
-            }
-            if context.command != "show" {
-                return Err(PluginCommandError::unknown_command(&context.command)).into();
-            }
-            let entry = match self.binding.enter(call.callback_execution.as_ref()) {
-                Ok(entry) => entry,
-                Err(error) => return Err(error).into(),
-            };
-            let outcome: bmux_plugin_sdk::definition::CommandOutcome = self.show(&context).into();
-            drop(entry);
-            outcome
-        })
+    async fn activate(&self, cx: &mut Activation) -> author::Result<()> {
+        self.binding.activate(cx.lifecycle())
     }
 
-    fn deactivate(
-        &self,
-        context: bmux_plugin_sdk::definition::PluginLifecycleContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
-    {
-        Box::pin(async move {
-            self.binding.close(&context)?;
-            let running = std::mem::take(&mut *self.tasks.running.lock().map_err(|_| {
+    async fn deactivate(&self, cx: &mut Deactivation) -> author::Result<()> {
+        self.binding.close(cx.lifecycle())?;
+        let running =
+            std::mem::take(&mut *self.tasks.running.lock().map_err(|_| {
                 PluginCommandError::unavailable("finder task owner requires recovery")
             })?);
-            for task in running {
-                task.abort();
-                let _ = task.await;
-            }
-            self.binding.drained(&context)
-        })
+        for task in running {
+            task.abort();
+            let _ = task.await;
+        }
+        self.binding.drained(cx.lifecycle())
+    }
+}
+
+impl FinderPlugin {
+    async fn command(&self, cx: &Call, context: NativeCommandContext) -> author::Result<i32> {
+        if cx
+            .cancellation()
+            .is_some_and(bmux_plugin_sdk::ServiceCancellation::is_cancelled)
+        {
+            return Err(PluginCommandError::unavailable(
+                "finder invocation cancelled",
+            ));
+        }
+        let entry = self.binding.enter(
+            cx.invocation()
+                .and_then(|call| call.callback_execution.as_ref()),
+        )?;
+        let result = self.show(&context);
+        drop(entry);
+        result
     }
 }
 
@@ -571,17 +551,18 @@ pub fn plugin_definition_with_activation_ports(
     + Sync
     + 'static,
 ) -> bmux_plugin_sdk::definition::PluginDefinition {
-    let metadata = plugin_definition().metadata;
     let bind: activation_ports::Binder = std::sync::Arc::new(bind);
-    bmux_plugin_sdk::definition::PluginDefinition::new(metadata, move |scope| {
-        Ok(std::sync::Arc::new(FinderPlugin {
-            binding: activation_ports::Binding::deferred(scope, bind.clone()),
-            tasks: FinderTasks::default(),
-        })
-            as std::sync::Arc<
-                dyn bmux_plugin_sdk::definition::PluginInstance,
-            >)
-    })
+    bmux_plugin_sdk::author::definition::<FinderPlugin>(
+        crate::declaration::PLUGIN_MANIFEST,
+        crate::declaration::SERVICE_CONTRACTS,
+        move |scope| {
+            Ok(FinderPlugin {
+                binding: activation_ports::Binding::deferred(scope.clone(), bind.clone()),
+                tasks: FinderTasks::default(),
+            })
+        },
+    )
+    .expect("embedded plugin declaration must be valid")
 }
 
 /// Retain compatibility with the create-context injector signature.
@@ -605,29 +586,12 @@ pub fn plugin_definition_with_ports(
     plugin_definition_with_activation_ports(move |context| inject(context.scope.clone()))
 }
 
-bmux_plugin_sdk::define_plugin!(
-    factory = |scope| Ok(std::sync::Arc::new(FinderPlugin {
-        binding: activation_ports::Binding::from_activation(scope),
+bmux_plugin_sdk::plugin!(
+    FinderPlugin,
+    create = |scope| Ok(FinderPlugin {
+        binding: activation_ports::Binding::from_activation(scope.clone()),
         tasks: FinderTasks::default(),
     })
-        as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
-    metadata = {
-        let manifest_toml = crate::declaration::PLUGIN_MANIFEST;
-        let manifest = bmux_plugin::PluginManifest::from_toml_str(manifest_toml)
-            .expect("embedded plugin declaration must be valid");
-        bmux_plugin_sdk::definition::PluginMetadata {
-            plugin_id: manifest.id,
-            version: manifest.version,
-            roles: manifest.component_roles,
-            required_capabilities: manifest
-                .required_capabilities
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            contracts: manifest.contracts,
-            manifest_toml: Some(manifest_toml.into()),
-        }
-    },
 );
 
 #[cfg(test)]

@@ -34,6 +34,7 @@ use bmux_performance_state::{
     PerformanceCaptureSettings, PerformanceRuntimeSettings, PerformanceSettingsHandle,
 };
 use bmux_plugin::{EventBus, PluginStateRegistry};
+use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use bmux_presentation_state::{
@@ -202,29 +203,33 @@ fn stop_metrics_worker(slot: &Mutex<Option<MetricsWorker>>) -> Result<(), Plugin
     Ok(())
 }
 
-impl RustPlugin for PerformancePlugin {
-    type Contract = bmux_performance_plugin_api::Contract;
+impl Plugin for PerformancePlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        d.blocking_activate(Self::activate)
+            .blocking_deactivate(Self::deactivate)
+            .blocking_services(Self::invoke_service, None)
+            .typed_services(Self::register_typed_services);
+    }
+}
 
+impl PerformancePlugin {
     fn activate(
-        &mut self,
-        context: NativeLifecycleContext,
-    ) -> std::result::Result<i32, PluginCommandError> {
+        &self,
+        context: bmux_plugin_sdk::NativeLifecycleContext,
+        _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
+    ) -> std::result::Result<(), PluginCommandError> {
         self.adopt_activation_bus(|| bmux_plugin::activation_event_bus(&context));
         self.adopt_activation_states(|| Some(bmux_plugin::activation_state_registry(&context)));
         self.activate_owner()?;
-        Ok(bmux_plugin_sdk::EXIT_OK)
+        Ok(())
     }
 
-    fn deactivate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+    fn deactivate(
+        &self,
+        _context: bmux_plugin_sdk::NativeLifecycleContext,
+    ) -> std::result::Result<(), PluginCommandError> {
         self.stop_worker()?;
-        Ok(bmux_plugin_sdk::EXIT_OK)
-    }
-
-    fn run_command(
-        &mut self,
-        _context: NativeCommandContext,
-    ) -> std::result::Result<i32, PluginCommandError> {
-        Err(PluginCommandError::unknown_command(""))
+        Ok(())
     }
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
@@ -1175,87 +1180,19 @@ impl PerformanceHost for ActivationPerformanceHost {
     }
 }
 
-impl bmux_plugin_sdk::definition::PluginInstance for PerformancePlugin {
-    fn service_contract_for(&self, interface: &str) -> Option<&'static [u8]> {
-        <bmux_performance_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface)
-    }
-
-    fn activate(
-        &self,
-        context: bmux_plugin_sdk::definition::PluginLifecycleContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
-    {
-        self.adopt_activation_bus(|| {
-            bmux_plugin::take_activation_event_bus(&context.capabilities).ok()
-        });
-        self.adopt_activation_states(|| {
-            bmux_plugin::take_activation_state_registry(&context.capabilities).ok()
-        });
-        Box::pin(async move { self.activate_owner() })
-    }
-    fn deactivate(
-        &self,
-        _context: bmux_plugin_sdk::definition::PluginLifecycleContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
-    {
-        Box::pin(async move {
-            tokio::runtime::Handle::try_current().map_err(|_| {
-                PluginCommandError::unavailable("metrics cleanup requires host async runtime")
-            })?;
-            if self
-                .cleanup_pending
-                .swap(true, std::sync::atomic::Ordering::AcqRel)
-            {
-                return Err(PluginCommandError::unavailable(
-                    "metrics cleanup pending or failed; recovery required",
-                ));
-            }
-            let worker = Arc::clone(&self.worker);
-            let pending = Arc::clone(&self.cleanup_pending);
-            // The blocking task retains cleanup authority even if this future
-            // is cancelled. Only a successful join permits reactivation.
-            tokio::task::spawn_blocking(move || {
-                stop_metrics_worker(&worker)?;
-                pending.store(false, std::sync::atomic::Ordering::Release);
-                Ok(())
-            })
-            .await
-            .map_err(|_| PluginCommandError::failed("metrics cleanup task panicked"))?
-        })
-    }
-    fn invoke(
-        &self,
-        call: bmux_plugin_sdk::definition::PluginCallContext,
-        context: NativeServiceContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<
-        '_,
-        bmux_plugin_sdk::definition::PluginResult<ServiceResponse>,
-    > {
-        Box::pin(async move {
-            if call.cancellation.is_cancelled() {
-                return Err(PluginCommandError::unavailable(
-                    "performance invocation cancelled",
-                ));
-            }
-            Ok(self.service(&context))
-        })
-    }
-}
 // The one definition both bundling and generated dynamic packaging use:
 // fresh default author state per created instance.
-bmux_plugin_sdk::define_plugin!(
-    rust_plugin = PerformancePlugin,
-    manifest = crate::declaration::PLUGIN_MANIFEST,
-    roles = vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
-);
+bmux_plugin_sdk::plugin!(PerformancePlugin);
 
 pub fn plugin_definition_with_host(
     host: Arc<dyn PerformanceHost>,
 ) -> bmux_plugin_sdk::definition::PluginDefinition {
-    use bmux_plugin_sdk::definition::{PluginDefinition, PluginInstance};
-    PluginDefinition::new(definition_metadata(), move |_scope| {
-        Ok(Arc::new(PerformancePlugin::with_host(Arc::clone(&host))) as Arc<dyn PluginInstance>)
-    })
+    bmux_plugin_sdk::author::definition::<PerformancePlugin>(
+        crate::declaration::PLUGIN_MANIFEST,
+        crate::declaration::SERVICE_CONTRACTS,
+        move |_| Ok(PerformancePlugin::with_host(Arc::clone(&host))),
+    )
+    .expect("embedded performance declaration must be valid")
 }
 
 #[cfg(test)]
@@ -1409,27 +1346,11 @@ mod tests {
     }
 }
 
-fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
-    bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<PerformancePlugin>(
-        crate::declaration::PLUGIN_MANIFEST,
-        vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
-    )
-    .expect("plugin manifest must define valid canonical metadata")
-    .metadata
-}
-
 #[cfg(test)]
 mod canonical_metadata_tests {
     #[test]
     fn embedded_manifest_matches_definition_metadata() {
-        let definition = bmux_plugin_sdk::definition::PluginDefinition::new(
-            super::definition_metadata(),
-            |_scope| {
-                Err(bmux_plugin_sdk::PluginCommandError::unavailable(
-                    "metadata-only regression",
-                ))
-            },
-        );
+        let definition = super::plugin_definition();
         definition
             .validate()
             .expect("canonical embedded identity must validate");

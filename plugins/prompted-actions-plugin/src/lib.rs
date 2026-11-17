@@ -56,6 +56,7 @@ mod sequence;
 
 mod activation_ports;
 
+use bmux_plugin_sdk::author::{self, Activation, Call, Deactivation, Declarations, Plugin};
 use bmux_plugin_sdk::prelude::*;
 
 #[derive(Default)]
@@ -115,24 +116,6 @@ impl PromptedActionsPlugin {
     }
 }
 
-impl RustPlugin for PromptedActionsPlugin {
-    type Contract = bmux_plugin_sdk::NoPluginContract;
-
-    fn deactivate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
-        self.tasks
-            .get_mut()
-            .map_err(|_| {
-                PluginCommandError::unavailable("prompted action task owner requires recovery")
-            })?
-            .abort_all();
-        Ok(EXIT_OK)
-    }
-
-    fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
-        self.run(&context)
-    }
-}
-
 fn resolve_prompted_action(
     context: &NativeCommandContext,
 ) -> Result<config::ActionDef, PluginCommandError> {
@@ -175,55 +158,46 @@ fn plugin_config_action_names_display(settings: Option<&toml::Value>) -> String 
         .join(", ")
 }
 
-impl bmux_plugin_sdk::definition::PluginInstance for PromptedActionsPlugin {
-    fn activate(
-        &self,
-        context: bmux_plugin_sdk::definition::PluginLifecycleContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
-    {
-        Box::pin(async move { self.binding.activate(&context) })
+impl Plugin for PromptedActionsPlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        d.native_command("run", Self::command);
     }
 
-    fn command(
-        &self,
-        call: bmux_plugin_sdk::definition::PluginCallContext,
-        context: NativeCommandContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::CommandOutcome>
-    {
-        Box::pin(async move {
-            if call.cancellation.is_cancelled() {
-                return Err(PluginCommandError::unavailable(
-                    "prompted action invocation cancelled",
-                ))
-                .into();
-            }
-            let entry = match self.binding.enter(call.callback_execution.as_ref()) {
-                Ok(entry) => entry,
-                Err(error) => return Err(error).into(),
-            };
-            let outcome: bmux_plugin_sdk::definition::CommandOutcome = self.run(&context).into();
-            drop(entry);
-            outcome
-        })
+    async fn activate(&self, cx: &mut Activation) -> author::Result<()> {
+        self.binding.activate(cx.lifecycle())
     }
 
-    fn deactivate(
-        &self,
-        context: bmux_plugin_sdk::definition::PluginLifecycleContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
-    {
-        Box::pin(async move {
-            self.binding.close(&context)?;
-            let mut tasks = {
-                let mut owned = self.tasks.lock().map_err(|_| {
-                    PluginCommandError::unavailable("prompted action task owner requires recovery")
-                })?;
-                std::mem::take(&mut *owned)
-            };
-            tasks.abort_all();
-            while tasks.join_next().await.is_some() {}
-            self.binding.drained(&context)
-        })
+    async fn deactivate(&self, cx: &mut Deactivation) -> author::Result<()> {
+        self.binding.close(cx.lifecycle())?;
+        let mut tasks = {
+            let mut owned = self.tasks.lock().map_err(|_| {
+                PluginCommandError::unavailable("prompted action task owner requires recovery")
+            })?;
+            std::mem::take(&mut *owned)
+        };
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+        self.binding.drained(cx.lifecycle())
+    }
+}
+
+impl PromptedActionsPlugin {
+    async fn command(&self, cx: &Call, context: NativeCommandContext) -> author::Result<i32> {
+        if cx
+            .cancellation()
+            .is_some_and(bmux_plugin_sdk::ServiceCancellation::is_cancelled)
+        {
+            return Err(PluginCommandError::unavailable(
+                "prompted action invocation cancelled",
+            ));
+        }
+        let entry = self.binding.enter(
+            cx.invocation()
+                .and_then(|call| call.callback_execution.as_ref()),
+        )?;
+        let result = self.run(&context);
+        drop(entry);
+        result
     }
 }
 
@@ -245,17 +219,18 @@ pub fn plugin_definition_with_activation_ports(
     + Sync
     + 'static,
 ) -> bmux_plugin_sdk::definition::PluginDefinition {
-    let metadata = plugin_definition().metadata;
     let bind: activation_ports::Binder = std::sync::Arc::new(bind);
-    bmux_plugin_sdk::definition::PluginDefinition::new(metadata, move |scope| {
-        Ok(std::sync::Arc::new(PromptedActionsPlugin {
-            binding: activation_ports::Binding::deferred(scope, bind.clone()),
-            tasks: std::sync::Mutex::default(),
-        })
-            as std::sync::Arc<
-                dyn bmux_plugin_sdk::definition::PluginInstance,
-            >)
-    })
+    bmux_plugin_sdk::author::definition::<PromptedActionsPlugin>(
+        crate::declaration::PLUGIN_MANIFEST,
+        crate::declaration::SERVICE_CONTRACTS,
+        move |scope| {
+            Ok(PromptedActionsPlugin {
+                binding: activation_ports::Binding::deferred(scope.clone(), bind.clone()),
+                tasks: std::sync::Mutex::default(),
+            })
+        },
+    )
+    .expect("embedded plugin declaration must be valid")
 }
 
 /// Retain compatibility with the create-context injector signature.
@@ -279,29 +254,12 @@ pub fn plugin_definition_with_ports(
     plugin_definition_with_activation_ports(move |context| inject(context.scope.clone()))
 }
 
-bmux_plugin_sdk::define_plugin!(
-    factory = |scope| Ok(std::sync::Arc::new(PromptedActionsPlugin {
-        binding: activation_ports::Binding::from_activation(scope),
+bmux_plugin_sdk::plugin!(
+    PromptedActionsPlugin,
+    create = |scope| Ok(PromptedActionsPlugin {
+        binding: activation_ports::Binding::from_activation(scope.clone()),
         tasks: std::sync::Mutex::default(),
     })
-        as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
-    metadata = {
-        let manifest_toml = crate::declaration::PLUGIN_MANIFEST;
-        let manifest = bmux_plugin::PluginManifest::from_toml_str(manifest_toml)
-            .expect("embedded plugin declaration must be valid");
-        bmux_plugin_sdk::definition::PluginMetadata {
-            plugin_id: manifest.id,
-            version: manifest.version,
-            roles: manifest.component_roles,
-            required_capabilities: manifest
-                .required_capabilities
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            contracts: manifest.contracts,
-            manifest_toml: Some(manifest_toml.into()),
-        }
-    },
 );
 
 #[cfg(test)]
@@ -313,9 +271,17 @@ mod definition_tests {
             bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
                 .unwrap();
         assert_eq!(definition.metadata.plugin_id, manifest.id);
+        let embedded = bmux_plugin::PluginManifest::from_toml_str(
+            definition.metadata.manifest_toml.as_deref().unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            definition.metadata.manifest_toml.as_deref(),
-            Some(crate::declaration::PLUGIN_MANIFEST)
+            (embedded.id, embedded.version, embedded.component_roles),
+            (
+                manifest.id.clone(),
+                manifest.version,
+                manifest.component_roles
+            )
         );
         assert_eq!(
             definition.metadata.roles,
