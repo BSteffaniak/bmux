@@ -298,3 +298,28 @@ fn the_host_shows_every_frame_with_full_row_scrolls() {
 fn the_host_shows_every_frame_painted_over_the_last() {
     run(ScrollRegionAcceleration::Auto, true);
 }
+
+#[test]
+fn streamed_cursor_and_tui_wrap_agree_at_right_margin() {
+    use bmux_tui::text_width::{display_width, wrap_text_with_continuation_character};
+    for (text, rows, col) in [
+        ("abce\u{301}X", ["abce\u{301}", "X"], 1),
+        ("abc界X", ["abc", "界X"], 3),
+        ("abc👩‍💻X", ["abc", "👩‍💻X"], 3),
+        ("abلاX", ["abلا", "X"], 1),
+    ] {
+        assert_eq!(wrap_text_with_continuation_character(text, 4, 4), rows);
+        assert_eq!(display_width(rows[1]), col);
+        let mut host = TerminalGridStream::new(4, 3, GridLimits::default()).unwrap();
+        for byte in text.bytes() {
+            host.process(&[byte]);
+        }
+        let grid = host.grid();
+        assert_eq!((grid.cursor().row, grid.cursor().col), (1, col), "{text}");
+        for (index, expected) in rows.iter().enumerate() {
+            let row = grid.viewport_row_ref(index).unwrap();
+            let actual: String = row.cells().iter().map(|cell| cell.text()).collect();
+            assert_eq!(actual.trim_end(), *expected);
+        }
+    }
+}

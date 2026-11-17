@@ -2,7 +2,6 @@ use crate::model::{Cursor, GridMode, PhysicalRow, ProtocolState, TerminalGrid};
 use crate::style::{Style, StyleId};
 use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellRunSnapshot {
@@ -162,7 +161,7 @@ pub(crate) fn validate_retained_alternate(
             }
             end = start;
             for grapheme in run.text.graphemes(true) {
-                let columns = UnicodeWidthStr::width(grapheme).min(2);
+                let columns = bmux_cell_geometry::grapheme_width(grapheme);
                 if columns == 0 || columns > usize::from(width).saturating_sub(end) {
                     return Err("invalid retained alternate glyph");
                 }

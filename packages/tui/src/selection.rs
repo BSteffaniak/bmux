@@ -1612,7 +1612,6 @@ pub fn plain_text_fragments_with_tabs(
     tab_width: u16,
 ) -> Vec<SelectionFragment> {
     use unicode_segmentation::UnicodeSegmentation;
-    use unicode_width::UnicodeWidthStr;
 
     let scope_id = scope_id.into();
     let content_id = content_id.into();
@@ -1639,8 +1638,11 @@ pub fn plain_text_fragments_with_tabs(
             let used = x.saturating_sub(area.x) % tab_width;
             tab_width.saturating_sub(used)
         } else {
-            u16::try_from(UnicodeWidthStr::width(grapheme).clamp(1, 2)).unwrap_or(2)
+            u16::try_from(bmux_cell_geometry::grapheme_width(grapheme)).unwrap_or(2)
         };
+        if width == 0 {
+            continue;
+        }
         if x >= area.right() || x.saturating_add(width) > area.right() {
             break;
         }
@@ -2766,7 +2768,7 @@ mod tests {
                     .expect("a painted cell at the fragment");
                 let text = &source[range];
                 let painted = text.trim_matches(|c: char| {
-                    unicode_width::UnicodeWidthChar::width(c) == Some(0) && !c.is_control()
+                    bmux_cell_geometry::scalar_width(c) == 0 && !c.is_control()
                 });
                 if !painted.chars().any(char::is_control) {
                     assert!(

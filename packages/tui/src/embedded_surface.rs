@@ -9,7 +9,6 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 use crate::buffer::Buffer;
 use crate::component::{
@@ -377,7 +376,7 @@ pub fn validate_cells(buffer: &Buffer, limits: SurfaceLimits) -> Result<(), Surf
                     return Err(SurfaceError::Invalid);
                 }
             } else if cell.symbol.graphemes(true).count() != 1
-                || cell.symbol.width() != usize::from(cell.width())
+                || bmux_cell_geometry::grapheme_width(&cell.symbol) != usize::from(cell.width())
                 || !(1..=2).contains(&cell.width())
                 || (cell.width() == 2
                     && row

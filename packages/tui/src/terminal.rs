@@ -1570,8 +1570,7 @@ mod tests {
         text.char_indices()
             .map(|(start, ch)| crate::paint::SizedCell {
                 symbol: &text[start..start + ch.len_utf8()],
-                width: u8::try_from(unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1))
-                    .unwrap_or(1),
+                width: u8::try_from(bmux_cell_geometry::scalar_width(ch)).unwrap_or(1),
                 style: Style::new(),
             })
             .collect()

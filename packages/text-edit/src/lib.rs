@@ -25,7 +25,6 @@ pub use pointer::{
 
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 /// A terminal visual cursor position measured in rows and columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -100,7 +99,7 @@ impl WrapLayout {
         let end = cursor.clamp(range.start, range.end);
         VisualCursor {
             row,
-            col: UnicodeWidthStr::width(&text[range.start..end]),
+            col: bmux_cell_geometry::display_width(&text[range.start..end]),
         }
     }
 
@@ -935,7 +934,7 @@ fn visual_cursor_for_wrapped_lines(
     let cursor = cursor.clamp(line_start, line_end);
     VisualCursor {
         row,
-        col: UnicodeWidthStr::width(&text[line_start..cursor]),
+        col: bmux_cell_geometry::display_width(&text[line_start..cursor]),
     }
 }
 
@@ -955,7 +954,7 @@ fn grapheme_spans(text: &str) -> Vec<GraphemeSpan> {
         .map(|(start, grapheme)| GraphemeSpan {
             start,
             end: start.saturating_add(grapheme.len()),
-            width: UnicodeWidthStr::width(grapheme),
+            width: bmux_cell_geometry::grapheme_width(grapheme),
         })
         .collect()
 }
@@ -1026,7 +1025,7 @@ fn next_word_boundary(text: &str, cursor: usize, policy: WordBoundaryPolicy) -> 
 fn byte_index_for_visual_col(line: &str, target_col: usize) -> usize {
     let mut col = 0usize;
     for (start, grapheme) in line.grapheme_indices(true) {
-        let width = UnicodeWidthStr::width(grapheme).max(1);
+        let width = bmux_cell_geometry::grapheme_width(grapheme);
         if col.saturating_add(width) > target_col {
             return start;
         }
@@ -1038,6 +1037,16 @@ fn byte_index_for_visual_col(line: &str, target_col: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visual_hits_follow_painted_cells_not_scalar_or_byte_counts() {
+        let text = "e\u{301}\u{200b}界👩‍💻لا";
+        let starts: Vec<_> = text.grapheme_indices(true).map(|(i, _)| i).collect();
+        for (column, cluster) in [0, 2, 2, 3, 3, 4, 5].into_iter().enumerate() {
+            assert_eq!(byte_index_for_visual_col(text, column), starts[cluster]);
+        }
+        assert_eq!(byte_index_for_visual_col(text, 7), text.len());
+    }
 
     #[test]
     fn inserts_and_deletes_at_cursor() {
@@ -1120,7 +1129,9 @@ mod tests {
                         Some(WrapExclusion { row: 0, columns }),
                     );
                     if let Some(line) = layout.lines.first() {
-                        assert!(UnicodeWidthStr::width(line.as_str()) <= width - columns);
+                        assert!(
+                            bmux_cell_geometry::display_width(line.as_str()) <= width - columns
+                        );
                     }
                     for range in layout.line_ranges {
                         assert!(text.get(range).is_some());

@@ -9,7 +9,6 @@ use bmux_tui::image::{ImageFit, ImageLifecycle};
 use bmux_tui::pointer::PointerShapeCapability;
 use bmux_tui::prelude::*;
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 const WIDTH: u16 = 12;
 const HEIGHT: u16 = 8;
@@ -145,7 +144,7 @@ impl Screen {
     }
 
     fn print(&mut self, grapheme: &str) {
-        let width = u16::try_from(grapheme.width().max(1)).unwrap();
+        let width = u16::try_from(bmux_cell_geometry::grapheme_width(grapheme).max(1)).unwrap();
         let index = usize::from(self.y) * usize::from(self.width) + usize::from(self.x);
         self.cells[index] = (grapheme.to_owned(), self.sgr.clone());
         if width == 2 {

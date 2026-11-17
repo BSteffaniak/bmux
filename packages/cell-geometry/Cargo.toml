@@ -1,0 +1,19 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Shared Unicode terminal cell geometry for bmux"
+edition     = { workspace = true }
+keywords    = ["bmux", "terminal", "grid", "unicode"]
+license     = { workspace = true }
+name        = "bmux_cell_geometry"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+unicode-segmentation = { workspace = true }
+unicode-width        = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

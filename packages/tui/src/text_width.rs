@@ -1,12 +1,11 @@
 //! Unicode-aware terminal text measurement and wrapping helpers.
 
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 /// Return the display width of a string in terminal cells.
 #[must_use]
 pub fn display_width(text: &str) -> usize {
-    UnicodeWidthStr::width(text)
+    bmux_cell_geometry::display_width(text)
 }
 
 /// Return the terminal cells [`Buffer::write_line`](crate::buffer::Buffer::write_line)
@@ -17,9 +16,7 @@ pub fn display_width(text: &str) -> usize {
 ///   one replacement cell), occupy one cell.
 /// * Wide graphemes occupy two cells.
 ///
-/// Use this, rather than [`display_width`], when computing cell positions that
-/// must agree with painted `Line` content, such as hit regions or selection
-/// geometry for text laid out grapheme by grapheme.
+/// Single-grapheme counterpart of [`display_width`] for painters and hit regions.
 #[must_use]
 pub fn painted_grapheme_width(grapheme: &str) -> u16 {
     crate::buffer::grapheme_width(grapheme)

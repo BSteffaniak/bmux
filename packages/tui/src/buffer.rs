@@ -7,7 +7,6 @@
 //! buffer cannot be installed into authoritative `PresentationState`.
 
 use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 use crate::geometry::{Point, Rect, Size};
 use crate::style::Style;
@@ -946,16 +945,7 @@ pub(crate) fn safe_symbol(symbol: &str) -> &str {
 /// graphemes (which paint nothing), 1 for narrow and control-containing ones
 /// (painted as their replacement), 2 for wide ones.
 pub(crate) fn grapheme_width(grapheme: &str) -> u16 {
-    // One byte is one ASCII character: printable ones are narrow, and
-    // controls measure like their replacement character.
-    if grapheme.len() == 1 || grapheme.chars().any(char::is_control) {
-        return 1;
-    }
-    match UnicodeWidthStr::width(grapheme) {
-        0 => 0,
-        1 => 1,
-        _ => 2,
-    }
+    u16::try_from(bmux_cell_geometry::grapheme_width(grapheme)).unwrap_or(2)
 }
 
 #[cfg(test)]

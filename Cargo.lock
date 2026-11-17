@@ -1715,6 +1715,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_cell_geometry"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "unicode-segmentation",
+ "unicode-width",
+]
+
+[[package]]
 name = "bmux_cli"
 version = "0.0.1-alpha.4"
 dependencies = [
@@ -3476,13 +3484,13 @@ dependencies = [
 name = "bmux_terminal_grid"
 version = "0.0.1-alpha.4"
 dependencies = [
+ "bmux_cell_geometry",
  "bmux_terminal_protocol",
  "bmux_tui",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "unicode-segmentation",
- "unicode-width",
 ]
 
 [[package]]
@@ -3496,11 +3504,11 @@ dependencies = [
 name = "bmux_text_edit"
 version = "0.0.1-alpha.4"
 dependencies = [
+ "bmux_cell_geometry",
  "bmux_keyboard",
  "serde",
  "serde_json",
  "unicode-segmentation",
- "unicode-width",
  "web-time",
  "zeroize",
 ]
@@ -3533,6 +3541,7 @@ dependencies = [
 name = "bmux_tui"
 version = "0.0.1-alpha.4"
 dependencies = [
+ "bmux_cell_geometry",
  "bmux_color",
  "bmux_keyboard",
  "bmux_terminal",
@@ -3544,7 +3553,6 @@ dependencies = [
  "serde",
  "serde_json",
  "unicode-segmentation",
- "unicode-width",
  "web-time",
  "zeroize",
 ]
