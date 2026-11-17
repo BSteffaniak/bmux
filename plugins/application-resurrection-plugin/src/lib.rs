@@ -25,8 +25,9 @@ pub mod shell;
 
 #[cfg(unix)]
 use bmux_application_resurrection_plugin_api::{resurrection_host_v1, resurrection_launch_v1};
+use bmux_plugin_sdk::author::{self, Activation, Call, Deactivation, Declarations, Plugin};
 use bmux_plugin_sdk::{
-    NativeLifecycleContext, NativeServiceContext, PluginCommandError, RustPlugin, ServiceResponse,
+    NativeLifecycleContext, NativeServiceContext, PluginCommandError, ServiceResponse,
 };
 
 /// Statically bundleable, independently disableable host adapter.
@@ -36,21 +37,17 @@ pub struct ApplicationResurrectionPlugin {
     host: std::sync::RwLock<Option<host::Host>>,
 }
 
-impl RustPlugin for ApplicationResurrectionPlugin {
-    type Contract = bmux_application_resurrection_plugin_api::Contract;
-
-    fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
-        self.activate_host(&context)?;
-        Ok(bmux_plugin_sdk::EXIT_OK)
+impl Plugin for ApplicationResurrectionPlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        d.native_services(Self::invoke);
     }
 
-    fn deactivate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
-        self.deactivate_host()?;
-        Ok(bmux_plugin_sdk::EXIT_OK)
+    async fn activate(&self, cx: &mut Activation) -> author::Result<()> {
+        self.activate_host(cx.native())
     }
 
-    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
-        self.service(&context)
+    async fn deactivate(&self, _cx: &mut Deactivation) -> author::Result<()> {
+        self.deactivate_host()
     }
 }
 
@@ -148,67 +145,43 @@ fn host_error(message: String) -> resurrection_launch_v1::HostError {
     resurrection_launch_v1::HostError::Failed { message }
 }
 
-impl bmux_plugin_sdk::definition::PluginInstance for ApplicationResurrectionPlugin {
-    fn service_contract_for(&self, interface: &str) -> Option<&'static [u8]> {
-        <bmux_application_resurrection_plugin_api::Contract as bmux_plugin_sdk::PluginContract>::service_contract_for(interface)
-    }
-
-    fn activate(
+impl ApplicationResurrectionPlugin {
+    /// Every resurrection call is checked: the generated contract frames the
+    /// request and the response around the hand-routed body.
+    async fn invoke(
         &self,
-        context: bmux_plugin_sdk::definition::PluginLifecycleContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
-    {
-        Box::pin(async move { self.activate_host(&context.native) })
-    }
-
-    fn deactivate(
-        &self,
-        _context: bmux_plugin_sdk::definition::PluginLifecycleContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
-    {
-        Box::pin(async move { self.deactivate_host() })
-    }
-
-    fn invoke(
-        &self,
-        call: bmux_plugin_sdk::definition::PluginCallContext,
+        cx: &Call,
         context: NativeServiceContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<
-        '_,
-        bmux_plugin_sdk::definition::PluginResult<ServiceResponse>,
-    > {
-        Box::pin(async move {
-            if call.cancellation.is_cancelled() {
-                return Err(PluginCommandError::unavailable(
-                    "resurrection invocation cancelled",
-                ));
-            }
-            bmux_plugin_sdk::typed_dispatch::invoke_checked_service_body::<
-                bmux_application_resurrection_plugin_api::Contract,
-            >(context, |context| self.service(&context))
-            .map_err(|error| PluginCommandError::failed(error.to_string()))
-        })
+    ) -> author::Result<ServiceResponse> {
+        if cx
+            .cancellation()
+            .is_some_and(bmux_plugin_sdk::ServiceCancellation::is_cancelled)
+        {
+            return Err(PluginCommandError::unavailable(
+                "resurrection invocation cancelled",
+            ));
+        }
+        bmux_plugin_sdk::typed_dispatch::invoke_checked_service_body::<
+            bmux_application_resurrection_plugin_api::Contract,
+        >(context, |context| self.service(&context))
+        .map_err(|error| PluginCommandError::failed(error.to_string()))
     }
 }
 
-bmux_plugin_sdk::define_plugin!(
-    factory = |_scope| Ok(
-        std::sync::Arc::new(ApplicationResurrectionPlugin::default())
-            as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>
-    ),
-    metadata = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<
-        ApplicationResurrectionPlugin,
-    >(
-        crate::declaration::PLUGIN_MANIFEST,
-        vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
-    )
-    .expect("resurrection declaration must be valid")
-    .metadata,
-);
+bmux_plugin_sdk::plugin!(ApplicationResurrectionPlugin);
 
 #[cfg(all(test, unix))]
 mod lifecycle_tests {
     use super::*;
+
+    fn selected() -> author::DeclaredInstance<ApplicationResurrectionPlugin> {
+        author::DeclaredInstance::new(
+            ApplicationResurrectionPlugin::default(),
+            declaration::PLUGIN_MANIFEST,
+            declaration::SERVICE_CONTRACTS,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn embedded_manifest_matches_definition_metadata() {
@@ -221,7 +194,7 @@ mod lifecycle_tests {
     fn selected_instance_preserves_generated_contracts_for_checked_dispatch() {
         use bmux_plugin_sdk::definition::PluginInstance;
 
-        let plugin = ApplicationResurrectionPlugin::default();
+        let plugin = selected();
         for interface in [
             "resurrection-host-v1",
             "resurrection-launch-v1",
@@ -310,7 +283,7 @@ mod lifecycle_tests {
             host_kernel_bridge: None,
             host_service_port: None,
         };
-        let plugin = ApplicationResurrectionPlugin::default();
+        let plugin = selected();
         let call = PluginCallContext {
             callback_execution: None,
             invocation_id: bmux_plugin_sdk::PluginInvocationId::new(),
@@ -333,7 +306,7 @@ mod lifecycle_tests {
         assert!(
             matches!(result, Err(resurrection_launch_v1::HostError::Failed { message }) if message == "host unavailable")
         );
-        assert!(plugin.host.read().unwrap().is_none());
+        assert!(plugin.plugin().host.read().unwrap().is_none());
     }
 
     #[test]

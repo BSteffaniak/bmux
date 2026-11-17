@@ -16,10 +16,8 @@ mod runner;
 
 use std::sync::{Arc, Mutex};
 
-use bmux_plugin_sdk::prelude::{
-    NativeCommandContext, NativeLifecycleContext, NativeServiceContext, PluginCommandError,
-    RustPlugin, ServiceResponse,
-};
+use bmux_plugin_sdk::author::{Declarations, Plugin};
+use bmux_plugin_sdk::prelude::{NativeServiceContext, PluginCommandError, ServiceResponse};
 
 #[derive(Default)]
 pub struct PlaybookPlugin {
@@ -44,25 +42,13 @@ impl Drop for PlaybookPlugin {
     }
 }
 
-impl RustPlugin for PlaybookPlugin {
-    type Contract = bmux_playbook_plugin_api::Contract;
-
-    fn activate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
-        self.start_poller()?;
-        Ok(bmux_plugin_sdk::EXIT_OK)
-    }
-
-    fn run_command(&mut self, _context: NativeCommandContext) -> Result<i32, PluginCommandError> {
-        Err(PluginCommandError::unknown_command(""))
-    }
-
-    fn deactivate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
-        self.drain()?;
-        Ok(bmux_plugin_sdk::EXIT_OK)
-    }
-
-    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
-        self.service(context)
+// The owner, its poller and every service body are synchronous: they run
+// on the host's blocking pool inside the call's callback entry.
+impl Plugin for PlaybookPlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        d.blocking_activate(|plugin, _, _| plugin.start_poller())
+            .blocking_deactivate(|plugin, _| plugin.drain())
+            .blocking_services(Self::service, None);
     }
 }
 
@@ -193,110 +179,11 @@ impl PlaybookPlugin {
     }
 }
 
-struct SelectedPlaybook {
-    instance: bmux_plugin_sdk::definition::LoadedInstanceId,
-    plugin: Arc<PlaybookPlugin>,
-}
-impl SelectedPlaybook {
-    fn execute<T: Send + 'static>(
-        &self,
-        execution: Option<bmux_plugin_sdk::PluginCallbackContext>,
-        work: impl FnOnce(&PlaybookPlugin) -> Result<T, PluginCommandError> + Send + 'static,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<'static, Result<T, PluginCommandError>> {
-        let instance = self.instance;
-        let plugin = self.plugin.clone();
-        Box::pin(async move {
-            let execution = execution.ok_or_else(|| {
-                PluginCommandError::unavailable("selected playbook callback authority missing")
-            })?;
-            let entry = execution.enter_adapter_entry(instance)?;
-            let output = Arc::new(Mutex::new(None));
-            let writer = output.clone();
-            execution
-                .execute_entered(
-                    instance,
-                    entry,
-                    Box::new(move || {
-                        let result = work(&plugin);
-                        *writer.lock().map_err(|_| {
-                            PluginCommandError::failed("playbook result poisoned")
-                        })? = Some(result);
-                        Ok(())
-                    }),
-                )
-                .await?;
-            let result = output
-                .lock()
-                .map_err(|_| PluginCommandError::failed("playbook result poisoned"))?
-                .take();
-            result.ok_or_else(|| {
-                PluginCommandError::failed("playbook callback settled without result")
-            })?
-        })
-    }
-}
-impl bmux_plugin_sdk::definition::PluginInstance for SelectedPlaybook {
-    fn activate(
-        &self,
-        context: bmux_plugin_sdk::definition::PluginLifecycleContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
-    {
-        self.execute(context.callback_execution, PlaybookPlugin::start_poller)
-    }
-    fn deactivate(
-        &self,
-        context: bmux_plugin_sdk::definition::PluginLifecycleContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>>
-    {
-        self.execute(context.callback_execution, PlaybookPlugin::drain)
-    }
-    fn invoke(
-        &self,
-        call: bmux_plugin_sdk::definition::PluginCallContext,
-        context: NativeServiceContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<
-        '_,
-        bmux_plugin_sdk::definition::PluginResult<ServiceResponse>,
-    > {
-        self.execute(call.callback_execution, move |plugin| {
-            if call.cancellation.is_cancelled() {
-                return Err(PluginCommandError::unavailable(
-                    "playbook invocation cancelled",
-                ));
-            }
-            Ok(plugin.service(context))
-        })
-    }
-}
-
-bmux_plugin_sdk::define_plugin!(
-    factory =
-        |scope: bmux_plugin_sdk::definition::PluginCreateContext| Ok(Arc::new(SelectedPlaybook {
-            instance: scope.instance,
-            plugin: Arc::new(PlaybookPlugin::default()),
-        })
-            as Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
-    metadata = definition_metadata(),
-);
+bmux_plugin_sdk::plugin!(PlaybookPlugin);
 
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
-
-    #[test]
-    fn selected_adapter_rejects_missing_authority_without_starting_poller() {
-        let selected = SelectedPlaybook {
-            instance: bmux_plugin_sdk::definition::LoadedInstanceId::from_uuid(uuid::Uuid::new_v4()),
-            plugin: Arc::new(PlaybookPlugin::default()),
-        };
-        let mut work = std::pin::pin!(selected.execute(None, PlaybookPlugin::start_poller));
-        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-        assert!(matches!(
-            std::future::Future::poll(work.as_mut(), &mut context),
-            std::task::Poll::Ready(Err(_))
-        ));
-        assert!(selected.plugin.poller.lock().unwrap().is_none());
-    }
 
     #[test]
     fn poller_is_activation_owned_and_reactivation_is_explicit() {
@@ -318,15 +205,6 @@ mod lifecycle_tests {
         assert!(second.poller.lock().unwrap().is_none());
         first.drain().unwrap();
     }
-}
-
-fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
-    bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<PlaybookPlugin>(
-        crate::declaration::PLUGIN_MANIFEST,
-        vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
-    )
-    .expect("plugin manifest must define valid canonical metadata")
-    .metadata
 }
 
 #[cfg(test)]

@@ -17,9 +17,9 @@ mod run_cmd;
 mod suggest;
 
 use bmux_plugin::HostRuntimeApi;
+use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::{
     CoreCliCommandRequest, CoreCliCommandResponse, NativeCommandContext, PluginCommandError,
-    RustPlugin,
     perf_telemetry::{PhaseChannel, PhasePayload, emit as emit_perf_phase},
 };
 use serde::Serialize;
@@ -29,11 +29,34 @@ use std::time::Instant;
 #[derive(Default)]
 pub struct PluginCliPlugin;
 
-impl RustPlugin for PluginCliPlugin {
-    type Contract = bmux_plugin_sdk::NoPluginContract;
-
-    fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
-        Self::command(&context)
+// Every command body is synchronous and runs inside its callback entry.
+impl Plugin for PluginCliPlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        for name in [
+            "list",
+            "run",
+            "rebuild",
+            "doctor",
+            "logs-path",
+            "logs-level",
+            "logs-tail",
+            "logs-watch",
+            "logs-profiles-list",
+            "logs-profiles-show",
+            "logs-profiles-delete",
+            "logs-profiles-rename",
+            "keymap-doctor",
+            "terminal-doctor",
+            "terminal-install-terminfo",
+            "playbook-run",
+            "playbook-validate",
+            "playbook-interactive",
+            "playbook-dry-run",
+            "playbook-diff",
+            "playbook-cleanup",
+        ] {
+            d.blocking_command(name, |_, context| Self::command(&context));
+        }
     }
 }
 
@@ -312,18 +335,22 @@ mod tests {
     use super::{PluginCliPlugin, core_proxy_command_path};
     use bmux_plugin_sdk::{
         CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostConnectionInfo, HostMetadata,
-        NativeCommandContext, RegisteredPluginInfo, RustPlugin,
+        NativeCommandContext, RegisteredPluginInfo,
     };
     use std::collections::BTreeMap;
 
     #[test]
     fn selected_command_rejects_missing_execution_before_any_host_effect() {
         use bmux_plugin_sdk::definition::PluginInstance;
-        let plugin = super::SelectedPluginCli {
-            instance: bmux_plugin_sdk::definition::LoadedInstanceId::from_uuid(
-                "00000000-0000-0000-0000-000000000001".parse().unwrap(),
-            ),
-        };
+        let plugin = bmux_plugin_sdk::author::DeclaredInstance::new(
+            PluginCliPlugin,
+            crate::declaration::PLUGIN_MANIFEST,
+            crate::declaration::SERVICE_CONTRACTS,
+        )
+        .unwrap()
+        .for_instance(bmux_plugin_sdk::definition::LoadedInstanceId::from_uuid(
+            "00000000-0000-0000-0000-000000000001".parse().unwrap(),
+        ));
         let call = bmux_plugin_sdk::definition::PluginCallContext {
             callback_execution: None,
             invocation_id: bmux_plugin_sdk::PluginInvocationId::new(),
@@ -343,7 +370,7 @@ mod tests {
             outcome
                 .error
                 .unwrap()
-                .contains("callback authority missing")
+                .contains("callback execution authority missing")
         );
     }
 
@@ -412,7 +439,6 @@ mod tests {
 
     #[test]
     fn integration_list_command_accepts_new_filter_flags() {
-        let mut plugin = PluginCliPlugin;
         let context = test_context(
             "list",
             vec![
@@ -421,15 +447,13 @@ mod tests {
                 "--capability=bmux.commands".to_string(),
             ],
         );
-        let exit = plugin
-            .run_command(context)
-            .expect("list with filter flags should succeed");
+        let exit =
+            PluginCliPlugin::command(&context).expect("list with filter flags should succeed");
         assert_eq!(exit, 0);
     }
 
     #[test]
     fn integration_doctor_command_accepts_summary_and_filters() {
-        let mut plugin = PluginCliPlugin;
         let context = test_context(
             "doctor",
             vec![
@@ -439,35 +463,29 @@ mod tests {
                 "--code=manifest".to_string(),
             ],
         );
-        let exit = plugin
-            .run_command(context)
+        let exit = PluginCliPlugin::command(&context)
             .expect("doctor with summary/filter flags should succeed");
         assert_eq!(exit, 0);
     }
 
     #[test]
     fn integration_run_help_succeeds_for_known_plugin() {
-        let mut plugin = PluginCliPlugin;
         let context = test_context(
             "run",
             vec!["bmux.example".to_string(), "--help".to_string()],
         );
-        let exit = plugin
-            .run_command(context)
-            .expect("run --help should succeed for known plugin");
+        let exit =
+            PluginCliPlugin::command(&context).expect("run --help should succeed for known plugin");
         assert_eq!(exit, 0);
     }
 
     #[test]
     fn integration_doctor_invalid_severity_is_actionable() {
-        let mut plugin = PluginCliPlugin;
         let context = test_context(
             "doctor",
             vec!["--severity=critical".to_string(), "--json".to_string()],
         );
-        let error = plugin
-            .run_command(context)
-            .expect_err("invalid severity should fail");
+        let error = PluginCliPlugin::command(&context).expect_err("invalid severity should fail");
         assert!(
             error
                 .to_string()
@@ -476,78 +494,7 @@ mod tests {
     }
 }
 
-struct SelectedPluginCli {
-    instance: bmux_plugin_sdk::definition::LoadedInstanceId,
-}
-
-impl bmux_plugin_sdk::definition::PluginInstance for SelectedPluginCli {
-    fn command(
-        &self,
-        call: bmux_plugin_sdk::definition::PluginCallContext,
-        context: NativeCommandContext,
-    ) -> bmux_plugin_sdk::definition::PluginFuture<'_, bmux_plugin_sdk::definition::CommandOutcome>
-    {
-        let instance = self.instance;
-        Box::pin(async move {
-            let result = async move {
-                let execution = call.callback_execution.ok_or_else(|| {
-                    PluginCommandError::unavailable("selected command callback authority missing")
-                })?;
-                if call.cancellation.is_cancelled() {
-                    return Err(PluginCommandError::unavailable("plugin command cancelled"));
-                }
-                let entry = execution.enter_adapter_entry(instance)?;
-                let output = std::sync::Arc::new(std::sync::Mutex::new(None));
-                let writer = output.clone();
-                execution
-                    .execute_entered(
-                        instance,
-                        entry,
-                        Box::new(move || {
-                            if call.cancellation.is_cancelled() {
-                                return Err(PluginCommandError::unavailable(
-                                    "plugin command cancelled",
-                                ));
-                            }
-                            let result = PluginCliPlugin::command(&context);
-                            *writer.lock().map_err(|_| {
-                                PluginCommandError::failed("command result poisoned")
-                            })? = Some(result);
-                            Ok(())
-                        }),
-                    )
-                    .await?;
-                let result = output
-                    .lock()
-                    .map_err(|_| PluginCommandError::failed("command result poisoned"))?
-                    .take();
-                result
-                    .ok_or_else(|| PluginCommandError::failed("command settled without result"))?
-            }
-            .await;
-            result.into()
-        })
-    }
-}
-
-bmux_plugin_sdk::define_plugin!(
-    factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| Ok(std::sync::Arc::new(
-        SelectedPluginCli {
-            instance: scope.instance
-        }
-    )
-        as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
-    metadata = definition_metadata(),
-);
-
-fn definition_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
-    bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<PluginCliPlugin>(
-        crate::declaration::PLUGIN_MANIFEST,
-        vec![bmux_plugin_sdk::definition::ComponentRole::Frontend],
-    )
-    .expect("plugin manifest must define valid canonical metadata")
-    .metadata
-}
+bmux_plugin_sdk::plugin!(PluginCliPlugin);
 
 #[cfg(test)]
 mod canonical_metadata_tests {
