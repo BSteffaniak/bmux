@@ -7,10 +7,18 @@ differ, and how a plugin crate builds its own dynamic library without a
 generated wrapper crate.
 
 All of it is implemented (`bmux_plugin_sdk::author`,
-`scripts/package-plugin.py`)
-and proven by `examples/hello-plugin`, `examples/counter-plugin` (provider),
-`examples/watcher-plugin` (consumer) and `examples/native-plugin`. BMUX's own
-workspace plugins move to it in Wave 2.
+`scripts/package-plugin.py`, `bmux_plugin_test`) and proven by the reference
+plugins, each tested bundled and as a real dylib under `TestHost`:
+
+| Example                   | Exercises                                                                                       |
+| ------------------------- | ----------------------------------------------------------------------------------------------- |
+| `examples/hello-plugin`   | a BPDL command with typed arguments                                                             |
+| `examples/counter-plugin` | provided services, a retained contract event (`emits`), a command calling back through the host |
+| `examples/watcher-plugin` | required services, a typed event subscription in an activation-owned task, a provided query     |
+| `examples/clock-plugin`   | a contribution to a host-declared extension point (`bmux_extpoints`)                            |
+
+`examples/native-plugin` covers hand-declared (`native_command`) commands.
+BMUX's own workspace plugins move to it in Wave 2.
 
 ## What BPDL generates today
 
@@ -34,6 +42,15 @@ For every service interface that has a capability, the interface module
 | `impl RequiredInterface for Client<T>`              | Type-level marker for consumed interfaces.                                                                                                                                                                               |
 | `impl ContractEvent for Changed`                    | An `events` payload bound to its channel (`STATE_KIND`/`EVENT_KIND`) and delivery, so `cx.emit(Changed { .. })` is typed.                                                                                                |
 
+An events interface (`counter_events`, which has an `events` item and no
+operations) generates, in its `v<N>` module, a subscription client:
+
+| Item                                              | Purpose                                                                                                                        |
+| ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `Client<T = PluginHostServices>`                  | `Client::remote(source)` over any `author::EventSource`; the activation's `PluginHostServices` is one in both packaging modes. |
+| `async fn subscribe_<event>()`                    | An `author::Subscription<Changed>`: typed items in order (a state channel yields its current value first).                     |
+| `impl EventClient for Client<PluginHostServices>` | Lets `Activation::events::<Client>()` connect a declared subscription.                                                         |
+
 Package-level declarations generate:
 
 - `commands::BumpArgs` (typed, parsed from the manifest's `--long` arguments
@@ -42,7 +59,10 @@ Package-level declarations generate:
 - `extension_points::<name>_v<N>`: the `Data` record, a `Behavior` trait
   (async, `where Self: Sized`), a wire `Request` enum, a `Point` type
   implementing `author::ExtensionPoint` (`ID`, `VERSION`, `Data`) and
-  `impl<B: Behavior> Extends<B> for Point`.
+  `impl<B: Behavior> Extends<B> for Point`. By convention, a data field
+  named `order` (an integer) generates `ExtensionPoint::order` and one named
+  `id` (a string) generates `ExtensionPoint::key`; hosts sort and
+  deduplicate contributions with them.
 
 The manifest macros (`schema! { manifest }`, `plugin_manifest!`) emit, next
 to `PLUGIN_ID` and `PLUGIN_MANIFEST`:
@@ -90,6 +110,8 @@ markers; nothing in it is product specific:
 | `command(decl, handler)`        | A BPDL command with typed arguments; `handler` is any `async fn(&self, &Call, Args) -> Result<()>`.                                       |
 | `native_command(name, handler)` | A command still declared by hand in `plugin.toml`, handled with the raw `NativeCommandContext` (`native-plugin` uses it).                 |
 | `extend::<E>(data)`             | A contribution to extension point `E` with `P` implementing its `Behavior`.                                                               |
+| `emits::<E>()`                  | A contract event `P` publishes: its channel is registered for the activation before `activate` runs.                                      |
+| `subscribe::<C>()`              | An events interface `P` follows; `Activation::events::<C>()` refuses undeclared subscriptions.                                            |
 | `on_event(handler)`             | Host events delivered to the plugin.                                                                                                      |
 
 `DeclaredInstance::new` validates the declarations against the generated
@@ -103,9 +125,60 @@ already: an author can only spell
 (`packages/plugin-schema-macros/tests/ui/fail/undeclared_provider.rs`).
 
 `Activation` gives the plugin id, settings, the lifecycle context, the host
-services, typed clients (`service::<C>()`), activation-owned tasks
-(`spawn`, on the host runtime through plug-rt) and `bind_events` to attach a
-host event bus to every `Call::emit`.
+services, typed clients (`service::<C>()`), typed event clients
+(`events::<C>()`), activation-owned tasks (`spawn`, on the host runtime
+through plug-rt) and `bind_events` to replace the emitter behind every
+`Call::emit`.
+
+## Contract events
+
+```rust
+impl Plugin for Counter {
+    fn declare(d: &mut Declarations<Self>) {
+        d.provide::<dyn counter_commands::v1::CounterCommands>()
+            .emits::<counter_events::v1::Changed>();
+    }
+}
+// in a provider method: cx.emit(counter_events::v1::Changed { value })?;
+
+impl Plugin for Watcher {
+    fn declare(d: &mut Declarations<Self>) {
+        d.subscribe::<counter_events::v1::Client>();
+    }
+    async fn activate(&self, cx: &mut Activation) -> Result<()> {
+        let mut changes = cx
+            .events::<counter_events::v1::Client>()?
+            .subscribe_changed()
+            .await?;
+        cx.spawn("observe-changes", async move {
+            while let Some(change) = changes.next().await {
+                // change: author::Result<Changed>
+            }
+        })
+    }
+}
+```
+
+Both sides go through the activation's host services, the same in both
+packaging modes:
+
+- Publishing: `PluginHostServices::register_event_channel(kind, state)` and
+  `publish_event(kind, json)`. In process they use the activation's scoped
+  view of the host `EventBus`. Inside a dylib they use the instance's plug-rt
+  event port. The port's `event_register_state` carries retained state
+  channels across the boundary. `DeclaredInstance` registers every `emits`
+  channel before `activate` and binds `Call::emit` to the route. A channel
+  emitted without a declaration is registered on first use. Without a
+  route (a host that bound no event bus), events stay unbound as before.
+  Channels belong to the activation and go away with it.
+- Payloads cross as JSON, the bus's serialized form: `Call::emit` encodes
+  with `serde_json`, and subscriptions decode the same bytes.
+- Subscribing: `subscribe_<event>()` wraps
+  `PluginHostServices::subscribe_event`. The subscription is owned by the
+  activation: it ends when the activation is released, and dropping it
+  releases it. Waits are woken by the host; nothing polls. A registered
+  state channel with no publication yet yields nothing. A payload that does
+  not decode arrives as an `Err` item, never silently dropped.
 
 ## `plugin!`
 
@@ -125,9 +198,13 @@ the generated module is not `crate::declaration`) emits
   - `register_typed_services` and `portable_services` use the stored
     `register` / `portable` functions with the provider-bound base `Call`;
   - `command` parses through the stored `CommandDecl` and calls the handler;
-  - `extension` dispatches through the stored `Extends` entry;
+  - `extension` dispatches through the stored `Extends` entry, and
+    `registrations` reports each `extend` as an extension contribution;
   - `activate_with_async` / `activate` / `deactivate` call the `Plugin` hooks
     with `Activation` / `Deactivation`.
+
+It also emits `plugin_crate()`: the definition plus the crate's
+`Cargo.toml`, which is what `TestHost` loads in either mode.
 
 Later Wave 2 swaps `PluginInstance` for the slim host trait without changing
 author code.
@@ -140,19 +217,103 @@ author code.
 | Consumer          | `Client::direct`/`from_handle`: one virtual call, no serialization         | `Client::remote(host)`: checked `bmux_codec` frames tagged with the interface's `SERVICE_CONTRACT` |
 | Contract evidence | Rust types                                                                 | `modeled_service_contracts` from `SERVICE_CONTRACTS` (the host refuses checked routes without it)  |
 | Call context      | Host-built per call in Wave 2; `base` today                                | Host-built from the invocation                                                                     |
-| Events            | `Call::emit` → scope emitter                                               | Same, emitter attached by the host                                                                 |
+| Events            | `Call::emit` → activation's bus view                                       | `Call::emit` → plug-rt event port → the same bus view                                              |
+| Subscriptions     | `subscribe_<event>()` → bus view                                           | `subscribe_<event>()` → plug-rt event port, woken by the host                                      |
+| Contributions     | registrations → host `ExtensionPoints`; behavior via `extension`           | Same, across the boundary                                                                          |
 
-Both modes run the same contract tests:
-`examples/watcher-plugin/tests/both_modes.rs` (direct registry calls versus
-codec frames through `PluginInstance::invoke`) and
-`packages/cli/tests/author_api_dylib_integration.rs` (both examples packaged
-as dylibs in a real server).
+Both modes run the same contract tests: every example's
+`tests/both_modes.rs` under `TestHost`, and
+`packages/cli/tests/author_api_dylib_integration.rs` (counter and watcher
+packaged as dylibs in a real server, including the watcher observing the
+counter's changes).
 
 `cx.service::<counter::v1::Client>()` (Wave 2) resolves the provider's
 registry handle and returns `Client::direct` when the provider is bundled in
 the same host, otherwise `Client::remote` over the scope's host services.
 Admission and authorization stay in the host for both: a direct handle is a
 lease checked per call, never a raw reference.
+
+## Testing in both modes: `TestHost`
+
+`bmux_plugin_test::TestHost` runs any `Plugin` under the same assertions,
+bundled and as a real dynamic library:
+
+```rust
+async fn contract(mode: Mode) -> author::Result<()> {
+    let host = TestHost::new(mode)
+        .load(bmux_example_counter_plugin::plugin_crate())
+        .await?;
+    let mut changes = host.subscribe::<counter_events::v1::Changed>()?;
+    let host = host.load(bmux_example_watcher_plugin::plugin_crate()).await?;
+    assert_eq!(host.client::<counter_state::v1::Client>().get().await?, 5);
+    assert_eq!(host.command("example.watcher", "watch", &["--by", "4"]).await?, 0);
+    host.shutdown().await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watcher_contract() {
+    bmux_plugin_test::both_modes(contract).await.unwrap();
+}
+```
+
+- The host is the real scoped loader (`DefinitionArtifact`,
+  `LoadedExecution`), one host `EventBus`, an `ExtensionPoints` registry and a
+  service router standing in for the server's. `Mode::Bundled` loads
+  `plugin_definition()` in process. `Mode::Dylib` packages the crate with
+  `scripts/package-plugin.py` into `<target>/plugin-dylib`, once per test
+  process (python3 3.11+), and loads it into a process-wide host runtime: a
+  library image is installed into one runtime and never unloaded.
+- Plugins activate in load order. Calls between plugins, and from the test
+  through `remote::<C>()`, go through the host as checked frames,
+  attributed to the caller and checked against its granted capabilities
+  (what it requires, plus what it provides). `client::<C>()` uses the
+  bundled direct-handle fast path when there is one
+  (`ServiceClient::direct`), otherwise the codec.
+- `subscribe::<E>()` records contract events from the bus. `events::<C>()`
+  returns an events client. `fake::<dyn I, _>(provider)` serves an interface
+  from the test. `command(plugin, name, args)` runs a plugin command.
+  `extension_point::<E>()` and `extensions::<E>()` declare a point and read
+  its contributions. `shutdown()` deactivates in reverse order and fails if
+  an activation left tasks behind.
+
+## Host-declared extension points
+
+A host program declares the extension points it offers. Plugins contribute
+in `declare()`:
+
+```rust
+// bmux_extpoints (bpdl/bmux-extpoints.bpdl):
+//   extension-point status-item version 1 {
+//     data { id: string, order: u32, label: string? }
+//     interface { query render(width: u16) -> string; }
+//   }
+impl Plugin for Clock {
+    fn declare(d: &mut Declarations<Self>) {
+        d.extend::<status_item_v1::Point>(status_item_v1::Data {
+            id: "clock".into(), order: 100, label: Some("UTC".into()),
+        });
+    }
+}
+impl status_item_v1::Behavior for Clock { /* async fn render(..) */ }
+```
+
+- `packages/extpoints` (`bmux_extpoints`) is the BMUX product layer: BPDL
+  extension points that BMUX declares, starting with `status-item`. It sits
+  above the framework, and no core crate depends on it.
+- `bmux_plugin::ExtensionPoints` is the generic host side. A host declares
+  points (`declare::<Point>()`) and collects contributions from each
+  instance's registrations (`contribute_registrations`, both packaging
+  modes). Consumers read `set::<Point>()`, an `ExtensionSet` holding a
+  snapshot sorted by `order` with the plugin id as a stable tiebreak, plus a
+  change stream (`changed()`). Each entry's `call(&Request::Render { .. })`
+  runs the contributor's behavior through its extension port.
+- Refused, with the plugins named: a contribution to an undeclared point,
+  data that does not decode as the point's `Data`, and a duplicate `id`.
+  `withdraw(plugin)` removes a plugin's contributions when its instance
+  goes away.
+- Plugins can still declare their own extension points in their package
+  (`counter-display`). Such points are typed the same way, but no host
+  declares them.
 
 ## Packaging without wrapper crates
 
@@ -217,9 +378,27 @@ their paths (`owns_paths`); `plugin.toml` may add paths, never remove them.
   held keep the entry's ancestry. A nested plugin command
   (`plugin_command_run`) still needs a live entry, and an entry cannot be
   held across an await.
-- The generated `dispatch` serves unary operations; streaming operations need
-  the `invoke_streaming` entry (`Portable<P>` already streams).
-- Clients do not yet generate `subscribe_<event>()`. The host subscription
-  handle exists in both modes: `PluginHostServices::subscribe_event(kind,
-  state)` returns a `HostEventSubscription` of JSON payloads owned by the
-  activation.
+- Streaming operations (`emits`) are served on the provider side in both
+  modes. The generated `dispatch_streaming` runs behind
+  `DeclaredInstance::invoke_streaming`, and `Portable<P>` streams for checked
+  callers. Plain `dispatch` answers a streaming operation with
+  `streaming_required`. A consumer cannot call one through the host yet:
+  `PluginHostServices` does not implement `supports_service_streaming`, so
+  generated clients reject request-scoped streams over
+  `Client::remote(host)`. `TestHost` therefore has no streaming route
+  either, and no example exercises one. Deferred: it needs a host streaming
+  route (sink plus credits) on the host-services port and the plug-rt
+  table, in both modes.
+- Contribution data lives in `declare()`, and hosts read it from an
+  instance's registrations once the instance is activated. BPDL
+  `contribute alias.point@N { .. }` parses and validates but is not yet
+  lowered into the generated manifest, so a host cannot read contributions
+  without creating an instance. Deferred: the manifest needs the encoded
+  data, and `Declarations::validate` should then match `extend` against it,
+  as it does for commands.
+- The BMUX server does not yet declare `bmux_extpoints` points or consume an
+  `ExtensionSet`. Only `TestHost` hosts them today. The existing surface,
+  layout, attach and prompt contracts still live in `packages/plugin` and
+  move to `bmux_extpoints` with the Wave 2 plugin port.
+- `TestHost` has no virtual clock. Plugins use the real plug-rt timers, and
+  tests wait with bounded polls.
