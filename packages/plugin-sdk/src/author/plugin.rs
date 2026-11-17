@@ -16,13 +16,14 @@ use super::{
     EventEmitter, Extends, Provides, RequiredInterface, Result,
 };
 use crate::definition::{
-    CommandOutcome, PluginCallContext, PluginCreateContext, PluginFuture, PluginHostServices,
-    PluginInstance, PluginLifecycleContext, PluginResult,
+    CommandOutcome, LoadedInstanceId, PluginCallContext, PluginCreateContext, PluginFuture,
+    PluginHostServices, PluginInstance, PluginLifecycleContext, PluginResult,
 };
 use crate::{
-    NativeCommandContext, NativeLifecycleContext, NativeServiceContext,
-    NativeStreamingServiceContext, PluginEvent, PluginEventKind, PortableServiceProvider,
-    ServiceInterfaceDescriptor, ServiceResponse, TypedServiceRegistry,
+    ContributionRegistrar, HostAsyncHandle, NativeCommandContext, NativeLifecycleContext,
+    NativeServiceContext, NativeStreamingServiceContext, PluginCallbackContext, PluginEvent,
+    PluginEventKind, PortableServiceProvider, ServiceInterfaceDescriptor, ServiceResponse,
+    TypedServiceRegistrationContext, TypedServiceRegistry,
 };
 
 /// The one author trait.
@@ -121,6 +122,25 @@ where
     }
 }
 
+/// A handler for service interfaces a plugin serves without generated
+/// bindings: `async fn(&self, &Call, NativeServiceContext) -> Result<ServiceResponse>`
+/// (or the streaming context).
+pub trait NativeServiceHandler<'a, P: 'a, C>: Send + Sync {
+    type Future: Future<Output = Result<ServiceResponse>> + Send + 'a;
+    fn call(&self, plugin: &'a P, cx: &'a Call, context: C) -> Self::Future;
+}
+
+impl<'a, P: 'a, C, F, Fut> NativeServiceHandler<'a, P, C> for F
+where
+    F: Fn(&'a P, &'a Call, C) -> Fut + Send + Sync,
+    Fut: Future<Output = Result<ServiceResponse>> + Send + 'a,
+{
+    type Future = Fut;
+    fn call(&self, plugin: &'a P, cx: &'a Call, context: C) -> Fut {
+        self(plugin, cx, context)
+    }
+}
+
 type Dispatch<P> =
     for<'a> fn(&'a P, Call, NativeServiceContext) -> BoxFuture<'a, Result<ServiceResponse>>;
 type DispatchStreaming<P> = for<'a> fn(
@@ -136,6 +156,40 @@ type CommandFn<P> = Box<
 >;
 type EventFn<P> =
     Box<dyn for<'a> Fn(&'a P, PluginEvent) -> BoxFuture<'a, Result<()>> + Send + Sync>;
+type NativeServiceFn<P> = Box<
+    dyn for<'a> Fn(&'a P, Call, NativeServiceContext) -> BoxFuture<'a, Result<ServiceResponse>>
+        + Send
+        + Sync,
+>;
+type NativeStreamingFn<P> = Box<
+    dyn for<'a> Fn(
+            &'a P,
+            Call,
+            NativeStreamingServiceContext,
+        ) -> BoxFuture<'a, Result<ServiceResponse>>
+        + Send
+        + Sync,
+>;
+/// A synchronous service body: the raw context in, the response out.
+pub type BlockingServiceFn<P> = fn(&P, NativeServiceContext) -> ServiceResponse;
+/// A synchronous streaming service body.
+pub type BlockingStreamingFn<P> = fn(&P, NativeStreamingServiceContext) -> ServiceResponse;
+/// A synchronous command body returning its exit code.
+pub type BlockingCommandFn<P> = fn(&P, NativeCommandContext) -> Result<i32>;
+/// A synchronous host-event body.
+pub type BlockingEventFn<P> = fn(&P, PluginEvent) -> Result<()>;
+/// A synchronous activation body, with the activation's task scope when the
+/// host provides one.
+pub type BlockingActivateFn<P> =
+    fn(&P, NativeLifecycleContext, Option<HostAsyncHandle>) -> Result<()>;
+/// A synchronous deactivation body.
+pub type BlockingDeactivateFn<P> = fn(&P, NativeLifecycleContext) -> Result<()>;
+/// Registers typed handles for interfaces whose providers are not generated
+/// author bindings, with the host's registration context.
+pub type TypedServicesFn<P> =
+    fn(&P, TypedServiceRegistrationContext<'_>, &mut TypedServiceRegistry);
+/// Registers activation-time contributions.
+pub type RegistrationsFn<P> = fn(&P, &mut ContributionRegistrar) -> crate::Result<()>;
 
 struct Provided<P> {
     descriptor: ServiceInterfaceDescriptor,
@@ -145,9 +199,32 @@ struct Provided<P> {
     portable: Portable<P>,
 }
 
+enum CommandRun<P> {
+    Async(CommandFn<P>),
+    Blocking(BlockingCommandFn<P>),
+}
+
 struct Command<P> {
     name: &'static str,
-    run: CommandFn<P>,
+    run: CommandRun<P>,
+}
+
+/// Service interfaces served without generated bindings.
+enum NativeServices<P> {
+    Async {
+        unary: NativeServiceFn<P>,
+        streaming: Option<NativeStreamingFn<P>>,
+    },
+    Blocking {
+        unary: BlockingServiceFn<P>,
+        streaming: Option<BlockingStreamingFn<P>>,
+    },
+}
+
+/// Host events: async, or a synchronous body run under the event's entry.
+enum Events<P> {
+    Async(EventFn<P>),
+    Blocking(BlockingEventFn<P>),
 }
 
 struct Contribution<P> {
@@ -162,9 +239,14 @@ pub struct Declarations<P> {
     required: Vec<ServiceInterfaceDescriptor>,
     commands: Vec<Command<P>>,
     contributions: Vec<Contribution<P>>,
-    events: Option<EventFn<P>>,
+    events: Option<Events<P>>,
     emitted: Vec<(PluginEventKind, EventDelivery)>,
     subscribed: Vec<PluginEventKind>,
+    native_services: Option<NativeServices<P>>,
+    blocking_activate: Option<BlockingActivateFn<P>>,
+    blocking_deactivate: Option<BlockingDeactivateFn<P>>,
+    typed_services: Option<TypedServicesFn<P>>,
+    registrations: Option<RegistrationsFn<P>>,
 }
 
 impl<P> Default for Declarations<P> {
@@ -177,6 +259,11 @@ impl<P> Default for Declarations<P> {
             events: None,
             emitted: Vec::new(),
             subscribed: Vec::new(),
+            native_services: None,
+            blocking_activate: None,
+            blocking_deactivate: None,
+            typed_services: None,
+            registrations: None,
         }
     }
 }
@@ -209,13 +296,13 @@ impl<P: Send + Sync + 'static> Declarations<P> {
     {
         self.commands.push(Command {
             name: decl.name(),
-            run: Box::new(move |plugin, call, context| {
+            run: CommandRun::Async(Box::new(move |plugin, call, context| {
                 let args = A::parse(&context.arguments);
                 Box::pin(async move {
                     handler.call(plugin, &call, args?).await?;
                     Ok(crate::EXIT_OK)
                 })
-            }),
+            })),
         });
         self
     }
@@ -228,9 +315,9 @@ impl<P: Send + Sync + 'static> Declarations<P> {
     {
         self.commands.push(Command {
             name,
-            run: Box::new(move |plugin, call, context| {
+            run: CommandRun::Async(Box::new(move |plugin, call, context| {
                 Box::pin(async move { handler.call(plugin, &call, context).await })
-            }),
+            })),
         });
         self
     }
@@ -273,9 +360,104 @@ impl<P: Send + Sync + 'static> Declarations<P> {
     where
         F: for<'a> EventHandler<'a, P> + Copy + 'static,
     {
-        self.events = Some(Box::new(move |plugin, event| {
+        self.events = Some(Events::Async(Box::new(move |plugin, event| {
             Box::pin(async move { handler.call(plugin, event).await })
-        }));
+        })));
+        self
+    }
+
+    /// Serve every service the manifest declares that is not
+    /// [`provide`](Self::provide)d with generated bindings through one
+    /// handler over the raw service context. The handler owns checked
+    /// framing. Prefer generated providers.
+    pub fn native_services<F>(&mut self, handler: F) -> &mut Self
+    where
+        F: for<'a> NativeServiceHandler<'a, P, NativeServiceContext> + Copy + 'static,
+    {
+        self.native_services = Some(NativeServices::Async {
+            unary: Box::new(move |plugin, call, context| {
+                Box::pin(async move { handler.call(plugin, &call, context).await })
+            }),
+            streaming: None,
+        });
+        self
+    }
+
+    /// Streaming invocations of [`native_services`](Self::native_services);
+    /// without it, a streaming call runs the unary handler.
+    pub fn native_streaming_services<F>(&mut self, handler: F) -> &mut Self
+    where
+        F: for<'a> NativeServiceHandler<'a, P, NativeStreamingServiceContext> + Copy + 'static,
+    {
+        if let Some(NativeServices::Async { streaming, .. }) = &mut self.native_services {
+            *streaming = Some(Box::new(move |plugin, call, context| {
+                Box::pin(async move { handler.call(plugin, &call, context).await })
+            }));
+        }
+        self
+    }
+
+    /// Like [`native_services`](Self::native_services), with synchronous
+    /// bodies (`streaming` defaults to the unary body). Each call runs on the
+    /// host's blocking pool inside the invocation's callback entry; checked
+    /// framing is decoded with the generated contract first and a successful
+    /// checked response is framed again.
+    pub fn blocking_services(
+        &mut self,
+        unary: BlockingServiceFn<P>,
+        streaming: Option<BlockingStreamingFn<P>>,
+    ) -> &mut Self {
+        self.native_services = Some(NativeServices::Blocking { unary, streaming });
+        self
+    }
+
+    /// A command `plugin.toml` declares by hand, with a synchronous body run
+    /// on the host's blocking pool inside the command's callback entry.
+    /// Command-outcome metadata the body records is returned with it.
+    pub fn blocking_command(
+        &mut self,
+        name: &'static str,
+        handler: BlockingCommandFn<P>,
+    ) -> &mut Self {
+        self.commands.push(Command {
+            name,
+            run: CommandRun::Blocking(handler),
+        });
+        self
+    }
+
+    /// Host events with a synchronous body run inside the event's callback
+    /// entry.
+    pub fn blocking_events(&mut self, handler: BlockingEventFn<P>) -> &mut Self {
+        self.events = Some(Events::Blocking(handler));
+        self
+    }
+
+    /// Synchronous activation work, run on the host's blocking pool inside
+    /// the activation's callback entry before [`Plugin::activate`]. Its
+    /// lifecycle context carries the activation's host-supplied capabilities.
+    pub fn blocking_activate(&mut self, handler: BlockingActivateFn<P>) -> &mut Self {
+        self.blocking_activate = Some(handler);
+        self
+    }
+
+    /// Synchronous deactivation work, run inside the deactivation's callback
+    /// entry after [`Plugin::deactivate`].
+    pub fn blocking_deactivate(&mut self, handler: BlockingDeactivateFn<P>) -> &mut Self {
+        self.blocking_deactivate = Some(handler);
+        self
+    }
+
+    /// Register typed handles for services that are not generated providers,
+    /// with the host's registration context.
+    pub fn typed_services(&mut self, register: TypedServicesFn<P>) -> &mut Self {
+        self.typed_services = Some(register);
+        self
+    }
+
+    /// Register activation-time contributions (state, readiness, frontend).
+    pub fn registrations(&mut self, register: RegistrationsFn<P>) -> &mut Self {
+        self.registrations = Some(register);
         self
     }
 
@@ -317,10 +499,9 @@ impl<P: Send + Sync + 'static> Declarations<P> {
                 )));
             }
         }
-        if let Some(missing) = services
-            .iter()
-            .find(|service| !provided.contains(service.interface_id.as_str()))
-        {
+        if let Some(missing) = services.iter().find(|service| {
+            self.native_services.is_none() && !provided.contains(service.interface_id.as_str())
+        }) {
             return Err(Error::failed(format!(
                 "the BPDL world provides '{}' but declare() does not",
                 missing.interface_id.as_str()
@@ -517,6 +698,12 @@ impl Activation {
         Ok(())
     }
 
+    /// The activation's task scope, when the host provides one.
+    #[must_use]
+    pub const fn tasks(&self) -> Option<&crate::HostAsyncHandle> {
+        self.tasks.as_ref()
+    }
+
     /// Bind the host event bus this plugin's `Call::emit` publishes through.
     pub fn bind_events(&self, events: Arc<dyn EventEmitter>) {
         if let Ok(mut slot) = self.emitter.lock() {
@@ -659,6 +846,8 @@ pub struct DeclaredInstance<P> {
     plugin: Arc<P>,
     declarations: Arc<Declarations<P>>,
     events: Arc<Mutex<Arc<dyn EventEmitter>>>,
+    services: &'static [ServiceInterfaceDescriptor],
+    instance: Option<LoadedInstanceId>,
 }
 
 impl<P: Plugin> DeclaredInstance<P> {
@@ -666,7 +855,11 @@ impl<P: Plugin> DeclaredInstance<P> {
     ///
     /// # Errors
     /// Returns the first mismatch between `declare()` and the manifest.
-    pub fn new(plugin: P, manifest: &str, services: &[ServiceInterfaceDescriptor]) -> Result<Self> {
+    pub fn new(
+        plugin: P,
+        manifest: &str,
+        services: &'static [ServiceInterfaceDescriptor],
+    ) -> Result<Self> {
         let mut declarations = Declarations::default();
         P::declare(&mut declarations);
         declarations.validate(manifest, services)?;
@@ -674,7 +867,17 @@ impl<P: Plugin> DeclaredInstance<P> {
             plugin: Arc::new(plugin),
             declarations: Arc::new(declarations),
             events: Arc::new(Mutex::new(Arc::new(Unbound))),
+            services,
+            instance: None,
         })
+    }
+
+    /// Bind the host-issued instance this value serves. Synchronous bodies
+    /// enter their callbacks on it; without it they are refused.
+    #[must_use]
+    pub const fn for_instance(mut self, instance: LoadedInstanceId) -> Self {
+        self.instance = Some(instance);
+        self
     }
 
     /// The plugin value (tests and in-process hosts).
@@ -740,6 +943,122 @@ impl<P: Plugin> DeclaredInstance<P> {
             *slot = Arc::new(Unbound);
         }
     }
+
+    /// Run a synchronous body on the host's blocking pool inside this
+    /// invocation's callback entry, on this exact instance.
+    fn entered<T: Send + 'static>(
+        &self,
+        execution: Option<PluginCallbackContext>,
+        work: impl FnOnce(&P) -> Result<T> + Send + 'static,
+    ) -> PluginFuture<'static, Result<T>> {
+        let plugin = self.plugin.clone();
+        let instance = self.instance;
+        Box::pin(async move {
+            let execution = execution
+                .ok_or_else(|| Error::unavailable("callback execution authority missing"))?;
+            let instance =
+                instance.ok_or_else(|| Error::unavailable("callback instance binding missing"))?;
+            let entry = execution.enter_adapter_entry(instance)?;
+            let output = Arc::new(Mutex::new(None));
+            let writer = output.clone();
+            execution
+                .execute_entered(
+                    instance,
+                    entry,
+                    Box::new(move || {
+                        let result = work(&plugin);
+                        *writer
+                            .lock()
+                            .map_err(|_| Error::failed("callback result poisoned"))? = Some(result);
+                        Ok(())
+                    }),
+                )
+                .await?;
+            let result = output
+                .lock()
+                .map_err(|_| Error::failed("callback result poisoned"))?
+                .take();
+            result.ok_or_else(|| Error::failed("callback settled without result"))?
+        })
+    }
+
+    /// Run a blocking activation or deactivation body.
+    fn lifecycle(
+        &self,
+        context: &PluginLifecycleContext,
+        work: impl FnOnce(&P, NativeLifecycleContext) -> Result<()> + Send + 'static,
+    ) -> PluginFuture<'static, Result<()>> {
+        let mut native = context.native.clone();
+        native.capabilities = context.capabilities.clone();
+        self.entered(context.callback_execution.clone(), move |plugin| {
+            work(plugin, native)
+        })
+    }
+
+    async fn activate_declared(
+        &self,
+        context: PluginLifecycleContext,
+        tasks: Option<crate::HostAsyncHandle>,
+    ) -> PluginResult<()> {
+        if let Some(activate) = self.declarations.blocking_activate {
+            let runtime = tasks.clone();
+            self.lifecycle(&context, move |plugin, native| {
+                activate(plugin, native, runtime)
+            })
+            .await?;
+        }
+        self.run_activation(self.activation(context, tasks)?).await
+    }
+
+    /// The generated contract of a service served without generated bindings.
+    fn native_contract(&self, interface: &str) -> Option<&'static [u8]> {
+        self.services
+            .iter()
+            .find(|service| service.interface_id.as_str() == interface)
+            .map(|service| service.contract)
+            .filter(|contract| !contract.is_empty())
+    }
+
+    /// Decode checked framing for a blocking body, as the generated
+    /// providers do for their own bodies.
+    fn checked(
+        &self,
+        mut context: NativeServiceContext,
+    ) -> PluginResult<(NativeServiceContext, bool)> {
+        let checked = crate::service_contract::is_checked(&context.request.payload);
+        if checked {
+            let interface = crate::service_contract::interface_id_for(
+                &context.request.service.interface_id,
+                &context.request.payload,
+            )
+            .map_err(|error| Error::failed(error.to_string()))?;
+            let evidence = self.native_contract(interface).ok_or_else(|| {
+                Error::failed("provider has no generated contract for checked interface")
+            })?;
+            context.request.payload = crate::service_contract::decode_for(
+                &context.request.service.interface_id,
+                evidence,
+                &context.request.payload,
+            )
+            .map_err(|error| Error::failed(error.to_string()))?
+            .to_vec();
+        }
+        Ok((context, checked))
+    }
+}
+
+fn checked_response(mut response: ServiceResponse, checked: bool) -> ServiceResponse {
+    if checked && response.error.is_none() {
+        response.payload = crate::service_contract::encode_response(&response.payload);
+    }
+    response
+}
+
+fn cancelled(call: &PluginCallContext) -> PluginResult<()> {
+    if call.cancellation.is_cancelled() {
+        return Err(Error::unavailable("invocation cancelled"));
+    }
+    Ok(())
 }
 
 fn unsupported_interface(interface: &str) -> ServiceResponse {
@@ -751,7 +1070,7 @@ fn unsupported_interface(interface: &str) -> ServiceResponse {
 
 impl<P: Plugin> PluginInstance for DeclaredInstance<P> {
     fn activate(&self, context: PluginLifecycleContext) -> PluginFuture<'_, PluginResult<()>> {
-        Box::pin(async move { self.run_activation(self.activation(context, None)?).await })
+        Box::pin(self.activate_declared(context, None))
     }
 
     fn activate_with_async(
@@ -759,16 +1078,23 @@ impl<P: Plugin> PluginInstance for DeclaredInstance<P> {
         context: PluginLifecycleContext,
         runtime: crate::HostAsyncHandle,
     ) -> PluginFuture<'_, PluginResult<()>> {
-        Box::pin(async move {
-            self.run_activation(self.activation(context, Some(runtime))?)
-                .await
-        })
+        Box::pin(self.activate_declared(context, Some(runtime)))
     }
 
     fn deactivate(&self, context: PluginLifecycleContext) -> PluginFuture<'_, PluginResult<()>> {
         Box::pin(async move {
+            let blocking = self
+                .declarations
+                .blocking_deactivate
+                .map(|deactivate| self.lifecycle(&context, deactivate));
             let mut cx = Deactivation { context };
-            let result = self.plugin.deactivate(&mut cx).await;
+            let result = match self.plugin.deactivate(&mut cx).await {
+                Ok(()) => match blocking {
+                    Some(work) => work.await,
+                    None => Ok(()),
+                },
+                Err(error) => Err(error),
+            };
             // The activation's channels go with it.
             self.unbind_events();
             result
@@ -789,8 +1115,23 @@ impl<P: Plugin> PluginInstance for DeclaredInstance<P> {
             else {
                 return Err(crate::PluginCommandError::unknown_command(&context.command)).into();
             };
-            let cx = Call::from_invocation(call).with_events(self.emitter());
-            (command.run)(&self.plugin, cx, context).await.into()
+            match &command.run {
+                CommandRun::Async(run) => {
+                    let cx = Call::from_invocation(call).with_events(self.emitter());
+                    run(&self.plugin, cx, context).await.into()
+                }
+                CommandRun::Blocking(run) => {
+                    if let Err(error) = cancelled(&call) {
+                        return Err(error).into();
+                    }
+                    let run = *run;
+                    self.entered(call.callback_execution, move |plugin| {
+                        Ok(CommandOutcome::capture(|| run(plugin, context)))
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(error).into())
+                }
+            }
         })
     }
 
@@ -801,11 +1142,26 @@ impl<P: Plugin> PluginInstance for DeclaredInstance<P> {
     ) -> PluginFuture<'_, PluginResult<ServiceResponse>> {
         Box::pin(async move {
             let interface = context.request.service.interface_id.clone();
-            let Some(entry) = self.provided(&interface) else {
-                return Ok(unsupported_interface(&interface));
-            };
-            let cx = Call::from_service(call, &context).with_events(self.emitter());
-            (entry.dispatch)(&self.plugin, cx, context).await
+            if let Some(entry) = self.provided(&interface) {
+                let cx = Call::from_service(call, &context).with_events(self.emitter());
+                return (entry.dispatch)(&self.plugin, cx, context).await;
+            }
+            match &self.declarations.native_services {
+                None => Ok(unsupported_interface(&interface)),
+                Some(NativeServices::Async { unary, .. }) => {
+                    let cx = Call::from_service(call, &context).with_events(self.emitter());
+                    unary(&self.plugin, cx, context).await
+                }
+                Some(NativeServices::Blocking { unary, .. }) => {
+                    cancelled(&call)?;
+                    let (context, checked) = self.checked(context)?;
+                    let unary = *unary;
+                    self.entered(call.callback_execution, move |plugin| {
+                        Ok(checked_response(unary(plugin, context), checked))
+                    })
+                    .await
+                }
+            }
         })
     }
 
@@ -816,18 +1172,66 @@ impl<P: Plugin> PluginInstance for DeclaredInstance<P> {
     ) -> PluginFuture<'_, PluginResult<ServiceResponse>> {
         Box::pin(async move {
             let interface = context.service.request.service.interface_id.clone();
-            let Some(entry) = self.provided(&interface) else {
-                return Ok(unsupported_interface(&interface));
-            };
-            let cx = Call::from_service(call, &context.service).with_events(self.emitter());
-            (entry.dispatch_streaming)(&self.plugin, cx, context).await
+            if let Some(entry) = self.provided(&interface) {
+                let cx = Call::from_service(call, &context.service).with_events(self.emitter());
+                return (entry.dispatch_streaming)(&self.plugin, cx, context).await;
+            }
+            match &self.declarations.native_services {
+                None => Ok(unsupported_interface(&interface)),
+                Some(NativeServices::Async { unary, streaming }) => {
+                    let cx = Call::from_service(call, &context.service).with_events(self.emitter());
+                    match streaming {
+                        Some(streaming) => streaming(&self.plugin, cx, context).await,
+                        None => unary(&self.plugin, cx, context.service).await,
+                    }
+                }
+                Some(NativeServices::Blocking { unary, streaming }) => {
+                    cancelled(&call)?;
+                    let NativeStreamingServiceContext { service, events } = context;
+                    let (service, checked) = self.checked(service)?;
+                    let (unary, streaming) = (*unary, *streaming);
+                    self.entered(call.callback_execution, move |plugin| {
+                        let response = match streaming {
+                            Some(streaming) => {
+                                streaming(plugin, NativeStreamingServiceContext { service, events })
+                            }
+                            None => unary(plugin, service),
+                        };
+                        Ok(checked_response(response, checked))
+                    })
+                    .await
+                }
+            }
+        })
+    }
+
+    fn event_scoped(
+        &self,
+        call: PluginCallContext,
+        event: PluginEvent,
+    ) -> PluginFuture<'_, PluginResult<()>> {
+        Box::pin(async move {
+            match &self.declarations.events {
+                Some(Events::Async(handler)) => handler(&self.plugin, event).await,
+                Some(Events::Blocking(handler)) => {
+                    let handler = *handler;
+                    self.entered(call.callback_execution, move |plugin| {
+                        handler(plugin, event)
+                    })
+                    .await
+                }
+                None => Ok(()),
+            }
         })
     }
 
     fn event(&self, event: PluginEvent) -> PluginFuture<'_, PluginResult<()>> {
         Box::pin(async move {
             match &self.declarations.events {
-                Some(handler) => handler(&self.plugin, event).await,
+                Some(Events::Async(handler)) => handler(&self.plugin, event).await,
+                Some(Events::Blocking(_)) => Err(Error::unavailable(
+                    "event requires scoped callback authority",
+                )),
                 None => Ok(()),
             }
         })
@@ -866,7 +1270,12 @@ impl<P: Plugin> PluginInstance for DeclaredInstance<P> {
                 })
                 .map_err(Error::failed)?;
         }
-        Ok(())
+        match self.declarations.registrations {
+            Some(register) => {
+                register(&self.plugin, registrar).map_err(|error| Error::failed(error.to_string()))
+            }
+            None => Ok(()),
+        }
     }
 
     fn portable_services(&self) -> PluginResult<Vec<Arc<dyn PortableServiceProvider>>> {
@@ -879,8 +1288,23 @@ impl<P: Plugin> PluginInstance for DeclaredInstance<P> {
     }
 
     fn service_contract_for(&self, interface: &str) -> Option<&'static [u8]> {
-        self.provided(interface)
-            .map(|entry| entry.descriptor.contract)
+        match self.provided(interface) {
+            Some(entry) => Some(entry.descriptor.contract),
+            None if self.declarations.native_services.is_some() => self.native_contract(interface),
+            None => None,
+        }
+    }
+
+    fn register_typed_services_with_context(
+        &self,
+        context: TypedServiceRegistrationContext<'_>,
+        registry: &mut TypedServiceRegistry,
+    ) -> PluginResult<()> {
+        self.register_typed_services(registry)?;
+        if let Some(register) = self.declarations.typed_services {
+            register(&self.plugin, context, registry);
+        }
+        Ok(())
     }
 
     fn register_typed_services(&self, registry: &mut TypedServiceRegistry) -> PluginResult<()> {
@@ -890,6 +1314,7 @@ impl<P: Plugin> PluginInstance for DeclaredInstance<P> {
         }
         Ok(())
     }
+
 }
 
 /// A plugin crate as test harnesses load it, emitted by [`crate::plugin!`]
@@ -939,8 +1364,9 @@ pub fn definition<P: Plugin>(
     let definition =
         crate::definition::PluginDefinition::new(metadata, move |scope: PluginCreateContext| {
             let plugin = create(&scope)?;
-            Ok(Arc::new(DeclaredInstance::new(plugin, manifest, services)?)
-                as Arc<dyn PluginInstance>)
+            Ok(Arc::new(
+                DeclaredInstance::new(plugin, manifest, services)?.for_instance(scope.instance),
+            ) as Arc<dyn PluginInstance>)
         });
     definition.validate()?;
     Ok(definition)

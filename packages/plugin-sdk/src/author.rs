@@ -27,8 +27,10 @@ use std::sync::Arc;
 
 mod plugin;
 pub use plugin::{
-    Activation, CommandHandler, Deactivation, Declarations, DeclaredInstance, EventHandler,
-    NativeCommandHandler, Plugin, PluginCrate, ServiceClient, definition, packaged,
+    Activation, BlockingActivateFn, BlockingCommandFn, BlockingDeactivateFn, BlockingEventFn,
+    BlockingServiceFn, BlockingStreamingFn, CommandHandler, Deactivation, Declarations,
+    DeclaredInstance, EventHandler, NativeCommandHandler, NativeServiceHandler, Plugin,
+    PluginCrate, RegistrationsFn, ServiceClient, TypedServicesFn, definition, packaged,
 };
 
 use crate::definition::{PluginCallContext, PluginHostServices};
@@ -470,8 +472,59 @@ pub fn metadata(
             toml::Value::try_from(&modeled).map_err(|error| Error::failed(error.to_string()))?,
         );
     }
+    let contracts = negotiation_contracts(&value, &modeled)?;
+    if !contracts.is_empty() {
+        value.insert(
+            "contracts".into(),
+            toml::Value::try_from(&contracts).map_err(|error| Error::failed(error.to_string()))?,
+        );
+    }
     let manifest = toml::to_string(&value).map_err(|error| Error::failed(error.to_string()))?;
     identity_metadata(&manifest)
+}
+
+/// Version-negotiation contracts: the manifest's explicit ones plus one per
+/// modeled `<name>/v<N>` interface (major `N`). An explicit entry for the same
+/// interface must agree.
+fn negotiation_contracts(
+    manifest: &toml::Table,
+    modeled: &[crate::definition::DeclaredServiceContract],
+) -> Result<Vec<crate::definition::ContractDescriptor>> {
+    let mut contracts = manifest
+        .get("contracts")
+        .cloned()
+        .map(toml::Value::try_into::<Vec<crate::definition::ContractDescriptor>>)
+        .transpose()
+        .map_err(|error| Error::failed(error.to_string()))?
+        .unwrap_or_default();
+    for service in modeled {
+        let Some((_, version)) = service.interface_id.rsplit_once("/v") else {
+            continue;
+        };
+        let major = version
+            .parse::<u16>()
+            .ok()
+            .filter(|major| *major > 0 && major.to_string() == version)
+            .ok_or_else(|| Error::failed("invalid generated interface version"))?;
+        let descriptor = crate::definition::ContractDescriptor {
+            interface_id: service.interface_id.clone(),
+            major,
+            minor: 0,
+        };
+        match contracts
+            .iter()
+            .find(|entry| entry.interface_id == descriptor.interface_id)
+        {
+            Some(explicit) if explicit != &descriptor => {
+                return Err(Error::failed(
+                    "explicit contract conflicts with generated version evidence",
+                ));
+            }
+            Some(_) => {}
+            None => contracts.push(descriptor),
+        }
+    }
+    Ok(contracts)
 }
 
 fn identity_metadata(manifest: &str) -> Result<crate::definition::PluginMetadata> {
