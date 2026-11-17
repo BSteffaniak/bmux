@@ -173,6 +173,12 @@ pub struct NativeLifecycleContext {
     /// Host-selected activation capability; never reconstructed from wire data.
     #[serde(skip)]
     pub host_service_port: Option<crate::PluginHostServices>,
+    /// Host-supplied in-process handles for this exact activation (for
+    /// example its scoped event bus). Never serialized: a dynamic artifact
+    /// receives an empty set, and taking a missing value is an explicit
+    /// error rather than a fallback to process-wide state.
+    #[serde(skip)]
+    pub capabilities: crate::definition::ActivationCapabilities,
 }
 
 /// Exact native ABI 1.0 lifecycle wire snapshot. Keep its field order and

@@ -33,13 +33,29 @@
 //!    [`EventBus::publish_state::<T>`] (state); state publishes
 //!    replace the retained value atomically.
 //! 3. Subscribers call the matching `subscribe` / `subscribe_state`.
+//!
+//! # Ownership
+//!
+//! There is no process-wide bus. The host program constructs one root bus
+//! with [`EventBus::new`] and hands each plugin activation a scoped view
+//! from [`EventBus::scoped`] through the activation's capabilities (see
+//! [`activation_binder`]). A scoped view shares the root's channels but owns
+//! the registrations made through it: they are removed when the view is
+//! dropped or its activation scope closes, and every operation on a view
+//! whose scope has closed fails with [`EventBusError::Closed`]. Two
+//! activations (including two instances of one plugin) therefore never share
+//! ownership, and a dynamically loaded library cannot reach a bus it was not
+//! handed.
 
+use bmux_plugin_runtime::{ActivationScope, AdmissionGuard};
 use bmux_plugin_sdk::PluginEventKind;
+use bmux_plugin_sdk::definition::ActivationCapabilities;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{broadcast, watch};
 
 /// Default capacity for newly-registered broadcast channels.
@@ -136,6 +152,9 @@ pub enum EventBusError {
         /// The interface id involved.
         interface: String,
     },
+    /// The activation scope that owns this bus view has closed; nothing is
+    /// admitted through it any more.
+    Closed,
 }
 
 impl std::fmt::Display for EventBusError {
@@ -166,6 +185,7 @@ impl std::fmt::Display for EventBusError {
                 f,
                 "event channel for `{interface}` was registered without a JSON projection"
             ),
+            Self::Closed => f.write_str("event bus view closed with its activation scope"),
         }
     }
 }
@@ -203,6 +223,9 @@ struct JsonProjection {
 /// uniform type to key on even though each channel's payload type
 /// differs.
 struct ChannelEntry {
+    /// Bus-unique registration identity, so an owner only ever removes the
+    /// registration it made (never a newer one under the same kind).
+    registration: u64,
     kind: ChannelKind,
     payload_type_id: TypeId,
     payload_type_name: &'static str,
@@ -252,27 +275,145 @@ where
     })
 }
 
-/// Host-side typed event bus.
+/// Channels shared by a root bus and every view scoped from it.
 #[derive(Default)]
-pub struct EventBus {
+struct BusCore {
     entries: RwLock<HashMap<PluginEventKind, ChannelEntry>>,
     registrations: watch::Sender<()>,
+    next_registration: AtomicU64,
+}
+
+/// The activation that owns a scoped view, and what it registered.
+struct ScopeOwner {
+    scope: ActivationScope,
+    owned: Mutex<Vec<(PluginEventKind, u64)>>,
+}
+
+/// Typed event bus: either a host-owned root or an activation-scoped view.
+pub struct EventBus {
+    core: Arc<BusCore>,
+    owner: Option<ScopeOwner>,
+}
+
+impl Default for EventBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for EventBus {
+    fn drop(&mut self) {
+        self.release_owned();
+    }
 }
 
 impl std::fmt::Debug for EventBus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let count = self.entries.read().map_or(0, |g| g.len());
+        let count = self.core.entries.read().map_or(0, |g| g.len());
         f.debug_struct("EventBus")
             .field("channels", &count)
+            .field("scoped", &self.owner.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl EventBus {
-    /// Construct an empty event bus.
+    /// Construct an empty root bus. The host program owns it and hands
+    /// plugins scoped views; nothing else can reach it.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            core: Arc::default(),
+            owner: None,
+        }
+    }
+
+    /// A view of this bus owned by one plugin activation.
+    ///
+    /// The view shares every channel with `self`. Channels registered
+    /// through it belong to the activation: they are removed when the view
+    /// is dropped or `scope` closes. Once `scope` closes, every emit,
+    /// publish and subscribe through the view fails with
+    /// [`EventBusError::Closed`] and registrations are not admitted.
+    #[must_use]
+    pub fn scoped(self: &Arc<Self>, scope: ActivationScope) -> Arc<Self> {
+        Arc::new(Self {
+            core: Arc::clone(&self.core),
+            owner: Some(ScopeOwner {
+                scope,
+                owned: Mutex::new(Vec::new()),
+            }),
+        })
+    }
+
+    /// Whether `self` and `other` deliver on the same channels.
+    #[must_use]
+    pub fn shares_channels_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.core, &other.core)
+    }
+
+    /// Admit one operation through a scoped view. A closed scope releases
+    /// the view's registrations and rejects the operation.
+    fn admit(&self) -> EventBusResult<Option<AdmissionGuard>> {
+        let Some(owner) = &self.owner else {
+            return Ok(None);
+        };
+        owner.scope.try_admit().map_or_else(
+            |_| {
+                self.release_owned();
+                Err(EventBusError::Closed)
+            },
+            |guard| Ok(Some(guard)),
+        )
+    }
+
+    /// Publish `entry` under `interface`, recording ownership for a scoped
+    /// view. Returns `false` (and publishes nothing) when the view's scope
+    /// has closed.
+    fn insert_entry(&self, interface: PluginEventKind, mut entry: ChannelEntry) -> bool {
+        let Ok(admission) = self.admit() else {
+            return false;
+        };
+        let registration = self.core.next_registration.fetch_add(1, Ordering::Relaxed);
+        entry.registration = registration;
+        if let Some(owner) = &self.owner
+            && let Ok(mut owned) = owner.owned.lock()
+        {
+            owned.push((interface.clone(), registration));
+        }
+        let mut guard = self.core.entries.write().expect("event bus lock poisoned");
+        guard.insert(interface, entry);
+        drop(guard);
+        drop(admission);
+        self.core.registrations.send_replace(());
+        true
+    }
+
+    /// Remove every channel this view registered that has not since been
+    /// replaced by another registration.
+    fn release_owned(&self) {
+        let Some(owner) = &self.owner else {
+            return;
+        };
+        let released = owner
+            .owned
+            .lock()
+            .map(|mut registrations| std::mem::take(&mut *registrations))
+            .unwrap_or_default();
+        if released.is_empty() {
+            return;
+        }
+        if let Ok(mut entries) = self.core.entries.write() {
+            for (interface, registration) in released {
+                if entries
+                    .get(&interface)
+                    .is_some_and(|entry| entry.registration == registration)
+                {
+                    entries.remove(&interface);
+                }
+            }
+        }
+        self.core.registrations.send_replace(());
     }
 
     /// Await a broadcast provider's registration without polling. Subscribing
@@ -287,7 +428,7 @@ impl EventBus {
     where
         E: Any + Send + Sync + 'static,
     {
-        let mut registrations = self.registrations.subscribe();
+        let mut registrations = self.core.registrations.subscribe();
         loop {
             match self.subscribe::<E>(interface) {
                 Err(EventBusError::ChannelNotRegistered { .. }) => {
@@ -403,16 +544,14 @@ impl EventBus {
     {
         let (sender, _) = watch::channel::<Arc<T>>(Arc::new(initial));
         let entry = ChannelEntry {
+            registration: 0,
             kind: ChannelKind::State(Arc::new(sender.clone())),
             payload_type_id: TypeId::of::<T>(),
             payload_type_name: std::any::type_name::<T>(),
             decoder: None,
             json: None,
         };
-        let mut guard = self.entries.write().expect("event bus lock poisoned");
-        guard.insert(interface, entry);
-        drop(guard);
-        self.registrations.send_replace(());
+        self.insert_entry(interface, entry);
         sender
     }
 
@@ -473,16 +612,14 @@ impl EventBus {
             None
         };
         let entry = ChannelEntry {
+            registration: 0,
             kind: ChannelKind::State(Arc::new(sender.clone())),
             payload_type_id: TypeId::of::<T>(),
             payload_type_name: std::any::type_name::<T>(),
             decoder: None,
             json,
         };
-        let mut guard = self.entries.write().expect("event bus lock poisoned");
-        guard.insert(interface, entry);
-        drop(guard);
-        self.registrations.send_replace(());
+        self.insert_entry(interface, entry);
         sender
     }
 
@@ -557,7 +694,7 @@ impl EventBus {
     }
 
     fn set_bytes_decoder(&self, interface: &PluginEventKind, decoder: BytesDecoder) {
-        if let Ok(mut guard) = self.entries.write()
+        if let Ok(mut guard) = self.core.entries.write()
             && let Some(entry) = guard.get_mut(interface)
         {
             entry.decoder = Some(decoder);
@@ -584,7 +721,9 @@ impl EventBus {
         interface: &PluginEventKind,
         payload: &[u8],
     ) -> Result<bool, EventBusBytesError> {
+        let _admission = self.admit()?;
         let decoder = self
+            .core
             .entries
             .read()
             .map_err(|_| EventBusBytesError::Decode("event bus lock poisoned".to_string()))?
@@ -619,6 +758,7 @@ impl EventBus {
     where
         E: Any + Send + Sync + 'static,
     {
+        let _admission = self.admit()?;
         let sender = self.broadcast_sender::<E>(interface)?;
         let event = Arc::new(event);
         let json_payload = if self.json_projection_observed(interface, DeliveryMode::Broadcast) {
@@ -648,6 +788,7 @@ impl EventBus {
     where
         T: Any + Send + Sync + 'static,
     {
+        let _admission = self.admit()?;
         let sender = self.state_sender::<T>(interface)?;
         // `send_replace` always updates the retained value, even when
         // no receivers are live. Using `send` would return an error
@@ -672,6 +813,7 @@ impl EventBus {
     where
         E: Any + Send + Sync + 'static,
     {
+        let _admission = self.admit()?;
         let sender = self.broadcast_sender::<E>(interface)?;
         Ok(sender.subscribe())
     }
@@ -696,6 +838,7 @@ impl EventBus {
     where
         T: Any + Send + Sync + 'static,
     {
+        let _admission = self.admit()?;
         let sender = self.state_sender::<T>(interface)?;
         let rx = sender.subscribe();
         let current = rx.borrow().clone();
@@ -717,8 +860,9 @@ impl EventBus {
         &self,
         interface: &PluginEventKind,
     ) -> EventBusResult<broadcast::Receiver<Arc<JsonPluginEvent>>> {
+        let _admission = self.admit()?;
         let sender = {
-            let guard = self.entries.read().expect("event bus lock poisoned");
+            let guard = self.core.entries.read().expect("event bus lock poisoned");
             let entry =
                 guard
                     .get(interface)
@@ -758,8 +902,9 @@ impl EventBus {
         &self,
         interface: &PluginEventKind,
     ) -> EventBusResult<(Arc<JsonPluginEvent>, watch::Receiver<Arc<JsonPluginEvent>>)> {
+        let _admission = self.admit()?;
         let (sender, current) = {
-            let guard = self.entries.read().expect("event bus lock poisoned");
+            let guard = self.core.entries.read().expect("event bus lock poisoned");
             let entry =
                 guard
                     .get(interface)
@@ -805,7 +950,11 @@ impl EventBus {
     /// Panics if the registry's internal lock is poisoned.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.read().expect("event bus lock poisoned").len()
+        self.core
+            .entries
+            .read()
+            .expect("event bus lock poisoned")
+            .len()
     }
 
     /// `true` when no interfaces have registered channels.
@@ -826,7 +975,7 @@ impl EventBus {
         E: Any + Send + Sync + 'static,
     {
         let (sender_arc, payload_type_id, payload_type_name) = {
-            let guard = self.entries.read().expect("event bus lock poisoned");
+            let guard = self.core.entries.read().expect("event bus lock poisoned");
             let entry =
                 guard
                     .get(interface)
@@ -885,16 +1034,14 @@ impl EventBus {
             }
         });
         let entry = ChannelEntry {
+            registration: 0,
             kind: ChannelKind::Broadcast(Arc::new(sender.clone())),
             payload_type_id: TypeId::of::<E>(),
             payload_type_name: std::any::type_name::<E>(),
             decoder: None,
             json,
         };
-        let mut guard = self.entries.write().expect("event bus lock poisoned");
-        guard.insert(interface, entry);
-        drop(guard);
-        self.registrations.send_replace(());
+        self.insert_entry(interface, entry);
         sender
     }
 
@@ -903,7 +1050,7 @@ impl EventBus {
         interface: &PluginEventKind,
         delivery: DeliveryMode,
     ) -> bool {
-        self.entries.read().is_ok_and(|guard| {
+        self.core.entries.read().is_ok_and(|guard| {
             let Some(json) = guard.get(interface).and_then(|entry| entry.json.as_ref()) else {
                 return false;
             };
@@ -926,7 +1073,7 @@ impl EventBus {
         event: &(dyn Any + Send + Sync),
     ) -> Option<JsonValue> {
         let encoder = {
-            let guard = self.entries.read().ok()?;
+            let guard = self.core.entries.read().ok()?;
             guard.get(interface)?.json.as_ref()?.event_encoder.clone()?
         };
         encoder(event)
@@ -934,7 +1081,7 @@ impl EventBus {
 
     fn publish_json_projection_from_state_if_observed(&self, interface: &PluginEventKind) {
         let payload = {
-            let Ok(guard) = self.entries.read() else {
+            let Ok(guard) = self.core.entries.read() else {
                 return;
             };
             let Some(entry) = guard.get(interface) else {
@@ -970,7 +1117,7 @@ impl EventBus {
             delivery,
             payload,
         });
-        let Ok(guard) = self.entries.read() else {
+        let Ok(guard) = self.core.entries.read() else {
             return;
         };
         let Some(entry) = guard.get(interface) else {
@@ -991,7 +1138,7 @@ impl EventBus {
         T: Any + Send + Sync + 'static,
     {
         let (sender_arc, payload_type_id, payload_type_name) = {
-            let guard = self.entries.read().expect("event bus lock poisoned");
+            let guard = self.core.entries.read().expect("event bus lock poisoned");
             let entry =
                 guard
                     .get(interface)
@@ -1042,6 +1189,63 @@ pub fn global_event_bus() -> Arc<EventBus> {
     GLOBAL.get_or_init(|| Arc::new(EventBus::new())).clone()
 }
 
+/// Host activation binder that offers each activation a view of `bus`
+/// scoped to that activation (see [`EventBus::scoped`]).
+///
+/// Register it on in-process executions before they activate. The plugin
+/// takes the view with [`take_activation_event_bus`].
+#[must_use]
+pub fn activation_binder(bus: Arc<EventBus>) -> Arc<crate::ActivationBinder> {
+    Arc::new(
+        move |scope: &ActivationScope, capabilities: &ActivationCapabilities| {
+            capabilities
+                .insert(ActivationEventBus(bus.scoped(scope.clone())))
+                .map_err(|error| bmux_plugin_sdk::PluginError::ServiceProtocol {
+                    details: error.message,
+                })
+        },
+    )
+}
+
+/// Take the event bus view the host supplied for a legacy author's
+/// activation, reporting at activation time when there is none.
+///
+/// A plugin without a bus keeps running with its events disabled; it never
+/// falls back to process-wide state.
+#[must_use]
+pub fn activation_event_bus(
+    context: &bmux_plugin_sdk::NativeLifecycleContext,
+) -> Option<Arc<EventBus>> {
+    match take_activation_event_bus(&context.capabilities) {
+        Ok(bus) => Some(bus),
+        Err(error) => {
+            tracing::warn!(
+                plugin_id = %context.plugin_id,
+                error = %error.message,
+                "activation has no host event bus; this plugin's events are disabled"
+            );
+            None
+        }
+    }
+}
+
+/// The activation-scoped bus a host offers through [`activation_binder`].
+pub struct ActivationEventBus(pub Arc<EventBus>);
+
+/// Take the event bus view the host supplied for this activation.
+///
+/// # Errors
+/// Returns an explicit unavailable error when the host supplied no bus (for
+/// example a dynamically loaded artifact, which cannot receive in-process
+/// values) or it was already taken. There is no process-wide fallback.
+pub fn take_activation_event_bus(
+    capabilities: &ActivationCapabilities,
+) -> Result<Arc<EventBus>, bmux_plugin_sdk::PluginCommandError> {
+    capabilities
+        .take::<ActivationEventBus>()
+        .map(|ActivationEventBus(bus)| bus)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1064,7 +1268,7 @@ mod tests {
         payload: u32,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+    #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
     struct FocusSnapshot {
         focused: Option<u64>,
         revision: u64,
@@ -1220,11 +1424,16 @@ mod tests {
         assert_eq!(received.value, "hello");
     }
 
-    #[tokio::test]
-    async fn global_bus_returns_same_instance() {
-        let a = global_event_bus();
-        let b = global_event_bus();
-        assert!(Arc::ptr_eq(&a, &b));
+    #[test]
+    fn independent_roots_never_share_channels() {
+        let a = Arc::new(EventBus::new());
+        let b = Arc::new(EventBus::new());
+        assert!(!a.shares_channels_with(&b));
+        a.register_channel::<SampleEvent>(PluginEventKind::from_static("test.independent"));
+        assert!(
+            b.subscribe::<SampleEvent>(&PluginEventKind::from_static("test.independent"))
+                .is_err()
+        );
     }
 
     // ── State-channel primitive tests ───────────────────────────────
@@ -1517,5 +1726,86 @@ mod tests {
             .subscribe_state::<SampleEvent>(&STATE_IFACE)
             .expect_err("wrong payload type should fail");
         assert!(matches!(err, EventBusError::PayloadTypeMismatch { .. }));
+    }
+
+    // ── Activation-scoped views ─────────────────────────────────────
+
+    fn activation() -> bmux_plugin_runtime::ActivationScope {
+        let instance = bmux_plugin_runtime::InstanceScope::new(
+            bmux_plugin_runtime::PluginRuntimeScopeId::from_uuid(uuid::Uuid::new_v4()),
+        );
+        instance
+            .begin_activation(bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent)
+            .expect("activation")
+    }
+
+    #[tokio::test]
+    async fn scoped_view_shares_channels_and_releases_its_registrations_on_drop() {
+        let root = Arc::new(EventBus::new());
+        let view = root.scoped(activation());
+        assert!(view.shares_channels_with(&root));
+        view.register_channel::<SampleEvent>(TEST_IFACE);
+        let mut sub = root.subscribe::<SampleEvent>(&TEST_IFACE).unwrap();
+        view.emit(&TEST_IFACE, SampleEvent { payload: 3 }).unwrap();
+        assert_eq!(sub.recv().await.unwrap().payload, 3);
+        drop(view);
+        assert!(matches!(
+            root.subscribe::<SampleEvent>(&TEST_IFACE),
+            Err(EventBusError::ChannelNotRegistered { .. })
+        ));
+        assert!(sub.recv().await.is_err(), "owner drop closes the channel");
+    }
+
+    #[test]
+    fn closed_scope_rejects_operations_and_releases_registrations() {
+        let scope = activation();
+        let root = Arc::new(EventBus::new());
+        let view = root.scoped(scope.clone());
+        view.register_state_channel::<FocusSnapshot>(STATE_IFACE, FocusSnapshot::default());
+        scope.close().unwrap();
+        assert!(matches!(
+            view.publish_state(&STATE_IFACE, FocusSnapshot::default()),
+            Err(EventBusError::Closed)
+        ));
+        assert!(matches!(
+            view.subscribe_state::<FocusSnapshot>(&STATE_IFACE),
+            Err(EventBusError::Closed)
+        ));
+        assert!(root.subscribe_state::<FocusSnapshot>(&STATE_IFACE).is_err());
+        view.register_channel::<SampleEvent>(TEST_IFACE);
+        assert!(
+            root.subscribe::<SampleEvent>(&TEST_IFACE).is_err(),
+            "a closed view admits no registration"
+        );
+    }
+
+    #[test]
+    fn owner_never_removes_a_newer_registration() {
+        let root = Arc::new(EventBus::new());
+        let first = root.scoped(activation());
+        let second = root.scoped(activation());
+        first.register_channel::<SampleEvent>(TEST_IFACE);
+        second.register_channel::<SampleEvent>(TEST_IFACE);
+        drop(first);
+        assert!(root.subscribe::<SampleEvent>(&TEST_IFACE).is_ok());
+        drop(second);
+        assert!(root.subscribe::<SampleEvent>(&TEST_IFACE).is_err());
+    }
+
+    #[test]
+    fn activation_binder_offers_each_activation_its_own_view() {
+        let root = Arc::new(EventBus::new());
+        let binder = activation_binder(Arc::clone(&root));
+        let take = |scope: &bmux_plugin_runtime::ActivationScope| {
+            let capabilities = ActivationCapabilities::default();
+            binder(scope, &capabilities).unwrap();
+            let bus = take_activation_event_bus(&capabilities).unwrap();
+            assert!(take_activation_event_bus(&capabilities).is_err());
+            bus
+        };
+        let (a, b) = (take(&activation()), take(&activation()));
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert!(a.shares_channels_with(&root) && b.shares_channels_with(&root));
+        assert!(take_activation_event_bus(&ActivationCapabilities::default()).is_err());
     }
 }

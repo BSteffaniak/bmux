@@ -78,6 +78,17 @@ impl ActivationCapabilities {
     }
 }
 
+// Identity equality: two sets holding values are equal only when they are
+// the same set (clones of one another), never because they hold equal
+// values. Two sets with nothing left to take are interchangeable, so a
+// context round-tripped through the wire (which never carries capabilities)
+// still compares equal to its source.
+impl PartialEq for ActivationCapabilities {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || (self.is_empty() && other.is_empty())
+    }
+}
+
 impl std::fmt::Debug for ActivationCapabilities {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let count = self.0.lock().map_or(0, |slots| slots.len());
@@ -104,6 +115,21 @@ mod tests {
         assert_eq!(capabilities.take::<String>().unwrap(), "port");
         assert!(clone.is_empty());
         assert!(clone.take::<u64>().is_err());
+    }
+
+    #[test]
+    fn equality_is_identity_unless_both_are_empty() {
+        let full = ActivationCapabilities::default();
+        full.insert(1_u8).unwrap();
+        let other = ActivationCapabilities::default();
+        other.insert(1_u8).unwrap();
+        assert_eq!(full, full.clone());
+        assert_ne!(full, other);
+        assert_ne!(full, ActivationCapabilities::default());
+        assert_eq!(
+            ActivationCapabilities::default(),
+            ActivationCapabilities::default()
+        );
     }
 
     #[test]

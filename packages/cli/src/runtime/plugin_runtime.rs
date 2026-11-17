@@ -1554,6 +1554,7 @@ fn plugin_lifecycle_context(
     NativeLifecycleContext {
         auxiliary_executables: BTreeMap::default(),
         host_service_port: None,
+        capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
         auxiliary_executable_errors: BTreeMap::default(),
         plugin_id: declaration.id.as_str().to_string(),
         required_capabilities: declaration

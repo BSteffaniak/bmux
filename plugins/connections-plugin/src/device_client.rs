@@ -646,9 +646,10 @@ mod tests {
                 },
             )]),
             host_service_port: None,
+            capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
             auxiliary_executable_errors: std::collections::BTreeMap::new(),
         };
-        bmux_sessions_plugin::SessionsPlugin
+        bmux_sessions_plugin::SessionsPlugin::default()
             .activate(context.clone())
             .unwrap();
         bmux_pane_runtime_plugin::PaneRuntimePlugin

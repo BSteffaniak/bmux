@@ -77,8 +77,10 @@ pub use discovery::{
     discover_registered_plugins_in_roots,
 };
 pub use event_bus::{
-    DEFAULT_EVENT_BUS_CAPACITY, DeliveryMode, EventBus, EventBusBytesError, EventBusChannelOptions,
-    EventBusError, EventBusResult, JsonPluginEvent, JsonProjectionPolicy, global_event_bus,
+    ActivationEventBus, DEFAULT_EVENT_BUS_CAPACITY, DeliveryMode, EventBus, EventBusBytesError,
+    EventBusChannelOptions, EventBusError, EventBusResult, JsonPluginEvent, JsonProjectionPolicy,
+    activation_binder as event_bus_activation_binder, activation_event_bus, global_event_bus,
+    take_activation_event_bus,
 };
 pub use host_builtins::InvocationHostBuiltins;
 pub use host_runtime::{

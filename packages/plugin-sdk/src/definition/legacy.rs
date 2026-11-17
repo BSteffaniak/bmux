@@ -41,6 +41,15 @@ fn unavailable() -> PluginCommandError {
 fn author_poisoned() -> PluginCommandError {
     PluginCommandError::failed("author implementation lock poisoned")
 }
+/// Hand the activation's host-supplied values to the legacy author, which
+/// only sees the native lifecycle context.
+fn with_activation_capabilities(
+    mut native: crate::NativeLifecycleContext,
+    capabilities: super::ActivationCapabilities,
+) -> crate::NativeLifecycleContext {
+    native.capabilities = capabilities;
+    native
+}
 fn lifecycle_result(result: PluginResult<i32>) -> PluginResult<()> {
     match result {
         Ok(0) => Ok(()),
@@ -98,13 +107,9 @@ impl<P: RustPlugin + Sync> PluginInstance for RustPluginAdapter<P> {
     }
 
     fn activate(&self, context: PluginLifecycleContext) -> PluginFuture<'_, PluginResult<()>> {
+        let native = with_activation_capabilities(context.native, context.capabilities);
         self.schedule(context.callback_execution, true, move |state| {
-            lifecycle_result(
-                state
-                    .write()
-                    .map_err(|_| unavailable())?
-                    .activate(context.native),
-            )
+            lifecycle_result(state.write().map_err(|_| unavailable())?.activate(native))
         })
     }
     fn activate_with_async(
@@ -112,12 +117,13 @@ impl<P: RustPlugin + Sync> PluginInstance for RustPluginAdapter<P> {
         context: PluginLifecycleContext,
         runtime: HostAsyncHandle,
     ) -> PluginFuture<'_, PluginResult<()>> {
+        let native = with_activation_capabilities(context.native, context.capabilities);
         self.schedule(context.callback_execution, true, move |state| {
             lifecycle_result(
                 state
                     .write()
                     .map_err(|_| unavailable())?
-                    .activate_with_async(context.native, runtime),
+                    .activate_with_async(native, runtime),
             )
         })
     }

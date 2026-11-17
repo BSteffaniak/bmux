@@ -2801,6 +2801,7 @@ minimum = "1.0"
         let context = NativeLifecycleContext {
             auxiliary_executables: BTreeMap::new(),
             host_service_port: None,
+            capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
             auxiliary_executable_errors: BTreeMap::new(),
             plugin_id: "test.plugin".to_string(),
             required_capabilities: Vec::new(),

@@ -951,6 +951,13 @@ impl LoadedExecution {
         retained::open(execution, dispatch)
     }
 
+    /// Whether this execution runs inside the host process and can therefore
+    /// receive in-process activation capabilities.
+    #[must_use]
+    pub const fn is_in_process(&self) -> bool {
+        matches!(self.backend, ExecutionBackend::Static(_))
+    }
+
     /// Register a trusted host activation binder before activation begins.
     ///
     /// Activation capabilities are live in-process values; they cannot cross
@@ -1203,6 +1210,7 @@ impl LoadedExecution {
                 auxiliary_executables: BTreeMap::new(),
                 auxiliary_executable_errors: BTreeMap::new(),
                 host_service_port: None,
+                capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
             },
             policy,
         )
@@ -4911,6 +4919,7 @@ mod tests {
             auxiliary_executables: BTreeMap::new(),
             auxiliary_executable_errors: BTreeMap::new(),
             host_service_port: None,
+            capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
             host_kernel_bridge: None,
         }
     }

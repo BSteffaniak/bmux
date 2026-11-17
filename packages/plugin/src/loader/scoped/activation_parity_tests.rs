@@ -169,6 +169,7 @@ pub(super) fn lifecycle_context() -> bmux_plugin_sdk::NativeLifecycleContext {
         auxiliary_executables: BTreeMap::new(),
         auxiliary_executable_errors: BTreeMap::new(),
         host_service_port: None,
+        capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
         host_kernel_bridge: None,
     }
 }
