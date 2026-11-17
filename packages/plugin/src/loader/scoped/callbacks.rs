@@ -462,6 +462,12 @@ impl bmux_plugin_sdk::HostServiceDispatch for EntryDispatch {
 /// instance dispatch for that invocation. Selection depends only on which
 /// admitted invocation the call carries and whether its entry is live; a
 /// failed call is never retried on the other route.
+///
+/// The entry is observed once per call and its lease is held for the whole
+/// entered call. The author may leave the entry at any moment (background
+/// work handed the activation services races `activate` returning), so a
+/// second look could find it gone after the route was chosen; holding the
+/// lease keeps the chosen route valid until the call returns.
 struct ActivationDispatch {
     binding: CallbackBinding,
     entered: Arc<dyn bmux_plugin_sdk::HostServiceDispatch>,
@@ -471,15 +477,20 @@ impl ActivationDispatch {
     fn route(
         &self,
         invocation: &InvocationScope,
-    ) -> super::Result<&Arc<dyn bmux_plugin_sdk::HostServiceDispatch>> {
+    ) -> super::Result<(
+        Option<CallbackEntryLease>,
+        &Arc<dyn bmux_plugin_sdk::HostServiceDispatch>,
+    )> {
         let own = invocation.id() == self.binding.invocation().id()
             && invocation.runtime_id() == self.binding.invocation().runtime_id();
-        if own && self.binding.active_entry().is_ok() {
-            return Ok(&self.entered);
+        if own && let Ok(lease) = self.binding.active_entry() {
+            return Ok((Some(lease), &self.entered));
         }
-        self.instance
+        let instance = self
+            .instance
             .as_ref()
-            .ok_or_else(|| super::failure("activation host dispatch not bound"))
+            .ok_or_else(|| super::failure("activation host dispatch not bound"))?;
+        Ok((None, instance))
     }
 }
 impl bmux_plugin_sdk::HostServiceDispatch for ActivationDispatch {
@@ -488,19 +499,22 @@ impl bmux_plugin_sdk::HostServiceDispatch for ActivationDispatch {
         invocation: &InvocationScope,
         request: bmux_plugin_sdk::HostServiceRequest<'_>,
     ) -> super::Result<Vec<u8>> {
-        self.route(invocation)?.invoke(invocation, request)
+        let (_lease, dispatch) = self.route(invocation)?;
+        dispatch.invoke(invocation, request)
     }
     fn open_retained_host(
         &self,
         invocation: &InvocationScope,
     ) -> super::Result<bmux_plugin_sdk::abi::retained::RetainedHostPort> {
-        self.route(invocation)?.open_retained_host(invocation)
+        let (_lease, dispatch) = self.route(invocation)?;
+        dispatch.open_retained_host(invocation)
     }
     fn open_retained_host_v2(
         &self,
         invocation: &InvocationScope,
     ) -> super::Result<bmux_plugin_sdk::abi::retained::RetainedHostPort> {
-        self.route(invocation)?.open_retained_host_v2(invocation)
+        let (_lease, dispatch) = self.route(invocation)?;
+        dispatch.open_retained_host_v2(invocation)
     }
     fn invoke_async(
         &self,
@@ -508,7 +522,13 @@ impl bmux_plugin_sdk::HostServiceDispatch for ActivationDispatch {
         request: bmux_plugin_sdk::HostServiceOwnedRequest,
     ) -> bmux_plugin_sdk::definition::PluginFuture<'static, super::Result<Vec<u8>>> {
         match self.route(invocation) {
-            Ok(dispatch) => dispatch.invoke_async(invocation, request),
+            Ok((lease, dispatch)) => {
+                let call = dispatch.invoke_async(invocation, request);
+                Box::pin(async move {
+                    let _lease = lease;
+                    call.await
+                })
+            }
             Err(error) => Box::pin(async move { Err(error) }),
         }
     }
@@ -521,7 +541,13 @@ impl bmux_plugin_sdk::HostServiceDispatch for ActivationDispatch {
         super::Result<bmux_plugin_sdk::typed_dispatch::SelectedServiceAvailability>,
     > {
         match self.route(invocation) {
-            Ok(dispatch) => dispatch.selected_service_availability(invocation, key),
+            Ok((lease, dispatch)) => {
+                let call = dispatch.selected_service_availability(invocation, key);
+                Box::pin(async move {
+                    let _lease = lease;
+                    call.await
+                })
+            }
             Err(error) => Box::pin(async move { Err(error) }),
         }
     }

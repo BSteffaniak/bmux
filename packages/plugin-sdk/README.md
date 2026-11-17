@@ -218,6 +218,15 @@ task scope, not a runtime handle: its spawns go through plug-rt and are torn
 down with the activation. Native adapters own no runtime; activation work runs
 on the host's runtime and cooperative tasks drain before cleanup.
 
+The host services `activate` receives (`context.host_service_port`) are
+activation-scoped: background work may keep them and call through them from
+the moment it receives them until deactivation begins, from any thread, and
+then they fail closed. A call that starts while the author is still inside
+`activate` keeps that entry's ancestry for the whole call, even if `activate`
+returns meanwhile; a call that starts afterwards runs on a fresh activation
+invocation. Plugins should still prefer `rt::spawn` for such work so the
+activation scope owns and tears it down.
+
 ### plug-rt: one runtime per host process
 
 Plugins never build or reach a Tokio runtime. They spawn, run blocking work and

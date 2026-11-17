@@ -564,6 +564,50 @@ fn activation_dispatch_routes_by_admitted_invocation_and_live_entry() {
     assert!(unbound.invoke(&fresh, request()).is_err());
     assert!(unbound.invoke(&own, request()).is_err());
 }
+/// Deterministic interleaving of the race between background work using the
+/// activation services and the author leaving `activate`: the author entry
+/// ends after the route chose the entered dispatch but before that dispatch
+/// resolves the entry. The chosen route must stay valid for the whole call.
+#[test]
+fn activation_dispatch_keeps_the_chosen_entry_route_when_the_author_leaves() {
+    struct LeavesThenResolves {
+        root: CallbackBinding,
+        author: Mutex<Option<CallbackEntryLease>>,
+    }
+    impl bmux_plugin_sdk::HostServiceDispatch for LeavesThenResolves {
+        fn invoke(
+            &self,
+            _: &InvocationScope,
+            _: bmux_plugin_sdk::HostServiceRequest<'_>,
+        ) -> super::super::Result<Vec<u8>> {
+            // The author returns from `activate` right now...
+            drop(self.author.lock().unwrap().take());
+            // ...and the entered dispatch resolves the entry, as
+            // `EntryDispatch` does, after the route was already chosen.
+            self.root.active_entry()?;
+            Ok(vec![1])
+        }
+    }
+    let execution = crate::loader::scoped::tests::fixture();
+    let root = binding(&execution);
+    let own = root.invocation().clone();
+    let author = root.enter().unwrap();
+    let entered = Arc::new(LeavesThenResolves {
+        root: root.clone(),
+        author: Mutex::new(Some(author)),
+    });
+    let dispatch = root.activation_dispatch(entered, None);
+    let request = bmux_plugin_sdk::HostServiceRequest {
+        capability: "test",
+        kind: bmux_plugin_sdk::ServiceKind::Query,
+        interface: "test/v1",
+        operation: "read",
+        payload: &[],
+    };
+    assert_eq!(dispatch.invoke(&own, request).unwrap(), vec![1]);
+    // Once that call returned, the entry is gone: later calls route outside it.
+    assert!(root.active_entry().is_err());
+}
 #[test]
 fn reentrant_query_binding_enters_same_instance_while_default_binding_is_rejected() {
     let first = crate::loader::scoped::tests::fixture();
