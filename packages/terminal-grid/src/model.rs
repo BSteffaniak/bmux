@@ -600,11 +600,33 @@ impl Cell {
 
 /// One physical terminal row. `wrapped` means this row soft-wraps into the next
 /// row and therefore belongs to the same logical line during resize reflow.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct PhysicalRow {
     cells: Vec<Cell>,
     wrapped: bool,
+    /// The cells changed since a renderer last took the row's changes (see
+    /// [`TerminalGrid::take_viewport_changes`]). A new row starts changed, and the flag moves with
+    /// the row when rows scroll.
+    changed: bool,
 }
+
+impl Default for PhysicalRow {
+    fn default() -> Self {
+        Self {
+            cells: Vec::new(),
+            wrapped: false,
+            changed: true,
+        }
+    }
+}
+
+impl PartialEq for PhysicalRow {
+    fn eq(&self, other: &Self) -> bool {
+        self.cells == other.cells && self.wrapped == other.wrapped
+    }
+}
+
+impl Eq for PhysicalRow {}
 
 impl PhysicalRow {
     pub(crate) fn allocated_bytes(&self) -> Option<usize> {
@@ -627,6 +649,7 @@ impl PhysicalRow {
         if cell.width == 2 && col + 1 >= width {
             return Some(());
         }
+        self.changed = true;
         let end = col.checked_add(if cell.width == 2 && col + 1 < width {
             2
         } else {
@@ -669,6 +692,7 @@ impl PhysicalRow {
         Self {
             cells: vec![Cell::blank(style); width],
             wrapped: false,
+            changed: true,
         }
     }
 
@@ -687,6 +711,7 @@ impl PhysicalRow {
     }
 
     pub(crate) fn set_cell(&mut self, col: usize, cell: Cell) {
+        self.changed = true;
         // Appending, as printing nearly always is: trailing blanks can only appear if this one
         // is blank.
         if col == self.cells.len() {
@@ -706,6 +731,7 @@ impl PhysicalRow {
     }
 
     pub(crate) fn cell_mut(&mut self, col: usize) -> Option<&mut Cell> {
+        self.changed = true;
         self.cells.get_mut(col)
     }
 
@@ -713,6 +739,7 @@ impl PhysicalRow {
         if start >= end {
             return;
         }
+        self.changed = true;
         let start = if self
             .cells
             .get(start)
@@ -751,6 +778,7 @@ impl PhysicalRow {
     }
 
     pub(crate) fn truncate(&mut self, len: usize) {
+        self.changed = true;
         self.cells.truncate(len);
         if self
             .cells
@@ -1863,6 +1891,18 @@ impl TerminalGrid {
     }
 
     #[must_use]
+    /// Which viewport rows changed since the last call, top to bottom, clearing the record. Rows
+    /// that only moved (scrolled) keep what they recorded; see
+    /// [`Self::take_viewport_scroll`] for how they moved.
+    pub fn take_viewport_changes(&mut self) -> Vec<bool> {
+        let height = self.height;
+        let take = |row: &mut PhysicalRow| std::mem::replace(&mut row.changed, false);
+        match self.mode {
+            GridMode::Main => self.main_rows.iter_mut().take(height).map(take).collect(),
+            GridMode::Alternate => self.alt_rows.iter_mut().take(height).map(take).collect(),
+        }
+    }
+
     pub fn viewport_row_ref(&self, row: usize) -> Option<&PhysicalRow> {
         match self.mode {
             GridMode::Main => self.main_rows.get(row),
@@ -3708,6 +3748,7 @@ fn try_clone_row(row: &PhysicalRow) -> Option<PhysicalRow> {
     Some(PhysicalRow {
         cells: try_clone_cells(&row.cells)?,
         wrapped: row.wrapped,
+        changed: row.changed,
     })
 }
 

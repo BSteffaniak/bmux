@@ -3193,6 +3193,11 @@ impl ShownRow {
         self.cells.clear();
     }
 
+    /// Columns this row records, zero when forgotten.
+    const fn width(&self) -> usize {
+        self.cells.len()
+    }
+
     fn continuation(&self, col: u16) -> bool {
         self.cells
             .get(usize::from(col))
@@ -5953,13 +5958,27 @@ fn queue_pane_content_for_surface<W: io::Write>(
         // Rows the application scrolled since the last drawn frame: move the host's copy instead
         // of redrawing them. Taken only when this frame draws, so moves accumulate across
         // frames that do not.
+        // Rows the grid did not change since this pane was last drawn, when `prev_rows` still
+        // describe the same rows: nothing moved, or every move was applied to `prev_rows` too.
+        let mut unchanged_rows: Option<Vec<bool>> = None;
         if stage.content_damage.requires_redraw() && !stage.sync_deferred {
             let moved = entry.terminal_grid.grid_mut().take_viewport_scroll();
+            let changes = entry.terminal_grid.grid_mut().take_viewport_changes();
+            let mut rows_follow = moved == ViewportScroll::None;
             if stage.scrollback.is_none() {
                 let scrolled = scroll_host_rows(stdout, stage, &mut entry.prev_rows, moved)?;
+                rows_follow |= scrolled > 0;
                 if let Some(stats) = render_stats.as_deref_mut() {
                     stats.pane_rows_scrolled = stats.pane_rows_scrolled.saturating_add(scrolled);
                 }
+            }
+            let same_appearance =
+                entry.prev_rows_appearance.as_ref() == Some(stage.runtime_appearance);
+            if rows_follow && same_appearance && stage.scrollback.is_none() {
+                unchanged_rows = Some(changes.into_iter().map(|changed| !changed).collect());
+            }
+            if !same_appearance {
+                entry.prev_rows_appearance = Some(stage.runtime_appearance.clone());
             }
         }
         // Per-pane scrollback: a pane renders frozen history if and only if it
@@ -5968,8 +5987,12 @@ fn queue_pane_content_for_surface<W: io::Write>(
         // pane was focused, leaking pane A's offset into pane B.
         let scrollback = stage.scrollback;
         let use_scrollback = scrollback.is_some();
-        let (grid_rows, viewport_base) =
-            entry.scrollback_render_window(scrollback.as_ref(), inner_h);
+        // A scrollback view renders a copied window; the live screen is read in place.
+        let window =
+            use_scrollback.then(|| entry.scrollback_render_window(scrollback.as_ref(), inner_h));
+        let viewport_base = window
+            .as_ref()
+            .map_or_else(|| entry.scrollback_viewport_base(None), |(_, base)| *base);
         let selection = scrollback.and_then(|view| entry.scrollback_selection_bounds(&view));
         if stage.focus {
             let (cursor_row, cursor_col) = if let Some(view) = scrollback {
@@ -6029,14 +6052,53 @@ fn queue_pane_content_for_surface<W: io::Write>(
             let effective_content_damage = stage.content_damage.effective_rects();
             let blank_row = PhysicalRow::new();
             let mut shown = ShownRow::default();
+            let under_rows: std::collections::BTreeSet<u16> = stage
+                .before_content_cells
+                .keys()
+                .map(|(_, row)| *row)
+                .collect();
             for row in 0..inner_h {
                 if let Some(stats) = render_stats.as_deref_mut() {
                     stats.pane_rows_examined = stats.pane_rows_examined.saturating_add(1);
                 }
                 let row_u16 = u16::try_from(row).unwrap_or(u16::MAX);
                 let y = stage.content.y.saturating_add(row_u16);
+                let grid_row = window
+                    .as_ref()
+                    .map_or_else(
+                        || entry.terminal_grid.grid().viewport_row_ref(row),
+                        |(rows, _)| rows.get(row),
+                    )
+                    .unwrap_or(&blank_row);
+                // A row the grid did not change shows what it showed, unless something else
+                // asks for it to be redrawn.
+                if unchanged_rows
+                    .as_ref()
+                    .is_some_and(|unchanged| unchanged.get(row).copied().unwrap_or(false))
+                    && entry
+                        .prev_rows
+                        .get(row)
+                        .is_some_and(|previous| previous.width() == inner_w)
+                    && !under_rows.contains(&y)
+                    && damaged_grid_row_ranges(
+                        grid_row,
+                        row_u16,
+                        inner_width,
+                        &effective_content_damage,
+                    )
+                    .is_empty()
+                {
+                    execute_pane_content_row_output_plan(
+                        stdout,
+                        stage.content.x,
+                        stage.surface_index,
+                        &PaneContentRowOutputPlan::cache_skip(row_u16),
+                        render_stats,
+                        render_trace,
+                    )?;
+                    continue;
+                }
                 let before_cells = before_content_row_cells(stage.before_content_cells, y);
-                let grid_row = grid_rows.get(row).unwrap_or(&blank_row);
                 let context = GridRowRenderContext {
                     row: grid_row,
                     selection,

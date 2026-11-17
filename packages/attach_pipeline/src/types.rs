@@ -247,6 +247,9 @@ pub struct PaneRenderBuffer {
     pub protocol_tracker: TerminalProtocolTracker,
     /// What the host terminal shows for each of the pane's rows, as last drawn.
     pub prev_rows: Vec<crate::render::ShownRow>,
+    /// The appearance `prev_rows` were resolved with: rows the grid did not change may be skipped
+    /// only while it is the same.
+    pub prev_rows_appearance: Option<bmux_appearance::RuntimeAppearance>,
     /// The pane's application is inside a synchronized update (DEC mode 2026) at the end of the
     /// output applied so far: it began a frame and has not finished it.
     pub sync_update_in_progress: bool,
@@ -693,6 +696,7 @@ impl Default for PaneRenderBuffer {
                 .expect("default pane render grid dimensions are valid"),
             protocol_tracker: TerminalProtocolTracker::new(),
             prev_rows: Vec::new(),
+            prev_rows_appearance: None,
             sync_update_in_progress: false,
             sync_update_since: None,
             expected_stream_start: None,
@@ -981,7 +985,10 @@ mod sync_update_tests {
         assert!(!buffer.sync_update_deferring(start));
         buffer.set_sync_update(true, start);
         assert!(buffer.sync_update_deferring(start + Duration::from_millis(10)));
-        assert_eq!(buffer.sync_update_deadline(), Some(start + SYNC_UPDATE_TIMEOUT));
+        assert_eq!(
+            buffer.sync_update_deadline(),
+            Some(start + SYNC_UPDATE_TIMEOUT)
+        );
         // Staying open does not restart the clock.
         buffer.set_sync_update(true, start + Duration::from_millis(100));
         assert!(!buffer.sync_update_deferring(start + SYNC_UPDATE_TIMEOUT));
