@@ -3,7 +3,10 @@
 //! The grammar uses a small set of tokens: keywords (`plugin`, `version`,
 //! `interface`, `import`, `record`, `variant`, `enum`,
 //! `query`, `command`, `emits`, `events`, `list`, `map`, `result`, `unit`), identifiers, integer
-//! literals, and punctuation (`{ } ( ) , ; : ? < > . = @ ->`).
+//! and string literals, `///` documentation lines, and punctuation
+//! (`{ } [ ] ( ) , ; : ? < > . = @ ->`). Newer constructs (`world`, `resource`,
+//! `flags`, `tuple`, `stream`, `future`, ...) are contextual identifiers so
+//! existing schemas may keep using those words as names.
 
 use crate::{Error, Span};
 
@@ -34,10 +37,16 @@ pub enum TokenKind {
 
     Identifier(String),
     IntLiteral(u64),
+    /// A double-quoted string literal with `\"`, `\\`, `\n`, `\t` escapes.
+    StringLiteral(String),
+    /// One `///` documentation line, without the marker.
+    DocComment(String),
 
     // Punctuation
     LBrace,
     RBrace,
+    LBracket,
+    RBracket,
     LParen,
     RParen,
     LAngle,
@@ -84,13 +93,27 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
                     // Line comment: consume until newline.
                     chars.next();
                     column += 1;
+                    let mut body = String::new();
                     for c in chars.by_ref() {
                         if c == '\n' {
                             line += 1;
                             column = 1;
                             break;
                         }
+                        body.push(c);
                         column += 1;
+                    }
+                    // `///` (but not `////`) documents the next declaration,
+                    // mirroring Rust and WIT.
+                    if let Some(doc) = body.strip_prefix('/')
+                        && !doc.starts_with('/')
+                    {
+                        tokens.push(Token {
+                            kind: TokenKind::DocComment(
+                                doc.strip_prefix(' ').unwrap_or(doc).trim_end().to_string(),
+                            ),
+                            span: start,
+                        });
                     }
                 } else {
                     return Err(Error::Lex {
@@ -98,6 +121,53 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
                         message: format!("unexpected character '{ch}'"),
                     });
                 }
+            }
+            '"' => {
+                chars.next();
+                column += 1;
+                let mut value = String::new();
+                loop {
+                    let Some(c) = chars.next() else {
+                        return Err(Error::Lex {
+                            span: start,
+                            message: "unterminated string literal".to_string(),
+                        });
+                    };
+                    column += 1;
+                    match c {
+                        '"' => break,
+                        '\\' => {
+                            let escaped = chars.next();
+                            column += 1;
+                            value.push(match escaped {
+                                Some('"') => '"',
+                                Some('\\') => '\\',
+                                Some('n') => '\n',
+                                Some('t') => '\t',
+                                other => {
+                                    return Err(Error::Lex {
+                                        span: start,
+                                        message: format!(
+                                            "unsupported string escape `\\{}`",
+                                            other.map(String::from).unwrap_or_default()
+                                        ),
+                                    });
+                                }
+                            });
+                        }
+                        '\n' => {
+                            return Err(Error::Lex {
+                                span: start,
+                                message: "string literals cannot span lines".to_string(),
+                            });
+                        }
+                        other => value.push(other),
+                    }
+                }
+                tokens.push(Token {
+                    kind: TokenKind::StringLiteral(value),
+                    span: start,
+                });
             }
             '{' => {
                 chars.next();
@@ -192,6 +262,22 @@ pub fn tokenize(source: &str) -> Result<Vec<Token>, Error> {
                 column += 1;
                 tokens.push(Token {
                     kind: TokenKind::At,
+                    span: start,
+                });
+            }
+            '[' => {
+                chars.next();
+                column += 1;
+                tokens.push(Token {
+                    kind: TokenKind::LBracket,
+                    span: start,
+                });
+            }
+            ']' => {
+                chars.next();
+                column += 1;
+                tokens.push(Token {
+                    kind: TokenKind::RBracket,
                     span: start,
                 });
             }

@@ -1,0 +1,12 @@
+error: BPDL `stream<T>` has no Rust binding yet; it lowers to WIT only
+  --> tests/ui/fail/stream_without_rust_binding.rs:1:1
+   |
+ 1 | / bmux_plugin_schema_macros::schema_inline!(
+ 2 | |     r#"
+ 3 | | plugin p version 1;
+...  |
+11 | | "#
+12 | | );
+   | |_^
+   |
+   = note: this error originates in the macro `bmux_plugin_schema_macros::schema_inline` (in Nightly builds, run with -Z macro-backtrace for more info)

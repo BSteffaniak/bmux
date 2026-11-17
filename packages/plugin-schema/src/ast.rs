@@ -19,11 +19,45 @@ pub struct Schema {
     /// typed [`bmux_plugin_sdk::CapabilityId`] constants.
     pub capabilities: Vec<CapabilityDecl>,
     pub interfaces: Vec<Interface>,
+    /// `world <name> { ... }` blocks: what this plugin provides and requires.
+    pub worlds: Vec<World>,
+    /// Plugin-level `command <name>(...)` declarations (CLI commands).
+    pub commands: Vec<PluginCommand>,
+    /// Declarative `contribute <extension-point> { ... };` data.
+    pub contributions: Vec<Contribution>,
+    /// Host- or plugin-declared `extension-point <name> version <n> { ... }`.
+    pub extension_points: Vec<ExtensionPoint>,
+}
+
+/// `///` documentation lines attached to the following declaration.
+///
+/// Documentation is metadata only: it never enters contract identity.
+pub type Docs = Vec<String>;
+
+/// Feature-gate and lifecycle annotations (`@since`, `@unstable`,
+/// `@deprecated`). Like documentation they are metadata only and never
+/// enter contract identity; they lower to the matching WIT gates.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Stability {
+    /// `@since(N)`: the package version that introduced the item.
+    pub since: Option<u32>,
+    /// `@unstable(feature-name)`: the item exists only behind a feature.
+    pub unstable: Option<String>,
+    /// `@deprecated(N)`: the package version that deprecated the item.
+    pub deprecated: Option<u32>,
+}
+
+impl Stability {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.since.is_none() && self.unstable.is_none() && self.deprecated.is_none()
+    }
 }
 
 /// The plugin header: `plugin <dotted.id> version <n>;`
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginHeader {
+    pub docs: Docs,
     pub plugin_id: String,
     pub version: u32,
     pub span: Span,
@@ -42,6 +76,7 @@ pub struct Import {
 /// A named capability constant declared at schema top level.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityDecl {
+    pub docs: Docs,
     /// Rust constant name emitted under `pub mod capabilities`.
     pub name: String,
     /// Canonical capability id, for example `bmux.foo.read`.
@@ -52,6 +87,8 @@ pub struct CapabilityDecl {
 /// An `interface <name> { ... }` block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Interface {
+    pub docs: Docs,
+    pub stability: Stability,
     pub name: String,
     /// Optional wire-version suffix for the generated service identifier.
     /// `@interface-version(1) interface foo` produces `foo/v1` while
@@ -70,6 +107,10 @@ pub enum InterfaceItem {
     Record(RecordDef),
     Variant(VariantDef),
     Enum(EnumDef),
+    /// `flags <name> { a, b }`: a set of named booleans.
+    Flags(FlagsDef),
+    /// `resource <name> { ... }`: a handle type with methods.
+    Resource(ResourceDef),
     Query(Operation),
     Command(Operation),
     /// Declares the event type emitted by this interface's event stream.
@@ -85,6 +126,8 @@ pub enum InterfaceItem {
 /// - `events T;` → [`DeliveryMode::Broadcast`] (default)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventsDecl {
+    pub docs: Docs,
+    pub stability: Stability,
     pub ty: TypeRef,
     pub delivery: DeliveryMode,
     pub span: Span,
@@ -108,6 +151,8 @@ pub enum DeliveryMode {
 /// A `record <name> { field: type, ... }` definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordDef {
+    pub docs: Docs,
+    pub stability: Stability,
     pub name: String,
     pub fields: Vec<Field>,
     pub span: Span,
@@ -116,6 +161,7 @@ pub struct RecordDef {
 /// A single field inside a record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Field {
+    pub docs: Docs,
     /// Diagnostic-only: redact Debug without altering serialization.
     pub secret: bool,
     pub name: String,
@@ -127,6 +173,8 @@ pub struct Field {
 /// Variants are tagged unions; cases may carry payload fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VariantDef {
+    pub docs: Docs,
+    pub stability: Stability,
     pub name: String,
     pub cases: Vec<VariantCase>,
     pub span: Span,
@@ -135,6 +183,7 @@ pub struct VariantDef {
 /// A single case in a variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VariantCase {
+    pub docs: Docs,
     pub name: String,
     /// Empty for unit cases (`focused`), non-empty for struct-like cases
     /// (`exited { code: i32 }`).
@@ -148,6 +197,8 @@ pub struct VariantCase {
 /// tagged sets with no payload; use `variant` if payload is needed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumDef {
+    pub docs: Docs,
+    pub stability: Stability,
     pub name: String,
     pub cases: Vec<EnumCase>,
     pub span: Span,
@@ -156,6 +207,7 @@ pub struct EnumDef {
 /// A single case in an enum.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnumCase {
+    pub docs: Docs,
     pub name: String,
     /// Marked `@default`. At most one per enum.
     pub is_default: bool,
@@ -166,6 +218,8 @@ pub struct EnumCase {
 /// declaration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Operation {
+    pub docs: Docs,
+    pub stability: Stability,
     pub name: String,
     pub params: Vec<Field>,
     pub returns: TypeRef,
@@ -208,10 +262,22 @@ pub enum TypeRef {
     Result(Box<TypeRef>, Box<TypeRef>),
     /// `unit` — empty payload / void.
     Unit,
+    /// `tuple<A, B, ...>` — positional product type.
+    Tuple(Vec<TypeRef>),
+    /// `stream<T>` — zero or more values delivered asynchronously.
+    Stream(Box<TypeRef>),
+    /// `future<T>` — exactly one value delivered asynchronously.
+    Future(Box<TypeRef>),
+    /// `own<R>` — an owned handle to resource `R`. A bare reference to a
+    /// resource type means the same thing.
+    Own(Box<TypeRef>),
+    /// `borrow<R>` — a handle to resource `R` borrowed for one call.
+    Borrow(Box<TypeRef>),
 }
 
 /// Primitive scalar types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Primitive {
     Bool,
     U8,
@@ -227,6 +293,7 @@ pub enum Primitive {
     String,
     Bytes,
     Uuid,
+    Char,
 }
 
 impl Primitive {
@@ -247,6 +314,7 @@ impl Primitive {
             Self::String => "string",
             Self::Bytes => "bytes",
             Self::Uuid => "uuid",
+            Self::Char => "char",
         }
     }
 
@@ -267,6 +335,7 @@ impl Primitive {
             "string" => Self::String,
             "bytes" => Self::Bytes,
             "uuid" => Self::Uuid,
+            "char" => Self::Char,
             _ => return None,
         })
     }
@@ -292,4 +361,198 @@ impl Primitive {
                 | Self::Uuid
         )
     }
+}
+
+/// A `flags <name> { a, b, c }` definition: a set of independent booleans.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlagsDef {
+    pub docs: Docs,
+    pub stability: Stability,
+    pub name: String,
+    pub flags: Vec<FlagDef>,
+    pub span: Span,
+}
+
+/// One named flag in a [`FlagsDef`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FlagDef {
+    pub docs: Docs,
+    pub name: String,
+    pub span: Span,
+}
+
+/// A `resource <name> { ... }` definition. Values of a resource type are
+/// handles (`own<R>` / `borrow<R>`), never copied state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceDef {
+    pub docs: Docs,
+    pub stability: Stability,
+    pub name: String,
+    pub methods: Vec<ResourceMethod>,
+    pub span: Span,
+}
+
+/// How a resource method is invoked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceMethodKind {
+    /// `constructor(params);` — returns a new owned handle.
+    Constructor,
+    /// `query name(params) -> T;` — read-only method on a borrowed handle.
+    Query,
+    /// `command name(params) -> T;` — mutating method on a borrowed handle.
+    Command,
+    /// `static query name(params) -> T;` — no receiver, read-only.
+    StaticQuery,
+    /// `static command name(params) -> T;` — no receiver, mutating.
+    StaticCommand,
+}
+
+/// One method of a [`ResourceDef`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceMethod {
+    pub docs: Docs,
+    pub stability: Stability,
+    pub kind: ResourceMethodKind,
+    /// `constructor` for constructors.
+    pub name: String,
+    pub params: Vec<Field>,
+    /// `None` for constructors.
+    pub returns: Option<TypeRef>,
+    pub span: Span,
+}
+
+/// A `world <name> { ... }` block. Worlds list what the plugin provides
+/// (exports) and what it requires from the host or other plugins (imports).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct World {
+    pub docs: Docs,
+    pub stability: Stability,
+    pub name: String,
+    pub items: Vec<WorldItem>,
+    pub span: Span,
+}
+
+/// Reference to an interface from a world: `name` or `alias.name`, with an
+/// optional `@N` wire version selecting one member of a versioned family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceRef {
+    /// Import alias, or `None` for an interface of this schema.
+    pub alias: Option<String>,
+    pub name: String,
+    pub version: Option<u32>,
+    pub span: Span,
+}
+
+/// Service kind of an opaque (not yet BPDL-modeled) provided service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceKindDecl {
+    Query,
+    Command,
+    Events,
+}
+
+/// One entry in a [`World`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorldItem {
+    /// `provide <iface> [capability <id>];` — the plugin serves this
+    /// interface. A capability may only be given for interfaces that do
+    /// not declare one (event interfaces), and is then required.
+    Provide {
+        docs: Docs,
+        interface: InterfaceRef,
+        capability: Option<String>,
+        span: Span,
+    },
+    /// `provide opaque <name>[@N]: <kind> capability <id>;` — a routed
+    /// service whose operations are not modeled in BPDL yet. It carries no
+    /// contract identity and has no WIT lowering.
+    ProvideOpaque {
+        docs: Docs,
+        name: String,
+        version: Option<u32>,
+        kind: ServiceKindDecl,
+        capability: String,
+        span: Span,
+    },
+    /// `provide capability <id>;` — a capability granted by this plugin
+    /// that is not tied to a service interface.
+    ProvideCapability {
+        docs: Docs,
+        capability: String,
+        span: Span,
+    },
+    /// `require [optional] <iface>;` — the plugin calls this interface.
+    Require {
+        docs: Docs,
+        optional: bool,
+        interface: InterfaceRef,
+        span: Span,
+    },
+    /// `require [optional] capability <id>;` — a host capability.
+    RequireCapability {
+        docs: Docs,
+        optional: bool,
+        capability: String,
+        span: Span,
+    },
+}
+
+/// A plugin-level `command <name>(params) [title "..."];` declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginCommand {
+    pub docs: Docs,
+    pub stability: Stability,
+    pub name: String,
+    pub params: Vec<Field>,
+    pub title: Option<String>,
+    pub span: Span,
+}
+
+/// A literal value in declarative contribution data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Literal {
+    String(String),
+    Int(u64),
+    Bool(bool),
+    List(Vec<Literal>),
+}
+
+/// Reference to an extension point: `[alias.]name@version`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionPointRef {
+    pub alias: Option<String>,
+    pub name: String,
+    pub version: u32,
+    pub span: Span,
+}
+
+/// `contribute <extension-point>@N { field: literal, ... };` — declarative
+/// data visible before activation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Contribution {
+    pub docs: Docs,
+    pub extension_point: ExtensionPointRef,
+    pub values: Vec<(String, Literal)>,
+    pub span: Span,
+}
+
+/// `extension-point <name> version <n> { data { ... } interface { ... } }`.
+/// Every contribution supplies the data record; contributing plugins
+/// implement the interface operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionPoint {
+    pub docs: Docs,
+    pub stability: Stability,
+    pub name: String,
+    pub version: u32,
+    pub data: Vec<Field>,
+    pub operations: Vec<ExtensionOperation>,
+    pub span: Span,
+}
+
+/// An operation in an extension point's `interface { ... }` section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExtensionOperation {
+    Query(Operation),
+    Command(Operation),
 }

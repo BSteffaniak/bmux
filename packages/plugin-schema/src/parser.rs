@@ -1,11 +1,35 @@
 //! Recursive-descent parser that produces [`crate::ast`] nodes from tokens.
+//!
+//! Top-level grammar (`///` documentation may precede every declaration):
+//!
+//! ```text
+//! schema      := header import* capability* top-item*
+//! header      := 'plugin' dotted 'version' INT ';'
+//! import      := 'import' NAME '=' dotted ';'
+//! capability  := 'capability' NAME '=' dotted ';'
+//! top-item    := annotation* ( interface | world | command | contribute | extension-point )
+//! interface   := 'interface' NAME '{' (annotation* iface-item)* '}'
+//! iface-item  := record | variant | enum | flags | resource | query | command | events
+//! world       := 'world' NAME '{' world-item* '}'
+//! world-item  := 'provide' iface-ref ['capability' dotted] ';'
+//!              | 'provide' 'opaque' NAME ['@' INT] ':' kind 'capability' dotted ';'
+//!              | 'provide' 'capability' dotted ';'
+//!              | 'require' ['optional'] (iface-ref | 'capability' dotted) ';'
+//! command     := 'command' NAME '(' params ')' ['title' STRING] ';'
+//! contribute  := 'contribute' [NAME '.'] NAME '@' INT '{' (NAME ':' literal),* '}'
+//! extension-point := 'extension-point' NAME 'version' INT
+//!                    '{' 'data' '{' fields '}' ['interface' '{' operation* '}'] '}'
+//! annotation  := '@' NAME ['(' (NAME | INT) ')']
+//! ```
 
 use crate::{
     Error, Span,
     ast::{
-        CapabilityDecl, DeliveryMode, EnumCase, EnumDef, EventsDecl, Field, Import, Interface,
-        InterfaceItem, Operation, PluginHeader, Primitive, RecordDef, Schema, TypeRef, VariantCase,
-        VariantDef,
+        CapabilityDecl, Contribution, DeliveryMode, Docs, EnumCase, EnumDef, EventsDecl,
+        ExtensionOperation, ExtensionPoint, ExtensionPointRef, Field, FlagDef, FlagsDef, Import,
+        Interface, InterfaceItem, InterfaceRef, Literal, Operation, PluginCommand, PluginHeader,
+        Primitive, RecordDef, ResourceDef, ResourceMethod, ResourceMethodKind, Schema,
+        ServiceKindDecl, Stability, TypeRef, VariantCase, VariantDef, World, WorldItem,
     },
     lexer::{Token, TokenKind},
 };
@@ -27,40 +51,178 @@ struct Parser<'a> {
     index: usize,
 }
 
+/// One parsed `@name` or `@name(arg)` annotation.
+#[derive(Debug, Clone)]
+struct Annotation {
+    name: String,
+    arg: Option<AnnotationArg>,
+    span: Span,
+}
+
+#[derive(Debug, Clone)]
+enum AnnotationArg {
+    Name(String),
+    Int(u64),
+}
+
+fn parse_error(span: Span, message: impl Into<String>) -> Error {
+    Error::Parse {
+        span,
+        message: message.into(),
+    }
+}
+
+impl Annotation {
+    fn int_arg(&self) -> Result<u32, Error> {
+        match &self.arg {
+            Some(AnnotationArg::Int(value)) => u32::try_from(*value).map_err(|_| {
+                parse_error(self.span, format!("`@{}` value must fit in u32", self.name))
+            }),
+            _ => Err(parse_error(
+                self.span,
+                format!("`@{}` requires an integer argument", self.name),
+            )),
+        }
+    }
+
+    fn name_arg(&self) -> Result<String, Error> {
+        match &self.arg {
+            Some(AnnotationArg::Name(value)) => Ok(value.clone()),
+            _ => Err(parse_error(
+                self.span,
+                format!("`@{}` requires a name argument", self.name),
+            )),
+        }
+    }
+}
+
+/// Split stability annotations from the rest, rejecting duplicates.
+fn take_stability(annotations: &mut Vec<Annotation>) -> Result<Stability, Error> {
+    let mut stability = Stability::default();
+    let mut rest = Vec::new();
+    for annotation in annotations.drain(..) {
+        let duplicate = match annotation.name.as_str() {
+            "since" => stability.since.replace(annotation.int_arg()?).is_some(),
+            "deprecated" => stability
+                .deprecated
+                .replace(annotation.int_arg()?)
+                .is_some(),
+            "unstable" => stability.unstable.replace(annotation.name_arg()?).is_some(),
+            _ => {
+                rest.push(annotation);
+                continue;
+            }
+        };
+        if duplicate {
+            return Err(parse_error(
+                annotation.span,
+                format!("duplicate `@{}` annotation", annotation.name),
+            ));
+        }
+    }
+    *annotations = rest;
+    Ok(stability)
+}
+
+fn reject_annotations(annotations: &[Annotation], target: &str) -> Result<(), Error> {
+    if let Some(annotation) = annotations.first() {
+        return Err(parse_error(
+            annotation.span,
+            format!(
+                "unknown annotation `@{}` on {target}; only `@since`, `@unstable`, and `@deprecated` apply here",
+                annotation.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
 impl Parser<'_> {
     fn parse_schema(&mut self) -> Result<Schema, Error> {
         let plugin = self.parse_plugin_header()?;
         let mut imports = Vec::new();
-        while self.check(&TokenKind::Import) {
+        while self.check_after_docs(&TokenKind::Import) {
             imports.push(self.parse_import()?);
         }
         let mut capabilities = Vec::new();
-        while self.check_identifier("capability") {
+        while self.check_identifier_after_docs("capability") {
             capabilities.push(self.parse_capability()?);
         }
-        let mut interfaces = Vec::new();
-        while self.peek().is_some() {
-            interfaces.push(self.parse_interface()?);
-        }
-        Ok(Schema {
+        let mut schema = Schema {
             plugin,
             imports,
             capabilities,
-            interfaces,
-        })
+            interfaces: Vec::new(),
+            worlds: Vec::new(),
+            commands: Vec::new(),
+            contributions: Vec::new(),
+            extension_points: Vec::new(),
+        };
+        while self.peek().is_some() {
+            self.parse_top_item(&mut schema)?;
+        }
+        Ok(schema)
+    }
+
+    fn parse_top_item(&mut self, schema: &mut Schema) -> Result<(), Error> {
+        let mut docs = self.take_docs();
+        let mut annotations = self.parse_annotations()?;
+        docs.extend(self.take_docs());
+        let token = self
+            .peek()
+            .cloned()
+            .ok_or_else(|| parse_error(Span::new(0, 0), "unexpected end of input"))?;
+        match &token.kind {
+            TokenKind::Interface => {
+                let interface = self.parse_interface(docs, annotations)?;
+                schema.interfaces.push(interface);
+            }
+            TokenKind::Command => {
+                let stability = take_stability(&mut annotations)?;
+                reject_annotations(&annotations, "a plugin command")?;
+                schema
+                    .commands
+                    .push(self.parse_plugin_command(docs, stability)?);
+            }
+            TokenKind::Identifier(name) if name == "world" => {
+                let stability = take_stability(&mut annotations)?;
+                reject_annotations(&annotations, "a world")?;
+                schema.worlds.push(self.parse_world(docs, stability)?);
+            }
+            TokenKind::Identifier(name) if name == "extension-point" => {
+                let stability = take_stability(&mut annotations)?;
+                reject_annotations(&annotations, "an extension point")?;
+                schema
+                    .extension_points
+                    .push(self.parse_extension_point(docs, stability)?);
+            }
+            TokenKind::Identifier(name) if name == "contribute" => {
+                reject_annotations(&annotations, "a contribution")?;
+                schema.contributions.push(self.parse_contribution(docs)?);
+            }
+            other => {
+                return Err(parse_error(
+                    token.span,
+                    format!(
+                        "expected `interface`, `world`, `command`, `contribute`, or `extension-point` (got {other:?})"
+                    ),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn parse_plugin_header(&mut self) -> Result<PluginHeader, Error> {
+        let docs = self.take_docs();
         let span = self.expect(&TokenKind::Plugin, "expected `plugin` keyword")?;
         let plugin_id = self.parse_dotted_ident("expected plugin id after `plugin`")?;
         self.expect(&TokenKind::Version, "expected `version` keyword")?;
         let version = self.expect_int("expected integer version literal")?;
         self.expect(&TokenKind::Semicolon, "expected `;` ending plugin header")?;
-        let version = u32::try_from(version).map_err(|_| Error::Parse {
-            span,
-            message: format!("plugin version {version} out of u32 range"),
-        })?;
+        let version = u32::try_from(version)
+            .map_err(|_| parse_error(span, format!("plugin version {version} out of u32 range")))?;
         Ok(PluginHeader {
+            docs,
             plugin_id,
             version,
             span,
@@ -68,6 +230,8 @@ impl Parser<'_> {
     }
 
     fn parse_import(&mut self) -> Result<Import, Error> {
+        // Imports carry no documentation; consume any for uniformity.
+        let _ = self.take_docs();
         let span = self.expect(&TokenKind::Import, "expected `import` keyword")?;
         let alias = self.expect_identifier("expected import alias")?;
         self.expect(&TokenKind::Equals, "expected `=` after import alias")?;
@@ -81,34 +245,79 @@ impl Parser<'_> {
     }
 
     fn parse_capability(&mut self) -> Result<CapabilityDecl, Error> {
+        let docs = self.take_docs();
         let span = self.expect_contextual_keyword("capability", "expected `capability` keyword")?;
         let name = self.expect_identifier("expected capability constant name")?;
         self.expect(&TokenKind::Equals, "expected `=` after capability name")?;
         let id = self.parse_dotted_ident("expected capability id")?;
         self.expect(&TokenKind::Semicolon, "expected `;` ending capability")?;
-        Ok(CapabilityDecl { name, id, span })
+        Ok(CapabilityDecl {
+            docs,
+            name,
+            id,
+            span,
+        })
     }
 
-    fn parse_interface(&mut self) -> Result<Interface, Error> {
+    fn parse_interface(
+        &mut self,
+        docs: Docs,
+        mut annotations: Vec<Annotation>,
+    ) -> Result<Interface, Error> {
+        let stability = take_stability(&mut annotations)?;
         let mut capability = None;
         let mut interface_version = None;
-        while self.check(&TokenKind::At) {
-            match self.consume_interface_annotation()? {
-                InterfaceAnnotation::Capability(value) => {
+        for annotation in &annotations {
+            match annotation.name.as_str() {
+                "capability" => {
+                    let value = match &annotation.arg {
+                        Some(AnnotationArg::Name(value)) => value.clone(),
+                        _ => {
+                            return Err(parse_error(
+                                annotation.span,
+                                "expected capability constant name in `@capability(NAME)`",
+                            ));
+                        }
+                    };
                     if capability.replace(value).is_some() {
-                        return Err(Error::Parse {
-                            span: self.peek().map_or(Span::new(0, 0), |token| token.span),
-                            message: "duplicate `@capability` interface annotation".to_string(),
-                        });
+                        return Err(parse_error(
+                            annotation.span,
+                            "duplicate `@capability` interface annotation",
+                        ));
                     }
                 }
-                InterfaceAnnotation::Version(value) => {
-                    if interface_version.replace(value).is_some() {
-                        return Err(Error::Parse {
-                            span: self.peek().map_or(Span::new(0, 0), |token| token.span),
-                            message: "duplicate `@interface-version` annotation".to_string(),
-                        });
+                "interface-version" => {
+                    let version = match &annotation.arg {
+                        Some(AnnotationArg::Int(value)) => u32::try_from(*value).map_err(|_| {
+                            parse_error(annotation.span, "interface version must fit in u32")
+                        })?,
+                        _ => {
+                            return Err(parse_error(
+                                annotation.span,
+                                "expected interface version integer in `@interface-version(N)`",
+                            ));
+                        }
+                    };
+                    if version == 0 {
+                        return Err(parse_error(
+                            annotation.span,
+                            "interface version must be greater than zero",
+                        ));
                     }
+                    if interface_version.replace(version).is_some() {
+                        return Err(parse_error(
+                            annotation.span,
+                            "duplicate `@interface-version` annotation",
+                        ));
+                    }
+                }
+                other => {
+                    return Err(parse_error(
+                        annotation.span,
+                        format!(
+                            "unknown interface annotation `@{other}`; expected `@capability(NAME)`, `@interface-version(N)`, `@since(N)`, `@unstable(feature)`, or `@deprecated(N)`"
+                        ),
+                    ));
                 }
             }
         }
@@ -116,11 +325,14 @@ impl Parser<'_> {
         let name = self.expect_identifier("expected interface name")?;
         self.expect(&TokenKind::LBrace, "expected `{` opening interface body")?;
         let mut items = Vec::new();
-        while !self.check(&TokenKind::RBrace) {
+        while !self.check_after_docs(&TokenKind::RBrace) {
             items.push(self.parse_interface_item()?);
         }
+        let _ = self.take_docs();
         self.expect(&TokenKind::RBrace, "expected `}` closing interface body")?;
         Ok(Interface {
+            docs,
+            stability,
             name,
             interface_version,
             capability,
@@ -129,53 +341,157 @@ impl Parser<'_> {
         })
     }
 
+    // One dispatch over every interface item kind and its legal
+    // annotations; splitting it would scatter the annotation rules.
+    #[allow(clippy::too_many_lines)]
     fn parse_interface_item(&mut self) -> Result<InterfaceItem, Error> {
-        let tok = self.peek().cloned().ok_or_else(|| Error::Parse {
-            span: Span::new(0, 0),
-            message: "unexpected end of input inside interface".to_string(),
+        let mut docs = self.take_docs();
+        let mut annotations = self.parse_annotations()?;
+        docs.extend(self.take_docs());
+        let stability = take_stability(&mut annotations)?;
+        let tok = self.peek().cloned().ok_or_else(|| {
+            parse_error(Span::new(0, 0), "unexpected end of input inside interface")
         })?;
-        match tok.kind {
-            TokenKind::Record => Ok(InterfaceItem::Record(self.parse_record()?)),
-            TokenKind::Variant => Ok(InterfaceItem::Variant(self.parse_variant()?)),
-            TokenKind::Enum => Ok(InterfaceItem::Enum(self.parse_enum()?)),
-            TokenKind::Query => Ok(InterfaceItem::Query(self.parse_operation(OpKind::Query)?)),
-            TokenKind::Command => Ok(InterfaceItem::Command(
-                self.parse_operation(OpKind::Command)?,
-            )),
-            TokenKind::Events => Ok(InterfaceItem::Events(
-                self.parse_events(DeliveryMode::Broadcast)?,
-            )),
-            TokenKind::At => {
-                // Annotation prefix. `@reentrant` precedes a `query`
-                // operation; `@state` precedes an `events` declaration.
-                if self.peek_annotation_name() == Some("reentrant") {
-                    return self.parse_reentrant_operation();
+        let reentrant = annotations.iter().filter(|a| a.name == "reentrant").count();
+        let state = annotations.iter().any(|a| a.name == "state");
+        if reentrant > 1 {
+            return Err(parse_error(
+                tok.span,
+                "`@reentrant` must directly precede a `query` operation",
+            ));
+        }
+        let item_annotations = |allowed: &[&str], target: &str| -> Result<(), Error> {
+            for annotation in &annotations {
+                if !allowed.contains(&annotation.name.as_str()) {
+                    return Err(parse_error(
+                        annotation.span,
+                        format!("unknown annotation `@{}` on {target}", annotation.name),
+                    ));
                 }
-                let delivery = self.consume_events_delivery_annotation()?;
-                Ok(InterfaceItem::Events(self.parse_events(delivery)?))
             }
-            _ => Err(Error::Parse {
-                span: tok.span,
-                message: format!("unexpected token in interface body: {:?}", tok.kind),
-            }),
+            Ok(())
+        };
+        if reentrant == 1 && !matches!(tok.kind, TokenKind::Query) {
+            return Err(match tok.kind {
+                TokenKind::Command => parse_error(
+                    tok.span,
+                    "`@reentrant` is only allowed on `query` operations; commands may mutate instance state and are never re-entrant",
+                ),
+                other => parse_error(
+                    tok.span,
+                    format!("`@reentrant` must precede a `query` operation (got {other:?})"),
+                ),
+            });
+        }
+        match &tok.kind {
+            TokenKind::Record => {
+                item_annotations(&[], "a record")?;
+                Ok(InterfaceItem::Record(self.parse_record(docs, stability)?))
+            }
+            TokenKind::Variant => {
+                item_annotations(&[], "a variant")?;
+                Ok(InterfaceItem::Variant(self.parse_variant(docs, stability)?))
+            }
+            TokenKind::Enum => {
+                item_annotations(&[], "an enum")?;
+                Ok(InterfaceItem::Enum(self.parse_enum(docs, stability)?))
+            }
+            TokenKind::Identifier(name) if name == "flags" => {
+                item_annotations(&[], "a flags type")?;
+                Ok(InterfaceItem::Flags(self.parse_flags(docs, stability)?))
+            }
+            TokenKind::Identifier(name) if name == "resource" => {
+                item_annotations(&[], "a resource")?;
+                Ok(InterfaceItem::Resource(
+                    self.parse_resource(docs, stability)?,
+                ))
+            }
+            TokenKind::Query => {
+                item_annotations(&["reentrant"], "a query")?;
+                let mut operation = self.parse_operation(OpKind::Query, docs, stability)?;
+                if reentrant == 1 {
+                    if operation.emits.is_some() {
+                        return Err(parse_error(
+                            operation.span,
+                            format!(
+                                "`@reentrant` is not allowed on streaming operation `{}`; operations with `emits` cannot be re-entered",
+                                operation.name,
+                            ),
+                        ));
+                    }
+                    operation.reentrant = true;
+                }
+                Ok(InterfaceItem::Query(operation))
+            }
+            TokenKind::Command => {
+                item_annotations(&[], "a command")?;
+                Ok(InterfaceItem::Command(self.parse_operation(
+                    OpKind::Command,
+                    docs,
+                    stability,
+                )?))
+            }
+            TokenKind::Events => {
+                for annotation in &annotations {
+                    if annotation.name != "state" {
+                        return Err(parse_error(
+                            annotation.span,
+                            format!(
+                                "unknown annotation `@{}`; only `@state` is recognised as a delivery hint on `events` declarations",
+                                annotation.name,
+                            ),
+                        ));
+                    }
+                }
+                let delivery = if state {
+                    DeliveryMode::State
+                } else {
+                    DeliveryMode::Broadcast
+                };
+                Ok(InterfaceItem::Events(
+                    self.parse_events(delivery, docs, stability)?,
+                ))
+            }
+            _ => {
+                if let Some(annotation) = annotations.first() {
+                    return Err(parse_error(
+                        annotation.span,
+                        format!(
+                            "unknown annotation `@{}` before {:?}",
+                            annotation.name, tok.kind
+                        ),
+                    ));
+                }
+                Err(parse_error(
+                    tok.span,
+                    format!("unexpected token in interface body: {:?}", tok.kind),
+                ))
+            }
         }
     }
 
-    fn parse_record(&mut self) -> Result<RecordDef, Error> {
+    fn parse_record(&mut self, docs: Docs, stability: Stability) -> Result<RecordDef, Error> {
         let span = self.expect(&TokenKind::Record, "expected `record`")?;
         let name = self.expect_identifier("expected record name")?;
         self.expect(&TokenKind::LBrace, "expected `{` opening record fields")?;
         let fields = self.parse_fields()?;
         self.expect(&TokenKind::RBrace, "expected `}` closing record fields")?;
-        Ok(RecordDef { name, fields, span })
+        Ok(RecordDef {
+            docs,
+            stability,
+            name,
+            fields,
+            span,
+        })
     }
 
-    fn parse_variant(&mut self) -> Result<VariantDef, Error> {
+    fn parse_variant(&mut self, docs: Docs, stability: Stability) -> Result<VariantDef, Error> {
         let span = self.expect(&TokenKind::Variant, "expected `variant`")?;
         let name = self.expect_identifier("expected variant name")?;
         self.expect(&TokenKind::LBrace, "expected `{` opening variant cases")?;
         let mut cases = Vec::new();
-        while !self.check(&TokenKind::RBrace) {
+        while !self.check_after_docs(&TokenKind::RBrace) {
+            let case_docs = self.take_docs();
             let is_default = self.consume_default_annotation();
             let case_span = self.peek().map_or(Span::new(0, 0), |t| t.span);
             let case_name = self.expect_identifier("expected variant case name")?;
@@ -188,14 +504,15 @@ impl Parser<'_> {
                 Vec::new()
             };
             if is_default && !payload.is_empty() {
-                return Err(Error::Parse {
-                    span: case_span,
-                    message: format!(
+                return Err(parse_error(
+                    case_span,
+                    format!(
                         "@default is only allowed on unit cases; variant case `{case_name}` carries payload",
                     ),
-                });
+                ));
             }
             cases.push(VariantCase {
+                docs: case_docs,
                 name: case_name,
                 payload,
                 is_default,
@@ -207,20 +524,29 @@ impl Parser<'_> {
                 break;
             }
         }
+        let _ = self.take_docs();
         self.expect(&TokenKind::RBrace, "expected `}` closing variant cases")?;
-        Ok(VariantDef { name, cases, span })
+        Ok(VariantDef {
+            docs,
+            stability,
+            name,
+            cases,
+            span,
+        })
     }
 
-    fn parse_enum(&mut self) -> Result<EnumDef, Error> {
+    fn parse_enum(&mut self, docs: Docs, stability: Stability) -> Result<EnumDef, Error> {
         let span = self.expect(&TokenKind::Enum, "expected `enum`")?;
         let name = self.expect_identifier("expected enum name")?;
         self.expect(&TokenKind::LBrace, "expected `{` opening enum cases")?;
         let mut cases = Vec::new();
-        while !self.check(&TokenKind::RBrace) {
+        while !self.check_after_docs(&TokenKind::RBrace) {
+            let case_docs = self.take_docs();
             let is_default = self.consume_default_annotation();
             let case_span = self.peek().map_or(Span::new(0, 0), |t| t.span);
             let case_name = self.expect_identifier("expected enum case name")?;
             cases.push(EnumCase {
+                docs: case_docs,
                 name: case_name,
                 is_default,
                 span: case_span,
@@ -231,65 +557,126 @@ impl Parser<'_> {
                 break;
             }
         }
+        let _ = self.take_docs();
         self.expect(&TokenKind::RBrace, "expected `}` closing enum cases")?;
-        Ok(EnumDef { name, cases, span })
+        Ok(EnumDef {
+            docs,
+            stability,
+            name,
+            cases,
+            span,
+        })
     }
 
-    /// The identifier following an `@` at the cursor, without consuming it.
-    fn peek_annotation_name(&self) -> Option<&str> {
-        if !self.check(&TokenKind::At) {
-            return None;
+    fn parse_flags(&mut self, docs: Docs, stability: Stability) -> Result<FlagsDef, Error> {
+        let span = self.expect_contextual_keyword("flags", "expected `flags`")?;
+        let name = self.expect_identifier("expected flags name")?;
+        self.expect(&TokenKind::LBrace, "expected `{` opening flags")?;
+        let mut flags = Vec::new();
+        while !self.check_after_docs(&TokenKind::RBrace) {
+            let flag_docs = self.take_docs();
+            let flag_span = self.peek().map_or(Span::new(0, 0), |t| t.span);
+            let flag_name = self.expect_identifier("expected flag name")?;
+            flags.push(FlagDef {
+                docs: flag_docs,
+                name: flag_name,
+                span: flag_span,
+            });
+            if self.check(&TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
         }
-        match self.tokens.get(self.index + 1).map(|token| &token.kind) {
-            Some(TokenKind::Identifier(name)) => Some(name.as_str()),
-            _ => None,
-        }
+        let _ = self.take_docs();
+        self.expect(&TokenKind::RBrace, "expected `}` closing flags")?;
+        Ok(FlagsDef {
+            docs,
+            stability,
+            name,
+            flags,
+            span,
+        })
     }
 
-    /// Parse `@reentrant query ...;`. The marker is a concurrency contract for
-    /// stateless queries only: commands may mutate instance state and
-    /// streaming operations hold their invocation open while emitting, so
-    /// neither can be safely entered from their own call chain.
-    fn parse_reentrant_operation(&mut self) -> Result<InterfaceItem, Error> {
-        let at_span = self.expect(&TokenKind::At, "expected `@`")?;
-        self.expect_contextual_keyword("reentrant", "expected `reentrant` after `@`")?;
-        if self.check(&TokenKind::At) {
-            return Err(Error::Parse {
-                span: at_span,
-                message: "`@reentrant` must directly precede a `query` operation".to_string(),
+    fn parse_resource(&mut self, docs: Docs, stability: Stability) -> Result<ResourceDef, Error> {
+        let span = self.expect_contextual_keyword("resource", "expected `resource`")?;
+        let name = self.expect_identifier("expected resource name")?;
+        self.expect(&TokenKind::LBrace, "expected `{` opening resource methods")?;
+        let mut methods = Vec::new();
+        while !self.check_after_docs(&TokenKind::RBrace) {
+            let mut method_docs = self.take_docs();
+            let mut annotations = self.parse_annotations()?;
+            method_docs.extend(self.take_docs());
+            let method_stability = take_stability(&mut annotations)?;
+            reject_annotations(&annotations, "a resource method")?;
+            let method_span = self.peek().map_or(Span::new(0, 0), |t| t.span);
+            if self.check_identifier("constructor") {
+                self.advance();
+                let params = self.parse_params()?;
+                self.expect(&TokenKind::Semicolon, "expected `;` ending constructor")?;
+                methods.push(ResourceMethod {
+                    docs: method_docs,
+                    stability: method_stability,
+                    kind: ResourceMethodKind::Constructor,
+                    name: "constructor".to_string(),
+                    params,
+                    returns: None,
+                    span: method_span,
+                });
+                continue;
+            }
+            let is_static = self.check_identifier("static");
+            if is_static {
+                self.advance();
+            }
+            let kind = match self.peek().map(|token| &token.kind) {
+                Some(TokenKind::Query) if is_static => ResourceMethodKind::StaticQuery,
+                Some(TokenKind::Command) if is_static => ResourceMethodKind::StaticCommand,
+                Some(TokenKind::Query) => ResourceMethodKind::Query,
+                Some(TokenKind::Command) => ResourceMethodKind::Command,
+                other => {
+                    return Err(parse_error(
+                        method_span,
+                        format!(
+                            "expected `constructor`, `query`, `command`, or `static` in resource body (got {other:?})"
+                        ),
+                    ));
+                }
+            };
+            self.advance();
+            let method_name = self.expect_contextual_name("expected resource method name")?;
+            let params = self.parse_params()?;
+            self.expect(&TokenKind::Arrow, "expected `->` before return type")?;
+            let returns = self.parse_type()?;
+            self.expect(&TokenKind::Semicolon, "expected `;` ending resource method")?;
+            methods.push(ResourceMethod {
+                docs: method_docs,
+                stability: method_stability,
+                kind,
+                name: method_name,
+                params,
+                returns: Some(returns),
+                span: method_span,
             });
         }
-        let tok = self.peek().cloned().ok_or_else(|| Error::Parse {
-            span: at_span,
-            message: "expected `query` after `@reentrant` (unexpected end of input)".to_string(),
-        })?;
-        match tok.kind {
-            TokenKind::Query => {
-                let mut operation = self.parse_operation(OpKind::Query)?;
-                if operation.emits.is_some() {
-                    return Err(Error::Parse {
-                        span: operation.span,
-                        message: format!(
-                            "`@reentrant` is not allowed on streaming operation `{}`; operations with `emits` cannot be re-entered",
-                            operation.name,
-                        ),
-                    });
-                }
-                operation.reentrant = true;
-                Ok(InterfaceItem::Query(operation))
-            }
-            TokenKind::Command => Err(Error::Parse {
-                span: tok.span,
-                message: "`@reentrant` is only allowed on `query` operations; commands may mutate instance state and are never re-entrant".to_string(),
-            }),
-            other => Err(Error::Parse {
-                span: tok.span,
-                message: format!("`@reentrant` must precede a `query` operation (got {other:?})"),
-            }),
-        }
+        let _ = self.take_docs();
+        self.expect(&TokenKind::RBrace, "expected `}` closing resource")?;
+        Ok(ResourceDef {
+            docs,
+            stability,
+            name,
+            methods,
+            span,
+        })
     }
 
-    fn parse_operation(&mut self, kind: OpKind) -> Result<Operation, Error> {
+    fn parse_operation(
+        &mut self,
+        kind: OpKind,
+        docs: Docs,
+        stability: Stability,
+    ) -> Result<Operation, Error> {
         let span = self.expect(
             match kind {
                 OpKind::Query => &TokenKind::Query,
@@ -298,15 +685,41 @@ impl Parser<'_> {
             "expected operation keyword",
         )?;
         let name = self.expect_contextual_name("expected operation name")?;
+        let params = self.parse_params()?;
+        self.expect(&TokenKind::Arrow, "expected `->` before return type")?;
+        let returns = self.parse_type()?;
+        let emits = if self.check(&TokenKind::Emits) {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+        self.expect(&TokenKind::Semicolon, "expected `;` ending operation")?;
+        Ok(Operation {
+            docs,
+            stability,
+            name,
+            params,
+            returns,
+            emits,
+            reentrant: false,
+            span,
+        })
+    }
+
+    /// `( [docs] [@secret] name: type, ... )`
+    fn parse_params(&mut self) -> Result<Vec<Field>, Error> {
         self.expect(&TokenKind::LParen, "expected `(` opening params")?;
         let mut params = Vec::new();
-        while !self.check(&TokenKind::RParen) {
+        while !self.check_after_docs(&TokenKind::RParen) {
+            let docs = self.take_docs();
             let param_span = self.peek().map_or(Span::new(0, 0), |t| t.span);
             let secret = self.parse_field_secret()?;
             let param_name = self.expect_identifier("expected parameter name")?;
             self.expect(&TokenKind::Colon, "expected `:` after parameter name")?;
             let ty = self.parse_type()?;
             params.push(Field {
+                docs,
                 secret,
                 name: param_name,
                 ty,
@@ -318,125 +731,424 @@ impl Parser<'_> {
                 break;
             }
         }
+        let _ = self.take_docs();
         self.expect(&TokenKind::RParen, "expected `)` closing params")?;
-        self.expect(&TokenKind::Arrow, "expected `->` before return type")?;
-        let returns = self.parse_type()?;
-        let emits = if self.check(&TokenKind::Emits) {
-            self.advance();
-            Some(self.parse_type()?)
-        } else {
-            None
-        };
-        self.expect(&TokenKind::Semicolon, "expected `;` ending operation")?;
-        Ok(Operation {
-            name,
-            params,
-            returns,
-            emits,
-            reentrant: false,
-            span,
-        })
+        Ok(params)
     }
 
-    fn parse_events(&mut self, delivery: DeliveryMode) -> Result<EventsDecl, Error> {
+    fn parse_events(
+        &mut self,
+        delivery: DeliveryMode,
+        docs: Docs,
+        stability: Stability,
+    ) -> Result<EventsDecl, Error> {
         let span = self.expect(&TokenKind::Events, "expected `events`")?;
         let ty = self.parse_type()?;
         self.expect(
             &TokenKind::Semicolon,
             "expected `;` ending events declaration",
         )?;
-        Ok(EventsDecl { ty, delivery, span })
+        Ok(EventsDecl {
+            docs,
+            stability,
+            ty,
+            delivery,
+            span,
+        })
     }
 
-    /// Consume an `@state` prefix annotation if present and return the
-    /// resulting delivery mode. Only `@state` is currently recognised;
-    /// any other `@<ident>` sequence before an `events` declaration is
-    /// rejected with a parse error pointing at the annotation site.
-    fn consume_events_delivery_annotation(&mut self) -> Result<DeliveryMode, Error> {
-        let at_span = self.expect(&TokenKind::At, "expected `@`")?;
-        let (name, span) = match self.advance().cloned() {
-            Some(Token {
-                kind: TokenKind::Identifier(name),
-                span,
-            }) => (name, span),
-            Some(other) => {
-                return Err(Error::Parse {
-                    span: other.span,
-                    message: format!("expected identifier after `@`; got {:?}", other.kind),
-                });
-            }
-            None => {
-                return Err(Error::Parse {
-                    span: at_span,
-                    message: "expected annotation identifier after `@`".to_string(),
-                });
-            }
-        };
-        match name.as_str() {
-            "state" => Ok(DeliveryMode::State),
-            other => Err(Error::Parse {
-                span,
-                message: format!(
-                    "unknown annotation `@{other}`; only `@state` is recognised as a delivery hint on `events` declarations",
-                ),
-            }),
+    fn parse_world(&mut self, docs: Docs, stability: Stability) -> Result<World, Error> {
+        let span = self.expect_contextual_keyword("world", "expected `world`")?;
+        let name = self.expect_identifier("expected world name")?;
+        self.expect(&TokenKind::LBrace, "expected `{` opening world")?;
+        let mut items = Vec::new();
+        while !self.check_after_docs(&TokenKind::RBrace) {
+            items.push(self.parse_world_item()?);
         }
+        let _ = self.take_docs();
+        self.expect(&TokenKind::RBrace, "expected `}` closing world")?;
+        Ok(World {
+            docs,
+            stability,
+            name,
+            items,
+            span,
+        })
     }
 
-    /// Consume one interface-level annotation.
-    fn consume_interface_annotation(&mut self) -> Result<InterfaceAnnotation, Error> {
-        let at_span = self.expect(&TokenKind::At, "expected `@`")?;
-        let (name, span) = match self.advance().cloned() {
-            Some(Token {
-                kind: TokenKind::Identifier(name),
-                span,
-            }) => (name, span),
-            Some(other) => {
-                return Err(Error::Parse {
-                    span: other.span,
-                    message: format!("expected identifier after `@`; got {:?}", other.kind),
-                });
-            }
-            None => {
-                return Err(Error::Parse {
-                    span: at_span,
-                    message: "expected annotation identifier after `@`".to_string(),
-                });
-            }
-        };
-        match name.as_str() {
-            "capability" => {
-                self.expect(&TokenKind::LParen, "expected `(` after `@capability`")?;
-                let capability = self.expect_identifier("expected capability constant name")?;
-                self.expect(&TokenKind::RParen, "expected `)` after capability name")?;
-                Ok(InterfaceAnnotation::Capability(capability))
-            }
-            "interface-version" => {
-                self.expect(
-                    &TokenKind::LParen,
-                    "expected `(` after `@interface-version`",
+    /// Is the token after the cursor an identifier (contextual keyword use)?
+    fn next_is_identifier(&self) -> bool {
+        matches!(
+            self.tokens.get(self.index + 1).map(|token| &token.kind),
+            Some(TokenKind::Identifier(_))
+        )
+    }
+
+    fn parse_world_item(&mut self) -> Result<WorldItem, Error> {
+        let docs = self.take_docs();
+        let span = self.peek().map_or(Span::new(0, 0), |t| t.span);
+        let item = if self.check_identifier("provide") {
+            self.advance();
+            if self.check_identifier("opaque") && self.next_is_identifier() {
+                self.advance();
+                let name = self.expect_identifier("expected opaque service interface name")?;
+                let version = self.parse_optional_version()?;
+                self.expect(&TokenKind::Colon, "expected `:` before opaque service kind")?;
+                let kind = match self.advance().map(|token| token.kind.clone()) {
+                    Some(TokenKind::Query) => ServiceKindDecl::Query,
+                    Some(TokenKind::Command) => ServiceKindDecl::Command,
+                    Some(TokenKind::Events) => ServiceKindDecl::Events,
+                    other => {
+                        return Err(parse_error(
+                            span,
+                            format!(
+                                "expected `query`, `command`, or `events` service kind (got {other:?})"
+                            ),
+                        ));
+                    }
+                };
+                self.expect_contextual_keyword(
+                    "capability",
+                    "opaque services must name their `capability <id>`",
                 )?;
-                let version = self.expect_int("expected interface version integer")?;
-                self.expect(&TokenKind::RParen, "expected `)` after interface version")?;
-                let version = u32::try_from(version).map_err(|_| Error::Parse {
+                let capability = self.parse_dotted_ident("expected capability id")?;
+                WorldItem::ProvideOpaque {
+                    docs,
+                    name,
+                    version,
+                    kind,
+                    capability,
                     span,
-                    message: "interface version must fit in u32".to_string(),
-                })?;
-                if version == 0 {
-                    return Err(Error::Parse {
-                        span,
-                        message: "interface version must be greater than zero".to_string(),
-                    });
                 }
-                Ok(InterfaceAnnotation::Version(version))
+            } else if self.check_identifier("capability") && self.next_is_identifier() {
+                self.advance();
+                let capability = self.parse_dotted_ident("expected capability id")?;
+                WorldItem::ProvideCapability {
+                    docs,
+                    capability,
+                    span,
+                }
+            } else {
+                let interface = self.parse_interface_ref()?;
+                let capability = if self.check_identifier("capability") {
+                    self.advance();
+                    Some(self.parse_dotted_ident("expected capability id")?)
+                } else {
+                    None
+                };
+                WorldItem::Provide {
+                    docs,
+                    interface,
+                    capability,
+                    span,
+                }
             }
-            other => Err(Error::Parse {
+        } else if self.check_identifier("require") {
+            self.advance();
+            let optional = self.check_identifier("optional") && self.next_is_identifier();
+            if optional {
+                self.advance();
+            }
+            if self.check_identifier("capability") && self.next_is_identifier() {
+                self.advance();
+                let capability = self.parse_dotted_ident("expected capability id")?;
+                WorldItem::RequireCapability {
+                    docs,
+                    optional,
+                    capability,
+                    span,
+                }
+            } else {
+                WorldItem::Require {
+                    docs,
+                    optional,
+                    interface: self.parse_interface_ref()?,
+                    span,
+                }
+            }
+        } else {
+            return Err(parse_error(
                 span,
-                message: format!(
-                    "unknown interface annotation `@{other}`; expected `@capability(NAME)` or `@interface-version(N)`"
+                format!(
+                    "expected `provide` or `require` in world body (got {:?})",
+                    self.peek().map(|token| &token.kind)
                 ),
-            }),
+            ));
+        };
+        self.expect(&TokenKind::Semicolon, "expected `;` ending world item")?;
+        Ok(item)
+    }
+
+    /// `name`, `alias.name`, either with an optional `@N` wire version.
+    fn parse_interface_ref(&mut self) -> Result<InterfaceRef, Error> {
+        let span = self.peek().map_or(Span::new(0, 0), |t| t.span);
+        let first = self.expect_identifier("expected interface name")?;
+        let (alias, name) = if self.check(&TokenKind::Dot) {
+            self.advance();
+            (
+                Some(first),
+                self.expect_identifier("expected interface name after `.`")?,
+            )
+        } else {
+            (None, first)
+        };
+        let version = self.parse_optional_version()?;
+        Ok(InterfaceRef {
+            alias,
+            name,
+            version,
+            span,
+        })
+    }
+
+    fn parse_optional_version(&mut self) -> Result<Option<u32>, Error> {
+        if !self.check(&TokenKind::At) {
+            return Ok(None);
         }
+        let span = self.expect(&TokenKind::At, "expected `@`")?;
+        let version = self.expect_int("expected wire version after `@`")?;
+        let version = u32::try_from(version)
+            .ok()
+            .filter(|version| *version > 0)
+            .ok_or_else(|| parse_error(span, "wire version must be a positive u32"))?;
+        Ok(Some(version))
+    }
+
+    fn parse_plugin_command(
+        &mut self,
+        docs: Docs,
+        stability: Stability,
+    ) -> Result<PluginCommand, Error> {
+        let span = self.expect(&TokenKind::Command, "expected `command`")?;
+        let name = self.expect_contextual_name("expected command name")?;
+        let params = self.parse_params()?;
+        let title = if self.check_identifier("title") {
+            self.advance();
+            Some(self.expect_string("expected string after `title`")?)
+        } else {
+            None
+        };
+        self.expect(&TokenKind::Semicolon, "expected `;` ending command")?;
+        Ok(PluginCommand {
+            docs,
+            stability,
+            name,
+            params,
+            title,
+            span,
+        })
+    }
+
+    fn parse_contribution(&mut self, docs: Docs) -> Result<Contribution, Error> {
+        let span = self.expect_contextual_keyword("contribute", "expected `contribute`")?;
+        let ref_span = self.peek().map_or(Span::new(0, 0), |t| t.span);
+        let first = self.expect_identifier("expected extension point name")?;
+        let (alias, name) = if self.check(&TokenKind::Dot) {
+            self.advance();
+            (
+                Some(first),
+                self.expect_identifier("expected extension point name after `.`")?,
+            )
+        } else {
+            (None, first)
+        };
+        let version = self
+            .parse_optional_version()?
+            .ok_or_else(|| parse_error(ref_span, "contributions must name `extension-point@N`"))?;
+        self.expect(&TokenKind::LBrace, "expected `{` opening contribution data")?;
+        let mut values = Vec::new();
+        while !self.check(&TokenKind::RBrace) {
+            let field = self.expect_contextual_name("expected contribution field name")?;
+            self.expect(&TokenKind::Colon, "expected `:` after contribution field")?;
+            values.push((field, self.parse_literal()?));
+            if self.check(&TokenKind::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RBrace, "expected `}` closing contribution data")?;
+        Ok(Contribution {
+            docs,
+            extension_point: ExtensionPointRef {
+                alias,
+                name,
+                version,
+                span: ref_span,
+            },
+            values,
+            span,
+        })
+    }
+
+    fn parse_literal(&mut self) -> Result<Literal, Error> {
+        let token = self.advance().cloned().ok_or_else(|| {
+            parse_error(
+                Span::new(0, 0),
+                "expected literal (unexpected end of input)",
+            )
+        })?;
+        match token.kind {
+            TokenKind::StringLiteral(value) => Ok(Literal::String(value)),
+            TokenKind::IntLiteral(value) => Ok(Literal::Int(value)),
+            TokenKind::Identifier(value) if value == "true" => Ok(Literal::Bool(true)),
+            TokenKind::Identifier(value) if value == "false" => Ok(Literal::Bool(false)),
+            TokenKind::LBracket => {
+                let mut items = Vec::new();
+                while !self.check(&TokenKind::RBracket) {
+                    items.push(self.parse_literal()?);
+                    if self.check(&TokenKind::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RBracket, "expected `]` closing list literal")?;
+                Ok(Literal::List(items))
+            }
+            other => Err(parse_error(
+                token.span,
+                format!("expected string, integer, boolean, or list literal (got {other:?})"),
+            )),
+        }
+    }
+
+    fn parse_extension_point(
+        &mut self,
+        docs: Docs,
+        stability: Stability,
+    ) -> Result<ExtensionPoint, Error> {
+        let span =
+            self.expect_contextual_keyword("extension-point", "expected `extension-point`")?;
+        let name = self.expect_identifier("expected extension point name")?;
+        self.expect(
+            &TokenKind::Version,
+            "expected `version` after extension point name",
+        )?;
+        let version = self.expect_int("expected extension point version")?;
+        let version = u32::try_from(version)
+            .ok()
+            .filter(|version| *version > 0)
+            .ok_or_else(|| parse_error(span, "extension point version must be a positive u32"))?;
+        self.expect(&TokenKind::LBrace, "expected `{` opening extension point")?;
+        self.expect_contextual_keyword("data", "extension points start with `data { ... }`")?;
+        self.expect(
+            &TokenKind::LBrace,
+            "expected `{` opening extension point data",
+        )?;
+        let data = self.parse_fields()?;
+        self.expect(
+            &TokenKind::RBrace,
+            "expected `}` closing extension point data",
+        )?;
+        let mut operations = Vec::new();
+        if self.check(&TokenKind::Interface) {
+            self.advance();
+            self.expect(
+                &TokenKind::LBrace,
+                "expected `{` opening extension point interface",
+            )?;
+            while !self.check_after_docs(&TokenKind::RBrace) {
+                let mut op_docs = self.take_docs();
+                let mut annotations = self.parse_annotations()?;
+                op_docs.extend(self.take_docs());
+                let op_stability = take_stability(&mut annotations)?;
+                reject_annotations(&annotations, "an extension point operation")?;
+                let operation = match self.peek().map(|token| &token.kind) {
+                    Some(TokenKind::Query) => ExtensionOperation::Query(self.parse_operation(
+                        OpKind::Query,
+                        op_docs,
+                        op_stability,
+                    )?),
+                    Some(TokenKind::Command) => ExtensionOperation::Command(self.parse_operation(
+                        OpKind::Command,
+                        op_docs,
+                        op_stability,
+                    )?),
+                    other => {
+                        return Err(parse_error(
+                            span,
+                            format!(
+                                "expected `query` or `command` in extension point interface (got {other:?})"
+                            ),
+                        ));
+                    }
+                };
+                operations.push(operation);
+            }
+            let _ = self.take_docs();
+            self.expect(
+                &TokenKind::RBrace,
+                "expected `}` closing extension point interface",
+            )?;
+        }
+        self.expect(&TokenKind::RBrace, "expected `}` closing extension point")?;
+        Ok(ExtensionPoint {
+            docs,
+            stability,
+            name,
+            version,
+            data,
+            operations,
+            span,
+        })
+    }
+
+    /// Parse zero or more `@name` / `@name(arg)` annotations.
+    fn parse_annotations(&mut self) -> Result<Vec<Annotation>, Error> {
+        let mut annotations = Vec::new();
+        while self.check(&TokenKind::At) {
+            let at_span = self.expect(&TokenKind::At, "expected `@`")?;
+            let (name, span) = match self.advance().cloned() {
+                Some(Token {
+                    kind: TokenKind::Identifier(name),
+                    span,
+                }) => (name, span),
+                Some(other) => {
+                    return Err(parse_error(
+                        other.span,
+                        format!("expected identifier after `@`; got {:?}", other.kind),
+                    ));
+                }
+                None => {
+                    return Err(parse_error(
+                        at_span,
+                        "expected annotation identifier after `@`",
+                    ));
+                }
+            };
+            let arg = if self.check(&TokenKind::LParen) {
+                self.advance();
+                let arg = match self.advance().cloned() {
+                    Some(Token {
+                        kind: TokenKind::Identifier(value),
+                        ..
+                    }) => AnnotationArg::Name(value),
+                    Some(Token {
+                        kind: TokenKind::IntLiteral(value),
+                        ..
+                    }) => AnnotationArg::Int(value),
+                    other => {
+                        return Err(parse_error(
+                            span,
+                            format!(
+                                "expected name or integer argument in `@{name}(...)` (got {:?})",
+                                other.map(|token| token.kind)
+                            ),
+                        ));
+                    }
+                };
+                self.expect(
+                    &TokenKind::RParen,
+                    "expected `)` closing annotation argument",
+                )?;
+                Some(arg)
+            } else {
+                None
+            };
+            annotations.push(Annotation { name, arg, span });
+        }
+        Ok(annotations)
     }
 
     fn parse_field_secret(&mut self) -> Result<bool, Error> {
@@ -446,23 +1158,25 @@ impl Parser<'_> {
         let span = self.expect(&TokenKind::At, "expected `@`")?;
         let name = self.expect_identifier("expected field annotation")?;
         if name != "secret" || self.check(&TokenKind::At) {
-            return Err(Error::Parse {
+            return Err(parse_error(
                 span,
-                message: "only one `@secret` annotation is allowed on a field or parameter".into(),
-            });
+                "only one `@secret` annotation is allowed on a field or parameter",
+            ));
         }
         Ok(true)
     }
 
     fn parse_fields(&mut self) -> Result<Vec<Field>, Error> {
         let mut fields = Vec::new();
-        while !self.check(&TokenKind::RBrace) {
+        while !self.check_after_docs(&TokenKind::RBrace) {
+            let docs = self.take_docs();
             let span = self.peek().map_or(Span::new(0, 0), |t| t.span);
             let secret = self.parse_field_secret()?;
             let name = self.expect_contextual_name("expected field name")?;
             self.expect(&TokenKind::Colon, "expected `:` after field name")?;
             let ty = self.parse_type()?;
             fields.push(Field {
+                docs,
                 secret,
                 name,
                 ty,
@@ -474,21 +1188,36 @@ impl Parser<'_> {
                 break;
             }
         }
+        let _ = self.take_docs();
         Ok(fields)
     }
 
+    fn parse_single_type_param(&mut self, keyword: &str) -> Result<TypeRef, Error> {
+        self.expect(
+            &TokenKind::LAngle,
+            &format!("expected `<` after `{keyword}`"),
+        )?;
+        let inner = self.parse_type()?;
+        self.expect(
+            &TokenKind::RAngle,
+            &format!("expected `>` closing `{keyword}<...>`"),
+        )?;
+        Ok(inner)
+    }
+
     fn parse_type(&mut self) -> Result<TypeRef, Error> {
-        let tok = self.peek().cloned().ok_or_else(|| Error::Parse {
-            span: Span::new(0, 0),
-            message: "unexpected end of input in type".to_string(),
-        })?;
+        let tok = self
+            .peek()
+            .cloned()
+            .ok_or_else(|| parse_error(Span::new(0, 0), "unexpected end of input in type"))?;
+        let next_is_angle = matches!(
+            self.tokens.get(self.index + 1).map(|token| &token.kind),
+            Some(TokenKind::LAngle)
+        );
         let ty = match tok.kind {
             TokenKind::List => {
                 self.advance();
-                self.expect(&TokenKind::LAngle, "expected `<` after `list`")?;
-                let inner = self.parse_type()?;
-                self.expect(&TokenKind::RAngle, "expected `>` closing `list<...>`")?;
-                TypeRef::List(Box::new(inner))
+                TypeRef::List(Box::new(self.parse_single_type_param("list")?))
             }
             TokenKind::Map => {
                 self.advance();
@@ -512,6 +1241,35 @@ impl Parser<'_> {
                 self.advance();
                 TypeRef::Unit
             }
+            // Contextual generic type constructors. Without a following `<`
+            // these words remain ordinary type names.
+            TokenKind::Identifier(ref name) if next_is_angle && name == "tuple" => {
+                self.advance();
+                self.expect(&TokenKind::LAngle, "expected `<` after `tuple`")?;
+                let mut items = vec![self.parse_type()?];
+                while self.check(&TokenKind::Comma) {
+                    self.advance();
+                    items.push(self.parse_type()?);
+                }
+                self.expect(&TokenKind::RAngle, "expected `>` closing `tuple<...>`")?;
+                TypeRef::Tuple(items)
+            }
+            TokenKind::Identifier(ref name) if next_is_angle && name == "stream" => {
+                self.advance();
+                TypeRef::Stream(Box::new(self.parse_single_type_param("stream")?))
+            }
+            TokenKind::Identifier(ref name) if next_is_angle && name == "future" => {
+                self.advance();
+                TypeRef::Future(Box::new(self.parse_single_type_param("future")?))
+            }
+            TokenKind::Identifier(ref name) if next_is_angle && name == "own" => {
+                self.advance();
+                TypeRef::Own(Box::new(self.parse_single_type_param("own")?))
+            }
+            TokenKind::Identifier(ref name) if next_is_angle && name == "borrow" => {
+                self.advance();
+                TypeRef::Borrow(Box::new(self.parse_single_type_param("borrow")?))
+            }
             TokenKind::Identifier(ref name) => {
                 self.advance();
                 // Qualified reference: `alias.type-name`.
@@ -531,10 +1289,10 @@ impl Parser<'_> {
                 }
             }
             _ => {
-                return Err(Error::Parse {
-                    span: tok.span,
-                    message: format!("expected type, got {:?}", tok.kind),
-                });
+                return Err(parse_error(
+                    tok.span,
+                    format!("expected type, got {:?}", tok.kind),
+                ));
             }
         };
 
@@ -580,6 +1338,37 @@ impl Parser<'_> {
         false
     }
 
+    /// Consume consecutive `///` documentation lines.
+    fn take_docs(&mut self) -> Docs {
+        let mut docs = Vec::new();
+        while let Some(Token {
+            kind: TokenKind::DocComment(line),
+            ..
+        }) = self.peek()
+        {
+            docs.push(line.clone());
+            self.index += 1;
+        }
+        docs
+    }
+
+    /// Like [`Self::check`], looking past documentation lines.
+    fn check_after_docs(&self, kind: &TokenKind) -> bool {
+        self.tokens[self.index.min(self.tokens.len())..]
+            .iter()
+            .find(|token| !matches!(token.kind, TokenKind::DocComment(_)))
+            .is_some_and(|token| &token.kind == kind)
+    }
+
+    fn check_identifier_after_docs(&self, value: &str) -> bool {
+        self.tokens[self.index.min(self.tokens.len())..]
+            .iter()
+            .find(|token| !matches!(token.kind, TokenKind::DocComment(_)))
+            .is_some_and(
+                |token| matches!(&token.kind, TokenKind::Identifier(ident) if ident == value),
+            )
+    }
+
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.index)
     }
@@ -601,26 +1390,30 @@ impl Parser<'_> {
     }
 
     fn expect(&mut self, kind: &TokenKind, message: &str) -> Result<Span, Error> {
-        let tok = self.peek().ok_or_else(|| Error::Parse {
-            span: Span::new(0, 0),
-            message: format!("{message} (unexpected end of input)"),
+        let tok = self.peek().ok_or_else(|| {
+            parse_error(
+                Span::new(0, 0),
+                format!("{message} (unexpected end of input)"),
+            )
         })?;
         if &tok.kind == kind {
             let span = tok.span;
             self.advance();
             Ok(span)
         } else {
-            Err(Error::Parse {
-                span: tok.span,
-                message: format!("{message} (got {:?})", tok.kind),
-            })
+            Err(parse_error(
+                tok.span,
+                format!("{message} (got {:?})", tok.kind),
+            ))
         }
     }
 
     fn expect_contextual_keyword(&mut self, value: &str, message: &str) -> Result<Span, Error> {
-        let tok = self.peek().cloned().ok_or_else(|| Error::Parse {
-            span: Span::new(0, 0),
-            message: format!("{message} (unexpected end of input)"),
+        let tok = self.peek().cloned().ok_or_else(|| {
+            parse_error(
+                Span::new(0, 0),
+                format!("{message} (unexpected end of input)"),
+            )
         })?;
         if let TokenKind::Identifier(name) = &tok.kind
             && name == value
@@ -628,17 +1421,19 @@ impl Parser<'_> {
             self.advance();
             Ok(tok.span)
         } else {
-            Err(Error::Parse {
-                span: tok.span,
-                message: format!("{message} (got {:?})", tok.kind),
-            })
+            Err(parse_error(
+                tok.span,
+                format!("{message} (got {:?})", tok.kind),
+            ))
         }
     }
 
     fn expect_contextual_name(&mut self, message: &str) -> Result<String, Error> {
-        let tok = self.peek().cloned().ok_or_else(|| Error::Parse {
-            span: Span::new(0, 0),
-            message: format!("{message} (unexpected end of input)"),
+        let tok = self.peek().cloned().ok_or_else(|| {
+            parse_error(
+                Span::new(0, 0),
+                format!("{message} (unexpected end of input)"),
+            )
         })?;
         let name = match tok.kind {
             TokenKind::Identifier(name) => name,
@@ -648,10 +1443,7 @@ impl Parser<'_> {
             TokenKind::Unit => "unit".to_string(),
             TokenKind::Events => "events".to_string(),
             other => {
-                return Err(Error::Parse {
-                    span: tok.span,
-                    message: format!("{message} (got {other:?})"),
-                });
+                return Err(parse_error(tok.span, format!("{message} (got {other:?})")));
             }
         };
         self.advance();
@@ -659,41 +1451,58 @@ impl Parser<'_> {
     }
 
     fn expect_identifier(&mut self, message: &str) -> Result<String, Error> {
-        let tok = self.peek().cloned().ok_or_else(|| Error::Parse {
-            span: Span::new(0, 0),
-            message: format!("{message} (unexpected end of input)"),
+        let tok = self.peek().cloned().ok_or_else(|| {
+            parse_error(
+                Span::new(0, 0),
+                format!("{message} (unexpected end of input)"),
+            )
         })?;
         if let TokenKind::Identifier(name) = tok.kind {
             self.advance();
             Ok(name)
         } else {
-            Err(Error::Parse {
-                span: tok.span,
-                message: format!("{message} (got {:?})", tok.kind),
-            })
+            Err(parse_error(
+                tok.span,
+                format!("{message} (got {:?})", tok.kind),
+            ))
+        }
+    }
+
+    fn expect_string(&mut self, message: &str) -> Result<String, Error> {
+        let tok = self.peek().cloned().ok_or_else(|| {
+            parse_error(
+                Span::new(0, 0),
+                format!("{message} (unexpected end of input)"),
+            )
+        })?;
+        if let TokenKind::StringLiteral(value) = tok.kind {
+            self.advance();
+            Ok(value)
+        } else {
+            Err(parse_error(
+                tok.span,
+                format!("{message} (got {:?})", tok.kind),
+            ))
         }
     }
 
     fn expect_int(&mut self, message: &str) -> Result<u64, Error> {
-        let tok = self.peek().cloned().ok_or_else(|| Error::Parse {
-            span: Span::new(0, 0),
-            message: format!("{message} (unexpected end of input)"),
+        let tok = self.peek().cloned().ok_or_else(|| {
+            parse_error(
+                Span::new(0, 0),
+                format!("{message} (unexpected end of input)"),
+            )
         })?;
         if let TokenKind::IntLiteral(n) = tok.kind {
             self.advance();
             Ok(n)
         } else {
-            Err(Error::Parse {
-                span: tok.span,
-                message: format!("{message} (got {:?})", tok.kind),
-            })
+            Err(parse_error(
+                tok.span,
+                format!("{message} (got {:?})", tok.kind),
+            ))
         }
     }
-}
-
-enum InterfaceAnnotation {
-    Capability(String),
-    Version(u32),
 }
 
 #[derive(Clone, Copy)]

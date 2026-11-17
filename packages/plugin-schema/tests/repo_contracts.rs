@@ -165,3 +165,45 @@ fn every_repo_contract_keeps_its_pinned_identity() {
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
+
+/// Packages ordered so every import precedes its importer.
+fn dependency_order(repo: &RepoSchemas) -> Vec<String> {
+    fn visit(id: &str, repo: &RepoSchemas, done: &mut Vec<String>, active: &mut Vec<String>) {
+        if done.iter().any(|seen| seen == id) {
+            return;
+        }
+        assert!(
+            !active.iter().any(|seen| seen == id),
+            "import cycle through {id}"
+        );
+        active.push(id.to_string());
+        for import in &repo.by_plugin[id].imports {
+            visit(&import.plugin_id, repo, done, active);
+        }
+        active.pop();
+        done.push(id.to_string());
+    }
+    let mut done = Vec::new();
+    for id in repo.by_plugin.keys() {
+        visit(id, repo, &mut done, &mut Vec::new());
+    }
+    done
+}
+
+#[test]
+fn every_repo_contract_lowers_to_valid_wit() {
+    let repo = repo_schemas();
+    let mut set = bmux_plugin_schema::ir::PackageSet::new();
+    for schema in repo.by_plugin.values() {
+        set.insert(bmux_plugin_schema::ir::lower(schema));
+    }
+    let mut resolve = wit_parser::Resolve::new();
+    for id in dependency_order(&repo) {
+        let package = set.get(&id).expect("lowered package");
+        let source = bmux_plugin_schema::wit::emit(&set, package)
+            .unwrap_or_else(|error| panic!("{id}: {error}"));
+        resolve
+            .push_source(&format!("{id}.wit"), &source)
+            .unwrap_or_else(|error| panic!("{id} lowered to invalid WIT: {error:?}\n{source}"));
+    }
+}

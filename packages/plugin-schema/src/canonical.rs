@@ -1,337 +1,527 @@
-//! Exact, versioned BPDL wire-contract bytes, independent of spans and source formatting.
+//! Exact, versioned BPDL wire-contract identity, computed from the
+//! canonical IR ([`crate::ir`]) independent of spans, documentation,
+//! stability metadata and source formatting.
+//!
 //! Interface identities include only reachable wire definitions. Declaration
-//! order is retained because enum/variant order can affect wire encoding. It does not
-//! claim structural or additive compatibility. No Rust paths or debug formatting enter it.
+//! order is retained because enum/variant order can affect wire encoding. It
+//! does not claim structural or additive compatibility. No Rust paths or
+//! debug formatting enter it.
+//!
+//! # Canonical v2 byte scheme
+//!
+//! The digest is SHA-256 over the domain string
+//! `bmux.bpdl.interface.sha256.v2\0bmux_codec.typed_stable.v1.envelope.v1\0`
+//! followed by a root package record and the sorted reachable definitions.
+//! Strings are `u64` little-endian length-prefixed UTF-8; counts are `u64`
+//! LE; versions are `u32` LE; flags are one byte.
+//!
+//! - package record: `id`, `version` (always 0: plugin releases do not
+//!   version interfaces), imports (always empty), capabilities (the guarding
+//!   capability only for the root), interfaces (exactly one).
+//! - interface: `name`, has-version + version, has-capability + constant
+//!   name, items. The root keeps only operations and events; each
+//!   reachable definition is hashed as its own one-item package record.
+//! - item tags: record 0, variant 1, enum 2, query 3 (`@reentrant` query
+//!   6), command 4, events 5, flags 7, resource 8.
+//! - type tags: primitive 0 + keyword, local reference 1 + name, scoped
+//!   reference 2 + scope alias + name, list 3, map 4, option 5, result 6,
+//!   unit 7, tuple 8 + count, stream 9, future 10, `own` 11 + reference,
+//!   `borrow` 12 + reference.
+//! - reachable definitions are keyed by `(defining package id,
+//!   "interface:has-version:version", type name)`; an import alias used by
+//!   a package binds `(package id, "import:alias", type)` to the imported
+//!   package id.
+//!
+//! The scheme for every construct that existed before the IR (tags 0–7 of
+//! both tables) is byte-for-byte the pre-IR v2 scheme, so every existing
+//! contract keeps its identity. Constructs added with the IR use tags that
+//! no earlier schema could produce, which is why they extend v2 instead of
+//! requiring v3: no previously hashed contract can collide with them.
 
-use crate::ast::{DeliveryMode, Field, InterfaceItem, Operation, Schema, TypeRef};
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::ast::{Interface as AstInterface, Schema};
 use crate::codegen_rust::ImportMap;
+use crate::ir::{
+    self, Delivery, ExtensionPoint, Field, Function, FunctionKind, Interface, Item, MethodKind,
+    Package, PackageSet, RefScope, Type, TypeDef, TypeDefKind, TypeRef,
+};
+
+const INTERFACE_DOMAIN: &[u8] =
+    b"bmux.bpdl.interface.sha256.v2\0bmux_codec.typed_stable.v1.envelope.v1\0";
+const EXTENSION_POINT_DOMAIN: &[u8] =
+    b"bmux.bpdl.extension-point.sha256.v1\0bmux_codec.typed_stable.v1.envelope.v1\0";
 
 fn text(out: &mut Vec<u8>, value: &str) {
     out.extend_from_slice(&(value.len() as u64).to_le_bytes());
     out.extend_from_slice(value.as_bytes());
 }
 
-fn ty(out: &mut Vec<u8>, value: &TypeRef) {
+fn count(out: &mut Vec<u8>, value: usize) {
+    out.extend_from_slice(&(value as u64).to_le_bytes());
+}
+
+fn reference(out: &mut Vec<u8>, value: &TypeRef) {
+    match &value.scope {
+        RefScope::Local => {
+            out.push(1);
+            text(out, &value.name);
+        }
+        RefScope::Interface(alias) | RefScope::Import(alias) => {
+            out.push(2);
+            text(out, alias);
+            text(out, &value.name);
+        }
+    }
+}
+
+fn ty(out: &mut Vec<u8>, value: &Type) {
     match value {
-        TypeRef::Primitive(primitive) => {
+        Type::Primitive(primitive) => {
             out.push(0);
             text(out, primitive.keyword());
         }
-        TypeRef::Named(name) => {
-            out.push(1);
-            text(out, name);
-        }
-        TypeRef::Qualified { alias, name } => {
-            out.push(2);
-            text(out, alias);
-            text(out, name);
-        }
-        TypeRef::List(inner) => {
+        Type::Ref(target) => reference(out, target),
+        Type::List(inner) => {
             out.push(3);
             ty(out, inner);
         }
-        TypeRef::Map(key, value) => {
+        Type::Map(key, value) => {
             out.push(4);
             ty(out, key);
             ty(out, value);
         }
-        TypeRef::Option(inner) => {
+        Type::Option(inner) => {
             out.push(5);
             ty(out, inner);
         }
-        TypeRef::Result(ok, error) => {
+        Type::Result(ok, error) => {
             out.push(6);
             ty(out, ok);
             ty(out, error);
         }
-        TypeRef::Unit => out.push(7),
+        Type::Unit => out.push(7),
+        Type::Tuple(items) => {
+            out.push(8);
+            count(out, items.len());
+            for item in items {
+                ty(out, item);
+            }
+        }
+        Type::Stream(inner) => {
+            out.push(9);
+            ty(out, inner);
+        }
+        Type::Future(inner) => {
+            out.push(10);
+            ty(out, inner);
+        }
+        Type::Own(target) => {
+            out.push(11);
+            reference(out, target);
+        }
+        Type::Borrow(target) => {
+            out.push(12);
+            reference(out, target);
+        }
     }
 }
 
 fn fields(out: &mut Vec<u8>, values: &[Field]) {
-    out.extend_from_slice(&(values.len() as u64).to_le_bytes());
+    count(out, values.len());
     for field in values {
-        // `secret` affects Rust diagnostics only, never wire compatibility.
+        // `secret` affects diagnostics only, never wire compatibility.
         text(out, &field.name);
         ty(out, &field.ty);
     }
 }
 
-fn operation(out: &mut Vec<u8>, value: &Operation) {
+fn function(out: &mut Vec<u8>, value: &Function) {
     text(out, &value.name);
     fields(out, &value.params);
-    ty(out, &value.returns);
+    ty(out, &value.result);
     out.push(u8::from(value.emits.is_some()));
     if let Some(events) = &value.emits {
         ty(out, events);
     }
 }
 
-fn schema_bytes(out: &mut Vec<u8>, schema: &Schema) {
-    text(out, &schema.plugin.plugin_id);
-    out.extend_from_slice(&schema.plugin.version.to_le_bytes());
-    out.extend_from_slice(&(schema.imports.len() as u64).to_le_bytes());
-    for import in &schema.imports {
-        text(out, &import.alias);
-        text(out, &import.plugin_id);
-    }
-    out.extend_from_slice(&(schema.capabilities.len() as u64).to_le_bytes());
-    for capability in &schema.capabilities {
-        text(out, &capability.name);
-        text(out, &capability.id);
-    }
-    out.extend_from_slice(&(schema.interfaces.len() as u64).to_le_bytes());
-    for interface in &schema.interfaces {
-        text(out, &interface.name);
-        out.push(u8::from(interface.interface_version.is_some()));
-        if let Some(version) = interface.interface_version {
-            out.extend_from_slice(&version.to_le_bytes());
+fn item(out: &mut Vec<u8>, value: &Item) {
+    match value {
+        Item::Type(def) => type_def(out, def),
+        Item::Function(op) => {
+            // `@reentrant` changes concurrency semantics, so it is
+            // identity-bearing when set. It uses a distinct item tag so
+            // unmarked queries keep their exact pre-existing bytes.
+            out.push(match (op.kind, op.reentrant) {
+                (FunctionKind::Query, false) => 3,
+                (FunctionKind::Query, true) => 6,
+                (FunctionKind::Command, _) => 4,
+            });
+            function(out, op);
         }
-        out.push(u8::from(interface.capability.is_some()));
-        if let Some(capability) = &interface.capability {
-            text(out, capability);
+        Item::Events(events) => {
+            out.push(5);
+            ty(out, &events.ty);
+            out.push(match events.delivery {
+                Delivery::Broadcast => 0,
+                Delivery::State => 1,
+            });
         }
-        out.extend_from_slice(&(interface.items.len() as u64).to_le_bytes());
-        for item in &interface.items {
-            match item {
-                InterfaceItem::Record(record) => {
-                    out.push(0);
-                    text(out, &record.name);
-                    fields(out, &record.fields);
-                }
-                InterfaceItem::Variant(variant) => {
-                    out.push(1);
-                    text(out, &variant.name);
-                    out.extend_from_slice(&(variant.cases.len() as u64).to_le_bytes());
-                    for case in &variant.cases {
-                        text(out, &case.name);
-                        out.push(u8::from(case.is_default));
-                        fields(out, &case.payload);
-                    }
-                }
-                InterfaceItem::Enum(enumeration) => {
-                    out.push(2);
-                    text(out, &enumeration.name);
-                    out.extend_from_slice(&(enumeration.cases.len() as u64).to_le_bytes());
-                    for case in &enumeration.cases {
-                        text(out, &case.name);
-                        out.push(u8::from(case.is_default));
-                    }
-                }
-                InterfaceItem::Query(query) => {
-                    // `@reentrant` changes concurrency semantics, so it is
-                    // identity-bearing when set. It uses a distinct item tag
-                    // so unmarked queries keep their exact pre-existing bytes.
-                    out.push(if query.reentrant { 6 } else { 3 });
-                    operation(out, query);
-                }
-                InterfaceItem::Command(command) => {
-                    out.push(4);
-                    operation(out, command);
-                }
-                InterfaceItem::Events(events) => {
-                    out.push(5);
-                    ty(out, &events.ty);
-                    out.push(match events.delivery {
-                        DeliveryMode::Broadcast => 0,
-                        DeliveryMode::State => 1,
-                    });
+    }
+}
+
+fn type_def(out: &mut Vec<u8>, def: &TypeDef) {
+    match &def.kind {
+        TypeDefKind::Record { fields: values } => {
+            out.push(0);
+            text(out, &def.name);
+            fields(out, values);
+        }
+        TypeDefKind::Variant { cases } => {
+            out.push(1);
+            text(out, &def.name);
+            count(out, cases.len());
+            for case in cases {
+                text(out, &case.name);
+                out.push(u8::from(case.default));
+                fields(out, &case.fields);
+            }
+        }
+        TypeDefKind::Enum { cases } => {
+            out.push(2);
+            text(out, &def.name);
+            count(out, cases.len());
+            for case in cases {
+                text(out, &case.name);
+                out.push(u8::from(case.default));
+            }
+        }
+        TypeDefKind::Flags { flags } => {
+            out.push(7);
+            text(out, &def.name);
+            count(out, flags.len());
+            for flag in flags {
+                text(out, &flag.name);
+            }
+        }
+        TypeDefKind::Resource { methods } => {
+            out.push(8);
+            text(out, &def.name);
+            count(out, methods.len());
+            for method in methods {
+                out.push(match method.kind {
+                    MethodKind::Constructor => 0,
+                    MethodKind::Query => 1,
+                    MethodKind::Command => 2,
+                    MethodKind::StaticQuery => 3,
+                    MethodKind::StaticCommand => 4,
+                });
+                text(out, &method.name);
+                fields(out, &method.params);
+                out.push(u8::from(method.result.is_some()));
+                if let Some(result) = &method.result {
+                    ty(out, result);
                 }
             }
         }
     }
 }
 
-/// SHA-256 identity of one interface and only its reachable wire definitions.
-///
-/// Canonical v2 fixes UTF-8 length-prefixed names, little-endian integers,
-/// declaration-ordered fields/variant cases/operations, and the SDK's named
-/// `bmux_codec` `TypedStable` service encoding (including envelope v1). These rules are part
-/// of the hash domain: changing encoding requires a new canonical version.
-/// Missing or ambiguous references produce no compatibility evidence.
-#[must_use]
-pub fn interface_contract(
-    schema: &Schema,
-    interface: &crate::ast::Interface,
-    imports: &ImportMap,
-) -> Vec<u8> {
-    use sha2::{Digest, Sha256};
-    let mut out =
-        b"bmux.bpdl.interface.sha256.v2\0bmux_codec.typed_stable.v1.envelope.v1\0".to_vec();
-    if interface
-        .capability
-        .as_ref()
-        .is_some_and(|name| !schema.capabilities.iter().any(|cap| cap.name == *name))
-    {
-        return Vec::new();
-    }
-    let mut root = schema.clone();
-    root.plugin.version = 0; // Plugin releases do not version individual interfaces.
-    root.imports.clear();
-    root.capabilities
-        .retain(|cap| interface.capability.as_ref() == Some(&cap.name));
-    let mut selected = interface.clone();
-    selected.items.retain(|item| {
-        matches!(
-            item,
-            InterfaceItem::Query(_) | InterfaceItem::Command(_) | InterfaceItem::Events(_)
-        )
-    });
-    root.interfaces = vec![selected.clone()];
-    schema_bytes(&mut out, &root);
-    let mut closure = WireClosure {
-        imports,
-        seen: std::collections::BTreeSet::new(),
-        definitions: std::collections::BTreeMap::new(),
-    };
-    for item in &selected.items {
-        if closure.item(schema, interface, item).is_none() {
-            return Vec::new();
+/// One package record holding exactly one interface with `items`.
+fn package_record(
+    out: &mut Vec<u8>,
+    package: &str,
+    capability: Option<(&str, &str)>,
+    iface: &Interface,
+    keep_capability: bool,
+    items: &[&Item],
+) {
+    text(out, package);
+    out.extend_from_slice(&0_u32.to_le_bytes()); // plugin releases do not version interfaces
+    count(out, 0); // imports are bound per reachable reference instead
+    match capability {
+        Some((name, id)) => {
+            count(out, 1);
+            text(out, name);
+            text(out, id);
         }
+        None => count(out, 0),
     }
-    for (key, bytes) in closure.definitions {
-        text(&mut out, &key.0);
-        text(&mut out, &key.1);
-        text(&mut out, &key.2);
-        out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        out.extend_from_slice(&bytes);
+    count(out, 1);
+    text(out, &iface.name);
+    out.push(u8::from(iface.version.is_some()));
+    if let Some(version) = iface.version {
+        out.extend_from_slice(&version.to_le_bytes());
     }
-    Sha256::digest(&out).to_vec()
+    let capability = iface.capability.as_ref().filter(|_| keep_capability);
+    out.push(u8::from(capability.is_some()));
+    if let Some(capability) = capability {
+        text(out, capability);
+    }
+    count(out, items.len());
+    for value in items {
+        item(out, value);
+    }
 }
 
 type WireKey = (String, String, String);
 
 struct WireClosure<'a> {
-    imports: &'a ImportMap,
-    seen: std::collections::BTreeSet<WireKey>,
-    definitions: std::collections::BTreeMap<WireKey, Vec<u8>>,
+    set: &'a PackageSet,
+    seen: BTreeSet<WireKey>,
+    definitions: BTreeMap<WireKey, Vec<u8>>,
 }
 
-fn item_name(item: &InterfaceItem) -> Option<&str> {
-    match item {
-        InterfaceItem::Record(value) => Some(&value.name),
-        InterfaceItem::Variant(value) => Some(&value.name),
-        InterfaceItem::Enum(value) => Some(&value.name),
-        _ => None,
+impl<'a> WireClosure<'a> {
+    fn new(set: &'a PackageSet) -> Self {
+        Self {
+            set,
+            seen: BTreeSet::new(),
+            definitions: BTreeMap::new(),
+        }
     }
-}
 
-impl WireClosure<'_> {
-    fn item(
+    fn types(&mut self, package: &'a Package, iface: &'a Interface, value: &Type) -> Option<()> {
+        match value {
+            Type::Ref(target) | Type::Own(target) | Type::Borrow(target) => {
+                self.reference(package, iface, target)
+            }
+            Type::List(inner) | Type::Option(inner) | Type::Stream(inner) | Type::Future(inner) => {
+                self.types(package, iface, inner)
+            }
+            Type::Map(first, second) | Type::Result(first, second) => {
+                self.types(package, iface, first)?;
+                self.types(package, iface, second)
+            }
+            Type::Tuple(items) => {
+                for value in items {
+                    self.types(package, iface, value)?;
+                }
+                Some(())
+            }
+            Type::Primitive(_) | Type::Unit => Some(()),
+        }
+    }
+
+    fn fields(
         &mut self,
-        schema: &Schema,
-        iface: &crate::ast::Interface,
-        item: &InterfaceItem,
+        package: &'a Package,
+        iface: &'a Interface,
+        values: &[Field],
     ) -> Option<()> {
-        let types: Vec<&TypeRef> = match item {
-            InterfaceItem::Record(value) => value.fields.iter().map(|field| &field.ty).collect(),
-            InterfaceItem::Variant(value) => value
-                .cases
-                .iter()
-                .flat_map(|case| case.payload.iter().map(|field| &field.ty))
-                .collect(),
-            InterfaceItem::Enum(_) => vec![],
-            InterfaceItem::Query(value) | InterfaceItem::Command(value) => value
-                .params
-                .iter()
-                .map(|field| &field.ty)
-                .chain(std::iter::once(&value.returns))
-                .chain(value.emits.iter())
-                .collect(),
-            InterfaceItem::Events(value) => vec![&value.ty],
-        };
-        for value in types {
-            self.ty(schema, iface, value)?;
+        for field in values {
+            self.types(package, iface, &field.ty)?;
         }
         Some(())
     }
 
-    fn ty(
+    fn function(
         &mut self,
-        schema: &Schema,
-        iface: &crate::ast::Interface,
-        value: &TypeRef,
+        package: &'a Package,
+        iface: &'a Interface,
+        op: &Function,
     ) -> Option<()> {
+        self.fields(package, iface, &op.params)?;
+        self.types(package, iface, &op.result)?;
+        if let Some(emits) = &op.emits {
+            self.types(package, iface, emits)?;
+        }
+        Some(())
+    }
+
+    fn item(&mut self, package: &'a Package, iface: &'a Interface, value: &Item) -> Option<()> {
         match value {
-            TypeRef::Named(name) => self.named(schema, iface, name),
-            TypeRef::Qualified { alias, name } => {
-                if let Some(import) = schema.imports.iter().find(|import| import.alias == *alias) {
-                    let mut providers = self
-                        .imports
-                        .values()
-                        .filter(|entry| entry.schema.plugin.plugin_id == import.plugin_id);
-                    let imported = &providers.next()?.schema;
-                    if providers.any(|entry| entry.schema != *imported) {
-                        return None;
+            Item::Function(op) => self.function(package, iface, op),
+            Item::Events(events) => self.types(package, iface, &events.ty),
+            Item::Type(def) => match &def.kind {
+                TypeDefKind::Record { fields } => self.fields(package, iface, fields),
+                TypeDefKind::Variant { cases } => {
+                    for case in cases {
+                        self.fields(package, iface, &case.fields)?;
                     }
-                    let mut candidates = imported.interfaces.iter().filter(|iface| {
-                        iface.items.iter().any(|item| item_name(item) == Some(name))
-                    });
-                    let target = candidates.next()?;
-                    if candidates.next().is_some() {
-                        return None;
-                    }
-                    // Bind the alias to its actual plugin, not the Rust import path.
-                    let key = (
-                        schema.plugin.plugin_id.clone(),
-                        format!("import:{alias}"),
-                        name.clone(),
-                    );
-                    self.definitions
-                        .insert(key, import.plugin_id.as_bytes().to_vec());
-                    self.named(imported, target, name)
-                } else {
-                    let mut candidates = schema.interfaces.iter().filter(|iface| {
-                        iface.name == *alias
-                            && iface.items.iter().any(|item| item_name(item) == Some(name))
-                    });
-                    let target = candidates.next()?;
-                    if candidates.next().is_some() {
-                        return None;
-                    }
-                    self.named(schema, target, name)
+                    Some(())
                 }
-            }
-            TypeRef::List(inner) | TypeRef::Option(inner) => self.ty(schema, iface, inner),
-            TypeRef::Map(first, second) | TypeRef::Result(first, second) => {
-                self.ty(schema, iface, first)?;
-                self.ty(schema, iface, second)
-            }
-            TypeRef::Primitive(_) | TypeRef::Unit => Some(()),
+                TypeDefKind::Enum { .. } | TypeDefKind::Flags { .. } => Some(()),
+                TypeDefKind::Resource { methods } => {
+                    for method in methods {
+                        self.fields(package, iface, &method.params)?;
+                        if let Some(result) = &method.result {
+                            self.types(package, iface, result)?;
+                        }
+                    }
+                    Some(())
+                }
+            },
         }
     }
 
-    fn named(&mut self, schema: &Schema, iface: &crate::ast::Interface, name: &str) -> Option<()> {
+    fn reference(
+        &mut self,
+        package: &'a Package,
+        iface: &'a Interface,
+        target: &TypeRef,
+    ) -> Option<()> {
+        if let RefScope::Import(alias) = &target.scope {
+            // Bind the alias to its actual package, not a language import path.
+            let imported = package.import(alias)?;
+            self.definitions.insert(
+                (
+                    package.id.clone(),
+                    format!("import:{alias}"),
+                    target.name.clone(),
+                ),
+                imported.as_bytes().to_vec(),
+            );
+        }
+        let (defining, owner, def) = self.set.resolve(package, iface, target)?;
+        self.named(defining, owner, def)
+    }
+
+    fn named(
+        &mut self,
+        package: &'a Package,
+        iface: &'a Interface,
+        def: &'a TypeDef,
+    ) -> Option<()> {
         let key = (
-            schema.plugin.plugin_id.clone(),
+            package.id.clone(),
             format!(
                 "{}:{}:{}",
                 iface.name,
-                u8::from(iface.interface_version.is_some()),
-                iface.interface_version.unwrap_or(0)
+                u8::from(iface.version.is_some()),
+                iface.version.unwrap_or(0)
             ),
-            name.to_owned(),
+            def.name.clone(),
         );
         if !self.seen.insert(key.clone()) {
             return Some(());
         }
-        let item = iface
-            .items
-            .iter()
-            .find(|item| item_name(item) == Some(name))?;
-        let mut selected = schema.clone();
-        selected.plugin.version = 0;
-        selected.imports.clear();
-        selected.capabilities.clear();
-        let mut target = iface.clone();
-        target.capability = None;
-        target.items = vec![item.clone()];
-        selected.interfaces = vec![target];
+        let value = Item::Type(def.clone());
         let mut bytes = Vec::new();
-        schema_bytes(&mut bytes, &selected);
+        package_record(&mut bytes, &package.id, None, iface, false, &[&value]);
         self.definitions.insert(key, bytes);
-        self.item(schema, iface, item)
+        self.item(package, iface, &value)
     }
+
+    fn finish(self, mut out: Vec<u8>) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        for (key, bytes) in self.definitions {
+            text(&mut out, &key.0);
+            text(&mut out, &key.1);
+            text(&mut out, &key.2);
+            count(&mut out, bytes.len());
+            out.extend_from_slice(&bytes);
+        }
+        Sha256::digest(&out).to_vec()
+    }
+}
+
+/// SHA-256 identity of one interface of `package` and only its reachable
+/// wire definitions, resolving imports through `set`.
+///
+/// Missing or ambiguous references produce no compatibility evidence: the
+/// result is empty rather than a guess.
+#[must_use]
+pub fn interface_identity(set: &PackageSet, package: &Package, iface: &Interface) -> Vec<u8> {
+    let capability = match &iface.capability {
+        Some(name) => match package.capability_id(name) {
+            Some(id) => Some((name.as_str(), id)),
+            None => return Vec::new(),
+        },
+        None => None,
+    };
+    let mut out = INTERFACE_DOMAIN.to_vec();
+    let operations: Vec<&Item> = iface
+        .items
+        .iter()
+        .filter(|value| matches!(value, Item::Function(_) | Item::Events(_)))
+        .collect();
+    package_record(&mut out, &package.id, capability, iface, true, &operations);
+    let mut closure = WireClosure::new(set);
+    for value in operations {
+        if closure.item(package, iface, value).is_none() {
+            return Vec::new();
+        }
+    }
+    closure.finish(out)
+}
+
+/// SHA-256 identity of an extension point: its data record, its interface
+/// operations, and their reachable wire definitions.
+#[must_use]
+pub fn extension_point_identity(
+    set: &PackageSet,
+    package: &Package,
+    point: &ExtensionPoint,
+) -> Vec<u8> {
+    let mut out = EXTENSION_POINT_DOMAIN.to_vec();
+    text(&mut out, &package.id);
+    text(&mut out, &point.name);
+    out.extend_from_slice(&point.version.to_le_bytes());
+    fields(&mut out, &point.data);
+    count(&mut out, point.functions.len());
+    for op in &point.functions {
+        out.push(match op.kind {
+            FunctionKind::Query => 3,
+            FunctionKind::Command => 4,
+        });
+        function(&mut out, op);
+    }
+    // Extension points define no types; references resolve as if made from
+    // an empty interface of the declaring package.
+    let scope = Interface {
+        name: String::new(),
+        version: None,
+        capability: None,
+        docs: Vec::new(),
+        stability: ir::Stability::default(),
+        items: Vec::new(),
+    };
+    let mut closure = WireClosure::new(set);
+    if closure.fields(package, &scope, &point.data).is_none() {
+        return Vec::new();
+    }
+    for op in &point.functions {
+        if closure.function(package, &scope, op).is_none() {
+            return Vec::new();
+        }
+    }
+    closure.finish(out)
+}
+
+/// Lower `schema` and every schema in `imports` into one [`PackageSet`].
+#[must_use]
+pub fn package_set(schema: &Schema, imports: &ImportMap) -> (Package, PackageSet) {
+    let mut set = PackageSet::new();
+    for info in imports.values() {
+        set.insert(ir::lower(&info.schema));
+    }
+    (ir::lower(schema), set)
+}
+
+/// SHA-256 identity of one interface of a parsed schema.
+///
+/// Compatibility entry point for AST-based callers (the Rust generator):
+/// lowers `schema` and `imports` into the IR and delegates to
+/// [`interface_identity`].
+#[must_use]
+pub fn interface_contract(schema: &Schema, iface: &AstInterface, imports: &ImportMap) -> Vec<u8> {
+    let Some(index) = schema
+        .interfaces
+        .iter()
+        .position(|candidate| std::ptr::eq(candidate, iface))
+        .or_else(|| {
+            schema
+                .interfaces
+                .iter()
+                .position(|candidate| candidate == iface)
+        })
+    else {
+        return Vec::new();
+    };
+    let (package, set) = package_set(schema, imports);
+    interface_identity(&set, &package, &package.interfaces[index])
 }
 
 #[cfg(test)]
@@ -375,8 +565,8 @@ mod tests {
         assert_eq!(first, identity(&base.replace("n: string", "n: bool")));
         assert_ne!(first, identity(&base.replace("n: u32", "n: u64")));
         let mut schema = crate::compile(base).unwrap();
-        if let InterfaceItem::Record(record) = &mut schema.interfaces[1].items[0] {
-            record.fields[0].ty = TypeRef::Named("missing".into());
+        if let crate::ast::InterfaceItem::Record(record) = &mut schema.interfaces[1].items[0] {
+            record.fields[0].ty = crate::ast::TypeRef::Named("missing".into());
         } else {
             panic!("expected reachable row record");
         }

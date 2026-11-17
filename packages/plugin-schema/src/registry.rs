@@ -302,6 +302,14 @@ fn format_type(ty: &crate::ast::TypeRef) -> String {
         TypeRef::Map(k, v) => format!("map<{},{}>", format_type(k), format_type(v)),
         TypeRef::Result(a, b) => format!("result<{},{}>", format_type(a), format_type(b)),
         TypeRef::Unit => "unit".to_string(),
+        TypeRef::Tuple(items) => format!(
+            "tuple<{}>",
+            items.iter().map(format_type).collect::<Vec<_>>().join(",")
+        ),
+        TypeRef::Stream(inner) => format!("stream<{}>", format_type(inner)),
+        TypeRef::Future(inner) => format!("future<{}>", format_type(inner)),
+        TypeRef::Own(inner) => format!("own<{}>", format_type(inner)),
+        TypeRef::Borrow(inner) => format!("borrow<{}>", format_type(inner)),
     }
 }
 

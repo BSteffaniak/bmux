@@ -20,6 +20,9 @@
 //!   references are resolved through a caller-provided import table.
 //! - The [`registry`] module: runtime schema registry used by the
 //!   plugin host to check consumer/provider compatibility.
+//! - The [`ir`] module: the language-neutral canonical contract IR every
+//!   backend consumes. [`canonical`] hashes contract identity from it and
+//!   [`wit`] lowers it to WIT.
 //!
 //! # Example schema
 //!
@@ -50,10 +53,12 @@
 pub mod ast;
 pub mod canonical;
 pub mod codegen_rust;
+pub mod ir;
 pub mod lexer;
 pub mod parser;
 pub mod registry;
 pub mod validator;
+pub mod wit;
 
 use std::collections::BTreeMap;
 use std::fmt;

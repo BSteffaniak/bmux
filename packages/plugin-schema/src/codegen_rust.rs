@@ -146,6 +146,8 @@ fn non_eq_type_set(schema: &Schema) -> NonEqTypeSet {
                         }),
                     ),
                     InterfaceItem::Enum(_)
+                    | InterfaceItem::Flags(_)
+                    | InterfaceItem::Resource(_)
                     | InterfaceItem::Query(_)
                     | InterfaceItem::Command(_)
                     | InterfaceItem::Events(_) => continue,
@@ -161,13 +163,22 @@ fn non_eq_type_set(schema: &Schema) -> NonEqTypeSet {
 
 fn type_contains_non_eq(ty: &TypeRef, non_eq_types: &NonEqTypeSet) -> bool {
     match ty {
-        TypeRef::Primitive(Primitive::F32 | Primitive::F64) => true,
+        // Handles and async values have no Rust binding yet; see
+        // [`unsupported_type`].
+        TypeRef::Primitive(Primitive::F32 | Primitive::F64)
+        | TypeRef::Stream(_)
+        | TypeRef::Future(_)
+        | TypeRef::Own(_)
+        | TypeRef::Borrow(_) => true,
         TypeRef::Primitive(_) | TypeRef::Qualified { .. } | TypeRef::Unit => false,
         TypeRef::Named(name) => non_eq_types.contains(name),
         TypeRef::Option(inner) | TypeRef::List(inner) => type_contains_non_eq(inner, non_eq_types),
         TypeRef::Map(key, value) | TypeRef::Result(key, value) => {
             type_contains_non_eq(key, non_eq_types) || type_contains_non_eq(value, non_eq_types)
         }
+        TypeRef::Tuple(items) => items
+            .iter()
+            .any(|item| type_contains_non_eq(item, non_eq_types)),
     }
 }
 
@@ -179,14 +190,8 @@ fn own_type_map(schema: &Schema) -> OwnTypeMap {
             let types = iface
                 .items
                 .iter()
-                .filter_map(|item| match item {
-                    InterfaceItem::Record(r) => Some(r.name.clone()),
-                    InterfaceItem::Variant(v) => Some(v.name.clone()),
-                    InterfaceItem::Enum(e) => Some(e.name.clone()),
-                    InterfaceItem::Query(_)
-                    | InterfaceItem::Command(_)
-                    | InterfaceItem::Events(_) => None,
-                })
+                .filter_map(crate::validator::defined_type_name)
+                .cloned()
                 .collect::<BTreeSet<_>>();
             (iface.name.clone(), types)
         })
@@ -233,6 +238,14 @@ fn emit_interface(
             InterfaceItem::Record(r) => emit_record(r, imports, own_types, non_eq_types, out),
             InterfaceItem::Variant(v) => emit_variant(v, imports, own_types, non_eq_types, out),
             InterfaceItem::Enum(e) => emit_enum(e, out),
+            InterfaceItem::Flags(f) => emit_flags(f, out),
+            InterfaceItem::Resource(r) => {
+                let message = format!(
+                    "BPDL resource `{}` has no Rust binding yet: resource handles need the host handle table",
+                    r.name
+                );
+                let _ = writeln!(out, "    ::core::compile_error!({message:?});");
+            }
             InterfaceItem::Query(_) | InterfaceItem::Command(_) | InterfaceItem::Events(_) => {}
         }
     }
@@ -278,6 +291,7 @@ fn emit_record(
     let name = pascal_case(&r.name);
     let secret = r.fields.iter().any(|field| field.secret);
     let debug = if secret { "" } else { "Debug, " };
+    emit_docs(&r.docs, "    ", out);
     if non_eq_types.contains(&r.name) {
         let _ = writeln!(
             out,
@@ -305,6 +319,7 @@ fn emit_record(
         if let Some(adapter) = serde_bytes_adapter(&f.ty) {
             let _ = writeln!(out, "        #[serde(with = \"{adapter}\")]");
         }
+        emit_docs(&f.docs, "        ", out);
         let _ = writeln!(out, "        pub {field_name}: {ty},");
     }
     out.push_str("    }\n\n");
@@ -323,8 +338,91 @@ fn type_has_default(ty: &crate::ast::TypeRef) -> bool {
     use crate::ast::TypeRef;
     match ty {
         TypeRef::Primitive(_) | TypeRef::List(_) | TypeRef::Map(_, _) | TypeRef::Option(_) => true,
-        TypeRef::Named(_) | TypeRef::Qualified { .. } | TypeRef::Result(_, _) | TypeRef::Unit => {
-            false
+        TypeRef::Named(_)
+        | TypeRef::Qualified { .. }
+        | TypeRef::Result(_, _)
+        | TypeRef::Unit
+        | TypeRef::Tuple(_)
+        | TypeRef::Stream(_)
+        | TypeRef::Future(_)
+        | TypeRef::Own(_)
+        | TypeRef::Borrow(_) => false,
+    }
+}
+
+/// Emit a `flags` type as a transparent `u64` bit set: flag `i` is bit `i`
+/// in declaration order, so the wire form is one integer.
+fn emit_flags(flags: &crate::ast::FlagsDef, out: &mut String) {
+    let name = pascal_case(&flags.name);
+    emit_docs(&flags.docs, "    ", out);
+    out.push_str("    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, ::serde::Serialize, ::serde::Deserialize)]
+");
+    out.push_str(
+        "    #[serde(transparent)]
+",
+    );
+    let _ = writeln!(
+        out,
+        "    pub struct {name}(u64);
+"
+    );
+    let _ = writeln!(out, "    impl {name} {{");
+    for (bit, flag) in flags.flags.iter().enumerate() {
+        emit_docs(&flag.docs, "        ", out);
+        let _ = writeln!(
+            out,
+            "        pub const {}: Self = Self(1 << {bit});",
+            snake_case(&flag.name).to_uppercase()
+        );
+    }
+    let all = flags
+        .flags
+        .iter()
+        .map(|flag| format!("Self::{}.0", snake_case(&flag.name).to_uppercase()))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    out.push_str(
+        "        /// No flags set.
+        #[must_use] pub const fn empty() -> Self { Self(0) }
+",
+    );
+    let _ = writeln!(
+        out,
+        "        /// Every declared flag.
+        #[must_use] pub const fn all() -> Self {{ Self({all}) }}"
+    );
+    out.push_str(
+        "        /// Raw bits; undeclared bits are never set by these constructors.
+        #[must_use] pub const fn bits(self) -> u64 { self.0 }
+",
+    );
+    out.push_str("        /// Keep only declared flags from raw bits.
+        #[must_use] pub const fn from_bits_truncate(bits: u64) -> Self { Self(bits & Self::all().0) }
+");
+    out.push_str(
+        "        /// Whether every flag in `other` is set.
+        #[must_use] pub const fn contains(self, other: Self) -> bool { self.0 & other.0 == other.0 }
+",
+    );
+    out.push_str(
+        "        /// Flags set in either value.
+        #[must_use] pub const fn union(self, other: Self) -> Self { Self(self.0 | other.0) }
+",
+    );
+    out.push_str(
+        "    }
+
+",
+    );
+}
+
+/// Emit `///` documentation lines at `indent`.
+fn emit_docs(docs: &[String], indent: &str, out: &mut String) {
+    for line in docs {
+        if line.is_empty() {
+            let _ = writeln!(out, "{indent}///");
+        } else {
+            let _ = writeln!(out, "{indent}/// {line}");
         }
     }
 }
@@ -337,6 +435,7 @@ fn emit_variant(
     out: &mut String,
 ) {
     let name = pascal_case(&v.name);
+    emit_docs(&v.docs, "    ", out);
     if non_eq_types.contains(&v.name) {
         out.push_str(
             "    #[derive(Debug, Clone, PartialEq, ::serde::Serialize, ::serde::Deserialize)]\n",
@@ -373,6 +472,7 @@ fn emit_variant_case(
     out: &mut String,
 ) {
     let case_name = pascal_case(&case.name);
+    emit_docs(&case.docs, "        ", out);
     if case.payload.is_empty() {
         let _ = writeln!(out, "        {case_name},");
     } else {
@@ -391,6 +491,7 @@ fn emit_variant_case(
 
 fn emit_enum(e: &EnumDef, out: &mut String) {
     let name = pascal_case(&e.name);
+    emit_docs(&e.docs, "    ", out);
     out.push_str("    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize)]\n");
     out.push_str("    #[serde(rename_all = \"snake_case\")]\n");
     let _ = writeln!(out, "    pub enum {name} {{");
@@ -548,7 +649,11 @@ fn interface_service_kind(iface: &Interface) -> Option<&'static str> {
             InterfaceItem::Query(_) => kind = Some("Query"),
             InterfaceItem::Command(_) => kind = Some("Command"),
             InterfaceItem::Events(_) => kind = Some("Event"),
-            InterfaceItem::Record(_) | InterfaceItem::Variant(_) | InterfaceItem::Enum(_) => {}
+            InterfaceItem::Record(_)
+            | InterfaceItem::Variant(_)
+            | InterfaceItem::Enum(_)
+            | InterfaceItem::Flags(_)
+            | InterfaceItem::Resource(_) => {}
         }
     }
     kind
@@ -832,6 +937,8 @@ fn emit_transport_client(
             InterfaceItem::Record(_)
             | InterfaceItem::Variant(_)
             | InterfaceItem::Enum(_)
+            | InterfaceItem::Flags(_)
+            | InterfaceItem::Resource(_)
             | InterfaceItem::Events(_) => None,
         })
         .collect::<Vec<_>>();
@@ -1185,6 +1292,7 @@ fn rust_type(ty: &TypeRef, imports: &ImportMap, own_types: &OwnTypeMap) -> Strin
             Primitive::String => "String".to_string(),
             Primitive::Bytes => "Vec<u8>".to_string(),
             Primitive::Uuid => "::uuid::Uuid".to_string(),
+            Primitive::Char => "char".to_string(),
         },
         TypeRef::Named(name) => pascal_case(name),
         TypeRef::Qualified { alias, name } => resolve_qualified(alias, name, imports, own_types),
@@ -1205,7 +1313,37 @@ fn rust_type(ty: &TypeRef, imports: &ImportMap, own_types: &OwnTypeMap) -> Strin
             )
         }
         TypeRef::Unit => "()".to_string(),
+        TypeRef::Tuple(items) => tuple_type(items, |item| rust_type(item, imports, own_types)),
+        TypeRef::Stream(_) | TypeRef::Future(_) | TypeRef::Own(_) | TypeRef::Borrow(_) => {
+            unsupported_type(ty)
+        }
     }
+}
+
+fn tuple_type(items: &[TypeRef], render: impl Fn(&TypeRef) -> String) -> String {
+    let rendered = items.iter().map(render).collect::<Vec<_>>();
+    if rendered.len() == 1 {
+        format!("({},)", rendered[0])
+    } else {
+        format!("({})", rendered.join(", "))
+    }
+}
+
+/// Handles and asynchronous values need the host handle table and stream
+/// transport, which the Rust tier does not provide yet. A `compile_error!`
+/// in type position fails the consuming build with an explicit reason
+/// instead of silently degrading the contract.
+fn unsupported_type(ty: &TypeRef) -> String {
+    let construct = match ty {
+        TypeRef::Stream(_) => "stream<T>",
+        TypeRef::Future(_) => "future<T>",
+        TypeRef::Own(_) => "own<R>",
+        _ => "borrow<R>",
+    };
+    format!(
+        "::core::compile_error!({:?})",
+        format!("BPDL `{construct}` has no Rust binding yet; it lowers to WIT only")
+    )
 }
 
 // Transport functions are nested one module below their interface types.
@@ -1233,7 +1371,15 @@ fn client_rust_type(ty: &TypeRef, imports: &ImportMap, own_types: &OwnTypeMap) -
             client_rust_type(ok, imports, own_types),
             client_rust_type(error, imports, own_types)
         ),
-        TypeRef::Primitive(_) | TypeRef::Unit => rust_type(ty, imports, own_types),
+        TypeRef::Tuple(items) => {
+            tuple_type(items, |item| client_rust_type(item, imports, own_types))
+        }
+        TypeRef::Primitive(_)
+        | TypeRef::Unit
+        | TypeRef::Stream(_)
+        | TypeRef::Future(_)
+        | TypeRef::Own(_)
+        | TypeRef::Borrow(_) => rust_type(ty, imports, own_types),
     }
 }
 
@@ -1279,11 +1425,8 @@ fn resolve_qualified(
     // Locate the interface in the imported schema that defines `name`.
     for iface in &info.schema.interfaces {
         for item in &iface.items {
-            let defined = match item {
-                InterfaceItem::Record(r) => &r.name,
-                InterfaceItem::Variant(v) => &v.name,
-                InterfaceItem::Enum(e) => &e.name,
-                _ => continue,
+            let Some(defined) = crate::validator::defined_type_name(item) else {
+                continue;
             };
             if defined == name {
                 return format!(
