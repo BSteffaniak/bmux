@@ -22,6 +22,7 @@ use bmux_pane_runtime_plugin_api::{
     pane_runtime_events::{self, PaneEvent},
     pane_runtime_focus::{self, SessionFocusStateMap},
 };
+use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use std::collections::BTreeMap;
@@ -55,7 +56,6 @@ mod retired_execution_tests;
 mod contract_tests {
     #[test]
     fn admitted_route_contribution_is_exact_and_matches_boundary_guard() {
-        use bmux_plugin_sdk::RustPlugin;
         let mut registrar = bmux_plugin_sdk::ContributionRegistrar::new();
         super::PaneRuntimePlugin::default()
             .register_contributions(&mut registrar)
@@ -140,7 +140,6 @@ mod contract_tests {
 
     #[test]
     fn source_queries_are_discoverable_without_spawn_commands() {
-        use bmux_plugin_sdk::RustPlugin as _;
         let services = super::PaneRuntimePlugin::provided_services().unwrap();
         let source_services: Vec<_> = services
             .iter()
@@ -244,34 +243,29 @@ mod contract_tests {
     }
 }
 
-bmux_plugin_sdk::define_plugin!(
-    factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| {
-        Ok(std::sync::Arc::new(
-            bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
-                PaneRuntimePlugin::default(),
-                scope.instance,
-            ),
-        )
-            as std::sync::Arc<
-                dyn bmux_plugin_sdk::definition::PluginInstance,
-            >)
-    },
-    metadata =
-        bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<PaneRuntimePlugin>(
-            crate::declaration::PLUGIN_MANIFEST,
-            vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
-        )
-        .expect("embedded foundational declaration must be valid")
-        .metadata,
-);
+bmux_plugin_sdk::plugin!(PaneRuntimePlugin);
 
 #[derive(Default)]
 pub struct PaneRuntimePlugin {
     /// The host handles this instance's activation received.
-    host: runtime::PaneRuntimeHost,
+    host: std::sync::RwLock<runtime::PaneRuntimeHost>,
+}
+
+fn slot_mut<T>(
+    slot: &std::sync::RwLock<T>,
+) -> std::result::Result<std::sync::RwLockWriteGuard<'_, T>, bmux_plugin_sdk::PluginCommandError> {
+    slot.write()
+        .map_err(|_| bmux_plugin_sdk::PluginCommandError::failed("plugin state lock poisoned"))
 }
 
 impl PaneRuntimePlugin {
+    fn host(&self) -> runtime::PaneRuntimeHost {
+        self.host
+            .read()
+            .map(|host| host.clone())
+            .unwrap_or_default()
+    }
+
     /// Services the generated manifest declares. The BPDL world provides the
     /// read-only spawn queries but not the unsupported spawn commands.
     fn provided_services() -> bmux_plugin_sdk::Result<Vec<bmux_plugin_sdk::PluginService>> {
@@ -287,9 +281,21 @@ impl PaneRuntimePlugin {
     }
 }
 
-impl RustPlugin for PaneRuntimePlugin {
-    type Contract = bmux_pane_runtime_plugin_api::Contract;
+impl Plugin for PaneRuntimePlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        d.blocking_activate(Self::activate)
+            .blocking_deactivate(Self::deactivate)
+            .blocking_command("pane-padding-show", Self::run_command)
+            .blocking_command("pane-padding-set", Self::run_command)
+            .blocking_command("pane-padding-configure", Self::run_command)
+            .blocking_command("pane-padding-reset", Self::run_command)
+            .blocking_services(Self::invoke_service, None)
+            .typed_services(Self::register_typed_services)
+            .registrations(Self::register_contributions);
+    }
+}
 
+impl PaneRuntimePlugin {
     fn register_contributions(
         &self,
         registrar: &mut bmux_plugin_sdk::ContributionRegistrar,
@@ -392,15 +398,16 @@ impl RustPlugin for PaneRuntimePlugin {
     }
 
     fn activate(
-        &mut self,
+        &self,
         context: NativeLifecycleContext,
-    ) -> std::result::Result<i32, PluginCommandError> {
+        _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
+    ) -> std::result::Result<(), PluginCommandError> {
         // The host handles this activation received; every runtime, handler
         // and task reaches the host through them.
         let states = bmux_plugin::activation_state_registry(&context);
         let events = bmux_plugin::activation_event_bus(&context);
-        self.host = runtime::PaneRuntimeHost::new(states, events);
-        let host = &self.host;
+        *slot_mut(&self.host)? = runtime::PaneRuntimeHost::new(states, events);
+        let host = &self.host();
         runtime::activate_managed_scope(host);
         application_resurrection::activate(host, &context);
         readiness::activate(host, &context);
@@ -447,14 +454,14 @@ impl RustPlugin for PaneRuntimePlugin {
             .map_err(PluginCommandError::invalid_arguments)?;
         runtime::activate_pane_runtime(host, config, padding_config)
             .map_err(PluginCommandError::failed)?;
-        Ok(bmux_plugin_sdk::EXIT_OK)
+        Ok(())
     }
 
     fn deactivate(
-        &mut self,
+        &self,
         _context: NativeLifecycleContext,
-    ) -> std::result::Result<i32, PluginCommandError> {
-        let host = &self.host;
+    ) -> std::result::Result<(), PluginCommandError> {
+        let host = &self.host();
         if let Some(handle) = host
             .states()
             .get::<runtime::PanePaddingRuntimeHandle>()
@@ -467,19 +474,19 @@ impl RustPlugin for PaneRuntimePlugin {
         if let Ok(service) = host.fact_service().read() {
             service.registry().remove_producer("bmux.pane_runtime");
         }
-        Ok(bmux_plugin_sdk::EXIT_OK)
+        Ok(())
     }
 
     fn run_command(
-        &mut self,
+        &self,
         context: NativeCommandContext,
     ) -> std::result::Result<i32, PluginCommandError> {
-        commands::run(&self.host, &context)?;
+        commands::run(&self.host(), &context)?;
         Ok(bmux_plugin_sdk::EXIT_OK)
     }
 
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
-        handlers::route(&self.host, context)
+        handlers::route(&self.host(), context)
     }
 
     fn register_typed_services(
@@ -525,15 +532,7 @@ mod definition_contract_tests {
         let manifest =
             bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
                 .unwrap();
-        let canonical = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<
-            super::PaneRuntimePlugin,
-        >(
-            crate::declaration::PLUGIN_MANIFEST,
-            vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
-        )
-        .unwrap();
         definition.validate().unwrap();
-        assert_eq!(definition.metadata, canonical.metadata);
         assert_eq!(definition.metadata.plugin_id, manifest.id);
         assert_eq!(definition.metadata.version, manifest.version);
         assert_eq!(definition.metadata.roles, manifest.component_roles);

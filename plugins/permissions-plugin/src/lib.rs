@@ -29,6 +29,7 @@ use bmux_permissions_plugin_api::session_policy_state::{
     HotPathDecisionResponse, HotPathOverrideEntry, SessionPolicyCheckResponse,
 };
 use bmux_plugin::{HostRuntimeApi, ServiceCaller};
+use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{StorageGetRequest, StorageSetRequest};
 use serde::{Deserialize, Serialize};
@@ -160,10 +161,23 @@ impl PermissionsPlugin {
     }
 }
 
-impl RustPlugin for PermissionsPlugin {
-    type Contract = bmux_permissions_plugin_api::Contract;
+impl Plugin for PermissionsPlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        d.blocking_command("permissions", Self::run_command)
+            .blocking_command("hot-path-policy", Self::run_command)
+            .blocking_command("permissions-current", Self::run_command)
+            .blocking_command("grant", Self::run_command)
+            .blocking_command("revoke", Self::run_command)
+            .blocking_command("grant-hot-path-override", Self::run_command)
+            .blocking_command("revoke-hot-path-override", Self::run_command)
+            .blocking_command("list-hot-path-overrides", Self::run_command)
+            .blocking_services(Self::invoke_service, None)
+            .registrations(Self::register_contributions);
+    }
+}
 
-    fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
+impl PermissionsPlugin {
+    fn run_command(&self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         handle_command(&context)?;
         Ok(EXIT_OK)
     }
@@ -1405,30 +1419,15 @@ fn has_flag(arguments: &[String], long_name: &str) -> bool {
     arguments.iter().any(|argument| argument == &long_flag)
 }
 
-bmux_plugin_sdk::define_plugin!(
-    factory = {
+bmux_plugin_sdk::plugin!(
+    PermissionsPlugin,
+    create = {
         let port = Arc::new(std::sync::Mutex::new(()));
-        move |scope: bmux_plugin_sdk::definition::PluginCreateContext| {
-            Ok(Arc::new(
-                bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
-                    PermissionsPlugin::with_mutation_port(Arc::clone(&port)),
-                    scope.instance,
-                ),
-            )
-                as Arc<dyn bmux_plugin_sdk::definition::PluginInstance>)
+        move |_: &bmux_plugin_sdk::definition::PluginCreateContext| {
+            Ok(PermissionsPlugin::with_mutation_port(Arc::clone(&port)))
         }
-    },
-    metadata = permissions_metadata(),
+    }
 );
-
-fn permissions_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
-    bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<PermissionsPlugin>(
-        crate::declaration::PLUGIN_MANIFEST,
-        vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
-    )
-    .expect("embedded permissions declaration must be valid")
-    .metadata
-}
 
 /// Hosts loading multiple artifacts against one authority must inject the same
 /// serialization port rather than each artifact constructing an independent lock.
@@ -1436,18 +1435,12 @@ fn permissions_metadata() -> bmux_plugin_sdk::definition::PluginMetadata {
 pub fn plugin_definition_with_mutation_port(
     port: Arc<std::sync::Mutex<()>>,
 ) -> bmux_plugin_sdk::definition::PluginDefinition {
-    bmux_plugin_sdk::definition::PluginDefinition::new(
-        permissions_metadata(),
-        move |scope: bmux_plugin_sdk::definition::PluginCreateContext| {
-            Ok(Arc::new(
-                bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
-                    PermissionsPlugin::with_mutation_port(Arc::clone(&port)),
-                    scope.instance,
-                ),
-            )
-                as Arc<dyn bmux_plugin_sdk::definition::PluginInstance>)
-        },
+    bmux_plugin_sdk::author::definition::<PermissionsPlugin>(
+        crate::declaration::PLUGIN_MANIFEST,
+        crate::declaration::SERVICE_CONTRACTS,
+        move |_| Ok(PermissionsPlugin::with_mutation_port(Arc::clone(&port))),
     )
+    .expect("embedded permissions declaration must be valid")
 }
 
 #[cfg(test)]
@@ -2716,12 +2709,17 @@ mod tests {
                 )
             },
         ));
-        // Exercise the selected definition instance (the same adapter the
-        // `define_plugin!` factory produces), not the raw RustPlugin body.
-        let plugin = bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
+        // Exercise the selected definition instance (the same instance the
+        // `plugin!` factory produces), not the raw synchronous body.
+        let plugin = bmux_plugin_sdk::author::DeclaredInstance::new(
             PermissionsPlugin::default(),
-            bmux_plugin_sdk::definition::LoadedInstanceId::from_uuid(Uuid::new_v4()),
-        );
+            crate::declaration::PLUGIN_MANIFEST,
+            crate::declaration::SERVICE_CONTRACTS,
+        )
+        .unwrap()
+        .for_instance(bmux_plugin_sdk::definition::LoadedInstanceId::from_uuid(
+            Uuid::new_v4(),
+        ));
         let body = encode_service_message(&GrantRequest {
             session: service_test_session_id().to_string(),
             client_id: Uuid::new_v4().to_string(),
@@ -3296,9 +3294,12 @@ mod definition_contract_tests {
     fn custom_instance_exposes_generated_contracts_without_alias_guessing() {
         use bmux_plugin_sdk::PluginContract;
         use bmux_plugin_sdk::definition::PluginInstance;
-        let plugin = bmux_plugin_sdk::definition::RustPluginAdapter::new(
+        let plugin = bmux_plugin_sdk::author::DeclaredInstance::new(
             super::PermissionsPlugin::default(),
-        );
+            crate::declaration::PLUGIN_MANIFEST,
+            crate::declaration::SERVICE_CONTRACTS,
+        )
+        .unwrap();
         let generated =
             bmux_permissions_plugin_api::Contract::service_contract_for("session-policy-state")
                 .expect("modeled policy query must have a generated contract");
@@ -3320,20 +3321,12 @@ mod definition_contract_tests {
         let manifest =
             bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
                 .unwrap();
-        let canonical = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<
-            super::PermissionsPlugin,
-        >(
-            crate::declaration::PLUGIN_MANIFEST,
-            vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
-        )
-        .unwrap();
         let injected = super::plugin_definition_with_mutation_port(std::sync::Arc::new(
             std::sync::Mutex::new(()),
         ));
         injected.validate().unwrap();
-        assert_eq!(injected.metadata, canonical.metadata);
+        assert_eq!(injected.metadata, definition.metadata);
         definition.validate().unwrap();
-        assert_eq!(definition.metadata, canonical.metadata);
         assert_eq!(definition.metadata.plugin_id, manifest.id);
         assert_eq!(definition.metadata.version, manifest.version);
         assert_eq!(definition.metadata.roles, manifest.component_roles);

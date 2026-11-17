@@ -26,6 +26,7 @@ use bmux_pane_runtime_plugin_api::{
     pane_runtime_state as api_pane_runtime_state,
 };
 use bmux_plugin::{HostRuntimeApi, ServiceCaller, TypedServiceCaller, prompt};
+use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
     LogWriteLevel, LogWriteRequest, PromptPolicy, PromptRequest, PromptResponse, PromptValidation,
@@ -1249,10 +1250,57 @@ pub struct TabsPlugin {
     runtime_state: TabRuntimeStateHandle,
 }
 
-impl RustPlugin for TabsPlugin {
-    type Contract = bmux_tabs_plugin_api::Contract;
+impl Plugin for TabsPlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        d.blocking_activate(Self::activate_with_async)
+            .blocking_command("explain-spawn-directory", Self::run_command)
+            .blocking_command("new-tab", Self::run_command)
+            .blocking_command("rename-tab", Self::run_command)
+            .blocking_command("rename-tab-by-id", Self::run_command)
+            .blocking_command("list-tabs", Self::run_command)
+            .blocking_command("kill-tab", Self::run_command)
+            .blocking_command("kill-all-tabs", Self::run_command)
+            .blocking_command("switch-tab", Self::run_command)
+            .blocking_command("move-tab", Self::run_command)
+            .blocking_command("next-tab", Self::run_command)
+            .blocking_command("prev-tab", Self::run_command)
+            .blocking_command("last-tab", Self::run_command)
+            .blocking_command("goto-tab", Self::run_command)
+            .blocking_command("close-current-tab", Self::run_command)
+            .blocking_command("reset-order", Self::run_command)
+            .blocking_command("focus-pane-in-direction", Self::run_command)
+            .blocking_command("split-pane", Self::run_command)
+            .blocking_command("resize-pane", Self::run_command)
+            .blocking_command("zoom-pane", Self::run_command)
+            .blocking_command("list-floating-panes", Self::run_command)
+            .blocking_command("create-floating-pane", Self::run_command)
+            .blocking_command("focus-floating-pane", Self::run_command)
+            .blocking_command("raise-floating-pane", Self::run_command)
+            .blocking_command("lower-floating-pane", Self::run_command)
+            .blocking_command("focus-next-floating-pane", Self::run_command)
+            .blocking_command("raise-active-floating-pane", Self::run_command)
+            .blocking_command("lower-active-floating-pane", Self::run_command)
+            .blocking_command("close-active-floating-pane", Self::run_command)
+            .blocking_command("move-floating-pane", Self::run_command)
+            .blocking_command("resize-floating-pane", Self::run_command)
+            .blocking_command("move-active-floating-pane", Self::run_command)
+            .blocking_command("resize-active-floating-pane", Self::run_command)
+            .blocking_command("set-floating-pane-z", Self::run_command)
+            .blocking_command("set-floating-pane-layer", Self::run_command)
+            .blocking_command("close-floating-pane", Self::run_command)
+            .blocking_command("close-active-pane", Self::run_command)
+            .blocking_command("restart-pane", Self::run_command)
+            .blocking_services(Self::invoke_service, None)
+            .typed_services(Self::register_typed_services);
+    }
+}
 
-    fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+impl TabsPlugin {
+    fn activate(
+        &self,
+        context: NativeLifecycleContext,
+        _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
+    ) -> std::result::Result<(), PluginCommandError> {
         cwd::CwdSettings::parse(context.settings.as_ref())
             .map_err(PluginCommandError::invalid_arguments)?;
         durable_storage::configure(&context.connection.data_dir)
@@ -1278,7 +1326,7 @@ impl RustPlugin for TabsPlugin {
         // subscribers (decoration, future UI plugins) can wait on
         // `subscribe::<PaneEvent>(...)` without racing the first emit.
         let Some(events) = events else {
-            return Ok(EXIT_OK);
+            return Ok(());
         };
         events.register_channel::<bmux_tabs_plugin_api::tabs_events::PaneEvent>(
             bmux_tabs_plugin_api::tabs_events::EVENT_KIND,
@@ -1299,10 +1347,10 @@ impl RustPlugin for TabsPlugin {
                 revision: 0,
             },
         );
-        Ok(EXIT_OK)
+        Ok(())
     }
 
-    fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
+    fn run_command(&self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         durable_storage::configure(&context.connection.data_dir)
             .map_err(PluginCommandError::failed)?;
         handle_command(self, &context)?;
@@ -1448,11 +1496,14 @@ impl RustPlugin for TabsPlugin {
     }
 
     fn activate_with_async(
-        &mut self,
+        &self,
         context: NativeLifecycleContext,
-        async_handle: bmux_plugin_sdk::HostAsyncHandle,
-    ) -> Result<i32, PluginCommandError> {
-        let result = self.activate(context.clone())?;
+        async_handle: Option<bmux_plugin_sdk::HostAsyncHandle>,
+    ) -> std::result::Result<(), PluginCommandError> {
+        self.activate(context.clone(), None)?;
+        let Some(async_handle) = async_handle else {
+            return Ok(());
+        };
         let shared = TabsSharedState {
             caller: Arc::new(TypedServiceCaller::from_lifecycle_context(&context)),
             settings: context.settings.clone(),
@@ -1510,7 +1561,7 @@ impl RustPlugin for TabsPlugin {
                 }).await.map_err(|error| error.to_string())?;
             }
         }).map_err(PluginCommandError::failed)?;
-        Ok(result)
+        Ok(())
     }
 
     fn register_typed_services(
@@ -4758,25 +4809,7 @@ struct RestartPaneArgs {
     target: Option<Selector>,
 }
 
-bmux_plugin_sdk::define_plugin!(
-    factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| {
-        Ok(std::sync::Arc::new(
-            bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
-                TabsPlugin::default(),
-                scope.instance,
-            ),
-        )
-            as std::sync::Arc<
-                dyn bmux_plugin_sdk::definition::PluginInstance,
-            >)
-    },
-    metadata = bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<TabsPlugin>(
-        crate::declaration::PLUGIN_MANIFEST,
-        vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
-    )
-    .expect("embedded foundational declaration must be valid")
-    .metadata,
-);
+bmux_plugin_sdk::plugin!(TabsPlugin);
 
 // Compile-time guards: ensure the string literals used in `route_service!`
 // and `plugin.toml` stay in sync with the BPDL-declared interface ids.
@@ -7091,7 +7124,7 @@ mod tests {
                     };
                     // Mirror the checked export boundary: resolve the actual
                     // provider contract and accept it before decoding or effects.
-                    let contract = <<TabsPlugin as RustPlugin>::Contract as
+                    let contract = <bmux_tabs_plugin_api::Contract as
                         bmux_plugin_sdk::PluginContract>::service_contract_for(&interface_id)
                         .expect("tabs provider declares the routed interface");
                     let payload = bmux_plugin_sdk::service_contract::decode_for(
@@ -7903,14 +7936,7 @@ mod definition_contract_tests {
         let manifest =
             bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
                 .unwrap();
-        let canonical =
-            bmux_plugin_sdk::definition::PluginDefinition::from_rust_plugin::<super::TabsPlugin>(
-                crate::declaration::PLUGIN_MANIFEST,
-                vec![bmux_plugin_sdk::definition::ComponentRole::Backend],
-            )
-            .unwrap();
         definition.validate().unwrap();
-        assert_eq!(definition.metadata, canonical.metadata);
         assert_eq!(definition.metadata.plugin_id, manifest.id);
         assert_eq!(definition.metadata.version, manifest.version);
         assert_eq!(definition.metadata.roles, manifest.component_roles);

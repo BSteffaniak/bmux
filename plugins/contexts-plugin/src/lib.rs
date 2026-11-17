@@ -508,7 +508,8 @@ impl ContextsPlugin {
         Ok(())
     }
 
-    fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
+    /// Serve one hand-routed service invocation (synchronous body).
+    pub fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         bmux_plugin_sdk::route_service!(context, {
             "contexts-visits-v1", "list-visits" => |_req: (), ctx| {
                 Ok(list_visits_local(&self.events(), ctx, ctx.caller_client_id))
