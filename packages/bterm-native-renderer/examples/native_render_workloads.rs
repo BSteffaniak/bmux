@@ -109,6 +109,7 @@ fn install_local_grids(
             clip: destination,
             fit: ImageFit::Contain,
             lifecycle: ImageLifecycle::Frame,
+            z: 0,
         });
         fragments.push(
             PreparedGridFragment::new(
@@ -177,6 +178,7 @@ fn paint(cx: &mut PaintCx<'_, '_>, case: &str, frame: usize) {
             clip: destination,
             fit: ImageFit::Contain,
             lifecycle: ImageLifecycle::Frame,
+            z: 0,
         }));
     }
 }

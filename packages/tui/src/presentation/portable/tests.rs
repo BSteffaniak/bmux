@@ -96,6 +96,7 @@ fn corrupt_source_boundaries_geometry_and_image_payloads_are_rejected() {
             allocation: None,
             fit: ImageFit::Contain,
             lifecycle: ImageLifecycle::Persistent,
+            z: 0,
         }));
     assert_eq!(
         value.validate(limits()),

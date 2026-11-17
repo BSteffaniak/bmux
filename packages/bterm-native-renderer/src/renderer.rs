@@ -816,6 +816,7 @@ mod tests {
             clip: bmux_tui::geometry::Rect::new(0, 0, 4, 2),
             fit: ImageFit::Contain,
             lifecycle: ImageLifecycle::Frame,
+            z: 0,
         };
         for scale in [0.875_f32, 1.375] {
             let cell = [8.0 * scale, 16.0 * scale];

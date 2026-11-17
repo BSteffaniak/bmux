@@ -668,6 +668,7 @@ impl MirrorFrame {
                     allocation: image.allocation,
                     clip: Rect::new(clip.x, clip.y, clip.width, clip.height),
                     lifecycle: ImageLifecycle::Frame,
+                    z: 0,
                 })
             })
             .collect::<Vec<_>>();

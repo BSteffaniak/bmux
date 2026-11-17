@@ -119,6 +119,7 @@ fn placement(pixels: &PixelBuffer) -> ImagePlacement {
         destination: Rect::new(2, 2, 80, 24),
         clip: Rect::new(0, 0, 100, 40),
         lifecycle: ImageLifecycle::Persistent,
+        z: 0,
     }
 }
 

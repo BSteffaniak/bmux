@@ -672,6 +672,7 @@ impl Component for ImageComponent {
                     destination,
                     clip: destination,
                     lifecycle: bmux_tui::image::ImageLifecycle::Frame,
+                    z: 0,
                 },
             ));
         }

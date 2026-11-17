@@ -57,6 +57,9 @@ pub struct KittyHostState {
     #[cfg(feature = "kitty")]
     frozen_upload: Option<std::sync::Arc<crate::frozen::FrozenImage>>,
     frame_seen: std::collections::HashSet<u64>,
+    /// Layer Kitty places the next images at: negative below the cells' text. Zero by default;
+    /// set for one image with [`KittyHostState::set_placement_layer`].
+    placement_z: i16,
     // Retained resources needed later in this frame, before their paint turn.
     frame_protected: std::collections::HashSet<u64>,
     repair_ids: std::collections::BTreeSet<u32>,
@@ -70,6 +73,11 @@ pub struct KittyHostState {
 }
 
 impl KittyHostState {
+    /// Place the images rendered next at Kitty layer `z` (negative below the cells' text).
+    pub(crate) const fn set_placement_layer(&mut self, z: i16) {
+        self.placement_z = z;
+    }
+
     pub(crate) fn set_cancellation(
         &mut self,
         cancelled: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -614,10 +622,11 @@ impl KittyHostState {
         // placements too, after any upload/deletion commands.
         write!(out, "\x1b[{};{}H", u32::from(y) + 1, u32::from(x) + 1)?;
         out.write_all(b"\x1b_")?;
+        let z = self.placement_z;
         let command = if let Some(crop) = crop {
-            crate::codec::kitty::encode_place_with_crop(host, id, cols, rows, crop)
+            crate::codec::kitty::encode_place_with_crop(host, id, z, cols, rows, crop)
         } else {
-            crate::codec::kitty::encode_place_with_z_and_cells(host, id, 0, cols, rows)
+            crate::codec::kitty::encode_place_with_z_and_cells(host, id, z, cols, rows)
         };
         out.write_all(&command)?;
         out.write_all(b"\x1b\\")

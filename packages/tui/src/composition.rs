@@ -2652,6 +2652,7 @@ mod tests {
                     fit: ImageFit::Stretch,
                     allocation: None,
                     lifecycle: ImageLifecycle::Frame,
+                    z: 0,
                 }));
             }
         }

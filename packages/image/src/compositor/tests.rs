@@ -1129,6 +1129,7 @@ fn frozen_native_png_matches_checked_wire_and_skips_only_warm_scans() {
         clip: Rect::new(0, 0, 100, 100),
         fit: ImageFit::Contain,
         lifecycle: ImageLifecycle::Frame,
+        z: 0,
     };
     let mut checked = KittyHostState::default();
     let mut owned = KittyHostState::default();
@@ -1183,6 +1184,7 @@ fn native_png_warm_placement_scans_content_without_cloning_payload() {
             clip: Rect::new(0, 0, 100, 100),
             fit: ImageFit::Contain,
             lifecycle: ImageLifecycle::Frame,
+            z: 0,
         };
         let mut state = KittyHostState::default();
         state.begin_frame();

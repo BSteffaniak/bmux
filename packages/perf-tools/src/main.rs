@@ -431,6 +431,7 @@ impl bmux_tui_runtime::Presenter<TuiBenchProgram> for TuiBenchPresenter {
                     destination: bmux_tui::geometry::Rect::new(90, 2, 2, 1),
                     clip: area,
                     lifecycle: bmux_tui::image::ImageLifecycle::Frame,
+                    z: 0,
                 },
             ));
             cx.set_cursor(bmux_tui::geometry::Point::new(2, 28), true);

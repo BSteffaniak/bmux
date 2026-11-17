@@ -78,6 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 destination: Rect::new(2, 7, 8, 4),
                 clip: Rect::new(0, 0, 80, 24),
                 lifecycle: ImageLifecycle::Persistent,
+                z: 0,
             }));
         },
         |prepared, _previous| {

@@ -297,6 +297,7 @@ fn image() -> ImagePlacement {
         allocation: None,
         fit: ImageFit::Contain,
         lifecycle: ImageLifecycle::Persistent,
+        z: 0,
     }
 }
 

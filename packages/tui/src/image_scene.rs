@@ -328,6 +328,7 @@ mod tests {
             destination: Rect::new(x, 0, 1, 1),
             clip: Rect::new(0, 0, 80, 24),
             lifecycle,
+            z: 0,
         }
     }
 

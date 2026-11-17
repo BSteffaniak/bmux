@@ -217,6 +217,7 @@ mod harness {
                         fit: ImageFit::Contain,
                         allocation: None,
                         lifecycle: ImageLifecycle::Frame,
+                        z: 0,
                     }));
                 }
             })

@@ -69,12 +69,13 @@ use crate::model::{
 pub fn encode_place_with_crop(
     image_id: u32,
     placement_id: u32,
+    z_index: i16,
     cols: u16,
     rows: u16,
     crop: KittySourceRect,
 ) -> Vec<u8> {
     format!(
-        "Ga=p,i={image_id},p={placement_id},z=0,c={cols},r={rows},q=2,x={},y={},w={},h={}",
+        "Ga=p,i={image_id},p={placement_id},z={z_index},c={cols},r={rows},q=2,x={},y={},w={},h={}",
         crop.x, crop.y, crop.width, crop.height
     )
     .into_bytes()
@@ -541,7 +542,7 @@ mod tests {
             width: 120,
             height: 80,
         };
-        let encoded = encode_place_with_crop(42, 9, 12, 4, crop);
+        let encoded = encode_place_with_crop(42, 9, 0, 12, 4, crop);
         let position = ImagePosition { row: 3, col: 5 };
         let Some(KittyCommand::Place(placement)) = parse_command(&encoded, position) else {
             panic!("expected placement");

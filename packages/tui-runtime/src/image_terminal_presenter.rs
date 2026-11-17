@@ -1911,6 +1911,7 @@ mod tests {
                         destination: Rect::new(0, 0, 1, 1),
                         clip: frame.clip(),
                         lifecycle: ImageLifecycle::Frame,
+                        z: 0,
                     }));
                 }
             };
@@ -1963,6 +1964,7 @@ mod tests {
                 destination: Rect::new(0, 0, 1, 1),
                 clip: frame.clip(),
                 lifecycle: ImageLifecycle::Frame,
+                z: 0,
             }));
         };
         let mut presenter = ImageTerminalPresenter::new(
@@ -2002,6 +2004,7 @@ mod tests {
                 destination: Rect::new(0, 0, 1, 1),
                 clip: frame.clip(),
                 lifecycle: ImageLifecycle::Frame,
+                z: 0,
             }));
         };
         let mut presenter = ImageTerminalPresenter::new(
@@ -2034,6 +2037,7 @@ mod tests {
                 destination: Rect::new(0, 0, 1, 1),
                 clip: frame.clip(),
                 lifecycle: ImageLifecycle::Frame,
+                z: 0,
             }));
         };
         let mut presenter = ImageTerminalPresenter::new(
@@ -2069,6 +2073,7 @@ mod tests {
                 destination: Rect::new(0, 0, 1, 1),
                 clip: frame.clip(),
                 lifecycle: ImageLifecycle::Frame,
+                z: 0,
             }));
         };
         let mut presenter = ImageTerminalPresenter::new(

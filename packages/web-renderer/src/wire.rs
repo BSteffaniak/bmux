@@ -764,6 +764,7 @@ pub fn decode_binary_with_resources(
                     destination: image.destination,
                     clip: image.clip,
                     lifecycle: image.lifecycle,
+                    z: 0,
                 };
                 contributions.push(ImageContribution::Present(placement));
             }

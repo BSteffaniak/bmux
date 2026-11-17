@@ -410,7 +410,8 @@ impl TuiImageCompositor {
                 // Set before writes: even a partial raster sequence needs repair.
                 self.raster_pending = true;
             }
-            render_image_clipped(
+            self.kitty_state.set_placement_layer(placement.z);
+            let rendered = render_image_clipped(
                 out,
                 &image,
                 placement.destination,
@@ -419,7 +420,9 @@ impl TuiImageCompositor {
                 host_caps,
                 &mut self.kitty_state,
                 Some(image.shared()),
-            )?;
+            );
+            self.kitty_state.set_placement_layer(0);
+            rendered?;
             self.trim_sources();
         }
         self.kitty_state.finish_frame(out)?;
@@ -2786,6 +2789,7 @@ mod tests {
             destination,
             clip,
             lifecycle: ImageLifecycle::Frame,
+            z: 0,
         }
     }
 
@@ -2905,6 +2909,48 @@ mod tests {
 
     #[cfg(feature = "kitty")]
     #[test]
+    fn places_each_image_at_its_layer() {
+        let terminal = PaneRect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 10,
+        };
+        let under = ImagePlacement {
+            z: -1,
+            ..placement("under", Rect::new(0, 0, 4, 2), Rect::new(0, 0, 20, 10), 1)
+        };
+        let over = placement("over", Rect::new(8, 0, 4, 2), Rect::new(0, 0, 20, 10), 2);
+        let mut scene = ImageScene::default();
+        scene.reconcile(&[
+            ImageContribution::Present(under),
+            ImageContribution::Present(over),
+        ]);
+        let mut output = Vec::new();
+        TuiImageCompositor::new()
+            .render(
+                &mut output,
+                &scene,
+                terminal,
+                &kitty_caps(),
+                &ImageConfig::default(),
+            )
+            .unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        // Each placement follows the cursor move to its cell.
+        let place_at = |cell: &str| {
+            output
+                .split("\u{1b}[")
+                .find(|command| command.starts_with(&format!("{cell}H\u{1b}_Ga=p")))
+                .unwrap_or_else(|| panic!("no placement at {cell}: {output:?}"))
+        };
+        assert!(place_at("1;1").contains(",z=-1,"), "{output:?}");
+        assert!(place_at("1;9").contains(",z=0,"), "{output:?}");
+    }
+
+    #[cfg(feature = "kitty")]
+    #[test]
     fn clips_right_and_bottom_edges_before_transmission() {
         let mut scene = ImageScene::default();
         scene.reconcile(&[ImageContribution::Present(placement(
@@ -2974,6 +3020,7 @@ mod tests {
             destination: Rect::new(0, 0, 4, 2),
             clip: Rect::new(2, 1, 2, 1),
             lifecycle: ImageLifecycle::Frame,
+            z: 0,
         })]);
         let mut compositor = TuiImageCompositor::new();
         let mut output = Vec::new();
@@ -3369,6 +3416,7 @@ mod tests {
                 destination: Rect::new(0, 0, 1, 1),
                 clip: Rect::new(0, 0, 10, 5),
                 lifecycle: ImageLifecycle::Frame,
+                z: 0,
             })]);
             let mut output = Vec::new();
             let result = TuiImageCompositor::new().render(

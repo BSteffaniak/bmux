@@ -1005,6 +1005,7 @@ fn place_graphic_overlay(
             graphic.cell_rect.h,
         ),
         lifecycle: bmux_tui::image::ImageLifecycle::Frame,
+        z: graphic.z_index,
     });
 }
 

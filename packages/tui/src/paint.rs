@@ -1289,6 +1289,7 @@ mod tests {
             destination: Rect::new(0, 0, 1, 1),
             clip: Rect::new(0, 0, 1, 1),
             lifecycle: ImageLifecycle::Frame,
+            z: 0,
         };
 
         paint.with_child(5, 0, LocalRect::new(0, 0, 1, 1), |paint| {
@@ -1427,6 +1428,7 @@ mod tests {
                 destination: Rect::new(0, 0, 5, 2),
                 clip: Rect::new(0, 0, 5, 2),
                 lifecycle: ImageLifecycle::Frame,
+                z: 0,
             }));
         });
 

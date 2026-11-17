@@ -1625,6 +1625,7 @@ mod tests {
             allocation: None,
             clip: Rect::new(x, 0, 2, 1),
             lifecycle: ImageLifecycle::Frame,
+            z: 0,
         };
         let mut terminal = Terminal::new(Vec::new(), Rect::new(0, 0, 10, 2));
         terminal
@@ -2293,6 +2294,7 @@ mod tests {
                     destination: frame.clip(),
                     clip: frame.clip(),
                     lifecycle: ImageLifecycle::Frame,
+                    z: 0,
                 }));
             })
             .expect("initial frame commits");
@@ -2313,6 +2315,7 @@ mod tests {
                     destination: frame.clip(),
                     clip: frame.clip(),
                     lifecycle: ImageLifecycle::Frame,
+                    z: 0,
                 }));
             },
             |_, _, _| Err(io::Error::other("injected overlay failure")),
@@ -2776,6 +2779,7 @@ mod tests {
             destination: Rect::new(1, 0, 2, 1),
             clip: Rect::new(0, 0, 4, 2),
             lifecycle: ImageLifecycle::Frame,
+            z: 0,
         };
 
         terminal

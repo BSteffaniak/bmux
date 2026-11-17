@@ -374,6 +374,7 @@ fn image_placements_disable_scroll_regions() {
             allocation: None,
             clip: Rect::new(0, 0, 2, 1),
             lifecycle: ImageLifecycle::Frame,
+            z: 0,
         }));
     };
     terminal
@@ -727,6 +728,7 @@ fn an_image_stops_only_the_scroll_it_overlaps() {
             allocation: None,
             clip: Rect::new(half + 1, 2, 2, 1),
             lifecycle: ImageLifecycle::Frame,
+            z: 0,
         }));
     };
     let (screen, expected, applied) = replay_panes((10, 50), (11, 48), image);

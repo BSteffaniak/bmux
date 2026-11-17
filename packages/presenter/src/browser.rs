@@ -1371,6 +1371,7 @@ mod tests {
                     allocation: None,
                     clip: Rect::new(0, 0, 1, 1),
                     lifecycle: ImageLifecycle::Frame,
+                    z: 0,
                 }))
             })
             .unwrap();

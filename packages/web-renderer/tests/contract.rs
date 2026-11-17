@@ -264,6 +264,7 @@ fn image() -> ImagePlacement {
             height: 1,
             format: ImagePixelFormat::Rgba8,
         },
+        z: 0,
     }
 }
 fn first(state: &mut PresentationState) -> BrowserFrame {

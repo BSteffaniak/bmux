@@ -547,6 +547,7 @@ mod audience_tests {
                     fit: ImageFit::Stretch,
                     allocation: None,
                     lifecycle: ImageLifecycle::Frame,
+                    z: 0,
                 }));
             })
             .unwrap();

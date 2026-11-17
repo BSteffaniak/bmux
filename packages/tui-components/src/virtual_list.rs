@@ -2812,6 +2812,7 @@ mod tests {
                     height,
                 ),
                 lifecycle: ImageLifecycle::Frame,
+                z: 0,
             }));
             if let Some(row) = self.cursor_row {
                 cx.set_cursor(Point::new(2, row), true);

@@ -165,6 +165,7 @@ fn image(payload: ImagePayload) -> ImageScene {
         fit: ImageFit::Contain,
         allocation: None,
         lifecycle: ImageLifecycle::Persistent,
+        z: 0,
     })]);
     scene
 }

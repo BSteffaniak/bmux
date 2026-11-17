@@ -2292,6 +2292,13 @@ mod tests {
         );
     }
 
+    /// Whether no image in `scene` shows inside `area`.
+    fn images_clear_of(scene: &ImageScene, area: Rect) -> bool {
+        scene
+            .placements()
+            .all(|image| image.clip.intersection(area).is_empty())
+    }
+
     #[test]
     fn regional_occlusion_preserves_images_and_metadata_outside_coverage_transactionally() {
         use crate::image::{ImageFit, ImageKey, ImageLifecycle, ImagePixelFormat, ImagePlacement};
@@ -2311,6 +2318,7 @@ mod tests {
             lifecycle: ImageLifecycle::Frame,
             fit: ImageFit::Stretch,
             allocation: None,
+            z: 0,
         };
         let background = |cx: &mut PaintCx<'_, '_>| {
             cx.push_image(ImageContribution::Present(source.clone()));
@@ -2333,12 +2341,7 @@ mod tests {
             .unwrap();
         assert!(matches!(prepared.damage(), Damage::Regions(_)));
         assert_eq!(prepared.cursor(), initial_cursor);
-        assert!(
-            prepared
-                .image_scene()
-                .placements()
-                .all(|image| image.clip.intersection(popup).is_empty())
-        );
+        assert!(images_clear_of(prepared.image_scene(), popup));
         assert!(
             prepared
                 .semantics()
@@ -2370,12 +2373,7 @@ mod tests {
                 |_, _| Ok::<_, ()>(()),
             )
             .unwrap();
-        assert!(
-            state
-                .image_scene()
-                .placements()
-                .all(|image| image.clip.intersection(popup).is_empty())
-        );
+        assert!(images_clear_of(state.image_scene(), popup));
         assert_eq!(state.cursor(), initial_cursor);
         // Moving an overlay repaints both the old exposed footprint and new coverage.
         let moved = Rect::new(7, 2, 4, 2);
@@ -2389,12 +2387,7 @@ mod tests {
                 |_, _| Ok::<_, ()>(()),
             )
             .unwrap();
-        assert!(
-            state
-                .image_scene()
-                .placements()
-                .all(|image| image.clip.intersection(moved).is_empty())
-        );
+        assert!(images_clear_of(state.image_scene(), moved));
         assert!(state.hits().hit_test(Point::new(4, 1)).is_some());
         assert!(state.hits().hit_test(Point::new(8, 2)).is_none());
     }
@@ -2415,6 +2408,7 @@ mod tests {
             lifecycle: ImageLifecycle::Persistent,
             fit: ImageFit::Stretch,
             allocation: None,
+            z: 0,
         };
         let mut state = PresentationState::new(Rect::new(0, 0, 8, 4));
         state

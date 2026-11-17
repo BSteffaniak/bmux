@@ -339,6 +339,7 @@ mod tests {
             clip: Rect::new(0, 0, 2, 2),
             fit: ImageFit::Contain,
             lifecycle: ImageLifecycle::Frame,
+            z: 0,
         };
         let with_image = fragment
             .clone()

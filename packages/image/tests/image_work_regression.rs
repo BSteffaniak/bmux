@@ -316,6 +316,7 @@ fn tui_scene_warm_movement_hide_reveal_replacement_and_cleanup() {
         destination: Rect::new(2, 1, 5, 3),
         clip: Rect::new(0, 0, 80, 24),
         lifecycle: ImageLifecycle::Persistent,
+        z: 0,
     };
     let mut scene = ImageScene::default();
     let mut compositor = TuiImageCompositor::new();

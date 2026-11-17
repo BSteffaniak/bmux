@@ -196,6 +196,10 @@ pub struct ImagePlacement {
     pub clip: Rect,
     /// Requested frame-to-frame lifetime.
     pub lifecycle: ImageLifecycle,
+    /// Layer relative to the cells' text: negative draws below the text where the host layers
+    /// images (Kitty graphics), zero and above draw over it. Missing wire fields are zero.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub z: i16,
 }
 
 /// One image lifecycle contribution emitted while rendering a frame.
@@ -228,6 +232,7 @@ mod tests {
             destination: Rect::new(0, 0, 40, 12),
             clip: Rect::new(0, 0, 40, 12),
             lifecycle: ImageLifecycle::Frame,
+            z: 0,
         };
         let contained = placement.pixel_rect(8.0, 16.0);
         assert!((contained.width - contained.height).abs() < 1e-10);
@@ -252,6 +257,7 @@ mod tests {
             destination: Rect::new(0, 0, 40, 12),
             clip: Rect::new(0, 0, 40, 12),
             lifecycle: ImageLifecycle::Frame,
+            z: 0,
         };
         for (width, height) in [(100, 100), (1100, 350), (100, 800)] {
             placement.payload = ImagePayload::Png {
@@ -302,6 +308,7 @@ mod tests {
             destination: Rect::new(4, 6, 40, 10),
             clip: Rect::new(0, 2, 80, 20),
             lifecycle: ImageLifecycle::Frame,
+            z: 0,
         });
 
         let ImageContribution::Present(placement) = contribution else {

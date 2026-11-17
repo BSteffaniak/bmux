@@ -759,6 +759,7 @@ pub(super) fn fragments(view: &AttachViewState) -> anyhow::Result<Vec<PreparedGr
                         allocation: None,
                         clip: destination,
                         lifecycle: ImageLifecycle::Persistent,
+                        z: 0,
                     }));
                 }
                 fragment
@@ -878,6 +879,7 @@ fn history_images(
                 allocation: None,
                 clip: destination,
                 lifecycle: ImageLifecycle::Persistent,
+                z: 0,
             }));
         }
         fragment

@@ -145,6 +145,7 @@ pub fn visible_image_strips(
             destination,
             clip: rect,
             lifecycle: ImageLifecycle::Frame,
+            z: 0,
         })
         .collect())
 }
