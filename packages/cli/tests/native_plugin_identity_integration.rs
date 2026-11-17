@@ -41,6 +41,20 @@ fn workspace_root() -> PathBuf {
 /// sources absolutely while the workspace spells its members relatively, so
 /// sharing one directory lets either build reuse or overwrite the other's
 /// artifacts and mixes two copies of one crate (e.g. `bmux_tui`) in a graph.
+/// Append `--cfg bmux_plugin_dylib` to the inherited flags, as the packager does.
+fn dynamic_mode_rustflags() -> String {
+    let mut flags: Vec<String> = match std::env::var("CARGO_ENCODED_RUSTFLAGS") {
+        Ok(encoded) if !encoded.is_empty() => encoded.split('\x1f').map(str::to_owned).collect(),
+        _ => std::env::var("RUSTFLAGS")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect(),
+    };
+    flags.extend(["--cfg".to_owned(), "bmux_plugin_dylib".to_owned()]);
+    flags.join("\x1f")
+}
+
 fn build_example_cdylib() -> PathBuf {
     let root = workspace_root();
     let profile_dir = support::bmux_binary()
@@ -100,6 +114,8 @@ fn build_example_cdylib() -> PathBuf {
         .arg(wrapper.join("Cargo.toml"))
         .arg("--target-dir")
         .arg(&wrapper_target_dir)
+        // Dynamic mode is a cfg the packager sets for wrapper builds, never a feature.
+        .env("CARGO_ENCODED_RUSTFLAGS", dynamic_mode_rustflags())
         .stderr(Stdio::inherit());
     if release {
         build.arg("--release");
