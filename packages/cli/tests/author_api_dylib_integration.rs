@@ -2,13 +2,16 @@
 //!
 //! Packages `examples/counter-plugin` (a provider written against the
 //! BPDL-generated traits) and `examples/watcher-plugin` (a consumer using the
-//! generated clients) as dynamic libraries, loads both into one isolated
+//! generated clients) as dynamic libraries straight from their own crates (no
+//! wrapper), loads both into one isolated
 //! server, and checks that the watcher's typed calls reach the counter through
 //! the host's checked codec. The same contract runs bundled in
 //! `examples/watcher-plugin/tests/both_modes.rs`.
 #![cfg(unix)]
 #[allow(dead_code)] // Reuse isolated paths and binary selection only.
 mod support;
+#[path = "support/packaging.rs"]
+mod packaging;
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -27,113 +30,13 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Append `--cfg bmux_plugin_dylib` to the inherited flags, as the packager does.
-fn dynamic_mode_rustflags() -> String {
-    let mut flags: Vec<String> = match std::env::var("CARGO_ENCODED_RUSTFLAGS") {
-        Ok(encoded) if !encoded.is_empty() => encoded.split('\x1f').map(str::to_owned).collect(),
-        _ => std::env::var("RUSTFLAGS")
-            .unwrap_or_default()
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect(),
-    };
-    flags.extend(["--cfg".to_owned(), "bmux_plugin_dylib".to_owned()]);
-    flags.join("\x1f")
-}
-
-/// Generate and build the dynamic wrapper of one example with the shared
-/// packager, using the profile of the `bmux` binary under test.
+/// Package one example crate as a dylib: the crate exports its own entry
+/// (`plugin!` + `dynamic-backend`); no wrapper crate is generated.
 fn build_cdylib(example: &str) -> PathBuf {
-    let root = workspace_root();
-    let profile_dir = support::bmux_binary()
-        .parent()
-        .expect("bmux binary directory")
-        .to_path_buf();
-    let target_dir = profile_dir.parent().expect("cargo target directory");
-    let release = profile_dir
-        .file_name()
-        .is_some_and(|name| name == "release");
-    let wrapper = target_dir.join(format!("plugin-packaging/author-api-{example}/backend"));
-    let wrapper_target_dir = target_dir.join("plugin-packaging/wrapper-target");
-    if wrapper.exists() {
-        std::fs::remove_dir_all(&wrapper).expect("remove previous generated wrapper");
-    }
-    let generate = Command::new("python3")
-        .current_dir(&root)
-        .arg("-B")
-        .arg("scripts/package-plugin.py")
-        .arg("--implementation-manifest")
-        .arg(format!("examples/{example}/Cargo.toml"))
-        .args([
-            "--sdk-manifest",
-            "packages/plugin-sdk/Cargo.toml",
-            "--component",
-            "backend",
-            "--artifact-id",
-        ])
-        .arg(format!("author-api-{example}"))
-        .arg("--output")
-        .arg(&wrapper)
-        .output()
-        .expect("run shared plugin packaging generator (python3 3.11+ required)");
-    support::assert_success(&generate, "generate dynamic wrapper");
-    std::fs::copy(root.join("Cargo.lock"), wrapper.join("Cargo.lock"))
-        .expect("pin wrapper to the workspace lockfile");
-    let wrapper_package = serde_json::from_str::<serde_json::Value>(
-        &std::fs::read_to_string(wrapper.join("packaging.json")).expect("read packaging.json"),
+    packaging::package_plugin_dylib(
+        &workspace_root().join(format!("examples/{example}/Cargo.toml")),
+        &format!("author-api-{example}"),
     )
-    .expect("parse packaging.json")["wrapper_package"]
-        .as_str()
-        .expect("wrapper package name")
-        .to_owned();
-    let mut build = Command::new(env!("CARGO"));
-    build
-        .current_dir(&root)
-        .args([
-            "build",
-            "--message-format=json-render-diagnostics",
-            "--manifest-path",
-        ])
-        .arg(wrapper.join("Cargo.toml"))
-        .arg("--target-dir")
-        .arg(&wrapper_target_dir)
-        .env("CARGO_ENCODED_RUSTFLAGS", dynamic_mode_rustflags())
-        .stderr(Stdio::inherit());
-    if release {
-        build.arg("--release");
-    }
-    let output = build.output().expect("run cargo build for wrapper");
-    assert!(output.status.success(), "build {example} wrapper failed");
-    let libraries = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|message| {
-            message["reason"] == "compiler-artifact"
-                && message["target"]["name"] == wrapper_package.as_str()
-                && message["target"]["crate_types"]
-                    .as_array()
-                    .is_some_and(|types| types.iter().any(|kind| kind == "cdylib"))
-        })
-        .flat_map(|message| {
-            message["filenames"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|name| name.as_str().map(PathBuf::from))
-                .collect::<Vec<_>>()
-        })
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "dylib" || extension == "so")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        libraries.len(),
-        1,
-        "expected one wrapper library: {libraries:?}"
-    );
-    libraries.into_iter().next().expect("wrapper library")
 }
 
 /// The sidecar packaging publishes: the artifact's embedded manifest, with

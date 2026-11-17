@@ -1,8 +1,8 @@
 //! Real dynamically packaged plugin against a real, fully sandboxed server.
 //!
-//! Packages the export-free `examples/native-plugin` implementation through
-//! the shared generator (`scripts/package-plugin.py`) into a thin `cdylib`
-//! wrapper, loads it into an isolated server through the shared v2 ABI, and
+//! Packages `examples/native-plugin` with the shared packager
+//! (`scripts/package-plugin.py`), which builds the crate itself as a `cdylib`
+//! (no wrapper), loads it into an isolated server through the shared v2 ABI, and
 //! checks that its tab-bar service calls are attributed to `example.native`
 //! (never `bmux.core`): from CLI commands, from `activate`, and from a
 //! background thread that was handed the activation's host services. Also
@@ -11,6 +11,8 @@
 #![cfg(unix)]
 #[allow(dead_code)] // Reuse isolated paths and binary selection only.
 mod support;
+#[path = "support/packaging.rs"]
+mod packaging;
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -29,136 +31,14 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Generate the thin dynamic wrapper for the example with the shared
-/// packaging generator, build it with the same profile as the `bmux` binary
-/// under test, and return the library Cargo reported.
-///
-/// The implementation crate stays an export-free rlib; only the generated
-/// wrapper is a `cdylib`. The wrapper reuses the workspace lockfile so it
-/// links exactly the dependency versions the host was built with. It builds
-/// into a target directory dedicated to generated wrappers, never the
-/// workspace's own: the out-of-tree wrapper workspace spells path crates'
-/// sources absolutely while the workspace spells its members relatively, so
-/// sharing one directory lets either build reuse or overwrite the other's
-/// artifacts and mixes two copies of one crate (e.g. `bmux_tui`) in a graph.
-/// Append `--cfg bmux_plugin_dylib` to the inherited flags, as the packager does.
-fn dynamic_mode_rustflags() -> String {
-    let mut flags: Vec<String> = match std::env::var("CARGO_ENCODED_RUSTFLAGS") {
-        Ok(encoded) if !encoded.is_empty() => encoded.split('\x1f').map(str::to_owned).collect(),
-        _ => std::env::var("RUSTFLAGS")
-            .unwrap_or_default()
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect(),
-    };
-    flags.extend(["--cfg".to_owned(), "bmux_plugin_dylib".to_owned()]);
-    flags.join("\x1f")
-}
-
+/// Package the example as a backend dylib with the shared packager, using the
+/// same profile as the `bmux` binary under test. The example exports its own
+/// entry (`plugin!` + `dynamic-backend`); no wrapper crate is generated.
 fn build_example_cdylib() -> PathBuf {
-    let root = workspace_root();
-    let profile_dir = support::bmux_binary()
-        .parent()
-        .expect("bmux binary directory")
-        .to_path_buf();
-    let target_dir = profile_dir.parent().expect("cargo target directory");
-    let release = profile_dir
-        .file_name()
-        .is_some_and(|name| name == "release");
-    let wrapper = target_dir.join("plugin-packaging/native-plugin-identity/backend");
-    // Shared with other generated wrappers (same source spelling), kept across
-    // runs for incremental builds, and outside the regenerated wrapper.
-    let wrapper_target_dir = target_dir.join("plugin-packaging/wrapper-target");
-    // Regenerate from scratch: the generator refuses to overwrite a
-    // directory it does not own, and stale sources must never be reused.
-    if wrapper.exists() {
-        std::fs::remove_dir_all(&wrapper).expect("remove previous generated wrapper");
-    }
-    let generate = Command::new("python3")
-        .current_dir(&root)
-        .arg("-B")
-        .arg("scripts/package-plugin.py")
-        .args([
-            "--implementation-manifest",
-            "examples/native-plugin/Cargo.toml",
-            "--sdk-manifest",
-            "packages/plugin-sdk/Cargo.toml",
-            "--component",
-            "backend",
-            "--artifact-id",
-            "native-plugin-identity-test",
-            "--output",
-        ])
-        .arg(&wrapper)
-        .output()
-        .expect("run shared plugin packaging generator (python3 3.11+ required)");
-    support::assert_success(&generate, "generate example dynamic wrapper");
-    std::fs::copy(root.join("Cargo.lock"), wrapper.join("Cargo.lock"))
-        .expect("pin wrapper to the workspace lockfile");
-    let wrapper_package = serde_json::from_str::<serde_json::Value>(
-        &std::fs::read_to_string(wrapper.join("packaging.json")).expect("read packaging.json"),
+    packaging::package_plugin_dylib(
+        &workspace_root().join("examples/native-plugin/Cargo.toml"),
+        "native-plugin-identity-test",
     )
-    .expect("parse packaging.json")["wrapper_package"]
-        .as_str()
-        .expect("wrapper package name")
-        .to_owned();
-
-    let mut build = Command::new(env!("CARGO"));
-    build
-        .current_dir(&root)
-        .args([
-            "build",
-            "--message-format=json-render-diagnostics",
-            "--manifest-path",
-        ])
-        .arg(wrapper.join("Cargo.toml"))
-        .arg("--target-dir")
-        .arg(&wrapper_target_dir)
-        // Dynamic mode is a cfg the packager sets for wrapper builds, never a feature.
-        .env("CARGO_ENCODED_RUSTFLAGS", dynamic_mode_rustflags())
-        .stderr(Stdio::inherit());
-    if release {
-        build.arg("--release");
-    }
-    let output = build.output().expect("run cargo build for example wrapper");
-    assert!(
-        output.status.success(),
-        "build example dynamic wrapper failed: {}",
-        output.status
-    );
-    // Cargo reports the emitted library; never guess a platform file name.
-    let libraries = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .filter(|message| {
-            message["reason"] == "compiler-artifact"
-                && message["target"]["name"] == wrapper_package.as_str()
-                && message["target"]["crate_types"]
-                    .as_array()
-                    .is_some_and(|types| types.iter().any(|kind| kind == "cdylib"))
-        })
-        .flat_map(|message| {
-            message["filenames"]
-                .as_array()
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter_map(|name| name.as_str().map(PathBuf::from))
-                .collect::<Vec<_>>()
-        })
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "dylib" || extension == "so")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        libraries.len(),
-        1,
-        "expected one wrapper library: {libraries:?}"
-    );
-    let library = libraries.into_iter().next().expect("wrapper library");
-    assert!(library.is_file(), "missing {}", library.display());
-    library
 }
 
 struct Sandbox {

@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
-"""Generate/build/install thin shared-ABI wrappers; never export from implementations.
+"""Package BMUX plugins as dynamic libraries; inspect and install artifacts.
 
-Python 3.11+. Generation alone does not invoke Cargo. Build output is obtained from
-Cargo JSON, never guessed from target/debug or host operating system suffixes.
+A plugin crate that declares the role features ``dynamic-backend`` /
+``dynamic-frontend`` packages itself: ``plugin!`` exports the entry symbol only
+under ``--cfg bmux_plugin_dylib`` plus the selected role feature, and this
+script builds the crate directly with ``cargo rustc --crate-type cdylib`` in its
+own workspace (its own Cargo.lock and dependency graph, so a git-pinned SDK is
+used exactly as resolved). No wrapper crate is generated.
+
+Crates that do not declare the role features yet (BMUX workspace plugins not
+ported to ``plugin!``) still use the legacy thin wrapper, which requires
+``--sdk-manifest`` and ``--output``.
+
+Python 3.11+. Build output is obtained from Cargo JSON, never guessed from
+target/debug or host operating system suffixes.
 """
 from __future__ import annotations
 
@@ -219,6 +230,107 @@ def build(manifest: Path, release: bool, target: str | None,
     if len(artifacts) != 1:
         raise RuntimeError(f"expected one wrapper library, received {len(artifacts)}")
     return artifacts.pop()
+
+
+ROLE_FEATURE = "dynamic-{}"
+SDK_PACKAGE = "bmux_plugin_sdk"
+
+
+def packages_itself(manifest: dict, role: str) -> bool:
+    """Whether the crate exports its own entry for ``role`` (``plugin!`` + role feature)."""
+    return ROLE_FEATURE.format(role) in manifest.get("features", {})
+
+
+def cargo_metadata(manifest: Path) -> dict:
+    """Resolve the crate's own workspace: its Cargo.lock and dependency graph."""
+    result = subprocess.run(
+        ["cargo", "metadata", "--format-version", "1", "--manifest-path", str(manifest)],
+        check=True, stdout=subprocess.PIPE, text=True)
+    return json.loads(result.stdout)
+
+
+def resolved_package(metadata: dict, manifest: Path) -> dict:
+    for package in metadata["packages"]:
+        if Path(package["manifest_path"]).resolve() == manifest.resolve():
+            return package
+    raise RuntimeError(f"cargo metadata does not list {manifest}")
+
+
+def sdk_source(metadata: dict, package: dict) -> str:
+    """The SDK the crate actually links, as its own lockfile resolved it.
+
+    Path dependencies report ``path+file://...``; git dependencies report the
+    exact ``git+...#<commit>``; registry dependencies their registry. Nothing
+    is substituted: the artifact speaks the ABI of this SDK.
+    """
+    nodes = {node["id"]: node for node in metadata.get("resolve", {}).get("nodes", [])}
+    packages = {candidate["id"]: candidate for candidate in metadata["packages"]}
+    node = nodes.get(package["id"])
+    if node is None:
+        raise RuntimeError(f"no resolved dependency graph for {package['name']}")
+    for dependency in node["deps"]:
+        candidate = packages.get(dependency["pkg"])
+        if candidate and candidate["name"] == SDK_PACKAGE:
+            return candidate.get("source") or f"path+file://{Path(candidate['manifest_path']).parent}"
+    raise RuntimeError(f"{package['name']} does not depend on {SDK_PACKAGE}; it cannot export a plugin entry")
+
+
+def direct_target_dir(metadata: dict, cargo_target_dir: Path | None) -> Path:
+    """A target directory for dylib builds only.
+
+    The cfg changes every crate's compiler flags, so sharing the workspace's
+    own target directory would rebuild everything back and forth.
+    """
+    return (cargo_target_dir or Path(metadata["target_directory"]) / "plugin-dylib").resolve()
+
+
+def build_direct(implementation: Path, role: str, features: list[str], release: bool,
+                 target: str | None, cargo_target_dir: Path | None, artifact_id: str,
+                 locked: bool = False) -> tuple[Path, dict]:
+    """Build the crate itself as a cdylib for one role; return the library and provenance."""
+    manifest = tomllib.loads(implementation.read_text())
+    if not packages_itself(manifest, role):
+        raise ValueError(f"{implementation} does not declare the {ROLE_FEATURE.format(role)!r} feature")
+    metadata = cargo_metadata(implementation)
+    package = resolved_package(metadata, implementation)
+    sdk = sdk_source(metadata, package)
+    selected = component_features(manifest, role, features)
+    selected = list(dict.fromkeys([*selected, ROLE_FEATURE.format(role)]))
+    target_dir = direct_target_dir(metadata, cargo_target_dir)
+    command = ["cargo", "rustc", "--manifest-path", str(implementation),
+               "--package", package["name"], "--lib", "--crate-type", "cdylib",
+               "--no-default-features", "--features", ",".join(selected),
+               "--target-dir", str(target_dir), "--message-format=json-render-diagnostics"]
+    if release:
+        command.append("--release")
+    if target:
+        command.extend(["--target", target])
+    if locked:
+        command.append("--locked")
+    environment = dynamic_mode_environment()
+    environment["BMUX_PLUGIN_ARTIFACT_ID"] = artifact_id
+    artifacts = set()
+    with subprocess.Popen(command, stdout=subprocess.PIPE, text=True, env=environment) as process:
+        assert process.stdout is not None
+        for line in process.stdout:
+            message = json.loads(line)
+            if message.get("reason") == "compiler-message":
+                rendered = message.get("message", {}).get("rendered")
+                if rendered:
+                    print(rendered, end="", file=sys.stderr)
+            if (message.get("reason") == "compiler-artifact"
+                    and message.get("package_id") == package["id"]
+                    and "cdylib" in message.get("target", {}).get("crate_types", [])):
+                artifacts.update(Path(name) for name in message["filenames"]
+                                 if Path(name).suffix in {".so", ".dylib", ".dll"})
+        if process.wait() != 0:
+            raise RuntimeError("plugin build failed; nothing installed")
+    if len(artifacts) != 1:
+        raise RuntimeError(f"expected one plugin library, received {len(artifacts)}")
+    provenance = {"package": package["name"], "version": package["version"],
+                  "component": role, "features": selected, "sdk_source": sdk,
+                  "artifact_id": artifact_id}
+    return artifacts.pop(), provenance
 
 
 def sync_directory(path: Path) -> None:
@@ -446,8 +558,10 @@ def packaging_owner(output: Path):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--implementation-manifest", type=Path)
-    parser.add_argument("--sdk-manifest", type=Path)
-    parser.add_argument("--output", type=Path)
+    parser.add_argument("--sdk-manifest", type=Path,
+                        help="legacy wrapper only: the SDK a generated wrapper links")
+    parser.add_argument("--output", type=Path,
+                        help="legacy wrapper: generated package directory; direct builds: provenance receipt directory")
     parser.add_argument("--discover-root", type=Path, help="hash-verified inventory only; never loads native code")
     parser.add_argument("--declaration-of", type=Path, metavar="LIBRARY",
                         help="print the sidecar plugin.toml a built artifact publishes (its embedded manifest)")
@@ -461,6 +575,8 @@ def main() -> None:
                         help="target directory dedicated to generated wrappers; defaults to <output>/target, never the inherited CARGO_TARGET_DIR")
     parser.add_argument("--install-root", type=Path,
                         help="publish the artifact with its embedded generated manifest as plugin.toml")
+    parser.add_argument("--locked", action="store_true",
+                        help="direct builds: require the crate's Cargo.lock to be up to date")
     args = parser.parse_args()
     if args.declaration_of:
         print(declaration_of(args.declaration_of.resolve()), end="")
@@ -470,16 +586,38 @@ def main() -> None:
             parser.error("discovery cannot build or install")
         print(json.dumps(discover(args.discover_root.resolve()), indent=2))
         return
-    if not all((args.implementation_manifest, args.sdk_manifest, args.output)):
-        parser.error("generation requires --implementation-manifest, --sdk-manifest and --output")
+    if not args.implementation_manifest:
+        parser.error("packaging requires --implementation-manifest")
     if args.cargo_target_dir and not args.build:
         parser.error("--cargo-target-dir requires --build")
     if args.install_root and not args.build:
         parser.error("--install-root requires --build")
-    output = args.output.resolve()
     artifact_id = args.artifact_id or str(uuid.uuid4())
+    implementation = args.implementation_manifest.resolve()
+    if packages_itself(tomllib.loads(implementation.read_text()), args.component):
+        if args.sdk_manifest:
+            parser.error("--sdk-manifest selects a legacy wrapper's SDK; a crate that packages "
+                         "itself links the SDK its own dependency graph resolves")
+        if not args.build:
+            parser.error("a crate that packages itself has nothing to generate; add --build")
+        library, provenance = build_direct(implementation, args.component, args.feature,
+                                           args.release, args.target, args.cargo_target_dir,
+                                           artifact_id, args.locked)
+        if args.output:
+            output = args.output.resolve()
+            output.mkdir(parents=True, exist_ok=True)
+            (output / "packaging.json").write_text(json.dumps(
+                {"schema_version": 2, **provenance, "library": str(library)}, indent=2) + "\n")
+        print(library)
+        if args.install_root:
+            print(install(library, args.install_root.resolve(), args.component, artifact_id))
+        return
+    if not all((args.sdk_manifest, args.output)):
+        parser.error("legacy wrapper packaging requires --sdk-manifest and --output "
+                     f"(or declare the {ROLE_FEATURE.format(args.component)!r} feature and use plugin!)")
+    output = args.output.resolve()
     with packaging_owner(output):
-        manifest = generate(args.implementation_manifest.resolve(), args.sdk_manifest.resolve(),
+        manifest = generate(implementation, args.sdk_manifest.resolve(),
                             output, args.component, args.feature, artifact_id)
         print(manifest)
         if args.build:

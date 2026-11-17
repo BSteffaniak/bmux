@@ -1,14 +1,16 @@
 # Plugin author API: `Plugin`, `Declarations` and `plugin!`
 
-Design note for Wave 2 of the shared plugin architecture. It describes how
-the single `Plugin` trait, the `Declarations` builder and the `plugin!` macro
-consume the bindings BPDL already generates, how the bundled fast path and
-the dylib path differ, and how a plugin crate builds its own dynamic library
-without a generated wrapper crate.
+The author API of the shared plugin architecture: how the single `Plugin`
+trait, the `Declarations` builder and the `plugin!` macro consume the
+bindings BPDL generates, how the bundled fast path and the dylib path
+differ, and how a plugin crate builds its own dynamic library without a
+generated wrapper crate.
 
-The generated layer described in the first section exists today and is
-proven by `examples/counter-plugin` (provider) and `examples/watcher-plugin`
-(consumer). The rest is the Wave 2 design that builds on it.
+All of it is implemented (`bmux_plugin_sdk::author`,
+`scripts/package-plugin.py`)
+and proven by `examples/hello-plugin`, `examples/counter-plugin` (provider),
+`examples/watcher-plugin` (consumer) and `examples/native-plugin`. BMUX's own
+workspace plugins move to it in Wave 2.
 
 ## What BPDL generates today
 
@@ -19,16 +21,18 @@ For every service interface that has a capability, the interface module
 (`counter_commands`) gains a module `v<N>` (`N` = `@interface-version`, else
 1):
 
-| Item                                       | Purpose                                                                                                                                                                                                                  |
-| ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `trait CounterCommands`                    | Async provider trait. Methods take `&author::Call` and return `author::Result<T>`. Every method is `where Self: Sized`, so authors write plain `async fn` and `dyn CounterCommands` stays a valid type for declarations. |
-| `Client<T = PluginHostServices>`           | Typed client. `Client::direct(..)`/`from_handle(..)` calls a bundled provider with no serialization; `Client::remote(transport)` uses any `TypedDispatchClient` through the checked codec.                               |
-| `dispatch(provider, call, context)`        | Serves one `PluginInstance::invoke` call: accepts checked and plain frames, maps provider failures to error responses.                                                                                                   |
-| `Portable<P>`                              | `PortableServiceProvider` over a provider: the checked byte adapter for dylib and cross-process callers (streams included).                                                                                              |
-| `register(provider, base, registry)`       | Registers the direct `Arc<dyn Erased>` and the portable adapter in a `TypedServiceRegistry`. Calls without host context run with `base`, the provider-bound `Call`.                                                      |
-| `impl Provides<P> for dyn CounterCommands` | Type-level proof that `P` implements the interface; carries `dispatch`, `register` and `portable` as associated functions.                                                                                               |
-| `impl RequiredInterface for Client<T>`     | Type-level marker for consumed interfaces.                                                                                                                                                                               |
-| `impl ContractEvent for Changed`           | An `events` payload bound to its channel (`STATE_KIND`/`EVENT_KIND`) and delivery, so `cx.emit(Changed { .. })` is typed.                                                                                                |
+| Item                                                | Purpose                                                                                                                                                                                                                  |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `trait CounterCommands`                             | Async provider trait. Methods take `&author::Call` and return `author::Result<T>`. Every method is `where Self: Sized`, so authors write plain `async fn` and `dyn CounterCommands` stays a valid type for declarations. |
+| `Client<T = PluginHostServices>`                    | Typed client. `Client::direct(..)`/`from_handle(..)` calls a bundled provider with no serialization; `Client::remote(transport)` uses any `TypedDispatchClient` through the checked codec.                               |
+| `dispatch(provider, call, context)`                 | Serves one `PluginInstance::invoke` call: accepts checked and plain frames, maps provider failures to error responses.                                                                                                   |
+| `dispatch_streaming(provider, call, context)`       | Serves one `PluginInstance::invoke_streaming` call: ordered event frames into the invocation's sink, then the single terminal response.                                                                                  |
+| `impl ServiceClient for Client<PluginHostServices>` | Lets `Activation::service::<Client>()` connect a declared requirement through the host.                                                                                                                                  |
+| `Portable<P>`                                       | `PortableServiceProvider` over a provider: the checked byte adapter for dylib and cross-process callers (streams included).                                                                                              |
+| `register(provider, base, registry)`                | Registers the direct `Arc<dyn Erased>` and the portable adapter in a `TypedServiceRegistry`. Calls without host context run with `base`, the provider-bound `Call`.                                                      |
+| `impl Provides<P> for dyn CounterCommands`          | Type-level proof that `P` implements the interface; carries `dispatch`, `register` and `portable` as associated functions.                                                                                               |
+| `impl RequiredInterface for Client<T>`              | Type-level marker for consumed interfaces.                                                                                                                                                                               |
+| `impl ContractEvent for Changed`                    | An `events` payload bound to its channel (`STATE_KIND`/`EVENT_KIND`) and delivery, so `cx.emit(Changed { .. })` is typed.                                                                                                |
 
 Package-level declarations generate:
 
@@ -65,64 +69,68 @@ pub trait Plugin: Send + Sync + 'static {
     async fn activate(&self, cx: &mut Activation) -> Result<()> { Ok(()) }
     async fn deactivate(&self, cx: &mut Deactivation) -> Result<()> { Ok(()) }
 }
+
+impl Plugin for Counter {
+    fn declare(d: &mut Declarations<Self>) {
+        d.provide::<dyn counter_commands::v1::CounterCommands>()
+            .provide::<dyn counter_state::v1::CounterState>()
+            .command(BUMP, Self::bump); // async fn bump(&self, &Call, BumpArgs) -> Result<()>
+    }
+}
+bmux_plugin_sdk::plugin!(Counter);
 ```
 
 `Declarations<P>` stores type-erased entries built from the generated
-markers. Nothing in it is product specific.
+markers; nothing in it is product specific:
 
-```rust
-impl<P: Plugin> Declarations<P> {
-    /// `I` is a generated `dyn Interface`; fails to compile unless `P: Interface`.
-    pub fn provide<I: ?Sized + Provides<P>>(&mut self) -> &mut Self {
-        self.provided.push(Provided {
-            descriptor: I::DESCRIPTOR,
-            dispatch: <I as Provides<P>>::dispatch,
-            register: <I as Provides<P>>::register,
-            portable: <I as Provides<P>>::portable,
-        });
-        self
-    }
-    pub fn require<C: RequiredInterface>(&mut self) -> &mut Self;
-    pub fn command<A: CommandArgs>(&mut self, decl: CommandDecl<A>, handler: CommandHandler<P, A>) -> &mut Self;
-    /// One contribution: declarative data plus the behavior implementation.
-    pub fn extend<E: Extends<P>>(&mut self, data: E::Data) -> &mut Self;
-    pub fn extend_with<E: Extends<B>, B: 'static>(&mut self, data: E::Data, behavior: fn(&P) -> &B) -> &mut Self;
-}
-```
+| Method                          | Entry                                                                                                                                     |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `provide::<dyn I>()`            | `I::DESCRIPTOR` plus the generated `dispatch`, `dispatch_streaming`, `register` and `portable` functions. Does not compile unless `P: I`. |
+| `require::<C>()`                | The client's descriptor; `Activation::service::<C>()` refuses undeclared requirements.                                                    |
+| `command(decl, handler)`        | A BPDL command with typed arguments; `handler` is any `async fn(&self, &Call, Args) -> Result<()>`.                                       |
+| `native_command(name, handler)` | A command still declared by hand in `plugin.toml`, handled with the raw `NativeCommandContext` (`native-plugin` uses it).                 |
+| `extend::<E>(data)`             | A contribution to extension point `E` with `P` implementing its `Behavior`.                                                               |
+| `on_event(handler)`             | Host events delivered to the plugin.                                                                                                      |
 
-`plugin!` checks declarations against the generated manifest when the
-definition is built: every `provide` must name an interface in
-`declaration::provides`, every `require` one in `requires`, every `command`
-one in `commands`, and nothing the world declares may be missing. Paths make
-most mistakes compile errors already: an author can only spell
+`DeclaredInstance::new` validates the declarations against the generated
+manifest before any instance runs: every interface the world provides with
+generated bindings (`SERVICE_CONTRACTS`) is provided exactly once and nothing
+else, every `require` names a capability the world requires, and the handled
+commands are exactly the manifest's. Paths make most mistakes compile errors
+already: an author can only spell
 `declaration::provides::counter_commands::v1::CounterCommands`, and
 `provide::<dyn I>()` for a type that does not implement `I` does not compile
 (`packages/plugin-schema-macros/tests/ui/fail/undeclared_provider.rs`).
 
+`Activation` gives the plugin id, settings, the lifecycle context, the host
+services, typed clients (`service::<C>()`), activation-owned tasks
+(`spawn`, on the host runtime through plug-rt) and `bind_events` to attach a
+host event bus to every `Call::emit`.
+
 ## `plugin!`
 
-`plug::plugin!(Counter)` (optionally `create = path`) emits
+`bmux_plugin_sdk::plugin!(Counter)` (optionally `create = path` for a
+`fn(&PluginCreateContext) -> Result<Counter>`, and `declaration = path` when
+the generated module is not `crate::declaration`) emits
 `plugin_definition()`:
 
 - metadata = `author::metadata(declaration::PLUGIN_MANIFEST,
   declaration::SERVICE_CONTRACTS)`, so the definition can never disagree with
   its declaration;
-- a factory creating a fresh `P` per host scope and wrapping it in a generic
-  `DeclaredInstance<P>` that implements today's `PluginInstance`:
-  - `invoke` routes by interface id to the stored `dispatch` entry, with a
-    host-built `Call` (invocation, caller, the scope's event emitter);
-  - `register_typed_services` calls each `register` entry with the
-    provider-bound base `Call`;
-  - `portable_services` returns each `portable` adapter;
+- a factory creating a fresh `P` per host scope wrapped in
+  `DeclaredInstance<P>`, a generic implementation of today's
+  `PluginInstance` (the host is unchanged):
+  - `invoke` / `invoke_streaming` route by interface id to the stored
+    `dispatch` / `dispatch_streaming`, with a host-built `Call`;
+  - `register_typed_services` and `portable_services` use the stored
+    `register` / `portable` functions with the provider-bound base `Call`;
   - `command` parses through the stored `CommandDecl` and calls the handler;
   - `extension` dispatches through the stored `Extends` entry;
-  - `activate`/`deactivate` build `Activation`/`Deactivation` from the
-    lifecycle context and call the `Plugin` hooks.
+  - `activate_with_async` / `activate` / `deactivate` call the `Plugin` hooks
+    with `Activation` / `Deactivation`.
 
-The examples hand-write exactly this glue today (`CounterPlugin::invoke`
-routes through `declaration::provides::*::v1::dispatch`). Wave 2 deletes the
-hand-written glue, and later swaps `PluginInstance` for the slim host trait
-without changing author code.
+Later Wave 2 swaps `PluginInstance` for the slim host trait without changing
+author code.
 
 ## Static fast path and dylib
 
@@ -148,10 +156,10 @@ lease checked per call, never a raw reference.
 
 ## Packaging without wrapper crates
 
-Today `scripts/package-plugin.py` generates a thin wrapper crate per dylib.
-The target is no generated crate at all:
+A plugin crate builds its own dynamic library; nothing is generated.
 
-- A plugin crate keeps `[lib] crate-type = ["rlib"]` and adds role features:
+- The crate keeps `[lib] crate-type = ["rlib"]` and declares the role
+  features:
 
   ```toml
   [features]
@@ -160,20 +168,40 @@ The target is no generated crate at all:
   ```
 
 - `plugin!` emits the single C entry symbol only under
-  `#[cfg(all(bmux_plugin_dylib, feature = "dynamic-backend"))]` (and the
-  frontend equivalent), so the symbol exists only in a packaged artifact for
-  the selected role.
-- The packager builds with
-  `cargo rustc -p <crate> --lib --crate-type cdylib --features dynamic-backend`,
-  sets `--cfg bmux_plugin_dylib` through `CARGO_ENCODED_RUSTFLAGS` (preserving
-  existing flags) and uses its own `--target-dir`. `--crate-type` applies to
-  that invocation only, so workspace builds never produce a cdylib.
+  `--cfg bmux_plugin_dylib` plus exactly one role feature (enabling both is a
+  compile error), and restricts the packaged definition to that role. The cfg
+  is evaluated inside the SDK's own macro definitions, so plugin crates never
+  name it. The packager's build label (`BMUX_PLUGIN_ARTIFACT_ID`) is retained
+  in the artifact bytes.
+- `scripts/package-plugin.py --implementation-manifest <crate>/Cargo.toml
+  --component backend --build` runs
+  `cargo rustc --lib --crate-type cdylib --no-default-features
+  --features <component features>,dynamic-backend` on the crate in its own
+  workspace, with `--cfg bmux_plugin_dylib` added to `CARGO_ENCODED_RUSTFLAGS`
+  (existing flags preserved) and a target directory reserved for dylib builds
+  (`<target>/plugin-dylib`, or `--cargo-target-dir`). `--crate-type` applies
+  to that invocation only, so workspace builds never produce a cdylib.
+- The SDK is whatever the crate's own dependency graph resolves (`cargo
+  metadata` over its Cargo.lock): a path SDK in this workspace, or bmux pinned
+  from git (`git = "...", branch = "master"`) in bcode. The receipt
+  (`--output/packaging.json`) records it, e.g.
+  `git+https://…?branch=master#<commit>`. There is no `--sdk-manifest`.
+  `packages/cli/tests/plugin_packaging_git_source_integration.rs` packages a
+  plugin whose bmux dependencies come from a `file://` git repository.
 - Two gates keep host builds clean: the cfg is never set by a workspace build
   (it is not a feature, so it cannot unify), and the feature only selects the
   role. A host that accidentally enabled `dynamic-backend` still gets no entry
   symbol without the cfg.
 - The sidecar `plugin.toml` stays the artifact's embedded manifest
   (`package-plugin.py --declaration-of`).
+
+Crates without the role features (BMUX workspace plugins until they are
+ported, and bcode plugins) still package through the legacy generated
+wrapper (`--sdk-manifest`, `--output`); `bmux plugin rebuild` picks the path
+per crate.
+
+BPDL commands are exposed in the CLI, so the generated manifest also claims
+their paths (`owns_paths`); `plugin.toml` may add paths, never remove them.
 
 ## Known gaps
 
@@ -191,5 +219,3 @@ The target is no generated crate at all:
   handle exists in both modes: `PluginHostServices::subscribe_event(kind,
   state)` returns a `HostEventSubscription` of JSON payloads owned by the
   activation.
-- Commands are exposed in the CLI by the generated manifest, so a plugin
-  still declares `owns_paths` for them in `plugin.toml`.

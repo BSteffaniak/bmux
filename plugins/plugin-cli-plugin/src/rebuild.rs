@@ -210,6 +210,9 @@ fn execute_rebuild_build(
     // Generated wrappers spell every path dependency the same way, so they
     // share one dedicated target directory (never the workspace's own).
     let wrapper_target = packaging_root.join("target");
+    // Direct dylib builds set `--cfg bmux_plugin_dylib` for every crate, so
+    // they get their own directory instead of thrashing the workspace's.
+    let dylib_target = Path::new(target_directory).join("plugin-dylib");
     for crate_name in targets {
         let package = packages
             .iter()
@@ -225,15 +228,23 @@ fn execute_rebuild_build(
                 .arg(&script)
                 .arg("--implementation-manifest")
                 .arg(manifest)
-                .arg("--sdk-manifest")
-                .arg(&sdk)
                 .arg("--output")
                 .arg(output)
                 .arg("--component")
                 .arg(role)
-                .arg("--build")
-                .arg("--cargo-target-dir")
-                .arg(&wrapper_target);
+                .arg("--build");
+            if packages_itself(package, role) {
+                // `plugin!` exports the entry; the crate is built directly,
+                // linking the SDK its own dependency graph resolves.
+                command.arg("--cargo-target-dir").arg(&dylib_target);
+            } else {
+                // Not yet ported: the legacy thin wrapper links this SDK.
+                command
+                    .arg("--sdk-manifest")
+                    .arg(&sdk)
+                    .arg("--cargo-target-dir")
+                    .arg(&wrapper_target);
+            }
             if matches!(profile, BuildProfile::Release) {
                 command.arg("--release");
             }
@@ -248,6 +259,15 @@ fn execute_rebuild_build(
         }
     }
     Ok(())
+}
+
+/// Whether the crate exports its own dylib entry for `role` (`plugin!` plus
+/// the `dynamic-<role>` feature) instead of needing a generated wrapper.
+fn packages_itself(package: &serde_json::Value, role: &str) -> bool {
+    package
+        .get("features")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|features| features.contains_key(&format!("dynamic-{role}")))
 }
 
 /// Every component the implementation's own `plugin.toml` declares; each is
