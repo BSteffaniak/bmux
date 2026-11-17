@@ -305,4 +305,20 @@ fn generated_clients_reach_a_generated_provider_across_dylibs() {
         "watcher: activation bumped to 2, read back 2",
         "watcher: activation bumped to 5, read back 5",
     ]);
+
+    // A CLI command-local activation of the dylib watcher in the CLI
+    // process: its activation also reaches the counter through
+    // `Client::remote(host)` on the asynchronous host route. (The `watch`
+    // command body itself is a callback-entry call path; see the known gaps
+    // in docs/plugin-author-api.md.)
+    let watch = sandbox.run(&["plugin", "run", "example.watcher", "watch", "--by", "4"]);
+    let stderr = String::from_utf8_lossy(&watch.stderr);
+    let bumps = stderr.matches("watcher: activation bumped to").count();
+    assert_eq!(
+        bumps,
+        2,
+        "command-local activation reached the counter twice: {stderr}\n{}",
+        sandbox.evidence()
+    );
+    assert!(!stderr.contains("activation call failed"), "{stderr}");
 }

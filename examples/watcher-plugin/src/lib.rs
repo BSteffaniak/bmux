@@ -27,10 +27,7 @@ use bmux_plugin_sdk::definition::{
     CommandOutcome, PluginCallContext, PluginCreateContext, PluginFuture, PluginInstance,
     PluginLifecycleContext, PluginResult,
 };
-use bmux_plugin_sdk::{
-    EXIT_OK, HostServiceRequest, NativeCommandContext, PluginCommandError, PluginHostServices,
-    ServiceKind, TypedDispatchClient, TypedDispatchClientError,
-};
+use bmux_plugin_sdk::{EXIT_OK, NativeCommandContext, PluginCommandError, TypedDispatchClient};
 use declaration::commands::WATCH;
 use declaration::requires::{counter_commands, counter_state};
 
@@ -50,49 +47,6 @@ pub async fn watch<T: TypedDispatchClient + Clone + Sync>(
     Ok((bumped, read))
 }
 
-/// Interim transport over the host's synchronous service route.
-///
-/// Inside a dylib, `PluginHostServices` has no asynchronous host route yet
-/// (`call_service_async` is unsupported until dylib host waits land), so the
-/// generated client rides the synchronous route every legacy plugin uses.
-/// Replace with `Client::remote(host)` once that route exists; the generated
-/// client and the provider are unchanged either way.
-#[derive(Clone)]
-pub struct SyncHost(pub PluginHostServices);
-
-impl TypedDispatchClient for SyncHost {
-    fn requires_service_contracts(&self) -> bool {
-        true
-    }
-
-    fn invoke_service_raw(
-        &mut self,
-        capability: &str,
-        kind: bmux_ipc::InvokeServiceKind,
-        interface: &str,
-        operation: &str,
-        payload: Vec<u8>,
-    ) -> impl std::future::Future<Output = Result<Vec<u8>, TypedDispatchClientError>> + Send {
-        let kind = match kind {
-            bmux_ipc::InvokeServiceKind::Query => ServiceKind::Query,
-            bmux_ipc::InvokeServiceKind::Command => ServiceKind::Command,
-        };
-        let result = self
-            .0
-            .invoke(HostServiceRequest {
-                capability,
-                kind,
-                interface,
-                operation,
-                payload: &payload,
-            })
-            .map_err(|error| {
-                TypedDispatchClientError::transport(interface, operation, error.to_string())
-            });
-        std::future::ready(result)
-    }
-}
-
 /// Scoped plugin instance.
 #[derive(Default)]
 pub struct WatcherPlugin;
@@ -106,8 +60,11 @@ impl PluginInstance for WatcherPlugin {
                 eprintln!("watcher: activated without host services");
                 return Ok(());
             };
-            let commands = counter_commands::v1::Client::remote(SyncHost(host.clone()));
-            let state = counter_state::v1::Client::remote(SyncHost(host));
+            // The host's services are a typed dispatch transport in both
+            // packaging modes; inside a dylib, calls run as host tasks
+            // awaited with real wakers.
+            let commands = counter_commands::v1::Client::remote(host.clone());
+            let state = counter_state::v1::Client::remote(host);
             for by in [2, 3] {
                 match watch(&commands, &state, by).await {
                     Ok((bumped, read)) => {
@@ -136,8 +93,8 @@ impl PluginInstance for WatcherPlugin {
                     .clone()
                     .ok_or_else(|| PluginCommandError::unavailable("watch needs host services"))?;
                 let (bumped, read) = watch(
-                    &counter_commands::v1::Client::remote(SyncHost(host.clone())),
-                    &counter_state::v1::Client::remote(SyncHost(host)),
+                    &counter_commands::v1::Client::remote(host.clone()),
+                    &counter_state::v1::Client::remote(host),
                     args.by.unwrap_or(1),
                 )
                 .await?;

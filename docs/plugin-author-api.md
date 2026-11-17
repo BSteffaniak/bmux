@@ -177,15 +177,19 @@ The target is no generated crate at all:
 
 ## Known gaps
 
-- Inside a dylib (and in the CLI process for command-local activations),
-  `PluginHostServices` has no asynchronous host route yet
-  (`call_service_async` is unsupported until dylib host waits land), so
-  `Client::remote(host)` fails there. The watcher example uses an
-  example-local `SyncHost` transport over the existing synchronous route
-  until then; the generated client and provider are unchanged.
+- Inside a dylib, `PluginHostServices::call_service_async` runs each call as
+  a host task owned by the instance's scope (plug-rt `rt::services`), awaited
+  with real wakers; dropping the future cancels the call on the host. The
+  watcher example uses `Client::remote(host)` from its server-side and its
+  CLI command-local activation. A CLI *command* body still reaches the host
+  only through a live callback entry (the CLI's command route is entry
+  bound), and an entry held across an await is not supported yet, so
+  asynchronous generated clients do not work from a dylib command body.
 - The generated `dispatch` serves unary operations; streaming operations need
   the `invoke_streaming` entry (`Portable<P>` already streams).
-- Clients do not yet generate `subscribe_<event>()`; it needs the host
-  subscription handle from the scoped event bus.
+- Clients do not yet generate `subscribe_<event>()`. The host subscription
+  handle exists in both modes: `PluginHostServices::subscribe_event(kind,
+  state)` returns a `HostEventSubscription` of JSON payloads owned by the
+  activation.
 - Commands are exposed in the CLI by the generated manifest, so a plugin
   still declares `owns_paths` for them in `plugin.toml`.
