@@ -421,6 +421,34 @@ impl EventBus {
         Ok(())
     }
 
+    /// Register a retained state channel of JSON values, owned like any
+    /// other registration through this view. Its value is JSON `null` until
+    /// the first publication; it accepts serialized input
+    /// ([`Self::emit_json`], [`Self::emit_from_bytes`]) and serves typed
+    /// (`serde_json::Value`) and JSON state subscribers. Works on a remote
+    /// bus.
+    ///
+    /// # Errors
+    /// The view's scope closed, or the host refused a remote registration.
+    pub fn register_json_state_channel(
+        self: &Arc<Self>,
+        interface: PluginEventKind,
+    ) -> EventBusResult<()> {
+        if let Some(remote) = &self.remote {
+            return remote
+                .register_state(interface.as_str())
+                .map_err(remote::port_error);
+        }
+        self.admit()?;
+        let kind = interface.clone();
+        self.register_state_channel_with_json_projection::<JsonValue>(interface, JsonValue::Null);
+        self.install_state_bytes_decoder::<JsonValue, _>(&kind, |bytes| {
+            serde_json::from_slice(bytes)
+                .map_err(|error| EventBusBytesError::Decode(error.to_string()))
+        });
+        Ok(())
+    }
+
     /// Publish a JSON payload on a channel that accepts serialized input
     /// (a JSON channel, or a typed channel registered with a decoder).
     /// Works on a remote bus.

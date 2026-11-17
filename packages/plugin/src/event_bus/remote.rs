@@ -147,6 +147,12 @@ impl ScopeEvents for BusScopeEvents {
             .map_err(|error| host_error(&error))
     }
 
+    fn register_state(&self, kind: &str) -> Result<(), EventPortError> {
+        self.0
+            .register_json_state_channel(PluginEventKind::from(kind.to_string()))
+            .map_err(|error| host_error(&error))
+    }
+
     fn publish(&self, kind: &str, payload: &[u8]) -> Result<(), EventPortError> {
         match self
             .0
@@ -193,19 +199,70 @@ fn payload(event: &JsonPluginEvent) -> Option<Vec<u8>> {
     serde_json::to_vec(&event.payload).ok()
 }
 
+fn bus_refusal(error: EventBusError) -> bmux_plugin_sdk::PluginError {
+    match error {
+        EventBusError::Closed => bmux_plugin_sdk::PluginError::InvocationCancelled,
+        other => bmux_plugin_sdk::PluginError::ServiceProtocol {
+            details: other.to_string(),
+        },
+    }
+}
+
+/// Register a serialized channel through `view` for
+/// [`bmux_plugin_sdk::PluginHostServices::register_event_channel`]; the view's
+/// activation owns it.
+///
+/// # Errors
+/// The view's activation closed.
+pub fn register_payloads(
+    view: &Arc<EventBus>,
+    kind: &str,
+    state: bool,
+) -> bmux_plugin_sdk::Result<()> {
+    let kind = PluginEventKind::from(kind.to_string());
+    if state {
+        view.register_json_state_channel(kind)
+    } else {
+        view.register_json_channel(kind)
+    }
+    .map_err(bus_refusal)
+}
+
+/// Publish one JSON payload through `view` for
+/// [`bmux_plugin_sdk::PluginHostServices::publish_event`].
+///
+/// # Errors
+/// The view's activation closed, no channel accepts serialized input for
+/// `kind`, or the payload does not decode.
+pub fn publish_payload(
+    view: &Arc<EventBus>,
+    kind: &str,
+    payload: &[u8],
+) -> bmux_plugin_sdk::Result<()> {
+    match view.emit_from_bytes(&PluginEventKind::from(kind.to_string()), payload) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+            details: format!("no channel `{kind}` accepts serialized payloads"),
+        }),
+        Err(EventBusBytesError::Bus(error)) => Err(bus_refusal(error)),
+        Err(error) => Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
+            details: error.to_string(),
+        }),
+    }
+}
+
 /// Subscribe through `view` for [`bmux_plugin_sdk::PluginHostServices::subscribe_event`].
+///
+/// # Errors
+/// The view's activation closed, or the channel is not registered or not
+/// observable serialized.
 pub fn subscribe_payloads(
     view: &Arc<EventBus>,
     kind: &str,
     state: bool,
 ) -> bmux_plugin_sdk::Result<bmux_plugin_sdk::HostEventSubscription> {
     let kind = PluginEventKind::from(kind.to_string());
-    let refused = |error: EventBusError| match error {
-        EventBusError::Closed => bmux_plugin_sdk::PluginError::InvocationCancelled,
-        other => bmux_plugin_sdk::PluginError::ServiceProtocol {
-            details: other.to_string(),
-        },
-    };
+    let refused = bus_refusal;
     let stream = if state {
         let (_, receiver) = view.subscribe_state_json(&kind).map_err(refused)?;
         rt::events::watch_stream(receiver, |event| payload(&event))

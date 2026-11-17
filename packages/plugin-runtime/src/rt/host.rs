@@ -117,6 +117,7 @@ impl PlugRtHost {
                 service_call: host_service_call,
                 service_poll: host_service_poll,
                 service_cancel: host_service_cancel,
+                event_register_state: host_event_register_state,
             },
             label: label.into(),
             runtime,
@@ -550,6 +551,21 @@ unsafe extern "C" fn host_event_register(host: *const c_void, scope: u64, kind: 
         let host = unsafe { host_ref(host) };
         match host.scope_events(scope) {
             Ok(events) => event_status(events.register(unsafe { kind.as_str() })),
+            Err(status) => status,
+        }
+    }))
+    .unwrap_or(RT_PANICKED)
+}
+
+unsafe extern "C" fn host_event_register_state(
+    host: *const c_void,
+    scope: u64,
+    kind: RtStr,
+) -> RtStatus {
+    catch_unwind(AssertUnwindSafe(|| {
+        let host = unsafe { host_ref(host) };
+        match host.scope_events(scope) {
+            Ok(events) => event_status(events.register_state(unsafe { kind.as_str() })),
             Err(status) => status,
         }
     }))

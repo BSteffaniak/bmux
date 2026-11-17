@@ -186,6 +186,15 @@ impl Drop for Admission {
         super::host_wake::notify_progress();
     }
 }
+fn event_port_error(error: bmux_plugin_runtime::rt::events::EventPortError) -> PluginError {
+    match error {
+        bmux_plugin_runtime::rt::events::EventPortError::Closed => PluginError::InvocationCancelled,
+        other => PluginError::ServiceProtocol {
+            details: other.to_string(),
+        },
+    }
+}
+
 fn protocol(status: AbiStatus) -> PluginError {
     PluginError::ServiceProtocol {
         details: format!("native invocation callback status {status}"),
@@ -514,23 +523,32 @@ impl InvocationPorts {
             // port, owned by its scope.
             if let Some(client) = bmux_plugin_runtime::rt::guest::installed_client() {
                 let events = client.events(scope);
-                port = port.with_event_subscriptions(move |kind, state| {
-                    events
-                        .subscribe(kind, state)
-                        .map(|subscription| {
-                            crate::HostEventSubscription::new(
-                                super::host_events::RemoteEventStream(subscription),
-                            )
-                        })
-                        .map_err(|error| match error {
-                            bmux_plugin_runtime::rt::events::EventPortError::Closed => {
-                                PluginError::InvocationCancelled
+                let register = events.clone();
+                let publish = events.clone();
+                port = port
+                    .with_event_subscriptions(move |kind, state| {
+                        events
+                            .subscribe(kind, state)
+                            .map(|subscription| {
+                                crate::HostEventSubscription::new(
+                                    super::host_events::RemoteEventStream(subscription),
+                                )
+                            })
+                            .map_err(event_port_error)
+                    })
+                    .with_event_publisher(
+                        move |kind, state| {
+                            if state {
+                                register.register_state(kind)
+                            } else {
+                                register.register(kind)
                             }
-                            other => PluginError::ServiceProtocol {
-                                details: other.to_string(),
-                            },
-                        })
-                });
+                            .map_err(event_port_error)
+                        },
+                        move |kind, payload| {
+                            publish.publish(kind, payload).map_err(event_port_error)
+                        },
+                    );
             }
         }
         if self.table.capabilities & CAP_RETAINED_HOST_LOOKUP_V2 != 0 {

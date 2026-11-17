@@ -177,6 +177,9 @@ pub struct PlugRtV1 {
     ) -> RtStatus,
     /// Cancel and release a call; its host future is dropped.
     pub service_cancel: unsafe extern "C" fn(*const c_void, u64),
+    /// Register a retained JSON state channel owned by the scope's
+    /// activation (subscribers see JSON `null` until the first publish).
+    pub event_register_state: unsafe extern "C" fn(*const c_void, u64, RtStr) -> RtStatus,
 }
 // SAFETY: the table is immutable after installation and its functions are
 // thread-safe; `host` is only interpreted by the host.

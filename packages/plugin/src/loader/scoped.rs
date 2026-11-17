@@ -2363,9 +2363,20 @@ impl LoadedExecution {
             return Ok(services);
         };
         let view = bus.scoped(activation);
-        Ok(services.with_event_subscriptions(move |kind, state| {
-            crate::event_bus::remote::subscribe_payloads(&view, kind, state)
-        }))
+        let register = Arc::clone(&view);
+        let publish = Arc::clone(&view);
+        Ok(services
+            .with_event_subscriptions(move |kind, state| {
+                crate::event_bus::remote::subscribe_payloads(&view, kind, state)
+            })
+            .with_event_publisher(
+                move |kind, state| {
+                    crate::event_bus::remote::register_payloads(&register, kind, state)
+                },
+                move |kind, payload| {
+                    crate::event_bus::remote::publish_payload(&publish, kind, payload)
+                },
+            ))
     }
     fn registration_port(&self) -> Result<Option<crate::ActivationRegistrationPort>> {
         Ok(self

@@ -478,6 +478,8 @@ fn services(owner: &Arc<Authority>) -> PluginHostServices {
     let availability = Arc::clone(owner);
     let asynchronous = Arc::clone(owner);
     let subscriptions = Arc::clone(owner);
+    let registrations = Arc::clone(owner);
+    let publications = Arc::clone(owner);
     PluginHostServices::new(move |request| invoke.ports()?.host_port().invoke(request))
         // Like the synchronous route, an asynchronous call is made through
         // the live callback entry when there is one (else the operation's
@@ -493,6 +495,20 @@ fn services(owner: &Arc<Authority>) -> PluginHostServices {
                 .host_port()
                 .subscribe_event(kind, state)
         })
+        .with_event_publisher(
+            move |kind, state| {
+                registrations
+                    .ports()?
+                    .host_port()
+                    .register_event_channel(kind, state)
+            },
+            move |kind, payload| {
+                publications
+                    .ports()?
+                    .host_port()
+                    .publish_event(kind, payload)
+            },
+        )
         .with_kernel(move |request| kernel.ports()?.host_port().execute_kernel_encoded(request))
         .with_registrations(move |mutation| {
             registration.ports()?.host_port().registration(mutation)

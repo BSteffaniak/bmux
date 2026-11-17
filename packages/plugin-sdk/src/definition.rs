@@ -130,6 +130,7 @@ pub struct PluginHostServices {
     registration: Option<Arc<RegistrationInvocation>>,
     kernel: Option<Arc<KernelInvocation>>,
     subscriptions: Option<Arc<crate::EventSubscriptionInvocation>>,
+    publisher: Option<Arc<crate::host_services::EventPublisher>>,
 }
 // Capability equality is identity equality, never equality of payload metadata.
 impl PartialEq for PluginHostServices {
@@ -170,6 +171,11 @@ impl PartialEq for PluginHostServices {
                 (Some(left), Some(right)) => Arc::ptr_eq(left, right),
                 _ => false,
             }
+            && match (&self.publisher, &other.publisher) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
     }
 }
 
@@ -194,6 +200,7 @@ impl PluginHostServices {
             registration: None,
             kernel: None,
             subscriptions: None,
+            publisher: None,
         }
     }
 
@@ -230,6 +237,63 @@ impl PluginHostServices {
                 })?;
         subscribe(kind, state)
     }
+    /// Bind the host's event publication route for this activation:
+    /// `register(kind, state)` creates a serialized channel owned by the
+    /// activation, `publish(kind, json)` publishes one JSON payload on it.
+    #[must_use]
+    pub fn with_event_publisher(
+        mut self,
+        register: impl Fn(&str, bool) -> crate::Result<()> + Send + Sync + 'static,
+        publish: impl Fn(&str, &[u8]) -> crate::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.publisher = Some(Arc::new(crate::host_services::EventPublisher::new(
+            register, publish,
+        )));
+        self
+    }
+
+    /// Register a serialized event channel owned by the activation these
+    /// services belong to (`state` for a retained state channel, whose
+    /// subscribers receive JSON `null` until the first publication). The
+    /// host releases it with the activation. Works in both packaging modes.
+    ///
+    /// # Errors
+    /// The host bound no publication route, the activation is closed, or
+    /// the host refused the channel.
+    pub fn register_event_channel(&self, kind: &str, state: bool) -> crate::Result<()> {
+        self.publisher()?.register(kind, state)
+    }
+
+    /// Publish one JSON payload on a channel registered through
+    /// [`Self::register_event_channel`] (or any channel that accepts
+    /// serialized input).
+    ///
+    /// # Errors
+    /// The host bound no publication route, the activation is closed, or
+    /// the channel rejected the payload.
+    pub fn publish_event(&self, kind: &str, payload: &[u8]) -> crate::Result<()> {
+        if payload.len() > crate::abi::MAX_BUFFER_BYTES {
+            return Err(crate::PluginError::ServiceProtocol {
+                details: "event payload exceeds transport bound".into(),
+            });
+        }
+        self.publisher()?.publish(kind, payload)
+    }
+
+    /// Whether the host bound an event publication route.
+    #[must_use]
+    pub const fn publishes_events(&self) -> bool {
+        self.publisher.is_some()
+    }
+
+    fn publisher(&self) -> crate::Result<&crate::host_services::EventPublisher> {
+        self.publisher
+            .as_deref()
+            .ok_or(crate::PluginError::UnsupportedHostOperation {
+                operation: "publish_event",
+            })
+    }
+
     /// Bind an invocation-scoped encoded kernel capability. The host is
     /// responsible for foundational-plugin authorization and live cancellation.
     #[must_use]

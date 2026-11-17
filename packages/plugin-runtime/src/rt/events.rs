@@ -51,6 +51,16 @@ pub trait ScopeEvents: Send + Sync {
     /// # Errors
     /// The scope closed or the host refused the registration.
     fn register(&self, kind: &str) -> Result<(), EventPortError>;
+    /// Register a retained JSON state channel owned by the scope's
+    /// activation. Subscribers see JSON `null` until the first publish.
+    ///
+    /// # Errors
+    /// The scope closed or the host refused the registration; hosts
+    /// without serialized state channels report `Unsupported`.
+    fn register_state(&self, kind: &str) -> Result<(), EventPortError> {
+        let _ = kind;
+        Err(EventPortError::Unsupported)
+    }
     /// Publish one JSON payload.
     ///
     /// # Errors
@@ -236,6 +246,19 @@ impl RemoteEvents {
         port_status(
             unsafe { (self.table.event_register)(self.table.host, self.scope, RtStr::new(kind)) },
             "register",
+        )
+    }
+
+    /// See [`ScopeEvents::register_state`].
+    ///
+    /// # Errors
+    /// As reported by the host.
+    pub fn register_state(&self, kind: &str) -> Result<(), EventPortError> {
+        port_status(
+            unsafe {
+                (self.table.event_register_state)(self.table.host, self.scope, RtStr::new(kind))
+            },
+            "register state",
         )
     }
 

@@ -627,3 +627,31 @@ impl HostEventSubscription {
 /// Host-selected event subscription route: `(kind, state)`.
 pub type EventSubscriptionInvocation =
     dyn Fn(&str, bool) -> crate::Result<HostEventSubscription> + Send + Sync;
+
+type EventChannelRegistration = dyn Fn(&str, bool) -> crate::Result<()> + Send + Sync;
+type EventPublication = dyn Fn(&str, &[u8]) -> crate::Result<()> + Send + Sync;
+
+/// Host-selected event publication route behind
+/// [`crate::PluginHostServices::publish_event`]: channels registered for the
+/// activation, and JSON publication on them.
+pub struct EventPublisher {
+    register: Box<EventChannelRegistration>,
+    publish: Box<EventPublication>,
+}
+impl EventPublisher {
+    pub(crate) fn new(
+        register: impl Fn(&str, bool) -> crate::Result<()> + Send + Sync + 'static,
+        publish: impl Fn(&str, &[u8]) -> crate::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            register: Box::new(register),
+            publish: Box::new(publish),
+        }
+    }
+    pub(crate) fn register(&self, kind: &str, state: bool) -> crate::Result<()> {
+        (self.register)(kind, state)
+    }
+    pub(crate) fn publish(&self, kind: &str, payload: &[u8]) -> crate::Result<()> {
+        (self.publish)(kind, payload)
+    }
+}
