@@ -48,7 +48,7 @@ operations) generates, in its `v<N>` module, a subscription client:
 | Item                                              | Purpose                                                                                                                        |
 | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | `Client<T = PluginHostServices>`                  | `Client::remote(source)` over any `author::EventSource`; the activation's `PluginHostServices` is one in both packaging modes. |
-| `async fn subscribe_<event>()`                    | An `author::Subscription<Changed>`: typed items in order (a state channel yields its current value first).                     |
+| `subscribe_<event>().await`                       | An `author::Subscription<Changed>`: typed items in order (a state channel yields its current value first).                     |
 | `impl EventClient for Client<PluginHostServices>` | Lets `Activation::events::<Client>()` connect a declared subscription.                                                         |
 
 Package-level declarations generate:
