@@ -35,7 +35,9 @@ unicode-width = { workspace = true }
 uuid = { workspace = true, features = ["std", "v4"] }
 
 [dev-dependencies]
-serde_json = { workspace = true }
+bmux_plugin_runtime = { workspace = true }
+serde_json          = { workspace = true }
+tokio               = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [features]
 fail-on-warnings = [

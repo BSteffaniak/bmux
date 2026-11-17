@@ -2572,6 +2572,87 @@ fn plugin_api_crates_do_not_own_runtime_implementation() {
     }
 }
 
+/// Plugins reach the host only through handles in their activation context.
+/// A process-wide event bus would be a different object in every dynamic
+/// library and would be shared by every instance of a plugin, so no plugin
+/// crate (tests included) may name one or keep a bus in a process static.
+#[test]
+fn plugin_crates_never_reach_a_process_wide_event_bus() {
+    const FORBIDDEN: &[&str] = &["global_event_bus", "fn global_bus", "GLOBAL_EVENT_BUS"];
+    for plugin_dir in iter_plugin_crate_dirs() {
+        for source_path in rust_source_files(&plugin_dir) {
+            let source = std::fs::read_to_string(&source_path)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", source_path.display()));
+            for marker in FORBIDDEN {
+                assert!(
+                    !source.contains(marker),
+                    "{} names `{marker}`; take the activation's bus with \
+                     `bmux_plugin::activation_event_bus` instead",
+                    source_path.display(),
+                );
+            }
+            for (index, line) in source.lines().enumerate() {
+                let line = line.trim_start();
+                let declares_static = line.starts_with("static ")
+                    || line.starts_with("pub static ")
+                    || line.starts_with("pub(crate) static ")
+                    || line.contains("thread_local!");
+                assert!(
+                    !(declares_static && line.contains("EventBus")),
+                    "{}:{} keeps an event bus in process-wide state; hold the \
+                     activation's bus in plugin instance state instead",
+                    source_path.display(),
+                    index + 1,
+                );
+            }
+        }
+    }
+}
+
+/// The host owns exactly one root bus per runtime and hands out scoped views;
+/// no crate in the workspace may reintroduce a process-wide accessor.
+#[test]
+fn workspace_has_no_process_wide_event_bus_accessor() {
+    let root = repo_root();
+    for dir in ["packages", "plugins"] {
+        for source_path in rust_source_files_under(&root.join(dir)) {
+            if source_path.ends_with("architecture_guardrails.rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&source_path)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", source_path.display()));
+            assert!(
+                !source.contains("global_event_bus"),
+                "{} references a process-wide event bus",
+                source_path.display(),
+            );
+        }
+    }
+}
+
+/// Every `.rs` file below `root`, skipping build output.
+fn rust_source_files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    fn visit(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(read) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|name| name == "target") {
+                    continue;
+                }
+                visit(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    visit(root, &mut out);
+    out
+}
+
 #[test]
 fn plugin_implementations_do_not_recreate_domain_ipc_layers() {
     for plugin_dir in iter_plugin_dirs() {
