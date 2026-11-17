@@ -175,19 +175,29 @@ impl Sandbox {
         for dir in ["home", "tmp", "cache", "plugins/example-native"] {
             std::fs::create_dir_all(env.root().join(dir)).expect("create sandbox dir");
         }
-        let manifest =
-            std::fs::read_to_string(workspace_root().join("examples/native-plugin/plugin.toml"))
-                .expect("read example manifest")
-                .lines()
-                .map(|line| {
-                    if line.starts_with("entry ") {
-                        format!("entry = {:?}", library.display().to_string())
-                    } else {
-                        line.to_string()
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
+        // The sidecar is the manifest the artifact embeds (generated from the
+        // example's BPDL world), exactly what packaging publishes.
+        let declaration = Command::new("python3")
+            .current_dir(workspace_root())
+            .arg("-B")
+            .arg("scripts/package-plugin.py")
+            .arg("--declaration-of")
+            .arg(library)
+            .output()
+            .expect("read the artifact's embedded declaration");
+        support::assert_success(&declaration, "read embedded declaration");
+        let manifest = String::from_utf8(declaration.stdout)
+            .expect("declaration is UTF-8")
+            .lines()
+            .map(|line| {
+                if line.starts_with("entry ") {
+                    format!("entry = {:?}", library.display().to_string())
+                } else {
+                    line.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         std::fs::write(
             env.root().join("plugins/example-native/plugin.toml"),
             manifest,

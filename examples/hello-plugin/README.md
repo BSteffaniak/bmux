@@ -16,8 +16,10 @@ python3 scripts/package-plugin.py \
 ```
 
 Without `--build` this only generates a thin standalone Cargo target. Add
-`--build` to compile it; add `--install-root <directory> --declaration
-examples/hello-plugin/plugin.toml` to publish an immutable artifact. Run build
+`--build` to compile it; add `--install-root <directory>` to publish an
+immutable artifact whose sidecar `plugin.toml` is the manifest embedded in the
+library (for BPDL-declared plugins, the one generated from the package world).
+Run build
 commands in the repository's Nix development environment. Python 3.11+ is
 needed.
 The generator follows workspace Cargo patches and Cargo's reported library path,
@@ -32,8 +34,9 @@ it contains no command implementation. Only the requested component role is
 advertised. Install directories separate logical ID, component, library hash
 and declaration hash. `artifact.json` names the observed library/declaration;
 it is not proof of compatibility, a credential, or permission to activate.
-The declaration is retained verbatim rather than silently rewritten to resemble
-a legacy ABI. Installation does not overwrite older artifacts or active runtime
+The published declaration is the artifact's embedded manifest, byte for byte,
+never a separately supplied or rewritten file. Installation does not overwrite
+older artifacts or active runtime
 selection. A loader must explicitly support this shared v2 descriptor and
 layout.
 

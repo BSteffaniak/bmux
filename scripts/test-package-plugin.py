@@ -145,7 +145,7 @@ class PublicationTests(unittest.TestCase):
 
     def publish(self):
         with patch.object(pack, "artifact_metadata", return_value=self.observed):
-            return pack.install(self.library, self.declaration, self.root / "install", "backend", "build-label")
+            return pack.install(self.library, self.root / "install", "backend", "build-label")
 
     def test_current_v3_receipt_preserves_profile_and_declaration(self):
         self.observed["version"] = 3
@@ -205,7 +205,7 @@ class PublicationTests(unittest.TestCase):
                 observed["metadata"][field] = value
                 with patch.object(pack, "artifact_metadata", return_value=observed):
                     with self.assertRaises(RuntimeError):
-                        pack.install(self.library, self.declaration, self.root / "install", "backend", "label")
+                        pack.install(self.library, self.root / "install", "backend", "label")
                 self.assertFalse((self.root / "install").exists())
 
 

@@ -331,33 +331,50 @@ def discover(root: Path) -> list[dict]:
     return found
 
 
-def install(library: Path, declaration: Path, root: Path, component: str,
-            artifact_id: str) -> Path:
+DECLARATION_NAME = "plugin.toml"
+
+
+def declaration_of(library: Path) -> str:
+    """The sidecar declaration published for a built artifact: its embedded manifest."""
+    manifest_toml = artifact_metadata(library)["metadata"].get("manifest_toml")
+    if not isinstance(manifest_toml, str) or not manifest_toml:
+        raise RuntimeError("artifact embeds no generated manifest")
+    return manifest_toml
+
+
+def install(library: Path, root: Path, component: str, artifact_id: str) -> Path:
     """Publish one immutable artifact directory, leaving selection to the host.
 
-    The receipt records observed bytes, not proof of ABI compatibility. No active
-    plugin, selection file, daemon or prior artifact is replaced or removed.
+    The sidecar declaration is the manifest the plugin generated from its BPDL
+    world and embedded in the artifact; the host reads it without running
+    plugin code and later verifies it against the embedded copy. The receipt
+    records observed bytes, not proof of ABI compatibility. No active plugin,
+    selection file, daemon or prior artifact is replaced or removed.
     """
     if os.name == "nt":
         raise RuntimeError("durable installation is not implemented on Windows")
-    declaration_bytes = declaration.read_bytes()
-    metadata = tomllib.loads(declaration_bytes.decode())
-    plugin_id = metadata["id"]
-    if not plugin_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for c in plugin_id):
-        raise ValueError("plugin id must be a safe single path component")
-    if plugin_id in {".", ".."}:
-        raise ValueError("invalid plugin id")
     library_bytes = library.read_bytes()
     observed = artifact_metadata(library)
     embedded = observed["metadata"]
     if library.read_bytes() != library_bytes:
         raise RuntimeError("artifact changed during descriptor discovery")
+    manifest_toml = embedded.get("manifest_toml")
+    if not isinstance(manifest_toml, str) or not manifest_toml:
+        raise RuntimeError("artifact embeds no generated manifest")
+    declaration_bytes = manifest_toml.encode()
+    try:
+        metadata = tomllib.loads(manifest_toml)
+    except tomllib.TOMLDecodeError as error:
+        raise RuntimeError("artifact embeds an invalid manifest") from error
+    plugin_id = metadata["id"]
+    if not plugin_id or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-" for c in plugin_id):
+        raise ValueError("plugin id must be a safe single path component")
+    if plugin_id in {".", ".."}:
+        raise ValueError("invalid plugin id")
     if embedded.get("plugin_id") != plugin_id or embedded.get("version") != metadata["version"]:
         raise RuntimeError("embedded plugin identity/version differs from declaration")
     if embedded.get("roles") != [component]:
         raise RuntimeError("embedded component role differs from requested package")
-    if embedded.get("manifest_toml") != declaration_bytes.decode():
-        raise RuntimeError("embedded declaration differs from selected declaration")
     if sorted(embedded.get("required_capabilities", [])) != sorted(metadata.get("required_capabilities", [])):
         raise RuntimeError("embedded required capabilities differ from declaration")
     digest = hashlib.sha256(library_bytes).hexdigest()
@@ -375,11 +392,11 @@ def install(library: Path, declaration: Path, root: Path, component: str,
     receipt = {"schema_version": 1, "plugin_id": plugin_id, "component": component,
                "artifact_id": artifact_id, "sha256": digest,
                "declaration_sha256": manifest_digest, "library": library.name,
-               "declaration": declaration.name, "shared_descriptor": observed}
+               "declaration": DECLARATION_NAME, "shared_descriptor": observed}
     if destination.exists():
         if (json.loads((destination / "artifact.json").read_text()) != receipt
                 or hashlib.sha256((destination / library.name).read_bytes()).hexdigest() != digest
-                or (destination / declaration.name).read_bytes() != declaration_bytes):
+                or (destination / DECLARATION_NAME).read_bytes() != declaration_bytes):
             raise RuntimeError(f"existing immutable artifact differs: {destination}")
         sync_directory(destination)
         sync_directory(parent)
@@ -388,9 +405,9 @@ def install(library: Path, declaration: Path, root: Path, component: str,
         stage = Path(temporary) / "artifact"
         stage.mkdir()
         (stage / library.name).write_bytes(library_bytes)
-        # The original declaration is retained verbatim. artifact.json resolves
+        # The embedded generated manifest is written verbatim. artifact.json resolves
         # the platform-specific library; old loaders must not guess this layout.
-        (stage / declaration.name).write_bytes(declaration_bytes)
+        (stage / DECLARATION_NAME).write_bytes(declaration_bytes)
         (stage / "artifact.json").write_text(json.dumps(receipt, indent=2) + "\n")
         for file in stage.iterdir():
             with file.open("rb") as stream:
@@ -402,7 +419,7 @@ def install(library: Path, declaration: Path, root: Path, component: str,
             if not destination.exists():
                 raise
             # A concurrent publisher must agree exactly, not merely share a name.
-            return install(library, declaration, root, component, artifact_id)
+            return install(library, root, component, artifact_id)
         sync_directory(parent)
     return destination
 
@@ -432,6 +449,8 @@ def main() -> None:
     parser.add_argument("--sdk-manifest", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--discover-root", type=Path, help="hash-verified inventory only; never loads native code")
+    parser.add_argument("--declaration-of", type=Path, metavar="LIBRARY",
+                        help="print the sidecar plugin.toml a built artifact publishes (its embedded manifest)")
     parser.add_argument("--component", choices=["backend", "frontend"], default="backend")
     parser.add_argument("--feature", action="append", default=[])
     parser.add_argument("--artifact-id", help="Build label retained in artifact bytes; defaults to a fresh UUID; byte hash is artifact identity")
@@ -440,9 +459,12 @@ def main() -> None:
     parser.add_argument("--target")
     parser.add_argument("--cargo-target-dir", type=Path,
                         help="target directory dedicated to generated wrappers; defaults to <output>/target, never the inherited CARGO_TARGET_DIR")
-    parser.add_argument("--install-root", type=Path)
-    parser.add_argument("--declaration", type=Path)
+    parser.add_argument("--install-root", type=Path,
+                        help="publish the artifact with its embedded generated manifest as plugin.toml")
     args = parser.parse_args()
+    if args.declaration_of:
+        print(declaration_of(args.declaration_of.resolve()), end="")
+        return
     if args.discover_root:
         if args.build or args.install_root:
             parser.error("discovery cannot build or install")
@@ -452,8 +474,8 @@ def main() -> None:
         parser.error("generation requires --implementation-manifest, --sdk-manifest and --output")
     if args.cargo_target_dir and not args.build:
         parser.error("--cargo-target-dir requires --build")
-    if args.install_root and (not args.build or not args.declaration):
-        parser.error("--install-root requires --build and --declaration")
+    if args.install_root and not args.build:
+        parser.error("--install-root requires --build")
     output = args.output.resolve()
     artifact_id = args.artifact_id or str(uuid.uuid4())
     with packaging_owner(output):
@@ -464,8 +486,7 @@ def main() -> None:
             library = build(manifest, args.release, args.target, args.cargo_target_dir)
             print(library)
             if args.install_root:
-                print(install(library, args.declaration.resolve(), args.install_root.resolve(),
-                              args.component, artifact_id))
+                print(install(library, args.install_root.resolve(), args.component, artifact_id))
 
 
 if __name__ == "__main__":

@@ -30,9 +30,8 @@ python3 scripts/package-plugin.py \
   --output target/plugin-packaging/native/backend --component backend --build
 ```
 
-Add `--install-root <directory> --declaration
-examples/native-plugin/plugin.toml`
-for immutable publication. See [hello-plugin](../hello-plugin/README.md) for
+Add `--install-root <directory>` for immutable publication; the sidecar
+`plugin.toml` is the manifest embedded in the library. See [hello-plugin](../hello-plugin/README.md) for
 artifact identity and loader integration constraints. The implementation build
 above produces only an rlib, not a loadable plugin.
 For a quick local run, point the declaration's `entry` at the library the
