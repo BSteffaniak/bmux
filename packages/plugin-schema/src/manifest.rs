@@ -331,6 +331,24 @@ fn commands(package: &Package) -> toml::Value {
     )
 }
 
+/// BPDL commands are exposed in the CLI, so the plugin owns their paths;
+/// settings may claim further paths, never fewer.
+fn claim_command_paths(table: &mut toml::Table, package: &Package) -> Result<(), Error> {
+    let mut owned = match table.remove("owns_paths") {
+        Some(toml::Value::Array(paths)) => paths,
+        Some(_) => return Err(manifest_error("owns_paths must be an array of paths")),
+        None => Vec::new(),
+    };
+    for command in &package.commands {
+        let path = toml::Value::Array(vec![command.name.clone().into()]);
+        if !owned.contains(&path) {
+            owned.push(path);
+        }
+    }
+    table.insert("owns_paths".into(), toml::Value::Array(owned));
+    Ok(())
+}
+
 /// Merge handwritten `settings` TOML with the declarations generated from
 /// the package's world, returning the complete manifest TOML.
 ///
@@ -426,6 +444,7 @@ pub fn generate(set: &PackageSet, package: &Package, settings: &str) -> Result<S
     }
     if !package.commands.is_empty() {
         table.insert("commands".into(), commands(package));
+        claim_command_paths(&mut table, package)?;
     }
     let body = toml::to_string(&table)
         .map_err(|error| manifest_error(format!("failed to render manifest TOML: {error}")))?;
@@ -548,10 +567,18 @@ mod tests {
                  command hello(/// Who to greet.
                  name: string?, count: u32, loud: bool, tags: list<string>) title \"Say hello\";",
             ),
-            "id = 'example.hello'\n",
+            "id = 'example.hello'\nowns_paths = [['greet', 'more'], ['hello']]\n",
         )
         .expect("manifest");
         let value: toml::Table = toml::from_str(&manifest).unwrap();
+        // The CLI path of every BPDL command is owned; settings add, never remove.
+        assert_eq!(
+            value["owns_paths"],
+            toml::Value::Array(vec![
+                toml::Value::Array(vec!["greet".into(), "more".into()]),
+                toml::Value::Array(vec!["hello".into()]),
+            ])
+        );
         let command = &value["commands"].as_array().unwrap()[0];
         assert_eq!(command["summary"].as_str(), Some("Say hello"));
         let arguments = command["arguments"].as_array().unwrap();
