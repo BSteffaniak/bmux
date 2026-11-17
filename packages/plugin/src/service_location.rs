@@ -216,7 +216,15 @@ impl ServiceLocationMap {
     }
 }
 
-/// Process-wide shared [`ServiceLocationMap`] instance.
+/// This host process's [`ServiceLocationMap`]: which providers this process
+/// executes and which it reaches through the host kernel.
+///
+/// Host-only routing state. It describes the process (a standalone CLI
+/// process routes every enabled provider to the server; the server marks
+/// the providers it activates local), not any plugin instance, and the
+/// legacy context `call_service_raw` path consults it for every typed call.
+/// Plugin crates must not use it: the architecture guardrail rejects any
+/// plugin source that names it.
 #[must_use]
 pub fn global_service_locations() -> Arc<ServiceLocationMap> {
     static GLOBAL: OnceLock<Arc<ServiceLocationMap>> = OnceLock::new();

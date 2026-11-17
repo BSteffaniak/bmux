@@ -199,6 +199,15 @@ fn register_bundled_definition(
     Ok(embedded)
 }
 
+/// The attach companions bundled plugins contributed to this CLI process.
+/// Host-private: attach runtimes start them with their own resources.
+pub(in crate::runtime) fn host_attach_companions() -> &'static bmux_plugin::AttachCompanionRegistry
+{
+    static COMPANIONS: std::sync::OnceLock<bmux_plugin::AttachCompanionRegistry> =
+        std::sync::OnceLock::new();
+    COMPANIONS.get_or_init(bmux_plugin::AttachCompanionRegistry::new)
+}
+
 /// Register an optional client-side adapter owned by one bundled plugin.
 #[cfg(any(
     feature = "bundled-plugin-connections",
@@ -224,7 +233,7 @@ fn install_bundled_client_adapter(plugin_id: &str, paths: &ConfigPaths) {
     #[cfg(feature = "bundled-plugin-broadcast")]
     if plugin_id == "bmux.broadcast" {
         let paths = paths.clone();
-        bmux_plugin::register_attach_companion(bmux_plugin::AttachCompanion::from_factory(
+        host_attach_companions().register(bmux_plugin::AttachCompanion::from_factory(
             plugin_id,
             std::sync::Arc::new(move |resources| {
                 Ok(Box::new(
@@ -246,7 +255,7 @@ fn install_bundled_client_adapter(plugin_id: &str, paths: &ConfigPaths) {
     if plugin_id == "bmux.tab_bar" {
         // Settings come from the invoking attach runtime's config, not the
         // config this process registered companions with.
-        bmux_plugin::register_attach_companion(bmux_plugin::AttachCompanion::from_factory(
+        host_attach_companions().register(bmux_plugin::AttachCompanion::from_factory(
             plugin_id,
             std::sync::Arc::new(|resources| {
                 Ok(Box::new(bmux_tab_bar_plugin::TabBarPresentation::install(
@@ -258,7 +267,7 @@ fn install_bundled_client_adapter(plugin_id: &str, paths: &ConfigPaths) {
     }
     #[cfg(feature = "bundled-plugin-sidebar")]
     if plugin_id == "bmux.sidebar" {
-        bmux_plugin::register_attach_companion(bmux_plugin::AttachCompanion::from_factory(
+        host_attach_companions().register(bmux_plugin::AttachCompanion::from_factory(
             plugin_id,
             std::sync::Arc::new(|resources| {
                 let presentation = bmux_sidebar_plugin::SidebarPresentation::install(
@@ -2069,10 +2078,6 @@ pub(super) async fn activate_loaded_plugins(
                 let _host_kernel_connection_guard =
                     enter_host_kernel_connection(connection_info.clone());
                 let deactivate_result = activated_plugin.deactivate_async(&context).await;
-                bmux_plugin::layout::global_plugin_layout_registry()
-                    .remove_owner(activated_plugin.declaration.id.as_str());
-                bmux_plugin::surface::global_plugin_surface_registry()
-                    .remove_owner(activated_plugin.declaration.id.as_str());
                 if let Err(deactivate_error) = deactivate_result {
                     warn!(
                         "failed rolling back plugin activation for {}: {deactivate_error}",
@@ -2200,10 +2205,6 @@ pub(super) async fn deactivate_loaded_plugins(
         plugin.drain_background_tasks().await?;
         let _host_kernel_connection_guard = enter_host_kernel_connection(connection_info.clone());
         let deactivate_result = plugin.deactivate_async(&context).await;
-        bmux_plugin::layout::global_plugin_layout_registry()
-            .remove_owner(plugin.declaration.id.as_str());
-        bmux_plugin::surface::global_plugin_surface_registry()
-            .remove_owner(plugin.declaration.id.as_str());
         let _ = deactivate_result.with_context(|| {
             format!(
                 "failed deactivating plugin '{}'",

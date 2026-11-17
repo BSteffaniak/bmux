@@ -52,16 +52,12 @@ mod typed_service_caller;
 #[cfg(feature = "tui")]
 pub use attach_companion::{
     AttachCompanion, AttachCompanionCallback, AttachCompanionFactory, AttachCompanionRegistry,
-    AttachPresentationResources, global_attach_companion_registry, register_attach_companion,
-    registered_attach_companions,
+    AttachPresentationResources,
 };
 pub use attach_presentation_input::{
     AttachPresentationCommittedHandler, AttachPresentationFocusLostHandler,
     AttachPresentationInputDispatch, AttachPresentationInputHandler,
     AttachPresentationInputRegistry, AttachPresentationPasteHandler,
-    dispatch_attach_presentation_input_handler, global_attach_presentation_input_registry,
-    global_attach_presentation_input_registry_handle, invoke_attach_presentation_input_handler,
-    register_attach_presentation_input_handler, remove_attach_presentation_input_handler,
 };
 pub use bmux_plugin_runtime::{
     ConcurrencyGate, EffectiveConcurrencyPolicy, PluginConcurrencyConfig,

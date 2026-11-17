@@ -2667,6 +2667,13 @@ fn workspace_has_no_process_wide_host_registry_accessors() {
                 "global_visual_adapter_registry",
                 "global_render_extension_registry",
                 "global_attach_provider_registry",
+                "global_plugin_layout_registry",
+                "global_plugin_surface_registry",
+                "global_allocation_registry",
+                "global_attach_presentation_input_registry",
+                "global_attach_companion_registry",
+                "register_attach_companion",
+                "registered_attach_companions",
             ] {
                 assert!(
                     !source.contains(removed),

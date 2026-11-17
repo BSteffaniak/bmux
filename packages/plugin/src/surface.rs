@@ -42,7 +42,7 @@
 use crate::layout::PluginLayoutId;
 use crate::{ExtensionRect, RenderOp};
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Mutex, OnceLock, RwLock};
+use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -977,23 +977,6 @@ fn render_op_text_bytes(op: &RenderOp) -> usize {
         | RenderOp::FillRect { .. }
         | RenderOp::Border { .. } => 0,
     }
-}
-
-static GLOBAL_PLUGIN_SURFACE_REGISTRY: OnceLock<std::sync::Arc<PluginSurfaceRegistry>> =
-    OnceLock::new();
-
-#[must_use]
-pub fn global_plugin_surface_registry() -> &'static PluginSurfaceRegistry {
-    GLOBAL_PLUGIN_SURFACE_REGISTRY
-        .get_or_init(|| std::sync::Arc::new(PluginSurfaceRegistry::new(64)))
-}
-
-/// Shared ownership of the default presentation's surface registry.
-#[must_use]
-pub fn global_plugin_surface_registry_handle() -> std::sync::Arc<PluginSurfaceRegistry> {
-    GLOBAL_PLUGIN_SURFACE_REGISTRY
-        .get_or_init(|| std::sync::Arc::new(PluginSurfaceRegistry::new(64)))
-        .clone()
 }
 
 #[cfg(test)]

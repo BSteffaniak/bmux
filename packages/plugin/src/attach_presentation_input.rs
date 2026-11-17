@@ -2,7 +2,7 @@
 
 use crate::{AttachInputEndpoint, AttachInputEvent, AttachInputResult};
 use std::collections::BTreeMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 
 pub type AttachPresentationInputHandler =
     Arc<dyn Fn(&AttachInputEvent) -> Option<AttachInputResult> + Send + Sync>;
@@ -243,48 +243,6 @@ impl AttachPresentationInputRegistry {
             handlers.remove(endpoint);
         }
     }
-}
-
-static GLOBAL_REGISTRY: OnceLock<Arc<AttachPresentationInputRegistry>> = OnceLock::new();
-
-#[must_use]
-pub fn global_attach_presentation_input_registry() -> &'static AttachPresentationInputRegistry {
-    GLOBAL_REGISTRY.get_or_init(|| Arc::new(AttachPresentationInputRegistry::new()))
-}
-
-/// Shared ownership of the default presentation's input registry.
-#[must_use]
-pub fn global_attach_presentation_input_registry_handle() -> Arc<AttachPresentationInputRegistry> {
-    GLOBAL_REGISTRY
-        .get_or_init(|| Arc::new(AttachPresentationInputRegistry::new()))
-        .clone()
-}
-
-pub fn register_attach_presentation_input_handler(
-    endpoint: AttachInputEndpoint,
-    handler: AttachPresentationInputHandler,
-) {
-    global_attach_presentation_input_registry().register(endpoint, handler);
-}
-
-#[must_use]
-pub fn dispatch_attach_presentation_input_handler(
-    endpoint: &AttachInputEndpoint,
-    event: &AttachInputEvent,
-) -> AttachPresentationInputDispatch {
-    global_attach_presentation_input_registry().dispatch(endpoint, event)
-}
-
-#[must_use]
-pub fn invoke_attach_presentation_input_handler(
-    endpoint: &AttachInputEndpoint,
-    event: &AttachInputEvent,
-) -> Option<AttachInputResult> {
-    dispatch_attach_presentation_input_handler(endpoint, event).into_result()
-}
-
-pub fn remove_attach_presentation_input_handler(endpoint: &AttachInputEndpoint) {
-    global_attach_presentation_input_registry().remove(endpoint);
 }
 
 #[cfg(test)]

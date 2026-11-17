@@ -5409,7 +5409,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         plugin_settings: std::sync::Arc::new(attach_config.plugins.settings.clone()),
     };
     let mut started_companions = Vec::new();
-    for companion in bmux_plugin::registered_attach_companions() {
+    for companion in super::super::plugin_runtime::host_attach_companions().snapshot() {
         let id = companion.id().to_owned();
         match companion.start_with_resources(&presentation_resources) {
             Ok(started) => started_companions.push(started),
@@ -9975,9 +9975,6 @@ struct AttachViewportInsets {
     bottom: u16,
     left: u16,
 }
-
-#[cfg(test)]
-use bmux_plugin::layout::global_plugin_layout_registry;
 
 fn resolved_attach_viewport_insets(
     geometry: TerminalGeometry,
@@ -21888,16 +21885,18 @@ mod tests {
     #[serial]
     fn retained_frame_plan_composes_published_plugin_surface_through_attach_path() {
         use bmux_plugin::layout::{LayoutEdge, LayoutExtent, PluginLayoutId, PluginLayoutSnapshot};
-        use bmux_plugin::surface::{
-            PluginSurface, PluginSurfaceId, PluginSurfaceSnapshot, global_plugin_surface_registry,
-        };
+        use bmux_plugin::surface::{PluginSurface, PluginSurfaceId, PluginSurfaceSnapshot};
 
+        // This test's own presentation registries (no process-wide ones).
+        let test_layouts = std::sync::Arc::new(bmux_plugin::layout::PluginLayoutRegistry::new(64));
+        let test_surfaces =
+            std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(64));
         let owner = "example.attach-surface";
-        global_plugin_layout_registry().remove_owner(owner);
-        global_plugin_surface_registry().remove_owner(owner);
+        test_layouts.remove_owner(owner);
+        test_surfaces.remove_owner(owner);
         let layout_id = PluginLayoutId::new(owner, "leading");
         assert_eq!(
-            global_plugin_layout_registry().publish(
+            test_layouts.publish(
                 owner,
                 PluginLayoutSnapshot {
                     revision: 1,
@@ -21913,7 +21912,7 @@ mod tests {
         );
         let retained_id = Uuid::from_u128(900);
         assert_eq!(
-            global_plugin_surface_registry().publish(
+            test_surfaces.publish(
                 owner,
                 PluginSurfaceSnapshot {
                     revision: 2,
@@ -21961,6 +21960,8 @@ mod tests {
             session_id,
             can_write: true,
         });
+        view_state.presentation_layouts = test_layouts.clone();
+        view_state.presentation_surfaces = test_surfaces.clone();
         let mut frame_damage = bmux_attach_pipeline::FrameDamage::default();
         let plan = build_retained_frame_plan(
             &mut view_state,
@@ -21985,27 +21986,29 @@ mod tests {
                 .any(|entry| entry.surface_id == retained_id)
         );
 
-        global_plugin_surface_registry().remove_owner(owner);
-        global_plugin_layout_registry().remove_owner(owner);
+        test_surfaces.remove_owner(owner);
+        test_layouts.remove_owner(owner);
     }
 
     #[test]
     #[serial]
     fn retained_plugin_surface_lifecycle_cleans_and_rehydrates_without_stale_state() {
         use bmux_plugin::layout::{LayoutEdge, LayoutExtent, PluginLayoutId, PluginLayoutSnapshot};
-        use bmux_plugin::surface::{
-            PluginSurface, PluginSurfaceId, PluginSurfaceSnapshot, global_plugin_surface_registry,
-        };
+        use bmux_plugin::surface::{PluginSurface, PluginSurfaceId, PluginSurfaceSnapshot};
 
+        // This test's own presentation registries (no process-wide ones).
+        let test_layouts = std::sync::Arc::new(bmux_plugin::layout::PluginLayoutRegistry::new(64));
+        let test_surfaces =
+            std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(64));
         let owner = "example.attach-lifecycle";
-        global_plugin_layout_registry().remove_owner(owner);
-        global_plugin_surface_registry().remove_owner(owner);
+        test_layouts.remove_owner(owner);
+        test_surfaces.remove_owner(owner);
         let viewport = DamageRect::new(0, 0, 80, 24);
         let retained_id = Uuid::from_u128(901);
         let layout_id = PluginLayoutId::new(owner, "leading");
         let publish = |revision, width| {
             assert_eq!(
-                global_plugin_layout_registry().publish(
+                test_layouts.publish(
                     owner,
                     PluginLayoutSnapshot {
                         revision,
@@ -22020,7 +22023,7 @@ mod tests {
                 Ok(bmux_plugin::layout::PluginLayoutPublishOutcome::Applied)
             );
             assert_eq!(
-                global_plugin_surface_registry().publish(
+                test_surfaces.publish(
                     owner,
                     PluginSurfaceSnapshot {
                         revision,
@@ -22041,11 +22044,13 @@ mod tests {
             );
         };
         publish(1, 12);
-        let view_state = AttachViewState::new(AttachOpenInfo {
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
             context_id: None,
             session_id: Uuid::from_u128(1),
             can_write: true,
         });
+        view_state.presentation_layouts = test_layouts.clone();
+        view_state.presentation_surfaces = test_surfaces.clone();
 
         let mut compositor = bmux_attach_pipeline::RetainedCompositor::new();
         let initial = compositor.replace_surfaces(
@@ -22070,8 +22075,8 @@ mod tests {
             .expect("new attach compositor should hydrate retained owner state");
         assert_eq!(reconnected_surface.revision, Some(1));
 
-        assert!(global_plugin_surface_registry().remove_owner(owner));
-        assert!(global_plugin_layout_registry().remove_owner(owner));
+        assert!(test_surfaces.remove_owner(owner));
+        assert!(test_layouts.remove_owner(owner));
         let removed = compositor.replace_surfaces(
             retained_plugin_surfaces(&view_state, viewport),
             viewport,
@@ -22094,8 +22099,8 @@ mod tests {
         assert_eq!(surface.revision, Some(2));
         assert_eq!(surface.rect, DamageRect::new(0, 0, 16, 24));
 
-        global_plugin_surface_registry().remove_owner(owner);
-        global_plugin_layout_registry().remove_owner(owner);
+        test_surfaces.remove_owner(owner);
+        test_layouts.remove_owner(owner);
     }
 
     #[test]
@@ -22113,10 +22118,13 @@ mod tests {
 
         use bmux_plugin::surface::{
             PluginSurface, PluginSurfaceId, PluginSurfaceSnapshot, PluginSurfaceTarget,
-            global_plugin_surface_registry,
         };
 
         const OWNER: &str = "test.incremental-presentation-output";
+        // This test's own presentation registries (no process-wide ones).
+        let test_layouts = std::sync::Arc::new(bmux_plugin::layout::PluginLayoutRegistry::new(64));
+        let test_surfaces =
+            std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(64));
         let session_id = Uuid::new_v4();
         let pane_id = Uuid::new_v4();
         let geometry = TerminalGeometry {
@@ -22147,11 +22155,13 @@ mod tests {
             session_id,
             can_write: true,
         });
+        view_state.presentation_layouts = test_layouts.clone();
+        view_state.presentation_surfaces = test_surfaces.clone();
         view_state
             .pane_buffers
             .insert(pane_id, PaneRenderBuffer::default());
         let publish = |revision, label: &str| {
-            global_plugin_surface_registry()
+            test_surfaces
                 .publish(
                     OWNER,
                     PluginSurfaceSnapshot {
@@ -22176,8 +22186,8 @@ mod tests {
                 .expect("publish test presentation");
         };
 
-        global_plugin_surface_registry().clear();
-        global_plugin_layout_registry().clear();
+        test_surfaces.clear();
+        test_layouts.clear();
         publish(1, "1:one 2:two 3:three");
         let mut output = Vec::new();
         render_attach_frame_to_writer(
@@ -22248,8 +22258,8 @@ mod tests {
             .is_err()
         );
         assert_eq!(view_state.retained_compositor, previous);
-        global_plugin_surface_registry().remove_owner(OWNER);
-        global_plugin_layout_registry().remove_owner(OWNER);
+        test_surfaces.remove_owner(OWNER);
+        test_layouts.remove_owner(OWNER);
     }
 
     #[test]

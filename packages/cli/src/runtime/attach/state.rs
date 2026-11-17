@@ -1,3 +1,7 @@
+/// Retained contributions each owner may keep in one attach runtime's own
+/// layout and surface registries.
+const PRESENTATION_OWNER_CONTRIBUTIONS: usize = 64;
+
 use crate::input::RuntimeAction;
 use bmux_appearance::RuntimeAppearance;
 use bmux_attach_layout_protocol::{
@@ -700,10 +704,16 @@ impl AttachViewState {
             presentation_extensions: std::sync::Arc::new(
                 bmux_plugin::RenderExtensionRegistry::new(),
             ),
-            presentation_layouts: bmux_plugin::layout::global_plugin_layout_registry_handle(),
-            presentation_allocations: bmux_plugin::layout::global_allocation_registry_handle(),
-            presentation_surfaces: bmux_plugin::surface::global_plugin_surface_registry_handle(),
-            presentation_input: bmux_plugin::global_attach_presentation_input_registry_handle(),
+            presentation_layouts: std::sync::Arc::new(
+                bmux_plugin::layout::PluginLayoutRegistry::new(PRESENTATION_OWNER_CONTRIBUTIONS),
+            ),
+            presentation_allocations: std::sync::Arc::default(),
+            presentation_surfaces: std::sync::Arc::new(
+                bmux_plugin::surface::PluginSurfaceRegistry::new(PRESENTATION_OWNER_CONTRIBUTIONS),
+            ),
+            presentation_input: std::sync::Arc::new(
+                bmux_plugin::AttachPresentationInputRegistry::new(),
+            ),
             self_client_id: None,
             command_state: None,
             owned_frontends: None,

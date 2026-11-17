@@ -7,7 +7,7 @@
 
 use crate::ExtensionRect;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{OnceLock, RwLock};
+use std::sync::RwLock;
 
 /// Stable identity of one plugin-owned layout request.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -64,32 +64,6 @@ impl AllocationRegistry {
             handler(rect);
         }
     }
-}
-
-fn allocation_handlers() -> &'static std::sync::Arc<AllocationRegistry> {
-    static HANDLERS: OnceLock<std::sync::Arc<AllocationRegistry>> = OnceLock::new();
-    HANDLERS.get_or_init(|| std::sync::Arc::new(AllocationRegistry::default()))
-}
-
-/// Shared ownership of the default presentation's allocation registry.
-#[must_use]
-pub fn global_allocation_registry_handle() -> std::sync::Arc<AllocationRegistry> {
-    allocation_handlers().clone()
-}
-
-/// Register an allocation consumer for the default process-local presentation.
-pub fn register_allocation_handler(id: PluginLayoutId, handler: AllocationHandler) {
-    allocation_handlers().register(id, handler);
-}
-
-/// Release a default process-local presentation's allocation consumer.
-pub fn remove_allocation_handler(id: &PluginLayoutId) {
-    allocation_handlers().remove(id);
-}
-
-/// Deliver resolved geometry to the default process-local presentation.
-pub fn notify_allocation(id: &PluginLayoutId, rect: ExtensionRect) {
-    allocation_handlers().notify(id, rect);
 }
 
 /// Viewport edge from which a region is split.
@@ -476,23 +450,6 @@ fn validate_snapshot(
     Ok(())
 }
 
-static GLOBAL_PLUGIN_LAYOUT_REGISTRY: OnceLock<std::sync::Arc<PluginLayoutRegistry>> =
-    OnceLock::new();
-
-/// Process-global retained layout registry used by the attach host.
-#[must_use]
-pub fn global_plugin_layout_registry() -> &'static PluginLayoutRegistry {
-    GLOBAL_PLUGIN_LAYOUT_REGISTRY.get_or_init(|| std::sync::Arc::new(PluginLayoutRegistry::new(64)))
-}
-
-/// Shared ownership of the default presentation's layout registry.
-#[must_use]
-pub fn global_plugin_layout_registry_handle() -> std::sync::Arc<PluginLayoutRegistry> {
-    GLOBAL_PLUGIN_LAYOUT_REGISTRY
-        .get_or_init(|| std::sync::Arc::new(PluginLayoutRegistry::new(64)))
-        .clone()
-}
-
 /// Resolve flat root-viewport requests in `(order, owner_plugin_id, local_id)`
 /// order.
 ///
@@ -633,16 +590,20 @@ mod tests {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = calls.clone();
         let target = id.clone();
-        register_allocation_handler(
+        let registry = std::sync::Arc::new(AllocationRegistry::default());
+        let owner = std::sync::Arc::downgrade(&registry);
+        registry.register(
             id.clone(),
             std::sync::Arc::new(move |rect| {
                 assert_eq!(rect, ExtensionRect::new(1, 2, 3, 4));
                 observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                remove_allocation_handler(&target);
+                if let Some(registry) = owner.upgrade() {
+                    registry.remove(&target);
+                }
             }),
         );
-        notify_allocation(&id, ExtensionRect::new(1, 2, 3, 4));
-        notify_allocation(&id, ExtensionRect::new(1, 2, 3, 4));
+        registry.notify(&id, ExtensionRect::new(1, 2, 3, 4));
+        registry.notify(&id, ExtensionRect::new(1, 2, 3, 4));
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 

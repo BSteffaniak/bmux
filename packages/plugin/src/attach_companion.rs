@@ -5,7 +5,7 @@
 //! entry and stops it on exit without knowing plugin IDs or product domains.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, RwLock};
 
 pub type AttachCompanionCallback = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
 
@@ -248,22 +248,6 @@ impl AttachCompanionRegistry {
             companions.clear();
         }
     }
-}
-
-static GLOBAL_ATTACH_COMPANION_REGISTRY: OnceLock<AttachCompanionRegistry> = OnceLock::new();
-
-#[must_use]
-pub fn global_attach_companion_registry() -> &'static AttachCompanionRegistry {
-    GLOBAL_ATTACH_COMPANION_REGISTRY.get_or_init(AttachCompanionRegistry::new)
-}
-
-pub fn register_attach_companion(companion: AttachCompanion) {
-    global_attach_companion_registry().register(companion);
-}
-
-#[must_use]
-pub fn registered_attach_companions() -> Vec<AttachCompanion> {
-    global_attach_companion_registry().snapshot()
 }
 
 #[cfg(test)]
