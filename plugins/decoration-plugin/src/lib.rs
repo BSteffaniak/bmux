@@ -3250,8 +3250,9 @@ impl DecorationPlugin {
         );
     }
 
+    /// Serve one hand-routed service invocation (synchronous body).
     #[allow(clippy::too_many_lines)] // route_service! naturally spans every typed op; splitting hurts readability.
-    fn invoke_service(
+    pub fn invoke_service(
         &self,
         context: bmux_plugin_sdk::NativeServiceContext,
     ) -> bmux_plugin_sdk::ServiceResponse {

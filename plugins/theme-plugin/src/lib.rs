@@ -12,8 +12,8 @@ use bmux_plugin::prompt;
 use bmux_plugin::{HostRuntimeApi, ServiceCaller};
 use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{
-    HostConnectionInfo, NativeServiceContext, PluginEvent, PromptEvent, PromptResponse,
-    PromptValue, ServiceKind, ServiceResponse, StorageGetRequest, StorageKey,
+    HostConnectionInfo, NativeServiceContext, PromptEvent, PromptResponse, PromptValue,
+    ServiceKind, ServiceResponse, StorageGetRequest, StorageKey,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -681,17 +681,7 @@ impl ThemeView {
     }
 }
 
-impl RustPlugin for ThemeView {
-    type Contract = control_contract::Contract;
-
-    fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
-        bmux_plugin_sdk::route_command!(context, {
-            "pick-theme" => pick_theme(&context),
-            "refresh-theme" => refresh_theme(&context),
-            "show-theme" => show_theme(&context),
-        })
-    }
-
+impl ThemeView {
     fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
         if self
             .recovery_required
@@ -3080,6 +3070,7 @@ mod tests {
     use super::*;
     use bmux_plugin::test_support::{TestServiceRouter, install_test_service_router};
     use bmux_plugin_sdk::StorageSetRequest;
+    use bmux_plugin_sdk::author::{Declarations, Plugin};
     use bmux_plugin_sdk::{
         ApiVersion, HostMetadata, HostScope, ProviderId, RegisteredService, ServiceKind,
         ServiceRequest, StorageGetResponse, decode_service_message, encode_service_message,
@@ -3093,9 +3084,18 @@ mod tests {
         calls: Arc<std::sync::atomic::AtomicUsize>,
     }
 
-    impl RustPlugin for CountedTheme {
-        type Contract = <ThemePlugin as RustPlugin>::Contract;
+    impl Plugin for CountedTheme {
+        fn declare(d: &mut Declarations<Self>) {
+            d.blocking_services(Self::invoke_service, None);
+            for name in ["pick-theme", "show-theme", "refresh-theme"] {
+                d.blocking_command(name, |_, context| {
+                    Err(PluginCommandError::unknown_command(&context.command))
+                });
+            }
+        }
+    }
 
+    impl CountedTheme {
         fn invoke_service(&self, context: NativeServiceContext) -> ServiceResponse {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.plugin.invoke_service(context)
@@ -3178,12 +3178,17 @@ mod tests {
         use bmux_plugin_sdk::definition::PluginInstance;
         let counted = CountedTheme::default();
         let calls = Arc::clone(&counted.calls);
-        let adapter = bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
+        let adapter = bmux_plugin_sdk::author::DeclaredInstance::new(
             counted,
-            bmux_plugin_sdk::definition::LoadedInstanceId::from_uuid(uuid::Uuid::from_u128(0x7e)),
-        );
+            crate::control_contract::PLUGIN_MANIFEST,
+            crate::control_contract::SERVICE_CONTRACTS,
+        )
+        .unwrap()
+        .for_instance(bmux_plugin_sdk::definition::LoadedInstanceId::from_uuid(
+            uuid::Uuid::from_u128(0x7e),
+        ));
         assert_eq!(
-            <<ThemePlugin as RustPlugin>::Contract as PluginContract>::service_contract_for(
+            <crate::control_contract::Contract as PluginContract>::service_contract_for(
                 "theme-state"
             ),
             Some(SERVICE_CONTRACT),
@@ -3524,7 +3529,7 @@ mod tests {
             .map_err(|error| error.to_string())?
             .to_vec();
         }
-        let mut response = RustPlugin::invoke_service(plugin, context);
+        let mut response = plugin.invoke_service(context);
         if checked && response.error.is_none() {
             response.payload = service_contract::encode_response(&response.payload);
         }
@@ -6176,49 +6181,15 @@ pub fn plugin_definition_with_runtime(
     events: std::sync::Arc<bmux_plugin::EventBus>,
     sink: std::sync::Arc<dyn bmux_plugin_sdk::WireEventSink>,
 ) -> bmux_plugin_sdk::definition::PluginDefinition {
-    let metadata = plugin_definition().metadata;
-    bmux_plugin_sdk::definition::PluginDefinition::new(
-        metadata,
-        move |scope: bmux_plugin_sdk::definition::PluginCreateContext| {
-            Ok(std::sync::Arc::new(
-                bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
-                    ThemePlugin::with_runtime(events.clone(), sink.clone()),
-                    scope.instance,
-                ),
-            )
-                as std::sync::Arc<
-                    dyn bmux_plugin_sdk::definition::PluginInstance,
-                >)
-        },
+    bmux_plugin_sdk::author::definition::<ThemePlugin>(
+        crate::control_contract::PLUGIN_MANIFEST,
+        crate::control_contract::SERVICE_CONTRACTS,
+        move |_| Ok(ThemePlugin::with_runtime(events.clone(), sink.clone())),
     )
+    .expect("embedded theme declaration must be valid")
 }
 
-bmux_plugin_sdk::define_plugin!(
-    factory = |scope: bmux_plugin_sdk::definition::PluginCreateContext| Ok(std::sync::Arc::new(
-        bmux_plugin_sdk::definition::RustPluginAdapter::for_instance(
-            ThemePlugin::default(),
-            scope.instance
-        )
-    )
-        as std::sync::Arc<dyn bmux_plugin_sdk::definition::PluginInstance>),
-    metadata = {
-        let manifest_toml = crate::control_contract::PLUGIN_MANIFEST;
-        let manifest = bmux_plugin::PluginManifest::from_toml_str(manifest_toml)
-            .expect("embedded plugin declaration must be valid");
-        bmux_plugin_sdk::definition::PluginMetadata {
-            plugin_id: manifest.id,
-            version: manifest.version,
-            roles: manifest.component_roles,
-            required_capabilities: manifest
-                .required_capabilities
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            contracts: manifest.contracts,
-            manifest_toml: Some(manifest_toml.into()),
-        }
-    },
-);
+bmux_plugin_sdk::plugin!(ThemePlugin, declaration = crate::control_contract);
 
 #[cfg(test)]
 mod embedded_declaration_identity_tests {
@@ -6238,12 +6209,17 @@ mod embedded_declaration_identity_tests {
         assert_eq!(definition.metadata.roles, manifest.component_roles);
         assert_eq!(definition.metadata.contracts, manifest.contracts);
         assert_eq!(
-            definition.metadata.required_capabilities,
+            definition
+                .metadata
+                .required_capabilities
+                .iter()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
             manifest
                 .required_capabilities
                 .iter()
                 .map(ToString::to_string)
-                .collect::<Vec<_>>()
+                .collect::<std::collections::BTreeSet<_>>()
         );
 
         // Deterministic verifier fixtures, not claims about built executable bytes.

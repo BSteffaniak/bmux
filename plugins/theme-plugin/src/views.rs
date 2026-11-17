@@ -1,12 +1,13 @@
 //! Attachment-local ownership. The default is a preference, never a live view.
 use super::{
-    ActiveThemeSource, ConfigScopeTarget, DetachTask, EXIT_OK, LiveTheme, NativeCommandContext,
-    NativeLifecycleContext, NativeServiceContext, PluginCommandError, PluginEvent, ResolvedTheme,
-    RustPlugin, ServiceResponse, ThemeSelection, ThemeView, active_theme_stack, control_contract,
+    ActiveThemeSource, ConfigScopeTarget, DetachTask, LiveTheme, NativeCommandContext,
+    NativeLifecycleContext, NativeServiceContext, PluginCommandError, ResolvedTheme,
+    ServiceResponse, ThemeSelection, ThemeView, active_theme_stack, control_contract,
     load_theme_catalog, picker_selection_name, resolve_live_selection,
     scoped_theme_settings_for_target, try_parse_settings,
 };
 use bmux_plugin::HostRuntimeApi;
+use bmux_plugin_sdk::author::{Declarations, Plugin};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -16,12 +17,19 @@ pub struct ThemePlugin {
     default: Mutex<Option<control_contract::theme_control_v1::Snapshot>>,
     detach_task: Mutex<Option<DetachTask>>,
     preview_sequence: Arc<std::sync::atomic::AtomicU64>,
-    events: Option<Arc<bmux_plugin::EventBus>>,
+    events: std::sync::RwLock<Option<Arc<bmux_plugin::EventBus>>>,
     sink: Option<Arc<dyn bmux_plugin_sdk::WireEventSink>>,
     /// The activation's view of the host state registry, consulted for the
     /// host's wire sink when no explicit runtime sink was composed. `None`
     /// before activation; never a process-wide registry.
-    states: Option<Arc<bmux_plugin::PluginStateRegistry>>,
+    states: std::sync::RwLock<Option<Arc<bmux_plugin::PluginStateRegistry>>>,
+}
+
+fn slot_mut<T>(
+    slot: &std::sync::RwLock<T>,
+) -> std::result::Result<std::sync::RwLockWriteGuard<'_, T>, bmux_plugin_sdk::PluginCommandError> {
+    slot.write()
+        .map_err(|_| bmux_plugin_sdk::PluginCommandError::failed("plugin state lock poisoned"))
 }
 
 struct View {
@@ -38,6 +46,14 @@ struct View {
 }
 
 impl ThemePlugin {
+    fn events(&self) -> Option<Arc<bmux_plugin::EventBus>> {
+        self.events.read().ok().and_then(|events| events.clone())
+    }
+
+    fn states(&self) -> Option<Arc<bmux_plugin::PluginStateRegistry>> {
+        self.states.read().ok().and_then(|states| states.clone())
+    }
+
     /// Supply this runtime's event bus and recipient sink.
     ///
     /// Explicit resources never fall back to another process-local host.
@@ -51,16 +67,16 @@ impl ThemePlugin {
             default: Mutex::default(),
             detach_task: Mutex::default(),
             preview_sequence: Arc::default(),
-            events: Some(events),
+            events: std::sync::RwLock::new(Some(events)),
             sink: Some(sink),
-            states: None,
+            states: std::sync::RwLock::default(),
         }
     }
 
     fn selected_sink(&self) -> Option<Arc<dyn bmux_plugin_sdk::WireEventSink>> {
         self.sink
             .clone()
-            .or_else(|| host_wire_sink(self.states.as_deref()))
+            .or_else(|| host_wire_sink(self.states().as_deref()))
     }
 
     pub(super) fn command_impl(context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
@@ -102,7 +118,7 @@ impl ThemePlugin {
                 },
                 context: context.clone(),
                 sink: self.selected_sink(),
-                states: self.states.clone(),
+                states: self.states().clone(),
                 closed: std::sync::atomic::AtomicBool::new(false),
                 published: Mutex::new(None),
                 explicit: std::sync::atomic::AtomicBool::new(false),
@@ -188,7 +204,7 @@ impl ThemePlugin {
             return;
         };
         let views = Arc::clone(&self.views);
-        let Some(bus) = self.events.clone() else {
+        let Some(bus) = self.events().clone() else {
             return;
         };
         let sink = self.selected_sink();
@@ -459,27 +475,35 @@ impl View {
     }
 }
 
-impl RustPlugin for ThemePlugin {
-    type Contract = control_contract::Contract;
+impl Plugin for ThemePlugin {
+    fn declare(d: &mut Declarations<Self>) {
+        d.blocking_activate(Self::activate)
+            .blocking_command("pick-theme", Self::run_command)
+            .blocking_command("show-theme", Self::run_command)
+            .blocking_command("refresh-theme", Self::run_command)
+            .blocking_services(Self::invoke_service, None);
+    }
+}
 
-    fn activate(&mut self, context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+impl ThemePlugin {
+    fn activate(
+        &self,
+        context: bmux_plugin_sdk::NativeLifecycleContext,
+        _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
+    ) -> std::result::Result<(), PluginCommandError> {
         // No lifecycle call applies theme/appearance globally. An explicit
         // runtime bus wins; otherwise use the bus this activation was handed.
-        if self.events.is_none() {
-            self.events = bmux_plugin::activation_event_bus(&context);
+        if self.events().is_none() {
+            *slot_mut(&self.events)? = bmux_plugin::activation_event_bus(&context);
         }
         if self.sink.is_none() {
-            self.states = Some(bmux_plugin::activation_state_registry(&context));
+            *slot_mut(&self.states)? = Some(bmux_plugin::activation_state_registry(&context));
         }
         self.watch_detach(&context);
-        Ok(EXIT_OK)
+        Ok(())
     }
 
-    fn handle_event(&mut self, _event: PluginEvent) -> Result<i32, PluginCommandError> {
-        Ok(EXIT_OK)
-    }
-
-    fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
+    fn run_command(&self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         Self::command_impl(&context)
     }
 
