@@ -263,14 +263,7 @@ impl Replay {
         let apply_cost = self.probe.since(mark);
         let applied = started.elapsed();
         let full = self.frames == 0;
-        let mut damage = FrameDamage::default();
-        if full {
-            damage.mark_full_frame();
-        } else {
-            for pane in &self.fed {
-                damage.mark_content_surface(*pane);
-            }
-        }
+        let damage = self.damage(full);
         let step = self.image_step();
         self.frames += 1;
         let started = Instant::now();
@@ -329,7 +322,11 @@ impl Replay {
             })
             .expect("render");
         match presented.presented {
-            crate::frame_presenter::Presented::Frame(bytes) => output.extend_from_slice(&bytes),
+            crate::frame_presenter::Presented::Frame(bytes) => {
+                output.extend_from_slice(&bytes);
+                // Written, as the attach client writes a frame, and given back.
+                self.presenter.recycle(bytes);
+            }
             crate::frame_presenter::Presented::Unchanged => {}
             crate::frame_presenter::Presented::Unsupported(reason) => {
                 panic!("the frame should be presentable: {reason}")
@@ -356,6 +353,19 @@ impl Replay {
             render_cost,
             observe_cost,
         }
+    }
+
+    /// The damage of a frame: all of it for the first, the fed panes' content after.
+    fn damage(&self, full: bool) -> FrameDamage {
+        let mut damage = FrameDamage::default();
+        if full {
+            damage.mark_full_frame();
+        } else {
+            for pane in &self.fed {
+                damage.mark_content_surface(*pane);
+            }
+        }
+        damage
     }
 
     /// Columns the images move this frame.
@@ -1083,7 +1093,7 @@ fn pipeline_soak() {
         replay.hold = true;
         replay
     };
-    let mut scenarios: Vec<(String, Replay, Vec<Frame>)> = vec![
+    let scenarios: Vec<(String, Replay, Vec<Frame>)> = vec![
         (
             "plain-stream".into(),
             Replay::new(size, true, delivery()),
@@ -1101,15 +1111,20 @@ fn pipeline_soak() {
         ),
     ];
     #[cfg(all(feature = "image-kitty", feature = "image-sixel"))]
-    for (protocol, kitty) in [("kitty", true), ("sixel", false)] {
-        scenarios.push((
-            format!("image/{protocol}/moving"),
-            image_replay(size, kitty, 1),
-            corpus_named(pane, "plain-stream"),
-        ));
-    }
+    let images: Vec<(String, Replay, Vec<Frame>)> = [("kitty", true), ("sixel", false)]
+        .into_iter()
+        .map(|(protocol, kitty)| {
+            (
+                format!("image/{protocol}/moving"),
+                image_replay(size, kitty, 1),
+                corpus_named(pane, "plain-stream"),
+            )
+        })
+        .collect();
+    #[cfg(not(all(feature = "image-kitty", feature = "image-sixel")))]
+    let images = Vec::new();
     let mut failures = Vec::new();
-    for (name, replay, frames) in scenarios {
+    for (name, replay, frames) in scenarios.into_iter().chain(images) {
         let live = soak(replay, &frames, ROUNDS);
         let start = live[ROUNDS / 2];
         let peak = live[ROUNDS / 2..].iter().copied().max().unwrap_or(start);

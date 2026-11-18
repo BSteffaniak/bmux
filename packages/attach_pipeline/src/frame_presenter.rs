@@ -36,6 +36,8 @@ pub struct FramePresenter {
     shown: bool,
     /// What the last call to [`Self::present`] did to the frame shown before it.
     last: Last,
+    /// Storage of a written frame's bytes given back with [`Self::recycle`].
+    spare_output: Vec<u8>,
 }
 
 impl Default for FramePresenter {
@@ -241,6 +243,7 @@ impl FramePresenter {
             images: Images::default(),
             shown: false,
             last: Last::Unknown,
+            spare_output: Vec::new(),
         }
     }
 
@@ -267,6 +270,15 @@ impl FramePresenter {
             self.images.reconfigured = true;
         }
         self.images.host = Some((capabilities, config));
+    }
+
+    /// Give back the bytes of a frame once written, so a later frame writes into their storage
+    /// instead of allocating its own.
+    pub fn recycle(&mut self, mut bytes: Vec<u8>) {
+        if bytes.capacity() > self.spare_output.capacity() {
+            bytes.clear();
+            self.spare_output = bytes;
+        }
     }
 
     /// Remove every image the compositor put on the host (when leaving it), writing the removal
@@ -406,7 +418,9 @@ impl FramePresenter {
                 } else {
                     Last::Full
                 };
-                Presented::Frame(std::mem::take(self.terminal.writer_mut()))
+                // The next frame writes into a buffer a caller recycled, if any.
+                let spare = std::mem::take(&mut self.spare_output);
+                Presented::Frame(std::mem::replace(self.terminal.writer_mut(), spare))
             }
             Ok(None) => {
                 self.last = Last::Unchanged;

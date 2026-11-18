@@ -2336,6 +2336,16 @@ impl DisplayCaptureFanout {
         }
     }
 
+    /// Whether a recording is open, so images are worth copying for it.
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    fn is_recording(&self) -> bool {
+        !self.writers.is_empty()
+    }
+
     fn record_resize(&mut self, cols: u16, rows: u16) {
         let mut failed = Vec::new();
         for (id, writer) in &mut self.writers {
@@ -11675,7 +11685,13 @@ fn render_attach_frame_inner(
     ))]
     {
         let mut all_images: Vec<bmux_attach_image_protocol::AttachPaneImage> = Vec::new();
-        for surface in &layout_state.scene.surfaces {
+        // Only a recording keeps them: every image's bytes are copied here.
+        let surfaces = if display_capture.is_recording() {
+            layout_state.scene.surfaces.as_slice()
+        } else {
+            &[]
+        };
+        for surface in surfaces {
             let Some(pane_id) = surface.pane_id else {
                 continue;
             };
@@ -11695,7 +11711,9 @@ fn render_attach_frame_inner(
                 }
             }
         }
-        display_capture.record_images(&all_images);
+        if display_capture.is_recording() {
+            display_capture.record_images(&all_images);
+        }
     }
 
     if terminal_write_ms >= slow_terminal_write_ms {
@@ -11724,6 +11742,7 @@ fn render_attach_frame_inner(
     view_state.last_help_overlay_surface = current_help_overlay_surface;
     view_state.last_prompt_overlay_surface = current_prompt_overlay_surface;
     view_state.dirty.clear_frame_damage();
+    view_state.terminal_presenter.recycle(frame_bytes);
     Ok(stats)
 }
 
