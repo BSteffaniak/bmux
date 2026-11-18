@@ -793,3 +793,13 @@ fn details_inside_list_items_and_block_quotes() {
         2
     );
 }
+
+#[test]
+fn plain_text_previews_drop_comments_and_scripts() {
+    assert_eq!(
+        bmux_markdown::markdown_to_plain_text(
+            "<!--\nhidden\nnote\n-->\nShown <b>bold</b> &amp;\n\n<script>\nno()\n</script>\n\ndone"
+        ),
+        "Shown bold & done"
+    );
+}

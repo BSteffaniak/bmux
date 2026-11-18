@@ -683,9 +683,24 @@ impl MarkdownRenderOptions {
 pub fn markdown_to_plain_text(markdown: &str) -> String {
     let document = parse_markdown_document(markdown);
     let mut output = String::new();
+    // HTML block lines arrive as separate events; markup such as a comment may
+    // span them, so consecutive fragments are read together.
+    let mut html_run = String::new();
     for event in document.events {
+        if let MarkdownSemanticEventKind::Html(html) = &event.kind {
+            if cfg!(feature = "html") {
+                html_run.push_str(html);
+            } else {
+                collect_html_plain_text(html, &mut output);
+            }
+            continue;
+        }
+        if !html_run.is_empty() {
+            collect_html_plain_text(&html_run, &mut output);
+            html_run.clear();
+        }
         match event.kind {
-            MarkdownSemanticEventKind::Start(_) => {}
+            MarkdownSemanticEventKind::Start(_) | MarkdownSemanticEventKind::Html(_) => {}
             MarkdownSemanticEventKind::End(tag) => {
                 if semantic_end_needs_separator(tag) {
                     output.push(' ');
@@ -695,9 +710,6 @@ pub fn markdown_to_plain_text(markdown: &str) -> String {
             | MarkdownSemanticEventKind::Code(text)
             | MarkdownSemanticEventKind::InlineMath(text)
             | MarkdownSemanticEventKind::DisplayMath(text) => output.push_str(&text),
-            MarkdownSemanticEventKind::Html(html) => {
-                collect_html_plain_text(&html, &mut output);
-            }
             MarkdownSemanticEventKind::FootnoteReference(label) => {
                 output.push_str(" [");
                 output.push_str(&label);
@@ -711,6 +723,9 @@ pub fn markdown_to_plain_text(markdown: &str) -> String {
                 output.push_str(if checked { "checked " } else { "unchecked " });
             }
         }
+    }
+    if !html_run.is_empty() {
+        collect_html_plain_text(&html_run, &mut output);
     }
     normalize_inline_whitespace(&output).trim().to_owned()
 }
