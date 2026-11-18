@@ -40,8 +40,20 @@ const TABLE_UNEVEN: &str = include_str!("fixtures/table_uneven.md");
 const TABLE_UNICODE: &str = include_str!("fixtures/table_unicode.md");
 const UNICODE: &str = include_str!("fixtures/unicode.md");
 
+/// Render options showing raw HTML as text, the only behavior without the
+/// `html` feature; HTML presentation has its own tests.
+#[cfg(feature = "html")]
+fn legacy_options(width: u16) -> MarkdownRenderOptions {
+    MarkdownRenderOptions::new(width).with_html(bmux_markdown::MarkdownHtmlMode::Raw)
+}
+
+#[cfg(not(feature = "html"))]
+fn legacy_options(width: u16) -> MarkdownRenderOptions {
+    MarkdownRenderOptions::new(width)
+}
+
 fn render(markdown: &str, width: u16) -> Vec<Line> {
-    render_markdown_lines(markdown, MarkdownRenderOptions::new(width))
+    render_markdown_lines(markdown, legacy_options(width))
 }
 
 fn visible_snapshot(markdown: &str, width: u16) -> String {
@@ -167,7 +179,7 @@ fn semantic_snapshot(markdown: &str) -> String {
 }
 
 fn contribution_snapshot(markdown: &str) -> String {
-    render_markdown(markdown, &MarkdownRenderOptions::new(80))
+    render_markdown(markdown, &legacy_options(80))
         .contributions
         .into_iter()
         .map(|contribution| {
@@ -194,7 +206,7 @@ struct MarkdownCapabilities {
 }
 
 fn capability_projection(markdown: &str, capabilities: MarkdownCapabilities) -> (String, usize) {
-    let mut options = MarkdownRenderOptions::new(50);
+    let mut options = legacy_options(50);
     if !capabilities.color {
         options.theme = bmux_markdown::MarkdownTheme {
             text: Style::new(),
@@ -217,6 +229,8 @@ fn capability_projection(markdown: &str, capabilities: MarkdownCapabilities) -> 
             task_unchecked: Style::new(),
             table_border: Style::new(),
             horizontal_rule: Style::new(),
+            keyboard: Style::new(),
+            highlight: Style::new(),
         };
     }
     if capabilities.mermaid {
@@ -345,7 +359,7 @@ fn rejected_destination_diagnostics_do_not_retain_sensitive_values() {
 
 #[test]
 fn image_sources_use_the_same_safe_context_classification_as_links() {
-    let options = MarkdownRenderOptions::new(80).with_document_context(MarkdownDocumentContext {
+    let options = legacy_options(80).with_document_context(MarkdownDocumentContext {
         base_url: None,
         base_directory: Some(std::path::PathBuf::from("/trusted/repository")),
         github_repository: None,
@@ -377,7 +391,7 @@ fn image_sources_use_the_same_safe_context_classification_as_links() {
 
     let badge = render_markdown(
         "[![Build](https://img.example/build.svg)](https://example.com/build)",
-        &MarkdownRenderOptions::new(80),
+        &legacy_options(80),
     );
     assert!(badge.contributions.iter().any(|item| matches!(
         &item.kind,
@@ -392,7 +406,7 @@ fn image_sources_use_the_same_safe_context_classification_as_links() {
 
 #[test]
 fn mermaid_contribution_renders_svg_or_keeps_source_with_diagnostic() {
-    let enabled = MarkdownRenderOptions::new(80).with_mermaid(800, 600);
+    let enabled = legacy_options(80).with_mermaid(800, 600);
     let rendered = render_markdown("```mermaid\nflowchart LR\nA --> B\n```", &enabled);
     assert!(rendered.contributions.iter().any(|item| matches!(
         &item.kind,
@@ -439,7 +453,7 @@ fn snapshots_details_noninteractive_fallback_at_normal_and_narrow_widths() {
 
 #[test]
 fn details_contributions_preserve_safe_summary_body_and_default_state() {
-    let result = render_markdown(DETAILS, &MarkdownRenderOptions::new(60));
+    let result = render_markdown(DETAILS, &legacy_options(60));
     let details = result
         .contributions
         .iter()
@@ -470,7 +484,7 @@ fn details_contributions_preserve_safe_summary_body_and_default_state() {
 
 #[test]
 fn nested_details_preserve_contributions_and_readable_recursive_fallback() {
-    let result = render_markdown(DETAILS_NESTED, &MarkdownRenderOptions::new(60));
+    let result = render_markdown(DETAILS_NESTED, &legacy_options(60));
     let details = result
         .contributions
         .iter()
@@ -512,7 +526,7 @@ fn streamed_incomplete_details_remain_visible_until_complete() {
     let partial = "Before.\n\n<details><summary>Retry</summary>Body with **important** content";
     let rendered = render_markdown(
         partial,
-        &MarkdownRenderOptions::new(50)
+        &legacy_options(50)
             .with_streaming(true)
             .with_details_open(std::collections::BTreeMap::new()),
     );
@@ -530,7 +544,7 @@ fn streamed_incomplete_details_remain_visible_until_complete() {
     );
 
     let complete = format!("{partial}</details>");
-    let rendered = render_markdown(&complete, &MarkdownRenderOptions::new(50));
+    let rendered = render_markdown(&complete, &legacy_options(50));
     let complete_visible = rendered_lines_text(&rendered.lines);
     assert!(complete_visible.contains("Retry"));
     assert!(complete_visible.contains("Body with important content"));
@@ -549,11 +563,11 @@ fn streamed_incomplete_details_remain_visible_until_complete() {
 fn streamed_semantic_ids_shift_only_at_or_after_changed_source() {
     let before = render_markdown(
         "[first](a.md) and [second](b.md)",
-        &MarkdownRenderOptions::new(80).with_document_id("stream:1"),
+        &legacy_options(80).with_document_id("stream:1"),
     );
     let after = render_markdown(
         "prefix [first](a.md) and [second](b.md)",
-        &MarkdownRenderOptions::new(80).with_document_id("stream:1"),
+        &legacy_options(80).with_document_id("stream:1"),
     );
     assert_eq!(before.contributions.len(), after.contributions.len());
     assert_ne!(before.contributions[0].id, after.contributions[0].id);
@@ -567,11 +581,11 @@ fn streamed_semantic_ids_shift_only_at_or_after_changed_source() {
 
     let append_before = render_markdown(
         "[first](a.md)",
-        &MarkdownRenderOptions::new(80).with_document_id("stream:1"),
+        &legacy_options(80).with_document_id("stream:1"),
     );
     let append_after = render_markdown(
         "[first](a.md) trailing stream text",
-        &MarkdownRenderOptions::new(80).with_document_id("stream:1"),
+        &legacy_options(80).with_document_id("stream:1"),
     );
     assert_eq!(
         append_before.contributions[0].id,
@@ -583,7 +597,7 @@ fn streamed_semantic_ids_shift_only_at_or_after_changed_source() {
 fn duplicate_semantic_nodes_have_unique_position_qualified_ids() {
     let rendered = render_markdown(
         "[same](target.md) [same](target.md)",
-        &MarkdownRenderOptions::new(80).with_document_id("item:duplicates"),
+        &legacy_options(80).with_document_id("item:duplicates"),
     );
     assert_eq!(rendered.contributions.len(), 2);
     assert_ne!(rendered.contributions[0].id, rendered.contributions[1].id);
@@ -591,24 +605,24 @@ fn duplicate_semantic_nodes_have_unique_position_qualified_ids() {
 
 #[test]
 fn markdown_layout_signature_tracks_every_renderer_owned_layout_input() {
-    let base = MarkdownRenderOptions::new(80).with_document_id("item:1");
+    let base = legacy_options(80).with_document_id("item:1");
     let base_result = render_markdown("[link](relative.md)", &base);
     let variants = [
-        MarkdownRenderOptions::new(40).with_document_id("item:1"),
-        MarkdownRenderOptions::new(80).with_document_id("item:2"),
-        MarkdownRenderOptions::new(80)
+        legacy_options(40).with_document_id("item:1"),
+        legacy_options(80).with_document_id("item:2"),
+        legacy_options(80)
             .with_document_id("item:1")
             .with_streaming(true),
-        MarkdownRenderOptions::new(80)
+        legacy_options(80)
             .with_document_id("item:1")
             .with_mermaid(800, 600),
-        MarkdownRenderOptions::new(80)
+        legacy_options(80)
             .with_document_id("item:1")
             .with_document_context(MarkdownDocumentContext {
                 base_url: Some(url::Url::parse("https://example.com/base/").unwrap()),
                 ..MarkdownDocumentContext::default()
             }),
-        MarkdownRenderOptions::new(80).with_theme(bmux_markdown::MarkdownTheme {
+        legacy_options(80).with_theme(bmux_markdown::MarkdownTheme {
             heading: Style::new().fg(Color::Red),
             ..bmux_markdown::MarkdownTheme::default()
         }),
@@ -628,7 +642,7 @@ fn markdown_layout_signature_tracks_every_renderer_owned_layout_input() {
 #[test]
 fn github_issue_references_require_explicit_repository_context() {
     let markdown = "Closes #42, see #7, but not #0, #abc, or `#99`.";
-    let without_context = render_markdown(markdown, &MarkdownRenderOptions::new(80));
+    let without_context = render_markdown(markdown, &legacy_options(80));
     assert!(
         !without_context
             .contributions
@@ -636,7 +650,7 @@ fn github_issue_references_require_explicit_repository_context() {
             .any(|item| matches!(item.kind, MarkdownContributionKind::GitHubIssue { .. }))
     );
 
-    let options = MarkdownRenderOptions::new(80).with_document_context(MarkdownDocumentContext {
+    let options = legacy_options(80).with_document_context(MarkdownDocumentContext {
         github_repository: Some(GitHubRepository {
             owner: "acme".to_owned(),
             name: "nebula".to_owned(),
@@ -663,9 +677,9 @@ fn github_issue_references_require_explicit_repository_context() {
 
 #[test]
 fn contribution_ids_include_explicit_owner_and_remain_width_stable() {
-    let wide_options = MarkdownRenderOptions::new(80).with_document_id("transcript:42");
-    let narrow_options = MarkdownRenderOptions::new(20).with_document_id("transcript:42");
-    let other_options = MarkdownRenderOptions::new(80).with_document_id("transcript:43");
+    let wide_options = legacy_options(80).with_document_id("transcript:42");
+    let narrow_options = legacy_options(20).with_document_id("transcript:42");
+    let other_options = legacy_options(80).with_document_id("transcript:43");
     let wide = render_markdown(SEMANTIC_EXTENSIONS, &wide_options);
     let narrow = render_markdown(SEMANTIC_EXTENSIONS, &narrow_options);
     let other = render_markdown(SEMANTIC_EXTENSIONS, &other_options);
@@ -746,7 +760,7 @@ fn rendered_link_contributions_include_classified_destinations() {
         base_directory: Some(std::path::PathBuf::from("/trusted/repository")),
         github_repository: None,
     };
-    let options = MarkdownRenderOptions::new(80).with_document_context(context);
+    let options = legacy_options(80).with_document_context(context);
     let result = render_markdown("[Protocol](./docs/protocol.md)", &options);
     assert!(result.contributions.iter().any(|item| matches!(
         &item.kind,
@@ -783,7 +797,7 @@ fn math_uses_unicode_subset_and_preserves_unsupported_source() {
 
 #[test]
 fn footnote_contributions_have_bidirectional_navigation_targets() {
-    let options = MarkdownRenderOptions::new(80).with_document_id("message:7");
+    let options = legacy_options(80).with_document_id("message:7");
     let rendered = render_markdown(FOOTNOTES, &options);
     let references = rendered
         .contributions
@@ -827,7 +841,7 @@ fn footnote_contributions_have_bidirectional_navigation_targets() {
 #[test]
 fn footnote_definition_geometry_is_in_the_footnote_section_when_the_body_repeats_its_number() {
     let source = "Claim[^n] here.\n\nfiller 1 and 1.\n\nmore 1\n\n[^n]: NOTEBODY";
-    let options = MarkdownRenderOptions::new(40).with_document_id("doc");
+    let options = legacy_options(40).with_document_id("doc");
     let rendered = render_markdown(source, &options);
     let definition = rendered
         .contributions
@@ -912,8 +926,8 @@ fn snapshots_parser_neutral_semantic_contributions() {
 
 #[test]
 fn semantic_contributions_have_stable_unique_ids_and_expected_payloads() {
-    let first = render_markdown(SEMANTIC_EXTENSIONS, &MarkdownRenderOptions::new(80));
-    let second = render_markdown(SEMANTIC_EXTENSIONS, &MarkdownRenderOptions::new(24));
+    let first = render_markdown(SEMANTIC_EXTENSIONS, &legacy_options(80));
+    let second = render_markdown(SEMANTIC_EXTENSIONS, &legacy_options(24));
     let first_ids = first
         .contributions
         .iter()
@@ -1071,7 +1085,7 @@ fn every_semantic_fallback_preserves_important_content() {
         "| Check | State |\n|---|---|\n| integration | passing |\n",
     );
     for width in [80_u16, 20] {
-        let rendered = render_markdown(source, &MarkdownRenderOptions::new(width));
+        let rendered = render_markdown(source, &legacy_options(width));
         let visible = rendered_lines_text(&rendered.lines);
         let compact = visible.replace('\n', "");
         for expected in [
@@ -1226,7 +1240,7 @@ fn streaming_projection_preserves_safety_and_converges_when_syntax_completes() {
     let unsafe_visible = rendered_lines_text(
         &render_markdown(
             unsafe_prefix,
-            &MarkdownRenderOptions::new(80)
+            &legacy_options(80)
                 .with_streaming(true)
                 .with_link_destination_fallbacks(true),
         )
@@ -1237,11 +1251,8 @@ fn streaming_projection_preserves_safety_and_converges_when_syntax_completes() {
     assert!(!unsafe_visible.contains("alert(1)"));
 
     let complete = "Before [guide](https://example.com) after";
-    let streaming = render_markdown(
-        complete,
-        &MarkdownRenderOptions::new(80).with_streaming(true),
-    );
-    let finalized = render_markdown(complete, &MarkdownRenderOptions::new(80));
+    let streaming = render_markdown(complete, &legacy_options(80).with_streaming(true));
+    let finalized = render_markdown(complete, &legacy_options(80));
     assert_eq!(streaming.lines, finalized.lines);
     assert_eq!(streaming.contributions, finalized.contributions);
 
@@ -1259,7 +1270,7 @@ fn streaming_projection_preserves_safety_and_converges_when_syntax_completes() {
     ];
     for (source, expected) in incomplete_cases {
         let visible = rendered_lines_text(
-            &render_markdown(source, &MarkdownRenderOptions::new(80).with_streaming(true)).lines,
+            &render_markdown(source, &legacy_options(80).with_streaming(true)).lines,
         );
         assert!(
             visible.contains(expected),
@@ -1311,8 +1322,7 @@ fn arbitrary_streaming_prefixes_keep_incomplete_source_content_visible() {
         {
             let prefix = &source[..prefix_end];
             let visible = rendered_lines_text(
-                &render_markdown(prefix, &MarkdownRenderOptions::new(40).with_streaming(true))
-                    .lines,
+                &render_markdown(prefix, &legacy_options(40).with_streaming(true)).lines,
             );
             for word in expected_words
                 .iter()

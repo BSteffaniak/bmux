@@ -32,6 +32,9 @@ hyperchad_markdown = { workspace = true, features = ["syntax-highlighting"] }
 
 [features]
 default = []
+# Render or strip raw HTML embedded in Markdown (GitHub's sanitized subset)
+# instead of showing it as text. See `MarkdownHtmlMode`.
+html = []
 fail-on-warnings = [
     "bmux_mermaid_render/fail-on-warnings",
     "bmux_syntax_render/fail-on-warnings",

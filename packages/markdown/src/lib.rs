@@ -23,8 +23,14 @@
 //!   tables communicate columns through header labels.
 //! * Images render as `[image: description]` using alt text, then source, then
 //!   a generic fallback.
-//! * Dangerous HTML is escaped by parser-level XSS protection; safe raw HTML is
+//! * Without the `html` feature (or with [`MarkdownHtmlMode::Raw`]), dangerous
+//!   HTML is escaped by parser-level XSS protection and safe raw HTML is
 //!   displayed as text.
+//! * With the `html` feature, raw HTML is rendered by default like GitHub's
+//!   sanitized subset: inline formatting, links, images, headings, lists,
+//!   tables, block quotes, preformatted text, `align`, and interactive
+//!   `<details>`; comments and `<script>`/`<style>`-like elements are removed.
+//!   `MarkdownRenderOptions::html` selects render, strip, or raw.
 //! * Footnotes and emoji aliases are intentionally disabled.
 //! * List markers, marker spacing, blockquote bars, code block frames, table
 //!   header alignment, and typographic punctuation are configurable through
@@ -70,6 +76,57 @@ use pulldown_cmark::{
 use smallvec::{SmallVec, smallvec};
 use unicode_segmentation::UnicodeSegmentation;
 use url::Url;
+
+#[cfg(feature = "html")]
+mod html;
+
+#[cfg(feature = "html")]
+pub use html::MarkdownHtmlMode;
+
+/// Container data key holding the contribution identity a raw HTML element owns.
+const HTML_CONTRIBUTION: &str = "bmux-contribution";
+/// Container data key holding a raw HTML block alignment (`center` or `right`).
+const HTML_ALIGN: &str = "bmux-html-align";
+/// Container data key marking the raw HTML element a container came from.
+const HTML_ELEMENT: &str = "bmux-html-element";
+/// Container data key holding comma-separated raw HTML table column alignments.
+const HTML_TABLE_ALIGN: &str = "bmux-html-table-align";
+/// Container data key holding a raw HTML details disclosure state.
+const HTML_DETAILS_STATE: &str = "bmux-html-details-state";
+/// Container data key holding the visible label of a raw HTML image.
+const HTML_IMAGE_LABEL: &str = "bmux-html-image-label";
+/// Container data key marking unstyled preformatted text.
+const HTML_PLAIN: &str = "bmux-html-plain";
+const HTML_KBD: &str = "bmux-html-kbd";
+const HTML_MARK: &str = "bmux-html-mark";
+const HTML_STRIKE: &str = "bmux-html-strike";
+const HTML_UNDERLINE: &str = "bmux-html-underline";
+const HTML_LINK: &str = "bmux-html-link";
+const HTML_IMAGE: &str = "bmux-html-image";
+const HTML_HEADING: &str = "bmux-html-heading";
+const HTML_PRE: &str = "bmux-html-pre";
+const HTML_INDENT: &str = "bmux-html-indent";
+const HTML_DETAILS: &str = "bmux-html-details";
+
+/// Source mapping facts produced by rendering raw HTML.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct HtmlProvenance {
+    /// Sorted source ranges of HTML text displayed verbatim.
+    visible_text: Vec<Range<usize>>,
+    /// Sorted source ranges whose text is hidden or transformed, so no
+    /// display cells are claimed for it.
+    unmapped: Vec<Range<usize>>,
+    /// Display text inserted after HTML elements, in source order.
+    insertions: Vec<DisplayInsertion>,
+}
+
+impl HtmlProvenance {
+    fn is_unmapped(&self, offset: usize) -> bool {
+        self.unmapped
+            .iter()
+            .any(|range| range.start <= offset && offset < range.end)
+    }
+}
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -172,6 +229,10 @@ pub struct MarkdownTheme {
     pub table_border: Style,
     /// Horizontal rule style.
     pub horizontal_rule: Style,
+    /// Keyboard input (`<kbd>`) style.
+    pub keyboard: Style,
+    /// Highlighted text (`<mark>`) style.
+    pub highlight: Style,
 }
 
 impl Default for MarkdownTheme {
@@ -201,6 +262,8 @@ impl Default for MarkdownTheme {
             task_unchecked: muted,
             table_border: muted,
             horizontal_rule: muted,
+            keyboard: Style::new().add_modifier(Modifier::REVERSED),
+            highlight: Style::new().fg(Color::Black).bg(Color::Yellow),
         }
     }
 }
@@ -460,6 +523,9 @@ pub struct MarkdownRenderOptions {
     pub details_open: BTreeMap<String, bool>,
     /// Structure glyphs, spacing, and punctuation presentation.
     pub presentation: MarkdownPresentation,
+    /// Presentation of raw HTML embedded in the Markdown.
+    #[cfg(feature = "html")]
+    pub html: MarkdownHtmlMode,
 }
 
 impl Default for MarkdownRenderOptions {
@@ -481,6 +547,8 @@ impl Default for MarkdownRenderOptions {
             details_interactive: false,
             details_open: BTreeMap::new(),
             presentation: MarkdownPresentation::default(),
+            #[cfg(feature = "html")]
+            html: MarkdownHtmlMode::default(),
         }
     }
 }
@@ -576,6 +644,27 @@ impl MarkdownRenderOptions {
         self
     }
 
+    /// Return options with a raw HTML presentation mode.
+    #[cfg(feature = "html")]
+    #[must_use]
+    pub const fn with_html(mut self, html: MarkdownHtmlMode) -> Self {
+        self.html = html;
+        self
+    }
+
+    /// Whether raw HTML is rendered or stripped instead of shown as text.
+    #[cfg_attr(not(feature = "html"), allow(clippy::unused_self))]
+    const fn presents_html(&self) -> bool {
+        #[cfg(feature = "html")]
+        {
+            !matches!(self.html, MarkdownHtmlMode::Raw)
+        }
+        #[cfg(not(feature = "html"))]
+        {
+            false
+        }
+    }
+
     /// Return options with bounded synchronous Mermaid rendering enabled.
     #[must_use]
     pub const fn with_mermaid(mut self, width: u32, height: u32) -> Self {
@@ -643,6 +732,12 @@ const fn semantic_end_needs_separator(tag: MarkdownSemanticTagEnd) -> bool {
     )
 }
 
+#[cfg(feature = "html")]
+fn collect_html_plain_text(html: &str, output: &mut String) {
+    html::collect_plain_text(html, output);
+}
+
+#[cfg(not(feature = "html"))]
 fn collect_html_plain_text(html: &str, output: &mut String) {
     let mut in_tag = false;
     for character in html.chars() {
@@ -836,6 +931,10 @@ pub struct MarkdownImage {
     pub reference_id: Option<String>,
     /// Image link syntax kind.
     pub kind: MarkdownLinkKind,
+    /// Declared width in pixels, from an HTML `width` attribute.
+    pub width: Option<u32>,
+    /// Declared height in pixels, from an HTML `height` attribute.
+    pub height: Option<u32>,
 }
 
 /// Parser-neutral link syntax kind.
@@ -857,6 +956,8 @@ pub enum MarkdownLinkKind {
     WikiLink,
     /// Unresolved reference form.
     Unresolved,
+    /// Raw HTML `<a>` or `<img>` element.
+    Html,
 }
 
 /// Parse Markdown into renderer-owned source-order semantic events using
@@ -1371,10 +1472,14 @@ fn assign_selection_geometry(
     source: &str,
     lines: &[Line],
     insertions: &[DisplayInsertion],
+    html: &HtmlProvenance,
 ) -> Vec<MarkdownSelectionProvenance> {
     let display = DisplayedMarkdown::new(lines);
     let mut search_from = 0;
-    let mut insertions = insertions.iter().peekable();
+    let mut insertions = insertions
+        .iter()
+        .filter(|insertion| !html.is_unmapped(insertion.after.saturating_sub(1)))
+        .peekable();
     // Text events expand to one unit per grapheme, so the projected vector is
     // far larger than the incoming event count. Reserve from the display cell
     // count to avoid repeated growth reallocation.
@@ -1394,12 +1499,47 @@ fn assign_selection_geometry(
                     .saturating_add(insertion.text.len());
             }
         }
+        if matches!(event.kind, MarkdownSemanticEventKind::Html(_)) {
+            let first = html
+                .visible_text
+                .partition_point(|range| range.start < event.source_range.start);
+            let visible = html.visible_text[first..]
+                .iter()
+                .take_while(|range| range.end <= event.source_range.end)
+                .filter(|range| !html.is_unmapped(range.start))
+                .cloned()
+                .collect::<Vec<_>>();
+            let containers = Arc::clone(&unit.containers);
+            projected.push(unit);
+            for range in visible {
+                let Some(canonical) = source.get(range.clone()) else {
+                    continue;
+                };
+                project_grapheme_geometry(
+                    canonical,
+                    range.start,
+                    &ProvenanceUnitShape {
+                        containers: &containers,
+                        semantic_expansion: None,
+                        kind: MarkdownSelectionKind::Text,
+                    },
+                    &display,
+                    &mut search_from,
+                    &mut projected,
+                );
+            }
+            continue;
+        }
         let (MarkdownSemanticEventKind::Text(visible) | MarkdownSemanticEventKind::Code(visible)) =
             &event.kind
         else {
             projected.push(unit);
             continue;
         };
+        if html.is_unmapped(event.source_range.start) {
+            projected.push(unit);
+            continue;
+        }
         let Some(canonical) = source.get(event.source_range.clone()) else {
             projected.push(unit);
             continue;
@@ -1413,53 +1553,67 @@ fn assign_selection_geometry(
             projected.push(unit);
             continue;
         }
-        let mut source_offset = event.source_range.start;
         // Every grapheme in one text event shares the same container stack and
-        // semantic identity. Hoist them out of the per-grapheme loop so the loop
-        // only allocates the single-element range vector it must own.
-        let unit_containers = unit.containers;
-        let unit_semantic_expansion = unit.semantic_expansion;
-        let unit_kind = unit.kind;
-        for grapheme in canonical.graphemes(true) {
-            let source_range = source_offset..source_offset.saturating_add(grapheme.len());
-            source_offset = source_range.end;
-            // Line breaks carry no display cell. Whitespace consumed by wrapping
-            // is the same case: searching forward for it would mis-map the unit
-            // onto an unrelated cell such as a blockquote or list prefix.
-            if matches!(grapheme, "\n" | "\r\n")
-                || grapheme.chars().all(char::is_whitespace)
-                    && !display.starts_with_at(grapheme, search_from)
-            {
-                projected.push(MarkdownSelectionProvenance {
-                    source_ranges: smallvec![source_range],
-                    rects: MarkdownCellRects::new(),
-                    semantic_expansion: unit_semantic_expansion.clone(),
-                    kind: unit_kind,
-                    containers: Arc::clone(&unit_containers),
-                });
-                continue;
-            }
-            let Some((display_range, rects)) = display.find_geometry(grapheme, search_from) else {
-                projected.push(MarkdownSelectionProvenance {
-                    source_ranges: smallvec![source_range],
-                    rects: MarkdownCellRects::new(),
-                    semantic_expansion: unit_semantic_expansion.clone(),
-                    kind: unit_kind,
-                    containers: Arc::clone(&unit_containers),
-                });
-                continue;
-            };
-            search_from = display_range.end;
-            projected.push(MarkdownSelectionProvenance {
-                source_ranges: smallvec![source_range],
-                rects,
-                semantic_expansion: unit_semantic_expansion.clone(),
-                kind: unit_kind,
-                containers: Arc::clone(&unit_containers),
-            });
-        }
+        // semantic identity, so they are passed once rather than per grapheme.
+        project_grapheme_geometry(
+            canonical,
+            event.source_range.start,
+            &ProvenanceUnitShape {
+                containers: &unit.containers,
+                semantic_expansion: unit.semantic_expansion.as_deref(),
+                kind: unit.kind,
+            },
+            &display,
+            &mut search_from,
+            &mut projected,
+        );
     }
     projected
+}
+
+/// Identity shared by every grapheme unit of one source text run.
+struct ProvenanceUnitShape<'a> {
+    containers: &'a MarkdownSelectionContainers,
+    semantic_expansion: Option<&'a str>,
+    kind: MarkdownSelectionKind,
+}
+
+/// Append one provenance unit per grapheme of `canonical`, which starts at
+/// `source_start`, assigning display cells found at or after `search_from`.
+fn project_grapheme_geometry(
+    canonical: &str,
+    source_start: usize,
+    shape: &ProvenanceUnitShape<'_>,
+    display: &DisplayedMarkdown,
+    search_from: &mut usize,
+    projected: &mut Vec<MarkdownSelectionProvenance>,
+) {
+    let mut source_offset = source_start;
+    for grapheme in canonical.graphemes(true) {
+        let source_range = source_offset..source_offset.saturating_add(grapheme.len());
+        source_offset = source_range.end;
+        // Line breaks carry no display cell. Whitespace consumed by wrapping
+        // is the same case: searching forward for it would mis-map the unit
+        // onto an unrelated cell such as a blockquote or list prefix.
+        let rects = if matches!(grapheme, "\n" | "\r\n")
+            || grapheme.chars().all(char::is_whitespace)
+                && !display.starts_with_at(grapheme, *search_from)
+        {
+            MarkdownCellRects::new()
+        } else if let Some((display_range, rects)) = display.find_geometry(grapheme, *search_from) {
+            *search_from = display_range.end;
+            rects
+        } else {
+            MarkdownCellRects::new()
+        };
+        projected.push(MarkdownSelectionProvenance {
+            source_ranges: smallvec![source_range],
+            rects,
+            semantic_expansion: shape.semantic_expansion.map(str::to_owned),
+            kind: shape.kind,
+            containers: Arc::clone(shape.containers),
+        });
+    }
 }
 
 /// Inputs retained so provenance-derived data can be produced on demand.
@@ -1476,6 +1630,8 @@ struct MarkdownProvenanceInputs {
     document: Option<MarkdownDocument>,
     /// Parse options the render used, so a deferred parse matches it exactly.
     parse_options: MarkdownParseOptions,
+    /// Raw HTML source mapping facts from the render.
+    html: HtmlProvenance,
 }
 
 impl MarkdownProvenanceInputs {
@@ -1604,13 +1760,15 @@ impl MarkdownRenderResult {
                 return Vec::new();
             };
             let document = inputs.document();
-            // Retained inputs exist only for projections that inserted no display text.
+            // Retained inputs exist only for projections whose inserted display
+            // text came from raw HTML.
             assign_selection_geometry(
                 markdown_selection_provenance(&document),
                 &document,
                 &inputs.source,
                 &self.lines,
-                &[],
+                &inputs.html.insertions,
+                &inputs.html,
             )
         })
     }
@@ -1873,6 +2031,7 @@ impl MarkdownStreamingRenderState {
                 // a selection actually asks for provenance.
                 document: None,
                 parse_options: options.presentation.parse_options(),
+                html: HtmlProvenance::default(),
             }),
             selection_source: markdown.to_owned(),
             selection_provenance: OnceLock::new(),
@@ -1964,7 +2123,12 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
     let parse_options = options.presentation.parse_options();
     let document = parse_markdown_document_with(markdown, &parse_options);
     let mut selection_provenance = markdown_selection_provenance(&document);
-    let details = collect_details_projections(markdown);
+    let presents_html = options.presents_html();
+    let details = if presents_html {
+        Vec::new()
+    } else {
+        collect_details_projections(markdown)
+    };
     let contributions = markdown_contributions(
         &document,
         options.document_context.as_ref(),
@@ -1989,7 +2153,7 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
         parse_markdown_document_with(projected_source, &parse_options)
     };
     let projected_details_storage;
-    let projected_details = if destination_unchanged {
+    let projected_details = if destination_unchanged || presents_html {
         details.as_slice()
     } else {
         projected_details_storage = collect_details_projections(projected_source);
@@ -2005,7 +2169,11 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
         destination_unchanged,
     );
     let projected_markdown = if options.streaming {
-        let details_projection = project_incomplete_details_fallback(&projection.markdown);
+        let details_projection = if presents_html {
+            Cow::Borrowed(projection.markdown.as_ref())
+        } else {
+            project_incomplete_details_fallback(&projection.markdown)
+        };
         Cow::Owned(project_incomplete_unsafe_destination_fallback(&details_projection).into_owned())
     } else {
         Cow::Borrowed(projection.markdown.as_ref())
@@ -2022,15 +2190,29 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
     } else {
         parse_markdown_document_with(&projected_markdown, &parse_options)
     };
-    let (lines, mut geometry, heading_rows) =
-        render_markdown_projection(&projected_markdown, options);
-    let insertions = link_destination_fallback_insertions(markdown, &contributions, options);
+    let (lines, mut geometry, heading_rows, html_output) =
+        render_markdown_projection(&projected_markdown, options, markdown, &document);
+    let mut contributions = contributions;
+    let html_contribution_ids = html_output
+        .contributions
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    if !html_output.contributions.is_empty() {
+        contributions.extend(html_output.contributions);
+        contributions.sort_by_key(|item| (item.source_range.start, item.source_range.end));
+    }
+    let html_provenance = html_output.provenance;
+    let mut insertions = link_destination_fallback_insertions(markdown, &contributions, options);
+    insertions.extend(html_provenance.insertions.iter().cloned());
+    insertions.sort_by_key(|insertion| insertion.after);
     selection_provenance = assign_selection_geometry(
         selection_provenance,
         &document,
         markdown,
         &lines,
         &insertions,
+        &html_provenance,
     );
     #[cfg(test)]
     record_markdown_stage(
@@ -2048,7 +2230,7 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
         &lines,
         &projection.contributions,
     ));
-    let geometry = assign_contribution_geometry(geometry, &contributions);
+    let geometry = assign_contribution_geometry(geometry, &contributions, &html_contribution_ids);
     let (code_block_geometry, geometry): (Vec<_>, Vec<_>) =
         geometry.into_iter().partition(|geometry| {
             geometry.contribution_id.starts_with("code-block:")
@@ -2078,6 +2260,7 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
             // This render already parsed the source, so reuse it.
             document: Some(document.clone()),
             parse_options,
+            html: html_provenance,
         }
     });
     #[cfg(test)]
@@ -2510,12 +2693,20 @@ impl DisplayedMarkdown {
 
 fn assign_contribution_geometry(
     mut geometry: Vec<MarkdownContributionGeometry>,
-    contributions: &[MarkdownContribution],
+    all_contributions: &[MarkdownContribution],
+    html_contribution_ids: &std::collections::BTreeSet<String>,
 ) -> Vec<MarkdownContributionGeometry> {
-    let contribution_ids = contributions
+    let contribution_ids = all_contributions
         .iter()
         .map(|contribution| contribution.id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
+    // Raw HTML elements record geometry under their exact identities, so only
+    // Markdown contributions take part in kind-ordered assignment.
+    let markdown_contributions = all_contributions
+        .iter()
+        .filter(|contribution| !html_contribution_ids.contains(&contribution.id))
+        .collect::<Vec<_>>();
+    let contributions = markdown_contributions.as_slice();
     let has_projected_details = geometry
         .iter()
         .any(|item| item.contribution_id == "details");
@@ -3460,10 +3651,30 @@ pub fn render_markdown_lines(markdown: &str, options: MarkdownRenderOptions) -> 
     result.lines
 }
 
+/// Rendered rows, renderer geometry, heading rows, and raw HTML results.
+type MarkdownProjection = (
+    Vec<Line>,
+    Vec<MarkdownContributionGeometry>,
+    Vec<u16>,
+    HtmlRenderOutput,
+);
+
+/// Contributions and source mapping facts from rendering raw HTML.
+#[derive(Debug, Default)]
+struct HtmlRenderOutput {
+    contributions: Vec<MarkdownContribution>,
+    provenance: HtmlProvenance,
+}
+
+/// Render the projected Markdown. `source` and `document` are the caller's
+/// original Markdown and its parse, which own raw HTML source identities.
+#[cfg_attr(not(feature = "html"), allow(unused_variables))]
 fn render_markdown_projection(
     markdown: &str,
     options: &MarkdownRenderOptions,
-) -> (Vec<Line>, Vec<MarkdownContributionGeometry>, Vec<u16>) {
+    source: &str,
+    document: &MarkdownDocument,
+) -> MarkdownProjection {
     #[cfg(test)]
     MARKDOWN_PROJECTION_COUNT.set(MARKDOWN_PROJECTION_COUNT.get().saturating_add(1));
     let table_alignments = table_alignments(markdown);
@@ -3472,6 +3683,30 @@ fn render_markdown_projection(
         markdown,
         hyperchad_markdown_options(options.presentation.smart_punctuation),
     );
+    #[cfg(feature = "html")]
+    let (container, html_output) = if options.presents_html()
+        && document
+            .events
+            .iter()
+            .any(|event| matches!(event.kind, MarkdownSemanticEventKind::Html(_)))
+    {
+        let input = html::HtmlRenderInput {
+            mode: options.html,
+            source,
+            events: html::HtmlRenderInput::events(source, document),
+            context: options.document_context.as_ref(),
+            document_id: options.document_id.as_deref(),
+            details_interactive: options.details_interactive,
+            details_open: &options.details_open,
+            link_fallbacks: options.link_destination_presentation
+                == MarkdownLinkDestinationPresentation::ReadableFallback,
+        };
+        html::render_html(container, &input)
+    } else {
+        (container, HtmlRenderOutput::default())
+    };
+    #[cfg(not(feature = "html"))]
+    let html_output = HtmlRenderOutput::default();
     let mut renderer = TerminalMarkdownRenderer::new(
         options.width,
         options.theme,
@@ -3489,7 +3724,8 @@ fn render_markdown_projection(
             preserve_whitespace: false,
         },
     );
-    renderer.finish_projection()
+    let (lines, geometry, heading_rows) = renderer.finish_projection();
+    (lines, geometry, heading_rows, html_output)
 }
 
 fn markdown_contributions(
@@ -3930,6 +4166,8 @@ fn semantic_start_tag(tag: Tag<'_>) -> Option<MarkdownSemanticTag> {
             title: optional_parser_string(title.as_ref()),
             reference_id: optional_parser_string(id.as_ref()),
             kind: link_kind(link_type),
+            width: None,
+            height: None,
         })),
         Tag::DefinitionList
         | Tag::DefinitionListTitle
@@ -4115,6 +4353,15 @@ impl TextStyle {
         {
             output.style = output.style.patch(theme.strikethrough);
         }
+        for class in &container.classes {
+            match class.as_str() {
+                HTML_KBD => output.style = output.style.patch(theme.keyboard),
+                HTML_MARK => output.style = output.style.patch(theme.highlight),
+                HTML_STRIKE => output.style = output.style.patch(theme.strikethrough),
+                HTML_UNDERLINE => output.style = output.style.add_modifier(Modifier::UNDERLINE),
+                _ => {}
+            }
+        }
         output
     }
 }
@@ -4271,14 +4518,86 @@ impl TerminalMarkdownRenderer {
         if container.hidden == Some(true) {
             return;
         }
+        if let Some(align) = container.data.get(HTML_ALIGN)
+            && !self.in_table_collection
+            && !matches!(container.element, Element::TH { .. } | Element::TD { .. })
+        {
+            let right = align == "right";
+            self.render_aligned(right, |renderer| {
+                renderer.render_unaligned_container(container, style);
+            });
+            return;
+        }
+        self.render_unaligned_container(container, style);
+    }
 
+    /// Render rows produced by `render` and shift each one to the center or
+    /// right edge of the available width, moving its geometry with it.
+    fn render_aligned(&mut self, right: bool, render: impl FnOnce(&mut Self)) {
+        self.flush_line();
+        let start_row = self.rows.len();
+        render(self);
+        self.flush_line();
+        let mut previous_offset = 0;
+        for row in start_row..self.rows.len() {
+            let line = &mut self.rows[row];
+            // Reserved rich-content rows follow the row that owns them.
+            let reserved = matches!(line.spans.as_slice(), [span] if span.content == " ");
+            let offset = if reserved {
+                previous_offset
+            } else {
+                let free = self.width.saturating_sub(line.width());
+                if right { free } else { free / 2 }
+            };
+            previous_offset = offset;
+            if offset == 0 || line.spans.is_empty() {
+                continue;
+            }
+            line.spans.insert(0, Span::raw(" ".repeat(offset)));
+            let y = u16::try_from(self.origin_y.saturating_add(row)).unwrap_or(u16::MAX);
+            let origin_x = u16::try_from(self.origin_x).unwrap_or(u16::MAX);
+            let shift = u16::try_from(offset).unwrap_or(u16::MAX);
+            for item in self.geometry.borrow_mut().iter_mut() {
+                for rect in &mut item.rects {
+                    if rect.y == y && rect.x >= origin_x {
+                        rect.x = rect.x.saturating_add(shift);
+                    }
+                }
+            }
+        }
+    }
+
+    fn render_unaligned_container(&mut self, container: &Container, style: TextStyle) {
         let style = style.merge_container(container, self.theme);
         match &container.element {
             Element::Text { value } | Element::Raw { value } => {
                 self.push_text(value, style);
             }
+            Element::Span if container.classes.iter().any(|class| class == HTML_IMAGE) => {
+                let label = container
+                    .data
+                    .get(HTML_IMAGE_LABEL)
+                    .map_or("image", String::as_str);
+                let kind = container
+                    .data
+                    .get(HTML_CONTRIBUTION)
+                    .map_or("html-image", String::as_str);
+                self.render_marked_reserved_text(
+                    &format!("[image: {label}]"),
+                    style,
+                    kind,
+                    self.image_reserved_rows,
+                );
+            }
             Element::Span | Element::THead | Element::TBody => {
                 self.render_container_children(container, style);
+            }
+            Element::Anchor { .. } if container.classes.iter().any(|class| class == HTML_LINK) => {
+                let kind = container
+                    .data
+                    .get(HTML_CONTRIBUTION)
+                    .map_or("html-link", String::as_str);
+                self.render_marked_children(container, style, kind);
             }
             Element::Anchor { href, .. } => {
                 let kind = match href.as_deref() {
@@ -4444,6 +4763,47 @@ impl TerminalMarkdownRenderer {
     }
 
     fn render_special_block_container(&mut self, container: &Container, style: TextStyle) {
+        let has_class = |name: &str| container.classes.iter().any(|class| class == name);
+        if has_class(HTML_DETAILS) {
+            self.render_html_details(container, style);
+            return;
+        }
+        if has_class(HTML_HEADING) {
+            // HTML headings are not Markdown anchors, so no heading row is recorded.
+            self.ensure_blank_line();
+            self.render_container_children(
+                container,
+                TextStyle {
+                    style: self.theme.heading,
+                    preserve_whitespace: style.preserve_whitespace,
+                },
+            );
+            self.ensure_blank_line();
+            return;
+        }
+        if has_class(HTML_PRE) {
+            self.flush_line();
+            self.ensure_blank_line();
+            let pre_style = if container.data.contains_key(HTML_PLAIN) {
+                style.style
+            } else {
+                style.style.patch(self.theme.code_block_text)
+            };
+            self.render_container_children(
+                container,
+                TextStyle {
+                    style: pre_style,
+                    preserve_whitespace: true,
+                },
+            );
+            self.ensure_blank_line();
+            return;
+        }
+        if has_class(HTML_INDENT) {
+            self.flush_line();
+            self.render_prefixed_list_item(container, style, "  ");
+            return;
+        }
         if container.classes.iter().any(|class| class == "markdown-p") {
             self.ensure_blank_line();
             self.render_container_children(container, style);
@@ -4480,12 +4840,57 @@ impl TerminalMarkdownRenderer {
         }
     }
 
+    /// Render a raw HTML `<details>` element: a summary row, preceded by a
+    /// disclosure marker when interactive, and the body when expanded.
+    fn render_html_details(&mut self, container: &Container, style: TextStyle) {
+        let state = container
+            .data
+            .get(HTML_DETAILS_STATE)
+            .map_or("static", String::as_str);
+        let kind = container
+            .data
+            .get(HTML_CONTRIBUTION)
+            .map_or("html-details", String::as_str);
+        let mut children = container.children.iter();
+        let summary = children.next();
+        self.ensure_blank_line();
+        self.begin_geometry(kind);
+        match state {
+            "open" => self.push_text("▼ ", style),
+            "closed" => self.push_text("▶ ", style),
+            _ => {}
+        }
+        if let Some(summary) = summary {
+            let summary_style = TextStyle {
+                style: style.style.patch(self.theme.strong),
+                preserve_whitespace: style.preserve_whitespace,
+            };
+            for child in &summary.children {
+                self.render_container(child, summary_style);
+            }
+        }
+        self.active_geometry.pop();
+        self.ensure_blank_line();
+        if state != "closed" {
+            for child in children {
+                self.render_container(child, style);
+            }
+        }
+        self.ensure_blank_line();
+    }
+
     fn render_blockquote(&mut self, container: &Container, style: TextStyle) {
         self.flush_line();
-        let blockquote_index = self.next_blockquote_index.get();
-        let alert_kind = self.alert_kinds.get(blockquote_index).copied().flatten();
-        self.next_blockquote_index
-            .set(blockquote_index.saturating_add(1));
+        // Alert kinds are indexed by Markdown blockquote; HTML blockquotes
+        // are never alerts and must not consume an index.
+        let alert_kind = if container.data.contains_key(HTML_ELEMENT) {
+            None
+        } else {
+            let blockquote_index = self.next_blockquote_index.get();
+            self.next_blockquote_index
+                .set(blockquote_index.saturating_add(1));
+            self.alert_kinds.get(blockquote_index).copied().flatten()
+        };
         let prefix = self.bounded_prefix(&format!("{} ", self.presentation.blockquote_bar));
         let prefix_width = text_display_width(&prefix);
         let mut nested = self.nested(
@@ -4704,12 +5109,26 @@ impl TerminalMarkdownRenderer {
             return;
         }
 
-        let alignments = self
-            .table_alignments
-            .get(self.next_table_index)
-            .cloned()
-            .unwrap_or_default();
-        self.next_table_index = self.next_table_index.saturating_add(1);
+        // Alignments are indexed by Markdown table; HTML tables carry their
+        // own and must not consume an index.
+        let alignments = if let Some(html) = container.data.get(HTML_TABLE_ALIGN) {
+            html.split(',')
+                .map(|alignment| match alignment {
+                    "c" => Alignment::Center,
+                    "r" => Alignment::Right,
+                    "l" => Alignment::Left,
+                    _ => Alignment::None,
+                })
+                .collect()
+        } else {
+            let alignments = self
+                .table_alignments
+                .get(self.next_table_index)
+                .cloned()
+                .unwrap_or_default();
+            self.next_table_index = self.next_table_index.saturating_add(1);
+            alignments
+        };
         let widths = table_column_widths(&rows, column_count);
         let total_width = widths.iter().sum::<usize>() + column_count.saturating_mul(3) + 1;
         if total_width > self.width {
@@ -5322,6 +5741,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Options that show raw HTML as text, the only behavior without the
+    /// `html` feature.
+    #[cfg(feature = "html")]
+    fn raw_html(options: MarkdownRenderOptions) -> MarkdownRenderOptions {
+        options.with_html(crate::MarkdownHtmlMode::Raw)
+    }
+
+    #[cfg(not(feature = "html"))]
+    const fn raw_html(options: MarkdownRenderOptions) -> MarkdownRenderOptions {
+        options
     }
 
     fn rendered_text(markdown: &str) -> String {
@@ -6969,7 +7400,7 @@ mod tests {
         for width in [80, 12] {
             let result = render_markdown(
                 markdown,
-                &MarkdownRenderOptions::new(width).with_document_id("item"),
+                &raw_html(MarkdownRenderOptions::new(width).with_document_id("item")),
             );
             let details_index = result
                 .geometry
