@@ -1802,11 +1802,7 @@ impl TerminalGrid {
     }
 
     pub(crate) fn set_graphic_rendition(&mut self, params: &[i64]) {
-        let params = if params.is_empty() {
-            vec![0]
-        } else {
-            params.to_vec()
-        };
+        let params: &[i64] = if params.is_empty() { &[0] } else { params };
         let mut i = 0;
         while i < params.len() {
             match params[i] {

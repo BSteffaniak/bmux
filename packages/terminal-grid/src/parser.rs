@@ -580,7 +580,7 @@ impl Perform for ProtocolPerformer<'_> {
             return;
         }
         let enabled = action == 'h';
-        for value in flatten_params(params) {
+        for value in flatten_params(params).iter().copied() {
             match value {
                 1 => self.protocol.application_cursor = enabled,
                 9 => self.set_mouse_tracking_mode(MouseProtocolMode::Press, enabled),
@@ -762,7 +762,7 @@ impl Perform for GridPerformer<'_> {
             }
             'h' | 'l' if intermediates == *b"?" => {
                 let enabled = action == 'h';
-                for value in values {
+                for value in values.iter().copied() {
                     match value {
                         1 => self.grid.set_application_cursor(enabled),
                         6 => self.grid.set_origin_mode(enabled),
@@ -794,7 +794,7 @@ impl Perform for GridPerformer<'_> {
                 }
             }
             'h' | 'l' if intermediates.is_empty() => {
-                for value in values {
+                for value in values.iter().copied() {
                     if value == 4 {
                         self.grid.set_insert_mode(action == 'h');
                     }
@@ -839,18 +839,63 @@ impl Perform for GridPerformer<'_> {
     }
 }
 
+/// Parameter values of one escape sequence, on the stack: a sequence holds at most 32 values
+/// (the parser's bound), so nothing it normalizes or flattens to needs more than this.
+pub(crate) struct ParamValues {
+    values: [i64; 64],
+    len: usize,
+}
+
+impl ParamValues {
+    const fn new() -> Self {
+        Self {
+            values: [0; 64],
+            len: 0,
+        }
+    }
+
+    const fn push(&mut self, value: i64) {
+        if self.len < self.values.len() {
+            self.values[self.len] = value;
+            self.len += 1;
+        }
+    }
+
+    pub(crate) fn as_slice(&self) -> &[i64] {
+        &self.values[..self.len]
+    }
+}
+
+impl std::ops::Deref for ParamValues {
+    type Target = [i64];
+
+    fn deref(&self) -> &[i64] {
+        self.as_slice()
+    }
+}
+
 /// Normalize SGR groups without interpreting color operands as independent
 /// commands. Colons belong to a single operation; semicolons separate operations
 /// except for the legacy extended-color forms.
-fn sgr_params(params: &Params) -> Vec<i64> {
-    let groups: Vec<_> = params.iter().collect();
-    let mut output = Vec::new();
+fn sgr_params(params: &Params) -> ParamValues {
+    let mut groups: [&[u16]; 32] = [&[]; 32];
+    let mut count = 0;
+    for group in params {
+        if count == groups.len() {
+            break;
+        }
+        groups[count] = group;
+        count += 1;
+    }
+    let groups = &groups[..count];
+    let mut output = ParamValues::new();
     let mut index = 0;
     while let Some(group) = groups.get(index) {
         let code = group[0];
         if matches!(code, 38 | 48 | 58) {
-            let (operands, consumed) = if group.len() > 1 {
-                (group[1..].to_vec(), 0)
+            let mut legacy = [0_u16; 32];
+            let (operands, consumed): (&[u16], usize) = if group.len() > 1 {
+                (&group[1..], 0)
             } else {
                 let mode = groups.get(index + 1).and_then(|g| g.first()).copied();
                 let count = match mode {
@@ -861,26 +906,30 @@ fn sgr_params(params: &Params) -> Vec<i64> {
                     _ => groups.len().saturating_sub(index + 1),
                 };
                 let consumed = count.min(groups.len().saturating_sub(index + 1));
-                let operands = groups[index + 1..index + 1 + consumed]
-                    .iter()
-                    .map(|g| if g.len() == 1 { g[0] } else { u16::MAX })
-                    .collect();
-                (operands, consumed)
+                for (slot, g) in legacy
+                    .iter_mut()
+                    .zip(&groups[index + 1..index + 1 + consumed])
+                {
+                    *slot = if g.len() == 1 { g[0] } else { u16::MAX };
+                }
+                (&legacy[..consumed], consumed)
             };
             if code != 58 {
-                let normalized = match operands.as_slice() {
-                    [5, value] if *value <= 255 => Some(vec![5, *value]),
-                    [2, r, g, b] if [r, g, b].iter().all(|v| **v <= 255) => {
-                        Some(vec![2, *r, *g, *b])
-                    }
-                    [2, 0, r, g, b] if [r, g, b].iter().all(|v| **v <= 255) => {
-                        Some(vec![2, *r, *g, *b])
+                let normalized: Option<(u16, &[u16])> = match operands {
+                    [5, value] if *value <= 255 => Some((5, std::slice::from_ref(value))),
+                    [2, rgb @ ..] | [2, 0, rgb @ ..]
+                        if rgb.len() == 3 && rgb.iter().all(|v| *v <= 255) =>
+                    {
+                        Some((2, rgb))
                     }
                     _ => None,
                 };
-                if let Some(normalized) = normalized {
+                if let Some((mode, values)) = normalized {
                     output.push(i64::from(code));
-                    output.extend(normalized.into_iter().map(i64::from));
+                    output.push(i64::from(mode));
+                    for value in values {
+                        output.push(i64::from(*value));
+                    }
                 }
             }
             index += consumed;
@@ -892,14 +941,14 @@ fn sgr_params(params: &Params) -> Vec<i64> {
         index += 1;
     }
     // An ignored operation is not SGR 0. The grid treats an empty slice as reset.
-    if output.is_empty() {
+    if output.as_slice().is_empty() {
         output.push(-1);
     }
     output
 }
 
-fn flatten_params(params: &Params) -> Vec<i64> {
-    let mut values = Vec::new();
+fn flatten_params(params: &Params) -> ParamValues {
+    let mut values = ParamValues::new();
     for param in params {
         let mut pushed = false;
         for subparam in param {

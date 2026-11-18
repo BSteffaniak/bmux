@@ -107,3 +107,40 @@ fn private_and_subparameter_cursor_commands_do_not_mutate_the_screen() {
     stream.process(b"abc\x1b[?2J\x1b[>2J\x1b[1:2HX");
     assert!(crate::visible_text_trimmed(stream.grid(), 0, 2).starts_with("abcX"));
 }
+
+/// Legacy (semicolon) extended colors take exactly their operands: what follows is an operation
+/// of its own, and an out-of-range or unknown color is ignored.
+#[test]
+fn legacy_extended_colors_take_exactly_their_operands() {
+    let cases: &[(&[u8], Style)] = &[
+        (
+            b"\x1b[1;38;5;200;48;5;17;3mX",
+            Style {
+                bold: true,
+                italic: true,
+                fg: Some(Color::Indexed(200)),
+                bg: Some(Color::Indexed(17)),
+                ..Style::default()
+            },
+        ),
+        (
+            b"\x1b[38;2;0;10;20;30mX",
+            Style {
+                fg: Some(Color::Indexed(0)),
+                ..Style::default()
+            },
+        ),
+        (b"\x1b[48;5;300mX", Style::default()),
+        (b"\x1b[38;9;1;2mX", Style::default()),
+    ];
+    for &(bytes, expected) in cases {
+        let mut stream = TerminalGridStream::new(20, 2, GridLimits::default()).unwrap();
+        stream.process(bytes);
+        assert_eq!(
+            style_at(&stream, 0),
+            expected,
+            "{}",
+            String::from_utf8_lossy(bytes)
+        );
+    }
+}
