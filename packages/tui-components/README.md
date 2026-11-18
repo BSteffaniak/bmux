@@ -244,6 +244,13 @@ keep it across frames and persist `sizes()` if layouts should be remembered.
   restores to. Dividers next to a collapsed panel neither resize nor react to the
   pointer.
 
+* **Maximizing.** `PanelGroupState::set_maximized(Some(index))` lays out only
+  that panel, over the whole group: the others are not laid out, painted or
+  routed events, and no divider shows or resizes, until `set_maximized(None)`.
+  `PanelGroup::layout` reports the hidden panels and dividers as empty
+  rectangles. For nested groups, maximize the branch holding the panel in each
+  group along the way.
+
 Applications that route pointer input themselves can call
 `PanelGroup::handle_event` with the group's area from the presented layout
 (`EventCx::find_visible_rect` on the group's layout id).

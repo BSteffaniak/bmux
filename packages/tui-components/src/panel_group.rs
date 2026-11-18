@@ -21,6 +21,9 @@ use crate::selection::{
     paint_component_scope,
 };
 
+/// Layout semantic label naming the child a group laid out maximized (`<label><index>`).
+const MAXIMIZED_SEMANTIC: &str = "panel-group.maximized=";
+
 /// Direction panels are laid out in a [`PanelGroup`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PanelGroupAxis {
@@ -326,6 +329,8 @@ pub struct PanelGroupState {
     constraints: Vec<PanelGroupConstraints>,
     /// Size to restore for each collapsed panel.
     collapsed: Vec<Option<PanelSize>>,
+    /// The panel laid out over the whole group, while one is.
+    maximized: Option<usize>,
     focused_panel: Option<usize>,
     hovered_divider: Option<usize>,
     active_drag: Option<PanelDividerDrag>,
@@ -340,6 +345,7 @@ impl PanelGroupState {
             constraints: vec![PanelGroupConstraints::default(); sizes.len()],
             collapsed: vec![None; sizes.len()],
             sizes,
+            maximized: None,
             focused_panel: None,
             hovered_divider: None,
             active_drag: None,
@@ -357,6 +363,12 @@ impl PanelGroupState {
     pub fn set_sizes(&mut self, sizes: impl Into<Vec<PanelSize>>) {
         self.sizes = sizes.into();
         self.collapsed.resize(self.sizes.len(), None);
+        if self
+            .maximized
+            .is_some_and(|index| index >= self.sizes.len())
+        {
+            self.maximized = None;
+        }
         if self
             .active_drag
             .is_some_and(|drag| drag.divider + 1 >= self.sizes.len())
@@ -429,10 +441,36 @@ impl PanelGroupState {
             .or_else(|| self.sizes.get(index).copied())
     }
 
+    /// Lay out panel `index` over the whole group, or every panel again with `None`. While a
+    /// panel is maximized the other panels are not laid out, painted, or routed events (they
+    /// keep their sizes for when it is restored), and no divider shows or resizes. An index
+    /// past the panels is ignored. Returns whether the maximized panel changed.
+    ///
+    /// For nested groups, maximize the branch holding the panel in every group along the way.
+    pub fn set_maximized(&mut self, index: Option<usize>) -> bool {
+        let index = index.filter(|index| *index < self.sizes.len());
+        if self.maximized == index {
+            return false;
+        }
+        self.maximized = index;
+        if index.is_some() {
+            self.active_drag = None;
+            self.hovered_divider = None;
+        }
+        true
+    }
+
+    /// The panel laid out over the whole group, while one is.
+    #[must_use]
+    pub const fn maximized(&self) -> Option<usize> {
+        self.maximized
+    }
+
     /// Whether the divider between `divider` and `divider + 1` can resize them.
     #[must_use]
     pub fn divider_resizable(&self, divider: usize) -> bool {
-        divider + 1 < self.sizes.len()
+        self.maximized.is_none()
+            && divider + 1 < self.sizes.len()
             && !self.is_collapsed(divider)
             && !self.is_collapsed(divider + 1)
     }
@@ -618,11 +656,51 @@ impl<'a> PanelGroupComponent<'a> {
         }
     }
 
+    /// The child laid out over the whole group in `layout`, when one was maximized. Read from
+    /// the layout itself, so painting and events follow what was laid out even when the state
+    /// changed since.
+    fn laid_out_maximized(layout: &LayoutNode) -> Option<usize> {
+        layout
+            .metadata
+            .semantics
+            .iter()
+            .find_map(|label| label.strip_prefix(MAXIMIZED_SEMANTIC)?.parse().ok())
+    }
+
+    /// Each laid-out child with its component index.
+    fn laid_out<'b>(
+        &'b self,
+        layout: &'b LayoutNode,
+    ) -> Vec<(usize, &'b ChildLayout, &'b Element<'a>)> {
+        Self::laid_out_maximized(layout).map_or_else(
+            || {
+                layout
+                    .children
+                    .iter()
+                    .zip(&self.children)
+                    .enumerate()
+                    .map(|(index, (child, component))| (index, child, component))
+                    .collect()
+            },
+            |index| {
+                layout
+                    .children
+                    .first()
+                    .zip(self.children.get(index))
+                    .map(|(child, component)| (index, child, component))
+                    .into_iter()
+                    .collect()
+            },
+        )
+    }
+
     fn paint_interaction(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
         let resolved = self.resolved_layout(layout);
         let state = self.state.borrow();
+        let maximized = Self::laid_out_maximized(layout);
         if self.group.policy.focus.enabled && self.group.policy.mouse.click_to_focus {
-            for (index, panel) in resolved.panels.iter().copied().enumerate() {
+            for (slot, panel) in resolved.panels.iter().copied().enumerate() {
+                let index = maximized.unwrap_or(slot);
                 cx.push_hit(
                     SceneRegion::new(format!("{}.panel.{index}", self.id.as_str()), panel)
                         .role(HitRole::Background)
@@ -636,7 +714,7 @@ impl<'a> PanelGroupComponent<'a> {
                 || (self.group.policy.mouse.drag_dividers && self.group.policy.resize.enabled));
         for (index, divider) in resolved.dividers.iter().copied().enumerate() {
             // Dividers beside a collapsed panel neither resize nor react to the pointer.
-            let resizable = state.divider_resizable(index);
+            let resizable = maximized.is_none() && state.divider_resizable(index);
             if divider_interactive && resizable {
                 cx.push_hit(
                     SceneRegion::new(format!("{}.divider.{index}", self.id.as_str()), divider)
@@ -698,6 +776,7 @@ impl Component for PanelGroupComponent<'_> {
         self.group.axis.hash(&mut layout);
         state.sizes.hash(&mut layout);
         state.constraints.hash(&mut layout);
+        state.maximized.hash(&mut layout);
         for child in &self.children {
             child.revision().layout.hash(&mut layout);
         }
@@ -734,6 +813,20 @@ impl Component for PanelGroupComponent<'_> {
             .unwrap_or(u16::MAX)
             .into(),
         };
+        if let Some(index) = state.maximized.filter(|index| *index < count) {
+            // Only the maximized child is laid out, over the whole group.
+            let node = self.children[index].layout(constraints, cx);
+            let size = constraints.constrain(node.size);
+            return LayoutNode::with_children(
+                self.id.clone(),
+                size,
+                vec![ChildLayout::new(0, 0, node)],
+            )
+            .with_metadata(
+                bmux_tui::component::LayoutMetadata::new()
+                    .semantic(format!("{MAXIMIZED_SEMANTIC}{index}")),
+            );
+        }
         let available =
             primary_max.saturating_sub(u64::from(self.group.reserved_divider_cells(count)));
         let gap = usize::from(matches!(self.group.divider_mode, PanelDividerMode::Gap));
@@ -798,7 +891,7 @@ impl Component for PanelGroupComponent<'_> {
     }
 
     fn paint(&self, layout: &LayoutNode, cx: &mut PaintCx<'_, '_>) {
-        for (child, component) in layout.children.iter().zip(&self.children) {
+        for (_, child, component) in self.laid_out(layout) {
             cx.with_child(
                 i32::try_from(child.x).unwrap_or(i32::MAX),
                 i64::try_from(child.y).unwrap_or(i64::MAX),
@@ -825,7 +918,7 @@ impl Component for PanelGroupComponent<'_> {
             return EventOutcome::Handled;
         }
         // Children are offset from this group, wherever the group itself is placed.
-        for (child, component) in layout.children.iter().zip(&self.children).rev() {
+        for (_, child, component) in self.laid_out(layout).into_iter().rev() {
             let outcome = cx.with_child(child, |cx| component.event(event, &child.node, cx));
             if outcome != EventOutcome::Ignored {
                 return outcome;
@@ -911,6 +1004,16 @@ impl PanelGroup {
             return PanelGroupLayout {
                 panels: Vec::new(),
                 dividers: Vec::new(),
+            };
+        }
+        if let Some(index) = state.maximized {
+            // The maximized panel covers the group; the others and the dividers are empty.
+            let empty = Rect::new(area.x, area.y, 0, 0);
+            let mut panels = vec![empty; count];
+            panels[index] = area;
+            return PanelGroupLayout {
+                panels,
+                dividers: vec![empty; count - 1],
             };
         }
         let available =
