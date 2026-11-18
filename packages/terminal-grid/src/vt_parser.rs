@@ -202,12 +202,7 @@ impl<const N: usize> Parser<N> {
     /// so a split request has identical semantics after hydration; other string
     /// payloads remain omitted. Numeric groups and ignore flags are retained.
     /// Storage remains bounded by the OSC capacity plus fixed header overhead.
-    pub(crate) fn replay_prefix(&self) -> Vec<u8> {
-        let mut prefix = Vec::with_capacity(208);
-        self.write_replay_prefix(&mut prefix);
-        prefix
-    }
-
+    ///
     /// Replaces caller-owned storage, retaining its capacity for reuse. Normal
     /// text without partial UTF-8 writes nothing and never reserves storage.
     pub(crate) fn write_replay_prefix(&self, prefix: &mut Vec<u8>) {

@@ -17,6 +17,8 @@ pub struct TerminalGridStream {
     parser: Parser,
     grid: TerminalGrid,
     pending_bytes: Vec<u8>,
+    /// The prefix before the last chunk, kept to compare with and to reuse its storage.
+    previous_pending: Vec<u8>,
 }
 
 impl TerminalGridStream {
@@ -36,6 +38,7 @@ impl TerminalGridStream {
             parser: Parser::new(),
             grid,
             pending_bytes: Vec::new(),
+            previous_pending: Vec::new(),
         }
     }
 
@@ -98,16 +101,17 @@ impl TerminalGridStream {
             return;
         }
         let revision = self.grid.revision();
-        let previous_pending = std::mem::take(&mut self.pending_bytes);
+        std::mem::swap(&mut self.pending_bytes, &mut self.previous_pending);
         let mut performer = GridPerformer {
             grid: &mut self.grid,
             on_pointer_query: &mut on_query,
         };
         self.parser.advance(&mut performer, bytes);
-        self.pending_bytes = self.parser.replay_prefix();
+        // Written into the storage of the prefix before last: normal text writes nothing.
+        self.parser.write_replay_prefix(&mut self.pending_bytes);
         // Parser prefixes are replicated state even when no terminal operation
         // completed. Do not mark visible content dirty for a prefix-only update.
-        if self.pending_bytes != previous_pending && self.grid.revision() == revision {
+        if self.pending_bytes != self.previous_pending && self.grid.revision() == revision {
             self.grid.bump_revision();
         }
     }
@@ -1006,6 +1010,7 @@ mod tests {
                 assert_eq!(tracker.pending_bytes.len(), 0);
                 // Protocol prefix capacity only, not allocator-wide counts.
                 assert_eq!(tracker.pending_bytes.capacity(), 0);
+                assert_eq!(stream.pending_bytes.capacity(), 0);
             }
         }
     }
