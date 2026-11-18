@@ -302,3 +302,79 @@ fn ingest_metrics() {
     }
     report.write_and_check();
 }
+
+/// Memory the pane reader keeps stops growing: replayed ten times over (text, and text with
+/// Kitty images), its live bytes in the second half of the rounds stay within 256 KiB of where
+/// the half started. Run in release:
+///
+/// ```text
+/// cargo test --release -p bmux_pane_runtime_plugin --features image-registry --lib \
+///     runtime::ingest_bench::ingest_soak -- --ignored --exact --nocapture --test-threads 1
+/// ```
+#[test]
+#[ignore = "memory soak; run explicitly with --ignored --nocapture"]
+fn ingest_soak() {
+    const ROUNDS: usize = 10;
+    const SLACK: usize = 256 * 1024;
+    let (cols, rows) = size();
+    let plain = corpus::plain_stream((cols, rows), 300);
+    let images = kitty_images((cols, rows), 300);
+    let mut failures = Vec::new();
+    for (name, frames) in [("plain-stream", plain), ("kitty-images", images)] {
+        let grid =
+            Mutex::new(TerminalGridStream::new(cols, rows, GridLimits::default()).expect("grid"));
+        let output = Mutex::new(OutputFanoutBuffer::new(1 << 20));
+        let mut modes = PaneTerminalModeTracker::default();
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        let mut tracker = PaneCursorTracker::new(rows, cols);
+        #[cfg(feature = "image-registry")]
+        let (mut interceptor, mut registry) = (
+            bmux_image::ImageInterceptor::new(),
+            bmux_image::ImageRegistry::default(),
+        );
+        let live: Vec<usize> = (0..ROUNDS)
+            .map(|_| {
+                for chunk in frames.iter().flat_map(|frame| frame.chunks(READ)) {
+                    #[cfg(feature = "image-registry")]
+                    let filtered = {
+                        let mut result = interceptor.process(chunk);
+                        let mut replies = Vec::new();
+                        super::ordered_image_output(
+                            &mut tracker,
+                            &mut engine,
+                            &mut registry,
+                            &mut result,
+                            (8, 16),
+                            &mut replies,
+                        )
+                        .expect("image output");
+                        result.filtered
+                    };
+                    #[cfg(feature = "image-registry")]
+                    let chunk = filtered.as_slice();
+                    modes.process(chunk);
+                    process_pane_output_with_pointer_queries(
+                        &grid,
+                        &output,
+                        chunk,
+                        ProtocolProfile::Bmux,
+                    )
+                    .expect("parse");
+                    #[cfg(not(feature = "image-registry"))]
+                    let _ = protocol_reply_for_chunk(&mut engine, &mut tracker, chunk);
+                }
+                bmux_bench::allocations::live_bytes()
+            })
+            .collect();
+        let start = live[ROUNDS / 2];
+        let peak = live[ROUNDS / 2..].iter().copied().max().unwrap_or(start);
+        println!(
+            "{name}: live bytes per round {live:?}, second-half growth {} B",
+            peak - start
+        );
+        if peak - start > SLACK {
+            failures.push(format!("{name} kept growing: {live:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

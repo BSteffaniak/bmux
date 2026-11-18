@@ -1038,3 +1038,88 @@ fn pipeline_metrics() {
     }
     report.write_and_check();
 }
+
+/// Live bytes after each of `rounds` replays of `frames` through one replay.
+fn soak(mut replay: Replay, frames: &[Frame], rounds: usize) -> Vec<usize> {
+    let mut output = Vec::new();
+    (0..rounds)
+        .map(|_| {
+            for frame in frames {
+                output.clear();
+                replay.frame(frame, &mut output);
+            }
+            bmux_bench::allocations::live_bytes()
+        })
+        .collect()
+}
+
+/// Memory a replay keeps stops growing: replayed ten times over, a scenario's live bytes in the
+/// second half of the rounds stay within 256 KiB of where the half started (history, caches and
+/// retained images are bounded). Run in release:
+///
+/// ```text
+/// cargo test --release -p bmux_attach_pipeline --features image-kitty,image-sixel --lib \
+///     pipeline_bench::pipeline_soak -- --ignored --exact --nocapture --test-threads 1
+/// ```
+#[test]
+#[ignore = "memory soak; run explicitly with --ignored --nocapture"]
+fn pipeline_soak() {
+    const ROUNDS: usize = 10;
+    const SLACK: usize = 256 * 1024;
+    let size = size();
+    let pane = (split_pane_width(size.0, 2), size.1);
+    let corpus_named = |size, name: &str| {
+        corpus::generated(size, 300)
+            .into_iter()
+            .find(|corpus| corpus.name == name)
+            .expect("generated corpus")
+            .frames
+    };
+    let observed = || {
+        let mut replay = Replay::new(size, true, delivery());
+        replay.observer = Some(bmux_tui::presentation::PresentationState::new(
+            bmux_tui::geometry::Rect::new(0, 0, size.0, size.1),
+        ));
+        replay.hold = true;
+        replay
+    };
+    let mut scenarios: Vec<(String, Replay, Vec<Frame>)> = vec![
+        (
+            "plain-stream".into(),
+            Replay::new(size, true, delivery()),
+            corpus_named(size, "plain-stream"),
+        ),
+        (
+            "full-repaint/observed".into(),
+            observed(),
+            corpus_named(size, "full-repaint"),
+        ),
+        (
+            "plain-stream/two-panes".into(),
+            Replay::split(size, 2, delivery()),
+            corpus_named(pane, "plain-stream"),
+        ),
+    ];
+    #[cfg(all(feature = "image-kitty", feature = "image-sixel"))]
+    for (protocol, kitty) in [("kitty", true), ("sixel", false)] {
+        scenarios.push((
+            format!("image/{protocol}/moving"),
+            image_replay(size, kitty, 1),
+            corpus_named(pane, "plain-stream"),
+        ));
+    }
+    let mut failures = Vec::new();
+    for (name, replay, frames) in scenarios {
+        let live = soak(replay, &frames, ROUNDS);
+        let start = live[ROUNDS / 2];
+        let peak = live[ROUNDS / 2..].iter().copied().max().unwrap_or(start);
+        println!(
+            "{name}: live bytes per round {live:?}, second-half growth {} B",
+            peak - start
+        );
+        if peak - start > SLACK {
+            failures.push(format!("{name} kept growing: {live:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
