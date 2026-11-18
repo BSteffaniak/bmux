@@ -43,23 +43,41 @@ impl Probe {
 
     /// Run `work`, returning its value and what it cost.
     pub fn measure<T>(&self, work: impl FnOnce() -> T) -> (T, Cost) {
-        let instructions_before = self.counter.as_ref().map(InstructionCounter::read);
-        let allocations_before = allocations::current();
+        let mark = self.mark();
         let value = work();
-        let allocations = allocations::current().since(allocations_before);
+        (value, self.since(mark))
+    }
+
+    /// Where the work about to be measured starts.
+    #[must_use]
+    pub fn mark(&self) -> Mark {
+        Mark {
+            instructions: self.counter.as_ref().map(InstructionCounter::read),
+            allocations: allocations::current(),
+        }
+    }
+
+    /// What the work since `mark` cost.
+    #[must_use]
+    pub fn since(&self, mark: Mark) -> Cost {
+        let allocations = allocations::current().since(mark.allocations);
         let instructions = self
             .counter
             .as_ref()
-            .zip(instructions_before)
+            .zip(mark.instructions)
             .map(|(counter, before)| counter.read().saturating_sub(before));
-        (
-            value,
-            Cost {
-                allocations,
-                instructions,
-            },
-        )
+        Cost {
+            allocations,
+            instructions,
+        }
     }
+}
+
+/// Where a measurement starts ([`Probe::mark`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Mark {
+    allocations: Allocations,
+    instructions: Option<u64>,
 }
 
 /// What one piece of work cost.
@@ -188,6 +206,30 @@ impl Report {
             regressions.extend(compare_scenario(actual, expected));
         }
         regressions
+    }
+
+    /// Finish a benchmark run: write the report where `BMUX_BENCH_JSON` says, and compare it
+    /// with the report `BMUX_BENCH_BASELINE` names, printing improvements.
+    ///
+    /// # Panics
+    /// Panics when the report cannot be written, the baseline cannot be read, or any gated
+    /// number regressed against it.
+    pub fn write_and_check(&self) {
+        if let Ok(path) = std::env::var("BMUX_BENCH_JSON") {
+            self.write(Path::new(&path)).expect("write the report");
+        }
+        if let Ok(path) = std::env::var("BMUX_BENCH_BASELINE") {
+            let baseline = Self::read(Path::new(&path)).expect("read the baseline");
+            for improvement in self.improvements(&baseline) {
+                println!("improved (the baseline can be lowered): {improvement}");
+            }
+            let regressions = self.regressions(&baseline);
+            assert!(
+                regressions.is_empty(),
+                "regressions against {path}:\n{}",
+                regressions.join("\n")
+            );
+        }
     }
 
     /// Scenarios whose gated numbers dropped well below `baseline`: the baseline can be lowered

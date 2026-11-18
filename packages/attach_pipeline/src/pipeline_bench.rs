@@ -1036,26 +1036,5 @@ fn pipeline_metrics() {
     for scenario in &report.scenarios {
         print_scenario(scenario);
     }
-    check_report(&report);
-}
-
-/// Write `report` where `BMUX_BENCH_JSON` says, and compare it with `BMUX_BENCH_BASELINE`.
-fn check_report(report: &Report) {
-    if let Ok(path) = std::env::var("BMUX_BENCH_JSON") {
-        report
-            .write(std::path::Path::new(&path))
-            .expect("write the report");
-    }
-    if let Ok(path) = std::env::var("BMUX_BENCH_BASELINE") {
-        let baseline = Report::read(std::path::Path::new(&path)).expect("read the baseline");
-        for improvement in report.improvements(&baseline) {
-            println!("improved (the baseline can be lowered): {improvement}");
-        }
-        let regressions = report.regressions(&baseline);
-        assert!(
-            regressions.is_empty(),
-            "regressions against {path}:\n{}",
-            regressions.join("\n")
-        );
-    }
+    report.write_and_check();
 }
