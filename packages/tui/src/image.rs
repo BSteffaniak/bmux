@@ -7,15 +7,18 @@ use crate::geometry::Rect;
 /// A key identifies the same logical image across frames. Reusing a key with
 /// different content or placement updates that image rather than adding a
 /// second image.
+///
+/// Keys are shared, not copied: scenes, placements and compositors clone them every frame.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct ImageKey(String);
+#[cfg_attr(feature = "serde", serde(from = "String", into = "String"))]
+pub struct ImageKey(std::sync::Arc<str>);
 
 impl ImageKey {
     /// Create an image key from caller-owned text.
     #[must_use]
     pub fn new(value: impl Into<String>) -> Self {
-        Self(value.into())
+        Self(value.into().into())
     }
 
     /// Return the key text.
@@ -34,6 +37,12 @@ impl From<String> for ImageKey {
 impl From<&str> for ImageKey {
     fn from(value: &str) -> Self {
         Self::new(value)
+    }
+}
+
+impl From<ImageKey> for String {
+    fn from(key: ImageKey) -> Self {
+        key.0.as_ref().to_owned()
     }
 }
 
@@ -216,6 +225,20 @@ pub enum ImageContribution {
 mod tests {
     use super::{ImageContribution, ImageKey, ImageLifecycle, ImagePayload, ImagePlacement};
     use crate::geometry::Rect;
+
+    /// A key is shared, not copied, and serializes as the plain string it always did.
+    #[test]
+    fn keys_share_their_text_and_serialize_as_strings() {
+        let key = ImageKey::new("pane:1:image");
+        let copy = key.clone();
+        assert!(std::ptr::eq(key.as_str(), copy.as_str()));
+        #[cfg(feature = "serde")]
+        {
+            let json = serde_json::to_string(&key).unwrap();
+            assert_eq!(json, "\"pane:1:image\"");
+            assert_eq!(serde_json::from_str::<ImageKey>(&json).unwrap(), key);
+        }
+    }
 
     #[test]
     fn default_fit_preserves_aspect_ratio_and_stretch_is_explicit() {

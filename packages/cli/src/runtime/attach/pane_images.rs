@@ -105,6 +105,8 @@ impl DecodedImage {
 #[derive(Default)]
 pub struct PaneImagePayloads {
     decoded: HashMap<ImageIdentity, DecodedImage>,
+    /// The map the next frame fills, kept empty between frames so its storage is reused.
+    spare: HashMap<ImageIdentity, DecodedImage>,
 }
 
 #[cfg(any(
@@ -123,7 +125,7 @@ impl PaneImagePayloads {
         layout: &bmux_client::AttachLayoutState,
         area: Rect,
     ) -> Vec<ImagePlacement> {
-        let mut decoded = HashMap::with_capacity(self.decoded.len());
+        let mut decoded = std::mem::take(&mut self.spare);
         let mut placements = Vec::new();
         let mut bytes = 0_usize;
         for surface in &layout.scene.surfaces {
@@ -196,7 +198,9 @@ impl PaneImagePayloads {
                 placements.extend(strips);
             }
         }
-        self.decoded = decoded;
+        // Images the frame no longer places are dropped; both maps keep their storage.
+        self.spare = std::mem::replace(&mut self.decoded, decoded);
+        self.spare.clear();
         placements
     }
 
