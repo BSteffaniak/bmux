@@ -2720,6 +2720,7 @@ kind = "query"
         .map_err(|error| format!("invalid noop definition: {}", error.message))?;
     let instance = definition
         .create(PluginCreateContext {
+            cli_command: None,
             runtime_scope: RuntimeScopeId::new(),
             // This tool is the host here: mint a fresh, unrelated instance id.
             instance: LoadedInstanceId::from_uuid(RuntimeScopeId::new().as_uuid()),

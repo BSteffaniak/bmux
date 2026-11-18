@@ -117,16 +117,14 @@ use bmux_plugin_sdk::author::{self, Call, Declarations, Plugin};
 #[derive(Default)]
 pub struct Pinger;
 
-impl Pinger {
-    async fn ping(&self, _cx: &Call, _args: declaration::commands::PingArgs) -> author::Result<()> {
-        println!("pong");
-        Ok(())
-    }
+async fn ping(_cx: &Call, _args: declaration::commands::PingArgs) -> author::Result<()> {
+    println!("pong");
+    Ok(())
 }
 
 impl Plugin for Pinger {
     fn declare(d: &mut Declarations<Self>) {
-        d.command(declaration::commands::PING, Self::ping);
+        d.command(declaration::commands::PING, ping);
     }
 }
 

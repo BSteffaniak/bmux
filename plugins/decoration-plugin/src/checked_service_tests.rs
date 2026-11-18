@@ -158,6 +158,7 @@ async fn selected_definition_uses_the_same_checked_boundary() {
     let definition = crate::plugin_definition();
     let instance = definition
         .create(PluginCreateContext {
+            cli_command: None,
             runtime_scope: bmux_plugin_sdk::definition::RuntimeScopeId::default(),
             instance: bmux_plugin_sdk::definition::LoadedInstanceId::from_uuid(Uuid::from_u128(
                 0x42,

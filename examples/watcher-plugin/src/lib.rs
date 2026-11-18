@@ -94,16 +94,14 @@ impl watcher_state::v1::WatcherState for Watcher {
     }
 }
 
-impl Watcher {
-    async fn watch_command(&self, cx: &Call, args: WatchArgs) -> author::Result<()> {
-        let host = cx
-            .host()
-            .ok_or_else(|| PluginCommandError::unavailable("watch needs host services"))?;
-        let (commands, state) = clients(host);
-        let (bumped, read) = watch(&commands, &state, args.by.unwrap_or(1)).await?;
-        println!("watcher: bumped to {bumped}, read back {read}");
-        Ok(())
-    }
+async fn watch_command(cx: &Call, args: WatchArgs) -> author::Result<()> {
+    let host = cx
+        .host()
+        .ok_or_else(|| PluginCommandError::unavailable("watch needs host services"))?;
+    let (commands, state) = clients(host);
+    let (bumped, read) = watch(&commands, &state, args.by.unwrap_or(1)).await?;
+    println!("watcher: bumped to {bumped}, read back {read}");
+    Ok(())
 }
 
 impl Plugin for Watcher {
@@ -112,15 +110,14 @@ impl Plugin for Watcher {
             .require::<counter_commands::v1::Client>()
             .require::<counter_state::v1::Client>()
             .subscribe::<counter_events::v1::Client>()
-            .command(WATCH, Self::watch_command);
+            .command(WATCH, watch_command);
     }
 
     /// Follow the counter's changes for the activation's lifetime, then
-    /// exercise it once; lifecycle diagnostics go to stderr (in a
-    /// command-local activation, stdout is command output).
+    /// exercise it once on the provider.
     async fn activate(&self, cx: &mut Activation) -> author::Result<()> {
         if let Err(error) = observe_changes(cx, self.observed.clone()).await {
-            // Hosts without an event bus (a CLI command-local activation).
+            // The activation host may not provide an event bus.
             eprintln!("watcher: not observing changes: {}", error.message);
         }
         let (commands, state) = clients(&cx.host()?);

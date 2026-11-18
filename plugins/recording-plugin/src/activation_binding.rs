@@ -201,6 +201,7 @@ mod tests {
         });
         let plugin = definition
             .create(PluginCreateContext {
+                cli_command: None,
                 runtime_scope: bmux_plugin_sdk::definition::RuntimeScopeId::default(),
                 instance: bmux_plugin_sdk::definition::LoadedInstanceId::from_uuid(
                     uuid::Uuid::from_u128(0x91),
@@ -233,6 +234,7 @@ mod tests {
     fn unbound_scoped_instance_refuses_work() {
         let scoped = Scoped {
             created: PluginCreateContext {
+                cli_command: None,
                 runtime_scope: bmux_plugin_sdk::definition::RuntimeScopeId::default(),
                 instance: bmux_plugin_sdk::definition::LoadedInstanceId::from_uuid(
                     uuid::Uuid::from_u128(0x92),

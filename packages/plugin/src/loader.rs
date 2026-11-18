@@ -1938,11 +1938,17 @@ impl NativePluginLoader {
         runtime: bmux_plugin_runtime::PluginRuntimeScopeId,
         available_capabilities: &[String],
         callback_runtime: tokio::runtime::Handle,
+        cli_command: Option<&str>,
     ) -> Result<Arc<scoped::LoadedExecution>> {
         let artifact = unsafe {
             scoped::DefinitionArtifact::load_selected_with_owner(selected, &self.bundled_executable)
         }?;
-        let execution = artifact.create(runtime, selected.role(), available_capabilities)?;
+        let execution = artifact.create_for_command(
+            runtime,
+            selected.role(),
+            available_capabilities,
+            cli_command,
+        )?;
         execution.bind_callback_runtime(callback_runtime)?;
         Ok(execution)
     }
@@ -1967,6 +1973,7 @@ impl NativePluginLoader {
         available_capabilities: &[String],
         definition: bmux_plugin_sdk::definition::PluginDefinition,
         callback_runtime: tokio::runtime::Handle,
+        cli_command: Option<&str>,
     ) -> Result<Arc<scoped::LoadedExecution>> {
         let artifact = unsafe {
             scoped::DefinitionArtifact::load_selected_with_definition(
@@ -1975,7 +1982,12 @@ impl NativePluginLoader {
                 Some(definition),
             )
         }?;
-        let execution = artifact.create(runtime, selected.role(), available_capabilities)?;
+        let execution = artifact.create_for_command(
+            runtime,
+            selected.role(),
+            available_capabilities,
+            cli_command,
+        )?;
         execution.bind_callback_runtime(callback_runtime)?;
         Ok(execution)
     }

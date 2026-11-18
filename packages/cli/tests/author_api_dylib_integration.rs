@@ -210,25 +210,15 @@ fn generated_clients_reach_a_generated_provider_across_dylibs() {
         "watcher: activation bumped to 5, read back 5",
     ]);
 
-    // A CLI command-local activation of the dylib watcher in the CLI
-    // process: its activation and then its async `watch` command body both
-    // reach the counter through `Client::remote(host)` on the asynchronous
-    // host route, attributed to the watcher on the issuing connection.
+    // A fresh CLI invocation runs the command, not the watcher's service lifecycle.
     let watch = sandbox.run(&["plugin", "run", "example.watcher", "watch", "--by", "4"]);
     let stderr = String::from_utf8_lossy(&watch.stderr);
-    let bumps = stderr.matches("watcher: activation bumped to").count();
-    assert_eq!(
-        bumps,
-        2,
-        "command-local activation reached the counter twice: {stderr}\n{}",
-        sandbox.evidence()
-    );
-    assert!(!stderr.contains("activation call failed"), "{stderr}");
-    // Server activation 2 + 3, CLI activation 2 + 3, then the command's 4.
+    assert!(!stderr.contains("watcher: activation"), "{stderr}");
+    // Server activation 2 + 3, then the command's 4.
     support::assert_success(&watch, "watch command body");
     let stdout = String::from_utf8_lossy(&watch.stdout);
     assert!(
-        stdout.contains("watcher: bumped to 14, read back 14"),
+        stdout.contains("watcher: bumped to 9, read back 9"),
         "{}\n{}",
         support::combined_output(&watch),
         sandbox.evidence()
@@ -238,19 +228,16 @@ fn generated_clients_reach_a_generated_provider_across_dylibs() {
     // through its generated `subscribe_changed()`: the counter (a dylib)
     // publishes on the host bus and the watcher's activation-owned task (a
     // dylib) receives it, including the change the CLI caused.
-    sandbox.wait_for_log(&["watcher: observed 14"]);
+    sandbox.wait_for_log(&["watcher: observed 9"]);
 
-    // A command-local activation of the counter in the CLI declares its
-    // channel where no event bus is bound: it activates with events unbound
-    // and its `bump` reaches the server's counter, whose change the server
-    // watcher observes.
+    // The separate CLI bumps the same server-owned counter.
     let bump = sandbox.run(&["plugin", "run", "example.counter", "bump", "--by", "1"]);
     support::assert_success(&bump, "counter bump");
     assert!(
-        String::from_utf8_lossy(&bump.stdout).contains("counter: 15"),
+        String::from_utf8_lossy(&bump.stdout).contains("counter: 10"),
         "{}\n{}",
         support::combined_output(&bump),
         sandbox.evidence()
     );
-    sandbox.wait_for_log(&["watcher: observed 15"]);
+    sandbox.wait_for_log(&["watcher: observed 10"]);
 }

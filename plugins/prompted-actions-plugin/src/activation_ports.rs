@@ -283,6 +283,7 @@ mod tests {
             .unwrap();
         owner.mark_active().unwrap();
         let scope = PluginCreateContext {
+            cli_command: None,
             runtime_scope: owner.runtime_id(),
             instance: owner.instance_id(),
             role: ComponentRole::Frontend,
@@ -352,6 +353,7 @@ mod tests {
             .begin_activation(PluginConcurrencyConfig::Concurrent)
             .unwrap();
         let scope = PluginCreateContext {
+            cli_command: None,
             runtime_scope: owner.runtime_id(),
             instance: owner.instance_id(),
             role: ComponentRole::Frontend,
@@ -370,6 +372,7 @@ mod tests {
             .unwrap();
         owner.mark_active().unwrap();
         let scope = PluginCreateContext {
+            cli_command: None,
             runtime_scope: owner.runtime_id(),
             instance: owner.instance_id(),
             role: ComponentRole::Frontend,

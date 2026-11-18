@@ -92,6 +92,7 @@ impl OwnedFrontends {
             &state.config,
             &definitions,
             state,
+            None,
         )
         .with_context(|| format!("failed loading frontend plugin '{id}'"))?;
         loaded

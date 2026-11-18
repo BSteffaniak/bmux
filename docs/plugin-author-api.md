@@ -95,7 +95,7 @@ impl Plugin for Counter {
     fn declare(d: &mut Declarations<Self>) {
         d.provide::<dyn counter_commands::v1::CounterCommands>()
             .provide::<dyn counter_state::v1::CounterState>()
-            .command(BUMP, Self::bump); // async fn bump(&self, &Call, BumpArgs) -> Result<()>
+            .command(BUMP, bump); // async fn bump(&Call, BumpArgs) -> Result<()>
     }
 }
 bmux_plugin_sdk::plugin!(Counter);
@@ -108,7 +108,7 @@ markers; nothing in it is product specific:
 | ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `provide::<dyn I>()`                        | `I::DESCRIPTOR` plus the generated `dispatch`, `dispatch_streaming`, `register` and `portable` functions. Does not compile unless `P: I`.                                     |
 | `require::<C>()`                            | The client's descriptor; `Activation::service::<C>()` refuses undeclared requirements.                                                                                        |
-| `command(decl, handler)`                    | A BPDL command with typed arguments; `handler` is any `async fn(&self, &Call, Args) -> Result<()>`.                                                                           |
+| `command(decl, handler)`                    | A BPDL command with typed arguments; `handler` is a free `async fn(&Call, Args) -> Result<()>`, with no provider receiver.                                                    |
 | `native_command(name, handler)`             | A command still declared by hand in `plugin.toml`, handled with the raw `NativeCommandContext` (`native-plugin` uses it).                                                     |
 | `extend::<E>(data)`                         | A contribution to extension point `E` with `P` implementing its `Behavior`.                                                                                                   |
 | `emits::<E>()`                              | A contract event `P` publishes: its channel is registered for the activation before `activate` runs.                                                                          |
@@ -385,8 +385,8 @@ their paths (`owns_paths`); `plugin.toml` may add paths, never remove them.
   a host task owned by the instance's scope (plug-rt `rt::services`), awaited
   with real wakers; dropping the future cancels the call on the host. The
   watcher example uses `Client::remote(host)` from its server-side
-  activation, its CLI command-local activation, and its async `watch`
-  command body. A command body (or blocking work it awaits) runs outside
+  activation and its async `watch` command body. Loading a fresh CLI instance
+  for a BPDL command does not construct or activate the service provider. A command body (or blocking work it awaits) runs outside
   the author's callback entry; its calls take the host's selected dispatch
   for that command's own invocation (same plugin attribution, declared
   capability checks and issuing route), and calls made while an entry is

@@ -70,6 +70,7 @@ fn definition() -> PluginDefinition {
 }
 fn scope(host: u128, instance: u128, role: ComponentRole) -> PluginCreateContext {
     PluginCreateContext {
+        cli_command: None,
         runtime_scope: RuntimeScopeId::from_uuid(uuid::Uuid::from_u128(host)),
         instance: LoadedInstanceId::from_uuid(uuid::Uuid::from_u128(instance)),
         role,
@@ -194,6 +195,7 @@ async fn native_and_static_have_identical_mutation_outcomes() {
     let host_scope =
         bmux_plugin_runtime::InstanceScope::new(bmux_plugin_runtime::PluginRuntimeScopeId::new());
     let context = PluginCreateContext {
+        cli_command: None,
         runtime_scope: RuntimeScopeId::from_uuid(host_scope.runtime_id().as_uuid()),
         instance: LoadedInstanceId::from_uuid(host_scope.id().as_uuid()),
         role: ComponentRole::Backend,

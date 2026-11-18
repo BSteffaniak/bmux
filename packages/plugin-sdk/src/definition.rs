@@ -34,6 +34,10 @@ pub enum ComponentRole {
 /// UUIDs are observations supplied by the trusted host, not plugin credentials.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginCreateContext {
+    /// Present only when loading a fresh instance for this CLI command.
+    /// Older hosts omit it; older factories retain their instance-bound behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_command: Option<String>,
     pub runtime_scope: RuntimeScopeId,
     pub instance: LoadedInstanceId,
     pub role: ComponentRole,
@@ -1055,6 +1059,7 @@ mod tests {
     }
     fn scope() -> PluginCreateContext {
         PluginCreateContext {
+            cli_command: None,
             runtime_scope: RuntimeScopeId::from_uuid(uuid::Uuid::from_u128(1)),
             instance: LoadedInstanceId::from_uuid(uuid::Uuid::from_u128(2)),
             role: ComponentRole::Backend,

@@ -15,16 +15,14 @@ use declaration::commands::{HELLO, HelloArgs};
 #[derive(Default)]
 pub struct Hello;
 
-impl Hello {
-    async fn hello(&self, _cx: &Call, args: HelloArgs) -> author::Result<()> {
-        println!("Hello, {}!", args.name.as_deref().unwrap_or("world"));
-        Ok(())
-    }
+async fn hello(_cx: &Call, args: HelloArgs) -> author::Result<()> {
+    println!("Hello, {}!", args.name.as_deref().unwrap_or("world"));
+    Ok(())
 }
 
 impl Plugin for Hello {
     fn declare(d: &mut Declarations<Self>) {
-        d.command(HELLO, Self::hello);
+        d.command(HELLO, hello);
     }
 }
 

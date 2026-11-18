@@ -51,20 +51,18 @@ impl counter_state::v1::CounterState for Counter {
     }
 }
 
-impl Counter {
-    /// `bump`: commands run in the issuing CLI, so reach the server instance
-    /// through the host like any other consumer.
-    async fn bump(&self, cx: &Call, args: BumpArgs) -> author::Result<()> {
-        let host = cx
-            .host()
-            .cloned()
-            .ok_or_else(|| PluginCommandError::unavailable("bump needs host services"))?;
-        let value = counter_commands::v1::Client::remote(host)
-            .incr(args.by.unwrap_or(1))
-            .await?;
-        println!("counter: {value}");
-        Ok(())
-    }
+/// `bump`: commands run in the issuing CLI, so reach the server instance
+/// through the host like any other consumer.
+async fn bump(cx: &Call, args: BumpArgs) -> author::Result<()> {
+    let host = cx
+        .host()
+        .cloned()
+        .ok_or_else(|| PluginCommandError::unavailable("bump needs host services"))?;
+    let value = counter_commands::v1::Client::remote(host)
+        .incr(args.by.unwrap_or(1))
+        .await?;
+    println!("counter: {value}");
+    Ok(())
 }
 
 impl Plugin for Counter {
@@ -72,7 +70,7 @@ impl Plugin for Counter {
         d.provide::<dyn counter_commands::v1::CounterCommands>()
             .provide::<dyn counter_state::v1::CounterState>()
             .emits::<counter_events::v1::Changed>()
-            .command(BUMP, Self::bump);
+            .command(BUMP, bump);
     }
 }
 
@@ -144,6 +142,36 @@ mod tests {
                 .unwrap();
         let rendered: String = bmux_plugin_sdk::decode_service_message(&response).unwrap();
         assert_eq!(rendered, "count=9");
+    }
+
+    #[test]
+    fn cli_bump_does_not_construct_the_counter() {
+        use bmux_plugin_sdk::definition::{
+            ComponentRole, LoadedInstanceId, PluginCreateContext, RuntimeScopeId,
+        };
+
+        let definition = author::definition::<Counter>(
+            declaration::PLUGIN_MANIFEST,
+            declaration::SERVICE_CONTRACTS,
+            |_| Err(PluginCommandError::failed("provider factory called")),
+        )
+        .unwrap();
+        let mut scope = PluginCreateContext {
+            cli_command: Some("bump".to_owned()),
+            runtime_scope: RuntimeScopeId::new(),
+            instance: LoadedInstanceId::from_uuid(RuntimeScopeId::new().as_uuid()),
+            role: ComponentRole::Backend,
+        };
+        assert!(definition.create(scope.clone()).is_ok());
+        scope.cli_command = None;
+        assert_eq!(
+            definition
+                .create(scope)
+                .err()
+                .expect("provider uses the factory")
+                .message,
+            "provider factory called"
+        );
     }
 
     #[test]

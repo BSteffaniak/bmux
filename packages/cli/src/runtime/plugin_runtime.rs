@@ -411,6 +411,7 @@ pub(super) fn load_plugin(
         config,
         &BTreeMap::new(),
         &state,
+        None,
     )
 }
 
@@ -422,6 +423,7 @@ fn load_plugin_with_definitions(
     config: &BmuxConfig,
     definitions: &BTreeMap<String, bmux_plugin_sdk::definition::PluginDefinition>,
     state: &RuntimeCommandState,
+    cli_command: Option<&str>,
 ) -> bmux_plugin_sdk::Result<ProductionPlugin> {
     let paths = &state.paths;
     let approvals = kernel_policy::load_native_approvals(paths)?;
@@ -431,6 +433,7 @@ fn load_plugin_with_definitions(
         available_capabilities,
         config,
         selected::ExecutionOwner {
+            cli_command,
             runtime_owner: state
                 .runtime_owner
                 .as_ref()
@@ -1307,6 +1310,7 @@ pub(super) fn load_enabled_plugins(
             &available_capabilities,
             config,
             selected::ExecutionOwner {
+                cli_command: None,
                 runtime_owner: runtime_owner.clone(),
                 runtime,
                 host_state: Arc::clone(host_state),
@@ -2962,7 +2966,11 @@ fn command_instance(
         (Rc::new(hosted), false)
     } else {
         (
-            load_command_plugin(plugin, state, command_local)?,
+            load_command_plugin(
+                plugin,
+                state,
+                command_local.then_some(context.command.as_str()),
+            )?,
             command_local,
         )
     };
@@ -2980,9 +2988,9 @@ fn command_instance(
 fn load_command_plugin(
     plugin: &bmux_plugin::RegisteredPlugin,
     state: &RuntimeCommandState,
-    command_local: bool,
+    cli_command: Option<&str>,
 ) -> Result<Rc<ProductionPlugin>> {
-    if command_local {
+    if cli_command.is_some() {
         let definitions = standalone_provider_definitions(state)?;
         Ok(Rc::new(load_plugin_with_definitions(
             plugin,
@@ -2991,6 +2999,7 @@ fn load_command_plugin(
             &state.config,
             &definitions,
             state,
+            cli_command,
         )?))
     } else {
         load_cached_plugin(plugin, state)
@@ -3103,6 +3112,7 @@ fn load_cached_plugin(
             &state.config,
             &definitions,
             state,
+            None,
         )
         .with_context(|| format!("failed loading enabled plugin '{plugin_id}'"))?;
         let loaded = Rc::new(loaded);

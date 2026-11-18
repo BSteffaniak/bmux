@@ -16,6 +16,7 @@ use bmux_plugin_sdk::{PluginError, TypedServiceRegistrationContext, TypedService
 use std::{collections::BTreeMap, future::Future, sync::Arc};
 
 pub(in crate::runtime) struct ExecutionOwner<'a> {
+    pub cli_command: Option<&'a str>,
     pub runtime_owner: Option<crate::runtime_owner::RuntimeOwner>,
     pub runtime: PluginRuntimeScopeId,
     pub host_state: Arc<bmux_plugin::PluginStateRegistry>,
@@ -428,6 +429,7 @@ impl ProductionPlugin {
                         &capabilities,
                         definition.clone(),
                         tokio::runtime::Handle::current(),
+                        owner.cli_command,
                     )
                 } else {
                     owner.loader.load_selected_execution_with_owner(
@@ -435,6 +437,7 @@ impl ProductionPlugin {
                         owner.runtime,
                         &capabilities,
                         tokio::runtime::Handle::current(),
+                        owner.cli_command,
                     )
                 }
             }?;

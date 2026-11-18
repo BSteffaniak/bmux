@@ -97,6 +97,7 @@ impl PluginInstance for Echo {
 }
 fn scope() -> PluginCreateContext {
     PluginCreateContext {
+        cli_command: None,
         runtime_scope: RuntimeScopeId::from_uuid(uuid::Uuid::from_u128(1)),
         instance: LoadedInstanceId::from_uuid(uuid::Uuid::from_u128(2)),
         role: ComponentRole::Backend,

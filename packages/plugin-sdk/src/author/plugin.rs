@@ -70,20 +70,20 @@ pub trait ServiceClient: RequiredInterface + Sized {
     }
 }
 
-/// A command handler: `async fn(&self, &Call, Args) -> Result<()>`.
-pub trait CommandHandler<'a, P: 'a, A>: Send + Sync {
+/// A command handler: `async fn(&Call, Args) -> Result<()>`.
+pub trait CommandHandler<'a, A>: Send + Sync {
     type Future: Future<Output = Result<()>> + Send + 'a;
-    fn call(&self, plugin: &'a P, cx: &'a Call, args: A) -> Self::Future;
+    fn call(&self, cx: &'a Call, args: A) -> Self::Future;
 }
 
-impl<'a, P: 'a, A, F, Fut> CommandHandler<'a, P, A> for F
+impl<'a, A, F, Fut> CommandHandler<'a, A> for F
 where
-    F: Fn(&'a P, &'a Call, A) -> Fut + Send + Sync,
+    F: Fn(&'a Call, A) -> Fut + Send + Sync,
     Fut: Future<Output = Result<()>> + Send + 'a,
 {
     type Future = Fut;
-    fn call(&self, plugin: &'a P, cx: &'a Call, args: A) -> Fut {
-        self(plugin, cx, args)
+    fn call(&self, cx: &'a Call, args: A) -> Fut {
+        self(cx, args)
     }
 }
 
@@ -199,7 +199,11 @@ struct Provided<P> {
     portable: Portable<P>,
 }
 
+type CliCommand =
+    Box<dyn Fn(Call, NativeCommandContext) -> BoxFuture<'static, Result<i32>> + Send + Sync>;
+
 enum CommandRun<P> {
+    Cli(CliCommand),
     Async(CommandFn<P>),
     Blocking(BlockingCommandFn<P>),
 }
@@ -288,18 +292,32 @@ impl<P: Send + Sync + 'static> Declarations<P> {
         self
     }
 
-    /// Handle a BPDL command with typed arguments.
+    /// Handle a BPDL command with typed arguments, without a service instance.
+    /// Instance methods cannot be CLI handlers, even on a plugin that provides services.
+    ///
+    /// ```compile_fail
+    /// use bmux_plugin_sdk::author::{Call, CommandArgs, CommandDecl, Declarations, Result};
+    /// struct Provider;
+    /// struct Args;
+    /// impl CommandArgs for Args {
+    ///     fn parse(_: &[String]) -> Result<Self> { Ok(Args) }
+    /// }
+    /// impl Provider {
+    ///     async fn run(&self, _: &Call, _: Args) -> Result<()> { Ok(()) }
+    /// }
+    /// Declarations::<Provider>::default().command(CommandDecl::<Args>::new("run"), Provider::run);
+    /// ```
     pub fn command<A, F>(&mut self, decl: CommandDecl<A>, handler: F) -> &mut Self
     where
         A: CommandArgs + Send + 'static,
-        F: for<'a> CommandHandler<'a, P, A> + Copy + 'static,
+        F: for<'a> CommandHandler<'a, A> + Copy + 'static,
     {
         self.commands.push(Command {
             name: decl.name(),
-            run: CommandRun::Async(Box::new(move |plugin, call, context| {
+            run: CommandRun::Cli(Box::new(move |call, context| {
                 let args = A::parse(&context.arguments);
                 Box::pin(async move {
-                    handler.call(plugin, &call, args?).await?;
+                    handler.call(&call, args?).await?;
                     Ok(crate::EXIT_OK)
                 })
             })),
@@ -1137,6 +1155,7 @@ impl<P: Plugin> PluginInstance for DeclaredInstance<P> {
                 return Err(crate::PluginCommandError::unknown_command(&context.command)).into();
             };
             match &command.run {
+                CommandRun::Cli(run) => run(Call::from_invocation(call), context).await.into(),
                 CommandRun::Async(run) => {
                     let cx = Call::from_invocation(call).with_events(self.emitter());
                     run(&self.plugin, cx, context).await.into()
@@ -1368,6 +1387,29 @@ impl PluginCrate {
     }
 }
 
+/// A scoped CLI invocation carries host authority but owns no provider state.
+struct CliInstance {
+    name: &'static str,
+    run: CliCommand,
+}
+
+impl PluginInstance for CliInstance {
+    fn command(
+        &self,
+        call: PluginCallContext,
+        context: NativeCommandContext,
+    ) -> PluginFuture<'_, CommandOutcome> {
+        Box::pin(async move {
+            if context.command != self.name {
+                return Err(Error::unknown_command(&context.command)).into();
+            }
+            (self.run)(Call::from_invocation(call), context)
+                .await
+                .into()
+        })
+    }
+}
+
 /// Build the definition [`crate::plugin!`] emits.
 ///
 /// # Errors
@@ -1380,6 +1422,23 @@ pub fn definition<P: Plugin>(
     let metadata = super::metadata(manifest, services)?;
     let definition =
         crate::definition::PluginDefinition::new(metadata, move |scope: PluginCreateContext| {
+            if let Some(name) = &scope.cli_command {
+                let mut declarations = Declarations::default();
+                P::declare(&mut declarations);
+                declarations.validate(manifest, services)?;
+                let entry = declarations
+                    .commands
+                    .into_iter()
+                    .find(|entry| entry.name == name)
+                    .ok_or_else(|| Error::unknown_command(name))?;
+                if let CommandRun::Cli(run) = entry.run {
+                    return Ok(Arc::new(CliInstance {
+                        name: entry.name,
+                        run,
+                    }) as Arc<dyn PluginInstance>);
+                }
+                // Legacy instance-bound commands retain their existing lifecycle.
+            }
             let plugin = create(&scope)?;
             Ok(Arc::new(
                 DeclaredInstance::new(plugin, manifest, services)?.for_instance(scope.instance),

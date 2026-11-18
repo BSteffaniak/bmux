@@ -585,6 +585,16 @@ impl DefinitionArtifact {
         role: ComponentRole,
         available_capabilities: &[String],
     ) -> Result<Arc<LoadedExecution>> {
+        self.create_for_command(runtime, role, available_capabilities, None)
+    }
+
+    pub(super) fn create_for_command(
+        &self,
+        runtime: PluginRuntimeScopeId,
+        role: ComponentRole,
+        available_capabilities: &[String],
+        cli_command: Option<&str>,
+    ) -> Result<Arc<LoadedExecution>> {
         if self
             .verified_selection
             .as_ref()
@@ -605,6 +615,7 @@ impl DefinitionArtifact {
             .set_label(self.metadata.plugin_id.as_str())
             .map_err(scope_error)?;
         let context = PluginCreateContext {
+            cli_command: cli_command.map(str::to_owned),
             runtime_scope: RuntimeScopeId::from_uuid(runtime.as_uuid()),
             instance: LoadedInstanceId::from_uuid(scope.id().as_uuid()),
             role,
