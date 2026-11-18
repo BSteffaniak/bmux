@@ -318,6 +318,7 @@ pub struct Pane<'a> {
     footer: Option<Line>,
     actions: Vec<PaneTitleAction>,
     title_hit: bool,
+    min_title: u16,
     padding: Insets,
     border: bool,
     policy: PanePolicy,
@@ -336,6 +337,7 @@ impl Pane<'_> {
             footer: None,
             actions: Vec::new(),
             title_hit: false,
+            min_title: 0,
             padding: Insets::all(0),
             border: true,
             policy: PanePolicy {
@@ -409,6 +411,15 @@ impl Pane<'_> {
         self
     }
 
+    /// Keep at least `cells` of the title (the whole title when it is shorter) on the title
+    /// row: actions that would leave it less are dropped, leftmost first. Without a title, or
+    /// with `0` (the default), actions take the room first and the title is clipped.
+    #[must_use]
+    pub const fn min_title_width(mut self, cells: u16) -> Self {
+        self.min_title = cells;
+        self
+    }
+
     /// Register the title row as a clickable region `<pane id>.title` (for focus or
     /// double-click handling by the caller). Panes with title-bar dragging already
     /// register that id as their drag handle.
@@ -448,6 +459,13 @@ impl Pane<'_> {
             .iter()
             .map(|action| u16::try_from(action.label.width()).unwrap_or(u16::MAX))
             .collect();
+        // The title's reserved room and the gap before the actions.
+        let reserve = title_width.unwrap_or(0).min(self.min_title).min(available);
+        let available = if reserve > 0 {
+            available.saturating_sub(reserve.saturating_add(1))
+        } else {
+            available
+        };
         // Keep as many trailing actions as fit, with one cell between neighbours.
         let mut first = widths.len();
         let mut used: u16 = 0;
@@ -989,6 +1007,7 @@ impl Component for PaneComponent<'_, '_> {
         format!("{:?}", self.pane.footer).hash(&mut paint);
         format!("{:?}", self.pane.right_title).hash(&mut paint);
         self.pane.title_hit.hash(&mut paint);
+        self.pane.min_title.hash(&mut paint);
         format!("{:?}", self.pane.policy).hash(&mut paint);
         format!("{:?}", state.interaction).hash(&mut paint);
         format!("{:?}", state.drag).hash(&mut paint);
@@ -1991,6 +2010,33 @@ mod tests {
         // Without the opt-in, the title row registers nothing of its own.
         let (_, hits) = rendered(with_actions("Files"), 14);
         assert!(!hits.iter().any(|(id, _)| id == "pane.title"));
+    }
+
+    #[test]
+    fn a_minimum_title_width_drops_actions_before_clipping_the_title() {
+        let pane = with_actions("Files").min_title_width(4);
+        // Room for the title's four cells, a gap and both actions.
+        let layout = pane.title_layout(Rect::new(0, 0, 10, 3));
+        assert_eq!(layout.actions.len(), 2);
+        assert_eq!(layout.title, Some(Rect::new(1, 0, 4, 1)));
+        // One cell less: the leftmost action goes, and the title keeps its room.
+        let layout = pane.title_layout(Rect::new(0, 0, 9, 3));
+        assert_eq!(layout.actions, [(1, Rect::new(7, 0, 1, 1))]);
+        assert_eq!(layout.title, Some(Rect::new(1, 0, 5, 1)));
+        // Too narrow for any action beside the reserve.
+        let layout = pane.title_layout(Rect::new(0, 0, 7, 3));
+        assert_eq!(layout.actions, Vec::new());
+        assert_eq!(layout.title, Some(Rect::new(1, 0, 5, 1)));
+        // A title shorter than the minimum reserves only its own width.
+        let layout = with_actions("ab")
+            .min_title_width(4)
+            .title_layout(Rect::new(0, 0, 8, 3));
+        assert_eq!(layout.actions.len(), 2);
+        assert_eq!(layout.title, Some(Rect::new(1, 0, 2, 1)));
+        // Painting and hit regions follow the same layout.
+        let (_, hits) = rendered(with_actions("Files").min_title_width(4), 9);
+        assert!(!hits.iter().any(|(id, _)| id == "pane.action.collapse"));
+        assert!(hits.contains(&("pane.action.close".to_owned(), Rect::new(7, 0, 1, 1))));
     }
 
     #[test]
