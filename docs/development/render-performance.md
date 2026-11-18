@@ -47,13 +47,44 @@ To find where allocations come from, profile a scenario with
 [dhat](https://docs.rs/dhat) or Instruments; `pipeline_bench_loop` replays one corpus for
 external profilers.
 
-## Allocation work
+## Results
 
-Each change lands as its own commit with its before/after numbers.
+`scripts/perf-render.py compare e06ff6ab HEAD`: the first revision that measured (master plus
+the metrics, nothing trimmed) against the allocation work, per frame at 420×90 on an Apple
+M-series machine. Bytes written to the host are identical in every scenario: no behavior changed.
 
-1. Escape-sequence parameters (SGR and CSI) are parsed without allocating.
-2. Rows are sized once and their storage reused.
-3. The changed columns of each row, the frame output buffer and the compositor's per-frame plans
-   reuse their storage across frames.
-4. The image path keys and compares pane images without copying or rescanning their bytes, and
-   reuses its per-frame vectors.
+| Scenario | Phase | Allocations | Instructions |
+| --- | --- | --- | --- |
+| Full repaint | client apply | 42,274 → 0 | 65.0M → 53.2M (−18%) |
+| Full repaint | client render | 120 → 25 | 22.8M → 22.7M |
+| Full repaint, two panes | client render | 212 → 27 | 22.7M → 22.7M |
+| Streaming text | client apply | 1,409 → 3 | 2.24M → 1.89M (−15%) |
+| Streaming text | client render | 33 → 27 | 1.37M → 1.36M |
+| Moving sixel image | client render | 6,552 → 47 | 22.5M → 6.7M (−70%) |
+| Kitty image beside streaming | client render | 56 → 37 | 5.07M → 5.06M |
+| Full repaint | pane reader, all stages | 101,285 → 33 | 136.7M → 104.9M (−23%) |
+| Streaming text | pane reader, all stages | 3,379 → 14 | 4.76M → 3.79M (−20%) |
+| Text with Kitty images | pane reader, image stage | 9,750 → 31 | 6.47M → 3.62M (−44%) |
+
+What changed, each its own commit with its numbers: escape-sequence parameters parse into a stack
+buffer; grid rows are erased and scrolled in place instead of rebuilt; the parser prefix, the
+reader's per-chunk buffers, the frame's changed-column runs and the frame output buffer keep their
+storage; metadata-free chunks pass the shell metadata parser uncopied; the sixel encoder writes
+straight into its output; the image content cache survives the screen clear that repairs raster
+images; image keys are shared, not copied; display capture copies images only while recording.
+
+## Known costs left
+
+- **The pane reader parses all output twice.** The cursor tracker keeps a second full terminal
+  grid (with its own 10,000-row history) to answer cursor queries and to place and evict images;
+  the main grid already holds the same state. Merging them would roughly halve the reader's parse
+  CPU and its memory per pane.
+- **A raster image repaints the whole screen when it moves.** Raster protocols cannot delete a
+  placement, so the presenter clears the screen and repaints every cell (about 104 KB per frame for
+  a moving sixel image); repainting only the old footprint would cut that to its cells.
+- **The render rebuilds a compositor plan every frame.** `render_attach_scene` builds a
+  `RetainedCompositor` from the scene to find the surfaces to repaint (about 15 small allocations
+  per frame), though the attach client keeps one across frames.
+- **Pane image payloads are compared by content every frame**, a scan of each image's bytes,
+  because a pane's image may change without a new id; a revision from the server would avoid it.
+- **History is held at full width**: a 420-column pane's 10,000 rows take about 70 MB.
