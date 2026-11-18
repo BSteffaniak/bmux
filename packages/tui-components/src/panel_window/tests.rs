@@ -127,10 +127,20 @@ fn lengths(total: u16, members: usize, fill: usize) -> Vec<u16> {
 /// An application holding the test tree: window state, group states and pane states.
 struct App {
     windows: PanelWindows<P>,
+    /// Show controls only on the focused and hovered panels, when set.
+    view: Option<View>,
     groups: [RefCell<PanelGroupState>; 3],
     panes: [Cell<PaneState>; 5],
     clicks: TitleClicks<P>,
     size: (u16, u16),
+}
+
+/// The focused panel and what the pointer is over.
+#[derive(Debug, Clone, Copy, Default)]
+struct View {
+    focused: Option<P>,
+    hovered: Option<P>,
+    control: Option<WindowControl>,
 }
 
 /// One painted frame.
@@ -178,6 +188,7 @@ impl App {
     fn new(width: u16, height: u16) -> Self {
         let app = Self {
             windows: windows(),
+            view: None,
             groups: std::array::from_fn(|_| RefCell::new(PanelGroupState::new(Vec::new()))),
             panes: std::array::from_fn(|_| Cell::new(PaneState::new(Rect::default()))),
             clicks: TitleClicks::default(),
@@ -203,11 +214,50 @@ impl App {
     }
 
     fn chrome(&self, panel: P) -> Pane<'static> {
-        self.windows.controls(panel).apply(
+        self.controls(panel).apply(
             Pane::new()
                 .title(panel.title().to_owned())
                 .action(PaneTitleAction::new("own", "+ own")),
         )
+    }
+
+    /// The controls of `panel` as painted: shown on the focused and hovered panels while the
+    /// view is set.
+    fn controls(&self, panel: P) -> WindowControls {
+        let controls = self.windows.controls(panel);
+        let Some(view) = self.view else {
+            return controls;
+        };
+        let hovered = view.hovered == Some(panel);
+        controls
+            .shown(view.focused == Some(panel) || hovered)
+            .hovered(view.control.filter(|_| hovered))
+    }
+
+    /// The pointer moved to `position`: the panel under it shows its controls, and the
+    /// control under it (hit tested on that panel's title row with its controls shown) is
+    /// hovered.
+    fn hover(&mut self, painted: &Painted, position: Point) {
+        let mut view = self.view.unwrap_or_default();
+        view.hovered = ALL.into_iter().find(|panel| {
+            painted
+                .area(panel.id())
+                .is_some_and(|area| area.contains(position))
+        });
+        view.control = view.hovered.and_then(|panel| {
+            let controls = self.windows.controls(panel);
+            let area = painted.area(panel.id())?;
+            let chrome = controls.apply(
+                Pane::new()
+                    .title(panel.title().to_owned())
+                    .action(PaneTitleAction::new("own", "+ own")),
+            );
+            match controls.target(&chrome, area, position)? {
+                TitleTarget::Control(control) => Some(control),
+                TitleTarget::Action(_) | TitleTarget::Title => None,
+            }
+        });
+        self.view = Some(view);
     }
 
     fn pane(&self, panel: P) -> PaneComponent<'static, '_> {
@@ -280,8 +330,7 @@ impl App {
     fn press(&mut self, painted: &Painted, position: Point) -> Option<(P, TitleTarget)> {
         let (panel, target) = ALL.into_iter().find_map(|panel| {
             let area = painted.area(panel.id())?;
-            self.windows
-                .controls(panel)
+            self.controls(panel)
                 .target(&self.chrome(panel), area, position)
                 .map(|target| (panel, target))
         })?;
@@ -342,7 +391,7 @@ impl App {
                     maximized.is_none_or(|maximized| maximized == panel),
                     "{context}: {id} while {maximized:?} is maximized"
                 );
-                let glyph = self.windows.controls(panel).glyph(control);
+                let glyph = self.controls(panel).glyph(control);
                 assert_eq!(
                     painted.text_in(*area).trim(),
                     glyph,
@@ -351,7 +400,7 @@ impl App {
                 // The control lies on its pane's title row, as hit testing reads it.
                 let pane = painted.area(panel.id()).expect("laid out");
                 assert_eq!(
-                    self.windows.controls(panel).target(
+                    self.controls(panel).target(
                         &self.chrome(panel),
                         pane,
                         Point::new(area.x, area.y)
@@ -379,26 +428,39 @@ fn controls_list_glyphs_and_strips() {
         normal.closable(false).list(),
         [WindowControl::Minimize, WindowControl::Maximize]
     );
-    assert_eq!(
-        WindowControls::new(PanelShape::Strip).list(),
-        [WindowControl::Minimize]
-    );
+    // A minimized panel offers only its restore control, as a row or a strip.
+    for shape in [PanelShape::Row, PanelShape::Strip] {
+        assert_eq!(WindowControls::new(shape).list(), [WindowControl::Minimize]);
+    }
     let glyphs = WindowGlyphs::UNICODE;
     assert_eq!(normal.glyph(WindowControl::Minimize), glyphs.minimize);
     assert_eq!(normal.glyph(WindowControl::Maximize), glyphs.maximize);
     for shape in [PanelShape::Row, PanelShape::Strip] {
         let controls = WindowControls::new(shape);
-        assert_eq!(controls.glyph(WindowControl::Minimize), glyphs.restore);
-        assert_eq!(controls.glyph(WindowControl::Maximize), glyphs.maximize);
+        assert_eq!(
+            controls.glyph(WindowControl::Minimize),
+            glyphs.restore_minimized
+        );
     }
-    let maximized = WindowControls::new(PanelShape::Maximized).glyphs(WindowGlyphs::ASCII);
-    assert_eq!(maximized.glyph(WindowControl::Maximize), "=");
-    assert_eq!(maximized.glyph(WindowControl::Minimize), "_");
-    assert_eq!(maximized.glyph(WindowControl::Close), "x");
-    // A strip holds its restore control between the corners.
+    let maximized = WindowControls::new(PanelShape::Maximized);
+    assert_eq!(
+        maximized.glyph(WindowControl::Maximize),
+        glyphs.restore_maximized
+    );
+    let ascii = WindowControls::new(PanelShape::Maximized).glyphs(WindowGlyphs::ASCII);
+    assert_eq!(ascii.glyph(WindowControl::Maximize), "=");
+    assert_eq!(ascii.glyph(WindowControl::Minimize), "v");
+    assert_eq!(ascii.glyph(WindowControl::Close), "x");
+    assert_eq!(
+        WindowControls::new(PanelShape::Row)
+            .glyphs(WindowGlyphs::ASCII)
+            .glyph(WindowControl::Minimize),
+        ">"
+    );
+    // A strip holds its padded restore control between the corners.
     assert_eq!(WindowControls::new(PanelShape::Strip).strip_width(), 5);
     let wide = WindowGlyphs {
-        restore: "⧉⧉",
+        restore_minimized: "⧉⧉",
         ..WindowGlyphs::UNICODE
     };
     assert_eq!(
@@ -432,16 +494,21 @@ fn narrow_title_rows_drop_own_actions_then_minimize_then_maximize_and_keep_the_t
         let title = pane.title_layout(Rect::new(0, 0, width, 3)).title;
         (ids, title)
     };
-    // Corners (2), title kept at 4 cells and a gap (5), then actions of 3 cells and gaps.
+    // Corners (2) and the title kept at 4 cells with a gap (5) leave the rest to the actions:
+    // the cluster is its caps (4), its glyphs with a space between, and a cell before the
+    // corner; the own action takes 5 cells and a gap.
     assert_eq!(
-        pane(30).0,
+        pane(23).0,
         ["own", "minimize", "maximize", "close"],
         "everything fits"
     );
-    assert_eq!(pane(18).0, ["minimize", "maximize", "close"]);
-    assert_eq!(pane(14).0, ["maximize", "close"]);
-    assert_eq!(pane(10).0, ["close"]);
-    assert_eq!(pane(8).0, Vec::<String>::new());
+    assert_eq!(pane(22).0, ["minimize", "maximize", "close"]);
+    assert_eq!(pane(17).0, ["minimize", "maximize", "close"]);
+    assert_eq!(pane(16).0, ["maximize", "close"]);
+    assert_eq!(pane(15).0, ["maximize", "close"]);
+    assert_eq!(pane(14).0, ["close"]);
+    assert_eq!(pane(13).0, ["close"]);
+    assert_eq!(pane(12).0, Vec::<String>::new());
     for width in 0..40 {
         let (_, title) = pane(width);
         if width >= 7 {
@@ -449,10 +516,11 @@ fn narrow_title_rows_drop_own_actions_then_minimize_then_maximize_and_keep_the_t
             assert!(title.is_some_and(|title| title.width >= 4), "{width}");
         }
     }
-    // A strip keeps only its restore control, without a title minimum.
+    // A strip keeps only its padded restore control, without a title minimum.
     let strip = WindowControls::new(PanelShape::Strip).apply(Pane::new().title("Files"));
     let layout = strip.title_layout(Rect::new(0, 0, 5, 10));
     assert_eq!(layout.actions, [(0, Rect::new(1, 0, 3, 1))]);
+    assert_eq!(layout.groups, []);
 }
 
 #[test]
@@ -1009,4 +1077,221 @@ fn group_states_ignore_out_of_range_lengths() {
     let state = windows.group_state(7, vec![3, 4], Vec::new());
     assert_eq!(state.sizes(), [PanelSize::flex(3), PanelSize::flex(4)]);
     assert_eq!(state.maximized(), None);
+}
+
+/// The title row of `panel` in `painted`.
+fn title_row(painted: &Painted, panel: P) -> String {
+    let area = painted.area(panel.id()).expect("laid out");
+    painted.text_in(Rect::new(area.x, area.y, area.width, 1))
+}
+
+/// The ids of `panel`'s painted controls.
+fn painted_controls(painted: &Painted, panel: P) -> Vec<WindowControl> {
+    let prefix = format!("{}.action.", panel.id());
+    painted
+        .hits
+        .iter()
+        .filter_map(|(id, _)| id.strip_prefix(&prefix).and_then(WindowControl::from_id))
+        .collect()
+}
+
+#[test]
+fn the_cluster_is_one_run_joined_to_the_border_with_the_state_glyphs() {
+    let row = |controls: WindowControls| {
+        let chrome = controls.apply(Pane::new().title("Guide").right_title("0/3"));
+        let state = Cell::new(PaneState::new(Rect::new(0, 0, 24, 3)));
+        let component = PaneComponent::new("pane", chrome, &state, Column::new());
+        let layout = component.layout(Constraints::new(24, 24, 3, Some(3)), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 24, 3));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        drop(frame);
+        buffer.row_symbols(0).unwrap_or_default()
+    };
+    let normal = WindowControls::new(PanelShape::Normal).min_title_width(4);
+    assert_eq!(row(normal), "┌Guide───0/3─┤ ▾ ⤢ × ├─┐");
+    assert_eq!(
+        row(WindowControls::new(PanelShape::Maximized).min_title_width(4)),
+        "┌Guide───0/3─┤ ▾ ⤡ × ├─┐"
+    );
+    // A minimized row offers only its restore control, shown even when the others hide.
+    assert_eq!(
+        row(WindowControls::new(PanelShape::Row).shown(false)),
+        "┌Guide───────0/3─┤ ▸ ├─┐"
+    );
+    assert_eq!(
+        row(normal.glyphs(WindowGlyphs::ASCII)),
+        "┌Guide───0/3─| v + x |─┐"
+    );
+    assert_eq!(row(normal.closable(false)), "┌Guide─────0/3─┤ ▾ ⤢ ├─┐");
+    // Hidden, the title row has no controls and the right title takes the room.
+    assert_eq!(row(normal.shown(false)), "┌Guide──────────────0/3┐");
+}
+
+#[test]
+fn hidden_controls_have_no_hit_regions_or_targets() {
+    let controls = WindowControls::new(PanelShape::Normal).shown(false);
+    assert_eq!(controls.painted(), []);
+    assert_eq!(controls.list().len(), 3);
+    let chrome = controls.apply(
+        Pane::new()
+            .title("Files")
+            .action(PaneTitleAction::new("own", "+ own")),
+    );
+    assert_eq!(chrome.actions().len(), 1);
+    let area = Rect::new(3, 2, 30, 6);
+    for x in area.x + 1..area.right() - 1 {
+        let target = controls.target(&chrome, area, Point::new(x, area.y));
+        assert!(
+            matches!(target, Some(TitleTarget::Title | TitleTarget::Action(0))),
+            "{x}: {target:?}"
+        );
+    }
+    // A hovered control that is not painted styles nothing.
+    let hovered = controls
+        .hovered(Some(WindowControl::Close))
+        .apply(Pane::new());
+    assert_eq!(
+        hovered,
+        Pane::new().min_title_width(super::DEFAULT_MIN_TITLE)
+    );
+}
+
+#[test]
+fn hovered_controls_take_their_hover_styles() {
+    use bmux_tui::style::{Color, Style};
+    let hover = Style::new().fg(Color::Blue);
+    let close = Style::new().fg(Color::Red);
+    let muted = Style::new().fg(Color::Yellow);
+    let fg_at = |hovered: Option<WindowControl>| {
+        let chrome = WindowControls::new(PanelShape::Normal)
+            .style(muted)
+            .hover_styles(hover, close)
+            .hovered(hovered)
+            .apply(Pane::new());
+        let state = Cell::new(PaneState::new(Rect::new(0, 0, 13, 3)));
+        let component = PaneComponent::new("pane", chrome, &state, Column::new());
+        let layout = component.layout(Constraints::new(13, 13, 3, Some(3)), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 13, 3));
+        let mut frame = Frame::new(&mut buffer);
+        component.paint(&layout, &mut PaintCx::new(&mut frame));
+        drop(frame);
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("┌─┤ ▾ ⤢ × ├─┐"));
+        [4u16, 6, 8].map(|x| buffer.get(Point::new(x, 0)).and_then(|cell| cell.style.fg))
+    };
+    let muted = muted.fg;
+    assert_eq!(fg_at(None), [muted, muted, muted]);
+    assert_eq!(
+        fg_at(Some(WindowControl::Close)),
+        [muted, muted, Some(Color::Red)]
+    );
+    assert_eq!(
+        fg_at(Some(WindowControl::Maximize)),
+        [muted, Some(Color::Blue), muted]
+    );
+    assert_eq!(
+        fg_at(Some(WindowControl::Minimize)),
+        [Some(Color::Blue), muted, muted]
+    );
+}
+
+#[test]
+fn controls_show_on_the_focused_and_hovered_panels_and_minimized_restores_always() {
+    let mut app = App::new(100, 30);
+    app.windows.set_minimized(P::Under, true);
+    app.windows.set_minimized(P::Top, true);
+    app.windows.set_minimized(P::Bottom, true);
+    app.sync();
+    app.view = Some(View {
+        focused: Some(P::Doc),
+        ..View::default()
+    });
+    let painted = app.paint();
+    app.assert_controls_agree(&painted, "focused");
+    assert_eq!(painted_controls(&painted, P::Doc).len(), 2, "doc: no close");
+    assert_eq!(painted_controls(&painted, P::Left), []);
+    assert!(!title_row(&painted, P::Left).contains('▾'));
+    // Minimized panels keep their restore control: a row's cluster and a strip's control.
+    for panel in [P::Under, P::Top, P::Bottom] {
+        assert_eq!(
+            painted_controls(&painted, panel),
+            [WindowControl::Minimize],
+            "{panel:?}"
+        );
+    }
+    assert!(title_row(&painted, P::Under).contains("┤ ▸ ├"));
+    // The pointer over the left panel shows its controls on the first frame after.
+    let left = painted.area("left").expect("laid out");
+    app.hover(&painted, Point::new(left.x + 2, left.y + 3));
+    let painted = app.paint();
+    app.assert_controls_agree(&painted, "hovered");
+    assert_eq!(painted_controls(&painted, P::Left).len(), 3);
+    assert!(title_row(&painted, P::Left).contains("┤ ▾ ⤢ × ├"));
+    // Over its close control, that control is hovered; a press closes the panel.
+    let close = painted.hit("left.action.close").expect("painted");
+    let at = Point::new(close.x, close.y);
+    app.hover(&painted, at);
+    assert_eq!(
+        app.view.and_then(|view| view.control),
+        Some(WindowControl::Close)
+    );
+    let painted = app.paint();
+    assert_eq!(painted.hit("left.action.close"), Some(close));
+    assert_eq!(
+        app.press(&painted, at),
+        Some((P::Left, TitleTarget::Control(WindowControl::Close)))
+    );
+    // Leaving the panel hides its controls with their regions; a press where the close
+    // control was is on the title.
+    let mut app = App::new(100, 30);
+    app.view = Some(View::default());
+    let painted = app.paint();
+    let left = painted.area("left").expect("laid out");
+    app.hover(&painted, Point::new(left.x + 2, left.y + 3));
+    let shown = app.paint();
+    let close = shown.hit("left.action.close").expect("painted");
+    let doc = shown.area("doc").expect("laid out");
+    app.hover(&shown, Point::new(doc.x + 2, doc.y + 3));
+    let hidden = app.paint();
+    app.assert_controls_agree(&hidden, "left");
+    assert_eq!(painted_controls(&hidden, P::Left), []);
+    assert!(matches!(
+        app.press(&hidden, Point::new(close.x, close.y)),
+        Some((P::Left, TitleTarget::Title | TitleTarget::Action(_)))
+    ));
+    assert_eq!(app.windows.shape(P::Left), PanelShape::Normal);
+}
+
+#[test]
+fn shown_and_hidden_controls_agree_with_painting_at_every_size() {
+    let sizes = [
+        (100, 30),
+        (40, 8),
+        (24, 5),
+        (12, 4),
+        (5, 3),
+        (3, 2),
+        (1, 1),
+        (0, 0),
+    ];
+    for focused in [None, Some(P::Doc), Some(P::Bottom)] {
+        let mut app = App::new(100, 30);
+        app.windows.set_minimized(P::Top, true);
+        app.view = Some(View {
+            focused,
+            hovered: Some(P::Left),
+            control: Some(WindowControl::Close),
+        });
+        for (width, height) in sizes {
+            app.size = (width, height);
+            app.sync();
+            let painted = app.paint();
+            app.assert_controls_agree(&painted, &format!("{focused:?} at {width}x{height}"));
+            for panel in [P::Under, P::Doc] {
+                if focused != Some(panel) {
+                    assert_eq!(painted_controls(&painted, panel), [], "{panel:?}");
+                }
+            }
+        }
+    }
 }

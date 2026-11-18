@@ -273,20 +273,32 @@ groups: minimize, maximize, restore and close. It is opt-in; panes and groups
 that do not use it are unaffected.
 
 * **Title-row controls.** `WindowControls::new(shape)` describes a panel's
-  controls: `closable`, `glyphs` (`WindowGlyphs::UNICODE`, the default, or
-  `WindowGlyphs::ASCII`, or the application's own), a label `style`, and the
-  title's `min_title_width` (16 cells by default). `apply(pane)` appends them
-  as the pane's last title actions (`minimize`, `maximize`, `close`; a strip
-  has only its restore control). With too little room the pane drops the
-  leftmost actions first (the pane's own, then minimize, then maximize) before
-  clipping the title. `target(&pane, area, position)` hit tests the pane's own
-  title layout, returning `TitleTarget::Control`, `Action` (one of the pane's
-  own actions) or `Title`, so clicks agree with what is painted.
+  controls: `closable`, `glyphs` (`WindowGlyphs::UNICODE`, the default:
+  minimize `▾`, restore a minimized panel `▸`, maximize `⤢`, restore a
+  maximized panel `⤡`, close `×` and the caps `┤` `├`; `WindowGlyphs::ASCII`:
+  `v` `>` `+` `=` `x` and `|` caps; or the application's own), a glyph
+  `style`, `hover_styles(hover, close_hover)` with the `hovered` control, and
+  the title's `min_title_width` (16 cells by default). `apply(pane)` appends
+  them as the pane's last title actions (`minimize`, `maximize`, `close`) in
+  one cluster joined to the border, `┤ ▾ ⤢ × ├`; a minimized panel has only its
+  restore control (`┤ ▸ ├` on a row, ` ▸ ` alone in a strip). With too little
+  room the pane drops the leftmost actions first (the pane's own, then
+  minimize, then maximize; the caps go with close) before clipping the title.
+  `target(&pane, area, position)` hit tests the pane's own title layout,
+  returning `TitleTarget::Control`, `Action` (one of the pane's own actions) or
+  `Title`, so clicks agree with what is painted.
+* **Visibility and hover.** `shown(false)` leaves the controls off the pane
+  (no painting, no hit regions, no targets); applications conventionally show
+  them only on the focused panel and the panel under the pointer, so other
+  title rows keep the room for their status. A minimized panel always shows its
+  restore control. Hover is the application's state: hit test the pointer with
+  `target` on the hovered panel's chrome and pass the control to `hovered`; the
+  frame painted after shows it.
 * **Shapes.** `PanelShape` is `Normal`, `Row` (minimized in a stacked group),
   `Strip` (minimized side by side) or `Maximized`. `minimized_content(id,
   shape, name, style)` is a minimized pane's content: the name down a strip, a
   grapheme a row, or nothing for a row. `WindowControls::strip_width` is a
-  strip's width: its restore control between the corners.
+  strip's width: its padded restore control between the corners.
 * **Window state.** `PanelWindows<K>` keeps, for panels keyed by `K`, which are
   minimized and which is maximized, over a `PanelTree` of nested groups
   (`PanelTreeGroup::new(axis, members)` with `PanelMember::Panel(key)` or

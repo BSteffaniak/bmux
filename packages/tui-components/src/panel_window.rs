@@ -3,13 +3,16 @@
 //! Everything here is opt-in; panes and panel groups that do not use it are unaffected.
 //!
 //! * **Title-row controls.** [`WindowControls`] appends a panel's controls to a [`Pane`] as its
-//!   last title-row actions, left to right: minimize (restore while minimized), maximize
-//!   (restore while maximized) and close. Their painting, their hit regions
-//!   (`<pane id>.action.minimize`, `.maximize`, `.close`) and [`WindowControls::target`] all
-//!   come from the pane's one title layout. The title keeps
-//!   [`WindowControls::min_title_width`] cells (or all of a shorter title): with less room the
-//!   pane drops the leftmost actions first (the panel's own actions, then minimize, then
-//!   maximize; close goes last), then clips the title.
+//!   last title-row actions, one cluster joined to the border (`┤ ▾ ⤢ × ├`), left to right:
+//!   minimize (restore while minimized), maximize (restore while maximized) and close. Their
+//!   painting, their hit regions (`<pane id>.action.minimize`, `.maximize`, `.close`) and
+//!   [`WindowControls::target`] all come from the pane's one title layout. The caller decides
+//!   when they show ([`WindowControls::shown`], conventionally on the focused or hovered panel;
+//!   a minimized panel always shows its restore control) and which one is hovered
+//!   ([`WindowControls::hovered`]). The title keeps [`WindowControls::min_title_width`] cells
+//!   (or all of a shorter title): with less room the pane drops the leftmost actions first
+//!   (the panel's own actions, then minimize, then maximize; close goes last, taking the caps
+//!   with it), then clips the title.
 //! * **Shapes.** A minimized panel collapses along the axis of the group it sits in
 //!   ([`PanelShape::minimized_along`]): to its title row when stacked ([`PanelShape::Row`]), or
 //!   to a strip [`WindowControls::strip_width`] columns wide when side by side
@@ -32,11 +35,11 @@ use web_time::Instant;
 
 use bmux_tui::composition::{Column, TextBlock};
 use bmux_tui::geometry::{Point, Rect};
-use bmux_tui::style::Style;
+use bmux_tui::style::{Modifier, Style};
 use bmux_tui::text::{Line, Span, Text, TextWrap};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::pane::{Pane, PaneTitleAction};
+use crate::pane::{Pane, PaneTitleAction, PaneTitleGroup};
 use crate::panel_group::{PanelGroupAxis, PanelGroupConstraints, PanelGroupState, PanelSize};
 
 /// Two presses on a panel's title row within this time make a double click.
@@ -118,34 +121,46 @@ impl WindowControl {
     }
 }
 
-/// Glyphs of the window controls.
+/// Glyphs of the window controls, and the caps that join their cluster to the border.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WindowGlyphs {
     /// The minimize control.
     pub minimize: &'static str,
+    /// The restore control of a minimized panel.
+    pub restore_minimized: &'static str,
     /// The maximize control.
     pub maximize: &'static str,
-    /// The restore control of a minimized or maximized panel.
-    pub restore: &'static str,
+    /// The restore control of a maximized panel.
+    pub restore_maximized: &'static str,
     /// The close control.
     pub close: &'static str,
+    /// The cap before the cluster, joining the border line on its left.
+    pub cap_start: &'static str,
+    /// The cap after the cluster, joining the border line on its right.
+    pub cap_end: &'static str,
 }
 
 impl WindowGlyphs {
-    /// Box-drawing and symbol glyphs.
+    /// Symbol glyphs, with caps for a single-line border.
     pub const UNICODE: Self = Self {
-        minimize: "▁",
-        maximize: "□",
-        restore: "❐",
-        close: "✕",
+        minimize: "▾",
+        restore_minimized: "▸",
+        maximize: "⤢",
+        restore_maximized: "⤡",
+        close: "×",
+        cap_start: "┤",
+        cap_end: "├",
     };
 
     /// ASCII glyphs, for terminals without the symbols.
     pub const ASCII: Self = Self {
-        minimize: "_",
+        minimize: "v",
+        restore_minimized: ">",
         maximize: "+",
-        restore: "=",
+        restore_maximized: "=",
         close: "x",
+        cap_start: "|",
+        cap_end: "|",
     };
 }
 
@@ -156,25 +171,39 @@ impl Default for WindowGlyphs {
 }
 
 /// The window controls of one panel in one shape.
+///
+/// On a title row the controls form one cluster, `┤ ▾ ⤢ × ├`: the caps join the border, a
+/// space sits between the glyphs, and a border cell separates the cluster from the title and
+/// the right title. A minimized strip shows its restore control alone, padded by a space on
+/// each side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowControls {
     shape: PanelShape,
     closable: bool,
+    shown: bool,
     glyphs: WindowGlyphs,
     style: Style,
+    hover: Style,
+    close_hover: Style,
+    hovered: Option<WindowControl>,
     min_title: u16,
 }
 
 impl WindowControls {
-    /// Controls of a closable panel shown as `shape`, with [`WindowGlyphs::UNICODE`], no style
-    /// and a [`DEFAULT_MIN_TITLE`] title.
+    /// Shown controls of a closable panel shown as `shape`, with [`WindowGlyphs::UNICODE`],
+    /// no style, bold while hovered, and a [`DEFAULT_MIN_TITLE`] title.
     #[must_use]
     pub const fn new(shape: PanelShape) -> Self {
+        let bold = Style::new().add_modifier(Modifier::BOLD);
         Self {
             shape,
             closable: true,
+            shown: true,
             glyphs: WindowGlyphs::UNICODE,
             style: Style::new(),
+            hover: bold,
+            close_hover: bold,
+            hovered: None,
             min_title: DEFAULT_MIN_TITLE,
         }
     }
@@ -186,6 +215,17 @@ impl WindowControls {
         self
     }
 
+    /// Whether the controls are shown (the default). Applications conventionally show them
+    /// only on the focused panel and the panel under the pointer, so other panels' title rows
+    /// keep the room. A minimized panel always shows its restore control, since nothing else
+    /// on it restores it by pointer. Hidden controls are not added to the pane, so they have
+    /// no hit regions and [`Self::target`] finds none.
+    #[must_use]
+    pub const fn shown(mut self, shown: bool) -> Self {
+        self.shown = shown;
+        self
+    }
+
     /// The glyphs of the controls.
     #[must_use]
     pub const fn glyphs(mut self, glyphs: WindowGlyphs) -> Self {
@@ -193,10 +233,26 @@ impl WindowControls {
         self
     }
 
-    /// The style of the controls' labels.
+    /// The style of the controls' glyphs.
     #[must_use]
     pub const fn style(mut self, style: Style) -> Self {
         self.style = style;
+        self
+    }
+
+    /// The styles layered over a hovered control: `hover` for minimize and maximize,
+    /// `close_hover` for close.
+    #[must_use]
+    pub const fn hover_styles(mut self, hover: Style, close_hover: Style) -> Self {
+        self.hover = hover;
+        self.close_hover = close_hover;
+        self
+    }
+
+    /// The control under the pointer, if any (see [`Self::target`]).
+    #[must_use]
+    pub const fn hovered(mut self, control: Option<WindowControl>) -> Self {
+        self.hovered = control;
         self
     }
 
@@ -214,10 +270,17 @@ impl WindowControls {
         self.shape
     }
 
-    /// The controls in title-row order, left to right. A strip has only its restore control.
+    /// Whether the controls are painted: shown, or the panel is minimized.
+    #[must_use]
+    pub const fn is_shown(&self) -> bool {
+        self.shown || self.shape.minimized()
+    }
+
+    /// The controls the panel offers in title-row order, left to right, shown or not. A
+    /// minimized panel has only its restore control.
     #[must_use]
     pub fn list(&self) -> Vec<WindowControl> {
-        if self.shape == PanelShape::Strip {
+        if self.shape.minimized() {
             return vec![WindowControl::Minimize];
         }
         let mut list = vec![WindowControl::Minimize, WindowControl::Maximize];
@@ -227,54 +290,101 @@ impl WindowControls {
         list
     }
 
+    /// The controls [`Self::apply`] adds: [`Self::list`] while [`Self::is_shown`], else none.
+    #[must_use]
+    pub fn painted(&self) -> Vec<WindowControl> {
+        if self.is_shown() {
+            self.list()
+        } else {
+            Vec::new()
+        }
+    }
+
     /// The glyph of `control` in this shape.
     #[must_use]
     pub const fn glyph(&self, control: WindowControl) -> &'static str {
         match control {
-            WindowControl::Minimize if self.shape.minimized() => self.glyphs.restore,
+            WindowControl::Minimize if self.shape.minimized() => self.glyphs.restore_minimized,
             WindowControl::Minimize => self.glyphs.minimize,
             WindowControl::Maximize if matches!(self.shape, PanelShape::Maximized) => {
-                self.glyphs.restore
+                self.glyphs.restore_maximized
             }
             WindowControl::Maximize => self.glyphs.maximize,
             WindowControl::Close => self.glyphs.close,
         }
     }
 
-    /// The label of `control`: its glyph with a cell of padding on each side.
+    /// The label of `control`: its glyph, padded by a space on each side in a strip (where it
+    /// stands alone between the corners).
     #[must_use]
     pub fn label(&self, control: WindowControl) -> Line {
-        self.label_of(self.glyph(control))
+        let glyph = self.glyph(control);
+        if self.shape == PanelShape::Strip {
+            Line::from_spans(vec![Span::styled(format!(" {glyph} "), self.style)])
+        } else {
+            Line::from_spans(vec![Span::styled(glyph, self.style)])
+        }
     }
 
-    fn label_of(&self, glyph: &str) -> Line {
-        Line::from_spans(vec![Span::styled(format!(" {glyph} "), self.style)])
+    /// The cluster's caps and separator: each cap a space inside its border glyph.
+    #[must_use]
+    pub fn group(&self) -> PaneTitleGroup {
+        PaneTitleGroup::new(
+            format!("{} ", self.glyphs.cap_start),
+            " ",
+            format!(" {}", self.glyphs.cap_end),
+        )
     }
 
-    /// Width of a minimized strip: its restore control between the pane's two corners.
+    /// Width of a minimized strip: its padded restore control between the pane's two corners.
     #[must_use]
     pub fn strip_width(&self) -> u16 {
-        let restore = self.label_of(self.glyphs.restore).width();
+        let restore = Line::raw(format!(" {} ", self.glyphs.restore_minimized)).width();
         u16::try_from(restore).unwrap_or(u16::MAX).saturating_add(2)
     }
 
-    /// `pane` with the controls appended as its last title-row actions. Unless the panel is a
-    /// strip, the title keeps [`Self::min_title_width`].
+    /// The title action of `control`.
+    fn action(&self, control: WindowControl) -> PaneTitleAction {
+        let hover = if control == WindowControl::Close {
+            self.close_hover
+        } else {
+            self.hover
+        };
+        PaneTitleAction::new(control.id(), self.label(control)).hover_style(hover)
+    }
+
+    /// `pane` with the painted controls appended as its last title-row actions: one cluster
+    /// ([`Self::group`]) on a title row, the restore control alone in a strip. Unless the
+    /// panel is a strip, the title keeps [`Self::min_title_width`].
     #[must_use]
     pub fn apply<'a>(&self, mut pane: Pane<'a>) -> Pane<'a> {
-        if self.shape != PanelShape::Strip {
+        let painted = self.painted();
+        if self.shape == PanelShape::Strip {
+            for control in painted {
+                pane = pane.action(self.action(control));
+            }
+        } else {
             pane = pane.min_title_width(self.min_title);
+            if !painted.is_empty() {
+                pane = pane.action_group(
+                    self.group(),
+                    painted.iter().map(|control| self.action(*control)),
+                );
+            }
         }
-        for control in self.list() {
-            pane = pane.action(PaneTitleAction::new(control.id(), self.label(control)));
+        match self
+            .hovered
+            .filter(|control| self.painted().contains(control))
+        {
+            Some(control) => pane.hovered_action(Some(control.id())),
+            None => pane,
         }
-        pane
     }
 
     /// What `position` is on in the title row of `pane` (built with [`Self::apply`]) laid out
-    /// at `area` (absolute): a control, one of the pane's own actions, or elsewhere on the row.
-    /// It hit tests the pane's own title layout, so it agrees with what the pane paints.
-    /// `None` off the title row, and on its corners (which a divider may cover).
+    /// at `area` (absolute): a painted control, one of the pane's own actions, or elsewhere on
+    /// the row. It hit tests the pane's own title layout, so it agrees with what the pane
+    /// paints. `None` off the title row, and on its corners (which a divider may cover).
     #[must_use]
     pub fn target(&self, pane: &Pane<'_>, area: Rect, position: Point) -> Option<TitleTarget> {
         if area.width < 3
@@ -285,7 +395,7 @@ impl WindowControls {
         {
             return None;
         }
-        let list = self.list();
+        let list = self.painted();
         let own = pane.actions().len().saturating_sub(list.len());
         let layout = pane.title_layout(Rect::new(0, 0, area.width, area.height));
         for (index, rect) in layout.actions {
