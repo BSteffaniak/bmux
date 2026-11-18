@@ -103,6 +103,11 @@ impl<'a> IntoIterator for &'a Params {
 }
 
 pub(crate) trait Perform {
+    /// Whether text and the controls within it ([`Self::print`], [`Self::execute`] in the text
+    /// state) mean anything to this performer. One that ignores them lets the parser skip from
+    /// one escape to the next, since nothing else in text changes the parser's state.
+    const OBSERVES_TEXT: bool = true;
+
     fn print(&mut self, _character: char) {}
     fn execute(&mut self, _byte: u8) {}
     fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
@@ -190,8 +195,25 @@ impl<const N: usize> Parser<N> {
             self.utf8_len += count;
             offset = self.complete_saved_utf8(performer, count);
         }
-        for &byte in &bytes[offset..] {
-            self.consume(performer, byte);
+        if P::OBSERVES_TEXT {
+            for &byte in &bytes[offset..] {
+                self.consume(performer, byte);
+            }
+            return;
+        }
+        let mut index = offset;
+        while index < bytes.len() {
+            if self.state == State::Text {
+                // Only an escape leaves text; what lies before it would be printed or executed,
+                // which this performer ignores, so a partial UTF-8 character is dropped with it.
+                self.utf8_len = 0;
+                match bytes[index..].iter().position(|&byte| byte == 0x1b) {
+                    Some(skipped) => index += skipped,
+                    None => return,
+                }
+            }
+            self.consume(performer, bytes[index]);
+            index += 1;
         }
     }
 

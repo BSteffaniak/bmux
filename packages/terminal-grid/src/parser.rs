@@ -558,6 +558,9 @@ impl ProtocolPerformer<'_> {
 }
 
 impl Perform for ProtocolPerformer<'_> {
+    // Protocol state lives in escape sequences only.
+    const OBSERVES_TEXT: bool = false;
+
     fn print(&mut self, _c: char) {}
 
     fn execute(&mut self, _byte: u8) {}
@@ -995,6 +998,87 @@ fn trailing_incomplete_sequence(bytes: &[u8]) -> Vec<u8> {
 mod tests {
     use crate::model::{GridLimits, TerminalGrid};
     use crate::parser::TerminalGridStream;
+
+    /// The protocol tracker skips text (its performer ignores it): what it tracks after every
+    /// chunk is what parsing every byte tracks, through UTF-8 split across chunks and interrupted
+    /// by escapes, mode changes, synchronized updates, pointer-shape strings, CAN/SUB and raw C1.
+    #[test]
+    fn skipping_text_tracks_the_protocol_exactly_as_parsing_every_byte() {
+        use super::{ProtocolPerformer, TerminalProtocolTracker};
+        use crate::vt_parser::{Params, Perform};
+
+        /// The protocol performer, observing text like any other performer.
+        struct Observing<'p, 'a>(&'p mut ProtocolPerformer<'a>);
+        impl Perform for Observing<'_, '_> {
+            fn osc_dispatch(&mut self, params: &[&[u8]], bell: bool) {
+                self.0.osc_dispatch(params, bell);
+            }
+            fn csi_dispatch(&mut self, params: &Params, inter: &[u8], ignore: bool, action: char) {
+                self.0.csi_dispatch(params, inter, ignore, action);
+            }
+            fn esc_dispatch(&mut self, inter: &[u8], ignore: bool, byte: u8) {
+                self.0.esc_dispatch(inter, ignore, byte);
+            }
+        }
+        fn observe(tracker: &mut TerminalProtocolTracker, bytes: &[u8]) -> (bool, bool) {
+            let mut performer = ProtocolPerformer {
+                protocol: &mut tracker.protocol,
+                alternate_screen: &mut tracker.alternate_screen,
+                synchronized_update: &mut tracker.synchronized_update,
+                toggled_alternate: false,
+                ended_synchronized_update: false,
+            };
+            tracker
+                .parser
+                .advance(&mut Observing(&mut performer), bytes);
+            (
+                performer.toggled_alternate,
+                performer.ended_synchronized_update,
+            )
+        }
+
+        let mut stream = Vec::new();
+        for round in 0..40_u32 {
+            stream.extend_from_slice("héllo wörld 界 👨‍👩‍👧 ".as_bytes());
+            stream.extend_from_slice(match round % 10 {
+                0 => b"\x1b[?1049h\x1b[?1000;1006h".as_slice(),
+                1 => b"\x1b[?2026h\x1b[1;31mframe\x1b[0m\x1b[?2026l",
+                2 => b"\x1b]22;pointer\x1b\\\x1b]22;>crosshair\x07",
+                3 => b"\x1b[?1h\x1b=\x1b[?2004h",
+                4 => b"\xe4\xb8\x1b[?1049l\xad",
+                5 => b"\x1b[?25\x18l\x1b[?1002h\x1a",
+                6 => b"\x9b?1049h\xc2\x9b\x1b[?1003l",
+                7 => b"\x1bP1;2|data\x1b\\\x1b_apc\x1b\\",
+                8 => b"\x1b[?1l\x1b>\x1b[?2004l\x1b[?1000l",
+                _ => b"\r\n\x08\x07\t",
+            });
+        }
+        for chunk_size in [1, 2, 3, 7, 64, 4096] {
+            let (mut skipping, mut observing) = (
+                TerminalProtocolTracker::new(),
+                TerminalProtocolTracker::new(),
+            );
+            let (mut toggles, mut ends) = (0, 0);
+            for chunk in stream.chunks(chunk_size) {
+                let outcome = skipping.process(chunk);
+                toggles += usize::from(outcome.toggled_alternate);
+                ends += usize::from(outcome.ended_synchronized_update);
+                let expected = observe(&mut observing, chunk);
+                assert_eq!(
+                    (outcome.toggled_alternate, outcome.ended_synchronized_update),
+                    expected,
+                    "chunk size {chunk_size}"
+                );
+                assert_eq!(skipping.protocol_state(), observing.protocol_state());
+                assert_eq!(skipping.alternate_screen(), observing.alternate_screen());
+                assert_eq!(
+                    skipping.synchronized_update(),
+                    observing.synchronized_update()
+                );
+            }
+            assert!(toggles > 0 && ends > 0, "the stream exercises the protocol");
+        }
+    }
 
     #[test]
     fn normal_text_keeps_protocol_prefix_storage_unallocated() {
