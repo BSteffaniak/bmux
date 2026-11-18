@@ -450,6 +450,31 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         }
     }
 
+    /// Write `text` from a local coordinate after translation and clipping,
+    /// keeping each cell's style: only the symbols change. Glyphs that join
+    /// already painted chrome (a tee interrupting a border line) take its
+    /// colours this way, whatever style is inherited. Graphemes are placed by
+    /// their painted width; a wide one that does not fit the clip is skipped.
+    pub fn write_symbols(&mut self, x: i32, y: i64, text: &str) {
+        let mut column = x;
+        for grapheme in unicode_segmentation::UnicodeSegmentation::graphemes(text, true) {
+            let width = crate::text_width::painted_grapheme_width(grapheme);
+            if width == 0 {
+                continue;
+            }
+            if let Some(area) = self.project_rect(LocalRect::new(column, y, width, 1))
+                && area.width == width
+            {
+                let buffer = self.frame.buffer_mut(area);
+                let point = Point::new(area.x, area.y);
+                if let Some(style) = buffer.get(point).map(|cell| cell.style) {
+                    buffer.set_cell(point, grapheme, style);
+                }
+            }
+            column = column.saturating_add(i32::from(width));
+        }
+    }
+
     /// Fill a local rectangle after translation and clipping, replacing each
     /// cell's style. Filling is how a background is set or cleared.
     pub fn fill(&mut self, area: LocalRect, symbol: &str, style: Style) {
@@ -953,6 +978,28 @@ mod tests {
             Style::new().fg(Color::Green).bg(Color::Blue)
         );
         assert_eq!(buffer.get(Point::new(1, 0)).unwrap().symbol, "b");
+    }
+
+    #[test]
+    fn write_symbols_keeps_each_cells_style_under_any_inherited_style() {
+        let mut buffer = filled(8);
+        buffer.set_cell(Point::new(2, 0), "─", Style::new().fg(Color::Cyan));
+        {
+            let mut frame = Frame::new(&mut buffer);
+            let mut paint = PaintCx::new(&mut frame);
+            paint.with_style(Style::new().fg(Color::Default), |paint| {
+                paint.with_child(1, 0, LocalRect::new(0, 0, 5, 1), |paint| {
+                    // Clipped after five cells; the wide grapheme at the clip edge is skipped.
+                    paint.write_symbols(1, 0, "┤e\u{301} 中");
+                });
+            });
+        }
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("  ┤e\u{301}    "));
+        assert_eq!(style_at(&buffer, 2).fg, Some(Color::Cyan));
+        assert_eq!(
+            style_at(&buffer, 3),
+            Style::new().fg(Color::White).bg(Color::Blue)
+        );
     }
 
     #[test]
