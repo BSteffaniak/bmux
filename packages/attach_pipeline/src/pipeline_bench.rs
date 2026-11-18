@@ -795,7 +795,13 @@ fn pipeline_bench_loop() {
     let frames = path.strip_prefix("generated:").map_or_else(
         || corpus::read(std::path::Path::new(path)).expect("corpus"),
         |name| {
-            corpus::generated(size(), 300)
+            // An image scenario's frames are written to the left pane of two.
+            let corpus_size = if std::env::var_os("BMUX_BENCH_IMAGE").is_some() {
+                (split_pane_width(size().0, 2), size().1)
+            } else {
+                size()
+            };
+            corpus::generated(corpus_size, 300)
                 .into_iter()
                 .find(|corpus| corpus.name == name)
                 .expect("generated corpus")
@@ -806,7 +812,8 @@ fn pipeline_bench_loop() {
     let rounds =
         std::env::var("BMUX_BENCH_ROUNDS").map_or(5, |rounds| rounds.parse().expect("rounds"));
     for _ in 0..rounds {
-        let mut replay = Replay::new(size(), true, delivery());
+        let mut replay =
+            image_loop_replay().unwrap_or_else(|| Replay::new(size(), true, delivery()));
         if mode == "observed" {
             replay.observer = Some(bmux_tui::presentation::PresentationState::new(
                 bmux_tui::geometry::Rect::new(0, 0, replay.size.0, replay.size.1),
@@ -822,6 +829,21 @@ fn pipeline_bench_loop() {
             }
         }
     }
+}
+
+/// With `BMUX_BENCH_IMAGE` set (`kitty` or `sixel`), [`pipeline_bench_loop`] replays the image
+/// scenario instead (`BMUX_BENCH_IMAGE_MOTION=1` moves the image each frame); its corpus should be
+/// sized for the left pane of two.
+fn image_loop_replay() -> Option<Replay> {
+    let protocol = std::env::var("BMUX_BENCH_IMAGE").ok()?;
+    #[cfg(all(feature = "image-kitty", feature = "image-sixel"))]
+    {
+        let motion = std::env::var("BMUX_BENCH_IMAGE_MOTION")
+            .map_or(0, |motion| motion.parse().expect("motion"));
+        Some(image_replay(size(), protocol == "kitty", motion))
+    }
+    #[cfg(not(all(feature = "image-kitty", feature = "image-sixel")))]
+    panic!("BMUX_BENCH_IMAGE={protocol} needs the image-kitty and image-sixel features")
 }
 
 /// The width of each of `panes` panes side by side across `cols`, one column apart.
