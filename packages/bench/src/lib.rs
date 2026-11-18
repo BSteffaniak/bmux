@@ -7,6 +7,7 @@ pub mod corpus;
 pub mod instructions;
 #[cfg(feature = "internal")]
 pub mod internal;
+pub mod metrics;
 pub mod model;
 pub mod runner;
 pub mod terminal;
