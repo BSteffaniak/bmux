@@ -25,9 +25,15 @@ use bmux_attach_layout_protocol::{
 };
 use bmux_attach_pipeline_models::AttachOutputChunkMeta;
 use bmux_bench::corpus::{self, Frame, SYNC_BEGIN, SYNC_END};
+use bmux_bench::metrics::{Cost, PhaseRecorder, Probe, Report, Scenario};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+// Allocations are counted in this test binary: the metrics below report them per frame.
+#[global_allocator]
+static ALLOCATOR: bmux_bench::allocations::CountingAllocator =
+    bmux_bench::allocations::CountingAllocator;
 
 fn size() -> (u16, u16) {
     std::env::var("BMUX_BENCH_SIZE").map_or((420, 90), |size| {
@@ -135,12 +141,28 @@ struct Replay {
     /// reused for the next frame).
     held: Vec<std::sync::Arc<bmux_tui::presentation::PreparedPresentation>>,
     hold: bool,
+    /// Panes the frames' output is applied to (every pane of the scene unless set otherwise).
+    fed: Vec<Uuid>,
+    /// Images every frame contributes, as the attach client contributes pane images.
+    images: Vec<bmux_tui::image::ImagePlacement>,
+    /// Columns the images move right each frame (cycling over eight steps); zero keeps them.
+    image_motion: u16,
+    appearance: bmux_appearance::RuntimeAppearance,
+    graphics: crate::TerminalGraphicsCache,
+    scrollback: PaneScrollbackViews,
+    probe: Probe,
 }
 
 struct Rendered {
     apply: Duration,
     render: Duration,
     stats: AttachSceneRenderStats,
+    /// What applying the frame's output cost.
+    apply_cost: Cost,
+    /// What rendering and presenting the frame cost.
+    render_cost: Cost,
+    /// What preparing and publishing the frame for an observer cost.
+    observe_cost: Option<Cost>,
 }
 
 impl Replay {
@@ -169,7 +191,46 @@ impl Replay {
             observer: None,
             held: Vec::new(),
             hold: false,
+            fed: vec![pane_id],
+            images: Vec::new(),
+            image_motion: 0,
+            appearance: bmux_appearance::RuntimeAppearance::default(),
+            graphics: crate::TerminalGraphicsCache::new(),
+            scrollback: PaneScrollbackViews::new(),
+            probe: Probe::new(),
         }
+    }
+
+    /// `panes` panes side by side across `size`, one column apart, every one fed the frames.
+    fn split(size: (u16, u16), panes: u16, chunk_size: usize) -> Self {
+        let mut replay = Self::new(size, true, chunk_size);
+        let width = split_pane_width(size.0, panes);
+        replay.scene.surfaces.clear();
+        replay.buffers.clear();
+        replay.fed.clear();
+        for index in 0..panes {
+            let pane_id = Uuid::from_u128(2 + u128::from(index));
+            let rect = AttachRect {
+                x: index * (width + 1),
+                y: 0,
+                w: width,
+                h: size.1,
+            };
+            let mut surface = scene(pane_id, size).surfaces.remove(0);
+            surface.rect = rect;
+            surface.content_rect = rect;
+            surface.cursor_owner = index == 0;
+            replay.scene.surfaces.push(surface);
+            let mut buffer = PaneRenderBuffer::default();
+            buffer
+                .terminal_grid
+                .resize(width, size.1)
+                .expect("grid size");
+            replay.buffers.insert(pane_id, buffer);
+            replay.fed.push(pane_id);
+        }
+        replay.pane_id = replay.fed[0];
+        replay
     }
 
     /// A pane inside a one-cell border, on a host with left/right margins: frames are written for
@@ -197,33 +258,23 @@ impl Replay {
     /// Apply `frame` and render, writing what the host terminal receives to `output`.
     fn frame(&mut self, frame: &[u8], output: &mut Vec<u8>) -> Rendered {
         let started = Instant::now();
-        for chunk in frame.chunks(self.chunk_size) {
-            self.open = sync_after(self.open, chunk);
-            let end = self.offset + chunk.len() as u64;
-            apply_attach_output_chunk_with(
-                &mut self.buffers,
-                self.pane_id,
-                chunk,
-                AttachOutputChunkMeta {
-                    stream_start: self.offset,
-                    stream_end: end,
-                    stream_gap: false,
-                    sync_update_active: self.open,
-                },
-                append_pane_output,
-            );
-            self.offset = end;
-        }
+        let mark = self.probe.mark();
+        self.apply_only(frame);
+        let apply_cost = self.probe.since(mark);
         let applied = started.elapsed();
         let full = self.frames == 0;
         let mut damage = FrameDamage::default();
         if full {
             damage.mark_full_frame();
         } else {
-            damage.mark_content_surface(self.pane_id);
+            for pane in &self.fed {
+                damage.mark_content_surface(*pane);
+            }
         }
+        let step = self.image_step();
         self.frames += 1;
         let started = Instant::now();
+        let mark = self.probe.mark();
         let capabilities = bmux_plugin::TerminalRenderCapabilities {
             left_right_margins: self.margins,
             ..bmux_plugin::TerminalRenderCapabilities::default()
@@ -236,28 +287,45 @@ impl Replay {
         };
         let (scene, policy, size, buffers) =
             (&self.scene, self.policy, self.size, &mut self.buffers);
+        let (graphics, scrollback, appearance, images) = (
+            &mut self.graphics,
+            &self.scrollback,
+            &self.appearance,
+            &self.images,
+        );
         let presented = self
             .presenter
             .present(&spec, |canvas| {
-                render_attach_scene_with_stats_and_trace_with_capabilities_and_occluders(
-                    canvas,
-                    scene,
-                    &[],
-                    buffers,
-                    &mut crate::TerminalGraphicsCache::new(),
-                    &damage,
-                    0,
-                    0,
-                    &PaneScrollbackViews::new(),
-                    false,
-                    size,
-                    &bmux_appearance::RuntimeAppearance::default(),
-                    policy,
-                    &[],
-                    capabilities,
-                    &[],
-                    None,
-                )
+                let rendered =
+                    render_attach_scene_with_stats_and_trace_with_capabilities_and_occluders(
+                        canvas,
+                        scene,
+                        &[],
+                        buffers,
+                        graphics,
+                        &damage,
+                        0,
+                        0,
+                        scrollback,
+                        false,
+                        size,
+                        appearance,
+                        policy,
+                        &[],
+                        capabilities,
+                        &[],
+                        None,
+                    );
+                if !images.is_empty() {
+                    canvas.declare_images();
+                    for image in images {
+                        let mut image = image.clone();
+                        image.destination.x += step;
+                        image.clip.x += step;
+                        canvas.image(image);
+                    }
+                }
+                rendered
             })
             .expect("render");
         match presented.presented {
@@ -267,6 +335,7 @@ impl Replay {
                 panic!("the frame should be presentable: {reason}")
             }
         }
+        let render_cost = self.probe.since(mark);
         let (_, mut stats) = presented.result;
         stats.pane_rows_scrolled = self
             .presenter
@@ -276,21 +345,31 @@ impl Replay {
                 u64::from(scroll.region.height).saturating_sub(scroll.rows.unsigned_abs())
             })
             .sum();
-        self.observe();
+        let mark = self.probe.mark();
+        let observed = self.observe();
+        let observe_cost = observed.then(|| self.probe.since(mark));
         Rendered {
             apply: applied,
             render: started.elapsed(),
             stats,
+            apply_cost,
+            render_cost,
+            observe_cost,
         }
+    }
+
+    /// Columns the images move this frame.
+    fn image_step(&self) -> u16 {
+        u16::try_from(self.frames % 8).unwrap_or(0) * self.image_motion
     }
 
     /// Prepare and publish the frame just presented as an observed client's observer does, when
     /// this replay has one: repaired over the last frame with the change the host's terminal
     /// made, with its local grids installed (each staging rechecks the frame's limits).
-    fn observe(&mut self) {
+    fn observe(&mut self) -> bool {
         let size = self.size;
         let Some(observer) = &mut self.observer else {
-            return;
+            return false;
         };
         observer.resize(bmux_tui::geometry::Rect::new(0, 0, size.0, size.1));
         let limits = bmux_tui::presentation::PresentationLimits {
@@ -322,25 +401,28 @@ impl Replay {
                 self.held.remove(0);
             }
         }
+        true
     }
 
-    /// Apply `frame` without rendering it.
+    /// Apply `frame` to every fed pane without rendering it.
     fn apply_only(&mut self, frame: &[u8]) {
         for chunk in frame.chunks(self.chunk_size) {
             self.open = sync_after(self.open, chunk);
             let end = self.offset + chunk.len() as u64;
-            apply_attach_output_chunk_with(
-                &mut self.buffers,
-                self.pane_id,
-                chunk,
-                AttachOutputChunkMeta {
-                    stream_start: self.offset,
-                    stream_end: end,
-                    stream_gap: false,
-                    sync_update_active: self.open,
-                },
-                append_pane_output,
-            );
+            for pane in &self.fed {
+                apply_attach_output_chunk_with(
+                    &mut self.buffers,
+                    *pane,
+                    chunk,
+                    AttachOutputChunkMeta {
+                        stream_start: self.offset,
+                        stream_end: end,
+                        stream_gap: false,
+                        sync_update_active: self.open,
+                    },
+                    append_pane_output,
+                );
+            }
             self.offset = end;
         }
     }
@@ -729,5 +811,251 @@ fn pipeline_bench_loop() {
                 replay.frame(frame, &mut output);
             }
         }
+    }
+}
+
+/// The width of each of `panes` panes side by side across `cols`, one column apart.
+fn split_pane_width(cols: u16, panes: u16) -> u16 {
+    cols.saturating_sub(panes.saturating_sub(1)) / panes.max(1)
+}
+
+/// Frames before a scenario's metrics are taken: buffers grow and caches fill while the
+/// replay warms up, which steady frames do not repeat.
+const WARMUP: usize = 30;
+
+/// Replay `frames` and measure every frame after warm-up: what applying, rendering and
+/// presenting (and observing, with an observer) allocate and execute, and the bytes written.
+fn measure(name: &str, mut replay: Replay, frames: &[Frame]) -> Scenario {
+    let (mut apply, mut render, mut observe) = (
+        PhaseRecorder::default(),
+        PhaseRecorder::default(),
+        PhaseRecorder::default(),
+    );
+    let mut output = Vec::new();
+    let (mut bytes_out, mut measured, mut observed) = (0_usize, 0_u64, false);
+    let mut live_after_warmup = 0;
+    for (index, frame) in frames.iter().enumerate() {
+        if index == WARMUP {
+            live_after_warmup = bmux_bench::allocations::live_bytes();
+        }
+        output.clear();
+        let rendered = replay.frame(frame, &mut output);
+        if index < WARMUP {
+            continue;
+        }
+        measured += 1;
+        bytes_out += output.len();
+        apply.record(rendered.apply_cost);
+        render.record(rendered.render_cost);
+        if let Some(cost) = rendered.observe_cost {
+            observe.record(cost);
+            observed = true;
+        }
+    }
+    let live_growth = i64::try_from(bmux_bench::allocations::live_bytes()).unwrap_or(i64::MAX)
+        - i64::try_from(live_after_warmup).unwrap_or(i64::MAX);
+    let mut phases = BTreeMap::from([
+        ("apply".to_owned(), apply.finish()),
+        ("render".to_owned(), render.finish()),
+    ]);
+    if observed {
+        phases.insert("observe".to_owned(), observe.finish());
+    }
+    Scenario {
+        name: name.to_owned(),
+        frames: measured,
+        phases,
+        output_bytes_per_frame: u64::try_from(bytes_out).unwrap_or(u64::MAX) / measured.max(1),
+        live_growth_bytes: live_growth,
+    }
+}
+
+/// A replay whose host shows images (Kitty or sixel), with one 40×20-cell image over the right
+/// pane of two while the left one is fed the frames; with `motion`, the image moves each frame.
+#[cfg(all(feature = "image-kitty", feature = "image-sixel"))]
+fn image_replay(size: (u16, u16), kitty: bool, motion: u16) -> Replay {
+    use bmux_tui::image::{
+        ImageFit, ImageKey, ImageLifecycle, ImagePayload, ImagePixelFormat, ImagePlacement,
+    };
+    let mut replay = Replay::split(size, 2, delivery());
+    replay.fed.truncate(1);
+    replay.presenter.set_image_host(
+        bmux_image::host_caps::HostImageCapabilities {
+            kitty_graphics: kitty,
+            sixel: !kitty,
+            cell_pixel_width: 8,
+            cell_pixel_height: 16,
+            ..bmux_image::host_caps::HostImageCapabilities::default()
+        },
+        bmux_image::ImageConfig::default(),
+    );
+    let right = replay.scene.surfaces[1].content_rect;
+    let destination = bmux_tui::geometry::Rect::new(right.x + 4, 4, 40, 20);
+    // A gradient, so encoders do real work.
+    let (width, height) = (320_u32, 320_u32);
+    let pixels: Vec<u8> = (0..width * height)
+        .flat_map(|index| {
+            let (x, y) = (index % width, index / width);
+            [
+                u8::try_from(x % 256).unwrap_or(0),
+                u8::try_from(y % 256).unwrap_or(0),
+                u8::try_from((x + y) % 256).unwrap_or(0),
+                255,
+            ]
+        })
+        .collect();
+    replay.images.push(ImagePlacement {
+        fit: ImageFit::Stretch,
+        allocation: None,
+        key: ImageKey::new("pane:bench:picture"),
+        payload: ImagePayload::Pixels {
+            bytes: pixels.into(),
+            width,
+            height,
+            format: ImagePixelFormat::Rgba8,
+        },
+        destination,
+        clip: bmux_tui::geometry::Rect::new(right.x, right.y, right.w, right.h),
+        lifecycle: ImageLifecycle::Frame,
+        z: 0,
+    });
+    replay.image_motion = motion;
+    replay
+}
+
+/// The scenarios the metrics cover: every generated corpus on one pane; the busiest ones with
+/// an observer, without scroll passthrough, and across two panes; scattered edits; and (with
+/// image features) an image beside streaming output and a moving image, on Kitty and sixel.
+fn metrics_report() -> Report {
+    let size = size();
+    let frames = 300;
+    let mut report = Report::default();
+    let busiest = |name: &str| matches!(name, "plain-stream" | "full-repaint");
+    for corpus in corpus::generated(size, frames) {
+        report.scenarios.push(measure(
+            corpus.name,
+            Replay::new(size, true, delivery()),
+            &corpus.frames,
+        ));
+        if !busiest(corpus.name) {
+            continue;
+        }
+        report.scenarios.push(measure(
+            &format!("{}/no-passthrough", corpus.name),
+            Replay::new(size, false, delivery()),
+            &corpus.frames,
+        ));
+        let mut observed = Replay::new(size, true, delivery());
+        observed.observer = Some(bmux_tui::presentation::PresentationState::new(
+            bmux_tui::geometry::Rect::new(0, 0, size.0, size.1),
+        ));
+        report.scenarios.push(measure(
+            &format!("{}/observed", corpus.name),
+            observed,
+            &corpus.frames,
+        ));
+    }
+    let pane = (split_pane_width(size.0, 2), size.1);
+    for corpus in corpus::generated(pane, frames) {
+        if busiest(corpus.name) {
+            report.scenarios.push(measure(
+                &format!("{}/two-panes", corpus.name),
+                Replay::split(size, 2, delivery()),
+                &corpus.frames,
+            ));
+        }
+    }
+    report.scenarios.push(measure(
+        "scattered-edits",
+        Replay::new(size, true, delivery()),
+        &scattered_edits(size, frames),
+    ));
+    #[cfg(all(feature = "image-kitty", feature = "image-sixel"))]
+    {
+        let stream = corpus::generated(pane, frames)
+            .into_iter()
+            .find(|corpus| corpus.name == "plain-stream")
+            .expect("plain-stream corpus")
+            .frames;
+        for (protocol, kitty) in [("kitty", true), ("sixel", false)] {
+            report.scenarios.push(measure(
+                &format!("image/{protocol}/beside-stream"),
+                image_replay(size, kitty, 0),
+                &stream,
+            ));
+            report.scenarios.push(measure(
+                &format!("image/{protocol}/moving"),
+                image_replay(size, kitty, 1),
+                &stream,
+            ));
+        }
+    }
+    report
+}
+
+fn print_scenario(scenario: &Scenario) {
+    let phase = |name: &str| {
+        scenario.phases.get(name).map_or_else(String::new, |phase| {
+            let instructions = phase
+                .instructions_per_frame
+                .map_or_else(String::new, |count| format!(", {count} instr"));
+            format!(
+                " | {name} {} allocs (max {}), {} B{instructions}",
+                phase.allocations_per_frame, phase.max_allocations, phase.allocated_bytes_per_frame
+            )
+        })
+    };
+    println!(
+        "{} ({} frames){}{}{} | out {} B | live growth {} B",
+        scenario.name,
+        scenario.frames,
+        phase("apply"),
+        phase("render"),
+        phase("observe"),
+        scenario.output_bytes_per_frame,
+        scenario.live_growth_bytes
+    );
+}
+
+/// Reproducible metrics of the client pipeline, per frame: allocations and allocated bytes of
+/// each phase, bytes written to the host, instructions retired where there is a counter. Run
+/// single-threaded in release:
+///
+/// ```text
+/// cargo test --release -p bmux_attach_pipeline --features image-kitty,image-sixel --lib \
+///     pipeline_bench::pipeline_metrics -- --ignored --exact --nocapture --test-threads 1
+/// ```
+///
+/// `BMUX_BENCH_JSON=<path>` writes the report; `BMUX_BENCH_BASELINE=<path>` fails on any
+/// allocation or output growth past that report (`docs/perf-baselines/render/pipeline.json` is
+/// the committed one; see `docs/development/render-performance.md`).
+#[test]
+#[ignore = "reproducible metrics; run explicitly with --ignored --nocapture"]
+fn pipeline_metrics() {
+    let report = metrics_report();
+    for scenario in &report.scenarios {
+        print_scenario(scenario);
+    }
+    check_report(&report);
+}
+
+/// Write `report` where `BMUX_BENCH_JSON` says, and compare it with `BMUX_BENCH_BASELINE`.
+fn check_report(report: &Report) {
+    if let Ok(path) = std::env::var("BMUX_BENCH_JSON") {
+        report
+            .write(std::path::Path::new(&path))
+            .expect("write the report");
+    }
+    if let Ok(path) = std::env::var("BMUX_BENCH_BASELINE") {
+        let baseline = Report::read(std::path::Path::new(&path)).expect("read the baseline");
+        for improvement in report.improvements(&baseline) {
+            println!("improved (the baseline can be lowered): {improvement}");
+        }
+        let regressions = report.regressions(&baseline);
+        assert!(
+            regressions.is_empty(),
+            "regressions against {path}:\n{}",
+            regressions.join("\n")
+        );
     }
 }
