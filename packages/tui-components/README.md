@@ -255,6 +255,72 @@ Applications that route pointer input themselves can call
 `PanelGroup::handle_event` with the group's area from the presented layout
 (`EventCx::find_visible_rect` on the group's layout id).
 
+## Panel windows
+
+`panel_window` (feature `panel-window`) adds window controls to panes in panel
+groups: minimize, maximize, restore and close. It is opt-in; panes and groups
+that do not use it are unaffected.
+
+* **Title-row controls.** `WindowControls::new(shape)` describes a panel's
+  controls: `closable`, `glyphs` (`WindowGlyphs::UNICODE`, the default, or
+  `WindowGlyphs::ASCII`, or the application's own), a label `style`, and the
+  title's `min_title_width` (16 cells by default). `apply(pane)` appends them
+  as the pane's last title actions (`minimize`, `maximize`, `close`; a strip
+  has only its restore control). With too little room the pane drops the
+  leftmost actions first (the pane's own, then minimize, then maximize) before
+  clipping the title. `target(&pane, area, position)` hit tests the pane's own
+  title layout, returning `TitleTarget::Control`, `Action` (one of the pane's
+  own actions) or `Title`, so clicks agree with what is painted.
+* **Shapes.** `PanelShape` is `Normal`, `Row` (minimized in a stacked group),
+  `Strip` (minimized side by side) or `Maximized`. `minimized_content(id,
+  shape, name, style)` is a minimized pane's content: the name down a strip, a
+  grapheme a row, or nothing for a row. `WindowControls::strip_width` is a
+  strip's width: its restore control between the corners.
+* **Window state.** `PanelWindows<K>` keeps, for panels keyed by `K`, which are
+  minimized and which is maximized, over a `PanelTree` of nested groups
+  (`PanelTreeGroup::new(axis, members)` with `PanelMember::Panel(key)` or
+  `PanelMember::Group(index)`, the first group being the root).
+  `PanelTreeGroup::fill(index)` names the member that takes the cells
+  minimized members free; `keep_one_expanded(true)` lets it minimize only
+  while another member stays expanded. A minimized panel collapses along its
+  group's axis (one row stacked, a strip side by side); a nested group whose
+  panels are all minimized collapses in its parent instead. The maximized
+  panel is the only one laid out: `group_state(group, lengths, constraints)`
+  builds each group's `PanelGroupState` from the application's lengths with
+  its collapses and its maximized branch applied, so restoring brings back the
+  same sizes. `shape(key)`, `shown(key)`, `maximized()` and `controls(key)`
+  read the resolved state.
+* **Commands.** `WindowCommand` (`Maximize`, `Minimize`, `Close`, `Grow`,
+  `Shrink`, `ResetSize`) acts on one panel, for example the focused one, from
+  a control (`WindowControl::command`), a key or a menu.
+  `PanelWindows::command` toggles maximize and minimize itself and returns a
+  `WindowCommandOutcome`: `Refused(WindowRefusal)` when the panel is not shown,
+  must stay expanded, does not close, or cannot resize; `CloseRequested`;
+  `Resize(PanelResize)` (a divider move toward the tree's fill panel, for
+  `PanelGroup::resize_divider`); or `ResetSizeRequested`. Sizes and visibility
+  stay with the application.
+* **Double clicks.** `TitleClicks<K>` reports two presses on the same panel's
+  title row within `DOUBLE_CLICK`, which conventionally toggle maximize.
+
+```rust
+use bmux_tui_components::panel_group::PanelGroupAxis;
+use bmux_tui_components::panel_window::{
+    PanelMember, PanelTree, PanelTreeGroup, PanelWindows,
+};
+
+let mut windows = PanelWindows::new().with_closable("doc", false);
+windows.set_tree(PanelTree::new(vec![
+    PanelTreeGroup::new(
+        PanelGroupAxis::Horizontal,
+        vec![PanelMember::Panel("files"), PanelMember::Panel("doc")],
+    )
+    .fill(1)
+    .keep_one_expanded(true),
+]));
+windows.toggle_minimize("files").expect("shown");
+let state = windows.group_state(0, vec![20, 60], Vec::new());
+```
+
 ## Canonical composition
 
 Use `bmux_tui::composition` for child ownership, measurement, placement, and

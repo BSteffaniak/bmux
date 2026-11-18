@@ -85,6 +85,7 @@ menu = ["selectable-list"]
 modal-frame = []
 pane = ["scroll-view"]
 panel-group = []
+panel-window = ["pane", "panel-group", "dep:unicode-segmentation"]
 picker-frame = []
 progress-bar = []
 radio-group = ["keyboard-input"]
@@ -145,6 +146,7 @@ all = [
     "modal-frame",
     "pane",
     "panel-group",
+    "panel-window",
     "picker-frame",
     "progress-bar",
     "radio-group",

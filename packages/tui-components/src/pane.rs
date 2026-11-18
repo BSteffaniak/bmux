@@ -411,6 +411,12 @@ impl Pane<'_> {
         self
     }
 
+    /// The title-row actions, in declaration order.
+    #[must_use]
+    pub fn actions(&self) -> &[PaneTitleAction] {
+        &self.actions
+    }
+
     /// Keep at least `cells` of the title (the whole title when it is shorter) on the title
     /// row: actions that would leave it less are dropped, leftmost first. Without a title, or
     /// with `0` (the default), actions take the room first and the title is clipped.

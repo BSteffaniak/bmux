@@ -72,6 +72,8 @@ pub mod modal_frame;
 pub mod pane;
 #[cfg(feature = "panel-group")]
 pub mod panel_group;
+#[cfg(feature = "panel-window")]
+pub mod panel_window;
 #[cfg(feature = "picker-frame")]
 pub mod picker_frame;
 #[cfg(feature = "progress-bar")]
