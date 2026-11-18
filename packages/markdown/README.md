@@ -24,6 +24,46 @@ authority.
 - `MarkdownTheme`, caller-supplied document context, and destination classification
   are reusable presentation inputs, not resource loading or activation policies.
 
+## Raw HTML (`html` feature)
+
+Markdown may embed raw HTML. By default it is shown as text (dangerous tags
+escaped). The off-by-default `html` Cargo feature adds `MarkdownHtmlMode` and
+`MarkdownRenderOptions::html` / `with_html`:
+
+- `Render` (the default with the feature): the element and attribute subset
+  GitHub keeps after sanitizing. Inline `b strong i em cite dfn var code tt samp
+  kbd mark ins u del s strike sub sup q small abbr span ruby rt rp br wbr`;
+  blocks `p div h1`–`h6 ul ol li dl dt dd blockquote pre hr table thead tbody
+  tfoot tr th td caption figure figcaption details summary`; `img` and
+  `picture`/`source`. Attributes read: `href src srcset media alt title width
+  height align open colspan`. Comments and `script style iframe object svg
+  template textarea title …` are removed with their contents; other tags are
+  removed and their text kept; character references are decoded with the full
+  HTML5 table.
+- `Strip`: every tag is removed and its text kept; blocks still start rows and
+  `<br>` still breaks; comments and script-like elements are removed.
+- `Raw`: today's text presentation, including the `<details>` projection.
+
+Rendering maps elements onto the existing renderer: bold/italic/code/strike,
+`kbd` and `mark` through `MarkdownTheme::keyboard` and `highlight`, `ins`/`u`
+underline, `sub`/`sup` as Unicode scripts when every character has one (else
+`_x`/`^(xy)`), headings without document anchors, HTML tables with their own
+column alignment (`align` on the first row's cells) and `colspan` as empty
+cells, and `p`/`div`/`h*` `align="center|right"` shifting each measured row and
+its geometry. Links and images become `Link`/`Image` contributions with
+`MarkdownLinkKind::Html`, destinations classified by
+`resolve_markdown_destination` under the document context; `img` `width` and
+`height` are exposed on `MarkdownImage`. A `<picture>` shows its fallback `img`,
+else a source without a media condition. `<details>` keeps interactive
+disclosure with the same contribution identities (`details:<start>:<end>`) and
+`open` default as the raw projection; Markdown after a blank line inside an
+element (for example a `<details>` body) belongs to it. HTML block lines are
+stitched together, so tags and comments may span lines; unclosed elements close
+at the end of their container and stray end tags are ignored.
+
+Selection provenance maps verbatim HTML text to its source bytes; text hidden
+by a collapsed `<details>` or transformed (`sub`/`sup`) claims no cells.
+
 Images retain source/alt metadata and geometry while the text fallback remains
 `[image: description]`. The caller owns fetching, decoding, image lifecycle,
 terminal placement, link activation, selection/export effects, and slide state.
