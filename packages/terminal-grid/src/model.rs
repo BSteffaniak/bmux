@@ -695,6 +695,17 @@ impl PhysicalRow {
         }
     }
 
+    /// Erase the row in place, as [`Self::erase_filled`] makes one, keeping its storage for what
+    /// is written next.
+    pub(crate) fn erase(&mut self, width: usize, style: StyleId) {
+        self.cells.clear();
+        if style != StyleId::DEFAULT {
+            self.cells.resize(width, Cell::blank(style));
+        }
+        self.wrapped = false;
+        self.changed = true;
+    }
+
     #[must_use]
     pub fn cells(&self) -> &[Cell] {
         &self.cells
@@ -2128,11 +2139,6 @@ impl TerminalGrid {
         row
     }
 
-    fn set_viewport_row(&mut self, row: usize, value: PhysicalRow) {
-        let absolute = Self::viewport_absolute_row(row);
-        *self.active_row_mut(absolute) = value;
-    }
-
     /// Interned style used to fill erased or newly exposed cells (BCE).
     fn erase_style(&mut self) -> StyleId {
         let fill = self.current_style.erase_fill();
@@ -2143,7 +2149,9 @@ impl TerminalGrid {
     }
 
     fn fill_viewport_row(&mut self, row: usize, style: StyleId) {
-        self.set_viewport_row(row, PhysicalRow::erase_filled(self.width, style));
+        let width = self.width;
+        let absolute = Self::viewport_absolute_row(row);
+        self.active_row_mut(absolute).erase(width, style);
     }
 
     fn effective_scroll_region(&self) -> (usize, usize) {
@@ -2202,11 +2210,10 @@ impl TerminalGrid {
         let fill = self.erase_style();
         match self.mode {
             GridMode::Main => {
-                if let Some(row) = self.main_rows.pop_front() {
-                    self.push_history_row(row);
-                }
-                self.main_rows
-                    .push_back(PhysicalRow::erase_filled(self.width, fill));
+                let mut row = self.main_rows.pop_front().unwrap_or_default();
+                self.push_history_row(&mut row);
+                row.erase(self.width, fill);
+                self.main_rows.push_back(row);
                 self.total_scrolled_rows = self.total_scrolled_rows.saturating_add(1);
                 self.evict_excess_history();
             }
@@ -2795,26 +2802,49 @@ impl TerminalGrid {
         })
     }
 
-    fn push_history_row(&mut self, row: PhysicalRow) {
+    /// Move a row leaving the screen into history. Its cells are taken (the row keeps its
+    /// storage, to be reused) and join the logical line they belong to; a line completed is
+    /// copied out at its exact size, and the pending buffer keeps its storage too.
+    fn push_history_row(&mut self, row: &mut PhysicalRow) {
         let wrapped = row.wrapped();
-        let cells = history_row_cells(row, self.width);
+        let start = self.pending_history_cells.len();
+        // Padding is only needed for a soft-wrapped row, written up to the edge: its unstored
+        // tail is spaces that belong to the line ([`row_logical_cells`] of the row).
+        let padding = if wrapped {
+            self.width.saturating_sub(row.cells.len())
+        } else {
+            0
+        };
+        self.pending_history_cells.extend(
+            row.cells
+                .drain(..)
+                .filter(|cell| !cell.is_wide_continuation()),
+        );
+        self.pending_history_cells
+            .extend(std::iter::repeat_n(Cell::blank(StyleId::DEFAULT), padding));
         // Kept nowhere, a row leaving the screen is final even within an unfinished line, so
         // its text goes at once: an endless line is never held, nor rendered again.
         if self.limits.scrollback_rows == 0 && self.evicted_text.is_some() {
             self.history_truncated = true;
+            let cells = self.pending_history_cells.split_off(start);
             self.hand_over_line(&cells, !wrapped);
             return;
         }
         self.history_bytes = self
             .history_bytes
-            .saturating_add(history_cells_bytes(&cells));
-        self.pending_history_cells.extend(cells);
+            .saturating_add(history_cells_bytes(&self.pending_history_cells[start..]));
         if !wrapped {
-            let pending = std::mem::take(&mut self.pending_history_cells);
             self.history_bytes = self
                 .history_bytes
-                .saturating_sub(history_cells_bytes(&pending));
-            let cells = trim_trailing_blank_cells(pending);
+                .saturating_sub(history_cells_bytes(&self.pending_history_cells));
+            let end = self
+                .pending_history_cells
+                .iter()
+                .rposition(|cell| !cell.is_discardable_blank())
+                .map_or(0, |last| last + 1);
+            self.pending_history_cells.truncate(end);
+            let mut cells = Vec::with_capacity(end);
+            cells.append(&mut self.pending_history_cells);
             self.push_history_line(LogicalLine::new(cells));
         }
     }
@@ -3310,8 +3340,8 @@ impl TerminalGrid {
             next_rows.push_back(PhysicalRow::new());
         }
         while next_rows.len() > new_height {
-            if let Some(row) = next_rows.pop_front() {
-                self.push_history_row(row);
+            if let Some(mut row) = next_rows.pop_front() {
+                self.push_history_row(&mut row);
             }
         }
         self.main_rows = next_rows;
@@ -3897,19 +3927,6 @@ fn row_logical_cells(row: &PhysicalRow, width: usize) -> Vec<Cell> {
         .into_iter()
         .filter(|cell| !cell.is_wide_continuation())
         .collect()
-}
-
-/// [`row_logical_cells`] of a row leaving the screen for history, taking its cells. Padding is
-/// only needed for a soft-wrapped row, written up to the edge: its unstored tail is spaces
-/// that belong to the line. A row ending its line would have its trailing blanks trimmed.
-fn history_row_cells(row: PhysicalRow, width: usize) -> Vec<Cell> {
-    let wrapped = row.wrapped();
-    let mut cells = row.cells;
-    if wrapped && cells.len() < width {
-        cells.resize_with(width, || Cell::blank(StyleId::DEFAULT));
-    }
-    cells.retain(|cell| !cell.is_wide_continuation());
-    cells
 }
 
 fn trim_trailing_blank_cells(mut cells: Vec<Cell>) -> Vec<Cell> {
