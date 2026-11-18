@@ -558,8 +558,9 @@ impl ProtocolPerformer<'_> {
 }
 
 impl Perform for ProtocolPerformer<'_> {
-    // Protocol state lives in escape sequences only.
+    // Protocol state lives in escape sequences only, among CSIs in private ones.
     const OBSERVES_TEXT: bool = false;
+    const OBSERVES_PLAIN_CSI: bool = false;
 
     fn print(&mut self, _c: char) {}
 
@@ -1185,7 +1186,7 @@ mod tests {
                 5 => b"\x1b[?25\x18l\x1b[?1002h\x1a",
                 6 => b"\x9b?1049h\xc2\x9b\x1b[?1003l",
                 7 => b"\x1bP1;2|data\x1b\\\x1b_apc\x1b\\",
-                8 => b"\x1b[?1l\x1b>\x1b[?2004l\x1b[?1000l",
+                8 => b"\x1b[?1l\x1b>\x1b[?2004l\x1b[?1000l\x1b[\x07?1049h\x1b[\x7f?1049l\x1b[1?h\x1b[>1h\x1b[?$p\x1b[12;24H\x1b[2J",
                 _ => b"\r\n\x08\x07\t",
             });
         }
