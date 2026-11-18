@@ -310,6 +310,16 @@ impl Report {
                         expected.name, before.allocations_per_frame, after.allocations_per_frame
                     ));
                 }
+                if let (Some(before), Some(after)) =
+                    (before.instructions_per_frame, after.instructions_per_frame)
+                    && (after as f64).mul_add(1.0 + INSTRUCTION_TOLERANCE, INSTRUCTION_SLACK)
+                        < before as f64
+                {
+                    improvements.push(format!(
+                        "{} {phase}: instructions per frame {before} -> {after}",
+                        expected.name
+                    ));
+                }
             }
         }
         improvements
