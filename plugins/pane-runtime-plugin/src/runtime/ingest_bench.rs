@@ -179,7 +179,7 @@ fn ingest(name: &str, (cols, rows): (u16, u16), frames: &[Frame]) -> Scenario {
             let mark = probe.mark();
             let parsed = metadata.process_chunk(chunk);
             add("metadata", probe.since(mark));
-            let chunk = parsed.filtered.as_slice();
+            let chunk = &*parsed.filtered;
             let mark = probe.mark();
             modes.process(chunk);
             add("modes", probe.since(mark));

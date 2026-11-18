@@ -2338,8 +2338,11 @@ impl PaneTerminalModeTracker {
                     }
                     self.csi_buffer.push(*byte);
                     if (0x40..=0x7e).contains(byte) {
-                        let sequence = std::mem::take(&mut self.csi_buffer);
+                        // Taken to apply, then given back: its storage serves every sequence.
+                        let mut sequence = std::mem::take(&mut self.csi_buffer);
                         self.apply_csi_sequence(&sequence);
+                        sequence.clear();
+                        self.csi_buffer = sequence;
                         self.parse_state = TerminalModeParseState::Ground;
                     } else if self.csi_buffer.len() > 64 {
                         self.parse_state = TerminalModeParseState::Ground;
@@ -2446,6 +2449,8 @@ struct PaneCursorTracker {
     rows: u16,
     cols: u16,
     cursor_escape_state: CursorEscapeState,
+    /// Each chunk's bytes as the grid is fed them, its storage kept from chunk to chunk.
+    normalized: Vec<u8>,
     /// Cumulative number of lines that have scrolled off the top.
     /// Used by the image registry to shift image positions on scroll.
     #[cfg(feature = "image-registry")]
@@ -2472,6 +2477,7 @@ impl PaneCursorTracker {
             rows,
             cols,
             cursor_escape_state: CursorEscapeState::Ground,
+            normalized: Vec::new(),
             #[cfg(feature = "image-registry")]
             total_scrollback: 0,
         }
@@ -2492,7 +2498,8 @@ impl PaneCursorTracker {
             return;
         }
 
-        let mut normalized = Vec::with_capacity(bytes.len());
+        let mut normalized = std::mem::take(&mut self.normalized);
+        normalized.clear();
         for byte in bytes {
             match self.cursor_escape_state {
                 CursorEscapeState::Ground => {
@@ -2532,6 +2539,7 @@ impl PaneCursorTracker {
         if !normalized.is_empty() {
             self.terminal_grid.process(&normalized);
         }
+        self.normalized = normalized;
     }
 
     fn cursor_position(&self) -> (u16, u16) {
@@ -3095,8 +3103,9 @@ enum ShellKind {
 }
 
 #[derive(Debug, Default)]
-struct PaneShellMetadataParseOutput {
-    filtered: Vec<u8>,
+struct PaneShellMetadataParseOutput<'chunk> {
+    /// The chunk without the shell metadata it carried: the chunk itself when it carried none.
+    filtered: std::borrow::Cow<'chunk, [u8]>,
     events: Vec<PaneShellMetadataEvent>,
 }
 
@@ -3124,11 +3133,26 @@ enum PaneShellMetadataParserState {
 }
 
 impl PaneShellMetadataParser {
-    fn process_chunk(&mut self, chunk: &[u8]) -> PaneShellMetadataParseOutput {
+    fn process_chunk<'chunk>(
+        &mut self,
+        chunk: &'chunk [u8],
+    ) -> PaneShellMetadataParseOutput<'chunk> {
+        // Outside any escape, a chunk that begins no OSC and does not end inside an escape
+        // carries no metadata and leaves the parser as it was: it passes through as is.
+        if matches!(self.state, PaneShellMetadataParserState::Ground)
+            && chunk.last() != Some(&0x1b)
+            && !chunk.windows(2).any(|pair| pair == b"\x1b]")
+        {
+            return PaneShellMetadataParseOutput {
+                filtered: std::borrow::Cow::Borrowed(chunk),
+                events: Vec::new(),
+            };
+        }
         let mut out = PaneShellMetadataParseOutput {
-            filtered: Vec::with_capacity(chunk.len()),
+            filtered: std::borrow::Cow::Owned(Vec::with_capacity(chunk.len())),
             events: Vec::new(),
         };
+        let filtered = out.filtered.to_mut();
 
         for byte in chunk {
             match &mut self.state {
@@ -3136,7 +3160,7 @@ impl PaneShellMetadataParser {
                     if *byte == 0x1b {
                         self.state = PaneShellMetadataParserState::Escape;
                     } else {
-                        out.filtered.push(*byte);
+                        filtered.push(*byte);
                     }
                 }
                 PaneShellMetadataParserState::Escape => {
@@ -3146,11 +3170,11 @@ impl PaneShellMetadataParser {
                             saw_escape: false,
                         };
                     } else {
-                        out.filtered.push(0x1b);
+                        filtered.push(0x1b);
                         if *byte == 0x1b {
                             self.state = PaneShellMetadataParserState::Escape;
                         } else {
-                            out.filtered.push(*byte);
+                            filtered.push(*byte);
                             self.state = PaneShellMetadataParserState::Ground;
                         }
                     }
@@ -3168,7 +3192,7 @@ impl PaneShellMetadataParser {
                                 out.events.push(event);
                             } else {
                                 append_raw_osc_sequence(
-                                    &mut out.filtered,
+                                    filtered,
                                     &payload,
                                     PaneShellMetadataTerminator::StringTerminator,
                                 );
@@ -3190,7 +3214,7 @@ impl PaneShellMetadataParser {
                             out.events.push(event);
                         } else {
                             append_raw_osc_sequence(
-                                &mut out.filtered,
+                                filtered,
                                 &payload,
                                 PaneShellMetadataTerminator::Bell,
                             );
@@ -3199,9 +3223,9 @@ impl PaneShellMetadataParser {
                     } else {
                         payload.push(*byte);
                         if payload.len() > MAX_SHELL_METADATA_PAYLOAD_BYTES {
-                            out.filtered.push(0x1b);
-                            out.filtered.push(b']');
-                            out.filtered.extend_from_slice(payload);
+                            filtered.push(0x1b);
+                            filtered.push(b']');
+                            filtered.extend_from_slice(payload);
                             self.state = PaneShellMetadataParserState::Ground;
                         }
                     }
@@ -8184,8 +8208,7 @@ impl SessionRuntimeManager {
                                 let chunk = chunk.as_slice();
 
                                 let metadata = shell_metadata_parser.process_chunk(chunk);
-                                let chunk = metadata.filtered;
-                                let chunk = chunk.as_slice();
+                                let chunk = &*metadata.filtered;
                                 note_replay_markers_read(chunk);
 
                                 // Update terminal mode tracking (mouse protocol,
@@ -21613,7 +21636,7 @@ exit 7"#
                 PaneShellMetadataEvent::CommandStart { command, cwd },
             ]
         );
-        assert_eq!(metadata.filtered, [] as [u8; 0]);
+        assert!(metadata.filtered.is_empty());
     }
 
     #[test]
@@ -21648,13 +21671,29 @@ exit 7"#
         }
     }
 
+    /// A chunk carrying no metadata (escapes, but no OSC) passes through without being copied,
+    /// and a chunk ending inside an escape is parsed, so an OSC split there is still found.
+    #[test]
+    fn chunks_without_metadata_pass_through_uncopied() {
+        let mut parser = PaneShellMetadataParser::default();
+        let plain = b"\x1b[1;31mred\x1b[0m \x1b\x1bx\r\n".as_slice();
+        let output = parser.process_chunk(plain);
+        assert!(matches!(output.filtered, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(&*output.filtered, plain);
+        let first = parser.process_chunk(b"text\x1b");
+        assert_eq!(&*first.filtered, b"text");
+        let second = parser.process_chunk(b"]633;bmux;start;ZWNobyBoaQ==;L3RtcA==\x07after");
+        assert_eq!(&*second.filtered, b"after");
+        assert_eq!(second.events.len(), 1);
+    }
+
     #[test]
     fn shell_metadata_parser_strips_bell_marker() {
         let mut parser = PaneShellMetadataParser::default();
         let output =
             parser.process_chunk(b"\x1b]633;bmux;start;ZWNobyBoaQ==;L3RtcA==\x07plain-output");
 
-        assert_eq!(output.filtered, b"plain-output");
+        assert_eq!(&*output.filtered, b"plain-output");
         assert_eq!(
             output.events,
             vec![PaneShellMetadataEvent::CommandStart {
