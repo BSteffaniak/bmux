@@ -485,7 +485,6 @@ tracing-subscriber = { version = "0.3.23", default-features = false }
 trybuild = { version = "1.0.122" }
 ttf-parser = { version = "0.25.1", default-features = true }
 unicode-segmentation = { version = "1.13.3", default-features = false }
-unicode-width = { version = "0.2.2", default-features = false }
 uniffi = { version = "0.32.2" }
 uuid = { version = "1.29.0", default-features = false }
 wasm-bindgen = { version = "0.2.129" }

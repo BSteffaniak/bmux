@@ -1719,7 +1719,6 @@ name = "bmux_cell_geometry"
 version = "0.0.1-alpha.4"
 dependencies = [
  "unicode-segmentation",
- "unicode-width",
 ]
 
 [[package]]
