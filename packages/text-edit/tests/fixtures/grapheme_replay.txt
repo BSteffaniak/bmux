@@ -1,0 +1,28 @@
+lines=["abce\u{301}", "!"] ranges=[0..6, 6..7]
+hits=[0, 1, 2, 3, 6]
+hits=[6, 7, 7, 7, 7]
+forward="abc!"@3
+cursor=6 grapheme=4 visual=0,4 selection=Some(TextSelection { start: 3, end: 6 }) copy=Some("e\u{301}")
+backward="abc!"@3
+delete selection="abc!"@3
+lines=["ab🇨🇦", "!"] ranges=[0..10, 10..11]
+hits=[0, 1, 2, 2, 10]
+hits=[10, 11, 11, 11, 11]
+forward="ab!"@2
+cursor=10 grapheme=3 visual=0,4 selection=Some(TextSelection { start: 2, end: 10 }) copy=Some("🇨🇦")
+backward="ab!"@2
+delete selection="ab!"@2
+lines=["abc", "क\u{94d}ष!"] ranges=[0..3, 3..13]
+hits=[0, 1, 2, 3, 3]
+hits=[3, 3, 12, 13, 13]
+forward="abc!"@3
+cursor=12 grapheme=4 visual=1,2 selection=Some(TextSelection { start: 3, end: 12 }) copy=Some("क\u{94d}ष")
+backward="abc!"@3
+delete selection="abc!"@3
+lines=["ab👩🏽\u{200d}💻", "!"] ranges=[0..17, 17..18]
+hits=[0, 1, 2, 2, 17]
+hits=[17, 18, 18, 18, 18]
+forward="ab!"@2
+cursor=17 grapheme=3 visual=0,4 selection=Some(TextSelection { start: 2, end: 17 }) copy=Some("👩🏽\u{200d}💻")
+backward="ab!"@2
+delete selection="ab!"@2

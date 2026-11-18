@@ -120,6 +120,7 @@ bmux_workspaces_plugin = { workspace = true, optional = true }
 anyhow = { workspace = true, features = ["std"] }
 bmux_image = { workspace = true, optional = true }
 bmux_terminal = { workspace = true }
+bmux_unicode_segmentation = { workspace = true }
 clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
 futures-util = { workspace = true }
 git_sshripped_recipient = { workspace = true }
@@ -166,7 +167,6 @@ tracing-subscriber = { workspace = true, features = [
     "fmt",
     "std",
 ] }
-unicode-segmentation = { workspace = true }
 uuid = { workspace = true, features = ["std"] }
 
 [target.'cfg(unix)'.dependencies]

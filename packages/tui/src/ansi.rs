@@ -1353,8 +1353,6 @@ mod tests {
 
     // Replay just the frame encoder's wire vocabulary, independently of its span selection.
     fn replay_frame(mut buffer: Buffer, wire: &[u8]) -> Buffer {
-        use unicode_segmentation::UnicodeSegmentation;
-
         let wire = std::str::from_utf8(wire).unwrap();
         let mut remaining = wire;
         let mut point = Point::new(0, 0);
@@ -1378,7 +1376,7 @@ mod tests {
                 remaining = &csi[end + 1..];
             } else {
                 let end = remaining.find('\x1b').unwrap_or(remaining.len());
-                for grapheme in remaining[..end].graphemes(true) {
+                for grapheme in bmux_unicode_segmentation::graphemes(&remaining[..end]) {
                     buffer.set_cell(point, grapheme, style);
                     point.x += u16::try_from(super::display_width(grapheme)).unwrap();
                 }

@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{PlaybackSpeed, managed::ManagedRun};
 
@@ -41,7 +40,9 @@ pub(crate) fn chunks(bytes: &[u8]) -> Vec<&[u8]> {
     };
     match std::str::from_utf8(text_bytes) {
         Ok(text) if !text.chars().any(char::is_control) => {
-            let mut chunks: Vec<_> = text.graphemes(true).map(str::as_bytes).collect();
+            let mut chunks: Vec<_> = bmux_unicode_segmentation::graphemes(text)
+                .map(str::as_bytes)
+                .collect();
             if let Some(enter) = enter {
                 chunks.push(enter);
             }

@@ -1,7 +1,5 @@
 //! Intra-line changed ranges for a removed/added line pair.
 
-use unicode_segmentation::UnicodeSegmentation;
-
 use super::{ChangedRange, MAX_INTRALINE_LINE_GRAPHEMES, MAX_LCS_CELLS, lcs_table};
 
 /// Changed byte ranges within a removed line and its paired added line.
@@ -116,7 +114,7 @@ fn tokens(text: &str) -> Option<Vec<Token<'_>>> {
     let mut output: Vec<Token<'_>> = Vec::new();
     let mut previous: Option<TokenClass> = None;
     let mut count = 0_usize;
-    for (start, grapheme) in text.grapheme_indices(true) {
+    for (start, grapheme) in bmux_unicode_segmentation::grapheme_indices(text) {
         count += 1;
         if count > MAX_INTRALINE_LINE_GRAPHEMES {
             return None;
@@ -246,8 +244,7 @@ mod tests {
                 "{old:?}"
             );
             for (text, ranges) in [(old, &changes.old), (new, &changes.new)] {
-                let boundaries = text
-                    .grapheme_indices(true)
+                let boundaries = bmux_unicode_segmentation::grapheme_indices(text)
                     .map(|(start, _)| start)
                     .chain([text.len()])
                     .collect::<Vec<_>>();

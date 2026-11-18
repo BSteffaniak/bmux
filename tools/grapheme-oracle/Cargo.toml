@@ -1,0 +1,13 @@
+[workspace]
+
+[package]
+name = "grapheme-oracle"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[dependencies]
+unicode-segmentation = { workspace = true }
+
+[workspace.dependencies]
+unicode-segmentation = "=1.13.3"

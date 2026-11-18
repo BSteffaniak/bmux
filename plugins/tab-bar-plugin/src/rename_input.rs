@@ -145,7 +145,7 @@ pub fn paint(
     }
     let mut offset = usize::try_from(scroll.horizontal_offset()).unwrap_or(usize::MAX);
     let mut boundary = 0;
-    for grapheme in unicode_segmentation::UnicodeSegmentation::graphemes(input.text(), true) {
+    for grapheme in bmux_unicode_segmentation::graphemes(input.text()) {
         let next = boundary + bmux_cell_geometry::grapheme_width(grapheme);
         if next > offset {
             offset = boundary;

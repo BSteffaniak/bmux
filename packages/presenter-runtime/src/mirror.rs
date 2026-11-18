@@ -409,7 +409,6 @@ impl MirrorFrame {
 pub use bmux_tui::embedded_surface::SurfacePlacement as CanvasPlacement;
 
 fn validate_cells(frame: &MirrorFrame) -> Result<(), HostError> {
-    use unicode_segmentation::UnicodeSegmentation;
     for row in frame.cells.chunks_exact(usize::from(frame.width)) {
         for (index, cell) in row.iter().enumerate() {
             if cell.continuation {
@@ -425,7 +424,7 @@ fn validate_cells(frame: &MirrorFrame) -> Result<(), HostError> {
                     return Err(HostError::Invalid);
                 }
             } else {
-                if cell.symbol.graphemes(true).count() != 1
+                if bmux_unicode_segmentation::graphemes(&cell.symbol).count() != 1
                     || bmux_cell_geometry::display_width(&cell.symbol) != usize::from(cell.width)
                     || !(1..=2).contains(&cell.width)
                 {

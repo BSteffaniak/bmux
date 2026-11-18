@@ -24,7 +24,6 @@ pub use pointer::{
 };
 
 use std::ops::Range;
-use unicode_segmentation::UnicodeSegmentation;
 
 /// A terminal visual cursor position measured in rows and columns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -342,7 +341,7 @@ impl TextEditBuffer {
     /// Return the cursor grapheme index.
     #[must_use]
     pub fn cursor_grapheme_index(&self) -> usize {
-        self.text[..self.cursor].graphemes(true).count()
+        bmux_unicode_segmentation::graphemes(&self.text[..self.cursor]).count()
     }
 
     /// Return the current word-boundary policy.
@@ -950,7 +949,7 @@ struct GraphemeSpan {
 }
 
 fn grapheme_spans(text: &str) -> Vec<GraphemeSpan> {
-    text.grapheme_indices(true)
+    bmux_unicode_segmentation::grapheme_indices(text)
         .map(|(start, grapheme)| GraphemeSpan {
             start,
             end: start.saturating_add(grapheme.len()),
@@ -962,11 +961,14 @@ fn grapheme_spans(text: &str) -> Vec<GraphemeSpan> {
 fn snap_to_grapheme_boundary(text: &str, index: usize) -> usize {
     let index = index.min(text.len());
     if text.is_char_boundary(index)
-        && (index == text.len() || text[index..].graphemes(true).next().is_some())
+        && (index == text.len()
+            || bmux_unicode_segmentation::graphemes(&text[index..])
+                .next()
+                .is_some())
     {
         return index;
     }
-    text.grapheme_indices(true)
+    bmux_unicode_segmentation::grapheme_indices(text)
         .map(|(start, _)| start)
         .take_while(|start| *start <= index)
         .last()
@@ -974,8 +976,7 @@ fn snap_to_grapheme_boundary(text: &str, index: usize) -> usize {
 }
 
 fn previous_grapheme_boundary(text: &str, cursor: usize) -> Option<usize> {
-    text[..cursor]
-        .grapheme_indices(true)
+    bmux_unicode_segmentation::grapheme_indices(&text[..cursor])
         .next_back()
         .map(|(index, _)| index)
 }
@@ -984,8 +985,7 @@ fn next_grapheme_boundary(text: &str, cursor: usize) -> Option<usize> {
     if cursor >= text.len() {
         return None;
     }
-    text[cursor..]
-        .grapheme_indices(true)
+    bmux_unicode_segmentation::grapheme_indices(&text[cursor..])
         .nth(1)
         .map_or(Some(text.len()), |(index, _)| {
             Some(cursor.saturating_add(index))
@@ -1024,7 +1024,7 @@ fn next_word_boundary(text: &str, cursor: usize, policy: WordBoundaryPolicy) -> 
 
 fn byte_index_for_visual_col(line: &str, target_col: usize) -> usize {
     let mut col = 0usize;
-    for (start, grapheme) in line.grapheme_indices(true) {
+    for (start, grapheme) in bmux_unicode_segmentation::grapheme_indices(line) {
         let width = bmux_cell_geometry::grapheme_width(grapheme);
         if col.saturating_add(width) > target_col {
             return start;
@@ -1041,7 +1041,9 @@ mod tests {
     #[test]
     fn visual_hits_follow_painted_cells_not_scalar_or_byte_counts() {
         let text = "e\u{301}\u{200b}界👩‍💻لا";
-        let starts: Vec<_> = text.grapheme_indices(true).map(|(i, _)| i).collect();
+        let starts: Vec<_> = bmux_unicode_segmentation::grapheme_indices(text)
+            .map(|(i, _)| i)
+            .collect();
         for (column, cluster) in [0, 2, 2, 3, 3, 4, 5].into_iter().enumerate() {
             assert_eq!(byte_index_for_visual_col(text, column), starts[cluster]);
         }

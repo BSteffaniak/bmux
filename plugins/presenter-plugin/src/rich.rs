@@ -6,7 +6,7 @@ use bmux_presenter_runtime::Asset;
 use bmux_tui::component::Element;
 use bmux_tui::image::ImagePayload;
 use std::collections::BTreeMap;
-use unicode_segmentation::UnicodeSegmentation;
+
 include!("highlight.rs");
 
 /// Cache font discovery once; every asset shares the immutable database.
@@ -218,7 +218,9 @@ impl bmux_tui::component::Component for PreparedCode<'_> {
         let mut offset = 0;
         for (row, line) in self.source.split_inclusive('\n').enumerate() {
             let mut column = 0_usize;
-            for (byte, grapheme) in line.trim_end_matches(['\r', '\n']).grapheme_indices(true) {
+            for (byte, grapheme) in
+                bmux_unicode_segmentation::grapheme_indices(line.trim_end_matches(['\r', '\n']))
+            {
                 let width = bmux_tui::text_width::display_width(grapheme);
                 if width > 0
                     && u64::try_from(row).unwrap_or(u64::MAX) < layout.size.height

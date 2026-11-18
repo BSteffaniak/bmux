@@ -458,7 +458,7 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
     /// their painted width; a wide one that does not fit the clip is skipped.
     pub fn write_symbols(&mut self, x: i32, y: i64, text: &str) {
         let mut column = x;
-        for grapheme in unicode_segmentation::UnicodeSegmentation::graphemes(text, true) {
+        for grapheme in bmux_unicode_segmentation::graphemes(text) {
             let width = crate::text_width::painted_grapheme_width(grapheme);
             if width == 0 {
                 continue;

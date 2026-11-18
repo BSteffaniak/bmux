@@ -1240,7 +1240,7 @@ fn render_tab_template_ranges(
 fn truncate_cells(value: &str, maximum: usize) -> String {
     let mut output = String::new();
     let mut width = 0_usize;
-    for grapheme in unicode_segmentation::UnicodeSegmentation::graphemes(value, true) {
+    for grapheme in bmux_unicode_segmentation::graphemes(value) {
         let character_width = bmux_cell_geometry::grapheme_width(grapheme);
         if width.saturating_add(character_width) > maximum {
             break;

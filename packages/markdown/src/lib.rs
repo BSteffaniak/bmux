@@ -74,7 +74,7 @@ use pulldown_cmark::{
     Options as ParserOptions, Parser, Tag, TagEnd,
 };
 use smallvec::{SmallVec, smallvec};
-use unicode_segmentation::UnicodeSegmentation;
+
 use url::Url;
 
 #[cfg(feature = "html")]
@@ -1604,7 +1604,7 @@ fn project_grapheme_geometry(
     projected: &mut Vec<MarkdownSelectionProvenance>,
 ) {
     let mut source_offset = source_start;
-    for grapheme in canonical.graphemes(true) {
+    for grapheme in bmux_unicode_segmentation::graphemes(canonical) {
         let source_range = source_offset..source_offset.saturating_add(grapheme.len());
         source_offset = source_range.end;
         // Line breaks carry no display cell. Whitespace consumed by wrapping
@@ -2623,7 +2623,7 @@ impl DisplayedMarkdown {
         for (row, line) in lines.iter().enumerate() {
             let mut column = 0;
             for span in &line.spans {
-                for grapheme in span.content.graphemes(true) {
+                for grapheme in bmux_unicode_segmentation::graphemes(&span.content) {
                     let byte_start = text.len();
                     text.push_str(grapheme);
                     let byte_end = text.len();
@@ -5701,7 +5701,6 @@ mod tests {
     };
     use bmux_tui::prelude::{Color, Modifier, Span, Style};
     use pulldown_cmark::Alignment;
-    use unicode_segmentation::UnicodeSegmentation;
 
     #[test]
     fn stacked_table_unicode_rows_fit_single_cell_viewports() {
@@ -6449,7 +6448,7 @@ mod tests {
                 .lines
                 .iter()
                 .flat_map(|line| line.spans.iter())
-                .map(|span| span.content.graphemes(true).count())
+                .map(|span| bmux_unicode_segmentation::graphemes(&span.content).count())
                 .sum();
             assert!(
                 spans < cells / 4,
@@ -7214,7 +7213,7 @@ mod tests {
                 let start = usize::from(rect.x);
                 let end = start.saturating_add(usize::from(rect.width));
                 let mut column = 0_usize;
-                text.graphemes(true)
+                bmux_unicode_segmentation::graphemes(&text)
                     .filter(|grapheme| {
                         let grapheme_start = column;
                         column = column.saturating_add(text_display_width(grapheme));

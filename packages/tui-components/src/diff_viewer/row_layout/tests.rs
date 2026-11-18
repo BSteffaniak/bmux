@@ -26,7 +26,7 @@ fn style() -> DiffViewerStyle {
 fn painted_width(line: &Line) -> usize {
     line.spans
         .iter()
-        .flat_map(|span| span.content.graphemes(true))
+        .flat_map(|span| bmux_unicode_segmentation::graphemes(&span.content))
         .map(|grapheme| usize::from(painted_grapheme_width(grapheme)))
         .sum()
 }
@@ -213,7 +213,7 @@ fn wrapped_segments_cover_the_source_exactly_once() {
                     grapheme = segment.graphemes.end;
                 }
                 assert_eq!(byte, text.len(), "{text:?} {width}");
-                assert_eq!(grapheme, text.graphemes(true).count());
+                assert_eq!(grapheme, bmux_unicode_segmentation::graphemes(text).count());
                 assert_eq!(layout.segments().len(), layout.height());
             }
         }
@@ -272,8 +272,7 @@ fn assert_segment_agrees(
     for unit in &units {
         assert!(usize::from(unit.x) >= segment.content.start);
         assert!(usize::from(unit.x + unit.width) <= segment.content.end);
-        let grapheme = source[unit.source_range()]
-            .graphemes(true)
+        let grapheme = bmux_unicode_segmentation::graphemes(&source[unit.source_range()])
             .find(|grapheme| *grapheme == "\t" || painted_grapheme_width(grapheme) > 0)
             .expect("a painted grapheme");
         let x = usize::from(unit.x);

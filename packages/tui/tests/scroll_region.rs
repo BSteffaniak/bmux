@@ -8,7 +8,6 @@
 use bmux_tui::image::{ImageFit, ImageLifecycle};
 use bmux_tui::pointer::PointerShapeCapability;
 use bmux_tui::prelude::*;
-use unicode_segmentation::UnicodeSegmentation;
 
 const WIDTH: u16 = 12;
 const HEIGHT: u16 = 8;
@@ -67,7 +66,7 @@ impl Screen {
                 rest = &sequence[end + 1..];
             } else {
                 let end = rest.find('\x1b').unwrap_or(rest.len());
-                for grapheme in rest[..end].graphemes(true) {
+                for grapheme in bmux_unicode_segmentation::graphemes(&rest[..end]) {
                     self.print(grapheme);
                 }
                 rest = &rest[end..];

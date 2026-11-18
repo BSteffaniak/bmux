@@ -133,17 +133,16 @@ pub(super) fn project_with_sources(
             )
         };
         if let Some(scene) = &metadata.selection {
-            use unicode_segmentation::UnicodeSegmentation as _;
             let mut boundaries = BTreeMap::new();
             for (id, text) in &metadata.text {
                 source_work = source_work.saturating_add(text.len());
                 if text.len() > 65_536 || source_work > 4_194_304 {
                     anyhow::bail!("source boundary validation budget exceeded");
                 }
-                let mut offsets: std::collections::BTreeSet<_> = text
-                    .grapheme_indices(true)
-                    .map(|(start, _)| start)
-                    .collect();
+                let mut offsets: std::collections::BTreeSet<_> =
+                    bmux_unicode_segmentation::grapheme_indices(text)
+                        .map(|(start, _)| start)
+                        .collect();
                 offsets.insert(text.len());
                 boundaries.insert(id, offsets);
             }

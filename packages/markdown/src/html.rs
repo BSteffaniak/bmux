@@ -15,7 +15,6 @@ use std::{borrow::Cow, collections::BTreeMap, ops::Range};
 
 use hyperchad_transformer::{Container, Element};
 use pulldown_cmark::{Event, Parser};
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     DisplayInsertion, HTML_ALIGN, HTML_CONTRIBUTION, HTML_DETAILS, HTML_DETAILS_STATE,
@@ -1069,7 +1068,7 @@ impl Transformer<'_, '_> {
         let marker = if superscript { "^" } else { "_" };
         let single = text
             .as_deref()
-            .is_some_and(|text| text.graphemes(true).count() == 1);
+            .is_some_and(|text| bmux_unicode_segmentation::graphemes(text).count() == 1);
         let mut output = Vec::with_capacity(children.len() + 2);
         output.push(html_text(if single {
             marker.to_owned()

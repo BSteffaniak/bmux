@@ -31,7 +31,6 @@ use bmux_tui::input::TextInput;
 use bmux_tui::paint::{LocalRect, PaintCx};
 use bmux_tui::semantic::SemanticRegion;
 use bmux_tui::style::Style;
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::scroll_view::{ScrollView, ScrollViewComponent, ScrollViewState};
 
@@ -89,11 +88,13 @@ impl TextInputMask {
         // A glyph must stay one grapheme per source grapheme: two copies must not
         // combine, and control characters must not alter the line layout.
         let pair: String = [glyph, glyph].iter().collect();
-        Some(if glyph.is_control() || pair.graphemes(true).count() != 2 {
-            Self::DEFAULT_GLYPH
-        } else {
-            glyph
-        })
+        Some(
+            if glyph.is_control() || bmux_unicode_segmentation::graphemes(&pair).count() != 2 {
+                Self::DEFAULT_GLYPH
+            } else {
+                glyph
+            },
+        )
     }
 }
 
@@ -223,8 +224,7 @@ impl TextInputState {
             .ok_or("missing editor text")?;
         let is_grapheme_boundary = |index: usize| {
             index == text.len()
-                || text
-                    .grapheme_indices(true)
+                || bmux_unicode_segmentation::grapheme_indices(text)
                     .any(|(offset, _)| offset == index)
         };
         for field in ["cursor", "selection_anchor"] {
@@ -380,7 +380,7 @@ impl TextInputState {
             TextInputMask::Hidden => Cow::Owned(TextEditBuffer::new()),
             TextInputMask::Mask(_) => {
                 let glyph = self.mask.glyph().unwrap_or(TextInputMask::DEFAULT_GLYPH);
-                let count = self.buffer.text().graphemes(true).count();
+                let count = bmux_unicode_segmentation::graphemes(self.buffer.text()).count();
                 let mut projection = TextEditBuffer::from_text(
                     std::iter::repeat_n(glyph, count).collect::<String>(),
                 );
@@ -404,7 +404,7 @@ impl TextInputState {
                 let glyph = self.mask.glyph().unwrap_or(TextInputMask::DEFAULT_GLYPH);
                 let text = self.buffer.text();
                 Some(
-                    text.grapheme_indices(true)
+                    bmux_unicode_segmentation::grapheme_indices(text)
                         .nth(projected / glyph.len_utf8())
                         .map_or(text.len(), |(offset, _)| offset),
                 )

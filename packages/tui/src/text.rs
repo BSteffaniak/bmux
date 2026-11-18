@@ -2,7 +2,6 @@
 
 use crate::style::Style;
 use crate::text_width::display_width;
-use unicode_segmentation::UnicodeSegmentation;
 
 /// A styled text span.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -113,7 +112,7 @@ impl Line {
         let mut annotation = annotations.next();
         let mut end = annotation.map_or(0, |span| span.content.len());
         let mut spans: Vec<Span> = Vec::new();
-        for (offset, grapheme) in source.grapheme_indices(true) {
+        for (offset, grapheme) in bmux_unicode_segmentation::grapheme_indices(&source) {
             while offset >= end && annotation.is_some() {
                 annotation = annotations.next();
                 end = end.saturating_add(annotation.map_or(0, |span| span.content.len()));
@@ -232,7 +231,7 @@ pub fn truncate_line_to_display_width(line: &Line, width: usize) -> Line {
     let mut ellipsis_style = None;
     'outer: for span in &line.spans {
         let mut content = String::new();
-        for grapheme in span.content.graphemes(true) {
+        for grapheme in bmux_unicode_segmentation::graphemes(&span.content) {
             let grapheme_width = display_width(grapheme);
             if grapheme_width == 0 {
                 continue;
@@ -285,7 +284,7 @@ pub fn truncate_line_shrinking_span(line: &Line, width: usize, span: usize) -> L
     };
     let mut kept: Vec<&str> = Vec::new();
     let mut used = 0usize;
-    for grapheme in target.content.graphemes(true).rev() {
+    for grapheme in bmux_unicode_segmentation::graphemes(&target.content).rev() {
         let grapheme_width = display_width(grapheme);
         if used.saturating_add(grapheme_width) > room {
             break;
@@ -318,7 +317,7 @@ pub fn line_viewport(line: &Line, horizontal_offset: usize, width: usize) -> Lin
     let mut spans: Vec<Span> = Vec::new();
     for span in &line.spans {
         let mut content = String::new();
-        for grapheme in span.content.graphemes(true) {
+        for grapheme in bmux_unicode_segmentation::graphemes(&span.content) {
             let grapheme_width = display_width(grapheme);
             if grapheme_width == 0 {
                 continue;
@@ -468,7 +467,7 @@ pub(crate) fn line_fits(line: &Line, width: usize) -> bool {
             // Short spans are cheap to measure outright.
             used = used.saturating_add(display_width(&span.content));
         } else {
-            for grapheme in span.content.graphemes(true) {
+            for grapheme in bmux_unicode_segmentation::graphemes(&span.content) {
                 used = used.saturating_add(display_width(grapheme));
                 if used > width {
                     return false;
@@ -600,16 +599,16 @@ fn word_segments(line: &Line) -> impl Iterator<Item = WordSegment<'_>> + '_ {
         .iter()
         .enumerate()
         .flat_map(|(index, span)| {
-            span.content
-                .grapheme_indices(true)
-                .map(move |(offset, grapheme)| {
+            bmux_unicode_segmentation::grapheme_indices(&span.content).map(
+                move |(offset, grapheme)| {
                     (
                         index,
                         offset,
                         grapheme,
                         grapheme.chars().all(char::is_whitespace),
                     )
-                })
+                },
+            )
         })
         .peekable();
     std::iter::from_fn(move || {
@@ -719,7 +718,7 @@ impl WrapSink {
     /// Emit graphemes, breaking whenever the current row is full.
     #[cfg(test)]
     fn push_graphemes(&mut self, content: &str, style: Style) {
-        for grapheme in content.graphemes(true) {
+        for grapheme in bmux_unicode_segmentation::graphemes(content) {
             let grapheme_width = display_width(grapheme);
             if self.column > 0 && self.column.saturating_add(grapheme_width) > self.current_width()
             {
@@ -769,9 +768,7 @@ pub(crate) fn character_row_count_up_to(
 ) -> usize {
     character_rows_fold(
         line.spans.iter().flat_map(|span| {
-            span.content
-                .graphemes(true)
-                .map(move |text| (text, span.style))
+            bmux_unicode_segmentation::graphemes(&span.content).map(move |text| (text, span.style))
         }),
         geometry,
         || (),
@@ -787,9 +784,7 @@ pub(crate) fn character_rows(
     geometry: TextWrapGeometry,
 ) -> impl Iterator<Item = Line> + '_ {
     let graphemes = line.spans.iter().flat_map(|span| {
-        span.content
-            .graphemes(true)
-            .map(move |text| (text, span.style))
+        bmux_unicode_segmentation::graphemes(&span.content).map(move |text| (text, span.style))
     });
     character_rows_from(graphemes, geometry)
 }
@@ -893,8 +888,7 @@ fn word_rows_with_mode<'a>(
             if let Some((segment, piece, offset)) = pending.as_mut() {
                 if let Some((content, style)) = segment.pieces.get(*piece) {
                     let measured = boundary_grapheme.take().or_else(|| {
-                        content[*offset..]
-                            .graphemes(true)
+                        bmux_unicode_segmentation::graphemes(&content[*offset..])
                             .next()
                             .map(|grapheme| (grapheme.len(), display_width(grapheme)))
                     });
@@ -1029,7 +1023,7 @@ pub fn wrap_text(text: &str, geometry: TextWrapGeometry, wrap: TextWrap) -> Vec<
     let mut word_start: Option<(usize, usize)> = None;
     let mut wrapped_any = false;
 
-    for grapheme in text.graphemes(true) {
+    for grapheme in bmux_unicode_segmentation::graphemes(text) {
         let grapheme_width = display_width(grapheme);
         let max_width = geometry.width_for_row(rows.len());
         let whitespace = matches!(wrap, TextWrap::Word)

@@ -776,11 +776,9 @@ fn publish_companion(companion: &CompanionState) -> Result<(), String> {
 }
 
 fn truncate_to_width(value: &str, maximum: usize) -> String {
-    use unicode_segmentation::UnicodeSegmentation;
-
     let mut result = String::new();
     let mut width = 0_usize;
-    for grapheme in value.graphemes(true) {
+    for grapheme in bmux_unicode_segmentation::graphemes(value) {
         let cell_width = bmux_cell_geometry::grapheme_width(grapheme);
         if width.saturating_add(cell_width) > maximum {
             break;

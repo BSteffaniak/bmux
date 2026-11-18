@@ -7,7 +7,6 @@ use crate::selection::{
 use bmux_tui::geometry::Rect;
 use bmux_tui::paint::PaintCx;
 use bmux_tui::prelude::{Color, Line, Modifier, Span, Style};
-use unicode_segmentation::UnicodeSegmentation;
 
 mod intraline;
 mod row_layout;
@@ -488,7 +487,7 @@ fn changed_ranges_for_pair(old: &str, new: &str) -> Option<(Vec<ChangedRange>, V
 }
 
 fn grapheme_bounds(text: &str) -> Vec<(usize, usize, &str)> {
-    text.grapheme_indices(true)
+    bmux_unicode_segmentation::grapheme_indices(text)
         .map(|(start, grapheme)| (start, start.saturating_add(grapheme.len()), grapheme))
         .collect()
 }
@@ -1295,7 +1294,7 @@ fn wrapped_source_chunks(source: &str, width: usize) -> Vec<(usize, &str)> {
     let mut output = Vec::new();
     let mut start = 0_usize;
     let mut display_width = 0_usize;
-    for (offset, grapheme) in source.grapheme_indices(true) {
+    for (offset, grapheme) in bmux_unicode_segmentation::grapheme_indices(source) {
         let grapheme_width = bmux_cell_geometry::grapheme_width(grapheme);
         if display_width > 0 && display_width.saturating_add(grapheme_width) > width {
             output.push((start, &source[start..offset]));
@@ -1800,7 +1799,7 @@ fn hidden_row_with_style(count: usize, width: u16, style: DiffViewerStyle) -> Li
 fn truncate_to_display_width(text: &str, width: usize) -> String {
     let mut output = String::new();
     let mut output_width = 0usize;
-    for grapheme in text.graphemes(true) {
+    for grapheme in bmux_unicode_segmentation::graphemes(text) {
         let grapheme_width = bmux_cell_geometry::grapheme_width(grapheme);
         if output_width.saturating_add(grapheme_width) > width {
             break;

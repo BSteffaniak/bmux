@@ -11,11 +11,11 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_cell_geometry     = { workspace = true }
-bmux_terminal_protocol = { workspace = true }
-serde                  = { workspace = true, features = ["derive", "std", "rc"] }
-thiserror              = { workspace = true }
-unicode-segmentation   = { workspace = true }
+bmux_cell_geometry        = { workspace = true }
+bmux_terminal_protocol    = { workspace = true }
+bmux_unicode_segmentation = { workspace = true }
+serde                     = { workspace = true, features = ["derive", "std", "rc"] }
+thiserror                 = { workspace = true }
 
 [dev-dependencies]
 bmux_tui   = { workspace = true }

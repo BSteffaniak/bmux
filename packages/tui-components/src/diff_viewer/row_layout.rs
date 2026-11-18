@@ -10,7 +10,6 @@ use std::ops::Range;
 use bmux_tui::prelude::{Line, Modifier, Span, Style};
 use bmux_tui::selection::SelectionCell;
 use bmux_tui::text_width::painted_grapheme_width;
-use unicode_segmentation::UnicodeSegmentation;
 
 use super::{ChangedRange, DiffLineKind, DiffSourceSide, DiffViewerStyle};
 
@@ -131,7 +130,7 @@ impl<'a> DiffRowTrailing<'a> {
     fn width(self) -> usize {
         self.spans
             .iter()
-            .flat_map(|span| span.content.graphemes(true))
+            .flat_map(|span| bmux_unicode_segmentation::graphemes(&span.content))
             .map(|grapheme| usize::from(painted_grapheme_width(grapheme)))
             .sum()
     }
@@ -1353,7 +1352,7 @@ fn place_content(
     if width == 0 {
         let mut row = ContentRow::new(0, 0);
         row.bytes.end = text.len();
-        row.graphemes.end = text.graphemes(true).count();
+        row.graphemes.end = bmux_unicode_segmentation::graphemes(text).count();
         return vec![row];
     }
     match overflow {
@@ -1381,7 +1380,7 @@ struct Grapheme {
 fn graphemes(text: &str, tab_width: u16) -> impl Iterator<Item = Grapheme> + '_ {
     let tab_width = usize::from(tab_width.max(1));
     let mut column = 0_usize;
-    text.grapheme_indices(true)
+    bmux_unicode_segmentation::grapheme_indices(text)
         .enumerate()
         .map(move |(index, (start, grapheme))| {
             let tab = grapheme == "\t";
@@ -1488,7 +1487,10 @@ fn place_truncated(text: &str, width: usize, tab_width: u16) -> ContentRow {
 
 fn place_scrolled(text: &str, width: usize, offset: usize, tab_width: u16) -> ContentRow {
     let mut row: Option<ContentRow> = None;
-    let mut position = (text.len(), text.graphemes(true).count());
+    let mut position = (
+        text.len(),
+        bmux_unicode_segmentation::graphemes(text).count(),
+    );
     let mut absolute = 0;
     let mut previous_placed = false;
     for Grapheme {
@@ -1594,8 +1596,7 @@ impl ContentStyles {
             if ellipsis_column > column {
                 output.blank(ellipsis_column - column, self.pad);
             }
-            let end = text.text[source..]
-                .graphemes(true)
+            let end = bmux_unicode_segmentation::graphemes(&text.text[source..])
                 .next()
                 .map_or(source, |grapheme| source + grapheme.len());
             output.push("…", self.grapheme_style(text, source, end));

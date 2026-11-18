@@ -6,8 +6,6 @@
 //! Private width/continuation fields are untrusted after decoding. A decoded
 //! buffer cannot be installed into authoritative `PresentationState`.
 
-use unicode_segmentation::UnicodeSegmentation;
-
 use crate::geometry::{Point, Rect, Size};
 use crate::style::Style;
 use crate::symbol::Symbol;
@@ -695,7 +693,7 @@ impl Buffer {
                 x = end;
                 continue;
             }
-            let mut graphemes = content.graphemes(true);
+            let mut graphemes = bmux_unicode_segmentation::graphemes(content);
             let mut offset = 0;
             loop {
                 let grapheme = if ascii {

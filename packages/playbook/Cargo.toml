@@ -45,7 +45,7 @@ tokio = { workspace = true, optional = true, features = [
     "time",
 ] }
 
-unicode-segmentation = { workspace = true, optional = true }
+bmux_unicode_segmentation = { workspace = true, optional = true }
 
 anyhow  = { workspace = true, features = ["std"] }
 libc    = { workspace = true }
@@ -88,7 +88,7 @@ fail-on-warnings = [
     "bmux_terminal_grid?/fail-on-warnings",
 ]
 runtime = [
-    "dep:unicode-segmentation",
+    "dep:bmux_unicode_segmentation",
     "dep:bmux_appearance",
     "dep:bmux_attach_layout_protocol",
     "dep:bmux_attach_pipeline",

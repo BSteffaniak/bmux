@@ -1,7 +1,6 @@
 //! Compact, width-aware terminal presentation helpers.
 
 use bmux_tui::prelude::{Line, Span, Style};
-use unicode_segmentation::UnicodeSegmentation;
 
 /// Render a title and metadata, wrapping metadata onto indented continuation rows as needed.
 #[must_use]
@@ -46,7 +45,7 @@ pub fn truncate_width(value: &str, width: usize) -> String {
     let target = width.saturating_sub(1);
     let mut output = String::new();
     let mut used = 0_usize;
-    for grapheme in value.graphemes(true) {
+    for grapheme in bmux_unicode_segmentation::graphemes(value) {
         let grapheme_width = bmux_cell_geometry::grapheme_width(grapheme);
         if used.saturating_add(grapheme_width) > target {
             break;

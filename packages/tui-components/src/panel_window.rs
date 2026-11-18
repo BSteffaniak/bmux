@@ -37,7 +37,6 @@ use bmux_tui::composition::{Column, TextBlock};
 use bmux_tui::geometry::{Point, Rect};
 use bmux_tui::style::{Modifier, Style};
 use bmux_tui::text::{Line, Span, Text, TextWrap};
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::pane::{Pane, PaneTitleAction, PaneTitleGroup};
 use crate::panel_group::{PanelGroupAxis, PanelGroupConstraints, PanelGroupState, PanelSize};
@@ -438,7 +437,7 @@ pub fn minimized_content(
     match shape {
         PanelShape::Strip => {
             let mut column = Column::new().id(id);
-            for grapheme in name.graphemes(true) {
+            for grapheme in bmux_unicode_segmentation::graphemes(name) {
                 column = column.child(
                     TextBlock::new(Text::from_lines(vec![Line::from_spans(vec![
                         Span::styled(format!(" {grapheme}"), style),

@@ -27,12 +27,12 @@ bmux_tui_components = { workspace = true, features = [
     "modal-frame",
     "toast-stack",
 ] }
+bmux_unicode_segmentation = { workspace = true }
 bmux_workspaces_plugin_api = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time"] }
 toml = { workspace = true }
 tracing = { workspace = true }
-unicode-segmentation = { workspace = true }
 uuid = { workspace = true, features = ["std", "v4"] }
 
 [dev-dependencies]

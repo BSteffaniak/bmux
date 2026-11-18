@@ -10,7 +10,6 @@ use std::time::Duration;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 
-use unicode_segmentation::UnicodeSegmentation;
 #[cfg(target_arch = "wasm32")]
 use web_time::Instant;
 
@@ -335,8 +334,7 @@ fn select(buffer: &mut TextEditBuffer, anchor: usize, cursor: usize) {
 #[must_use]
 pub fn word_range_at(text: &str, byte_index: usize) -> Option<Range<usize>> {
     let index = byte_index.min(text.len());
-    let ranges = text
-        .grapheme_indices(true)
+    let ranges = bmux_unicode_segmentation::grapheme_indices(text)
         .map(|(start, grapheme)| (start, start.saturating_add(grapheme.len()), grapheme))
         .collect::<Vec<_>>();
     if ranges.is_empty() {

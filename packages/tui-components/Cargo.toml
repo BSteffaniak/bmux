@@ -32,10 +32,10 @@ bmux_text_edit = { workspace = true, features = [
     "serde",
 ], optional = true }
 bmux_tui = { workspace = true }
+bmux_unicode_segmentation = { workspace = true, optional = true }
 chrono = { workspace = true, features = ["serde"], optional = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-unicode-segmentation = { workspace = true, optional = true }
 
 [dev-dependencies]
 bmux_keyboard = { workspace = true }
@@ -64,15 +64,15 @@ breadcrumbs = ["keyboard-input"]
 button = ["keyboard-input"]
 canvas = []
 card = []
-chart = ["dep:unicode-segmentation"]
+chart = ["dep:bmux_unicode_segmentation"]
 checkbox = ["keyboard-input"]
-compact = ["dep:unicode-segmentation", "dep:bmux_cell_geometry"]
+compact = ["dep:bmux_unicode_segmentation", "dep:bmux_cell_geometry"]
 completion = ["text-input", "selectable-list", "picker-frame"]
 date-picker = ["keyboard-input", "dep:bmux_text_edit", "dep:chrono"]
 dialog = ["action-row", "modal-frame"]
 diff-viewer = [
     "source-viewer",
-    "dep:unicode-segmentation",
+    "dep:bmux_unicode_segmentation",
     "dep:bmux_cell_geometry",
 ]
 disclosure = []
@@ -85,7 +85,7 @@ menu = ["selectable-list"]
 modal-frame = []
 pane = ["scroll-view"]
 panel-group = []
-panel-window = ["pane", "panel-group", "dep:unicode-segmentation"]
+panel-window = ["pane", "panel-group", "dep:bmux_unicode_segmentation"]
 picker-frame = []
 progress-bar = []
 radio-group = ["keyboard-input"]
@@ -94,7 +94,7 @@ scroll-view = ["keyboard-input", "scrollbar"]
 scrollbar = []
 select-dropdown = ["selectable-list"]
 selectable-list = ["keyboard-input", "scroll-view"]
-source-viewer = ["dep:unicode-segmentation", "dep:bmux_cell_geometry"]
+source-viewer = ["dep:bmux_unicode_segmentation", "dep:bmux_cell_geometry"]
 sparkline = []
 spinner = []
 split-button = ["button", "menu"]
@@ -108,7 +108,7 @@ text-input = [
     "scroll-view",
     "keyboard-input",
     "dep:bmux_text_edit",
-    "dep:unicode-segmentation",
+    "dep:bmux_unicode_segmentation",
 ]
 text-input-box = ["text-input", "form-field"]
 text-view = ["scroll-view"]

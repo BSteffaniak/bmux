@@ -1,7 +1,6 @@
 //! BMUX terminal cell geometry. Input to `grapheme_width` is one extended
 //! grapheme cluster, not a byte, Unicode scalar, or shaped run.
 
-use unicode_segmentation::UnicodeSegmentation;
 mod width_data;
 
 #[inline]
@@ -63,7 +62,7 @@ pub fn display_width(text: &str) -> usize {
 
 /// Extended graphemes in the order in which a terminal row paints them.
 pub fn graphemes(text: &str) -> impl DoubleEndedIterator<Item = &str> + Clone {
-    text.graphemes(true)
+    bmux_unicode_segmentation::graphemes(text)
 }
 
 #[cfg(test)]

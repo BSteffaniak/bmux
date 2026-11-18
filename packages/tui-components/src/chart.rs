@@ -7,7 +7,6 @@ use bmux_tui::prelude::{Line, Span, display_width};
 use bmux_tui::style::{Color, Style};
 use bmux_tui::text::truncate_line_to_display_width;
 use bmux_tui::text_width::truncate_to_display_width;
-use unicode_segmentation::UnicodeSegmentation;
 
 /// One chart point.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -676,7 +675,7 @@ fn render_legend(
 fn write_line(cx: &mut PaintCx<'_, '_>, area: LocalRect, line: &Line) {
     let mut x = area.x;
     for span in &line.spans {
-        for grapheme in span.content.graphemes(true) {
+        for grapheme in bmux_unicode_segmentation::graphemes(&span.content) {
             let width = u16::try_from(display_width(grapheme)).unwrap_or(u16::MAX);
             if width == 0 {
                 continue;

@@ -4,7 +4,7 @@
 //! BMUX layout primitives; secret bytes have no selection or source projection.
 
 use std::fmt;
-use unicode_segmentation::UnicodeSegmentation;
+
 use zeroize::{Zeroize, Zeroizing};
 
 /// Maximum UTF-8 bytes accepted by a private control.
@@ -53,8 +53,7 @@ impl SensitiveInputBuffer {
             self.clear();
             return;
         };
-        let start = text
-            .grapheme_indices(true)
+        let start = bmux_unicode_segmentation::grapheme_indices(text)
             .next_back()
             .map_or(0, |(start, _)| start);
         self.bytes[start..self.len].zeroize();

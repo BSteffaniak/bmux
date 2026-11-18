@@ -1,0 +1,13 @@
+[workspace]
+
+[package]
+name = "grapheme-perf-candidate"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+bmux_unicode_segmentation = { workspace = true }
+
+[workspace.dependencies]
+bmux_unicode_segmentation = { path = "../../../packages/unicode-segmentation", default-features = false }

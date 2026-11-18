@@ -8,8 +8,6 @@
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use unicode_segmentation::UnicodeSegmentation;
-
 use crate::buffer::Buffer;
 use crate::component::{
     Component, ComponentRevision, Constraints, EventCx, LayoutCx, LayoutId, LayoutNode, LogicalSize,
@@ -375,7 +373,7 @@ pub fn validate_cells(buffer: &Buffer, limits: SurfaceLimits) -> Result<(), Surf
                 {
                     return Err(SurfaceError::Invalid);
                 }
-            } else if cell.symbol.graphemes(true).count() != 1
+            } else if bmux_unicode_segmentation::graphemes(&cell.symbol).count() != 1
                 || bmux_cell_geometry::grapheme_width(&cell.symbol) != usize::from(cell.width())
                 || !(1..=2).contains(&cell.width())
                 || (cell.width() == 2

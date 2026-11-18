@@ -1719,7 +1719,7 @@ dependencies = [
 name = "bmux_cell_geometry"
 version = "0.0.1-alpha.4"
 dependencies = [
- "unicode-segmentation",
+ "bmux_unicode_segmentation",
 ]
 
 [[package]]
@@ -1808,6 +1808,7 @@ dependencies = [
  "bmux_theme_plugin",
  "bmux_tui",
  "bmux_tui_components",
+ "bmux_unicode_segmentation",
  "bmux_visual_adapters_plugin_renderer",
  "bmux_web_host",
  "bmux_web_renderer",
@@ -1846,7 +1847,6 @@ dependencies = [
  "tracing-appender",
  "tracing-log",
  "tracing-subscriber",
- "unicode-segmentation",
  "uuid",
  "windows-sys 0.61.2",
 ]
@@ -2525,6 +2525,7 @@ dependencies = [
  "bmux_mermaid_render",
  "bmux_syntax_render",
  "bmux_tui",
+ "bmux_unicode_segmentation",
  "hyperchad_color",
  "hyperchad_markdown",
  "hyperchad_transformer",
@@ -2532,7 +2533,6 @@ dependencies = [
  "insta",
  "pulldown-cmark",
  "smallvec",
- "unicode-segmentation",
  "url 2.5.8",
 ]
 
@@ -2795,6 +2795,7 @@ dependencies = [
  "bmux_tabs_plugin_api",
  "bmux_terminal",
  "bmux_terminal_grid",
+ "bmux_unicode_segmentation",
  "libc",
  "regex",
  "serde",
@@ -2804,7 +2805,6 @@ dependencies = [
  "tokio",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
- "unicode-segmentation",
  "uuid",
 ]
 
@@ -2995,6 +2995,7 @@ dependencies = [
  "bmux_tui",
  "bmux_tui_components",
  "bmux_tui_runtime",
+ "bmux_unicode_segmentation",
  "bmux_web_host",
  "bmux_web_renderer",
  "clap",
@@ -3008,7 +3009,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "ttf-parser",
- "unicode-segmentation",
  "uuid",
 ]
 
@@ -3033,6 +3033,7 @@ dependencies = [
  "bmux_mermaid_render",
  "bmux_presenter",
  "bmux_tui",
+ "bmux_unicode_segmentation",
  "image",
  "pulldown-cmark",
  "rcgen",
@@ -3043,7 +3044,6 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
- "unicode-segmentation",
  "uuid",
 ]
 
@@ -3306,10 +3306,10 @@ dependencies = [
  "bmux_tabs_plugin_api",
  "bmux_tui",
  "bmux_tui_components",
+ "bmux_unicode_segmentation",
  "tokio",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
- "unicode-segmentation",
  "uuid",
 ]
 
@@ -3405,13 +3405,13 @@ dependencies = [
  "bmux_text_edit",
  "bmux_tui",
  "bmux_tui_components",
+ "bmux_unicode_segmentation",
  "bmux_workspaces_plugin_api",
  "serde",
  "serde_json",
  "tokio",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
- "unicode-segmentation",
  "uuid",
 ]
 
@@ -3487,10 +3487,10 @@ dependencies = [
  "bmux_cell_geometry",
  "bmux_terminal_protocol",
  "bmux_tui",
+ "bmux_unicode_segmentation",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
- "unicode-segmentation",
 ]
 
 [[package]]
@@ -3506,9 +3506,9 @@ version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_cell_geometry",
  "bmux_keyboard",
+ "bmux_unicode_segmentation",
  "serde",
  "serde_json",
- "unicode-segmentation",
  "web-time",
  "zeroize",
 ]
@@ -3547,12 +3547,12 @@ dependencies = [
  "bmux_terminal",
  "bmux_terminal_protocol",
  "bmux_text_edit",
+ "bmux_unicode_segmentation",
  "futures-util",
  "image",
  "libc",
  "serde",
  "serde_json",
- "unicode-segmentation",
  "web-time",
  "zeroize",
 ]
@@ -3568,11 +3568,11 @@ dependencies = [
  "bmux_text_edit",
  "bmux_tui",
  "bmux_tui_runtime",
+ "bmux_unicode_segmentation",
  "chrono",
  "serde",
  "serde_json",
  "tokio",
- "unicode-segmentation",
  "web-time",
 ]
 
@@ -3635,6 +3635,10 @@ dependencies = [
  "tokio",
  "zeroize",
 ]
+
+[[package]]
+name = "bmux_unicode_segmentation"
+version = "0.0.1-alpha.4"
 
 [[package]]
 name = "bmux_visual_adapters_plugin_renderer"

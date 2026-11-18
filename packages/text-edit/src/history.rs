@@ -11,7 +11,6 @@ use std::time::Instant;
 use web_time::Instant;
 
 use crate::TextEditBuffer;
-use unicode_segmentation::UnicodeSegmentation;
 
 /// Maximum retained undo and redo transactions combined.
 pub const MAX_HISTORY_ENTRIES: usize = 128;
@@ -380,8 +379,7 @@ impl TextEditBuffer {
             position <= text.len()
                 && text.is_char_boundary(position)
                 && (position == text.len()
-                    || text
-                        .grapheme_indices(true)
+                    || bmux_unicode_segmentation::grapheme_indices(&text)
                         .any(|(start, _)| start == position))
         };
         if !valid_position(cursor) || selection_anchor.is_some_and(|anchor| !valid_position(anchor))

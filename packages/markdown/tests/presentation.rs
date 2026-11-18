@@ -7,7 +7,6 @@ use bmux_markdown::{
     parse_markdown_document_with, render_markdown,
 };
 use bmux_tui::prelude::{Line, Style};
-use unicode_segmentation::UnicodeSegmentation;
 
 /// Rendered rows without the trailing space word wrapping may leave.
 fn rows(result: &MarkdownRenderResult) -> Vec<String> {
@@ -42,7 +41,7 @@ fn displayed_in_rect(lines: &[Line], x: u16, y: u16, width: u16) -> String {
     let end = start + usize::from(width);
     let mut column = 0;
     let mut text = String::new();
-    for grapheme in line.plain_text().graphemes(true) {
+    for grapheme in bmux_unicode_segmentation::graphemes(&line.plain_text()) {
         if column >= start && column < end {
             text.push_str(grapheme);
         }

@@ -17,7 +17,7 @@ use bmux_tab_bar_plugin_api::{
     status_items::{StatusItemError, client::SetStatusItemRequest},
     status_items_list::{self, StatusItem, StatusItemSnapshot},
 };
-use unicode_segmentation::UnicodeSegmentation;
+
 use uuid::Uuid;
 
 /// Most items one plugin may keep on the bar at once.
@@ -244,9 +244,7 @@ fn sanitize(value: &str, maximum_graphemes: usize) -> String {
             }
         })
         .collect::<String>();
-    cleaned
-        .trim()
-        .graphemes(true)
+    bmux_unicode_segmentation::graphemes(cleaned.trim())
         .take(maximum_graphemes)
         .collect::<String>()
         .trim_end()
@@ -529,12 +527,9 @@ mod tests {
         store
             .set_item("a", item("long", &"y".repeat(200), 0))
             .unwrap();
-        assert!(
-            store
-                .list_items(None)
-                .iter()
-                .all(|item| item.text.graphemes(true).count() <= MAX_TEXT_GRAPHEMES)
-        );
+        assert!(store.list_items(None).iter().all(|item| {
+            bmux_unicode_segmentation::graphemes(&item.text).count() <= MAX_TEXT_GRAPHEMES
+        }));
         for index in 2..MAX_ITEMS_PER_OWNER {
             store
                 .set_item("a", item(&format!("i{index}"), "x", 0))

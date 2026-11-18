@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
-use unicode_segmentation::UnicodeSegmentation;
 
 /// Limits for retained terminal state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3549,7 +3548,7 @@ impl TerminalGrid {
         }
         let mut text = cell.text().to_owned();
         text.push(ch);
-        if text.graphemes(true).count() != 1 {
+        if bmux_unicode_segmentation::graphemes(&text).count() != 1 {
             return false;
         }
         let width = bmux_cell_geometry::grapheme_width(&text).max(1);
@@ -3937,7 +3936,7 @@ fn row_from_snapshot(snapshot: &RowSnapshot, width: usize) -> PhysicalRow {
     row.set_wrapped(snapshot.wrapped);
     for run in &snapshot.runs {
         let mut col = usize::from(run.start_col).min(width.saturating_sub(1));
-        for grapheme in run.text.graphemes(true) {
+        for grapheme in bmux_unicode_segmentation::graphemes(&run.text) {
             let char_width = bmux_cell_geometry::grapheme_width(grapheme);
             if char_width == 0 {
                 continue;

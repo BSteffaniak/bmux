@@ -11,18 +11,18 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_cell_geometry     = { workspace = true }
-bmux_color             = { workspace = true }
-bmux_keyboard          = { workspace = true, features = ["csi-u"] }
-bmux_terminal          = { workspace = true, optional = true }
-bmux_terminal_protocol = { workspace = true }
-bmux_text_edit         = { workspace = true, features = ["keyboard"] }
-futures-util           = { workspace = true, optional = true, features = ["std"] }
-image                  = { workspace = true, features = ["png", "jpeg", "gif", "bmp"] }
-serde                  = { workspace = true, optional = true, features = ["derive", "rc"] }
-serde_json             = { workspace = true }
-unicode-segmentation   = { workspace = true }
-zeroize                = { workspace = true, features = ["alloc"] }
+bmux_cell_geometry        = { workspace = true }
+bmux_color                = { workspace = true }
+bmux_keyboard             = { workspace = true, features = ["csi-u"] }
+bmux_terminal             = { workspace = true, optional = true }
+bmux_terminal_protocol    = { workspace = true }
+bmux_text_edit            = { workspace = true, features = ["keyboard"] }
+bmux_unicode_segmentation = { workspace = true }
+futures-util              = { workspace = true, optional = true, features = ["std"] }
+image                     = { workspace = true, features = ["png", "jpeg", "gif", "bmp"] }
+serde                     = { workspace = true, optional = true, features = ["derive", "rc"] }
+serde_json                = { workspace = true }
+zeroize                   = { workspace = true, features = ["alloc"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }

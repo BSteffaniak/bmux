@@ -298,11 +298,9 @@ impl SelectionFragment {
     /// Callers must bound source size/work before using this linear-time check.
     #[must_use]
     pub fn source_is_grapheme_aligned(&self, text: &str) -> bool {
-        use unicode_segmentation::UnicodeSegmentation as _;
         let boundary = |offset| {
             offset == text.len()
-                || text
-                    .grapheme_indices(true)
+                || bmux_unicode_segmentation::grapheme_indices(text)
                     .any(|(start, _)| start == offset)
         };
         let valid = |range: &Range<usize>| {
@@ -1611,8 +1609,6 @@ pub fn plain_text_fragments_with_tabs(
     revision: u64,
     tab_width: u16,
 ) -> Vec<SelectionFragment> {
-    use unicode_segmentation::UnicodeSegmentation;
-
     let scope_id = scope_id.into();
     let content_id = content_id.into();
     if source.is_empty() {
@@ -1633,7 +1629,7 @@ pub fn plain_text_fragments_with_tabs(
     let tab_width = tab_width.max(1);
     let mut x = area.x;
     let mut output = Vec::new();
-    for (byte_offset, grapheme) in source.grapheme_indices(true) {
+    for (byte_offset, grapheme) in bmux_unicode_segmentation::grapheme_indices(source) {
         let width = if grapheme == "\t" {
             let used = x.saturating_sub(area.x) % tab_width;
             tab_width.saturating_sub(used)
@@ -1742,13 +1738,11 @@ pub fn painted_text_fragments(
 /// all-zero-width row contributes one boundary unit over the available row.
 #[must_use]
 pub fn painted_text_cells(source: &str, source_offset: usize, width: u16) -> Vec<SelectionCell> {
-    use unicode_segmentation::UnicodeSegmentation;
-
     let mut x = 0_u16;
     let mut output: Vec<SelectionCell> = Vec::new();
     // Start of leading zero-width bytes not yet attached to a unit.
     let mut leading: Option<usize> = None;
-    for (byte_offset, grapheme) in source.grapheme_indices(true) {
+    for (byte_offset, grapheme) in bmux_unicode_segmentation::grapheme_indices(source) {
         let start = source_offset.saturating_add(byte_offset);
         let end = start.saturating_add(grapheme.len());
         let cells = crate::buffer::grapheme_width(grapheme);
@@ -2800,8 +2794,7 @@ mod tests {
     }
 
     fn buffer_width(text: &str) -> u16 {
-        use unicode_segmentation::UnicodeSegmentation;
-        text.graphemes(true)
+        bmux_unicode_segmentation::graphemes(text)
             .map(crate::buffer::grapheme_width)
             .sum()
     }

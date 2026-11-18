@@ -38,11 +38,15 @@ def check(path, table, section=()):
     for key, value in table.items():
         current = section + (key,)
         if key in {"dependencies", "dev-dependencies", "build-dependencies"}:
-            if current == ("workspace", "dependencies"):
-                continue
             for name, dependency in value.items():
                 spec = dependency if isinstance(dependency, dict) else {}
                 location = f"{path} [{'.'.join(current)}] {name}"
+                if spec.get("package", name) == "unicode-segmentation" and path not in {
+                    "tools/grapheme-oracle/Cargo.toml", "tools/grapheme-perf/Cargo.toml",
+                }:
+                    errors.append(f"{location}: segment text through bmux_unicode_segmentation")
+                if current == ("workspace", "dependencies"):
+                    continue
                 if spec.get("package", name) == "unicode-width":
                     errors.append(f"{location}: measure terminal cells through bmux_cell_geometry")
                 inherited = spec.get("workspace") is True

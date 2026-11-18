@@ -1,0 +1,15 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Unicode extended grapheme segmentation for bmux"
+edition     = { workspace = true }
+keywords    = ["bmux", "terminal", "grid", "unicode"]
+license     = { workspace = true }
+name        = "bmux_unicode_segmentation"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

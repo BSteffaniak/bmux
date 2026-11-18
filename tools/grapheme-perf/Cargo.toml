@@ -1,0 +1,13 @@
+[workspace]
+
+[package]
+name = "grapheme-perf-upstream"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+unicode-segmentation = { workspace = true }
+
+[workspace.dependencies]
+unicode-segmentation = "=1.13.3"

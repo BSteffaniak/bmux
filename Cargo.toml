@@ -89,6 +89,7 @@ members = [
     "packages/keyboard",
     "packages/terminal",
     "packages/cell-geometry",
+    "packages/unicode-segmentation",
     "packages/text-edit",
     "packages/tui",
     "packages/tui-components",
@@ -316,6 +317,7 @@ bmux_text_edit = { version = "0.0.1-alpha.4", default-features = false, path = "
 bmux_tui = { version = "0.0.1-alpha.4", default-features = false, path = "packages/tui" }
 bmux_tui_components = { version = "0.0.1-alpha.4", default-features = false, path = "packages/tui-components" }
 bmux_tui_runtime = { version = "0.0.1-alpha.4", default-features = false, path = "packages/tui-runtime" }
+bmux_unicode_segmentation = { version = "0.0.1-alpha.4", default-features = false, path = "packages/unicode-segmentation" }
 bmux_web_host = { version = "0.0.1-alpha.4", default-features = false, path = "packages/web-host" }
 bmux_web_renderer = { version = "0.0.1-alpha.4", default-features = false, path = "packages/web-renderer" }
 hyperchad_docs_config = { version = "0.5.0", default-features = false }
@@ -485,7 +487,6 @@ tracing-log = { version = "0.2.0", default-features = false }
 tracing-subscriber = { version = "0.3.23", default-features = false }
 trybuild = { version = "1.0.122" }
 ttf-parser = { version = "0.25.1", default-features = true }
-unicode-segmentation = { version = "1.13.3", default-features = false }
 uniffi = { version = "0.32.2" }
 uuid = { version = "1.29.0", default-features = false }
 wasm-bindgen = { version = "0.2.129" }
@@ -528,12 +529,13 @@ opt-level = 3
 # uses by their crates.io versions; resolve those to this workspace so one
 # copy of each is built.
 [patch.crates-io]
-bmux_cell_geometry  = { path = "packages/cell-geometry" }
-bmux_keyboard       = { path = "packages/keyboard" }
-bmux_terminal       = { path = "packages/terminal" }
-bmux_text_edit      = { path = "packages/text-edit" }
-bmux_tui            = { path = "packages/tui" }
-bmux_tui_components = { path = "packages/tui-components" }
+bmux_cell_geometry        = { path = "packages/cell-geometry" }
+bmux_keyboard             = { path = "packages/keyboard" }
+bmux_terminal             = { path = "packages/terminal" }
+bmux_text_edit            = { path = "packages/text-edit" }
+bmux_tui                  = { path = "packages/tui" }
+bmux_tui_components       = { path = "packages/tui-components" }
+bmux_unicode_segmentation = { path = "packages/unicode-segmentation" }
 
 # [patch."https://github.com/MoosicBox/MoosicBox"]
 # moosicbox_log_runtime = { path = "../MoosicBox/packages/log_runtime" }

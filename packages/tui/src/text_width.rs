@@ -1,7 +1,5 @@
 //! Unicode-aware terminal text measurement and wrapping helpers.
 
-use unicode_segmentation::UnicodeSegmentation;
-
 /// Return the display width of a string in terminal cells.
 #[must_use]
 pub fn display_width(text: &str) -> usize {
@@ -76,7 +74,7 @@ pub fn truncate_to_display_width(text: &str, width: usize) -> String {
     let body_width = width.saturating_sub(1);
     let mut used = 0usize;
     let mut body_end = None;
-    for (index, grapheme) in text.grapheme_indices(true) {
+    for (index, grapheme) in bmux_unicode_segmentation::grapheme_indices(text) {
         let grapheme_width = display_width(grapheme);
         if body_end.is_none() && used.saturating_add(grapheme_width) > body_width {
             body_end = Some(index);
@@ -102,8 +100,11 @@ mod tests {
 
     /// The measure-everything implementation the early-exit one replaced.
     fn reference_truncate(text: &str, width: usize) -> String {
-        use unicode_segmentation::UnicodeSegmentation;
-        if text.graphemes(true).map(display_width).sum::<usize>() <= width {
+        if bmux_unicode_segmentation::graphemes(text)
+            .map(display_width)
+            .sum::<usize>()
+            <= width
+        {
             return text.to_owned();
         }
         if width <= 1 {
@@ -111,7 +112,7 @@ mod tests {
         }
         let mut output = String::new();
         let mut used = 0;
-        for grapheme in text.graphemes(true) {
+        for grapheme in bmux_unicode_segmentation::graphemes(text) {
             let grapheme_width = display_width(grapheme);
             if used + grapheme_width > width - 1 {
                 output.push('…');
@@ -210,13 +211,12 @@ mod tests {
         use crate::buffer::Buffer;
         use crate::geometry::Rect;
         use crate::text::Line;
-        use unicode_segmentation::UnicodeSegmentation;
 
         let text = "a界e\u{301}\u{200b}\t👨‍👩‍👧‍👦x";
         let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 1));
         buffer.write_line(Rect::new(0, 0, 20, 1), &Line::raw(text));
         let mut column = 0_u16;
-        for grapheme in text.graphemes(true) {
+        for grapheme in bmux_unicode_segmentation::graphemes(text) {
             let width = super::painted_grapheme_width(grapheme);
             if width > 0 {
                 let painted = buffer

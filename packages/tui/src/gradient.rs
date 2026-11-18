@@ -6,7 +6,6 @@
 //! unaffected because coloring never changes graphemes.
 
 use bmux_color::{Rgb, mix};
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::style::{Color, Style};
 use crate::text::{Line, Span};
@@ -77,7 +76,7 @@ impl ColorGradient {
 /// unstyled text. Empty text yields an empty line.
 #[must_use]
 pub fn gradient_line(text: &str, gradient: ColorGradient, base: Style) -> Line {
-    let graphemes: Vec<&str> = text.graphemes(true).collect();
+    let graphemes: Vec<&str> = bmux_unicode_segmentation::graphemes(text).collect();
     let span = u64::try_from(graphemes.len().saturating_sub(1)).unwrap_or(u64::MAX);
     Line::from_spans(
         graphemes

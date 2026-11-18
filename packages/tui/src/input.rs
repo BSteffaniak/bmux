@@ -3,7 +3,6 @@
 use std::hash::{Hash, Hasher};
 
 use bmux_text_edit::{TextEditBuffer, TextSelection};
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::component::{
     Component, ComponentRevision, Constraints, LayoutCx, LayoutId, LayoutNode, LogicalSize,
@@ -293,7 +292,9 @@ fn selected_wrapped_lines(
         .take(rows.end.saturating_sub(rows.start))
         .map(|range| {
             let mut line = Line::new();
-            for (offset, grapheme) in text[range.clone()].grapheme_indices(true) {
+            for (offset, grapheme) in
+                bmux_unicode_segmentation::grapheme_indices(&text[range.clone()])
+            {
                 let start = range.start.saturating_add(offset);
                 let style = if selection_contains(selection, start) {
                     base_style.patch(selection_style)
