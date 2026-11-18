@@ -191,8 +191,8 @@ let chrome = Pane::new()
 `Pane::action_group(group, actions)` appends actions drawn as one cluster:
 `PaneTitleGroup` gives the `start` cap, the `separator` between members and the
 `end` cap (`PaneTitleGroup::joined()` is `┤ `, ` `, ` ├`), with no border
-between members. The pieces are layered over the border, so unstyled caps keep
-the border's colours and join its line; a group keeps one border cell before
+between members. Unstyled pieces change only the border cells' symbols, so the
+caps keep the border's colours and join its line; a group keeps one border cell before
 the corner. Members are ordinary actions with their own hit regions and drop
 leftmost first; the caps stay while any member shows. Their geometry is
 `PaneTitleLayout::groups`. `PaneTitleAction::hover_style` layers a style over

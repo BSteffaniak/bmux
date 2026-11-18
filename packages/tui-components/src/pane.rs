@@ -314,8 +314,9 @@ impl PaneTitleAction {
 ///
 /// `start` goes before its first visible member, `separator` between neighbours and `end`
 /// after its last, with no border between them.
-/// The pieces are layered over the border, so spans without colours keep the border's (a
-/// focus gradient included): a cap such as `┤` joins the border line it interrupts. A group
+/// Spans without a style change only the symbols of the border cells beneath, so they keep
+/// the border's colours (a focus gradient included): a cap such as `┤` joins the border line
+/// it interrupts. A group
 /// keeps one border cell after it, so its end cap never touches the corner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneTitleGroup {
@@ -1180,13 +1181,36 @@ impl PaneComponent<'_, '_> {
                 );
             }
         };
+        // Unstyled pieces of a group keep the border's own cell styles, whatever is inherited.
+        let piece = |cx: &mut PaintCx<'_, '_>, area: Rect, line: &Line| {
+            let mut x = i32::from(area.x);
+            let end = x.saturating_add(i32::from(area.width));
+            for span in &line.spans {
+                let width = i32::try_from(span.width()).unwrap_or(i32::MAX);
+                let room = u16::try_from(end.saturating_sub(x).max(0)).unwrap_or(0);
+                if room == 0 {
+                    break;
+                }
+                if span.style == Style::default() {
+                    cx.with_child(0, 0, LocalRect::new(x, i64::from(area.y), room, 1), |cx| {
+                        cx.write_symbols(x, i64::from(area.y), &span.content);
+                    });
+                } else {
+                    cx.write_line(
+                        LocalRect::new(x, i64::from(area.y), room, 1),
+                        &Line::from_spans(vec![span.clone()]),
+                    );
+                }
+                x = x.saturating_add(width);
+            }
+        };
         for placed in &title_row.groups {
             let group = &self.pane.groups[placed.group].0;
-            write(cx, placed.start, &group.start);
+            piece(cx, placed.start, &group.start);
             for area in &placed.separators {
-                write(cx, *area, &group.separator);
+                piece(cx, *area, &group.separator);
             }
-            write(cx, placed.end, &group.end);
+            piece(cx, placed.end, &group.end);
         }
         for (index, area) in title_row.actions {
             let action = &self.pane.actions[index];
@@ -2448,6 +2472,22 @@ mod tests {
         let (buffer, _) = rendered(pane(Some("min")), 10);
         assert_eq!(fg(&buffer, 3), Some(Color::Green));
         assert_eq!(fg(&buffer, 5), Some(Color::Red));
+        // Under an inherited style with its own colours (an application canvas), the caps
+        // still take the border's.
+        let state = Cell::new(PaneState::new(Rect::new(0, 0, 10, 3)));
+        let component = PaneComponent::new("pane", pane(None), &state, TextBlock::new(""));
+        let layout = component.layout(Constraints::new(10, 10, 3, Some(3)), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 3));
+        let mut frame = Frame::new(&mut buffer);
+        PaintCx::new(&mut frame).with_style(Style::new().fg(Color::Default), |cx| {
+            component.paint(&layout, cx);
+        });
+        drop(frame);
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("┌┤ ▾ × ├─┐"));
+        for x in [1, 7] {
+            assert_eq!(fg(&buffer, x), Some(Color::Red), "{x}");
+        }
+        assert_eq!(fg(&buffer, 3), Some(Color::Blue));
         // Hovering changes the paint revision only; the layout stays.
         let state = Cell::new(PaneState::new(Rect::new(0, 0, 10, 3)));
         let revision = |hovered| {
