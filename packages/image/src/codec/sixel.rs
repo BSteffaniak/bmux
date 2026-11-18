@@ -6,6 +6,8 @@
 //! with `#` directives.  The data consists of characters in the range
 //! `0x3F`..`0x7E`, each representing a 6-bit column of pixels.
 
+use std::io::Write as _;
+
 use crate::model::{ImagePixelSize, PixelBuffer, PixelFormat};
 
 /// Estimate the pixel dimensions of a sixel image from its raw body data
@@ -293,7 +295,8 @@ pub fn encode_cancellable(
     let mut out = Vec::with_capacity(pixel_count);
 
     // Raster attributes: Pan=1; Pad=1; Ph=width; Pv=height
-    out.extend_from_slice(format!("\"1;1;{};{}", width, height).as_bytes());
+    // Formatting straight into `out` (a Vec, which cannot fail to write) allocates nothing.
+    let _ = write!(out, "\"1;1;{width};{height}");
 
     // Build a simple 216-color palette (6x6x6 RGB cube).
     for r in 0..6u8 {
@@ -304,7 +307,7 @@ pub fn encode_cancellable(
                 let rp = (r as u32) * 100 / 5;
                 let gp = (g as u32) * 100 / 5;
                 let bp = (b as u32) * 100 / 5;
-                out.extend_from_slice(format!("#{idx};2;{rp};{gp};{bp}").as_bytes());
+                let _ = write!(out, "#{idx};2;{rp};{gp};{bp}");
             }
         }
     }
@@ -328,7 +331,7 @@ pub fn encode_cancellable(
             if band_has_output {
                 out.push(b'$'); // Carriage return (same band, different color).
             }
-            out.extend_from_slice(format!("#{color_idx}").as_bytes());
+            let _ = write!(out, "#{color_idx}");
 
             // Emit sixel characters with run-length encoding.
             let mut i = 0;
@@ -345,7 +348,7 @@ pub fn encode_cancellable(
                     run += 1;
                 }
                 if run > 3 {
-                    out.extend_from_slice(format!("!{run}").as_bytes());
+                    let _ = write!(out, "!{run}");
                     out.push(sixel_char);
                 } else {
                     for _ in 0..run {
