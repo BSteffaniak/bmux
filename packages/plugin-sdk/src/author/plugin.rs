@@ -1019,7 +1019,8 @@ impl<P: Plugin> DeclaredInstance<P> {
                 activate(plugin, native, runtime)
             })
         });
-        self.run_activation(self.activation(context, tasks)?).await?;
+        self.run_activation(self.activation(context, tasks)?)
+            .await?;
         let result = match blocking {
             Some(work) => work.await,
             None => Ok(()),
@@ -1331,7 +1332,6 @@ impl<P: Plugin> PluginInstance for DeclaredInstance<P> {
         }
         Ok(())
     }
-
 }
 
 /// A plugin crate as test harnesses load it, emitted by [`crate::plugin!`]
@@ -1454,47 +1454,60 @@ macro_rules! plugin {
                 ::core::concat!(::core::env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
             )
         }
-        $crate::__plugin_dylib_entry!();
+        $crate::packaged_entry!(plugin_definition);
     };
 }
 
-/// The packaged entry symbol for the role the packager selected.
+/// Export `definition` as this crate's packaged plugin entry.
 ///
-/// `--cfg bmux_plugin_dylib` is evaluated here, in the SDK (the packager sets
-/// it for every crate of the build), so plugin crates never name the cfg;
-/// they only declare the `dynamic-backend`/`dynamic-frontend` role features.
+/// [`plugin!`] calls this for `impl Plugin` crates. Product author layers
+/// that build a [`PluginDefinition`](crate::definition::PluginDefinition)
+/// themselves call it from their own macro with the path of a
+/// `fn() -> PluginDefinition`, and get the same packaged entry:
+///
+/// ```ignore
+/// fn my_definition() -> bmux_plugin_sdk::definition::PluginDefinition { /* ... */ }
+/// bmux_plugin_sdk::packaged_entry!(my_definition);
+/// ```
+///
+/// The crate declares the `dynamic-backend`/`dynamic-frontend` role features
+/// and is built by the plugin packager, which selects one role and sets
+/// `--cfg bmux_plugin_dylib` for the whole build. That cfg is evaluated here,
+/// in the SDK, so crates never name it; the role features are evaluated in
+/// the calling crate. Every other build (workspace, bundled, tests) exports
+/// nothing.
 #[cfg(bmux_plugin_dylib)]
-#[doc(hidden)]
 #[macro_export]
-macro_rules! __plugin_dylib_entry {
-    () => {
+macro_rules! packaged_entry {
+    ($definition:path $(,)?) => {
         #[cfg(all(feature = "dynamic-backend", feature = "dynamic-frontend"))]
         ::core::compile_error!(
             "a dynamic library packages one component: enable either `dynamic-backend` or `dynamic-frontend`"
         );
         #[cfg(all(feature = "dynamic-backend", not(feature = "dynamic-frontend")))]
-        $crate::__plugin_dylib_export!(Backend);
+        $crate::__plugin_dylib_export!($definition, Backend);
         #[cfg(all(feature = "dynamic-frontend", not(feature = "dynamic-backend")))]
-        $crate::__plugin_dylib_export!(Frontend);
+        $crate::__plugin_dylib_export!($definition, Frontend);
     };
 }
 
+/// Export `definition` as this crate's packaged plugin entry.
+///
 /// Without `--cfg bmux_plugin_dylib` (every workspace and bundled build)
-/// nothing is exported.
+/// nothing is exported; see the packaged variant for details.
 #[cfg(not(bmux_plugin_dylib))]
-#[doc(hidden)]
 #[macro_export]
-macro_rules! __plugin_dylib_entry {
-    () => {};
+macro_rules! packaged_entry {
+    ($definition:path $(,)?) => {};
 }
 
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __plugin_dylib_export {
-    ($role:ident) => {
+    ($definition:path, $role:ident) => {
         const _: () = {
             fn __bmux_packaged_definition() -> $crate::definition::PluginDefinition {
-                $crate::author::packaged(plugin_definition(), $crate::ComponentRole::$role)
+                $crate::author::packaged($definition(), $crate::ComponentRole::$role)
             }
             $crate::export_plugin_entrypoint!(__bmux_packaged_definition);
             // The packager's build label, retained in the artifact bytes (the
