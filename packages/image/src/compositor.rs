@@ -540,7 +540,9 @@ impl KittyHostState {
         // ACK/deadline or an explicit physical-connection abort.
         self.repair_ids.extend(self.resources.values().copied());
         self.emit_repair(out)?;
-        self.cache.clear();
+        // The cache holds content only (decoded sources, prepared and encoded fragments, keyed by
+        // host protocol and cell size), never host resources: it outlives a reset, so a raster
+        // image repaired after the screen is cleared is written again without re-encoding.
         Ok(())
     }
 
@@ -1191,4 +1193,3 @@ fn pixels_as_png(pixels: &crate::model::PixelBuffer) -> std::io::Result<Vec<u8>>
         .map_err(std::io::Error::other)?;
     Ok(png)
 }
-

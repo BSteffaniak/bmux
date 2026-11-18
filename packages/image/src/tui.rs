@@ -3021,6 +3021,50 @@ mod tests {
         }
     }
 
+    /// A raster image that moves, staying whole inside its clip, is written again from the
+    /// encoding it already has, after the screen is cleared to repair its old footprint: neither
+    /// decoded nor prepared again.
+    #[cfg(feature = "sixel")]
+    #[test]
+    fn a_moved_raster_image_reuses_its_encoding() {
+        let terminal = PaneRect {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 10,
+        };
+        let caps = HostImageCapabilities {
+            sixel: true,
+            cell_pixel_width: 8,
+            cell_pixel_height: 16,
+            ..HostImageCapabilities::default()
+        };
+        let mut compositor = TuiImageCompositor::new();
+        for x in [2, 3, 4, 3] {
+            let mut scene = ImageScene::default();
+            scene.reconcile(&[ImageContribution::Present(placement(
+                "moving",
+                Rect::new(x, 1, 4, 2),
+                Rect::new(0, 0, 40, 10),
+                1,
+            ))]);
+            let mut output = Vec::new();
+            compositor.prepare_output(&mut output).unwrap();
+            compositor
+                .render(
+                    &mut output,
+                    &scene,
+                    terminal,
+                    &caps,
+                    &ImageConfig::default(),
+                )
+                .unwrap();
+            assert!(String::from_utf8_lossy(&output).contains("\u{1b}Pq"));
+        }
+        let (_, decodes, preparations) = compositor.work_counts();
+        assert_eq!((decodes, preparations), (1, 1));
+    }
+
     #[cfg(feature = "kitty")]
     #[test]
     fn places_each_image_at_its_layer() {
