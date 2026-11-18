@@ -101,9 +101,17 @@
             "wasm32-unknown-unknown"
           ];
         };
+        # LLVM's profiling tools (llvm-profdata, llvm-cov) of the same Rust release, for reading the
+        # execution counts of coverage-instrumented builds (scripts/perf-render.py work). Kept out of
+        # the dev shell's toolchain so its store path, and the cargo target directory named after
+        # it, do not change.
+        llvmTools = pkgs.rust-bin.stable.latest.default.override {
+          extensions = [ "llvm-tools-preview" ];
+        };
       in
       {
         packages.rust-toolchain = rustToolchain;
+        packages.llvm-tools = llvmTools;
         # Native non-Nix CI can consume this value instead of floating rustup stable.
         rustVersion = rustToolchain.version;
         devShells.default = pkgs.mkShell {

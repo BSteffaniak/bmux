@@ -1,11 +1,21 @@
 # Render path performance: reproducible metrics
 
 Wall time on a developer machine moves with load more than the differences worth measuring, so
-the render path is measured by numbers that do not: **allocations and allocated bytes** per frame
-and phase, and **bytes written** to the host terminal per frame. They repeat exactly between runs
-of the same code, so CI fails on any increase. **Instructions retired** are reported too, for A/B
-comparisons on one machine; they differ between machines and never gate. Latency on a real
-terminal (`bmux-bench replay`) is the last check, not the gate.
+the render path is measured by numbers that do not:
+
+- **Allocations and allocated bytes** per frame and phase, and **bytes written** to the host
+  terminal per frame: exact, run to run and machine to machine.
+- **Units of work** per frame: every function entry and counted region a scenario executes, from
+  a coverage-instrumented build. Exact on any machine and OS, with a per-function profile that
+  says which code does the work and how often it runs.
+- **Instructions retired** per frame and phase: each scenario runs three times and each frame
+  keeps its fewest instructions, which strips interrupts and other noise (they only ever add).
+  Run to run they differ by about 0.01% (0.07% at worst); they are tied to the architecture and
+  toolchain, so baselines are per OS.
+
+All three gate: CI fails on any increase. Latency on a real terminal (`bmux-bench replay`) is the
+last check, not the gate. None of it touches application code: the counting allocator, probes and
+instrumentation live in the benchmarks, `bmux_bench` and `scripts/perf-render.py`.
 
 ## What is measured
 
@@ -24,28 +34,42 @@ growing through the second half: history, caches, retained images and the image 
 bounded.
 
 The primitives are in `bmux_bench`: `allocations` (a counting global allocator, per-thread counts,
-process-wide live and peak bytes), `instructions` (`perf_event_open` on Linux, `proc_pid_rusage`
-on macOS) and `metrics` (per-phase recording, the JSON report, comparison against a baseline).
+process-wide live and peak bytes), `instructions` (`perf_event_open` on Linux, counting this
+thread's user-space instructions; `proc_pid_rusage` on macOS, which counts kernel instructions too,
+so the minimum across repeats matters there), `metrics` (per-phase recording, repeats, the JSON
+report, comparison against a baseline) and `work` (reading coverage profiles into units of work).
 
 ## Running
 
 From the repository root, in the Nix shell:
 
 ```sh
-scripts/perf-render.py check            # gate against docs/perf-baselines/render/<bench>-<os>.json
-scripts/perf-render.py check --soak     # and the memory soaks (what CI runs)
-scripts/perf-render.py update           # rewrite this OS's baselines after an improvement
-scripts/perf-render.py compare master   # A/B: master against HEAD, every metric and its change
+scripts/perf-render.py check                  # gate against docs/perf-baselines/render/<bench>-<os>.json
+scripts/perf-render.py check --soak --work    # and the memory soaks and units of work (what CI runs)
+scripts/perf-render.py update [--work]        # rewrite this OS's baselines after an improvement
+scripts/perf-render.py compare master         # A/B: master against HEAD, every metric and its change
+scripts/perf-render.py work --scenario full-repaint --top 20   # where a scenario's work goes
 ```
 
 A check prints `improved (the baseline can be lowered)` when a number drops well below its
-baseline; commit the updated baseline with the change so the gain cannot be lost. A tolerance of
-1% (or one allocation) absorbs small differences between platforms' standard libraries. Baselines
-are per OS; CI uploads its reports, and a missing Linux baseline is taken from that artifact.
+baseline; commit the updated baseline with the change so the gain cannot be lost. Allocations and
+bytes allow 1% (or one allocation) for differences between platforms' standard libraries;
+instructions allow 0.5% plus 1,000 per frame; units of work allow 0.2%. Baselines are per OS; CI
+uploads its reports, and a missing Linux baseline is taken from that artifact. A machine whose
+instruction counts legitimately differ from the baseline's runs with `BMUX_BENCH_GATE_INSTRUCTIONS=0`.
 
-To find where allocations come from, profile a scenario with
-[dhat](https://docs.rs/dhat) or Instruments; `pipeline_bench_loop` replays one corpus for
-external profilers.
+Units of work come from a build with `-C instrument-coverage` in its own target directory
+(`$CARGO_TARGET_DIR-coverage`), one process per scenario (`BMUX_BENCH_ONLY`, one repeat), read with
+`llvm-profdata` of the same toolchain: `LLVM_PROFDATA`, the toolchain's `llvm-tools-preview`
+component, or the flake's `llvm-tools` package (kept out of the dev shell so its toolchain, and the
+target directory named after it, stay as they are). The benchmark library and modules are left out
+of the counts. Units count executions, not instructions: they say what ran and how often, and
+instructions say what it cost.
+
+To find where time goes beyond counts (cache misses, memory waits), sample a scenario with
+[samply](https://github.com/mstange/samply) or Instruments; to find where allocations come from,
+use [dhat](https://docs.rs/dhat). `pipeline_bench_loop` replays one corpus (or, with
+`BMUX_BENCH_IMAGE`, an image scenario) for external profilers.
 
 ## Results
 

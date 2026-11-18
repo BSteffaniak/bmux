@@ -380,9 +380,9 @@ jobs:
         if: ${{ steps.changes.outputs.run != 'true' }}
         run: echo "Skipping plugin runtime perf gates (no plugin/runtime touching changes)."
 
-  # Allocations and bytes written per frame repeat exactly between runs, so any growth against
-  # docs/perf-baselines/render fails (docs/development/render-performance.md). Without a Linux
-  # baseline the reports are only uploaded, to commit as one.
+  # Allocations, bytes written and units of work per frame repeat exactly between runs, so any
+  # growth against docs/perf-baselines/render fails (docs/development/render-performance.md).
+  # Without Linux baselines the reports are only uploaded, to commit as them.
   render-metrics:
     name: Render Metrics
     runs-on: ubuntu-latest
@@ -396,10 +396,12 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ needs.rust-version.outputs.version }}
+          # llvm-profdata reads the coverage-instrumented builds' units of work.
+          components: llvm-tools-preview
 
-      - name: Render metrics gate and memory soak
+      - name: Render metrics, units of work and memory soak
         shell: bash
-        run: python3 scripts/perf-render.py check --soak --out "$RUNNER_TEMP/render-metrics"
+        run: python3 scripts/perf-render.py check --soak --work --out "$RUNNER_TEMP/render-metrics"
 
       - name: Upload render metrics
         if: always()

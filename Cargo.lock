@@ -1646,6 +1646,7 @@ dependencies = [
  "bmux_terminal_grid",
  "bmux_tui",
  "libc",
+ "rustc-demangle",
  "serde",
  "serde_json",
  "sha2 0.11.1",

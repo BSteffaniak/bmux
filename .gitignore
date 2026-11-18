@@ -42,3 +42,6 @@ infra/wrangler/.wrangler/
 __pycache__/
 
 .claude/
+
+# Coverage profiles (scripts/perf-render.py work)
+*.profraw
