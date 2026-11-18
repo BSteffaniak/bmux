@@ -125,7 +125,10 @@ const WARMUP: usize = 30;
 /// metadata filtering, terminal-mode tracking, the grid parse with the push into the output
 /// buffer, and the protocol replies (with the image registry built in, the image interceptor and
 /// registry, which produce the replies, instead).
-fn ingest(name: &str, (cols, rows): (u16, u16), frames: &[Frame]) -> Scenario {
+fn ingest_once(
+    (cols, rows): (u16, u16),
+    frames: &[Frame],
+) -> (BTreeMap<String, PhaseRecorder>, u64, i64) {
     let probe = Probe::new();
     let grid =
         Mutex::new(TerminalGridStream::new(cols, rows, GridLimits::default()).expect("grid"));
@@ -204,7 +207,29 @@ fn ingest(name: &str, (cols, rows): (u16, u16), frames: &[Frame]) -> Scenario {
     }
     let live_growth = i64::try_from(bmux_bench::allocations::live_bytes()).unwrap_or(i64::MAX)
         - i64::try_from(live_after_warmup).unwrap_or(i64::MAX);
-    Scenario {
+    (stages, measured, live_growth)
+}
+
+/// Measure scenario `name` (when selected, see [`bmux_bench::metrics::selected`]): read through a
+/// fresh reader [`bmux_bench::metrics::repeats`] times, which must allocate identically, each
+/// frame keeping its fewest instructions.
+fn ingest(name: &str, size: (u16, u16), frames: &[Frame]) -> Option<Scenario> {
+    if !bmux_bench::metrics::selected(name) {
+        return None;
+    }
+    let (mut stages, measured, live_growth) = ingest_once(size, frames);
+    for _ in 1..bmux_bench::metrics::repeats() {
+        let (repeat, _, _) = ingest_once(size, frames);
+        for (stage, recorder) in &mut stages {
+            let other = repeat
+                .get(stage)
+                .unwrap_or_else(|| panic!("{name}: stage {stage} missing from a repeat"));
+            recorder
+                .fold_repeat(other)
+                .unwrap_or_else(|error| panic!("{name} {stage}: {error}"));
+        }
+    }
+    Some(Scenario {
         name: name.to_owned(),
         frames: measured,
         phases: stages
@@ -213,7 +238,7 @@ fn ingest(name: &str, (cols, rows): (u16, u16), frames: &[Frame]) -> Scenario {
             .collect(),
         output_bytes_per_frame: 0,
         live_growth_bytes: live_growth,
-    }
+    })
 }
 
 /// Text streaming with a 64×64 Kitty image (raw RGBA, transmitted and shown at once) every 30
@@ -276,11 +301,11 @@ fn ingest_metrics() {
     for corpus in corpus::generated(size, 300) {
         report
             .scenarios
-            .push(ingest(corpus.name, corpus.size, &corpus.frames));
+            .extend(ingest(corpus.name, corpus.size, &corpus.frames));
     }
     report
         .scenarios
-        .push(ingest("kitty-images", size, &kitty_images(size, 300)));
+        .extend(ingest("kitty-images", size, &kitty_images(size, 300)));
     for scenario in &report.scenarios {
         let stages: Vec<String> = scenario
             .phases

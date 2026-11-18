@@ -4,8 +4,9 @@
 //! A benchmark measures each phase of each frame with a [`Probe`], keeps the samples in a
 //! [`PhaseRecorder`] per phase, and reports a [`Scenario`] per workload. Allocation counts and
 //! bytes written do not depend on machine load or speed, so a [`Report`] compared against a
-//! committed baseline ([`Report::regressions`]) fails on any increase; instructions retired are
-//! reported for local A/B comparison but never gate, since they differ between machines.
+//! committed baseline ([`Report::regressions`]) fails on any increase. Instructions retired are
+//! near-exact too once each frame keeps its fewest across repeats (interrupts and other noise only
+//! add), and gate within 0.5% where both reports counted them.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -94,19 +95,54 @@ pub struct Cost {
 pub struct PhaseRecorder {
     allocations: Vec<u64>,
     bytes: u64,
-    instructions: Option<u64>,
+    /// Each frame's instructions, while every frame had a count.
+    instructions: Option<Vec<u64>>,
 }
 
 impl PhaseRecorder {
     /// Record one frame's cost of this phase.
     pub fn record(&mut self, cost: Cost) {
+        let first = self.allocations.is_empty();
         self.allocations.push(cost.allocations.count);
         self.bytes += cost.allocations.bytes;
-        self.instructions = match (self.instructions, cost.instructions) {
-            (None, Some(instructions)) if self.allocations.len() == 1 => Some(instructions),
-            (Some(total), Some(instructions)) => Some(total + instructions),
+        match (cost.instructions, &mut self.instructions) {
+            (Some(count), None) if first => self.instructions = Some(vec![count]),
+            (Some(count), Some(counts)) => counts.push(count),
+            _ => self.instructions = None,
+        }
+    }
+
+    /// Fold in a repeat of the same frames: their allocations must be identical (the workload is
+    /// deterministic), and each frame keeps its fewest instructions, which strips what interrupts
+    /// and other noise added (they only ever add).
+    ///
+    /// # Errors
+    /// Returns why the repeat is not the same work: a different number of frames, or different
+    /// allocations.
+    pub fn fold_repeat(&mut self, repeat: &Self) -> Result<(), String> {
+        if self.allocations != repeat.allocations || self.bytes != repeat.bytes {
+            let frame = self
+                .allocations
+                .iter()
+                .zip(&repeat.allocations)
+                .position(|(a, b)| a != b);
+            return Err(format!(
+                "allocations differ between repeats ({} vs {} frames, first difference at frame \
+                 {frame:?}): the workload is not deterministic",
+                self.allocations.len(),
+                repeat.allocations.len()
+            ));
+        }
+        self.instructions = match (self.instructions.take(), &repeat.instructions) {
+            (Some(mut counts), Some(other)) => {
+                for (count, other) in counts.iter_mut().zip(other) {
+                    *count = (*count).min(*other);
+                }
+                Some(counts)
+            }
             _ => None,
         };
+        Ok(())
     }
 
     /// The phase's metrics over the frames recorded.
@@ -118,9 +154,32 @@ impl PhaseRecorder {
             allocations_per_frame: per_frame(total, frames),
             max_allocations: self.allocations.iter().copied().max().unwrap_or(0),
             allocated_bytes_per_frame: self.bytes / frames,
-            instructions_per_frame: self.instructions.map(|total| total / frames),
+            instructions_per_frame: self
+                .instructions
+                .as_ref()
+                .map(|counts| counts.iter().sum::<u64>() / frames),
         }
     }
+}
+
+/// How many times each scenario runs (`BMUX_BENCH_REPEATS`, 3 by default): instructions are each
+/// frame's fewest across the repeats, and the repeats must allocate identically.
+#[must_use]
+pub fn repeats() -> usize {
+    std::env::var("BMUX_BENCH_REPEATS")
+        .ok()
+        .and_then(|repeats| repeats.parse().ok())
+        .unwrap_or(3)
+        .max(1)
+}
+
+/// Whether scenario `name` runs: every scenario, unless `BMUX_BENCH_ONLY` lists the names to run
+/// (comma-separated), as a profiler running one scenario per process sets it.
+#[must_use]
+pub fn selected(name: &str) -> bool {
+    std::env::var("BMUX_BENCH_ONLY").map_or(true, |only| {
+        only.split(',').any(|selected| selected.trim() == name)
+    })
 }
 
 /// `total / frames`, to two decimal places (what a report keeps).
@@ -262,6 +321,19 @@ fn grew(actual: f64, expected: f64) -> bool {
     actual > expected.mul_add(1.0 + TOLERANCE, 1.0)
 }
 
+/// How much instructions per frame may exceed their baseline: they repeat to within a few
+/// hundredths of a percent on one machine once each frame keeps its fewest across repeats.
+const INSTRUCTION_TOLERANCE: f64 = 0.005;
+/// Instructions per frame any phase may grow by, however small: a phase that does almost nothing
+/// (a frame deferred, say) varies by a few hundred instructions between runs.
+const INSTRUCTION_SLACK: f64 = 1000.0;
+
+/// Whether instruction counts gate (`BMUX_BENCH_GATE_INSTRUCTIONS=0` turns it off, for a machine
+/// whose counts legitimately differ from the baseline's).
+fn instructions_gate() -> bool {
+    std::env::var("BMUX_BENCH_GATE_INSTRUCTIONS").map_or(true, |gate| gate != "0")
+}
+
 /// The gated numbers of `actual` that grew past `expected`'s, as messages.
 fn compare_scenario(actual: &Scenario, expected: &Scenario) -> Vec<String> {
     let name = &expected.name;
@@ -286,6 +358,17 @@ fn compare_scenario(actual: &Scenario, expected: &Scenario) -> Vec<String> {
             after.allocated_bytes_per_frame as f64,
             before.allocated_bytes_per_frame as f64,
         ));
+        // Compared only when both reports counted them (a machine without a counter has none).
+        if let (Some(after), Some(before)) =
+            (after.instructions_per_frame, before.instructions_per_frame)
+            && instructions_gate()
+            && after as f64
+                > (before as f64).mul_add(1.0 + INSTRUCTION_TOLERANCE, INSTRUCTION_SLACK)
+        {
+            regressions.push(format!(
+                "{name}: {phase} instructions per frame grew from {before} to {after}"
+            ));
+        }
     }
     regressions.extend(
         checks
@@ -321,6 +404,28 @@ mod tests {
                 live_growth_bytes: 0,
             }],
         }
+    }
+
+    #[test]
+    fn repeats_keep_each_frames_fewest_instructions_and_must_allocate_alike() {
+        use super::{Cost, PhaseRecorder};
+        use crate::allocations::Allocations;
+        let frame = |count, instructions| Cost {
+            allocations: Allocations { count, bytes: 8 },
+            instructions: Some(instructions),
+        };
+        let mut first = PhaseRecorder::default();
+        first.record(frame(2, 100));
+        first.record(frame(3, 205));
+        let mut repeat = PhaseRecorder::default();
+        repeat.record(frame(2, 104));
+        repeat.record(frame(3, 200));
+        first.fold_repeat(&repeat).unwrap();
+        assert_eq!(first.finish().instructions_per_frame, Some(150));
+        let mut different = PhaseRecorder::default();
+        different.record(frame(2, 100));
+        different.record(frame(4, 200));
+        assert!(first.fold_repeat(&different).is_err());
     }
 
     #[test]

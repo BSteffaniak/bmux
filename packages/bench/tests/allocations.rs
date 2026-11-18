@@ -5,8 +5,18 @@ use bmux_bench::allocations::{self, Allocations, CountingAllocator};
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
+/// Live bytes are process-wide: tests measuring them must not overlap the others' allocations.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[test]
 fn measures_what_work_on_this_thread_allocates() {
+    let _serial = serial();
     assert!(allocations::installed());
     let ((), none) = allocations::measure(|| {
         std::hint::black_box(1 + 1);
@@ -35,17 +45,24 @@ fn measures_what_work_on_this_thread_allocates() {
 
 #[test]
 fn live_and_peak_bytes_follow_allocations_and_frees() {
+    let _serial = serial();
     allocations::reset_peak();
     let before = allocations::live_bytes();
     let block = std::hint::black_box(vec![0_u8; 1 << 20]);
-    assert!(allocations::peak_bytes() >= before + (1 << 20));
+    let peak = allocations::peak_bytes();
     drop(block);
-    // Other tests may allocate concurrently; a megabyte freed shows anyway.
-    assert!(allocations::live_bytes() < before + (1 << 19));
+    let after = allocations::live_bytes();
+    // Process-wide: the test harness's threads allocate and free a little meanwhile.
+    let slack = 64 * 1024;
+    assert!(
+        peak + slack >= before + (1 << 20) && after < before + slack,
+        "before {before}, peak {peak}, after {after}"
+    );
 }
 
 #[test]
 fn instruction_counts_grow_with_work_where_there_is_a_counter() {
+    let _serial = serial();
     let Some(counter) = bmux_bench::instructions::InstructionCounter::new() else {
         return;
     };

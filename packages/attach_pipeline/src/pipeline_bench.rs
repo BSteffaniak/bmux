@@ -855,16 +855,26 @@ fn split_pane_width(cols: u16, panes: u16) -> u16 {
 /// replay warms up, which steady frames do not repeat.
 const WARMUP: usize = 30;
 
+/// One run of a scenario's frames, measured after warm-up.
+struct Run {
+    apply: PhaseRecorder,
+    render: PhaseRecorder,
+    observe: Option<PhaseRecorder>,
+    bytes_out: usize,
+    measured: u64,
+    live_growth: i64,
+}
+
 /// Replay `frames` and measure every frame after warm-up: what applying, rendering and
 /// presenting (and observing, with an observer) allocate and execute, and the bytes written.
-fn measure(name: &str, mut replay: Replay, frames: &[Frame]) -> Scenario {
+fn run_once(mut replay: Replay, frames: &[Frame]) -> Run {
     let (mut apply, mut render, mut observe) = (
         PhaseRecorder::default(),
         PhaseRecorder::default(),
-        PhaseRecorder::default(),
+        None::<PhaseRecorder>,
     );
     let mut output = Vec::new();
-    let (mut bytes_out, mut measured, mut observed) = (0_usize, 0_u64, false);
+    let (mut bytes_out, mut measured) = (0_usize, 0_u64);
     let mut live_after_warmup = 0;
     for (index, frame) in frames.iter().enumerate() {
         if index == WARMUP {
@@ -880,26 +890,63 @@ fn measure(name: &str, mut replay: Replay, frames: &[Frame]) -> Scenario {
         apply.record(rendered.apply_cost);
         render.record(rendered.render_cost);
         if let Some(cost) = rendered.observe_cost {
-            observe.record(cost);
-            observed = true;
+            observe
+                .get_or_insert_with(PhaseRecorder::default)
+                .record(cost);
         }
     }
     let live_growth = i64::try_from(bmux_bench::allocations::live_bytes()).unwrap_or(i64::MAX)
         - i64::try_from(live_after_warmup).unwrap_or(i64::MAX);
+    Run {
+        apply,
+        render,
+        observe,
+        bytes_out,
+        measured,
+        live_growth,
+    }
+}
+
+/// Measure scenario `name` (when selected, see [`bmux_bench::metrics::selected`]): its frames
+/// replayed through fresh replays [`bmux_bench::metrics::repeats`] times, which must allocate and
+/// write identically, each frame keeping its fewest instructions.
+fn measure(name: &str, replay: impl Fn() -> Replay, frames: &[Frame]) -> Option<Scenario> {
+    if !bmux_bench::metrics::selected(name) {
+        return None;
+    }
+    let mut run = run_once(replay(), frames);
+    for _ in 1..bmux_bench::metrics::repeats() {
+        let repeat = run_once(replay(), frames);
+        assert_eq!(
+            run.bytes_out, repeat.bytes_out,
+            "{name}: bytes written differ between repeats"
+        );
+        let fold = |phase: &mut PhaseRecorder, other: &PhaseRecorder, label: &str| {
+            phase
+                .fold_repeat(other)
+                .unwrap_or_else(|error| panic!("{name} {label}: {error}"));
+        };
+        fold(&mut run.apply, &repeat.apply, "apply");
+        fold(&mut run.render, &repeat.render, "render");
+        if let (Some(observe), Some(other)) = (&mut run.observe, &repeat.observe) {
+            fold(observe, other, "observe");
+        }
+    }
     let mut phases = BTreeMap::from([
-        ("apply".to_owned(), apply.finish()),
-        ("render".to_owned(), render.finish()),
+        ("apply".to_owned(), run.apply.finish()),
+        ("render".to_owned(), run.render.finish()),
     ]);
-    if observed {
+    if let Some(observe) = &run.observe {
         phases.insert("observe".to_owned(), observe.finish());
     }
-    Scenario {
+    Some(Scenario {
         name: name.to_owned(),
-        frames: measured,
+        frames: run.measured,
         phases,
-        output_bytes_per_frame: u64::try_from(bytes_out).unwrap_or(u64::MAX) / measured.max(1),
-        live_growth_bytes: live_growth,
-    }
+        output_bytes_per_frame: u64::try_from(run.bytes_out).unwrap_or(u64::MAX)
+            / run.measured.max(1),
+        live_growth_bytes: run.live_growth,
+    })
 }
 
 /// A replay whose host shows images (Kitty or sixel), with one 40×20-cell image over the right
@@ -963,25 +1010,28 @@ fn metrics_report() -> Report {
     let frames = 300;
     let mut report = Report::default();
     let busiest = |name: &str| matches!(name, "plain-stream" | "full-repaint");
+    let observed = move || {
+        let mut replay = Replay::new(size, true, delivery());
+        replay.observer = Some(bmux_tui::presentation::PresentationState::new(
+            bmux_tui::geometry::Rect::new(0, 0, size.0, size.1),
+        ));
+        replay
+    };
     for corpus in corpus::generated(size, frames) {
-        report.scenarios.push(measure(
+        report.scenarios.extend(measure(
             corpus.name,
-            Replay::new(size, true, delivery()),
+            || Replay::new(size, true, delivery()),
             &corpus.frames,
         ));
         if !busiest(corpus.name) {
             continue;
         }
-        report.scenarios.push(measure(
+        report.scenarios.extend(measure(
             &format!("{}/no-passthrough", corpus.name),
-            Replay::new(size, false, delivery()),
+            || Replay::new(size, false, delivery()),
             &corpus.frames,
         ));
-        let mut observed = Replay::new(size, true, delivery());
-        observed.observer = Some(bmux_tui::presentation::PresentationState::new(
-            bmux_tui::geometry::Rect::new(0, 0, size.0, size.1),
-        ));
-        report.scenarios.push(measure(
+        report.scenarios.extend(measure(
             &format!("{}/observed", corpus.name),
             observed,
             &corpus.frames,
@@ -990,16 +1040,16 @@ fn metrics_report() -> Report {
     let pane = (split_pane_width(size.0, 2), size.1);
     for corpus in corpus::generated(pane, frames) {
         if busiest(corpus.name) {
-            report.scenarios.push(measure(
+            report.scenarios.extend(measure(
                 &format!("{}/two-panes", corpus.name),
-                Replay::split(size, 2, delivery()),
+                || Replay::split(size, 2, delivery()),
                 &corpus.frames,
             ));
         }
     }
-    report.scenarios.push(measure(
+    report.scenarios.extend(measure(
         "scattered-edits",
-        Replay::new(size, true, delivery()),
+        || Replay::new(size, true, delivery()),
         &scattered_edits(size, frames),
     ));
     #[cfg(all(feature = "image-kitty", feature = "image-sixel"))]
@@ -1010,14 +1060,14 @@ fn metrics_report() -> Report {
             .expect("plain-stream corpus")
             .frames;
         for (protocol, kitty) in [("kitty", true), ("sixel", false)] {
-            report.scenarios.push(measure(
+            report.scenarios.extend(measure(
                 &format!("image/{protocol}/beside-stream"),
-                image_replay(size, kitty, 0),
+                || image_replay(size, kitty, 0),
                 &stream,
             ));
-            report.scenarios.push(measure(
+            report.scenarios.extend(measure(
                 &format!("image/{protocol}/moving"),
-                image_replay(size, kitty, 1),
+                || image_replay(size, kitty, 1),
                 &stream,
             ));
         }
