@@ -170,6 +170,10 @@ pub(crate) struct Parser<const OSC_RAW_BUF_SIZE: usize = 1024> {
     utf8: [u8; 4],
     utf8_len: usize,
     utf8_expected: usize,
+    /// Consume every byte through the general state machine, with no runs taken at once: the
+    /// reference the fast paths are tested against.
+    #[cfg(test)]
+    pub(crate) per_byte: bool,
 }
 
 impl Parser {
@@ -195,7 +199,30 @@ impl<const N: usize> Parser<N> {
             utf8: [0; 4],
             utf8_len: 0,
             utf8_expected: 0,
+            #[cfg(test)]
+            per_byte: false,
         }
+    }
+
+    /// In a CSI or DCS header's parameters, a run of digits and separators only accumulates
+    /// numbers: take the run at once. Returns the bytes taken.
+    fn parameter_run(&mut self, bytes: &[u8]) -> usize {
+        let numbers = match self.state {
+            State::CsiStart | State::CsiNumbers => State::CsiNumbers,
+            State::DcsStart | State::DcsNumbers => State::DcsNumbers,
+            _ => return 0,
+        };
+        let run = bytes
+            .iter()
+            .position(|byte| !(0x30..=0x3b).contains(byte))
+            .unwrap_or(bytes.len());
+        if run > 0 {
+            for &byte in &bytes[..run] {
+                self.parameter(byte);
+            }
+            self.state = numbers;
+        }
+        run
     }
 
     pub(crate) fn advance<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) {
@@ -206,21 +233,37 @@ impl<const N: usize> Parser<N> {
             self.utf8_len += count;
             offset = self.complete_saved_utf8(performer, count);
         }
+        #[cfg(test)]
+        if self.per_byte {
+            for &byte in &bytes[offset..] {
+                self.consume(performer, byte);
+            }
+            return;
+        }
         if P::OBSERVES_TEXT {
             let mut index = offset;
             while index < bytes.len() {
-                if self.state == State::Text && self.utf8_len == 0 {
+                let run = match self.state {
                     // Printable ASCII in text is printed byte by byte with no state change: hand
                     // the performer the whole run.
-                    let run = bytes[index..]
-                        .iter()
-                        .position(|byte| !(0x20..=0x7e).contains(byte))
-                        .unwrap_or(bytes.len() - index);
-                    if run > 0 {
-                        performer.print_ascii(&bytes[index..index + run]);
-                        index += run;
-                        continue;
+                    State::Text if self.utf8_len == 0 => {
+                        let run = bytes[index..]
+                            .iter()
+                            .position(|byte| !(0x20..=0x7e).contains(byte))
+                            .unwrap_or(bytes.len() - index);
+                        if run > 0 {
+                            performer.print_ascii(&bytes[index..index + run]);
+                        }
+                        run
                     }
+                    State::CsiStart | State::CsiNumbers | State::DcsStart | State::DcsNumbers => {
+                        self.parameter_run(&bytes[index..])
+                    }
+                    _ => 0,
+                };
+                if run > 0 {
+                    index += run;
+                    continue;
                 }
                 self.consume(performer, bytes[index]);
                 index += 1;

@@ -839,6 +839,63 @@ pub(crate) fn trace(bytes: &[u8], chunk: usize) -> Vec<Event> {
     recorder.dispatched
 }
 
+/// The callbacks a parser makes for `bytes` delivered in `chunk`-sized pieces, taking runs at
+/// once or (`per_byte`) every byte through the general state machine.
+fn trace_runs(bytes: &[u8], chunk: usize, per_byte: bool) -> Vec<Event> {
+    let mut parser = Parser::new();
+    parser.per_byte = per_byte;
+    let mut recorder = Recorder::default();
+    for bytes in bytes.chunks(chunk.max(1)) {
+        parser.advance(&mut recorder, bytes);
+    }
+    recorder.dispatched
+}
+
+/// Taking parameter and text runs at once makes exactly the callbacks parsing every byte makes:
+/// over CSI and DCS headers with many, huge, colon-separated or overflowing parameters, private
+/// markers, intermediates, controls, DEL and escapes inside them, and the vte fixture.
+#[test]
+fn runs_parse_exactly_as_every_byte_does() {
+    let mut seed = 0x1234_5678_u32;
+    let mut next = |bound: u32| {
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        seed % bound.max(1)
+    };
+    let mut stream = FIXTURE.to_vec();
+    for _ in 0..3000 {
+        let params: Vec<String> = (0..next(40))
+            .map(|_| match next(5) {
+                0 => String::new(),
+                1 => "99999999".to_owned(),
+                2 => format!("{}:{}:{}", next(9), next(300), next(9)),
+                _ => next(400).to_string(),
+            })
+            .collect();
+        let header = params.join(";");
+        let token: Vec<u8> = match next(12) {
+            0..=3 => format!("\x1b[{header}m").into_bytes(),
+            4 => format!("\x1b[?{header}h").into_bytes(),
+            5 => format!("\x1b[{header} q").into_bytes(),
+            6 => format!("\x1bP{header}qdata\x1b\\").into_bytes(),
+            7 => format!("\x1b[{}\x07{}H", next(30), next(30)).into_bytes(),
+            8 => format!("\x1b[{}\x7f;{}H", next(30), next(30)).into_bytes(),
+            9 => format!("\x1b[{}\x1b[{}J", next(30), next(3)).into_bytes(),
+            10 => format!("\x1b[{}>{}c\x1b[<{}u", next(9), next(9), next(9)).into_bytes(),
+            _ => "plain text, wide 界 and done ".as_bytes().to_vec(),
+        };
+        stream.extend(token);
+    }
+    for chunk in [1, 2, 3, 7, 61, 4096, stream.len()] {
+        assert_eq!(
+            trace_runs(&stream, chunk, false),
+            trace_runs(&stream, chunk, true),
+            "chunk size {chunk}"
+        );
+    }
+}
+
 fn every_split(bytes: &[u8]) {
     let expected = trace(bytes, bytes.len());
     assert_eq!(trace(bytes, 1), expected, "bytewise {bytes:02x?}");
