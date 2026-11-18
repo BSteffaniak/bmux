@@ -286,6 +286,9 @@ pub struct PaneTitleAction {
     pub id: String,
     /// Label, including any padding and styling.
     pub label: Line,
+    /// Style layered over the label while the action is the pane's hovered action
+    /// ([`Pane::hovered_action`]). It changes no geometry.
+    pub hover: Option<Style>,
 }
 
 impl PaneTitleAction {
@@ -295,8 +298,92 @@ impl PaneTitleAction {
         Self {
             id: id.into(),
             label: label.into(),
+            hover: None,
         }
     }
+
+    /// Layer `style` over the label while the action is hovered.
+    #[must_use]
+    pub const fn hover_style(mut self, style: Style) -> Self {
+        self.hover = Some(style);
+        self
+    }
+}
+
+/// How a run of consecutive title-row actions is drawn as one cluster ([`Pane::action_group`]).
+///
+/// `start` goes before its first visible member, `separator` between neighbours and `end`
+/// after its last, with no border between them.
+/// The pieces are layered over the border, so spans without colours keep the border's (a
+/// focus gradient included): a cap such as `┤` joins the border line it interrupts. A group
+/// keeps one border cell after it, so its end cap never touches the corner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneTitleGroup {
+    /// Drawn before the first visible member.
+    pub start: Line,
+    /// Drawn between neighbouring members.
+    pub separator: Line,
+    /// Drawn after the last member.
+    pub end: Line,
+}
+
+impl PaneTitleGroup {
+    /// A group drawn with `start`, `separator` and `end`.
+    #[must_use]
+    pub fn new(start: impl Into<Line>, separator: impl Into<Line>, end: impl Into<Line>) -> Self {
+        Self {
+            start: start.into(),
+            separator: separator.into(),
+            end: end.into(),
+        }
+    }
+
+    /// Caps joining a single-line border, `┤ ` and ` ├`, with a space between members.
+    #[must_use]
+    pub fn joined() -> Self {
+        Self::new("┤ ", " ", " ├")
+    }
+
+    fn widths(&self) -> (u16, u16, u16) {
+        (cells(&self.start), cells(&self.separator), cells(&self.end))
+    }
+}
+
+impl Default for PaneTitleGroup {
+    fn default() -> Self {
+        Self::joined()
+    }
+}
+
+/// Terminal cells of `line`, saturating.
+fn cells(line: &Line) -> u16 {
+    u16::try_from(line.width()).unwrap_or(u16::MAX)
+}
+
+/// Where a visible [`PaneTitleGroup`]'s pieces are drawn, relative to the pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneTitleGroupLayout {
+    /// Index of the group, in the order the groups were added.
+    pub group: usize,
+    /// The start cap.
+    pub start: Rect,
+    /// The separators between visible members, left to right.
+    pub separators: Vec<Rect>,
+    /// The end cap.
+    pub end: Rect,
+}
+
+/// One unit of the title row's actions: an action alone, or the visible members of a group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TitleUnit {
+    /// An action outside any group.
+    Single(usize),
+    /// Group `group` showing members `first..end`.
+    Group {
+        group: usize,
+        first: usize,
+        end: usize,
+    },
 }
 
 /// Title-row geometry shared by painting and hit registration, relative to the pane.
@@ -308,6 +395,8 @@ pub struct PaneTitleLayout {
     pub actions: Vec<(usize, Rect)>,
     /// Where the right title is written, when it fits beside the whole title.
     pub right_title: Option<Rect>,
+    /// Visible action groups, left to right.
+    pub groups: Vec<PaneTitleGroupLayout>,
 }
 
 /// Configurable pane renderer and event handler.
@@ -317,6 +406,8 @@ pub struct Pane<'a> {
     right_title: Option<Line>,
     footer: Option<Line>,
     actions: Vec<PaneTitleAction>,
+    groups: Vec<(PaneTitleGroup, std::ops::Range<usize>)>,
+    hovered: Option<String>,
     title_hit: bool,
     min_title: u16,
     padding: Insets,
@@ -336,6 +427,8 @@ impl Pane<'_> {
             right_title: None,
             footer: None,
             actions: Vec::new(),
+            groups: Vec::new(),
+            hovered: None,
             title_hit: false,
             min_title: 0,
             padding: Insets::all(0),
@@ -411,10 +504,91 @@ impl Pane<'_> {
         self
     }
 
+    /// Append `actions` as one cluster drawn as `group`: its members sit side by side with
+    /// `group.separator` between them and its caps around them, and no border between. Its
+    /// members are ordinary title actions (in [`Self::actions`], with their own hit regions)
+    /// and drop leftmost first like any others; the caps stay while any member is shown.
+    #[must_use]
+    pub fn action_group(
+        mut self,
+        group: PaneTitleGroup,
+        actions: impl IntoIterator<Item = PaneTitleAction>,
+    ) -> Self {
+        let start = self.actions.len();
+        self.actions.extend(actions);
+        if self.actions.len() > start {
+            self.groups.push((group, start..self.actions.len()));
+        }
+        self
+    }
+
     /// The title-row actions, in declaration order.
     #[must_use]
     pub fn actions(&self) -> &[PaneTitleAction] {
         &self.actions
+    }
+
+    /// Mark the action `id` as hovered (or none): its [`PaneTitleAction::hover`] style is
+    /// layered over its label. Hover is the caller's state, so it shows on the frame painted
+    /// after the caller records it.
+    #[must_use]
+    pub fn hovered_action(mut self, id: Option<impl Into<String>>) -> Self {
+        self.hovered = id.map(Into::into);
+        self
+    }
+
+    /// The title-row units of the actions from `first` on, left to right.
+    fn title_units(&self, first: usize) -> Vec<TitleUnit> {
+        let mut units = Vec::new();
+        let mut index = first;
+        while index < self.actions.len() {
+            if let Some(group) = self
+                .groups
+                .iter()
+                .position(|(_, range)| range.contains(&index))
+            {
+                let end = self.groups[group].1.end;
+                units.push(TitleUnit::Group {
+                    group,
+                    first: index,
+                    end,
+                });
+                index = end;
+            } else {
+                units.push(TitleUnit::Single(index));
+                index += 1;
+            }
+        }
+        units
+    }
+
+    /// Cells `units` take: their widths, a cell between neighbours, and a cell after a group
+    /// that ends the row.
+    fn units_width(&self, units: &[TitleUnit], widths: &[u16]) -> u16 {
+        let mut used: u16 = 0;
+        for unit in units {
+            let width = match *unit {
+                TitleUnit::Single(index) => widths[index],
+                TitleUnit::Group { group, first, end } => {
+                    let (start, separator, cap) = self.groups[group].0.widths();
+                    let members = widths[first..end]
+                        .iter()
+                        .fold(0u16, |sum, width| sum.saturating_add(*width));
+                    let gaps = u16::try_from(end - first - 1).unwrap_or(u16::MAX);
+                    start
+                        .saturating_add(members)
+                        .saturating_add(separator.saturating_mul(gaps))
+                        .saturating_add(cap)
+                }
+            };
+            used = used
+                .saturating_add(width)
+                .saturating_add(u16::from(used > 0));
+        }
+        if matches!(units.last(), Some(TitleUnit::Group { .. })) {
+            used = used.saturating_add(1);
+        }
+        used
     }
 
     /// Keep at least `cells` of the title (the whole title when it is shorter) on the title
@@ -454,6 +628,7 @@ impl Pane<'_> {
                 title: None,
                 actions: Vec::new(),
                 right_title: None,
+                groups: Vec::new(),
             };
         }
         // Inside the corners.
@@ -463,7 +638,7 @@ impl Pane<'_> {
         let widths: Vec<u16> = self
             .actions
             .iter()
-            .map(|action| u16::try_from(action.label.width()).unwrap_or(u16::MAX))
+            .map(|action| cells(&action.label))
             .collect();
         // The title's reserved room and the gap before the actions.
         let reserve = title_width.unwrap_or(0).min(self.min_title).min(available);
@@ -472,26 +647,49 @@ impl Pane<'_> {
         } else {
             available
         };
-        // Keep as many trailing actions as fit, with one cell between neighbours.
-        let mut first = widths.len();
-        let mut used: u16 = 0;
-        while first > 0 {
-            let width = widths[first - 1];
-            let needed = used
-                .saturating_add(width)
-                .saturating_add(u16::from(used > 0));
-            if needed > available {
-                break;
+        // Keep as many trailing actions as fit, dropping the leftmost first.
+        let (units, used) = (0..=widths.len())
+            .map(|first| {
+                let units = self.title_units(first);
+                let used = self.units_width(&units, &widths);
+                (units, used)
+            })
+            .find(|(_, used)| *used <= available)
+            .unwrap_or_default();
+        let mut actions = Vec::with_capacity(widths.len());
+        let mut groups = Vec::new();
+        let actions_start = inner_end.saturating_sub(used);
+        let mut x = actions_start;
+        let place = |x: &mut u16, width: u16| {
+            let rect = Rect::new(*x, size.y, width, 1);
+            *x = x.saturating_add(width);
+            rect
+        };
+        for (position, unit) in units.iter().enumerate() {
+            if position > 0 {
+                x = x.saturating_add(1);
             }
-            used = needed;
-            first -= 1;
-        }
-        let mut actions = Vec::with_capacity(widths.len() - first);
-        let mut x = inner_end.saturating_sub(used);
-        let actions_start = x;
-        for (index, width) in widths.iter().copied().enumerate().skip(first) {
-            actions.push((index, Rect::new(x, size.y, width, 1)));
-            x = x.saturating_add(width).saturating_add(1);
+            match *unit {
+                TitleUnit::Single(index) => actions.push((index, place(&mut x, widths[index]))),
+                TitleUnit::Group { group, first, end } => {
+                    let (start, separator, cap) = self.groups[group].0.widths();
+                    let start = place(&mut x, start);
+                    let mut separators = Vec::new();
+                    for (index, width) in widths.iter().copied().enumerate().take(end).skip(first) {
+                        if index > first {
+                            separators.push(place(&mut x, separator));
+                        }
+                        actions.push((index, place(&mut x, width)));
+                    }
+                    let end = place(&mut x, cap);
+                    groups.push(PaneTitleGroupLayout {
+                        group,
+                        start,
+                        separators,
+                        end,
+                    });
+                }
+            }
         }
         // The title ends one cell before the first action.
         let title_end = if actions.is_empty() {
@@ -518,6 +716,7 @@ impl Pane<'_> {
             title,
             actions,
             right_title,
+            groups,
         }
     }
 
@@ -973,12 +1172,29 @@ impl PaneComponent<'_, '_> {
                 right,
             );
         }
+        let write = |cx: &mut PaintCx<'_, '_>, area: Rect, line: &Line| {
+            if area.width > 0 {
+                cx.write_line(
+                    LocalRect::new(i32::from(area.x), i64::from(area.y), area.width, 1),
+                    line,
+                );
+            }
+        };
+        for placed in &title_row.groups {
+            let group = &self.pane.groups[placed.group].0;
+            write(cx, placed.start, &group.start);
+            for area in &placed.separators {
+                write(cx, *area, &group.separator);
+            }
+            write(cx, placed.end, &group.end);
+        }
         for (index, area) in title_row.actions {
             let action = &self.pane.actions[index];
-            cx.write_line(
-                LocalRect::new(i32::from(area.x), i64::from(area.y), area.width, 1),
-                &action.label,
-            );
+            let hovered = self.pane.hovered.as_deref() == Some(action.id.as_str());
+            match action.hover.filter(|_| hovered) {
+                Some(style) => write(cx, area, &action.label.patch_style(style)),
+                None => write(cx, area, &action.label),
+            }
             cx.push_hit(
                 SceneRegion::new(format!("{}.action.{}", self.id.as_str(), action.id), area)
                     .role(HitRole::Action)
@@ -1002,6 +1218,20 @@ impl Component for PaneComponent<'_, '_> {
         format!("{:?}", self.pane.title).hash(&mut layout);
         format!("{:?}", self.pane.padding).hash(&mut layout);
         self.pane.border.hash(&mut layout);
+        // A title component is laid out in the room the actions leave it.
+        for action in &self.pane.actions {
+            action.label.width().hash(&mut layout);
+        }
+        for (group, range) in &self.pane.groups {
+            group.widths().hash(&mut layout);
+            range.hash(&mut layout);
+        }
+        self.pane.min_title.hash(&mut layout);
+        self.pane
+            .right_title
+            .as_ref()
+            .map(Line::width)
+            .hash(&mut layout);
         let state = self.state.get();
         state.area.width.hash(&mut layout);
         state.area.height.hash(&mut layout);
@@ -1010,6 +1240,8 @@ impl Component for PaneComponent<'_, '_> {
         format!("{:?}", self.pointer_intent).hash(&mut paint);
         format!("{:?}", self.pane.styles).hash(&mut paint);
         format!("{:?}", self.pane.actions).hash(&mut paint);
+        format!("{:?}", self.pane.groups).hash(&mut paint);
+        self.pane.hovered.hash(&mut paint);
         format!("{:?}", self.pane.footer).hash(&mut paint);
         format!("{:?}", self.pane.right_title).hash(&mut paint);
         self.pane.title_hit.hash(&mut paint);
@@ -1376,7 +1608,7 @@ mod tests {
 
     use super::{
         Pane, PaneBoundsPolicy, PaneComponent, PaneMousePolicy, PaneOutcome, PanePolicy, PaneState,
-        PaneTitleAction, ResizeHandles,
+        PaneStyles, PaneTitleAction, PaneTitleGroup, ResizeHandles,
     };
 
     /// A leaf filling its constraints that records where pointer events land, in its own
@@ -2089,6 +2321,147 @@ mod tests {
             .right_title("変更")
             .title_layout(Rect::new(0, 0, 5, 3));
         assert_eq!(layout.right_title, None);
+    }
+
+    fn grouped(title: &str) -> Pane<'static> {
+        Pane::new()
+            .title(title.to_owned())
+            .right_title("12")
+            .action(PaneTitleAction::new("own", "+"))
+            .action_group(
+                PaneTitleGroup::joined(),
+                [
+                    PaneTitleAction::new("min", "▾"),
+                    PaneTitleAction::new("max", "⤢"),
+                    PaneTitleAction::new("close", "×"),
+                ],
+            )
+    }
+
+    #[test]
+    fn grouped_actions_sit_between_caps_without_border_between_them() {
+        let (buffer, hits) = rendered(grouped("Files"), 24);
+        assert_eq!(
+            buffer.row_symbols(0).as_deref(),
+            Some("┌Files──12─+─┤ ▾ ⤢ × ├─┐")
+        );
+        for (id, x) in [("own", 11), ("min", 15), ("max", 17), ("close", 19)] {
+            assert_eq!(
+                hits_of(&hits, &format!("pane.action.{id}")),
+                Some(Rect::new(x, 0, 1, 1)),
+                "{id}"
+            );
+        }
+        // The caps and the spaces between members are not interactive.
+        let layout = grouped("Files").title_layout(Rect::new(0, 0, 24, 3));
+        assert_eq!(layout.groups.len(), 1);
+        assert_eq!(layout.groups[0].start, Rect::new(13, 0, 2, 1));
+        assert_eq!(
+            layout.groups[0].separators,
+            [Rect::new(16, 0, 1, 1), Rect::new(18, 0, 1, 1)]
+        );
+        assert_eq!(layout.groups[0].end, Rect::new(20, 0, 2, 1));
+        assert_eq!(
+            hits.iter().filter(|(id, _)| id.contains("action")).count(),
+            4
+        );
+    }
+
+    #[test]
+    fn narrow_groups_drop_members_leftmost_first_and_keep_their_caps_with_the_last() {
+        let row = |width| {
+            let (buffer, hits) = rendered(grouped("Files"), width);
+            let ids: Vec<String> = hits
+                .into_iter()
+                .filter_map(|(id, _)| id.strip_prefix("pane.action.").map(str::to_owned))
+                .collect();
+            (buffer.row_symbols(0).unwrap_or_default(), ids)
+        };
+        let ids = |ids: &[&str]| ids.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+        // The actions keep their room first (no title minimum here); the own action goes first.
+        assert_eq!(
+            row(13),
+            ("┌─┤ ▾ ⤢ × ├─┐".to_owned(), ids(&["min", "max", "close"]))
+        );
+        assert_eq!(row(11), ("┌─┤ ⤢ × ├─┐".to_owned(), ids(&["max", "close"])));
+        assert_eq!(row(9), ("┌─┤ × ├─┐".to_owned(), ids(&["close"])));
+        assert_eq!(row(8), ("┌┤ × ├─┐".to_owned(), vec!["close".to_owned()]));
+        // Too narrow for the last member with its caps: nothing of the group is drawn.
+        assert_eq!(row(7), ("┌Files┐".to_owned(), Vec::<String>::new()));
+        // Wide titles are clipped by cells beside the group, never split.
+        let wide = Pane::new().title("変更点").action_group(
+            PaneTitleGroup::joined(),
+            [
+                PaneTitleAction::new("min", "▾"),
+                PaneTitleAction::new("max", "⤢"),
+                PaneTitleAction::new("close", "×"),
+            ],
+        );
+        let (buffer, _) = rendered(wide, 16);
+        let text = buffer.row_symbols(0).unwrap_or_default();
+        assert!(text.starts_with("┌変") && !text.contains('更'), "{text}");
+        assert!(text.ends_with("┤ ▾ ⤢ × ├─┐"), "{text}");
+    }
+
+    #[test]
+    fn group_caps_keep_the_border_colours_and_hovered_actions_take_their_style() {
+        use bmux_tui::style::{Color, Style};
+        use bmux_tui::text::Line;
+        let border = Style::new().fg(Color::Red);
+        let hover = Style::new().fg(Color::Green);
+        let pane = |hovered: Option<&str>| {
+            Pane::new()
+                .styles(PaneStyles {
+                    background: None,
+                    border,
+                    focused_border: border,
+                })
+                .action_group(
+                    PaneTitleGroup::joined(),
+                    [
+                        PaneTitleAction::new(
+                            "min",
+                            Line::from_spans(vec![bmux_tui::text::Span::styled(
+                                "▾",
+                                Style::new().fg(Color::Blue),
+                            )]),
+                        )
+                        .hover_style(hover),
+                        PaneTitleAction::new("close", "×").hover_style(hover),
+                    ],
+                )
+                .hovered_action(hovered)
+        };
+        let fg =
+            |buffer: &Buffer, x: u16| buffer.get(Point::new(x, 0)).and_then(|cell| cell.style.fg);
+        let (buffer, _) = rendered(pane(None), 10);
+        assert_eq!(buffer.row_symbols(0).as_deref(), Some("┌┤ ▾ × ├─┐"));
+        // Caps and separators keep the border's colour; the labels keep their own.
+        for x in [1, 2, 4, 6, 7] {
+            assert_eq!(fg(&buffer, x), Some(Color::Red), "{x}");
+        }
+        assert_eq!(fg(&buffer, 3), Some(Color::Blue));
+        assert_eq!(fg(&buffer, 5), Some(Color::Red));
+        let (buffer, _) = rendered(pane(Some("close")), 10);
+        assert_eq!(fg(&buffer, 5), Some(Color::Green));
+        assert_eq!(fg(&buffer, 3), Some(Color::Blue));
+        let (buffer, _) = rendered(pane(Some("min")), 10);
+        assert_eq!(fg(&buffer, 3), Some(Color::Green));
+        assert_eq!(fg(&buffer, 5), Some(Color::Red));
+        // Hovering changes the paint revision only; the layout stays.
+        let state = Cell::new(PaneState::new(Rect::new(0, 0, 10, 3)));
+        let revision = |hovered| {
+            PaneComponent::new("pane", pane(hovered), &state, TextBlock::new("")).revision()
+        };
+        let (plain, hovered) = (revision(None), revision(Some("close")));
+        assert_eq!(plain.layout, hovered.layout);
+        assert_ne!(plain.paint, hovered.paint);
+    }
+
+    fn hits_of(hits: &[(String, Rect)], id: &str) -> Option<Rect> {
+        hits.iter()
+            .find(|(candidate, _)| candidate == id)
+            .map(|(_, area)| *area)
     }
 
     #[cfg(feature = "tab-bar")]

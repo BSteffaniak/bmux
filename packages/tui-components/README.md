@@ -188,6 +188,17 @@ let chrome = Pane::new()
     .action(PaneTitleAction::new("close", "✕"));
 ```
 
+`Pane::action_group(group, actions)` appends actions drawn as one cluster:
+`PaneTitleGroup` gives the `start` cap, the `separator` between members and the
+`end` cap (`PaneTitleGroup::joined()` is `┤ `, ` `, ` ├`), with no border
+between members. The pieces are layered over the border, so unstyled caps keep
+the border's colours and join its line; a group keeps one border cell before
+the corner. Members are ordinary actions with their own hit regions and drop
+leftmost first; the caps stay while any member shows. Their geometry is
+`PaneTitleLayout::groups`. `PaneTitleAction::hover_style` layers a style over
+an action while `Pane::hovered_action(Some(id))` names it (hover is the
+caller's state; it changes paint only, never geometry).
+
 `Pane::right_title` writes non-interactive status (a count, a state) on the
 title row, right-aligned before the actions. It is shown only when the whole
 title fits beside it with a one-cell gap; otherwise it is dropped and the title
