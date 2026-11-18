@@ -890,8 +890,8 @@ pub(super) async fn run_server_gateway(
 }
 
 #[cfg(not(feature = "remote-iroh"))]
-async fn run_server_gateway_iroh() -> Result<u8> {
-    Err(crate::ssh_access::iroh_unavailable())
+fn run_server_gateway_iroh() -> std::future::Ready<Result<u8>> {
+    std::future::ready(Err(crate::ssh_access::iroh_unavailable()))
 }
 
 #[allow(clippy::too_many_lines)]

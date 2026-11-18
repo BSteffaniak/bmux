@@ -1,6 +1,7 @@
 use super::{BmuxConfig, Context, Instant, Result, Uuid, active_runtime_name};
+use bmux_performance_state::{PERF_RECORDING_SCHEMA_VERSION, PERF_RECORDING_SOURCE};
+#[cfg(feature = "remote-iroh")]
 use bmux_performance_state::{
-    PERF_RECORDING_SCHEMA_VERSION, PERF_RECORDING_SOURCE,
     PerformanceRecordingLevel as RuntimePerformanceRecordingLevel,
     PerformanceRuntimeSettings as RuntimePerformanceRuntimeSettings,
 };
@@ -26,6 +27,7 @@ impl PerfCaptureLevel {
         }
     }
 
+    #[cfg(feature = "remote-iroh")]
     #[must_use]
     pub(super) const fn from_runtime(level: RuntimePerformanceRecordingLevel) -> Self {
         match level {
@@ -87,6 +89,7 @@ impl PerfCaptureSettings {
         }
     }
 
+    #[cfg(feature = "remote-iroh")]
     #[must_use]
     pub(super) fn from_runtime_settings(settings: &RuntimePerformanceRuntimeSettings) -> Self {
         Self {
@@ -236,6 +239,7 @@ impl PerfEventEmitter {
         serde_json::Value::Object(object)
     }
 
+    #[cfg(feature = "remote-iroh")]
     pub(super) async fn emit_with_client(
         &mut self,
         client: &mut bmux_client::BmuxClient,

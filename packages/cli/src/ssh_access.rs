@@ -1,4 +1,5 @@
 use anyhow::Result;
+#[cfg(feature = "remote-iroh")]
 use bmux_config::{BmuxConfig, CompressionMode};
 #[cfg(feature = "remote-iroh")]
 mod auth;
@@ -21,6 +22,7 @@ pub enum IrohTargetCompression {
 }
 
 impl IrohTargetCompression {
+    #[cfg(feature = "remote-iroh")]
     #[must_use]
     pub const fn as_query_value(self) -> &'static str {
         match self {
@@ -43,6 +45,7 @@ impl IrohTargetCompression {
     }
 }
 
+#[cfg(feature = "remote-iroh")]
 #[must_use]
 pub const fn iroh_target_compression_from_config(config: &BmuxConfig) -> IrohTargetCompression {
     if !config.behavior.compression.enabled {
@@ -54,11 +57,13 @@ pub const fn iroh_target_compression_from_config(config: &BmuxConfig) -> IrohTar
     }
 }
 
+#[cfg(feature = "remote-iroh")]
 #[must_use]
 pub const fn iroh_ssh_access_enabled(config: &BmuxConfig) -> bool {
     config.connections.iroh_ssh_access.enabled
 }
 
+#[cfg(feature = "remote-iroh")]
 pub fn ensure_iroh_ssh_access_ready(config: &BmuxConfig) -> Result<()> {
     let access = &config.connections.iroh_ssh_access;
     if access.enabled && access.allowlist.is_empty() {
@@ -69,6 +74,7 @@ pub fn ensure_iroh_ssh_access_ready(config: &BmuxConfig) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "remote-iroh")]
 #[must_use]
 pub fn iroh_target_url(
     endpoint_id: &str,
@@ -137,9 +143,18 @@ pub fn parse_iroh_target(input: &str) -> Result<ParsedIrohTarget> {
     })
 }
 
+#[cfg(not(feature = "remote-iroh"))]
+pub fn iroh_unavailable() -> anyhow::Error {
+    anyhow::anyhow!(
+        "Iroh transport is not enabled in this build; rebuild with the `remote-iroh` feature"
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{IrohTargetCompression, iroh_target_url, parse_iroh_target};
+    #[cfg(feature = "remote-iroh")]
+    use super::iroh_target_url;
+    use super::{IrohTargetCompression, parse_iroh_target};
 
     #[test]
     fn parse_iroh_target_extracts_relay_and_auth_query() {
@@ -153,6 +168,7 @@ mod tests {
         assert_eq!(parsed.transport_compression, IrohTargetCompression::Zstd);
     }
 
+    #[cfg(feature = "remote-iroh")]
     #[test]
     fn iroh_target_url_emits_expected_query_order() {
         let url = iroh_target_url(
@@ -175,11 +191,4 @@ mod tests {
         assert!(!parsed.require_ssh_auth);
         assert_eq!(parsed.transport_compression, IrohTargetCompression::Auto);
     }
-}
-
-#[cfg(not(feature = "remote-iroh"))]
-pub fn iroh_unavailable() -> anyhow::Error {
-    anyhow::anyhow!(
-        "Iroh transport is not enabled in this build; rebuild with the `remote-iroh` feature"
-    )
 }

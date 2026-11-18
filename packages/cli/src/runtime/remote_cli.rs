@@ -8,13 +8,16 @@ use anyhow::{Context, Result};
 use bmux_cli_schema::{Cli, Command, ServerAutostartCommand, ServerCommand, SessionCommand};
 use bmux_client::BmuxClient;
 use bmux_config::{BmuxConfig, ConfigPaths, TlsTrustMode};
+#[cfg(feature = "remote-iroh")]
 use bmux_recording_protocol::RecordingRollingStartOptions;
 use bmux_sessions_plugin_api::sessions_state::{self, SessionSummary};
 use std::fmt::Write as FmtWrite;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(feature = "remote-iroh")]
+use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{collections::BTreeMap, collections::BTreeSet};
 use uuid::Uuid;
 
@@ -25,9 +28,10 @@ use super::{
     hosted_output::{
         HostedHostState, hosted_not_ready_reason, status_not_ready_lines, status_ready_lines,
     },
-    map_cli_client_error, perf_telemetry, run_server_start, run_session_attach,
-    run_session_attach_with_client,
+    map_cli_client_error, run_session_attach, run_session_attach_with_client,
 };
+#[cfg(feature = "remote-iroh")]
+use super::{perf_telemetry, run_server_start};
 
 /// Typed dispatch wrapper for `sessions-state:list-sessions` via
 /// `BmuxClient::invoke_service_raw`. `BmuxClient` no longer carries a
@@ -40,8 +44,11 @@ async fn typed_list_sessions_remote(client: &mut BmuxClient) -> Result<Vec<Sessi
 }
 use bmux_cli_schema::HostedModeArg;
 use bmux_config::{ConnectionTargetConfig, ConnectionTransport, HostedMode, RemoteServerStartMode};
+#[cfg(feature = "remote-iroh")]
 use bmux_ipc::IpcEndpoint;
-use bmux_ipc::transport::{ErasedIpcStream, LocalIpcStream};
+use bmux_ipc::transport::ErasedIpcStream;
+#[cfg(feature = "remote-iroh")]
+use bmux_ipc::transport::LocalIpcStream;
 #[cfg(feature = "remote-iroh")]
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
 use qrcode::QrCode;
@@ -135,6 +142,13 @@ struct BmuxTlsServerVerifier {
     webpki: Option<Arc<dyn ServerCertVerifier>>,
 }
 
+#[cfg_attr(
+    not(feature = "remote-iroh"),
+    expect(
+        dead_code,
+        reason = "Iroh targets are parsed and validated in every build, but only the `remote-iroh` transport reads their connection details"
+    )
+)]
 #[derive(Debug, Clone)]
 struct IrohTarget {
     label: String,
@@ -145,6 +159,7 @@ struct IrohTarget {
     connect_timeout_ms: u64,
 }
 
+#[cfg(feature = "remote-iroh")]
 const fn iroh_target_uses_compression(target: &IrohTarget, config: &BmuxConfig) -> bool {
     match target.transport_compression {
         IrohTargetCompression::Zstd => true,
@@ -159,6 +174,7 @@ const fn iroh_target_uses_compression(target: &IrohTarget, config: &BmuxConfig) 
     }
 }
 
+#[cfg(feature = "remote-iroh")]
 #[derive(Debug, Default, Clone, Serialize)]
 struct IrohConnectPerfSummary {
     bind_ms: u64,
@@ -173,11 +189,13 @@ struct IrohConnectPerfSummary {
     compression_enabled: bool,
 }
 
+#[cfg(feature = "remote-iroh")]
 #[allow(clippy::cast_possible_truncation)]
 fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+#[cfg(feature = "remote-iroh")]
 const fn attach_exit_reason_label(reason: AttachExitReason) -> &'static str {
     match reason {
         AttachExitReason::Detached => "detached",
@@ -186,6 +204,7 @@ const fn attach_exit_reason_label(reason: AttachExitReason) -> &'static str {
     }
 }
 
+#[cfg(feature = "remote-iroh")]
 async fn emit_iroh_connect_perf_event(
     perf_emitter: &mut perf_telemetry::PerfEventEmitter,
     client: &mut BmuxClient,
@@ -259,6 +278,7 @@ async fn emit_iroh_connect_perf_event(
         .await
 }
 
+#[cfg(feature = "remote-iroh")]
 async fn refresh_perf_emitter_settings_from_server(
     perf_emitter: &mut perf_telemetry::PerfEventEmitter,
     client: &mut BmuxClient,
@@ -273,6 +293,7 @@ async fn refresh_perf_emitter_settings_from_server(
     }
 }
 
+#[cfg(feature = "remote-iroh")]
 async fn emit_iroh_attach_attempt_perf_event(
     perf_emitter: &mut perf_telemetry::PerfEventEmitter,
     client: &mut BmuxClient,
@@ -312,6 +333,7 @@ async fn emit_iroh_attach_attempt_perf_event(
         .await
 }
 
+#[cfg(feature = "remote-iroh")]
 async fn emit_iroh_reconnect_outage_perf_event(
     perf_emitter: &mut perf_telemetry::PerfEventEmitter,
     client: &mut BmuxClient,
@@ -361,6 +383,7 @@ pub(super) const SSH_RECONNECT_MAX_ATTEMPTS: usize = 4;
 const SSH_RECONNECT_BASE_BACKOFF_MS: u64 = 300;
 const BRIDGE_PREFLIGHT_TOKEN: &str = "BMUX_BRIDGE_READY";
 const RECENT_CACHE_MAX: usize = 10;
+#[cfg(feature = "remote-iroh")]
 const BMUX_IROH_ALPN: &[u8] = b"bmux/gateway/iroh/1";
 const DEFAULT_CONTROL_PLANE_URL: &str = "https://api.bmux.run";
 
@@ -416,6 +439,7 @@ struct ShareLinkResponse {
     url: Option<String>,
 }
 
+#[cfg(feature = "remote-iroh")]
 #[derive(Debug, Clone, Serialize)]
 struct RegisterHostRequest {
     name: Option<String>,
@@ -713,7 +737,7 @@ async fn run_connect_with(
             Ok(status)
         }
         #[cfg(not(feature = "remote-iroh"))]
-        ResolvedTarget::Iroh(_) => return Err(crate::ssh_access::iroh_unavailable()),
+        ResolvedTarget::Iroh(_) => Err(crate::ssh_access::iroh_unavailable()),
         #[cfg(feature = "remote-iroh")]
         ResolvedTarget::Iroh(iroh_target) => {
             let mut perf_emitter = perf_telemetry::PerfEventEmitter::new(
@@ -805,7 +829,7 @@ pub(super) async fn connect_attach_target_with_kernel(
             Ok((client, Some(kernel_factory)))
         }
         #[cfg(not(feature = "remote-iroh"))]
-        ResolvedTarget::Iroh(_) => return Err(crate::ssh_access::iroh_unavailable()),
+        ResolvedTarget::Iroh(_) => Err(crate::ssh_access::iroh_unavailable()),
         #[cfg(feature = "remote-iroh")]
         ResolvedTarget::Iroh(iroh_target) => {
             let (client, connection) = connect_iroh_bridge(&iroh_target, client_name, None).await?;
@@ -1345,6 +1369,7 @@ fn format_setup_summary_lines(
     lines
 }
 
+#[cfg(feature = "remote-iroh")]
 fn normalize_relay_url_for_display(raw: &str) -> String {
     let Some(scheme_sep) = raw.find("://") else {
         return raw.to_string();
@@ -1365,6 +1390,7 @@ fn normalize_relay_url_for_display(raw: &str) -> String {
     )
 }
 
+#[cfg(feature = "remote-iroh")]
 fn normalize_url_authority_host(authority: &str) -> String {
     let (prefix, host_port) = authority
         .rsplit_once('@')
@@ -2072,6 +2098,7 @@ fn clear_host_runtime_state(paths: &ConfigPaths) -> Result<()> {
     }
 }
 
+#[cfg(feature = "remote-iroh")]
 fn current_unix_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2233,6 +2260,7 @@ fn spawn_host_daemon(listen: &str, name: Option<&str>, mode: HostedMode) -> Resu
     Ok(0)
 }
 
+#[cfg(feature = "remote-iroh")]
 async fn ensure_local_ipc_backend_ready(paths: &ConfigPaths, mode: HostedMode) -> Result<()> {
     let endpoint = local_ipc_endpoint_from_paths(paths);
     if local_ipc_connectable(&endpoint).await {
@@ -2275,10 +2303,12 @@ async fn ensure_local_ipc_backend_ready(paths: &ConfigPaths, mode: HostedMode) -
     ))
 }
 
+#[cfg(feature = "remote-iroh")]
 async fn local_ipc_connectable(endpoint: &IpcEndpoint) -> bool {
     LocalIpcStream::connect(endpoint).await.is_ok()
 }
 
+#[cfg(feature = "remote-iroh")]
 async fn wait_for_local_ipc_ready(endpoint: &IpcEndpoint, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -2607,6 +2637,7 @@ async fn create_share_link_with_fallback_name(
     anyhow::bail!("share creation failed: could not allocate unique share name")
 }
 
+#[cfg(feature = "remote-iroh")]
 async fn register_host_presence(
     control_plane_url: &str,
     token: &str,
@@ -2810,6 +2841,7 @@ async fn poll_device_login(
         .context("failed parsing device poll response")
 }
 
+#[cfg(feature = "remote-iroh")]
 fn local_ipc_endpoint_from_paths(paths: &ConfigPaths) -> IpcEndpoint {
     #[cfg(unix)]
     {
@@ -2885,6 +2917,7 @@ async fn delete_share_link(control_plane_url: &str, token: &str, name: &str) -> 
 
 // Only connection establishment is retried. Never wrap attachment, input, or a
 // service mutation in this helper: a lost response does not establish non-execution.
+#[cfg(feature = "remote-iroh")]
 async fn retry_iroh_connection<T, Connect, ConnectFuture, Sleep, SleepFuture>(
     attempts: &mut usize,
     forever: bool,
@@ -2912,6 +2945,7 @@ where
     Ok(None)
 }
 
+#[cfg(feature = "remote-iroh")]
 fn iroh_connect_error_is_transient(error: &anyhow::Error) -> bool {
     // SSH auth currently exposes anyhow rather than a typed rejection contract.
     // Treat its existing stage boundary as terminal, including local agent I/O;
@@ -2935,7 +2969,6 @@ fn iroh_connect_error_is_transient(error: &anyhow::Error) -> bool {
                 _ => false,
             };
         }
-        #[cfg(feature = "remote-iroh")]
         if let Some(error) = source.downcast_ref::<iroh::endpoint::ConnectingError>()
             && !matches!(
                 error,
@@ -2944,7 +2977,6 @@ fn iroh_connect_error_is_transient(error: &anyhow::Error) -> bool {
         {
             return false;
         }
-        #[cfg(feature = "remote-iroh")]
         if let Some(error) = source.downcast_ref::<iroh::endpoint::ConnectionError>() {
             return matches!(
                 error,
@@ -2961,6 +2993,7 @@ fn iroh_connect_error_is_transient(error: &anyhow::Error) -> bool {
     false
 }
 
+#[cfg(feature = "remote-iroh")]
 fn iroh_io_error_is_transient(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -3240,7 +3273,7 @@ pub(super) async fn run_remote_test(target: &str) -> Result<u8> {
             Ok(0)
         }
         #[cfg(not(feature = "remote-iroh"))]
-        ResolvedTarget::Iroh(_) => return Err(crate::ssh_access::iroh_unavailable()),
+        ResolvedTarget::Iroh(_) => Err(crate::ssh_access::iroh_unavailable()),
         #[cfg(feature = "remote-iroh")]
         ResolvedTarget::Iroh(iroh_target) => {
             let (mut client, _) =
@@ -3320,7 +3353,7 @@ pub(super) async fn run_remote_doctor(target: &str, fix: bool) -> Result<u8> {
             Ok(0)
         }
         #[cfg(not(feature = "remote-iroh"))]
-        ResolvedTarget::Iroh(_) => return Err(crate::ssh_access::iroh_unavailable()),
+        ResolvedTarget::Iroh(_) => Err(crate::ssh_access::iroh_unavailable()),
         #[cfg(feature = "remote-iroh")]
         ResolvedTarget::Iroh(iroh_target) => {
             let (mut client, _) =
@@ -3948,6 +3981,7 @@ async fn connect_iroh_bridge(
     .with_context(|| format!("failed establishing iroh target '{}'", target.label))
 }
 
+#[cfg(feature = "remote-iroh")]
 async fn iroh_connect_with_deadline<T>(
     timeout_ms: u64,
     connect: impl std::future::Future<Output = Result<T>>,
@@ -5609,6 +5643,7 @@ mod tests {
         assert!(command_requires_remote_server(Some(&command)));
     }
 
+    #[cfg(feature = "remote-iroh")]
     #[tokio::test]
     async fn iroh_reconnect_retries_failures_without_reattaching() {
         let mut attempts = 0;
@@ -5635,6 +5670,7 @@ mod tests {
         assert_eq!(delays, [300, 600, 1_200]);
     }
 
+    #[cfg(feature = "remote-iroh")]
     #[tokio::test]
     async fn iroh_reconnect_exhausts_lifetime_budget() {
         let mut attempts = SSH_RECONNECT_MAX_ATTEMPTS - 1;
@@ -5659,6 +5695,7 @@ mod tests {
         assert_eq!(recovered, None);
     }
 
+    #[cfg(feature = "remote-iroh")]
     #[tokio::test]
     async fn iroh_reconnect_forever_caps_backoff_and_saturates_attempts() {
         let mut attempts = usize::MAX;
@@ -5686,6 +5723,7 @@ mod tests {
         assert_eq!(attempts, usize::MAX);
     }
 
+    #[cfg(feature = "remote-iroh")]
     #[tokio::test]
     async fn iroh_reconnect_forever_stops_on_auth_failure() {
         let mut attempts = 0;
@@ -5736,6 +5774,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "remote-iroh")]
     #[tokio::test]
     async fn iroh_reconnect_deadline_bounds_pending_setup() {
         // No network or live endpoint: a permanently pending online/setup phase
@@ -5988,6 +6027,7 @@ mod tests {
         assert_eq!(lines[0], "Host online: demo-host");
     }
 
+    #[cfg(feature = "remote-iroh")]
     #[test]
     fn normalize_relay_url_for_display_trims_trailing_dot() {
         let normalized =
@@ -5995,6 +6035,7 @@ mod tests {
         assert_eq!(normalized, "https://use1-1.relay.n0.iroh-canary.iroh.link/");
     }
 
+    #[cfg(feature = "remote-iroh")]
     #[test]
     fn normalize_relay_url_for_display_keeps_non_url_strings() {
         let normalized = normalize_relay_url_for_display("not-a-url");

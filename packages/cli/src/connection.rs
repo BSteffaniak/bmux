@@ -152,6 +152,13 @@ struct TlsTarget {
     connect_timeout_ms: u64,
 }
 
+#[cfg_attr(
+    not(feature = "remote-iroh"),
+    expect(
+        dead_code,
+        reason = "Iroh targets are parsed and validated in every build, but only the `remote-iroh` transport reads their connection details"
+    )
+)]
 #[derive(Debug, Clone)]
 struct IrohTarget {
     label: String,
@@ -231,8 +238,8 @@ async fn connect_tls_target(target: &TlsTarget, client_name: &'static str) -> Re
 }
 
 #[cfg(not(feature = "remote-iroh"))]
-async fn connect_iroh_target(_: &IrohTarget, _: &'static str) -> Result<BmuxClient> {
-    Err(crate::ssh_access::iroh_unavailable())
+fn connect_iroh_target(_: &IrohTarget, _: &'static str) -> std::future::Ready<Result<BmuxClient>> {
+    std::future::ready(Err(crate::ssh_access::iroh_unavailable()))
 }
 
 #[cfg(feature = "remote-iroh")]
