@@ -113,13 +113,17 @@ def coverage_binary(bench: str) -> str:
     package_args = [arg for arg in args[:-1] if arg != "--lib"]
     env = {
         **os.environ,
-        "RUSTFLAGS": (os.environ.get("RUSTFLAGS", "") + " -C instrument-coverage").strip(),
+        # Counters sit in the code before optimization, so units do not depend on it: a lightly
+        # optimized dev build counts the same and compiles far faster than an instrumented release
+        # build. Debug assertions stay off, as in release, so they add no counted code.
+        "RUSTFLAGS": (os.environ.get("RUSTFLAGS", "")
+                      + " -C instrument-coverage -C opt-level=1 -C debug-assertions=off").strip(),
         "CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(ROOT / "target")) + "-coverage",
         # Instrumented build scripts and proc macros write profiles too: keep them out of the tree.
         "LLVM_PROFILE_FILE": str(Path(tempfile.gettempdir()) / "perf-render-build-%p.profraw"),
     }
     build = subprocess.run(
-        ["cargo", "test", "--release", "-j", os.environ.get("PERF_RENDER_JOBS", "4"), *package_args,
+        ["cargo", "test", "-j", os.environ.get("PERF_RENDER_JOBS", "4"), *package_args,
          "--lib", "--no-run", "--message-format=json"],
         cwd=ROOT, env=env, capture_output=True, text=True, check=False)
     for stale in Path(tempfile.gettempdir()).glob("perf-render-build-*.profraw"):
