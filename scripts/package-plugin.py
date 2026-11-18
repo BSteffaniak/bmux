@@ -105,20 +105,39 @@ def resolved_package(metadata: dict, manifest: Path) -> dict:
 def sdk_source(metadata: dict, package: dict) -> str:
     """The SDK the crate actually links, as its own lockfile resolved it.
 
-    Path dependencies report ``path+file://...``; git dependencies report the
+    The SDK may be a direct dependency or reached through a product author
+    layer that re-exports it; either way exactly one SDK is linked. Path
+    dependencies report ``path+file://...``; git dependencies report the
     exact ``git+...#<commit>``; registry dependencies their registry. Nothing
     is substituted: the artifact speaks the ABI of this SDK.
     """
     nodes = {node["id"]: node for node in metadata.get("resolve", {}).get("nodes", [])}
     packages = {candidate["id"]: candidate for candidate in metadata["packages"]}
-    node = nodes.get(package["id"])
-    if node is None:
+    if package["id"] not in nodes:
         raise RuntimeError(f"no resolved dependency graph for {package['name']}")
-    for dependency in node["deps"]:
-        candidate = packages.get(dependency["pkg"])
-        if candidate and candidate["name"] == SDK_PACKAGE:
-            return candidate.get("source") or f"path+file://{Path(candidate['manifest_path']).parent}"
-    raise RuntimeError(f"{package['name']} does not depend on {SDK_PACKAGE}; it cannot export a plugin entry")
+    found: dict[str, dict] = {}
+    seen = {package["id"]}
+    pending = [package["id"]]
+    while pending:
+        for dependency in nodes.get(pending.pop(), {}).get("deps", []):
+            # Only normal (linked) dependencies: build scripts and dev
+            # dependencies never reach the packaged library.
+            kinds = {kind.get("kind") for kind in dependency.get("dep_kinds", [{"kind": None}])}
+            if None not in kinds or dependency["pkg"] in seen:
+                continue
+            seen.add(dependency["pkg"])
+            candidate = packages.get(dependency["pkg"])
+            if candidate and candidate["name"] == SDK_PACKAGE:
+                found[candidate["id"]] = candidate
+            else:
+                pending.append(dependency["pkg"])
+    if not found:
+        raise RuntimeError(f"{package['name']} does not link {SDK_PACKAGE}; it cannot export a plugin entry")
+    if len(found) > 1:
+        versions = ", ".join(sorted(found))
+        raise RuntimeError(f"{package['name']} links more than one {SDK_PACKAGE} ({versions}); a plugin speaks one ABI")
+    candidate = next(iter(found.values()))
+    return candidate.get("source") or f"path+file://{Path(candidate['manifest_path']).parent}"
 
 
 def direct_target_dir(metadata: dict, cargo_target_dir: Path | None) -> Path:

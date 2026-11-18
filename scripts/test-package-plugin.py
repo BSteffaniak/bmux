@@ -298,7 +298,7 @@ class GenerationTests(unittest.TestCase):
             self.assertEqual(len(report["artifacts"]), 5)
             for domain in ("filesystem", "shell"):
                 artifact = str(output / domain / "cargo-selected-native-artifact")
-                self.assertEqual(report["environment"][f"BCODE_{domain.upper()}_WRAPPER_ARTIFACT"], artifact)
+                self.assertEqual(report["environment"][f"BCODE_{domain.upper()}_BACKEND_ARTIFACT"], artifact)
                 self.assertIn({"expected_id": f"bcode.{domain}", "path": artifact}, report["artifacts"])
 
 
@@ -339,6 +339,33 @@ class DirectPackagingTests(unittest.TestCase):
         orphan["resolve"]["nodes"][0]["deps"] = []
         with self.assertRaises(RuntimeError):
             pack.sdk_source(orphan, package)
+
+    def test_sdk_is_found_through_an_author_layer_and_must_be_unique(self):
+        package = self.METADATA["packages"][0]
+        plugin, sdk = package["id"], self.METADATA["packages"][1]["id"]
+        layer = "path+file:///work/product-sdk#product_sdk@0.1.0"
+        layered = copy.deepcopy(self.METADATA)
+        layered["packages"].append({"id": layer, "name": "product_sdk", "version": "0.1.0",
+                                    "manifest_path": "/work/product-sdk/Cargo.toml", "source": None})
+        layered["resolve"]["nodes"] = [
+            {"id": plugin, "deps": [{"name": "product_sdk", "pkg": layer}]},
+            {"id": layer, "deps": [{"name": "bmux_plugin_sdk", "pkg": sdk}]},
+        ]
+        self.assertEqual(pack.sdk_source(layered, package), "git+file:///repo/bmux?branch=master#abc")
+
+        dev_only = copy.deepcopy(self.METADATA)
+        dev_only["resolve"]["nodes"][0]["deps"][0]["dep_kinds"] = [{"kind": "dev", "target": None}]
+        with self.assertRaises(RuntimeError):
+            pack.sdk_source(dev_only, package)
+
+        other = "git+file:///repo/bmux?branch=master#def#bmux_plugin_sdk@0.0.1"
+        twice = copy.deepcopy(layered)
+        twice["packages"].append({"id": other, "name": "bmux_plugin_sdk", "version": "0.0.1",
+                                  "manifest_path": "/cargo/git/bmux-def/packages/plugin-sdk/Cargo.toml",
+                                  "source": "git+file:///repo/bmux?branch=master#def"})
+        twice["resolve"]["nodes"][0]["deps"].append({"name": "bmux_plugin_sdk", "pkg": other})
+        with self.assertRaisesRegex(RuntimeError, "more than one"):
+            pack.sdk_source(twice, package)
 
     def test_build_runs_cargo_rustc_cdylib_with_role_feature_cfg_and_label(self):
         with tempfile.TemporaryDirectory() as temporary:
