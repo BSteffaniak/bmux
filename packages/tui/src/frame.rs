@@ -87,6 +87,8 @@ pub struct Frame<'buffer> {
     over: Option<OverChanges>,
     /// The buffer started as the committed cells: writes report only the cells they change.
     over_committed: bool,
+    /// Storage for the changed columns of the row being painted, shared by every row.
+    changed_columns: crate::buffer::ChangedColumns,
 }
 
 /// What a frame painted in place over the last one changed: the cells painted, carried along by
@@ -386,6 +388,7 @@ impl<'buffer> Frame<'buffer> {
             moved_painted: false,
             over: None,
             over_committed: false,
+            changed_columns: crate::buffer::ChangedColumns::new(),
         }
     }
 
@@ -626,6 +629,18 @@ impl<'buffer> Frame<'buffer> {
 
     /// The buffer, for a write whose extent is known only once it is done; the caller reports it
     /// with [`Self::wrote`].
+    /// Empty storage for a row's changed columns, to give back with
+    /// [`Self::return_changed_columns`] once the row is painted.
+    pub(crate) fn take_changed_columns(&mut self) -> crate::buffer::ChangedColumns {
+        std::mem::take(&mut self.changed_columns)
+    }
+
+    /// Give back the storage [`Self::take_changed_columns`] lent, for the next row.
+    pub(crate) fn return_changed_columns(&mut self, mut changed: crate::buffer::ChangedColumns) {
+        changed.clear();
+        self.changed_columns = changed;
+    }
+
     pub(crate) const fn buffer_for_write(&mut self) -> &mut Buffer {
         self.buffer
     }

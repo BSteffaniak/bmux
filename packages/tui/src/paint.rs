@@ -362,7 +362,7 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         let mut changed = self
             .frame
             .reports_changes_only()
-            .then(crate::buffer::ChangedColumns::default);
+            .then(|| self.frame.take_changed_columns());
         let buffer = self.frame.buffer_for_write();
         let mut cells = cells
             .into_iter()
@@ -420,6 +420,7 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
                 self.frame
                     .wrote(Rect::new(run.start, row.y, run.end - run.start, 1));
             }
+            self.frame.return_changed_columns(changed);
             return;
         }
         // Report only the columns written: callers paint runs much shorter than the row.

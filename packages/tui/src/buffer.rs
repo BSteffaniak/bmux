@@ -139,6 +139,14 @@ impl Cell {
 pub(crate) struct ChangedColumns(Vec<std::ops::Range<u16>>);
 
 impl ChangedColumns {
+    pub(crate) const fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.0.clear();
+    }
+
     /// Note columns `start..end` changed; writes go left to right.
     pub(crate) fn note(&mut self, start: u16, end: u16) {
         match self.0.last_mut() {
