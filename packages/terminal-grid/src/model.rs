@@ -720,6 +720,33 @@ impl PhysicalRow {
         self.wrapped = wrapped;
     }
 
+    /// Write narrow ASCII cells from `col` in `style`, as one-cell clears and writes of each in
+    /// turn do: a wide character the run starts inside or splits at its end is blanked in
+    /// `style`, missing columns are filled with blanks, and trailing blanks are trimmed once. A
+    /// row that must grow reserves the terminal's `width` at once: rows are reused, so it grows
+    /// only once.
+    pub(crate) fn write_ascii(&mut self, col: usize, text: &[u8], style: StyleId, width: usize) {
+        self.changed = true;
+        let end = col + text.len();
+        if col > 0 && self.cells.get(col).is_some_and(Cell::is_wide_continuation) {
+            self.cells[col - 1] = Cell::blank(style);
+        }
+        if self.cells.get(end).is_some_and(Cell::is_wide_continuation) {
+            self.cells[end] = Cell::blank(style);
+        }
+        if self.cells.len() < end {
+            if self.cells.capacity() < end {
+                self.cells.reserve_exact(width.max(end) - self.cells.len());
+            }
+            self.cells
+                .resize_with(end, || Cell::blank(StyleId::DEFAULT));
+        }
+        for (cell, &byte) in self.cells[col..end].iter_mut().zip(text) {
+            *cell = Cell::with_text(CellText::from_char(char::from(byte)), style, 1);
+        }
+        self.trim_trailing_blanks();
+    }
+
     pub(crate) fn set_cell(&mut self, col: usize, cell: Cell) {
         self.changed = true;
         // Appending, as printing nearly always is: trailing blanks can only appear if this one
@@ -1619,6 +1646,57 @@ impl TerminalGrid {
             return;
         }
         self.print_grapheme(CellText::from_char(ch), char_width.min(2));
+    }
+
+    /// Print a run of printable ASCII (`0x20..=0x7e`, translated already): exactly what printing
+    /// each byte with [`Self::print_char`] does, a row segment at a time. Insert mode and disabled
+    /// autowrap take the per-character path.
+    pub(crate) fn print_ascii(&mut self, mut text: &[u8]) {
+        if self.terminal_state.insert_mode || !self.autowrap {
+            for &byte in text {
+                self.print_char(char::from(byte));
+            }
+            return;
+        }
+        while !text.is_empty() {
+            if self.pending_wrap {
+                self.pending_wrap = false;
+                self.mark_current_row_wrapped();
+                self.cursor.col = 0;
+                self.linefeed();
+            }
+            let col = self.cursor.col;
+            if col >= self.width {
+                for &byte in text {
+                    self.print_char(char::from(byte));
+                }
+                return;
+            }
+            let style = match self.interned_style {
+                Some((style, id)) if style == self.current_style => id,
+                _ => {
+                    let id = self.palette.intern(self.current_style);
+                    self.interned_style = Some((self.current_style, id));
+                    id
+                }
+            };
+            let count = text.len().min(self.width - col);
+            let (row, width) = (self.cursor_absolute_row(), self.width);
+            self.active_row_mut(row)
+                .write_ascii(col, &text[..count], style, width);
+            if col + count >= self.width {
+                self.cursor.col = self.width - 1;
+                self.pending_wrap = true;
+            } else {
+                self.cursor.col = col + count;
+                self.pending_wrap = false;
+            }
+            // One revision per character, as printing them one by one counts.
+            let count_revisions = u64::try_from(count).unwrap_or(u64::MAX);
+            self.content_revision = self.content_revision.saturating_add(count_revisions);
+            self.revision = self.revision.saturating_add(count_revisions);
+            text = &text[count..];
+        }
     }
 
     fn print_grapheme(&mut self, text: CellText, char_width: usize) {

@@ -9,6 +9,11 @@ pub struct CharacterState {
 }
 
 impl CharacterState {
+    /// Whether the active character set translates characters (DEC special graphics).
+    pub(crate) fn translates(self) -> bool {
+        self.graphics.get(self.active).copied().unwrap_or(false)
+    }
+
     pub(crate) fn translate(self, ch: char) -> char {
         if !self.graphics.get(self.active).copied().unwrap_or(false) {
             return ch;

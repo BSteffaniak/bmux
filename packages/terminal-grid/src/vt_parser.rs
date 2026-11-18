@@ -109,6 +109,13 @@ pub(crate) trait Perform {
     const OBSERVES_TEXT: bool = true;
 
     fn print(&mut self, _character: char) {}
+    /// Print a run of printable ASCII (`0x20..=0x7e`), each byte as [`Self::print`] would: a
+    /// performer can write the run at once instead of character by character.
+    fn print_ascii(&mut self, text: &[u8]) {
+        for &byte in text {
+            self.print(char::from(byte));
+        }
+    }
     fn execute(&mut self, _byte: u8) {}
     fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
     fn put(&mut self, _byte: u8) {}
@@ -196,8 +203,23 @@ impl<const N: usize> Parser<N> {
             offset = self.complete_saved_utf8(performer, count);
         }
         if P::OBSERVES_TEXT {
-            for &byte in &bytes[offset..] {
-                self.consume(performer, byte);
+            let mut index = offset;
+            while index < bytes.len() {
+                if self.state == State::Text && self.utf8_len == 0 {
+                    // Printable ASCII in text is printed byte by byte with no state change: hand
+                    // the performer the whole run.
+                    let run = bytes[index..]
+                        .iter()
+                        .position(|byte| !(0x20..=0x7e).contains(byte))
+                        .unwrap_or(bytes.len() - index);
+                    if run > 0 {
+                        performer.print_ascii(&bytes[index..index + run]);
+                        index += run;
+                        continue;
+                    }
+                }
+                self.consume(performer, bytes[index]);
+                index += 1;
             }
             return;
         }

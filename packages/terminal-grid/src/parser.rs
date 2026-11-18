@@ -634,6 +634,19 @@ impl Perform for GridPerformer<'_> {
         self.grid.print_char(ch);
     }
 
+    fn print_ascii(&mut self, text: &[u8]) {
+        if self.grid.characters.translates() {
+            for &byte in text {
+                self.print(char::from(byte));
+            }
+            return;
+        }
+        if let Some(&last) = text.last() {
+            self.grid.characters.last = Some(char::from(last));
+        }
+        self.grid.print_ascii(text);
+    }
+
     fn execute(&mut self, byte: u8) {
         match byte {
             b'\n' | 0x0b | 0x0c => self.grid.linefeed(),
@@ -998,6 +1011,129 @@ fn trailing_incomplete_sequence(bytes: &[u8]) -> Vec<u8> {
 mod tests {
     use crate::model::{GridLimits, TerminalGrid};
     use crate::parser::TerminalGridStream;
+
+    /// The grid's performer, printing ASCII a character at a time.
+    struct Characters<'p, 'a>(&'p mut super::GridPerformer<'a>);
+
+    impl crate::vt_parser::Perform for Characters<'_, '_> {
+        fn print(&mut self, character: char) {
+            self.0.print(character);
+        }
+        fn execute(&mut self, byte: u8) {
+            self.0.execute(byte);
+        }
+        fn hook(&mut self, params: &Params, inter: &[u8], ignore: bool, action: char) {
+            self.0.hook(params, inter, ignore, action);
+        }
+        fn put(&mut self, byte: u8) {
+            self.0.put(byte);
+        }
+        fn unhook(&mut self) {
+            self.0.unhook();
+        }
+        fn osc_dispatch(&mut self, params: &[&[u8]], bell: bool) {
+            self.0.osc_dispatch(params, bell);
+        }
+        fn csi_dispatch(&mut self, params: &Params, inter: &[u8], ignore: bool, action: char) {
+            self.0.csi_dispatch(params, inter, ignore, action);
+        }
+        fn esc_dispatch(&mut self, inter: &[u8], ignore: bool, byte: u8) {
+            self.0.esc_dispatch(inter, ignore, byte);
+        }
+    }
+
+    use crate::vt_parser::Params;
+
+    /// What [`TerminalGridStream::process`] does with `chunk`, printing a character at a time.
+    fn process_per_character(stream: &mut TerminalGridStream, chunk: &[u8]) {
+        let revision = stream.grid.revision();
+        std::mem::swap(&mut stream.pending_bytes, &mut stream.previous_pending);
+        let mut on_query = |_: &[u8], _| {};
+        let mut performer = super::GridPerformer {
+            grid: &mut stream.grid,
+            on_pointer_query: &mut on_query,
+        };
+        stream
+            .parser
+            .advance(&mut Characters(&mut performer), chunk);
+        stream.parser.write_replay_prefix(&mut stream.pending_bytes);
+        if stream.pending_bytes != stream.previous_pending && stream.grid.revision() == revision {
+            stream.grid.bump_revision();
+        }
+    }
+
+    /// Pseudo-random terminal output mixing ASCII runs with what interacts with them: wide and
+    /// combining characters, moves, erases, styled blanks, insert mode, autowrap, DEC line
+    /// drawing, repeats, scroll regions, tabs, backspace and DEL.
+    fn mixed_stream(tokens: usize) -> Vec<u8> {
+        let mut seed = 0x9e37_79b9_u32;
+        let mut next = |bound: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed % bound.max(1)
+        };
+        let mut stream = Vec::new();
+        for _ in 0..tokens {
+            let token: Vec<u8> = match next(24) {
+                0..=5 => b"words and more ascii text".to_vec(),
+                6 => b"   ".to_vec(),
+                7 => "界".as_bytes().to_vec(),
+                8 => "e\u{301}x".as_bytes().to_vec(),
+                9 => "👨‍👩‍👧".as_bytes().to_vec(),
+                10 => b"\r\n".to_vec(),
+                11 => format!("\x1b[{};{}H", next(6) + 1, next(14) + 1).into_bytes(),
+                12 => format!("\x1b[{}K", next(3)).into_bytes(),
+                13 => format!("\x1b[{}J", next(3)).into_bytes(),
+                14 => format!("\x1b[48;5;{}m", next(256)).into_bytes(),
+                15 => b"\x1b[0m".to_vec(),
+                16 if next(2) == 0 => b"\x1b[4h".to_vec(),
+                16 => b"\x1b[4l".to_vec(),
+                17 if next(2) == 0 => b"\x1b[?7l".to_vec(),
+                17 => b"\x1b[?7h".to_vec(),
+                18 if next(2) == 0 => b"\x1b(0qx".to_vec(),
+                18 => b"\x1b(B".to_vec(),
+                19 => format!("z\x1b[{}b", next(4) + 1).into_bytes(),
+                20 => format!("\x1b[{};{}r", next(3) + 1, next(3) + 3).into_bytes(),
+                21 => b"\t\x08\x7f".to_vec(),
+                22 => {
+                    format!("\x1b[{}G{}", next(14) + 1, "界".repeat(next(3) as usize)).into_bytes()
+                }
+                _ => b"\x0e\x0f".to_vec(),
+            };
+            stream.extend(token);
+        }
+        stream
+    }
+
+    /// Printing a run of ASCII at once leaves the grid exactly as printing it a character at a
+    /// time: cells, wraps, wide characters it overwrites, styled blanks, history, cursor,
+    /// revisions and character state, at every chunk boundary.
+    #[test]
+    fn printing_ascii_runs_matches_printing_each_character() {
+        let stream = mixed_stream(4000);
+        for chunk_size in [1, 5, 13, 97, 4096] {
+            let limits = GridLimits {
+                scrollback_rows: 20,
+            };
+            let mut runs = TerminalGridStream::new(13, 5, limits).unwrap();
+            let mut characters = TerminalGridStream::new(13, 5, limits).unwrap();
+            for (index, chunk) in stream.chunks(chunk_size).enumerate() {
+                runs.process(chunk);
+                process_per_character(&mut characters, chunk);
+                let (a, b) = (runs.grid(), characters.grid());
+                let at = format!("chunk size {chunk_size}, chunk {index}");
+                let rows = a.height() + a.history_line_count();
+                assert_eq!(a.snapshot(0, rows), b.snapshot(0, rows), "{at}");
+                // Rows cell for cell too: snapshots drop trailing blanks.
+                assert_eq!(a.viewport_rows(), b.viewport_rows(), "{at}");
+                assert_eq!(a.cursor(), b.cursor(), "{at}");
+                assert_eq!(a.revision(), b.revision(), "{at}");
+                assert_eq!(a.content_revision(), b.content_revision(), "{at}");
+                assert_eq!(a.characters, b.characters, "{at}");
+            }
+        }
+    }
 
     /// The protocol tracker skips text (its performer ignores it): what it tracks after every
     /// chunk is what parsing every byte tracks, through UTF-8 split across chunks and interrupted
