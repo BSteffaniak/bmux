@@ -6,7 +6,7 @@
 //! bytes written do not depend on machine load or speed, so a [`Report`] compared against a
 //! committed baseline ([`Report::regressions`]) fails on any increase. Instructions retired are
 //! near-exact too once each frame keeps its fewest across repeats (interrupts and other noise only
-//! add), and gate within 0.5% where both reports counted them.
+//! add), and gate within 2% (what code generation moves them) where both reports counted them.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -331,9 +331,12 @@ fn grew(actual: f64, expected: f64) -> bool {
     actual > expected.mul_add(1.0 + TOLERANCE, 1.0)
 }
 
-/// How much instructions per frame may exceed their baseline: they repeat to within a few
-/// hundredths of a percent on one machine once each frame keeps its fewest across repeats.
-const INSTRUCTION_TOLERANCE: f64 = 0.005;
+/// How much instructions per frame may exceed their baseline. They repeat to within a few
+/// hundredths of a percent once each frame keeps its fewest across repeats, but code generation
+/// moves them more: generic code is compiled into each crate using it, and with one codegen unit
+/// a change anywhere in that crate can shift inlining in unrelated code by about a percent. Units
+/// of work (`crate::work`) gate the work itself exactly; this gates what it costs.
+const INSTRUCTION_TOLERANCE: f64 = 0.02;
 /// Instructions per frame any phase may grow by, however small: a phase that does almost nothing
 /// (a frame deferred, say) varies by a few hundred instructions between runs.
 const INSTRUCTION_SLACK: f64 = 1000.0;

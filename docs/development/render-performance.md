@@ -54,7 +54,7 @@ scripts/perf-render.py work --scenario full-repaint --top 20   # where a scenari
 A check prints `improved (the baseline can be lowered)` when a number drops well below its
 baseline; commit the updated baseline with the change so the gain cannot be lost. Allocations and
 bytes allow 1% (or one allocation) for differences between platforms' standard libraries;
-instructions allow 0.5% plus 1,000 per frame; units of work allow 0.2%. Baselines are per OS; CI
+instructions allow 2% plus 1,000 per frame, since code generation moves them by about a percent (generic code is compiled into each crate using it, and with one codegen unit a change elsewhere in that crate shifts inlining); units of work, which code generation cannot move, allow 0.2%. Baselines are per OS; CI
 uploads its reports, and a missing Linux baseline is taken from that artifact. A machine whose
 instruction counts legitimately differ from the baseline's runs with `BMUX_BENCH_GATE_INSTRUCTIONS=0`.
 
