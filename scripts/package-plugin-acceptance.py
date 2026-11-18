@@ -170,7 +170,7 @@ def main() -> None:
     for artifact in artifacts:
         if artifact["expected_id"] in {"bcode.filesystem", "bcode.shell"}:
             domain = artifact["expected_id"].split(".")[1].upper()
-            environment[f"BCODE_{domain}_WRAPPER_ARTIFACT"] = artifact["path"]
+            environment[f"BCODE_{domain}_BACKEND_ARTIFACT"] = artifact["path"]
     report = {"schema_version": 1, "artifacts": artifacts,
               "abi_version": shared["ABI_VERSION"],
               "required_capabilities": shared["REQUIRED_CAPABILITIES"],

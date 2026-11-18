@@ -104,16 +104,16 @@ bmux_plugin_sdk::plugin!(Counter);
 `Declarations<P>` stores type-erased entries built from the generated
 markers; nothing in it is product specific:
 
-| Method                          | Entry                                                                                                                                     |
-| ------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `provide::<dyn I>()`            | `I::DESCRIPTOR` plus the generated `dispatch`, `dispatch_streaming`, `register` and `portable` functions. Does not compile unless `P: I`. |
-| `require::<C>()`                | The client's descriptor; `Activation::service::<C>()` refuses undeclared requirements.                                                    |
-| `command(decl, handler)`        | A BPDL command with typed arguments; `handler` is any `async fn(&self, &Call, Args) -> Result<()>`.                                       |
-| `native_command(name, handler)` | A command still declared by hand in `plugin.toml`, handled with the raw `NativeCommandContext` (`native-plugin` uses it).                 |
-| `extend::<E>(data)`             | A contribution to extension point `E` with `P` implementing its `Behavior`.                                                               |
-| `emits::<E>()`                  | A contract event `P` publishes: its channel is registered for the activation before `activate` runs.                                      |
-| `subscribe::<C>()`              | An events interface `P` follows; `Activation::events::<C>()` refuses undeclared subscriptions.                                            |
-| `on_event(handler)`             | Host events delivered to the plugin.                                                                                                      |
+| Method                                      | Entry                                                                                                                                                                         |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `provide::<dyn I>()`                        | `I::DESCRIPTOR` plus the generated `dispatch`, `dispatch_streaming`, `register` and `portable` functions. Does not compile unless `P: I`.                                     |
+| `require::<C>()`                            | The client's descriptor; `Activation::service::<C>()` refuses undeclared requirements.                                                                                        |
+| `command(decl, handler)`                    | A BPDL command with typed arguments; `handler` is any `async fn(&self, &Call, Args) -> Result<()>`.                                                                           |
+| `native_command(name, handler)`             | A command still declared by hand in `plugin.toml`, handled with the raw `NativeCommandContext` (`native-plugin` uses it).                                                     |
+| `extend::<E>(data)`                         | A contribution to extension point `E` with `P` implementing its `Behavior`.                                                                                                   |
+| `emits::<E>()`                              | A contract event `P` publishes: its channel is registered for the activation before `activate` runs.                                                                          |
+| `subscribe::<C>()`                          | An events interface `P` follows; `Activation::events::<C>()` refuses undeclared subscriptions.                                                                                |
+| `on_event(handler)`                         | Host events delivered to the plugin.                                                                                                                                          |
 | `native_services(handler)`                  | One async handler over the raw service context for every manifest service not `provide`d with generated bindings (opaque or hand-routed interfaces). It owns checked framing. |
 | `blocking_services(unary, streaming)`       | The same with synchronous bodies, run on the host's blocking pool inside the call's callback entry; checked frames are decoded with the generated contract and re-framed.     |
 | `blocking_command(name, handler)`           | A hand-declared command with a synchronous body run inside its callback entry; command-outcome metadata it records is returned.                                               |
@@ -344,6 +344,10 @@ A plugin crate builds its own dynamic library; nothing is generated.
   is evaluated inside the SDK's own macro definitions, so plugin crates never
   name it. The packager's build label (`BMUX_PLUGIN_ARTIFACT_ID`) is retained
   in the artifact bytes.
+- Product author layers that build a `PluginDefinition` without `impl Plugin`
+  (bcode's `define_plugin!`) export the same entry with
+  `bmux_plugin_sdk::packaged_entry!(<fn() -> PluginDefinition>)`; `plugin!`
+  is that call over its generated `plugin_definition`.
 - `scripts/package-plugin.py --implementation-manifest <crate>/Cargo.toml
   --component backend --build` runs
   `cargo rustc --lib --crate-type cdylib --no-default-features
@@ -354,7 +358,9 @@ A plugin crate builds its own dynamic library; nothing is generated.
   to that invocation only, so workspace builds never produce a cdylib.
 - The SDK is whatever the crate's own dependency graph resolves (`cargo
   metadata` over its Cargo.lock): a path SDK in this workspace, or bmux pinned
-  from git (`git = "...", branch = "master"`) in bcode. The receipt
+  from git (`git = "...", branch = "master"`) in bcode. It may be linked
+  directly or through an author layer that re-exports it; exactly one SDK
+  must be linked, and build or dev dependencies don't count. The receipt
   (`--output/packaging.json`) records it, e.g.
   `git+https://…?branch=master#<commit>`. There is no `--sdk-manifest`.
   `packages/cli/tests/plugin_packaging_git_source_integration.rs` packages a
@@ -368,8 +374,7 @@ A plugin crate builds its own dynamic library; nothing is generated.
 
 Every BMUX workspace plugin declares the role features and is packaged this
 way by `bmux plugin rebuild`; there is no generated-wrapper path. A crate
-without the role feature for a component cannot be packaged as that component
-(bcode plugins gain the features as they move to `plugin!`).
+without the role feature for a component cannot be packaged as that component.
 
 BPDL commands are exposed in the CLI, so the generated manifest also claims
 their paths (`owns_paths`); `plugin.toml` may add paths, never remove them.
