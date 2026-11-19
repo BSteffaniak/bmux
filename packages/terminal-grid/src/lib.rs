@@ -47,8 +47,8 @@ pub use model::{
     TerminalGridError, ViewportScroll, physical_row_is_blank,
 };
 pub use parser::{
-    ProtocolProcessOutcome, TerminalGridStream, TerminalGridStreamDeltaError,
-    TerminalProtocolTracker,
+    HeaderValues, IgnoreSequences, MAX_OBSERVED_DCS_BYTES, ProtocolProcessOutcome, SequenceHeader,
+    SequenceObserver, TerminalGridStream, TerminalGridStreamDeltaError, TerminalProtocolTracker,
 };
 pub use render::{
     content_text, full_screen_repaint_bytes, row_text, visible_text, visible_text_lines,

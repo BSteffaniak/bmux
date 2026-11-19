@@ -51,7 +51,8 @@ use bmux_session_models::{ClientId, SessionId};
 use bmux_session_state::SessionManagerHandle;
 use bmux_snapshot_runtime::{SnapshotDirtyFlag, SnapshotDirtyFlagHandle};
 use bmux_terminal_grid::{
-    GridDeltaBatch, GridLimits, ProtocolState, TerminalGrid, TerminalGridStream,
+    GridDeltaBatch, GridLimits, ProtocolState, SequenceHeader, SequenceObserver, TerminalGrid,
+    TerminalGridStream,
 };
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
 use pty::Slave as _;
@@ -2338,26 +2339,24 @@ impl PaneReader {
         self.pointer_replies.clear();
     }
 
-    /// Parse `bytes` into `grid`, collecting pointer-shape query replies.
-    fn feed(&mut self, grid: &mut TerminalGridStream, bytes: &[u8]) {
-        use bmux_terminal_protocol::pointer_shape::{
-            PointerShape, PointerShapeQueryContext, encode_pointer_shape_query_reply,
-        };
-        let (profile, replies) = (self.profile, &mut self.pointer_replies);
-        grid.process_with_pointer_queries(bytes, |query, current| {
-            if matches!(profile, ProtocolProfile::Bmux) {
-                // The grid has already bounded and validated the complete OSC payload.
-                let _ = encode_pointer_shape_query_reply(
-                    query,
-                    PointerShapeQueryContext {
-                        current,
-                        default: PointerShape::Text,
-                        grabbed: PointerShape::Default,
-                    },
-                    replies,
-                );
-            }
-        });
+    /// Parse `bytes` into `grid`, answering the queries among them as the grid reaches each:
+    /// the protocol engine's into `replies`, pointer-shape queries into the reader's own.
+    fn feed(
+        &mut self,
+        grid: &mut TerminalGridStream,
+        engine: &mut TerminalProtocolEngine,
+        bytes: &[u8],
+        replies: &mut Vec<u8>,
+    ) {
+        grid.process_observed(
+            bytes,
+            &mut ReaderObserver {
+                engine,
+                replies,
+                pointer_replies: &mut self.pointer_replies,
+                profile: self.profile,
+            },
+        );
     }
 
     /// Rows scrolled since the last call, to move image positions by.
@@ -2366,6 +2365,85 @@ impl PaneReader {
         let total = grid.grid().viewport_scroll_revision();
         let delta = total.wrapping_sub(self.scrolled.replace(total).unwrap_or(total));
         u16::try_from(delta).unwrap_or(u16::MAX)
+    }
+}
+
+/// What the pane reader observes of its grid's parse: queries answered by the protocol engine with
+/// the cursor and modes as of each query, and pointer-shape queries answered for the bmux profile.
+struct ReaderObserver<'a> {
+    engine: &'a mut TerminalProtocolEngine,
+    replies: &'a mut Vec<u8>,
+    pointer_replies: &'a mut Vec<u8>,
+    profile: ProtocolProfile,
+}
+
+impl SequenceObserver for ReaderObserver<'_> {
+    fn csi(&mut self, grid: &TerminalGrid, sequence: &SequenceHeader<'_>) {
+        if !TerminalProtocolEngine::may_answer_csi(sequence.action()) {
+            return;
+        }
+        let Some(values) = sequence.values() else {
+            return;
+        };
+        let cursor = grid_cursor_position(grid);
+        if sequence.action() == 'n' && *values == [6] {
+            trace!(
+                tracked_row = cursor.0.saturating_add(1),
+                tracked_col = cursor.1.saturating_add(1),
+                pane_rows = grid.height(),
+                pane_cols = grid.width(),
+                alternate_screen = matches!(grid.mode(), bmux_terminal_grid::GridMode::Alternate),
+                "pane protocol reply: cursor position report"
+            );
+        }
+        self.engine.answer_csi(
+            &values,
+            sequence.intermediates(),
+            sequence.action(),
+            cursor,
+            grid.protocol_state().bracketed_paste,
+            self.replies,
+        );
+    }
+
+    fn osc(&mut self, _grid: &TerminalGrid, params: &[&[u8]], _bell_terminated: bool) {
+        self.engine.answer_osc(params, self.replies);
+    }
+
+    fn wants_dcs(&mut self, introducer: &SequenceHeader<'_>) -> bool {
+        introducer.values().is_some_and(|values| {
+            TerminalProtocolEngine::wants_dcs(
+                &values,
+                introducer.intermediates(),
+                introducer.action(),
+            )
+        })
+    }
+
+    fn dcs(&mut self, _grid: &TerminalGrid, intermediates: &[u8], _action: char, data: &[u8]) {
+        self.engine.answer_dcs(intermediates, data, self.replies);
+    }
+
+    fn pointer_query(
+        &mut self,
+        query: &[u8],
+        current: Option<bmux_terminal_protocol::pointer_shape::PointerShape>,
+    ) {
+        use bmux_terminal_protocol::pointer_shape::{
+            PointerShape, PointerShapeQueryContext, encode_pointer_shape_query_reply,
+        };
+        if matches!(self.profile, ProtocolProfile::Bmux) {
+            // The grid has already bounded and validated the complete OSC payload.
+            let _ = encode_pointer_shape_query_reply(
+                query,
+                PointerShapeQueryContext {
+                    current,
+                    default: PointerShape::Text,
+                    grabbed: PointerShape::Default,
+                },
+                self.pointer_replies,
+            );
+        }
     }
 }
 
@@ -2402,8 +2480,8 @@ impl PaneCursorTracker {
 }
 
 /// The cursor of `grid`, as a cursor position report gives it (zero-based row and column).
-fn grid_cursor_position(grid: &TerminalGridStream) -> (u16, u16) {
-    let cursor = grid.grid().cursor();
+fn grid_cursor_position(grid: &TerminalGrid) -> (u16, u16) {
+    let cursor = grid.cursor();
     (
         u16::try_from(cursor.row).unwrap_or(u16::MAX),
         u16::try_from(cursor.col).unwrap_or(u16::MAX),
@@ -2503,7 +2581,7 @@ fn follow_output(
     replies: &mut Vec<u8>,
 ) {
     let filtered = visible_output(reader, bytes);
-    replies.extend(protocol_reply_for_chunk(protocol, reader, grid, &filtered));
+    reader.feed(grid, protocol, &filtered, replies);
 }
 
 fn sanitize_pty_size(rows: u16, cols: u16) -> (u16, u16) {
@@ -2609,7 +2687,7 @@ fn ordered_image_output(
             replies,
         )?;
         fed = offset;
-        let (row, col) = grid_cursor_position(grid);
+        let (row, col) = grid_cursor_position(grid.grid());
         event.set_position(bmux_image::ImagePosition { row, col });
         registry.handle_event(event.clone(), cell_pixels.0, cell_pixels.1);
         // Kitty graphics answers go back to the program in order with its other replies.
@@ -2648,7 +2726,7 @@ fn image_terminal_bytes(
         let erase = grid.grid().display_erase_revision();
         let history_erase = grid.grid().history_erase_revision();
         let reset = grid.grid().reset_revision();
-        replies.extend(protocol_reply_for_chunk(protocol, reader, grid, unit));
+        reader.feed(grid, protocol, unit, replies);
         if reset != grid.grid().reset_revision() {
             registry.reset();
         }
@@ -3007,32 +3085,18 @@ mod image_lifecycle_tests {
     }
 }
 
+/// The replies `chunk` draws as the pane reader follows it through `grid` (tests drive replies
+/// through this).
+#[cfg(test)]
 fn protocol_reply_for_chunk(
     protocol_engine: &mut TerminalProtocolEngine,
     reader: &mut PaneReader,
     grid: &mut TerminalGridStream,
     chunk: &[u8],
 ) -> Vec<u8> {
-    // The grid follows the chunk in whole spans, split only where a cursor-position query ends,
-    // so each reply still sees the cursor exactly as of its query.
-    let mut fed = 0;
-    let reply = protocol_engine.process_output_with_cursor(chunk, |index| {
-        reader.feed(grid, &chunk[fed..=index]);
-        fed = index + 1;
-        let (row, col) = grid_cursor_position(grid);
-        trace!(
-            tracked_row = row.saturating_add(1),
-            tracked_col = col.saturating_add(1),
-            pane_rows = grid.grid().height(),
-            pane_cols = grid.grid().width(),
-            alternate_screen =
-                matches!(grid.grid().mode(), bmux_terminal_grid::GridMode::Alternate),
-            "pane protocol reply: cursor position report"
-        );
-        (row, col)
-    });
-    reader.feed(grid, &chunk[fed..]);
-    reply
+    let mut replies = Vec::new();
+    reader.feed(grid, protocol_engine, chunk, &mut replies);
+    replies
 }
 
 const BMUX_SHELL_METADATA_PREFIX: &str = "633;bmux;";
@@ -20502,7 +20566,7 @@ exit 7"#
             let suffix = &b"\x1b[4;15H"[prefix.len()..];
             let mut grid = pane.terminal_grid.lock().unwrap();
             grid.process(suffix);
-            assert_eq!(grid_cursor_position(&grid), (3, 14));
+            assert_eq!(grid_cursor_position(grid.grid()), (3, 14));
             assert_eq!(grid.grid().cursor().row, 3);
             assert_eq!(grid.grid().cursor().col, 14);
         }

@@ -19,6 +19,8 @@ pub struct TerminalGridStream {
     pending_bytes: Vec<u8>,
     /// The prefix before the last chunk, kept to compare with and to reuse its storage.
     previous_pending: Vec<u8>,
+    /// A DCS string an observer asked for, collected across chunks.
+    observed_dcs: ObservedDcs,
 }
 
 impl TerminalGridStream {
@@ -39,6 +41,7 @@ impl TerminalGridStream {
             grid,
             pending_bytes: Vec::new(),
             previous_pending: Vec::new(),
+            observed_dcs: ObservedDcs::default(),
         }
     }
 
@@ -84,7 +87,7 @@ impl TerminalGridStream {
 
     /// Process one chunk of PTY output.
     pub fn process(&mut self, bytes: &[u8]) {
-        self.process_with_pointer_queries(bytes, |_, _| {});
+        self.process_observed(bytes, &mut IgnoreSequences);
     }
 
     /// Process output and synchronously observe each complete OSC 22 query.
@@ -95,8 +98,14 @@ impl TerminalGridStream {
     pub fn process_with_pointer_queries(
         &mut self,
         bytes: &[u8],
-        mut on_query: impl FnMut(&[u8], Option<PointerShape>),
+        on_query: impl FnMut(&[u8], Option<PointerShape>),
     ) {
+        self.process_observed(bytes, &mut PointerQueries(on_query));
+    }
+
+    /// Process output, showing `observer` each sequence in order as the grid applies it (see
+    /// [`SequenceObserver`]). Snapshot restoration never shows an observer anything.
+    pub fn process_observed<O: SequenceObserver>(&mut self, bytes: &[u8], observer: &mut O) {
         if bytes.is_empty() {
             return;
         }
@@ -104,7 +113,8 @@ impl TerminalGridStream {
         std::mem::swap(&mut self.pending_bytes, &mut self.previous_pending);
         let mut performer = GridPerformer {
             grid: &mut self.grid,
-            on_pointer_query: &mut on_query,
+            observer,
+            dcs: &mut self.observed_dcs,
         };
         self.parser.advance(&mut performer, bytes);
         // Written into the storage of the prefix before last: normal text writes nothing.
@@ -506,9 +516,118 @@ pub(crate) fn process(grid: &mut TerminalGrid, bytes: &[u8]) {
     let mut parser = Parser::new();
     let mut performer = GridPerformer {
         grid,
-        on_pointer_query: &mut |_, _| {},
+        observer: &mut IgnoreSequences,
+        dcs: &mut ObservedDcs::default(),
     };
     parser.advance(&mut performer, bytes);
+}
+
+/// The longest DCS string an observer is shown; a longer one is dropped.
+pub const MAX_OBSERVED_DCS_BYTES: usize = 512;
+
+/// What a caller observes of the sequences a [`TerminalGridStream`] parses, in order with the
+/// grid's own handling: each call comes after the grid has applied the sequence, with the grid as
+/// it then is (its cursor, its modes). Observers are statically dispatched, and every method
+/// defaults to nothing, so a stream that observes nothing ([`TerminalGridStream::process`])
+/// costs what it did without them.
+pub trait SequenceObserver {
+    /// A complete CSI sequence the parser did not ignore.
+    fn csi(&mut self, _grid: &TerminalGrid, _sequence: &SequenceHeader<'_>) {}
+
+    /// A complete OSC string, split at `;` into at most 16 parameters.
+    fn osc(&mut self, _grid: &TerminalGrid, _params: &[&[u8]], _bell_terminated: bool) {}
+
+    /// Whether to collect the DCS string `introducer` starts, for [`Self::dcs`]. Asked once per
+    /// string; data is collected only when this says so.
+    fn wants_dcs(&mut self, _introducer: &SequenceHeader<'_>) -> bool {
+        false
+    }
+
+    /// A complete DCS string [`Self::wants_dcs`] asked for: its introducer's intermediates and
+    /// final byte, and its data (at most [`MAX_OBSERVED_DCS_BYTES`]).
+    fn dcs(&mut self, _grid: &TerminalGrid, _intermediates: &[u8], _action: char, _data: &[u8]) {}
+
+    /// An OSC 22 pointer-shape query (its query list, without `?`) and the active screen's current
+    /// shape. Replies and default/grabbed policy are the observer's.
+    fn pointer_query(&mut self, _query: &[u8], _current: Option<PointerShape>) {}
+}
+
+/// An observer of nothing.
+pub struct IgnoreSequences;
+
+impl SequenceObserver for IgnoreSequences {}
+
+/// An observer of pointer-shape queries only.
+struct PointerQueries<F>(F);
+
+impl<F: FnMut(&[u8], Option<PointerShape>)> SequenceObserver for PointerQueries<F> {
+    fn pointer_query(&mut self, query: &[u8], current: Option<PointerShape>) {
+        (self.0)(query, current);
+    }
+}
+
+/// The header of a CSI sequence or DCS string: parameters, intermediates (a private marker such
+/// as `?` or `>` first) and final byte.
+pub struct SequenceHeader<'a> {
+    params: &'a Params,
+    intermediates: &'a [u8],
+    action: char,
+}
+
+impl SequenceHeader<'_> {
+    /// Private marker and intermediate bytes, in order.
+    #[must_use]
+    pub const fn intermediates(&self) -> &[u8] {
+        self.intermediates
+    }
+
+    /// The final byte.
+    #[must_use]
+    pub const fn action(&self) -> char {
+        self.action
+    }
+
+    /// The parameter values (one omitted is 0), or `None` when any has subparameters.
+    #[must_use]
+    pub fn values(&self) -> Option<HeaderValues> {
+        let mut values = HeaderValues {
+            values: [0; 32],
+            len: 0,
+        };
+        for group in self.params {
+            let [value] = group else {
+                return None;
+            };
+            *values.values.get_mut(values.len)? = *value;
+            values.len += 1;
+        }
+        Some(values)
+    }
+}
+
+/// A sequence's parameter values, on the stack (a sequence holds at most 32).
+pub struct HeaderValues {
+    values: [u16; 32],
+    len: usize,
+}
+
+impl std::ops::Deref for HeaderValues {
+    type Target = [u16];
+
+    fn deref(&self) -> &[u16] {
+        &self.values[..self.len]
+    }
+}
+
+/// A DCS string being collected for an observer.
+#[derive(Default)]
+struct ObservedDcs {
+    collecting: bool,
+    overflow: bool,
+    intermediates: [u8; 2],
+    intermediate_len: usize,
+    action: char,
+    data: Vec<u8>,
 }
 
 struct ParserRestore;
@@ -630,12 +749,13 @@ impl Perform for ProtocolPerformer<'_> {
     }
 }
 
-struct GridPerformer<'a> {
+struct GridPerformer<'a, O: SequenceObserver> {
     grid: &'a mut TerminalGrid,
-    on_pointer_query: &'a mut dyn FnMut(&[u8], Option<PointerShape>),
+    observer: &'a mut O,
+    dcs: &'a mut ObservedDcs,
 }
 
-impl Perform for GridPerformer<'_> {
+impl<O: SequenceObserver> Perform for GridPerformer<'_, O> {
     fn print(&mut self, c: char) {
         let ch = self.grid.characters.translate(c);
         self.grid.characters.last = Some(ch);
@@ -669,13 +789,73 @@ impl Perform for GridPerformer<'_> {
         }
     }
 
-    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
+    fn hook(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        let header = SequenceHeader {
+            params,
+            intermediates,
+            action,
+        };
+        let dcs = &mut *self.dcs;
+        dcs.collecting = !ignore && self.observer.wants_dcs(&header);
+        if dcs.collecting {
+            dcs.overflow = false;
+            dcs.intermediate_len = intermediates.len().min(dcs.intermediates.len());
+            dcs.intermediates[..dcs.intermediate_len]
+                .copy_from_slice(&intermediates[..dcs.intermediate_len]);
+            dcs.action = action;
+            dcs.data.clear();
+        }
+    }
 
-    fn put(&mut self, _byte: u8) {}
+    fn put(&mut self, byte: u8) {
+        let dcs = &mut *self.dcs;
+        if dcs.collecting && !dcs.overflow {
+            if dcs.data.len() < MAX_OBSERVED_DCS_BYTES {
+                dcs.data.push(byte);
+            } else {
+                dcs.overflow = true;
+            }
+        }
+    }
 
-    fn unhook(&mut self) {}
+    fn unhook(&mut self) {
+        let dcs = &mut *self.dcs;
+        if std::mem::take(&mut dcs.collecting) && !dcs.overflow {
+            self.observer.dcs(
+                self.grid,
+                &dcs.intermediates[..dcs.intermediate_len],
+                dcs.action,
+                &dcs.data,
+            );
+        }
+    }
 
-    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
+        self.apply_osc(params);
+        self.observer.osc(self.grid, params, bell_terminated);
+    }
+
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        self.apply_csi(params, intermediates, ignore, action);
+        if !ignore {
+            self.observer.csi(
+                self.grid,
+                &SequenceHeader {
+                    params,
+                    intermediates,
+                    action,
+                },
+            );
+        }
+    }
+
+    fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+        self.apply_esc(intermediates, ignore, byte);
+    }
+}
+
+impl<O: SequenceObserver> GridPerformer<'_, O> {
+    fn apply_osc(&mut self, params: &[&[u8]]) {
         if let [selector, payload] = params
             && *selector == b"22"
             && let Ok(operation) = parse_pointer_shape(payload)
@@ -686,7 +866,7 @@ impl Perform for GridPerformer<'_> {
                     .protocol_state()
                     .pointer_shapes
                     .current(self.grid.mode() == GridMode::Alternate);
-                (self.on_pointer_query)(query, current);
+                self.observer.pointer_query(query, current);
             } else {
                 self.grid.apply_pointer_shape(operation);
             }
@@ -697,7 +877,7 @@ impl Perform for GridPerformer<'_> {
         clippy::too_many_lines,
         reason = "single CSI dispatcher keeps terminal escape handling in one explicit state-machine branch"
     )]
-    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+    fn apply_csi(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
         if !ignore && is_soft_reset(params, intermediates, action) {
             self.grid.soft_reset_input_modes();
             return;
@@ -836,7 +1016,7 @@ impl Perform for GridPerformer<'_> {
         }
     }
 
-    fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+    fn apply_esc(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
         if ignore {
             return;
         }
@@ -1036,7 +1216,7 @@ mod tests {
     use crate::parser::TerminalGridStream;
 
     /// The grid's performer, printing ASCII a character at a time.
-    struct Characters<'p, 'a>(&'p mut super::GridPerformer<'a>);
+    struct Characters<'p, 'a>(&'p mut super::GridPerformer<'a, super::IgnoreSequences>);
 
     impl crate::vt_parser::Perform for Characters<'_, '_> {
         fn print(&mut self, character: char) {
@@ -1071,10 +1251,10 @@ mod tests {
     fn process_per_character(stream: &mut TerminalGridStream, chunk: &[u8]) {
         let revision = stream.grid.revision();
         std::mem::swap(&mut stream.pending_bytes, &mut stream.previous_pending);
-        let mut on_query = |_: &[u8], _| {};
         let mut performer = super::GridPerformer {
             grid: &mut stream.grid,
-            on_pointer_query: &mut on_query,
+            observer: &mut super::IgnoreSequences,
+            dcs: &mut stream.observed_dcs,
         };
         stream
             .parser
