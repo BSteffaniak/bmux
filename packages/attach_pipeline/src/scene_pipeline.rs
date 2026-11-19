@@ -22,7 +22,7 @@ use bmux_attach_pipeline_models::{
 };
 use bmux_attach_view_protocol::AttachViewComponent;
 use bmux_client::{AttachLayoutState, AttachPaneSnapshotState, AttachSnapshotState};
-use bmux_terminal_grid::{GridFrame, GridLimits, GridMode, GridSnapshot, TerminalGridStream};
+use bmux_terminal_grid::{GridLimits, GridMode, GridSnapshot, TerminalGridStream};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -34,13 +34,14 @@ pub struct AttachPaneGridSnapshotState {
     pub snapshot: GridSnapshot,
 }
 
-/// A frame for one pane's replica, decoded.
+/// A frame for one pane's replica, as the server sent it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachPaneFrameState {
     pub pane_id: Uuid,
     /// The program is inside a synchronized update as of the frame.
     pub sync_update_active: bool,
-    pub frame: GridFrame,
+    /// The frame, as `TerminalGrid::write_frame_since` writes it.
+    pub frame: Vec<u8>,
 }
 
 pub struct AttachScenePipeline {
@@ -1016,7 +1017,13 @@ mod tests {
         AttachPaneFrameState {
             pane_id,
             sync_update_active: false,
-            frame: source.grid_mut().frame_since(cursor, usize::MAX),
+            frame: {
+                let mut bytes = Vec::new();
+                source
+                    .grid_mut()
+                    .write_frame_since(cursor, usize::MAX, &mut bytes);
+                bytes
+            },
         }
     }
 
@@ -1089,14 +1096,14 @@ mod tests {
             pane_id,
             pipeline.pane_buffers[&pane_id].replica,
         );
-        stale.frame.base.epoch += 7;
+        // Cut short in transit.
+        stale.frame.truncate(stale.frame.len() / 2);
         assert_eq!(pipeline.apply_pane_frames(vec![stale]), vec![pane_id]);
         let reset = frame_for(
             &mut source,
             pane_id,
             bmux_terminal_grid::ReplicaCursor::default(),
         );
-        assert!(reset.frame.reset);
         assert_eq!(pipeline.apply_pane_frames(vec![reset]), Vec::<Uuid>::new());
         assert_eq!(
             pipeline.pane_buffers[&pane_id]

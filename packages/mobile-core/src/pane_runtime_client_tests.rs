@@ -104,14 +104,15 @@ fn generated_frame_transport_carries_frames_that_apply() {
     let pane_id = Uuid::new_v4();
     let mut producer = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
     producer.process(b"hi\x1b]22;pointer\x07");
-    let frame = producer
+    let mut frame = Vec::new();
+    producer
         .grid_mut()
-        .frame_since(ReplicaCursor::default(), usize::MAX);
+        .write_frame_since(ReplicaCursor::default(), usize::MAX, &mut frame);
     let response = Ok::<_, attach_state::AttachStateError>(attach_state::AttachPaneFrames {
         frames: vec![attach_state::PaneFrame {
             pane_id,
             sync_update_active: true,
-            encoded: bmux_ipc::encode(&frame).unwrap(),
+            encoded: frame.clone(),
             replay_markers: Vec::new(),
         }],
         frames_still_pending: false,
@@ -132,10 +133,10 @@ fn generated_frame_transport_carries_frames_that_apply() {
         .unwrap();
     assert!(!pending);
     assert!(received[0].sync_update_active);
-    let decoded: bmux_terminal_grid::GridFrame = bmux_ipc::decode(&received[0].encoded).unwrap();
+    assert_eq!(received[0].encoded, frame);
     let mut replica = TerminalGrid::new(1, 1, GridLimits::default()).unwrap();
     replica
-        .apply_frame(&decoded, &mut ReplicaCursor::default())
+        .apply_frame(&received[0].encoded, &mut ReplicaCursor::default())
         .unwrap();
     assert_eq!(
         replica.snapshot(0, 2).rows,

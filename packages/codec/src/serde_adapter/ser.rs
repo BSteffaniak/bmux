@@ -51,6 +51,22 @@ pub(crate) fn to_vec_with_mode<T: Serialize>(
     Ok(serializer.into_vec())
 }
 
+/// Serialize `value`, appending to `output` (whose storage the serializer borrows, so a reused
+/// buffer allocates nothing once large enough).
+pub(crate) fn append_with_mode<T: Serialize + ?Sized>(
+    value: &T,
+    mode: EncodingMode,
+    output: &mut Vec<u8>,
+) -> Result<(), Error> {
+    let mut serializer = Serializer {
+        output: std::mem::take(output),
+        mode,
+    };
+    let result = value.serialize(&mut serializer);
+    *output = serializer.into_vec();
+    result
+}
+
 impl ser::Serializer for &mut Serializer {
     type Ok = ();
     type Error = Error;

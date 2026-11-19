@@ -1292,7 +1292,7 @@ interface attach-runtime-state {
         // The program is inside a synchronized update (DEC mode 2026) as of this frame: hold
         // rendering until it ends or times out.
         sync_update_active: bool,
-        // A `bmux_terminal_grid::GridFrame`, encoded with `bmux_ipc::encode`.
+        // The frame, as bmux_terminal_grid's TerminalGrid::write_frame_since writes it.
         encoded: list<u8>,
         // `bmux-bench replay` markers the program wrote since the client's last frame, as
         // written; empty unless the server logs replay.

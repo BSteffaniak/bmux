@@ -33,7 +33,7 @@ pub use error::Error;
 pub use serde_adapter::stable::{from_bytes, to_vec};
 
 #[cfg(all(feature = "serde", feature = "positional"))]
-pub use serde_adapter::positional::{from_positional_bytes, to_positional_vec};
+pub use serde_adapter::positional::{append_positional, from_positional_bytes, to_positional_vec};
 
 #[cfg(all(feature = "serde", feature = "typed-stable"))]
 pub use serde_adapter::typed_stable::{from_typed_bytes, to_typed_vec};

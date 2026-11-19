@@ -10,6 +10,13 @@
 //!
 //! A replica that cannot be brought forward exactly (it is new, its epoch fell out of the move
 //! log, or the grid was reset or resized) is sent a reset frame, which replaces its whole state.
+//!
+//! Frames are bytes, written straight into a caller's buffer ([`TerminalGrid::write_frame_since`])
+//! and applied straight from it ([`TerminalGrid::apply_frame`]), each row decoded into the
+//! storage of the row it replaces: building and applying a frame allocates nothing once the
+//! buffers are warm, beyond the history lines a replica keeps. Rows, lines and moves are
+//! varint-encoded by hand (they are the volume); new palette entries and the terminal state,
+//! small and rare, are `bmux_codec` positional blobs.
 
 use super::{
     Cell, CellText, Cursor, GridMode, LogicalLine, PhysicalRow, TerminalGrid, ViewportScroll,
@@ -24,6 +31,16 @@ use std::sync::OnceLock;
 /// Moves kept for replicas behind the grid; one further behind is sent a reset frame.
 const MAX_LOGGED_MOVES: usize = 4096;
 
+/// The frame encoding written and accepted.
+const FRAME_VERSION: u8 = 1;
+
+const FLAG_RESET: u8 = 1;
+const FLAG_HISTORY_CLEARED: u8 = 2;
+const FLAG_PENDING_HISTORY: u8 = 4;
+
+const LINE_COMPACT: u8 = 0;
+const LINE_CELLS: u8 = 1;
+
 /// Where a replica is: the last frame it applied. A new replica is at the default, which is
 /// behind everything, so its first frame is a reset frame.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,128 +53,32 @@ pub struct ReplicaCursor {
     pub styles: u32,
 }
 
-/// Which screen a row or move belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FrameScreen {
-    Main,
-    Alternate,
-}
-
-/// Rows `top..=bottom` of a screen moved by `rows`, positive toward `top`. Rows moved out of
-/// the region are dropped (history arrives as lines); rows exposed are always sent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FrameMove {
-    pub screen: FrameScreen,
-    pub top: u16,
-    pub bottom: u16,
-    pub rows: i32,
-}
-
-/// One row as it now is.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FrameRow {
-    pub screen: FrameScreen,
-    pub index: u32,
-    pub wrapped: bool,
-    pub cells: FrameLine,
-}
-
-/// A row's or line's cells: their text joined, with style runs and wide cells, or each cell as
-/// it is when the compact form cannot hold them exactly.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FrameLine {
-    Compact {
-        text: String,
-        /// Where each cell's text ends, when some cell is not exactly one character.
-        ends: Vec<u32>,
-        /// Cells two columns wide; each is followed by its continuation, which is not counted.
-        wide: Vec<u32>,
-        /// The first cell's style id.
-        style: u32,
-        /// Each later style run's first cell and style id.
-        runs: Vec<(u32, u32)>,
-        /// Cells, continuations not counted.
-        len: u32,
-    },
-    Cells(Vec<FrameCell>),
-}
-
-/// A cell, as [`FrameLine::Cells`] carries it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FrameCell {
-    pub text: String,
-    pub style: u32,
-    pub width: u8,
-    pub continuation: bool,
-}
-
-/// Autowrap and the pending wrap, live and saved with the cursor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FrameWrap {
-    pub autowrap: bool,
-    pub pending: bool,
-    pub saved_pending: bool,
-}
-
-/// The grid's terminal state, sent whole in every frame (it is small).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FrameState {
-    pub screen: FrameScreen,
-    pub cursor: CursorSnapshot,
-    pub saved_cursor: CursorSnapshot,
-    pub wrap: FrameWrap,
-    pub characters: crate::CharacterState,
-    pub saved_characters: crate::CharacterState,
-    pub current_style: Style,
-    pub terminal_state: TerminalStateSnapshot,
-    pub scroll_region: Option<ScrollRegionSnapshot>,
-    pub protocol: crate::ProtocolState,
-    pub total_scrolled_rows: u64,
-    pub history_truncated: bool,
-}
-
-/// What a replica applies to come level with the grid: see the module documentation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GridFrame {
-    /// The cursor the replica must be at; ignored by a reset frame.
-    pub base: ReplicaCursor,
-    /// The replica's cursor once applied.
+/// What a frame written by [`TerminalGrid::write_frame_since`] holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameSummary {
+    /// The replica's cursor once it applies the frame.
     pub next: ReplicaCursor,
-    /// Replace the replica's whole state: palette, rows, history.
+    /// The frame replaces the replica's whole state.
     pub reset: bool,
-    /// The grid's revision and content revision as of the frame: the replica takes them, so a
-    /// request naming a revision (an alternate-screen resize) means the same grid on both.
-    pub revision: u64,
-    pub content_revision: u64,
-    pub width: u16,
-    pub height: u16,
-    /// Palette entries from `base.styles` (from 0 in a reset frame).
-    pub styles: Vec<Style>,
-    pub moves: Vec<FrameMove>,
-    pub rows: Vec<FrameRow>,
-    /// Clear history before appending `history`.
-    pub history_cleared: bool,
-    /// History lines pushed since `base`, oldest first.
-    pub history: Vec<FrameLine>,
-    /// History lines the grid retains: the replica drops its oldest beyond these.
-    pub history_retained: u32,
-    /// The open history line (the start of a wrapped line scrolled off), when it changed.
-    pub pending_history: Option<FrameLine>,
-    pub state: FrameState,
+    pub moves: usize,
+    pub rows: usize,
+    pub history: usize,
+    pub styles: usize,
 }
 
-impl GridFrame {
-    /// Whether the frame changes nothing but state (no rows, moves, history or styles).
+impl FrameSummary {
+    /// Whether the frame changes nothing but terminal state.
     #[must_use]
-    pub fn is_state_only(&self) -> bool {
-        !self.reset
-            && self.styles.is_empty()
-            && self.moves.is_empty()
-            && self.rows.is_empty()
-            && !self.history_cleared
-            && self.history.is_empty()
-            && self.pending_history.is_none()
+    pub const fn is_state_only(&self) -> bool {
+        !self.reset && self.moves == 0 && self.rows == 0 && self.history == 0 && self.styles == 0
     }
+}
+
+/// What applying a frame did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameApplied {
+    /// The frame replaced the replica's whole state.
+    pub reset: bool,
 }
 
 /// Why a frame could not be applied: the replica must be sent a reset frame.
@@ -167,6 +88,82 @@ pub enum FrameApplyError {
     BaseMismatch,
     #[error("frame is malformed: {0}")]
     Malformed(&'static str),
+}
+
+/// Which screen a row or move belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrameScreen {
+    Main,
+    Alternate,
+}
+
+impl FrameScreen {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Main => 0,
+            Self::Alternate => 1,
+        }
+    }
+
+    const fn from_code(code: u8) -> Result<Self, FrameApplyError> {
+        match code {
+            0 => Ok(Self::Main),
+            1 => Ok(Self::Alternate),
+            _ => Err(FrameApplyError::Malformed("unknown screen")),
+        }
+    }
+}
+
+/// Rows `top..=bottom` of a screen moved by `rows`, positive toward `top`. Rows moved out of
+/// the region are dropped (history arrives as lines); rows exposed are always sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameMove {
+    screen: FrameScreen,
+    top: u16,
+    bottom: u16,
+    rows: i32,
+}
+
+/// Autowrap and the pending wrap, live and saved with the cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct FrameWrap {
+    autowrap: bool,
+    pending: bool,
+    saved_pending: bool,
+}
+
+/// The grid's terminal state, sent whole in every frame (it is small), written from a borrowed
+/// view of the grid and read back owned: both serialize the same fields in the same order.
+#[derive(Serialize)]
+struct FrameStateRef<'a> {
+    alternate: bool,
+    cursor: CursorSnapshot,
+    saved_cursor: CursorSnapshot,
+    wrap: FrameWrap,
+    characters: crate::CharacterState,
+    saved_characters: crate::CharacterState,
+    current_style: Style,
+    terminal_state: &'a TerminalStateSnapshot,
+    scroll_region: Option<ScrollRegionSnapshot>,
+    protocol: &'a crate::ProtocolState,
+    total_scrolled_rows: u64,
+    history_truncated: bool,
+}
+
+#[derive(Deserialize)]
+struct FrameState {
+    alternate: bool,
+    cursor: CursorSnapshot,
+    saved_cursor: CursorSnapshot,
+    wrap: FrameWrap,
+    characters: crate::CharacterState,
+    saved_characters: crate::CharacterState,
+    current_style: Style,
+    terminal_state: TerminalStateSnapshot,
+    scroll_region: Option<ScrollRegionSnapshot>,
+    protocol: crate::ProtocolState,
+    total_scrolled_rows: u64,
+    history_truncated: bool,
 }
 
 /// What a grid records for its replicas (see the module documentation).
@@ -284,10 +281,16 @@ impl TerminalGrid {
         self.damage = damage;
     }
 
-    /// The frame that brings a replica at `base` level with this grid, sealing the changes so
-    /// far into an epoch. At most `max_history_lines` history lines are sent; older ones the
-    /// replica lacks are skipped, and it marks its history truncated.
-    pub fn frame_since(&mut self, base: ReplicaCursor, max_history_lines: usize) -> GridFrame {
+    /// Write into `out` (cleared first) the frame that brings a replica at `base` level with
+    /// this grid, sealing the changes so far into an epoch, and say what it holds. At most
+    /// `max_history_lines` history lines are sent; older ones the replica lacks are skipped, and
+    /// it marks its history truncated.
+    pub fn write_frame_since(
+        &mut self,
+        base: ReplicaCursor,
+        max_history_lines: usize,
+        out: &mut Vec<u8>,
+    ) -> FrameSummary {
         let sealed = self.damage.open();
         for row in self.main_rows.iter_mut().chain(self.alt_rows.iter_mut()) {
             row.seal(sealed);
@@ -299,19 +302,6 @@ impl TerminalGrid {
             || base.epoch + 1 < self.damage.moves_from
             || base.styles as usize > self.palette.len();
         let since = if reset { 0 } else { base.epoch };
-        let moves = if reset {
-            Vec::new()
-        } else {
-            self.damage
-                .moves
-                .iter()
-                .filter(|(epoch, _)| *epoch > since)
-                .map(|(_, movement)| *movement)
-                .collect()
-        };
-        let rows = self.frame_rows(since);
-        let styles_from = if reset { 0 } else { base.styles as usize };
-        let styles = self.palette.styles()[styles_from..].to_vec();
         let (history_cleared, history_from) = match self.damage.history_cleared {
             _ if reset => (true, 0),
             Some((epoch, pushed)) if epoch > since => (true, pushed.max(base.history)),
@@ -319,72 +309,109 @@ impl TerminalGrid {
         };
         let unsent = usize::try_from(self.damage.history_pushed.saturating_sub(history_from))
             .unwrap_or(usize::MAX);
-        let send = unsent.min(self.main_history.len()).min(max_history_lines);
-        let history = self
-            .main_history
-            .iter()
-            .skip(self.main_history.len() - send)
-            .map(|line| FrameLine::encode(&line.cells()))
-            .collect();
-        let pending_history = (reset || self.damage.pending_at > since)
-            .then(|| FrameLine::encode(&self.pending_history_cells));
-        GridFrame {
-            base,
-            next: ReplicaCursor {
-                epoch: sealed,
-                history: self.damage.history_pushed,
-                styles: u32::try_from(self.palette.len()).unwrap_or(u32::MAX),
-            },
-            reset,
-            revision: self.revision,
-            content_revision: self.content_revision,
-            width: u16::try_from(self.width).unwrap_or(u16::MAX),
-            height: u16::try_from(self.height).unwrap_or(u16::MAX),
-            styles,
-            moves,
-            rows,
-            history_cleared,
-            history,
-            history_retained: u32::try_from(self.main_history.len()).unwrap_or(u32::MAX),
-            pending_history,
-            state: self.frame_state(),
-        }
-    }
+        let history = unsent.min(self.main_history.len()).min(max_history_lines);
+        let pending = reset || self.damage.pending_at > since;
+        let next = ReplicaCursor {
+            epoch: sealed,
+            history: self.damage.history_pushed,
+            styles: u32::try_from(self.palette.len()).unwrap_or(u32::MAX),
+        };
 
-    fn frame_rows(&self, since: u64) -> Vec<FrameRow> {
+        // Size the buffer once: each changed row or line takes about its width (text and a few
+        // bytes of runs), plus the header and state.
+        let changed = self
+            .main_rows
+            .iter()
+            .chain(self.alt_rows.iter())
+            .filter(|row| row.stamp > since)
+            .count();
+        out.clear();
+        out.reserve(512 + (changed + history + usize::from(pending)) * (self.width + 16));
+        out.push(FRAME_VERSION);
+        out.push(
+            (u8::from(reset) * FLAG_RESET)
+                | (u8::from(history_cleared) * FLAG_HISTORY_CLEARED)
+                | (u8::from(pending) * FLAG_PENDING_HISTORY),
+        );
+        for cursor in [base, next] {
+            put(out, cursor.epoch);
+            put(out, cursor.history);
+            put(out, u64::from(cursor.styles));
+        }
+        put(out, self.revision);
+        put(out, self.content_revision);
+        put(out, self.width as u64);
+        put(out, self.height as u64);
+        let styles = &self.palette.styles()[if reset { 0 } else { base.styles as usize }..];
+        put_blob(out, &styles);
+
+        let mut moves = 0;
+        let moves_at = out.len();
+        put_placeholder(out);
+        if !reset {
+            for (_, movement) in self.damage.moves.iter().filter(|(epoch, _)| *epoch > since) {
+                out.push(movement.screen.code());
+                put(out, u64::from(movement.top));
+                put(out, u64::from(movement.bottom));
+                put_signed(out, i64::from(movement.rows));
+                moves += 1;
+            }
+        }
+        patch(out, moves_at, moves);
+
+        let mut rows = 0;
+        let rows_at = out.len();
+        put_placeholder(out);
         let main = self.main_rows.iter().map(|row| (FrameScreen::Main, row));
         let alternate = self
             .alt_rows
             .iter()
             .map(|row| (FrameScreen::Alternate, row));
-        let mut rows = Vec::new();
-        let mut index = [0_u32; 2];
+        let mut index = [0_u64; 2];
         for (screen, row) in main.chain(alternate) {
-            let slot = &mut index[usize::from(screen == FrameScreen::Alternate)];
+            let slot = &mut index[usize::from(screen.code())];
             if row.stamp > since {
-                rows.push(FrameRow {
-                    screen,
-                    index: *slot,
-                    wrapped: row.wrapped,
-                    cells: FrameLine::encode(&row.cells),
-                });
+                out.push(screen.code());
+                put(out, *slot);
+                out.push(u8::from(row.wrapped));
+                write_line(out, &row.cells);
+                rows += 1;
             }
             *slot += 1;
         }
-        rows
+        patch(out, rows_at, rows);
+
+        put(out, history as u64);
+        for line in self
+            .main_history
+            .iter()
+            .skip(self.main_history.len() - history)
+        {
+            write_line(out, &line.cells());
+        }
+        put(out, self.main_history.len() as u64);
+        if pending {
+            write_line(out, &self.pending_history_cells);
+        }
+        put_blob(out, &self.frame_state());
+        FrameSummary {
+            next,
+            reset,
+            moves,
+            rows,
+            history,
+            styles: styles.len(),
+        }
     }
 
-    fn frame_state(&self) -> FrameState {
+    fn frame_state(&self) -> FrameStateRef<'_> {
         let cursor = |cursor: Cursor| CursorSnapshot {
             row: u16::try_from(cursor.row).unwrap_or(u16::MAX),
             col: u16::try_from(cursor.col).unwrap_or(u16::MAX),
             visible: cursor.visible,
         };
-        FrameState {
-            screen: match self.mode {
-                GridMode::Main => FrameScreen::Main,
-                GridMode::Alternate => FrameScreen::Alternate,
-            },
+        FrameStateRef {
+            alternate: self.mode == GridMode::Alternate,
             cursor: cursor(self.cursor),
             saved_cursor: cursor(self.saved_cursor),
             wrap: FrameWrap {
@@ -395,38 +422,50 @@ impl TerminalGrid {
             characters: self.characters,
             saved_characters: self.saved_characters,
             current_style: self.current_style,
-            terminal_state: self.terminal_state.clone(),
+            terminal_state: &self.terminal_state,
             scroll_region: self
                 .scroll_region
                 .map(|(top, bottom)| ScrollRegionSnapshot {
                     top: u16::try_from(top).unwrap_or(u16::MAX),
                     bottom: u16::try_from(bottom).unwrap_or(u16::MAX),
                 }),
-            protocol: self.protocol,
+            protocol: &self.protocol,
             total_scrolled_rows: self.total_scrolled_rows,
             history_truncated: self.history_truncated,
         }
     }
 
-    /// Apply a frame built by [`Self::frame_since`] for this replica's `cursor`, and advance it.
-    /// A replica that sees an error must be sent a reset frame.
+    /// Apply a frame written by [`Self::write_frame_since`] for this replica's `cursor`, and
+    /// advance it. A replica that sees an error must be sent a reset frame.
     ///
     /// # Errors
     /// Returns an error when the frame is not for `cursor` or is malformed.
     pub fn apply_frame(
         &mut self,
-        frame: &GridFrame,
+        frame: &[u8],
         cursor: &mut ReplicaCursor,
-    ) -> Result<(), FrameApplyError> {
-        if !frame.reset && frame.base != *cursor {
+    ) -> Result<FrameApplied, FrameApplyError> {
+        let mut input = Reader::new(frame);
+        if input.byte()? != FRAME_VERSION {
+            return Err(FrameApplyError::Malformed("unknown frame version"));
+        }
+        let flags = input.byte()?;
+        let reset = flags & FLAG_RESET != 0;
+        let base = input.cursor()?;
+        let next = input.cursor()?;
+        if !reset && base != *cursor {
             return Err(FrameApplyError::BaseMismatch);
         }
-        let (width, height) = (usize::from(frame.width), usize::from(frame.height));
+        let revision = input.number()?;
+        let content_revision = input.number()?;
+        let width = input.size()?;
+        let height = input.size()?;
         if width == 0 || height == 0 {
             return Err(FrameApplyError::Malformed("zero dimensions"));
         }
-        if frame.reset {
-            self.palette = StylePalette::from_styles(frame.styles.clone());
+        let styles: Vec<Style> = input.blob()?;
+        if reset {
+            self.palette = StylePalette::from_styles(styles);
             self.width = width;
             self.height = height;
             self.main_rows = std::iter::repeat_with(PhysicalRow::new)
@@ -438,35 +477,48 @@ impl TerminalGrid {
             if (width, height) != (self.width, self.height) {
                 return Err(FrameApplyError::Malformed("size changed without a reset"));
             }
-            for style in &frame.styles {
-                self.palette.push(*style);
+            for style in styles {
+                self.palette.push(style);
             }
         }
-        let styles = self.palette.len();
-        for movement in &frame.moves {
-            self.apply_move(*movement)?;
+        let palette = self.palette.len();
+        for _ in 0..input.count()? {
+            let movement = FrameMove {
+                screen: FrameScreen::from_code(input.byte()?)?,
+                top: input.narrow()?,
+                bottom: input.narrow()?,
+                rows: i32::try_from(input.signed()?)
+                    .map_err(|_| FrameApplyError::Malformed("move too long"))?,
+            };
+            self.apply_move(movement)?;
         }
-        for row in &frame.rows {
-            let index = row.index as usize;
+        for _ in 0..input.count()? {
+            let screen = FrameScreen::from_code(input.byte()?)?;
+            let index = input.size()?;
+            let wrapped = input.byte()? != 0;
+            let rows: &mut dyn std::ops::IndexMut<usize, Output = PhysicalRow> = match screen {
+                FrameScreen::Main => &mut self.main_rows,
+                FrameScreen::Alternate => &mut self.alt_rows,
+            };
             if index >= height {
                 return Err(FrameApplyError::Malformed("row outside the screen"));
             }
-            let cells = row.cells.decode(styles)?;
-            let target = match row.screen {
-                FrameScreen::Main => &mut self.main_rows[index],
-                FrameScreen::Alternate => &mut self.alt_rows[index],
-            };
-            target.cells = cells;
-            target.wrapped = row.wrapped;
+            let target = &mut rows[index];
+            read_line(&mut input, &mut target.cells, palette)?;
+            target.wrapped = wrapped;
             target.changed = true;
             target.fresh = true;
         }
-        self.apply_history(frame, styles)?;
-        self.apply_state(&frame.state)?;
-        self.revision = frame.revision;
-        self.content_revision = frame.content_revision;
-        *cursor = frame.next;
-        Ok(())
+        self.apply_history(&mut input, flags, base, next, palette, reset)?;
+        let state: FrameState = input.blob()?;
+        self.apply_state(&state)?;
+        if !input.is_empty() {
+            return Err(FrameApplyError::Malformed("trailing bytes"));
+        }
+        self.revision = revision;
+        self.content_revision = content_revision;
+        *cursor = next;
+        Ok(FrameApplied { reset })
     }
 
     fn apply_move(&mut self, movement: FrameMove) -> Result<(), FrameApplyError> {
@@ -481,17 +533,12 @@ impl TerminalGrid {
         let up = movement.rows > 0;
         match movement.screen {
             FrameScreen::Main => {
-                let (front, back) = self.main_rows.as_mut_slices();
-                if back.is_empty() {
-                    rotate_region(&mut front[top..=bottom], shift, up);
-                } else {
-                    self.main_rows.make_contiguous();
-                    rotate_region(
-                        &mut self.main_rows.as_mut_slices().0[top..=bottom],
-                        shift,
-                        up,
-                    );
-                }
+                self.main_rows.make_contiguous();
+                rotate_region(
+                    &mut self.main_rows.as_mut_slices().0[top..=bottom],
+                    shift,
+                    up,
+                );
             }
             FrameScreen::Alternate => rotate_region(&mut self.alt_rows[top..=bottom], shift, up),
         }
@@ -505,8 +552,16 @@ impl TerminalGrid {
         Ok(())
     }
 
-    fn apply_history(&mut self, frame: &GridFrame, styles: usize) -> Result<(), FrameApplyError> {
-        if frame.history_cleared {
+    fn apply_history(
+        &mut self,
+        input: &mut Reader<'_>,
+        flags: u8,
+        base: ReplicaCursor,
+        next: ReplicaCursor,
+        palette: usize,
+        reset: bool,
+    ) -> Result<(), FrameApplyError> {
+        if flags & FLAG_HISTORY_CLEARED != 0 {
             let retained: usize = self
                 .main_history
                 .iter()
@@ -516,22 +571,25 @@ impl TerminalGrid {
             self.main_history.clear();
             self.main_history_projected_rows = OnceLock::from(0);
         }
+        let lines = input.size()?;
+        let mut cells = Vec::new();
+        for _ in 0..lines {
+            read_line(input, &mut cells, palette)?;
+            self.push_history_line(LogicalLine::from_slice(&cells));
+        }
+        let retained = input.size()?;
         // Lines the grid pushed that this frame does not carry leave a gap in the replica's
         // history; a reset frame starts it over, marked only by what it skips.
-        let skipped = if frame.reset {
-            frame.history.len() < frame.history_retained as usize
+        let skipped = if reset {
+            lines < retained
         } else {
-            frame.next.history.saturating_sub(frame.base.history) > frame.history.len() as u64
+            next.history.saturating_sub(base.history) > lines as u64
         };
-        if frame.reset {
+        if reset {
             self.history_truncated = false;
         }
         self.history_truncated |= skipped;
-        for line in &frame.history {
-            let cells = line.decode(styles)?;
-            self.push_history_line(LogicalLine::new(cells));
-        }
-        while self.main_history.len() > frame.history_retained as usize {
+        while self.main_history.len() > retained {
             let Some(line) = self.main_history.pop_front() else {
                 break;
             };
@@ -540,13 +598,16 @@ impl TerminalGrid {
                 *count = count.saturating_sub(line.projected_row_count(self.width));
             }
         }
-        if let Some(pending) = &frame.pending_history {
-            let cells = pending.decode(styles)?;
+        if flags & FLAG_PENDING_HISTORY != 0 {
+            let mut pending = std::mem::take(&mut self.pending_history_cells);
             self.history_bytes = self
                 .history_bytes
-                .saturating_sub(history_cells_bytes(&self.pending_history_cells))
-                .saturating_add(history_cells_bytes(&cells));
-            self.pending_history_cells = cells;
+                .saturating_sub(history_cells_bytes(&pending));
+            read_line(input, &mut pending, palette)?;
+            self.history_bytes = self
+                .history_bytes
+                .saturating_add(history_cells_bytes(&pending));
+            self.pending_history_cells = pending;
         }
         Ok(())
     }
@@ -562,9 +623,10 @@ impl TerminalGrid {
         {
             return Err(FrameApplyError::Malformed("cursor outside the screen"));
         }
-        let mode = match state.screen {
-            FrameScreen::Main => GridMode::Main,
-            FrameScreen::Alternate => GridMode::Alternate,
+        let mode = if state.alternate {
+            GridMode::Alternate
+        } else {
+            GridMode::Main
         };
         if mode != self.mode {
             // The other screen's rows replace these; a renderer redraws.
@@ -579,7 +641,7 @@ impl TerminalGrid {
         self.characters = state.characters;
         self.saved_characters = state.saved_characters;
         self.current_style = state.current_style;
-        self.terminal_state = state.terminal_state.clone();
+        self.terminal_state.clone_from(&state.terminal_state);
         self.scroll_region = state
             .scroll_region
             .map(|region| (usize::from(region.top), usize::from(region.bottom)));
@@ -607,132 +669,324 @@ fn rotate_region(rows: &mut [PhysicalRow], shift: usize, up: bool) {
     }
 }
 
-impl FrameLine {
-    /// `cells` as a frame carries them.
-    pub(super) fn encode(cells: &[Cell]) -> Self {
-        Self::encode_compact(cells).unwrap_or_else(|| {
-            Self::Cells(
-                cells
-                    .iter()
-                    .map(|cell| FrameCell {
-                        text: cell.text().to_owned(),
-                        style: cell.style.0,
-                        width: cell.width,
-                        continuation: cell.wide_continuation,
-                    })
-                    .collect(),
-            )
-        })
+/// Write `cells` as a line: compactly (text, style runs, wide cells, text ends only when some
+/// cell is not one character) when every cell is one or two columns wide, each two-column cell
+/// followed by a continuation of its style and no other continuation; else cell by cell.
+fn write_line(out: &mut Vec<u8>, cells: &[Cell]) {
+    let Some(shape) = compact_shape(cells) else {
+        out.push(LINE_CELLS);
+        put(out, cells.len() as u64);
+        for cell in cells {
+            out.push(u8::from(cell.wide_continuation));
+            put(out, u64::from(cell.width));
+            put(out, u64::from(cell.style.0));
+            let text = cell.text();
+            put(out, text.len() as u64);
+            out.extend_from_slice(text.as_bytes());
+        }
+        return;
+    };
+    let logical = || cells.iter().filter(|cell| !cell.wide_continuation);
+    out.push(LINE_COMPACT);
+    put(out, shape.len as u64);
+    put(out, u64::from(cells.first().map_or(0, |cell| cell.style.0)));
+    put(out, shape.runs as u64);
+    put(out, shape.wide as u64);
+    out.push(u8::from(!shape.single));
+    put(out, shape.text as u64);
+    for cell in logical() {
+        out.extend_from_slice(cell.text().as_bytes());
     }
+    let mut current = cells.first().map_or(0, |cell| cell.style.0);
+    for (index, cell) in (0_u64..).zip(logical()) {
+        if cell.style.0 != current {
+            put(out, index);
+            put(out, u64::from(cell.style.0));
+            current = cell.style.0;
+        }
+    }
+    for (index, cell) in (0_u64..).zip(logical()) {
+        if cell.width == 2 {
+            put(out, index);
+        }
+    }
+    if !shape.single {
+        let mut end = 0;
+        for cell in logical() {
+            end += cell.text().len() as u64;
+            put(out, end);
+        }
+    }
+}
 
-    /// The compact form, when it holds `cells` exactly: every cell one or two columns wide, each
-    /// two-column cell followed by a continuation of its style, and no other continuation.
-    fn encode_compact(cells: &[Cell]) -> Option<Self> {
-        let style = cells.first().map_or(0, |cell| cell.style.0);
-        let (mut text, mut ends, mut wide, mut runs) =
-            (String::new(), Vec::new(), Vec::new(), Vec::new());
-        let (mut current, mut single, mut index) = (style, true, 0_u32);
-        let mut iter = cells.iter();
-        while let Some(cell) = iter.next() {
-            if cell.wide_continuation || !(1..=2).contains(&cell.width) {
+/// What the compact form of a line holds, or `None` when it cannot hold the cells exactly.
+struct CompactShape {
+    len: usize,
+    runs: usize,
+    wide: usize,
+    text: usize,
+    single: bool,
+}
+
+fn compact_shape(cells: &[Cell]) -> Option<CompactShape> {
+    let mut shape = CompactShape {
+        len: 0,
+        runs: 0,
+        wide: 0,
+        text: 0,
+        single: true,
+    };
+    let mut current = cells.first().map(|cell| cell.style);
+    let mut iter = cells.iter();
+    while let Some(cell) = iter.next() {
+        if cell.wide_continuation || !(1..=2).contains(&cell.width) {
+            return None;
+        }
+        if cell.width == 2 {
+            let continuation = iter.next()?;
+            if !continuation.wide_continuation || continuation.style != cell.style {
                 return None;
             }
-            if cell.width == 2 {
-                let continuation = iter.next()?;
-                if !continuation.wide_continuation || continuation.style != cell.style {
-                    return None;
+            shape.wide += 1;
+        }
+        let text = cell.text();
+        shape.single &= text.len() == 1 || text.chars().count() == 1;
+        shape.text += text.len();
+        if current != Some(cell.style) {
+            shape.runs += 1;
+            current = Some(cell.style);
+        }
+        shape.len += 1;
+    }
+    Some(shape)
+}
+
+/// Read a line written by [`write_line`] into `cells` (cleared first, its storage kept), its
+/// styles checked against a palette of `palette` entries.
+fn read_line(
+    input: &mut Reader<'_>,
+    cells: &mut Vec<Cell>,
+    palette: usize,
+) -> Result<(), FrameApplyError> {
+    let style_id = |id: u64| match u32::try_from(id) {
+        Ok(id) if (id as usize) < palette.max(1) => Ok(StyleId(id)),
+        _ => Err(FrameApplyError::Malformed("style outside the palette")),
+    };
+    let malformed = FrameApplyError::Malformed("line inconsistent");
+    cells.clear();
+    match input.byte()? {
+        LINE_CELLS => {
+            for _ in 0..input.size()? {
+                let continuation = input.byte()? != 0;
+                let width = u8::try_from(input.number()?).map_err(|_| malformed)?;
+                let style = style_id(input.number()?)?;
+                let length = input.size()?;
+                let text = std::str::from_utf8(input.take(length)?).map_err(|_| malformed)?;
+                cells.push(if continuation {
+                    Cell::spacer(style)
+                } else {
+                    Cell::with_text(CellText::from_str(text), style, width)
+                });
+            }
+            Ok(())
+        }
+        LINE_COMPACT => {
+            let len = input.size()?;
+            let mut style = style_id(input.number()?)?;
+            let (runs, wide) = (input.size()?, input.size()?);
+            let ends = input.byte()? != 0;
+            let length = input.size()?;
+            let text = std::str::from_utf8(input.take(length)?).map_err(|_| malformed)?;
+            // The run, wide and end lists follow one another; read them side by side.
+            let mut run_list = input.clone();
+            input.skip_numbers(runs * 2)?;
+            let mut wide_list = input.clone();
+            input.skip_numbers(wide)?;
+            let mut end_list = input.clone();
+            if ends {
+                input.skip_numbers(len)?;
+            }
+            let (mut runs_left, mut wide_left) = (runs, wide);
+            let mut next_run = None;
+            if runs_left > 0 {
+                next_run = Some((run_list.number()?, run_list.number()?));
+                runs_left -= 1;
+            }
+            let mut next_wide = None;
+            if wide_left > 0 {
+                next_wide = Some(wide_list.number()?);
+                wide_left -= 1;
+            }
+            cells.reserve(len + wide);
+            let mut chars = text.char_indices();
+            let mut start = 0_usize;
+            for index in 0..len as u64 {
+                if let Some((first, run_style)) = next_run
+                    && first == index
+                {
+                    style = style_id(run_style)?;
+                    next_run = None;
+                    if runs_left > 0 {
+                        next_run = Some((run_list.number()?, run_list.number()?));
+                        runs_left -= 1;
+                    }
                 }
-                wide.push(index);
+                let end = if ends {
+                    usize::try_from(end_list.number()?).map_err(|_| malformed)?
+                } else {
+                    chars
+                        .next()
+                        .map(|(offset, ch)| offset + ch.len_utf8())
+                        .ok_or(malformed)?
+                };
+                let cell_text = text.get(start..end).ok_or(malformed)?;
+                let two = next_wide == Some(index);
+                if two {
+                    next_wide = None;
+                    if wide_left > 0 {
+                        next_wide = Some(wide_list.number()?);
+                        wide_left -= 1;
+                    }
+                }
+                cells.push(Cell::with_text(
+                    CellText::from_str(cell_text),
+                    style,
+                    if two { 2 } else { 1 },
+                ));
+                if two {
+                    cells.push(Cell::spacer(style));
+                }
+                start = end;
             }
-            let cell_text = cell.text();
-            single &= cell_text.chars().count() == 1;
-            text.push_str(cell_text);
-            ends.push(u32::try_from(text.len()).ok()?);
-            if cell.style.0 != current {
-                runs.push((index, cell.style.0));
-                current = cell.style.0;
+            if start != text.len() || next_run.is_some() || next_wide.is_some() {
+                return Err(malformed);
             }
-            index += 1;
+            Ok(())
         }
-        if single {
-            ends.clear();
+        _ => Err(FrameApplyError::Malformed("unknown line form")),
+    }
+}
+
+/// Append `value` as a LEB128 varint.
+fn put(out: &mut Vec<u8>, mut value: u64) {
+    loop {
+        let low = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(low);
+            return;
         }
-        Some(Self::Compact {
-            text,
-            ends,
-            wide,
-            style,
-            runs,
-            len: index,
+        out.push(low | 0x80);
+    }
+}
+
+/// Append `value` zigzag-encoded.
+fn put_signed(out: &mut Vec<u8>, value: i64) {
+    put(out, ((value << 1) ^ (value >> 63)).cast_unsigned());
+}
+
+/// Reserve room for a count written later by [`patch`]: a fixed four bytes.
+fn put_placeholder(out: &mut Vec<u8>) {
+    out.extend_from_slice(&[0; 4]);
+}
+
+fn patch(out: &mut [u8], at: usize, count: usize) {
+    let count = u32::try_from(count).unwrap_or(u32::MAX);
+    out[at..at + 4].copy_from_slice(&count.to_le_bytes());
+}
+
+/// Append `value` as a positional `bmux_codec` blob after its length (four bytes).
+fn put_blob<T: Serialize + ?Sized>(out: &mut Vec<u8>, value: &T) {
+    let at = out.len();
+    put_placeholder(out);
+    // Plain data with no failing serializations.
+    let _ = bmux_codec::append_positional(value, out);
+    let length = out.len() - at - 4;
+    patch(out, at, length);
+}
+
+/// A frame being read.
+#[derive(Clone)]
+struct Reader<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> Reader<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    fn byte(&mut self) -> Result<u8, FrameApplyError> {
+        let (&first, rest) = self
+            .bytes
+            .split_first()
+            .ok_or(FrameApplyError::Malformed("frame ends early"))?;
+        self.bytes = rest;
+        Ok(first)
+    }
+
+    fn take(&mut self, length: usize) -> Result<&'a [u8], FrameApplyError> {
+        if length > self.bytes.len() {
+            return Err(FrameApplyError::Malformed("frame ends early"));
+        }
+        let (taken, rest) = self.bytes.split_at(length);
+        self.bytes = rest;
+        Ok(taken)
+    }
+
+    fn number(&mut self) -> Result<u64, FrameApplyError> {
+        let mut value = 0_u64;
+        for shift in (0..64).step_by(7) {
+            let byte = self.byte()?;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+        Err(FrameApplyError::Malformed("number too long"))
+    }
+
+    fn signed(&mut self) -> Result<i64, FrameApplyError> {
+        let value = self.number()?;
+        Ok((value >> 1).cast_signed() ^ -((value & 1).cast_signed()))
+    }
+
+    fn size(&mut self) -> Result<usize, FrameApplyError> {
+        usize::try_from(self.number()?).map_err(|_| FrameApplyError::Malformed("size too large"))
+    }
+
+    fn narrow(&mut self) -> Result<u16, FrameApplyError> {
+        u16::try_from(self.number()?).map_err(|_| FrameApplyError::Malformed("value too large"))
+    }
+
+    fn count(&mut self) -> Result<usize, FrameApplyError> {
+        let bytes = self.take(4)?;
+        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize)
+    }
+
+    fn cursor(&mut self) -> Result<ReplicaCursor, FrameApplyError> {
+        Ok(ReplicaCursor {
+            epoch: self.number()?,
+            history: self.number()?,
+            styles: u32::try_from(self.number()?)
+                .map_err(|_| FrameApplyError::Malformed("palette too large"))?,
         })
     }
 
-    /// The cells, their styles checked against a palette of `styles` entries.
-    pub(super) fn decode(&self, styles: usize) -> Result<Vec<Cell>, FrameApplyError> {
-        let style_id = |id: u32| {
-            if (id as usize) < styles.max(1) {
-                Ok(StyleId(id))
-            } else {
-                Err(FrameApplyError::Malformed("style outside the palette"))
-            }
-        };
-        match self {
-            Self::Cells(cells) => cells
-                .iter()
-                .map(|cell| {
-                    let style = style_id(cell.style)?;
-                    Ok(if cell.continuation {
-                        Cell::spacer(style)
-                    } else {
-                        Cell::with_text(CellText::from_str(&cell.text), style, cell.width)
-                    })
-                })
-                .collect(),
-            Self::Compact {
-                text,
-                ends,
-                wide,
-                style,
-                runs,
-                len,
-            } => {
-                let malformed = FrameApplyError::Malformed("compact line inconsistent");
-                if !ends.is_empty() && ends.len() != *len as usize {
-                    return Err(malformed);
-                }
-                let mut cells = Vec::with_capacity(*len as usize + wide.len());
-                let (mut runs, mut wide) = (runs.iter().peekable(), wide.iter().peekable());
-                let mut chars = text.char_indices();
-                let (mut current, mut start) = (style_id(*style)?, 0_usize);
-                for index in 0..*len {
-                    if let Some((_, run_style)) = runs.next_if(|(first, _)| *first == index) {
-                        current = style_id(*run_style)?;
-                    }
-                    let end = if ends.is_empty() {
-                        chars
-                            .next()
-                            .map(|(offset, ch)| offset + ch.len_utf8())
-                            .ok_or(malformed)?
-                    } else {
-                        ends[index as usize] as usize
-                    };
-                    let cell_text = text.get(start..end).ok_or(malformed)?;
-                    let two = wide.next_if(|cell| **cell == index).is_some();
-                    cells.push(Cell::with_text(
-                        CellText::from_str(cell_text),
-                        current,
-                        if two { 2 } else { 1 },
-                    ));
-                    if two {
-                        cells.push(Cell::spacer(current));
-                    }
-                    start = end;
-                }
-                if start != text.len() || runs.next().is_some() || wide.next().is_some() {
-                    return Err(malformed);
-                }
-                Ok(cells)
-            }
+    fn skip_numbers(&mut self, count: usize) -> Result<(), FrameApplyError> {
+        for _ in 0..count {
+            self.number()?;
         }
+        Ok(())
+    }
+
+    fn blob<T: serde::de::DeserializeOwned>(&mut self) -> Result<T, FrameApplyError> {
+        let length = self.count()?;
+        bmux_codec::from_positional_bytes(self.take(length)?)
+            .map_err(|_| FrameApplyError::Malformed("undecodable state"))
     }
 }

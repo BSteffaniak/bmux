@@ -450,14 +450,15 @@ impl Replay {
             .fed
             .iter()
             .map(|pane| {
+                // A fresh buffer a frame, as the server's moves into its response.
                 let cursor = self.buffers[pane].replica;
-                let built = self
-                    .sources
+                let mut bytes = Vec::new();
+                self.sources
                     .get_mut(pane)
                     .expect("source")
                     .grid_mut()
-                    .frame_since(cursor, 0);
-                (*pane, bmux_ipc::encode(&built).expect("frame encodes"))
+                    .write_frame_since(cursor, 0, &mut bytes);
+                (*pane, bytes)
             })
             .collect();
         (encoded, mark)
@@ -466,10 +467,8 @@ impl Replay {
     /// Decode and apply each pane's frame, as the attach client does.
     fn apply_frames(&mut self, frames: &[(Uuid, Vec<u8>)]) {
         for (pane, encoded) in frames {
-            let decoded: bmux_terminal_grid::GridFrame =
-                bmux_ipc::decode(encoded).expect("frame decodes");
             let buffer = self.buffers.get_mut(pane).expect("fed pane");
-            apply_pane_frame(buffer, &decoded).expect("frame applies");
+            apply_pane_frame(buffer, encoded).expect("frame applies");
             buffer.set_sync_update(self.open, Instant::now());
         }
     }

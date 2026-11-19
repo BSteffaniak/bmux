@@ -1637,24 +1637,16 @@ async fn apply_visible_frames(
         )
         .await
         .map_err(backend)?;
-        let mut undecodable = Vec::new();
-        let decoded = frames
-            .into_iter()
-            .filter_map(|frame| {
-                if let Ok(decoded) = bmux_ipc::decode(&frame.encoded) {
-                    Some(AttachPaneFrameState {
-                        pane_id: frame.pane_id,
-                        sync_update_active: frame.sync_update_active,
-                        frame: decoded,
-                    })
-                } else {
-                    undecodable.push(frame.pane_id);
-                    None
-                }
-            })
-            .collect();
-        let mut failed = state.apply_frames(decoded);
-        failed.extend(undecodable);
+        let failed = state.apply_frames(
+            frames
+                .into_iter()
+                .map(|frame| AttachPaneFrameState {
+                    pane_id: frame.pane_id,
+                    sync_update_active: frame.sync_update_active,
+                    frame: frame.encoded,
+                })
+                .collect(),
+        );
         if !failed.is_empty() {
             reset_attach_pane_frames_streaming(client, session_id, failed)
                 .await
@@ -2125,9 +2117,12 @@ mod tests {
             TerminalPointerShape::Shape(PointerShape::Pointer)
         );
         producer.process(b"\x1b]22;crosshair\x07");
-        let frame = producer
-            .grid_mut()
-            .frame_since(bmux_terminal_grid::ReplicaCursor::default(), usize::MAX);
+        let mut frame = Vec::new();
+        producer.grid_mut().write_frame_since(
+            bmux_terminal_grid::ReplicaCursor::default(),
+            usize::MAX,
+            &mut frame,
+        );
         assert_eq!(
             state.apply_frames(vec![AttachPaneFrameState {
                 pane_id,

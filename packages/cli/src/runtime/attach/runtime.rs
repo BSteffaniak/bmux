@@ -2518,16 +2518,8 @@ fn apply_pane_frames(
         if applied.failed.contains(&pane_id) {
             continue;
         }
-        let decoded: bmux_terminal_grid::GridFrame = match bmux_ipc::decode(&frame.encoded) {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                tracing::warn!(%pane_id, %error, "decoding pane frame");
-                applied.failed.push(pane_id);
-                continue;
-            }
-        };
         let buffer = view_state.pane_buffers.entry(pane_id).or_default();
-        let switched = match super::render::apply_pane_frame(buffer, &decoded) {
+        let switched = match super::render::apply_pane_frame(buffer, &frame.encoded) {
             Ok(switched) => switched,
             Err(error) => {
                 tracing::debug!(%pane_id, %error, "pane frame did not apply; starting over");
@@ -22895,7 +22887,11 @@ mod tests {
             crate::pane_runtime_client::PaneFrameResult {
                 pane_id,
                 sync_update_active: false,
-                encoded: bmux_ipc::encode(&source.grid_mut().frame_since(cursor, 0)).unwrap(),
+                encoded: {
+                    let mut bytes = Vec::new();
+                    source.grid_mut().write_frame_since(cursor, 0, &mut bytes);
+                    bytes
+                },
                 replay_markers: Vec::new(),
             }
         };

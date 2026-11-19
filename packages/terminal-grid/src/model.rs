@@ -9,10 +9,7 @@ pub use content::{
     ContentRowSource, ContentRows, ContentSelectionRow, ScreenRowSource, ScreenRows,
     ScreenSelectionRow, SelectionCell,
 };
-pub use frame::{
-    FrameApplyError, FrameCell, FrameLine, FrameMove, FrameRow, FrameScreen, FrameState, FrameWrap,
-    GridFrame, ReplicaCursor,
-};
+pub use frame::{FrameApplied, FrameApplyError, FrameSummary, ReplicaCursor};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Mutex, OnceLock};

@@ -179,7 +179,7 @@ pub struct AttachPaneFrame {
     /// The program is inside a synchronized update (DEC mode 2026) as of this frame: a client
     /// holds rendering until it ends or times out.
     pub sync_update_active: bool,
-    /// The `bmux_terminal_grid::GridFrame`, encoded with `bmux_ipc::encode`.
+    /// The frame, as `bmux_terminal_grid::TerminalGrid::write_frame_since` writes it.
     pub encoded: Vec<u8>,
     /// `bmux-bench replay` markers the program wrote since the client's last frame, as written
     /// (empty unless the server logs replay).

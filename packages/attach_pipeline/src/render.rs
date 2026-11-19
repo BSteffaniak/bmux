@@ -2197,25 +2197,28 @@ pub fn append_pane_output(buffer: &mut PaneRenderBuffer, bytes: &[u8]) -> bool {
 /// client must ask the server for reset frames.
 pub fn apply_pane_frame(
     buffer: &mut PaneRenderBuffer,
-    frame: &bmux_terminal_grid::GridFrame,
+    frame: &[u8],
 ) -> Result<bool, bmux_terminal_grid::FrameApplyError> {
     let was_alternate =
         buffer.terminal_grid.grid().mode() == bmux_terminal_grid::GridMode::Alternate;
-    if let Err(error) = buffer
+    let applied = match buffer
         .terminal_grid
         .grid_mut()
         .apply_frame(frame, &mut buffer.replica)
     {
-        buffer.replica = bmux_terminal_grid::ReplicaCursor::default();
-        return Err(error);
-    }
+        Ok(applied) => applied,
+        Err(error) => {
+            buffer.replica = bmux_terminal_grid::ReplicaCursor::default();
+            return Err(error);
+        }
+    };
     buffer.visual_row_fingerprints.clear();
     let grid = buffer.terminal_grid.grid();
     let alternate = grid.mode() == bmux_terminal_grid::GridMode::Alternate;
     buffer
         .protocol_tracker
         .restore(grid.protocol_state(), alternate, &[]);
-    if alternate != was_alternate || frame.reset {
+    if alternate != was_alternate || applied.reset {
         buffer.forget_drawn_rows();
     }
     Ok(alternate != was_alternate)

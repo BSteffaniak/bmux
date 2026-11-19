@@ -3,7 +3,10 @@
 //! however output is split, however often the replica syncs, and across resizes, resets,
 //! screen switches and history erasure.
 
-use crate::{GridFrame, GridLimits, GridSnapshot, ReplicaCursor, TerminalGrid, TerminalGridStream};
+use crate::{
+    FrameApplyError, FrameSummary, GridLimits, GridSnapshot, ReplicaCursor, TerminalGrid,
+    TerminalGridStream,
+};
 
 /// A small deterministic generator (xorshift), so every failure replays from its seed.
 struct Rng(u64);
@@ -184,15 +187,22 @@ impl Replica {
         }
     }
 
-    /// Bring the replica level with `source` through a frame (round-tripped through
-    /// serialization, as a wire carries it) and check it is.
+    /// Write the frame bringing this replica level with `source`, as the server does.
+    fn frame(&self, source: &mut TerminalGridStream, history: usize) -> (Vec<u8>, FrameSummary) {
+        let mut bytes = Vec::new();
+        let summary = source
+            .grid_mut()
+            .write_frame_since(self.cursor, history, &mut bytes);
+        (bytes, summary)
+    }
+
+    /// Bring the replica level with `source` through a frame and check it is.
     fn sync(&mut self, source: &mut TerminalGridStream, context: &str) {
-        let frame = source.grid_mut().frame_since(self.cursor, usize::MAX);
-        let wire: GridFrame = serde_json::from_slice(&serde_json::to_vec(&frame).unwrap()).unwrap();
-        assert_eq!(wire, frame, "{context}: frame survives serialization");
+        let (bytes, summary) = self.frame(source, usize::MAX);
         self.grid
-            .apply_frame(&wire, &mut self.cursor)
+            .apply_frame(&bytes, &mut self.cursor)
             .unwrap_or_else(|error| panic!("{context}: {error}"));
+        assert_eq!(self.cursor, summary.next, "{context}: cursor advances");
         let (replica, source) = (replicated(&self.grid), replicated(source.grid()));
         if replica != source {
             let mut differences = Vec::new();
@@ -255,17 +265,22 @@ fn a_frame_for_another_base_is_refused_and_a_reset_frame_recovers() {
     let mut replica = Replica::new();
     replica.sync(&mut source, "first");
     source.process(b"one\r\n");
-    let stale = source
-        .grid_mut()
-        .frame_since(ReplicaCursor::default(), usize::MAX);
-    assert!(stale.reset, "a replica at the start gets a reset frame");
+    let (stale, summary) = Replica::new().frame(&mut source, usize::MAX);
+    assert!(summary.reset, "a replica at the start gets a reset frame");
     source.process(b"two\r\n");
-    let mut skipped = source.grid_mut().frame_since(replica.cursor, usize::MAX);
-    skipped.base.epoch += 1;
+    let (later, _) = replica.frame(&mut source, usize::MAX);
+    let mut elsewhere = replica.cursor;
+    elsewhere.epoch += 1;
     assert_eq!(
-        replica.grid.apply_frame(&skipped, &mut replica.cursor),
-        Err(crate::FrameApplyError::BaseMismatch)
+        replica.grid.apply_frame(&later, &mut elsewhere),
+        Err(FrameApplyError::BaseMismatch)
     );
+    assert!(matches!(
+        replica
+            .grid
+            .apply_frame(&later[..later.len() / 2], &mut replica.cursor),
+        Err(FrameApplyError::Malformed(_))
+    ));
     replica
         .grid
         .apply_frame(&stale, &mut replica.cursor)
@@ -281,18 +296,18 @@ fn quiet_frames_carry_only_state_and_scrolls_move_rows_instead_of_resending_them
         source.process(format!("line {line}\r\n").as_bytes());
     }
     replica.sync(&mut source, "filled");
-    let quiet = source.grid_mut().frame_since(replica.cursor, usize::MAX);
-    assert!(quiet.is_state_only());
+    let (quiet, summary) = replica.frame(&mut source, usize::MAX);
+    assert!(summary.is_state_only());
     replica
         .grid
         .apply_frame(&quiet, &mut replica.cursor)
         .unwrap();
     source.process(b"next\r\n");
-    let scrolled = source.grid_mut().frame_since(replica.cursor, usize::MAX);
-    assert_eq!(scrolled.moves.len(), 1, "{:?}", scrolled.moves);
+    let (scrolled, summary) = replica.frame(&mut source, usize::MAX);
+    assert_eq!(summary.moves, 1, "{summary:?}");
     // The line written and the row exposed, not the screen.
-    assert!(scrolled.rows.len() <= 2, "{} rows", scrolled.rows.len());
-    assert_eq!(scrolled.history.len(), 1);
+    assert!(summary.rows <= 2, "{summary:?}");
+    assert_eq!(summary.history, 1);
     replica
         .grid
         .apply_frame(&scrolled, &mut replica.cursor)
@@ -307,24 +322,41 @@ fn a_capped_first_frame_sends_recent_history_and_marks_the_rest_truncated() {
         source.process(format!("line {line}\r\n").as_bytes());
     }
     let mut replica = Replica::new();
-    let frame = source.grid_mut().frame_since(replica.cursor, 10);
-    assert!(frame.reset);
-    assert_eq!(frame.history.len(), 10);
+    let (first, summary) = replica.frame(&mut source, 10);
+    assert!(summary.reset);
+    assert_eq!(summary.history, 10);
     replica
         .grid
-        .apply_frame(&frame, &mut replica.cursor)
+        .apply_frame(&first, &mut replica.cursor)
         .unwrap();
     assert_eq!(replica.grid.history_line_count(), 10);
     assert_eq!(replica.grid.snapshot(0, 100).history_truncated, Some(true));
     // Later frames carry what is new; the replica keeps the recent lines it was sent.
     source.process(b"new\r\n");
-    let frame = source.grid_mut().frame_since(replica.cursor, 10);
-    assert_eq!(frame.history.len(), 1);
+    let (next, summary) = replica.frame(&mut source, 10);
+    assert_eq!(summary.history, 1);
     replica
         .grid
-        .apply_frame(&frame, &mut replica.cursor)
+        .apply_frame(&next, &mut replica.cursor)
         .unwrap();
     assert_eq!(replica.grid.history_line_count(), 11);
     let tail = |grid: &TerminalGrid| grid.snapshot(0, 16).rows;
     assert_eq!(tail(&replica.grid), tail(source.grid()));
+}
+
+/// Applying a frame reuses the storage of the rows it replaces: a warm replica allocates only
+/// for the history lines it keeps.
+#[test]
+fn applying_frames_reuses_row_storage() {
+    let mut source = TerminalGridStream::new(80, 24, GridLimits::default()).unwrap();
+    let mut replica = Replica::new();
+    source.process(&b"x".repeat(80 * 24));
+    replica.sync(&mut source, "warm");
+    let storage = replica.grid.viewport_row_ref(3).unwrap().cells().as_ptr();
+    source.process(b"\x1b[4;1Hrewritten row");
+    replica.sync(&mut source, "rewritten");
+    assert_eq!(
+        replica.grid.viewport_row_ref(3).unwrap().cells().as_ptr(),
+        storage
+    );
 }

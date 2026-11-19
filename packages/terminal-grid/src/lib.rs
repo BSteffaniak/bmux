@@ -40,12 +40,11 @@ mod stream_compat_tests;
 
 pub use model::{
     Cell, ContentAnchor, ContentBudget, ContentCursor, ContentPosition, ContentProjection,
-    ContentRowSource, ContentRows, ContentSelectionRow, Cursor, FrameApplyError, FrameCell,
-    FrameLine, FrameMove, FrameRow, FrameScreen, FrameState, FrameWrap, GridFrame, GridLimits,
-    GridMode, GridRowWindow, HistoryLineAssembly, HistorySlice, HistorySliceEnd, HistorySliceError,
-    MouseProtocolEncoding, MouseProtocolMode, PhysicalRow, ProjectedRows, ProtocolState,
-    ReplicaCursor, ScreenRowSource, ScreenRows, ScreenSelectionRow, SelectionCell, TerminalGrid,
-    TerminalGridError, ViewportScroll, physical_row_is_blank,
+    ContentRowSource, ContentRows, ContentSelectionRow, Cursor, FrameApplied, FrameApplyError,
+    FrameSummary, GridLimits, GridMode, GridRowWindow, HistoryLineAssembly, HistorySlice,
+    HistorySliceEnd, HistorySliceError, MouseProtocolEncoding, MouseProtocolMode, PhysicalRow,
+    ProjectedRows, ProtocolState, ReplicaCursor, ScreenRowSource, ScreenRows, ScreenSelectionRow,
+    SelectionCell, TerminalGrid, TerminalGridError, ViewportScroll, physical_row_is_blank,
 };
 pub use parser::{
     HeaderValues, IgnoreSequences, MAX_OBSERVED_DCS_BYTES, ProtocolProcessOutcome, SequenceHeader,

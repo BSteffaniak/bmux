@@ -12021,16 +12021,15 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                 continue;
             }
             // Sealing a frame not sent loses nothing: the next one is built from the same base.
-            let frame = grid
-                .grid_mut()
-                .frame_since(replica.cursor, max_history_lines);
+            let mut encoded = Vec::new();
+            let frame =
+                grid.grid_mut()
+                    .write_frame_since(replica.cursor, max_history_lines, &mut encoded);
             let sync_update_active = pane.output_buffer.lock().is_ok_and(|output| {
                 let end = output.end_offset();
                 output.sync_update_open_at(end)
             });
             drop(grid);
-            let encoded = bmux_ipc::encode(&frame)
-                .map_err(|_| SessionRuntimeError::ResponseBudgetExceeded)?;
             if encoded.len() > remaining && !frames.is_empty() {
                 still_pending = true;
                 continue;
@@ -18409,15 +18408,18 @@ exit 7"#
         let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
         let mut replica = TerminalGrid::new(1, 1, GridLimits::default()).unwrap();
         let mut cursor = bmux_terminal_grid::ReplicaCursor::default();
+        let mut reset_seen = false;
         let mut apply = |frames: &[bmux_pane_runtime_state::AttachPaneFrame]| {
             for frame in frames {
-                let frame: bmux_terminal_grid::GridFrame =
-                    bmux_ipc::decode(&frame.encoded).expect("frame decodes");
-                replica
-                    .apply_frame(&frame, &mut cursor)
-                    .expect("frame applies");
+                reset_seen |= replica
+                    .apply_frame(&frame.encoded, &mut cursor)
+                    .expect("frame applies")
+                    .reset;
             }
-            replica.snapshot(0, 100).rows
+            (
+                replica.snapshot(0, 100).rows,
+                std::mem::take(&mut reset_seen),
+            )
         };
         let frames = |adapter: &ServerSessionRuntimeAdapter| {
             let (frames, pending) =
@@ -18426,25 +18428,29 @@ exit 7"#
             assert!(!pending);
             frames
         };
-        let level = |rows: Vec<bmux_terminal_grid::RowSnapshot>| {
+        let level = |(rows, reset): (Vec<bmux_terminal_grid::RowSnapshot>, bool)| {
             assert_eq!(rows, grid.lock().unwrap().grid().snapshot(0, 100).rows);
+            reset
         };
 
         let first = frames(&adapter);
         assert_eq!(first.len(), 1);
-        level(apply(&first));
+        assert!(
+            level(apply(&first)),
+            "a new replica's first frame is a reset frame"
+        );
         assert!(
             frames(&adapter).is_empty(),
             "an unchanged grid needs no frame"
         );
         grid.lock().unwrap().process(b"three\r\nfour");
-        level(apply(&frames(&adapter)));
+        assert!(!level(apply(&frames(&adapter))));
 
         Api::reset_attach_pane_frames(&adapter, session_id, client_id, &[pane_id]).unwrap();
-        let reset = frames(&adapter);
-        let decoded: bmux_terminal_grid::GridFrame = bmux_ipc::decode(&reset[0].encoded).unwrap();
-        assert!(decoded.reset);
-        level(apply(&reset));
+        assert!(
+            level(apply(&frames(&adapter))),
+            "a reset replica starts over"
+        );
 
         let other = ClientId(Uuid::new_v4());
         assert_eq!(
