@@ -9,10 +9,10 @@
 //! checks that those activation services fail closed once deactivation
 //! begins and that calls fail once the server is gone.
 #![cfg(unix)]
-#[allow(dead_code)] // Reuse isolated paths and binary selection only.
-mod support;
 #[path = "support/packaging.rs"]
 mod packaging;
+#[allow(dead_code)] // Reuse isolated paths and binary selection only.
+mod support;
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};

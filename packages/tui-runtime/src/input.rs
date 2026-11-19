@@ -5,8 +5,8 @@
 //! handing packets to async consumers through bounded channels. Other
 //! platforms read through the shared `bmux_terminal` reader.
 
-use bmux_tui::terminal_io::TerminalEventStream;
 use bmux_tui::event::Event;
+use bmux_tui::terminal_io::TerminalEventStream;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 

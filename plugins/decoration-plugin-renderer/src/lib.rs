@@ -298,7 +298,6 @@ impl DecorationRenderExtension {
         );
         Some(render_ops_to_under_cells(&ops))
     }
-
 }
 
 impl AttachRenderExtension for DecorationRenderExtension {
@@ -390,7 +389,6 @@ impl AttachRenderExtension for DecorationRenderExtension {
         // disappearing until the next decoration tick.
         layer == RenderExtensionLayer::AfterPaneContent
     }
-
 
     fn render_layer_ops(
         &self,
@@ -566,7 +564,6 @@ impl AttachRenderExtension for DecorationRenderExtension {
             scene_capabilities_from_terminal(context.capabilities),
         )
     }
-
 
     fn render_ops(
         &self,

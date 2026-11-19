@@ -338,7 +338,11 @@ mod tests {
         assert_eq!(written(SetForegroundColor(Color::Reset)), "\x1b[39m");
         assert_eq!(written(SetBackgroundColor(Color::Reset)), "\x1b[49m");
         assert_eq!(
-            written(SetForegroundColor(Color::Rgb { r: 0, g: 128, b: 255 })),
+            written(SetForegroundColor(Color::Rgb {
+                r: 0,
+                g: 128,
+                b: 255
+            })),
             "\x1b[38;2;0;128;255m"
         );
         for index in [0u8, 7, 42, 199, 255] {
@@ -355,7 +359,10 @@ mod tests {
         assert_eq!(written(SetAttribute(Attribute::Reset)), "\x1b[0m");
         assert_eq!(written(SetAttribute(Attribute::Bold)), "\x1b[1m");
         assert_eq!(written(SetAttribute(Attribute::Undercurled)), "\x1b[4:3m");
-        assert_eq!(written(SetAttribute(Attribute::NormalIntensity)), "\x1b[22m");
+        assert_eq!(
+            written(SetAttribute(Attribute::NormalIntensity)),
+            "\x1b[22m"
+        );
         assert_eq!(written(SetAttribute(Attribute::NotCrossedOut)), "\x1b[29m");
     }
 

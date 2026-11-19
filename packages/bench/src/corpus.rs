@@ -94,7 +94,10 @@ pub fn decode(bytes: &[u8]) -> io::Result<Vec<Frame>> {
         let length = usize::try_from(u64::from_le_bytes(*length))
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "frame too large"))?;
         if tail.len() < length {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated frame"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "truncated frame",
+            ));
         }
         let (frame, tail) = tail.split_at(length);
         frames.push(frame.to_vec());
@@ -161,7 +164,9 @@ pub fn generated(size: (u16, u16), frames: usize) -> Vec<Generated> {
 fn text_line(cols: u16, line: usize) -> String {
     let mut text = String::new();
     let _ = write!(text, "\x1b[38;5;{}m{line:>6} ", 30 + line % 200);
-    let words = ["fn", "let", "match", "pipeline", "engine", "row", "cls", "->", "str", "{"];
+    let words = [
+        "fn", "let", "match", "pipeline", "engine", "row", "cls", "->", "str", "{",
+    ];
     let mut width = 7usize;
     let mut index = line;
     while width < usize::from(cols) {

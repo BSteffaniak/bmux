@@ -558,7 +558,8 @@ mod tests {
     fn preserves_super_and_meta_char_modifiers() {
         let key = KeyEvent {
             code: bmux_terminal::event::KeyCode::Char('c'),
-            modifiers: bmux_terminal::event::KeyModifiers::SUPER | bmux_terminal::event::KeyModifiers::META,
+            modifiers: bmux_terminal::event::KeyModifiers::SUPER
+                | bmux_terminal::event::KeyModifiers::META,
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         };
@@ -590,7 +591,9 @@ mod tests {
     fn converts_mouse_events() {
         let event = event_from_terminal(bmux_terminal::event::Event::Mouse(
             bmux_terminal::event::MouseEvent {
-                kind: bmux_terminal::event::MouseEventKind::Down(bmux_terminal::event::MouseButton::Left),
+                kind: bmux_terminal::event::MouseEventKind::Down(
+                    bmux_terminal::event::MouseButton::Left,
+                ),
                 column: 4,
                 row: 7,
                 modifiers: bmux_terminal::event::KeyModifiers::ALT,

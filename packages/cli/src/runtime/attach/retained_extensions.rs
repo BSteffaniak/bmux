@@ -318,7 +318,6 @@ mod tests {
                 _ => panic!("a selected representation must not probe operations"),
             }
         }
-
     }
 
     fn snapshot(representation: Representation) -> Arc<dyn AttachRenderExtension> {

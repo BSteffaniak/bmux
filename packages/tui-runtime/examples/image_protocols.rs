@@ -5,8 +5,8 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use bmux_keyboard::KeyCode;
-use bmux_tui::terminal_io::{TerminalGuard, poll_event, terminal_size};
 use bmux_tui::event::Event;
+use bmux_tui::terminal_io::{TerminalGuard, poll_event, terminal_size};
 
 // Complete 2x2 RGBA checkerboard PNG for OSC 1337.
 const PNG: &[u8] = &[

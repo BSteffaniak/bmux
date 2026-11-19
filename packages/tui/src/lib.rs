@@ -77,11 +77,6 @@ pub mod prelude {
         SizeBox, Stack, StyleScope, Surface, TextBlock, TextProjectionRow, TextProjectionWindow,
         TextSourceRows, VerticalAlignment, Visibility,
     };
-    #[cfg(feature = "terminal-io")]
-    pub use crate::terminal_io::{
-        TerminalGuard, event_from_terminal, key_from_terminal, mouse_from_terminal, poll_event,
-        read_event, terminal_size,
-    };
     pub use crate::damage::{Damage, DamagePolicy};
     pub use crate::event::{
         Event, EventHandler, EventOutcome, FocusEvent, MouseButton, MouseEvent, MouseEventKind,
@@ -119,6 +114,11 @@ pub mod prelude {
     pub use crate::source_map::{OffsetSourceRows, SourceMapped};
     pub use crate::style::{Color, Easing, Modifier, Style};
     pub use crate::terminal::{AppliedScroll, DrawStats, ScrollRegionAcceleration, Terminal};
+    #[cfg(feature = "terminal-io")]
+    pub use crate::terminal_io::{
+        TerminalGuard, event_from_terminal, key_from_terminal, mouse_from_terminal, poll_event,
+        read_event, terminal_size,
+    };
     pub use crate::text::{
         Line, Span, Text, TextWrap, TextWrapGeometry, TrailingAlign, TrailingPlacement, wrap_text,
     };

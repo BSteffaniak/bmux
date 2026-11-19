@@ -4,9 +4,9 @@
 //! representation, including both the logical `KeyStroke` (for keybind matching)
 //! and the raw byte encoding (for PTY forwarding).
 
-use bmux_terminal::keyboard::key_event_to_stroke;
 use bmux_keyboard::encode::{KeyEncodingModes, encode_key_with_modes};
 use bmux_terminal::event::{Event, KeyEvent as TermKeyEvent, KeyEventKind};
+use bmux_terminal::keyboard::key_event_to_stroke;
 
 use super::{DecodedStroke, InputEvent};
 

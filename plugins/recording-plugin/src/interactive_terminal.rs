@@ -12,8 +12,10 @@ use bmux_recording_plugin_api::{
     recording_process_live_presentation_v1 as live,
     recording_process_presentation_v1 as presentation, recording_process_v4 as process,
 };
+use bmux_terminal::event::{
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 use bmux_terminal_grid::{GridLimits, GridSnapshot, TerminalGridStream};
-use bmux_terminal::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind};
 use uuid::Uuid;
 
 const MAX_INPUT: usize = 16_384;
@@ -143,8 +145,8 @@ fn encode_input(event: Event, modes: InputModes) -> Result<Option<Vec<u8>>> {
 }
 
 fn encode_mouse(mouse: MouseEvent, modes: InputModes) -> Result<Option<Vec<u8>>> {
-    use bmux_terminal_grid::MouseProtocolMode;
     use bmux_terminal::event::MouseButton;
+    use bmux_terminal_grid::MouseProtocolMode;
     let tracking = modes.mouse_mode();
     if tracking == MouseProtocolMode::None {
         return Ok(None);

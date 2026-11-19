@@ -3,10 +3,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
-use bmux_tui::terminal_io::{TerminalGuard, poll_event};
 use bmux_tui::event::Event;
 use bmux_tui::geometry::{Rect, Size};
 use bmux_tui::terminal::Terminal;
+use bmux_tui::terminal_io::{TerminalGuard, poll_event};
 use bmux_tui_components_navigation::NavigationDemo;
 
 fn main() -> Result<()> {

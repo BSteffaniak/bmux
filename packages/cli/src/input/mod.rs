@@ -1,6 +1,6 @@
-mod terminal_adapter;
 mod decoder;
 mod parse;
+mod terminal_adapter;
 
 use anyhow::{Result, bail};
 use bmux_config::{MAX_TIMEOUT_MS, MIN_TIMEOUT_MS};
@@ -13,9 +13,9 @@ use bmux_terminal::event::Event;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
-use terminal_adapter::terminal_event_to_input_event;
 use decoder::ByteDecoder;
 use parse::{parse_chord, parse_stroke};
+use terminal_adapter::terminal_event_to_input_event;
 
 // ============================================================================
 // Types
@@ -1199,7 +1199,9 @@ pub fn stroke_to_string(stroke: &KeyStroke) -> String {
 #[cfg(test)]
 mod tests {
     use super::{InputEvent, InputProcessor, Keymap, RuntimeAction, action_to_config_name};
-    use bmux_terminal::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use bmux_terminal::event::{
+        Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+    };
     use std::collections::BTreeMap;
     use std::thread;
     use std::time::Duration;

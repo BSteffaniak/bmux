@@ -67,8 +67,16 @@ mod tests {
     #[test]
     fn cursor_commands_write_expected_sequences() {
         let mut out = Vec::new();
-        queue!(out, MoveTo(0, 0), MoveTo(79, 23), Hide, Show, SavePosition, RestorePosition)
-            .unwrap();
+        queue!(
+            out,
+            MoveTo(0, 0),
+            MoveTo(79, 23),
+            Hide,
+            Show,
+            SavePosition,
+            RestorePosition
+        )
+        .unwrap();
         assert_eq!(
             out,
             b"\x1b[1;1H\x1b[24;80H\x1b[?25l\x1b[?25h\x1b7\x1b8".as_slice()

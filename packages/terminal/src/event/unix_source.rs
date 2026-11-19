@@ -6,9 +6,9 @@ use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::Event;
 use super::reader::{InternalEvent, Source, Waker};
 use super::unix_parse::Parser;
-use super::Event;
 use crate::sys::unix::{TtyFd, raw_mode_enabled};
 use crate::unix::sigwinch;
 

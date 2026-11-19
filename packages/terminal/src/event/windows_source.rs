@@ -11,23 +11,24 @@ use windows_sys::Win32::System::Console::{
     CAPSLOCK_ON, DOUBLE_CLICK, FOCUS_EVENT, FROM_LEFT_1ST_BUTTON_PRESSED,
     FROM_LEFT_2ND_BUTTON_PRESSED, FROM_LEFT_3RD_BUTTON_PRESSED, FROM_LEFT_4TH_BUTTON_PRESSED,
     GetNumberOfConsoleInputEvents, INPUT_RECORD, KEY_EVENT, KEY_EVENT_RECORD, LEFT_ALT_PRESSED,
-    LEFT_CTRL_PRESSED, MOUSE_EVENT, MOUSE_EVENT_RECORD, MOUSE_HWHEELED, MOUSE_MOVED,
-    MOUSE_WHEELED, RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED, RIGHTMOST_BUTTON_PRESSED,
-    ReadConsoleInputW, SHIFT_PRESSED, WINDOW_BUFFER_SIZE_EVENT,
+    LEFT_CTRL_PRESSED, MOUSE_EVENT, MOUSE_EVENT_RECORD, MOUSE_HWHEELED, MOUSE_MOVED, MOUSE_WHEELED,
+    RIGHT_ALT_PRESSED, RIGHT_CTRL_PRESSED, RIGHTMOST_BUTTON_PRESSED, ReadConsoleInputW,
+    SHIFT_PRESSED, WINDOW_BUFFER_SIZE_EVENT,
 };
 use windows_sys::Win32::System::Threading::{
     CreateEventW, INFINITE, ResetEvent, SetEvent, WaitForMultipleObjects,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyboardLayout, ToUnicodeEx, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
-    VK_F1, VK_F24, VK_HOME, VK_INSERT, VK_LEFT, VK_MENU, VK_NEXT, VK_NUMPAD0, VK_NUMPAD9,
-    VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
+    VK_F1, VK_F24, VK_HOME, VK_INSERT, VK_LEFT, VK_MENU, VK_NEXT, VK_NUMPAD0, VK_NUMPAD9, VK_PRIOR,
+    VK_RETURN, VK_RIGHT, VK_SHIFT, VK_TAB, VK_UP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
 use super::reader::{InternalEvent, Source, Waker};
-use super::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-    MouseEventKind};
+use super::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crate::sys::windows::{ConsoleHandle, window_dimensions};
 
 /// An owned manual-reset event used to interrupt waits.
@@ -404,7 +405,9 @@ fn key_record(record: &KEY_EVENT_RECORD) -> Option<DecodedKey> {
             unit => KeyCode::Char(char::from_u32(u32::from(unit))?),
         },
     };
-    Some(DecodedKey::Key(KeyEvent::new_with_kind(code, modifiers, kind)))
+    Some(DecodedKey::Key(KeyEvent::new_with_kind(
+        code, modifiers, kind,
+    )))
 }
 
 impl Source for WindowsSource {
@@ -478,7 +481,12 @@ mod tests {
             ))
         );
         assert_eq!(
-            decoded(&record(0x41, u16::from(b'A'), true, SHIFT_PRESSED | LEFT_ALT_PRESSED)),
+            decoded(&record(
+                0x41,
+                u16::from(b'A'),
+                true,
+                SHIFT_PRESSED | LEFT_ALT_PRESSED
+            )),
             Some(KeyEvent::new(
                 KeyCode::Char('A'),
                 KeyModifiers::SHIFT | KeyModifiers::ALT
@@ -494,13 +502,19 @@ mod tests {
         assert!(translate_key(&mut surrogate, &record(0xe7, 0xd83d, true, 0)).is_none());
         assert_eq!(
             translate_key(&mut surrogate, &record(0xe7, 0xde00, true, 0)),
-            Some(Event::Key(KeyEvent::new(KeyCode::Char('😀'), KeyModifiers::NONE)))
+            Some(Event::Key(KeyEvent::new(
+                KeyCode::Char('😀'),
+                KeyModifiers::NONE
+            )))
         );
         // A pair split across key-down and key-up records is one press.
         assert!(translate_key(&mut surrogate, &record(0xe7, 0xd83d, true, 0)).is_none());
         assert_eq!(
             translate_key(&mut surrogate, &record(0xe7, 0xde00, false, 0)),
-            Some(Event::Key(KeyEvent::new(KeyCode::Char('😀'), KeyModifiers::NONE)))
+            Some(Event::Key(KeyEvent::new(
+                KeyCode::Char('😀'),
+                KeyModifiers::NONE
+            )))
         );
     }
 }

@@ -166,7 +166,9 @@ mod tests {
 
     #[test]
     fn keys_without_strokes_are_skipped() {
-        assert!(key_event_to_stroke(&KeyEvent::new(KeyCode::CapsLock, KeyModifiers::NONE)).is_none());
+        assert!(
+            key_event_to_stroke(&KeyEvent::new(KeyCode::CapsLock, KeyModifiers::NONE)).is_none()
+        );
         assert!(key_event_to_stroke(&KeyEvent::new(KeyCode::Null, KeyModifiers::NONE)).is_none());
     }
 
@@ -181,7 +183,10 @@ mod tests {
                 ..Modifiers::NONE
             },
         );
-        assert_eq!(key_event_to_stroke(&stroke_to_key_event(stroke)), Some(stroke));
+        assert_eq!(
+            key_event_to_stroke(&stroke_to_key_event(stroke)),
+            Some(stroke)
+        );
         assert_eq!(
             stroke_to_key_event(KeyStroke::simple(StrokeKey::Space)).code,
             KeyCode::Char(' ')
@@ -190,9 +195,15 @@ mod tests {
 
     #[test]
     fn release_detection() {
-        let release =
-            KeyEvent::new_with_kind(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventKind::Release);
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        );
         assert!(key_event_is_release(&release));
-        assert!(!key_event_is_release(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)));
+        assert!(!key_event_is_release(&KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE
+        )));
     }
 }

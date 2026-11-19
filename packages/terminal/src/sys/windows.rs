@@ -153,8 +153,7 @@ pub fn supports_keyboard_enhancement() -> io::Result<bool> {
 pub fn supports_ansi() -> bool {
     static SUPPORTED: OnceLock<bool> = OnceLock::new();
     *SUPPORTED.get_or_init(|| {
-        enable_vt_processing().is_ok()
-            || std::env::var("TERM").is_ok_and(|term| term != "dumb")
+        enable_vt_processing().is_ok() || std::env::var("TERM").is_ok_and(|term| term != "dumb")
     })
 }
 

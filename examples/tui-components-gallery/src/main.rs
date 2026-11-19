@@ -2,12 +2,12 @@ use std::io::{Stdout, stdout};
 
 use anyhow::Result;
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
-use bmux_tui::terminal_io::{TerminalGuard, terminal_size};
 use bmux_tui::event::Event;
 use bmux_tui::geometry::Rect;
 use bmux_tui::interaction::InteractionRouter;
 use bmux_tui::paint::PaintCx;
 use bmux_tui::terminal::Terminal;
+use bmux_tui::terminal_io::{TerminalGuard, terminal_size};
 use bmux_tui_components_gallery::render_gallery_interactive;
 use bmux_tui_runtime::{
     Lifecycle, PointerContextPresenter, Program, Runtime, RuntimeConfig, RuntimeEvent,

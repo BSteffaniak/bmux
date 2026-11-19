@@ -112,7 +112,9 @@ impl Reader {
         let Some(source) = self.source.as_mut() else {
             return Err(io::Error::other(format!(
                 "terminal input unavailable: {}",
-                self.source_error.as_deref().unwrap_or("source not initialized")
+                self.source_error
+                    .as_deref()
+                    .unwrap_or("source not initialized")
             )));
         };
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
@@ -262,12 +264,17 @@ fn global() -> &'static TimedLock<Option<Reader>> {
 }
 
 /// Run `operation` on the global reader, creating it if needed.
-fn with_reader<R>(guard: &mut TimedGuard<'_, Option<Reader>>, operation: impl FnOnce(&mut Reader) -> R) -> R {
+fn with_reader<R>(
+    guard: &mut TimedGuard<'_, Option<Reader>>,
+    operation: impl FnOnce(&mut Reader) -> R,
+) -> R {
     operation(guard.get_or_insert_with(Reader::new))
 }
 
 /// Lock the reader, waiting at most `timeout` when one is given.
-fn acquire(timeout: Option<Duration>) -> Option<(TimedGuard<'static, Option<Reader>>, Option<Duration>)> {
+fn acquire(
+    timeout: Option<Duration>,
+) -> Option<(TimedGuard<'static, Option<Reader>>, Option<Duration>)> {
     match timeout {
         Some(timeout) => {
             let started = Instant::now();
@@ -342,7 +349,10 @@ fn query_keyboard_enhancement_raw() -> io::Result<bool> {
     }
 
     loop {
-        match poll_internal(Some(Duration::from_secs(2)), Filter::KeyboardEnhancementReply) {
+        match poll_internal(
+            Some(Duration::from_secs(2)),
+            Filter::KeyboardEnhancementReply,
+        ) {
             Ok(true) => {
                 return match read_internal(Filter::KeyboardEnhancementReply) {
                     Ok(InternalEvent::KeyboardEnhancementFlags) => {
@@ -443,7 +453,10 @@ mod tests {
 
     #[test]
     fn interrupted_poll_reports_no_event() {
-        let mut reader = reader(vec![Err(io::Error::new(io::ErrorKind::Interrupted, "woken"))]);
+        let mut reader = reader(vec![Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "woken",
+        ))]);
         assert!(!reader.poll(None, Filter::Event).unwrap());
     }
 

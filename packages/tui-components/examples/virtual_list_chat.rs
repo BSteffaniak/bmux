@@ -18,12 +18,12 @@ use std::time::Duration;
 use bmux_keyboard::KeyCode;
 use bmux_tui::component::{Component, Constraints, Element, EventCx, LayoutCx, LayoutNode};
 use bmux_tui::composition::{Column, Flex, TextBlock};
-use bmux_tui::terminal_io::{TerminalGuard, terminal_size};
 use bmux_tui::event::Event;
 use bmux_tui::geometry::{Rect, Size};
 use bmux_tui::paint::PaintCx;
 use bmux_tui::style::{Color, Easing, Modifier, Style};
 use bmux_tui::terminal::Terminal;
+use bmux_tui::terminal_io::{TerminalGuard, terminal_size};
 use bmux_tui::text::{Line, Span, Text, TextWrap};
 use bmux_tui_components::virtual_list::{
     ListAnchor, ListPosition, NoSourceMap, Overscroll, ScrollTarget, VirtualItemSource,

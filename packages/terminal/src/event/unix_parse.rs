@@ -75,7 +75,10 @@ const fn plain(code: KeyCode) -> Parsed {
 }
 
 const fn ctrl(character: char) -> Parsed {
-    key(KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL))
+    key(KeyEvent::new(
+        KeyCode::Char(character),
+        KeyModifiers::CONTROL,
+    ))
 }
 
 const fn event(event: Event) -> Parsed {
@@ -428,9 +431,7 @@ fn parse_csi_u(buffer: &[u8], raw_mode: bool) -> Parsed {
             ModifierKeyCode::LeftSuper | ModifierKeyCode::RightSuper => KeyModifiers::SUPER,
             ModifierKeyCode::LeftHyper | ModifierKeyCode::RightHyper => KeyModifiers::HYPER,
             ModifierKeyCode::LeftMeta | ModifierKeyCode::RightMeta => KeyModifiers::META,
-            ModifierKeyCode::IsoLevel3Shift | ModifierKeyCode::IsoLevel5Shift => {
-                KeyModifiers::NONE
-            }
+            ModifierKeyCode::IsoLevel3Shift | ModifierKeyCode::IsoLevel5Shift => KeyModifiers::NONE,
         };
         modifiers.insert(held);
     }
@@ -702,7 +703,10 @@ mod tests {
         );
         assert_eq!(
             one_key(b"\x1b\x01"),
-            k(KeyCode::Char('a'), KeyModifiers::ALT | KeyModifiers::CONTROL)
+            k(
+                KeyCode::Char('a'),
+                KeyModifiers::ALT | KeyModifiers::CONTROL
+            )
         );
         assert_eq!(one_key(b"\x1b\r"), k(KeyCode::Enter, KeyModifiers::ALT));
         assert_eq!(
@@ -716,11 +720,26 @@ mod tests {
         assert_eq!(one_key(b"\r"), k(KeyCode::Enter, KeyModifiers::NONE));
         assert_eq!(one_key(b"\t"), k(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(one_key(b"\x7f"), k(KeyCode::Backspace, KeyModifiers::NONE));
-        assert_eq!(one_key(b"\x00"), k(KeyCode::Char(' '), KeyModifiers::CONTROL));
-        assert_eq!(one_key(b"\x03"), k(KeyCode::Char('c'), KeyModifiers::CONTROL));
-        assert_eq!(one_key(b"\x08"), k(KeyCode::Char('h'), KeyModifiers::CONTROL));
-        assert_eq!(one_key(b"\x1c"), k(KeyCode::Char('4'), KeyModifiers::CONTROL));
-        assert_eq!(one_key(b"\x1f"), k(KeyCode::Char('7'), KeyModifiers::CONTROL));
+        assert_eq!(
+            one_key(b"\x00"),
+            k(KeyCode::Char(' '), KeyModifiers::CONTROL)
+        );
+        assert_eq!(
+            one_key(b"\x03"),
+            k(KeyCode::Char('c'), KeyModifiers::CONTROL)
+        );
+        assert_eq!(
+            one_key(b"\x08"),
+            k(KeyCode::Char('h'), KeyModifiers::CONTROL)
+        );
+        assert_eq!(
+            one_key(b"\x1c"),
+            k(KeyCode::Char('4'), KeyModifiers::CONTROL)
+        );
+        assert_eq!(
+            one_key(b"\x1f"),
+            k(KeyCode::Char('7'), KeyModifiers::CONTROL)
+        );
         // Line feed is Ctrl+J in raw mode and Enter otherwise.
         assert_eq!(one_key(b"\n"), k(KeyCode::Char('j'), KeyModifiers::CONTROL));
         assert_eq!(
@@ -748,7 +767,10 @@ mod tests {
         assert_eq!(parse(&[0xe2, 0x82], false, true), Incomplete);
         assert_eq!(parse(&[0xe2, 0x41], false, true), Invalid);
         assert_eq!(parse(&[0x80], false, true), Invalid);
-        assert_eq!(keys(&[0xff, b'x']), vec![k(KeyCode::Char('x'), KeyModifiers::NONE)]);
+        assert_eq!(
+            keys(&[0xff, b'x']),
+            vec![k(KeyCode::Char('x'), KeyModifiers::NONE)]
+        );
     }
 
     #[test]
@@ -782,14 +804,8 @@ mod tests {
 
     #[test]
     fn modified_and_tilde_keys() {
-        assert_eq!(
-            one_key(b"\x1b[1;5A"),
-            k(KeyCode::Up, KeyModifiers::CONTROL)
-        );
-        assert_eq!(
-            one_key(b"\x1b[1;2D"),
-            k(KeyCode::Left, KeyModifiers::SHIFT)
-        );
+        assert_eq!(one_key(b"\x1b[1;5A"), k(KeyCode::Up, KeyModifiers::CONTROL));
+        assert_eq!(one_key(b"\x1b[1;2D"), k(KeyCode::Left, KeyModifiers::SHIFT));
         assert_eq!(
             one_key(b"\x1b[1;5:3C"),
             KeyEvent::new_with_kind(KeyCode::Right, KeyModifiers::CONTROL, KeyEventKind::Release)
@@ -835,7 +851,10 @@ mod tests {
 
     #[test]
     fn csi_u_keys() {
-        assert_eq!(one_key(b"\x1b[97u"), k(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(
+            one_key(b"\x1b[97u"),
+            k(KeyCode::Char('a'), KeyModifiers::NONE)
+        );
         assert_eq!(
             one_key(b"\x1b[97;5u"),
             k(KeyCode::Char('a'), KeyModifiers::CONTROL)
@@ -850,9 +869,15 @@ mod tests {
         );
         assert_eq!(one_key(b"\x1b[27u"), k(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(one_key(b"\x1b[13u"), k(KeyCode::Enter, KeyModifiers::NONE));
-        assert_eq!(one_key(b"\x1b[127u"), k(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(
+            one_key(b"\x1b[127u"),
+            k(KeyCode::Backspace, KeyModifiers::NONE)
+        );
         assert_eq!(one_key(b"\x1b[9u"), k(KeyCode::Tab, KeyModifiers::NONE));
-        assert_eq!(one_key(b"\x1b[9;2u"), k(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(
+            one_key(b"\x1b[9;2u"),
+            k(KeyCode::BackTab, KeyModifiers::SHIFT)
+        );
         // The shifted alternate replaces the key and absorbs Shift.
         assert_eq!(
             one_key(b"\x1b[49:33;2u"),
@@ -875,8 +900,14 @@ mod tests {
                 KeyEventState::KEYPAD
             )
         );
-        assert_eq!(one_key(b"\x1b[57376u"), k(KeyCode::F(13), KeyModifiers::NONE));
-        assert_eq!(one_key(b"\x1b[57398u"), k(KeyCode::F(35), KeyModifiers::NONE));
+        assert_eq!(
+            one_key(b"\x1b[57376u"),
+            k(KeyCode::F(13), KeyModifiers::NONE)
+        );
+        assert_eq!(
+            one_key(b"\x1b[57398u"),
+            k(KeyCode::F(35), KeyModifiers::NONE)
+        );
         assert_eq!(
             one_key(b"\x1b[57441u"),
             k(
@@ -893,7 +924,10 @@ mod tests {
                 KeyEventState::CAPS_LOCK
             )
         );
-        assert_eq!(decode_all(b"\x1b[1114112u", true), Vec::<InternalEvent>::new());
+        assert_eq!(
+            decode_all(b"\x1b[1114112u", true),
+            Vec::<InternalEvent>::new()
+        );
     }
 
     #[test]
@@ -970,7 +1004,10 @@ mod tests {
                 modifiers: KeyModifiers::NONE,
             })
         );
-        assert_eq!(decode_all(b"\x1b[<200;1;1M", true), Vec::<InternalEvent>::new());
+        assert_eq!(
+            decode_all(b"\x1b[<200;1;1M", true),
+            Vec::<InternalEvent>::new()
+        );
     }
 
     #[test]
@@ -1013,7 +1050,13 @@ mod tests {
 
     #[test]
     fn unknown_sequences_are_discarded_and_decoding_resumes() {
-        assert_eq!(keys(b"\x1b[1;5Xa"), vec![k(KeyCode::Char('a'), KeyModifiers::NONE)]);
-        assert_eq!(keys(b"\x1b[!a"), vec![k(KeyCode::Char('a'), KeyModifiers::NONE)]);
+        assert_eq!(
+            keys(b"\x1b[1;5Xa"),
+            vec![k(KeyCode::Char('a'), KeyModifiers::NONE)]
+        );
+        assert_eq!(
+            keys(b"\x1b[!a"),
+            vec![k(KeyCode::Char('a'), KeyModifiers::NONE)]
+        );
     }
 }
