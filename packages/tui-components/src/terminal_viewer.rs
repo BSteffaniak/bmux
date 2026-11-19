@@ -11,6 +11,7 @@ use crate::selection::{
     ComponentSelectionOutcome, ComponentSelectionPolicy, ComponentSelectionState,
     paint_component_scope,
 };
+pub use crate::terminal_style::TerminalPalette;
 
 /// Default maximum number of terminal rows rendered inline.
 pub const MAX_INLINE_TERMINAL_ROWS: usize = 28;
@@ -158,8 +159,26 @@ pub struct TerminalViewerInput<'a> {
 /// Render terminal transcript rows using terminal-grid semantics.
 #[must_use]
 pub fn terminal_viewer_rows(input: TerminalViewerInput<'_>, width: u16) -> Vec<Line> {
+    terminal_viewer_rows_with_palette(input, width, None)
+}
+
+/// Render terminal transcript rows with an optional palette for the output's colors.
+///
+/// Like [`terminal_viewer_rows`], painting the terminal output's colors from `palette` when
+/// given. Status and truncation rows keep their own styles, and the rows' text is the same
+/// with or without a palette.
+#[must_use]
+pub fn terminal_viewer_rows_with_palette(
+    input: TerminalViewerInput<'_>,
+    width: u16,
+    palette: Option<&TerminalPalette>,
+) -> Vec<Line> {
     let mut rows = terminal_viewer_chrome_rows(&input, width);
     for line in terminal_output_lines(&input, width.saturating_sub(4)) {
+        let line = match palette {
+            Some(colors) => colors.line(line),
+            None => line,
+        };
         rows.push(prefix_line(line, "    ", muted_style()));
     }
     rows
@@ -687,5 +706,47 @@ mod tests {
                 .iter()
                 .all(|fragment| fragment.source_range.end <= decoded_len)
         );
+    }
+
+    #[test]
+    fn palettes_repaint_terminal_output_but_not_chrome() {
+        let input = TerminalViewerInput {
+            output: "\x1b[32mok\x1b[0m plain",
+            columns: 20,
+            rows: 3,
+            exit_code: Some(1),
+            timed_out: None,
+            elapsed: None,
+            show_status: true,
+            output_truncated: false,
+            output_bytes: None,
+            retained_output_bytes: None,
+            sizing: TerminalViewerSizing::Compact,
+        };
+        let mut ansi = [Color::Default; 16];
+        ansi[1] = Color::Rgb(1, 0, 0);
+        ansi[2] = Color::Rgb(0, 2, 0);
+        ansi[8] = Color::Rgb(8, 8, 8);
+        let palette = TerminalPalette::new(ansi);
+        let host = terminal_viewer_rows(input, 30);
+        let themed = terminal_viewer_rows_with_palette(input, 30, Some(&palette));
+
+        assert_eq!(rendered_text(&host), rendered_text(&themed));
+        assert_eq!(
+            terminal_viewer_rows_with_palette(input, 30, None),
+            host,
+            "no palette paints as before"
+        );
+        // The status row keeps its own colors.
+        assert_eq!(themed[0], host[0]);
+        let output = themed.last().unwrap();
+        let green = output
+            .spans
+            .iter()
+            .find(|span| span.content == "ok")
+            .unwrap();
+        assert_eq!(green.style.fg, Some(Color::Rgb(0, 2, 0)));
+        // The row prefix is chrome.
+        assert_eq!(output.spans[0], host.last().unwrap().spans[0]);
     }
 }

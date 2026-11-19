@@ -20,6 +20,10 @@
 //! styled lines through [`TerminalState::window`] (reflowed output, with selection rows and
 //! anchors that survive reflow) and [`TerminalState::screen_window`] (a crop of the screen).
 //!
+//! A [`TerminalPalette`] paints the sixteen ANSI colors (and optionally the default colors) in
+//! an application's own colors: [`TerminalViewComponent::palette`] for the component and
+//! [`TerminalWindow::with_palette`] for windows. Without one, output is painted as before.
+//!
 //! Running the process (for example with `bmux_pty`) is the caller's concern: feed what it
 //! writes with [`TerminalState::feed`] and report its end with [`TerminalState::finish`].
 
@@ -45,8 +49,8 @@ use crate::scroll_view::{
     ScrollExtent, ScrollSource, ScrollViewComponent, ScrollViewState, TrackScrollbar,
 };
 use crate::scrollbar_layout::{ScrollbarAxisLayoutMode, ScrollbarLayoutPolicy, scrollbar_layout};
-pub use crate::terminal_style::terminal_grid_line;
 use crate::terminal_style::terminal_grid_style;
+pub use crate::terminal_style::{TerminalPalette, terminal_grid_line};
 
 /// Work and memory allowed for one reflow projection.
 const REFLOW_BUDGET: ContentBudget = ContentBudget {
@@ -144,6 +148,19 @@ pub struct TerminalWindow {
     pub selection: Vec<TerminalSelectionRow>,
     /// Older output was dropped from history.
     pub history_truncated: bool,
+}
+
+impl TerminalWindow {
+    /// This window with its lines painted from `palette`. Text, sources, and selection rows
+    /// are unchanged, so selection and hit regions are the same as without a palette.
+    #[must_use]
+    pub fn with_palette(mut self, palette: &TerminalPalette) -> Self {
+        self.lines = std::mem::take(&mut self.lines)
+            .into_iter()
+            .map(|line| palette.line(line))
+            .collect();
+        self
+    }
 }
 
 /// What a projection captured.
@@ -550,6 +567,7 @@ pub struct TerminalViewComponent<'a> {
     max_rows: Option<u64>,
     cursor: bool,
     scrollbar: ScrollbarAxisLayoutMode,
+    palette: Option<TerminalPalette>,
 }
 
 impl<'a> TerminalViewComponent<'a> {
@@ -563,7 +581,15 @@ impl<'a> TerminalViewComponent<'a> {
             max_rows: None,
             cursor: true,
             scrollbar: ScrollbarAxisLayoutMode::Hidden,
+            palette: None,
         }
+    }
+
+    /// Paint output colors from `palette` (default: the host terminal's colors).
+    #[must_use]
+    pub const fn palette(mut self, palette: TerminalPalette) -> Self {
+        self.palette = Some(palette);
+        self
     }
 
     /// Draw a scrollbar inside the view (default hidden; panes can carry one on their border
@@ -671,6 +697,7 @@ impl Component for TerminalViewComponent<'_> {
         self.state.status.hash(&mut paint);
         self.cursor.hash(&mut paint);
         self.scrollbar.hash(&mut paint);
+        self.palette.hash(&mut paint);
         ComponentRevision::new(layout.finish(), paint.finish())
     }
 
@@ -741,6 +768,10 @@ impl Component for TerminalViewComponent<'_> {
                     break;
                 }
                 let style = terminal_grid_style(palette.get(cell.style()));
+                let style = self
+                    .palette
+                    .as_ref()
+                    .map_or(style, |colors| colors.style(style));
                 let symbol = if cell.text().is_empty() {
                     " "
                 } else {
@@ -769,8 +800,8 @@ mod tests {
     use bmux_tui::style::{Color, Modifier};
 
     use super::{
-        ScrollSource, TerminalRows, TerminalState, TerminalStatus, TerminalViewComponent,
-        TerminalViewMode, terminal_viewport_id,
+        ScrollSource, TerminalPalette, TerminalRows, TerminalState, TerminalStatus,
+        TerminalViewComponent, TerminalViewMode, terminal_viewport_id,
     };
     use crate::scroll_view::{ScrollExtent, ScrollViewState};
 
@@ -1121,5 +1152,125 @@ mod tests {
         ] {
             assert!(!status.success(), "{status:?}");
         }
+    }
+
+    /// A palette whose ANSI color `n` is `Rgb(n, n, n)`.
+    fn numbered_palette() -> TerminalPalette {
+        let mut ansi = [Color::Default; 16];
+        for (index, color) in ansi.iter_mut().enumerate() {
+            let value = u8::try_from(index).unwrap();
+            *color = Color::Rgb(value, value, value);
+        }
+        TerminalPalette::new(ansi)
+    }
+
+    /// Red, bright red, 256-color 200, true color, blue background, then default text.
+    const COLORED: &[u8] = b"\x1b[31mR\x1b[91mB\x1b[38;5;200mI\x1b[38;2;1;2;3mT\x1b[0;44mG\x1b[0mD";
+
+    #[test]
+    fn palettes_repaint_ansi_colors_and_keep_other_colors() {
+        let state = state(10, 1, COLORED);
+        let view = || TerminalViewComponent::new("t", &state).cursor(false);
+        let host = paint(&view(), tight(10, 1));
+        let themed = paint(&view().palette(numbered_palette()), tight(10, 1));
+        let fg = |buffer: &Buffer, x| buffer.get(Point::new(x, 0)).unwrap().style.fg;
+        let bg = |buffer: &Buffer, x| buffer.get(Point::new(x, 0)).unwrap().style.bg;
+
+        // Without a palette the host terminal's named colors are used.
+        assert_eq!(fg(&host, 0), Some(Color::Red));
+        assert_eq!(fg(&host, 1), Some(Color::BrightRed));
+        assert_eq!(bg(&host, 4), Some(Color::Blue));
+        // A palette repaints ANSI 0-15, bright variants included.
+        assert_eq!(fg(&themed, 0), Some(Color::Rgb(1, 1, 1)));
+        assert_eq!(fg(&themed, 1), Some(Color::Rgb(9, 9, 9)));
+        assert_eq!(bg(&themed, 4), Some(Color::Rgb(4, 4, 4)));
+        // 256-color indices and true colors are painted as written.
+        assert_eq!(fg(&themed, 2), Some(Color::Indexed(200)));
+        assert_eq!(fg(&themed, 3), Some(Color::Rgb(1, 2, 3)));
+        assert_eq!(fg(&host, 2), fg(&themed, 2));
+        assert_eq!(fg(&host, 3), fg(&themed, 3));
+        // Default colors stay the host's unless the palette sets them.
+        assert_eq!((fg(&themed, 5), bg(&themed, 5)), (None, None));
+        let defaults = numbered_palette()
+            .with_foreground(Color::Rgb(100, 0, 0))
+            .with_background(Color::Rgb(0, 0, 100));
+        let themed = paint(&view().palette(defaults), tight(10, 1));
+        assert_eq!(fg(&themed, 5), Some(Color::Rgb(100, 0, 0)));
+        assert_eq!(bg(&themed, 5), Some(Color::Rgb(0, 0, 100)));
+        assert_eq!(fg(&themed, 4), Some(Color::Rgb(100, 0, 0)));
+        assert_eq!(bg(&themed, 4), Some(Color::Rgb(4, 4, 4)));
+        // The text is the same.
+        assert_eq!(rows(&host), rows(&themed));
+    }
+
+    fn colored_lines() -> TerminalState {
+        let bytes: Vec<u8> = (1..=10)
+            .flat_map(|n| format!("\x1b[3{}mline {n}\x1b[0m\r\n", n % 8).into_bytes())
+            .collect();
+        state(8, 3, &bytes)
+    }
+
+    #[cfg(feature = "pane")]
+    #[test]
+    fn palettes_leave_text_and_hit_regions_alone() {
+        use std::cell::Cell;
+
+        use crate::pane::{Pane, PaneComponent, PaneState};
+
+        let state = colored_lines();
+        let paint_pane = |palette: Option<TerminalPalette>| {
+            let pane_state = Cell::new(PaneState::new(Rect::new(0, 0, 10, 5)));
+            let mut view = TerminalViewComponent::new("t", &state);
+            if let Some(palette) = palette {
+                view = view.palette(palette);
+            }
+            let pane = PaneComponent::new("pane", Pane::new(), &pane_state, view)
+                .border_scrollbar(terminal_viewport_id(&"t".into()), &state);
+            let layout = pane.layout(tight(10, 5), &mut LayoutCx::new());
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 10, 5));
+            let mut frame = Frame::new(&mut buffer);
+            pane.paint(&layout, &mut PaintCx::new(&mut frame));
+            let hits = frame.hits().regions().to_vec();
+            drop(frame);
+            (rows(&buffer), hits)
+        };
+        assert_eq!(paint_pane(None), paint_pane(Some(numbered_palette())));
+    }
+
+    #[test]
+    fn palettes_leave_window_text_and_selection_alone() {
+        let state = colored_lines();
+        let window = state.window(5, TerminalRows::Tail(4)).unwrap();
+        let themed = window.clone().with_palette(&numbered_palette());
+        assert_eq!(themed.selection, window.selection);
+        assert_eq!(themed.sources, window.sources);
+        assert_eq!(
+            themed.lines.iter().map(text).collect::<Vec<_>>(),
+            window.lines.iter().map(text).collect::<Vec<_>>()
+        );
+        assert_ne!(themed.lines, window.lines);
+        let screen = state.screen_window(0..8, 0..3).unwrap();
+        let themed = screen.clone().with_palette(&numbered_palette());
+        assert_eq!(themed.selection, screen.selection);
+        assert!(
+            themed
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .filter_map(|span| span.style.fg)
+                .all(|color| matches!(color, Color::Rgb(..))),
+            "{:?}",
+            themed.lines
+        );
+    }
+
+    #[test]
+    fn palettes_map_named_and_low_indexed_colors_alike() {
+        let palette = numbered_palette();
+        assert_eq!(palette.color(Color::BrightWhite), Color::Rgb(15, 15, 15));
+        assert_eq!(palette.color(Color::Indexed(12)), Color::Rgb(12, 12, 12));
+        assert_eq!(palette.color(Color::Indexed(16)), Color::Indexed(16));
+        assert_eq!(palette.color(Color::Default), Color::Default);
+        assert_eq!(palette.color(Color::Rgb(7, 8, 9)), Color::Rgb(7, 8, 9));
     }
 }
