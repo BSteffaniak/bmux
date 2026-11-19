@@ -11,7 +11,7 @@ use std::ops::Range;
 
 use crate::{
     FontEmphasis, ScopeClassifier, SyntaxHighlighter, SyntaxRole, SyntaxSpan, SyntaxStyle,
-    syntax_for, syntax_style,
+    TokenRoles, syntax_for, syntax_style,
 };
 
 /// One highlighted token as a byte range of its line.
@@ -219,7 +219,11 @@ impl SyntaxHighlighter {
         TextHighlight {
             grammar: syntax_for(path_or_language)
                 .map(|syntax| ScopeClassifier::new(syntax, self.palette)),
-            plain: syntax_style(SyntaxRole::Text, self.palette.text, FontEmphasis::default()),
+            plain: syntax_style(
+                TokenRoles::base(SyntaxRole::Text),
+                self.palette,
+                FontEmphasis::default(),
+            ),
             output: HighlightedText::default(),
             consumed: 0,
             buffer: String::new(),

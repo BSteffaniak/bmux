@@ -150,6 +150,14 @@ fn highlight_cache() -> &'static Mutex<HighlightCache> {
 /// Code roles describe programming-language tokens. Markup roles describe prose
 /// structure emitted by markup grammars such as Markdown, `AsciiDoc`,
 /// `reStructuredText`, Textile, Org Mode, and `MediaWiki`.
+///
+/// The first thirteen roles (`Text` through `Raw`) are *base* roles; every
+/// token has one, reported as [`SyntaxStyle::base_role`]. The remaining roles
+/// are *refined* roles that name a finer token kind where the grammar exposes
+/// one. A refined token's base role is what it would be classified as without
+/// refinement, so consumers that only know the base roles render it exactly as
+/// before by reading [`SyntaxStyle::base_role`]. [`SyntaxRole::fallback`] gives
+/// the nearest base role when no token is at hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SyntaxRole {
     Text,
@@ -168,6 +176,90 @@ pub enum SyntaxRole {
     Link,
     /// Literal spans in markup languages, such as inline code.
     Raw,
+    /// Named constants: language constants (`true`, `None`, `null`), constant
+    /// identifiers, character escapes and entities, and format placeholders.
+    /// Numeric literals stay [`SyntaxRole::Number`].
+    Constant,
+    /// Function and closure parameters.
+    Parameter,
+    /// Object properties, members, fields, and mapping keys.
+    Property,
+    /// Names supplied by the language or its runtime: builtin functions,
+    /// classes, constants, macros, and language variables such as `self` or
+    /// `this`.
+    Builtin,
+    /// Markup tag names, such as `div` in `<div>`.
+    Tag,
+    /// Markup attribute names, such as `class` in `<div class="x">`.
+    Attribute,
+}
+
+impl SyntaxRole {
+    /// Every role, base roles first, in declaration order.
+    pub const ALL: [Self; 19] = [
+        Self::Text,
+        Self::Comment,
+        Self::Keyword,
+        Self::Function,
+        Self::Variable,
+        Self::String,
+        Self::Number,
+        Self::Type,
+        Self::Operator,
+        Self::Punctuation,
+        Self::Heading,
+        Self::Link,
+        Self::Raw,
+        Self::Constant,
+        Self::Parameter,
+        Self::Property,
+        Self::Builtin,
+        Self::Tag,
+        Self::Attribute,
+    ];
+
+    /// Whether this is one of the thirteen base roles.
+    #[must_use]
+    pub const fn is_base(self) -> bool {
+        self.fallback_or_none().is_none()
+    }
+
+    /// Nearest base role for this role; base roles map to themselves.
+    ///
+    /// Use this to color a role when no token is at hand, such as in a palette
+    /// preview. For a highlighted token prefer [`SyntaxStyle::base_role`], which
+    /// is exact: a character escape is a [`SyntaxRole::Constant`] whose base
+    /// role is [`SyntaxRole::String`], while `Constant` falls back to
+    /// [`SyntaxRole::Number`] here.
+    #[must_use]
+    pub const fn fallback(self) -> Self {
+        match self.fallback_or_none() {
+            Some(base) => base,
+            None => self,
+        }
+    }
+
+    const fn fallback_or_none(self) -> Option<Self> {
+        match self {
+            Self::Constant => Some(Self::Number),
+            Self::Parameter | Self::Property | Self::Attribute => Some(Self::Variable),
+            Self::Builtin => Some(Self::Function),
+            Self::Tag => Some(Self::Keyword),
+            Self::Text
+            | Self::Comment
+            | Self::Keyword
+            | Self::Function
+            | Self::Variable
+            | Self::String
+            | Self::Number
+            | Self::Type
+            | Self::Operator
+            | Self::Punctuation
+            | Self::Heading
+            | Self::Link
+            | Self::Raw => None,
+        }
+    }
 }
 
 /// Renderer-neutral syntax-highlighted text span.
@@ -190,8 +282,12 @@ impl SyntaxSpan {
 /// Renderer-neutral syntax style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyntaxStyle {
-    /// Semantic token role determined from syntax scopes.
+    /// Semantic token role determined from syntax scopes, refined where the
+    /// grammar exposes a finer token kind.
     pub role: SyntaxRole,
+    /// Base role of the token: equal to `role` for base roles, otherwise the
+    /// base role the token has without refinement. Always a base role.
+    pub base_role: SyntaxRole,
     /// Foreground terminal color selected by the active palette.
     pub foreground: SyntaxColor,
     /// Whether text should be bold.
@@ -250,6 +346,20 @@ pub struct SyntaxPalette {
     pub link: SyntaxColor,
     /// Markup literal spans such as inline code.
     pub raw: SyntaxColor,
+    /// Named constants; `None` paints them with their base role color.
+    pub constant: Option<SyntaxColor>,
+    /// Parameters; `None` paints them with their base role color.
+    pub parameter: Option<SyntaxColor>,
+    /// Properties and mapping keys; `None` paints them with their base role
+    /// color.
+    pub property: Option<SyntaxColor>,
+    /// Language and runtime builtins; `None` paints them with their base role
+    /// color.
+    pub builtin: Option<SyntaxColor>,
+    /// Markup tag names; `None` paints them with their base role color.
+    pub tag: Option<SyntaxColor>,
+    /// Markup attribute names; `None` paints them with their base role color.
+    pub attribute: Option<SyntaxColor>,
 }
 
 impl Default for SyntaxPalette {
@@ -268,12 +378,42 @@ impl Default for SyntaxPalette {
             heading: SyntaxColor::rgb(97, 175, 239),
             link: SyntaxColor::rgb(86, 182, 194),
             raw: SyntaxColor::rgb(209, 154, 102),
+            constant: None,
+            parameter: None,
+            property: None,
+            builtin: None,
+            tag: None,
+            attribute: None,
         }
     }
 }
 
 impl SyntaxPalette {
-    const fn color(self, role: SyntaxRole) -> SyntaxColor {
+    /// Color for a token with `role` whose base role is `base_role`.
+    ///
+    /// Base roles use their own color. A refined role uses its color when the
+    /// palette sets one, otherwise the color of `base_role`, so a palette
+    /// without refined colors paints every token exactly as the base
+    /// classification does.
+    #[must_use]
+    pub const fn resolve(self, role: SyntaxRole, base_role: SyntaxRole) -> SyntaxColor {
+        let refined = match role {
+            SyntaxRole::Constant => self.constant,
+            SyntaxRole::Parameter => self.parameter,
+            SyntaxRole::Property => self.property,
+            SyntaxRole::Builtin => self.builtin,
+            SyntaxRole::Tag => self.tag,
+            SyntaxRole::Attribute => self.attribute,
+            _ => return self.base_color(role),
+        };
+        match refined {
+            Some(color) => color,
+            None => self.base_color(base_role),
+        }
+    }
+
+    /// Color of a base role; refined roles use their fallback's color.
+    const fn base_color(self, role: SyntaxRole) -> SyntaxColor {
         match role {
             SyntaxRole::Text => self.text,
             SyntaxRole::Comment => self.comment,
@@ -288,6 +428,12 @@ impl SyntaxPalette {
             SyntaxRole::Heading => self.heading,
             SyntaxRole::Link => self.link,
             SyntaxRole::Raw => self.raw,
+            SyntaxRole::Constant
+            | SyntaxRole::Parameter
+            | SyntaxRole::Property
+            | SyntaxRole::Builtin
+            | SyntaxRole::Tag
+            | SyntaxRole::Attribute => self.base_color(role.fallback()),
         }
     }
 }
@@ -552,10 +698,10 @@ impl ScopeClassifier {
             if content.is_empty() {
                 continue;
             }
-            let (role, font) = classify_scope_stack(&self.scope_stack);
+            let (roles, font) = classify_scope_stack(&self.scope_stack);
             spans.push(SyntaxSpan::new(
                 content.to_owned(),
-                syntax_style(role, self.palette.color(role), font),
+                syntax_style(roles, self.palette, font),
             ));
         }
         Some(if spans.is_empty() {
@@ -589,8 +735,8 @@ impl ScopeClassifier {
             if start >= end {
                 continue;
             }
-            let (role, font) = classify_scope_stack(&self.scope_stack);
-            let style = syntax_style(role, self.palette.color(role), font);
+            let (roles, font) = classify_scope_stack(&self.scope_stack);
+            let style = syntax_style(roles, self.palette, font);
             let mergeable = tokens.len() > first;
             match tokens.last_mut() {
                 Some(last) if mergeable && last.style == style && last.end == start => {
@@ -611,11 +757,26 @@ struct FontEmphasis {
     underline: bool,
 }
 
-/// Resolve one scope stack into a semantic role and font emphasis.
+/// A token's refined role paired with its base role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TokenRoles {
+    role: SyntaxRole,
+    base: SyntaxRole,
+}
+
+impl TokenRoles {
+    const fn base(role: SyntaxRole) -> Self {
+        Self { role, base: role }
+    }
+}
+
+/// Resolve one scope stack into semantic roles and font emphasis.
 ///
 /// Code roles are resolved first so languages embedded in markup fences keep
 /// their own semantic colors; markup roles describe the remaining prose spans.
-fn classify_scope_stack(stack: &ScopeStack) -> (SyntaxRole, FontEmphasis) {
+/// The base role is resolved independently of refinement, then a refined role
+/// may name a finer kind for the same token.
+fn classify_scope_stack(stack: &ScopeStack) -> (TokenRoles, FontEmphasis) {
     let scopes = stack
         .scopes
         .iter()
@@ -623,13 +784,75 @@ fn classify_scope_stack(stack: &ScopeStack) -> (SyntaxRole, FontEmphasis) {
         .collect::<Vec<_>>();
     let has = |needle: &str| scopes.iter().any(|scope| scope_contains(scope, needle));
 
-    let role = code_role(&has)
+    let base = code_role(&has)
         .or_else(|| markup_role(&has))
         // Delimiters are shared by both families, so they resolve only after
         // language and markup structure had a chance to claim the span.
         .or_else(|| has("punctuation").then_some(SyntaxRole::Punctuation))
         .unwrap_or(SyntaxRole::Text);
-    (role, emphasis(&has))
+    let role = refined_role(&has, base).unwrap_or(base);
+    (TokenRoles { role, base }, emphasis(&has))
+}
+
+/// Name a finer token kind for a token whose base role is `base`.
+///
+/// Comments, keywords, operators, punctuation, and markup structure are never
+/// refined, so delimiters inside a refined construct keep their own role.
+/// Inside string literals only embedded constants (escapes, placeholders) and
+/// mapping keys are refined, so interpolated code keeps the string's role.
+fn refined_role(has: &impl Fn(&str) -> bool, base: SyntaxRole) -> Option<SyntaxRole> {
+    let is_property = || {
+        has("variable.other.property")
+            || has("variable.other.member")
+            || has("variable.object.property")
+            || has("support.variable.property")
+            || has("support.type.property-name")
+            || has("meta.object-literal.key")
+            || has("meta.mapping.key")
+            || has("entity.name.field")
+            || has("entity.name.property")
+    };
+    let is_constant = || {
+        has("constant.language")
+            || has("constant.other")
+            || has("constant.character")
+            || has("support.constant.language")
+    };
+    match base {
+        SyntaxRole::Comment
+        | SyntaxRole::Keyword
+        | SyntaxRole::Operator
+        | SyntaxRole::Punctuation
+        | SyntaxRole::Heading
+        | SyntaxRole::Link
+        | SyntaxRole::Raw => None,
+        SyntaxRole::String => {
+            if is_property() {
+                Some(SyntaxRole::Property)
+            } else if is_constant() {
+                Some(SyntaxRole::Constant)
+            } else {
+                None
+            }
+        }
+        _ if has("constant.numeric") => None,
+        _ if has("entity.name.tag") => Some(SyntaxRole::Tag),
+        _ if has("entity.other.attribute-name") => Some(SyntaxRole::Attribute),
+        _ if has("variable.parameter") => Some(SyntaxRole::Parameter),
+        _ if is_property() => Some(SyntaxRole::Property),
+        _ if has("support.function")
+            || has("support.class")
+            || has("support.constant")
+            || has("support.macro")
+            || has("variable.language")
+            || has("variable.function.builtin")
+            || has("entity.name.function.builtin") =>
+        {
+            Some(SyntaxRole::Builtin)
+        }
+        _ if is_constant() => Some(SyntaxRole::Constant),
+        _ => None,
+    }
 }
 
 /// Classify programming-language token scopes.
@@ -710,14 +933,23 @@ fn scope_contains(scope: &str, needle: &str) -> bool {
 fn plain_syntax_spans(line: &str, palette: SyntaxPalette) -> Vec<SyntaxSpan> {
     vec![SyntaxSpan::new(
         line.to_owned(),
-        syntax_style(SyntaxRole::Text, palette.text, FontEmphasis::default()),
+        syntax_style(
+            TokenRoles::base(SyntaxRole::Text),
+            palette,
+            FontEmphasis::default(),
+        ),
     )]
 }
 
-const fn syntax_style(role: SyntaxRole, color: SyntaxColor, font: FontEmphasis) -> SyntaxStyle {
+const fn syntax_style(
+    roles: TokenRoles,
+    palette: SyntaxPalette,
+    font: FontEmphasis,
+) -> SyntaxStyle {
     SyntaxStyle {
-        role,
-        foreground: color,
+        role: roles.role,
+        base_role: roles.base,
+        foreground: palette.resolve(roles.role, roles.base),
         bold: font.bold,
         italic: font.italic,
         underline: font.underline,
@@ -915,6 +1147,7 @@ mod tests {
             heading: SyntaxColor::Ansi(AnsiColor::Magenta),
             link: SyntaxColor::Indexed(45),
             raw: SyntaxColor::Ansi(AnsiColor::Yellow),
+            ..SyntaxPalette::default()
         };
         let lines = ["// comment", "pub fn main() { let value = 42; }"];
         let spans = SyntaxHighlighter::with_palette(palette)
@@ -954,6 +1187,7 @@ mod tests {
             heading: SyntaxColor::rgb(11, 11, 11),
             link: SyntaxColor::rgb(12, 12, 12),
             raw: SyntaxColor::rgb(13, 13, 13),
+            ..SyntaxPalette::default()
         };
         let lines = ["// comment", "pub fn main() { let value = 42; }"];
         let spans = SyntaxHighlighter::with_palette(palette)
@@ -967,11 +1201,9 @@ mod tests {
         assert!(roles.contains(&SyntaxRole::Keyword), "{spans:?}");
         assert!(roles.contains(&SyntaxRole::Function), "{spans:?}");
         assert!(roles.contains(&SyntaxRole::Number), "{spans:?}");
-        assert!(
-            spans
-                .iter()
-                .all(|span| { span.style.foreground == palette.color(span.style.role) })
-        );
+        assert!(spans.iter().all(|span| {
+            span.style.foreground == palette.resolve(span.style.role, span.style.base_role)
+        }));
     }
 
     #[test]
@@ -1217,9 +1449,8 @@ mod tests {
             );
         }
         assert!(
-            spans
-                .iter()
-                .all(|span| span.style.foreground == palette.color(span.style.role)),
+            spans.iter().all(|span| span.style.foreground
+                == palette.resolve(span.style.role, span.style.base_role)),
             "every markup span resolves its own role color: {spans:?}"
         );
     }
@@ -1271,5 +1502,207 @@ mod tests {
             .join("\n");
 
         assert_eq!(reconstructed, source.trim_end_matches('\n'));
+    }
+
+    /// Highlight `source` and return every span with non-blank content.
+    fn spans_for(palette: SyntaxPalette, hint: &str, source: &str) -> Vec<super::SyntaxSpan> {
+        let lines = source.lines().collect::<Vec<_>>();
+        SyntaxHighlighter::with_palette(palette)
+            .highlight_lines_tokens(hint, &lines)
+            .into_iter()
+            .flatten()
+            .filter(|span| !span.content.trim().is_empty())
+            .collect()
+    }
+
+    /// Expected token text with its refined role and base role.
+    type Expectation = (&'static str, SyntaxRole, SyntaxRole);
+
+    /// Representative sources whose tokens exercise every refined role.
+    const REFINED_CASES: [(&str, &str, &[Expectation]); 5] = [
+        (
+            "rust",
+            "fn f(param: u32) { let s = self.x; println!(\"a\\n\", true); const MAX: u8 = 1; }",
+            &[
+                ("param", SyntaxRole::Parameter, SyntaxRole::Variable),
+                ("self", SyntaxRole::Builtin, SyntaxRole::Variable),
+                ("println!", SyntaxRole::Builtin, SyntaxRole::Text),
+                ("\\n", SyntaxRole::Constant, SyntaxRole::String),
+                ("true", SyntaxRole::Constant, SyntaxRole::Text),
+                ("MAX", SyntaxRole::Constant, SyntaxRole::Text),
+                ("1", SyntaxRole::Number, SyntaxRole::Number),
+                ("f", SyntaxRole::Function, SyntaxRole::Function),
+            ],
+        ),
+        (
+            "typescript",
+            "function f(param: number) { const o = { key: 1 }; this.prop = null ?? undefined; console.log(o); }",
+            &[
+                ("param", SyntaxRole::Parameter, SyntaxRole::Variable),
+                ("key", SyntaxRole::Property, SyntaxRole::Text),
+                ("this", SyntaxRole::Builtin, SyntaxRole::Variable),
+                ("prop", SyntaxRole::Property, SyntaxRole::Variable),
+                ("null", SyntaxRole::Constant, SyntaxRole::Number),
+                ("undefined", SyntaxRole::Constant, SyntaxRole::Text),
+                ("console", SyntaxRole::Builtin, SyntaxRole::Function),
+                ("log", SyntaxRole::Builtin, SyntaxRole::Function),
+                ("number", SyntaxRole::Type, SyntaxRole::Type),
+            ],
+        ),
+        (
+            "html",
+            "<div class=\"x\">&amp; text</div>",
+            &[
+                ("div", SyntaxRole::Tag, SyntaxRole::Text),
+                ("class", SyntaxRole::Attribute, SyntaxRole::Text),
+                ("amp", SyntaxRole::Constant, SyntaxRole::Text),
+                ("x", SyntaxRole::String, SyntaxRole::String),
+            ],
+        ),
+        (
+            "json",
+            "{\"key\": true, \"n\": null, \"s\": \"v\\n\", \"x\": 1}",
+            &[
+                ("key", SyntaxRole::Property, SyntaxRole::String),
+                ("true", SyntaxRole::Constant, SyntaxRole::Text),
+                ("null", SyntaxRole::Constant, SyntaxRole::Text),
+                ("\\n", SyntaxRole::Constant, SyntaxRole::String),
+                ("v", SyntaxRole::String, SyntaxRole::String),
+                ("1", SyntaxRole::Number, SyntaxRole::Number),
+            ],
+        ),
+        (
+            "python",
+            "def f(param):\n    self.attr = len(param) or None\n    print(\"a\\n\")",
+            &[
+                ("param", SyntaxRole::Parameter, SyntaxRole::Variable),
+                ("self", SyntaxRole::Builtin, SyntaxRole::Variable),
+                ("len", SyntaxRole::Builtin, SyntaxRole::Function),
+                ("None", SyntaxRole::Constant, SyntaxRole::Text),
+                ("\\n", SyntaxRole::Constant, SyntaxRole::String),
+            ],
+        ),
+    ];
+
+    #[test]
+    fn refined_roles_cover_representative_grammars() {
+        for (hint, source, expectations) in REFINED_CASES {
+            let spans = spans_for(SyntaxPalette::default(), hint, source);
+            for &(text, role, base_role) in expectations {
+                assert!(
+                    spans.iter().any(|span| span.content.trim() == text
+                        && span.style.role == role
+                        && span.style.base_role == base_role),
+                    "expected {text:?} as {role:?} (base {base_role:?}) in {hint}: {spans:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn palette_without_refined_colors_paints_base_role_colors() {
+        let palette = SyntaxPalette::default();
+        for (hint, source, _) in REFINED_CASES {
+            for span in spans_for(palette, hint, source) {
+                assert!(span.style.base_role.is_base(), "{span:?}");
+                assert!(
+                    span.style.role == span.style.base_role || !span.style.role.is_base(),
+                    "a token is either unrefined or carries a refined role: {span:?}"
+                );
+                assert_eq!(
+                    span.style.foreground,
+                    palette.resolve(span.style.base_role, span.style.base_role),
+                    "unset refined colors keep the base color in {hint}: {span:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn refined_palette_colors_apply_only_to_refined_tokens() {
+        let palette = SyntaxPalette {
+            constant: Some(SyntaxColor::rgb(1, 0, 0)),
+            parameter: Some(SyntaxColor::rgb(2, 0, 0)),
+            property: Some(SyntaxColor::rgb(3, 0, 0)),
+            builtin: Some(SyntaxColor::rgb(4, 0, 0)),
+            tag: Some(SyntaxColor::rgb(5, 0, 0)),
+            attribute: Some(SyntaxColor::rgb(6, 0, 0)),
+            ..SyntaxPalette::default()
+        };
+        let base_palette = SyntaxPalette::default();
+        for (hint, source, _) in REFINED_CASES {
+            let refined = spans_for(palette, hint, source);
+            let base = spans_for(base_palette, hint, source);
+            assert_eq!(refined.len(), base.len());
+            for (refined, base) in refined.iter().zip(&base) {
+                assert_eq!(refined.style.role, base.style.role);
+                let expected = match refined.style.role {
+                    SyntaxRole::Constant => palette.constant,
+                    SyntaxRole::Parameter => palette.parameter,
+                    SyntaxRole::Property => palette.property,
+                    SyntaxRole::Builtin => palette.builtin,
+                    SyntaxRole::Tag => palette.tag,
+                    SyntaxRole::Attribute => palette.attribute,
+                    _ => None,
+                }
+                .unwrap_or(base.style.foreground);
+                assert_eq!(refined.style.foreground, expected, "{refined:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn delimiters_inside_refined_constructs_keep_their_roles() {
+        let spans = spans_for(
+            SyntaxPalette::default(),
+            "typescript",
+            "const o = { key: 1 };",
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.content == ":" && span.style.role == SyntaxRole::Punctuation),
+            "{spans:?}"
+        );
+        let spans = spans_for(SyntaxPalette::default(), "html", "<div class=\"x\"></div>");
+        assert!(
+            spans
+                .iter()
+                .any(|span| span.content == "<" && span.style.role == SyntaxRole::Punctuation),
+            "{spans:?}"
+        );
+    }
+
+    #[test]
+    fn comments_are_never_refined() {
+        let spans = spans_for(
+            SyntaxPalette::default(),
+            "typescript",
+            "/** @param value the input */",
+        );
+        assert!(
+            spans
+                .iter()
+                .all(|span| span.style.role == SyntaxRole::Comment),
+            "{spans:?}"
+        );
+    }
+
+    #[test]
+    fn fallback_maps_every_role_to_a_base_role() {
+        for role in SyntaxRole::ALL {
+            assert!(role.fallback().is_base(), "{role:?}");
+            if role.is_base() {
+                assert_eq!(role.fallback(), role);
+            }
+        }
+        assert_eq!(
+            SyntaxRole::ALL.iter().filter(|role| role.is_base()).count(),
+            13
+        );
+        assert_eq!(SyntaxRole::Constant.fallback(), SyntaxRole::Number);
+        assert_eq!(SyntaxRole::Parameter.fallback(), SyntaxRole::Variable);
+        assert_eq!(SyntaxRole::Property.fallback(), SyntaxRole::Variable);
+        assert_eq!(SyntaxRole::Builtin.fallback(), SyntaxRole::Function);
     }
 }

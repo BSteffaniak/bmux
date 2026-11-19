@@ -18,6 +18,33 @@ grammars. Unknown hints safely fall back to plain text.
 - `highlight_line` / `highlight_lines` return canonical `bmux_tui::Span` values.
 - Multi-line parsing retains grammar scope state across lines.
 
+## Roles and refined roles
+
+Every token has one of thirteen base roles (`Text` through `Raw`), reported as
+`SyntaxStyle::base_role`. Where the grammar exposes a finer kind, the token's
+`SyntaxStyle::role` is a refined role instead:
+
+| Refined role | Typical scopes | `fallback()` |
+| --- | --- | --- |
+| `Constant` | `constant.language`, `constant.other`, `constant.character` (escapes, entities), placeholders | `Number` |
+| `Parameter` | `variable.parameter` | `Variable` |
+| `Property` | `variable.other.property`/`member`, `support.type.property-name`, `meta.object-literal.key`, `meta.mapping.key` | `Variable` |
+| `Builtin` | `support.function`/`class`/`constant`/`macro`, `variable.language`, `*.builtin` functions | `Function` |
+| `Tag` | `entity.name.tag` | `Keyword` |
+| `Attribute` | `entity.other.attribute-name` | `Variable` |
+
+Numeric literals stay `Number`. Comments, keywords, operators, punctuation, and
+markup structure are never refined; inside string literals only embedded
+constants and mapping keys are.
+
+`SyntaxPalette`'s refined colors (`constant`, `parameter`, `property`,
+`builtin`, `tag`, `attribute`) are optional and default to `None`. An unset
+refined color paints the token with its base role color, so a palette without
+refined colors renders exactly as the base classification. Consumers that map
+roles to their own colors should map refined roles they know and use
+`SyntaxStyle::base_role` otherwise; `SyntaxRole::fallback()` is the nearest base
+role for contexts without a token, such as palette previews.
+
 The shared derived-result cache retains at most 4 MiB of source keys and skips
 entries over 256 KiB. It preserves the upstream cache accounting: those limits
 bound retained source bytes, not total token allocation or input size. Callers
