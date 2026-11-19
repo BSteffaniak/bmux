@@ -1,11 +1,17 @@
 use crate::reflow::{project_logical_line, projected_logical_line_row_count};
 mod content;
+mod frame;
+
 use crate::snapshot::{GridSnapshot, RowSnapshot, TerminalStateSnapshot};
 use crate::style::{Color, Style, StyleId, StylePalette};
 pub use content::{
     ContentAnchor, ContentBudget, ContentCursor, ContentPosition, ContentProjection,
     ContentRowSource, ContentRows, ContentSelectionRow, ScreenRowSource, ScreenRows,
     ScreenSelectionRow, SelectionCell,
+};
+pub use frame::{
+    FrameApplyError, FrameCell, FrameLine, FrameMove, FrameRow, FrameScreen, FrameState, FrameWrap,
+    GridFrame, ReplicaCursor,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -607,6 +613,10 @@ pub struct PhysicalRow {
     /// [`TerminalGrid::take_viewport_changes`]). A new row starts changed, and the flag moves with
     /// the row when rows scroll.
     changed: bool,
+    /// Changed since the grid last sealed its changes for replicas (see [`GridFrame`]).
+    fresh: bool,
+    /// The epoch the row's last change was sealed into; moves with the row.
+    stamp: u64,
 }
 
 impl Default for PhysicalRow {
@@ -615,7 +625,17 @@ impl Default for PhysicalRow {
             cells: Vec::new(),
             wrapped: false,
             changed: true,
+            fresh: true,
+            stamp: 0,
         }
+    }
+}
+
+impl PhysicalRow {
+    /// Record a change, for the renderer and for replicas.
+    const fn mark_changed(&mut self) {
+        self.changed = true;
+        self.fresh = true;
     }
 }
 
@@ -648,7 +668,7 @@ impl PhysicalRow {
         if cell.width == 2 && col + 1 >= width {
             return Some(());
         }
-        self.changed = true;
+        self.mark_changed();
         let end = col.checked_add(if cell.width == 2 && col + 1 < width {
             2
         } else {
@@ -692,6 +712,8 @@ impl PhysicalRow {
             cells: vec![Cell::blank(style); width],
             wrapped: false,
             changed: true,
+            fresh: true,
+            stamp: 0,
         }
     }
 
@@ -703,7 +725,7 @@ impl PhysicalRow {
             self.cells.resize(width, Cell::blank(style));
         }
         self.wrapped = false;
-        self.changed = true;
+        self.mark_changed();
     }
 
     #[must_use]
@@ -717,7 +739,11 @@ impl PhysicalRow {
     }
 
     pub fn set_wrapped(&mut self, wrapped: bool) {
-        self.wrapped = wrapped;
+        if self.wrapped != wrapped {
+            self.wrapped = wrapped;
+            // Nothing a renderer draws changed, but a replica's row must follow.
+            self.fresh = true;
+        }
     }
 
     /// Write narrow ASCII cells from `col` in `style`, as one-cell clears and writes of each in
@@ -726,7 +752,7 @@ impl PhysicalRow {
     /// row that must grow reserves the terminal's `width` at once: rows are reused, so it grows
     /// only once.
     pub(crate) fn write_ascii(&mut self, col: usize, text: &[u8], style: StyleId, width: usize) {
-        self.changed = true;
+        self.mark_changed();
         let end = col + text.len();
         if col > 0 && self.cells.get(col).is_some_and(Cell::is_wide_continuation) {
             self.cells[col - 1] = Cell::blank(style);
@@ -748,7 +774,7 @@ impl PhysicalRow {
     }
 
     pub(crate) fn set_cell(&mut self, col: usize, cell: Cell) {
-        self.changed = true;
+        self.mark_changed();
         // Appending, as printing nearly always is: trailing blanks can only appear if this one
         // is blank.
         if col == self.cells.len() {
@@ -768,7 +794,7 @@ impl PhysicalRow {
     }
 
     pub(crate) fn cell_mut(&mut self, col: usize) -> Option<&mut Cell> {
-        self.changed = true;
+        self.mark_changed();
         self.cells.get_mut(col)
     }
 
@@ -776,7 +802,7 @@ impl PhysicalRow {
         if start >= end {
             return;
         }
-        self.changed = true;
+        self.mark_changed();
         let start = if self
             .cells
             .get(start)
@@ -815,7 +841,7 @@ impl PhysicalRow {
     }
 
     pub(crate) fn truncate(&mut self, len: usize) {
-        self.changed = true;
+        self.mark_changed();
         self.cells.truncate(len);
         if self
             .cells
@@ -937,6 +963,8 @@ pub struct TerminalGrid {
     pending_wrap: bool,
     scroll_region: Option<(usize, usize)>,
     protocol: ProtocolState,
+    /// What replicas are sent frames from.
+    damage: frame::Damage,
 }
 
 #[derive(Debug, Default)]
@@ -1304,6 +1332,7 @@ impl TerminalGrid {
             pending_wrap: false,
             scroll_region: None,
             protocol: ProtocolState::default(),
+            damage: frame::Damage::default(),
         })
     }
 
@@ -1415,6 +1444,7 @@ impl TerminalGrid {
                 .scroll_region
                 .map(|region| (usize::from(region.top), usize::from(region.bottom))),
             protocol: snapshot.protocol,
+            damage: frame::Damage::default(),
         };
         grid.restore_snapshot_saved_state(snapshot);
         grid.clamp_cursor();
@@ -1516,6 +1546,7 @@ impl TerminalGrid {
 
     fn note_viewport_scroll(&mut self, top: usize, bottom: usize, rows: i64) {
         self.viewport_scroll = self.viewport_scroll.then(top, bottom, rows);
+        self.log_move(top, bottom, rows);
     }
 
     /// Resize, returning the signed main viewport shift for unchanged columns.
@@ -1537,8 +1568,10 @@ impl TerminalGrid {
         if self.width == width && self.height == height {
             return Ok(Some(0));
         }
-        // A size change rewraps or crops rows; a renderer's previous frame no longer lines up.
+        // A size change rewraps or crops rows; a renderer's previous frame no longer lines up,
+        // and replicas start again.
         self.viewport_scroll = ViewportScroll::Unknown;
+        self.log_reset();
         let same_width = self.width == width;
         let main_cursor = match self.mode {
             GridMode::Main => self.cursor,
@@ -2065,6 +2098,7 @@ impl TerminalGrid {
                 self.main_history.clear();
                 self.main_history_projected_rows = OnceLock::from(0);
                 self.pending_history_cells.clear();
+                self.log_history_clear();
             }
             _ => {}
         }
@@ -2447,6 +2481,7 @@ impl TerminalGrid {
             reset.viewport_scroll = ViewportScroll::Unknown;
             reset.reset_revision = self.reset_revision.wrapping_add(1);
             reset.bump_content_revision();
+            reset.restore_damage(self.take_damage_for_reset());
             *self = reset;
         }
     }
@@ -3170,6 +3205,7 @@ impl TerminalGrid {
     /// storage, to be reused) and join the logical line they belong to; a line completed is
     /// copied out at its exact size, and the pending buffer keeps its storage too.
     fn push_history_row(&mut self, row: &mut PhysicalRow) {
+        self.log_pending_change();
         let wrapped = row.wrapped();
         let start = self.pending_history_cells.len();
         // Padding is only needed for a soft-wrapped row, written up to the edge: its unstored
@@ -3214,6 +3250,7 @@ impl TerminalGrid {
     }
 
     fn push_history_line(&mut self, line: LogicalLine) {
+        self.log_history_push();
         // Without history, a completed line leaves at once.
         if self.limits.scrollback_rows == 0 {
             self.history_truncated = true;
@@ -3701,6 +3738,7 @@ impl TerminalGrid {
             row_index = line_end;
         }
         self.pending_history_cells = trim_trailing_blank_cells(next_pending);
+        self.log_pending_change();
         self.history_bytes = self
             .main_history
             .iter()
@@ -3762,6 +3800,7 @@ impl TerminalGrid {
     fn live_logical_lines(&mut self, source_rows: &[PhysicalRow]) -> Vec<LogicalLine> {
         let mut lines = Vec::new();
         let mut logical = std::mem::take(&mut self.pending_history_cells);
+        self.log_pending_change();
         for row in source_rows {
             logical.extend(row_logical_cells(row, self.width));
             if !row.wrapped() {
@@ -4057,6 +4096,7 @@ impl TerminalGrid {
             pending_wrap: self.pending_wrap,
             scroll_region: self.scroll_region,
             protocol: self.protocol,
+            damage: self.damage.clone(),
         };
         // Exact reservations may still receive excess capacity from an allocator.
         // Do not publish that capacity without charging the shared budget.
@@ -4135,6 +4175,7 @@ impl TerminalGrid {
                 }
             } else {
                 let pending = std::mem::take(&mut self.pending_history_cells);
+                self.log_pending_change();
                 // The rest of this open line follows in a later line.
                 self.hand_over_line(&pending, false);
                 self.history_bytes = 0;
@@ -4181,6 +4222,8 @@ fn try_clone_row(row: &PhysicalRow) -> Option<PhysicalRow> {
         cells: try_clone_cells(&row.cells)?,
         wrapped: row.wrapped,
         changed: row.changed,
+        fresh: row.fresh,
+        stamp: row.stamp,
     })
 }
 

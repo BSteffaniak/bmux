@@ -170,6 +170,23 @@ impl StylePalette {
         self.styles.capacity()
     }
 
+    /// Styles held.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.styles.len()
+    }
+
+    /// Whether the palette holds no style.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.styles.is_empty()
+    }
+
+    /// Append `style` at the next id, as a replica copies its source's palette in order.
+    pub(crate) fn push(&mut self, style: Style) {
+        std::sync::Arc::make_mut(&mut self.styles).push(style);
+    }
+
     /// All interned styles in id order.
     #[must_use]
     pub fn styles(&self) -> &[Style] {

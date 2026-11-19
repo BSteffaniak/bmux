@@ -3,7 +3,7 @@
     {
       "name": "su-scroll",
       "frames": 301,
-      "units_per_frame": 155511.67,
+      "units_per_frame": 155824.26,
       "functions": [
         {
           "name": "<bmux_pane_runtime_plugin::runtime::EscSeqPhase>::is_ground",
@@ -210,7 +210,7 @@
     {
       "name": "region-linefeed",
       "frames": 301,
-      "units_per_frame": 155452.37,
+      "units_per_frame": 155776.92,
       "functions": [
         {
           "name": "<bmux_pane_runtime_plugin::runtime::EscSeqPhase>::is_ground",
@@ -417,7 +417,7 @@
     {
       "name": "full-repaint",
       "frames": 301,
-      "units_per_frame": 4135426.38,
+      "units_per_frame": 4143826.04,
       "functions": [
         {
           "name": "<bmux_pane_runtime_plugin::runtime::EscSeqPhase>::is_ground",
@@ -624,7 +624,7 @@
     {
       "name": "plain-stream",
       "frames": 301,
-      "units_per_frame": 164869.39,
+      "units_per_frame": 165172.32,
       "functions": [
         {
           "name": "<bmux_pane_runtime_plugin::runtime::EscSeqPhase>::is_ground",
@@ -831,7 +831,7 @@
     {
       "name": "unclosed-sync",
       "frames": 302,
-      "units_per_frame": 177096.77,
+      "units_per_frame": 177426.08,
       "functions": [
         {
           "name": "<bmux_pane_runtime_plugin::runtime::EscSeqPhase>::is_ground",
@@ -1038,7 +1038,7 @@
     {
       "name": "kitty-images",
       "frames": 301,
-      "units_per_frame": 391090.84,
+      "units_per_frame": 392376.88,
       "functions": [
         {
           "name": "<bmux_terminal_grid::parser::TerminalGridStream>::grid",

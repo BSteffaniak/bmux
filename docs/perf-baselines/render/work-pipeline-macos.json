@@ -3,7 +3,7 @@
     {
       "name": "su-scroll",
       "frames": 301,
-      "units_per_frame": 232623.55,
+      "units_per_frame": 232936.46,
       "functions": [
         {
           "name": "<bmux_terminal_grid::vt_parser::Parser>::consume::<bmux_terminal_grid::parser::ProtocolPerformer>",
@@ -210,7 +210,7 @@
     {
       "name": "region-linefeed",
       "frames": 301,
-      "units_per_frame": 232397.35,
+      "units_per_frame": 232722.22,
       "functions": [
         {
           "name": "<bmux_terminal_grid::vt_parser::Parser>::consume::<bmux_terminal_grid::parser::ProtocolPerformer>",
@@ -417,7 +417,7 @@
     {
       "name": "full-repaint",
       "frames": 301,
-      "units_per_frame": 5438039.29,
+      "units_per_frame": 5446439.27,
       "functions": [
         {
           "name": "<bmux_terminal_grid::vt_parser::Parser>::consume::<bmux_terminal_grid::parser::ProtocolPerformer>",
@@ -624,7 +624,7 @@
     {
       "name": "full-repaint/no-passthrough",
       "frames": 301,
-      "units_per_frame": 5438033.28,
+      "units_per_frame": 5446433.26,
       "functions": [
         {
           "name": "<bmux_terminal_grid::vt_parser::Parser>::consume::<bmux_terminal_grid::parser::ProtocolPerformer>",
@@ -831,7 +831,7 @@
     {
       "name": "full-repaint/observed",
       "frames": 301,
-      "units_per_frame": 6290724.82,
+      "units_per_frame": 6299124.8,
       "functions": [
         {
           "name": "<bmux_terminal_grid::vt_parser::Parser>::consume::<bmux_terminal_grid::parser::ProtocolPerformer>",
@@ -1038,7 +1038,7 @@
     {
       "name": "plain-stream",
       "frames": 301,
-      "units_per_frame": 259307.7,
+      "units_per_frame": 259610.95,
       "functions": [
         {
           "name": "<bmux_terminal_grid::vt_parser::Parser>::consume::<bmux_terminal_grid::parser::ProtocolPerformer>",
@@ -1245,7 +1245,7 @@
     {
       "name": "plain-stream/no-passthrough",
       "frames": 301,
-      "units_per_frame": 2416060.97,
+      "units_per_frame": 2416364.22,
       "functions": [
         {
           "name": "<bmux_tui::style::Modifier>::contains",
@@ -1452,7 +1452,7 @@
     {
       "name": "plain-stream/observed",
       "frames": 301,
-      "units_per_frame": 938679.5,
+      "units_per_frame": 938982.75,
       "functions": [
         {
           "name": "<bmux_tui::geometry::Rect>::contains",
@@ -1659,7 +1659,7 @@
     {
       "name": "unclosed-sync",
       "frames": 302,
-      "units_per_frame": 146558.36,
+      "units_per_frame": 146887.99,
       "functions": [
         {
           "name": "<bmux_terminal_grid::vt_parser::Parser>::consume::<bmux_terminal_grid::parser::ProtocolPerformer>",
@@ -1866,7 +1866,7 @@
     {
       "name": "full-repaint/two-panes",
       "frames": 301,
-      "units_per_frame": 5471523.56,
+      "units_per_frame": 5480061.11,
       "functions": [
         {
           "name": "<bmux_terminal_grid::vt_parser::Parser>::consume::<bmux_terminal_grid::parser::ProtocolPerformer>",
@@ -2073,7 +2073,7 @@
     {
       "name": "plain-stream/two-panes",
       "frames": 301,
-      "units_per_frame": 1085179.44,
+      "units_per_frame": 1085512.08,
       "functions": [
         {
           "name": "<bmux_tui::style::Modifier>::contains",
@@ -2280,7 +2280,7 @@
     {
       "name": "scattered-edits",
       "frames": 301,
-      "units_per_frame": 127473.06,
+      "units_per_frame": 127493.16,
       "functions": [
         {
           "name": "<bmux_tui::symbol::Symbol>::is",
@@ -2487,7 +2487,7 @@
     {
       "name": "image/kitty/beside-stream",
       "frames": 301,
-      "units_per_frame": 554951.46,
+      "units_per_frame": 555118.26,
       "functions": [
         {
           "name": "<bmux_tui::style::Modifier>::contains",
@@ -2694,7 +2694,7 @@
     {
       "name": "image/kitty/moving",
       "frames": 301,
-      "units_per_frame": 555293.45,
+      "units_per_frame": 555460.26,
       "functions": [
         {
           "name": "<bmux_tui::style::Modifier>::contains",
@@ -2901,7 +2901,7 @@
     {
       "name": "image/sixel/beside-stream",
       "frames": 301,
-      "units_per_frame": 562738.83,
+      "units_per_frame": 562905.64,
       "functions": [
         {
           "name": "<bmux_tui::style::Modifier>::contains",
@@ -3108,7 +3108,7 @@
     {
       "name": "image/sixel/moving",
       "frames": 301,
-      "units_per_frame": 566395.32,
+      "units_per_frame": 566562.12,
       "functions": [
         {
           "name": "<bmux_tui::style::Modifier>::contains",

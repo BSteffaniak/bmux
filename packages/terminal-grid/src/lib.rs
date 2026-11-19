@@ -36,14 +36,17 @@ mod rendition_regression_tests;
 
 #[cfg(test)]
 mod stream_compat_tests;
+#[cfg(test)]
+mod frame_tests;
 
 pub use delta::{GridDeltaApplyError, GridDeltaBatch, RowUpdateSnapshot};
 pub use model::{
     Cell, ContentAnchor, ContentBudget, ContentCursor, ContentPosition, ContentProjection,
-    ContentRowSource, ContentRows, ContentSelectionRow, Cursor, GridLimits, GridMode,
-    GridRowWindow, HistoryLineAssembly, HistorySlice, HistorySliceEnd, HistorySliceError,
+    ContentRowSource, ContentRows, ContentSelectionRow, Cursor, FrameApplyError, FrameCell,
+    FrameLine, FrameMove, FrameRow, FrameScreen, FrameState, FrameWrap, GridFrame, GridLimits,
+    GridMode, GridRowWindow, HistoryLineAssembly, HistorySlice, HistorySliceEnd, HistorySliceError,
     MouseProtocolEncoding, MouseProtocolMode, PhysicalRow, ProjectedRows, ProtocolState,
-    ScreenRowSource, ScreenRows, ScreenSelectionRow, SelectionCell, TerminalGrid,
+    ReplicaCursor, ScreenRowSource, ScreenRows, ScreenSelectionRow, SelectionCell, TerminalGrid,
     TerminalGridError, ViewportScroll, physical_row_is_blank,
 };
 pub use parser::{

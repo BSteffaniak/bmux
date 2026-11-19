@@ -8,7 +8,7 @@
           "allocations_per_frame": 2.02,
           "max_allocations": 3,
           "allocated_bytes_per_frame": 29562,
-          "instructions_per_frame": 947673
+          "instructions_per_frame": 948717
         }
       },
       "output_bytes_per_frame": 0,
@@ -22,7 +22,7 @@
           "allocations_per_frame": 2.02,
           "max_allocations": 3,
           "allocated_bytes_per_frame": 29561,
-          "instructions_per_frame": 948428
+          "instructions_per_frame": 949909
         }
       },
       "output_bytes_per_frame": 0,
@@ -36,7 +36,7 @@
           "allocations_per_frame": 32.9,
           "max_allocations": 37,
           "allocated_bytes_per_frame": 144360,
-          "instructions_per_frame": 28086069
+          "instructions_per_frame": 28115736
         }
       },
       "output_bytes_per_frame": 0,
@@ -48,27 +48,27 @@
       "phases": {
         "read": {
           "allocations_per_frame": 8.08,
-          "max_allocations": 17,
+          "max_allocations": 18,
           "allocated_bytes_per_frame": 30420,
-          "instructions_per_frame": 1155333
+          "instructions_per_frame": 1155274
         }
       },
       "output_bytes_per_frame": 0,
-      "live_growth_bytes": 3807482
+      "live_growth_bytes": 3807578
     },
     {
       "name": "unclosed-sync",
       "frames": 272,
       "phases": {
         "read": {
-          "allocations_per_frame": 8.04,
-          "max_allocations": 13,
+          "allocations_per_frame": 8.05,
+          "max_allocations": 14,
           "allocated_bytes_per_frame": 35666,
-          "instructions_per_frame": 1155545
+          "instructions_per_frame": 1156209
         }
       },
       "output_bytes_per_frame": 0,
-      "live_growth_bytes": 4513722
+      "live_growth_bytes": 4513818
     },
     {
       "name": "kitty-images",
@@ -77,12 +77,12 @@
         "read": {
           "allocations_per_frame": 31.42,
           "max_allocations": 93,
-          "allocated_bytes_per_frame": 169487,
-          "instructions_per_frame": 2794476
+          "allocated_bytes_per_frame": 169488,
+          "instructions_per_frame": 2797591
         }
       },
       "output_bytes_per_frame": 0,
-      "live_growth_bytes": 21284064
+      "live_growth_bytes": 21284160
     }
   ]
 }
