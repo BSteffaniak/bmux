@@ -35,6 +35,7 @@ uuid               = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 bmux_bench = { workspace = true }
+bmux_ipc   = { workspace = true }
 
 [features]
 default = []

@@ -5,25 +5,25 @@
 //! cargo test --release -p bmux_attach_pipeline pipeline_bench -- --ignored --nocapture
 //! ```
 //!
-//! Each corpus frame is delivered in chunks the way the server hands pane output to a client
-//! (`BMUX_BENCH_DELIVERY` bytes each, 8192 by default), applied with [`append_pane_output`], and
-//! rendered once with the attach renderer into memory. Reported per corpus: apply and render time
-//! per frame, bytes the application wrote against bytes written to the host terminal (and their
-//! ratio), and frames left inside an unfinished synchronized update when rendered.
+//! Each corpus frame is parsed by a source grid per pane, standing for the server's (its cost is
+//! the ingest bench's), and reaches the client as the server sends it: a frame per pane, built
+//! for the client's replica and encoded (the `frame` phase), then decoded and applied with
+//! [`apply_pane_frame`] (the `apply` phase), and rendered once with the attach renderer into
+//! memory. Reported per corpus: frame, apply and render costs per frame, bytes the application
+//! wrote against bytes written to the host terminal (and their ratio), and frames left inside an
+//! unfinished synchronized update when rendered.
 //!
 //! Generated corpora run at `BMUX_BENCH_SIZE` (`420x90` by default); captured corpora are listed
 //! in `BMUX_BENCH_CORPUS` (comma-separated paths, at the same size).
 
-use crate::reconcile::apply_attach_output_chunk_with;
 use crate::render::{
-    AttachSceneRenderStats, DamageCoalescingPolicy, FrameDamage, append_pane_output,
+    AttachSceneRenderStats, DamageCoalescingPolicy, FrameDamage, apply_pane_frame,
     render_attach_scene_with_stats_and_trace_with_capabilities_and_occluders,
 };
 use crate::types::{PaneRenderBuffer, PaneScrollbackViews};
 use bmux_attach_layout_protocol::{
     AttachFocusTarget, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
 };
-use bmux_attach_pipeline_models::AttachOutputChunkMeta;
 use bmux_bench::corpus::{self, Frame, SYNC_BEGIN, SYNC_END};
 use bmux_bench::metrics::{Cost, PhaseRecorder, Probe, Report, Scenario};
 use std::collections::BTreeMap;
@@ -143,6 +143,8 @@ struct Replay {
     hold: bool,
     /// Panes the frames' output is applied to (every pane of the scene unless set otherwise).
     fed: Vec<Uuid>,
+    /// Each fed pane's source grid: the server's, which parses the output and builds frames.
+    sources: BTreeMap<Uuid, bmux_terminal_grid::TerminalGridStream>,
     /// Images every frame contributes, as the attach client contributes pane images.
     images: Vec<bmux_tui::image::ImagePlacement>,
     /// Columns the images move right each frame (cycling over eight steps); zero keeps them.
@@ -157,7 +159,9 @@ struct Rendered {
     apply: Duration,
     render: Duration,
     stats: AttachSceneRenderStats,
-    /// What applying the frame's output cost.
+    /// What building and encoding the panes' frames cost (the server's side).
+    frame_cost: Cost,
+    /// What decoding and applying the panes' frames cost.
     apply_cost: Cost,
     /// What rendering and presenting the frame cost.
     render_cost: Cost,
@@ -192,6 +196,7 @@ impl Replay {
             held: Vec::new(),
             hold: false,
             fed: vec![pane_id],
+            sources: BTreeMap::new(),
             images: Vec::new(),
             image_motion: 0,
             appearance: bmux_appearance::RuntimeAppearance::default(),
@@ -257,9 +262,11 @@ impl Replay {
 
     /// Apply `frame` and render, writing what the host terminal receives to `output`.
     fn frame(&mut self, frame: &[u8], output: &mut Vec<u8>) -> Rendered {
+        let encoded = self.serve(frame);
+        let frame_cost = self.probe.since(encoded.1);
         let started = Instant::now();
         let mark = self.probe.mark();
-        self.apply_only(frame);
+        self.apply_frames(&encoded.0);
         let apply_cost = self.probe.since(mark);
         let applied = started.elapsed();
         let full = self.frames == 0;
@@ -349,6 +356,7 @@ impl Replay {
             apply: applied,
             render: started.elapsed(),
             stats,
+            frame_cost,
             apply_cost,
             render_cost,
             observe_cost,
@@ -414,26 +422,55 @@ impl Replay {
         true
     }
 
-    /// Apply `frame` to every fed pane without rendering it.
-    fn apply_only(&mut self, frame: &[u8]) {
+    /// The server's side of `frame`: each fed pane's source grid parses it (not measured: the
+    /// ingest bench's), then a frame is built and encoded for each pane's replica (measured from
+    /// the returned mark). Returns the encoded frames and the mark.
+    fn serve(&mut self, frame: &[u8]) -> (Vec<(Uuid, Vec<u8>)>, bmux_bench::metrics::Mark) {
         for chunk in frame.chunks(self.chunk_size) {
             self.open = sync_after(self.open, chunk);
-            let end = self.offset + chunk.len() as u64;
-            for pane in &self.fed {
-                apply_attach_output_chunk_with(
-                    &mut self.buffers,
-                    *pane,
-                    chunk,
-                    AttachOutputChunkMeta {
-                        stream_start: self.offset,
-                        stream_end: end,
-                        stream_gap: false,
-                        sync_update_active: self.open,
-                    },
-                    append_pane_output,
-                );
-            }
-            self.offset = end;
+            self.offset += chunk.len() as u64;
+        }
+        for pane in &self.fed {
+            let grid = self.buffers[pane].terminal_grid.grid();
+            let (width, height) = (grid.width(), grid.height());
+            self.sources
+                .entry(*pane)
+                .or_insert_with(|| {
+                    bmux_terminal_grid::TerminalGridStream::new(
+                        u16::try_from(width).unwrap_or(u16::MAX),
+                        u16::try_from(height).unwrap_or(u16::MAX),
+                        bmux_terminal_grid::GridLimits::default(),
+                    )
+                    .expect("source grid")
+                })
+                .process(frame);
+        }
+        let mark = self.probe.mark();
+        let encoded = self
+            .fed
+            .iter()
+            .map(|pane| {
+                let cursor = self.buffers[pane].replica;
+                let built = self
+                    .sources
+                    .get_mut(pane)
+                    .expect("source")
+                    .grid_mut()
+                    .frame_since(cursor, 0);
+                (*pane, bmux_ipc::encode(&built).expect("frame encodes"))
+            })
+            .collect();
+        (encoded, mark)
+    }
+
+    /// Decode and apply each pane's frame, as the attach client does.
+    fn apply_frames(&mut self, frames: &[(Uuid, Vec<u8>)]) {
+        for (pane, encoded) in frames {
+            let decoded: bmux_terminal_grid::GridFrame =
+                bmux_ipc::decode(encoded).expect("frame decodes");
+            let buffer = self.buffers.get_mut(pane).expect("fed pane");
+            apply_pane_frame(buffer, &decoded).expect("frame applies");
+            buffer.set_sync_update(self.open, Instant::now());
         }
     }
 
@@ -823,7 +860,8 @@ fn pipeline_bench_loop() {
         for frame in &frames {
             output.clear();
             if mode == "apply" {
-                replay.apply_only(frame);
+                let (encoded, _) = replay.serve(frame);
+                replay.apply_frames(&encoded);
             } else {
                 replay.frame(frame, &mut output);
             }
@@ -857,6 +895,8 @@ const WARMUP: usize = 30;
 
 /// One run of a scenario's frames, measured after warm-up.
 struct Run {
+    /// Building and encoding frames: the server's side of delivery.
+    frame: PhaseRecorder,
     apply: PhaseRecorder,
     render: PhaseRecorder,
     observe: Option<PhaseRecorder>,
@@ -868,7 +908,8 @@ struct Run {
 /// Replay `frames` and measure every frame after warm-up: what applying, rendering and
 /// presenting (and observing, with an observer) allocate and execute, and the bytes written.
 fn run_once(mut replay: Replay, frames: &[Frame]) -> Run {
-    let (mut apply, mut render, mut observe) = (
+    let (mut frame_phase, mut apply, mut render, mut observe) = (
+        PhaseRecorder::default(),
         PhaseRecorder::default(),
         PhaseRecorder::default(),
         None::<PhaseRecorder>,
@@ -887,6 +928,7 @@ fn run_once(mut replay: Replay, frames: &[Frame]) -> Run {
         }
         measured += 1;
         bytes_out += output.len();
+        frame_phase.record(rendered.frame_cost);
         apply.record(rendered.apply_cost);
         render.record(rendered.render_cost);
         if let Some(cost) = rendered.observe_cost {
@@ -898,6 +940,7 @@ fn run_once(mut replay: Replay, frames: &[Frame]) -> Run {
     let live_growth = i64::try_from(bmux_bench::allocations::live_bytes()).unwrap_or(i64::MAX)
         - i64::try_from(live_after_warmup).unwrap_or(i64::MAX);
     Run {
+        frame: frame_phase,
         apply,
         render,
         observe,
@@ -926,6 +969,7 @@ fn measure(name: &str, replay: impl Fn() -> Replay, frames: &[Frame]) -> Option<
                 .fold_repeat(other)
                 .unwrap_or_else(|error| panic!("{name} {label}: {error}"));
         };
+        fold(&mut run.frame, &repeat.frame, "frame");
         fold(&mut run.apply, &repeat.apply, "apply");
         fold(&mut run.render, &repeat.render, "render");
         if let (Some(observe), Some(other)) = (&mut run.observe, &repeat.observe) {
@@ -933,6 +977,7 @@ fn measure(name: &str, replay: impl Fn() -> Replay, frames: &[Frame]) -> Option<
         }
     }
     let mut phases = BTreeMap::from([
+        ("frame".to_owned(), run.frame.finish()),
         ("apply".to_owned(), run.apply.finish()),
         ("render".to_owned(), run.render.finish()),
     ]);

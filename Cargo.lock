@@ -1581,6 +1581,7 @@ dependencies = [
  "bmux_cell_geometry",
  "bmux_client",
  "bmux_image",
+ "bmux_ipc",
  "bmux_plugin",
  "bmux_raster",
  "bmux_scene_protocol_render",
