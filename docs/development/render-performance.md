@@ -74,53 +74,49 @@ use [dhat](https://docs.rs/dhat). `pipeline_bench_loop` replays one corpus (or, 
 ## Results
 
 The first revision that measured (`e06ff6ab`: master plus the metrics, nothing changed) against the
-work since, per frame at 420×90 on an Apple M-series machine, from the committed baselines.
+work since, per frame at 420×90 on an Apple M-series machine, from the committed baselines. The
+client now keeps its panes current with frames (see
+[terminal-architecture.md](terminal-architecture.md)): `apply` is decoding and applying them, and
+`frame` is the server building them, which replaces the client parsing pane output.
 
 | Scenario | Phase | Allocations | Instructions | Bytes written |
 | --- | --- | --- | --- | --- |
-| Full repaint | client apply | 42,274 → 0 | 65.1M → 25.4M (−61%) | 128,475 → 128,475 |
-| Full repaint | client render | 120 → 25 | 22.8M → 22.7M | 128,475 → 128,475 |
-| Full repaint, two panes | client render | 212 → 27 | 22.8M → 22.7M | 128,226 → 128,226 |
-| Streaming text | client apply | 1,409 → 3 | 2.24M → 1.03M (−54%) | 4,769 → 4,769 |
-| Streaming text | client render | 33 → 27 | 1.37M → 1.36M | 4,769 → 4,769 |
-| Moving sixel image | client render | 6,552 → 49 | 22.5M → 5.15M (−77%) | 104,180 → 85,639 |
-| Kitty image beside streaming | client render | 56 → 37 | 5.09M → 5.06M | 64,010 → 64,010 |
-| Full repaint | pane reader | 101,285 → 33 | 136.9M → 33.4M (−76%) | |
-| Streaming text | pane reader | 3,380 → 8 | 4.75M → 1.33M (−72%) | |
-| Text with Kitty images | pane reader | 11,715 → 31 | 8.99M → 3.25M (−64%) | |
+| Full repaint | client apply | 42,274 → 0 | 65.1M → 6.6M (−90%) | 128,475 → 128,475 |
+| Full repaint | server frame build | — → 4 | — → 3.9M | |
+| Full repaint | client render | 120 → 25 | 22.8M → 22.4M | |
+| Streaming text | client apply | 1,409 → 3 | 2.24M → 0.24M (−89%) | 4,769 → 4,769 |
+| Streaming text | server frame build | — → 3 | — → 0.15M | |
+| Moving sixel image | client apply + render | 7,270 → 52 | 23.6M → 5.1M (−78%) | 104,180 → 85,639 |
+| Full repaint | pane reader | 101,285 → 33 | 136.9M → 28.1M (−79%) | |
+| Streaming text | pane reader | 3,380 → 8 | 4.75M → 1.16M (−76%) | |
+| Text with Kitty images | pane reader | 11,715 → 31 | 8.99M → 2.80M (−69%) | |
 
 Bytes written change only where intended (a moving raster image repairs its footprint, not the
-screen). Memory: the pane reader keeps one grid instead of two, and history lines are stored
-compactly, so a full 8 MiB history (the cap, charged by its cells' logical size) takes about 1 MB.
+screen). Memory: the pane reader keeps one grid instead of two, history lines are stored compactly
+(a full 8 MiB history takes about 1 MB), and a client no longer keeps a parser per pane.
 
 What changed, each its own commit with its numbers:
 
 - Allocation: escape-sequence parameters parse into a stack buffer; grid rows are erased and
-  scrolled in place; the parser prefix, the reader's per-chunk buffers, the frame's changed-column
-  runs and the frame output buffer keep their storage; metadata-free chunks pass the shell
-  metadata parser uncopied; the sixel encoder writes straight into its output; image keys and pane
-  image bytes are shared, not copied; display capture copies images only while recording.
-- Parser CPU: styles are interned through a hash index; runs of printable ASCII are written a
-  row segment at a time; CSI and DCS parameters are taken in runs; the client's protocol tracker
-  skips text and plain CSI sequences, which carry nothing it follows.
-- The pane reader follows output through the pane's one grid instead of a second cursor-tracking
-  grid.
-- Images: the content cache survives the screen clear that repairs raster images; a raster image
-  that moves is repaired by repainting its old footprint's cells, not by clearing the screen; the
-  attach client matches pane images by their shared bytes, not by rescanning them.
-- History lines are stored compactly. This one costs CPU for memory: each scrolled line is encoded
-  once, about 8% more instructions per streaming frame.
+  scrolled in place; per-chunk buffers keep their storage; the sixel encoder writes straight into
+  its output; image keys and pane image bytes are shared; frames are written and applied as bytes,
+  each row decoded into the storage of the row it replaces.
+- Parser CPU: styles are interned through a hash index; runs of printable ASCII are written a row
+  segment at a time; CSI and DCS parameters are taken in runs.
+- One pass on the server: input modes come from the grid, and terminal queries are answered by
+  an observer of the grid's own parse, instead of separate scanners.
+- Frames: clients (desktop and mobile) apply damage frames instead of parsing pane output, so
+  their cost follows screen size and frame rate, not how much a program writes.
+- Images: the content cache survives raster repairs; a moved raster image repaints only its old
+  footprint.
+- History lines are stored compactly (this one trades about 8% streaming CPU for memory).
 
 ## Known costs left
 
-- **The client still parses pane output twice**, into its grid and through its protocol tracker.
-  The tracker now skips text and plain CSI sequences, so it costs little; folding what it follows
-  into the grid's parser would remove it.
-- **The render rebuilds a compositor plan every frame.** `render_attach_scene` builds a
-  `RetainedCompositor` from the scene to find the surfaces to repaint (about 15 small allocations
-  per frame), though the attach client keeps one across frames.
-- **Client render per cell.** Rendering a full repaint costs about as much as applying it (22.7M
-  instructions); its per-cell work (style conversion, symbol checks, changed-run tracking) is spread
-  across small helpers.
-- **Raster images are re-sent when they move.** The repair is now the footprint, but a moved sixel
-  image is written again in full (about 20 KB per frame here); terminals offer no move.
+- **Client render** is now the client's largest cost (22.4M instructions for a full repaint, about
+  600 a cell): grid cells are converted to the TUI buffer's cells one at a time (symbol checks,
+  style patching, change tracking) and then encoded row by row.
+- **The server still runs separate scanners for images and shell metadata**, and the raw output
+  fan-out for its remaining consumers (cluster replication, playbook, recording).
+- **The render rebuilds a compositor plan every frame** (about 15 small allocations).
+- **Cluster replication** still moves pane output between nodes as bytes.

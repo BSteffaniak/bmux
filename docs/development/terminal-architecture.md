@@ -181,3 +181,26 @@ Each phase is independently shippable, measured, and keeps every invariant.
    (clipboard policy included); pane modes in input context; retained layers and revisioned
    relays; the duplicated APIs replaced in place, with every in-repo plugin migrated in the same
    change.
+
+## Status
+
+Done (each a measured commit; see [render-performance.md](render-performance.md) for numbers):
+
+- Phase 1, in part: input modes come from the grid (the mode tracker is gone, DECSTR added) and
+  terminal queries are answered through a `SequenceObserver` on the grid's parse, statically
+  dispatched so a grid observing nothing costs what it did.
+- Phase 2: grids record damage for any number of replicas; frames are written into a caller's
+  buffer and applied from it without allocating. A randomized differential test requires a
+  replica's whole snapshot, revisions included, to equal its source after every frame.
+- Phase 3, for the desktop attach client and mobile: frames are pushed (or read) per client and
+  applied to replicas; the client no longer parses pane output, and the unused delta format is
+  gone. Frames carry the source's revisions, synchronized-update state and benchmark replay
+  markers; a grid resize wakes its clients.
+
+Changed from the plan: the image and shell-metadata scanners are folded in after every client
+reads frames, since until then their only other job is producing the filtered byte stream clients
+parsed. Rendering from damage comes before cluster replication, since rendering is now the
+client's largest cost.
+
+Remaining: the image and shell-metadata transforms; render from damage (phase 4); cluster
+replication and playbook on frames; compact cells (phase 5); the plugin model (phase 6).
