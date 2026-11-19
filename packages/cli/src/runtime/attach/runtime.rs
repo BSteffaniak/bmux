@@ -19730,15 +19730,15 @@ mod tests {
             .unwrap();
             assert_eq!(output.windows(2).any(|bytes| bytes == b"\x1bP"), visible);
             if !visible {
-                let clear = output
-                    .windows(4)
-                    .position(|bytes| bytes == b"\x1b[2J")
-                    .unwrap();
-                let begin = output
-                    .windows(8)
-                    .position(|bytes| bytes == b"\x1b[?2026h")
-                    .unwrap();
-                assert!(begin < clear, "raster deletion must be inside the frame");
+                // The image's cells are rewritten over it, inside the frame: no screen clear.
+                assert!(
+                    !output.windows(4).any(|bytes| bytes == b"\x1b[2J"),
+                    "a removed raster image is repaired by its cells, not a cleared screen"
+                );
+                assert!(
+                    output.windows(8).any(|bytes| bytes == b"\x1b[?2026h"),
+                    "the repair is one synchronized frame"
+                );
             }
             assert_eq!(state.shows_images(), visible);
             assert!(state.presenting, "frames went through the presenter");
