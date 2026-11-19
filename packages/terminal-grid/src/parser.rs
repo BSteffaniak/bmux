@@ -584,6 +584,13 @@ impl Perform for ProtocolPerformer<'_> {
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        if !ignore && is_soft_reset(params, intermediates, action) {
+            *self.protocol = ProtocolState {
+                pointer_shapes: self.protocol.pointer_shapes,
+                ..ProtocolState::default()
+            };
+            return;
+        }
         if ignore || intermediates != *b"?" || !matches!(action, 'h' | 'l') {
             return;
         }
@@ -691,6 +698,10 @@ impl Perform for GridPerformer<'_> {
         reason = "single CSI dispatcher keeps terminal escape handling in one explicit state-machine branch"
     )]
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        if !ignore && is_soft_reset(params, intermediates, action) {
+            self.grid.soft_reset_input_modes();
+            return;
+        }
         if ignore
             || !(intermediates.is_empty() || matches!(action, 'h' | 'l') && intermediates == b"?")
             || (action != 'm' && params.iter().any(|group| group.len() != 1))
@@ -858,6 +869,17 @@ impl Perform for GridPerformer<'_> {
             _ => {}
         }
     }
+}
+
+/// Whether a CSI sequence is a soft terminal reset (DECSTR, `CSI ! p`), which takes no parameters
+/// (the parser reports their absence as one default zero).
+fn is_soft_reset(params: &Params, intermediates: &[u8], action: char) -> bool {
+    action == 'p'
+        && intermediates == b"!"
+        && params
+            .iter()
+            .all(|group| group.iter().all(|value| *value == 0))
+        && params.iter().count() <= 1
 }
 
 /// Parameter values of one escape sequence, on the stack: a sequence holds at most 32 values
@@ -3360,6 +3382,34 @@ mod tests {
         assert!(!protocol.application_cursor);
         assert!(!protocol.application_keypad);
         assert!(!protocol.bracketed_paste);
+    }
+
+    /// DECSTR returns every input mode to its default in the grid and the protocol tracker alike,
+    /// keeping the pointer shape; parameters or other intermediates make it something else.
+    #[test]
+    fn soft_reset_returns_input_modes_to_defaults() {
+        let modes = b"\x1b[?1003h\x1b[?1006h\x1b[?1;2004h\x1b=\x1b]22;pointer\x1b\\";
+        let mut stream = TerminalGridStream::new(80, 24, GridLimits::default()).unwrap();
+        let mut tracker = super::TerminalProtocolTracker::new();
+        stream.process(modes);
+        tracker.process(modes);
+        let shapes = stream.grid().protocol_state().pointer_shapes;
+        for not_reset in [&b"\x1b[1!p"[..], b"\x1b[?!p", b"\x1b[\"p"] {
+            stream.process(not_reset);
+            tracker.process(not_reset);
+            assert!(stream.grid().protocol_state().bracketed_paste);
+            assert!(tracker.protocol_state().bracketed_paste);
+        }
+        let revision = stream.grid().revision();
+        stream.process(b"\x1b[!p");
+        tracker.process(b"\x1b[!p");
+        let expected = crate::ProtocolState {
+            pointer_shapes: shapes,
+            ..crate::ProtocolState::default()
+        };
+        assert_eq!(stream.grid().protocol_state(), expected);
+        assert_eq!(tracker.protocol_state(), expected);
+        assert!(stream.grid().revision() > revision);
     }
 
     #[test]

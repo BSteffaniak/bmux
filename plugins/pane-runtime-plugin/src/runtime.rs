@@ -50,7 +50,9 @@ use bmux_recording_runtime::{RecordMeta, RecordingSinkHandle};
 use bmux_session_models::{ClientId, SessionId};
 use bmux_session_state::SessionManagerHandle;
 use bmux_snapshot_runtime::{SnapshotDirtyFlag, SnapshotDirtyFlagHandle};
-use bmux_terminal_grid::{GridDeltaBatch, GridLimits, TerminalGrid, TerminalGridStream};
+use bmux_terminal_grid::{
+    GridDeltaBatch, GridLimits, ProtocolState, TerminalGrid, TerminalGridStream,
+};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
 use pty::Slave as _;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -2264,189 +2266,36 @@ pub(crate) enum PaneRuntimeCommand {
     },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TerminalModeParseState {
-    Ground,
-    Esc,
-    Csi,
+/// A pane's mouse protocol, as input routing encodes mouse events for it, from its grid's modes:
+/// the most inclusive tracking mode enabled, and SGR before UTF-8 encoding.
+const fn attach_mouse_protocol(modes: ProtocolState) -> AttachMouseProtocolState {
+    let mode = if modes.mouse_any_motion {
+        AttachMouseProtocolMode::AnyMotion
+    } else if modes.mouse_button_motion {
+        AttachMouseProtocolMode::ButtonMotion
+    } else if modes.mouse_press_release {
+        AttachMouseProtocolMode::PressRelease
+    } else if modes.mouse_x10 {
+        AttachMouseProtocolMode::Press
+    } else {
+        AttachMouseProtocolMode::None
+    };
+    let encoding = if modes.mouse_sgr {
+        AttachMouseProtocolEncoding::Sgr
+    } else if modes.mouse_utf8 {
+        AttachMouseProtocolEncoding::Utf8
+    } else {
+        AttachMouseProtocolEncoding::Default
+    };
+    AttachMouseProtocolState { mode, encoding }
 }
 
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Debug)]
-struct PaneTerminalModeTracker {
-    parse_state: TerminalModeParseState,
-    csi_buffer: Vec<u8>,
-    x10_mode: bool,
-    press_release_mode: bool,
-    button_motion_mode: bool,
-    any_motion_mode: bool,
-    utf8_encoding: bool,
-    sgr_encoding: bool,
-    application_cursor: bool,
-    application_keypad: bool,
-    bracketed_paste: bool,
-    /// DEC mode 2026: the inner application has begun a synchronized
-    /// update (`\x1b[?2026h`) but has not yet ended it (`\x1b[?2026l`).
-    sync_update: bool,
-}
-
-impl Default for PaneTerminalModeTracker {
-    fn default() -> Self {
-        Self {
-            parse_state: TerminalModeParseState::Ground,
-            csi_buffer: Vec::new(),
-            x10_mode: false,
-            press_release_mode: false,
-            button_motion_mode: false,
-            any_motion_mode: false,
-            utf8_encoding: false,
-            sgr_encoding: false,
-            application_cursor: false,
-            application_keypad: false,
-            bracketed_paste: false,
-            sync_update: false,
-        }
-    }
-}
-
-impl PaneTerminalModeTracker {
-    fn process(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            match self.parse_state {
-                TerminalModeParseState::Ground => {
-                    if *byte == 0x1b {
-                        self.parse_state = TerminalModeParseState::Esc;
-                    }
-                }
-                TerminalModeParseState::Esc => {
-                    if *byte == b'[' {
-                        self.parse_state = TerminalModeParseState::Csi;
-                        self.csi_buffer.clear();
-                    } else if *byte == b'=' {
-                        self.application_keypad = true;
-                        self.parse_state = TerminalModeParseState::Ground;
-                    } else if *byte == b'>' {
-                        self.application_keypad = false;
-                        self.parse_state = TerminalModeParseState::Ground;
-                    } else if *byte == b'c' {
-                        self.reset();
-                    } else if *byte == 0x1b {
-                        self.parse_state = TerminalModeParseState::Esc;
-                    } else {
-                        self.parse_state = TerminalModeParseState::Ground;
-                    }
-                }
-                TerminalModeParseState::Csi => {
-                    if *byte == 0x1b {
-                        self.parse_state = TerminalModeParseState::Esc;
-                        self.csi_buffer.clear();
-                        continue;
-                    }
-                    self.csi_buffer.push(*byte);
-                    if (0x40..=0x7e).contains(byte) {
-                        // Taken to apply, then given back: its storage serves every sequence.
-                        let mut sequence = std::mem::take(&mut self.csi_buffer);
-                        self.apply_csi_sequence(&sequence);
-                        sequence.clear();
-                        self.csi_buffer = sequence;
-                        self.parse_state = TerminalModeParseState::Ground;
-                    } else if self.csi_buffer.len() > 64 {
-                        self.parse_state = TerminalModeParseState::Ground;
-                        self.csi_buffer.clear();
-                    }
-                }
-            }
-        }
-    }
-
-    const fn current_protocol(&self) -> AttachMouseProtocolState {
-        let mode = if self.any_motion_mode {
-            AttachMouseProtocolMode::AnyMotion
-        } else if self.button_motion_mode {
-            AttachMouseProtocolMode::ButtonMotion
-        } else if self.press_release_mode {
-            AttachMouseProtocolMode::PressRelease
-        } else if self.x10_mode {
-            AttachMouseProtocolMode::Press
-        } else {
-            AttachMouseProtocolMode::None
-        };
-
-        let encoding = if self.sgr_encoding {
-            AttachMouseProtocolEncoding::Sgr
-        } else if self.utf8_encoding {
-            AttachMouseProtocolEncoding::Utf8
-        } else {
-            AttachMouseProtocolEncoding::Default
-        };
-
-        AttachMouseProtocolState { mode, encoding }
-    }
-
-    const fn current_input_modes(&self) -> AttachInputModeState {
-        AttachInputModeState {
-            application_cursor: self.application_cursor,
-            application_keypad: self.application_keypad,
-            bracketed_paste: self.bracketed_paste,
-        }
-    }
-
-    fn reset(&mut self) {
-        self.parse_state = TerminalModeParseState::Ground;
-        self.csi_buffer.clear();
-        self.x10_mode = false;
-        self.press_release_mode = false;
-        self.button_motion_mode = false;
-        self.any_motion_mode = false;
-        self.utf8_encoding = false;
-        self.sgr_encoding = false;
-        self.application_cursor = false;
-        self.application_keypad = false;
-        self.bracketed_paste = false;
-        self.sync_update = false;
-    }
-
-    fn apply_csi_sequence(&mut self, sequence: &[u8]) {
-        if sequence == b"!p" {
-            self.reset();
-            return;
-        }
-
-        let Some((&final_byte, params)) = sequence.split_last() else {
-            return;
-        };
-
-        let enable = match final_byte {
-            b'h' => true,
-            b'l' => false,
-            _ => return,
-        };
-
-        let Some(private_modes) = params.strip_prefix(b"?") else {
-            return;
-        };
-
-        for mode in private_modes
-            .split(|byte| *byte == b';')
-            .filter_map(parse_private_mode_number)
-        {
-            self.apply_private_mode(mode, enable);
-        }
-    }
-
-    const fn apply_private_mode(&mut self, mode: u16, enable: bool) {
-        match mode {
-            1 => self.application_cursor = enable,
-            9 => self.x10_mode = enable,
-            1000 => self.press_release_mode = enable,
-            1002 => self.button_motion_mode = enable,
-            1003 => self.any_motion_mode = enable,
-            1005 => self.utf8_encoding = enable,
-            1006 => self.sgr_encoding = enable,
-            2004 => self.bracketed_paste = enable,
-            2026 => self.sync_update = enable,
-            _ => {}
-        }
+/// A pane's cursor key, keypad and paste modes, from its grid's modes.
+const fn attach_input_modes(modes: ProtocolState) -> AttachInputModeState {
+    AttachInputModeState {
+        application_cursor: modes.application_cursor,
+        application_keypad: modes.application_keypad,
+        bracketed_paste: modes.bracketed_paste,
     }
 }
 
@@ -3184,21 +3033,6 @@ fn protocol_reply_for_chunk(
     });
     reader.feed(grid, &chunk[fed..]);
     reply
-}
-
-fn parse_private_mode_number(bytes: &[u8]) -> Option<u16> {
-    if bytes.is_empty() {
-        return None;
-    }
-    let mut value: u16 = 0;
-    for byte in bytes {
-        if !byte.is_ascii_digit() {
-            return None;
-        }
-        value = value.checked_mul(10)?;
-        value = value.checked_add(u16::from(*byte - b'0'))?;
-    }
-    Some(value)
 }
 
 const BMUX_SHELL_METADATA_PREFIX: &str = "633;bmux;";
@@ -8168,7 +8002,6 @@ impl SessionRuntimeManager {
                     let mut conpty_projection = native_process::conpty_startup::PrefixQuery::default();
                     let mut protocol_engine = TerminalProtocolEngine::new(protocol_profile)
                         .with_bracketed_paste_support(bracketed_paste_supported);
-                    let mut terminal_mode_tracker = PaneTerminalModeTracker::default();
                     let mut capture_handshake = crate::capture_handshake::CaptureHandshake::default();
                     let mut reader_state = PaneReader::new(
                         protocol_profile,
@@ -8303,17 +8136,15 @@ impl SessionRuntimeManager {
                                 let chunk = reader_state.visible.as_slice();
                                 note_replay_markers_read(chunk);
 
-                                // Update terminal mode tracking (mouse protocol,
-                                // cursor/keypad modes, synchronized update) BEFORE
-                                // making the chunk visible in the output buffer.
-                                // This ensures per-pane mode snapshots are always
-                                // consistent with or ahead of the buffered data.
-                                terminal_mode_tracker.process(chunk);
+                                // Publish the pane's modes, as the grid now holds them, BEFORE
+                                // making the chunk visible in the output buffer, so per-pane mode
+                                // snapshots are always consistent with or ahead of the buffered data.
+                                let modes = grid.grid().protocol_state();
                                 if let Ok(mut protocol) = mouse_protocol_state_for_reader.lock() {
-                                    *protocol = terminal_mode_tracker.current_protocol();
+                                    *protocol = attach_mouse_protocol(modes);
                                 }
                                 if let Ok(mut mode_state) = input_mode_state_for_reader.lock() {
-                                    *mode_state = terminal_mode_tracker.current_input_modes();
+                                    *mode_state = attach_input_modes(modes);
                                 }
                                 let Ok(mut output) = reader_output.lock() else { break; };
                                 output.push_chunk(chunk);
@@ -21422,81 +21253,72 @@ exit 7"#
         assert!(manager.runtimes.contains_key(&session_id));
     }
 
+    /// A pane's grid's modes, as input routing sees them.
+    fn pane_modes(bytes: &[u8]) -> (AttachMouseProtocolState, AttachInputModeState) {
+        let mut grid = TerminalGridStream::new(80, 24, GridLimits::default()).unwrap();
+        grid.process(bytes);
+        let modes = grid.grid().protocol_state();
+        (attach_mouse_protocol(modes), attach_input_modes(modes))
+    }
+
     #[test]
-    fn pane_mouse_protocol_tracker_tracks_dec_private_modes() {
-        let mut tracker = PaneTerminalModeTracker::default();
-
+    fn pane_mouse_protocol_follows_dec_private_modes() {
+        let protocol = |bytes: &[u8]| pane_modes(bytes).0;
+        assert_eq!(protocol(b""), AttachMouseProtocolState::default());
         assert_eq!(
-            tracker.current_protocol().mode,
-            AttachMouseProtocolMode::None
-        );
-        assert_eq!(
-            tracker.current_protocol().encoding,
-            AttachMouseProtocolEncoding::Default
-        );
-
-        tracker.process(b"\x1b[?1000h\x1b[?1006h");
-        assert_eq!(
-            tracker.current_protocol(),
+            protocol(b"\x1b[?1000h\x1b[?1006h"),
             AttachMouseProtocolState {
                 mode: AttachMouseProtocolMode::PressRelease,
                 encoding: AttachMouseProtocolEncoding::Sgr,
             }
         );
-
-        tracker.process(b"\x1b[?1003h");
         assert_eq!(
-            tracker.current_protocol().mode,
+            protocol(b"\x1b[?1000h\x1b[?1003h").mode,
             AttachMouseProtocolMode::AnyMotion
         );
-
-        tracker.process(b"\x1b[?1003l");
         assert_eq!(
-            tracker.current_protocol().mode,
+            protocol(b"\x1b[?1000h\x1b[?1003h\x1b[?1003l").mode,
             AttachMouseProtocolMode::PressRelease
         );
-
-        tracker.process(b"\x1b[?1000l\x1b[?1006l");
+        // UTF-8 encoding counts only without SGR; urxvt alone leaves the default encoding.
         assert_eq!(
-            tracker.current_protocol(),
-            AttachMouseProtocolState {
-                mode: AttachMouseProtocolMode::None,
-                encoding: AttachMouseProtocolEncoding::Default,
-            }
+            protocol(b"\x1b[?1005h").encoding,
+            AttachMouseProtocolEncoding::Utf8
+        );
+        assert_eq!(
+            protocol(b"\x1b[?1005h\x1b[?1006h").encoding,
+            AttachMouseProtocolEncoding::Sgr
+        );
+        assert_eq!(
+            protocol(b"\x1b[?1015h").encoding,
+            AttachMouseProtocolEncoding::Default
+        );
+        assert_eq!(
+            protocol(b"\x1b[?1000h\x1b[?1006h\x1b[?1000l\x1b[?1006l"),
+            AttachMouseProtocolState::default()
         );
     }
 
     #[test]
-    fn pane_terminal_mode_tracker_tracks_input_modes() {
-        let mut tracker = PaneTerminalModeTracker::default();
-
+    fn pane_input_modes_follow_dec_modes_and_resets() {
+        let modes = |bytes: &[u8]| pane_modes(bytes).1;
+        assert_eq!(modes(b""), AttachInputModeState::default());
+        let enabled = AttachInputModeState {
+            application_cursor: true,
+            application_keypad: true,
+            bracketed_paste: true,
+        };
+        assert_eq!(modes(b"\x1b[?1;2004h\x1b="), enabled);
         assert_eq!(
-            tracker.current_input_modes(),
+            modes(b"\x1b[?1;2004h\x1b=\x1b[?1;2004l\x1b>"),
             AttachInputModeState::default()
         );
-
-        tracker.process(b"\x1b[?1;2004h\x1b=");
-        assert_eq!(
-            tracker.current_input_modes(),
-            AttachInputModeState {
-                application_cursor: true,
-                application_keypad: true,
-                bracketed_paste: true,
-            }
-        );
-
-        tracker.process(b"\x1b[?1;2004l\x1b>");
-        assert_eq!(
-            tracker.current_input_modes(),
-            AttachInputModeState::default()
-        );
-
-        tracker.process(b"\x1b[?1h\x1b=");
-        tracker.process(b"\x1bc");
-        assert_eq!(
-            tracker.current_input_modes(),
-            AttachInputModeState::default()
-        );
+        // A full reset and a soft reset (DECSTR) both return every mode to its default.
+        for reset in [&b"\x1bc"[..], b"\x1b[!p"] {
+            let mut bytes = b"\x1b[?1;2004h\x1b=\x1b[?1003h".to_vec();
+            bytes.extend_from_slice(reset);
+            assert_eq!(pane_modes(&bytes), Default::default(), "{reset:?}");
+        }
     }
 
     #[test]

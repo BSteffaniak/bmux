@@ -107,7 +107,8 @@ pub(crate) trait Perform {
     /// state) mean anything to this performer. One that ignores them lets the parser skip from
     /// one escape to the next, since nothing else in text changes the parser's state.
     const OBSERVES_TEXT: bool = true;
-    /// Whether CSI sequences other than private ones (`CSI ?`) mean anything to this performer.
+    /// Whether CSI sequences other than private ones (`CSI ?`) and soft resets (`CSI ! p`) mean
+    /// anything to this performer.
     /// One that ignores them lets the parser discard such a sequence from its first byte instead
     /// of parsing its parameters.
     const OBSERVES_PLAIN_CSI: bool = true;
@@ -645,12 +646,13 @@ impl<const N: usize> Parser<N> {
     }
 
     fn header<P: Perform>(&mut self, performer: &mut P, byte: u8) {
-        // A first byte other than `?` (or a control, DEL or high byte, which leave the state as
-        // it is) makes the sequence a plain CSI: discard it for a performer that ignores those.
+        // A first byte other than `?` or `!` (or a control, DEL or high byte, which leave the
+        // state as it is) makes the sequence a plain CSI: discard it for a performer that ignores
+        // those.
         if !P::OBSERVES_PLAIN_CSI
             && self.state == State::CsiStart
             && (0x20..=0x7e).contains(&byte)
-            && byte != b'?'
+            && !matches!(byte, b'?' | b'!')
         {
             self.state = if byte >= 0x40 {
                 State::Text

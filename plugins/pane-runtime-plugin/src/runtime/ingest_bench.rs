@@ -12,8 +12,9 @@
 //! (`420x90` by default); captured ones are listed in `BMUX_BENCH_CORPUS`.
 
 use super::{
-    OutputFanoutBuffer, PaneReader, PaneShellMetadataParser, PaneTerminalModeTracker,
-    ProtocolProfile, TerminalProtocolEngine, follow_chunk,
+    AttachInputModeState, AttachMouseProtocolState, OutputFanoutBuffer, PaneReader,
+    PaneShellMetadataParser, ProtocolProfile, TerminalProtocolEngine, attach_input_modes,
+    attach_mouse_protocol, follow_chunk,
 };
 use bmux_bench::corpus::{self, Frame};
 use bmux_bench::metrics::{PhaseRecorder, Probe, Report, Scenario};
@@ -29,7 +30,8 @@ struct Pane {
     grid: TerminalGridStream,
     output: OutputFanoutBuffer,
     reader: PaneReader,
-    modes: PaneTerminalModeTracker,
+    /// The modes the reader publishes for input routing.
+    modes: (AttachMouseProtocolState, AttachInputModeState),
     engine: TerminalProtocolEngine,
     #[cfg(feature = "image-registry")]
     registry: bmux_image::ImageRegistry,
@@ -47,7 +49,7 @@ impl Pane {
                 ProtocolProfile::Bmux,
                 Some(PaneShellMetadataParser::default()),
             ),
-            modes: PaneTerminalModeTracker::default(),
+            modes: Default::default(),
             engine: TerminalProtocolEngine::new(ProtocolProfile::Bmux),
             #[cfg(feature = "image-registry")]
             registry: bmux_image::ImageRegistry::default(),
@@ -86,7 +88,8 @@ impl Pane {
             chunk,
             &mut self.replies,
         );
-        self.modes.process(&self.reader.visible);
+        let modes = self.grid.grid().protocol_state();
+        self.modes = (attach_mouse_protocol(modes), attach_input_modes(modes));
         self.output.push_chunk(&self.reader.visible);
         self.replies.extend_from_slice(&self.reader.pointer_replies);
     }

@@ -1732,6 +1732,19 @@ impl TerminalGrid {
         }
     }
 
+    /// Soft terminal reset (DECSTR, `CSI ! p`): mouse tracking and encodings, cursor and keypad
+    /// modes and bracketed paste return to their defaults. Pointer shapes are kept.
+    pub(crate) fn soft_reset_input_modes(&mut self) {
+        let reset = ProtocolState {
+            pointer_shapes: self.protocol.pointer_shapes,
+            ..ProtocolState::default()
+        };
+        if self.protocol != reset {
+            self.protocol = reset;
+            self.bump_revision();
+        }
+    }
+
     pub(crate) fn set_bracketed_paste(&mut self, enabled: bool) {
         if self.protocol.bracketed_paste != enabled {
             self.protocol.bracketed_paste = enabled;

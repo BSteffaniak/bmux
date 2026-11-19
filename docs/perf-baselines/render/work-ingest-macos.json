@@ -3,7 +3,7 @@
     {
       "name": "su-scroll",
       "frames": 301,
-      "units_per_frame": 178280.26,
+      "units_per_frame": 166732.58,
       "functions": [
         {
           "name": "<bmux_pane_runtime_plugin::runtime::EscSeqPhase>::is_ground",
@@ -18,11 +18,6 @@
         {
           "name": "<bmux_terminal_protocol::TerminalProtocolEngine>::process_output_with_cursor::<bmux_pane_runtime_plugin::runtime::protocol_reply_for_chunk::{closure#0}>",
           "units_per_frame": 11828.04,
-          "entries_per_frame": 1.04
-        },
-        {
-          "name": "<bmux_pane_runtime_plugin::runtime::PaneTerminalModeTracker>::process",
-          "units_per_frame": 11508.86,
           "entries_per_frame": 1.04
         },
         {
@@ -131,6 +126,11 @@
           "entries_per_frame": 919.22
         },
         {
+          "name": "<bmux_terminal_grid::parser::GridPerformer as bmux_terminal_grid::vt_parser::Perform>::csi_dispatch",
+          "units_per_frame": 1595.02,
+          "entries_per_frame": 314.89
+        },
+        {
           "name": "<bmux_terminal_grid::vt_parser::ParamsIter as core::iter::traits::iterator::Iterator>::next",
           "units_per_frame": 1588.01,
           "entries_per_frame": 1261.55
@@ -161,11 +161,6 @@
           "entries_per_frame": 1381.39
         },
         {
-          "name": "<bmux_terminal_grid::parser::GridPerformer as bmux_terminal_grid::vt_parser::Perform>::csi_dispatch",
-          "units_per_frame": 1280.13,
-          "entries_per_frame": 314.89
-        },
-        {
           "name": "<bmux_terminal_grid::vt_parser::Params>::is_empty",
           "units_per_frame": 1261.55,
           "entries_per_frame": 1261.55
@@ -179,11 +174,6 @@
           "name": "<bmux_terminal_grid::vt_parser::Parser>::pointer_string_control::<bmux_terminal_grid::parser::GridPerformer>",
           "units_per_frame": 946.67,
           "entries_per_frame": 946.67
-        },
-        {
-          "name": "<bmux_pane_runtime_plugin::runtime::PaneTerminalModeTracker>::apply_csi_sequence",
-          "units_per_frame": 632.78,
-          "entries_per_frame": 314.89
         },
         {
           "name": "<bmux_terminal_protocol::TerminalProtocolEngine>::update_private_modes",
@@ -204,13 +194,23 @@
           "name": "<bmux_terminal_grid::vt_parser::Parser>::clear_header",
           "units_per_frame": 629.78,
           "entries_per_frame": 629.78
+        },
+        {
+          "name": "<bmux_terminal_grid::vt_parser::Parser>::end_string::<bmux_terminal_grid::parser::GridPerformer>",
+          "units_per_frame": 629.78,
+          "entries_per_frame": 314.89
+        },
+        {
+          "name": "<bmux_terminal_grid::vt_parser::Parser>::finish_header",
+          "units_per_frame": 629.78,
+          "entries_per_frame": 314.89
         }
       ]
     },
     {
       "name": "region-linefeed",
       "frames": 301,
-      "units_per_frame": 178202.02,
+      "units_per_frame": 166663.31,
       "functions": [
         {
           "name": "<bmux_pane_runtime_plugin::runtime::EscSeqPhase>::is_ground",
@@ -225,11 +225,6 @@
         {
           "name": "<bmux_terminal_protocol::TerminalProtocolEngine>::process_output_with_cursor::<bmux_pane_runtime_plugin::runtime::protocol_reply_for_chunk::{closure#0}>",
           "units_per_frame": 11817.07,
-          "entries_per_frame": 1.04
-        },
-        {
-          "name": "<bmux_pane_runtime_plugin::runtime::PaneTerminalModeTracker>::process",
-          "units_per_frame": 11499.89,
           "entries_per_frame": 1.04
         },
         {
@@ -274,7 +269,7 @@
         },
         {
           "name": "<bmux_bench::allocations::CountingAllocator as core::alloc::global::GlobalAlloc>::realloc",
-          "units_per_frame": 3440.19,
+          "units_per_frame": 3440.18,
           "entries_per_frame": 1720.09
         },
         {
@@ -338,6 +333,11 @@
           "entries_per_frame": 918.23
         },
         {
+          "name": "<bmux_terminal_grid::parser::GridPerformer as bmux_terminal_grid::vt_parser::Perform>::csi_dispatch",
+          "units_per_frame": 1589.04,
+          "entries_per_frame": 313.89
+        },
+        {
           "name": "<bmux_terminal_grid::vt_parser::ParamsIter as core::iter::traits::iterator::Iterator>::next",
           "units_per_frame": 1582.03,
           "entries_per_frame": 1257.56
@@ -368,11 +368,6 @@
           "entries_per_frame": 1381.39
         },
         {
-          "name": "<bmux_terminal_grid::parser::GridPerformer as bmux_terminal_grid::vt_parser::Perform>::csi_dispatch",
-          "units_per_frame": 1275.15,
-          "entries_per_frame": 313.89
-        },
-        {
           "name": "<bmux_terminal_grid::vt_parser::Params>::is_empty",
           "units_per_frame": 1257.56,
           "entries_per_frame": 1257.56
@@ -386,11 +381,6 @@
           "name": "<bmux_terminal_grid::vt_parser::Parser>::pointer_string_control::<bmux_terminal_grid::parser::GridPerformer>",
           "units_per_frame": 946.67,
           "entries_per_frame": 946.67
-        },
-        {
-          "name": "<bmux_pane_runtime_plugin::runtime::PaneTerminalModeTracker>::apply_csi_sequence",
-          "units_per_frame": 630.78,
-          "entries_per_frame": 313.89
         },
         {
           "name": "<bmux_terminal_protocol::TerminalProtocolEngine>::update_private_modes",
@@ -411,13 +401,23 @@
           "name": "<bmux_terminal_grid::vt_parser::Parser>::clear_header",
           "units_per_frame": 627.78,
           "entries_per_frame": 627.78
+        },
+        {
+          "name": "<bmux_terminal_grid::vt_parser::Parser>::end_string::<bmux_terminal_grid::parser::GridPerformer>",
+          "units_per_frame": 627.78,
+          "entries_per_frame": 313.89
+        },
+        {
+          "name": "<bmux_terminal_grid::vt_parser::Parser>::finish_header",
+          "units_per_frame": 627.78,
+          "entries_per_frame": 313.89
         }
       ]
     },
     {
       "name": "full-repaint",
       "frames": 301,
-      "units_per_frame": 4752598.87,
+      "units_per_frame": 4439929.09,
       "functions": [
         {
           "name": "<bmux_pane_runtime_plugin::runtime::EscSeqPhase>::is_ground",
@@ -432,11 +432,6 @@
         {
           "name": "<bmux_terminal_protocol::TerminalProtocolEngine>::process_output_with_cursor::<bmux_pane_runtime_plugin::runtime::protocol_reply_for_chunk::{closure#0}>",
           "units_per_frame": 321271.83,
-          "entries_per_frame": 16.0
-        },
-        {
-          "name": "<bmux_pane_runtime_plugin::runtime::PaneTerminalModeTracker>::process",
-          "units_per_frame": 312690.76,
           "entries_per_frame": 16.0
         },
         {
@@ -540,6 +535,11 @@
           "entries_per_frame": 25012.2
         },
         {
+          "name": "<bmux_terminal_grid::parser::GridPerformer as bmux_terminal_grid::vt_parser::Perform>::csi_dispatch",
+          "units_per_frame": 42643.34,
+          "entries_per_frame": 8490.06
+        },
+        {
           "name": "<bmux_terminal_grid::vt_parser::ParamsIter as core::iter::traits::iterator::Iterator>::next",
           "units_per_frame": 42634.34,
           "entries_per_frame": 33960.27
@@ -570,11 +570,6 @@
           "entries_per_frame": 37800.0
         },
         {
-          "name": "<bmux_terminal_grid::parser::GridPerformer as bmux_terminal_grid::vt_parser::Perform>::csi_dispatch",
-          "units_per_frame": 34153.27,
-          "entries_per_frame": 8490.06
-        },
-        {
           "name": "<bmux_terminal_grid::vt_parser::Params>::is_empty",
           "units_per_frame": 33960.27,
           "entries_per_frame": 33960.27
@@ -588,11 +583,6 @@
           "name": "<bmux_terminal_grid::vt_parser::Parser>::pointer_string_control::<bmux_terminal_grid::parser::GridPerformer>",
           "units_per_frame": 25472.2,
           "entries_per_frame": 25472.2
-        },
-        {
-          "name": "<bmux_pane_runtime_plugin::runtime::PaneTerminalModeTracker>::apply_csi_sequence",
-          "units_per_frame": 16983.13,
-          "entries_per_frame": 8490.06
         },
         {
           "name": "<bmux_terminal_protocol::TerminalProtocolEngine>::update_private_modes",
@@ -618,13 +608,23 @@
           "name": "<bmux_terminal_grid::vt_parser::Parser>::end_string::<bmux_terminal_grid::parser::GridPerformer>",
           "units_per_frame": 16980.13,
           "entries_per_frame": 8490.06
+        },
+        {
+          "name": "<bmux_terminal_grid::vt_parser::Parser>::finish_header",
+          "units_per_frame": 16980.13,
+          "entries_per_frame": 8490.06
+        },
+        {
+          "name": "<bmux_terminal_grid::parser::ParamValues>::as_slice",
+          "units_per_frame": 16887.13,
+          "entries_per_frame": 16887.13
         }
       ]
     },
     {
       "name": "plain-stream",
       "frames": 301,
-      "units_per_frame": 185241.31,
+      "units_per_frame": 174922.99,
       "functions": [
         {
           "name": "<bmux_pane_runtime_plugin::runtime::EscSeqPhase>::is_ground",
@@ -639,11 +639,6 @@
         {
           "name": "<bmux_terminal_protocol::TerminalProtocolEngine>::process_output_with_cursor::<bmux_pane_runtime_plugin::runtime::protocol_reply_for_chunk::{closure#0}>",
           "units_per_frame": 10603.98,
-          "entries_per_frame": 1.0
-        },
-        {
-          "name": "<bmux_pane_runtime_plugin::runtime::PaneTerminalModeTracker>::process",
-          "units_per_frame": 10322.29,
           "entries_per_frame": 1.0
         },
         {
@@ -693,7 +688,7 @@
         },
         {
           "name": "<bmux_bench::allocations::CountingAllocator as core::alloc::global::GlobalAlloc>::realloc",
-          "units_per_frame": 3440.25,
+          "units_per_frame": 3440.24,
           "entries_per_frame": 1720.12
         },
         {
@@ -782,6 +777,11 @@
           "entries_per_frame": 824.08
         },
         {
+          "name": "<bmux_terminal_grid::parser::GridPerformer as bmux_terminal_grid::vt_parser::Perform>::csi_dispatch",
+          "units_per_frame": 1396.43,
+          "entries_per_frame": 278.68
+        },
+        {
           "name": "<bmux_terminal_grid::vt_parser::Parser>::escape::<bmux_terminal_grid::parser::GridPerformer>",
           "units_per_frame": 1393.43,
           "entries_per_frame": 278.68
@@ -831,7 +831,7 @@
     {
       "name": "unclosed-sync",
       "frames": 302,
-      "units_per_frame": 199433.54,
+      "units_per_frame": 188119.77,
       "functions": [
         {
           "name": "<bmux_pane_runtime_plugin::runtime::EscSeqPhase>::is_ground",
@@ -846,11 +846,6 @@
         {
           "name": "<bmux_terminal_protocol::TerminalProtocolEngine>::process_output_with_cursor::<bmux_pane_runtime_plugin::runtime::protocol_reply_for_chunk::{closure#0}>",
           "units_per_frame": 11626.73,
-          "entries_per_frame": 1.04
-        },
-        {
-          "name": "<bmux_pane_runtime_plugin::runtime::PaneTerminalModeTracker>::process",
-          "units_per_frame": 11317.73,
           "entries_per_frame": 1.04
         },
         {
@@ -905,7 +900,7 @@
         },
         {
           "name": "<bmux_bench::allocations::CountingAllocator as core::alloc::global::GlobalAlloc>::realloc",
-          "units_per_frame": 3428.85,
+          "units_per_frame": 3428.84,
           "entries_per_frame": 1714.42
         },
         {
@@ -989,6 +984,11 @@
           "entries_per_frame": 903.68
         },
         {
+          "name": "<bmux_terminal_grid::parser::GridPerformer as bmux_terminal_grid::vt_parser::Perform>::csi_dispatch",
+          "units_per_frame": 1532.2,
+          "entries_per_frame": 305.71
+        },
+        {
           "name": "<bmux_terminal_grid::vt_parser::Parser>::escape::<bmux_terminal_grid::parser::GridPerformer>",
           "units_per_frame": 1528.55,
           "entries_per_frame": 305.71
@@ -1019,11 +1019,6 @@
           "entries_per_frame": 1253.34
         },
         {
-          "name": "<bmux_terminal_grid::parser::GridPerformer as bmux_terminal_grid::vt_parser::Perform>::csi_dispatch",
-          "units_per_frame": 1226.49,
-          "entries_per_frame": 305.71
-        },
-        {
           "name": "<bmux_terminal_grid::vt_parser::Params>::is_empty",
           "units_per_frame": 1216.88,
           "entries_per_frame": 1216.88
@@ -1032,18 +1027,23 @@
           "name": "<bmux_terminal_grid::vt_parser::Params>::len",
           "units_per_frame": 1216.88,
           "entries_per_frame": 1216.88
+        },
+        {
+          "name": "<bmux_terminal_grid::model::Cell>::is_wide_continuation",
+          "units_per_frame": 1181.28,
+          "entries_per_frame": 1181.28
         }
       ]
     },
     {
       "name": "kitty-images",
       "frames": 301,
-      "units_per_frame": 424303.39,
+      "units_per_frame": 413985.29,
       "functions": [
         {
           "name": "<bmux_terminal_grid::parser::TerminalGridStream>::grid",
-          "units_per_frame": 34252.99,
-          "entries_per_frame": 34252.99
+          "units_per_frame": 34254.09,
+          "entries_per_frame": 34254.09
         },
         {
           "name": "<bmux_terminal_grid::vt_parser::Parser>::write_replay_prefix",
@@ -1074,11 +1074,6 @@
           "name": "<bmux_terminal_grid::vt_parser::Parser>::write_number",
           "units_per_frame": 12539.76,
           "entries_per_frame": 4908.11
-        },
-        {
-          "name": "<bmux_pane_runtime_plugin::runtime::PaneTerminalModeTracker>::process",
-          "units_per_frame": 10322.51,
-          "entries_per_frame": 1.1
         },
         {
           "name": "<bmux_pane_runtime_plugin::runtime::EscSeqPhase>::advance",
@@ -1212,7 +1207,7 @@
         },
         {
           "name": "<bmux_bench::allocations::CountingAllocator as core::alloc::global::GlobalAlloc>::realloc",
-          "units_per_frame": 3442.81,
+          "units_per_frame": 3442.8,
           "entries_per_frame": 1721.4
         },
         {
@@ -1237,6 +1232,11 @@
         },
         {
           "name": "<bmux_terminal_grid::model::CellText>::empty",
+          "units_per_frame": 2517.31,
+          "entries_per_frame": 2517.31
+        },
+        {
+          "name": "<bmux_terminal_grid::model::CellText>::from_char",
           "units_per_frame": 2517.31,
           "entries_per_frame": 2517.31
         }
