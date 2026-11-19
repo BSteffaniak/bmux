@@ -1100,34 +1100,10 @@ fn write_ansi_style_change(
 fn write_style_difference(writer: &mut impl Write, from: Style, to: Style) -> io::Result<()> {
     let shown = |color: Option<Color>| color.filter(|color| *color != Color::Default);
     let mut codes = io::Cursor::new([0_u8; 96]);
-    let removed = from.modifiers.difference(to.modifiers);
-    let mut added = to.modifiers.difference(from.modifiers);
-    // One code turns off both bold and dim; whichever stays is turned back on.
-    if removed.contains(Modifier::BOLD) || removed.contains(Modifier::DIM) {
-        codes.write_all(b";22")?;
-        added = added.union(
-            to.modifiers
-                .difference(Modifier::ITALIC)
-                .difference(Modifier::UNDERLINE)
-                .difference(Modifier::SLOW_BLINK)
-                .difference(Modifier::REVERSED)
-                .difference(Modifier::HIDDEN)
-                .difference(Modifier::CROSSED_OUT),
-        );
+    // Most changes between cells are of color alone.
+    if from.modifiers != to.modifiers {
+        write_modifier_difference(&mut codes, from.modifiers, to.modifiers)?;
     }
-    for (modifier, off) in [
-        (Modifier::ITALIC, &b";23"[..]),
-        (Modifier::UNDERLINE, b";24"),
-        (Modifier::SLOW_BLINK, b";25"),
-        (Modifier::REVERSED, b";27"),
-        (Modifier::HIDDEN, b";28"),
-        (Modifier::CROSSED_OUT, b";29"),
-    ] {
-        if removed.contains(modifier) {
-            codes.write_all(off)?;
-        }
-    }
-    write_ansi_modifier(&mut codes, added)?;
     if shown(from.fg) != shown(to.fg) {
         match shown(to.fg) {
             Some(fg) => write_ansi_color(&mut codes, fg, ColorRole::Foreground)?,
@@ -1148,6 +1124,41 @@ fn write_style_difference(writer: &mut impl Write, from: Style, to: Style) -> io
     writer.write_all(b"\x1b[")?;
     writer.write_all(&codes.get_ref()[1..len])?;
     writer.write_all(b"m")
+}
+
+/// Write the codes taking modifiers `from` to `to`.
+fn write_modifier_difference(
+    codes: &mut io::Cursor<[u8; 96]>,
+    from: Modifier,
+    to: Modifier,
+) -> io::Result<()> {
+    let removed = from.difference(to);
+    let mut added = to.difference(from);
+    // One code turns off both bold and dim; whichever stays is turned back on.
+    if removed.contains(Modifier::BOLD) || removed.contains(Modifier::DIM) {
+        codes.write_all(b";22")?;
+        added = added.union(
+            to.difference(Modifier::ITALIC)
+                .difference(Modifier::UNDERLINE)
+                .difference(Modifier::SLOW_BLINK)
+                .difference(Modifier::REVERSED)
+                .difference(Modifier::HIDDEN)
+                .difference(Modifier::CROSSED_OUT),
+        );
+    }
+    for (modifier, off) in [
+        (Modifier::ITALIC, &b";23"[..]),
+        (Modifier::UNDERLINE, b";24"),
+        (Modifier::SLOW_BLINK, b";25"),
+        (Modifier::REVERSED, b";27"),
+        (Modifier::HIDDEN, b";28"),
+        (Modifier::CROSSED_OUT, b";29"),
+    ] {
+        if removed.contains(modifier) {
+            codes.write_all(off)?;
+        }
+    }
+    write_ansi_modifier(codes, added)
 }
 
 pub(crate) fn write_ansi_style(

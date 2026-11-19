@@ -8,19 +8,19 @@
           "allocations_per_frame": 3.01,
           "max_allocations": 5,
           "allocated_bytes_per_frame": 40245,
-          "instructions_per_frame": 237221
+          "instructions_per_frame": 237167
         },
         "frame": {
           "allocations_per_frame": 4.0,
           "max_allocations": 4,
           "allocated_bytes_per_frame": 5538,
-          "instructions_per_frame": 151271
+          "instructions_per_frame": 151214
         },
         "render": {
           "allocations_per_frame": 27.0,
           "max_allocations": 27,
           "allocated_bytes_per_frame": 11114,
-          "instructions_per_frame": 1205946
+          "instructions_per_frame": 1194650
         }
       },
       "output_bytes_per_frame": 4348,
@@ -34,19 +34,19 @@
           "allocations_per_frame": 3.01,
           "max_allocations": 5,
           "allocated_bytes_per_frame": 40245,
-          "instructions_per_frame": 237231
+          "instructions_per_frame": 237146
         },
         "frame": {
           "allocations_per_frame": 4.0,
           "max_allocations": 4,
           "allocated_bytes_per_frame": 5538,
-          "instructions_per_frame": 151274
+          "instructions_per_frame": 151202
         },
         "render": {
           "allocations_per_frame": 27.0,
           "max_allocations": 27,
           "allocated_bytes_per_frame": 11114,
-          "instructions_per_frame": 1196839
+          "instructions_per_frame": 1185543
         }
       },
       "output_bytes_per_frame": 4348,
@@ -60,19 +60,19 @@
           "allocations_per_frame": 0.0,
           "max_allocations": 0,
           "allocated_bytes_per_frame": 0,
-          "instructions_per_frame": 6593085
+          "instructions_per_frame": 6593011
         },
         "frame": {
           "allocations_per_frame": 4.0,
           "max_allocations": 4,
           "allocated_bytes_per_frame": 119334,
-          "instructions_per_frame": 3869380
+          "instructions_per_frame": 3867832
         },
         "render": {
           "allocations_per_frame": 24.99,
           "max_allocations": 25,
           "allocated_bytes_per_frame": 11001,
-          "instructions_per_frame": 22702538
+          "instructions_per_frame": 22366828
         }
       },
       "output_bytes_per_frame": 128475,
@@ -86,19 +86,19 @@
           "allocations_per_frame": 0.0,
           "max_allocations": 0,
           "allocated_bytes_per_frame": 0,
-          "instructions_per_frame": 6593181
+          "instructions_per_frame": 6593075
         },
         "frame": {
           "allocations_per_frame": 4.0,
           "max_allocations": 4,
           "allocated_bytes_per_frame": 119334,
-          "instructions_per_frame": 3868270
+          "instructions_per_frame": 3867958
         },
         "render": {
           "allocations_per_frame": 24.99,
           "max_allocations": 25,
           "allocated_bytes_per_frame": 11001,
-          "instructions_per_frame": 22702638
+          "instructions_per_frame": 22367235
         }
       },
       "output_bytes_per_frame": 128475,
@@ -112,25 +112,25 @@
           "allocations_per_frame": 0.0,
           "max_allocations": 0,
           "allocated_bytes_per_frame": 0,
-          "instructions_per_frame": 6593121
+          "instructions_per_frame": 6593230
         },
         "frame": {
           "allocations_per_frame": 4.0,
           "max_allocations": 4,
           "allocated_bytes_per_frame": 119334,
-          "instructions_per_frame": 3867973
+          "instructions_per_frame": 3868095
         },
         "observe": {
           "allocations_per_frame": 12.0,
           "max_allocations": 12,
           "allocated_bytes_per_frame": 5032,
-          "instructions_per_frame": 3539965
+          "instructions_per_frame": 3540371
         },
         "render": {
           "allocations_per_frame": 24.99,
           "max_allocations": 25,
           "allocated_bytes_per_frame": 11001,
-          "instructions_per_frame": 22702331
+          "instructions_per_frame": 22367913
         }
       },
       "output_bytes_per_frame": 128475,
@@ -144,19 +144,19 @@
           "allocations_per_frame": 3.01,
           "max_allocations": 4,
           "allocated_bytes_per_frame": 40224,
-          "instructions_per_frame": 237622
+          "instructions_per_frame": 237606
         },
         "frame": {
           "allocations_per_frame": 3.0,
           "max_allocations": 3,
           "allocated_bytes_per_frame": 2770,
-          "instructions_per_frame": 150040
+          "instructions_per_frame": 150020
         },
         "render": {
           "allocations_per_frame": 27.0,
           "max_allocations": 28,
           "allocated_bytes_per_frame": 11114,
-          "instructions_per_frame": 1363361
+          "instructions_per_frame": 1352234
         }
       },
       "output_bytes_per_frame": 4769,
@@ -170,19 +170,19 @@
           "allocations_per_frame": 3.01,
           "max_allocations": 4,
           "allocated_bytes_per_frame": 40224,
-          "instructions_per_frame": 237616
+          "instructions_per_frame": 237602
         },
         "frame": {
           "allocations_per_frame": 3.0,
           "max_allocations": 3,
           "allocated_bytes_per_frame": 2770,
-          "instructions_per_frame": 150289
+          "instructions_per_frame": 150300
         },
         "render": {
           "allocations_per_frame": 24.6,
           "max_allocations": 28,
           "allocated_bytes_per_frame": 14842,
-          "instructions_per_frame": 22568552
+          "instructions_per_frame": 22238524
         }
       },
       "output_bytes_per_frame": 126992,
@@ -196,25 +196,25 @@
           "allocations_per_frame": 3.01,
           "max_allocations": 4,
           "allocated_bytes_per_frame": 40224,
-          "instructions_per_frame": 237619
+          "instructions_per_frame": 237602
         },
         "frame": {
           "allocations_per_frame": 3.0,
           "max_allocations": 3,
           "allocated_bytes_per_frame": 2770,
-          "instructions_per_frame": 150024
+          "instructions_per_frame": 150018
         },
         "observe": {
           "allocations_per_frame": 14.0,
           "max_allocations": 14,
           "allocated_bytes_per_frame": 1880,
-          "instructions_per_frame": 1366246
+          "instructions_per_frame": 1366228
         },
         "render": {
           "allocations_per_frame": 27.0,
           "max_allocations": 28,
           "allocated_bytes_per_frame": 11114,
-          "instructions_per_frame": 1363364
+          "instructions_per_frame": 1352232
         }
       },
       "output_bytes_per_frame": 4769,
@@ -228,19 +228,19 @@
           "allocations_per_frame": 3.0,
           "max_allocations": 5,
           "allocated_bytes_per_frame": 39999,
-          "instructions_per_frame": 237477
+          "instructions_per_frame": 237481
         },
         "frame": {
           "allocations_per_frame": 3.0,
           "max_allocations": 4,
           "allocated_bytes_per_frame": 2780,
-          "instructions_per_frame": 150019
+          "instructions_per_frame": 150023
         },
         "render": {
           "allocations_per_frame": 22.0,
           "max_allocations": 22,
           "allocated_bytes_per_frame": 10864,
-          "instructions_per_frame": 24969
+          "instructions_per_frame": 25113
         }
       },
       "output_bytes_per_frame": 0,
@@ -254,19 +254,19 @@
           "allocations_per_frame": 0.0,
           "max_allocations": 0,
           "allocated_bytes_per_frame": 0,
-          "instructions_per_frame": 6549183
+          "instructions_per_frame": 6549153
         },
         "frame": {
           "allocations_per_frame": 7.0,
           "max_allocations": 7,
           "allocated_bytes_per_frame": 124728,
-          "instructions_per_frame": 3849840
+          "instructions_per_frame": 3849689
         },
         "render": {
           "allocations_per_frame": 26.71,
           "max_allocations": 27,
           "allocated_bytes_per_frame": 11602,
-          "instructions_per_frame": 22664460
+          "instructions_per_frame": 22328082
         }
       },
       "output_bytes_per_frame": 128226,
@@ -280,19 +280,19 @@
           "allocations_per_frame": 6.03,
           "max_allocations": 8,
           "allocated_bytes_per_frame": 39937,
-          "instructions_per_frame": 247427
+          "instructions_per_frame": 247413
         },
         "frame": {
           "allocations_per_frame": 5.0,
           "max_allocations": 5,
           "allocated_bytes_per_frame": 3430,
-          "instructions_per_frame": 163578
+          "instructions_per_frame": 163563
         },
         "render": {
           "allocations_per_frame": 29.02,
           "max_allocations": 33,
           "allocated_bytes_per_frame": 15598,
-          "instructions_per_frame": 9927305
+          "instructions_per_frame": 9590085
         }
       },
       "output_bytes_per_frame": 127644,
@@ -306,19 +306,19 @@
           "allocations_per_frame": 1.12,
           "max_allocations": 5,
           "allocated_bytes_per_frame": 6512,
-          "instructions_per_frame": 289361
+          "instructions_per_frame": 289353
         },
         "frame": {
           "allocations_per_frame": 3.0,
           "max_allocations": 3,
           "allocated_bytes_per_frame": 3149,
-          "instructions_per_frame": 187851
+          "instructions_per_frame": 187822
         },
         "render": {
           "allocations_per_frame": 29.14,
           "max_allocations": 32,
           "allocated_bytes_per_frame": 11524,
-          "instructions_per_frame": 830373
+          "instructions_per_frame": 830256
         }
       },
       "output_bytes_per_frame": 256,
@@ -332,19 +332,19 @@
           "allocations_per_frame": 3.01,
           "max_allocations": 4,
           "allocated_bytes_per_frame": 19968,
-          "instructions_per_frame": 127029
+          "instructions_per_frame": 127018
         },
         "frame": {
           "allocations_per_frame": 3.0,
           "max_allocations": 3,
           "allocated_bytes_per_frame": 1715,
-          "instructions_per_frame": 85260
+          "instructions_per_frame": 85249
         },
         "render": {
           "allocations_per_frame": 37.01,
           "max_allocations": 39,
           "allocated_bytes_per_frame": 17779,
-          "instructions_per_frame": 5061821
+          "instructions_per_frame": 4893268
         }
       },
       "output_bytes_per_frame": 64010,
@@ -358,19 +358,19 @@
           "allocations_per_frame": 3.01,
           "max_allocations": 4,
           "allocated_bytes_per_frame": 19968,
-          "instructions_per_frame": 127015
+          "instructions_per_frame": 126999
         },
         "frame": {
           "allocations_per_frame": 3.0,
           "max_allocations": 3,
           "allocated_bytes_per_frame": 1715,
-          "instructions_per_frame": 85247
+          "instructions_per_frame": 85232
         },
         "render": {
           "allocations_per_frame": 77.01,
           "max_allocations": 79,
           "allocated_bytes_per_frame": 21897,
-          "instructions_per_frame": 6119209
+          "instructions_per_frame": 5949582
         }
       },
       "output_bytes_per_frame": 64092,
@@ -384,19 +384,19 @@
           "allocations_per_frame": 3.01,
           "max_allocations": 4,
           "allocated_bytes_per_frame": 19968,
-          "instructions_per_frame": 127019
+          "instructions_per_frame": 127001
         },
         "frame": {
           "allocations_per_frame": 3.0,
           "max_allocations": 3,
           "allocated_bytes_per_frame": 1715,
-          "instructions_per_frame": 85250
+          "instructions_per_frame": 85233
         },
         "render": {
           "allocations_per_frame": 37.01,
           "max_allocations": 39,
           "allocated_bytes_per_frame": 18220,
-          "instructions_per_frame": 5088586
+          "instructions_per_frame": 4919105
         }
       },
       "output_bytes_per_frame": 64010,
@@ -410,19 +410,19 @@
           "allocations_per_frame": 3.01,
           "max_allocations": 4,
           "allocated_bytes_per_frame": 19968,
-          "instructions_per_frame": 127019
+          "instructions_per_frame": 127001
         },
         "frame": {
           "allocations_per_frame": 3.0,
           "max_allocations": 3,
           "allocated_bytes_per_frame": 1715,
-          "instructions_per_frame": 85251
+          "instructions_per_frame": 85233
         },
         "render": {
           "allocations_per_frame": 49.01,
           "max_allocations": 52,
           "allocated_bytes_per_frame": 19932,
-          "instructions_per_frame": 5151921
+          "instructions_per_frame": 4981601
         }
       },
       "output_bytes_per_frame": 85639,
