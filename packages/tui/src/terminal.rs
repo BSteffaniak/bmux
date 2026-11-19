@@ -1447,6 +1447,10 @@ impl TtyOutput {
                 "stdout is not a tty",
             ));
         }
+        // Opening /proc/self/fd/N cannot fail to name the device; finding its name elsewhere can.
+        #[cfg(target_os = "linux")]
+        let path = Self::device_path(fd);
+        #[cfg(not(target_os = "linux"))]
         let path = Self::device_path(fd)?;
         let source = Self::identity(fd)?;
         let file = std::fs::OpenOptions::new()
@@ -1468,8 +1472,8 @@ impl TtyOutput {
 
     /// A path that opens the terminal device behind `fd` anew.
     #[cfg(target_os = "linux")]
-    fn device_path(fd: std::os::fd::RawFd) -> io::Result<std::path::PathBuf> {
-        Ok(format!("/proc/self/fd/{fd}").into())
+    fn device_path(fd: std::os::fd::RawFd) -> std::path::PathBuf {
+        format!("/proc/self/fd/{fd}").into()
     }
 
     /// A path that opens the terminal device behind `fd` anew.

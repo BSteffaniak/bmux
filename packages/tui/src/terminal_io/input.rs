@@ -525,6 +525,10 @@ impl RawInput {
                 "stdout is not tty",
             ));
         }
+        // Opening /proc/self/fd/1 cannot fail to name the tty; finding its name elsewhere can.
+        #[cfg(target_os = "linux")]
+        let path = stdout_tty_path();
+        #[cfg(not(target_os = "linux"))]
         let path = stdout_tty_path()?;
         let identity = std::fs::metadata(&path)?;
         let file = std::fs::OpenOptions::new()
@@ -682,8 +686,8 @@ impl RawInput {
 
 /// The filesystem path of the tty on stdout.
 #[cfg(target_os = "linux")]
-fn stdout_tty_path() -> io::Result<std::path::PathBuf> {
-    Ok("/proc/self/fd/1".into())
+fn stdout_tty_path() -> std::path::PathBuf {
+    "/proc/self/fd/1".into()
 }
 
 /// The filesystem path of the tty on stdout.

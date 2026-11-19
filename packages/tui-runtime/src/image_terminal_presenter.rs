@@ -1284,7 +1284,7 @@ mod async_tests {
             cx.push_image(ImageContribution::Present(ImagePlacement {
                 key: "fixture".into(),
                 payload: ImagePayload::Pixels {
-                    bytes: [17, 34, 51, 255].repeat(4),
+                    bytes: [17, 34, 51, 255].repeat(4).into(),
                     width: 2,
                     height: 2,
                     format: ImagePixelFormat::Rgba8,
@@ -1294,6 +1294,7 @@ mod async_tests {
                 fit: ImageFit::Stretch,
                 allocation: None,
                 lifecycle: ImageLifecycle::Frame,
+                z: 0,
             }));
         }
         fn read_wire(master: &mut std::fs::File) -> Vec<u8> {
