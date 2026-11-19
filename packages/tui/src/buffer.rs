@@ -516,6 +516,45 @@ impl Buffer {
         set
     }
 
+    /// Set columns `x..end` of row `y` to blanks in `style`, as narrow blanks put one at a time
+    /// would (a wide grapheme a blank lands on is cleared), noting in `changed` the columns that
+    /// change. Returns the columns set (clipped to the buffer).
+    pub(crate) fn put_blank_run(
+        &mut self,
+        x: u16,
+        end: u16,
+        y: u16,
+        style: Style,
+        mut changed: Option<&mut ChangedColumns>,
+    ) -> u16 {
+        let end = end.min(self.area.right());
+        let mut column = x;
+        while column < end {
+            let point = Point::new(column, y);
+            let Some(index) = self.index(point) else {
+                break;
+            };
+            let cell = &mut self.cells[index];
+            if cell.width == 1 && !cell.wide_continuation {
+                if let Some(changed) = changed.as_deref_mut()
+                    && (cell.style != style || !cell.symbol.is(" "))
+                {
+                    changed.note(column, column + 1);
+                }
+                cell.assign(" ", 1, style);
+            } else {
+                if let Some(changed) = changed.as_deref_mut()
+                    && !self.holds_symbol(point, " ", 1, style)
+                {
+                    changed.note(column, column + 1);
+                }
+                self.put_symbol(point, " ", 1, style);
+            }
+            column += 1;
+        }
+        column - x
+    }
+
     /// Whether [`Self::put_symbol`] with these arguments would leave the cells as they are: a
     /// narrow symbol over the same narrow cell, or a wide one over the same wide grapheme.
     pub(crate) fn holds_symbol(

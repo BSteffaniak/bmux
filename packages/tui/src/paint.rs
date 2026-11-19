@@ -433,6 +433,32 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         }
     }
 
+    /// Paint `width` blanks in `style` from a local coordinate, exactly as [`Self::replace_cells`]
+    /// paints narrow blank cells (each cell's whole style replaced, only the cells that change
+    /// reported when painting over the last frame), without building them one at a time: the
+    /// blank tail of a terminal row is most of it.
+    pub fn replace_blanks(&mut self, x: i32, y: i64, width: u16, style: Style) {
+        let Some(row) = self.project_rect(LocalRect::new(x, y, width, 1)) else {
+            return;
+        };
+        let style = self.inherited_style.patch(style);
+        let mut changed = self
+            .frame
+            .reports_changes_only()
+            .then(|| self.frame.take_changed_columns());
+        let buffer = self.frame.buffer_for_write();
+        let set = buffer.put_blank_run(row.x, row.right(), row.y, style, changed.as_mut());
+        if let Some(changed) = changed {
+            for run in changed.runs() {
+                self.frame
+                    .wrote(Rect::new(run.start, row.y, run.end - run.start, 1));
+            }
+            self.frame.return_changed_columns(changed);
+        } else if set > 0 {
+            self.frame.wrote(Rect::new(row.x, row.y, set, 1));
+        }
+    }
+
     /// Layer `style` over the cells of a local rectangle after translation and
     /// clipping, keeping their symbols. Colors and modifiers `style` leaves unset
     /// keep each cell's own, so already painted chrome (a border, a title) can be

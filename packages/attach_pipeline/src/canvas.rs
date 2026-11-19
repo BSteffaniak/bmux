@@ -132,6 +132,13 @@ impl<'canvas, 'frame, 'buffer> Canvas<'canvas, 'frame, 'buffer> {
         self.cx.replace_cells(i32::from(x), i64::from(y), cells);
     }
 
+    /// Paint `width` blanks in `style` from column `x` of row `y`, as [`Self::cells`] paints
+    /// narrow blank cells.
+    pub fn blanks(&mut self, x: u16, y: u16, width: u16, style: Style) {
+        self.cx
+            .replace_blanks(i32::from(x), i64::from(y), width, style);
+    }
+
     /// Move the cells of `area` by `rows` (positive up), as a terminal scroll inside it moves
     /// them; the rows it exposes are blank.
     pub fn scroll(&mut self, area: Rect, rows: i64) {

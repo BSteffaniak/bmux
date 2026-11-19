@@ -2484,6 +2484,7 @@ fn paint_pane_row(
         }
         cell_style_to_tui(apply_content_effects(style, context.runtime_appearance))
     };
+    let width = paint_blank_tail(canvas, context, x, y, width, style_of(None, false));
     // Consecutive cells mostly share a style: resolve each grid style once while it repeats.
     let mut memo: Option<((bmux_terminal_grid::StyleId, bool), bmux_tui::style::Style)> = None;
     let mut col = 0u16;
@@ -2617,6 +2618,45 @@ fn row_damaged(row_index: u16, width: u16, rects: &[DamageRect]) -> bool {
             && row_index < rect.bottom()
             && rect.x.min(width) < rect.right().min(width)
     })
+}
+
+/// Paint the blank tail of `context`'s row (the columns past its cells, up to `width`) at once
+/// in `blank` style, unless a selection or a glyph under the pane reaches it, and return the
+/// columns still to paint cell by cell.
+fn paint_blank_tail(
+    canvas: &mut Canvas<'_, '_, '_>,
+    context: &GridRowRenderContext<'_>,
+    x: u16,
+    y: u16,
+    width: u16,
+    blank: bmux_tui::style::Style,
+) -> u16 {
+    let filled = u16::try_from(context.row.cells().len())
+        .unwrap_or(u16::MAX)
+        .min(width);
+    if filled < width
+        && !row_selected(context.selection, context.selection_line)
+        && context
+            .before_content_cells
+            .range(filled..width)
+            .next()
+            .is_none()
+    {
+        canvas.blanks(x.saturating_add(filled), y, width - filled, blank);
+        return filled;
+    }
+    width
+}
+
+/// Whether `selection` covers any of line `line`.
+const fn row_selected(
+    selection: Option<(AttachScrollbackPosition, AttachScrollbackPosition)>,
+    line: u64,
+) -> bool {
+    match selection {
+        Some((start, end)) => line >= start.line && line <= end.line,
+        None => false,
+    }
 }
 
 const fn cell_selected(
