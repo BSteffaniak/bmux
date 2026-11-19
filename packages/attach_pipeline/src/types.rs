@@ -240,6 +240,8 @@ pub struct PaneLocalZoom {
 pub struct PaneRenderBuffer {
     pub local_zoom: PaneLocalZoom,
     pub terminal_grid: TerminalGridStream,
+    /// Where the grid is as a replica of the server's (the last frame applied to it).
+    pub replica: bmux_terminal_grid::ReplicaCursor,
     /// Neutral declarative output retained alongside extension byte caches.
     pub extension_projection_cache:
         BTreeMap<(String, Uuid), Vec<crate::projection::PaintOperation>>,
@@ -703,6 +705,7 @@ impl Default for PaneRenderBuffer {
             local_zoom: PaneLocalZoom::default(),
             terminal_grid: TerminalGridStream::new(80, 24, GridLimits::default())
                 .expect("default pane render grid dimensions are valid"),
+            replica: bmux_terminal_grid::ReplicaCursor::default(),
             protocol_tracker: TerminalProtocolTracker::new(),
             rows_drawn: false,
             drawn_appearance: None,

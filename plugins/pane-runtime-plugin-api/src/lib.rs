@@ -28,6 +28,10 @@ pub mod input_capture;
 /// encoded `attach_runtime_state::AttachPaneOutputBatch`.
 pub const OUTPUT_PUSH_KIND: &str = "bmux.pane_runtime/output-push";
 
+/// Plugin bus kind of pane frames pushed to an attach client after `attach-pane-frame-push`: an
+/// encoded `attach_runtime_state::AttachPaneFrames`.
+pub const FRAME_PUSH_KIND: &str = "bmux.pane_runtime/frame-push";
+
 /// Plugin bus kind telling an attach client that its input producer barriers changed (one began
 /// or settled), so it reads them with `input-producer-barriers-v2` instead of polling. The
 /// payload is empty.
@@ -124,7 +128,7 @@ mod tests {
         use super::pane_runtime_execution_v4::TerminalExecutionRef;
         use super::pane_runtime_pointer_grid_v1::{
             GridCapabilities,
-            client::{DeltasRequest, ScreenRequest, SnapshotsRequest},
+            client::{FramesRequest, ScreenRequest, SnapshotsRequest},
         };
         let session_id = uuid::Uuid::new_v4();
         let pane_id = uuid::Uuid::new_v4();
@@ -138,16 +142,15 @@ mod tests {
         let decoded: SnapshotsRequest = bmux_codec::from_bytes(&encoded).unwrap();
         assert_eq!(decoded.format_version, 1);
         assert_eq!(decoded.pane_ids, vec![pane_id]);
-        let deltas = DeltasRequest {
+        let frames = FramesRequest {
             format_version: 1,
             session_id,
             pane_ids: vec![pane_id],
-            base_revisions: vec![7],
-            max_batches_per_pane: 16,
+            max_history_lines: 16,
         };
-        let encoded = bmux_codec::to_vec(&deltas).unwrap();
-        let decoded: DeltasRequest = bmux_codec::from_bytes(&encoded).unwrap();
-        assert_eq!(decoded.base_revisions, vec![7]);
+        let encoded = bmux_codec::to_vec(&frames).unwrap();
+        let decoded: FramesRequest = bmux_codec::from_bytes(&encoded).unwrap();
+        assert_eq!(decoded.max_history_lines, 16);
         let screen = ScreenRequest {
             format_version: 1,
             execution: TerminalExecutionRef {

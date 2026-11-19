@@ -172,20 +172,15 @@ pub struct AttachGridWindowState {
     pub windows: Vec<AttachPaneGridWindow>,
 }
 
-/// Structured terminal-grid delta batches for one pane.
+/// A frame bringing a client's replica of one pane's grid level with it.
 #[derive(Debug, Clone)]
-pub struct AttachPaneGridDelta {
+pub struct AttachPaneFrame {
     pub pane_id: Uuid,
-    pub base_revision: u64,
-    pub revision: u64,
-    pub desynced: bool,
+    /// The program is inside a synchronized update (DEC mode 2026) as of this frame: a client
+    /// holds rendering until it ends or times out.
+    pub sync_update_active: bool,
+    /// The `bmux_terminal_grid::GridFrame`, encoded with `bmux_ipc::encode`.
     pub encoded: Vec<u8>,
-}
-
-/// Structured terminal-grid delta DTO.
-#[derive(Debug, Clone)]
-pub struct AttachGridDeltaState {
-    pub deltas: Vec<AttachPaneGridDelta>,
 }
 
 /// Process identity for a running pane runtime. `pid` is the spawned
@@ -585,14 +580,25 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
         pin_id: u64,
     ) -> Result<AttachPaneScrollbackUnpinAck, SessionRuntimeError>;
 
-    fn attach_grid_delta_state(
+    /// Frames bringing `client_id`'s replicas of `pane_ids` level with their grids: one for each
+    /// pane whose grid changed since that client's last frame of it (a reset frame for a pane it
+    /// has none of yet), at most `max_history_lines` history lines in a reset frame. Returns the
+    /// frames and whether more remain for the next call (a response budget was reached).
+    fn attach_pane_frames(
         &self,
         session_id: SessionId,
         client_id: ClientId,
         pane_ids: &[Uuid],
-        base_revisions: &[u64],
-        max_batches_per_pane: usize,
-    ) -> Result<AttachGridDeltaState, SessionRuntimeError>;
+        max_history_lines: usize,
+    ) -> Result<(Vec<AttachPaneFrame>, bool), SessionRuntimeError>;
+
+    /// Start `client_id`'s replicas of `pane_ids` over: each next frame is a reset frame.
+    fn reset_attach_pane_frames(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        pane_ids: &[Uuid],
+    ) -> Result<(), SessionRuntimeError>;
 
     /// Composite: clear `image_dirty` on each pane, then compute image
     /// registry deltas per pane since the provided sequence numbers.
@@ -1104,14 +1110,22 @@ impl SessionRuntimeManagerApi for NoopSessionRuntimeManager {
         Err(SessionRuntimeError::NotFound)
     }
 
-    fn attach_grid_delta_state(
+    fn attach_pane_frames(
         &self,
         _session_id: SessionId,
         _client_id: ClientId,
         _pane_ids: &[Uuid],
-        _base_revisions: &[u64],
-        _max_batches_per_pane: usize,
-    ) -> Result<AttachGridDeltaState, SessionRuntimeError> {
+        _max_history_lines: usize,
+    ) -> Result<(Vec<AttachPaneFrame>, bool), SessionRuntimeError> {
+        Err(SessionRuntimeError::NotFound)
+    }
+
+    fn reset_attach_pane_frames(
+        &self,
+        _session_id: SessionId,
+        _client_id: ClientId,
+        _pane_ids: &[Uuid],
+    ) -> Result<(), SessionRuntimeError> {
         Err(SessionRuntimeError::NotFound)
     }
     fn attach_pane_image_deltas(

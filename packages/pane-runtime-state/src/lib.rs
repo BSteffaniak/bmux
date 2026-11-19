@@ -36,8 +36,8 @@ pub use layout::{
     PaneResizeDirection, contains_pane,
 };
 pub use manager_handle::{
-    AttachGridDeltaState, AttachGridSnapshotState, AttachGridWindowState, AttachLayoutState,
-    AttachPaneGridDelta, AttachPaneGridSnapshot, AttachPaneGridWindow, AttachPaneGridWindowRequest,
+    AttachGridSnapshotState, AttachGridWindowState, AttachLayoutState, AttachPaneFrame,
+    AttachPaneGridSnapshot, AttachPaneGridWindow, AttachPaneGridWindowRequest,
     AttachPaneScrollbackPin, AttachPaneScrollbackUnpinAck, AttachPaneSnapshotState,
     AttachSnapshotState, FloatingPaneRuntimeSummary, HistoryEnd, HistoryFetchError,
     NoopSessionRuntimeManager, PaneProcessIdentity, PaneProcessSignal, PaneScrollbackMetadata,

@@ -99,9 +99,9 @@ fn route_authorized(
             pointer_grid::select(req.format_version)?;
             Ok::<_, ServiceResponse>(attach_state::pane_grid_snapshot_state(host, &attach_state::PaneGridSnapshotArgs { session_id: req.session_id, pane_id: req.pane_id, max_rows: req.max_rows }))
         },
-        "pane-runtime-pointer-grid-v1", "deltas" => |req: bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::client::DeltasRequest, ctx| {
+        "pane-runtime-pointer-grid-v1", "frames" => |req: bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::client::FramesRequest, ctx| {
             pointer_grid::select(req.format_version)?;
-            Ok::<_, ServiceResponse>(attach_state::attach_pane_grid_delta_state(host, &attach_state::AttachPaneGridDeltaArgs { session_id: req.session_id, pane_ids: req.pane_ids, base_revisions: req.base_revisions, max_batches_per_pane: req.max_batches_per_pane }, ctx))
+            Ok::<_, ServiceResponse>(attach_state::attach_pane_frames(host, &attach_state::AttachPaneFramesArgs { session_id: req.session_id, pane_ids: req.pane_ids, max_history_lines: req.max_history_lines }, ctx))
         },
         "pane-runtime-pointer-grid-v1", "windows" => |req: bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::client::WindowsRequest, ctx| {
             pointer_grid::select(req.format_version)?;
@@ -480,8 +480,14 @@ fn route_authorized(
         "attach-runtime-state", "attach-pane-scrollback-unpin" => |req: attach_state::AttachPaneScrollbackUnpinArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_state::attach_pane_scrollback_unpin(host, &req, ctx))
         },
-        "attach-runtime-state", "attach-pane-grid-delta-state" => |req: attach_state::AttachPaneGridDeltaArgs, ctx| {
-            pointer_grid::legacy(attach_state::attach_pane_grid_delta_state(host, &req, ctx))
+        "attach-runtime-state", "attach-pane-frames" => |req: attach_state::AttachPaneFramesArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_state::attach_pane_frames(host, &req, ctx))
+        },
+        "attach-runtime-state", "attach-pane-frames-reset" => |req: attach_state::AttachPaneFramesResetArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_state::attach_pane_frames_reset(host, &req, ctx))
+        },
+        "attach-runtime-state", "attach-pane-frame-push" => |req: attach_state::AttachPaneFramesArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_state::attach_pane_frame_push(host, &req, ctx))
         },
         "attach-runtime-state", "attach-history-images-v1" => |req: attach_state::HistoryImagesArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_state::history_images(host, &req, ctx))

@@ -7,6 +7,11 @@
 //! not queued messages: its output collects in the pane's buffer and is read later, together, or
 //! reported as a gap past the buffer's retention (the client then resynchronizes from a snapshot).
 //!
+//! Frames are pushed the same way (`subscribe_frames`): a subscribed client is sent, when it can
+//! take a message, frames bringing its replicas of its panes level with their grids. Frames are
+//! built when sent, from the grids as they then are, so a client that falls behind is sent one
+//! frame a pane, never a backlog.
+//!
 //! The same mechanism tells a client that its input producer barriers changed, so it reads them
 //! when they do instead of polling.
 
@@ -19,7 +24,9 @@ use bmux_plugin_sdk::WireEventSink;
 use bmux_session_models::{ClientId, SessionId};
 use uuid::Uuid;
 
-use bmux_pane_runtime_plugin_api::{OUTPUT_PUSH_KIND, PRODUCER_BARRIERS_CHANGED_KIND};
+use bmux_pane_runtime_plugin_api::{
+    FRAME_PUSH_KIND, OUTPUT_PUSH_KIND, PRODUCER_BARRIERS_CHANGED_KIND,
+};
 
 struct Subscription {
     session_id: Uuid,
@@ -30,9 +37,17 @@ struct Subscription {
 /// One pane-runtime activation's push subscriptions, pending barrier
 /// notices and pull-source registration. Owned by that activation's host
 /// handles; nothing here is process-wide.
+/// A client's pushed frames: its panes, and the history a reset frame carries at most.
+struct FrameSubscription {
+    session_id: Uuid,
+    pane_ids: Vec<Uuid>,
+    max_history_lines: usize,
+}
+
 #[derive(Default)]
 pub(crate) struct OutputPushState {
     subscriptions: Mutex<BTreeMap<Uuid, Subscription>>,
+    frame_subscriptions: Mutex<BTreeMap<Uuid, FrameSubscription>>,
     barriers_changed: Mutex<std::collections::BTreeSet<Uuid>>,
     registered: OnceLock<bool>,
 }
@@ -42,6 +57,15 @@ fn subscriptions(
 ) -> MutexGuard<'_, BTreeMap<Uuid, Subscription>> {
     host.output_push()
         .subscriptions
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+fn frame_subscriptions(
+    host: &crate::runtime::PaneRuntimeHost,
+) -> MutexGuard<'_, BTreeMap<Uuid, FrameSubscription>> {
+    host.output_push()
+        .frame_subscriptions
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
 }
@@ -66,12 +90,19 @@ fn source_registered(host: &crate::runtime::PaneRuntimeHost) -> bool {
     *host.output_push().registered.get_or_init(|| {
         sink(host).is_some_and(|sink| {
             let output_host = host.clone();
+            let frame_host = host.clone();
             let barrier_host = host.clone();
             sink.register_pull_source(
                 OUTPUT_PUSH_KIND.to_string(),
                 Arc::new(move |client| pull(&output_host, client)),
             )
             .is_ok()
+                && sink
+                    .register_pull_source(
+                        FRAME_PUSH_KIND.to_string(),
+                        Arc::new(move |client| pull_frames(&frame_host, client)),
+                    )
+                    .is_ok()
                 && sink
                     .register_pull_source(
                         PRODUCER_BARRIERS_CHANGED_KIND.to_string(),
@@ -133,11 +164,40 @@ pub fn subscribe(
     wake(host, client)
 }
 
+/// Push frames of `pane_ids` in `session_id` to `client` (replacing any earlier set; empty
+/// stops). Returns whether frames are now pushed.
+pub fn subscribe_frames(
+    host: &crate::runtime::PaneRuntimeHost,
+    client: Uuid,
+    session_id: Uuid,
+    pane_ids: Vec<Uuid>,
+    max_history_lines: usize,
+) -> bool {
+    if pane_ids.is_empty() {
+        frame_subscriptions(host).remove(&client);
+        return false;
+    }
+    if !source_registered(host) {
+        return false;
+    }
+    frame_subscriptions(host).insert(
+        client,
+        FrameSubscription {
+            session_id,
+            pane_ids,
+            max_history_lines,
+        },
+    );
+    // The panes as they are now are sent at once.
+    wake(host, client)
+}
+
 fn wake(host: &crate::runtime::PaneRuntimeHost, client: Uuid) -> bool {
     let woken = sink(host).is_some_and(|sink| sink.wake(client).is_ok());
     if !woken {
         // Disconnected (or no host): stop pushing to it.
         subscriptions(host).remove(&client);
+        frame_subscriptions(host).remove(&client);
     }
     woken
 }
@@ -148,19 +208,23 @@ pub fn pane_output_available(
     session_id: Uuid,
     pane_id: Uuid,
 ) {
-    let clients: Vec<Uuid> = {
-        let subscriptions = subscriptions(host);
-        if subscriptions.is_empty() {
-            return;
-        }
-        subscriptions
+    let mut clients: Vec<Uuid> = subscriptions(host)
+        .iter()
+        .filter(|(_, subscription)| {
+            subscription.session_id == session_id && subscription.pane_ids.contains(&pane_id)
+        })
+        .map(|(client, _)| *client)
+        .collect();
+    clients.extend(
+        frame_subscriptions(host)
             .iter()
             .filter(|(_, subscription)| {
                 subscription.session_id == session_id && subscription.pane_ids.contains(&pane_id)
             })
-            .map(|(client, _)| *client)
-            .collect()
-    };
+            .map(|(client, _)| *client),
+    );
+    clients.sort_unstable();
+    clients.dedup();
     for client in clients {
         wake(host, client);
     }
@@ -204,4 +268,36 @@ fn pull(host: &crate::runtime::PaneRuntimeHost, client: Uuid) -> Option<Vec<u8>>
         output_still_pending: still_pending,
     };
     bmux_ipc::encode(&batch).ok()
+}
+
+/// The host can send to `client`: frames for its panes that changed, encoded.
+fn pull_frames(host: &crate::runtime::PaneRuntimeHost, client: Uuid) -> Option<Vec<u8>> {
+    let (session_id, pane_ids, max_history_lines) = {
+        let subscriptions = frame_subscriptions(host);
+        let subscription = subscriptions.get(&client)?;
+        (
+            subscription.session_id,
+            subscription.pane_ids.clone(),
+            subscription.max_history_lines,
+        )
+    };
+    let handle = host.registered_session_runtime()?;
+    let Ok((frames, still_pending)) = handle.0.attach_pane_frames(
+        SessionId(session_id),
+        ClientId(client),
+        &pane_ids,
+        max_history_lines,
+    ) else {
+        // Detached from the session: stop pushing.
+        frame_subscriptions(host).remove(&client);
+        return None;
+    };
+    if still_pending {
+        // More than one message's worth: build the rest once this one is queued.
+        wake(host, client);
+    }
+    if frames.is_empty() {
+        return None;
+    }
+    bmux_ipc::encode(&super::attach_state::frames_record(frames, still_pending)).ok()
 }

@@ -3,10 +3,7 @@ use bmux_attach_layout_protocol::{
     PaneSummary,
 };
 use bmux_attach_token_state::AttachGrant;
-use bmux_client::{
-    AttachLayoutState, AttachOpenInfo, AttachPaneSnapshotState, AttachSnapshotState, ClientError,
-    PaneOutputBatchResult,
-};
+use bmux_client::{AttachLayoutState, AttachOpenInfo, AttachSnapshotState, ClientError};
 use bmux_ipc::ErrorCode;
 use bmux_pane_runtime_plugin_api::{
     attach_runtime_commands as attach_commands, attach_runtime_state as attach_state,
@@ -32,12 +29,11 @@ pub struct PaneGridSnapshotResult {
     pub encoded: Vec<u8>,
 }
 
+/// A frame for one pane's replica, as received: decode `encoded` with `bmux_ipc::decode`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PaneGridDeltaResult {
+pub struct PaneFrameResult {
     pub pane_id: Uuid,
-    pub base_revision: u64,
-    pub revision: u64,
-    pub desynced: bool,
+    pub sync_update_active: bool,
     pub encoded: Vec<u8>,
 }
 
@@ -71,37 +67,51 @@ pub async fn attach_pane_grid_snapshot_state_streaming(
     }
 }
 
-pub async fn attach_pane_grid_delta_state_streaming(
+/// Frames bringing this client's replicas of `pane_ids` level with their grids, and whether
+/// more remain for another call.
+pub async fn attach_pane_frames_streaming(
     client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
     session_id: Uuid,
     pane_ids: Vec<Uuid>,
-    base_revisions: Vec<u64>,
-    max_batches_per_pane: usize,
-) -> ClientResult<Vec<PaneGridDeltaResult>> {
-    let max_batches_per_pane = u32::try_from(max_batches_per_pane).unwrap_or(u32::MAX);
-    match pointer_grid::client::deltas(
+    max_history_lines: usize,
+) -> ClientResult<(Vec<PaneFrameResult>, bool)> {
+    let max_history_lines = u32::try_from(max_history_lines).unwrap_or(u32::MAX);
+    match pointer_grid::client::frames(
         client,
         POINTER_GRID_FORMAT_VERSION,
         session_id,
         pane_ids,
-        base_revisions,
-        max_batches_per_pane,
+        max_history_lines,
     )
     .await
     {
-        Ok(Ok(state)) => Ok(state
-            .deltas
-            .into_iter()
-            .map(|delta| PaneGridDeltaResult {
-                pane_id: delta.pane_id,
-                base_revision: delta.base_revision,
-                revision: delta.revision,
-                desynced: delta.desynced,
-                encoded: delta.encoded,
-            })
-            .collect()),
-        Ok(Err(err)) => typed_server_error("pointer-grid-v1 deltas", err),
-        Err(err) => typed_dispatch_error("pointer-grid-v1 deltas", err),
+        Ok(Ok(state)) => Ok((
+            state
+                .frames
+                .into_iter()
+                .map(|frame| PaneFrameResult {
+                    pane_id: frame.pane_id,
+                    sync_update_active: frame.sync_update_active,
+                    encoded: frame.encoded,
+                })
+                .collect(),
+            state.frames_still_pending,
+        )),
+        Ok(Err(err)) => typed_server_error("pointer-grid-v1 frames", err),
+        Err(err) => typed_dispatch_error("pointer-grid-v1 frames", err),
+    }
+}
+
+/// Start this client's replicas of `pane_ids` over: their next frames are reset frames.
+pub async fn reset_attach_pane_frames_streaming(
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
+    session_id: Uuid,
+    pane_ids: Vec<Uuid>,
+) -> ClientResult<()> {
+    match attach_state::client::attach_pane_frames_reset(client, session_id, pane_ids).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(err)) => typed_server_error("attach-pane-frames-reset", err),
+        Err(err) => typed_dispatch_error("attach-pane-frames-reset", err),
     }
 }
 
@@ -164,25 +174,11 @@ pub trait PaneRuntimeClientExt {
         session_id: Uuid,
     ) -> impl Future<Output = ClientResult<AttachLayoutState>> + Send;
 
-    fn attach_pane_output_batch(
-        &mut self,
-        session_id: Uuid,
-        pane_ids: Vec<Uuid>,
-        max_bytes: usize,
-    ) -> impl Future<Output = ClientResult<PaneOutputBatchResult>> + Send;
-
     fn attach_snapshot(
         &mut self,
         session_id: Uuid,
         max_bytes_per_pane: usize,
     ) -> impl Future<Output = ClientResult<AttachSnapshotState>> + Send;
-
-    fn attach_pane_snapshot(
-        &mut self,
-        session_id: Uuid,
-        pane_ids: Vec<Uuid>,
-        max_bytes_per_pane: usize,
-    ) -> impl Future<Output = ClientResult<AttachPaneSnapshotState>> + Send;
 
     fn detach(&mut self) -> impl Future<Output = ClientResult<()>> + Send;
 }
@@ -239,30 +235,12 @@ impl PaneRuntimeClientExt for bmux_client::BmuxClient {
         attach_layout(self, session_id).await
     }
 
-    async fn attach_pane_output_batch(
-        &mut self,
-        session_id: Uuid,
-        pane_ids: Vec<Uuid>,
-        max_bytes: usize,
-    ) -> ClientResult<PaneOutputBatchResult> {
-        attach_pane_output_batch(self, session_id, pane_ids, max_bytes).await
-    }
-
     async fn attach_snapshot(
         &mut self,
         session_id: Uuid,
         max_bytes_per_pane: usize,
     ) -> ClientResult<AttachSnapshotState> {
         attach_snapshot(self, session_id, max_bytes_per_pane).await
-    }
-
-    async fn attach_pane_snapshot(
-        &mut self,
-        session_id: Uuid,
-        pane_ids: Vec<Uuid>,
-        max_bytes_per_pane: usize,
-    ) -> ClientResult<AttachPaneSnapshotState> {
-        attach_pane_snapshot(self, session_id, pane_ids, max_bytes_per_pane).await
     }
 
     async fn detach(&mut self) -> ClientResult<()> {
@@ -322,30 +300,12 @@ impl PaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
         attach_layout(self, session_id).await
     }
 
-    async fn attach_pane_output_batch(
-        &mut self,
-        session_id: Uuid,
-        pane_ids: Vec<Uuid>,
-        max_bytes: usize,
-    ) -> ClientResult<PaneOutputBatchResult> {
-        attach_pane_output_batch(self, session_id, pane_ids, max_bytes).await
-    }
-
     async fn attach_snapshot(
         &mut self,
         session_id: Uuid,
         max_bytes_per_pane: usize,
     ) -> ClientResult<AttachSnapshotState> {
         attach_snapshot(self, session_id, max_bytes_per_pane).await
-    }
-
-    async fn attach_pane_snapshot(
-        &mut self,
-        session_id: Uuid,
-        pane_ids: Vec<Uuid>,
-        max_bytes_per_pane: usize,
-    ) -> ClientResult<AttachPaneSnapshotState> {
-        attach_pane_snapshot(self, session_id, pane_ids, max_bytes_per_pane).await
     }
 
     async fn detach(&mut self) -> ClientResult<()> {
@@ -441,34 +401,6 @@ async fn attach_layout(
     }
 }
 
-async fn attach_pane_output_batch(
-    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
-    session_id: Uuid,
-    pane_ids: Vec<Uuid>,
-    max_bytes: usize,
-) -> ClientResult<PaneOutputBatchResult> {
-    let max_bytes_u32 = u32::try_from(max_bytes).unwrap_or(u32::MAX);
-    match attach_state::client::attach_pane_output_batch(
-        client,
-        session_id,
-        pane_ids,
-        max_bytes_u32,
-    )
-    .await
-    {
-        Ok(Ok(batch)) => Ok(PaneOutputBatchResult {
-            chunks: batch
-                .chunks
-                .into_iter()
-                .map(pane_chunk_from_record)
-                .collect(),
-            output_still_pending: batch.output_still_pending,
-        }),
-        Ok(Err(err)) => typed_server_error("attach-pane-output-batch", err),
-        Err(err) => typed_dispatch_error("attach-pane-output-batch", err),
-    }
-}
-
 async fn attach_snapshot(
     client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
     session_id: Uuid,
@@ -479,43 +411,6 @@ async fn attach_snapshot(
         Ok(Ok(snap)) => decode_attach_snapshot(snap),
         Ok(Err(err)) => typed_server_error("attach-snapshot-state", err),
         Err(err) => typed_dispatch_error("attach-snapshot-state", err),
-    }
-}
-
-async fn attach_pane_snapshot(
-    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
-    session_id: Uuid,
-    pane_ids: Vec<Uuid>,
-    max_bytes_per_pane: usize,
-) -> ClientResult<AttachPaneSnapshotState> {
-    let max_bytes_u32 = u32::try_from(max_bytes_per_pane).unwrap_or(u32::MAX);
-    match attach_state::client::attach_pane_snapshot_state(
-        client,
-        session_id,
-        pane_ids,
-        max_bytes_u32,
-    )
-    .await
-    {
-        Ok(Ok(snap)) => Ok(AttachPaneSnapshotState {
-            chunks: snap
-                .chunks
-                .into_iter()
-                .map(pane_chunk_from_record)
-                .collect(),
-            pane_mouse_protocols: snap
-                .pane_mouse_protocols
-                .iter()
-                .map(pane_mouse_from_record)
-                .collect::<std::result::Result<Vec<_>, _>>()?,
-            pane_input_modes: snap
-                .pane_input_modes
-                .iter()
-                .map(pane_input_mode_from_record)
-                .collect::<std::result::Result<Vec<_>, _>>()?,
-        }),
-        Ok(Err(err)) => typed_server_error("attach-pane-snapshot-state", err),
-        Err(err) => typed_dispatch_error("attach-pane-snapshot-state", err),
     }
 }
 

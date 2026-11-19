@@ -11,12 +11,12 @@ use bmux_attach_layout_protocol::{
     PaneSummary,
 };
 use bmux_pane_runtime_plugin_api::attach_runtime_state::{
-    AttachLayout as AttachLayoutRecord, AttachPaneGridDelta, AttachPaneGridSnapshot,
-    AttachPaneGridWindow, AttachPaneImages, AttachPaneOutputBatch, AttachPaneOutputPush,
-    AttachPaneSnapshot as AttachPaneSnapshotRecord, AttachSnapshot as AttachSnapshotRecord,
-    AttachStateError, PaneChunk, PaneGridDelta, PaneGridSnapshot, PaneGridWindow,
-    PaneGridWindowRequest, PaneInputMode, PaneMouseProtocol, PaneOutputCursorRead,
-    PaneScrollbackPin, PaneScrollbackUnpinAck,
+    AttachLayout as AttachLayoutRecord, AttachPaneFrames, AttachPaneFramesReset,
+    AttachPaneGridSnapshot, AttachPaneGridWindow, AttachPaneImages, AttachPaneOutputBatch,
+    AttachPaneOutputPush, AttachPaneSnapshot as AttachPaneSnapshotRecord,
+    AttachSnapshot as AttachSnapshotRecord, AttachStateError, PaneChunk, PaneFrame,
+    PaneGridSnapshot, PaneGridWindow, PaneGridWindowRequest, PaneInputMode, PaneMouseProtocol,
+    PaneOutputCursorRead, PaneScrollbackPin, PaneScrollbackUnpinAck,
 };
 use bmux_plugin_sdk::NativeServiceContext;
 use bmux_session_models::{ClientId, SessionId};
@@ -220,11 +220,16 @@ pub struct AttachPaneScrollbackUnpinArgs {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AttachPaneGridDeltaArgs {
+pub struct AttachPaneFramesArgs {
     pub session_id: Uuid,
     pub pane_ids: Vec<Uuid>,
-    pub base_revisions: Vec<u64>,
-    pub max_batches_per_pane: u32,
+    pub max_history_lines: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachPaneFramesResetArgs {
+    pub session_id: Uuid,
+    pub pane_ids: Vec<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -656,38 +661,83 @@ pub fn attach_pane_scrollback_unpin(
     })
 }
 
-/// `attach-pane-grid-delta-state` delivers revisioned structured grid
-/// deltas serialized as JSON (`Vec<GridDeltaBatch>`) per pane.
-pub fn attach_pane_grid_delta_state(
+/// `attach-pane-frames`: frames bringing the caller's replicas of the panes level with their
+/// grids.
+pub fn attach_pane_frames(
     host: &crate::runtime::PaneRuntimeHost,
-    req: &AttachPaneGridDeltaArgs,
+    req: &AttachPaneFramesArgs,
     ctx: &NativeServiceContext,
-) -> Result<AttachPaneGridDelta, AttachStateError> {
+) -> Result<AttachPaneFrames, AttachStateError> {
     let handle = host
         .registered_session_runtime()
         .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
-    let state = handle
+    let (frames, frames_still_pending) = handle
         .0
-        .attach_grid_delta_state(
+        .attach_pane_frames(
             SessionId(req.session_id),
             caller_client_id(ctx),
             &req.pane_ids,
-            &req.base_revisions,
-            req.max_batches_per_pane as usize,
+            req.max_history_lines as usize,
         )
         .map_err(attach_runtime_error)?;
-    Ok(AttachPaneGridDelta {
-        deltas: state
-            .deltas
+    Ok(frames_record(frames, frames_still_pending))
+}
+
+/// Frames as the contract carries them.
+pub(super) fn frames_record(
+    frames: Vec<bmux_pane_runtime_state::AttachPaneFrame>,
+    frames_still_pending: bool,
+) -> AttachPaneFrames {
+    AttachPaneFrames {
+        frames: frames
             .into_iter()
-            .map(|delta| PaneGridDelta {
-                pane_id: delta.pane_id,
-                base_revision: delta.base_revision,
-                revision: delta.revision,
-                desynced: delta.desynced,
-                encoded: delta.encoded,
+            .map(|frame| PaneFrame {
+                pane_id: frame.pane_id,
+                sync_update_active: frame.sync_update_active,
+                encoded: frame.encoded,
             })
             .collect(),
+        frames_still_pending,
+    }
+}
+
+/// `attach-pane-frames-reset`: the caller's replicas of the panes start over.
+pub fn attach_pane_frames_reset(
+    host: &crate::runtime::PaneRuntimeHost,
+    req: &AttachPaneFramesResetArgs,
+    ctx: &NativeServiceContext,
+) -> Result<AttachPaneFramesReset, AttachStateError> {
+    let handle = host
+        .registered_session_runtime()
+        .ok_or_else(|| failed("pane-runtime manager handle not registered"))?;
+    handle
+        .0
+        .reset_attach_pane_frames(
+            SessionId(req.session_id),
+            caller_client_id(ctx),
+            &req.pane_ids,
+        )
+        .map_err(attach_runtime_error)?;
+    Ok(AttachPaneFramesReset {
+        panes: u32::try_from(req.pane_ids.len()).unwrap_or(u32::MAX),
+    })
+}
+
+/// `attach-pane-frame-push`: push the caller's frames for the panes (see `output_push`).
+pub fn attach_pane_frame_push(
+    host: &crate::runtime::PaneRuntimeHost,
+    req: &AttachPaneFramesArgs,
+    ctx: &NativeServiceContext,
+) -> Result<AttachPaneOutputPush, AttachStateError> {
+    let client = ctx.caller_client_id.ok_or(AttachStateError::NotAttached)?;
+    Ok(AttachPaneOutputPush {
+        enabled: super::output_push::subscribe_frames(
+            host,
+            client,
+            req.session_id,
+            req.pane_ids.clone(),
+            req.max_history_lines as usize,
+        ),
     })
 }
 

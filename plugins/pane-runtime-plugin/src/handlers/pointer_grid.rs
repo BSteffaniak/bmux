@@ -100,16 +100,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_checks_execution_and_delta_opaque_payloads() {
+    fn legacy_checks_opaque_grid_payloads() {
         let mut grid = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
-        let delta = grid.process_delta(b"\x1b]22;pointer\x07").unwrap();
-        for (key, payload) in [
-            ("encoded", serde_json::to_vec(&vec![delta]).unwrap()),
-            (
-                "encoded_grid",
-                serde_json::to_vec(&grid.snapshot(0, 2)).unwrap(),
-            ),
-        ] {
+        grid.process(b"\x1b]22;pointer\x07");
+        let snapshot = serde_json::to_vec(&grid.snapshot(0, 2)).unwrap();
+        for (key, payload) in [("encoded", snapshot.clone()), ("encoded_grid", snapshot)] {
             let value = serde_json::json!({(key): payload});
             assert!(legacy(value).is_err());
         }

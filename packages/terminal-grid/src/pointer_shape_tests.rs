@@ -146,48 +146,6 @@ fn every_split_snapshot_restores_pending_set_push_pop_and_query() {
 }
 
 #[test]
-fn deltas_preserve_stack_only_changes_and_pending_payloads() {
-    let limits = GridLimits::default();
-    let mut producer = stream();
-    let mut consumer = stream();
-    let content_revision = producer.grid().content_revision();
-    for chunk in [
-        b"\x1b]22;>text\x07".as_slice(),
-        b"\x1b]22;>text\x07",
-        b"\x1b]22;>wait,",
-        b"pointer\x1b",
-        b"\\",
-    ] {
-        let delta = producer
-            .process_delta(chunk)
-            .expect("replicated state changed");
-        assert_eq!(
-            delta.row_updates,
-            [] as [crate::delta::RowUpdateSnapshot; 0]
-        );
-        assert_eq!(delta.content_revision, content_revision);
-        let wire = serde_json::to_vec(&delta).unwrap();
-        let decoded = serde_json::from_slice(&wire).unwrap();
-        consumer.apply_delta(&decoded, limits).unwrap();
-        assert_eq!(consumer.snapshot(0, 3), producer.snapshot(0, 3));
-    }
-    for expected in [
-        Some(PointerShape::Wait),
-        Some(PointerShape::Text),
-        Some(PointerShape::Text),
-        None,
-    ] {
-        consumer.process(b"\x1b]22;<\x07");
-        assert_eq!(current(&consumer), expected);
-    }
-    let revision = producer.grid().revision();
-    producer.process_with_pointer_queries(b"\x1b]22;?__current__\x07", |_, _| {});
-    producer.process(b"\x1b]22;unknown\x07");
-    producer.process(b"\x1b]22;pointer\x07");
-    assert_eq!(producer.grid().revision(), revision);
-}
-
-#[test]
 fn oversized_requests_are_discarded_whole_even_after_hydration() {
     for query in [false, true] {
         let mut prefix = if query {

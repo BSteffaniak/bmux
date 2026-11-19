@@ -1,4 +1,4 @@
-use crate::{GridDeltaBatch, GridLimits, GridSnapshot, TerminalGrid, TerminalGridStream};
+use crate::{GridLimits, GridSnapshot, TerminalGrid, TerminalGridStream};
 
 fn stream(width: u16, height: u16) -> TerminalGridStream {
     TerminalGridStream::new(width, height, GridLimits::default()).unwrap()
@@ -60,58 +60,6 @@ fn origin_cup_relative_moves_and_axis_moves_apply_margin_once() {
 }
 
 #[test]
-fn insert_mode_custom_and_cleared_tabs_survive_snapshots_and_deltas() {
-    let mut grid = stream(20, 3);
-    grid.process(b"abcdef\x1b[1;3H\x1b[4h\x1b[3g\x1b[1;6H\x1bH\x1b[1;3H");
-    let before = grid.snapshot(0, 3);
-    let mut replica = before.clone();
-    let mut resumed = hydrate(&before);
-    grid.process(b"XY\tZ");
-    resumed.process(b"XY\tZ");
-    let after = grid.snapshot(0, 3);
-    GridDeltaBatch::between(&before, &after)
-        .unwrap()
-        .apply_to_snapshot(&mut replica)
-        .unwrap();
-    assert_eq!(replica, after);
-    assert_eq!(resumed.snapshot(0, 3), after);
-    assert_eq!(row(&grid, 0).trim_end(), "abXYcZdef");
-    grid.process(b"\x1b[3g\r\t");
-    assert_eq!(grid.grid().cursor().col, 19);
-    let mut resumed = hydrate(&grid.snapshot(0, 3));
-    resumed.process(b"\r\t");
-    assert_eq!(resumed.grid().cursor().col, 19);
-    resumed.grid_mut().reset();
-    resumed.process(b"\t");
-    assert_eq!(resumed.grid().cursor().col, 8);
-    assert!(!resumed.snapshot(0, 3).terminal_state.insert_mode);
-}
-
-#[test]
-fn mode_47_retains_hidden_alternate_across_hydration_and_delta() {
-    let mut grid = stream(12, 3);
-    grid.process(b"main\x1b[?47h\x1b[Hretained\x1b[?47l");
-    let before = grid.snapshot(0, 3);
-    let mut resumed = hydrate(&before);
-    resumed.process(b"\x1b[?47h");
-    assert_eq!(row(&resumed, 0).trim_end(), "retained");
-    resumed.process(b"\x1b[?47l\x1b[?1047h");
-    assert_eq!(row(&resumed, 0).trim_end(), "");
-    resumed.process(b"new\x1b[?1047l\x1b[?47h");
-    assert_eq!(row(&resumed, 0).trim_end(), "");
-    grid.process(b"\x1b[?47h\x1b[Hupdated\x1b[?47l");
-    let after = grid.snapshot(0, 3);
-    let mut replica = before.clone();
-    GridDeltaBatch::between(&before, &after)
-        .unwrap()
-        .apply_to_snapshot(&mut replica)
-        .unwrap();
-    let mut resumed = hydrate(&replica);
-    resumed.process(b"\x1b[?47h");
-    assert_eq!(row(&resumed, 0).trim_end(), "updatedd");
-}
-
-#[test]
 fn ed3_clears_only_history_and_preserves_viewport_cursor_and_style() {
     let mut grid = stream(12, 2);
     grid.process(b"old\r\nvisible\r\n\x1b[31mbottom");
@@ -148,35 +96,6 @@ fn overlapping_wide_writes_erases_inserts_deletes_and_clipping_are_valid() {
 }
 
 #[test]
-fn state_hydration_rejects_unknown_or_corrupt_representation_and_defaults_legacy() {
-    let grid = stream(12, 3);
-    let original = grid.snapshot(0, 3);
-    let mut bad = original.clone();
-    bad.terminal_state.version = 2;
-    assert!(TerminalGrid::from_snapshot(&bad, GridLimits::default()).is_err());
-    for stops in [vec![4, 4], vec![9, 4], vec![12]] {
-        bad = original.clone();
-        bad.terminal_state.tab_stops = Some(stops);
-        assert!(TerminalGrid::from_snapshot(&bad, GridLimits::default()).is_err());
-    }
-    let mut value = serde_json::to_value(&original).unwrap();
-    value.as_object_mut().unwrap().remove("terminal_state");
-    value.as_object_mut().unwrap().remove("retained_alt_rows");
-    let legacy: GridSnapshot = serde_json::from_value(value).unwrap();
-    let mut resumed = hydrate(&legacy);
-    resumed.process(b"\t");
-    assert_eq!(resumed.grid().cursor().col, 8);
-    assert!(!legacy.terminal_state.origin_mode);
-    let mut target = original.clone();
-    bad = original.clone();
-    bad.revision += 1;
-    bad.terminal_state.version = 8;
-    let delta = GridDeltaBatch::between(&original, &bad).unwrap();
-    assert!(delta.apply_to_snapshot(&mut target).is_err());
-    assert_eq!(target, original);
-}
-
-#[test]
 fn state_resize_clips_tabs_and_wide_cells_without_recreating_cleared_stops() {
     let mut grid = stream(12, 3);
     grid.process("界界界\x1b[3g\x1b[1;11H\x1bH".as_bytes());
@@ -188,34 +107,6 @@ fn state_resize_clips_tabs_and_wide_cells_without_recreating_cleared_stops() {
     resumed.resize(20, 4).unwrap();
     resumed.process(b"\r\t");
     assert_eq!(resumed.grid().cursor().col, 19);
-}
-
-#[test]
-fn retained_alternate_corruption_rejects_hydration_and_delta_atomically() {
-    let mut grid = stream(6, 2);
-    grid.process(b"\x1b[?47hX\x1b[?47l");
-    let base = grid.snapshot(0, 2);
-    for kind in 0..4 {
-        let mut corrupt = base.clone();
-        corrupt.revision += 1;
-        let rows = corrupt.retained_alt_rows.as_mut().unwrap();
-        match kind {
-            0 => {
-                rows.pop();
-            }
-            1 => rows[0].runs[0].style = crate::StyleId(999),
-            2 => rows[0].runs[0].start_col = 6,
-            _ => {
-                rows[0].runs[0].start_col = 5;
-                rows[0].runs[0].text = "界".to_owned();
-            }
-        }
-        assert!(TerminalGrid::from_snapshot(&corrupt, GridLimits::default()).is_err());
-        let delta = GridDeltaBatch::between(&base, &corrupt).unwrap();
-        let mut replica = base.clone();
-        assert!(delta.apply_to_snapshot(&mut replica).is_err());
-        assert_eq!(replica, base);
-    }
 }
 
 #[test]

@@ -1,15 +1,15 @@
 use crate::connection::{TerminalMouseButton, TerminalMouseEvent, TerminalMouseEventKind};
 use crate::error::{MobileCoreError, Result};
 use crate::pane_runtime_client::{
-    PaneRuntimeClientExt, attach_pane_grid_delta_state_streaming,
-    attach_pane_grid_snapshot_state_streaming,
+    PaneRuntimeClientExt, attach_pane_frames_streaming, attach_pane_grid_snapshot_state_streaming,
+    reset_attach_pane_frames_streaming,
 };
 use crate::target::{TargetRecord, TargetTransport};
-use bmux_attach_layout_protocol::{AttachPaneChunk, AttachRect};
+use bmux_attach_layout_protocol::AttachRect;
 use bmux_attach_pipeline::mouse as attach_mouse;
 use bmux_attach_pipeline::render::visible_scene_pane_ids;
-use bmux_attach_pipeline::scene_pipeline::{AttachPaneGridDeltaState, AttachPaneGridSnapshotState};
-use bmux_attach_pipeline::{AttachChunkApplyOutcome, AttachScenePipeline, AttachViewport};
+use bmux_attach_pipeline::scene_pipeline::{AttachPaneFrameState, AttachPaneGridSnapshotState};
+use bmux_attach_pipeline::{AttachScenePipeline, AttachViewport};
 use bmux_attach_view_protocol::AttachViewComponent;
 use bmux_client::{BmuxClient, ClientError, ServerEvent, StreamingBmuxClient};
 use bmux_ipc::ErrorCode;
@@ -39,7 +39,8 @@ const IROH_COMPRESSED_RETRY_COUNT: usize = 0;
 const OUTPUT_QUEUE_MAX_BYTES: usize = 4 * 1024 * 1024;
 const EVENT_TRIGGER_FETCH_MAX_BYTES: usize = 256 * 1024;
 const GRID_SNAPSHOT_MAX_ROWS_PER_PANE: usize = 100_000;
-const GRID_DELTA_MAX_BATCHES_PER_PANE: usize = 256;
+/// History lines a pane's first frame carries at most; older lines stay on the server.
+const FRAME_MAX_HISTORY_LINES: usize = 2_000;
 const SESSION_KEEPALIVE_INTERVAL_MS: u64 = 10_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1545,31 +1546,7 @@ async fn handle_pane_runtime_event(
         } if event_session_id == session_id => {
             let pane_ids = state.visible_pane_ids();
             if !pane_ids.is_empty() {
-                let batch = client
-                    .attach_pane_output_batch(
-                        session_id,
-                        pane_ids.clone(),
-                        EVENT_TRIGGER_FETCH_MAX_BYTES,
-                    )
-                    .await
-                    .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()))?;
-                let mut desynced = false;
-                for chunk in batch.chunks {
-                    let pane_id = chunk.pane_id;
-                    let outcome = state.apply_chunk(&chunk);
-                    if matches!(outcome, AttachChunkApplyOutcome::Desync) {
-                        desynced = true;
-                        recover_desynced_pane(client, state, session_id, pane_id).await?;
-                    }
-                }
-                if !desynced {
-                    match apply_visible_grid_deltas(client, state, session_id, pane_ids).await {
-                        Ok(true) => {}
-                        Ok(false) | Err(_) => {
-                            hydrate_full_scene_snapshot(client, state, session_id).await?;
-                        }
-                    }
-                }
+                apply_visible_frames(client, state, session_id, pane_ids).await?;
             }
         }
         pane_runtime_events::PaneEvent::AttachViewChanged {
@@ -1642,42 +1619,52 @@ async fn hydrate_visible_grid_snapshots(
     state.hydrate_grid_snapshots(decoded)
 }
 
-async fn apply_visible_grid_deltas(
+/// Bring the replicas of `pane_ids` level with their grids through frames. A pane whose frame
+/// does not apply starts over from a reset frame.
+async fn apply_visible_frames(
     client: &mut StreamingBmuxClient,
     state: &mut StreamOutputState,
     session_id: Uuid,
     pane_ids: Vec<Uuid>,
-) -> Result<bool> {
-    if pane_ids.is_empty() {
-        return Ok(true);
-    }
-    let base_revisions = state.pane_grid_revisions(&pane_ids);
-    let deltas = attach_pane_grid_delta_state_streaming(
-        client,
-        session_id,
-        pane_ids,
-        base_revisions,
-        GRID_DELTA_MAX_BATCHES_PER_PANE,
-    )
-    .await
-    .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()))?;
-    if deltas.iter().any(|delta| delta.desynced) {
-        return Ok(false);
-    }
-    let decoded = deltas
-        .into_iter()
-        .map(|delta| {
-            let batches =
-                serde_json::from_slice::<Vec<bmux_terminal_grid::GridDeltaBatch>>(&delta.encoded)
-                    .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()))?;
-            Ok::<AttachPaneGridDeltaState, MobileCoreError>(AttachPaneGridDeltaState {
-                pane_id: delta.pane_id,
-                batches,
+) -> Result<()> {
+    let backend = |error: ClientError| MobileCoreError::TerminalBackendFailure(error.to_string());
+    loop {
+        let (frames, still_pending) = attach_pane_frames_streaming(
+            client,
+            session_id,
+            pane_ids.clone(),
+            FRAME_MAX_HISTORY_LINES,
+        )
+        .await
+        .map_err(backend)?;
+        let mut undecodable = Vec::new();
+        let decoded = frames
+            .into_iter()
+            .filter_map(|frame| {
+                if let Ok(decoded) = bmux_ipc::decode(&frame.encoded) {
+                    Some(AttachPaneFrameState {
+                        pane_id: frame.pane_id,
+                        sync_update_active: frame.sync_update_active,
+                        frame: decoded,
+                    })
+                } else {
+                    undecodable.push(frame.pane_id);
+                    None
+                }
             })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    state.apply_grid_deltas(decoded)?;
-    Ok(true)
+            .collect();
+        let mut failed = state.apply_frames(decoded);
+        failed.extend(undecodable);
+        if !failed.is_empty() {
+            reset_attach_pane_frames_streaming(client, session_id, failed)
+                .await
+                .map_err(backend)?;
+            continue;
+        }
+        if !still_pending {
+            return Ok(());
+        }
+    }
 }
 
 async fn hydrate_full_scene_snapshot(
@@ -1692,23 +1679,6 @@ async fn hydrate_full_scene_snapshot(
     state.hydrate_snapshot(snapshot);
     hydrate_visible_grid_snapshots(client, state, session_id).await?;
     Ok(())
-}
-
-async fn recover_desynced_pane(
-    client: &mut StreamingBmuxClient,
-    state: &mut StreamOutputState,
-    session_id: Uuid,
-    pane_id: Uuid,
-) -> Result<()> {
-    if let Ok(snapshot) = client
-        .attach_pane_snapshot(session_id, vec![pane_id], EVENT_TRIGGER_FETCH_MAX_BYTES)
-        .await
-    {
-        state.hydrate_pane_snapshot(&[pane_id], snapshot);
-        return hydrate_visible_grid_snapshots(client, state, session_id).await;
-    }
-
-    hydrate_full_scene_snapshot(client, state, session_id).await
 }
 
 struct StreamOutputState {
@@ -1754,22 +1724,8 @@ impl StreamOutputState {
             .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()))
     }
 
-    fn apply_grid_deltas(&mut self, deltas: Vec<AttachPaneGridDeltaState>) -> Result<()> {
-        self.pipeline
-            .apply_pane_grid_deltas(deltas)
-            .map_err(|error| MobileCoreError::TerminalBackendFailure(error.to_string()))
-    }
-
-    fn pane_grid_revisions(&self, pane_ids: &[Uuid]) -> Vec<u64> {
-        self.pipeline.pane_grid_revisions(pane_ids)
-    }
-
-    fn hydrate_pane_snapshot(
-        &mut self,
-        pane_ids: &[Uuid],
-        snapshot: bmux_client::AttachPaneSnapshotState,
-    ) {
-        self.pipeline.hydrate_pane_snapshot(pane_ids, snapshot);
+    fn apply_frames(&mut self, frames: Vec<AttachPaneFrameState>) -> Vec<Uuid> {
+        self.pipeline.apply_pane_frames(frames)
     }
 
     fn apply_layout_state(&mut self, layout_state: bmux_client::AttachLayoutState) -> bool {
@@ -1778,10 +1734,6 @@ impl StreamOutputState {
 
     fn apply_view_change_components(&mut self, components: &[AttachViewComponent]) -> bool {
         self.pipeline.apply_view_change_components(components)
-    }
-
-    fn apply_chunk(&mut self, chunk: &AttachPaneChunk) -> AttachChunkApplyOutcome {
-        self.pipeline.apply_chunk(chunk)
     }
 
     fn visible_pane_ids(&self) -> Vec<Uuid> {
@@ -2149,7 +2101,7 @@ mod tests {
     }
 
     #[test]
-    fn native_pointer_snapshot_delta_and_repair_share_retained_resolution() {
+    fn native_pointer_snapshot_frame_and_repair_share_retained_resolution() {
         use crate::pointer_output::TerminalPointerShape;
         use bmux_terminal_grid::{GridLimits, TerminalGridStream};
         use bmux_terminal_protocol::pointer_shape::PointerShape;
@@ -2172,14 +2124,19 @@ mod tests {
             state.take_pointer_output(1).unwrap().unwrap().shape,
             TerminalPointerShape::Shape(PointerShape::Pointer)
         );
-        let delta = producer.process_delta(b"\x1b]22;crosshair\x07").unwrap();
-        state
-            .apply_grid_deltas(vec![AttachPaneGridDeltaState {
+        producer.process(b"\x1b]22;crosshair\x07");
+        let frame = producer
+            .grid_mut()
+            .frame_since(bmux_terminal_grid::ReplicaCursor::default(), usize::MAX);
+        assert_eq!(
+            state.apply_frames(vec![AttachPaneFrameState {
                 pane_id,
-                batches: vec![delta],
-            }])
-            .unwrap();
-        state.resolve_pointer(); // stationary pointer, protocol-only delta
+                sync_update_active: false,
+                frame,
+            }]),
+            Vec::<Uuid>::new()
+        );
+        state.resolve_pointer(); // stationary pointer, protocol-only change
         assert_eq!(
             state.take_pointer_output(1).unwrap().unwrap().shape,
             TerminalPointerShape::Shape(PointerShape::Crosshair)

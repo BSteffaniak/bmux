@@ -56,8 +56,8 @@ interface pane-runtime-pointer-grid-v1 {
         -> result<attach-runtime-state.attach-pane-grid-snapshot, attach-runtime-state.attach-state-error>;
     command snapshot(format_version: u32, session_id: uuid, pane_id: uuid, max_rows: u32)
         -> result<attach-runtime-state.pane-grid-snapshot, attach-runtime-state.attach-state-error>;
-    command deltas(format_version: u32, session_id: uuid, pane_ids: list<uuid>, base_revisions: list<u64>, max_batches_per_pane: u32)
-        -> result<attach-runtime-state.attach-pane-grid-delta, attach-runtime-state.attach-state-error>;
+    command frames(format_version: u32, session_id: uuid, pane_ids: list<uuid>, max_history_lines: u32)
+        -> result<attach-runtime-state.attach-pane-frames, attach-runtime-state.attach-state-error>;
     command windows(format_version: u32, session_id: uuid, windows: list<attach-runtime-state.pane-grid-window-request>)
         -> result<attach-runtime-state.attach-pane-grid-window, attach-runtime-state.attach-state-error>;
     command screen(format_version: u32, execution: pane-runtime-execution-v4.terminal-execution-ref)
@@ -1287,16 +1287,24 @@ interface attach-runtime-state {
         windows: list<pane-grid-window>,
     }
 
-    record pane-grid-delta {
+    record pane-frame {
         pane_id: uuid,
-        base_revision: u64,
-        revision: u64,
-        desynced: bool,
+        // The program is inside a synchronized update (DEC mode 2026) as of this frame: hold
+        // rendering until it ends or times out.
+        sync_update_active: bool,
+        // A `bmux_terminal_grid::GridFrame`, encoded with `bmux_ipc::encode`.
         encoded: list<u8>,
     }
 
-    record attach-pane-grid-delta {
-        deltas: list<pane-grid-delta>,
+    record attach-pane-frames {
+        frames: list<pane-frame>,
+        // A response budget was reached: call again for the rest.
+        frames_still_pending: bool,
+    }
+
+    record attach-pane-frames-reset {
+        // Panes whose replicas start over.
+        panes: u32,
     }
 
     record attach-pane-images {
@@ -1394,12 +1402,32 @@ interface attach-runtime-state {
         pin_id: u64,
     ) -> result<pane-scrollback-unpin-ack, attach-state-error>;
 
-    query attach-pane-grid-delta-state(
+    // Frames bringing the caller's replicas of `pane_ids` level with their grids, without the
+    // client parsing pane output: one for each pane whose grid changed since the caller's last
+    // frame of it, a reset frame for a pane it has none of yet (at most `max_history_lines`
+    // history lines in a reset frame). A client applies each in order to its replica.
+    query attach-pane-frames(
         session_id: uuid,
         pane_ids: list<uuid>,
-        base_revisions: list<u64>,
-        max_batches_per_pane: u32,
-    ) -> result<attach-pane-grid-delta, attach-state-error>;
+        max_history_lines: u32,
+    ) -> result<attach-pane-frames, attach-state-error>;
+
+    // Start the caller's replicas of `pane_ids` over, as after a frame it could not apply: each
+    // next frame is a reset frame.
+    query attach-pane-frames-reset(
+        session_id: uuid,
+        pane_ids: list<uuid>,
+    ) -> result<attach-pane-frames-reset, attach-state-error>;
+
+    // Push the caller's frames for `pane_ids` instead of it calling attach-pane-frames: whenever
+    // a pane changed and the client can take a message, the server sends an encoded
+    // attach-pane-frames, plugin bus kind "bmux.pane_runtime/frame-push". Each call replaces the
+    // set of panes; an empty list stops pushing.
+    query attach-pane-frame-push(
+        session_id: uuid,
+        pane_ids: list<uuid>,
+        max_history_lines: u32,
+    ) -> result<attach-pane-output-push, attach-state-error>;
 
     record history-images-v1 {
         capture_id: uuid,

@@ -64,20 +64,10 @@ fn every_split(bytes: &[u8]) {
 
     for split in 0..=bytes.len() {
         let mut source = stream();
-        let mut replica = stream();
         let mut protocol = TerminalProtocolTracker::new();
         let first_toggle = protocol.process(&bytes[..split]).toggled_alternate;
-        if let Some(delta) = source.process_delta(&bytes[..split]) {
-            let wire = serde_json::to_vec(&delta).unwrap();
-            replica
-                .apply_delta(
-                    &serde_json::from_slice(&wire).unwrap(),
-                    GridLimits::default(),
-                )
-                .unwrap();
-        }
+        source.process(&bytes[..split]);
         let prefix = wire_snapshot(&capture(&source));
-        assert_eq!(capture(&replica), prefix, "delta prefix {split}: {bytes:?}");
         assert_protocol(&source, &protocol);
         let mut hydrated =
             TerminalGridStream::from_snapshot(&prefix, GridLimits::default()).unwrap();
@@ -96,12 +86,9 @@ fn every_split(bytes: &[u8]) {
             "protocol restore {split}: {bytes:?}"
         );
         assert_eq!(first_toggle || second_toggle, expected_toggle);
-        if let Some(delta) = source.process_delta(&bytes[split..]) {
-            replica.apply_delta(&delta, GridLimits::default()).unwrap();
-        }
+        source.process(&bytes[split..]);
         hydrated.process(&bytes[split..]);
         let actual = capture(&source);
-        assert_eq!(capture(&replica), actual, "delta suffix {split}: {bytes:?}");
         assert_eq!(
             capture(&hydrated),
             actual,
@@ -203,7 +190,6 @@ fn bytewise_and_seeded_chunks_restore_after_each_prefix() {
     for seed in [0_u32, 1, 7, 0x5eed] {
         let mut source = stream();
         let mut hydrated = stream();
-        let mut replica = stream();
         let mut tracker = TerminalProtocolTracker::new();
         let mut restored = TerminalProtocolTracker::new();
         let mut state = seed;
@@ -219,13 +205,10 @@ fn bytewise_and_seeded_chunks_restore_after_each_prefix() {
             let chunk = &bytes[offset..end];
             let live_outcome = tracker.process(chunk);
             assert_eq!(restored.process(chunk), live_outcome);
-            if let Some(delta) = source.process_delta(chunk) {
-                replica.apply_delta(&delta, GridLimits::default()).unwrap();
-            }
+            source.process(chunk);
             hydrated.process(chunk);
             let snapshot = wire_snapshot(&capture(&source));
             assert_eq!(capture(&hydrated), snapshot, "seed {seed}, prefix {end}");
-            assert_eq!(capture(&replica), snapshot, "seed {seed}, delta {end}");
             assert_protocol(&source, &tracker);
             assert_protocol(&source, &restored);
             hydrated = TerminalGridStream::from_snapshot(&snapshot, GridLimits::default()).unwrap();
@@ -235,45 +218,6 @@ fn bytewise_and_seeded_chunks_restore_after_each_prefix() {
         }
         assert_eq!(semantic(capture(&source)), expected, "seed {seed}");
     }
-}
-
-#[test]
-fn prefix_only_delta_advances_revision_without_dirty_rows() {
-    let mut source = stream();
-    let mut replica = stream();
-    let before = capture(&source);
-    assert!(source.process_delta(b"").is_none());
-    assert_eq!(capture(&source), before);
-    for prefix in [b"\x1b".as_slice(), b"[", b"3", b"1"] {
-        let before = capture(&source);
-        let delta = source
-            .process_delta(prefix)
-            .expect("changed prefix is replicated");
-        assert_eq!(delta.base_revision, before.revision);
-        assert!(delta.revision > before.revision);
-        assert_eq!(delta.content_revision, before.content_revision);
-        assert!(!delta.reset_rows);
-        assert!(
-            delta.row_updates.is_empty(),
-            "prefix does not dirty visible rows"
-        );
-        replica.apply_delta(&delta, GridLimits::default()).unwrap();
-        assert_eq!(capture(&replica), capture(&source));
-        let hydrated = TerminalGridStream::from_snapshot(
-            &wire_snapshot(&capture(&source)),
-            GridLimits::default(),
-        )
-        .unwrap();
-        assert_eq!(capture(&hydrated), capture(&source));
-    }
-    let delta = source.process_delta(b"mR").unwrap();
-    assert_ne!(
-        delta.row_updates,
-        [] as [crate::delta::RowUpdateSnapshot; 0]
-    );
-    assert!(delta.content_revision > before.content_revision);
-    replica.apply_delta(&delta, GridLimits::default()).unwrap();
-    assert_eq!(capture(&replica), capture(&source));
 }
 
 #[test]
@@ -327,30 +271,6 @@ fn cancelled_strings_must_not_replay_printed_suffix_on_restore() {
 }
 
 #[test]
-fn rejected_delta_keeps_existing_prefix_for_retry() {
-    let mut source = stream();
-    let mut replica = stream();
-    let first = source.process_delta(b"\x1b[3").unwrap();
-    replica.apply_delta(&first, GridLimits::default()).unwrap();
-    let before = capture(&replica);
-    let valid = source.process_delta(b"1mR").unwrap();
-    let mut invalid = valid.clone();
-    invalid.base_revision = invalid.base_revision.saturating_add(1);
-    assert!(
-        replica
-            .apply_delta(&invalid, GridLimits::default())
-            .is_err()
-    );
-    assert_eq!(capture(&replica), before);
-    // Continue the retained parser independently, not merely retry hydration.
-    let mut continued = TerminalGridStream::from_snapshot(&before, GridLimits::default()).unwrap();
-    continued.process(b"1mR");
-    replica.process(b"1mR");
-    assert_eq!(capture(&replica), capture(&continued));
-    assert_eq!(capture(&replica), capture(&source));
-}
-
-#[test]
 fn embedded_csi_controls_restore_grid_and_protocol_without_reexecution() {
     // LF/VT/FF advance rows; CR/BS/HT alter the cursor; SO/SI mutate charset
     // state. Every prefix is JSON-hydrated and delta-applied by every_split,
@@ -396,7 +316,6 @@ fn escape_controls_preserve_every_split_continuation() {
 fn bounded_long_prefix_case(introducer: &[u8], fill: u8, suffix: &[u8]) {
     let mut source = stream();
     let mut hydrated = stream();
-    let mut replica = stream();
     let mut tracker = TerminalProtocolTracker::new();
     let mut restored = TerminalProtocolTracker::new();
     let chunk = [fill; 1024];
@@ -409,10 +328,7 @@ fn bounded_long_prefix_case(introducer: &[u8], fill: u8, suffix: &[u8]) {
     {
         let outcome = tracker.process(bytes);
         assert_eq!(restored.process(bytes), outcome);
-        if let Some(delta) = source.process_delta(bytes) {
-            assert!(delta.pending_bytes.len() <= REPLAY_PREFIX_BOUND);
-            replica.apply_delta(&delta, GridLimits::default()).unwrap();
-        }
+        source.process(bytes);
         hydrated.process(bytes);
         let prefix = wire_snapshot(&capture(&source));
         assert!(
@@ -421,7 +337,6 @@ fn bounded_long_prefix_case(introducer: &[u8], fill: u8, suffix: &[u8]) {
             prefix.pending_bytes.len()
         );
         assert_eq!(capture(&hydrated), prefix);
-        assert_eq!(capture(&replica), prefix);
         assert_protocol(&source, &tracker);
         assert_protocol(&source, &restored);
         for budget in [0, 1] {
@@ -446,12 +361,9 @@ fn bounded_long_prefix_case(introducer: &[u8], fill: u8, suffix: &[u8]) {
     }
     let outcome = tracker.process(suffix);
     assert_eq!(restored.process(suffix), outcome);
-    if let Some(delta) = source.process_delta(suffix) {
-        replica.apply_delta(&delta, GridLimits::default()).unwrap();
-    }
+    source.process(suffix);
     hydrated.process(suffix);
     assert_eq!(capture(&hydrated), capture(&source));
-    assert_eq!(capture(&replica), capture(&source));
     assert_protocol(&source, &tracker);
     assert_protocol(&source, &restored);
     assert!(source.grid().protocol_state().bracketed_paste);

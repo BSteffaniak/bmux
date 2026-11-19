@@ -10,7 +10,6 @@
 #![allow(clippy::module_name_repetitions)]
 
 mod charset;
-mod delta;
 pub use charset::CharacterState;
 mod frozen;
 pub use frozen::FrozenContentRows;
@@ -35,11 +34,10 @@ mod state_regression_tests;
 mod rendition_regression_tests;
 
 #[cfg(test)]
-mod stream_compat_tests;
-#[cfg(test)]
 mod frame_tests;
+#[cfg(test)]
+mod stream_compat_tests;
 
-pub use delta::{GridDeltaApplyError, GridDeltaBatch, RowUpdateSnapshot};
 pub use model::{
     Cell, ContentAnchor, ContentBudget, ContentCursor, ContentPosition, ContentProjection,
     ContentRowSource, ContentRows, ContentSelectionRow, Cursor, FrameApplyError, FrameCell,
@@ -51,7 +49,7 @@ pub use model::{
 };
 pub use parser::{
     HeaderValues, IgnoreSequences, MAX_OBSERVED_DCS_BYTES, ProtocolProcessOutcome, SequenceHeader,
-    SequenceObserver, TerminalGridStream, TerminalGridStreamDeltaError, TerminalProtocolTracker,
+    SequenceObserver, TerminalGridStream, TerminalProtocolTracker,
 };
 pub use render::{
     content_text, full_screen_repaint_bytes, row_text, visible_text, visible_text_lines,

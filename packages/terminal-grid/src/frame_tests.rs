@@ -42,7 +42,7 @@ fn burst(rng: &mut Rng, out: &mut Vec<u8>) {
         "~$ ",
         "─┼─",
     ];
-    match rng.below(20) {
+    match rng.below(26) {
         0..=5 => {
             for _ in 0..rng.below(12) {
                 out.extend_from_slice(words[rng.pick(8)].as_bytes());
@@ -100,6 +100,32 @@ fn burst(rng: &mut Rng, out: &mut Vec<u8>) {
         16 => out.extend_from_slice(b"\x1b[r\x1bM\x1bD\x1bE"),
         17 => out.extend_from_slice(if rng.chance(20) { b"\x1bc" } else { b"\x1b[!p" }),
         18 => out.extend_from_slice(b"\x1b7\x1b[5;5H\x1b[4hins\x1b[4l\x1b8"),
+        19 => out.extend_from_slice(
+            [&b"\x1b(0lqk\x1b(B"[..], b"\x1b)0\x0eaq\x0f", b"\x1b(B\x0f"][rng.pick(3)],
+        ),
+        20 => out.extend_from_slice(
+            [
+                &b"\x1bH"[..],
+                b"\x1b[g",
+                b"\x1b[3g",
+                b"\t\t",
+                b"\x1b[2I",
+                b"\x1b[Z",
+            ][rng.pick(6)],
+        ),
+        21 => out.extend_from_slice(
+            [&b"\x1b[?6h"[..], b"\x1b[?6l", b"\x1b[?7l", b"\x1b[?7h"][rng.pick(4)],
+        ),
+        22 => out.extend_from_slice(
+            [
+                &b"\x1b]22;pointer\x07"[..],
+                b"\x1b]22;>crosshair\x07",
+                b"\x1b]22;<\x07",
+                b"\x1b]22;\x07",
+            ][rng.pick(4)],
+        ),
+        23 => out.extend_from_slice(b"\xff\xfe\xe7\x95"),
+        24 => out.extend_from_slice(format!("\x1b[{}G\x1b[1;3m", rng.below(120)).as_bytes()),
         _ => out.extend_from_slice(b"\x1b[?25l\x1b[?2004h\x1b[?1000h\x1b[?25h"),
     }
 }
@@ -191,8 +217,9 @@ fn replicas_stay_level_with_their_source_through_random_output() {
     for seed in 1..=24_u64 {
         let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         let (mut cols, mut rows) = (90_u16, 30_u16);
+        // Grids that keep no history, a little, and plenty.
         let limits = GridLimits {
-            scrollback_rows: 500,
+            scrollback_rows: [0, 3, 500][usize::try_from(seed % 3).unwrap_or(0)],
         };
         let mut source = TerminalGridStream::new(cols, rows, limits).unwrap();
         let (mut eager, mut lazy) = (Replica::new(), Replica::new());
@@ -290,7 +317,7 @@ fn a_capped_first_frame_sends_recent_history_and_marks_the_rest_truncated() {
         .apply_frame(&frame, &mut replica.cursor)
         .unwrap();
     assert_eq!(replica.grid.history_line_count(), 10);
-    assert!(replica.grid.snapshot(0, 100).history_truncated == Some(true));
+    assert_eq!(replica.grid.snapshot(0, 100).history_truncated, Some(true));
     // Later frames carry what is new; the replica keeps the recent lines it was sent.
     source.process(b"new\r\n");
     let frame = source.grid_mut().frame_since(replica.cursor, 10);

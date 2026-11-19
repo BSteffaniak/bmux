@@ -34,13 +34,12 @@ impl TypedDispatchClient for GridDispatch {
                         assert_eq!(request.pane_ids, vec![self.pane_id]);
                         assert_eq!(request.max_rows_per_pane, 2);
                     }
-                    "deltas" => {
-                        let request: pointer_grid::client::DeltasRequest =
+                    "frames" => {
+                        let request: pointer_grid::client::FramesRequest =
                             bmux_plugin_sdk::decode_service_message(&payload).unwrap();
                         assert_eq!(request.format_version, 1);
                         assert_eq!(request.pane_ids, vec![self.pane_id]);
-                        assert_eq!(request.base_revisions, vec![7]);
-                        assert_eq!(request.max_batches_per_pane, 4);
+                        assert_eq!(request.max_history_lines, 4);
                     }
                     _ => panic!("unexpected legacy fallback: {operation}"),
                 }
@@ -100,19 +99,21 @@ fn generated_snapshot_transport_preserves_complete_pointer_recovery_state() {
 }
 
 #[test]
-fn generated_delta_transport_preserves_pointer_stacks_and_revision_repair() {
-    use bmux_terminal_grid::{GridDeltaBatch, GridLimits, TerminalGridStream};
+fn generated_frame_transport_carries_frames_that_apply() {
+    use bmux_terminal_grid::{GridLimits, ReplicaCursor, TerminalGrid, TerminalGridStream};
     let pane_id = Uuid::new_v4();
     let mut producer = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
-    let delta = producer.process_delta(b"\x1b]22;pointer\x07").unwrap();
-    let response = Ok::<_, attach_state::AttachStateError>(attach_state::AttachPaneGridDelta {
-        deltas: vec![attach_state::PaneGridDelta {
+    producer.process(b"hi\x1b]22;pointer\x07");
+    let frame = producer
+        .grid_mut()
+        .frame_since(ReplicaCursor::default(), usize::MAX);
+    let response = Ok::<_, attach_state::AttachStateError>(attach_state::AttachPaneFrames {
+        frames: vec![attach_state::PaneFrame {
             pane_id,
-            base_revision: 7,
-            revision: 8,
-            desynced: false,
-            encoded: serde_json::to_vec(&vec![delta.clone()]).unwrap(),
+            sync_update_active: true,
+            encoded: bmux_ipc::encode(&frame).unwrap(),
         }],
+        frames_still_pending: false,
     });
     let mut dispatch = GridDispatch {
         pane_id,
@@ -120,20 +121,25 @@ fn generated_delta_transport_preserves_pointer_stacks_and_revision_repair() {
         reject: false,
         calls: 0,
     };
-    let received = runtime()
-        .block_on(attach_pane_grid_delta_state_streaming(
+    let (received, pending) = runtime()
+        .block_on(attach_pane_frames_streaming(
             &mut dispatch,
             Uuid::nil(),
             vec![pane_id],
-            vec![7],
             4,
         ))
         .unwrap();
-    let decoded: Vec<GridDeltaBatch> = serde_json::from_slice(&received[0].encoded).unwrap();
-    assert_eq!(decoded, vec![delta]);
-    assert_eq!(received[0].base_revision, 7);
-    assert_eq!(received[0].revision, 8);
-    assert!(!received[0].desynced);
+    assert!(!pending);
+    assert!(received[0].sync_update_active);
+    let decoded: bmux_terminal_grid::GridFrame = bmux_ipc::decode(&received[0].encoded).unwrap();
+    let mut replica = TerminalGrid::new(1, 1, GridLimits::default()).unwrap();
+    replica
+        .apply_frame(&decoded, &mut ReplicaCursor::default())
+        .unwrap();
+    assert_eq!(
+        replica.snapshot(0, 2).rows,
+        producer.grid().snapshot(0, 2).rows
+    );
     assert_eq!(dispatch.calls, 1);
 }
 
@@ -160,11 +166,10 @@ fn unsupported_pointer_representation_does_not_retry_legacy_transport() {
     assert_eq!(dispatch.calls, 1);
     assert!(
         runtime
-            .block_on(attach_pane_grid_delta_state_streaming(
+            .block_on(attach_pane_frames_streaming(
                 &mut dispatch,
                 Uuid::nil(),
                 vec![pane_id],
-                vec![7],
                 4,
             ))
             .is_err()

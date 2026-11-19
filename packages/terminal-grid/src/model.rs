@@ -4148,10 +4148,6 @@ impl TerminalGrid {
         Some(bytes)
     }
 
-    pub(crate) fn retained_history_line_count(&self) -> usize {
-        self.main_history.len()
-    }
-
     fn evict_excess_history(&mut self) {
         self.evict_history_to_budget(8 * 1024 * 1024);
     }
@@ -5178,7 +5174,6 @@ mod tests {
                     assert_eq!(recovered.snapshot(offset, 2).rows, window.rows);
                 }
                 let mut continued = resized.clone();
-                let mut replica = full.clone();
                 for output in [
                     b"more\r\nnext".as_slice(),
                     b"\x1b[?1049htui",
@@ -5186,11 +5181,7 @@ mod tests {
                 ] {
                     continued.process(output);
                     recovered.process(output);
-                    let after = continued.snapshot(0, 20_010);
-                    let delta = crate::GridDeltaBatch::between(&replica, &after).unwrap();
-                    delta.apply_to_snapshot(&mut replica).unwrap();
-                    assert_eq!(replica, after);
-                    assert_eq!(recovered.snapshot(0, 20_010), after);
+                    assert_eq!(recovered.snapshot(0, 20_010), continued.snapshot(0, 20_010));
                 }
             }
         }
