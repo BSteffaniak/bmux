@@ -144,7 +144,23 @@ impl ImageInterceptor {
         #[allow(unused_mut)]
         let mut events = Vec::new();
 
-        for &byte in input {
+        let mut index = 0;
+        while index < input.len() {
+            // Text in ground passes through as it is: copy it up to the next ESC, CAN or SUB at
+            // once rather than byte by byte.
+            if matches!(self.state, State::Ground) {
+                let run = input[index..]
+                    .iter()
+                    .position(|byte| matches!(byte, 0x1B | 0x18 | 0x1A))
+                    .unwrap_or(input.len() - index);
+                filtered.extend_from_slice(&input[index..index + run]);
+                index += run;
+                if index == input.len() {
+                    break;
+                }
+            }
+            let byte = input[index];
+            index += 1;
             if matches!(byte, 0x18 | 0x1A) {
                 // CAN/SUB cancel an in-flight control string, including one
                 // being discarded for exceeding its budget. Preserve the

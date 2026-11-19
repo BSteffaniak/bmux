@@ -5041,6 +5041,11 @@ struct SyncUpdateMarks {
 impl SyncUpdateMarks {
     const PREFIX: &'static [u8] = b"\x1b[?2026";
 
+    /// Whether no part of the sequence is matched: a byte other than ESC then matches nothing.
+    const fn idle(&self) -> bool {
+        self.matched == 0
+    }
+
     /// Feed one stream byte; `after` is the stream offset just after it.
     fn scan(&mut self, byte: u8, after: u64) {
         if self.matched == Self::PREFIX.len() {
@@ -5184,7 +5189,17 @@ impl OutputFanoutBuffer {
         // correctly handles it.  The unsafe region begins at the byte AFTER
         // the ESC (e.g. the `[` in CSI, the `]` in OSC) and extends to the
         // byte after the final/terminator byte.
-        for (i, &byte) in chunk.iter().enumerate() {
+        let mut i = 0;
+        while i < chunk.len() {
+            // Text between escapes changes neither the phase nor the marks: jump to the next
+            // ESC (CAN and SUB abort only sequences, and ground is no sequence).
+            if self.esc_phase.is_ground() && self.sync_updates.idle() {
+                match chunk[i..].iter().position(|&byte| byte == 0x1b) {
+                    Some(skip) => i += skip,
+                    None => break,
+                }
+            }
+            let byte = chunk[i];
             self.sync_updates.scan(byte, base_offset + i as u64 + 1);
             let prev = self.esc_phase;
             self.esc_phase = prev.advance(byte);
@@ -5202,6 +5217,7 @@ impl OutputFanoutBuffer {
                     last.1 = base_offset + i as u64 + 1;
                 }
             }
+            i += 1;
         }
 
         let mut contention_retries = 0;
