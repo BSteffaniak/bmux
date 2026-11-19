@@ -4,7 +4,7 @@ In each checkout's configured dev shell, build a distinct executable:
   old (pinned shipping SHA, copy ONLY examples/interop_peer.rs into the crate):
     cargo build --locked -p bmux_clipboard --example interop_peer
   candidate:
-    cargo build --locked -p bmux_clipboard --example interop_peer --features native-clipboard
+    cargo build --locked -p bmux_clipboard --example interop_peer
 Copy each resulting executable before building the next if targets are shared.
 From the disposable session, set BMUX_CLIPBOARD_ISOLATED_TEST=1, then run:
   python3 packages/clipboard/tests/interop.py /path/to/old-peer /path/to/new-peer

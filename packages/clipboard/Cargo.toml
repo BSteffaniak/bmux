@@ -28,5 +28,3 @@ tempfile = { workspace = true }
 [features]
 default          = []
 fail-on-warnings = []
-# Retained for downstream manifests; the native backend is always compiled.
-native-clipboard = []

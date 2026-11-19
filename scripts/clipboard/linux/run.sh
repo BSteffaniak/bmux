@@ -8,8 +8,7 @@ set -euo pipefail
 lane=$(cd "$(dirname "$0")" && pwd)
 unset DISPLAY WAYLAND_DISPLAY WAYLAND_SOCKET XAUTHORITY SWAYSOCK DBUS_SESSION_BUS_ADDRESS
 case ${1:-} in
-  shipping) features=();;
-  candidate) features=(--features native-clipboard);;
+  shipping|candidate) ;;
   *) echo 'expected shipping or candidate' >&2; exit 2;;
 esac
 # Extract shipping directly from Git: never benchmark a dirty checkout as the reference.
@@ -29,9 +28,9 @@ pkgs="github:NixOS/nixpkgs/$rev"
 nix develop --no-write-lock-file --command bash -eu -o pipefail -c '
   lane=$1; pkgs=$2; shift 2
   rustc -Vv
-  cargo build --locked -p bmux_clipboard --example lane_probe "$@"
+  cargo build --locked -p bmux_clipboard --example lane_probe
   probe=${CARGO_TARGET_DIR:?}/debug/examples/lane_probe
   export BMUX_LANE_NIXPKGS="$pkgs"
   python=$(nix build --no-link --print-out-paths --impure --expr '\''let pkgs = (builtins.getFlake (builtins.getEnv "BMUX_LANE_NIXPKGS")).legacyPackages.${builtins.currentSystem}; in pkgs.python3.withPackages (p: [ p.pillow ])'\'')
   nix shell "$pkgs#xorg-server" "$pkgs#xauth" "$pkgs#xclip" "$pkgs#sway" "$pkgs#wl-clipboard" --command "$python/bin/python3" "$lane/interop.py" "$probe"
-' _ "$lane" "$pkgs" "${features[@]}"
+' _ "$lane" "$pkgs"

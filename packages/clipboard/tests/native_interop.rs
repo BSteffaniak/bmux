@@ -1,5 +1,4 @@
 //! Native interoperability checks must run only on an explicitly isolated display.
-#![cfg(feature = "native-clipboard")]
 
 use bmux_clipboard::{ClipboardPayload, copy_png_image, native_text, read_payload};
 

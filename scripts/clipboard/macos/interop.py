@@ -56,7 +56,7 @@ arboard = {{ path = "arboard-{version}", default-features = false, features = ["
 def main():
     if sys.platform != "darwin" or not os.getenv("IN_NIX_SHELL"):
         sys.exit("requires macOS in the repository Nix shell")
-    native = build(["test", "--locked", "-p", "bmux_clipboard", "--features", "native-clipboard", "--lib", "--no-run"], ROOT, "bmux_clipboard")
+    native = build(["test", "--locked", "-p", "bmux_clipboard", "--lib", "--no-run"], ROOT, "bmux_clipboard")
     if CHILD + ": test" not in subprocess.check_output([native, "--list", "--ignored"], text=True).splitlines():
         sys.exit("missing named-board child")
     with tempfile.TemporaryDirectory() as directory:

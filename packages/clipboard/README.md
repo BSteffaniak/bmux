@@ -1,10 +1,7 @@
 # bmux_clipboard
 
 BMUX's clipboard helpers use its own native backend: AppKit on macOS, Win32 on
-Windows, and Wayland or X11 on supported Unix desktops. `native-clipboard`
-remains a no-op Cargo feature for downstream compatibility. Reported source
-identifiers such as `arboard_image` are unchanged; they do not identify a
-runtime dependency.
+Windows, and Wayland or X11 on supported Unix desktops.
 
 ## Text and images
 

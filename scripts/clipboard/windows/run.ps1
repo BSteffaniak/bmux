@@ -74,14 +74,13 @@ foreach ($label in 'shipping','candidate') {
     try {
         $env:CARGO_TARGET_DIR = Join-Path $Output "$label-target"
         $env:CARGO_BUILD_BUILD_DIR = Join-Path $Output "$label-build"
-        $features = @(); if ($label -eq 'candidate') {$features = @('--features','native-clipboard')}
         Push-Location -LiteralPath $tree
         try {
-            & $cargo build --frozen -p bmux_clipboard --example win_guarded_peer @features
+            & $cargo build --frozen -p bmux_clipboard --example win_guarded_peer
             if ($LASTEXITCODE) {throw "$label build failed; no online retry"}
             if ($label -eq 'candidate') {
                 # The selected unit tests exercise conversion only, never a system board.
-                & $cargo test --frozen -p bmux_clipboard --features native-clipboard --lib -- native::windows::tests::
+                & $cargo test --frozen -p bmux_clipboard --lib -- native::windows::tests::
                 if ($LASTEXITCODE) {throw 'clipboard-free Windows unit tests failed'}
             }
         } finally {Pop-Location}

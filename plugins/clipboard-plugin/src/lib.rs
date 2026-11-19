@@ -220,7 +220,7 @@ fn materialize_payload(
                 bytes_len: text.len(),
                 path: None,
                 clipboard_written: true,
-                backend: Some("arboard_or_command".to_string()),
+                backend: Some("native_or_command".to_string()),
                 warning: None,
             })
         }
@@ -246,7 +246,7 @@ fn materialize_payload(
                 bytes_len: payload.bytes.len(),
                 path: Some(path.to_string_lossy().into_owned()),
                 clipboard_written,
-                backend: Some("arboard".to_string()),
+                backend: Some("native".to_string()),
                 warning,
             })
         }
