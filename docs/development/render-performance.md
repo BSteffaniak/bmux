@@ -22,7 +22,7 @@ instrumentation live in the benchmarks, `bmux_bench` and `scripts/perf-render.py
 | Benchmark | Where | Phases per frame |
 | --- | --- | --- |
 | Client pipeline | `pipeline_bench::pipeline_metrics` (`packages/attach_pipeline`) | `apply` (pane output into the client's grids), `render` (painting and presenting), `observe` (preparing and publishing for an observer) |
-| Pane reader | `runtime::ingest_bench::ingest_metrics` (`plugins/pane-runtime-plugin`) | `images` (image interceptor, registry and protocol replies), `metadata`, `modes`, `parse` (grid parse and output push) |
+| Pane reader | `runtime::ingest_bench::ingest_metrics` (`plugins/pane-runtime-plugin`) | `read`: one PTY read as the reader handles it (`follow_chunk`: images intercepted, shell metadata filtered, queries answered and the pane's grid parsed in one pass; then mode tracking and the output push) |
 
 Scenarios: every generated corpus (`bmux_bench::corpus`) at 420×90; the busiest without scroll
 passthrough, with an observer, and across two panes; scattered edits; Kitty and sixel images beside
@@ -73,42 +73,54 @@ use [dhat](https://docs.rs/dhat). `pipeline_bench_loop` replays one corpus (or, 
 
 ## Results
 
-`scripts/perf-render.py compare e06ff6ab HEAD`: the first revision that measured (master plus
-the metrics, nothing trimmed) against the allocation work, per frame at 420×90 on an Apple
-M-series machine. Bytes written to the host are identical in every scenario: no behavior changed.
+The first revision that measured (`e06ff6ab`: master plus the metrics, nothing changed) against the
+work since, per frame at 420×90 on an Apple M-series machine, from the committed baselines.
 
-| Scenario | Phase | Allocations | Instructions |
-| --- | --- | --- | --- |
-| Full repaint | client apply | 42,274 → 0 | 65.0M → 53.2M (−18%) |
-| Full repaint | client render | 120 → 25 | 22.8M → 22.7M |
-| Full repaint, two panes | client render | 212 → 27 | 22.7M → 22.7M |
-| Streaming text | client apply | 1,409 → 3 | 2.24M → 1.89M (−15%) |
-| Streaming text | client render | 33 → 27 | 1.37M → 1.36M |
-| Moving sixel image | client render | 6,552 → 47 | 22.5M → 6.7M (−70%) |
-| Kitty image beside streaming | client render | 56 → 37 | 5.07M → 5.06M |
-| Full repaint | pane reader, all stages | 101,285 → 33 | 136.7M → 104.9M (−23%) |
-| Streaming text | pane reader, all stages | 3,379 → 14 | 4.76M → 3.79M (−20%) |
-| Text with Kitty images | pane reader, image stage | 9,750 → 31 | 6.47M → 3.62M (−44%) |
+| Scenario | Phase | Allocations | Instructions | Bytes written |
+| --- | --- | --- | --- | --- |
+| Full repaint | client apply | 42,274 → 0 | 65.1M → 25.4M (−61%) | 128,475 → 128,475 |
+| Full repaint | client render | 120 → 25 | 22.8M → 22.7M | 128,475 → 128,475 |
+| Full repaint, two panes | client render | 212 → 27 | 22.8M → 22.7M | 128,226 → 128,226 |
+| Streaming text | client apply | 1,409 → 3 | 2.24M → 1.03M (−54%) | 4,769 → 4,769 |
+| Streaming text | client render | 33 → 27 | 1.37M → 1.36M | 4,769 → 4,769 |
+| Moving sixel image | client render | 6,552 → 49 | 22.5M → 5.15M (−77%) | 104,180 → 85,639 |
+| Kitty image beside streaming | client render | 56 → 37 | 5.09M → 5.06M | 64,010 → 64,010 |
+| Full repaint | pane reader | 101,285 → 33 | 136.9M → 33.4M (−76%) | |
+| Streaming text | pane reader | 3,380 → 8 | 4.75M → 1.33M (−72%) | |
+| Text with Kitty images | pane reader | 11,715 → 31 | 8.99M → 3.25M (−64%) | |
 
-What changed, each its own commit with its numbers: escape-sequence parameters parse into a stack
-buffer; grid rows are erased and scrolled in place instead of rebuilt; the parser prefix, the
-reader's per-chunk buffers, the frame's changed-column runs and the frame output buffer keep their
-storage; metadata-free chunks pass the shell metadata parser uncopied; the sixel encoder writes
-straight into its output; the image content cache survives the screen clear that repairs raster
-images; image keys are shared, not copied; display capture copies images only while recording.
+Bytes written change only where intended (a moving raster image repairs its footprint, not the
+screen). Memory: the pane reader keeps one grid instead of two, and history lines are stored
+compactly, so a full 8 MiB history (the cap, charged by its cells' logical size) takes about 1 MB.
+
+What changed, each its own commit with its numbers:
+
+- Allocation: escape-sequence parameters parse into a stack buffer; grid rows are erased and
+  scrolled in place; the parser prefix, the reader's per-chunk buffers, the frame's changed-column
+  runs and the frame output buffer keep their storage; metadata-free chunks pass the shell
+  metadata parser uncopied; the sixel encoder writes straight into its output; image keys and pane
+  image bytes are shared, not copied; display capture copies images only while recording.
+- Parser CPU: styles are interned through a hash index; runs of printable ASCII are written a
+  row segment at a time; CSI and DCS parameters are taken in runs; the client's protocol tracker
+  skips text and plain CSI sequences, which carry nothing it follows.
+- The pane reader follows output through the pane's one grid instead of a second cursor-tracking
+  grid.
+- Images: the content cache survives the screen clear that repairs raster images; a raster image
+  that moves is repaired by repainting its old footprint's cells, not by clearing the screen; the
+  attach client matches pane images by their shared bytes, not by rescanning them.
+- History lines are stored compactly. This one costs CPU for memory: each scrolled line is encoded
+  once, about 8% more instructions per streaming frame.
 
 ## Known costs left
 
-- **The pane reader parses all output twice.** The cursor tracker keeps a second full terminal
-  grid (with its own 10,000-row history) to answer cursor queries and to place and evict images;
-  the main grid already holds the same state. Merging them would roughly halve the reader's parse
-  CPU and its memory per pane.
-- **A raster image repaints the whole screen when it moves.** Raster protocols cannot delete a
-  placement, so the presenter clears the screen and repaints every cell (about 104 KB per frame for
-  a moving sixel image); repainting only the old footprint would cut that to its cells.
+- **The client still parses pane output twice**, into its grid and through its protocol tracker.
+  The tracker now skips text and plain CSI sequences, so it costs little; folding what it follows
+  into the grid's parser would remove it.
 - **The render rebuilds a compositor plan every frame.** `render_attach_scene` builds a
   `RetainedCompositor` from the scene to find the surfaces to repaint (about 15 small allocations
   per frame), though the attach client keeps one across frames.
-- **Pane image payloads are compared by content every frame**, a scan of each image's bytes,
-  because a pane's image may change without a new id; a revision from the server would avoid it.
-- **History is held at full width**: a 420-column pane's 10,000 rows take about 70 MB.
+- **Client render per cell.** Rendering a full repaint costs about as much as applying it (22.7M
+  instructions); its per-cell work (style conversion, symbol checks, changed-run tracking) is spread
+  across small helpers.
+- **Raster images are re-sent when they move.** The repair is now the footprint, but a moved sixel
+  image is written again in full (about 20 KB per frame here); terminals offer no move.
