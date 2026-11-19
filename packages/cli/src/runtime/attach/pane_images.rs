@@ -76,8 +76,9 @@ struct DecodedImage {
     protocol: AttachImageProtocol,
     compression: CompressionId,
     pixels: (u32, u32),
-    /// The protocol bytes decoded: an image is only ever matched by its content.
-    raw: Box<[u8]>,
+    /// The protocol bytes decoded, shared with the image: the same allocation is the same image,
+    /// and other bytes are matched by their content.
+    raw: std::sync::Arc<[u8]>,
     payload: ImagePayload,
 }
 
@@ -91,7 +92,7 @@ impl DecodedImage {
         self.protocol == image.protocol
             && self.compression == image.compression
             && self.pixels == (image.pixel_width, image.pixel_height)
-            && *self.raw == *image.raw_data
+            && (std::sync::Arc::ptr_eq(&self.raw, &image.raw_data) || *self.raw == *image.raw_data)
     }
 }
 
@@ -225,7 +226,7 @@ impl PaneImagePayloads {
                     protocol: image.protocol,
                     compression: image.compression,
                     pixels: (image.pixel_width, image.pixel_height),
-                    raw: image.raw_data.clone().into_boxed_slice(),
+                    raw: std::sync::Arc::clone(&image.raw_data),
                     payload,
                 }
             }
@@ -285,11 +286,11 @@ mod tests {
     use std::collections::HashMap;
     use uuid::Uuid;
 
-    const fn image(id: u64, raw_data: Vec<u8>) -> AttachPaneImage {
+    fn image(id: u64, raw_data: Vec<u8>) -> AttachPaneImage {
         AttachPaneImage {
             id,
             protocol: AttachImageProtocol::KittyGraphics,
-            raw_data,
+            raw_data: raw_data.into(),
             compression: CompressionId::None,
             position_row: 0,
             position_col: 0,

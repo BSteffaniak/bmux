@@ -1298,7 +1298,7 @@ mod history_tests {
             id: 7,
             protocol: bmux_attach_image_protocol::AttachImageProtocol::Sixel,
             compression: bmux_attach_image_protocol::CompressionId::None,
-            raw_data: vec![1, 2, 3],
+            raw_data: vec![1, 2, 3].into(),
             position_row: 0,
             position_col: 1,
             cell_rows: 1,
@@ -1690,7 +1690,7 @@ mod history_tests {
         let image = bmux_attach_image_protocol::AttachPaneImage {
             id: 1,
             protocol: bmux_attach_image_protocol::AttachImageProtocol::Sixel,
-            raw_data: vec![1, 2],
+            raw_data: vec![1, 2].into(),
             compression: bmux_attach_image_protocol::CompressionId::None,
             position_row: 2,
             position_col: 0,
@@ -1795,7 +1795,7 @@ mod history_tests {
         let image = bmux_attach_image_protocol::AttachPaneImage {
             id: 1,
             protocol: bmux_attach_image_protocol::AttachImageProtocol::Sixel,
-            raw_data: vec![1, 2],
+            raw_data: vec![1, 2].into(),
             compression: bmux_attach_image_protocol::CompressionId::None,
             position_row: 0,
             position_col: 0,

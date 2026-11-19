@@ -19589,7 +19589,7 @@ mod tests {
             vec![bmux_attach_image_protocol::AttachPaneImage {
                 id: 42,
                 protocol: bmux_attach_image_protocol::AttachImageProtocol::Sixel,
-                raw_data: b"\"1;1;1;6#1;2;100;0;0~".to_vec(),
+                raw_data: b"\"1;1;1;6#1;2;100;0;0~".to_vec().into(),
                 compression: bmux_attach_image_protocol::CompressionId::None,
                 position_row: 0,
                 position_col: 3,
@@ -19629,7 +19629,8 @@ mod tests {
         let moved = observed_test_image(&observer);
         assert_eq!(initial.key, moved.key);
         assert_ne!(initial.destination, moved.destination);
-        state.pane_images.get_mut(&pane).unwrap()[0].raw_data = b"\"1;1;1;6#1;2;0;100;0~".to_vec();
+        state.pane_images.get_mut(&pane).unwrap()[0].raw_data =
+            b"\"1;1;1;6#1;2;0;100;0~".to_vec().into();
         state.dirty.mark_full_frame(AttachDirtySource::ManualRedraw);
         render_observed_test_frame(&mut state, &layout);
         let replaced = observed_test_image(&observer);
@@ -19682,7 +19683,7 @@ mod tests {
                 images: vec![bmux_attach_image_protocol::AttachPaneImage {
                     id: 42,
                     protocol: bmux_attach_image_protocol::AttachImageProtocol::Sixel,
-                    raw_data: b"\"1;1;1;6#1;2;100;0;0~".to_vec(),
+                    raw_data: b"\"1;1;1;6#1;2;100;0;0~".to_vec().into(),
                     compression: bmux_attach_image_protocol::CompressionId::None,
                     position_row: 0,
                     position_col: 3,
@@ -19795,7 +19796,9 @@ mod tests {
         let image = bmux_attach_image_protocol::AttachPaneImage {
             id: 42,
             protocol: bmux_attach_image_protocol::AttachImageProtocol::KittyGraphics,
-            raw_data: include_bytes!("../../../../presenter/examples/architecture.png").to_vec(),
+            raw_data: include_bytes!("../../../../presenter/examples/architecture.png")
+                .to_vec()
+                .into(),
             compression: bmux_attach_image_protocol::CompressionId::None,
             position_row: 1,
             position_col: 3,
@@ -19858,7 +19861,8 @@ mod tests {
                 id: 42,
                 protocol: bmux_attach_image_protocol::AttachImageProtocol::KittyGraphics,
                 raw_data: include_bytes!("../../../../presenter/examples/architecture.png")
-                    .to_vec(),
+                    .as_slice()
+                    .into(),
                 compression: bmux_attach_image_protocol::CompressionId::None,
                 position_row: 1,
                 position_col: 3,

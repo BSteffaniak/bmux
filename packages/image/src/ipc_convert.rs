@@ -35,7 +35,7 @@ pub fn pane_image_to_ipc(
     AttachPaneImage {
         id: img.id,
         protocol: protocol_to_ipc(img.protocol),
-        raw_data: compressed_data,
+        raw_data: compressed_data.into(),
         compression: compression_id,
         position_row: img.position.row,
         position_col: img.position.col,
@@ -246,7 +246,7 @@ mod tests {
             CompressionId::None,
             "small payload should not be compressed"
         );
-        assert_eq!(ipc.raw_data, raw);
+        assert_eq!(*ipc.raw_data, *raw);
     }
 
     #[test]
@@ -261,7 +261,7 @@ mod tests {
             CompressionId::None,
             "pre-compressed PNG should not be compressed again"
         );
-        assert_eq!(ipc.raw_data, raw);
+        assert_eq!(*ipc.raw_data, *raw);
     }
 
     #[cfg(feature = "compression-zstd")]

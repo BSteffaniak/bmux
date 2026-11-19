@@ -269,7 +269,7 @@ impl PaneZoomHistoryProjection {
                 window.images.capacity().saturating_mul(std::mem::size_of::<
                     bmux_attach_image_protocol::AttachPaneImage,
                 >()),
-                |bytes, image| bytes.checked_add(image.raw_data.capacity()),
+                |bytes, image| bytes.checked_add(image.raw_data.len()),
             )
             .ok_or(HistorySliceError::BudgetExhausted)?;
         let palette_bytes = window

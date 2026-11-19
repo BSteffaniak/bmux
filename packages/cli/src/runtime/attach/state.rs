@@ -1145,7 +1145,7 @@ mod tests {
         let image = bmux_attach_image_protocol::AttachPaneImage {
             id: 1,
             protocol: bmux_attach_image_protocol::AttachImageProtocol::Sixel,
-            raw_data: Vec::new(),
+            raw_data: Vec::new().into(),
             compression: bmux_attach_image_protocol::CompressionId::None,
             position_row: 0,
             position_col: 0,

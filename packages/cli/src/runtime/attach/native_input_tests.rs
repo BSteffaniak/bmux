@@ -319,7 +319,8 @@ async fn pane_zoom_native_images_share_local_grid_and_do_not_duplicate_root() {
                 2, 8, 6, 0, 0, 0, 114, 182, 13, 36, 0, 0, 0, 18, 73, 68, 65, 84, 120, 156, 99, 248,
                 207, 192, 0, 66, 64, 12, 36, 64, 44, 0, 67, 206, 7, 249, 19, 116, 7, 229, 0, 0, 0,
                 0, 73, 69, 78, 68, 174, 66, 96, 130,
-            ],
+            ]
+            .into(),
             compression: CompressionId::None,
             pixel_width: 2,
             pixel_height: 2,

@@ -2868,7 +2868,7 @@ mod image_lifecycle_tests {
             serde_json::from_slice(&encoded).unwrap();
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].position_row, 0);
-        assert_ne!(images[0].raw_data, [] as [u8; 0]);
+        assert!(!images[0].raw_data.is_empty());
         request.scrollback_offset = 0;
         assert_eq!(encode_captured_image_window(&pin, &request).unwrap(), b"[]");
         request.width = 40;
@@ -2941,7 +2941,7 @@ mod image_lifecycle_tests {
             assert_eq!(images.len(), 1);
             assert_eq!(images[0].position_row, 0);
             assert_eq!(images[0].position_col, 0);
-            assert_ne!(images[0].raw_data, [] as [u8; 0]);
+            assert!(!images[0].raw_data.is_empty());
         }
     }
 
@@ -19457,7 +19457,7 @@ exit 7"#
             serde_json::from_slice(&response.encoded).unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].position_row, 0);
-        assert_ne!(recovered[0].raw_data, [] as [u8; 0]);
+        assert!(!recovered[0].raw_data.is_empty());
         assert_anchored_history_image_recovery(&mut dispatch, session, pane, &capture).await;
         assert_history_image_window_replacement(
             &mut dispatch,
@@ -19514,7 +19514,7 @@ exit 7"#
                 if line == 0 {
                     assert_eq!(images.len(), 1);
                     assert_eq!((images[0].position_row, images[0].position_col), (0, 0));
-                    assert_ne!(images[0].raw_data, [] as [u8; 0]);
+                    assert!(!images[0].raw_data.is_empty());
                 } else {
                     assert!(
                         images.is_empty(),

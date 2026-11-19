@@ -1319,7 +1319,7 @@ mod tests {
                 images: vec![AttachPaneImage {
                     id: 42,
                     protocol: bmux_attach_image_protocol::AttachImageProtocol::Sixel,
-                    raw_data: vec![0x1b, 0x50, 0x71],
+                    raw_data: vec![0x1b, 0x50, 0x71].into(),
                     compression: CompressionId::None,
                     position_row: 3,
                     position_col: 5,

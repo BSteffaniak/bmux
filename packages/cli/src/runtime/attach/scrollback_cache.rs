@@ -313,7 +313,7 @@ mod tests {
                 id: 1,
                 protocol: bmux_attach_image_protocol::AttachImageProtocol::Sixel,
                 compression: bmux_attach_image_protocol::CompressionId::None,
-                raw_data: vec![1, 2, 3],
+                raw_data: vec![1, 2, 3].into(),
                 position_row: 2,
                 position_col: 3,
                 cell_rows: 1,
@@ -346,7 +346,7 @@ mod tests {
         }
         assert!(cache.get(pane, None, 10, 40, 40).is_none());
         cache.invalidate(pane);
-        source.images[0].raw_data = vec![0; MAX_BYTES + 1];
+        source.images[0].raw_data = vec![0; MAX_BYTES + 1].into();
         cache.insert(pane, None, &source);
         assert!(cache.entries.is_empty());
         assert_eq!(cache.bytes, 0);
