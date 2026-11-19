@@ -1,7 +1,6 @@
 //! Bounded image projection using compositor visibility and authoritative content geometry.
 use bmux_tui::geometry::Rect;
 use bmux_tui::image::{ImageKey, ImageLifecycle, ImagePayload, ImagePixelFormat, ImagePlacement};
-use image::ImageEncoder;
 use std::collections::BTreeMap;
 
 /// Maximum decoded pixels for any one observed resource.
@@ -32,7 +31,7 @@ pub fn compact_payload(
     };
     if pixels == 0
         || pixels > MAX_IMAGE_PIXELS
-        || pixels.checked_mul(channels) != Some(bytes.len() as u64)
+        || pixels.checked_mul(u64::from(channels)) != Some(bytes.len() as u64)
     {
         return Err(format!(
             "image dimensions/pixel admission failed: dimensions={width}x{height}, pixels={pixels}, pixel_limit={MAX_IMAGE_PIXELS}, payload_bytes={}",
@@ -42,17 +41,7 @@ pub fn compact_payload(
     if bytes.len() < 256 * 1024 {
         return Ok(std::borrow::Cow::Borrowed(payload));
     }
-    let mut png = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut png)
-        .write_image(
-            bytes,
-            *width,
-            *height,
-            match format {
-                ImagePixelFormat::Rgb8 => image::ExtendedColorType::Rgb8,
-                ImagePixelFormat::Rgba8 => image::ExtendedColorType::Rgba8,
-            },
-        )
+    let png = bmux_raster::encode_png(*width, *height, channels, bytes)
         .map_err(|_| "lossless image resource encoding failed".to_owned())?;
     if png.len() >= bytes.len() {
         return Ok(std::borrow::Cow::Borrowed(payload));
@@ -178,19 +167,7 @@ fn validate_projection_payload(payload: &ImagePayload) -> Result<usize, String> 
     }
     match payload {
         ImagePayload::Png { .. } => {
-            let mut reader = image::ImageReader::with_format(
-                std::io::Cursor::new(bytes),
-                image::ImageFormat::Png,
-            );
-            let mut limits = image::Limits::default();
-            limits.max_image_width = Some(width);
-            limits.max_image_height = Some(height);
-            limits.max_alloc = Some(MAX_IMAGE_PIXELS * 8);
-            reader.limits(limits);
-            let decoded = reader.decode().map_err(|error| error.to_string())?;
-            if decoded.width() != width || decoded.height() != height {
-                return Err("image dimensions mismatch".to_owned());
-            }
+            bmux_raster::validate_png(bytes, width, height, MAX_IMAGE_PIXELS * 8)?;
         }
         ImagePayload::Pixels { format, .. } => {
             let channels = match format {
@@ -296,6 +273,41 @@ mod tests {
     }
 
     #[test]
+    fn raw_compaction_starts_at_256_kib() {
+        let payload = |width, height| ImagePayload::Pixels {
+            width,
+            height,
+            bytes: vec![42; usize::try_from(width * height * 4).unwrap()].into(),
+            format: ImagePixelFormat::Rgba8,
+        };
+        // Exactly one RGBA pixel below the threshold, then exactly at it.
+        assert!(matches!(
+            compact_payload(&payload(255, 257)).unwrap(),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            compact_payload(&payload(256, 256)).unwrap().as_ref(),
+            ImagePayload::Png { .. }
+        ));
+    }
+
+    #[test]
+    fn clip_expansion_admits_exact_byte_budget_but_not_one_more_strip() {
+        let payload = ImagePayload::Pixels {
+            bytes: vec![0; 128 * 128 * 4].into(),
+            width: 128,
+            height: 128,
+            format: ImagePixelFormat::Rgba8,
+        };
+        let project = |width| {
+            let rect = Rect::new(0, 0, width, 1);
+            visible_image_strips("budget", &payload, rect, rect, |x, _| x % 2 == 0)
+        };
+        assert_eq!(project(256).unwrap().len(), 128);
+        assert!(project(257).unwrap_err().contains("projection byte budget"));
+    }
+
+    #[test]
     fn four_k_pixels_compact_losslessly_before_clip_expansion() {
         let original = ImagePayload::Pixels {
             bytes: vec![255; 3840 * 2160 * 4].into(),
@@ -308,8 +320,10 @@ mod tests {
             panic!("4K resource was not compacted");
         };
         assert!(bytes.len() < 256 * 1024);
-        let decoded = image::load_from_memory(bytes).unwrap().to_rgba8();
-        assert_eq!(decoded.as_raw(), &vec![255; 3840 * 2160 * 4]);
+        let decoded = bmux_raster::decode(bytes, 3840, 2160, MAX_IMAGE_PIXELS * 8).unwrap();
+        assert_eq!((decoded.width, decoded.height), (3840, 2160));
+        assert!(decoded.rgba.len() == 3840 * 2160 * 4 && decoded.rgba.iter().all(|&v| v == 255));
+        drop(decoded);
         let clips = visible_image_strips(
             "4k",
             &original,

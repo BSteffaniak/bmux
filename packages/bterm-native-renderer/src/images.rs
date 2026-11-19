@@ -45,23 +45,6 @@ fn validate(payload: &ImagePayload) -> Result<(u32, u32, usize), RenderError> {
     Ok((width, height, length))
 }
 
-fn image_limits() -> image::Limits {
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_IMAGE_EDGE);
-    limits.max_image_height = Some(MAX_IMAGE_EDGE);
-    limits.max_alloc = Some(MAX_IMAGE_BYTES as u64);
-    limits
-}
-
-/// PNG metadata is parsed during decoder construction, so limits must be supplied
-/// here, not just applied after inspecting dimensions.
-fn png_decoder(
-    bytes: &[u8],
-    limits: image::Limits,
-) -> image::ImageResult<image::codecs::png::PngDecoder<std::io::Cursor<&[u8]>>> {
-    image::codecs::png::PngDecoder::with_limits(std::io::Cursor::new(bytes), limits)
-}
-
 pub(crate) fn decode(payload: &ImagePayload) -> Result<(u32, u32, Vec<u8>), RenderError> {
     let (width, height, length) = validate(payload)?;
     let rgba = match payload {
@@ -82,31 +65,19 @@ pub(crate) fn decode(payload: &ImagePayload) -> Result<(u32, u32, Vec<u8>), Rend
             rgba
         }
         ImagePayload::Png { bytes, .. } => {
-            use image::ImageDecoder;
-            let mut limits = image_limits();
-            let mut decoder = png_decoder(bytes, limits.clone())
-                .map_err(|e| RenderError::Image(e.to_string()))?;
-            if decoder.dimensions() != (width, height) {
+            // Compare the fixed IHDR width/height before the decoder allocates
+            // metadata or pixels. The decoder still validates the full header.
+            if !bytes.starts_with(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR")
+                || bytes.get(16..20) != Some(width.to_be_bytes().as_slice())
+                || bytes.get(20..24) != Some(height.to_be_bytes().as_slice())
+            {
                 return Err(RenderError::Image(
                     "PNG declared dimensions differ from encoded dimensions".into(),
                 ));
             }
-            // Match ImageReader::decode's output-buffer accounting, without building
-            // a second decoder or reparsing metadata under a different budget.
-            limits
-                .reserve(decoder.total_bytes())
-                .map_err(|e| RenderError::Image(e.to_string()))?;
-            decoder
-                .set_limits(limits)
-                .map_err(|e| RenderError::Image(e.to_string()))?;
-            let image = image::DynamicImage::from_decoder(decoder)
-                .map_err(|e| RenderError::Image(e.to_string()))?;
-            if image.width() != width || image.height() != height {
-                return Err(RenderError::Image(
-                    "PNG declared dimensions differ from decoded dimensions".into(),
-                ));
-            }
-            image.into_rgba8().into_raw()
+            bmux_raster::decode(bytes, width, height, MAX_IMAGE_BYTES as u64)
+                .map_err(RenderError::Image)?
+                .rgba
         }
     };
     Ok((width, height, rgba))
@@ -342,12 +313,7 @@ mod tests {
     }
 
     fn png_fixture() -> Vec<u8> {
-        use image::ImageEncoder;
-        let mut bytes = Vec::new();
-        image::codecs::png::PngEncoder::new(&mut bytes)
-            .write_image(&[1, 2, 3, 255], 1, 1, image::ExtendedColorType::Rgba8)
-            .unwrap();
-        bytes
+        bmux_raster::encode_png(1, 1, 4, &[1, 2, 3, 255]).unwrap()
     }
 
     // Build ancillary metadata without another dependency; PNG CRC covers type+data.
@@ -374,18 +340,16 @@ mod tests {
         text.extend_from_slice(&[b'x'; 4096]);
         // Signature (8 bytes) + complete IHDR (25 bytes), before IDAT.
         bytes.splice(33..33, png_chunk(b"tEXt", &text));
-        let limits = image_limits();
-        assert_eq!(limits.max_alloc, Some(MAX_IMAGE_BYTES as u64));
-        assert_eq!(limits.max_image_width, Some(MAX_IMAGE_EDGE));
-        assert_eq!(limits.max_image_height, Some(MAX_IMAGE_EDGE));
-        assert!(png_decoder(&bytes, limits.clone()).is_ok());
-        // A scaled budget exercises the same constructor without a 64 MiB fixture.
-        let mut small = limits;
-        small.max_alloc = Some(1024);
-        assert!(matches!(
-            png_decoder(&bytes, small),
-            Err(image::ImageError::Limits(_))
-        ));
+        assert!(
+            bmux_raster::decode(
+                &bytes,
+                MAX_IMAGE_EDGE,
+                MAX_IMAGE_EDGE,
+                MAX_IMAGE_BYTES as u64
+            )
+            .is_ok()
+        );
+        assert!(bmux_raster::decode(&bytes, MAX_IMAGE_EDGE, MAX_IMAGE_EDGE, 1024).is_err());
     }
 
     #[test]

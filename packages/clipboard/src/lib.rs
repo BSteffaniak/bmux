@@ -21,7 +21,7 @@ pub mod native_text {
     pub use super::native::read_text as read;
 }
 use std::ffi::OsString;
-use std::io::{Cursor, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -782,32 +782,37 @@ fn run_read_command(
     })
 }
 
+// The auto-detected clipboard paths historically used a 512 MiB decoder budget
+// without per-axis limits. Platform clipboard transfers have separate limits.
+const CLIPBOARD_DECODE_LIMIT: u64 = 512 * 1024 * 1024;
+
 /// Copy PNG image bytes to the system clipboard when supported.
 ///
 /// # Errors
 ///
 /// Returns [`ClipboardError`] if image clipboard writes are unsupported or fail.
 pub fn copy_png_image(bytes: &[u8]) -> Result<(), ClipboardError> {
-    let image = image::load_from_memory(bytes).map_err(|error| ClipboardError::BackendFailed {
-        backend: "image".to_string(),
-        message: error.to_string(),
-    })?;
-    let rgba = image.into_rgba8();
-    let (width, height) = rgba.dimensions();
+    let image = bmux_raster::decode(bytes, u32::MAX, u32::MAX, CLIPBOARD_DECODE_LIMIT).map_err(
+        |message| ClipboardError::BackendFailed {
+            backend: "image".to_string(),
+            message,
+        },
+    )?;
+    let (width, height) = (image.width, image.height);
     native::copy_image(&native::NativeImage {
         width: usize::try_from(width).unwrap_or(usize::MAX),
         height: usize::try_from(height).unwrap_or(usize::MAX),
-        bytes: rgba.into_raw(),
+        bytes: image.rgba,
     })
 }
 
 fn read_native_image() -> Result<Option<ClipboardPayload>, ClipboardError> {
     native::read_image()?
-        .map(|image| encode_native_image_png(image).map(ClipboardPayload::ImagePng))
+        .map(|image| encode_native_image_png(&image).map(ClipboardPayload::ImagePng))
         .transpose()
 }
 
-fn encode_native_image_png(image: native::NativeImage) -> Result<Vec<u8>, ClipboardError> {
+fn encode_native_image_png(image: &native::NativeImage) -> Result<Vec<u8>, ClipboardError> {
     let width = u32::try_from(image.width).map_err(|error| ClipboardError::BackendFailed {
         backend: "native".to_string(),
         message: error.to_string(),
@@ -816,20 +821,23 @@ fn encode_native_image_png(image: native::NativeImage) -> Result<Vec<u8>, Clipbo
         backend: "native".to_string(),
         message: error.to_string(),
     })?;
-    let rgba = image::RgbaImage::from_raw(width, height, image.bytes).ok_or_else(|| {
+    if image
+        .width
+        .checked_mul(image.height)
+        .and_then(|n| n.checked_mul(4))
+        != Some(image.bytes.len())
+    {
+        return Err(ClipboardError::BackendFailed {
+            backend: "native".into(),
+            message: "invalid RGBA clipboard image buffer".into(),
+        });
+    }
+    bmux_raster::encode_png(width, height, 4, &image.bytes).map_err(|message| {
         ClipboardError::BackendFailed {
-            backend: "native".to_string(),
-            message: "invalid RGBA clipboard image buffer".to_string(),
+            backend: "image".into(),
+            message,
         }
-    })?;
-    let mut output = Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgba8(rgba)
-        .write_to(&mut output, image::ImageFormat::Png)
-        .map_err(|error| ClipboardError::BackendFailed {
-            backend: "image".to_string(),
-            message: error.to_string(),
-        })?;
-    Ok(output.into_inner())
+    })
 }
 
 fn read_image_file_reference_payload() -> Result<Option<ClipboardPayload>, ClipboardError> {
@@ -903,24 +911,23 @@ fn read_image_file_payload(path: &Path) -> Result<Option<ClipboardPayload>, Clip
         );
         return Ok(Some(ClipboardPayload::ImagePng(bytes)));
     }
-    let Ok(image) = image::load_from_memory(&bytes) else {
-        tracing::debug!(
-            bmux.component = "clipboard.remote_sync",
-            stage = "file_reference_read",
-            path = %path.display(),
-            bytes_len = bytes.len(),
-            "clipboard file-reference payload is not a supported image"
-        );
-        return Ok(None);
-    };
-    let mut output = Cursor::new(Vec::new());
-    image
-        .write_to(&mut output, image::ImageFormat::Png)
-        .map_err(|error| ClipboardError::BackendFailed {
-            backend: "image".to_string(),
-            message: error.to_string(),
-        })?;
-    Ok(Some(ClipboardPayload::ImagePng(output.into_inner())))
+    match bmux_raster::transcode_png_staged(&bytes, u32::MAX, u32::MAX, CLIPBOARD_DECODE_LIMIT) {
+        Ok(output) => Ok(Some(ClipboardPayload::ImagePng(output))),
+        Err(bmux_raster::TranscodeError::Decode(_)) => {
+            tracing::debug!(
+                bmux.component = "clipboard.remote_sync",
+                stage = "file_reference_read",
+                path = %path.display(),
+                bytes_len = bytes.len(),
+                "clipboard file-reference payload is not a supported image"
+            );
+            Ok(None)
+        }
+        Err(bmux_raster::TranscodeError::Encode(message)) => Err(ClipboardError::BackendFailed {
+            backend: "image".into(),
+            message,
+        }),
+    }
 }
 
 fn percent_decode_file_url_path(path: &str) -> String {
@@ -948,11 +955,11 @@ fn is_png(bytes: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::{CLIPBOARD_DECODE_LIMIT, encode_native_image_png, native};
     use super::{
         Clipboard, ClipboardCommand, ClipboardError, clipboard_commands, copy_with_commands,
         detect_backend, image_path_from_text, is_png, percent_decode_file_url_path,
     };
-    use super::{encode_native_image_png, native};
     use std::path::PathBuf;
 
     #[test]
@@ -1401,23 +1408,67 @@ mod tests {
     #[test]
     fn native_rgba_png_conversion_preserves_pixels() {
         let pixels = vec![255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0, 1, 2, 3, 255];
-        let png = encode_native_image_png(native::NativeImage {
+        let png = encode_native_image_png(&native::NativeImage {
             width: 2,
             height: 2,
             bytes: pixels.clone(),
         })
         .unwrap();
-        let decoded = image::load_from_memory(&png).unwrap().into_rgba8();
-        assert_eq!(decoded.dimensions(), (2, 2));
-        assert_eq!(decoded.into_raw(), pixels);
+        let decoded = bmux_raster::decode(&png, 2, 2, CLIPBOARD_DECODE_LIMIT).unwrap();
+        assert_eq!((decoded.width, decoded.height), (2, 2));
+        assert_eq!(decoded.rgba, pixels);
         assert!(
-            encode_native_image_png(native::NativeImage {
+            encode_native_image_png(&native::NativeImage {
                 width: 2,
                 height: 2,
                 bytes: vec![]
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn file_reference_preserves_png_and_normalizes_rgb_without_alpha() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clipboard.data");
+        assert!(
+            matches!(super::read_image_file_payload(&path), Err(ClipboardError::BackendFailed { backend, .. }) if backend == "file")
+        );
+
+        // The file-reference PNG fast path is a byte pass-through, not validation.
+        let signature = b"\x89PNG\r\n\x1a\n";
+        std::fs::write(&path, signature).unwrap();
+        assert!(
+            matches!(super::read_image_file_payload(&path).unwrap(), Some(super::ClipboardPayload::ImagePng(bytes)) if bytes == signature)
+        );
+
+        // Single 24-bit BGR pixel with one row-padding byte in a Windows BMP.
+        let mut bmp = [0_u8; 58];
+        bmp[..2].copy_from_slice(b"BM");
+        bmp[2] = 58;
+        bmp[10] = 54;
+        bmp[14] = 40;
+        bmp[18] = 1;
+        bmp[22] = 1;
+        bmp[26] = 1;
+        bmp[28] = 24;
+        bmp[54..57].copy_from_slice(&[3, 2, 1]);
+        std::fs::write(&path, bmp).unwrap();
+        let Some(super::ClipboardPayload::ImagePng(bytes)) =
+            super::read_image_file_payload(&path).unwrap()
+        else {
+            panic!("expected BMP to PNG conversion");
+        };
+        assert_eq!(&bytes[24..26], &[8, 2], "expected RGB8 PNG");
+        assert_eq!(
+            bmux_raster::decode(&bytes, 1, 1, 1 << 20).unwrap().rgba,
+            [1, 2, 3, 255]
+        );
+
+        // Same format and complete dimensions, but no pixel data. Never classify
+        // a failed decode as an encode failure based on a successful header probe.
+        std::fs::write(&path, &bmp[..54]).unwrap();
+        assert!(super::read_image_file_payload(&path).unwrap().is_none());
     }
 
     #[test]

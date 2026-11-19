@@ -27,6 +27,7 @@ bmux_plugin_sdk = { workspace = true }
 bmux_presenter = { workspace = true }
 bmux_presenter_plugin_api = { workspace = true }
 bmux_presenter_runtime = { workspace = true }
+bmux_raster = { workspace = true, features = ["formats"] }
 bmux_syntax_render = { workspace = true }
 bmux_terminal = { workspace = true }
 bmux_text_edit = { workspace = true, features = ["serde"] }
@@ -65,7 +66,6 @@ bmux_tui_runtime = { workspace = true, features = [
 bmux_unicode_segmentation = { workspace = true }
 bmux_web_host = { workspace = true, features = ["presentation"] }
 bmux_web_renderer = { workspace = true }
-image = { workspace = true, features = ["png", "jpeg", "gif", "bmp"] }
 libc = { workspace = true }
 resvg = { workspace = true }
 rustls = { workspace = true }

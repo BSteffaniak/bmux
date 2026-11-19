@@ -190,22 +190,30 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, HostError> {
     Ok(bytes)
 }
 fn normalize_image(bytes: &[u8], limit: usize) -> Result<Vec<u8>, HostError> {
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
+    let output = bmux_raster::transcode_png(bytes, 4096, 4096, 64 * 1024 * 1024)
         .map_err(|_| HostError::Invalid)?;
-    let mut bounds = image::Limits::default();
-    bounds.max_image_width = Some(4096);
-    bounds.max_image_height = Some(4096);
-    bounds.max_alloc = Some(64 * 1024 * 1024);
-    reader.limits(bounds);
-    let decoded = reader.decode().map_err(|_| HostError::Invalid)?;
-    let mut output = std::io::Cursor::new(Vec::new());
-    decoded
-        .write_to(&mut output, image::ImageFormat::Png)
-        .map_err(|_| HostError::Invalid)?;
-    let output = output.into_inner();
     if output.len() > limit {
         return Err(HostError::Limit);
     }
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_image;
+
+    #[test]
+    fn normalization_keeps_sixteen_bit_grayscale_png() {
+        // One grayscale sample, 0x1234: RGBA8 normalization would lose precision.
+        let source = [
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x10, 0x00, 0x00, 0x00,
+            0x00, 0x6a, 0xee, 0x47, 0x16, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9c, 0x63, 0x10, 0x32, 0x01, 0x00, 0x00, 0x5b, 0x00, 0x47, 0x96, 0xfb, 0x1b, 0x65,
+            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        let png = normalize_image(&source, 4096).unwrap();
+        assert_eq!(&png[24..26], &[16, 0], "IHDR bit depth and color type");
+        bmux_raster::validate_png(&png, 1, 1, 4096).unwrap();
+    }
 }

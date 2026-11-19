@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "image-oracle"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[workspace.dependencies]
+bmux_raster = { path = "../../packages/raster", default-features = false }
+image = { version = "=0.25.10", default-features = false, features = ["bmp", "gif", "jpeg", "png"] }
+
+[dependencies]
+bmux_raster = { workspace = true, optional = true }
+image = { workspace = true }
+
+[features]
+candidate-png = ["dep:bmux_raster"]
+candidate = ["candidate-png", "bmux_raster/formats"]

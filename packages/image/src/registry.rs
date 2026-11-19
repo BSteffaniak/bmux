@@ -1052,26 +1052,19 @@ impl ImageRegistry {
         let raw = if format == crate::model::PixelFormat::Png {
             pixels.data.clone()
         } else {
-            use image::ImageEncoder;
             let color = if format == crate::model::PixelFormat::Rgb8 {
-                image::ExtendedColorType::Rgb8
+                3u8
             } else {
-                image::ExtendedColorType::Rgba8
+                4u8
             };
             let expected = u64::from(pixels.width)
                 .checked_mul(u64::from(pixels.height))
-                .and_then(|size| size.checked_mul(u64::from(color.channel_count())));
+                .and_then(|size| size.checked_mul(u64::from(color)));
             if expected != Some(pixels.data.len() as u64) {
                 return Err("EINVAL: image data does not match its size");
             }
-            let mut png = Vec::new();
-            if image::codecs::png::PngEncoder::new(&mut png)
-                .write_image(&pixels.data, pixels.width, pixels.height, color)
-                .is_err()
-            {
-                return Err("EINVAL: image cannot be encoded");
-            }
-            png
+            bmux_raster::encode_png(pixels.width, pixels.height, color, &pixels.data)
+                .map_err(|_| "EINVAL: image cannot be encoded")?
         };
         let key = (placement.image_id, placement.placement_id);
         if let Some(old_id) = self.kitty_placements.remove(&key) {
@@ -1326,7 +1319,6 @@ impl ImageRegistry {
 
 /// Preserve the existing protocol payload representation for a cropped view.
 fn encode_projected_payload(image: &PaneImage) -> std::io::Result<Vec<u8>> {
-    use image::ImageEncoder;
     let pixels = image
         .payload
         .pixels
@@ -1338,15 +1330,13 @@ fn encode_projected_payload(image: &PaneImage) -> std::io::Result<Vec<u8>> {
             .ok_or_else(|| std::io::Error::other("could not encode projected Sixel image"));
     }
     let color = match pixels.format {
-        crate::model::PixelFormat::Rgb8 => image::ExtendedColorType::Rgb8,
-        crate::model::PixelFormat::Rgba8 => image::ExtendedColorType::Rgba8,
+        crate::model::PixelFormat::Rgb8 => 3u8,
+        crate::model::PixelFormat::Rgba8 => 4u8,
         crate::model::PixelFormat::Png => {
             return Err(std::io::Error::other("projection requires decoded pixels"));
         }
     };
-    let mut png = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut png)
-        .write_image(&pixels.data, pixels.width, pixels.height, color)
+    let png = bmux_raster::encode_png(pixels.width, pixels.height, color, &pixels.data)
         .map_err(std::io::Error::other)?;
     match image.protocol {
         ImageProtocol::KittyGraphics => Ok(png),

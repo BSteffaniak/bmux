@@ -99,6 +99,7 @@ members = [
     "packages/mobile-core",
     "packages/mobile-ffi",
     "packages/image",
+    "packages/raster",
     "packages/docs-site",
     "packages/docs-site/ui",
     "plugins/clients-plugin",
@@ -298,6 +299,7 @@ bmux_presenter_plugin = { version = "0.0.1-alpha.4", default-features = false, p
 bmux_presenter_plugin_api = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/presenter-plugin-api" }
 bmux_presenter_runtime = { version = "0.0.1-alpha.4", default-features = false, path = "packages/presenter-runtime" }
 bmux_pty = { version = "0.0.1-alpha.4", default-features = false, path = "packages/pty" }
+bmux_raster = { version = "0.0.1-alpha.4", default-features = false, path = "packages/raster" }
 bmux_recording_protocol = { version = "0.0.1-alpha.4", default-features = false, path = "packages/recording-protocol" }
 bmux_recording_runtime = { version = "0.0.1-alpha.4", default-features = false, path = "packages/recording-runtime" }
 bmux_sandbox_harness = { version = "0.0.1-alpha.4", default-features = false, path = "packages/sandbox-harness" }
@@ -419,7 +421,6 @@ futures-core = { version = "0.3.34", default-features = false }
 futures-util = { version = "0.3.34", default-features = false }
 getrandom = "0.4.3"
 gif = { version = "0.14.2" }
-image = { version = "0.25.10", default-features = false }
 iroh = { version = "1.4.1", default-features = true }
 js-sys = { version = "0.3.106" }
 libc = { version = "0.2" }
@@ -492,6 +493,8 @@ wayland-protocols-wlr = { version = "0.3.12", default-features = false }
 web-sys = { version = "0.3.106" }
 web-time = { version = "1.1.0", default-features = false }
 windows-sys = { version = "0.61.2" }
+zune-core = { version = "0.5.3", default-features = false }
+zune-jpeg = { version = "0.5.15" }
 # Dev-only: validates BPDL-to-WIT lowering against the reference WIT parser.
 wit-parser = { version = "0.263.0", default-features = false }
 x11rb      = { version = "0.14.0", default-features = false }

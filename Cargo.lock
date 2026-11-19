@@ -1582,13 +1582,13 @@ dependencies = [
  "bmux_client",
  "bmux_image",
  "bmux_plugin",
+ "bmux_raster",
  "bmux_scene_protocol_render",
  "bmux_terminal",
  "bmux_terminal_grid",
  "bmux_terminal_protocol",
  "bmux_tui",
  "futures-util",
- "image",
  "tokio",
  "tracing",
  "uuid",
@@ -1910,7 +1910,7 @@ dependencies = [
 name = "bmux_clipboard"
 version = "0.0.1-alpha.4"
 dependencies = [
- "image",
+ "bmux_raster",
  "libc",
  "tempfile",
  "thiserror 2.0.21",
@@ -2454,9 +2454,9 @@ version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_attach_image_protocol",
  "bmux_ipc",
+ "bmux_raster",
  "bmux_tui",
  "flate2",
- "image",
  "png",
  "serde",
  "uuid",
@@ -2932,10 +2932,10 @@ name = "bmux_presenter"
 version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_markdown",
+ "bmux_raster",
  "bmux_tui",
  "bmux_tui_components",
  "bmux_web_renderer",
- "image",
  "pulldown-cmark",
  "serde",
  "serde_json",
@@ -2966,6 +2966,7 @@ dependencies = [
  "bmux_presenter",
  "bmux_presenter_plugin_api",
  "bmux_presenter_runtime",
+ "bmux_raster",
  "bmux_syntax_render",
  "bmux_terminal",
  "bmux_text_edit",
@@ -2976,7 +2977,6 @@ dependencies = [
  "bmux_web_host",
  "bmux_web_renderer",
  "clap",
- "image",
  "libc",
  "resvg",
  "rustls",
@@ -3009,9 +3009,9 @@ dependencies = [
  "bmux_cell_geometry",
  "bmux_mermaid_render",
  "bmux_presenter",
+ "bmux_raster",
  "bmux_tui",
  "bmux_unicode_segmentation",
- "image",
  "pulldown-cmark",
  "rcgen",
  "rustls",
@@ -3077,6 +3077,16 @@ version = "0.0.1-alpha.4"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "bmux_raster"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "gif",
+ "png",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -3521,12 +3531,12 @@ dependencies = [
  "bmux_cell_geometry",
  "bmux_color",
  "bmux_keyboard",
+ "bmux_raster",
  "bmux_terminal",
  "bmux_terminal_protocol",
  "bmux_text_edit",
  "bmux_unicode_segmentation",
  "futures-util",
- "image",
  "libc",
  "serde",
  "serde_json",
@@ -3796,11 +3806,11 @@ name = "bterm_native_renderer"
 version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_fonts",
+ "bmux_raster",
  "bmux_tui",
  "bterm_native_platform",
  "bytemuck",
  "fontdb",
- "image",
  "pollster",
  "swash",
  "thiserror 2.0.21",
@@ -7141,23 +7151,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "image"
-version = "0.25.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
-dependencies = [
- "bytemuck",
- "byteorder-lite",
- "color_quant",
- "gif",
- "moxcms",
- "num-traits",
- "png",
- "zune-core",
- "zune-jpeg",
-]
-
-[[package]]
 name = "image-webp"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8384,16 +8377,6 @@ dependencies = [
  "moosicbox_assert",
  "qstring",
  "switchy_async",
-]
-
-[[package]]
-name = "moxcms"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
-dependencies = [
- "num-traits",
- "pxfm",
 ]
 
 [[package]]
@@ -10402,12 +10385,6 @@ dependencies = [
  "quote",
  "syn 3.0.9",
 ]
-
-[[package]]
-name = "pxfm"
-version = "0.1.30"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "qrcode"

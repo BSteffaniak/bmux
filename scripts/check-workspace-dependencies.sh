@@ -47,6 +47,8 @@ def check(path, table, section=()):
                     errors.append(f"{location}: segment text through bmux_unicode_segmentation")
                 if spec.get("package", name) == "semver" and path != "tools/plugin-version-oracle/Cargo.toml":
                     errors.append(f"{location}: use bmux_plugin::dependency_version")
+                if spec.get("package", name) == "image" and path != "tools/image-oracle/Cargo.toml":
+                    errors.append(f"{location}: use bmux_raster for raster payloads and pixel operations")
                 if spec.get("package", name) == "arboard":
                     errors.append(f"{location}: use the owned bmux_clipboard backend")
                 if current == ("workspace", "dependencies"):

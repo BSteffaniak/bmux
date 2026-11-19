@@ -2,6 +2,11 @@
 
 use bmux_clipboard::{ClipboardPayload, copy_png_image, native_text, read_payload};
 
+fn decode_pixels(bytes: &[u8]) -> (u32, u32, Vec<u8>) {
+    let image = bmux_raster::decode(bytes, u32::MAX, u32::MAX, 512 * 1024 * 1024).unwrap();
+    (image.width, image.height, image.rgba)
+}
+
 #[test]
 #[ignore = "requires BMUX_CLIPBOARD_ISOLATED_TEST=1 and a disposable native clipboard"]
 fn native_text_and_image_roundtrip() {
@@ -23,17 +28,13 @@ fn native_text_and_image_roundtrip() {
     native_text::write(&text).unwrap();
     assert!(native_text::read().unwrap().as_ref() == Some(&text));
 
-    let rgba = image::RgbaImage::from_raw(
+    let rgba = (
         2,
         2,
         vec![255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0, 1, 2, 3, 255],
-    )
-    .unwrap();
-    let mut png = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgba8(rgba.clone())
-        .write_to(&mut png, image::ImageFormat::Png)
-        .unwrap();
-    copy_png_image(png.get_ref()).unwrap();
+    );
+    let png = bmux_raster::encode_png(rgba.0, rgba.1, 4, &rgba.2).unwrap();
+    copy_png_image(&png).unwrap();
     assert!(
         native_text::read().unwrap().is_none(),
         "image-only owner advertised text"
@@ -41,7 +42,7 @@ fn native_text_and_image_roundtrip() {
     let ClipboardPayload::ImagePng(bytes) = read_payload(true).unwrap() else {
         panic!("native image was not selected");
     };
-    assert!(image::load_from_memory(&bytes).unwrap().into_rgba8() == rgba);
+    assert!(decode_pixels(&bytes) == rgba);
 }
 
 #[cfg(target_os = "linux")]
@@ -147,12 +148,9 @@ fn independent_text_interoperability(wayland: bool) {
     let _ = owner.wait();
     assert!(result, "external text not received intact");
 
-    let rgba = image::RgbaImage::from_raw(2, 1, vec![255, 0, 0, 128, 0, 1, 2, 255]).unwrap();
-    let mut png = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgba8(rgba.clone())
-        .write_to(&mut png, image::ImageFormat::Png)
-        .unwrap();
-    copy_png_image(png.get_ref()).unwrap();
+    let rgba = (2, 1, vec![255, 0, 0, 128, 0, 1, 2, 255]);
+    let png = bmux_raster::encode_png(rgba.0, rgba.1, 4, &rgba.2).unwrap();
+    copy_png_image(&png).unwrap();
     let output = Command::new("timeout")
         .args(if wayland {
             vec!["15s", "wl-paste", "--no-newline", "--type", "image/png"]
@@ -170,19 +168,11 @@ fn independent_text_interoperability(wayland: bool) {
         .output()
         .unwrap();
     assert!(output.status.success(), "external reader failed");
-    assert!(
-        image::load_from_memory(&output.stdout)
-            .unwrap()
-            .into_rgba8()
-            == rgba
-    );
+    assert!(decode_pixels(&output.stdout) == rgba);
 
-    let external_rgba =
-        image::RgbaImage::from_raw(1, 2, vec![0, 255, 0, 255, 0, 0, 255, 64]).unwrap();
-    let mut external_png = std::io::Cursor::new(Vec::new());
-    image::DynamicImage::ImageRgba8(external_rgba.clone())
-        .write_to(&mut external_png, image::ImageFormat::Png)
-        .unwrap();
+    let external_rgba = (1, 2, vec![0, 255, 0, 255, 0, 0, 255, 64]);
+    let external_png =
+        bmux_raster::encode_png(external_rgba.0, external_rgba.1, 4, &external_rgba.2).unwrap();
     let mut owner = Command::new("timeout")
         .args(if wayland {
             vec!["15s", "wl-copy", "--foreground", "--type", "image/png"]
@@ -207,15 +197,13 @@ fn independent_text_interoperability(wayland: bool) {
         .stdin
         .take()
         .unwrap()
-        .write_all(external_png.get_ref())
+        .write_all(&external_png)
         .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let result = loop {
         let result = read_payload(true).map(|payload| match payload {
-            ClipboardPayload::ImagePng(bytes) => {
-                image::load_from_memory(&bytes).unwrap().into_rgba8()
-            }
-            _ => image::RgbaImage::new(0, 0),
+            ClipboardPayload::ImagePng(bytes) => decode_pixels(&bytes),
+            _ => (0, 0, Vec::new()),
         });
         match result {
             Ok(value) if value == external_rgba => break Ok(value),

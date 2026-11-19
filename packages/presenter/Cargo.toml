@@ -15,6 +15,7 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 bmux_markdown = { workspace = true }
+bmux_raster = { workspace = true }
 bmux_tui = { workspace = true, features = ["serde"] }
 bmux_tui_components = { workspace = true, features = [
     "scroll-view",
@@ -22,7 +23,6 @@ bmux_tui_components = { workspace = true, features = [
     "progress-bar",
 ] }
 bmux_web_renderer = { workspace = true }
-image = { workspace = true, features = ["png"] }
 pulldown-cmark = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

@@ -88,24 +88,23 @@ impl RichAssets {
                     height: size.height(),
                 }
             } else {
-                let mut reader = image::ImageReader::new(std::io::Cursor::new(&asset.bytes))
-                    .with_guessed_format()?;
-                let mut limits = image::Limits::default();
-                limits.max_image_width = Some(4096);
-                limits.max_image_height = Some(4096);
-                limits.max_alloc = Some(64 * 1024 * 1024);
-                reader.limits(limits);
-                let decoded = reader.decode()?;
-                // Keep prepared PNG bytes for compact protocol uploads. Decoding
-                // here still validates the full stream under the existing limits.
-                let width = decoded.width();
-                let height = decoded.height();
-                let bytes = if image::guess_format(&asset.bytes)? == image::ImageFormat::Png {
-                    asset.bytes.clone()
+                let limit = 64 * 1024 * 1024;
+                let (bytes, width, height) = if asset.bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+                    let (width, height) = bmux_raster::png_dimensions(&asset.bytes, limit)
+                        .map_err(anyhow::Error::msg)?;
+                    ensure!(
+                        width <= 4096 && height <= 4096,
+                        "asset exceeds dimension limits"
+                    );
+                    bmux_raster::validate_png(&asset.bytes, width, height, limit)
+                        .map_err(anyhow::Error::msg)?;
+                    (asset.bytes.clone(), width, height)
                 } else {
-                    let mut encoded = std::io::Cursor::new(Vec::new());
-                    decoded.write_to(&mut encoded, image::ImageFormat::Png)?;
-                    encoded.into_inner()
+                    let bytes = bmux_raster::transcode_png(&asset.bytes, 4096, 4096, limit)
+                        .map_err(anyhow::Error::msg)?;
+                    let (width, height) =
+                        bmux_raster::png_dimensions(&bytes, limit).map_err(anyhow::Error::msg)?;
+                    (bytes, width, height)
                 };
                 ImagePayload::Png {
                     bytes: bytes.into(),

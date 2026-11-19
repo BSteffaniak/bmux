@@ -274,16 +274,7 @@ fn speculative_reset_protocol_switch_and_failed_output_retain_committed_upload_l
 #[cfg(all(feature = "sixel", feature = "iterm2"))]
 #[test]
 fn cancellable_raster_protocols_match_existing_actual_output() {
-    let mut png = Vec::new();
-    use image::ImageEncoder;
-    image::codecs::png::PngEncoder::new(&mut png)
-        .write_image(
-            &(0..32).collect::<Vec<u8>>(),
-            4,
-            2,
-            image::ExtendedColorType::Rgba8,
-        )
-        .unwrap();
+    let png = bmux_raster::encode_png(4, 2, 4, &(0..32).collect::<Vec<u8>>()).unwrap();
     let mut source = image();
     source.payload.pixels = Some(PixelBuffer {
         width: 4,
@@ -1063,18 +1054,10 @@ fn protocol_switch_releases_hidden_content_and_retransmits_on_return() {
 #[cfg(feature = "kitty")]
 #[test]
 fn validated_png_is_preserved_only_for_full_source() {
-    use image::ImageEncoder;
     let mut source = image();
     let pixels = source.payload.pixels.take().unwrap();
-    let mut png = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut png)
-        .write_image(
-            &pixels.data,
-            pixels.width,
-            pixels.height,
-            image::ColorType::Rgba8.into(),
-        )
-        .unwrap();
+
+    let png = bmux_raster::encode_png(pixels.width, pixels.height, 4, &pixels.data).unwrap();
     source.payload.pixels = Some(PixelBuffer {
         data: png.clone(),
         format: PixelFormat::Png,
@@ -1098,7 +1081,6 @@ fn validated_png_is_preserved_only_for_full_source() {
 
 #[cfg(feature = "kitty")]
 fn native_png_work_source(side: u32) -> PaneImage {
-    use image::ImageEncoder;
     // Incompressible, deterministic valid PNG for payload-size-dependent work.
     let mut random = 1_u32;
     let rgba: Vec<u8> = (0..side * side)
@@ -1109,10 +1091,8 @@ fn native_png_work_source(side: u32) -> PaneImage {
             random.to_le_bytes()
         })
         .collect();
-    let mut png = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut png)
-        .write_image(&rgba, side, side, image::ColorType::Rgba8.into())
-        .unwrap();
+
+    let png = bmux_raster::encode_png(side, side, 4, &rgba).unwrap();
     let mut source = image();
     source.id = 71;
     source.position = ImagePosition { row: 17, col: 19 };

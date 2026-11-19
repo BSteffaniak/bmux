@@ -16,9 +16,7 @@
 
 use super::NativeImage;
 use crate::ClipboardError;
-use image::{ImageDecoder, ImageEncoder};
 use std::ffi::{CStr, c_char, c_void};
-use std::io::Cursor;
 
 type Id = *mut c_void;
 type Sel = *mut c_void;
@@ -349,10 +347,7 @@ fn encode_png(image: &NativeImage) -> Result<Vec<u8>, ClipboardError> {
     }
     let width = u32::try_from(image.width).map_err(|error| failed(error.to_string()))?;
     let height = u32::try_from(image.height).map_err(|error| failed(error.to_string()))?;
-    let mut bytes = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut bytes)
-        .write_image(&image.bytes, width, height, image::ExtendedColorType::Rgba8)
-        .map_err(|error| failed(error.to_string()))?;
+    let bytes = bmux_raster::encode_png(width, height, 4, &image.bytes).map_err(failed)?;
     if bytes.len() > MAX_BYTES {
         return Err(failed("encoded PNG exceeds 256 MiB"));
     }
@@ -360,30 +355,14 @@ fn encode_png(image: &NativeImage) -> Result<Vec<u8>, ClipboardError> {
 }
 
 fn decode_png(bytes: &[u8]) -> Result<NativeImage, ClipboardError> {
-    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), image::ImageFormat::Png);
-    let mut limits = image::Limits::default();
-    limits.max_alloc = Some(MAX_BYTES as u64);
-    reader.limits(limits);
-    let decoder = reader
-        .into_decoder()
-        .map_err(|error| failed(error.to_string()))?;
-    let (width, height) = decoder.dimensions();
-    let rgba_length = u64::from(width)
-        .checked_mul(u64::from(height))
-        .and_then(|n| n.checked_mul(4));
-    if rgba_length.is_none_or(|length| length > MAX_BYTES as u64) {
-        return Err(failed("decoded PNG exceeds 256 MiB"));
+    if !crate::is_png(bytes) {
+        return Err(failed("invalid PNG signature"));
     }
-    let rgba = image::DynamicImage::from_decoder(decoder)
-        .map_err(|error| failed(error.to_string()))?
-        .into_rgba8();
-    if rgba.len() > MAX_BYTES {
-        return Err(failed("decoded image exceeds 256 MiB"));
-    }
+    let rgba = bmux_raster::decode(bytes, u32::MAX, u32::MAX, MAX_BYTES as u64).map_err(failed)?;
     Ok(NativeImage {
-        width: rgba.width() as usize,
-        height: rgba.height() as usize,
-        bytes: rgba.into_raw(),
+        width: rgba.width as usize,
+        height: rgba.height as usize,
+        bytes: rgba.rgba,
     })
 }
 

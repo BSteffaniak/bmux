@@ -48,15 +48,8 @@ const CASES: [&str; 11] = [
 
 static PNG_PAYLOAD: std::sync::OnceLock<ImagePayload> = std::sync::OnceLock::new();
 
-fn prepare_png() -> Result<(), image::ImageError> {
-    use image::ImageEncoder;
-    let mut bytes = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut bytes).write_image(
-        &[32, 128, 224, 255].repeat(128 * 128),
-        128,
-        128,
-        image::ExtendedColorType::Rgba8,
-    )?;
+fn prepare_png() -> Result<(), String> {
+    let bytes = bmux_raster::encode_png(128, 128, 4, &[32, 128, 224, 255].repeat(128 * 128))?;
     let _ = PNG_PAYLOAD.set(ImagePayload::Png {
         bytes: bytes.into(),
         width: 128,

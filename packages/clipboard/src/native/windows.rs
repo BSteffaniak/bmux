@@ -10,9 +10,7 @@
 
 use super::NativeImage;
 use crate::ClipboardError;
-use image::{ImageDecoder, ImageEncoder};
 use std::ffi::c_void;
-use std::io::Cursor;
 use std::ptr;
 use std::thread;
 use std::time::Duration;
@@ -403,62 +401,29 @@ fn decode_dib(mut bytes: Vec<u8>) -> Result<NativeImage, ClipboardError> {
     bmp.extend_from_slice(&[0; 4]);
     bmp.extend_from_slice(&(offset + 14).to_le_bytes());
     bmp.extend_from_slice(&bytes);
-    let mut decoder = image::codecs::bmp::BmpDecoder::new(Cursor::new(bmp))
-        .map_err(|error| failed(error.to_string()))?;
-    let mut limits = image::Limits::default();
-    limits.max_alloc = Some(MAX_BYTES as u64);
-    decoder
-        .set_limits(limits)
-        .map_err(|error| failed(error.to_string()))?;
-    let (width, height) = decoder.dimensions();
-    let rgba_length = u64::from(width) * u64::from(height) * 4;
-    if decoder.total_bytes() > MAX_BYTES as u64 || rgba_length > MAX_BYTES as u64 {
-        return Err(failed("decoded DIB exceeds 256 MiB"));
-    }
-    let rgba = image::DynamicImage::from_decoder(decoder)
-        .map_err(|error| failed(error.to_string()))?
-        .into_rgba8();
+    let rgba = bmux_raster::decode(&bmp, u32::MAX, u32::MAX, MAX_BYTES as u64).map_err(failed)?;
     Ok(NativeImage {
-        width: rgba.width() as usize,
-        height: rgba.height() as usize,
-        bytes: rgba.into_raw(),
+        width: rgba.width as usize,
+        height: rgba.height as usize,
+        bytes: rgba.rgba,
     })
 }
 
 fn decode_png(bytes: &[u8]) -> Result<NativeImage, ClipboardError> {
-    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), image::ImageFormat::Png);
-    let mut limits = image::Limits::default();
-    limits.max_alloc = Some(MAX_BYTES as u64);
-    reader.limits(limits);
-    let decoder = reader
-        .into_decoder()
-        .map_err(|error| failed(error.to_string()))?;
-    let (width, height) = decoder.dimensions();
-    let rgba_length = u64::from(width)
-        .checked_mul(u64::from(height))
-        .and_then(|n| n.checked_mul(4));
-    if rgba_length.is_none_or(|length| length > MAX_BYTES as u64) {
-        return Err(failed("decoded PNG exceeds 256 MiB"));
+    if !crate::is_png(bytes) {
+        return Err(failed("invalid PNG signature"));
     }
-    let rgba = image::DynamicImage::from_decoder(decoder)
-        .map_err(|error| failed(error.to_string()))?
-        .into_rgba8();
-    if rgba.len() > MAX_BYTES {
-        return Err(failed("decoded PNG exceeds 256 MiB"));
-    }
+    let rgba = bmux_raster::decode(bytes, u32::MAX, u32::MAX, MAX_BYTES as u64).map_err(failed)?;
     Ok(NativeImage {
-        width: rgba.width() as usize,
-        height: rgba.height() as usize,
-        bytes: rgba.into_raw(),
+        width: rgba.width as usize,
+        height: rgba.height as usize,
+        bytes: rgba.rgba,
     })
 }
 
 pub(super) fn copy_image(image: &NativeImage) -> Result<(), ClipboardError> {
     let (width, height) = dimensions(image)?;
-    let mut png = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut png)
-        .write_image(&image.bytes, width, height, image::ExtendedColorType::Rgba8)
-        .map_err(|error| failed(error.to_string()))?;
+    let png = bmux_raster::encode_png(width, height, 4, &image.bytes).map_err(failed)?;
     // Complete encoding/allocation before clearing the old clipboard.
     let format = png_format()?;
     let png = Allocation::new(&png)?;
@@ -571,10 +536,7 @@ mod tests {
     #[test]
     fn png_preserves_straight_alpha_and_row_order() {
         let image = pixels();
-        let mut png = Vec::new();
-        image::codecs::png::PngEncoder::new(&mut png)
-            .write_image(&image.bytes, 2, 2, image::ExtendedColorType::Rgba8)
-            .unwrap();
+        let png = bmux_raster::encode_png(2, 2, 4, &image.bytes).unwrap();
         let decoded = decode_png(&png).unwrap();
         assert_eq!((decoded.width, decoded.height), (2, 2));
         assert_eq!(decoded.bytes, image.bytes);

@@ -731,30 +731,22 @@ impl TuiImageCompositor {
 // output storage bounds even incompressible/adversarial input to the raster size.
 #[cfg(feature = "kitty")]
 fn encode_fitted_png(payload: &mut ImagePayload) {
-    encode_fitted_png_with_compression(payload, image::codecs::png::CompressionType::Default);
+    encode_fitted_png_with_compression(payload, png::Compression::Balanced);
 }
 
 #[cfg(feature = "kitty")]
-fn encode_fitted_png_with_compression(
-    payload: &mut ImagePayload,
-    compression: image::codecs::png::CompressionType,
-) {
-    use image::ImageEncoder;
+fn encode_fitted_png_with_compression(payload: &mut ImagePayload, compression: png::Compression) {
     let pixels = payload.pixels.as_ref().expect("fitted pixels");
     let mut storage = vec![0; pixels.data.len()];
     let mut output = std::io::Cursor::new(storage.as_mut_slice());
-    let encoder = image::codecs::png::PngEncoder::new_with_quality(
-        &mut output,
-        compression,
-        image::codecs::png::FilterType::Adaptive,
-    );
+    let mut encoder = png::Encoder::new(&mut output, pixels.width, pixels.height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(compression);
+    encoder.set_filter(png::Filter::Adaptive);
     if encoder
-        .write_image(
-            &pixels.data,
-            pixels.width,
-            pixels.height,
-            image::ExtendedColorType::Rgba8,
-        )
+        .write_header()
+        .and_then(|mut writer| writer.write_image_data(&pixels.data))
         .is_ok()
     {
         let length = usize::try_from(output.position()).expect("bounded PNG length");
@@ -778,6 +770,10 @@ fn contain_payload(
     contain_payload_cancellable(placement, source, caps, config, None)
 }
 
+// Synchronous PNG intake historically had a 512 MiB native decoder limit,
+// independent of the configured encoded and expanded RGBA8 byte limits.
+const NATIVE_PNG_LIMIT: usize = 512 * 1024 * 1024;
+
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Bounded allocation coordinates.
 fn contain_payload_cancellable(
     placement: &bmux_tui::image::ImagePlacement,
@@ -791,7 +787,7 @@ fn contain_payload_cancellable(
     let ch = u32::from(ch);
     let width = u32::from(placement.destination.width) * cw;
     let height = u32::from(placement.destination.height) * ch;
-    let count = u64::from(width) * u64::from(height) * 4;
+    let count = (u64::from(width) * u64::from(height)).saturating_mul(4);
     if count > u64::try_from(config.max_image_bytes).unwrap_or(u64::MAX) {
         return Err(invalid(
             &placement.key,
@@ -801,7 +797,7 @@ fn contain_payload_cancellable(
     let fit = placement.pixel_rect(f64::from(cw), f64::from(ch));
     let fit_width = fit.width.round().max(1.0) as u32;
     let fit_height = fit.height.round().max(1.0) as u32;
-    if u64::from(fit_width) * u64::from(fit_height) * 4
+    if (u64::from(fit_width) * u64::from(fit_height)).saturating_mul(4)
         > u64::try_from(config.max_image_bytes).unwrap_or(u64::MAX)
     {
         return Err(invalid(
@@ -810,60 +806,77 @@ fn contain_payload_cancellable(
         ));
     }
     let pixels = source.pixels.as_ref().expect("validated pixels");
-    let decoded = match pixels.format {
-        PixelFormat::Rgb8 => image::DynamicImage::ImageRgb8(
-            image::RgbImage::from_raw(pixels.width, pixels.height, pixels.data.clone())
-                .expect("validated RGB"),
-        ),
-        PixelFormat::Rgba8 => image::DynamicImage::ImageRgba8(
-            image::RgbaImage::from_raw(pixels.width, pixels.height, pixels.data.clone())
-                .expect("validated RGBA"),
-        ),
-        PixelFormat::Png if cancelled.is_some() => {
-            let token = cancelled.expect("checked token");
-            let rgba = crate::compositor::clipping::decode_png_cancellable(
-                &pixels.data,
-                config.max_image_bytes,
-                || token.load(std::sync::atomic::Ordering::Acquire),
-            )?;
-            image::DynamicImage::ImageRgba8(
-                image::RgbaImage::from_raw(rgba.width, rgba.height, rgba.data)
-                    .expect("validated PNG rows"),
-            )
-        }
-        PixelFormat::Png => image::ImageReader::with_format(
-            std::io::Cursor::new(&pixels.data),
-            image::ImageFormat::Png,
-        )
-        .decode()
-        .map_err(|error| invalid(&placement.key, format!("PNG decode failed: {error}")))?,
-    };
-    let fitted = if let Some(token) = cancelled {
-        crate::compositor::clipping::resize_rgba_cancellable(
-            &decoded.into_rgba8(),
-            fit_width,
-            fit_height,
-            || token.load(std::sync::atomic::Ordering::Acquire),
+    // The synchronous path historically filtered native PNG samples before converting
+    // to RGBA8. IHDR bit depth is at byte 24; the PNG reader validates the header.
+    let fitted = if cancelled.is_none()
+        && pixels.format == PixelFormat::Png
+        && pixels.data.get(24) == Some(&16)
+        && (pixels.width, pixels.height) != (fit_width, fit_height)
+    {
+        bmux_raster::transforms::lanczos3_png16(
+            &pixels.data,
+            (pixels.width, pixels.height),
+            (fit_width, fit_height),
+            NATIVE_PNG_LIMIT,
         )?
     } else {
-        decoded
-            .resize_exact(fit_width, fit_height, image::imageops::FilterType::Lanczos3)
-            .into_rgba8()
+        let decoded = match pixels.format {
+            PixelFormat::Rgb8 | PixelFormat::Rgba8 => bmux_raster::transforms::from_pixels(
+                pixels.width,
+                pixels.height,
+                if pixels.format == PixelFormat::Rgb8 {
+                    3
+                } else {
+                    4
+                },
+                pixels.data.clone(),
+            )?,
+            PixelFormat::Png if cancelled.is_some() => {
+                let token = cancelled.expect("checked token");
+                let rgba = crate::compositor::clipping::decode_png_cancellable(
+                    &pixels.data,
+                    config.max_image_bytes,
+                    || token.load(std::sync::atomic::Ordering::Acquire),
+                )?;
+                bmux_raster::Raster {
+                    width: rgba.width,
+                    height: rgba.height,
+                    rgba: rgba.data,
+                }
+            }
+            PixelFormat::Png => bmux_raster::decode(
+                &pixels.data,
+                pixels.width,
+                pixels.height,
+                NATIVE_PNG_LIMIT as u64,
+            )
+            .map_err(|error| invalid(&placement.key, format!("PNG decode failed: {error}")))?,
+        };
+        if cancelled.is_some()
+            && [decoded.width, decoded.height, fit_width, fit_height]
+                .into_iter()
+                .any(|n| n > 4096)
+        {
+            return Err(std::io::Error::other("invalid resize dimensions").into());
+        }
+        bmux_raster::transforms::lanczos3(&decoded, fit_width, fit_height, || {
+            cancelled.is_some_and(|token| token.load(std::sync::atomic::Ordering::Acquire))
+        })?
     };
-    let mut canvas = image::RgbaImage::new(width, height);
-    image::imageops::overlay(
+    let mut canvas = bmux_raster::transforms::blank(width, height)?;
+    bmux_raster::transforms::overlay(
         &mut canvas,
         &fitted,
         (fit.x - f64::from(placement.destination.x) * f64::from(cw)).round() as i64,
         (fit.y - f64::from(placement.destination.y) * f64::from(ch)).round() as i64,
-    );
+    )?;
     Ok(ImagePayload {
         raw: None,
         pixels: Some(PixelBuffer {
             width,
             height,
             format: PixelFormat::Rgba8,
-            data: canvas.into_raw(),
+            data: canvas.rgba,
         }),
     })
 }
@@ -1038,33 +1051,27 @@ fn decode_payload_cancellable(
                     "encoded payload exceeds configured byte limit",
                 ));
             }
-            let decoded = if let Some(token) = cancelled {
+            if (u64::from(*width) * u64::from(*height))
+                .checked_mul(4)
+                .is_none_or(|n| n > config.max_image_bytes as u64)
+            {
+                return Err(invalid(key, "decoded pixels exceed configured byte limit"));
+            }
+            if let Some(token) = cancelled {
                 let rgba = crate::compositor::clipping::decode_png_cancellable(
                     bytes,
                     config.max_image_bytes,
                     || token.load(std::sync::atomic::Ordering::Acquire),
                 )?;
-                image::DynamicImage::ImageRgba8(
-                    image::RgbaImage::from_raw(rgba.width, rgba.height, rgba.data)
-                        .expect("validated PNG rows"),
-                )
+                if rgba.width != *width || rgba.height != *height {
+                    return Err(invalid(
+                        key,
+                        "declared dimensions do not match decoded PNG dimensions",
+                    ));
+                }
             } else {
-                image::ImageReader::with_format(
-                    std::io::Cursor::new(bytes),
-                    image::ImageFormat::Png,
-                )
-                .decode()
-                .map_err(|error| invalid(key, format!("PNG decode failed: {error}")))?
-            };
-            if decoded.width() != *width || decoded.height() != *height {
-                return Err(invalid(
-                    key,
-                    "declared dimensions do not match decoded PNG dimensions",
-                ));
-            }
-            let rgba = decoded.into_rgba8().into_raw();
-            if rgba.len() > config.max_image_bytes {
-                return Err(invalid(key, "decoded pixels exceed configured byte limit"));
+                bmux_raster::validate_png(bytes, *width, *height, NATIVE_PNG_LIMIT as u64)
+                    .map_err(|error| invalid(key, format!("PNG decode failed: {error}")))?;
             }
             (bytes.clone(), *width, *height, PixelFormat::Png)
         }
@@ -1499,15 +1506,11 @@ mod tests {
 
     #[cfg(feature = "kitty")]
     fn distinct_pressure_png(value: u8) -> ImagePayload {
-        use image::ImageEncoder;
-        let mut bytes = Vec::new();
         let mut pixels = vec![value; 8 * 4 * 4];
         for alpha in pixels.iter_mut().skip(3).step_by(4) {
             *alpha = 255;
         }
-        image::codecs::png::PngEncoder::new(&mut bytes)
-            .write_image(&pixels, 8, 4, image::ColorType::Rgba8.into())
-            .unwrap();
+        let bytes = bmux_raster::encode_png(8, 4, 4, &pixels).unwrap();
         ImagePayload::Png {
             bytes: bytes.into(),
             width: 8,
@@ -1691,17 +1694,19 @@ mod tests {
                 source_id = Some(full.id);
                 let crop = placements[0].source_rect.unwrap();
                 let pixels = full.payload.pixels.as_ref().unwrap();
-                let full =
-                    image::RgbaImage::from_raw(pixels.width, pixels.height, pixels.data.clone())
-                        .unwrap();
-                let actual =
-                    image::imageops::crop_imm(&full, crop.x, crop.y, crop.width, crop.height)
-                        .to_image();
+                let full = bmux_raster::transforms::from_pixels(
+                    pixels.width,
+                    pixels.height,
+                    4,
+                    pixels.data.clone(),
+                )
+                .unwrap();
+                let actual = cropped_rgba(&full, crop.x, crop.y, crop.width, crop.height);
                 let source = &compositor.sources[&placed.key].2;
                 let expected =
                     super::contain_payload(&placed, &source.payload, &caps, &config).unwrap();
                 assert_eq!(
-                    actual.as_raw(),
+                    &actual,
                     &expected.pixels.unwrap().data,
                     "fit={fit:?}, offset={offset}"
                 );
@@ -1925,11 +1930,7 @@ mod tests {
     #[cfg(feature = "kitty")]
     #[test]
     fn fractional_letterbox_keeps_identical_raster_when_overlay_clips() {
-        let pixels = image::RgbaImage::from_pixel(20, 20, image::Rgba([90, 120, 150, 255]));
-        let mut bytes = std::io::Cursor::new(Vec::new());
-        pixels
-            .write_to(&mut bytes, image::ImageFormat::Png)
-            .unwrap();
+        let bytes = bmux_raster::encode_png(20, 20, 4, &[90, 120, 150, 255].repeat(400)).unwrap();
         let mut placed = placement(
             "fractional",
             Rect::new(2, 2, 12, 7),
@@ -1938,7 +1939,7 @@ mod tests {
         );
         placed.fit = bmux_tui::image::ImageFit::Contain;
         placed.payload = ImagePayload::Png {
-            bytes: bytes.into_inner().into(),
+            bytes: bytes.into(),
             width: 20,
             height: 20,
         };
@@ -1997,7 +1998,7 @@ mod tests {
             include_bytes!("../../../presentations/bmux-tour/assets/frame.png").as_slice(),
             include_bytes!("../../../presentations/bmux-tour/assets/ownership.png").as_slice(),
         ] {
-            let decoded = image::load_from_memory(bytes).unwrap();
+            let decoded = bmux_raster::decode(bytes, 4096, 4096, 64 * 1024 * 1024).unwrap();
             let mut placed = placement(
                 "deck-png",
                 Rect::new(0, 0, 40, 12),
@@ -2007,8 +2008,8 @@ mod tests {
             placed.fit = bmux_tui::image::ImageFit::default();
             placed.payload = ImagePayload::Png {
                 bytes: bytes.to_vec().into(),
-                width: decoded.width(),
-                height: decoded.height(),
+                width: decoded.width,
+                height: decoded.height,
             };
             let config = ImageConfig::default();
             let source = super::decode_payload(&placed.key, &placed.payload, &config).unwrap();
@@ -2348,16 +2349,9 @@ mod tests {
                 255,
             );
             placed.fit = bmux_tui::image::ImageFit::Contain;
-            let mut png = std::io::Cursor::new(Vec::new());
-            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-                8,
-                4,
-                image::Rgba([255; 4]),
-            ))
-            .write_to(&mut png, image::ImageFormat::Png)
-            .unwrap();
+            let png = bmux_raster::encode_png(8, 4, 4, &[255; 4].repeat(8 * 4)).unwrap();
             placed.payload = ImagePayload::Png {
-                bytes: png.into_inner().into(),
+                bytes: png.into(),
                 width: 8,
                 height: 4,
             };
@@ -2537,10 +2531,8 @@ mod tests {
                     )
                     .unwrap();
                     let crop = placement.source_rect.unwrap();
-                    let actual =
-                        image::imageops::crop_imm(pixels, crop.x, crop.y, crop.width, crop.height)
-                            .to_image();
-                    assert_eq!(actual.as_raw(), &expected.pixels.unwrap().data);
+                    let actual = cropped_rgba(pixels, crop.x, crop.y, crop.width, crop.height);
+                    assert_eq!(&actual, &expected.pixels.unwrap().data);
                     assert_eq!(placement.cell_size.cols, 10);
                     assert_eq!(placement.cell_size.rows, placed.destination.height);
                 }
@@ -2649,16 +2641,10 @@ mod tests {
             width: 33,
             height: 17,
         });
-        let mut png = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-            400,
-            400,
-            image::Rgba([20, 120, 220, 255]),
-        ))
-        .write_to(&mut png, image::ImageFormat::Png)
-        .unwrap();
+        let png =
+            bmux_raster::encode_png(400, 400, 4, &[20, 120, 220, 255].repeat(400 * 400)).unwrap();
         placed.payload = ImagePayload::Png {
-            bytes: png.into_inner().into(),
+            bytes: png.into(),
             width: 400,
             height: 400,
         };
@@ -2718,13 +2704,13 @@ mod tests {
                 .unwrap();
             let full = fitted.payload.pixels.as_ref().unwrap();
             let full =
-                image::RgbaImage::from_raw(full.width, full.height, full.data.clone()).unwrap();
-            let actual = image::imageops::crop_imm(&full, crop.x, crop.y, crop.width, crop.height)
-                .to_image();
+                bmux_raster::transforms::from_pixels(full.width, full.height, 4, full.data.clone())
+                    .unwrap();
+            let actual = cropped_rgba(&full, crop.x, crop.y, crop.width, crop.height);
             let source = &compositor.sources[&placed.key].2;
             let expected =
                 super::contain_payload(&placed, &source.payload, &caps, &config).unwrap();
-            assert_eq!(actual.as_raw(), &expected.pixels.unwrap().data);
+            assert_eq!(&actual, &expected.pixels.unwrap().data);
         }
     }
 
@@ -2745,10 +2731,9 @@ mod tests {
         let pixels = payload.pixels.as_ref().unwrap();
         assert!(encoded.len() < pixels.data.len());
         assert_eq!(
-            image::load_from_memory(encoded)
+            &bmux_raster::decode(encoded, 4096, 4096, 64 * 1024 * 1024)
                 .unwrap()
-                .into_rgba8()
-                .as_raw(),
+                .rgba,
             &pixels.data
         );
         let mut tiny = crate::model::ImagePayload {
@@ -2773,23 +2758,24 @@ mod tests {
     #[ignore = "explicit representative-cover microbenchmark"]
     fn benchmark_real_cover_fitted_png() {
         let path = std::env::var("BMUX_COVER_BENCH").expect("captured decoded cover path");
-        let image = image::open(path)
-            .unwrap()
-            .resize_exact(264, 272, image::imageops::FilterType::Lanczos3)
-            .into_rgba8();
+        let image = bmux_raster::transforms::lanczos3(
+            &bmux_raster::decode(&std::fs::read(path).unwrap(), 4096, 4096, 64 * 1024 * 1024)
+                .unwrap(),
+            264,
+            272,
+            || false,
+        )
+        .unwrap();
         let mut payload = crate::model::ImagePayload {
             raw: None,
             pixels: Some(crate::model::PixelBuffer {
                 width: 264,
                 height: 272,
                 format: crate::model::PixelFormat::Rgba8,
-                data: image.into_raw(),
+                data: image.rgba,
             }),
         };
-        for compression in [
-            image::codecs::png::CompressionType::Fast,
-            image::codecs::png::CompressionType::Default,
-        ] {
+        for compression in [png::Compression::Fast, png::Compression::Balanced] {
             let mut times = Vec::new();
             let mut bytes = 0;
             for _ in 0..10 {
@@ -2802,8 +2788,8 @@ mod tests {
                     .as_ref()
                     .expect("representative cover should compress");
                 bytes = encoded.len();
-                let decoded = image::load_from_memory(encoded).unwrap().into_rgba8();
-                assert_eq!(decoded.as_raw(), &payload.pixels.as_ref().unwrap().data);
+                let decoded = bmux_raster::decode(encoded, 4096, 4096, 64 * 1024 * 1024).unwrap();
+                assert_eq!(&decoded.rgba, &payload.pixels.as_ref().unwrap().data);
             }
             times.sort_unstable();
             eprintln!(
@@ -2818,25 +2804,27 @@ mod tests {
 
     #[cfg(feature = "kitty")]
     fn transition_png() -> ImagePayload {
-        let mut png = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
-            8,
-            4,
-            image::Rgba([20, 120, 220, 255]),
-        ))
-        .write_to(&mut png, image::ImageFormat::Png)
-        .unwrap();
+        let png = bmux_raster::encode_png(8, 4, 4, &[20, 120, 220, 255].repeat(8 * 4)).unwrap();
         ImagePayload::Png {
-            bytes: png.into_inner().into(),
+            bytes: png.into(),
             width: 8,
             height: 4,
         }
     }
 
     #[cfg(feature = "kitty")]
+    fn cropped_rgba(src: &bmux_raster::Raster, x: u32, y: u32, w: u32, h: u32) -> Vec<u8> {
+        let mut bytes = vec![];
+        for row in y..y + h {
+            let at = ((row * src.width + x) * 4) as usize;
+            bytes.extend_from_slice(&src.rgba[at..at + w as usize * 4]);
+        }
+        bytes
+    }
+    #[cfg(feature = "kitty")]
     fn displayable_kitty_placements(
         output: &str,
-        uploads: &mut std::collections::BTreeMap<u32, image::RgbaImage>,
+        uploads: &mut std::collections::BTreeMap<u32, bmux_raster::Raster>,
     ) -> Vec<crate::model::KittyPlacement> {
         use crate::model::{KittyCommand, KittyFormat};
         let mut placements = Vec::new();
@@ -2859,9 +2847,11 @@ mod tests {
                 } => {
                     assert!(!more_chunks, "small regression images must fit one chunk");
                     let pixels = match format {
-                        KittyFormat::Png => image::load_from_memory(&data).unwrap().into_rgba8(),
+                        KittyFormat::Png => {
+                            bmux_raster::decode(&data, 4096, 4096, 64 * 1024 * 1024).unwrap()
+                        }
                         KittyFormat::Rgba => {
-                            image::RgbaImage::from_raw(width, height, data).unwrap()
+                            bmux_raster::transforms::from_pixels(width, height, 4, data).unwrap()
                         }
                         KittyFormat::Rgb => panic!("expected PNG or RGBA"),
                     };
@@ -2870,8 +2860,10 @@ mod tests {
                 KittyCommand::Place(placement) => {
                     assert!(
                         uploads[&placement.image_id]
-                            .pixels()
-                            .any(|p| p.0 == [20, 120, 220, 255]),
+                            .rgba
+                            .as_chunks::<4>()
+                            .0
+                            .contains(&[20, 120, 220, 255]),
                         "placed resource must contain real image pixels"
                     );
                     placements.push(placement);

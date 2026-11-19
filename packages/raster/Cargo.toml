@@ -1,0 +1,22 @@
+[package]
+authors     = { workspace = true }
+categories  = ["multimedia::images"]
+description = "Bounded raster decoding and pixel operations for BMUX"
+edition     = { workspace = true }
+keywords    = ["bmux", "pixels", "raster", "terminal"]
+license     = { workspace = true }
+name        = "bmux_raster"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+gif       = { workspace = true, optional = true }
+png       = { workspace = true }
+zune-core = { workspace = true, optional = true }
+zune-jpeg = { workspace = true, optional = true }
+
+[features]
+default          = []
+fail-on-warnings = []
+formats          = ["dep:gif", "dep:zune-core", "dep:zune-jpeg"]

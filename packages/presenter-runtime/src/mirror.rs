@@ -530,19 +530,8 @@ fn validate_images(
             return Err(HostError::Invalid);
         }
         if png && decode_png {
-            let mut reader = image::ImageReader::with_format(
-                std::io::Cursor::new(bytes),
-                image::ImageFormat::Png,
-            );
-            let mut limits = image::Limits::default();
-            limits.max_image_width = Some(width);
-            limits.max_image_height = Some(height);
-            limits.max_alloc = Some(32 * 1024 * 1024);
-            reader.limits(limits);
-            let decoded = reader.decode().map_err(|_| HostError::Invalid)?;
-            if decoded.width() != width || decoded.height() != height {
-                return Err(HostError::Invalid);
-            }
+            bmux_raster::validate_png(bytes, width, height, 32 * 1024 * 1024)
+                .map_err(|_| HostError::Invalid)?;
         }
     }
     Ok(())

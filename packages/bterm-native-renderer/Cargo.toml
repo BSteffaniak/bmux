@@ -12,11 +12,11 @@ version     = { workspace = true }
 
 [dependencies]
 bmux_fonts            = { workspace = true, features = ["bundled-nerd-fonts"] }
+bmux_raster           = { workspace = true, features = ["formats"] }
 bmux_tui              = { workspace = true }
 bterm_native_platform = { workspace = true, features = ["renderer-adapter"] }
 bytemuck              = { workspace = true, features = ["derive"] }
 fontdb                = { workspace = true }
-image                 = { workspace = true, features = ["png", "jpeg", "gif", "bmp"] }
 pollster              = { workspace = true }
 swash                 = { workspace = true }
 thiserror             = { workspace = true }

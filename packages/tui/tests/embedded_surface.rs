@@ -244,12 +244,38 @@ fn native_cell_ingestion_rejects_mutated_graphemes_and_controls() {
 }
 
 #[test]
+fn legacy_checkerboard_requires_complete_pixels_and_exact_dimensions() {
+    // Encoded fixture from the pre-migration image_iterm2 example, independent of the new encoder.
+    let checkerboard: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 2, 0, 0, 0, 2, 8, 6,
+        0, 0, 0, 114, 182, 13, 36, 0, 0, 0, 18, 73, 68, 65, 84, 120, 156, 99, 248, 207, 192, 0, 66,
+        64, 12, 36, 64, 44, 0, 67, 206, 7, 249, 19, 116, 7, 229, 0, 0, 0, 0, 73, 69, 78, 68, 174,
+        66, 96, 130,
+    ];
+    let admit = |bytes: &[u8], width| {
+        RetainedSurface::new(
+            identity(1),
+            Arc::new(Buffer::empty(Rect::new(0, 0, 2, 1))),
+            Arc::new(image(ImagePayload::Png {
+                bytes: bytes.into(),
+                width,
+                height: 2,
+            })),
+            limits(),
+        )
+    };
+    assert!(admit(checkerboard, 2).is_ok());
+    assert_eq!(admit(checkerboard, 3).unwrap_err(), SurfaceError::Invalid);
+    // The complete IHDR still advertises 2x2, but the IDAT is incomplete.
+    assert_eq!(
+        admit(&checkerboard[..45], 2).unwrap_err(),
+        SurfaceError::Invalid
+    );
+}
+
+#[test]
 fn valid_png_is_admitted_once_and_paints_from_the_retained_scene() {
-    use image::ImageEncoder;
-    let mut bytes = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut bytes)
-        .write_image(&[10, 20, 30, 255], 1, 1, image::ExtendedColorType::Rgba8)
-        .unwrap();
+    let bytes = bmux_raster::encode_png(1, 1, 4, &[10, 20, 30, 255]).unwrap();
     let source = RetainedSurface::new(
         identity(1),
         Arc::new(Buffer::empty(Rect::new(0, 0, 2, 1))),

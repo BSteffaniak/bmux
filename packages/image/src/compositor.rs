@@ -13,9 +13,6 @@ pub(crate) mod residency;
 mod tests;
 use std::io::Write;
 
-#[cfg(feature = "iterm2")]
-use image::ImageEncoder;
-
 use crate::host_caps::HostImageCapabilities;
 use crate::model::PaneImage;
 
@@ -918,45 +915,26 @@ fn emit_pixels(
                 } else {
                     pixels.clone()
                 };
-                let rgba = match decoded.format {
-                    crate::model::PixelFormat::Rgb8 => image::DynamicImage::ImageRgb8(
-                        image::RgbImage::from_raw(decoded.width, decoded.height, decoded.data)
-                            .ok_or_else(|| std::io::Error::other("invalid RGB image"))?,
-                    )
-                    .to_rgba8(),
-                    _ => image::RgbaImage::from_raw(decoded.width, decoded.height, decoded.data)
-                        .ok_or_else(|| std::io::Error::other("invalid RGBA image"))?,
+                let channels = if decoded.format == crate::model::PixelFormat::Rgb8 {
+                    3
+                } else {
+                    4
                 };
+                let rgba = bmux_raster::transforms::from_pixels(
+                    decoded.width,
+                    decoded.height,
+                    channels,
+                    decoded.data,
+                )?;
                 scaled = crate::model::PixelBuffer {
-                    data: if kitty_state.cancellation().is_some() {
-                        let mut output = image::RgbaImage::new(target_width, target_height);
-                        for y in 0..target_height {
-                            kitty_state.check_cancelled()?;
-                            let sy = (((y as f32 + 0.5) * rgba.height() as f32
-                                / target_height as f32)
-                                .floor() as u32)
-                                .min(rgba.height() - 1);
-                            for x in 0..target_width {
-                                if x.is_multiple_of(256) {
-                                    kitty_state.check_cancelled()?;
-                                }
-                                let sx = (((x as f32 + 0.5) * rgba.width() as f32
-                                    / target_width as f32)
-                                    .floor() as u32)
-                                    .min(rgba.width() - 1);
-                                output.put_pixel(x, y, *rgba.get_pixel(sx, sy));
-                            }
-                        }
-                        output.into_raw()
-                    } else {
-                        image::imageops::resize(
-                            &rgba,
-                            target_width,
-                            target_height,
-                            image::imageops::FilterType::Nearest,
-                        )
-                        .into_raw()
-                    },
+                    data: bmux_raster::transforms::nearest(
+                        &rgba,
+                        target_width,
+                        target_height,
+                        kitty_state.cancellation().is_some(),
+                        || kitty_state.check_cancelled(),
+                    )?
+                    .rgba,
                     width: target_width,
                     height: target_height,
                     format: crate::model::PixelFormat::Rgba8,
@@ -1183,13 +1161,10 @@ fn pixels_as_png(pixels: &crate::model::PixelBuffer) -> std::io::Result<Vec<u8>>
         return Ok(pixels.data.clone());
     }
     let color = match pixels.format {
-        crate::model::PixelFormat::Rgb8 => image::ColorType::Rgb8,
-        crate::model::PixelFormat::Rgba8 => image::ColorType::Rgba8,
+        crate::model::PixelFormat::Rgb8 => 3,
+        crate::model::PixelFormat::Rgba8 => 4,
         crate::model::PixelFormat::Png => unreachable!(),
     };
-    let mut png = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut png)
-        .write_image(&pixels.data, pixels.width, pixels.height, color.into())
-        .map_err(std::io::Error::other)?;
-    Ok(png)
+    bmux_raster::encode_png(pixels.width, pixels.height, color, &pixels.data)
+        .map_err(std::io::Error::other)
 }

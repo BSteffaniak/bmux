@@ -1,7 +1,7 @@
 //! Copy this file alone into the pinned shipping checkout's clipboard examples.
 //! Uses only the public API shared by shipping and candidate; no native-only cfgs.
 use bmux_clipboard::{ClipboardPayload, copy_png_image, copy_text, read_payload};
-use std::io::{Cursor, Read, Write};
+use std::io::{Read, Write};
 use std::process::ExitCode;
 
 fn run() -> Result<(), &'static str> {
@@ -19,10 +19,12 @@ fn run() -> Result<(), &'static str> {
     };
     let seed = seed.parse::<u32>().map_err(|_| "invalid seed")?;
     // Opaque pixels avoid platform-dependent rounding of premultiplied alpha.
-    let rgba = image::RgbaImage::from_fn(37, 29, |x, y| {
-        let [r, g, b, _] = (seed ^ (x + 37 * y).wrapping_mul(0x9e37_79b9)).to_le_bytes();
-        image::Rgba([r, g, b, 255])
-    });
+    let rgba: Vec<u8> = (0..37_u32 * 29)
+        .flat_map(|i| {
+            let [r, g, b, _] = (seed ^ i.wrapping_mul(0x9e37_79b9)).to_le_bytes();
+            [r, g, b, 255]
+        })
+        .collect();
     let text = match case.as_str() {
         "text" => format!("bmux {seed} 界 🦀 e\u{301}\n").repeat(8192),
         "empty" | "image" => String::new(),
@@ -31,10 +33,8 @@ fn run() -> Result<(), &'static str> {
     match operation.as_str() {
         "write" => {
             if case == "image" {
-                let mut png = Cursor::new(Vec::new());
-                rgba.write_to(&mut png, image::ImageFormat::Png)
-                    .map_err(|_| "encode failed")?;
-                copy_png_image(png.get_ref()).map_err(|_| "image write failed")?;
+                let png = bmux_raster::encode_png(37, 29, 4, &rgba).map_err(|_| "encode failed")?;
+                copy_png_image(&png).map_err(|_| "image write failed")?;
             } else {
                 copy_text(&text).map_err(|_| "text write failed")?;
             }
@@ -52,13 +52,15 @@ fn run() -> Result<(), &'static str> {
                     actual.into_bytes()
                 }
                 ClipboardPayload::ImagePng(png) if case == "image" => {
-                    let actual = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
-                        .map_err(|_| "invalid PNG")?
-                        .into_rgba8();
-                    if actual != rgba {
+                    if !png.starts_with(b"\x89PNG\r\n\x1a\n") {
+                        return Err("invalid PNG");
+                    }
+                    let actual = bmux_raster::decode(&png, 37, 29, 512 * 1024 * 1024)
+                        .map_err(|_| "invalid PNG")?;
+                    if (actual.width, actual.height) != (37, 29) || actual.rgba != rgba {
                         return Err("RGBA mismatch");
                     }
-                    actual.into_raw()
+                    actual.rgba
                 }
                 _ => return Err("flavor or content mismatch"),
             };

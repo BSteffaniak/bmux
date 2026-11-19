@@ -11,9 +11,9 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-image     = { workspace = true, features = ["png", "jpeg", "gif", "bmp"] }
-thiserror = { workspace = true }
-tracing   = { workspace = true }
+bmux_raster = { workspace = true, features = ["formats"] }
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
 
 [target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android", target_os = "emscripten"))))'.dependencies]
 libc                  = { workspace = true }

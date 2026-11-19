@@ -548,15 +548,7 @@ mod pipeline {
             height: 2,
             format: PixelFormat::Rgba8,
         };
-        let mut png = Vec::new();
-        image::ImageEncoder::write_image(
-            image::codecs::png::PngEncoder::new(&mut png),
-            &rgba,
-            2,
-            2,
-            image::ExtendedColorType::Rgba8,
-        )
-        .unwrap();
+        let png = bmux_raster::encode_png(2, 2, 4, &rgba).unwrap();
         let mut sixel = b"\x1bPq".to_vec();
         sixel.extend(bmux_image::codec::sixel::encode(&pixels).unwrap());
         sixel.extend_from_slice(b"\x1b\\");
@@ -636,20 +628,18 @@ mod pipeline {
                         bmux_image::codec::iterm2::parse_body(image.payload.raw.as_ref().unwrap())
                             .unwrap();
                     assert_eq!(
-                        image::load_from_memory(&bytes)
+                        bmux_raster::decode(&bytes, 4096, 4096, 64 * 1024 * 1024)
                             .unwrap()
-                            .to_rgba8()
-                            .into_raw(),
+                            .rgba,
                         rgba
                     );
                 } else {
                     // A PNG source goes to Kitty as is; Kitty scales it to its cells.
                     let pixels = image.payload.pixels.as_ref().unwrap();
                     let data = if pixels.format == PixelFormat::Png {
-                        image::load_from_memory(&pixels.data)
+                        bmux_raster::decode(&pixels.data, 4096, 4096, 64 * 1024 * 1024)
                             .unwrap()
-                            .to_rgba8()
-                            .into_raw()
+                            .rgba
                     } else {
                         pixels.data.clone()
                     };
@@ -782,10 +772,14 @@ mod pipeline {
             }
             assert_eq!(registry.images().len(), 1, "split {split}");
             let image = &registry.images()[0];
-            let pixels = image::load_from_memory(image.payload.raw.as_ref().unwrap())
-                .unwrap()
-                .to_rgba8();
-            assert_eq!(pixels.into_raw(), vec![3, 4, 5, 6], "split {split}");
+            let pixels = bmux_raster::decode(
+                image.payload.raw.as_ref().unwrap(),
+                4096,
+                4096,
+                64 * 1024 * 1024,
+            )
+            .unwrap();
+            assert_eq!(pixels.rgba, vec![3, 4, 5, 6], "split {split}");
         }
     }
 
@@ -813,10 +807,14 @@ mod pipeline {
         assert_eq!(image.cell_size, ImageCellSize { rows: 8, cols: 16 });
         let transported: bmux_attach_image_protocol::AttachPaneImage = image.into();
         let restored = PaneImage::from(&transported);
-        let decoded = image::load_from_memory(restored.payload.raw.as_ref().unwrap())
-            .unwrap()
-            .to_rgba8();
-        assert_eq!(decoded.into_raw(), rgba);
+        let decoded = bmux_raster::decode(
+            restored.payload.raw.as_ref().unwrap(),
+            4096,
+            4096,
+            64 * 1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(decoded.rgba, rgba);
         let caps = bmux_image::host_caps::HostImageCapabilities {
             kitty_graphics: true,
             ..Default::default()
@@ -994,15 +992,7 @@ mod pipeline {
         // Simulate an iTerm2 inline image OSC.
         let mut input = Vec::new();
         input.extend_from_slice(b"\x1b]1337;File=");
-        let mut png = Vec::new();
-        image::ImageEncoder::write_image(
-            image::codecs::png::PngEncoder::new(&mut png),
-            &[255, 0, 0, 255],
-            1,
-            1,
-            image::ExtendedColorType::Rgba8,
-        )
-        .unwrap();
+        let png = bmux_raster::encode_png(1, 1, 4, &[255, 0, 0, 255]).unwrap();
         input.extend(bmux_image::codec::iterm2::encode_body(&png, true));
         input.push(0x07); // BEL terminator
 
@@ -1141,12 +1131,7 @@ mod kitty_intake {
     use bmux_image::registry::ImageRegistry;
 
     fn png() -> Vec<u8> {
-        let image = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
-        let mut png = Vec::new();
-        image
-            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-            .unwrap();
-        png
+        bmux_raster::encode_png(2, 2, 4, &[255, 0, 0, 255].repeat(4)).unwrap()
     }
 
     /// Feed `wire` to a registry at cursor row 1, column 2; its images and the replies owed.

@@ -177,11 +177,11 @@ impl AudienceRenderer {
         if self.resources.contains_key(id) {
             return Err("changed bytes for admitted audience resource".into());
         }
-        let dimensions =
-            image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Png)
-                .into_dimensions()
-                .map_err(|error| error.to_string())?;
-        let decoded = usize::try_from(u64::from(dimensions.0) * u64::from(dimensions.1) * 4)
+        let (width, height) = bmux_raster::png_dimensions(bytes, 64 * 1024 * 1024)?;
+        if width > 4096 || height > 4096 {
+            return Err("audience image pixel limit".into());
+        }
+        let decoded = usize::try_from(u64::from(width) * u64::from(height) * 4)
             .map_err(|_| "image dimension overflow")?;
         if decoded > MAX_DECODED_BYTES {
             return Err("audience image pixel limit".into());
@@ -217,21 +217,11 @@ impl AudienceRenderer {
             residency.add(pending.content.budget)?;
         }
         residency.add(ImageBudget::default())?;
-        let mut reader =
-            image::ImageReader::with_format(std::io::Cursor::new(bytes), image::ImageFormat::Png);
-        let mut limits = image::Limits::default();
-        limits.max_image_width = Some(4096);
-        limits.max_image_height = Some(4096);
-        limits.max_alloc = Some(64 * 1024 * 1024);
-        reader.limits(limits);
-        let image = reader.decode().map_err(|error| error.to_string())?;
-        if u64::from(image.width()) * u64::from(image.height()) > 16 * 1024 * 1024 {
-            return Err("audience image pixel limit".into());
-        }
+        bmux_raster::validate_png(bytes, width, height, 64 * 1024 * 1024)?;
         let payload = ImagePayload::Png {
             bytes: bytes.to_vec().into(),
-            width: image.width(),
-            height: image.height(),
+            width,
+            height,
         };
         while self.cache_bytes + bytes.len() > MAX_CACHE_BYTES || self.resources.len() >= 128 {
             let oldest = self
@@ -1685,10 +1675,7 @@ mod tests {
     }
     #[test]
     fn hydrated_reference_image_reaches_retained_scene() {
-        let image = image::DynamicImage::new_rgba8(2, 2);
-        let mut png = std::io::Cursor::new(Vec::new());
-        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
-        let png = png.into_inner();
+        let png = bmux_raster::encode_png(2, 2, 4, &[0; 16]).unwrap();
         let id = sha256_hex(&png);
         // Unmapped images are never quietly dropped.
         assert!(
@@ -1767,10 +1754,7 @@ mod tests {
     }
     #[test]
     fn repeated_diagram_resize_and_scroll_preserve_full_frame_height() {
-        let image = image::DynamicImage::new_rgba8(2, 2);
-        let mut png = std::io::Cursor::new(Vec::new());
-        image.write_to(&mut png, image::ImageFormat::Png).unwrap();
-        let png = png.into_inner();
+        let png = bmux_raster::encode_png(2, 2, 4, &[0; 16]).unwrap();
         let id = sha256_hex(&png);
         let deck = crate::DeckBuilder::new("diagram")
             .slide(

@@ -19,7 +19,6 @@ use bmux_tui::image::{
     ImagePlacement,
 };
 use bmux_tui::image_scene::ImageScene;
-use image::ImageEncoder;
 
 type Samples = BTreeMap<String, Vec<Sample>>;
 type WorkCounts = (usize, usize, usize, usize, usize);
@@ -274,13 +273,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("require 1..=1000 iterations and 1..=4096 dimensions".into());
     }
     let pixels = support::fixture(width, height, &fixture)?;
-    let mut png = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut png).write_image(
-        &pixels.data,
-        width,
-        height,
-        image::ExtendedColorType::Rgba8,
-    )?;
+
+    let png = bmux_raster::encode_png(width, height, 4, &pixels.data)?;
     let reference = sixel_reference::encode(&pixels).ok_or("reference fixture rejected")?;
     let optimized = sixel::encode(&pixels).ok_or("optimized fixture rejected")?;
     assert_eq!(

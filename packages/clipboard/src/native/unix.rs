@@ -4,7 +4,6 @@
 //! protocols. Ignored interoperability tests require explicitly isolated displays.
 use super::NativeImage;
 use crate::ClipboardError;
-use std::io::Cursor;
 
 mod wayland;
 mod x11;
@@ -66,7 +65,6 @@ pub fn read_text() -> Result<Option<String>, ClipboardError> {
         .transpose()
 }
 pub fn copy_image(image: &NativeImage) -> Result<(), ClipboardError> {
-    use image::ImageEncoder as _;
     let (width, height) = (u32::try_from(image.width), u32::try_from(image.height));
     let (Ok(width), Ok(height)) = (width, height) else {
         return Err(failure(
@@ -88,29 +86,24 @@ pub fn copy_image(image: &NativeImage) -> Result<(), ClipboardError> {
             "invalid or oversized RGBA image".to_string(),
         ));
     }
-    let mut bytes = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut bytes)
-        .write_image(&image.bytes, width, height, image::ExtendedColorType::Rgba8)
-        .map_err(|e| failure("native-unix", e.to_string()))?;
+    let bytes = bmux_raster::encode_png(width, height, 4, &image.bytes)
+        .map_err(|e| failure("native-unix", e))?;
     write(bytes, true)
 }
 pub fn read_image() -> Result<Option<NativeImage>, ClipboardError> {
     let Some(bytes) = read(true)? else {
         return Ok(None);
     };
-    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), image::ImageFormat::Png);
-    let mut limits = image::Limits::default();
-    limits.max_alloc = Some(LIMIT as u64);
-    reader.limits(limits);
-    let decoded = reader
-        .decode()
-        .map_err(|e| failure("native-unix", e.to_string()))?;
-    checked_rgba_size(decoded.width(), decoded.height())?;
-    let image = decoded.into_rgba8();
+    if !crate::is_png(&bytes) {
+        return Err(failure("native-unix", "invalid PNG signature".into()));
+    }
+    let image = bmux_raster::decode(&bytes, u32::MAX, u32::MAX, LIMIT as u64)
+        .map_err(|e| failure("native-unix", e))?;
+    checked_rgba_size(image.width, image.height)?;
     Ok(Some(NativeImage {
-        width: image.width() as usize,
-        height: image.height() as usize,
-        bytes: image.into_raw(),
+        width: image.width as usize,
+        height: image.height as usize,
+        bytes: image.rgba,
     }))
 }
 

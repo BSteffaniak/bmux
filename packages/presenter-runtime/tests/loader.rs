@@ -41,7 +41,11 @@ fn loader_prepares_inline_images_and_rejects_unknown_themes_and_oversized_assets
     let root = std::env::temp_dir().join(format!("bmux-inline-images-{}", uuid::Uuid::new_v4()));
     fs::create_dir(&root).unwrap();
     let image_path = root.join("picture.png");
-    image::RgbaImage::new(1, 1).save(&image_path).unwrap();
+    fs::write(
+        &image_path,
+        bmux_raster::encode_png(1, 1, 4, &[0; 4]).unwrap(),
+    )
+    .unwrap();
     let mut deck = DeckBuilder::new("inline")
         .slide(SlideBuilder::new("a").build())
         .build()

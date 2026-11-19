@@ -103,10 +103,9 @@ mod png_cancellation_tests {
         .unwrap();
         assert_eq!(
             actual.data,
-            image::load_from_memory(&png)
+            bmux_raster::decode(&png, 4096, 4096, 64 * 1024 * 1024)
                 .unwrap()
-                .into_rgba8()
-                .into_raw()
+                .rgba
         );
         for stop in [1, 3, 12, 26, count] {
             let mut steps = 0;
@@ -173,10 +172,9 @@ mod png_cancellation_tests {
             let actual = decode_png_cancellable(&bytes, 64 * 1024 * 1024, || false).unwrap();
             assert_eq!(
                 actual.data,
-                image::load_from_memory(&bytes)
+                bmux_raster::decode(&bytes, 4096, 4096, 64 * 1024 * 1024)
                     .unwrap()
-                    .into_rgba8()
-                    .into_raw()
+                    .rgba
             );
         }
     }
@@ -195,8 +193,8 @@ mod png_cancellation_tests {
             false
         })
         .unwrap();
-        let decoded = image::load_from_memory(&bytes).unwrap().into_rgba8();
-        assert_eq!(decoded.as_raw(), &pixels.data);
+        let decoded = bmux_raster::decode(&bytes, 4096, 4096, 64 * 1024 * 1024).unwrap();
+        assert_eq!(&decoded.rgba, &pixels.data);
         assert!(checks >= pixels.height as usize + 2);
         for stop in 1..=checks {
             let mut steps = 0;
@@ -268,20 +266,13 @@ pub(crate) fn decoded(image: &crate::model::PaneImage) -> std::io::Result<PixelB
 }
 
 fn decode_png(data: &[u8]) -> std::io::Result<PixelBuffer> {
-    let mut reader = image::ImageReader::new(std::io::Cursor::new(data))
-        .with_guessed_format()
-        .map_err(std::io::Error::other)?;
-    let mut limits = image::Limits::default();
-    limits.max_alloc = Some(64 * 1024 * 1024);
-    limits.max_image_width = Some(4096);
-    limits.max_image_height = Some(4096);
-    reader.limits(limits);
-    let decoded = reader.decode().map_err(std::io::Error::other)?.to_rgba8();
+    let decoded =
+        bmux_raster::decode(data, 4096, 4096, 64 * 1024 * 1024).map_err(std::io::Error::other)?;
     Ok(PixelBuffer {
-        width: decoded.width(),
-        height: decoded.height(),
+        width: decoded.width,
+        height: decoded.height,
         format: PixelFormat::Rgba8,
-        data: decoded.into_raw(),
+        data: decoded.rgba,
     })
 }
 
@@ -311,195 +302,6 @@ pub(super) fn pixels(payload: &ImagePayload) -> std::io::Result<PixelBuffer> {
         return Err(std::io::Error::other("invalid or oversized decoded image"));
     }
     Ok(pixels.clone())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn fragments_exclude_overlay_and_preserve_uncovered_area() {
-        let fragments = subtract(Rect::new(0, 0, 10, 10), Rect::new(2, 2, 4, 4));
-        assert_eq!(fragments.len(), 4);
-        assert_eq!(
-            fragments
-                .iter()
-                .map(|r| u32::from(r.width) * u32::from(r.height))
-                .sum::<u32>(),
-            84
-        );
-        assert!(
-            fragments
-                .iter()
-                .all(|r| r.intersection(Rect::new(2, 2, 4, 4)).is_empty())
-        );
-    }
-}
-
-/// Equivalent image-0.25.10 Lanczos3 passes for RGBA8. Checkpoints occur within
-/// tap accumulation (at most 64 taps), retaining f32 operation order/rounding.
-#[allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss
-)] // Validated raster dimensions and clamped channel output.
-pub(crate) fn resize_rgba_cancellable(
-    source: &image::RgbaImage,
-    width: u32,
-    height: u32,
-    mut cancelled: impl FnMut() -> bool,
-) -> std::io::Result<image::RgbaImage> {
-    let mut check = || {
-        if cancelled() {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "resampling cancelled",
-            ))
-        } else {
-            Ok(())
-        }
-    };
-    check()?;
-    let (sw, sh) = source.dimensions();
-    if sw == 0
-        || sh == 0
-        || width == 0
-        || height == 0
-        || sw > 4096
-        || sh > 4096
-        || width > 4096
-        || height > 4096
-    {
-        return Err(std::io::Error::other("invalid resize dimensions"));
-    }
-    if (sw, sh) == (width, height) {
-        return Ok(source.clone());
-    }
-    fn kernel(x: f32) -> f32 {
-        fn sinc(x: f32) -> f32 {
-            let a = x * std::f32::consts::PI;
-            if x == 0.0 { 1.0 } else { a.sin() / a }
-        }
-        if x.abs() < 3.0 {
-            sinc(x) * sinc(x / 3.0)
-        } else {
-            0.0
-        }
-    }
-    fn weights(
-        size: u32,
-        target: u32,
-        pos: u32,
-        check: &mut impl FnMut() -> std::io::Result<()>,
-    ) -> std::io::Result<(u32, Vec<f32>)> {
-        let ratio = size as f32 / target as f32;
-        let sratio = ratio.max(1.0);
-        let support = 3.0 * sratio;
-        let center = (pos as f32 + 0.5) * ratio;
-        let left = ((center - support).floor() as i64).clamp(0, i64::from(size) - 1) as u32;
-        let right =
-            ((center + support).ceil() as i64).clamp(i64::from(left) + 1, i64::from(size)) as u32;
-        let center = center - 0.5;
-        let mut values = Vec::new();
-        let mut sum = 0.0;
-        for i in left..right {
-            if (i - left).is_multiple_of(64) {
-                check()?;
-            }
-            let value = kernel((i as f32 - center) / sratio);
-            values.push(value);
-            sum += value;
-        }
-        for (i, value) in values.iter_mut().enumerate() {
-            if i % 64 == 0 {
-                check()?;
-            }
-            *value /= sum;
-        }
-        Ok((left, values))
-    }
-    let mut vertical = image::ImageBuffer::<image::Rgba<f32>, Vec<f32>>::new(sw, height);
-    for y in 0..height {
-        check()?;
-        let (left, ws) = weights(sh, height, y, &mut check)?;
-        for x in 0..sw {
-            let mut sums = [0.0f32; 4];
-            for (i, weight) in ws.iter().enumerate() {
-                if i % 64 == 0 {
-                    check()?;
-                }
-                let pixel = source.get_pixel(x, left + i as u32);
-                for channel in 0..4 {
-                    sums[channel] += f32::from(pixel[channel]) * weight;
-                }
-            }
-            vertical.put_pixel(x, y, image::Rgba(sums));
-        }
-    }
-    let mut output = image::RgbaImage::new(width, height);
-    for x in 0..width {
-        check()?;
-        let (left, ws) = weights(sw, width, x, &mut check)?;
-        for y in 0..height {
-            let mut sums = [0.0f32; 4];
-            for (i, weight) in ws.iter().enumerate() {
-                if i % 64 == 0 {
-                    check()?;
-                }
-                let pixel = vertical.get_pixel(left + i as u32, y);
-                for channel in 0..4 {
-                    sums[channel] += pixel[channel] * weight;
-                }
-            }
-            output.put_pixel(
-                x,
-                y,
-                image::Rgba(sums.map(|v| v.clamp(0.0, 255.0).round() as u8)),
-            );
-        }
-    }
-    Ok(output)
-}
-
-#[cfg(test)]
-mod resize_cancellation_tests {
-    use super::*;
-    #[test]
-    fn lanczos_pixels_match_locked_image_and_cancel_inside_both_passes() {
-        for (sw, sh, w, h) in [
-            (7, 13, 19, 5),
-            (31, 17, 8, 29),
-            (1, 9, 7, 1),
-            (20, 20, 20, 20),
-        ] {
-            let source = image::RgbaImage::from_fn(sw, sh, |x, y| {
-                image::Rgba([
-                    ((x * 71 + y * 29) % 256) as u8,
-                    ((x * 17 + y * 101) % 256) as u8,
-                    ((x * 89 + y * 11) % 256) as u8,
-                    ((x * 31 + y * 37) % 256) as u8,
-                ])
-            });
-            let expected =
-                image::imageops::resize(&source, w, h, image::imageops::FilterType::Lanczos3);
-            let mut total = 0;
-            let actual = resize_rgba_cancellable(&source, w, h, || {
-                total += 1;
-                false
-            })
-            .unwrap();
-            assert_eq!(actual, expected, "{sw}x{sh} -> {w}x{h}");
-            for stop in [1, total / 3 + 1, total * 2 / 3 + 1, total] {
-                let mut steps = 0;
-                let error = resize_rgba_cancellable(&source, w, h, || {
-                    steps += 1;
-                    steps == stop
-                })
-                .unwrap_err();
-                assert_eq!(steps, stop);
-                assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
-            }
-        }
-    }
 }
 
 /// Decode PNG rows with the locked codec's expansion/interlace implementation.
@@ -660,4 +462,26 @@ pub(crate) fn decode_png_cancellable(
         format: PixelFormat::Rgba8,
         data: rgba,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn fragments_exclude_overlay_and_preserve_uncovered_area() {
+        let fragments = subtract(Rect::new(0, 0, 10, 10), Rect::new(2, 2, 4, 4));
+        assert_eq!(fragments.len(), 4);
+        assert_eq!(
+            fragments
+                .iter()
+                .map(|r| u32::from(r.width) * u32::from(r.height))
+                .sum::<u32>(),
+            84
+        );
+        assert!(
+            fragments
+                .iter()
+                .all(|r| r.intersection(Rect::new(2, 2, 4, 4)).is_empty())
+        );
+    }
 }
