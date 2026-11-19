@@ -107,12 +107,12 @@ mod tests {
         let (mut view, content) = view();
         view.mouse.config.enabled = false;
         let buffer = view.pane_buffers.get_mut(&content).unwrap();
-        super::super::render::append_pane_output(buffer, b"\x1b]22;pointer\x1b\\");
+        bmux_attach_pipeline::render::append_pane_output(buffer, b"\x1b]22;pointer\x1b\\");
         assert_eq!(
             resolve(&view),
             Some(ResolvedPointerShape::Shape(PointerShape::Pointer))
         );
-        super::super::render::append_pane_output(
+        bmux_attach_pipeline::render::append_pane_output(
             view.pane_buffers.get_mut(&content).unwrap(),
             b"\x1b]22;wait\x1b\\",
         );
@@ -140,7 +140,7 @@ mod tests {
     #[test]
     fn alternate_screen_and_configuration_remain_independent() {
         let (mut view, content) = view();
-        super::super::render::append_pane_output(
+        bmux_attach_pipeline::render::append_pane_output(
             view.pane_buffers.get_mut(&content).unwrap(),
             b"\x1b]22;pointer\x1b\\\x1b[?1049h\x1b]22;crosshair\x1b\\",
         );
@@ -148,7 +148,7 @@ mod tests {
             resolve(&view),
             Some(ResolvedPointerShape::Shape(PointerShape::Crosshair))
         );
-        super::super::render::append_pane_output(
+        bmux_attach_pipeline::render::append_pane_output(
             view.pane_buffers.get_mut(&content).unwrap(),
             b"\x1b[?1049l",
         );

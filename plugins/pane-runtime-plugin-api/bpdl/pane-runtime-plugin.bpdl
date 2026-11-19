@@ -1294,6 +1294,9 @@ interface attach-runtime-state {
         sync_update_active: bool,
         // A `bmux_terminal_grid::GridFrame`, encoded with `bmux_ipc::encode`.
         encoded: list<u8>,
+        // `bmux-bench replay` markers the program wrote since the client's last frame, as
+        // written; empty unless the server logs replay.
+        replay_markers: list<u8>,
     }
 
     record attach-pane-frames {

@@ -181,6 +181,9 @@ pub struct AttachPaneFrame {
     pub sync_update_active: bool,
     /// The `bmux_terminal_grid::GridFrame`, encoded with `bmux_ipc::encode`.
     pub encoded: Vec<u8>,
+    /// `bmux-bench replay` markers the program wrote since the client's last frame, as written
+    /// (empty unless the server logs replay).
+    pub replay_markers: Vec<u8>,
 }
 
 /// Process identity for a running pane runtime. `pid` is the spawned

@@ -245,17 +245,17 @@ impl AttachDirtyFlags {
 /// Pane output the server pushes instead of this client reading it.
 #[derive(Default)]
 pub struct OutputPush {
-    /// Panes whose output is pushed.
+    /// Panes whose frames are pushed.
     pub(super) panes: std::collections::BTreeSet<Uuid>,
-    /// The server cannot push: output is read instead, without asking again.
+    /// The server cannot push: frames are read instead, without asking again.
     pub(super) unsupported: bool,
-    /// Pushed chunks not yet applied.
-    pub(super) received: Vec<bmux_attach_layout_protocol::AttachPaneChunk>,
+    /// Pushed frames not yet applied.
+    pub(super) received: Vec<crate::pane_runtime_client::PaneFrameResult>,
 }
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct AttachViewState {
-    /// Pane output pushed by the server.
+    /// Pane frames pushed by the server.
     pub(super) output_push: OutputPush,
     /// The server said this client's input producer barriers changed.
     pub(super) producer_barriers_changed: bool,

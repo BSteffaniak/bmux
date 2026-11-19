@@ -125,6 +125,10 @@ pub struct GridFrame {
     pub next: ReplicaCursor,
     /// Replace the replica's whole state: palette, rows, history.
     pub reset: bool,
+    /// The grid's revision and content revision as of the frame: the replica takes them, so a
+    /// request naming a revision (an alternate-screen resize) means the same grid on both.
+    pub revision: u64,
+    pub content_revision: u64,
     pub width: u16,
     pub height: u16,
     /// Palette entries from `base.styles` (from 0 in a reset frame).
@@ -332,6 +336,8 @@ impl TerminalGrid {
                 styles: u32::try_from(self.palette.len()).unwrap_or(u32::MAX),
             },
             reset,
+            revision: self.revision,
+            content_revision: self.content_revision,
             width: u16::try_from(self.width).unwrap_or(u16::MAX),
             height: u16::try_from(self.height).unwrap_or(u16::MAX),
             styles,
@@ -457,6 +463,8 @@ impl TerminalGrid {
         }
         self.apply_history(frame, styles)?;
         self.apply_state(&frame.state)?;
+        self.revision = frame.revision;
+        self.content_revision = frame.content_revision;
         *cursor = frame.next;
         Ok(())
     }
@@ -578,7 +586,6 @@ impl TerminalGrid {
         self.protocol = state.protocol;
         self.total_scrolled_rows = state.total_scrolled_rows;
         self.history_truncated |= state.history_truncated;
-        self.bump_content_revision();
         Ok(())
     }
 }

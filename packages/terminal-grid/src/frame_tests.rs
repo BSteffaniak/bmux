@@ -130,12 +130,10 @@ fn burst(rng: &mut Rng, out: &mut Vec<u8>) {
     }
 }
 
-/// A grid's whole snapshot, with what replication does not carry (revision counters, the
-/// parser's unfinished prefix) left out.
+/// A grid's whole snapshot, revisions included, without what replication does not carry (the
+/// parser's unfinished prefix: a replica does not parse).
 fn replicated(grid: &TerminalGrid) -> GridSnapshot {
     let mut snapshot = grid.snapshot(0, 100_000);
-    snapshot.revision = 0;
-    snapshot.content_revision = 0;
     snapshot.pending_bytes.clear();
     snapshot
 }

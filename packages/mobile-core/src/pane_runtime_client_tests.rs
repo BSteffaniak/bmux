@@ -112,6 +112,7 @@ fn generated_frame_transport_carries_frames_that_apply() {
             pane_id,
             sync_update_active: true,
             encoded: bmux_ipc::encode(&frame).unwrap(),
+            replay_markers: Vec::new(),
         }],
         frames_still_pending: false,
     });

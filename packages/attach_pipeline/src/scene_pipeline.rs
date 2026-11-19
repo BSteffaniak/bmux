@@ -542,47 +542,22 @@ impl AttachScenePipeline {
                 continue;
             }
             let buffer = self.pane_buffers.entry(pane.pane_id).or_default();
-            let previous_mode = buffer.terminal_grid.grid().mode();
-            if let Err(error) = buffer
-                .terminal_grid
-                .grid_mut()
-                .apply_frame(&pane.frame, &mut buffer.replica)
-            {
-                buffer.replica = bmux_terminal_grid::ReplicaCursor::default();
-                self.push_diagnostic(
-                    AttachPipelineDiagnosticCode::ChunkDesync,
-                    format!("frame for pane {} not applied: {error}", pane.pane_id),
-                    Some(pane.pane_id),
-                );
-                failed.push(pane.pane_id);
-                continue;
+            match crate::render::apply_pane_frame(buffer, &pane.frame) {
+                Ok(switched) => self.full_pane_redraw |= switched,
+                Err(error) => {
+                    self.push_diagnostic(
+                        AttachPipelineDiagnosticCode::ChunkDesync,
+                        format!("frame for pane {} not applied: {error}", pane.pane_id),
+                        Some(pane.pane_id),
+                    );
+                    failed.push(pane.pane_id);
+                    continue;
+                }
             }
             self.hydrated_grid_panes.insert(pane.pane_id);
-            let grid = buffer.terminal_grid.grid();
-            if grid.mode() != previous_mode {
-                self.full_pane_redraw = true;
-            }
-            let rows_reset = pane.frame.reset || !pane.frame.moves.is_empty();
-            let updated_rows: Vec<u32> = pane
-                .frame
-                .rows
-                .iter()
-                .filter(|row| {
-                    (row.screen == bmux_terminal_grid::FrameScreen::Alternate)
-                        == (grid.mode() == GridMode::Alternate)
-                })
-                .map(|row| row.index)
-                .collect();
-            buffer.visual_row_fingerprints.invalidate_rows(
-                rows_reset,
-                grid.content_revision(),
-                &updated_rows,
-            );
-            let protocol = grid.protocol_state();
-            let alternate_screen = grid.mode() == GridMode::Alternate;
-            buffer
-                .protocol_tracker
-                .restore(protocol, alternate_screen, &[]);
+            let Some(buffer) = self.pane_buffers.get_mut(&pane.pane_id) else {
+                continue;
+            };
             buffer.set_sync_update(pane.sync_update_active, std::time::Instant::now());
             buffer.forget_drawn_rows();
             sync_protocol_hints_from_buffer(

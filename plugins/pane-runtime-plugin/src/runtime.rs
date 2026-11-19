@@ -1239,7 +1239,9 @@ mod pointer_query_tests {
 /// `docs/development/pane-output-performance.md`): with `BMUX_REPLAY_LOG` naming a file, each
 /// replay marker read from a pane appends `S frame written_ns read_ns`, beside the attach client's
 /// lines for when the frame reached the host.
-fn note_replay_markers_read(bytes: &[u8]) {
+/// Log the replay markers in `bytes` as read, when `BMUX_REPLAY_LOG` asks for it, and return
+/// them (empty without the log), for the frames that carry them to clients.
+fn note_replay_markers_read(bytes: &[u8]) -> Vec<(u64, u128)> {
     // Process-wide debug log file opened from the process environment; a
     // diagnostic sink, not per-instance state.
     static LOG: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
@@ -1253,22 +1255,23 @@ fn note_replay_markers_read(bytes: &[u8]) {
             .ok()
             .map(std::sync::Mutex::new)
     }) else {
-        return;
+        return Vec::new();
     };
     let markers = bmux_bench::corpus::markers(bytes);
     if markers.is_empty() {
-        return;
+        return markers;
     }
     let read = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_nanos());
     let mut lines = Vec::new();
-    for (frame, written) in markers {
+    for (frame, written) in &markers {
         let _ = writeln!(lines, "S {frame} {written} {read}");
     }
     if let Ok(mut file) = file.lock() {
         let _ = file.write_all(&lines);
     }
+    markers
 }
 
 fn push_pane_runtime_notice(
@@ -2205,7 +2208,6 @@ struct PaneRuntimeHandle {
     publication: Arc<StartupPublication>,
     cleanup: watch::Receiver<Option<std::result::Result<(), String>>>,
     startup: watch::Receiver<Option<std::result::Result<(), String>>>,
-    #[cfg(feature = "image-registry")]
     session_id: SessionId,
     meta: PaneRuntimeMeta,
     process_start_identity: Arc<std::sync::Mutex<Option<ProcessStartIdentity>>>,
@@ -3963,6 +3965,25 @@ impl PaneRuntimeHandle {
         true
     }
 
+    /// Tell clients the pane's grid changed, as new output does: once until they read it.
+    fn notify_grid_changed(&self) {
+        if self
+            .output_dirty
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            self.host.publish_pane_event(PaneEvent::OutputAvailable {
+                session_id: self.session_id.0,
+                pane_id: self.meta.id,
+            });
+            crate::handlers::output_push::pane_output_available(
+                &self.host,
+                self.session_id.0,
+                self.meta.id,
+            );
+        }
+    }
+
     #[cfg(feature = "image-registry")]
     fn publish_resized_images(&self) {
         if self
@@ -4206,6 +4227,9 @@ impl PaneRuntimeHandle {
             .geometry_revision
             .fetch_add(1, Ordering::SeqCst);
         self.execution.notify();
+        // The grid changed without output: clients replicating it take its new geometry now,
+        // not when the program next writes.
+        self.notify_grid_changed();
         if expected_grid_revision.is_none() {
             self.dispatch_uncaptured_resize(rows, cols, permit);
         }
@@ -4222,10 +4246,12 @@ impl PaneRuntimeHandle {
 
 /// Where one client's replica of a pane's grid is: its cursor, and the grid revision it was last
 /// sent a frame at (a grid that has not changed since needs no frame).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct PaneFrameReplica {
     cursor: bmux_terminal_grid::ReplicaCursor,
     revision: u64,
+    /// `bmux-bench replay` markers read since its last frame (only while replay is logged).
+    replay_markers: Vec<(u64, u128)>,
 }
 
 #[derive(Clone)]
@@ -6918,7 +6944,9 @@ impl SessionRuntimeManager {
                 .expect("initial pane terminal grid dimensions are valid"),
         ));
         let terminal_grid_for_reader = Arc::clone(&terminal_grid);
-        let frame_replicas = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let frame_replicas: Arc<std::sync::Mutex<BTreeMap<ClientId, PaneFrameReplica>>> =
+            Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let frame_replicas_for_reader = Arc::clone(&frame_replicas);
         let last_requested_size = Arc::new(std::sync::Mutex::new((initial_rows, initial_cols)));
         let shell = pane_meta.shell.clone();
         let launch = pane_meta.launch.clone();
@@ -8034,7 +8062,14 @@ impl SessionRuntimeManager {
                                 #[cfg(feature = "image-registry")]
                                 let image_events = std::mem::take(&mut images.events);
                                 let chunk = reader_state.visible.as_slice();
-                                note_replay_markers_read(chunk);
+                                let markers = note_replay_markers_read(chunk);
+                                if !markers.is_empty()
+                                    && let Ok(mut replicas) = frame_replicas_for_reader.lock()
+                                {
+                                    for replica in replicas.values_mut() {
+                                        replica.replay_markers.extend_from_slice(&markers);
+                                    }
+                                }
 
                                 // Publish the pane's modes, as the grid now holds them, BEFORE
                                 // making the chunk visible in the output buffer, so per-pane mode
@@ -8521,7 +8556,6 @@ impl SessionRuntimeManager {
             publication,
             startup,
             cleanup,
-            #[cfg(feature = "image-registry")]
             session_id,
             meta: pane_meta,
             process_start_identity,
@@ -11961,11 +11995,15 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                 m.attach_pane_data_refs_for_session_panes(session_id, client_id, pane_ids)
             })
             .unwrap_or(Err(SessionRuntimeError::Closed))?;
+        // As an output read does: output after this wakes the client again.
+        for pane in &panes {
+            pane.output_dirty.store(false, Ordering::SeqCst);
+        }
         let mut frames = Vec::new();
         let mut remaining = RESPONSE_OUTPUT_BUDGET;
         let mut still_pending = false;
         let mut seen = BTreeSet::new();
-        for pane in panes {
+        for pane in &panes {
             if !seen.insert(pane.pane_id) {
                 continue;
             }
@@ -12000,12 +12038,23 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             remaining = remaining.saturating_sub(encoded.len());
             replica.cursor = frame.next;
             replica.revision = revision;
+            let replay_markers = replica
+                .replay_markers
+                .drain(..)
+                .flat_map(|(frame, written)| bmux_bench::corpus::marker(frame, written))
+                .collect();
             frames.push(bmux_pane_runtime_state::AttachPaneFrame {
                 pane_id: pane.pane_id,
                 sync_update_active,
                 encoded,
+                replay_markers,
             });
         }
+        // Output that arrived while these frames were built is sent next.
+        let still_pending = still_pending
+            || panes
+                .iter()
+                .any(|pane| pane.output_dirty.load(Ordering::SeqCst));
         Ok((frames, still_pending))
     }
 
@@ -17232,7 +17281,6 @@ exit 7"#
             publication: Arc::new(StartupPublication::default()),
             startup: watch::channel(Some(Ok(()))).1,
             cleanup: watch::channel(Some(Ok(()))).1,
-            #[cfg(feature = "image-registry")]
             session_id: SessionId(Uuid::nil()),
             meta: PaneRuntimeMeta {
                 id,

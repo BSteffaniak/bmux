@@ -404,7 +404,8 @@ pub fn resize_attach_grids_for_scene_with_size_preserving(
             h: inner_h,
         };
         let buffer = pane_buffers.entry(pane_id).or_default();
-        if buffer.local_zoom.preserve_execution_geometry {
+        // A grid kept by frames is the server's size: a resize there arrives as a reset frame.
+        if buffer.local_zoom.preserve_execution_geometry || buffer.replica.epoch != 0 {
             continue;
         }
         let previous_grid_size = (

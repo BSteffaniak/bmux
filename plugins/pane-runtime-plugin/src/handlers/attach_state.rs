@@ -695,6 +695,7 @@ pub(super) fn frames_record(
                 pane_id: frame.pane_id,
                 sync_update_active: frame.sync_update_active,
                 encoded: frame.encoded,
+                replay_markers: frame.replay_markers,
             })
             .collect(),
         frames_still_pending,

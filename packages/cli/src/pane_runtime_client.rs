@@ -101,6 +101,16 @@ pub struct PaneGridSnapshotResult {
     pub encoded: Vec<u8>,
 }
 
+/// A frame for one pane's replica, as received: decode `encoded` with `bmux_ipc::decode`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneFrameResult {
+    pub pane_id: Uuid,
+    pub sync_update_active: bool,
+    pub encoded: Vec<u8>,
+    /// `bmux-bench replay` markers written since the last frame, as written.
+    pub replay_markers: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaneGridWindowRequest {
     pub pane_id: Uuid,
@@ -3931,6 +3941,76 @@ pub async fn attach_pane_scrollback_unpin_streaming(
     }
 }
 
+/// Frames bringing this client's replicas of `pane_ids` level with their grids, and whether
+/// more remain for another call.
+pub async fn attach_pane_frames_streaming(
+    client: &mut bmux_client::StreamingBmuxClient,
+    session_id: Uuid,
+    pane_ids: Vec<Uuid>,
+    max_history_lines: usize,
+) -> ClientResult<(Vec<PaneFrameResult>, bool)> {
+    let max_history_lines = u32::try_from(max_history_lines).unwrap_or(u32::MAX);
+    let response = if pointer_grid_available(client).await? {
+        PointerGrid::client::frames(client, 1, session_id, pane_ids, max_history_lines).await
+    } else {
+        AttachState::client::attach_pane_frames(client, session_id, pane_ids, max_history_lines)
+            .await
+    };
+    match response {
+        Ok(Ok(state)) => Ok((
+            state
+                .frames
+                .into_iter()
+                .map(|frame| PaneFrameResult {
+                    pane_id: frame.pane_id,
+                    sync_update_active: frame.sync_update_active,
+                    encoded: frame.encoded,
+                    replay_markers: frame.replay_markers,
+                })
+                .collect(),
+            state.frames_still_pending,
+        )),
+        Ok(Err(err)) => typed_server_error("attach-pane-frames", err),
+        Err(err) => typed_dispatch_error("attach-pane-frames", err),
+    }
+}
+
+/// Start this client's replicas of `pane_ids` over: their next frames are reset frames.
+pub async fn reset_attach_pane_frames_streaming(
+    client: &mut bmux_client::StreamingBmuxClient,
+    session_id: Uuid,
+    pane_ids: Vec<Uuid>,
+) -> ClientResult<()> {
+    match AttachState::client::attach_pane_frames_reset(client, session_id, pane_ids).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(err)) => typed_server_error("attach-pane-frames-reset", err),
+        Err(err) => typed_dispatch_error("attach-pane-frames-reset", err),
+    }
+}
+
+/// Have the server push this client's frames for `pane_ids` (see `attach-pane-frame-push`);
+/// returns whether it now does. An empty list stops pushing.
+pub async fn attach_pane_frame_push_streaming(
+    client: &mut bmux_client::StreamingBmuxClient,
+    session_id: Uuid,
+    pane_ids: Vec<Uuid>,
+    max_history_lines: usize,
+) -> ClientResult<bool> {
+    let max_history_lines = u32::try_from(max_history_lines).unwrap_or(u32::MAX);
+    match AttachState::client::attach_pane_frame_push(
+        client,
+        session_id,
+        pane_ids,
+        max_history_lines,
+    )
+    .await
+    {
+        Ok(Ok(push)) => Ok(push.enabled),
+        Ok(Err(err)) => typed_server_error("attach-pane-frame-push", err),
+        Err(err) => typed_dispatch_error("attach-pane-frame-push", err),
+    }
+}
+
 #[derive(serde::Deserialize)]
 struct LayoutPayload {
     panes: Vec<PaneSummary>,
@@ -4037,15 +4117,6 @@ pub trait BmuxPaneRuntimeClientExt {
         pane_ids: Vec<Uuid>,
         max_bytes: usize,
     ) -> impl Future<Output = ClientResult<PaneOutputBatchResult>> + Send;
-
-    /// Have the server push this client's output for `pane_ids` (see
-    /// `attach-pane-output-push`); returns whether it now does. An empty list stops pushing.
-    fn attach_pane_output_push(
-        &mut self,
-        session_id: Uuid,
-        pane_ids: Vec<Uuid>,
-        max_bytes: usize,
-    ) -> impl Future<Output = ClientResult<bool>> + Send;
 
     // Used by the attach runtime binary path; `cargo check -p bmux_cli` checks the
     // library target separately and reports this trait item as otherwise unused.
@@ -4285,27 +4356,6 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
             }),
             Ok(Err(err)) => typed_server_error("attach-pane-output-batch", err),
             Err(err) => typed_dispatch_error("attach-pane-output-batch", err),
-        }
-    }
-
-    async fn attach_pane_output_push(
-        &mut self,
-        session_id: Uuid,
-        pane_ids: Vec<Uuid>,
-        max_bytes: usize,
-    ) -> ClientResult<bool> {
-        let max_bytes_u32 = u32::try_from(max_bytes).unwrap_or(u32::MAX);
-        match AttachState::client::attach_pane_output_push(
-            self,
-            session_id,
-            pane_ids,
-            max_bytes_u32,
-        )
-        .await
-        {
-            Ok(Ok(push)) => Ok(push.enabled),
-            Ok(Err(err)) => typed_server_error("attach-pane-output-push", err),
-            Err(err) => typed_dispatch_error("attach-pane-output-push", err),
         }
     }
 
@@ -4875,27 +4925,6 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
         }
     }
 
-    async fn attach_pane_output_push(
-        &mut self,
-        session_id: Uuid,
-        pane_ids: Vec<Uuid>,
-        max_bytes: usize,
-    ) -> ClientResult<bool> {
-        let max_bytes_u32 = u32::try_from(max_bytes).unwrap_or(u32::MAX);
-        match AttachState::client::attach_pane_output_push(
-            self,
-            session_id,
-            pane_ids,
-            max_bytes_u32,
-        )
-        .await
-        {
-            Ok(Ok(push)) => Ok(push.enabled),
-            Ok(Err(err)) => typed_server_error("attach-pane-output-push", err),
-            Err(err) => typed_dispatch_error("attach-pane-output-push", err),
-        }
-    }
-
     async fn attach_pane_images(
         &mut self,
         session_id: Uuid,
@@ -5018,13 +5047,19 @@ fn decode_attach_snapshot(snap: AttachState::AttachSnapshot) -> ClientResult<Att
 /// The chunks of a pane output batch the server pushed (plugin bus kind
 /// `bmux_pane_runtime_plugin_api::OUTPUT_PUSH_KIND`), or `None` when it cannot be decoded.
 #[must_use]
-pub fn decode_pushed_output(payload: &[u8]) -> Option<Vec<AttachPaneChunk>> {
-    let batch: AttachState::AttachPaneOutputBatch = bmux_ipc::decode(payload).ok()?;
+/// The frames in a pushed `bmux.pane_runtime/frame-push` message.
+pub fn decode_pushed_frames(payload: &[u8]) -> Option<Vec<PaneFrameResult>> {
+    let batch: AttachState::AttachPaneFrames = bmux_ipc::decode(payload).ok()?;
     Some(
         batch
-            .chunks
+            .frames
             .into_iter()
-            .map(pane_chunk_from_record)
+            .map(|frame| PaneFrameResult {
+                pane_id: frame.pane_id,
+                sync_update_active: frame.sync_update_active,
+                encoded: frame.encoded,
+                replay_markers: frame.replay_markers,
+            })
             .collect(),
     )
 }

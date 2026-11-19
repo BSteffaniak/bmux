@@ -1949,16 +1949,20 @@ use super::state::{
 use super::tui_surface::{buffer_render_ops, component_theme, surface_buffer};
 use crate::connection::CliAttachEndpointConnector;
 use crate::pane_runtime_client::{
-    BmuxPaneRuntimeClientExt, StreamingAttachInputExt, attach_pane_grid_snapshot_state_streaming,
-    attach_pane_scrollback_pin_streaming, attach_pane_scrollback_unpin_streaming,
-    pane_scrollback_rule_metadata_streaming,
+    BmuxPaneRuntimeClientExt, PaneFrameResult, StreamingAttachInputExt,
+    attach_pane_frame_push_streaming, attach_pane_frames_streaming,
+    attach_pane_grid_snapshot_state_streaming, attach_pane_scrollback_pin_streaming,
+    attach_pane_scrollback_unpin_streaming, pane_scrollback_rule_metadata_streaming,
+    reset_attach_pane_frames_streaming,
 };
 use bmux_plugin::{RenderDamage, RenderExtensionContext, RenderExtensionLayer, RenderOp};
 
 /// Bytes of pane output one request may return: enough for a large application frame in one
 /// round trip, well inside the IPC response budget.
-const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 512 * 1024;
 const ATTACH_STRUCTURED_SNAPSHOT_MAX_BYTES_PER_PANE: usize = 0;
+/// History lines a pane's first frame carries: none, as hydration took only the screen. Lines
+/// written after attach arrive in later frames; older ones are fetched as scrollback.
+const ATTACH_FRAME_MAX_HISTORY_LINES: usize = 0;
 const ATTACH_GRID_SNAPSHOT_FALLBACK_ROWS_PER_PANE: usize = 1;
 /// Requests one drain may make; with the batch size above, a drain normally takes one.
 const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 32;
@@ -2416,56 +2420,6 @@ impl DisplayCaptureFanout {
     }
 }
 
-fn apply_attach_output_chunk(
-    view_state: &mut AttachViewState,
-    pane_id: Uuid,
-    bytes: &[u8],
-    meta: AttachOutputChunkMeta,
-    frame_needs_render: &mut bool,
-) -> AttachChunkApplyOutcome {
-    let pane_mouse_protocol_hints = &mut view_state.pane_mouse_protocol_hints;
-    let pane_input_mode_hints = &mut view_state.pane_input_mode_hints;
-    let replay_log = &mut view_state.replay_log;
-    let mut toggled_alternate = false;
-    let outcome = apply_attach_output_chunk_with(
-        &mut view_state.pane_buffers,
-        pane_id,
-        bytes,
-        meta,
-        |buffer, data| {
-            if data.is_empty() {
-                return false;
-            }
-
-            replay_log.applied(data);
-            toggled_alternate =
-                super::render::append_pane_output(buffer, data) || toggled_alternate;
-            update_protocol_hints_from_state(
-                pane_mouse_protocol_hints,
-                pane_input_mode_hints,
-                pane_id,
-                buffer.protocol_tracker.protocol_state(),
-            );
-            true
-        },
-    );
-
-    if outcome == (AttachChunkApplyOutcome::Applied { had_data: true }) {
-        view_state
-            .dirty
-            .mark_pane_dirty(pane_id, AttachDirtySource::PaneOutput);
-        *frame_needs_render = true;
-    }
-
-    if toggled_alternate {
-        view_state
-            .dirty
-            .mark_full_frame(AttachDirtySource::AlternateScreenTransition);
-    }
-
-    outcome
-}
-
 fn bytes_contain_sequence(bytes: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && bytes.windows(needle.len()).any(|window| window == needle)
 }
@@ -2541,52 +2495,89 @@ async fn sync_input_producer_barriers<T: AttachHost + ?Sized>(
     Ok(())
 }
 
-/// What applying a run of output chunks did.
+/// What applying a batch of frames did.
 #[derive(Default)]
-struct AppliedChunks {
+struct AppliedFrames {
     had_data: bool,
     any_sync_active: bool,
-    /// A pane whose chunk did not continue its stream; the rest were not applied.
-    desynced: Option<Uuid>,
+    /// Panes whose frame did not apply: their replicas start over.
+    failed: Vec<Uuid>,
 }
 
-fn apply_output_chunks(
+/// Apply frames to the panes' replicas (see [`super::render::apply_pane_frame`]): what they
+/// changed is drawn, their modes become the panes' input hints, and replay markers they carry
+/// are logged as applied.
+fn apply_pane_frames(
     view_state: &mut AttachViewState,
-    chunks: Vec<bmux_attach_layout_protocol::AttachPaneChunk>,
+    frames: Vec<PaneFrameResult>,
     frame_needs_render: &mut bool,
-) -> AppliedChunks {
-    let mut applied = AppliedChunks::default();
-    for chunk in chunks {
-        let pane_id = chunk.pane_id;
-        let sync_update_active = chunk.sync_update_active;
-        match apply_attach_output_chunk(
-            view_state,
-            pane_id,
-            &chunk.data,
-            AttachOutputChunkMeta {
-                stream_start: chunk.stream_start,
-                stream_end: chunk.stream_end,
-                stream_gap: chunk.stream_gap,
-                sync_update_active,
-            },
-            frame_needs_render,
-        ) {
-            AttachChunkApplyOutcome::Applied { had_data } => {
-                applied.had_data |= had_data;
-                applied.any_sync_active |= sync_update_active;
-            }
-            AttachChunkApplyOutcome::Stale => {}
-            AttachChunkApplyOutcome::Desync => {
-                applied.desynced = Some(pane_id);
-                break;
-            }
+) -> AppliedFrames {
+    let mut applied = AppliedFrames::default();
+    for frame in frames {
+        let pane_id = frame.pane_id;
+        if applied.failed.contains(&pane_id) {
+            continue;
         }
+        let decoded: bmux_terminal_grid::GridFrame = match bmux_ipc::decode(&frame.encoded) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                tracing::warn!(%pane_id, %error, "decoding pane frame");
+                applied.failed.push(pane_id);
+                continue;
+            }
+        };
+        let buffer = view_state.pane_buffers.entry(pane_id).or_default();
+        let switched = match super::render::apply_pane_frame(buffer, &decoded) {
+            Ok(switched) => switched,
+            Err(error) => {
+                tracing::debug!(%pane_id, %error, "pane frame did not apply; starting over");
+                applied.failed.push(pane_id);
+                continue;
+            }
+        };
+        buffer.set_sync_update(frame.sync_update_active, Instant::now());
+        update_protocol_hints_from_state(
+            &mut view_state.pane_mouse_protocol_hints,
+            &mut view_state.pane_input_mode_hints,
+            pane_id,
+            buffer.terminal_grid.grid().protocol_state(),
+        );
+        view_state.replay_log.applied(&frame.replay_markers);
+        view_state
+            .dirty
+            .mark_pane_dirty(pane_id, AttachDirtySource::PaneOutput);
+        if switched {
+            view_state
+                .dirty
+                .mark_full_frame(AttachDirtySource::AlternateScreenTransition);
+        }
+        *frame_needs_render = true;
+        applied.had_data = true;
+        applied.any_sync_active |= frame.sync_update_active;
     }
     applied
 }
 
-/// Have the server push output for the panes whose output this client reads, asking only when
-/// that set changes. A server that cannot push is not asked again; output is then read.
+/// Start the replicas of `pane_ids` over and apply the reset frames that bring them back.
+async fn recover_pane_frames(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    pane_ids: Vec<Uuid>,
+    frame_needs_render: &mut bool,
+) -> std::result::Result<AppliedFrames, ClientError> {
+    reset_attach_pane_frames_streaming(client, view_state.attached_id, pane_ids.clone()).await?;
+    let (frames, _) = attach_pane_frames_streaming(
+        client,
+        view_state.attached_id,
+        pane_ids,
+        ATTACH_FRAME_MAX_HISTORY_LINES,
+    )
+    .await?;
+    Ok(apply_pane_frames(view_state, frames, frame_needs_render))
+}
+
+/// Have the server push frames for the panes whose output this client reads, asking only when
+/// that set changes. A server that cannot push is not asked again; frames are then read.
 async fn update_output_push(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
@@ -2601,13 +2592,13 @@ async fn update_output_push(
     if wanted == view_state.output_push.panes {
         return;
     }
-    match client
-        .attach_pane_output_push(
-            view_state.attached_id,
-            wanted.iter().copied().collect(),
-            ATTACH_OUTPUT_BATCH_MAX_BYTES,
-        )
-        .await
+    match attach_pane_frame_push_streaming(
+        client,
+        view_state.attached_id,
+        wanted.iter().copied().collect(),
+        ATTACH_FRAME_MAX_HISTORY_LINES,
+    )
+    .await
     {
         Ok(true) => view_state.output_push.panes = wanted,
         Ok(false) if wanted.is_empty() => view_state.output_push.panes.clear(),
@@ -2669,32 +2660,6 @@ fn apply_attach_output_chunk_protocol_only(
     }
 
     outcome
-}
-
-async fn recover_attach_output_desync_for_pane(
-    client: &mut StreamingBmuxClient,
-    view_state: &mut AttachViewState,
-    pane_id: Uuid,
-) -> std::result::Result<(), ClientError> {
-    if let Some(layout_state) = view_state.cached_layout_state.clone()
-        && attach_layout_pane_id_set(&layout_state).contains(&pane_id)
-        && hydrate_attach_revealed_panes_from_snapshot(
-            client,
-            view_state,
-            &layout_state,
-            &[pane_id],
-        )
-        .await
-        .is_ok()
-    {
-        view_state
-            .dirty
-            .mark_full_frame(AttachDirtySource::SnapshotHydration);
-        return Ok(());
-    }
-
-    hydrate_attach_state_from_snapshot_mode(client, view_state, SnapshotHydrationMode::FullResync)
-        .await
 }
 
 #[derive(Debug, Clone, Default)]
@@ -6607,28 +6572,26 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 .pane_images
                 .retain(|pane_id, _| active_pane_ids.contains(pane_id));
 
-            // Drain the pane output the server has before rendering, so a frame is drawn
-            // whole. One request normally returns all of it; the server says whether output
-            // remains (left unread at the budget, or arrived during the read), and the loop
-            // reads until it does not, within a time budget. A pane inside a synchronized
-            // update is not polled: its next bytes wake the loop with an output event, and
-            // the renderer holds the pane's last finished frame meanwhile.
+            // Bring the panes' replicas level with the server's grids before rendering, so a
+            // frame is drawn whole. Pushed frames are applied first; panes not pushed are read
+            // until the server has no more for them, within a time budget. A pane inside a
+            // synchronized update holds its last finished frame meanwhile.
             let mut last_round_had_data = false;
             let mut drained_any_data = false;
-            let mut recovered_output_desync = false;
-            // Output the server pushed is applied first; the panes it covers are not read.
             let pushed = std::mem::take(&mut view_state.output_push.received);
             if !pushed.is_empty() {
-                let applied = apply_output_chunks(&mut view_state, pushed, &mut frame_needs_render);
+                let applied = apply_pane_frames(&mut view_state, pushed, &mut frame_needs_render);
                 drained_any_data |= applied.had_data;
-                if let Some(desynced_pane_id) = applied.desynced {
-                    recover_attach_output_desync_for_pane(
+                if !applied.failed.is_empty() {
+                    let recovered = recover_pane_frames(
                         &mut client,
                         &mut view_state,
-                        desynced_pane_id,
+                        applied.failed,
+                        &mut frame_needs_render,
                     )
-                    .await?;
-                    recovered_output_desync = true;
+                    .await
+                    .map_err(map_attach_client_error)?;
+                    drained_any_data |= recovered.had_data;
                 }
             }
             let read_pane_ids: Vec<Uuid> = pane_ids
@@ -6636,7 +6599,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 .copied()
                 .filter(|pane_id| !view_state.output_push.panes.contains(pane_id))
                 .collect();
-            let read_rounds = if read_requested && !read_pane_ids.is_empty() && !recovered_output_desync {
+            let read_rounds = if read_requested && !read_pane_ids.is_empty() {
                 ATTACH_OUTPUT_DRAIN_MAX_ROUNDS
             } else {
                 0
@@ -6645,13 +6608,13 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
             for _round in 0..read_rounds {
                 perf_window.record_drain_round();
                 let drain_call_started_at = Instant::now();
-                let result = match client
-                    .attach_pane_output_batch(
-                        view_state.attached_id,
-                        read_pane_ids.clone(),
-                        ATTACH_OUTPUT_BATCH_MAX_BYTES,
-                    )
-                    .await
+                let (frames, still_pending) = match attach_pane_frames_streaming(
+                    &mut client,
+                    view_state.attached_id,
+                    read_pane_ids.clone(),
+                    ATTACH_FRAME_MAX_HISTORY_LINES,
+                )
+                .await
                 {
                     Ok(result) => result,
                     Err(error)
@@ -6667,33 +6630,27 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                     }
                     Err(error) => return Err(map_attach_client_error(error)),
                 };
-                let batch_bytes: usize = result.chunks.iter().map(|chunk| chunk.data.len()).sum();
+                let batch_bytes: usize = frames.iter().map(|frame| frame.encoded.len()).sum();
                 perf_window.record_drain_ipc(
                     duration_millis_u64(drain_call_started_at.elapsed()),
                     batch_bytes,
                 );
-
-                let AppliedChunks {
-                    had_data,
-                    any_sync_active,
-                    desynced: desynced_pane_id,
-                } = apply_output_chunks(&mut view_state, result.chunks, &mut frame_needs_render);
-                drained_any_data |= had_data;
-
-                if let Some(desynced_pane_id) = desynced_pane_id {
-                    recover_attach_output_desync_for_pane(
+                let applied = apply_pane_frames(&mut view_state, frames, &mut frame_needs_render);
+                drained_any_data |= applied.had_data;
+                perf_window.record_drain_result(applied.had_data, applied.any_sync_active);
+                if !applied.failed.is_empty() {
+                    let recovered = recover_pane_frames(
                         &mut client,
                         &mut view_state,
-                        desynced_pane_id,
+                        applied.failed,
+                        &mut frame_needs_render,
                     )
-                    .await?;
-                    last_round_had_data = false;
-                    break;
+                    .await
+                    .map_err(map_attach_client_error)?;
+                    drained_any_data |= recovered.had_data;
                 }
-
-                perf_window.record_drain_result(had_data, any_sync_active);
-                last_round_had_data = result.output_still_pending;
-                if !result.output_still_pending {
+                last_round_had_data = still_pending;
+                if !still_pending {
                     break;
                 }
                 if drain_start.elapsed() >= ATTACH_OUTPUT_DRAIN_TIME_BUDGET {
@@ -7146,11 +7103,11 @@ async fn handle_attach_stream_server_event(
             }
         } else if kind.as_str() == bmux_pane_runtime_plugin_api::PRODUCER_BARRIERS_CHANGED_KIND {
             view_state.producer_barriers_changed = true;
-        } else if kind.as_str() == bmux_pane_runtime_plugin_api::OUTPUT_PUSH_KIND {
-            if let Some(chunks) = crate::pane_runtime_client::decode_pushed_output(payload) {
-                view_state.output_push.received.extend(chunks);
+        } else if kind.as_str() == bmux_pane_runtime_plugin_api::FRAME_PUSH_KIND {
+            if let Some(frames) = crate::pane_runtime_client::decode_pushed_frames(payload) {
+                view_state.output_push.received.extend(frames);
             } else {
-                tracing::warn!(kind = %kind, "decoding pushed pane output");
+                tracing::warn!(kind = %kind, "decoding pushed pane frames");
             }
         } else if kind.as_str() == pane_events::EVENT_KIND.as_str() {
             match serde_json::from_slice::<pane_events::PaneEvent>(payload) {
@@ -12379,15 +12336,13 @@ fn attach_grid_snapshot_max_rows_for_panes(
         .unwrap_or(ATTACH_GRID_SNAPSHOT_FALLBACK_ROWS_PER_PANE)
 }
 
-pub(super) async fn hydrate_attach_structured_grid_snapshots(
+/// The execution token of each pane's source, for zoom (only while zoom is shared).
+async fn zoom_execution_tokens(
     client: &mut StreamingBmuxClient,
-    view_state: &mut AttachViewState,
-    pane_ids: Vec<Uuid>,
-) -> std::result::Result<BTreeSet<Uuid>, ClientError> {
-    if pane_ids.is_empty() {
-        return Ok(BTreeSet::new());
-    }
-    let mut zoom_execution_tokens = BTreeMap::new();
+    view_state: &AttachViewState,
+    pane_ids: &[Uuid],
+) -> BTreeMap<Uuid, Uuid> {
+    let mut tokens = BTreeMap::new();
     if view_state.pane_zoom.shared.is_some() {
         for pane in pane_ids.iter().take(256) {
             if let Ok(Ok(source)) =
@@ -12398,10 +12353,22 @@ pub(super) async fn hydrate_attach_structured_grid_snapshots(
                 )
                 .await
             {
-                zoom_execution_tokens.insert(*pane, source.execution_token);
+                tokens.insert(*pane, source.execution_token);
             }
         }
     }
+    tokens
+}
+
+pub(super) async fn hydrate_attach_structured_grid_snapshots(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    pane_ids: Vec<Uuid>,
+) -> std::result::Result<BTreeSet<Uuid>, ClientError> {
+    if pane_ids.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let zoom_execution_tokens = zoom_execution_tokens(client, view_state, &pane_ids).await;
     let max_rows_per_pane = attach_grid_snapshot_max_rows_for_panes(view_state, &pane_ids);
     let snapshots = match attach_pane_grid_snapshot_state_streaming(
         client,
@@ -12419,6 +12386,7 @@ pub(super) async fn hydrate_attach_structured_grid_snapshots(
     };
 
     let mut hydrated = BTreeSet::new();
+    let mut frame_kept = Vec::new();
     for snapshot in snapshots {
         let decoded = match serde_json::from_slice::<bmux_terminal_grid::GridSnapshot>(
             &snapshot.encoded,
@@ -12467,6 +12435,12 @@ pub(super) async fn hydrate_attach_structured_grid_snapshots(
                 .remove(&snapshot.pane_id);
         }
         let buffer = view_state.pane_buffers.entry(snapshot.pane_id).or_default();
+        hydrated.insert(snapshot.pane_id);
+        // Frames keep such a grid: the snapshot is not their base; frames level it below.
+        if buffer.replica.epoch != 0 {
+            frame_kept.push(snapshot.pane_id);
+            continue;
+        }
         buffer.terminal_grid = stream;
         buffer.protocol_tracker.set_protocol_state(protocol);
         buffer
@@ -12478,10 +12452,34 @@ pub(super) async fn hydrate_attach_structured_grid_snapshots(
             buffer.scrollback_window = None;
         }
         buffer.forget_drawn_rows();
-        hydrated.insert(snapshot.pane_id);
     }
-
+    level_frame_kept_panes(client, view_state, frame_kept).await?;
     Ok(hydrated)
+}
+
+/// Bring panes whose grids frames keep as current as a snapshot would make them: apply the
+/// frames since each one's last, starting any that do not apply over.
+async fn level_frame_kept_panes(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    pane_ids: Vec<Uuid>,
+) -> std::result::Result<(), ClientError> {
+    if pane_ids.is_empty() {
+        return Ok(());
+    }
+    let (frames, _) = attach_pane_frames_streaming(
+        client,
+        view_state.attached_id,
+        pane_ids,
+        ATTACH_FRAME_MAX_HISTORY_LINES,
+    )
+    .await?;
+    let mut needs_render = false;
+    let applied = apply_pane_frames(view_state, frames, &mut needs_render);
+    if !applied.failed.is_empty() {
+        recover_pane_frames(client, view_state, applied.failed, &mut needs_render).await?;
+    }
+    Ok(())
 }
 
 /// Resolve cached windows locally and schedule at most one missing history read.
@@ -19886,11 +19884,11 @@ mod tests {
     use super::*;
     use crate::input::InputProcessor;
     use crate::runtime::attach::input::TerminalModifiers;
-    use crate::runtime::attach::render::append_pane_output;
     use crate::runtime::attach::state::{
         AttachEventAction, AttachMouseSelectionDrag, AttachScrollbackCursor,
         AttachScrollbackPosition, AttachUiMode, AttachViewState, PaneRenderBuffer,
     };
+    use bmux_attach_pipeline::render::append_pane_output;
     use bmux_plugin::RenderStyle;
 
     use bmux_attach_layout_protocol::{
@@ -22880,6 +22878,65 @@ mod tests {
         );
     }
 
+    /// Frames bring a pane's replica level with the server's grid: the pane is redrawn, its
+    /// modes become its input hints, a screen switch redraws the frame, and a frame that does
+    /// not apply is reported so the replica starts over.
+    #[test]
+    fn pane_frames_update_the_replica_hints_and_redraw() {
+        use bmux_terminal_grid::{GridLimits, ReplicaCursor, TerminalGridStream};
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        let pane_id = view_state
+            .cached_layout_state
+            .as_ref()
+            .map(|layout| layout.focused_pane_id)
+            .expect("focused pane id");
+        let mut source = TerminalGridStream::new(20, 4, GridLimits::default()).unwrap();
+        let frame_for = |source: &mut TerminalGridStream, cursor: ReplicaCursor| {
+            crate::pane_runtime_client::PaneFrameResult {
+                pane_id,
+                sync_update_active: false,
+                encoded: bmux_ipc::encode(&source.grid_mut().frame_since(cursor, 0)).unwrap(),
+                replay_markers: Vec::new(),
+            }
+        };
+        source.process(b"hello\x1b[?1000h");
+        view_state.pane_buffers.remove(&pane_id);
+        let mut needs_render = false;
+        let applied = super::apply_pane_frames(
+            &mut view_state,
+            vec![frame_for(&mut source, ReplicaCursor::default())],
+            &mut needs_render,
+        );
+        assert!(applied.had_data && applied.failed.is_empty() && needs_render);
+        assert_eq!(
+            view_state.pane_buffers[&pane_id]
+                .terminal_grid
+                .grid()
+                .snapshot(0, 4)
+                .rows,
+            source.grid().snapshot(0, 4).rows
+        );
+        assert_eq!(
+            view_state.pane_mouse_protocol_hints[&pane_id].mode,
+            AttachMouseProtocolMode::PressRelease
+        );
+
+        view_state.dirty.full_pane_redraw = false;
+        source.process(b"\x1b[?1049h");
+        let cursor = view_state.pane_buffers[&pane_id].replica;
+        super::apply_pane_frames(
+            &mut view_state,
+            vec![frame_for(&mut source, cursor)],
+            &mut needs_render,
+        );
+        assert!(view_state.dirty.full_pane_redraw);
+
+        let mut stale = frame_for(&mut source, ReplicaCursor::default());
+        stale.encoded = b"not a frame".to_vec();
+        let applied = super::apply_pane_frames(&mut view_state, vec![stale], &mut needs_render);
+        assert_eq!(applied.failed, vec![pane_id]);
+    }
+
     #[test]
     fn protocol_only_output_marks_full_redraw_on_alt_screen_toggle() {
         let mut view_state = attach_view_state_with_scrollback_fixture();
@@ -22893,10 +22950,7 @@ mod tests {
 
         let mut payload = Vec::new();
         payload.extend_from_slice(b"\x1b[?1049h");
-        payload.extend(std::iter::repeat_n(
-            b'x',
-            super::ATTACH_OUTPUT_BATCH_MAX_BYTES * super::ATTACH_OUTPUT_DRAIN_MAX_ROUNDS + 64,
-        ));
+        payload.extend(std::iter::repeat_n(b'x', 256 * 1024));
         payload.extend_from_slice(b"\x1b[?1049l\r\n$ ");
 
         let outcome = super::apply_attach_output_chunk_protocol_only(
@@ -22923,64 +22977,6 @@ mod tests {
             .get(&pane_id)
             .expect("pane render buffer");
         assert!(!buffer.protocol_tracker.alternate_screen());
-    }
-
-    #[test]
-    fn apply_attach_output_chunk_updates_continuity_state() {
-        let mut view_state = attach_view_state_with_scrollback_fixture();
-        let pane_id = view_state
-            .cached_layout_state
-            .as_ref()
-            .map(|layout| layout.focused_pane_id)
-            .expect("focused pane id");
-
-        let mut frame_needs_render = false;
-        let opening = b"\x1b[?2026habc";
-        let outcome = super::apply_attach_output_chunk(
-            &mut view_state,
-            pane_id,
-            opening,
-            super::AttachOutputChunkMeta {
-                stream_start: 100,
-                stream_end: 100 + opening.len() as u64,
-                stream_gap: false,
-                sync_update_active: true,
-            },
-            &mut frame_needs_render,
-        );
-
-        assert!(matches!(
-            outcome,
-            super::AttachChunkApplyOutcome::Applied { had_data: true }
-        ));
-        assert!(frame_needs_render);
-        let buffer = view_state
-            .pane_buffers
-            .get(&pane_id)
-            .expect("pane render buffer");
-        assert_eq!(buffer.expected_stream_start, Some(111));
-        assert!(buffer.sync_update_in_progress);
-
-        // The frame ends in the next chunk. A server flag read after the application began its
-        // next frame still says "open"; the bytes the client applied say the frame is finished.
-        let closing = b"\x1b[?2026l";
-        super::apply_attach_output_chunk(
-            &mut view_state,
-            pane_id,
-            closing,
-            super::AttachOutputChunkMeta {
-                stream_start: 111,
-                stream_end: 111 + closing.len() as u64,
-                stream_gap: false,
-                sync_update_active: true,
-            },
-            &mut frame_needs_render,
-        );
-        let buffer = view_state
-            .pane_buffers
-            .get(&pane_id)
-            .expect("pane render buffer");
-        assert!(!buffer.sync_update_in_progress);
     }
 
     #[test]
@@ -23091,102 +23087,6 @@ mod tests {
                 .map(|hint| hint.mode),
             Some(AttachMouseProtocolMode::None)
         );
-    }
-
-    #[test]
-    fn apply_attach_output_chunk_marks_gap_as_desync() {
-        let mut view_state = attach_view_state_with_scrollback_fixture();
-        let pane_id = view_state
-            .cached_layout_state
-            .as_ref()
-            .map(|layout| layout.focused_pane_id)
-            .expect("focused pane id");
-
-        let mut frame_needs_render = false;
-        let outcome = super::apply_attach_output_chunk(
-            &mut view_state,
-            pane_id,
-            b"",
-            super::AttachOutputChunkMeta {
-                stream_start: 50,
-                stream_end: 50,
-                stream_gap: true,
-                sync_update_active: false,
-            },
-            &mut frame_needs_render,
-        );
-
-        assert_eq!(outcome, super::AttachChunkApplyOutcome::Desync);
-        assert!(!frame_needs_render);
-    }
-
-    #[test]
-    fn apply_attach_output_chunk_ignores_stale_chunks() {
-        let mut view_state = attach_view_state_with_scrollback_fixture();
-        let pane_id = view_state
-            .cached_layout_state
-            .as_ref()
-            .map(|layout| layout.focused_pane_id)
-            .expect("focused pane id");
-        view_state
-            .pane_buffers
-            .get_mut(&pane_id)
-            .expect("pane render buffer")
-            .expected_stream_start = Some(80);
-
-        let mut frame_needs_render = false;
-        let outcome = super::apply_attach_output_chunk(
-            &mut view_state,
-            pane_id,
-            b"late",
-            super::AttachOutputChunkMeta {
-                stream_start: 70,
-                stream_end: 80,
-                stream_gap: false,
-                sync_update_active: false,
-            },
-            &mut frame_needs_render,
-        );
-
-        assert_eq!(outcome, super::AttachChunkApplyOutcome::Stale);
-        assert!(!frame_needs_render);
-        let buffer = view_state
-            .pane_buffers
-            .get(&pane_id)
-            .expect("pane render buffer");
-        assert_eq!(buffer.expected_stream_start, Some(80));
-    }
-
-    #[test]
-    fn apply_attach_output_chunk_detects_offset_mismatch() {
-        let mut view_state = attach_view_state_with_scrollback_fixture();
-        let pane_id = view_state
-            .cached_layout_state
-            .as_ref()
-            .map(|layout| layout.focused_pane_id)
-            .expect("focused pane id");
-        view_state
-            .pane_buffers
-            .get_mut(&pane_id)
-            .expect("pane render buffer")
-            .expected_stream_start = Some(80);
-
-        let mut frame_needs_render = false;
-        let outcome = super::apply_attach_output_chunk(
-            &mut view_state,
-            pane_id,
-            b"future",
-            super::AttachOutputChunkMeta {
-                stream_start: 81,
-                stream_end: 87,
-                stream_gap: false,
-                sync_update_active: false,
-            },
-            &mut frame_needs_render,
-        );
-
-        assert_eq!(outcome, super::AttachChunkApplyOutcome::Desync);
-        assert!(!frame_needs_render);
     }
 
     #[test]
