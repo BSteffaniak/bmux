@@ -359,27 +359,7 @@ impl TerminalGrid {
         }
         patch(out, moves_at, moves);
 
-        let mut rows = 0;
-        let rows_at = out.len();
-        put_placeholder(out);
-        let main = self.main_rows.iter().map(|row| (FrameScreen::Main, row));
-        let alternate = self
-            .alt_rows
-            .iter()
-            .map(|row| (FrameScreen::Alternate, row));
-        let mut index = [0_u64; 2];
-        for (screen, row) in main.chain(alternate) {
-            let slot = &mut index[usize::from(screen.code())];
-            if row.stamp > since {
-                out.push(screen.code());
-                put(out, *slot);
-                out.push(u8::from(row.wrapped));
-                write_line(out, &row.cells);
-                rows += 1;
-            }
-            *slot += 1;
-        }
-        patch(out, rows_at, rows);
+        let rows = self.write_rows_since(since, out);
 
         put(out, history as u64);
         for line in self
@@ -402,6 +382,32 @@ impl TerminalGrid {
             history,
             styles: styles.len(),
         }
+    }
+
+    /// Write every row of either screen changed since epoch `since`, after their count.
+    fn write_rows_since(&self, since: u64, out: &mut Vec<u8>) -> usize {
+        let mut rows = 0;
+        let rows_at = out.len();
+        put_placeholder(out);
+        let main = self.main_rows.iter().map(|row| (FrameScreen::Main, row));
+        let alternate = self
+            .alt_rows
+            .iter()
+            .map(|row| (FrameScreen::Alternate, row));
+        let mut index = [0_u64; 2];
+        for (screen, row) in main.chain(alternate) {
+            let slot = &mut index[usize::from(screen.code())];
+            if row.stamp > since {
+                out.push(screen.code());
+                put(out, *slot);
+                out.push(u8::from(row.wrapped));
+                write_line(out, &row.cells);
+                rows += 1;
+            }
+            *slot += 1;
+        }
+        patch(out, rows_at, rows);
+        rows
     }
 
     fn frame_state(&self) -> FrameStateRef<'_> {
