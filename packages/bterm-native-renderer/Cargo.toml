@@ -12,7 +12,7 @@ version     = { workspace = true }
 
 [dependencies]
 bmux_fonts            = { workspace = true, features = ["bundled-nerd-fonts"] }
-bmux_raster           = { workspace = true, features = ["formats"] }
+bmux_raster           = { workspace = true }
 bmux_tui              = { workspace = true }
 bterm_native_platform = { workspace = true, features = ["renderer-adapter"] }
 bytemuck              = { workspace = true, features = ["derive"] }

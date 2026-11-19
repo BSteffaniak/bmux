@@ -170,9 +170,7 @@ fn gif(bytes: &[u8], limits: Limits) -> Result<Samples, String> {
         usize::from(frame.height),
     );
     let (w, h) = (width as usize, height as usize);
-    if fw == 0 || fh == 0 {
-        return Err("empty GIF frame".into());
-    }
+    // A zero-sized first frame leaves the whole logical screen transparent.
     let mut rgba = buffer(len)?;
     if left == 0 && fw == w && top + fh <= h {
         dec.read_into_buffer(&mut rgba[top * w * 4..(top + fh) * w * 4])

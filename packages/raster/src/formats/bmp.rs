@@ -199,11 +199,13 @@ fn rle(
     pixel_size: usize,
 ) -> Result<(), String> {
     let h = rgba.len() / pixel_size / w;
+    // `x` is the logical column. An over-long RLE8 run paints only to the end of
+    // the row but still advances `x` past it, as the reference decoder does.
     let (mut x, mut y) = (0usize, 0usize);
     while y < h {
         let (&[count, op], rest) = data.split_first_chunk().ok_or(EOF)?;
         data = rest;
-        let n = usize::from(count);
+        let room = w.saturating_sub(x);
         let (n, source) = match (count, op) {
             (0, 0) => {
                 x = 0;
@@ -214,13 +216,15 @@ fn rle(
             (0, 2) => {
                 let (&[dx, dy], rest) = data.split_first_chunk().ok_or(EOF)?;
                 data = rest;
-                x = x
-                    .checked_add(usize::from(dx))
-                    .ok_or("BMP RLE delta overflow")?;
-                y += usize::from(dy);
-                if x > w || y >= h {
+                let (dx, dy) = (usize::from(dx), usize::from(dy));
+                // Skipped pixels are black: `dx` more in this row, or the first
+                // `x + dx` of the target row. Either span must fit the scanline.
+                let fits = if dy == 0 { dx <= room } else { x + dx <= w };
+                if !fits || y + dy >= h {
                     return Err("BMP RLE delta outside image".into());
                 }
+                x += dx;
+                y += dy;
                 continue;
             }
             (0, count) => {
@@ -230,23 +234,29 @@ fn rle(
                 data = rest;
                 (n, Some(src))
             }
-            // Some writers produce RLE8 encoded runs that exceed a row.
-            _ if bits == 8 => (n.min(w - x), None),
-            _ => (n, None),
+            _ => (usize::from(count), None),
         };
-        if n > w - x {
+        // Some writers produce RLE8 encoded runs that exceed a row; other runs
+        // and absolute spans must fit.
+        let painted = if source.is_none() && bits == 8 {
+            n.min(room)
+        } else if n > room {
             return Err("BMP RLE run crosses scanline".into());
-        }
-        let offset = ((h - 1 - y) * w + x) * pixel_size;
-        for (i, p) in rgba[offset..offset + pixel_size * n]
-            .chunks_exact_mut(pixel_size)
-            .enumerate()
-        {
-            let k = source.map_or_else(
-                || index(&[op], if bits == 4 { i % 2 } else { 0 }, bits),
-                |src| index(src, i, bits),
-            );
-            p.copy_from_slice(&palette[k][..pixel_size]);
+        } else {
+            n
+        };
+        if painted > 0 {
+            let offset = ((h - 1 - y) * w + x) * pixel_size;
+            for (i, p) in rgba[offset..offset + pixel_size * painted]
+                .chunks_exact_mut(pixel_size)
+                .enumerate()
+            {
+                let k = source.map_or_else(
+                    || index(&[op], if bits == 4 { i % 2 } else { 0 }, bits),
+                    |src| index(src, i, bits),
+                );
+                p.copy_from_slice(&palette[k][..pixel_size]);
+            }
         }
         x += n;
     }
