@@ -1,6 +1,6 @@
+use crate::dependency_version::{Version, VersionReq};
 use crate::{PluginDeclaration, PluginEntrypoint, PluginManifest};
 use bmux_plugin_sdk::{HostMetadata, HostScope, PluginError, RegisteredService, Result};
-use semver::Version;
 use std::collections::BTreeMap;
 use std::fs;
 #[cfg(unix)]
@@ -251,15 +251,14 @@ impl PluginRegistry {
                     version_req: dependency.version_req.clone(),
                     details: error.to_string(),
                 })?;
-                let version_req =
-                    semver::VersionReq::parse(&dependency.version_req).map_err(|error| {
-                        PluginError::InvalidDependencyVersion {
-                            plugin_id: plugin_id.to_string(),
-                            dependency_id: dependency_id.to_string(),
-                            version_req: dependency.version_req.clone(),
-                            details: error.to_string(),
-                        }
-                    })?;
+                let version_req = VersionReq::parse(&dependency.version_req).map_err(|error| {
+                    PluginError::InvalidDependencyVersion {
+                        plugin_id: plugin_id.to_string(),
+                        dependency_id: dependency_id.to_string(),
+                        version_req: dependency.version_req.clone(),
+                        details: error.to_string(),
+                    }
+                })?;
                 if !version_req.matches(&dependency_version) {
                     return Err(PluginError::IncompatibleDependencyVersion {
                         plugin_id: plugin_id.to_string(),

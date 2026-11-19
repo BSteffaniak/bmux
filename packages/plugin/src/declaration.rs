@@ -1,9 +1,9 @@
+use crate::dependency_version::VersionReq;
 use bmux_plugin_sdk::{
     CommandExecutionKind, HostScope, PluginCommand, PluginContext, PluginError,
     PluginEventPublication, PluginEventSubscription, PluginFeature, PluginService, Result,
     VersionRange,
 };
-use semver::VersionReq;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 

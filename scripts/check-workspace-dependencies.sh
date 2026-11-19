@@ -45,6 +45,8 @@ def check(path, table, section=()):
                     "tools/grapheme-oracle/Cargo.toml", "tools/grapheme-perf/Cargo.toml",
                 }:
                     errors.append(f"{location}: segment text through bmux_unicode_segmentation")
+                if spec.get("package", name) == "semver" and path != "tools/plugin-version-oracle/Cargo.toml":
+                    errors.append(f"{location}: use bmux_plugin::dependency_version")
                 if spec.get("package", name) == "arboard":
                     errors.append(f"{location}: use the owned bmux_clipboard backend")
                 if current == ("workspace", "dependencies"):

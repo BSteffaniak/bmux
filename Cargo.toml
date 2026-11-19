@@ -451,7 +451,6 @@ rustls-native-certs = { version = "0.8.5", default-features = false }
 rustls-pemfile = { version = "2.2.0", default-features = false, features = [
     "std",
 ] }
-semver = { version = "1.0.28", default-features = false, features = ["std"] }
 serde = { version = "1.0.229", default-features = false, features = ["std"] }
 serde_json = { version = "1.0.154", default-features = false, features = [
     "std",

@@ -27,6 +27,7 @@ pub mod component_render;
 #[cfg(feature = "tui")]
 pub mod component_viewport;
 mod declaration;
+pub mod dependency_version;
 mod discovery;
 mod event_bus;
 mod extension_points;
