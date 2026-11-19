@@ -25,6 +25,11 @@ fn write(bytes: Vec<u8>, image: bool) -> Result<(), ClipboardError> {
         ));
     }
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        // In a Wayland-only session there is no X11 fallback. Preserve the
+        // transport error and avoid cloning a potentially 256 MiB payload.
+        if std::env::var_os("DISPLAY").is_none() {
+            return wayland::write(bytes, image);
+        }
         match wayland::write(bytes.clone(), image) {
             Ok(()) => return Ok(()),
             Err(wayland_error) => {
@@ -38,6 +43,9 @@ fn write(bytes: Vec<u8>, image: bool) -> Result<(), ClipboardError> {
 }
 fn read(image: bool) -> Result<Option<Vec<u8>>, ClipboardError> {
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        if std::env::var_os("DISPLAY").is_none() {
+            return wayland::read(image);
+        }
         match wayland::read(image) {
             Ok(result) => return Ok(result),
             Err(wayland_error) => {

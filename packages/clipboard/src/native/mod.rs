@@ -56,10 +56,18 @@ mod platform {
     }
 }
 
+/// Publish text without command fallback.
+///
+/// # Errors
+/// Returns the platform error if the clipboard cannot accept the write.
 pub fn copy_text(text: &str) -> Result<(), ClipboardError> {
     platform::copy_text(text)
 }
 
+/// Read the native text flavor, or `None` when absent.
+///
+/// # Errors
+/// Returns the platform error if the clipboard cannot be read.
 pub fn read_text() -> Result<Option<String>, ClipboardError> {
     platform::read_text()
 }

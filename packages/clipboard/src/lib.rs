@@ -4,8 +4,22 @@
 
 use std::env;
 
-#[cfg(feature = "native-clipboard")]
 mod native;
+
+/// Direct desktop clipboard operations. Unlike the application-level helpers,
+/// these never start a clipboard command or redirect to a different desktop.
+pub mod native_text {
+    /// Publish text using the native backend.
+    ///
+    /// # Errors
+    /// Returns the native backend error if ownership cannot be acquired.
+    pub use super::native::copy_text as write;
+    /// Read the native text flavor, distinguishing absence from empty text.
+    ///
+    /// # Errors
+    /// Returns the native backend error if the clipboard cannot be read.
+    pub use super::native::read_text as read;
+}
 use std::ffi::OsString;
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
@@ -255,18 +269,7 @@ const fn unique_wayland_display(_runtime_dir: &Path) -> Option<OsString> {
 pub fn copy_text(text: &str) -> Result<(), ClipboardError> {
     let displays = ClipboardDisplays::detect();
     displays.check_read_available(env::consts::OS)?;
-    #[cfg(feature = "native-clipboard")]
-    let result = native::copy_text(text);
-    #[cfg(not(feature = "native-clipboard"))]
-    let result = arboard_clipboard().and_then(|mut clipboard| {
-        clipboard
-            .set_text(text.to_string())
-            .map_err(|error| ClipboardError::BackendFailed {
-                backend: "arboard".to_string(),
-                message: error.to_string(),
-            })
-    });
-    match result {
+    match native::copy_text(text) {
         Ok(()) => Ok(()),
         Err(error) => copy_with_commands(
             clipboard_commands(env::consts::OS)
@@ -504,7 +507,7 @@ pub fn read_payload_detailed(prefer_image: bool) -> Result<ClipboardReadResult, 
         "clipboard payload read started"
     );
     if prefer_image {
-        match read_arboard_image() {
+        match read_native_image() {
             Ok(Some(payload)) => {
                 report.attempts.push(ClipboardReadAttempt {
                     backend: "arboard",
@@ -661,53 +664,17 @@ fn clipboard_read_result(
 /// backend command fails.
 pub fn read_text() -> Result<String, ClipboardError> {
     ClipboardDisplays::detect().check_read_available(env::consts::OS)?;
-    #[cfg(feature = "native-clipboard")]
-    {
-        match native::read_text() {
-            Ok(Some(text)) => Ok(text),
-            Ok(None) => Err(ClipboardError::BackendFailed {
-                backend: "native".to_string(),
-                message: "clipboard has no text format".to_string(),
-            }),
-            Err(error) => {
-                tracing::debug!(error = %error, "native text read failed; trying command backend");
-                read_text_fallback(error)
-            }
+    match native::read_text() {
+        Ok(Some(text)) => Ok(text),
+        Ok(None) => Err(ClipboardError::BackendFailed {
+            backend: "native".to_string(),
+            message: "clipboard has no text format".to_string(),
+        }),
+        Err(error) => {
+            tracing::debug!(error = %error, "native text read failed; trying command backend");
+            read_text_fallback(error)
         }
     }
-    #[cfg(not(feature = "native-clipboard"))]
-    arboard_clipboard().map_or_else(
-        |error| {
-            tracing::debug!(
-                bmux.component = "clipboard.remote_sync",
-                stage = "arboard_text_init",
-                error = %error,
-                "arboard text read initialization failed; falling back to command backend"
-            );
-            read_text_fallback(error)
-        },
-        |mut clipboard| {
-            tracing::debug!(
-                bmux.component = "clipboard.remote_sync",
-                stage = "arboard_text",
-                "clipboard text read attempted"
-            );
-            clipboard
-                .get_text()
-                .inspect(|text| {
-                    tracing::debug!(
-                        bmux.component = "clipboard.remote_sync",
-                        stage = "arboard_text",
-                        bytes_len = text.len(),
-                        "clipboard text read succeeded"
-                    );
-                })
-                .map_err(|error| ClipboardError::BackendFailed {
-                    backend: "arboard".to_string(),
-                    message: error.to_string(),
-                })
-        },
-    )
 }
 
 fn read_text_fallback(native_error: ClipboardError) -> Result<String, ClipboardError> {
@@ -821,51 +788,25 @@ fn run_read_command(
 ///
 /// Returns [`ClipboardError`] if image clipboard writes are unsupported or fail.
 pub fn copy_png_image(bytes: &[u8]) -> Result<(), ClipboardError> {
-    #[cfg(not(feature = "native-clipboard"))]
-    let mut clipboard = arboard_clipboard()?;
     let image = image::load_from_memory(bytes).map_err(|error| ClipboardError::BackendFailed {
         backend: "image".to_string(),
         message: error.to_string(),
     })?;
     let rgba = image.into_rgba8();
     let (width, height) = rgba.dimensions();
-    #[cfg(feature = "native-clipboard")]
-    {
-        native::copy_image(&native::NativeImage {
-            width: usize::try_from(width).unwrap_or(usize::MAX),
-            height: usize::try_from(height).unwrap_or(usize::MAX),
-            bytes: rgba.into_raw(),
-        })
-    }
-    #[cfg(not(feature = "native-clipboard"))]
-    clipboard
-        .set_image(arboard::ImageData {
-            width: usize::try_from(width).unwrap_or(usize::MAX),
-            height: usize::try_from(height).unwrap_or(usize::MAX),
-            bytes: rgba.into_raw().into(),
-        })
-        .map_err(|error| ClipboardError::BackendFailed {
-            backend: "arboard".to_string(),
-            message: error.to_string(),
-        })
-}
-
-#[cfg(not(feature = "native-clipboard"))]
-fn arboard_clipboard() -> Result<arboard::Clipboard, ClipboardError> {
-    arboard::Clipboard::new().map_err(|error| ClipboardError::BackendFailed {
-        backend: "arboard".to_string(),
-        message: error.to_string(),
+    native::copy_image(&native::NativeImage {
+        width: usize::try_from(width).unwrap_or(usize::MAX),
+        height: usize::try_from(height).unwrap_or(usize::MAX),
+        bytes: rgba.into_raw(),
     })
 }
 
-#[cfg(feature = "native-clipboard")]
-fn read_arboard_image() -> Result<Option<ClipboardPayload>, ClipboardError> {
+fn read_native_image() -> Result<Option<ClipboardPayload>, ClipboardError> {
     native::read_image()?
         .map(|image| encode_native_image_png(image).map(ClipboardPayload::ImagePng))
         .transpose()
 }
 
-#[cfg(feature = "native-clipboard")]
 fn encode_native_image_png(image: native::NativeImage) -> Result<Vec<u8>, ClipboardError> {
     let width = u32::try_from(image.width).map_err(|error| ClipboardError::BackendFailed {
         backend: "native".to_string(),
@@ -891,61 +832,13 @@ fn encode_native_image_png(image: native::NativeImage) -> Result<Vec<u8>, Clipbo
     Ok(output.into_inner())
 }
 
-#[cfg(not(feature = "native-clipboard"))]
-fn read_arboard_image() -> Result<Option<ClipboardPayload>, ClipboardError> {
-    tracing::debug!(
-        bmux.component = "clipboard.remote_sync",
-        stage = "arboard_image",
-        "clipboard arboard image read attempted"
-    );
-    let mut clipboard = arboard_clipboard()?;
-    match clipboard.get_image() {
-        Ok(image) => {
-            encode_arboard_image_png(image).map(|bytes| Some(ClipboardPayload::ImagePng(bytes)))
-        }
-        Err(arboard::Error::ContentNotAvailable) => Ok(None),
-        Err(error) => Err(ClipboardError::BackendFailed {
-            backend: "arboard".to_string(),
-            message: error.to_string(),
-        }),
-    }
-}
-
-#[cfg(not(feature = "native-clipboard"))]
-fn encode_arboard_image_png(image: arboard::ImageData<'_>) -> Result<Vec<u8>, ClipboardError> {
-    let width = u32::try_from(image.width).map_err(|error| ClipboardError::BackendFailed {
-        backend: "arboard".to_string(),
-        message: error.to_string(),
-    })?;
-    let height = u32::try_from(image.height).map_err(|error| ClipboardError::BackendFailed {
-        backend: "arboard".to_string(),
-        message: error.to_string(),
-    })?;
-    let rgba =
-        image::RgbaImage::from_raw(width, height, image.bytes.into_owned()).ok_or_else(|| {
-            ClipboardError::BackendFailed {
-                backend: "arboard".to_string(),
-                message: "invalid RGBA clipboard image buffer".to_string(),
-            }
-        })?;
-    let dynamic = image::DynamicImage::ImageRgba8(rgba);
-    let mut output = Cursor::new(Vec::new());
-    dynamic
-        .write_to(&mut output, image::ImageFormat::Png)
-        .map_err(|error| ClipboardError::BackendFailed {
-            backend: "image".to_string(),
-            message: error.to_string(),
-        })?;
-    Ok(output.into_inner())
-}
-
 fn read_image_file_reference_payload() -> Result<Option<ClipboardPayload>, ClipboardError> {
     tracing::debug!(
         bmux.component = "clipboard.remote_sync",
         stage = "file_reference",
         "clipboard image file-reference fallback attempted"
     );
-    if let Some(path) = read_arboard_image_path_text()? {
+    if let Some(path) = read_native_image_path_text()? {
         tracing::debug!(
             bmux.component = "clipboard.remote_sync",
             stage = "file_reference",
@@ -957,41 +850,11 @@ fn read_image_file_reference_payload() -> Result<Option<ClipboardPayload>, Clipb
     Ok(None)
 }
 
-fn read_arboard_image_path_text() -> Result<Option<PathBuf>, ClipboardError> {
-    #[cfg(feature = "native-clipboard")]
+fn read_native_image_path_text() -> Result<Option<PathBuf>, ClipboardError> {
     let Some(text) = native::read_text()? else {
         return Ok(None);
     };
-    #[cfg(not(feature = "native-clipboard"))]
-    let text = read_arboard_file_reference_text()?;
-    #[cfg(not(feature = "native-clipboard"))]
-    let Some(text) = text else {
-        return Ok(None);
-    };
     Ok(image_path_from_text(&text))
-}
-
-#[cfg(not(feature = "native-clipboard"))]
-fn read_arboard_file_reference_text() -> Result<Option<String>, ClipboardError> {
-    let mut clipboard = arboard_clipboard()?;
-    let text = match clipboard.get_text() {
-        Ok(text) => text,
-        Err(arboard::Error::ContentNotAvailable) => {
-            tracing::debug!(
-                bmux.component = "clipboard.remote_sync",
-                stage = "file_reference_text",
-                "clipboard text unavailable while probing file reference"
-            );
-            return Ok(None);
-        }
-        Err(error) => {
-            return Err(ClipboardError::BackendFailed {
-                backend: "arboard".to_string(),
-                message: error.to_string(),
-            });
-        }
-    };
-    Ok(Some(text))
 }
 
 fn image_path_from_text(text: &str) -> Option<PathBuf> {
@@ -1089,7 +952,6 @@ mod tests {
         Clipboard, ClipboardCommand, ClipboardError, clipboard_commands, copy_with_commands,
         detect_backend, image_path_from_text, is_png, percent_decode_file_url_path,
     };
-    #[cfg(feature = "native-clipboard")]
     use super::{encode_native_image_png, native};
     use std::path::PathBuf;
 
@@ -1536,7 +1398,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "native-clipboard")]
     #[test]
     fn native_rgba_png_conversion_preserves_pixels() {
         let pixels = vec![255, 0, 0, 255, 0, 255, 0, 128, 0, 0, 255, 0, 1, 2, 3, 255];

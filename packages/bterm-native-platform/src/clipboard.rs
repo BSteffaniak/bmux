@@ -28,16 +28,13 @@ pub enum ClipboardError {
 /// this adapter does not observe selection, synthesize paste, or own OSC replies.
 /// Deliberately has no `Debug` implementation to avoid exposing backend state.
 pub struct Clipboard {
-    backend: Option<arboard::Clipboard>,
+    closed: bool,
 }
 
 impl Clipboard {
-    /// Connect to the platform clipboard, failing explicitly if unavailable.
+    /// Create a handle without contacting the OS; availability is checked on use.
     pub fn new() -> Result<Self, ClipboardError> {
-        let backend = arboard::Clipboard::new().map_err(|_| ClipboardError::Unavailable)?;
-        Ok(Self {
-            backend: Some(backend),
-        })
+        Ok(Self { closed: false })
     }
 
     /// Read UTF-8 text. Oversized text is rejected, never silently truncated.
@@ -45,30 +42,36 @@ impl Clipboard {
     /// The OS/backend allocates the incoming payload before its length can be
     /// checked; this is a transfer limit, not a hostile-server allocation limit.
     pub fn read_text(&mut self) -> Result<String, ClipboardError> {
-        let backend = self.backend.as_mut().ok_or(ClipboardError::Closed)?;
-        let text = backend.get_text().map_err(|error| match error {
-            arboard::Error::ContentNotAvailable => ClipboardError::NoText,
-            _ => ClipboardError::Unavailable,
-        })?;
-        validate_text(&text)?;
-        Ok(text)
+        if self.closed {
+            return Err(ClipboardError::Closed);
+        }
+        native_read_result(bmux_clipboard::native_text::read())
     }
 
     /// Publish text without retaining a second in-process copy.
     pub fn write_text(&mut self, text: String) -> Result<(), ClipboardError> {
         validate_text(&text)?;
-        self.backend
-            .as_mut()
-            .ok_or(ClipboardError::Closed)?
-            .set_text(text)
-            .map_err(|_| ClipboardError::Unavailable)
+        if self.closed {
+            return Err(ClipboardError::Closed);
+        }
+        bmux_clipboard::native_text::write(&text).map_err(|_| ClipboardError::Unavailable)
     }
 
-    /// Release this process's clipboard owner during application shutdown.
-    /// Does not clear another application's clipboard or pretend persistence.
+    /// Close this handle during application shutdown. The shared native backend
+    /// retains process-owned selections independently of individual handles.
     pub fn close(&mut self) {
-        self.backend.take();
+        self.closed = true;
     }
+}
+
+fn native_read_result(
+    result: Result<Option<String>, bmux_clipboard::ClipboardError>,
+) -> Result<String, ClipboardError> {
+    let text = result
+        .map_err(|_| ClipboardError::Unavailable)?
+        .ok_or(ClipboardError::NoText)?;
+    validate_text(&text)?;
+    Ok(text)
 }
 
 fn validate_text(text: &str) -> Result<(), ClipboardError> {
@@ -94,8 +97,35 @@ mod tests {
     }
 
     #[test]
+    fn native_reads_distinguish_absence_from_empty_and_redact_backend_errors() {
+        assert_eq!(native_read_result(Ok(None)), Err(ClipboardError::NoText));
+        for text in ["", "é\n"] {
+            assert_eq!(native_read_result(Ok(Some(text.into()))), Ok(text.into()));
+        }
+        let err = bmux_clipboard::ClipboardError::BackendFailed {
+            backend: "private".into(),
+            message: "sensitive".into(),
+        };
+        assert_eq!(
+            native_read_result(Err(err)),
+            Err(ClipboardError::Unavailable)
+        );
+    }
+
+    #[test]
+    fn oversized_write_rejected_before_native_io() {
+        let mut clipboard = Clipboard::new().unwrap();
+        assert_eq!(
+            clipboard.write_text("x".repeat(MAX_CLIPBOARD_BYTES + 1)),
+            Err(ClipboardError::TooLarge)
+        );
+        clipboard.close();
+        assert_eq!(clipboard.read_text(), Err(ClipboardError::Closed));
+    }
+
+    #[test]
     fn closed_owner_does_not_reopen_or_fall_back() {
-        let mut clipboard = Clipboard { backend: None };
+        let mut clipboard = Clipboard::new().unwrap();
         clipboard.close();
         assert_eq!(clipboard.read_text(), Err(ClipboardError::Closed));
         assert_eq!(

@@ -1,7 +1,7 @@
 //! Native interoperability checks must run only on an explicitly isolated display.
 #![cfg(feature = "native-clipboard")]
 
-use bmux_clipboard::{ClipboardPayload, copy_png_image, copy_text, read_payload, read_text};
+use bmux_clipboard::{ClipboardPayload, copy_png_image, native_text, read_payload};
 
 #[test]
 #[ignore = "requires BMUX_CLIPBOARD_ISOLATED_TEST=1 and a disposable native clipboard"]
@@ -16,13 +16,13 @@ fn native_text_and_image_roundtrip() {
         "trailing newline\n",
     ] {
         eprintln!("copy text bytes={}", text.len());
-        copy_text(text).unwrap();
+        native_text::write(text).unwrap();
         eprintln!("read text bytes={}", text.len());
-        assert_eq!(read_text().unwrap(), text);
+        assert!(native_text::read().unwrap().as_deref() == Some(text));
     }
     let text = "large 界\n".repeat(200_000);
-    copy_text(&text).unwrap();
-    assert_eq!(read_text().unwrap(), text);
+    native_text::write(&text).unwrap();
+    assert!(native_text::read().unwrap().as_ref() == Some(&text));
 
     let rgba = image::RgbaImage::from_raw(
         2,
@@ -35,10 +35,14 @@ fn native_text_and_image_roundtrip() {
         .write_to(&mut png, image::ImageFormat::Png)
         .unwrap();
     copy_png_image(png.get_ref()).unwrap();
+    assert!(
+        native_text::read().unwrap().is_none(),
+        "image-only owner advertised text"
+    );
     let ClipboardPayload::ImagePng(bytes) = read_payload(true).unwrap() else {
         panic!("native image was not selected");
     };
-    assert_eq!(image::load_from_memory(&bytes).unwrap().into_rgba8(), rgba);
+    assert!(image::load_from_memory(&bytes).unwrap().into_rgba8() == rgba);
 }
 
 #[cfg(target_os = "linux")]
@@ -72,7 +76,7 @@ fn independent_text_interoperability(wayland: bool) {
         assert!(std::env::var_os("WAYLAND_DISPLAY").is_none());
     }
     let text = "independent UTF-8 界\n".repeat(100_000);
-    copy_text(&text).unwrap();
+    native_text::write(&text).unwrap();
     let output = Command::new("timeout")
         .args(if wayland {
             vec![
@@ -95,12 +99,8 @@ fn independent_text_interoperability(wayland: bool) {
         })
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(output.stdout, text.as_bytes());
+    assert!(output.status.success(), "external reader failed");
+    assert!(output.stdout == text.as_bytes(), "external reader mismatch");
 
     // Foreground owner remains alive until our native reader has consumed it.
     let text = "external producer 界\n".repeat(100_000);
@@ -138,15 +138,15 @@ fn independent_text_interoperability(wayland: bool) {
         .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let result = loop {
-        match read_text() {
-            Ok(value) if value == text => break Ok(value),
-            value if std::time::Instant::now() >= deadline => break value,
+        match native_text::read() {
+            Ok(Some(value)) if value == text => break true,
+            _ if std::time::Instant::now() >= deadline => break false,
             _ => std::thread::sleep(std::time::Duration::from_millis(10)),
         }
     };
     let _ = owner.kill();
     let _ = owner.wait();
-    assert_eq!(result.unwrap(), text);
+    assert!(result, "external text not received intact");
 
     let rgba = image::RgbaImage::from_raw(2, 1, vec![255, 0, 0, 128, 0, 1, 2, 255]).unwrap();
     let mut png = std::io::Cursor::new(Vec::new());
@@ -170,16 +170,12 @@ fn independent_text_interoperability(wayland: bool) {
         })
         .output()
         .unwrap();
+    assert!(output.status.success(), "external reader failed");
     assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
         image::load_from_memory(&output.stdout)
             .unwrap()
-            .into_rgba8(),
-        rgba
+            .into_rgba8()
+            == rgba
     );
 
     let external_rgba =
@@ -230,5 +226,5 @@ fn independent_text_interoperability(wayland: bool) {
     };
     let _ = owner.kill();
     let _ = owner.wait();
-    assert_eq!(result.unwrap(), external_rgba);
+    assert!(result.unwrap() == external_rgba);
 }

@@ -17,7 +17,7 @@ accesskit_winit = { workspace = true, features = [
     "accesskit_unix",
     "async-io",
 ] }
-arboard = { workspace = true }
+bmux_clipboard = { workspace = true, features = ["native-clipboard"] }
 bmux_frontend_runtime = { workspace = true }
 bmux_tui = { workspace = true }
 raw-window-handle = { workspace = true }
@@ -27,4 +27,6 @@ winit = { workspace = true }
 [features]
 default          = []
 fail-on-warnings = []
+# Compatibility for builds that explicitly selected the native backend.
+native-clipboard = []
 renderer-adapter = []

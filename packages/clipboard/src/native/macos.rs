@@ -268,6 +268,13 @@ fn clear(pasteboard: Id) -> Result<(), ClipboardError> {
 }
 
 pub(super) fn copy_text(text: &str) -> Result<(), ClipboardError> {
+    copy_text_on(text, pasteboard)
+}
+
+fn copy_text_on(
+    text: &str,
+    pasteboard: impl FnOnce() -> Result<Id, ClipboardError>,
+) -> Result<(), ClipboardError> {
     let _pool = Pool::new();
     let value = string(text)?;
     let pasteboard = pasteboard()?;
@@ -292,6 +299,12 @@ fn decode_text(bytes: &[u8]) -> Result<String, ClipboardError> {
 }
 
 pub(super) fn read_text() -> Result<Option<String>, ClipboardError> {
+    read_text_on(pasteboard)
+}
+
+fn read_text_on(
+    pasteboard: impl FnOnce() -> Result<Id, ClipboardError>,
+) -> Result<Option<String>, ClipboardError> {
     let _pool = Pool::new();
     let pasteboard = pasteboard()?;
     // SAFETY: stringForType returns a live NSString or nil. The UTF8String
@@ -522,6 +535,13 @@ fn bitmap_representation(input: Id, file_type: usize) -> Result<Id, ClipboardErr
 }
 
 pub(super) fn copy_image(image: &NativeImage) -> Result<(), ClipboardError> {
+    copy_image_on(image, pasteboard)
+}
+
+fn copy_image_on(
+    image: &NativeImage,
+    pasteboard: impl FnOnce() -> Result<Id, ClipboardError>,
+) -> Result<(), ClipboardError> {
     let png = encode_png(image)?;
     let _pool = Pool::new();
     let png = data(&png)?;
@@ -544,6 +564,12 @@ pub(super) fn copy_image(image: &NativeImage) -> Result<(), ClipboardError> {
 }
 
 pub(super) fn read_image() -> Result<Option<NativeImage>, ClipboardError> {
+    read_image_on(pasteboard)
+}
+
+fn read_image_on(
+    pasteboard: impl FnOnce() -> Result<Id, ClipboardError>,
+) -> Result<Option<NativeImage>, ClipboardError> {
     let _pool = Pool::new();
     let pasteboard = pasteboard()?;
     // SAFETY: dataForType returns NSData or nil; objects remain valid until the
@@ -568,6 +594,38 @@ pub(super) fn read_image() -> Result<Option<NativeImage>, ClipboardError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "run scripts/clipboard/macos/interop.py inside the Nix shell"]
+    fn named_board_child() {
+        let token = std::env::var("BMUX_MAC_INTEROP_TOKEN").unwrap();
+        assert!(token.len() == 32 && token.bytes().all(|b| b.is_ascii_hexdigit()));
+        let named = || {
+            let name = string(&format!("org.bmux.clipboard.test.{token}"))?;
+            // SAFETY: called inside the operation's pool, with an NSString.
+            let board =
+                unsafe { send_id_arg(class(c"NSPasteboard")?, c"pasteboardWithName:", name.0) };
+            if board.is_null() {
+                return Err(failed("named pasteboard unavailable"));
+            }
+            Ok(board)
+        };
+        let image = NativeImage {
+            width: 2,
+            height: 2,
+            bytes: vec![
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 0, 255,
+            ],
+        };
+        let text = "bmux 🦀\n東京";
+        match std::env::var("BMUX_MAC_INTEROP_OP").unwrap().as_str() {
+            "write-text" => copy_text_on(text, named).unwrap(),
+            "read-text" => assert_eq!(read_text_on(named).unwrap().as_deref(), Some(text)),
+            "write-image" => copy_image_on(&image, named).unwrap(),
+            "read-image" => assert_eq!(read_image_on(named).unwrap(), Some(image)),
+            op => panic!("unknown named-board operation: {op}"),
+        }
+    }
 
     #[test]
     fn native_budget_accounts_for_precision_channels_padding_and_overflow() {
