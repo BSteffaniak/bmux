@@ -1131,7 +1131,12 @@ mod pointer_query_tests {
         let pointer = process(&grid, chunk);
         let mut tracker = PaneCursorTracker::new(24, 80);
         let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
-        let mut replies = protocol_reply_for_chunk(&mut engine, &mut tracker, chunk);
+        let mut replies = protocol_reply_for_chunk(
+            &mut engine,
+            &mut tracker.reader,
+            &mut tracker.terminal_grid,
+            chunk,
+        );
         assert!(replies.starts_with(b"\x1b[4;7R"));
         assert!(replies.windows(5).any(|bytes| bytes == b"\x1b]10;"));
         replies.extend(pointer);
@@ -1153,7 +1158,8 @@ mod pointer_query_tests {
         let mut registry = bmux_image::ImageRegistry::default();
         let mut replies = Vec::new();
         ordered_image_output(
-            &mut tracker,
+            &mut tracker.reader,
+            &mut tracker.terminal_grid,
             &mut engine,
             &mut registry,
             &mut output,
@@ -1183,7 +1189,8 @@ mod pointer_query_tests {
         let mut registry = bmux_image::ImageRegistry::default();
         let mut replies = Vec::new();
         ordered_image_output(
-            &mut tracker,
+            &mut tracker.reader,
+            &mut tracker.terminal_grid,
             &mut engine,
             &mut registry,
             &mut output,
@@ -2216,7 +2223,6 @@ struct PaneRuntimeHandle {
     terminal_grid_deltas: Arc<std::sync::Mutex<TerminalGridDeltaLog>>,
     exited: Arc<AtomicBool>,
     last_requested_size: Arc<std::sync::Mutex<(u16, u16)>>,
-    cursor_tracker: Arc<std::sync::Mutex<PaneCursorTracker>>,
     /// Set to `true` by the PTY reader when new output arrives. The broadcast
     /// event is only emitted on the `false→true` transition, coalescing
     /// thousands of per-chunk writes into ~1 event per fetch cycle.
@@ -2444,121 +2450,211 @@ impl PaneTerminalModeTracker {
     }
 }
 
+/// What the pane reader keeps from chunk to chunk while it follows the pane's output through the
+/// pane's grid: the shell metadata filter, the rows already scrolled out of image positions, and
+/// the buffers one chunk's visible bytes, metadata events and pointer-shape replies collect in.
+/// The grid itself is the pane's one grid: cursor positions for image placement and cursor
+/// reports are read from it as of each byte.
+struct PaneReader {
+    metadata: Option<PaneShellMetadataParser>,
+    metadata_events: Vec<PaneShellMetadataEvent>,
+    /// The chunk's bytes as the grid sees them (images and shell metadata removed): what the
+    /// output buffer publishes.
+    visible: Vec<u8>,
+    pointer_replies: Vec<u8>,
+    profile: ProtocolProfile,
+    /// The grid's viewport scroll revision already applied to image positions, from the first
+    /// bytes followed (a grid restored from a snapshot does not start at zero).
+    #[cfg(feature = "image-registry")]
+    scrolled: Option<u64>,
+}
+
+impl PaneReader {
+    const fn new(profile: ProtocolProfile, metadata: Option<PaneShellMetadataParser>) -> Self {
+        Self {
+            metadata,
+            metadata_events: Vec::new(),
+            visible: Vec::new(),
+            pointer_replies: Vec::new(),
+            profile,
+            #[cfg(feature = "image-registry")]
+            scrolled: None,
+        }
+    }
+
+    /// Start a chunk: its visible bytes, metadata events and pointer replies start empty.
+    fn begin_chunk(&mut self) {
+        self.visible.clear();
+        self.metadata_events.clear();
+        self.pointer_replies.clear();
+    }
+
+    /// Parse `bytes` into `grid`, collecting pointer-shape query replies.
+    fn feed(&mut self, grid: &mut TerminalGridStream, bytes: &[u8]) {
+        use bmux_terminal_protocol::pointer_shape::{
+            PointerShape, PointerShapeQueryContext, encode_pointer_shape_query_reply,
+        };
+        let (profile, replies) = (self.profile, &mut self.pointer_replies);
+        grid.process_with_pointer_queries(bytes, |query, current| {
+            if matches!(profile, ProtocolProfile::Bmux) {
+                // The grid has already bounded and validated the complete OSC payload.
+                let _ = encode_pointer_shape_query_reply(
+                    query,
+                    PointerShapeQueryContext {
+                        current,
+                        default: PointerShape::Text,
+                        grabbed: PointerShape::Default,
+                    },
+                    replies,
+                );
+            }
+        });
+    }
+
+    /// Rows scrolled since the last call, to move image positions by.
+    #[cfg(feature = "image-registry")]
+    fn drain_scroll_delta(&mut self, grid: &TerminalGridStream) -> u16 {
+        let total = grid.grid().viewport_scroll_revision();
+        let delta = total.wrapping_sub(self.scrolled.replace(total).unwrap_or(total));
+        u16::try_from(delta).unwrap_or(u16::MAX)
+    }
+}
+
+/// A grid with the reader state that follows output through it, as tests drive image ordering
+/// and cursor reports without a pane: what the reader thread keeps beside a pane's grid.
+#[cfg(test)]
 struct PaneCursorTracker {
-    terminal_grid: bmux_terminal_grid::TerminalGridStream,
+    terminal_grid: TerminalGridStream,
+    reader: PaneReader,
     rows: u16,
     cols: u16,
-    cursor_escape_state: CursorEscapeState,
-    /// Each chunk's bytes as the grid is fed them, its storage kept from chunk to chunk.
-    normalized: Vec<u8>,
-    /// Cumulative number of lines that have scrolled off the top.
-    /// Used by the image registry to shift image positions on scroll.
-    #[cfg(feature = "image-registry")]
-    total_scrollback: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CursorEscapeState {
-    Ground,
-    Esc,
-    EscBracket,
-}
-
+#[cfg(test)]
 impl PaneCursorTracker {
     fn new(rows: u16, cols: u16) -> Self {
         let (rows, cols) = sanitize_pty_size(rows, cols);
         Self {
-            terminal_grid: bmux_terminal_grid::TerminalGridStream::new(
-                cols,
-                rows,
-                bmux_terminal_grid::GridLimits::default(),
-            )
-            .expect("pane cursor tracker grid dimensions are valid"),
+            terminal_grid: TerminalGridStream::new(cols, rows, GridLimits::default())
+                .expect("test grid dimensions are valid"),
+            reader: PaneReader::new(ProtocolProfile::Bmux, None),
             rows,
             cols,
-            cursor_escape_state: CursorEscapeState::Ground,
-            normalized: Vec::new(),
-            #[cfg(feature = "image-registry")]
-            total_scrollback: 0,
         }
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
         let (rows, cols) = sanitize_pty_size(rows, cols);
-        if self.rows == rows && self.cols == cols {
-            return;
+        if (self.rows, self.cols) != (rows, cols) {
+            let _ = self.terminal_grid.resize(cols, rows);
+            (self.rows, self.cols) = (rows, cols);
         }
-        let _ = self.terminal_grid.resize(cols, rows);
-        self.rows = rows;
-        self.cols = cols;
     }
+}
 
-    fn process(&mut self, bytes: &[u8]) {
-        if bytes.is_empty() {
-            return;
+/// The cursor of `grid`, as a cursor position report gives it (zero-based row and column).
+fn grid_cursor_position(grid: &TerminalGridStream) -> (u16, u16) {
+    let cursor = grid.grid().cursor();
+    (
+        u16::try_from(cursor.row).unwrap_or(u16::MAX),
+        u16::try_from(cursor.col).unwrap_or(u16::MAX),
+    )
+}
+
+/// The image state one PTY read is intercepted and placed with, and the image events it held.
+#[cfg(feature = "image-registry")]
+struct ChunkImages<'a> {
+    registry: &'a mut bmux_image::ImageRegistry,
+    interceptor: &'a mut bmux_image::ImageInterceptor,
+    cell_pixels: (u16, u16),
+    events: Vec<bmux_image::ImageEvent>,
+}
+
+/// One PTY read as the pane reader follows it: the interceptor extracts image sequences first,
+/// and the rest is followed through the pane's grid in order with the images
+/// ([`follow_output`]); the bytes the grid saw collect in the reader's `visible`.
+#[cfg(feature = "image-registry")]
+fn follow_chunk(
+    reader: &mut PaneReader,
+    grid: &mut TerminalGridStream,
+    protocol: &mut TerminalProtocolEngine,
+    images: &mut ChunkImages<'_>,
+    chunk: &[u8],
+    replies: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    reader.begin_chunk();
+    let mut intercepted = images.interceptor.process(chunk);
+    let followed = ordered_image_output(
+        reader,
+        grid,
+        protocol,
+        images.registry,
+        &mut intercepted,
+        images.cell_pixels,
+        replies,
+    );
+    images.events = intercepted.events;
+    followed
+}
+
+/// One PTY read as the pane reader follows it through the pane's grid ([`follow_output`]); the
+/// bytes the grid saw collect in the reader's `visible`.
+#[cfg(not(feature = "image-registry"))]
+fn follow_chunk(
+    reader: &mut PaneReader,
+    grid: &mut TerminalGridStream,
+    protocol: &mut TerminalProtocolEngine,
+    chunk: &[u8],
+    replies: &mut Vec<u8>,
+) {
+    reader.begin_chunk();
+    follow_output(reader, grid, protocol, chunk, replies);
+}
+
+/// `bytes` without the shell metadata they carry (collected in the reader's metadata events),
+/// added to what the grid sees and the output buffer publishes.
+fn visible_output<'b>(reader: &mut PaneReader, bytes: &'b [u8]) -> std::borrow::Cow<'b, [u8]> {
+    let filtered = match reader.metadata.as_mut() {
+        Some(parser) => {
+            let parsed = parser.process_chunk(bytes);
+            reader.metadata_events.extend(parsed.events);
+            parsed.filtered
         }
+        None => std::borrow::Cow::Borrowed(bytes),
+    };
+    reader.visible.extend_from_slice(&filtered);
+    filtered
+}
 
-        let mut normalized = std::mem::take(&mut self.normalized);
-        normalized.clear();
-        for byte in bytes {
-            match self.cursor_escape_state {
-                CursorEscapeState::Ground => {
-                    if *byte == 0x1b {
-                        self.cursor_escape_state = CursorEscapeState::Esc;
-                    } else {
-                        normalized.push(*byte);
-                    }
-                }
-                CursorEscapeState::Esc => {
-                    if *byte == b'[' {
-                        self.cursor_escape_state = CursorEscapeState::EscBracket;
-                    } else if *byte == 0x1b {
-                        normalized.push(0x1b);
-                        self.cursor_escape_state = CursorEscapeState::Esc;
-                    } else {
-                        normalized.extend_from_slice(&[0x1b, *byte]);
-                        self.cursor_escape_state = CursorEscapeState::Ground;
-                    }
-                }
-                CursorEscapeState::EscBracket => {
-                    match *byte {
-                        // Preserve CSI s/u save/restore short forms across split
-                        // escape chunks before feeding the structured grid.
-                        b's' => normalized.extend_from_slice(b"\x1b7"),
-                        b'u' => normalized.extend_from_slice(b"\x1b8"),
-                        _ => {
-                            normalized.extend_from_slice(b"\x1b[");
-                            normalized.push(*byte);
-                        }
-                    }
-                    self.cursor_escape_state = CursorEscapeState::Ground;
-                }
-            }
-        }
+/// Follow `bytes` of pane output (images already intercepted) through the pane's grid: shell
+/// metadata is removed first, then the protocol engine answers queries (cursor reports as of each
+/// query) while the grid parses, and image positions follow the grid's erases, resets, screen
+/// switches and scrolls.
+#[cfg(feature = "image-registry")]
+fn follow_output(
+    reader: &mut PaneReader,
+    grid: &mut TerminalGridStream,
+    protocol: &mut TerminalProtocolEngine,
+    registry: &mut bmux_image::ImageRegistry,
+    bytes: &[u8],
+    replies: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    let filtered = visible_output(reader, bytes);
+    image_terminal_bytes(reader, grid, protocol, registry, &filtered, replies)
+}
 
-        if !normalized.is_empty() {
-            self.terminal_grid.process(&normalized);
-        }
-        self.normalized = normalized;
-    }
-
-    fn cursor_position(&self) -> (u16, u16) {
-        let cursor = self.terminal_grid.grid().cursor();
-        (
-            u16::try_from(cursor.row).unwrap_or(u16::MAX),
-            u16::try_from(cursor.col).unwrap_or(u16::MAX),
-        )
-    }
-
-    /// Consume any scrollback that accumulated since the last call.
-    /// Returns the number of lines that scrolled since last drain.
-    #[cfg(feature = "image-registry")]
-    fn drain_scroll_delta(&mut self) -> u16 {
-        let total_scrolled = self.terminal_grid.grid().viewport_scroll_revision();
-        let delta = total_scrolled.wrapping_sub(self.total_scrollback);
-        self.total_scrollback = total_scrolled;
-        u16::try_from(delta).unwrap_or(u16::MAX)
-    }
+/// Follow `bytes` of pane output through the pane's grid: shell metadata is removed first, then
+/// the protocol engine answers queries (cursor reports as of each query) while the grid parses.
+#[cfg(not(feature = "image-registry"))]
+fn follow_output(
+    reader: &mut PaneReader,
+    grid: &mut TerminalGridStream,
+    protocol: &mut TerminalProtocolEngine,
+    bytes: &[u8],
+    replies: &mut Vec<u8>,
+) {
+    let filtered = visible_output(reader, bytes);
+    replies.extend(protocol_reply_for_chunk(protocol, reader, grid, &filtered));
 }
 
 fn sanitize_pty_size(rows: u16, cols: u16) -> (u16, u16) {
@@ -2639,12 +2735,13 @@ fn image_event_to_recording_payload(event: &bmux_image::ImageEvent) -> Recording
     }
 }
 
-/// Check if a chunk contains a screen-clearing CSI sequence.
-/// Looks for `\e[2J` (erase display) or `\e[3J` (erase scrollback + display).
-#[cfg(feature = "image-registry")]
+/// Follow an intercepted chunk through the pane's grid in order: the bytes before each image are
+/// followed first, so the image is placed where the grid's cursor then is and its replies come in
+/// order with the program's other replies.
 #[cfg(feature = "image-registry")]
 fn ordered_image_output(
-    tracker: &mut PaneCursorTracker,
+    reader: &mut PaneReader,
+    grid: &mut TerminalGridStream,
     protocol: &mut TerminalProtocolEngine,
     registry: &mut bmux_image::ImageRegistry,
     output: &mut bmux_image::intercept::InterceptResult,
@@ -2654,22 +2751,24 @@ fn ordered_image_output(
     let mut fed = 0;
     for event in &mut output.events {
         let offset = event.filtered_byte_offset();
-        image_terminal_bytes(
-            tracker,
+        follow_output(
+            reader,
+            grid,
             protocol,
             registry,
             &output.filtered[fed..offset],
             replies,
         )?;
         fed = offset;
-        let (row, col) = tracker.cursor_position();
+        let (row, col) = grid_cursor_position(grid);
         event.set_position(bmux_image::ImagePosition { row, col });
         registry.handle_event(event.clone(), cell_pixels.0, cell_pixels.1);
         // Kitty graphics answers go back to the program in order with its other replies.
         replies.extend(registry.take_replies());
     }
-    image_terminal_bytes(
-        tracker,
+    follow_output(
+        reader,
+        grid,
         protocol,
         registry,
         &output.filtered[fed..],
@@ -2679,7 +2778,8 @@ fn ordered_image_output(
 
 #[cfg(feature = "image-registry")]
 fn image_terminal_bytes(
-    tracker: &mut PaneCursorTracker,
+    reader: &mut PaneReader,
+    grid: &mut TerminalGridStream,
     protocol: &mut TerminalProtocolEngine,
     registry: &mut bmux_image::ImageRegistry,
     bytes: &[u8],
@@ -2692,26 +2792,28 @@ fn image_terminal_bytes(
     } else {
         Box::new(bytes.chunks(1))
     };
+    reader
+        .scrolled
+        .get_or_insert_with(|| grid.grid().viewport_scroll_revision());
     for unit in units {
-        let erase = tracker.terminal_grid.grid().display_erase_revision();
-        let history_erase = tracker.terminal_grid.grid().history_erase_revision();
-        let reset = tracker.terminal_grid.grid().reset_revision();
-        replies.extend(protocol_reply_for_chunk(protocol, tracker, unit));
-        if reset != tracker.terminal_grid.grid().reset_revision() {
+        let erase = grid.grid().display_erase_revision();
+        let history_erase = grid.grid().history_erase_revision();
+        let reset = grid.grid().reset_revision();
+        replies.extend(protocol_reply_for_chunk(protocol, reader, grid, unit));
+        if reset != grid.grid().reset_revision() {
             registry.reset();
         }
-        registry.set_alternate_screen(
-            tracker.terminal_grid.grid().mode() == bmux_terminal_grid::GridMode::Alternate,
-        );
-        if history_erase != tracker.terminal_grid.grid().history_erase_revision() {
+        registry
+            .set_alternate_screen(grid.grid().mode() == bmux_terminal_grid::GridMode::Alternate);
+        if history_erase != grid.grid().history_erase_revision() {
             registry.clear();
-        } else if erase != tracker.terminal_grid.grid().display_erase_revision() {
+        } else if erase != grid.grid().display_erase_revision() {
             registry.clear_display();
         }
-        let scrolled = tracker.drain_scroll_delta();
+        let scrolled = reader.drain_scroll_delta(grid);
         if scrolled > 0 {
             registry.scroll_up(scrolled)?;
-            registry.evict_history(tracker.terminal_grid.grid().max_scrollback_offset());
+            registry.evict_history(grid.grid().max_scrollback_offset());
         }
     }
     Ok(())
@@ -2729,7 +2831,8 @@ mod image_lifecycle_tests {
         let mut interceptor = bmux_image::ImageInterceptor::new();
         let mut output = interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\\r\n\r\n\r\n");
         ordered_image_output(
-            &mut tracker,
+            &mut tracker.reader,
+            &mut tracker.terminal_grid,
             &mut protocol,
             &mut registry,
             &mut output,
@@ -2797,7 +2900,8 @@ mod image_lifecycle_tests {
         let mut interceptor = bmux_image::ImageInterceptor::new();
         let mut output = interceptor.process("\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\ab界".as_bytes());
         ordered_image_output(
-            &mut tracker,
+            &mut tracker.reader,
+            &mut tracker.terminal_grid,
             &mut protocol,
             &mut registry,
             &mut output,
@@ -2854,7 +2958,8 @@ mod image_lifecycle_tests {
             for chunk in [&bytes[..split], &bytes[split..]] {
                 let mut output = interceptor.process(chunk);
                 ordered_image_output(
-                    &mut tracker,
+                    &mut tracker.reader,
+                    &mut tracker.terminal_grid,
                     &mut protocol,
                     &mut registry,
                     &mut output,
@@ -2868,7 +2973,8 @@ mod image_lifecycle_tests {
             for _ in 0..3 {
                 let mut output = interceptor.process(b"\r\n");
                 ordered_image_output(
-                    &mut tracker,
+                    &mut tracker.reader,
+                    &mut tracker.terminal_grid,
                     &mut protocol,
                     &mut registry,
                     &mut output,
@@ -2899,7 +3005,8 @@ mod image_lifecycle_tests {
             for chunk in [&bytes[..split], &bytes[split..]] {
                 let mut output = interceptor.process(chunk);
                 ordered_image_output(
-                    &mut tracker,
+                    &mut tracker.reader,
+                    &mut tracker.terminal_grid,
                     &mut protocol,
                     &mut registry,
                     &mut output,
@@ -2928,7 +3035,8 @@ mod image_lifecycle_tests {
         ] {
             let mut output = interceptor.process(bytes);
             ordered_image_output(
-                &mut tracker,
+                &mut tracker.reader,
+                &mut tracker.terminal_grid,
                 &mut protocol,
                 &mut registry,
                 &mut output,
@@ -2952,7 +3060,8 @@ mod image_lifecycle_tests {
             b"normal\r\n\r\n\r\n\r\n\x1b[?1049h\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\\r\n\r\n\r\n",
         );
         ordered_image_output(
-            &mut tracker,
+            &mut tracker.reader,
+            &mut tracker.terminal_grid,
             &mut protocol,
             &mut registry,
             &mut output,
@@ -2984,7 +3093,8 @@ mod image_lifecycle_tests {
             for chunk in [&bytes[..split], &bytes[split..]] {
                 let mut output = interceptor.process(chunk);
                 ordered_image_output(
-                    &mut tracker,
+                    &mut tracker.reader,
+                    &mut tracker.terminal_grid,
                     &mut protocol,
                     &mut registry,
                     &mut output,
@@ -3016,7 +3126,8 @@ mod image_lifecycle_tests {
             for chunk in [&bytes[..split], &bytes[split..]] {
                 let mut output = interceptor.process(chunk);
                 ordered_image_output(
-                    &mut tracker,
+                    &mut tracker.reader,
+                    &mut tracker.terminal_grid,
                     &mut protocol,
                     &mut registry,
                     &mut output,
@@ -3033,7 +3144,8 @@ mod image_lifecycle_tests {
             );
             let mut output = interceptor.process(b"\x1b[2J");
             ordered_image_output(
-                &mut tracker,
+                &mut tracker.reader,
+                &mut tracker.terminal_grid,
                 &mut protocol,
                 &mut registry,
                 &mut output,
@@ -3048,30 +3160,29 @@ mod image_lifecycle_tests {
 
 fn protocol_reply_for_chunk(
     protocol_engine: &mut TerminalProtocolEngine,
-    cursor_tracker: &mut PaneCursorTracker,
+    reader: &mut PaneReader,
+    grid: &mut TerminalGridStream,
     chunk: &[u8],
 ) -> Vec<u8> {
-    // The tracker follows the chunk in whole spans, split only where a cursor-position query
-    // ends, so each reply still sees the cursor exactly as of its query.
+    // The grid follows the chunk in whole spans, split only where a cursor-position query ends,
+    // so each reply still sees the cursor exactly as of its query.
     let mut fed = 0;
     let reply = protocol_engine.process_output_with_cursor(chunk, |index| {
-        cursor_tracker.process(&chunk[fed..=index]);
+        reader.feed(grid, &chunk[fed..=index]);
         fed = index + 1;
-        let (row, col) = cursor_tracker.cursor_position();
+        let (row, col) = grid_cursor_position(grid);
         trace!(
             tracked_row = row.saturating_add(1),
             tracked_col = col.saturating_add(1),
-            pane_rows = cursor_tracker.rows,
-            pane_cols = cursor_tracker.cols,
-            alternate_screen = matches!(
-                cursor_tracker.terminal_grid.grid().mode(),
-                bmux_terminal_grid::GridMode::Alternate
-            ),
+            pane_rows = grid.grid().height(),
+            pane_cols = grid.grid().width(),
+            alternate_screen =
+                matches!(grid.grid().mode(), bmux_terminal_grid::GridMode::Alternate),
             "pane protocol reply: cursor position report"
         );
         (row, col)
     });
-    cursor_tracker.process(&chunk[fed..]);
+    reader.feed(grid, &chunk[fed..]);
     reply
 }
 
@@ -4239,9 +4350,10 @@ impl PaneRuntimeHandle {
         let Ok(mut last) = self.last_requested_size.lock() else {
             return Err(execution::failed("geometry lock poisoned"));
         };
-        let Ok(mut tracker) = self.cursor_tracker.lock() else {
-            return Err(execution::failed("cursor lock poisoned"));
-        };
+        // The size last requested: the grid's geometry once the reader has consumed what
+        // preceded this resize.
+        #[cfg(feature = "image-registry")]
+        let (previous_rows, previous_cols) = *last;
         // Pinned captures hold image state before grid/output. Participate in
         // that ordering so a resize cannot bisect a combined capture.
         #[cfg(feature = "image-registry")]
@@ -4288,15 +4400,14 @@ impl PaneRuntimeHandle {
                 return Err(execution::failed("capture prefix is not projected"));
             }
             #[cfg(feature = "image-registry")]
-            if (cols != tracker.cols || rows != tracker.rows)
+            if (cols != previous_cols || rows != previous_rows)
                 && rows > 0
                 && cols > 0
                 && images.has_main_images()
             {
                 // Stage geometry before committing image projection and grids.
                 let mut budget = RESPONSE_OUTPUT_BUDGET;
-                let Some(mut resized) = tracker.terminal_grid.grid().try_clone_charged(&mut budget)
-                else {
+                let Some(mut resized) = grid.grid().try_clone_charged(&mut budget) else {
                     return Err(execution::failed("image reflow exceeds response budget"));
                 };
                 let Ok(shift) = resized.resize_with_main_row_shift(cols, rows) else {
@@ -4309,8 +4420,7 @@ impl PaneRuntimeHandle {
                             .map(|row| (row, column))
                             .ok_or_else(|| std::io::Error::other("image resize anchor overflow"));
                     }
-                    let (row, column) = tracker
-                        .terminal_grid
+                    let (row, column) = grid
                         .grid()
                         .retained_position_after_resize(
                             row,
@@ -4332,7 +4442,7 @@ impl PaneRuntimeHandle {
                 images_changed = true;
             }
             #[cfg(feature = "image-registry")]
-            if rows > 0 && cols > 0 && rows != tracker.rows && !images_changed {
+            if rows > 0 && cols > 0 && rows != previous_rows && !images_changed {
                 let revision = images.sequence();
                 if let Err(error) = images.resize_alternate_viewport(rows) {
                     warn!(%error, "alternate image resize failed; retaining previous geometry");
@@ -4366,7 +4476,6 @@ impl PaneRuntimeHandle {
         } else {
             return Err(execution::failed("grid lock poisoned"));
         }
-        tracker.resize(rows, cols);
         *last = (rows, cols);
         self.execution
             .geometry_revision
@@ -4377,7 +4486,6 @@ impl PaneRuntimeHandle {
         }
         #[cfg(feature = "image-registry")]
         drop(images);
-        drop(tracker);
         drop(last);
         #[cfg(feature = "image-registry")]
         if images_changed {
@@ -7078,11 +7186,6 @@ impl SessionRuntimeManager {
         let terminal_grid_for_reader = Arc::clone(&terminal_grid);
         let terminal_grid_deltas = Arc::new(std::sync::Mutex::new(TerminalGridDeltaLog::default()));
         let last_requested_size = Arc::new(std::sync::Mutex::new((initial_rows, initial_cols)));
-        let cursor_tracker = Arc::new(std::sync::Mutex::new(PaneCursorTracker::new(
-            initial_rows,
-            initial_cols,
-        )));
-        let cursor_tracker_for_reader = Arc::clone(&cursor_tracker);
         let shell = pane_meta.shell.clone();
         let launch = pane_meta.launch.clone();
         let launch_resolution_error = resolved_launch.err().map(|error| error.to_string());
@@ -8067,7 +8170,13 @@ impl SessionRuntimeManager {
                         .with_bracketed_paste_support(bracketed_paste_supported);
                     let mut terminal_mode_tracker = PaneTerminalModeTracker::default();
                     let mut capture_handshake = crate::capture_handshake::CaptureHandshake::default();
-                    let mut shell_metadata_parser = PaneShellMetadataParser { token: Some(shell_marker_token), ..PaneShellMetadataParser::default() };
+                    let mut reader_state = PaneReader::new(
+                        protocol_profile,
+                        Some(PaneShellMetadataParser {
+                            token: Some(shell_marker_token),
+                            ..PaneShellMetadataParser::default()
+                        }),
+                    );
 
                     // Image interceptor: detects and extracts image escape sequences
                     // (Sixel, Kitty, iTerm2) from PTY output before they reach the
@@ -8138,77 +8247,60 @@ impl SessionRuntimeManager {
                                     RecordMeta { session_id: Some(session_id.0), pane_id: Some(pane_id), client_id: None },
                                     || RecordingPayload::Bytes { data: chunk.to_vec() },
                                 );
-                                // Keep resize requests out until both image state
-                                // and the shared grid have consumed this chunk.
-                                let Ok(mut cursor_tracker) = cursor_tracker_for_reader.lock() else {
-                                    break;
-                                };
-                                let (rows, cols) = *requested_size;
-                                cursor_tracker.resize(rows, cols);
-
-                                // When image support is enabled, run the interceptor
-                                // to extract image sequences from the byte stream.
-                                // The filtered bytes (images stripped) are what gets
-                                // pushed to the structured grid cursor tracker.
-                                #[cfg(feature = "image-registry")]
-                                let mut image_protocol_reply = Vec::new();
+                                // The size lock (held through the chunk) keeps resizes out
+                                // until image state and the grid have consumed this chunk.
+                                // With image support the interceptor first extracts image
+                                // sequences; the bytes left are followed through the pane's
+                                // grid in order with the images.
+                                let mut reply = Vec::new();
                                 #[cfg(feature = "image-registry")]
                                 let Ok(mut registry) = image_registry_for_reader.lock() else { break; };
                                 #[cfg(feature = "image-registry")]
-                                let chunk = {
-                                    let mut result = image_interceptor.process(chunk);
-
+                                let images_before = registry.sequence();
+                                // All combined captures and writes acquire grid before output.
+                                // The grid guard is held from the parse through the push, so a
+                                // snapshot (grid, then output) never pairs parsed state with
+                                // another chunk's offset; the output guard is taken only for
+                                // the push. Replies are only collected: PTY writes happen
+                                // after the capture locks release.
+                                let Ok(mut grid) = terminal_grid_for_reader.lock() else { break; };
+                                #[cfg(feature = "image-registry")]
+                                let mut images = {
                                     let (cpw, cph) =
                                         cell_pixel_size_for_reader.lock().map_or((8, 16), |s| *s);
-                                    let before = registry.sequence();
-                                    if let Err(error) = ordered_image_output(
-                                        &mut cursor_tracker,
-                                        &mut protocol_engine,
-                                        &mut registry,
-                                        &mut result,
-                                        (
+                                    ChunkImages {
+                                        registry: &mut registry,
+                                        interceptor: &mut image_interceptor,
+                                        cell_pixels: (
                                             if cpw == 0 { 8 } else { cpw },
                                             if cph == 0 { 16 } else { cph },
                                         ),
-                                        &mut image_protocol_reply,
-                                    ) {
-                                        warn!(%pane_id, %error, "image projection failed; stopping output reader");
-                                        break;
+                                        events: Vec::new(),
                                     }
-                                    let changed = registry.sequence() != before;
-                                    if changed
-                                        && image_dirty_for_reader
-                                            .compare_exchange(
-                                                false,
-                                                true,
-                                                Ordering::SeqCst,
-                                                Ordering::SeqCst,
-                                            )
-                                            .is_ok()
-                                    {
-                                        host.publish_pane_event(PaneEvent::ImageAvailable {
-                                            session_id: session_id.0,
-                                            pane_id,
-                                        });
-                                    }
-                                    for event in &result.events {
-                                        host.record(
-                                            RecordingEventKind::PaneImage,
-                                            image_event_to_recording_payload(event),
-                                            RecordMeta {
-                                                session_id: Some(session_id.0),
-                                                pane_id: Some(pane_id),
-                                                client_id: None,
-                                            },
-                                        );
-                                    }
-                                    result.filtered
                                 };
                                 #[cfg(feature = "image-registry")]
-                                let chunk = chunk.as_slice();
-
-                                let metadata = shell_metadata_parser.process_chunk(chunk);
-                                let chunk = &*metadata.filtered;
+                                if let Err(error) = follow_chunk(
+                                    &mut reader_state,
+                                    &mut grid,
+                                    &mut protocol_engine,
+                                    &mut images,
+                                    chunk,
+                                    &mut reply,
+                                ) {
+                                    warn!(%pane_id, %error, "image projection failed; stopping output reader");
+                                    break;
+                                }
+                                #[cfg(not(feature = "image-registry"))]
+                                follow_chunk(
+                                    &mut reader_state,
+                                    &mut grid,
+                                    &mut protocol_engine,
+                                    chunk,
+                                    &mut reply,
+                                );
+                                #[cfg(feature = "image-registry")]
+                                let image_events = std::mem::take(&mut images.events);
+                                let chunk = reader_state.visible.as_slice();
                                 note_replay_markers_read(chunk);
 
                                 // Update terminal mode tracking (mouse protocol,
@@ -8223,24 +8315,42 @@ impl SessionRuntimeManager {
                                 if let Ok(mut mode_state) = input_mode_state_for_reader.lock() {
                                     *mode_state = terminal_mode_tracker.current_input_modes();
                                 }
-
-                                let Ok(pointer_reply) = process_pane_output_with_pointer_queries(
-                                    &terminal_grid_for_reader,
-                                    &reader_output,
-                                    chunk,
-                                    protocol_profile,
-                                ) else {
-                                    break;
-                                };
-                                #[cfg(not(feature = "image-registry"))]
-                                let mut reply = protocol_reply_for_chunk(
-                                    &mut protocol_engine,
-                                    &mut cursor_tracker,
-                                    chunk,
-                                );
+                                let Ok(mut output) = reader_output.lock() else { break; };
+                                output.push_chunk(chunk);
+                                drop(output);
+                                drop(grid);
+                                reply.extend_from_slice(&reader_state.pointer_replies);
                                 #[cfg(feature = "image-registry")]
-                                drop(registry);
-                                drop(cursor_tracker);
+                                {
+                                    if registry.sequence() != images_before
+                                        && image_dirty_for_reader
+                                            .compare_exchange(
+                                                false,
+                                                true,
+                                                Ordering::SeqCst,
+                                                Ordering::SeqCst,
+                                            )
+                                            .is_ok()
+                                    {
+                                        host.publish_pane_event(PaneEvent::ImageAvailable {
+                                            session_id: session_id.0,
+                                            pane_id,
+                                        });
+                                    }
+                                    for event in &image_events {
+                                        host.record(
+                                            RecordingEventKind::PaneImage,
+                                            image_event_to_recording_payload(event),
+                                            RecordMeta {
+                                                session_id: Some(session_id.0),
+                                                pane_id: Some(pane_id),
+                                                client_id: None,
+                                            },
+                                        );
+                                    }
+                                    drop(registry);
+                                }
+                                let metadata_events = std::mem::take(&mut reader_state.metadata_events);
                                 execution_for_reader.output_watermark.fetch_add(
                                     u64::try_from(bytes_read).unwrap_or(u64::MAX), Ordering::SeqCst,
                                 );
@@ -8254,7 +8364,7 @@ impl SessionRuntimeManager {
                                 drop(requested_size);
                                 // Metadata callbacks can acquire the runtime manager. Never
                                 // invoke them while holding image/grid/output capture locks.
-                                if !metadata.events.is_empty() {
+                                if !metadata_events.is_empty() {
                                     let padding_before = pane_padding_state(&host, session_id, pane_id);
                                     let mut replay_command = None;
                                     if let Ok(mut resurrection_state) =
@@ -8263,7 +8373,7 @@ impl SessionRuntimeManager {
                                         if let Some(resume) = resurrection_state.launch.clone()
                                             && !resurrection_state.frozen
                                         {
-                                            for event in &metadata.events {
+                                            for event in &metadata_events {
                                                 if matches!(event, PaneShellMetadataEvent::NestedReplay) { continue; }
                                                 match resume.boundary(matches!(event, PaneShellMetadataEvent::Prompt { .. })) {
                                                     Ok(identity) => resurrection_state.execution_token = Some(identity),
@@ -8281,10 +8391,10 @@ impl SessionRuntimeManager {
                                                 apply_shell_metadata_events_and_take_prompt_replay(
                                                     &mut resurrection_state,
                                                     &mut pending_replay,
-                                                    metadata.events,
+                                                    metadata_events,
                                                 );
                                         } else {
-                                            for event in metadata.events {
+                                            for event in metadata_events {
                                                 resurrection_state.apply_event(event);
                                             }
                                         }
@@ -8324,9 +8434,6 @@ impl SessionRuntimeManager {
                                         pane_id,
                                     );
                                 }
-                                #[cfg(feature = "image-registry")]
-                                let mut reply = image_protocol_reply;
-                                reply.extend_from_slice(&pointer_reply);
                                 if !reply.is_empty() {
                                     host.record(
                                         RecordingEventKind::ProtocolReplyRaw,
@@ -8699,7 +8806,6 @@ impl SessionRuntimeManager {
             terminal_grid_deltas,
             exited,
             last_requested_size,
-            cursor_tracker,
             output_dirty,
             mouse_protocol_state,
             input_mode_state,
@@ -17456,7 +17562,6 @@ exit 7"#
             terminal_grid_deltas: Arc::new(std::sync::Mutex::new(TerminalGridDeltaLog::default())),
             exited: Arc::new(AtomicBool::new(false)),
             last_requested_size: Arc::new(std::sync::Mutex::new((1, 1))),
-            cursor_tracker: Arc::new(std::sync::Mutex::new(PaneCursorTracker::new(1, 1))),
             output_dirty: Arc::new(AtomicBool::new(false)),
             mouse_protocol_state: Arc::new(std::sync::Mutex::new(
                 AttachMouseProtocolState::default(),
@@ -19307,7 +19412,8 @@ exit 7"#
         let mut interceptor = bmux_image::ImageInterceptor::new();
         let mut output = interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\\r\n\r\n\r\n");
         ordered_image_output(
-            &mut tracker,
+            &mut tracker.reader,
+            &mut tracker.terminal_grid,
             &mut protocol,
             &mut images.lock().unwrap(),
             &mut output,
@@ -20514,10 +20620,6 @@ exit 7"#
             finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         });
         assert_eq!(*pane.last_requested_size.lock().unwrap(), (4, 20));
-        let tracker = pane.cursor_tracker.lock().unwrap();
-        assert_eq!((tracker.rows, tracker.cols), (4, 20));
-        assert_eq!(tracker.terminal_grid.grid().width(), 20);
-        assert_eq!(tracker.terminal_grid.grid().height(), 4);
         let grid = pane.terminal_grid.lock().unwrap();
         assert_eq!(grid.grid().width(), 20);
         assert_eq!(grid.grid().height(), 4);
@@ -20564,15 +20666,12 @@ exit 7"#
             let runtime = runtime_with_panes(&[pane_id]);
             let pane = runtime.panes.get(&pane_id).expect("pane should exist");
             pane.resize_pty(2, 10);
-            pane.cursor_tracker.lock().unwrap().process(prefix);
             pane.terminal_grid.lock().unwrap().process(prefix);
             pane.resize_pty(5, 20);
             let suffix = &b"\x1b[4;15H"[prefix.len()..];
-            let mut tracker = pane.cursor_tracker.lock().unwrap();
-            tracker.process(suffix);
             let mut grid = pane.terminal_grid.lock().unwrap();
             grid.process(suffix);
-            assert_eq!(tracker.cursor_position(), (3, 14));
+            assert_eq!(grid_cursor_position(&grid), (3, 14));
             assert_eq!(grid.grid().cursor().row, 3);
             assert_eq!(grid.grid().cursor().col, 14);
         }
@@ -20588,7 +20687,8 @@ exit 7"#
         let mut interceptor = bmux_image::ImageInterceptor::new();
         let mut output = interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\\r\n\r\n\r\n");
         ordered_image_output(
-            &mut pane.cursor_tracker.lock().unwrap(),
+            &mut PaneReader::new(ProtocolProfile::Bmux, None),
+            &mut pane.terminal_grid.lock().unwrap(),
             &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
             &mut pane.image_registry.lock().unwrap(),
             &mut output,
@@ -20596,7 +20696,6 @@ exit 7"#
             &mut Vec::new(),
         )
         .unwrap();
-        pane.terminal_grid.lock().unwrap().process(&output.filtered);
         let before = pane
             .image_registry
             .lock()
@@ -20607,7 +20706,7 @@ exit 7"#
         let images = pane.image_registry.lock().unwrap();
         assert_eq!(images.project_viewport(1, 3).unwrap(), before);
         assert!(pane.image_dirty.load(Ordering::SeqCst));
-        assert_eq!(pane.cursor_tracker.lock().unwrap().rows, 5);
+        assert_eq!(pane.last_requested_size.lock().unwrap().0, 5);
     }
 
     #[cfg(feature = "image-registry")]
@@ -20639,7 +20738,7 @@ exit 7"#
         pane.resize_pty(5, 80);
         assert_eq!(*pane.last_requested_size.lock().unwrap(), (3, 80));
         assert_eq!(pane.terminal_grid.lock().unwrap().grid().height(), 3);
-        assert_eq!(pane.cursor_tracker.lock().unwrap().rows, 3);
+        assert_eq!(pane.last_requested_size.lock().unwrap().0, 3);
         let images = pane.image_registry.lock().unwrap();
         assert_eq!(images.sequence(), revision);
         assert_eq!(images.images(), original);
@@ -20656,7 +20755,8 @@ exit 7"#
         let mut output =
             interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\a\r\nb\r\nc\r\nd\r\ne");
         ordered_image_output(
-            &mut pane.cursor_tracker.lock().unwrap(),
+            &mut PaneReader::new(ProtocolProfile::Bmux, None),
+            &mut pane.terminal_grid.lock().unwrap(),
             &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
             &mut pane.image_registry.lock().unwrap(),
             &mut output,
@@ -20664,7 +20764,6 @@ exit 7"#
             &mut Vec::new(),
         )
         .unwrap();
-        pane.terminal_grid.lock().unwrap().process(&output.filtered);
         let original = pane.image_registry.lock().unwrap().images()[0].clone();
         pane.resize_pty(3, 80);
         let images = pane.image_registry.lock().unwrap();
@@ -20681,13 +20780,12 @@ exit 7"#
         pane.resize_pty(5, 80);
         *pane.terminal_grid.lock().unwrap() =
             TerminalGridStream::new(80, 5, GridLimits { scrollback_rows: 0 }).unwrap();
-        pane.cursor_tracker.lock().unwrap().terminal_grid =
-            TerminalGridStream::new(80, 5, GridLimits { scrollback_rows: 0 }).unwrap();
         let mut interceptor = bmux_image::ImageInterceptor::new();
         let mut output =
             interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\a\r\nb\r\nc\r\nd\r\ne");
         ordered_image_output(
-            &mut pane.cursor_tracker.lock().unwrap(),
+            &mut PaneReader::new(ProtocolProfile::Bmux, None),
+            &mut pane.terminal_grid.lock().unwrap(),
             &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
             &mut pane.image_registry.lock().unwrap(),
             &mut output,
@@ -20695,7 +20793,6 @@ exit 7"#
             &mut Vec::new(),
         )
         .unwrap();
-        pane.terminal_grid.lock().unwrap().process(&output.filtered);
         assert_eq!(pane.image_registry.lock().unwrap().images().len(), 1);
         pane.resize_pty(3, 80);
         assert_eq!(
@@ -20726,7 +20823,8 @@ exit 7"#
         let mut interceptor = bmux_image::ImageInterceptor::new();
         let mut output = interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\abcdefghijkl");
         ordered_image_output(
-            &mut pane.cursor_tracker.lock().unwrap(),
+            &mut PaneReader::new(ProtocolProfile::Bmux, None),
+            &mut pane.terminal_grid.lock().unwrap(),
             &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
             &mut pane.image_registry.lock().unwrap(),
             &mut output,
@@ -20734,7 +20832,6 @@ exit 7"#
             &mut Vec::new(),
         )
         .unwrap();
-        pane.terminal_grid.lock().unwrap().process(&output.filtered);
         let original = pane
             .image_registry
             .lock()
@@ -20763,7 +20860,8 @@ exit 7"#
         let mut output =
             interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\abcdefghijkl\x1b[?1049h");
         ordered_image_output(
-            &mut pane.cursor_tracker.lock().unwrap(),
+            &mut PaneReader::new(ProtocolProfile::Bmux, None),
+            &mut pane.terminal_grid.lock().unwrap(),
             &mut protocol,
             &mut pane.image_registry.lock().unwrap(),
             &mut output,
@@ -20771,13 +20869,13 @@ exit 7"#
             &mut Vec::new(),
         )
         .unwrap();
-        pane.terminal_grid.lock().unwrap().process(&output.filtered);
         pane.resize_pty(2, 8);
         assert_eq!(*pane.last_requested_size.lock().unwrap(), (2, 8));
         assert_eq!(pane.image_registry.lock().unwrap().images(), []);
         let mut output = interceptor.process(b"\x1b[?1049l");
         ordered_image_output(
-            &mut pane.cursor_tracker.lock().unwrap(),
+            &mut PaneReader::new(ProtocolProfile::Bmux, None),
+            &mut pane.terminal_grid.lock().unwrap(),
             &mut protocol,
             &mut pane.image_registry.lock().unwrap(),
             &mut output,
@@ -20785,7 +20883,6 @@ exit 7"#
             &mut Vec::new(),
         )
         .unwrap();
-        pane.terminal_grid.lock().unwrap().process(&output.filtered);
         let images = pane.image_registry.lock().unwrap();
         assert_eq!(images.images().len(), 1);
         assert_eq!(images.images()[0].position.row, 0);
@@ -20802,7 +20899,8 @@ exit 7"#
         let mut interceptor = bmux_image::ImageInterceptor::new();
         let mut output = interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\abcdefghijklmnop");
         ordered_image_output(
-            &mut pane.cursor_tracker.lock().unwrap(),
+            &mut PaneReader::new(ProtocolProfile::Bmux, None),
+            &mut pane.terminal_grid.lock().unwrap(),
             &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
             &mut pane.image_registry.lock().unwrap(),
             &mut output,
@@ -20810,7 +20908,6 @@ exit 7"#
             &mut Vec::new(),
         )
         .unwrap();
-        pane.terminal_grid.lock().unwrap().process(&output.filtered);
         let original = pane
             .image_registry
             .lock()
@@ -20838,21 +20935,14 @@ exit 7"#
             b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\r\n"
                 .repeat(8000);
         {
-            let mut tracker = pane.cursor_tracker.lock().unwrap();
-            tracker.process(&text);
+            let mut grid = pane.terminal_grid.lock().unwrap();
+            grid.process(&text);
             let mut budget = RESPONSE_OUTPUT_BUDGET;
-            assert!(
-                tracker
-                    .terminal_grid
-                    .grid()
-                    .try_clone_charged(&mut budget)
-                    .is_none()
-            );
+            assert!(grid.grid().try_clone_charged(&mut budget).is_none());
         }
-        pane.terminal_grid.lock().unwrap().process(&text);
         pane.resize_pty(5, 80);
         assert_eq!(*pane.last_requested_size.lock().unwrap(), (5, 80));
-        assert_eq!(pane.cursor_tracker.lock().unwrap().rows, 5);
+        assert_eq!(pane.last_requested_size.lock().unwrap().0, 5);
         assert_eq!(pane.terminal_grid.lock().unwrap().grid().height(), 5);
     }
 
@@ -20871,7 +20961,8 @@ exit 7"#
         bytes.extend_from_slice(image);
         let mut output = interceptor.process(&bytes);
         ordered_image_output(
-            &mut pane.cursor_tracker.lock().unwrap(),
+            &mut PaneReader::new(ProtocolProfile::Bmux, None),
+            &mut pane.terminal_grid.lock().unwrap(),
             &mut protocol,
             &mut pane.image_registry.lock().unwrap(),
             &mut output,
@@ -20879,14 +20970,14 @@ exit 7"#
             &mut Vec::new(),
         )
         .unwrap();
-        pane.terminal_grid.lock().unwrap().process(&output.filtered);
         let alternate = pane.image_registry.lock().unwrap().images().to_vec();
         assert_eq!(alternate.len(), 1);
         pane.resize_pty(4, 5);
         assert_eq!(pane.image_registry.lock().unwrap().images(), alternate);
         let mut output = interceptor.process(b"\x1b[?1049l");
         ordered_image_output(
-            &mut pane.cursor_tracker.lock().unwrap(),
+            &mut PaneReader::new(ProtocolProfile::Bmux, None),
+            &mut pane.terminal_grid.lock().unwrap(),
             &mut protocol,
             &mut pane.image_registry.lock().unwrap(),
             &mut output,
@@ -20894,7 +20985,6 @@ exit 7"#
             &mut Vec::new(),
         )
         .unwrap();
-        pane.terminal_grid.lock().unwrap().process(&output.filtered);
         let images = pane.image_registry.lock().unwrap();
         assert_eq!(images.images().len(), 1);
         assert_eq!(images.images()[0].id, 1);
@@ -20913,7 +21003,8 @@ exit 7"#
         let mut output =
             interceptor.process(b"\x1b[?1049h\x1b[5;1H\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\");
         ordered_image_output(
-            &mut pane.cursor_tracker.lock().unwrap(),
+            &mut PaneReader::new(ProtocolProfile::Bmux, None),
+            &mut pane.terminal_grid.lock().unwrap(),
             &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
             &mut pane.image_registry.lock().unwrap(),
             &mut output,
@@ -20921,7 +21012,6 @@ exit 7"#
             &mut Vec::new(),
         )
         .unwrap();
-        pane.terminal_grid.lock().unwrap().process(&output.filtered);
         let original = pane.image_registry.lock().unwrap().images().to_vec();
         assert_eq!(original.len(), 1);
         assert!(!pane.image_registry.lock().unwrap().has_main_images());
@@ -20942,7 +21032,8 @@ exit 7"#
         // Placement in trailing blank cells has no retained text anchor.
         let mut output = interceptor.process(b"\x1b[1;7H\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\");
         ordered_image_output(
-            &mut pane.cursor_tracker.lock().unwrap(),
+            &mut PaneReader::new(ProtocolProfile::Bmux, None),
+            &mut pane.terminal_grid.lock().unwrap(),
             &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
             &mut pane.image_registry.lock().unwrap(),
             &mut output,
@@ -20950,14 +21041,10 @@ exit 7"#
             &mut Vec::new(),
         )
         .unwrap();
-        pane.terminal_grid.lock().unwrap().process(&output.filtered);
         let id = pane.image_registry.lock().unwrap().images()[0].id;
         pane.resize_pty(2, 4);
         assert_eq!(*pane.last_requested_size.lock().unwrap(), (2, 4));
-        let tracker = pane.cursor_tracker.lock().unwrap();
-        let cursor = tracker.terminal_grid.grid().cursor();
-        let grid = pane.terminal_grid.lock().unwrap();
-        assert_eq!(grid.grid().cursor(), cursor);
+        let cursor = pane.terminal_grid.lock().unwrap().grid().cursor();
         let images = pane.image_registry.lock().unwrap();
         assert_eq!(images.images().len(), 1);
         assert_eq!(images.images()[0].id, id);
@@ -21417,12 +21504,27 @@ exit 7"#
         let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
         let mut cursor_tracker = PaneCursorTracker::new(24, 80);
 
-        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[12;34H");
+        let _ = protocol_reply_for_chunk(
+            &mut engine,
+            &mut cursor_tracker.reader,
+            &mut cursor_tracker.terminal_grid,
+            b"\x1b[12;34H",
+        );
 
-        let cpr_reply = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n");
+        let cpr_reply = protocol_reply_for_chunk(
+            &mut engine,
+            &mut cursor_tracker.reader,
+            &mut cursor_tracker.terminal_grid,
+            b"\x1b[6n",
+        );
         assert_eq!(cpr_reply, b"\x1b[12;34R");
 
-        let dec_cpr_reply = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[?6n");
+        let dec_cpr_reply = protocol_reply_for_chunk(
+            &mut engine,
+            &mut cursor_tracker.reader,
+            &mut cursor_tracker.terminal_grid,
+            b"\x1b[?6n",
+        );
         assert_eq!(dec_cpr_reply, b"\x1b[?12;34R");
     }
 
@@ -21431,22 +21533,57 @@ exit 7"#
         let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
         let mut cursor_tracker = PaneCursorTracker::new(24, 80);
 
-        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[12;34H");
+        let _ = protocol_reply_for_chunk(
+            &mut engine,
+            &mut cursor_tracker.reader,
+            &mut cursor_tracker.terminal_grid,
+            b"\x1b[12;34H",
+        );
         assert_eq!(
-            protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n"),
+            protocol_reply_for_chunk(
+                &mut engine,
+                &mut cursor_tracker.reader,
+                &mut cursor_tracker.terminal_grid,
+                b"\x1b[6n"
+            ),
             b"\x1b[12;34R"
         );
 
-        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[?1049h");
-        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[4;7H");
+        let _ = protocol_reply_for_chunk(
+            &mut engine,
+            &mut cursor_tracker.reader,
+            &mut cursor_tracker.terminal_grid,
+            b"\x1b[?1049h",
+        );
+        let _ = protocol_reply_for_chunk(
+            &mut engine,
+            &mut cursor_tracker.reader,
+            &mut cursor_tracker.terminal_grid,
+            b"\x1b[4;7H",
+        );
         assert_eq!(
-            protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n"),
+            protocol_reply_for_chunk(
+                &mut engine,
+                &mut cursor_tracker.reader,
+                &mut cursor_tracker.terminal_grid,
+                b"\x1b[6n"
+            ),
             b"\x1b[4;7R"
         );
 
-        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[?1049l");
+        let _ = protocol_reply_for_chunk(
+            &mut engine,
+            &mut cursor_tracker.reader,
+            &mut cursor_tracker.terminal_grid,
+            b"\x1b[?1049l",
+        );
         assert_eq!(
-            protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n"),
+            protocol_reply_for_chunk(
+                &mut engine,
+                &mut cursor_tracker.reader,
+                &mut cursor_tracker.terminal_grid,
+                b"\x1b[6n"
+            ),
             b"\x1b[12;34R"
         );
     }
@@ -21456,14 +21593,44 @@ exit 7"#
         let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
         let mut cursor_tracker = PaneCursorTracker::new(30, 120);
 
-        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[9;17H");
-        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[s");
-        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[?u");
-        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[H");
-        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[u");
+        let _ = protocol_reply_for_chunk(
+            &mut engine,
+            &mut cursor_tracker.reader,
+            &mut cursor_tracker.terminal_grid,
+            b"\x1b[9;17H",
+        );
+        let _ = protocol_reply_for_chunk(
+            &mut engine,
+            &mut cursor_tracker.reader,
+            &mut cursor_tracker.terminal_grid,
+            b"\x1b[s",
+        );
+        let _ = protocol_reply_for_chunk(
+            &mut engine,
+            &mut cursor_tracker.reader,
+            &mut cursor_tracker.terminal_grid,
+            b"\x1b[?u",
+        );
+        let _ = protocol_reply_for_chunk(
+            &mut engine,
+            &mut cursor_tracker.reader,
+            &mut cursor_tracker.terminal_grid,
+            b"\x1b[H",
+        );
+        let _ = protocol_reply_for_chunk(
+            &mut engine,
+            &mut cursor_tracker.reader,
+            &mut cursor_tracker.terminal_grid,
+            b"\x1b[u",
+        );
 
         assert_eq!(
-            protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n"),
+            protocol_reply_for_chunk(
+                &mut engine,
+                &mut cursor_tracker.reader,
+                &mut cursor_tracker.terminal_grid,
+                b"\x1b[6n"
+            ),
             b"\x1b[9;17R"
         );
     }
@@ -21473,13 +21640,33 @@ exit 7"#
         let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
         let mut cursor_tracker = PaneCursorTracker::new(5, 5);
 
-        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[24;80H");
-        let clamped_reply = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n");
+        let _ = protocol_reply_for_chunk(
+            &mut engine,
+            &mut cursor_tracker.reader,
+            &mut cursor_tracker.terminal_grid,
+            b"\x1b[24;80H",
+        );
+        let clamped_reply = protocol_reply_for_chunk(
+            &mut engine,
+            &mut cursor_tracker.reader,
+            &mut cursor_tracker.terminal_grid,
+            b"\x1b[6n",
+        );
         assert_eq!(clamped_reply, b"\x1b[5;5R");
 
         cursor_tracker.resize(40, 120);
-        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[24;80H");
-        let resized_reply = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n");
+        let _ = protocol_reply_for_chunk(
+            &mut engine,
+            &mut cursor_tracker.reader,
+            &mut cursor_tracker.terminal_grid,
+            b"\x1b[24;80H",
+        );
+        let resized_reply = protocol_reply_for_chunk(
+            &mut engine,
+            &mut cursor_tracker.reader,
+            &mut cursor_tracker.terminal_grid,
+            b"\x1b[6n",
+        );
         assert_eq!(resized_reply, b"\x1b[24;80R");
     }
 

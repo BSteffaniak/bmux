@@ -6,25 +6,91 @@
 //! ```
 //!
 //! Each corpus frame is read in 8 KiB pieces, as the pane's PTY reader does, and each piece goes
-//! through the stages the reader runs for it, timed separately: terminal-mode tracking, the main
-//! grid parse with the push into the output buffer, and the cursor tracker's protocol replies.
-//! Generated corpora run at `BMUX_BENCH_SIZE` (`420x90` by default); captured ones are listed in
-//! `BMUX_BENCH_CORPUS`.
+//! through what the reader runs for it ([`super::follow_chunk`], then mode tracking and the push
+//! into the output buffer): images intercepted, shell metadata filtered, protocol queries
+//! answered and the pane's grid parsed in one pass. Generated corpora run at `BMUX_BENCH_SIZE`
+//! (`420x90` by default); captured ones are listed in `BMUX_BENCH_CORPUS`.
 
 use super::{
-    OutputFanoutBuffer, PaneCursorTracker, PaneShellMetadataParser, PaneTerminalModeTracker,
-    ProtocolProfile, TerminalProtocolEngine, process_pane_output_with_pointer_queries,
-    protocol_reply_for_chunk,
+    OutputFanoutBuffer, PaneReader, PaneShellMetadataParser, PaneTerminalModeTracker,
+    ProtocolProfile, TerminalProtocolEngine, follow_chunk,
 };
 use bmux_bench::corpus::{self, Frame};
 use bmux_bench::metrics::{PhaseRecorder, Probe, Report, Scenario};
 use bmux_terminal_grid::{GridLimits, TerminalGridStream};
 use std::collections::BTreeMap;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Bytes one PTY read delivers at most (the reader's buffer).
 const READ: usize = 8192;
+
+/// One pane's reader: what the PTY reader keeps and the pane state it writes, minus the host.
+struct Pane {
+    grid: TerminalGridStream,
+    output: OutputFanoutBuffer,
+    reader: PaneReader,
+    modes: PaneTerminalModeTracker,
+    engine: TerminalProtocolEngine,
+    #[cfg(feature = "image-registry")]
+    registry: bmux_image::ImageRegistry,
+    #[cfg(feature = "image-registry")]
+    interceptor: bmux_image::ImageInterceptor,
+    replies: Vec<u8>,
+}
+
+impl Pane {
+    fn new((cols, rows): (u16, u16)) -> Self {
+        Self {
+            grid: TerminalGridStream::new(cols, rows, GridLimits::default()).expect("grid"),
+            output: OutputFanoutBuffer::new(1 << 20),
+            reader: PaneReader::new(
+                ProtocolProfile::Bmux,
+                Some(PaneShellMetadataParser::default()),
+            ),
+            modes: PaneTerminalModeTracker::default(),
+            engine: TerminalProtocolEngine::new(ProtocolProfile::Bmux),
+            #[cfg(feature = "image-registry")]
+            registry: bmux_image::ImageRegistry::default(),
+            #[cfg(feature = "image-registry")]
+            interceptor: bmux_image::ImageInterceptor::new(),
+            replies: Vec::new(),
+        }
+    }
+
+    /// One PTY read, as the pane reader handles it: followed through the grid, modes tracked, the
+    /// visible bytes pushed for clients.
+    fn read(&mut self, chunk: &[u8]) {
+        self.replies.clear();
+        #[cfg(feature = "image-registry")]
+        let mut images = super::ChunkImages {
+            registry: &mut self.registry,
+            interceptor: &mut self.interceptor,
+            cell_pixels: (8, 16),
+            events: Vec::new(),
+        };
+        #[cfg(feature = "image-registry")]
+        follow_chunk(
+            &mut self.reader,
+            &mut self.grid,
+            &mut self.engine,
+            &mut images,
+            chunk,
+            &mut self.replies,
+        )
+        .expect("follow the chunk");
+        #[cfg(not(feature = "image-registry"))]
+        follow_chunk(
+            &mut self.reader,
+            &mut self.grid,
+            &mut self.engine,
+            chunk,
+            &mut self.replies,
+        );
+        self.modes.process(&self.reader.visible);
+        self.output.push_chunk(&self.reader.visible);
+        self.replies.extend_from_slice(&self.reader.pointer_replies);
+    }
+}
 
 // Allocations are counted in this test binary: `ingest_metrics` reports them per frame.
 #[global_allocator]
@@ -55,47 +121,25 @@ fn summary(mut samples: Vec<Duration>) -> String {
 }
 
 fn run(name: &str, (cols, rows): (u16, u16), frames: &[Frame]) {
-    let grid =
-        Mutex::new(TerminalGridStream::new(cols, rows, GridLimits::default()).expect("grid"));
-    let output = Mutex::new(OutputFanoutBuffer::new(1 << 20));
-    let mut modes = PaneTerminalModeTracker::default();
-    let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
-    let mut tracker = PaneCursorTracker::new(rows, cols);
-    let (mut mode, mut parse, mut replies, mut total) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut reader = Pane::new((cols, rows));
+    let mut total = Vec::new();
     let mut bytes = 0usize;
     for (index, frame) in frames.iter().enumerate() {
-        let (mut frame_mode, mut frame_parse, mut frame_replies) =
-            (Duration::ZERO, Duration::ZERO, Duration::ZERO);
+        let started = Instant::now();
         for chunk in frame.chunks(READ) {
-            let started = Instant::now();
-            modes.process(chunk);
-            frame_mode += started.elapsed();
-            let started = Instant::now();
-            process_pane_output_with_pointer_queries(&grid, &output, chunk, ProtocolProfile::Bmux)
-                .expect("parse");
-            frame_parse += started.elapsed();
-            let started = Instant::now();
-            let _ = protocol_reply_for_chunk(&mut engine, &mut tracker, chunk);
-            frame_replies += started.elapsed();
+            reader.read(chunk);
         }
         // The first frame is the full repaint every corpus starts with.
         if index > 0 {
             bytes += frame.len();
-            mode.push(frame_mode);
-            parse.push(frame_parse);
-            replies.push(frame_replies);
-            total.push(frame_mode + frame_parse + frame_replies);
+            total.push(started.elapsed());
         }
     }
     let frames = total.len().max(1);
     println!(
-        "{name} {cols}x{rows} ({frames} frames, {} B/frame): total {} | modes {} | grid parse {} | cursor tracker {}",
+        "{name} {cols}x{rows} ({frames} frames, {} B/frame): read {}",
         bytes / frames,
         summary(total),
-        summary(mode),
-        summary(parse),
-        summary(replies),
     );
 }
 
@@ -121,93 +165,34 @@ fn ingest_bench() {
 /// Frames before a scenario's metrics are taken (buffers grow while the reader warms up).
 const WARMUP: usize = 30;
 
-/// Read `frames` as the pane reader does and measure each stage per frame after warm-up: shell
-/// metadata filtering, terminal-mode tracking, the grid parse with the push into the output
-/// buffer, and the protocol replies (with the image registry built in, the image interceptor and
-/// registry, which produce the replies, instead).
-fn ingest_once(
-    (cols, rows): (u16, u16),
-    frames: &[Frame],
-) -> (BTreeMap<String, PhaseRecorder>, u64, i64) {
+/// Read `frames` as the pane reader does and measure each frame's reading after warm-up.
+fn ingest_once(size: (u16, u16), frames: &[Frame]) -> (BTreeMap<String, PhaseRecorder>, u64, i64) {
     let probe = Probe::new();
-    let grid =
-        Mutex::new(TerminalGridStream::new(cols, rows, GridLimits::default()).expect("grid"));
-    let output = Mutex::new(OutputFanoutBuffer::new(1 << 20));
-    let mut metadata = PaneShellMetadataParser::default();
-    let mut modes = PaneTerminalModeTracker::default();
-    let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
-    let mut tracker = PaneCursorTracker::new(rows, cols);
-    #[cfg(feature = "image-registry")]
-    let (mut interceptor, mut registry) = (
-        bmux_image::ImageInterceptor::new(),
-        bmux_image::ImageRegistry::default(),
-    );
-    let mut stages: BTreeMap<String, PhaseRecorder> = BTreeMap::new();
+    let mut reader = Pane::new(size);
+    let mut read = PhaseRecorder::default();
     let mut live_after_warmup = 0;
     let mut measured = 0_u64;
     for (index, frame) in frames.iter().enumerate() {
         if index == WARMUP {
             live_after_warmup = bmux_bench::allocations::live_bytes();
         }
-        let mut costs: BTreeMap<&str, bmux_bench::metrics::Cost> = BTreeMap::new();
-        let mut add = |stage: &'static str, cost: bmux_bench::metrics::Cost| {
-            let total = costs.entry(stage).or_default();
-            total.allocations += cost.allocations;
-            total.instructions = match (total.instructions, cost.instructions) {
-                (Some(a), Some(b)) => Some(a + b),
-                (None, b) => b,
-                (a, None) => a,
-            };
-        };
+        let mark = probe.mark();
         for chunk in frame.chunks(READ) {
-            #[cfg(feature = "image-registry")]
-            let filtered = {
-                let mark = probe.mark();
-                let mut result = interceptor.process(chunk);
-                let mut replies = Vec::new();
-                super::ordered_image_output(
-                    &mut tracker,
-                    &mut engine,
-                    &mut registry,
-                    &mut result,
-                    (8, 16),
-                    &mut replies,
-                )
-                .expect("image output");
-                add("images", probe.since(mark));
-                result.filtered
-            };
-            #[cfg(feature = "image-registry")]
-            let chunk = filtered.as_slice();
-            let mark = probe.mark();
-            let parsed = metadata.process_chunk(chunk);
-            add("metadata", probe.since(mark));
-            let chunk = &*parsed.filtered;
-            let mark = probe.mark();
-            modes.process(chunk);
-            add("modes", probe.since(mark));
-            let mark = probe.mark();
-            process_pane_output_with_pointer_queries(&grid, &output, chunk, ProtocolProfile::Bmux)
-                .expect("parse");
-            add("parse", probe.since(mark));
-            #[cfg(not(feature = "image-registry"))]
-            {
-                let mark = probe.mark();
-                let _ = protocol_reply_for_chunk(&mut engine, &mut tracker, chunk);
-                add("replies", probe.since(mark));
-            }
+            reader.read(chunk);
         }
-        if index < WARMUP {
-            continue;
-        }
-        measured += 1;
-        for (stage, cost) in costs {
-            stages.entry(stage.to_owned()).or_default().record(cost);
+        let cost = probe.since(mark);
+        if index >= WARMUP {
+            measured += 1;
+            read.record(cost);
         }
     }
     let live_growth = i64::try_from(bmux_bench::allocations::live_bytes()).unwrap_or(i64::MAX)
         - i64::try_from(live_after_warmup).unwrap_or(i64::MAX);
-    (stages, measured, live_growth)
+    (
+        BTreeMap::from([("read".to_owned(), read)]),
+        measured,
+        live_growth,
+    )
 }
 
 /// Measure scenario `name` (when selected, see [`bmux_bench::metrics::selected`]): read through a
@@ -341,52 +326,16 @@ fn ingest_metrics() {
 fn ingest_soak() {
     const ROUNDS: usize = 10;
     const SLACK: usize = 256 * 1024;
-    let (cols, rows) = size();
-    let plain = corpus::plain_stream((cols, rows), 300);
-    let images = kitty_images((cols, rows), 300);
+    let size = size();
+    let plain = corpus::plain_stream(size, 300);
+    let images = kitty_images(size, 300);
     let mut failures = Vec::new();
     for (name, frames) in [("plain-stream", plain), ("kitty-images", images)] {
-        let grid =
-            Mutex::new(TerminalGridStream::new(cols, rows, GridLimits::default()).expect("grid"));
-        let output = Mutex::new(OutputFanoutBuffer::new(1 << 20));
-        let mut modes = PaneTerminalModeTracker::default();
-        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
-        let mut tracker = PaneCursorTracker::new(rows, cols);
-        #[cfg(feature = "image-registry")]
-        let (mut interceptor, mut registry) = (
-            bmux_image::ImageInterceptor::new(),
-            bmux_image::ImageRegistry::default(),
-        );
+        let mut reader = Pane::new(size);
         let live: Vec<usize> = (0..ROUNDS)
             .map(|_| {
                 for chunk in frames.iter().flat_map(|frame| frame.chunks(READ)) {
-                    #[cfg(feature = "image-registry")]
-                    let filtered = {
-                        let mut result = interceptor.process(chunk);
-                        let mut replies = Vec::new();
-                        super::ordered_image_output(
-                            &mut tracker,
-                            &mut engine,
-                            &mut registry,
-                            &mut result,
-                            (8, 16),
-                            &mut replies,
-                        )
-                        .expect("image output");
-                        result.filtered
-                    };
-                    #[cfg(feature = "image-registry")]
-                    let chunk = filtered.as_slice();
-                    modes.process(chunk);
-                    process_pane_output_with_pointer_queries(
-                        &grid,
-                        &output,
-                        chunk,
-                        ProtocolProfile::Bmux,
-                    )
-                    .expect("parse");
-                    #[cfg(not(feature = "image-registry"))]
-                    let _ = protocol_reply_for_chunk(&mut engine, &mut tracker, chunk);
+                    reader.read(chunk);
                 }
                 bmux_bench::allocations::live_bytes()
             })

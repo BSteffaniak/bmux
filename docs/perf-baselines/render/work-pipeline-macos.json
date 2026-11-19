@@ -2280,7 +2280,7 @@
     {
       "name": "scattered-edits",
       "frames": 301,
-      "units_per_frame": 128280.08,
+      "units_per_frame": 127395.0,
       "functions": [
         {
           "name": "<bmux_tui::symbol::Symbol>::is",
@@ -2448,11 +2448,6 @@
           "entries_per_frame": 502.28
         },
         {
-          "name": "unicode_segmentation::tables::util::bsearch_range_table::{closure#0}",
-          "units_per_frame": 458.1,
-          "entries_per_frame": 195.54
-        },
-        {
           "name": "<bmux_terminal_grid::model::Cell>::is_discardable_blank",
           "units_per_frame": 418.7,
           "entries_per_frame": 146.76
@@ -2479,6 +2474,11 @@
         },
         {
           "name": "<bmux_terminal_grid::model::CellText>::from_char",
+          "units_per_frame": 368.8,
+          "entries_per_frame": 368.8
+        },
+        {
+          "name": "<bmux_terminal_grid::model::CellText>::push_str",
           "units_per_frame": 368.8,
           "entries_per_frame": 368.8
         }
