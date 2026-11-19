@@ -285,6 +285,25 @@ impl FrameChanges<'_> {
     }
 }
 
+/// What a frame painted in place must repaint beyond what it changed, as an output hook that
+/// cleared what earlier frames left on the host decides (raster images leave footprints).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Repaint {
+    /// Only the cells the frame changed.
+    Changes,
+    /// Every cell.
+    All,
+    /// The cells the frame changed and every cell of these areas.
+    Regions(Vec<Rect>),
+}
+
+impl From<bool> for Repaint {
+    /// `true` repaints every cell, `false` only the changes.
+    fn from(all: bool) -> Self {
+        if all { Self::All } else { Self::Changes }
+    }
+}
+
 /// What a frame wrote of its cells, for the output that follows them (images placed over them).
 pub enum Written<'frame> {
     /// Every cell: a full repaint.
@@ -836,37 +855,38 @@ impl<W: Write> Terminal<W> {
     ///
     /// # Errors
     /// Returns the render's rejection, or output and hook errors without committing the frame.
-    pub fn try_draw_over_with_output_hooks<E>(
+    pub fn try_draw_over_with_output_hooks<E, R: Into<Repaint>>(
         &mut self,
         render: impl FnOnce(&mut PaintCx<'_, '_>) -> Result<bool, E>,
-        before: impl FnOnce(&mut W, Option<&ImageSceneDelta>) -> io::Result<bool>,
+        before: impl FnOnce(&mut W, Option<&ImageSceneDelta>) -> io::Result<R>,
         overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta, &Written<'_>) -> io::Result<()>,
     ) -> Result<Option<DrawStats>, TryDrawError<E>> {
         self.draw_over_core(render, before, overlay, true)
     }
 
     /// [`Self::draw_over`] with output hooks around its cells. `before` receives the frame's
-    /// image delta, `None` for a full frame (nothing to paint over), and returns whether every
-    /// cell must be repainted; `overlay` follows the cells with the committed image scene, its
+    /// image delta, `None` for a full frame (nothing to paint over), and returns what must be
+    /// repainted beyond the frame's changes ([`Repaint`], or a `bool` for every cell); `overlay`
+    /// follows the cells with the committed image scene, its
     /// delta and the cells written ([`Written`]), so output placed over them (raster images) is
     /// rewritten only where it needs to be. The frame is written even when it paints nothing,
     /// so the hooks always run.
     ///
     /// # Errors
     /// Returns output or hook errors without committing failed output.
-    pub fn draw_over_with_output_hooks(
+    pub fn draw_over_with_output_hooks<R: Into<Repaint>>(
         &mut self,
         render: impl FnOnce(&mut PaintCx<'_, '_>),
-        before: impl FnOnce(&mut W, Option<&ImageSceneDelta>) -> io::Result<bool>,
+        before: impl FnOnce(&mut W, Option<&ImageSceneDelta>) -> io::Result<R>,
         overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta, &Written<'_>) -> io::Result<()>,
     ) -> io::Result<DrawStats> {
         self.draw_over_inner(render, before, overlay, false)
     }
 
-    fn draw_over_inner(
+    fn draw_over_inner<R: Into<Repaint>>(
         &mut self,
         render: impl FnOnce(&mut PaintCx<'_, '_>),
-        before: impl FnOnce(&mut W, Option<&ImageSceneDelta>) -> io::Result<bool>,
+        before: impl FnOnce(&mut W, Option<&ImageSceneDelta>) -> io::Result<R>,
         overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta, &Written<'_>) -> io::Result<()>,
         skip_unchanged: bool,
     ) -> io::Result<DrawStats> {
@@ -885,10 +905,10 @@ impl<W: Write> Terminal<W> {
     }
 
     #[allow(clippy::too_many_lines)] // One ordered frame: paint, decide, encode, commit.
-    fn draw_over_core<E>(
+    fn draw_over_core<E, R: Into<Repaint>>(
         &mut self,
         render: impl FnOnce(&mut PaintCx<'_, '_>) -> Result<bool, E>,
-        before: impl FnOnce(&mut W, Option<&ImageSceneDelta>) -> io::Result<bool>,
+        before: impl FnOnce(&mut W, Option<&ImageSceneDelta>) -> io::Result<R>,
         overlay: impl FnOnce(&mut W, &ImageScene, &ImageSceneDelta, &Written<'_>) -> io::Result<()>,
         skip_unchanged: bool,
     ) -> Result<Option<DrawStats>, TryDrawError<E>> {
@@ -905,7 +925,8 @@ impl<W: Write> Terminal<W> {
             return self
                 .draw_prepared_with_output_hooks(
                     prepared,
-                    |writer| before(writer, None),
+                    // A full frame writes every cell: whatever the hook asks is covered.
+                    |writer| before(writer, None).map(|repaint| repaint.into() != Repaint::Changes),
                     |writer, scene, delta| overlay(writer, scene, delta, &Written::All),
                 )
                 .map(Some)
@@ -1019,7 +1040,17 @@ impl<W: Write> Terminal<W> {
         );
         let result = (|| -> io::Result<DrawStats> {
             let stats = write_synchronized(writer, synchronized, |writer| {
-                let repaint = before(writer, Some(image_delta))?;
+                let repaint = match before(writer, Some(image_delta))?.into() {
+                    Repaint::Changes => false,
+                    Repaint::All => true,
+                    Repaint::Regions(regions) => {
+                        // The areas are rewritten as though the frame had changed them.
+                        for region in regions {
+                            changes.mark(region.intersection(area));
+                        }
+                        false
+                    }
+                };
                 encoded.clear();
                 let stats = PresentationPhase::AnsiEncode.measure(
                     || -> io::Result<DrawStats> {

@@ -84,13 +84,13 @@ impl ImageFrame<'_> {
         &self,
         writer: &mut Vec<u8>,
         delta: Option<&bmux_tui::image_scene::ImageSceneDelta>,
-    ) -> std::io::Result<bool> {
+    ) -> std::io::Result<bmux_tui::terminal::Repaint> {
         if self.images.host.is_none()
             || (!self.images.reconfigured && delta.is_some_and(delta_is_empty))
         {
-            return Ok(false);
+            return Ok(bmux_tui::terminal::Repaint::Changes);
         }
-        self.staged().prepare_output(writer)
+        self.staged().prepare_output_regions(writer)
     }
 
     /// After the frame's cells: write the image scene, keeping the frame's cursor. The scene is
@@ -370,13 +370,14 @@ impl FramePresenter {
                 Ok(reconfigured)
             },
             |writer, delta| {
-                // Raster images leave footprints only a cleared screen and a full repaint remove.
+                // Raster images leave footprints: their cells are repainted (or, when what reached
+                // the host is unknown, the screen is cleared and repainted).
                 #[cfg(image_protocols)]
                 return images.prepare_output(writer, delta);
                 #[cfg(not(image_protocols))]
                 {
                     let _ = (writer, delta);
-                    Ok(false)
+                    Ok(bmux_tui::terminal::Repaint::Changes)
                 }
             },
             |writer, scene, delta, written| {
@@ -789,6 +790,30 @@ mod image_tests {
         assert_eq!(frame(&mut presenter, None, Some(&picture)), "");
         let gone = frame(&mut presenter, None, Some(&[]));
         assert!(gone.contains("a=d"), "{gone:?}");
+    }
+
+    /// A raster image that moves is repaired by repainting the cells it covered, not by clearing
+    /// the screen and repainting every cell: the frame writes the old footprint's cells and the
+    /// image at its new place.
+    #[test]
+    fn a_moved_raster_image_repaints_only_its_old_footprint() {
+        let mut presenter = presenter(false);
+        let first = frame(
+            &mut presenter,
+            Some((5, "status line")),
+            Some(&[image(Rect::new(2, 1, 4, 2))]),
+        );
+        assert!(first.contains("\u{1b}P"), "{first:?}");
+        let moved = frame(&mut presenter, None, Some(&[image(Rect::new(10, 1, 4, 2))]));
+        assert!(!moved.contains("\u{1b}[2J"), "no screen clear: {moved:?}");
+        assert!(
+            moved.contains("\u{1b}P"),
+            "the image at its new place: {moved:?}"
+        );
+        assert!(
+            !moved.contains("status line"),
+            "cells outside the footprint are not rewritten: {moved:?}"
+        );
     }
 
     /// Raster images are part of the cells they cover: one is written again when the frame's

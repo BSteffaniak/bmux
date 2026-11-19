@@ -155,8 +155,12 @@ pub struct TuiImageCompositor {
     reset_pending: bool,
     validations: usize,
     // Raster protocols have no reusable placement deletion. A prior footprint
-    // requires ED2 followed by a complete cell repaint before the next overlay.
+    // requires its cells repainted before the next overlay.
     raster_pending: bool,
+    // The cells raster images were written over since the last repair.
+    raster_footprints: Vec<bmux_tui::geometry::Rect>,
+    // A write failed, so what reached the host is unknown: only ED2 and a full repaint repair it.
+    raster_footprints_uncertain: bool,
 }
 
 impl TuiImageCompositor {
@@ -292,6 +296,10 @@ impl TuiImageCompositor {
     /// Mark all potentially emitted host IDs for repair after write or flush failure.
     /// Call on committed state with the failed candidate; do not commit the candidate.
     pub fn invalidate_after_failed_output(&mut self, candidate: &Self) {
+        if candidate.raster_pending {
+            // What reached the host is unknown: only a cleared screen is certain to repair it.
+            self.raster_footprints_uncertain = true;
+        }
         self.raster_pending |= candidate.raster_pending;
         self.kitty_state
             .invalidate_after_failed_output(&candidate.kitty_state);
@@ -309,9 +317,37 @@ impl TuiImageCompositor {
         }
         out.write_all(b"\x1b[2J")?;
         self.raster_pending = false;
+        self.raster_footprints.clear();
+        self.raster_footprints_uncertain = false;
         // ED2 may discard Kitty resources too, notably after a protocol switch.
         self.kitty_state.reset(out)?;
         Ok(true)
+    }
+
+    /// Repair what raster images left on the host before painting cells, as
+    /// [`Self::prepare_output`] does, but by repainting only the cells they were written over
+    /// when those are known exactly: writing a cell replaces the image pixels under it, so a
+    /// moved or removed raster image costs its footprint, not the screen. Otherwise (after a
+    /// failed write) it clears the screen and asks for every cell.
+    ///
+    /// # Errors
+    /// Returns an output error; pending repair remains set on failure.
+    pub fn prepare_output_regions(
+        &mut self,
+        out: &mut impl Write,
+    ) -> std::io::Result<bmux_tui::terminal::Repaint> {
+        if !self.raster_pending {
+            return Ok(bmux_tui::terminal::Repaint::Changes);
+        }
+        if self.raster_footprints_uncertain {
+            return self
+                .prepare_output(out)
+                .map(bmux_tui::terminal::Repaint::from);
+        }
+        self.raster_pending = false;
+        Ok(bmux_tui::terminal::Repaint::Regions(std::mem::take(
+            &mut self.raster_footprints,
+        )))
     }
 
     fn render_candidate(
@@ -473,6 +509,13 @@ impl TuiImageCompositor {
             if host_caps.preferred_protocol() != Some(ImageProtocol::KittyGraphics) {
                 // Set before writes: even a partial raster sequence needs repair.
                 self.raster_pending = true;
+                let footprint = placement
+                    .destination
+                    .intersection(placement.clip)
+                    .intersection(terminal_clip);
+                if !footprint.is_empty() && !self.raster_footprints.contains(&footprint) {
+                    self.raster_footprints.push(footprint);
+                }
             }
             self.kitty_state.set_placement_layer(placement.z);
             let rendered = render_image_clipped(
@@ -3019,6 +3062,67 @@ mod tests {
                 "z={z}: {removed:?}"
             );
         }
+    }
+
+    /// A raster image's footprint is repaired by repainting the cells it was written over, not
+    /// by clearing the screen; after a failed write, when what reached the host is unknown, the
+    /// screen is cleared and every cell repainted.
+    #[cfg(feature = "sixel")]
+    #[test]
+    fn raster_footprints_are_repainted_instead_of_clearing_the_screen() {
+        use bmux_tui::terminal::Repaint;
+        let terminal = PaneRect {
+            x: 0,
+            y: 0,
+            w: 40,
+            h: 10,
+        };
+        let caps = HostImageCapabilities {
+            sixel: true,
+            cell_pixel_width: 8,
+            cell_pixel_height: 16,
+            ..HostImageCapabilities::default()
+        };
+        let render = |compositor: &mut TuiImageCompositor, x: u16| {
+            let mut scene = ImageScene::default();
+            scene.reconcile(&[ImageContribution::Present(placement(
+                "moving",
+                Rect::new(x, 1, 4, 2),
+                Rect::new(0, 0, 40, 10),
+                1,
+            ))]);
+            let mut output = Vec::new();
+            compositor
+                .render(
+                    &mut output,
+                    &scene,
+                    terminal,
+                    &caps,
+                    &ImageConfig::default(),
+                )
+                .unwrap();
+        };
+        let mut compositor = TuiImageCompositor::new();
+        let mut output = Vec::new();
+        assert_eq!(
+            compositor.prepare_output_regions(&mut output).unwrap(),
+            Repaint::Changes
+        );
+        render(&mut compositor, 2);
+        assert_eq!(
+            compositor.prepare_output_regions(&mut output).unwrap(),
+            Repaint::Regions(vec![Rect::new(2, 1, 4, 2)])
+        );
+        assert!(output.is_empty(), "no screen clear: {output:?}");
+        render(&mut compositor, 9);
+        let mut failed = compositor.clone();
+        render(&mut failed, 20);
+        compositor.invalidate_after_failed_output(&failed);
+        assert_eq!(
+            compositor.prepare_output_regions(&mut output).unwrap(),
+            Repaint::All
+        );
+        assert!(String::from_utf8_lossy(&output).contains("\x1b[2J"));
     }
 
     /// A raster image that moves, staying whole inside its clip, is written again from the
