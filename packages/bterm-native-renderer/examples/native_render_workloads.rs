@@ -32,7 +32,8 @@ const LIMITS: PresentationLimits = PresentationLimits {
     max_entries: 128,
     max_bytes: 2 * 1024 * 1024,
 };
-const CASES: [&str; 11] = [
+const CASES: [&str; 12] = [
+    "decoration-only",
     "local-grids",
     "cold-text",
     "warm-text",
@@ -137,6 +138,33 @@ fn paint(cx: &mut PaintCx<'_, '_>, case: &str, frame: usize) {
                 "{source:05} rev={revision:04} fn render() {{ retained text 0123456789 }} café e\u{301} 界"
             )),
         );
+    }
+    if case == "decoration-only" {
+        use bmux_tui::style::{Color, Style};
+        let style = Style::new().fg(if frame.is_multiple_of(2) {
+            Color::Rgb(240, 40, 80)
+        } else {
+            Color::Rgb(40, 220, 120)
+        });
+        if frame % 6 != 5 {
+            cx.write_line(
+                LocalRect::new(0, 0, area.width, 1),
+                &Line::raw("─".repeat(usize::from(area.width))).patch_style(style),
+            );
+            cx.write_line(
+                LocalRect::new(0, i64::from(area.height - 1), area.width, 1),
+                &Line::raw("─".repeat(usize::from(area.width))).patch_style(style),
+            );
+            for row in 1..area.height - 1 {
+                for col in [0, area.width - 1] {
+                    cx.write_line(
+                        LocalRect::new(i32::from(col), i64::from(row), 1, 1),
+                        &Line::raw("│").patch_style(style),
+                    );
+                }
+            }
+        }
+        cx.set_cursor_local((frame % 8 + 3) as u16, 3, !frame.is_multiple_of(3));
     }
     if matches!(case, "static-image" | "static-png" | "changing-image") {
         // Stable identity; changing content replaces it instead of accumulating images.
@@ -361,9 +389,27 @@ impl Workload {
         sample.prepare_ns = start.elapsed().as_nanos();
         let start = Instant::now();
         // Sole commit point: output error propagates, and no sample is recorded as success.
-        let output = self
-            .presentation
-            .present_prepared(prepared, |prepared, _| renderer.present(prepared));
+        let output = self.presentation.present_prepared(prepared, |prepared, _| {
+            let report = renderer.present(prepared)?;
+            if self.case == "decoration-only"
+                || self.case == "local-grids"
+                || self.case == "fractional-zoom"
+                || self.case.contains("image")
+            {
+                renderer.verify_retained_output(prepared)?;
+            }
+            if self.case == "decoration-only" && self.iteration > 0 {
+                let telemetry = report.telemetry.expect("workload enables telemetry");
+                assert!(
+                    telemetry.repaint_pixels
+                        < u64::from(metrics.physical_size.width)
+                            * u64::from(metrics.physical_size.height)
+                            / 2
+                );
+                assert!(telemetry.text_cell_visits < u64::from(width) * u64::from(height) / 2);
+            }
+            Ok(report)
+        });
         let output_commit_ns = start.elapsed().as_nanos();
         let report = match output {
             Ok(report) => report,

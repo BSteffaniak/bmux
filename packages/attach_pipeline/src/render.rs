@@ -1199,6 +1199,22 @@ impl DamageRect {
         Self::new(x1, y1, x2.saturating_sub(x1), y2.saturating_sub(y1))
     }
 
+    /// Whether bounding-box merging introduces no undamaged pixels.
+    #[must_use]
+    pub fn rectangular_union(self, other: Self) -> bool {
+        let width = self
+            .right()
+            .min(other.right())
+            .saturating_sub(self.x.max(other.x));
+        let height = self
+            .bottom()
+            .min(other.bottom())
+            .saturating_sub(self.y.max(other.y));
+        u64::from(self.union(other).area())
+            == u64::from(self.area()) + u64::from(other.area())
+                - u64::from(width) * u64::from(height)
+    }
+
     #[must_use]
     pub const fn touches_or_overlaps(self, other: Self) -> bool {
         self.x <= other.right()
@@ -2071,7 +2087,7 @@ fn push_overlay_rect(rects: &mut Vec<DamageRect>, rect: DamageRect, terminal_siz
     };
     let mut index = 0;
     while index < rects.len() {
-        if rects[index].touches_or_overlaps(merged) {
+        if rects[index].rectangular_union(merged) {
             merged = rects.swap_remove(index).union(merged);
             index = 0;
         } else {
@@ -2101,7 +2117,7 @@ fn coalesce_surface_rect(
     };
     let mut index = 0;
     while index < rects.len() {
-        if rects[index].touches_or_overlaps(merged) {
+        if rects[index].rectangular_union(merged) {
             merged = rects.swap_remove(index).union(merged);
             index = 0;
         } else {

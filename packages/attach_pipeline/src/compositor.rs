@@ -2037,7 +2037,7 @@ fn coalesce_absolute_damage(
         };
         let mut index = 0;
         while index < merged.len() {
-            if merged[index].touches_or_overlaps(next) {
+            if merged[index].rectangular_union(next) {
                 next = merged.swap_remove(index).union(next);
                 index = 0;
             } else {
@@ -3893,7 +3893,10 @@ mod tests {
             DamageCoalescingPolicy::default(),
         );
 
-        assert_eq!(damage.rects(), &[DamageRect::new(10, 5, 22, 6)]);
+        assert_eq!(
+            damage.rects(),
+            &[DamageRect::new(10, 5, 12, 3), DamageRect::new(20, 8, 12, 3)]
+        );
     }
 
     #[test]

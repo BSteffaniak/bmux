@@ -11550,6 +11550,10 @@ fn render_attach_frame_inner(
             .observer
             .as_ref()
             .is_some_and(super::observer::AttachObserverPublisher::has_published)
+        && scene_render_stats.retained_scene_added_items == 0
+        && scene_render_stats.retained_scene_changed_items == 0
+        && scene_render_stats.retained_scene_removed_items == 0
+        && scene_render_stats.extension_render_calls == scene_render_stats.retained_scene_calls
         && !frame_plan.retained.damage.merged_damaged()
         && !frame_plan.retained.graph_damaged()
         && pending_cursor_state == view_state.last_cursor_state
@@ -18797,6 +18801,108 @@ mod tests {
             let next = observer.latest().unwrap();
             assert!(next.revision > committed.revision);
             assert_ne!(next.prepared.buffer(), committed.prepared.buffer());
+        }
+    }
+
+    #[test]
+    fn idle_decoration_changes_publish_without_pane_damage_and_noops_do_not() {
+        struct Border(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl bmux_plugin::AttachRenderExtension for Border {
+            fn name(&self) -> &'static str {
+                "idle-border-regression"
+            }
+            fn render_surface(
+                &self,
+                _: &mut dyn std::io::Write,
+                _: Uuid,
+                _: &bmux_plugin::ExtensionRect,
+                _: &bmux_plugin::RenderDamage,
+            ) -> std::io::Result<bool> {
+                panic!("retained scene must not use imperative output")
+            }
+            fn render_layer_scene_with_context(
+                &self,
+                _: Uuid,
+                rect: &bmux_plugin::ExtensionRect,
+                layer: bmux_plugin::RenderExtensionLayer,
+                _: &bmux_plugin::RenderExtensionContext,
+            ) -> Option<bmux_plugin::RenderLayerScene> {
+                let value = self.0.load(std::sync::atomic::Ordering::SeqCst);
+                let items =
+                    if layer == bmux_plugin::RenderExtensionLayer::AfterPaneContent && value != 2 {
+                        vec![bmux_plugin::RenderSceneItem::border(
+                            bmux_plugin::RenderSceneItemKey::new("border"),
+                            0,
+                            *rect,
+                            bmux_plugin::BorderGlyphs::rounded(),
+                            bmux_plugin::RenderStyle::new().named_foreground(if value == 0 {
+                                bmux_plugin::RenderNamedColor::Red
+                            } else {
+                                bmux_plugin::RenderNamedColor::Green
+                            }),
+                        )]
+                    } else {
+                        Vec::new()
+                    };
+                Some(bmux_plugin::RenderLayerScene::new(
+                    Some(value as u64),
+                    items,
+                ))
+            }
+        }
+        let session = Uuid::new_v4();
+        let pane = Uuid::new_v4();
+        let mut state = AttachViewState::with_private_presentation(AttachOpenInfo {
+            session_id: session,
+            context_id: None,
+            can_write: true,
+        });
+        let layout = retry_test_layout(&mut state, pane, session);
+        state.presentation_only = true;
+        let value = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        state.presentation_extensions = Arc::new(bmux_plugin::RenderExtensionRegistry::new());
+        state
+            .presentation_extensions
+            .register(Arc::new(Border(value.clone())));
+        let (publisher, output) = super::super::observer::attach_observer_channel();
+        state.set_observer(publisher);
+        render_observed_test_frame(&mut state, &layout);
+        let mut previous = output.latest().unwrap();
+        let content_revision = state.pane_buffers[&pane]
+            .terminal_grid
+            .grid()
+            .content_revision();
+        for next in [1, 2] {
+            value.store(next, std::sync::atomic::Ordering::SeqCst);
+            state
+                .dirty
+                .mark_extension_dirty(AttachDirtySource::SceneChanged);
+            assert!(state.dirty.needs_render());
+            assert!(!state.dirty.full_pane_redraw);
+            assert!(state.dirty.pane_dirty_ids.is_empty());
+            render_observed_test_frame(&mut state, &layout);
+            let current = output.latest().unwrap();
+            assert!(
+                current.revision > previous.revision,
+                "decoration-only update was suppressed"
+            );
+            assert_ne!(current.prepared.buffer(), previous.prepared.buffer());
+            assert_eq!(
+                state.pane_buffers[&pane]
+                    .terminal_grid
+                    .grid()
+                    .content_revision(),
+                content_revision
+            );
+            previous = current;
+            state
+                .dirty
+                .mark_extension_dirty(AttachDirtySource::SceneChanged);
+            render_observed_test_frame(&mut state, &layout);
+            assert!(
+                Arc::ptr_eq(&previous, &output.latest().unwrap()),
+                "unchanged scene published redundant output"
+            );
         }
     }
 

@@ -9,6 +9,11 @@ use std::{
 
 const ATLAS: u32 = 4096;
 const MAX_VERTICES: usize = 4_000_000;
+const MAX_RETAINED_BYTES: u64 = 256 * 1024 * 1024;
+
+fn retained_size_allowed(size: PhysicalSize) -> bool {
+    u64::from(size.width) * u64::from(size.height) * 4 <= MAX_RETAINED_BYTES
+}
 const MAX_CACHE_ENTRIES: usize = 16_384;
 const MAX_CACHE_BYTES: usize = ATLAS as usize * ATLAS as usize * 4;
 
@@ -163,6 +168,11 @@ pub(crate) struct Gpu {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     texture: wgpu::Texture,
+    retained: wgpu::Texture,
+    retained_bind: wgpu::BindGroup,
+    layout: wgpu::BindGroupLayout,
+    retained_valid: bool,
+    damage_clip: Option<[f32; 4]>,
     bind: wgpu::BindGroup,
     vertices: Vec<Vertex>,
     vertex_buffer: Option<wgpu::Buffer>,
@@ -173,6 +183,48 @@ pub(crate) struct Gpu {
     size: PhysicalSize,
     failure: Arc<Mutex<Option<String>>>,
     telemetry: Option<FrameTelemetry>,
+}
+
+fn retained_target(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+    layout: &wgpu::BindGroupLayout,
+) -> (wgpu::Texture, wgpu::BindGroup) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("retained native composition"),
+        size: wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: config.format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("retained composition output"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(
+                    &texture.create_view(&Default::default()),
+                ),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(
+                    &device.create_sampler(&wgpu::SamplerDescriptor::default()),
+                ),
+            },
+        ],
+    });
+    (texture, bind)
 }
 
 impl Gpu {
@@ -195,7 +247,8 @@ impl Gpu {
             })
             .await
             .map_err(|e| RenderError::Device(e.to_string()))?;
-        if size.width > device.limits().max_texture_dimension_2d
+        if !retained_size_allowed(size)
+            || size.width > device.limits().max_texture_dimension_2d
             || size.height > device.limits().max_texture_dimension_2d
             || ATLAS > device.limits().max_texture_dimension_2d
         {
@@ -297,7 +350,13 @@ impl Gpu {
             fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some("fs"), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: config.format, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })] }),
             primitive: Default::default(), depth_stencil: None, multisample: Default::default(), multiview_mask: None, cache: None,
         });
+        let (retained, retained_bind) = retained_target(&device, &config, &layout);
         Ok(Self {
+            retained,
+            retained_bind,
+            layout,
+            retained_valid: false,
+            damage_clip: None,
             surface,
             instance,
             target,
@@ -337,11 +396,15 @@ impl Gpu {
             return;
         }
         if !size.is_empty()
+            && retained_size_allowed(size)
             && size.width <= self.device.limits().max_texture_dimension_2d
             && size.height <= self.device.limits().max_texture_dimension_2d
         {
+            self.retained_valid = false;
             self.config.width = size.width;
             self.config.height = size.height;
+            (self.retained, self.retained_bind) =
+                retained_target(&self.device, &self.config, &self.layout);
             self.surface.configure(&self.device, &self.config);
         }
     }
@@ -357,7 +420,11 @@ impl Gpu {
     pub fn frame_telemetry(&self) -> FrameTelemetry {
         self.telemetry.unwrap_or_default()
     }
+    pub fn set_damage_clip(&mut self, clip: [f32; 4]) {
+        self.damage_clip = Some(clip);
+    }
     pub fn begin(&mut self) {
+        self.damage_clip = None;
         self.vertices.clear();
         // Completion uncertainty forbids *all* resource reuse, including atlas reset.
         if self.check_failure().is_err() {
@@ -438,6 +505,18 @@ impl Gpu {
     ) -> Result<(), RenderError> {
         self.check_failure()?;
         self.atlas.check_frame()?;
+        let clip = if let Some(damage) = self.damage_clip {
+            let left = clip[0].max(damage[0]);
+            let top = clip[1].max(damage[1]);
+            [
+                left,
+                top,
+                (clip[0] + clip[2]).min(damage[0] + damage[2]) - left,
+                (clip[1] + clip[3]).min(damage[1] + damage[3]) - top,
+            ]
+        } else {
+            clip
+        };
         let [x, y, w, h] = rect;
         if w <= 0.0 || h <= 0.0 {
             return Ok(());
@@ -485,10 +564,71 @@ impl Gpu {
         }
         Ok(())
     }
+    /// Readback is explicit diagnostic work, never part of normal presentation.
+    pub fn readback(&self) -> Result<Vec<u8>, RenderError> {
+        self.check_failure()?;
+        let stride = (self.config.width * 4).div_ceil(256) * 256;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("diagnostic retained readback"),
+            size: u64::from(stride) * u64::from(self.config.height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.retained,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: Some(self.config.height),
+                },
+            },
+            wgpu::Extent3d {
+                width: self.config.width,
+                height: self.config.height,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit([encoder.finish()]);
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+        self.device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_secs(2)),
+            })
+            .map_err(|e| RenderError::Device(e.to_string()))?;
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .map_err(|e| RenderError::Device(e.to_string()))?
+            .map_err(|e| RenderError::Device(e.to_string()))?;
+        let result = buffer
+            .slice(..)
+            .get_mapped_range()
+            .map_err(|e| RenderError::Device(e.to_string()))?
+            .chunks_exact(stride as usize)
+            .flat_map(|row| row[..self.config.width as usize * 4].iter().copied())
+            .collect();
+        buffer.unmap();
+        Ok(result)
+    }
+
     pub fn present(&mut self) -> Result<(), RenderError> {
         self.check_failure()?;
         self.atlas.check_frame()?;
-        if self.size.width > self.device.limits().max_texture_dimension_2d
+        if !retained_size_allowed(self.size)
+            || self.size.width > self.device.limits().max_texture_dimension_2d
             || self.size.height > self.device.limits().max_texture_dimension_2d
         {
             return Err(RenderError::Capacity("surface exceeds device limits"));
@@ -526,6 +666,10 @@ impl Gpu {
         };
         let encode_start = self.telemetry.as_ref().map(|_| std::time::Instant::now());
         let validation_scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let scene_vertices = self.vertices.len() as u32;
+        self.damage_clip = None;
+        let screen = [0.0, 0.0, self.size.width as f32, self.size.height as f32];
+        self.quad(screen, Some([0.0, 0.0, 1.0, 1.0]), [1.0; 4], screen)?;
         let capacity = vertex_capacity(self.vertices.len().max(1), self.vertex_capacity)?;
         let buffer_bytes = (capacity * std::mem::size_of::<Vertex>()) as u64;
         if buffer_bytes > self.device.limits().max_buffer_size {
@@ -552,7 +696,7 @@ impl Gpu {
             self.queue
                 .write_buffer(buffer, 0, bytemuck::cast_slice(&self.vertices));
         }
-        let view = frame.texture.create_view(&Default::default());
+        let view = self.retained.create_view(&Default::default());
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -562,7 +706,11 @@ impl Gpu {
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        load: if self.retained_valid {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(wgpu::Color::BLACK)
+                        },
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -574,7 +722,27 @@ impl Gpu {
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind, &[]);
             pass.set_vertex_buffer(0, buffer.slice(..));
-            pass.draw(0..self.vertices.len() as u32, 0..1);
+            pass.draw(0..scene_vertices, 0..1);
+        }
+        {
+            let output_view = frame.texture.create_view(&Default::default());
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("present retained composition"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &output_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.retained_bind, &[]);
+            pass.set_vertex_buffer(0, buffer.slice(..));
+            pass.draw(scene_vertices..self.vertices.len() as u32, 0..1);
         }
         let submission = self.queue.submit([encoder.finish()]);
         if let Some(telemetry) = &mut self.telemetry {
@@ -607,6 +775,7 @@ impl Gpu {
         self.check_failure()?;
         let present_start = self.telemetry.as_ref().map(|_| std::time::Instant::now());
         self.queue.present(frame);
+        self.retained_valid = true;
         if let Some(telemetry) = &mut self.telemetry {
             telemetry.present_call_ns = elapsed_ns(present_start);
         }

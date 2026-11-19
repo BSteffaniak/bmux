@@ -28,6 +28,9 @@ macro_rules! measurements {
     };
 }
 measurements!(
+    damage_regions,
+    repaint_pixels,
+    text_cell_visits,
     text_cpu_ns,
     image_cpu_ns,
     surface_acquire_ns,

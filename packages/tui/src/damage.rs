@@ -280,7 +280,7 @@ fn merge_regions(regions: impl IntoIterator<Item = Rect>, viewport: Rect) -> Vec
         }
         let mut index = 0;
         while index < merged.len() {
-            if touches_or_overlaps(merged[index], next) {
+            if rectangular_union(merged[index], next) {
                 next = union(merged.swap_remove(index), next);
                 index = 0;
             } else {
@@ -297,11 +297,16 @@ fn area(rect: Rect) -> u64 {
     u64::from(rect.width) * u64::from(rect.height)
 }
 
-const fn touches_or_overlaps(left: Rect, right: Rect) -> bool {
-    left.x <= right.right()
-        && right.x <= left.right()
-        && left.y <= right.bottom()
-        && right.y <= left.bottom()
+fn rectangular_union(left: Rect, right: Rect) -> bool {
+    let width = left
+        .right()
+        .min(right.right())
+        .saturating_sub(left.x.max(right.x));
+    let height = left
+        .bottom()
+        .min(right.bottom())
+        .saturating_sub(left.y.max(right.y));
+    area(union(left, right)) == area(left) + area(right) - u64::from(width) * u64::from(height)
 }
 
 const fn union(left: Rect, right: Rect) -> Rect {
@@ -339,7 +344,35 @@ mod tests {
 
         assert_eq!(
             damage,
-            Damage::Regions(vec![Rect::new(1, 1, 4, 2), Rect::new(8, 3, 2, 2)])
+            Damage::Regions(vec![
+                Rect::new(1, 1, 2, 2),
+                Rect::new(2, 2, 3, 1),
+                Rect::new(8, 3, 2, 2)
+            ])
+        );
+    }
+
+    #[test]
+    fn perimeter_does_not_damage_pane_interior() {
+        let damage = Damage::regions(
+            [
+                Rect::new(0, 0, 80, 1),
+                Rect::new(0, 23, 80, 1),
+                Rect::new(0, 1, 1, 22),
+                Rect::new(79, 1, 1, 22),
+            ],
+            Rect::new(0, 0, 80, 24),
+            DamagePolicy::default(),
+        );
+        let Damage::Regions(rects) = damage else {
+            panic!("border promoted to full damage");
+        };
+        assert_eq!(
+            rects
+                .iter()
+                .map(|r| u32::from(r.width) * u32::from(r.height))
+                .sum::<u32>(),
+            204
         );
     }
 

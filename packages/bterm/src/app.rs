@@ -678,7 +678,7 @@ impl<W: AttachWorker> Application<W> {
                                 let renderer = renderer
                                     .as_mut()
                                     .ok_or_else(|| "native renderer unavailable".to_string())?;
-                                let rendered = renderer.present(&delivery.prepared);
+                                let rendered = renderer.present_shared(std::sync::Arc::clone(&delivery.prepared));
                                 *frame_telemetry = renderer.last_frame_telemetry();
                                 rendered.map_err(|error| error.to_string())?;
                                 *last_output = Some(delivery.identity);
@@ -830,7 +830,7 @@ impl<W: AttachWorker> Application<W> {
                     {
                         // Exposure redraws replay the actual retained output;
                         // they never acknowledge a new interaction revision.
-                        renderer.present(&retained.prepared)?;
+                        renderer.present_shared(std::sync::Arc::clone(&retained.prepared))?;
                     }
                 }
             }

@@ -196,10 +196,22 @@ impl NativeRenderer {
         &mut self,
         prepared: &PreparedPresentation,
     ) -> Result<PresentReport, RenderError> {
+        self.present_shared(std::sync::Arc::new(prepared.clone()))
+    }
+
+    /// Retain the admitted snapshot without copying cell/image payloads. The baseline
+    /// advances only after successful native output, never when queueing a frame.
+    pub fn present_shared(
+        &mut self,
+        prepared: std::sync::Arc<PreparedPresentation>,
+    ) -> Result<PresentReport, RenderError> {
         let enabled = self.telemetry.is_some();
         let mut measurement = Measurement::new(enabled);
         self.gpu.begin_telemetry(enabled);
-        let mut result = self.present_inner(prepared, &mut measurement);
+        let mut result = self.present_inner(&prepared, &mut measurement);
+        if result.is_err() {
+            self.damage.invalidate();
+        }
         if let Some(telemetry) = &mut self.telemetry {
             let sample = measurement.finish(self.gpu.frame_telemetry());
             telemetry.record(sample, result.is_err());
@@ -207,8 +219,33 @@ impl NativeRenderer {
                 report.telemetry = Some(sample);
             }
         }
+        if result.is_ok() {
+            let generation = self.damage.committed(prepared);
+            if let Ok(report) = &mut result {
+                report.generation = generation;
+            }
+        }
         result
     }
+    /// Explicit diagnostic: compare current retained pixels with a forced complete
+    /// reconstruction. Intended for isolated workloads, not interactive rendering.
+    /// The complete rebuild becomes the new successful renderer baseline.
+    pub fn verify_retained_output(
+        &mut self,
+        prepared: &PreparedPresentation,
+    ) -> Result<(), RenderError> {
+        let incremental = self.gpu.readback()?;
+        self.damage.invalidate();
+        self.present(prepared)?;
+        let complete = self.gpu.readback()?;
+        if incremental != complete {
+            return Err(RenderError::Device(
+                "incremental output differs from full reconstruction".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn draw_image(
         &mut self,
         placement: &bmux_tui::image::ImagePlacement,
@@ -337,14 +374,35 @@ impl NativeRenderer {
             return Err(RenderError::Capacity("overlay work budget exhausted"));
         }
         self.gpu.begin();
-        let mut overlay_clip_budget = 1_000_000_usize;
-        let [cw, ch] = self.cell;
         let screen = [
             0.0,
             0.0,
             self.options.size.width as f32,
             self.options.size.height as f32,
         ];
+        let regions = self.damage.regions(prepared, self.cell, screen);
+        measurement.sample.damage_regions = regions.len() as u64;
+        for region in regions {
+            self.gpu.set_damage_clip(region);
+            self.gpu.quad(region, None, [0.0, 0.0, 0.0, 1.0], region)?;
+            measurement.sample.repaint_pixels += (region[2] * region[3]) as u64;
+            self.draw_region(prepared, measurement, region)?;
+        }
+        self.gpu.present()?;
+        Ok(PresentReport {
+            generation: 0,
+            telemetry: None,
+        })
+    }
+
+    fn draw_region(
+        &mut self,
+        prepared: &PreparedPresentation,
+        measurement: &mut Measurement,
+        screen: [f32; 4],
+    ) -> Result<(), RenderError> {
+        let mut overlay_clip_budget = 1_000_000_usize;
+        let [cw, ch] = self.cell;
         // Final compositor-winning clips exclude higher root chrome/overlays.
         // This iterator is output only, never an independent scene authority.
         let root = std::iter::once((
@@ -406,10 +464,13 @@ impl NativeRenderer {
         for (buffer, origin, scale, visible_clip, cursor, local_images, sparse_background, later) in
             root.chain(fragments)
         {
+            let Some(visible_clip) = intersect_clip(visible_clip, screen) else {
+                continue;
+            };
             let area = buffer.area();
             let [cw, ch] = [cw * scale, ch * scale];
-            // Swapchain images are not persistent; every accepted grid is redrawn.
-            for (index, cell) in buffer.cells().iter().enumerate() {
+            for index in visible_cell_indices(area, origin, [cw, ch], visible_clip) {
+                let cell = &buffer.cells()[index];
                 let x = f32::from(area.x) + (index % usize::from(area.width)) as f32;
                 let y = f32::from(area.y) + (index / usize::from(area.width)) as f32;
                 if sparse_background == Some(false) {
@@ -426,7 +487,8 @@ impl NativeRenderer {
             // Deduplicate repeated cells within the frame; GPU retention owns atlas lifetime.
             measurement.stage(Some(Stage::Text));
             let mut uploaded = HashMap::new();
-            for (index, cell) in buffer.cells().iter().enumerate() {
+            for index in visible_cell_indices(area, origin, [cw, ch], visible_clip) {
+                let cell = &buffer.cells()[index];
                 if cell.is_wide_continuation() || cell.style.modifiers.contains(Modifier::HIDDEN) {
                     continue;
                 }
@@ -458,6 +520,10 @@ impl NativeRenderer {
                     };
                     let (baseline, phase) =
                         crate::text::raster_origin([x, y + self.ascent * scale]);
+                    measurement.sample.text_cell_visits += 1;
+                    if measurement.sample.text_cell_visits > 1_000_000 {
+                        return Err(RenderError::Capacity("regional text work budget exhausted"));
+                    }
                     let raster = self.text.rasterize_cell_phased(
                         &cell.symbol,
                         u16::from(cell.width()),
@@ -564,6 +630,9 @@ impl NativeRenderer {
         // exceeds the retention budget. No payload or decoded pixels are retained here.
         let mut uploaded_images = HashMap::new();
         for placement in prepared.image_scene().placements() {
+            let Some((rect, clip)) = image_geometry(placement, [0.0; 2], [cw, ch], screen) else {
+                continue;
+            };
             let key = images::cache_key(&placement.payload)?;
             let uv = match uploaded_images.entry(key) {
                 std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
@@ -582,24 +651,7 @@ impl NativeRenderer {
                     uv
                 }
             };
-            let rect = placement.pixel_rect(f64::from(cw), f64::from(ch));
-            let clip = placement.clip.intersection(placement.destination);
-            self.gpu.quad(
-                [
-                    rect.x as f32,
-                    rect.y as f32,
-                    rect.width as f32,
-                    rect.height as f32,
-                ],
-                Some(uv),
-                [1.0; 4],
-                [
-                    f32::from(clip.x) * cw,
-                    f32::from(clip.y) * ch,
-                    f32::from(clip.width) * cw,
-                    f32::from(clip.height) * ch,
-                ],
-            )?;
+            self.gpu.quad(rect, Some(uv), [1.0; 4], clip)?;
         }
         measurement.stage(None);
         if let Some(cursor) = prepared.cursor().filter(|cursor| cursor.visible) {
@@ -615,11 +667,7 @@ impl NativeRenderer {
                 screen,
             )?;
         }
-        self.gpu.present()?;
-        Ok(PresentReport {
-            generation: self.damage.committed(),
-            telemetry: None,
-        })
+        Ok(())
     }
 }
 /// Subtract later original replacement spans from foreground/cursor paint only.
@@ -713,6 +761,25 @@ fn image_geometry(
     )?;
     intersect_clip(rect, clip)?;
     Some((rect, clip))
+}
+
+// Include a possible wide leader immediately left of the pixel cover.
+fn visible_cell_indices(
+    area: bmux_tui::geometry::Rect,
+    origin: [f32; 2],
+    cell: [f32; 2],
+    clip: [f32; 4],
+) -> impl Iterator<Item = usize> {
+    let left = (((clip[0] - origin[0]) / cell[0]).floor() - f32::from(area.x)).max(0.0) as usize;
+    let right =
+        (((clip[0] + clip[2] - origin[0]) / cell[0]).ceil() - f32::from(area.x)).max(0.0) as usize;
+    let top = (((clip[1] - origin[1]) / cell[1]).floor() - f32::from(area.y)).max(0.0) as usize;
+    let bottom =
+        (((clip[1] + clip[3] - origin[1]) / cell[1]).ceil() - f32::from(area.y)).max(0.0) as usize;
+    let width = usize::from(area.width);
+    (top.min(usize::from(area.height))..bottom.min(usize::from(area.height))).flat_map(move |row| {
+        (left.saturating_sub(1).min(width)..right.min(width)).map(move |col| row * width + col)
+    })
 }
 
 fn intersect_clip(a: [f32; 4], b: [f32; 4]) -> Option<[f32; 4]> {

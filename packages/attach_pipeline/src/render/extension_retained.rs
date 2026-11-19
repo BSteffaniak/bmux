@@ -526,6 +526,28 @@ pub(super) fn evict_retained_layer_snapshots_for_surface(
         .retain(|_, entry| entry.surface_id != surface_id);
 }
 
+// Borders paint a perimeter, not their interior bounding box. Preserve that
+// footprint for updates and cleanup before any downstream coalescing.
+fn item_damage(item: &RenderSceneItem) -> Vec<ExtensionRect> {
+    if let RenderSceneItemKind::Border { rect, .. } = &item.kind
+        && rect.w >= 2
+        && rect.h >= 2
+    {
+        return vec![
+            ExtensionRect::new(rect.x, rect.y, rect.w, 1),
+            ExtensionRect::new(rect.x, rect.y.saturating_add(rect.h - 1), rect.w, 1),
+            ExtensionRect::new(rect.x, rect.y.saturating_add(1), 1, rect.h - 2),
+            ExtensionRect::new(
+                rect.x.saturating_add(rect.w - 1),
+                rect.y.saturating_add(1),
+                1,
+                rect.h - 2,
+            ),
+        ];
+    }
+    vec![item.bounds]
+}
+
 pub(super) fn build_extension_layer_diff_plan(
     previous: Option<&ExtensionRetainedLayerSnapshot>,
     current: Option<&ExtensionRetainedLayerSnapshot>,
@@ -542,16 +564,16 @@ pub(super) fn build_extension_layer_diff_plan(
     match (previous, current) {
         (None, None) => {}
         (None, Some(current)) => {
-            update_rects.extend(current.items.iter().map(|item| item.bounds));
+            update_rects.extend(current.items.iter().flat_map(item_damage));
             added_items.extend(current.items.iter().map(|item| item.key.clone()));
         }
         (Some(previous), None) => {
-            cleanup_rects.extend(previous.items.iter().map(|item| item.bounds));
+            cleanup_rects.extend(previous.items.iter().flat_map(item_damage));
             removed_items.extend(previous.items.iter().map(|item| item.key.clone()));
         }
         (Some(previous), Some(current)) if previous.surface_rect != current.surface_rect => {
             cleanup_rects.push(previous.surface_rect);
-            update_rects.extend(current.items.iter().map(|item| item.bounds));
+            update_rects.extend(current.items.iter().flat_map(item_damage));
             changed_items.extend(current.items.iter().map(|item| item.key.clone()));
             removed_items.extend(previous.items.iter().map(|item| item.key.clone()));
         }
@@ -570,15 +592,20 @@ pub(super) fn build_extension_layer_diff_plan(
             for item in &current.items {
                 match previous_items.get(&item.key) {
                     None => {
-                        update_rects.push(item.bounds);
+                        update_rects.extend(item_damage(item));
                         added_items.push(item.key.clone());
                     }
                     Some(previous_item) if retained_items_equivalent(previous_item, item) => {
                         unchanged_items.push(item.key.clone());
                     }
                     Some(previous_item) => {
-                        update_rects.push(item.bounds);
-                        cleanup_rects.extend(rect_difference(previous_item.bounds, item.bounds));
+                        update_rects.extend(item_damage(item));
+                        if matches!(previous_item.kind, RenderSceneItemKind::Border { .. }) {
+                            cleanup_rects.extend(item_damage(previous_item));
+                        } else {
+                            cleanup_rects
+                                .extend(rect_difference(previous_item.bounds, item.bounds));
+                        }
                         changed_items.push(item.key.clone());
                     }
                 }
@@ -586,7 +613,7 @@ pub(super) fn build_extension_layer_diff_plan(
 
             for item in &previous.items {
                 if !current_items.contains_key(&item.key) {
-                    cleanup_rects.push(item.bounds);
+                    cleanup_rects.extend(item_damage(item));
                     removed_items.push(item.key.clone());
                 }
             }
