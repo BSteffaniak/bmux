@@ -337,7 +337,7 @@ pub async fn fetch_captured_history_line(
             line_index as usize,
             offset as usize,
             &HistorySlice {
-                cells: &cells,
+                cells: std::borrow::Cow::Borrowed(&cells),
                 next_cell_offset: next,
                 end,
             },
@@ -360,7 +360,7 @@ mod history_tests {
             0,
             0,
             &HistorySlice {
-                cells: &[Cell::new("X".to_owned(), StyleId(0), 1)],
+                cells: std::borrow::Cow::Borrowed(&[Cell::new("X".to_owned(), StyleId(0), 1)]),
                 next_cell_offset: 1,
                 end: HistorySliceEnd::HardBreak,
             },
@@ -1369,7 +1369,7 @@ mod history_tests {
                 index as usize,
                 0,
                 &HistorySlice {
-                    cells: &cells,
+                    cells: std::borrow::Cow::Borrowed(&cells),
                     next_cell_offset: cells.len(),
                     end: HistorySliceEnd::HardBreak,
                 },
@@ -3283,7 +3283,7 @@ pub async fn captured_tail_window(
                 line_index,
                 line.next_offset(),
                 &HistorySlice {
-                    cells: &cells,
+                    cells: std::borrow::Cow::Borrowed(&cells),
                     next_cell_offset: next,
                     end,
                 },
@@ -3529,7 +3529,7 @@ async fn fetch_captured_content_line(
             logical,
             0,
             &HistorySlice {
-                cells,
+                cells: std::borrow::Cow::Borrowed(cells),
                 next_cell_offset: prefix.next_offset(),
                 end: HistorySliceEnd::Continue,
             },
@@ -3576,7 +3576,7 @@ async fn fetch_captured_content_line(
                 logical,
                 line.next_offset(),
                 &HistorySlice {
-                    cells: &cells,
+                    cells: std::borrow::Cow::Borrowed(&cells),
                     next_cell_offset: tail_next_column(line.next_offset(), &cells)?,
                     end,
                 },
@@ -3687,7 +3687,7 @@ async fn captured_tail_prefix(
             0,
             0,
             &HistorySlice {
-                cells,
+                cells: std::borrow::Cow::Borrowed(cells),
                 next_cell_offset: prefix.next_offset(),
                 end: HistorySliceEnd::Continue,
             },

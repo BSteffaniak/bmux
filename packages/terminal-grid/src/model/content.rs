@@ -241,7 +241,7 @@ impl TerminalGrid {
                 .take(max_lines.saturating_sub(lines.len()))
             {
                 let mut cells = Vec::new();
-                copy_cells(&mut cells, &line.cells, &mut budget)?;
+                copy_cells(&mut cells, &line.cells(), &mut budget)?;
                 push_line(&mut lines, cells, false, &mut budget)?;
                 history_used += 1;
             }

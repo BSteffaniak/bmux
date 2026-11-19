@@ -41,17 +41,28 @@ pub(crate) fn projected_logical_line_row_count_retained(
     width: usize,
     retain: bool,
 ) -> usize {
-    let width = width.max(1);
-    let cells = projection_cells(cells, retain);
-    if cells.is_empty() {
-        return 1;
-    }
+    projected_row_count_from_widths(
+        projection_cells(cells, retain)
+            .iter()
+            .map(|cell| usize::from(cell.width())),
+        width,
+    )
+}
 
+/// The rows cells of these widths project to at `width` (the cells' own trailing blanks already
+/// left out, as [`projection_cells`] leaves them).
+pub(crate) fn projected_row_count_from_widths(
+    widths: impl IntoIterator<Item = usize>,
+    width: usize,
+) -> usize {
+    let width = width.max(1);
     let mut rows = 0_usize;
     let mut col = 0_usize;
     let mut current_has_cells = false;
-    for cell in cells {
-        let cell_width = usize::from(cell.width()).max(1);
+    let mut any = false;
+    for cell_width in widths {
+        any = true;
+        let cell_width = cell_width.max(1);
         if col > 0 && col.saturating_add(cell_width) > width {
             rows = rows.saturating_add(1);
             col = 0;
@@ -63,6 +74,9 @@ pub(crate) fn projected_logical_line_row_count_retained(
             col = 0;
             current_has_cells = false;
         }
+    }
+    if !any {
+        return 1;
     }
     if current_has_cells {
         rows = rows.saturating_add(1);
