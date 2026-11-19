@@ -145,13 +145,23 @@ def work_tool(*args: str) -> subprocess.CompletedProcess:
          *args], cwd=ROOT, capture_output=True, text=True, check=False)
 
 
+def bench_scenarios(bench: str, out: Path) -> list[dict]:
+    """`bench`'s scenarios and their frame counts, which are the same on every OS: from the metrics
+    report this run wrote, else this OS's baseline, else another OS's."""
+    candidates = [out / baseline_path(bench).name, baseline_path(bench),
+                  *sorted(BASELINES.glob(f"{bench}-*.json"))]
+    for path in candidates:
+        if path.exists():
+            return json.loads(path.read_text())["scenarios"]
+    sys.exit(f"no metrics report or baseline lists {bench}'s scenarios; run `check` first")
+
+
 def run_work(bench: str, out: Path, only: str | None = None, top: int = 40) -> dict:
-    """Profile each of `bench`'s scenarios (those of its metrics baseline) in its own process and
-    return its work report."""
+    """Profile each of `bench`'s scenarios in its own process and return its work report."""
     test, _ = TESTS[bench]
     binary = coverage_binary(bench)
     profdata = llvm_profdata()
-    scenarios = json.loads(baseline_path(bench).read_text())["scenarios"]
+    scenarios = bench_scenarios(bench, out)
     report = {"scenarios": []}
     for scenario in scenarios:
         name = scenario["name"]
