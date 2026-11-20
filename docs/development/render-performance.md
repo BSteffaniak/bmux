@@ -92,10 +92,10 @@ client now keeps its panes current with frames (see
 | --- | --- | --- | --- | --- |
 | Full repaint | client apply | 42,274 → 0 | 65.1M → 4.9M (−93%) | 128,475 → 128,475 |
 | Full repaint | server frame build | — → 4 | — → 3.2M | |
-| Full repaint | client render | 120 → 24 | 22.8M → 17.5M (−23%) | |
+| Full repaint | client render | 120 → 24 | 22.8M → 14.5M (−36%) | |
 | Streaming text | client apply | 1,409 → 3 | 2.24M → 0.18M (−92%) | 4,769 → 4,769 |
 | Streaming text | server frame build | — → 3 | — → 0.13M | |
-| Streaming text | client render | — | 1.35M → 1.11M (−18%) | |
+| Streaming text | client render | — | 1.35M → 1.01M (−25%) | |
 | Moving sixel image | client apply + render | 7,270 → 52 | 23.6M → 5.0M (−79%) | 104,180 → 85,639 |
 | Full repaint | pane reader | 101,285 → 2.8 | 136.9M → 14.4M (−89%) | |
 | Streaming text | pane reader | 3,380 → 6 | 4.75M → 0.70M (−85%) | |
@@ -128,13 +128,14 @@ What changed, each its own commit with its numbers:
   without an image start skip the image interceptor; escapes are found with memchr; control
   sequence parameters reuse one buffer in one pass; no per-chunk allocation or per-sequence
   memset in the reader; image positions follow each grid operation in the one parse, not a byte
-  at a time.
+  at a time. Colour-only SGR changes are written directly, without building the reset and
+  difference forms to compare.
 
 ## Known costs left
 
-- **Client render** is still the client's largest cost (17.5M instructions for a full repaint,
-  about 460 a cell), most of it encoding: the SGR changes a colourful screen needs, written cell
-  run by cell run.
+- **Client render** is still the client's largest cost (14.5M instructions for a full repaint,
+  about 380 a cell): comparing and writing the compositor's 40-byte cells, and encoding the SGR
+  changes a colourful screen needs. Compact cells (phase 5) would shrink both.
 - **The server still runs separate scanners for images and shell metadata**, and the raw output
   fan-out for its remaining consumers (cluster replication, playbook, recording), now with
   memchr and a pass-through check, but still a scan each.
