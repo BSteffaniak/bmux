@@ -2535,6 +2535,12 @@ fn apply_pane_frames(
             buffer.terminal_grid.grid().protocol_state(),
         );
         view_state.replay_log.applied(&frame.replay_markers);
+        if !frame.clipboard_writes.is_empty() {
+            let policy = load_attach_config().unwrap_or_default().clipboard.osc52;
+            for text in frame.clipboard_writes {
+                pane_clipboard_write(view_state, pane_id, text, policy);
+            }
+        }
         view_state
             .dirty
             .mark_pane_dirty(pane_id, AttachDirtySource::PaneOutput);
@@ -2548,6 +2554,67 @@ fn apply_pane_frames(
         applied.any_sync_active |= frame.sync_update_active;
     }
     applied
+}
+
+/// A pane's program set the clipboard (OSC 52): write it, drop it, or ask, as
+/// `clipboard.osc52` says; under `ask` the answer holds for the pane while attached.
+fn pane_clipboard_write(
+    view_state: &mut AttachViewState,
+    pane_id: Uuid,
+    text: String,
+    policy: bmux_config::ClipboardOsc52Policy,
+) {
+    use bmux_config::ClipboardOsc52Policy;
+    let allowed = match policy {
+        ClipboardOsc52Policy::Allow => true,
+        ClipboardOsc52Policy::Deny => false,
+        ClipboardOsc52Policy::Ask => {
+            if let Some(allowed) = view_state.clipboard_permissions.get(&pane_id) {
+                *allowed
+            } else {
+                ask_pane_clipboard_write(view_state, pane_id, text);
+                return;
+            }
+        }
+    };
+    if allowed {
+        write_pane_clipboard_text(view_state, &text);
+    }
+}
+
+fn ask_pane_clipboard_write(view_state: &mut AttachViewState, pane_id: Uuid, text: String) {
+    let now = SystemAttachClock.now();
+    if view_state.prompt.is_busy() {
+        view_state.set_transient_status(
+            "clipboard write from a pane ignored: a prompt is open",
+            now,
+            ATTACH_TRANSIENT_STATUS_TTL,
+        );
+        return;
+    }
+    let length = text.chars().count();
+    view_state.prompt.enqueue_internal(
+        PromptRequest::confirm("Allow this pane to set the clipboard?")
+            .message(format!(
+                "A program in the pane wrote {length} characters to the clipboard (OSC 52). \
+                 Your answer holds for this pane while attached."
+            ))
+            .submit_label("Allow")
+            .cancel_label("Deny")
+            .confirm_default(false)
+            .policy(prompt::PromptPolicy::RejectIfBusy),
+        AttachInternalPromptAction::ClipboardWrite { pane_id, text },
+    );
+}
+
+fn write_pane_clipboard_text(view_state: &mut AttachViewState, text: &str) {
+    if let Err(error) = copy_text_with_clipboard_plugin(text) {
+        view_state.set_transient_status(
+            format!("clipboard write failed: {error}"),
+            SystemAttachClock.now(),
+            ATTACH_TRANSIENT_STATUS_TTL,
+        );
+    }
 }
 
 /// Start the replicas of `pane_ids` over and apply the reset frames that bring them back.
@@ -14473,6 +14540,13 @@ pub async fn handle_attach_prompt_completion_at(
             let _ = response_tx.send(completion.response);
         }
         AttachPromptOrigin::Internal(action) => match action {
+            AttachInternalPromptAction::ClipboardWrite { pane_id, text } => {
+                let allowed = prompt_response_is_confirmed(&completion.response);
+                view_state.clipboard_permissions.insert(pane_id, allowed);
+                if allowed {
+                    write_pane_clipboard_text(view_state, &text);
+                }
+            }
             AttachInternalPromptAction::QuitSession => {
                 if prompt_response_is_confirmed(&completion.response) {
                     let selector = attached_session_selector(view_state);
@@ -23008,6 +23082,36 @@ mod tests {
         );
     }
 
+    /// Under `ask`, a pane's first clipboard write asks, and none is written meanwhile; a pane
+    /// already denied is not asked again, and `deny` never asks.
+    #[test]
+    fn pane_clipboard_writes_follow_the_policy() {
+        use bmux_config::ClipboardOsc52Policy;
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        let (asked, denied) = (Uuid::new_v4(), Uuid::new_v4());
+        super::pane_clipboard_write(
+            &mut view_state,
+            asked,
+            "one".into(),
+            ClipboardOsc52Policy::Ask,
+        );
+        assert!(view_state.prompt.is_busy(), "the first write asks");
+        view_state.clipboard_permissions.insert(denied, false);
+        let mut quiet = attach_view_state_with_scrollback_fixture();
+        quiet.clipboard_permissions.insert(denied, false);
+        super::pane_clipboard_write(&mut quiet, denied, "two".into(), ClipboardOsc52Policy::Ask);
+        super::pane_clipboard_write(
+            &mut quiet,
+            asked,
+            "three".into(),
+            ClipboardOsc52Policy::Deny,
+        );
+        assert!(
+            !quiet.prompt.is_busy(),
+            "a denied pane and the deny policy never ask"
+        );
+    }
+
     /// Frames bring a pane's replica level with the server's grid: the pane is redrawn, its
     /// modes become its input hints, a screen switch redraws the frame, and a frame that does
     /// not apply is reported so the replica starts over.
@@ -23031,6 +23135,7 @@ mod tests {
                     bytes
                 },
                 replay_markers: Vec::new(),
+                clipboard_writes: Vec::new(),
             }
         };
         source.process(b"hello\x1b[?1000h");

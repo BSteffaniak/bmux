@@ -1217,6 +1217,22 @@ pub struct ClipboardConfig {
     /// Remote clipboard sync policy.
     #[config_doc(nested)]
     pub remote_sync: ClipboardRemoteSyncConfig,
+    /// What a program in a pane may do to the clipboard by writing OSC 52: `ask` (the first
+    /// write from a pane asks; the answer holds for that pane while attached), `allow`, or `deny`.
+    pub osc52: ClipboardOsc52Policy,
+}
+
+/// Whether programs in panes may set the clipboard (OSC 52).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardOsc52Policy {
+    /// Ask on a pane's first write; the answer holds for that pane while attached.
+    #[default]
+    Ask,
+    /// Write without asking.
+    Allow,
+    /// Never write.
+    Deny,
 }
 
 /// Remote clipboard sync policy and limits.

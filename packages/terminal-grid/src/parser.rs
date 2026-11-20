@@ -20,6 +20,8 @@ pub struct TerminalGridStream {
     previous_pending: Vec<u8>,
     /// A DCS string an observer asked for, collected across chunks.
     observed_dcs: ObservedDcs,
+    /// An OSC payload an observer asked for, collected across chunks.
+    observed_osc: ObservedOsc,
 }
 
 impl TerminalGridStream {
@@ -41,6 +43,7 @@ impl TerminalGridStream {
             pending_bytes: Vec::new(),
             previous_pending: Vec::new(),
             observed_dcs: ObservedDcs::default(),
+            observed_osc: ObservedOsc::default(),
         }
     }
 
@@ -114,6 +117,7 @@ impl TerminalGridStream {
             grid: &mut self.grid,
             observer,
             dcs: &mut self.observed_dcs,
+            osc: &mut self.observed_osc,
         };
         self.parser.advance(&mut performer, bytes);
         // Written into the storage of the prefix before last: normal text writes nothing.
@@ -277,12 +281,17 @@ pub(crate) fn process(grid: &mut TerminalGrid, bytes: &[u8]) {
         grid,
         observer: &mut IgnoreSequences,
         dcs: &mut ObservedDcs::default(),
+        osc: &mut ObservedOsc::default(),
     };
     parser.advance(&mut performer, bytes);
 }
 
 /// The longest DCS string an observer is shown; a longer one is dropped.
 pub const MAX_OBSERVED_DCS_BYTES: usize = 512;
+
+/// The longest OSC payload an observer collects ([`SequenceObserver::wants_osc`]); a longer
+/// one is dropped.
+pub const MAX_OBSERVED_OSC_BYTES: usize = 1024 * 1024;
 
 /// What a caller observes of the sequences a [`TerminalGridStream`] parses, in order with the
 /// grid's own handling: each call comes after the grid has applied the sequence, with the grid as
@@ -312,6 +321,17 @@ pub trait SequenceObserver {
 
     /// The bell (BEL outside any string, where it terminates nothing).
     fn bell(&mut self, _grid: &TerminalGrid) {}
+
+    /// Whether to collect the whole payload of OSC strings numbered `number`, for
+    /// [`Self::osc_payload`]: [`Self::osc`] shows parameters bounded by the parser's buffer,
+    /// which truncates long strings.
+    fn wants_osc(&mut self, _number: u32) -> bool {
+        false
+    }
+
+    /// The whole payload (after the number and its `;`, at most [`MAX_OBSERVED_OSC_BYTES`]) of a
+    /// complete OSC string [`Self::wants_osc`] asked for.
+    fn osc_payload(&mut self, _grid: &TerminalGrid, _number: u32, _payload: &[u8]) {}
 }
 
 /// An observer of nothing.
@@ -379,6 +399,24 @@ impl std::ops::Deref for HeaderValues {
     fn deref(&self) -> &[u16] {
         &self.values[..self.len]
     }
+}
+
+/// An OSC payload being collected for an observer: its number is read first, then the rest
+/// collected when the observer wants it.
+#[derive(Default)]
+struct ObservedOsc {
+    phase: OscPhase,
+    number: u32,
+    overflow: bool,
+    data: Vec<u8>,
+}
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum OscPhase {
+    #[default]
+    Ignoring,
+    Number,
+    Collecting,
 }
 
 /// A DCS string being collected for an observer.
@@ -515,6 +553,7 @@ struct GridPerformer<'a, O: SequenceObserver> {
     grid: &'a mut TerminalGrid,
     observer: &'a mut O,
     dcs: &'a mut ObservedDcs,
+    osc: &'a mut ObservedOsc,
 }
 
 impl<O: SequenceObserver> Perform for GridPerformer<'_, O> {
@@ -593,9 +632,47 @@ impl<O: SequenceObserver> Perform for GridPerformer<'_, O> {
         }
     }
 
+    fn osc_start(&mut self) {
+        let osc = &mut *self.osc;
+        osc.phase = OscPhase::Number;
+        osc.number = 0;
+    }
+
+    fn osc_put(&mut self, byte: u8) {
+        let osc = &mut *self.osc;
+        match osc.phase {
+            OscPhase::Ignoring => {}
+            OscPhase::Number => match byte {
+                b'0'..=b'9' => {
+                    osc.number = osc
+                        .number
+                        .saturating_mul(10)
+                        .saturating_add(u32::from(byte - b'0'));
+                }
+                b';' if self.observer.wants_osc(osc.number) => {
+                    osc.phase = OscPhase::Collecting;
+                    osc.overflow = false;
+                    osc.data.clear();
+                }
+                _ => osc.phase = OscPhase::Ignoring,
+            },
+            OscPhase::Collecting => {
+                if osc.data.len() < MAX_OBSERVED_OSC_BYTES {
+                    osc.data.push(byte);
+                } else {
+                    osc.overflow = true;
+                }
+            }
+        }
+    }
+
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         self.apply_osc(params);
         self.observer.osc(self.grid, params, bell_terminated);
+        let osc = &mut *self.osc;
+        if std::mem::take(&mut osc.phase) == OscPhase::Collecting && !osc.overflow {
+            self.observer.osc_payload(self.grid, osc.number, &osc.data);
+        }
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
@@ -1018,6 +1095,7 @@ mod tests {
             grid: &mut stream.grid,
             observer: &mut super::IgnoreSequences,
             dcs: &mut stream.observed_dcs,
+            osc: &mut stream.observed_osc,
         };
         stream
             .parser
@@ -1933,6 +2011,36 @@ mod tests {
         assert!(!protocol.application_cursor);
         assert!(!protocol.application_keypad);
         assert!(!protocol.bracketed_paste);
+    }
+
+    /// An observer wanting an OSC number gets its whole payload, however long and however split
+    /// across chunks; others are not collected.
+    #[test]
+    fn wanted_osc_payloads_are_collected_whole_across_chunks() {
+        #[derive(Default)]
+        struct Clipboard(Vec<(u32, Vec<u8>)>);
+        impl super::SequenceObserver for Clipboard {
+            fn wants_osc(&mut self, number: u32) -> bool {
+                number == 52
+            }
+            fn osc_payload(&mut self, _grid: &TerminalGrid, number: u32, payload: &[u8]) {
+                self.0.push((number, payload.to_vec()));
+            }
+        }
+        let long = "QUJD".repeat(1250);
+        let stream_bytes = format!("\x1b]2;title\x07\x1b]52;c;{long}\x07\x1b]52;p;?\x1b\\");
+        let mut stream = TerminalGridStream::new(20, 4, GridLimits::default()).unwrap();
+        let mut observer = Clipboard::default();
+        for chunk in stream_bytes.as_bytes().chunks(777) {
+            stream.process_observed(chunk, &mut observer);
+        }
+        assert_eq!(
+            observer.0,
+            [
+                (52, format!("c;{long}").into_bytes()),
+                (52, b"p;?".to_vec())
+            ]
+        );
     }
 
     /// DECSTR returns every input mode to its default in the grid and the protocol tracker alike,

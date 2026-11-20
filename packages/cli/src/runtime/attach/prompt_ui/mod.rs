@@ -72,6 +72,11 @@ pub enum AttachInternalPromptAction {
         pane_id: Uuid,
         session_id: Uuid,
     },
+    /// A pane's program set the clipboard (OSC 52) under the `ask` policy.
+    ClipboardWrite {
+        pane_id: Uuid,
+        text: String,
+    },
 }
 
 #[derive(Debug)]

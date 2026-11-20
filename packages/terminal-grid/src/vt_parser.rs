@@ -125,6 +125,11 @@ pub(crate) trait Perform {
     fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _action: char) {}
     fn put(&mut self, _byte: u8) {}
     fn unhook(&mut self) {}
+    /// An OSC string begins.
+    fn osc_start(&mut self) {}
+    /// One byte of the OSC string's payload, `;` separators included, as it arrives (not
+    /// bounded by the parser's own buffer).
+    fn osc_put(&mut self, _byte: u8) {}
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
     fn csi_dispatch(
         &mut self,
@@ -585,6 +590,7 @@ impl<const N: usize> Parser<N> {
                     }
                 }
                 b';' => {
+                    performer.osc_put(byte);
                     if self.osc_args < 16 {
                         self.osc_ends[self.osc_args] = self.osc_len;
                         self.osc_args += 1;
@@ -593,6 +599,7 @@ impl<const N: usize> Parser<N> {
                     }
                 }
                 _ => {
+                    performer.osc_put(byte);
                     if self.osc_len < N && self.osc_args < 16 {
                         self.osc[self.osc_len] = byte;
                         self.osc_len += 1;
@@ -631,6 +638,7 @@ impl<const N: usize> Parser<N> {
                 self.osc_args = 0;
                 self.osc_overflow = false;
                 self.state = State::Osc;
+                performer.osc_start();
             }
             b'X' | b'^' | b'_' if self.state == State::Escape => self.state = State::StringDiscard,
             0x30..=0x7e => {

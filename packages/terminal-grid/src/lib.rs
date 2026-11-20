@@ -47,8 +47,9 @@ pub use model::{
     SelectionCell, TerminalGrid, TerminalGridError, ViewportScroll, physical_row_is_blank,
 };
 pub use parser::{
-    HeaderValues, IgnoreSequences, MAX_OBSERVED_DCS_BYTES, ProtocolProcessOutcome, SequenceHeader,
-    SequenceObserver, TerminalGridStream, TerminalProtocolTracker,
+    HeaderValues, IgnoreSequences, MAX_OBSERVED_DCS_BYTES, MAX_OBSERVED_OSC_BYTES,
+    ProtocolProcessOutcome, SequenceHeader, SequenceObserver, TerminalGridStream,
+    TerminalProtocolTracker,
 };
 pub use render::{
     content_text, full_screen_repaint_bytes, row_text, visible_text, visible_text_lines,

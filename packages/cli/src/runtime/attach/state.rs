@@ -259,6 +259,9 @@ pub struct AttachViewState {
     pub(super) output_push: OutputPush,
     /// The server said this client's input producer barriers changed.
     pub(super) producer_barriers_changed: bool,
+    /// Whether each pane may set the clipboard (OSC 52), as answered under the `ask` policy;
+    /// the answer holds while attached.
+    pub(super) clipboard_permissions: std::collections::BTreeMap<Uuid, bool>,
     /// Opt-in end-to-end latency log for replayed frames.
     pub(super) replay_log: super::replay_log::ReplayLog,
     /// Presents frames on the host through a `bmux_tui` terminal from what the renderer captures.
@@ -679,6 +682,7 @@ impl AttachViewState {
         Self {
             output_push: OutputPush::default(),
             producer_barriers_changed: false,
+            clipboard_permissions: std::collections::BTreeMap::new(),
             replay_log: super::replay_log::ReplayLog::from_env(),
             presenting: false,
             terminal_presenter: bmux_attach_pipeline::frame_presenter::FramePresenter::new(),

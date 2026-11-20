@@ -2409,6 +2409,27 @@ enum PaneSignal {
         line: u64,
         exit_status: Option<u32>,
     },
+    /// OSC 52: the program sets a clipboard. Sent only to the clients viewing the pane (in their
+    /// frames), which apply their own policy; never published to plugins.
+    ClipboardWrite {
+        selection: String,
+        text: String,
+    },
+}
+
+/// The clipboard write an OSC 52 payload (`selection;base64`) carries, if any: a query (`?`)
+/// reads instead, and text must be valid UTF-8.
+fn clipboard_write(payload: &[u8]) -> Option<PaneSignal> {
+    let split = payload.iter().position(|byte| *byte == b';')?;
+    let (selection, data) = (&payload[..split], &payload[split + 1..]);
+    if data == b"?" {
+        return None;
+    }
+    let text = String::from_utf8(decode_base64(std::str::from_utf8(data).ok()?)?).ok()?;
+    Some(PaneSignal::ClipboardWrite {
+        selection: String::from_utf8_lossy(selection).into_owned(),
+        text,
+    })
 }
 
 impl PaneSignal {
@@ -2489,6 +2510,7 @@ impl PaneSignal {
                 line,
                 exit_status,
             },
+            Self::ClipboardWrite { .. } => unreachable!("clipboard writes go to clients only"),
         }
     }
 }
@@ -2534,6 +2556,14 @@ impl SequenceObserver for ReaderObserver<'_> {
 
     fn bell(&mut self, _grid: &TerminalGrid) {
         self.signals.push(PaneSignal::Bell);
+    }
+
+    fn wants_osc(&mut self, number: u32) -> bool {
+        number == 52
+    }
+
+    fn osc_payload(&mut self, _grid: &TerminalGrid, _number: u32, payload: &[u8]) {
+        self.signals.extend(clipboard_write(payload));
     }
 
     fn wants_dcs(&mut self, introducer: &SequenceHeader<'_>) -> bool {
@@ -4380,6 +4410,8 @@ struct PaneFrameReplica {
     revision: u64,
     /// `bmux-bench replay` markers read since its last frame (only while replay is logged).
     replay_markers: Vec<(u64, u128)>,
+    /// Clipboard writes (selection, text) the pane's program made since its last frame.
+    clipboard_writes: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -8345,6 +8377,17 @@ impl SessionRuntimeManager {
                                     );
                                 }
                                 for signal in reader_state.signals.drain(..) {
+                                    if let PaneSignal::ClipboardWrite { selection, text } = signal {
+                                        // Only for the clients viewing the pane, in their frames.
+                                        if let Ok(mut replicas) = frame_replicas_for_reader.lock() {
+                                            for replica in replicas.values_mut() {
+                                                replica
+                                                    .clipboard_writes
+                                                    .push((selection.clone(), text.clone()));
+                                            }
+                                        }
+                                        continue;
+                                    }
                                     host.publish_terminal_event(
                                         signal.into_event(session_id.0, pane_id),
                                     );
@@ -12166,7 +12209,10 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                 .map_err(|_| SessionRuntimeError::Closed)?;
             let replica = replicas.entry(client_id).or_default();
             let revision = grid.grid().revision();
-            if replica.cursor.epoch != 0 && replica.revision == revision {
+            if replica.cursor.epoch != 0
+                && replica.revision == revision
+                && replica.clipboard_writes.is_empty()
+            {
                 continue;
             }
             // Sealing a frame not sent loses nothing: the next one is built from the same base.
@@ -12191,11 +12237,22 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                 .drain(..)
                 .flat_map(|(frame, written)| bmux_bench::corpus::marker(frame, written))
                 .collect();
+            let clipboard_writes = replica
+                .clipboard_writes
+                .drain(..)
+                .map(
+                    |(selection, text)| bmux_pane_runtime_state::PaneClipboardWrite {
+                        selection,
+                        text,
+                    },
+                )
+                .collect();
             frames.push(bmux_pane_runtime_state::AttachPaneFrame {
                 pane_id: pane.pane_id,
                 sync_update_active,
                 encoded,
                 replay_markers,
+                clipboard_writes,
             });
         }
         // Output that arrived while these frames were built is sent next.
@@ -18537,6 +18594,62 @@ exit 7"#
         );
         assert_eq!(remaining, expected.len() - 1);
         assert_eq!(grid.snapshot(0, 2), snapshot);
+    }
+
+    /// OSC 52 writes are recognized (selection kept, text decoded); queries and malformed or
+    /// non-UTF-8 payloads are not writes.
+    #[test]
+    fn clipboard_writes_are_decoded_and_queries_ignored() {
+        assert_eq!(
+            clipboard_write(b"c;aGVsbG8gd29ybGQ="),
+            Some(PaneSignal::ClipboardWrite {
+                selection: "c".into(),
+                text: "hello world".into(),
+            })
+        );
+        assert_eq!(clipboard_write(b"c;?"), None);
+        assert_eq!(clipboard_write(b"c;not base64!"), None);
+        assert_eq!(clipboard_write(b"c;/w=="), None, "not UTF-8");
+        assert_eq!(clipboard_write(b"no separator"), None);
+    }
+
+    /// A clipboard write queued for a client reaches it in a frame, even when the grid did not
+    /// otherwise change, and only once.
+    #[tokio::test]
+    async fn queued_clipboard_writes_reach_the_client_in_its_next_frame() {
+        use bmux_pane_runtime_state::SessionRuntimeManagerApi as Api;
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[pane_id]);
+        runtime.attached_clients.insert(client_id);
+        let pane = runtime.panes.get(&pane_id).expect("pane should exist");
+        set_pane_grid(pane, 20, 4);
+        let replicas = Arc::clone(&pane.frame_replicas);
+        let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
+        let frames = || {
+            Api::attach_pane_frames(&adapter, session_id, client_id, &[pane_id], 0)
+                .expect("attached client gets frames")
+                .0
+        };
+        assert_eq!(frames().len(), 1);
+        assert!(frames().is_empty());
+        replicas
+            .lock()
+            .unwrap()
+            .get_mut(&client_id)
+            .unwrap()
+            .clipboard_writes
+            .push(("c".into(), "copied".into()));
+        let sent = frames();
+        assert_eq!(
+            sent[0].clipboard_writes,
+            [bmux_pane_runtime_state::PaneClipboardWrite {
+                selection: "c".into(),
+                text: "copied".into(),
+            }]
+        );
+        assert!(frames().is_empty(), "sent once");
     }
 
     /// What a program signals beyond the screen reaches the reader in order: titles (even with

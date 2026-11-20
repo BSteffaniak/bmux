@@ -114,6 +114,7 @@ fn generated_frame_transport_carries_frames_that_apply() {
             sync_update_active: true,
             encoded: frame.clone(),
             replay_markers: Vec::new(),
+            clipboard_writes: Vec::new(),
         }],
         frames_still_pending: false,
     });

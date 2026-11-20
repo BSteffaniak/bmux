@@ -1297,6 +1297,15 @@ interface attach-runtime-state {
         // `bmux-bench replay` markers the program wrote since the client's last frame, as
         // written; empty unless the server logs replay.
         replay_markers: list<u8>,
+        // Clipboard writes (OSC 52) the program made since the client's last frame, for the
+        // client's clipboard policy.
+        clipboard_writes: list<pane-clipboard-write>,
+    }
+
+    record pane-clipboard-write {
+        // The selection named (c clipboard, p primary, ...), as given.
+        selection: string,
+        text: string,
     }
 
     record attach-pane-frames {

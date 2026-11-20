@@ -184,6 +184,17 @@ pub struct AttachPaneFrame {
     /// `bmux-bench replay` markers the program wrote since the client's last frame, as written
     /// (empty unless the server logs replay).
     pub replay_markers: Vec<u8>,
+    /// Clipboard writes (OSC 52) the program made since the client's last frame, for the
+    /// client's clipboard policy.
+    pub clipboard_writes: Vec<PaneClipboardWrite>,
+}
+
+/// A clipboard write a pane's program made (OSC 52).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneClipboardWrite {
+    /// The selection it names (`c` clipboard, `p` primary, ...), as given.
+    pub selection: String,
+    pub text: String,
 }
 
 /// Process identity for a running pane runtime. `pid` is the spawned

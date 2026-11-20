@@ -109,6 +109,8 @@ pub struct PaneFrameResult {
     pub encoded: Vec<u8>,
     /// `bmux-bench replay` markers written since the last frame, as written.
     pub replay_markers: Vec<u8>,
+    /// Clipboard texts the pane's program set (OSC 52) since the last frame.
+    pub clipboard_writes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3966,6 +3968,11 @@ pub async fn attach_pane_frames_streaming(
                     sync_update_active: frame.sync_update_active,
                     encoded: frame.encoded,
                     replay_markers: frame.replay_markers,
+                    clipboard_writes: frame
+                        .clipboard_writes
+                        .into_iter()
+                        .map(|write| write.text)
+                        .collect(),
                 })
                 .collect(),
             state.frames_still_pending,
@@ -5059,6 +5066,11 @@ pub fn decode_pushed_frames(payload: &[u8]) -> Option<Vec<PaneFrameResult>> {
                 sync_update_active: frame.sync_update_active,
                 encoded: frame.encoded,
                 replay_markers: frame.replay_markers,
+                clipboard_writes: frame
+                    .clipboard_writes
+                    .into_iter()
+                    .map(|write| write.text)
+                    .collect(),
             })
             .collect(),
     )

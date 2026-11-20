@@ -14,9 +14,9 @@ use bmux_pane_runtime_plugin_api::attach_runtime_state::{
     AttachLayout as AttachLayoutRecord, AttachPaneFrames, AttachPaneFramesReset,
     AttachPaneGridSnapshot, AttachPaneGridWindow, AttachPaneImages, AttachPaneOutputBatch,
     AttachPaneOutputPush, AttachPaneSnapshot as AttachPaneSnapshotRecord,
-    AttachSnapshot as AttachSnapshotRecord, AttachStateError, PaneChunk, PaneFrame,
-    PaneGridSnapshot, PaneGridWindow, PaneGridWindowRequest, PaneInputMode, PaneMouseProtocol,
-    PaneOutputCursorRead, PaneScrollbackPin, PaneScrollbackUnpinAck,
+    AttachSnapshot as AttachSnapshotRecord, AttachStateError, PaneChunk, PaneClipboardWrite,
+    PaneFrame, PaneGridSnapshot, PaneGridWindow, PaneGridWindowRequest, PaneInputMode,
+    PaneMouseProtocol, PaneOutputCursorRead, PaneScrollbackPin, PaneScrollbackUnpinAck,
 };
 use bmux_plugin_sdk::NativeServiceContext;
 use bmux_session_models::{ClientId, SessionId};
@@ -696,6 +696,14 @@ pub(super) fn frames_record(
                 sync_update_active: frame.sync_update_active,
                 encoded: frame.encoded,
                 replay_markers: frame.replay_markers,
+                clipboard_writes: frame
+                    .clipboard_writes
+                    .into_iter()
+                    .map(|write| PaneClipboardWrite {
+                        selection: write.selection,
+                        text: write.text,
+                    })
+                    .collect(),
             })
             .collect(),
         frames_still_pending,

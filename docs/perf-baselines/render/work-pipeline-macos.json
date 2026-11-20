@@ -1659,17 +1659,17 @@
     {
       "name": "unclosed-sync",
       "frames": 302,
-      "units_per_frame": 165539.9,
+      "units_per_frame": 178792.92,
       "functions": [
         {
           "name": "<bmux_bench::allocations::CountingAllocator as core::alloc::global::GlobalAlloc>::realloc",
-          "units_per_frame": 9189.9,
+          "units_per_frame": 9189.91,
           "entries_per_frame": 4594.95
         },
         {
           "name": "<bmux_terminal_grid::model::CellText>::as_str",
-          "units_per_frame": 7688.12,
-          "entries_per_frame": 7688.12
+          "units_per_frame": 7878.2,
+          "entries_per_frame": 7878.2
         },
         {
           "name": "<bmux_terminal_grid::model::CompactCells>::encode",
@@ -1693,8 +1693,8 @@
         },
         {
           "name": "<bmux_terminal_grid::model::Cell>::text",
-          "units_per_frame": 5125.27,
-          "entries_per_frame": 5125.27
+          "units_per_frame": 5315.35,
+          "entries_per_frame": 5315.35
         },
         {
           "name": "bmux_terminal_grid::model::frame::read_line",
@@ -1812,6 +1812,11 @@
           "entries_per_frame": 1687.2
         },
         {
+          "name": "<bmux_tui::symbol::Symbol>::is",
+          "units_per_frame": 1599.46,
+          "entries_per_frame": 533.15
+        },
+        {
           "name": "<bmux_terminal_grid::parser::GridPerformer<bmux_terminal_grid::parser::IgnoreSequences>>::apply_csi",
           "units_per_frame": 1532.2,
           "entries_per_frame": 305.71
@@ -1837,14 +1842,14 @@
           "entries_per_frame": 636.4
         },
         {
+          "name": "<bmux_terminal_grid::model::Cell>::is_wide_continuation",
+          "units_per_frame": 1496.49,
+          "entries_per_frame": 1496.49
+        },
+        {
           "name": "bmux_terminal_grid::model::frame::read_line::{closure#5}",
           "units_per_frame": 1374.97,
           "entries_per_frame": 1374.97
-        },
-        {
-          "name": "<bmux_terminal_grid::model::Cell>::is_wide_continuation",
-          "units_per_frame": 1306.41,
-          "entries_per_frame": 1306.41
         },
         {
           "name": "<bmux_terminal_grid::model::Cell>::blank",
@@ -1855,11 +1860,6 @@
           "name": "<bmux_terminal_grid::model::Cell>::from_char",
           "units_per_frame": 1260.92,
           "entries_per_frame": 1260.92
-        },
-        {
-          "name": "<bmux_terminal_grid::model::PhysicalRow>::write_ascii::{closure#0}",
-          "units_per_frame": 1253.34,
-          "entries_per_frame": 1253.34
         }
       ]
     },
