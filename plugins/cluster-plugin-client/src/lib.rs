@@ -26,7 +26,8 @@ use bmux_cluster_plugin_api::cluster_types::{
     ExecutionRef, ObservedExecution, WorkerAuthority, WorkerRoute, WorkerServiceError,
 };
 use bmux_cluster_plugin_api::{
-    cluster_attach_command, cluster_attach_state, cluster_control_state, cluster_worker_stream,
+    cluster_attach_command, cluster_attach_state, cluster_control_state, cluster_control_watch,
+    cluster_worker_stream,
 };
 use bmux_pane_runtime_plugin_api::attach_runtime_state::{AttachPaneFrames, PaneFrame};
 use std::any::Any;
@@ -39,12 +40,8 @@ const CLUSTER_PROVIDER_ID: &str = "bmux.cluster";
 /// How long a new stream's worker has to push its first frame (it pushes one at once).
 const HYDRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How often the session asks the ingress whether the layout changed (see
-/// [`ClusterAttachSession::changed_layout`]).
-const LAYOUT_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-
-/// How long after a worker could not be observed (unreachable, or not yet running the execution)
-/// the session tries again, unless the layout changes first.
+/// How long after a worker could not be observed (unreachable, or not yet running the execution),
+/// or the ingress's control subscription failed, the session tries again.
 const OBSERVE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Debug)]
@@ -340,12 +337,23 @@ enum LinkCommand {
         authorities: Vec<WorkerAuthority>,
         reply: oneshot::Sender<Result<Result<Vec<ObservedExecution>, WorkerServiceError>, String>>,
     },
+    /// Have the ingress push this connection each new control revision.
+    Watch {
+        reply: oneshot::Sender<
+            Result<
+                Result<u64, bmux_cluster_plugin_api::cluster_types::ControlServiceError>,
+                String,
+            >,
+        >,
+    },
 }
 
 /// What a worker connection reports to the session.
 enum LinkEvent {
     /// Frames the worker pushed, as one batch.
     Frames { link: u64, frames: Vec<PaneFrame> },
+    /// The cluster's control state advanced to `revision` (pushed by the ingress).
+    ControlApplied { link: u64, revision: u64 },
     /// The connection closed, or can no longer be followed.
     Closed { link: u64 },
 }
@@ -370,6 +378,8 @@ impl Drop for WorkerLink {
 struct WorkerLinks {
     connector: Arc<dyn AttachEndpointConnector>,
     links: BTreeMap<String, WorkerLink>,
+    /// The connection to the ingress that pushes control revisions, while subscribed.
+    control: Option<WorkerLink>,
     next_id: u64,
     events_tx: mpsc::UnboundedSender<LinkEvent>,
     events: mpsc::UnboundedReceiver<LinkEvent>,
@@ -381,6 +391,7 @@ impl WorkerLinks {
         Self {
             connector,
             links: BTreeMap::new(),
+            control: None,
             next_id: 0,
             events_tx,
             events,
@@ -399,11 +410,32 @@ impl WorkerLinks {
         self.links.len() != before
     }
 
-    async fn connect(&mut self, endpoint: &str) -> Result<WorkerLink, String> {
-        let client = self
-            .connector
-            .connect(endpoint, "bmux-cli-cluster-observe")
-            .await?;
+    /// Subscribe to the control revisions the ingress at `target` applies (replacing any
+    /// earlier subscription); returns the revision applied now.
+    async fn watch_control(&mut self, target: &str) -> Result<u64, String> {
+        self.control = None;
+        let link = self.connect(target, "bmux-cli-cluster-watch").await?;
+        let (reply, replied) = oneshot::channel();
+        link.commands
+            .send(LinkCommand::Watch { reply })
+            .map_err(|_| "ingress connection closed".to_string())?;
+        let revision = replied
+            .await
+            .map_err(|_| "ingress connection closed".to_string())??
+            .map_err(|error| format!("control watch refused: {error:?}"))?;
+        self.control = Some(link);
+        Ok(revision)
+    }
+
+    /// Whether `link` is the current control connection.
+    fn is_control(&self, link: u64) -> bool {
+        self.control
+            .as_ref()
+            .is_some_and(|control| control.id == link)
+    }
+
+    async fn connect(&mut self, endpoint: &str, name: &'static str) -> Result<WorkerLink, String> {
+        let client = self.connector.connect(endpoint, name).await?;
         let mut client =
             bmux_client::StreamingBmuxClient::from_client(client).map_err(|e| e.to_string())?;
         client
@@ -435,7 +467,10 @@ impl WorkerLinks {
         targets: &[ObserveTarget],
     ) -> Result<(), ObserveError> {
         if !self.links.contains_key(endpoint) {
-            let link = self.connect(endpoint).await.map_err(ObserveError::Link)?;
+            let link = self
+                .connect(endpoint, "bmux-cli-cluster-observe")
+                .await
+                .map_err(ObserveError::Link)?;
             self.links.insert(endpoint.to_string(), link);
         }
         let (reply, replied) = oneshot::channel();
@@ -483,13 +518,22 @@ async fn run_worker_link(
     loop {
         tokio::select! {
             command = commands.recv() => {
-                let Some(LinkCommand::Observe { authorities, reply }) = command else {
-                    return;
-                };
-                let result = cluster_worker_stream::client::observe(&mut client, authorities, 0)
-                    .await
-                    .map_err(|error| error.to_string());
-                let _ = reply.send(result);
+                match command {
+                    Some(LinkCommand::Observe { authorities, reply }) => {
+                        let result =
+                            cluster_worker_stream::client::observe(&mut client, authorities, 0)
+                                .await
+                                .map_err(|error| error.to_string());
+                        let _ = reply.send(result);
+                    }
+                    Some(LinkCommand::Watch { reply }) => {
+                        let result = cluster_control_watch::client::watch(&mut client, true)
+                            .await
+                            .map_err(|error| error.to_string());
+                        let _ = reply.send(result);
+                    }
+                    None => return,
+                }
             }
             event = client.event_receiver().recv() => {
                 let Some(event) = event else {
@@ -499,6 +543,16 @@ async fn run_worker_link(
                 let bmux_client::ServerEvent::PluginBusEvent { kind, payload } = event else {
                     continue;
                 };
+                if kind == bmux_cluster_plugin_api::CONTROL_APPLIED_KIND {
+                    let Ok(revision) = bmux_ipc::decode::<u64>(&payload) else {
+                        let _ = events.send(LinkEvent::Closed { link: id });
+                        return;
+                    };
+                    if events.send(LinkEvent::ControlApplied { link: id, revision }).is_err() {
+                        return;
+                    }
+                    continue;
+                }
                 if kind != bmux_pane_runtime_plugin_api::FRAME_PUSH_KIND {
                     continue;
                 }
@@ -653,7 +707,10 @@ struct ClusterAttachSession {
     unzoomed_scene: Option<bmux_attach_layout_protocol::AttachScene>,
     zoomed_pane: Option<uuid::Uuid>,
     viewport: (u16, u16),
-    next_layout_check: tokio::time::Instant,
+    /// The layout may have changed: read it before waiting again.
+    check_layout: bool,
+    /// When to subscribe to control revisions again (the subscription failed or closed).
+    rewatch_at: Option<tokio::time::Instant>,
     /// When the streams must be observed again (a worker connection closed or fell out of step).
     reobserve_at: Option<tokio::time::Instant>,
     detached: bool,
@@ -736,7 +793,8 @@ impl ClusterAttachSession {
             unzoomed_scene: None,
             zoomed_pane: None,
             viewport: (80, 24),
-            next_layout_check: tokio::time::Instant::now(),
+            check_layout: false,
+            rewatch_at: Some(tokio::time::Instant::now()),
             reobserve_at: None,
             detached: false,
         };
@@ -793,10 +851,9 @@ impl ClusterAttachSession {
 
     /// The layout, when its control revision advanced past the session's.
     ///
-    /// This is the session's remaining poll: arrangement changes (panes added, moved or closed,
-    /// executions restarted as new generations, availability) are committed through cluster
-    /// consensus on the ingress, and nothing yet pushes them to a client, so the session asks
-    /// every [`LAYOUT_CHECK_INTERVAL`]. Screens are not polled: workers push their frames.
+    /// Read when the ingress pushes a newer control revision (arrangement changes are
+    /// committed through cluster consensus there), and once after each subscription, for
+    /// changes made while unsubscribed. Nothing is polled.
     async fn changed_layout(
         &mut self,
     ) -> Result<Option<bmux_cluster_plugin_api::cluster_types::AttachLayout>, AttachSessionError>
@@ -923,8 +980,16 @@ impl ClusterAttachSession {
                     changed.insert(stream_id);
                 }
             }
+            LinkEvent::ControlApplied { link, revision } => {
+                if self.links.is_control(link) && revision > self.control_revision {
+                    self.check_layout = true;
+                }
+            }
             LinkEvent::Closed { link } => {
-                if self.links.remove(link) {
+                if self.links.is_control(link) {
+                    self.links.control = None;
+                    self.rewatch_at = Some(tokio::time::Instant::now());
+                } else if self.links.remove(link) {
                     self.reobserve_at = Some(tokio::time::Instant::now());
                 }
             }
@@ -1271,19 +1336,37 @@ impl ClusterAttachSession {
     async fn next_change(
         &mut self,
     ) -> Result<Option<bmux_client::AttachProviderEvent>, AttachSessionError> {
+        if std::mem::take(&mut self.check_layout)
+            && let Some(layout) = self.changed_layout().await?
+        {
+            return self.reconcile_layout(layout).await.map(Some);
+        }
         let now = tokio::time::Instant::now();
-        if now >= self.next_layout_check {
-            self.next_layout_check = now + LAYOUT_CHECK_INTERVAL;
-            if let Some(layout) = self.changed_layout().await? {
-                return self.reconcile_layout(layout).await.map(Some);
+        if self.rewatch_at.is_some_and(|at| at <= now) {
+            let cluster = self.cluster.clone();
+            match self.links.watch_control(&cluster).await {
+                Ok(_) => {
+                    // Whatever changed while unsubscribed is read now.
+                    self.rewatch_at = None;
+                    self.check_layout = true;
+                    return Ok(None);
+                }
+                Err(_) => self.rewatch_at = Some(now + OBSERVE_RETRY_INTERVAL),
             }
         }
         if self.reobserve_at.is_some_and(|at| at <= now) {
             return self.reobserve().await;
         }
-        let wake_at = self
-            .reobserve_at
-            .map_or(self.next_layout_check, |at| at.min(self.next_layout_check));
+        let wake_at = match (self.reobserve_at, self.rewatch_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let sleep = async {
+            match wake_at {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             event = self.links.events.recv() => {
                 let event = event
@@ -1296,7 +1379,7 @@ impl ClusterAttachSession {
                 }
                 Ok(self.frames_delta(&changed))
             }
-            () = tokio::time::sleep_until(wake_at) => Ok(None),
+            () = sleep => Ok(None),
         }
     }
 }

@@ -24,6 +24,7 @@ pub mod consensus_runtime;
 pub mod consensus_storage;
 pub mod control_codec;
 pub mod control_state;
+mod control_watch;
 pub(crate) mod durable_storage;
 pub(crate) mod endpoint;
 pub(crate) mod events;
@@ -119,6 +120,10 @@ pub struct ClusterPlugin {
     /// The worker registry, observing executions for connections (`cluster-worker-stream`), set
     /// when the typed services register.
     observer: std::sync::RwLock<Option<Arc<dyn worker_runtime::ExecutionObserver>>>,
+    /// Connections watching the control state (`cluster-control-watch`).
+    control_watch: Arc<control_watch::ControlWatch>,
+    /// The activation's plugin state, where the host's push sink is.
+    states: std::sync::RwLock<Option<Arc<bmux_plugin::PluginStateRegistry>>>,
 }
 
 const NO_ACTIVATION: &str = "cluster consensus requires an active plugin activation";
@@ -127,11 +132,54 @@ impl ClusterPlugin {
     /// `cluster-worker-stream` `observe`: push the caller's connection frames of the executions
     /// its leases authorize. `None` for any other service.
     fn invoke_worker_stream(&self, context: &NativeServiceContext) -> Option<ServiceResponse> {
-        ((
+        match (
             context.request.service.interface_id.as_str(),
             context.request.operation.as_str(),
-        ) == ("cluster-worker-stream/v1", "observe"))
-            .then(|| self.invoke_observe(context))
+        ) {
+            ("cluster-worker-stream/v1", "observe") => Some(self.invoke_observe(context)),
+            ("cluster-control-watch/v1", "watch") => Some(self.invoke_control_watch(context)),
+            _ => None,
+        }
+    }
+
+    /// `cluster-control-watch` `watch`: push the caller's connection each new control revision.
+    fn invoke_control_watch(&self, context: &NativeServiceContext) -> ServiceResponse {
+        use bmux_cluster_plugin_api::cluster_types::ControlServiceError;
+        let request = match bmux_plugin_sdk::decode_service_message::<
+            bmux_cluster_plugin_api::cluster_control_watch::client::WatchRequest,
+        >(&context.request.payload)
+        {
+            Ok(request) => request,
+            Err(error) => return ServiceResponse::error("watch_invalid", error.to_string()),
+        };
+        let result: Result<u64, ControlServiceError> = (|| {
+            let internal = |reason: String| ControlServiceError::Internal { reason };
+            let client = context
+                .caller_client_id
+                .ok_or_else(|| internal("watching needs a client connection".to_string()))?;
+            let identity = self
+                .node_identity()
+                .ok_or_else(|| internal("cluster identity unavailable".to_string()))?;
+            let node = self
+                .nodes
+                .clone()
+                .get(*identity.node_id())
+                .map_err(internal)?;
+            let sink = self
+                .states
+                .read()
+                .ok()
+                .and_then(|states| states.clone())
+                .and_then(|states| states.get::<bmux_plugin_sdk::WireEventSinkHandle>())
+                .and_then(|sink| sink.read().ok().map(|sink| sink.0.clone()));
+            self.control_watch
+                .watch(client, request.enabled, &node, sink)
+                .map_err(internal)
+        })();
+        match bmux_plugin_sdk::encode_service_message(&result) {
+            Ok(payload) => ServiceResponse::ok(payload),
+            Err(error) => ServiceResponse::error("watch_failed", error.to_string()),
+        }
     }
 
     fn invoke_observe(&self, context: &NativeServiceContext) -> ServiceResponse {
@@ -359,6 +407,7 @@ impl ClusterPlugin {
         *slot_mut(&self.activation_caller)? = Some(Arc::new(
             bmux_plugin::TypedServiceCaller::from_lifecycle_context(context),
         ));
+        *slot_mut(&self.states)? = Some(bmux_plugin::activation_state_registry(context));
         let configured_endpoint = configured_consensus_endpoint(context.settings.as_ref())
             .map_err(PluginCommandError::failed)?;
         if let Err(error) =

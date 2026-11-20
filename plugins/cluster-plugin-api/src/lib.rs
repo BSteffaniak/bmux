@@ -13,3 +13,7 @@ bmux_plugin_schema_macros::schema! {
     source: "bpdl/cluster-plugin.bpdl",
     export: export_schema,
 }
+
+/// The kind of message pushed to a connection watching the cluster's control state
+/// (`cluster-control-watch`): the control revision just applied, bmux_ipc-encoded as a `u64`.
+pub const CONTROL_APPLIED_KIND: &str = "bmux.cluster/control-applied";

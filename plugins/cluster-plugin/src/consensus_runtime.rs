@@ -803,6 +803,25 @@ impl ConsensusNode {
             .map(|state_machine: ConsensusStateMachine| state_machine.control_state().clone())
     }
 
+    /// The control revision applied now.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the state machine cannot be read.
+    pub fn control_revision(&self) -> Result<u64, ConsensusStorageError> {
+        self.storage
+            .state_machine()
+            .map(|state_machine: ConsensusStateMachine| state_machine.control_state().revision)
+    }
+
+    /// The node's Raft metrics as they change (the applied log among them).
+    #[must_use]
+    pub fn metrics_watch(
+        &self,
+    ) -> tokio::sync::watch::Receiver<openraft::RaftMetrics<NodeId, openraft::BasicNode>> {
+        self.raft.metrics()
+    }
+
     /// Gracefully stops the node and waits for its Raft task to exit.
     ///
     /// # Errors

@@ -533,7 +533,7 @@ fn interface_ids_and_operations_match_schema() {
 fn generated_contract_declares_all_services() {
     let services = bmux_cluster_plugin_api::service_declarations()
         .expect("cluster service declarations should be valid");
-    assert_eq!(services.len(), 20);
+    assert_eq!(services.len(), 21);
     let service_ids = services
         .iter()
         .map(|service| service.interface_id.as_str())
@@ -563,6 +563,7 @@ fn generated_contract_declares_all_services() {
         "provide cluster-attach-command;",
         "provide cluster-worker-state;",
         "provide cluster-worker-stream;",
+        "provide cluster-control-watch;",
         "provide cluster-control-command@2;",
         "provide cluster-control-state@2;",
     ] {

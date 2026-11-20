@@ -818,6 +818,15 @@ interface cluster-worker-state {
     query inventory() -> cluster-types.worker-execution-list;
 }
 
+// Push the caller's connection the control revision whenever the cluster's control state
+// advances (CONTROL_APPLIED_KIND), so it reads what changed then instead of polling. Returns
+// the revision applied now; `enabled: false` stops.
+@capability(CLUSTER_READ)
+@interface-version(1)
+interface cluster-control-watch {
+    query watch(enabled: bool) -> result<u64, cluster-types.control-service-error>;
+}
+
 // Executions' screens pushed to the observing connection as frames (the pane runtime's frame
 // push), each authorized by an observe lease the ingress signed. Observing a new set replaces
 // the previous one; an empty set stops.
@@ -882,6 +891,7 @@ world cluster {
     provide cluster-worker-command;
     provide cluster-worker-state;
     provide cluster-worker-stream;
+    provide cluster-control-watch;
     provide cluster-peer-auth;
     provide cluster-connection-events;
     provide cluster-control-command@1;

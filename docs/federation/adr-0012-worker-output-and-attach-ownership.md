@@ -103,7 +103,7 @@ Workers push frames, not output bytes:
 - The attaching client holds one connection per worker and calls `cluster-worker-stream/v1` `observe(authorities, max_history_lines)` on it. The worker verifies each lease and has its pane runtime push frames of those executions' panes to that connection (the pane runtime's frame push, as for local attach). Observing a new set replaces the previous one.
 - The client keeps a replica grid per stream from those frames and relays frames from it to its renderer. A new connection is sent reset frames, so a connection that closes, or whose frames no longer apply, is replaced. A generation change still requires control reconciliation.
 - Frames are built when they can be sent, from the grid as it then is, so a slow client is sent one frame a pane rather than a backlog; nothing is retained per client beyond its replica cursor.
-- Terminal state never enters consensus. The client still reads the layout from the ingress periodically to notice control-revision changes.
+- Terminal state never enters consensus. Control changes are pushed too: the client calls `cluster-control-watch/v1` `watch(true)` on a connection to the ingress, which pushes it each newly applied control revision (`bmux.cluster/control-applied`, sent once and only when newer, from a watcher on the consensus metrics), and the client reads the layout then, and once after each subscription. Nothing is polled.
 
 ## Consequences
 
