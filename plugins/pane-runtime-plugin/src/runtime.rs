@@ -2983,10 +2983,10 @@ fn image_terminal_bytes(
 ) -> std::io::Result<()> {
     // With no image anywhere, screen changes only flip registry state: apply the chunk's in
     // one pass. Images move with each change in order, so then the chunk goes byte by byte.
-    let units: Box<dyn Iterator<Item = &[u8]>> = if registry.holds_nothing() {
-        Box::new(std::iter::once(bytes))
+    let unit = if registry.holds_nothing() {
+        bytes.len()
     } else {
-        Box::new(bytes.chunks(1))
+        1
     };
     reader
         .scrolled
@@ -2995,7 +2995,12 @@ fn image_terminal_bytes(
     let shared = reader.filters.clone();
     let guard = read_filters(shared.as_ref());
     let filters = active_filters(guard.as_deref());
-    for unit in units {
+    // Units of `unit` bytes in order (one, empty, for empty bytes).
+    let mut start = 0;
+    loop {
+        let end = (start + unit.max(1)).min(bytes.len());
+        let unit = &bytes[start..end];
+        start = end;
         let erase = grid.grid().display_erase_revision();
         let history_erase = grid.grid().history_erase_revision();
         let reset = grid.grid().reset_revision();
@@ -3014,6 +3019,9 @@ fn image_terminal_bytes(
         if scrolled > 0 {
             registry.scroll_up(scrolled)?;
             registry.evict_history(grid.grid().max_scrollback_offset());
+        }
+        if start >= bytes.len() {
+            break;
         }
     }
     Ok(())

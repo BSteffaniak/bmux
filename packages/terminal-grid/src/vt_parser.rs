@@ -39,9 +39,9 @@ impl Params {
     }
 
     fn clear(&mut self) {
-        // Only the ends up to the open group are ever written.
-        let touched = (self.groups + 1).min(self.ends.len());
-        self.ends[..touched].fill(0);
+        // A group's end reads as 0 until written: the first one's here, each next one's as the
+        // group before it closes.
+        self.ends[0] = 0;
         self.used = 0;
         self.groups = 0;
     }
@@ -67,6 +67,9 @@ impl Params {
         self.ends[self.groups] = self.used;
         if close {
             self.groups += 1;
+            if let Some(next) = self.ends.get_mut(self.groups) {
+                *next = 0;
+            }
         }
         true
     }
