@@ -18927,15 +18927,6 @@ mod tests {
             fn name(&self) -> &'static str {
                 "idle-border-regression"
             }
-            fn render_surface(
-                &self,
-                _: &mut dyn std::io::Write,
-                _: Uuid,
-                _: &bmux_plugin::ExtensionRect,
-                _: &bmux_plugin::RenderDamage,
-            ) -> std::io::Result<bool> {
-                panic!("retained scene must not use imperative output")
-            }
             fn render_layer_scene_with_context(
                 &self,
                 _: Uuid,
