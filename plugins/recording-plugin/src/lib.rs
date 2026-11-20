@@ -47,8 +47,8 @@ mod process_store;
 pub mod recording_runtime;
 mod services;
 pub use recording_runtime::{
-    RecordingCutError, RecordingRuntime, cut_missing_active_recording_dir, execute_recording_cut,
-    prune_old_recordings,
+    CutWindow, RecordingCutError, RecordingRuntime, cut_missing_active_recording_dir,
+    execute_recording_cut, prune_old_recordings,
 };
 
 use bmux_plugin::PluginStateRegistry;
@@ -115,6 +115,10 @@ struct DeleteRequest {
 struct CutRequest {
     last_seconds: Option<u64>,
     name: Option<String>,
+    #[serde(default)]
+    start_epoch_ms: Option<u64>,
+    #[serde(default)]
+    end_epoch_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -122,6 +126,29 @@ struct QueueCutRequest {
     last_seconds: Option<u64>,
     name: Option<String>,
     export_fps: Option<u32>,
+    #[serde(default)]
+    start_epoch_ms: Option<u64>,
+    #[serde(default)]
+    end_epoch_ms: Option<u64>,
+}
+
+/// Build the cut window from wire fields, rejecting a range combined with `last_seconds`.
+fn cut_window(
+    last_seconds: Option<u64>,
+    start_epoch_ms: Option<u64>,
+    end_epoch_ms: Option<u64>,
+) -> anyhow::Result<CutWindow> {
+    match (last_seconds, start_epoch_ms, end_epoch_ms) {
+        (seconds, None, None) => Ok(CutWindow::LastSeconds(seconds)),
+        (None, Some(start_epoch_ms), end_epoch_ms) => Ok(CutWindow::Range {
+            start_epoch_ms,
+            end_epoch_ms,
+        }),
+        (Some(_), _, _) => {
+            anyhow::bail!("recording cut takes either last seconds or a start/end range, not both")
+        }
+        (None, None, Some(_)) => anyhow::bail!("recording cut end requires a start"),
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1001,11 +1028,29 @@ impl RecordingOwner {
 
         targets
     }
-    fn handle_cut(
+    /// Announce a cut, then run it.
+    fn announced_cut(
         &self,
         last_seconds: Option<u64>,
         name: Option<String>,
+        start_epoch_ms: Option<u64>,
+        end_epoch_ms: Option<u64>,
     ) -> anyhow::Result<RecordingSummary> {
+        self.publish_recording_cut_started(
+            last_seconds,
+            name.clone(),
+            start_epoch_ms,
+            end_epoch_ms,
+        );
+        self.handle_cut(cut_window(last_seconds, start_epoch_ms, end_epoch_ms), name)
+    }
+
+    fn handle_cut(
+        &self,
+        window: anyhow::Result<CutWindow>,
+        name: Option<String>,
+    ) -> anyhow::Result<RecordingSummary> {
+        let window = window?;
         let config = self.config_handle();
         let cfg = config
             .read()
@@ -1025,7 +1070,7 @@ impl RecordingOwner {
             let runtime = rolling.as_mut().ok_or_else(|| {
                 anyhow::anyhow!("recording cut requires rolling recording mode to be enabled")
             })?;
-            runtime.prepare_cut(output_root, last_seconds, name)?
+            runtime.prepare_cut(output_root, window, name)?
         };
 
         let _cut_guard = self
@@ -1380,10 +1425,21 @@ impl RecordingOwner {
             .host
             .publish(recording_events::RecordingEvent::CutFailed { reason });
     }
-    fn publish_recording_cut_started(&self, last_seconds: Option<u64>, name: Option<String>) {
+    fn publish_recording_cut_started(
+        &self,
+        last_seconds: Option<u64>,
+        name: Option<String>,
+        start_epoch_ms: Option<u64>,
+        end_epoch_ms: Option<u64>,
+    ) {
         let _ = self
             .host
-            .publish(recording_events::RecordingEvent::CutStarted { last_seconds, name });
+            .publish(recording_events::RecordingEvent::CutStarted {
+                last_seconds,
+                name,
+                start_epoch_ms,
+                end_epoch_ms,
+            });
     }
     pub(crate) fn publish_recording_export_completed(
         &self,
@@ -1457,8 +1513,12 @@ impl RecordingOwner {
         &self,
         req: CutRequest,
     ) -> Result<recording_types::RecordingSummary, recording_types::RecordingError> {
-        self.publish_recording_cut_started(req.last_seconds, req.name.clone());
-        match self.handle_cut(req.last_seconds, req.name) {
+        match self.announced_cut(
+            req.last_seconds,
+            req.name,
+            req.start_epoch_ms,
+            req.end_epoch_ms,
+        ) {
             Ok(summary) => {
                 self.publish_recording_cut_completed(&summary);
                 Ok(summary.into())
@@ -1700,9 +1760,13 @@ impl RecordingOwner {
             job.status = recording_types::RecordingJobStatus::Cutting;
         });
         self.publish_recording_job_updated(&cutting);
-        self.publish_recording_cut_started(req.last_seconds, req.name.clone());
 
-        let summary = match self.handle_cut(req.last_seconds, req.name) {
+        let summary = match self.announced_cut(
+            req.last_seconds,
+            req.name,
+            req.start_epoch_ms,
+            req.end_epoch_ms,
+        ) {
             Ok(summary) => summary,
             Err(error) => {
                 let reason = error.to_string();
@@ -1801,6 +1865,8 @@ impl RecordingOwner {
         context: &NativeCommandContext,
     ) -> std::result::Result<i32, PluginCommandError> {
         let last_seconds = parse_u64_option(&context.arguments, "last-seconds");
+        let start_epoch_ms = parse_u64_option(&context.arguments, "start-epoch-ms");
+        let end_epoch_ms = parse_u64_option(&context.arguments, "end-epoch-ms");
         let export_fps = parse_u32_option(&context.arguments, "export-fps");
         let name = parse_string_option(&context.arguments, "name");
         tracing::info!(
@@ -1816,6 +1882,8 @@ impl RecordingOwner {
                 last_seconds,
                 name,
                 export_fps,
+                start_epoch_ms,
+                end_epoch_ms,
             })
             .map_err(|error| {
                 tracing::warn!(?error, "recording cut queue failed");
@@ -2589,5 +2657,31 @@ mod canonical_metadata_tests {
         definition
             .validate()
             .expect("canonical embedded identity must validate");
+    }
+}
+
+#[cfg(test)]
+mod cut_window_tests {
+    use super::{CutWindow, cut_window};
+
+    #[test]
+    fn wire_fields_select_exactly_one_window() {
+        assert_eq!(
+            cut_window(Some(30), None, None).unwrap(),
+            CutWindow::LastSeconds(Some(30))
+        );
+        assert_eq!(
+            cut_window(None, None, None).unwrap(),
+            CutWindow::LastSeconds(None)
+        );
+        assert_eq!(
+            cut_window(None, Some(10), Some(20)).unwrap(),
+            CutWindow::Range {
+                start_epoch_ms: 10,
+                end_epoch_ms: Some(20)
+            }
+        );
+        assert!(cut_window(Some(30), Some(10), None).is_err());
+        assert!(cut_window(None, None, Some(20)).is_err());
     }
 }

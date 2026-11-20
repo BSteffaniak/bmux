@@ -256,7 +256,7 @@ interface recording-events {
     variant recording-event {
         started { target: recording-types.recording-capture-target },
         stopped { recording_id: uuid },
-        cut-started { last_seconds: u64?, name: string? },
+        cut-started { last_seconds: u64?, name: string?, start_epoch_ms: u64?, end_epoch_ms: u64? },
         cut-completed { summary: recording-types.recording-summary },
         cut-failed { reason: string },
         export-started { recording_id: uuid, output_path: string },
@@ -304,10 +304,19 @@ interface recording-commands {
 
     command delete-all() -> u64;
 
-    command cut(last_seconds: u64?, name: string?)
+    // A cut keeps either the last `last_seconds` (the rolling window when absent) or the
+    // wall-clock range from `start_epoch_ms` to `end_epoch_ms` (now when absent), inclusive.
+    // `last_seconds` and a range are mutually exclusive.
+    command cut(last_seconds: u64?, name: string?, start_epoch_ms: u64?, end_epoch_ms: u64?)
         -> result<recording-types.recording-summary, recording-types.recording-error>;
 
-    command queue-cut(last_seconds: u64?, name: string?, export_fps: u32?)
+    command queue-cut(
+        last_seconds: u64?,
+        name: string?,
+        export_fps: u32?,
+        start_epoch_ms: u64?,
+        end_epoch_ms: u64?,
+    )
         -> recording-types.recording-job;
 
     command rolling-start(options: recording-types.recording-rolling-start-options)

@@ -39,12 +39,47 @@ pub struct RecordingRuntime {
     writer_ack: Option<(Uuid, writer_ack::WriterAck)>,
 }
 
+/// Which part of the rolling recording a cut keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CutWindow {
+    /// The last N seconds before the cut, or the rolling window when `None`.
+    LastSeconds(Option<u64>),
+    /// Wall-clock milliseconds since the Unix epoch, inclusive; `end` defaults to the cut time.
+    Range {
+        start_epoch_ms: u64,
+        end_epoch_ms: Option<u64>,
+    },
+}
+
+/// A cut window resolved against the wall clock when the cut was prepared, in milliseconds
+/// since the Unix epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResolvedCutWindow {
+    start: u64,
+    end: u64,
+    /// When the cut was prepared. Display tracks carry only their own monotonic clock, so
+    /// their latest frame is taken to be this instant.
+    prepared_at: u64,
+}
+
+impl ResolvedCutWindow {
+    /// Nanoseconds before the latest display frame at which the window starts and ends.
+    const fn display_offsets_ns(&self) -> (u64, u64) {
+        let start = self.prepared_at.saturating_sub(self.start);
+        let end = self.prepared_at.saturating_sub(self.end);
+        (
+            start.saturating_mul(1_000_000),
+            end.saturating_mul(1_000_000),
+        )
+    }
+}
+
 #[derive(Debug)]
 pub struct RecordingCutPlan {
     source_dir: PathBuf,
     output_root: PathBuf,
     name: Option<String>,
-    window_secs: u64,
+    window: ResolvedCutWindow,
     segment_mb: usize,
     session_filter: Option<Uuid>,
     capture_input: bool,
@@ -524,7 +559,7 @@ impl RecordingRuntime {
     pub fn prepare_cut(
         &mut self,
         output_root: PathBuf,
-        last_seconds: Option<u64>,
+        window: CutWindow,
         name: Option<String>,
     ) -> Result<RecordingCutPlan> {
         let active = self
@@ -545,18 +580,13 @@ impl RecordingRuntime {
             );
         }
         let name = normalize_recording_name(name)?.or_else(|| active.name.clone());
-        let window_secs = last_seconds.or(self.rolling_window_secs).ok_or_else(|| {
-            anyhow::anyhow!("recording cut requires rolling recording mode to be enabled")
-        })?;
-        if window_secs == 0 {
-            anyhow::bail!("recording cut window must be greater than zero seconds")
-        }
+        let window = resolve_cut_window(window, self.rolling_window_secs, epoch_millis_now())?;
 
         Ok(RecordingCutPlan {
             source_dir: active.path.clone(),
             output_root,
             name,
-            window_secs,
+            window,
             segment_mb: self.segment_mb,
             session_filter: active.session_filter,
             capture_input: active.capture_input,
@@ -573,10 +603,10 @@ impl RecordingRuntime {
     pub fn cut(
         &mut self,
         output_root: &Path,
-        last_seconds: Option<u64>,
+        window: CutWindow,
         name: Option<String>,
     ) -> Result<RecordingSummary> {
-        let plan = self.prepare_cut(output_root.to_path_buf(), last_seconds, name)?;
+        let plan = self.prepare_cut(output_root.to_path_buf(), window, name)?;
         execute_recording_cut(plan)
     }
 }
@@ -587,7 +617,6 @@ impl RecordingRuntime {
 /// Returns an error if the cut source cannot be read, contains no events in the
 /// requested window, or the cut output cannot be written.
 pub fn execute_recording_cut(plan: RecordingCutPlan) -> Result<RecordingSummary> {
-    let cutoff_ms = epoch_millis_now().saturating_sub(plan.window_secs.saturating_mul(1000));
     let segment_names = list_segment_names(&plan.source_dir)?;
     let mut events = Vec::new();
     for name in &segment_names {
@@ -596,7 +625,7 @@ pub fn execute_recording_cut(plan: RecordingCutPlan) -> Result<RecordingSummary>
         events.append(&mut segment_events);
     }
 
-    events.retain(|event| event.wall_epoch_ms >= cutoff_ms);
+    events.retain(|event| (plan.window.start..=plan.window.end).contains(&event.wall_epoch_ms));
     if events.is_empty() {
         anyhow::bail!("rolling recording has no events in the requested window")
     }
@@ -640,7 +669,7 @@ pub fn execute_recording_cut(plan: RecordingCutPlan) -> Result<RecordingSummary>
         started_epoch_ms: events
             .first()
             .map_or_else(epoch_millis_now, |event| event.wall_epoch_ms),
-        ended_epoch_ms: Some(epoch_millis_now()),
+        ended_epoch_ms: Some(plan.window.end),
         event_count,
         payload_bytes,
         path: cut_dir.to_string_lossy().to_string(),
@@ -648,13 +677,57 @@ pub fn execute_recording_cut(plan: RecordingCutPlan) -> Result<RecordingSummary>
         total_segment_bytes: 0,
     };
 
-    copy_display_tracks_for_cut(&plan.source_dir, &cut_dir, plan.window_secs)?;
+    let (start_offset_ns, end_offset_ns) = plan.window.display_offsets_ns();
+    copy_display_tracks_for_cut(&plan.source_dir, &cut_dir, start_offset_ns, end_offset_ns)?;
     copy_owner_client_metadata(&plan.source_dir, &cut_dir)?;
 
     let mut finalized = summary;
     finalized.total_segment_bytes = compute_total_segment_bytes(&cut_dir, &finalized.segments);
     write_manifest(&cut_dir.join(MANIFEST_FILE_NAME), &finalized)?;
     Ok(finalized)
+}
+
+/// Resolve a requested window to wall-clock bounds at `now_ms`.
+///
+/// # Errors
+/// Returns an error for a zero-length or inverted window, a window ending in the future, or a
+/// last-seconds cut without a configured rolling window.
+fn resolve_cut_window(
+    window: CutWindow,
+    rolling_window_secs: Option<u64>,
+    now_ms: u64,
+) -> Result<ResolvedCutWindow> {
+    let (start_epoch_ms, end_epoch_ms) = match window {
+        CutWindow::LastSeconds(seconds) => {
+            let seconds = seconds.or(rolling_window_secs).ok_or_else(|| {
+                anyhow::anyhow!("recording cut requires rolling recording mode to be enabled")
+            })?;
+            if seconds == 0 {
+                anyhow::bail!("recording cut window must be greater than zero seconds")
+            }
+            (now_ms.saturating_sub(seconds.saturating_mul(1000)), now_ms)
+        }
+        CutWindow::Range {
+            start_epoch_ms,
+            end_epoch_ms,
+        } => {
+            let end_epoch_ms = end_epoch_ms.unwrap_or(now_ms);
+            if end_epoch_ms > now_ms {
+                anyhow::bail!(
+                    "recording cut end {end_epoch_ms} is in the future (now {now_ms}); cut after it has passed"
+                )
+            }
+            if start_epoch_ms >= end_epoch_ms {
+                anyhow::bail!("recording cut start must be before its end")
+            }
+            (start_epoch_ms, end_epoch_ms)
+        }
+    };
+    Ok(ResolvedCutWindow {
+        start: start_epoch_ms,
+        end: end_epoch_ms,
+        prepared_at: now_ms,
+    })
 }
 
 fn normalize_recording_name(name: Option<String>) -> Result<Option<String>> {
@@ -1276,19 +1349,23 @@ fn push_cut_cursor_snapshot_baseline_if_needed(
     }
 }
 
+/// Keep frames from `start_offset_ns` to `end_offset_ns` before the track's latest frame,
+/// preceded by the baselines a replayer needs to start there.
 fn cut_display_track_frames(
     all_frames: &[DisplayTrackEnvelope],
-    window_ns: u64,
+    start_offset_ns: u64,
+    end_offset_ns: u64,
 ) -> Vec<DisplayTrackEnvelope> {
     if all_frames.is_empty() {
         return Vec::new();
     }
 
     let last_ns = all_frames.last().map_or(0, |frame| frame.mono_ns);
-    let cutoff_ns = last_ns.saturating_sub(window_ns);
+    let start_ns = last_ns.saturating_sub(start_offset_ns);
+    let end_ns = last_ns.saturating_sub(end_offset_ns);
     let mut kept: Vec<DisplayTrackEnvelope> = all_frames
         .iter()
-        .filter(|frame| frame.mono_ns >= cutoff_ns)
+        .filter(|frame| (start_ns..=end_ns).contains(&frame.mono_ns))
         .cloned()
         .collect();
     if kept.is_empty() {
@@ -1312,11 +1389,15 @@ fn cut_display_track_frames(
     output
 }
 
-fn copy_display_tracks_for_cut(source_dir: &Path, dest_dir: &Path, window_secs: u64) -> Result<()> {
-    if window_secs == 0 {
+fn copy_display_tracks_for_cut(
+    source_dir: &Path,
+    dest_dir: &Path,
+    start_offset_ns: u64,
+    end_offset_ns: u64,
+) -> Result<()> {
+    if start_offset_ns <= end_offset_ns {
         return Ok(());
     }
-    let window_ns = window_secs.saturating_mul(1_000_000_000);
     let mut tracks: BTreeMap<String, Vec<(u64, PathBuf)>> = BTreeMap::new();
     for entry in std::fs::read_dir(source_dir).with_context(|| {
         format!(
@@ -1350,7 +1431,7 @@ fn copy_display_tracks_for_cut(source_dir: &Path, dest_dir: &Path, window_secs: 
             frames.extend(result.frames);
         }
         frames.sort_by_key(|frame| frame.mono_ns);
-        let output = cut_display_track_frames(&frames, window_ns);
+        let output = cut_display_track_frames(&frames, start_offset_ns, end_offset_ns);
 
         if output.is_empty() {
             continue;
@@ -1625,7 +1706,7 @@ mod tests {
 
     #[test]
     fn cut_empty_input_returns_empty() {
-        let result = super::cut_display_track_frames(&[], 10_000_000_000);
+        let result = super::cut_display_track_frames(&[], 10_000_000_000, 0);
         assert_eq!(
             result,
             [] as [bmux_recording_protocol::DisplayTrackEnvelope; 0]
@@ -1641,7 +1722,7 @@ mod tests {
             frame_bytes_frame(3_000),
         ];
         // Window of 1 second easily covers all frames (max mono_ns = 3_000 ns).
-        let result = super::cut_display_track_frames(&frames, 1_000_000_000);
+        let result = super::cut_display_track_frames(&frames, 1_000_000_000, 0);
         assert_eq!(result.len(), 4);
         // StreamOpened should be first, no extra baselines injected.
         assert!(matches!(
@@ -1672,7 +1753,7 @@ mod tests {
         ];
         // Window of 0 ns: cutoff == last_ns, so only the frame at last_ns
         // passes the >= filter, plus injected baselines.
-        let result = super::cut_display_track_frames(&frames, 0);
+        let result = super::cut_display_track_frames(&frames, 0, 0);
         assert!(
             matches!(result[0].event, DisplayTrackEvent::StreamOpened { .. }),
             "should inject StreamOpened baseline"
@@ -1710,7 +1791,7 @@ mod tests {
             frame_bytes_frame(30_000_000_000),
             frame_bytes_frame(40_000_000_000),
         ];
-        let result = super::cut_display_track_frames(&frames, 15_000_000_000);
+        let result = super::cut_display_track_frames(&frames, 15_000_000_000, 0);
         assert!(
             matches!(result.first(), Some(f) if matches!(f.event, DisplayTrackEvent::StreamOpened { .. })),
             "cut should start with injected StreamOpened baseline"
@@ -1728,7 +1809,7 @@ mod tests {
             cursor_snapshot_frame(300, 0, 0),
             frame_bytes_frame(400),
         ];
-        let result = super::cut_display_track_frames(&frames, 1_000_000_000);
+        let result = super::cut_display_track_frames(&frames, 1_000_000_000, 0);
         // Should have exactly one StreamOpened (the original, not a duplicate).
         let opened_count = result
             .iter()
@@ -1748,7 +1829,7 @@ mod tests {
             frame_bytes_frame(30_000_000_000),
             frame_bytes_frame(40_000_000_000),
         ];
-        let result = super::cut_display_track_frames(&frames, 15_000_000_000);
+        let result = super::cut_display_track_frames(&frames, 15_000_000_000, 0);
         let resizes: Vec<(u16, u16)> = result
             .iter()
             .filter_map(|f| match f.event {
@@ -1777,7 +1858,7 @@ mod tests {
             cursor_snapshot_frame(35_000_000_001, 5, 3),
             frame_bytes_frame(40_000_000_000),
         ];
-        let result = super::cut_display_track_frames(&frames, 15_000_000_000);
+        let result = super::cut_display_track_frames(&frames, 15_000_000_000, 0);
         let resizes: Vec<(u16, u16)> = result
             .iter()
             .filter_map(|f| match f.event {
@@ -1803,7 +1884,7 @@ mod tests {
             frame_bytes_frame(30_000_000_000),
             frame_bytes_frame(40_000_000_000),
         ];
-        let result = super::cut_display_track_frames(&frames, 15_000_000_000);
+        let result = super::cut_display_track_frames(&frames, 15_000_000_000, 0);
         let snapshots: Vec<(u16, u16)> = result
             .iter()
             .filter_map(|f| match f.event {
@@ -1836,7 +1917,7 @@ mod tests {
             frame_bytes_frame(35_000_000_001),
             frame_bytes_frame(40_000_000_000),
         ];
-        let result = super::cut_display_track_frames(&frames, 15_000_000_000);
+        let result = super::cut_display_track_frames(&frames, 15_000_000_000, 0);
         let snapshots: Vec<(u16, u16)> = result
             .iter()
             .filter_map(|f| match f.event {
@@ -1863,7 +1944,7 @@ mod tests {
             cursor_snapshot_frame(30_000_010_000, 77, 22),
             frame_bytes_frame(40_000_000_000),
         ];
-        let result = super::cut_display_track_frames(&frames, 15_000_000_000);
+        let result = super::cut_display_track_frames(&frames, 15_000_000_000, 0);
         let snapshots: Vec<(u16, u16)> = result
             .iter()
             .filter_map(|f| match f.event {
@@ -1894,7 +1975,7 @@ mod tests {
             cursor_snapshot_frame(35_000_000_000, 77, 22),
             frame_bytes_frame(40_000_000_000),
         ];
-        let result = super::cut_display_track_frames(&frames, 15_000_000_000);
+        let result = super::cut_display_track_frames(&frames, 15_000_000_000, 0);
         let snapshots: Vec<(u16, u16)> = result
             .iter()
             .filter_map(|f| match f.event {
@@ -1926,7 +2007,7 @@ mod tests {
             frame_bytes_frame(30_000_000_000),
             frame_bytes_frame(40_000_000_000),
         ];
-        let result = super::cut_display_track_frames(&frames, 15_000_000_000);
+        let result = super::cut_display_track_frames(&frames, 15_000_000_000, 0);
         // Baselines are injected at mono_ns = 0.
         // Kept frames should be rebased: first_kept_ns = 30_000_000_000.
         let kept_timestamps: Vec<u64> = result.iter().map(|f| f.mono_ns).collect();
@@ -1959,7 +2040,7 @@ mod tests {
             },
         ];
 
-        let result = super::cut_display_track_frames(&frames, 15_000_000_000);
+        let result = super::cut_display_track_frames(&frames, 15_000_000_000, 0);
         let repaint = result
             .iter()
             .find_map(|frame| match &frame.event {
@@ -2318,7 +2399,7 @@ mod tests {
             ],
         );
 
-        super::copy_display_tracks_for_cut(&source_dir, &cut_dir, 10)
+        super::copy_display_tracks_for_cut(&source_dir, &cut_dir, 10_000_000_000, 0)
             .expect("display track copy should succeed");
 
         let cut_frames = read_display_track(&cut_dir.join(display_name));
@@ -2365,7 +2446,7 @@ mod tests {
             ],
         );
 
-        super::copy_display_tracks_for_cut(&source_dir, &cut_dir, 10)
+        super::copy_display_tracks_for_cut(&source_dir, &cut_dir, 10_000_000_000, 0)
             .expect("display track copy should succeed");
 
         let cut_frames = read_display_track(&cut_dir.join(display_name));
@@ -2413,7 +2494,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1200));
 
         let cut = runtime
-            .cut(&cut_root, None, None)
+            .cut(&cut_root, super::CutWindow::LastSeconds(None), None)
             .expect("rolling cut should succeed");
         assert!(cut.ended_epoch_ms.is_some());
         assert!(cut.event_count >= 1);
@@ -2424,6 +2505,144 @@ mod tests {
                 .exists(),
             "cut manifest should exist"
         );
+
+        let _ = runtime.stop(None).expect("rolling recording should stop");
+    }
+
+    #[test]
+    fn cut_windows_resolve_against_the_wall_clock() {
+        let now = 1_000_000;
+        let last = super::resolve_cut_window(super::CutWindow::LastSeconds(Some(30)), None, now)
+            .expect("last seconds");
+        assert_eq!((last.start, last.end), (now - 30_000, now));
+        let rolling = super::resolve_cut_window(super::CutWindow::LastSeconds(None), Some(60), now)
+            .expect("rolling window");
+        assert_eq!(rolling.start, now - 60_000);
+
+        let range = super::CutWindow::Range {
+            start_epoch_ms: now - 5_000,
+            end_epoch_ms: Some(now - 1_000),
+        };
+        let range = super::resolve_cut_window(range, Some(60), now).expect("range");
+        assert_eq!((range.start, range.end), (now - 5_000, now - 1_000));
+        assert_eq!(
+            range.display_offsets_ns(),
+            (5_000_000_000, 1_000_000_000),
+            "display tracks measure the range back from their latest frame"
+        );
+
+        let open_ended = super::CutWindow::Range {
+            start_epoch_ms: now - 5_000,
+            end_epoch_ms: None,
+        };
+        assert_eq!(
+            super::resolve_cut_window(open_ended, None, now)
+                .expect("open-ended range")
+                .end,
+            now
+        );
+
+        for invalid in [
+            super::CutWindow::LastSeconds(Some(0)),
+            super::CutWindow::LastSeconds(None),
+            super::CutWindow::Range {
+                start_epoch_ms: now - 1_000,
+                end_epoch_ms: Some(now + 1),
+            },
+            super::CutWindow::Range {
+                start_epoch_ms: now - 1_000,
+                end_epoch_ms: Some(now - 1_000),
+            },
+        ] {
+            assert!(
+                super::resolve_cut_window(invalid, None, now).is_err(),
+                "{invalid:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn display_cut_keeps_only_frames_inside_a_closed_range() {
+        let frames = vec![
+            stream_opened_frame(0),
+            resize_frame(1_000, 80, 24),
+            cursor_snapshot_frame(2_000, 0, 0),
+            frame_bytes_frame(10_000_000_000),
+            frame_bytes_frame(20_000_000_000),
+            frame_bytes_frame(30_000_000_000),
+            frame_bytes_frame(40_000_000_000),
+        ];
+        // From 25s to 15s before the latest frame: [15s, 25s].
+        let result = super::cut_display_track_frames(&frames, 25_000_000_000, 15_000_000_000);
+        let content: Vec<u64> = result
+            .iter()
+            .filter(|frame| matches!(frame.event, DisplayTrackEvent::FrameBytes { .. }))
+            .map(|frame| frame.mono_ns)
+            .collect();
+        // The full-repaint baseline plus the 20s frame, rebased to 0.
+        assert_eq!(content, vec![0, 0]);
+        assert!(
+            result.iter().all(|frame| frame.mono_ns == 0),
+            "nothing after the range end may be kept"
+        );
+    }
+
+    #[test]
+    fn rolling_range_cut_keeps_only_events_inside_the_range() {
+        let root = temp_dir();
+        let mut runtime = RecordingRuntime::new_rolling(root.join(".rolling"), 64, 300);
+        runtime
+            .start(
+                None,
+                true,
+                None,
+                RecordingProfile::Functional,
+                vec![RecordingEventKind::PaneOutputRaw],
+            )
+            .expect("rolling recording should start");
+        let record = |data: &[u8]| {
+            runtime
+                .record(
+                    RecordingEventKind::PaneOutputRaw,
+                    RecordingPayload::Bytes {
+                        data: data.to_vec(),
+                    },
+                    RecordMeta {
+                        session_id: None,
+                        pane_id: None,
+                        client_id: None,
+                    },
+                )
+                .expect("rolling event should be accepted");
+        };
+
+        record(b"before");
+        std::thread::sleep(Duration::from_millis(50));
+        let start = super::epoch_millis_now();
+        std::thread::sleep(Duration::from_millis(5));
+        record(b"inside");
+        std::thread::sleep(Duration::from_millis(5));
+        let end = super::epoch_millis_now();
+        std::thread::sleep(Duration::from_millis(50));
+        record(b"after");
+        std::thread::sleep(Duration::from_millis(1200));
+
+        let cut = runtime
+            .cut(
+                &root.join("cuts"),
+                super::CutWindow::Range {
+                    start_epoch_ms: start,
+                    end_epoch_ms: Some(end),
+                },
+                None,
+            )
+            .expect("range cut should succeed");
+        assert_eq!(
+            cut.event_count, 1,
+            "only the event inside the range is kept"
+        );
+        assert_eq!(cut.ended_epoch_ms, Some(end));
+        assert!(cut.started_epoch_ms >= start);
 
         let _ = runtime.stop(None).expect("rolling recording should stop");
     }
@@ -2460,7 +2679,11 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1200));
 
         let cut = runtime
-            .cut(&cut_root, None, Some("look-at-this-one".to_string()))
+            .cut(
+                &cut_root,
+                super::CutWindow::LastSeconds(None),
+                Some("look-at-this-one".to_string()),
+            )
             .expect("rolling cut should succeed");
         assert_eq!(cut.name.as_deref(), Some("look-at-this-one"));
 
@@ -2493,7 +2716,7 @@ mod tests {
             .expect("active recording dir should be movable");
 
         let error = runtime
-            .cut(&cut_root, None, None)
+            .cut(&cut_root, super::CutWindow::LastSeconds(None), None)
             .expect_err("cut should fail when active dir is missing");
         let missing_path = super::cut_missing_active_recording_dir(&error)
             .expect("error should classify as missing active recording dir");

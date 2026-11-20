@@ -1,10 +1,10 @@
 use crate::{RecordingOwner, auto_export_output_path, export};
 use anyhow::{Context, Result};
-use bmux_ipc::{InvokeServiceKind, Request, Response, ResponsePayload};
+use bmux_ipc::InvokeServiceKind;
+use bmux_plugin::ServiceCaller as _;
 use bmux_plugin_sdk::{
-    HostKernelBridge, HostKernelBridgeRequest, HostKernelBridgeResponse, NativeCommandContext,
-    PluginCommandError, TypedDispatchClient, TypedDispatchClientError, TypedDispatchClientResult,
-    decode_service_message, encode_service_message,
+    NativeCommandContext, PluginCommandError, ServiceKind, decode_service_message,
+    encode_service_message,
 };
 use bmux_recording_plugin_api::{recording_commands, recording_state, recording_types};
 use bmux_recording_protocol::{
@@ -20,9 +20,6 @@ use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::time::Duration;
 use uuid::Uuid;
-
-const KERNEL_STATUS_OK: i32 = 0;
-const KERNEL_STATUS_BUFFER_TOO_SMALL: i32 = 4;
 
 type RecordingPayload = ProtocolRecordingPayload<bmux_ipc::Event, bmux_ipc::ErrorCode>;
 type RecordingEventEnvelope = ProtocolRecordingEventEnvelope<bmux_ipc::Event, bmux_ipc::ErrorCode>;
@@ -204,6 +201,8 @@ fn flag_takes_value(name: &str) -> bool {
             | "rolling-window-secs"
             | "rolling-event-kind"
             | "last-seconds"
+            | "start-epoch-ms"
+            | "end-epoch-ms"
             | "export-fps"
             | "older-than"
             | "older-than-days"
@@ -273,129 +272,17 @@ where
         InvokeServiceKind::Query => "recording-state",
         InvokeServiceKind::Command => "recording-commands",
     };
-    let response = invoke_service_raw_bridge(
-        context.host_kernel_bridge.clone(),
-        capability,
-        kind,
-        interface_id,
-        operation,
-        payload,
-    )?;
+    // Host calls go through the command's own service port, which every command
+    // backend provides; the raw kernel bridge is withheld from scoped commands.
+    let kind = match kind {
+        InvokeServiceKind::Query => ServiceKind::Query,
+        InvokeServiceKind::Command => ServiceKind::Command,
+    };
+    let response = context
+        .call_service_raw(capability, kind, interface_id, operation, payload)
+        .map_err(|error| anyhow::anyhow!("recording service call failed: {error}"))?;
     decode_service_message(&response)
         .map_err(|error| anyhow::anyhow!("failed decoding recording service response: {error}"))
-}
-
-fn invoke_service_raw_bridge(
-    bridge: Option<HostKernelBridge>,
-    capability: &str,
-    kind: InvokeServiceKind,
-    interface_id: &str,
-    operation: &str,
-    payload: Vec<u8>,
-) -> Result<Vec<u8>> {
-    let request = Request::InvokeService {
-        capability: capability.to_string(),
-        kind,
-        interface_id: interface_id.to_string(),
-        operation: operation.to_string(),
-        payload,
-    };
-    let response_payload = execute_kernel_request(bridge, &request)?;
-    let ResponsePayload::ServiceInvoked { payload } = response_payload else {
-        anyhow::bail!("recording service returned unexpected response shape");
-    };
-    Ok(payload)
-}
-
-struct HostBridgeTypedClient {
-    bridge: Option<HostKernelBridge>,
-}
-
-impl TypedDispatchClient for HostBridgeTypedClient {
-    fn invoke_service_raw(
-        &mut self,
-        capability: &str,
-        kind: InvokeServiceKind,
-        interface_id: &str,
-        operation: &str,
-        payload: Vec<u8>,
-    ) -> impl std::future::Future<Output = TypedDispatchClientResult<Vec<u8>>> {
-        let mut payload = Some(payload);
-        std::future::poll_fn(move |_| {
-            std::task::Poll::Ready(
-                invoke_service_raw_bridge(
-                    self.bridge.clone(),
-                    capability,
-                    kind,
-                    interface_id,
-                    operation,
-                    payload.take().expect("transport polled after completion"),
-                )
-                .map_err(|error| {
-                    TypedDispatchClientError::transport(interface_id, operation, error.to_string())
-                }),
-            )
-        })
-    }
-}
-
-fn execute_kernel_request(
-    bridge: Option<HostKernelBridge>,
-    request: &Request,
-) -> Result<ResponsePayload> {
-    let bridge = bridge.context("recording command requires a running bmux server")?;
-    let encoded_request = bmux_ipc::encode(request)
-        .map_err(|error| anyhow::anyhow!("failed encoding kernel request: {error}"))?;
-    let encoded_response = invoke_host_kernel_bridge(&bridge, encoded_request)?;
-    let response: Response = bmux_ipc::decode(&encoded_response)
-        .map_err(|error| anyhow::anyhow!("failed decoding kernel response: {error}"))?;
-    match response {
-        Response::Ok(payload) => Ok(payload),
-        Response::Err(error) => anyhow::bail!(error.message),
-    }
-}
-
-fn invoke_host_kernel_bridge(bridge: &HostKernelBridge, payload: Vec<u8>) -> Result<Vec<u8>> {
-    let request = encode_service_message(&HostKernelBridgeRequest::new(payload))
-        .map_err(|error| anyhow::anyhow!("failed encoding host bridge request: {error}"))?;
-    let mut output = vec![0u8; request.len().saturating_mul(4).max(1024)];
-    let mut output_len = 0usize;
-    // SAFETY: the bridge came from this process's host; the request buffer is
-    // readable for its length, `output` is writable for `output.len()` bytes and
-    // the length out-parameter is a live local, all valid for the call.
-    let status = unsafe {
-        bridge.invoke(
-            request.as_ptr(),
-            request.len(),
-            output.as_mut_ptr(),
-            output.len(),
-            &raw mut output_len,
-        )
-    };
-    if status == KERNEL_STATUS_BUFFER_TOO_SMALL {
-        output.resize(output_len, 0);
-        // SAFETY: the bridge came from this process's host; the request buffer is
-        // readable for its length, `output` is writable for `output.len()` bytes and
-        // the length out-parameter is a live local, all valid for the call.
-        let status = unsafe {
-            bridge.invoke(
-                request.as_ptr(),
-                request.len(),
-                output.as_mut_ptr(),
-                output.len(),
-                &raw mut output_len,
-            )
-        };
-        if status != KERNEL_STATUS_OK {
-            anyhow::bail!("kernel bridge invocation failed with status {status}");
-        }
-    } else if status != KERNEL_STATUS_OK {
-        anyhow::bail!("kernel bridge invocation failed with status {status}");
-    }
-    output.truncate(output_len);
-    let response: HostKernelBridgeResponse = decode_service_message(&output)
-        .map_err(|error| anyhow::anyhow!("failed decoding host bridge response: {error}"))?;
-    Ok(response.payload)
 }
 
 fn run_start(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32> {
@@ -1006,15 +893,15 @@ fn run_delete_all(
 }
 
 fn run_cut(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32> {
-    let last_seconds = args.u64_option("last-seconds")?;
+    let window = CutArgs {
+        last_seconds: args.u64_option("last-seconds")?,
+        start_epoch_ms: args.u64_option("start-epoch-ms")?,
+        end_epoch_ms: args.u64_option("end-epoch-ms")?,
+    };
+    window.validate()?;
     let export_fps = args.u32_option("export-fps")?;
     let name = normalize_recording_name(args.option("name").as_deref())?;
-    let completed_job = queue_cut_generated_and_wait(
-        context.host_kernel_bridge.clone(),
-        last_seconds,
-        name,
-        export_fps,
-    )?;
+    let completed_job = queue_cut_generated_and_wait(context, window, name, export_fps)?;
     let recording_path = completed_job.recording_path.as_deref().unwrap_or("-");
     let export_path = completed_job.export_output_path.as_deref();
     match completed_job.status {
@@ -1046,48 +933,59 @@ fn run_cut(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32> 
     }
 }
 
-fn queue_cut_generated_and_wait(
-    bridge: Option<HostKernelBridge>,
+/// `recording cut` window flags: `--last-seconds`, or `--start-epoch-ms` with an optional
+/// `--end-epoch-ms` (wall-clock milliseconds since the Unix epoch).
+#[derive(Debug, Clone, Copy)]
+struct CutArgs {
     last_seconds: Option<u64>,
+    start_epoch_ms: Option<u64>,
+    end_epoch_ms: Option<u64>,
+}
+
+impl CutArgs {
+    fn validate(self) -> Result<()> {
+        if self.last_seconds.is_some() && self.start_epoch_ms.is_some() {
+            anyhow::bail!("--last-seconds conflicts with --start-epoch-ms")
+        }
+        if self.end_epoch_ms.is_some() && self.start_epoch_ms.is_none() {
+            anyhow::bail!("--end-epoch-ms requires --start-epoch-ms")
+        }
+        Ok(())
+    }
+}
+
+fn queue_cut_generated_and_wait(
+    context: &NativeCommandContext,
+    window: CutArgs,
     name: Option<String>,
     export_fps: Option<u32>,
 ) -> Result<recording_types::RecordingJob> {
-    let worker = std::thread::spawn(move || -> Result<recording_types::RecordingJob> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .context("failed creating recording command async runtime")?;
-        runtime.block_on(async move {
-            let mut client = HostBridgeTypedClient { bridge };
-            let mut last_job =
-                recording_commands::client::queue_cut(&mut client, last_seconds, name, export_fps)
-                    .await
-                    .map_err(|error| {
-                        anyhow::anyhow!("recording queue-cut dispatch failed: {error}")
-                    })?;
-            println!("recording cut queued: {}", last_job.id);
-            loop {
-                if matches!(
-                    last_job.status,
-                    recording_types::RecordingJobStatus::Completed
-                        | recording_types::RecordingJobStatus::Failed
-                ) {
-                    return Ok(last_job);
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                let job_id = last_job.id;
-                last_job = recording_state::client::job_status(&mut client, job_id)
-                    .await
-                    .map_err(|error| {
-                        anyhow::anyhow!("recording job-status dispatch failed: {error}")
-                    })?
-                    .ok_or_else(|| anyhow::anyhow!("recording job disappeared: {job_id}"))?;
-            }
-        })
-    });
-    worker
-        .join()
-        .map_err(|_| anyhow::anyhow!("recording cut worker thread panicked"))?
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
+    let mut last_job = bmux_plugin::block_on_typed_dispatch(recording_commands::client::queue_cut(
+        &mut client,
+        window.last_seconds,
+        name,
+        export_fps,
+        window.start_epoch_ms,
+        window.end_epoch_ms,
+    ))
+    .map_err(|error| anyhow::anyhow!("recording queue-cut dispatch failed: {error}"))?;
+    println!("recording cut queued: {}", last_job.id);
+    while !matches!(
+        last_job.status,
+        recording_types::RecordingJobStatus::Completed
+            | recording_types::RecordingJobStatus::Failed
+    ) {
+        std::thread::sleep(Duration::from_millis(100));
+        let job_id = last_job.id;
+        last_job = bmux_plugin::block_on_typed_dispatch(recording_state::client::job_status(
+            &mut client,
+            job_id,
+        ))
+        .map_err(|error| anyhow::anyhow!("recording job-status dispatch failed: {error}"))?
+        .ok_or_else(|| anyhow::anyhow!("recording job disappeared: {job_id}"))?;
+    }
+    Ok(last_job)
 }
 
 fn run_prune(
