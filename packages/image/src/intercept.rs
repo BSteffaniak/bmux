@@ -136,6 +136,50 @@ impl ImageInterceptor {
     /// offset to feed filtered bytes to the cursor tracker and capture
     /// the cursor position at the right moment, then call
     /// `event.set_position(pos)` before passing to the registry.
+    /// Whether [`Self::process`] would return `input` unchanged with no events (and leave the
+    /// interceptor as it is): no sequence is in progress, and no escape in `input` begins, or
+    /// might yet begin, an image sequence. A caller can then use `input` as it is, without the
+    /// copy and the per-escape work of processing it.
+    #[must_use]
+    pub fn passes_through(&self, input: &[u8]) -> bool {
+        if !matches!(self.state, State::Ground) {
+            return false;
+        }
+        let mut rest = input;
+        while let Some(at) = rest.iter().position(|&byte| byte == 0x1B) {
+            // An escape at the end might begin anything.
+            let Some(&next) = rest.get(at + 1) else {
+                return false;
+            };
+            match next {
+                // CAN and SUB cancel the escape, dropping it.
+                0x18 | 0x1A => return false,
+                #[cfg(feature = "sixel")]
+                b'P' => return false,
+                #[cfg(feature = "kitty")]
+                b'_' => return false,
+                #[cfg(feature = "iterm2")]
+                b']' => {
+                    const PREFIX: &[u8] = b"1337;File=";
+                    // Passed through once it diverges from an image's prefix, unless it diverges
+                    // on CAN or SUB, which cancel (and drop) the prefix read so far.
+                    let body = &rest[at + 2..];
+                    match body
+                        .iter()
+                        .zip(PREFIX)
+                        .position(|(byte, expected)| byte != expected)
+                    {
+                        Some(diverges) if !matches!(body[diverges], 0x18 | 0x1A) => {}
+                        _ => return false,
+                    }
+                }
+                _ => {}
+            }
+            rest = &rest[at + 1..];
+        }
+        true
+    }
+
     pub fn process(&mut self, input: &[u8]) -> InterceptResult {
         // Bytes preceding a sequence split across reads were already delivered
         // in the previous result. Its offset is relative to this new chunk.
@@ -458,6 +502,54 @@ impl Default for ImageInterceptor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whenever pass-through says a chunk would come out unchanged, processing it does return
+    /// it unchanged with no events, split anywhere across chunks; and it does not claim so for
+    /// chunks holding (or ending inside) an image sequence's start.
+    #[test]
+    fn passing_through_agrees_with_processing() {
+        let pieces: &[&[u8]] = &[
+            b"plain text",
+            b"\x1b[1;31mred\x1b[0m",
+            b"\x1b]0;title\x07",
+            b"\x1b]133;A\x1b\\",
+            b"\x1b]13",
+            b"\x1bPq#0;2;0;0;0~\x1b\\",
+            b"\x1b_Ga=T,f=100;AAAA\x1b\\",
+            b"\x1b]1337;File=inline=1:AAAA\x07",
+            b"\x1b\x1b[2J",
+            b"\x18\x1a",
+            b"\x1b",
+        ];
+        for first in pieces {
+            for second in pieces {
+                let stream = [*first, *second].concat();
+                for split in 0..=stream.len() {
+                    let mut interceptor = ImageInterceptor::new();
+                    for chunk in [&stream[..split], &stream[split..]] {
+                        let passes = interceptor.passes_through(chunk);
+                        let result = interceptor.process(chunk);
+                        if passes {
+                            assert_eq!(result.filtered, chunk, "{stream:?} split at {split}");
+                            assert!(result.events.is_empty());
+                        }
+                    }
+                }
+            }
+        }
+        let interceptor = ImageInterceptor::new();
+        assert!(interceptor.passes_through(b"\x1b[1mbold\x1b]0;t\x07"));
+        assert!(
+            !interceptor.passes_through(b"x\x1b"),
+            "an escape at the end"
+        );
+        #[cfg(feature = "sixel")]
+        assert!(!interceptor.passes_through(b"a\x1bPq"));
+        #[cfg(feature = "kitty")]
+        assert!(!interceptor.passes_through(b"\x1b_G"));
+        #[cfg(feature = "iterm2")]
+        assert!(!interceptor.passes_through(b"\x1b]1337;Fi"));
+    }
 
     #[cfg(feature = "sixel")]
     #[test]

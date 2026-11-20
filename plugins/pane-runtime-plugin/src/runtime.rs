@@ -2766,6 +2766,11 @@ fn follow_chunk(
     replies: &mut Vec<u8>,
 ) -> std::io::Result<()> {
     reader.begin_chunk();
+    // Most chunks hold no image: follow them as they are.
+    if images.interceptor.passes_through(chunk) {
+        images.events.clear();
+        return follow_output(reader, grid, protocol, images.registry, chunk, replies);
+    }
     let mut intercepted = images.interceptor.process(chunk);
     let followed = ordered_image_output(
         reader,
