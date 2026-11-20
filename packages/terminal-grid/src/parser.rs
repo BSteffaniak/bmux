@@ -888,6 +888,7 @@ impl<O: SequenceObserver> GridPerformer<'_, O> {
                             .set_mouse_encoding(MouseProtocolEncoding::Sgr, enabled),
                         1015 => self.grid.set_mouse_urxvt_encoding(enabled),
                         2004 => self.grid.set_bracketed_paste(enabled),
+                        2026 => self.grid.set_synchronized_update(enabled),
                         _ => {}
                     }
                 }
@@ -2057,6 +2058,27 @@ mod tests {
         assert!(!protocol.application_cursor);
         assert!(!protocol.application_keypad);
         assert!(!protocol.bracketed_paste);
+    }
+
+    /// The grid follows synchronized updates (DEC mode 2026) as it parses: opened, closed, closed
+    /// by a full reset, and across chunk boundaries.
+    #[test]
+    fn grids_follow_synchronized_updates() {
+        let mut stream = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+        let open = |stream: &mut TerminalGridStream, bytes: &[u8]| {
+            stream.process(bytes);
+            stream.grid().synchronized_update()
+        };
+        assert!(open(&mut stream, b"\x1b[?2026h"));
+        assert!(open(&mut stream, b"frame"));
+        assert!(!open(&mut stream, b"\x1b[?2026l"));
+        assert!(open(&mut stream, b"\x1b[?2026h"));
+        assert!(!open(&mut stream, b"\x1bc"), "a full reset closes it");
+        assert!(
+            !open(&mut stream, b"\x1b[?20"),
+            "split across chunks: not yet"
+        );
+        assert!(open(&mut stream, b"26h"));
     }
 
     /// Filters drop the sequences they decline before the grid applies them; sequences no filter

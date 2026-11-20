@@ -12493,10 +12493,7 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             let frame =
                 grid.grid_mut()
                     .write_frame_since(replica.cursor, max_history_lines, &mut encoded);
-            let sync_update_active = pane.output_buffer.lock().is_ok_and(|output| {
-                let end = output.end_offset();
-                output.sync_update_open_at(end)
-            });
+            let sync_update_active = grid.grid().synchronized_update();
             drop(grid);
             if encoded.len() > remaining && !frames.is_empty() {
                 still_pending = true;

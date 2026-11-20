@@ -948,6 +948,9 @@ pub struct TerminalGrid {
     evicted_text: Option<String>,
     /// The style printing last interned, and its id: printed runs share one style.
     interned_style: Option<(Style, StyleId)>,
+    /// A synchronized update (DEC mode 2026) is open: the program began a frame and has not
+    /// finished it. Kept by the source grid; replicas are told it with each frame.
+    synchronized_update: bool,
     main_history_projected_rows: OnceLock<usize>,
     pending_history_cells: Vec<Cell>,
     main_rows: VecDeque<PhysicalRow>,
@@ -1316,6 +1319,7 @@ impl TerminalGrid {
             history_truncated: false,
             evicted_text: None,
             interned_style: None,
+            synchronized_update: false,
             main_history_projected_rows: OnceLock::from(0),
             pending_history_cells: Vec::new(),
             main_rows,
@@ -1422,6 +1426,7 @@ impl TerminalGrid {
             // Collection is the caller's runtime choice, not snapshotted state.
             evicted_text: None,
             interned_style: None,
+            synchronized_update: false,
             main_history,
             main_history_projected_rows: OnceLock::from(main_history_projected_rows),
             pending_history_cells,
@@ -2497,6 +2502,16 @@ impl TerminalGrid {
             reset.restore_damage(self.take_damage_for_reset());
             *self = reset;
         }
+    }
+
+    /// Whether the output applied so far leaves a synchronized update (DEC mode 2026) open.
+    #[must_use]
+    pub const fn synchronized_update(&self) -> bool {
+        self.synchronized_update
+    }
+
+    pub(crate) const fn set_synchronized_update(&mut self, open: bool) {
+        self.synchronized_update = open;
     }
 
     pub(crate) fn bump_revision(&mut self) {
@@ -4083,6 +4098,7 @@ impl TerminalGrid {
             // A bounded copy for presentation does not carry collected text.
             evicted_text: None,
             interned_style: None,
+            synchronized_update: false,
             main_history,
             main_history_projected_rows: OnceLock::new(),
             pending_history_cells: try_clone_cells(&self.pending_history_cells)?,
