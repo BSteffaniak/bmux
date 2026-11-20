@@ -2,8 +2,8 @@
 
 use crate::endpoint::EndpointDispatchClient;
 use bmux_cluster_plugin_api::cluster_types::{
-    AttachLayout, AttachLayoutRect, ControlServiceError, ExecutionId, WorkerOutput,
-    WorkerServiceError, WorkerTerminalSnapshot, WorkspaceId,
+    AttachLayout, AttachLayoutRect, ControlServiceError, ExecutionId, ExecutionRef, WorkerRoute,
+    WorkerServiceError, WorkspaceId,
 };
 use bmux_plugin::ServiceCaller;
 use std::sync::Arc;
@@ -379,57 +379,43 @@ where
         })
     }
 
-    fn snapshot<'a>(
+    fn routes<'a>(
         &'a self,
         workspace_id: WorkspaceId,
-        execution_id: ExecutionId,
-        generation: u64,
+        principal_id: String,
+        executions: Vec<ExecutionRef>,
     ) -> std::pin::Pin<
         Box<
-            dyn std::future::Future<Output = Result<WorkerTerminalSnapshot, WorkerServiceError>>
+            dyn std::future::Future<Output = Result<Vec<WorkerRoute>, WorkerServiceError>>
                 + Send
                 + 'a,
         >,
     > {
         Box::pin(async move {
-            let endpoint = self
-                .resolve_worker(&workspace_id, &execution_id, generation)
-                .await?;
-            let mut remote = EndpointDispatchClient::new(self.caller.as_ref(), endpoint);
-            bmux_cluster_plugin_api::cluster_worker_state::client::snapshot(
-                &mut remote,
-                execution_id,
-                generation,
-            )
-            .await
-            .map_err(dispatch_error)?
-        })
-    }
-
-    fn output<'a>(
-        &'a self,
-        workspace_id: WorkspaceId,
-        execution_id: ExecutionId,
-        generation: u64,
-        cursor: u64,
-        max_bytes: u32,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<WorkerOutput, WorkerServiceError>> + Send + 'a>,
-    > {
-        Box::pin(async move {
-            let endpoint = self
-                .resolve_worker(&workspace_id, &execution_id, generation)
-                .await?;
-            let mut remote = EndpointDispatchClient::new(self.caller.as_ref(), endpoint);
-            bmux_cluster_plugin_api::cluster_worker_state::client::output(
-                &mut remote,
-                execution_id,
-                generation,
-                cursor,
-                max_bytes,
-            )
-            .await
-            .map_err(dispatch_error)?
+            let mut routes = Vec::with_capacity(executions.len());
+            for execution in executions {
+                let lease = bmux_cluster_plugin_api::cluster_types::CommandId {
+                    value: uuid::Uuid::new_v4(),
+                };
+                let (endpoint, authority) = self
+                    .worker_authority(
+                        &workspace_id,
+                        &execution.execution_id,
+                        execution.generation,
+                        &lease,
+                        principal_id.clone(),
+                        bmux_cluster_plugin_api::cluster_types::WorkerOperationClass::Observe,
+                    )
+                    .await?;
+                routes.push(WorkerRoute {
+                    execution_id: execution.execution_id,
+                    generation: execution.generation,
+                    node_id: authority.audience_node_id.clone(),
+                    endpoint,
+                    authority,
+                });
+            }
+            Ok(routes)
         })
     }
 }

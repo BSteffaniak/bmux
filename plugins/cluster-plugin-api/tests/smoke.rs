@@ -13,14 +13,14 @@ use bmux_cluster_plugin_api::{
         ControlCommandRequest, ControlCommandResult, ControlReadConsistency, ControlResourceKind,
         ControlResponse, ControlServiceError, ControlStateView, ControlWorkflowStatus,
         EnrollmentTokenResult, ExecutionAssignment, ExecutionId, LogicalPaneId, LogicalPaneRecord,
-        LogicalTabId, LogicalTabRecord, PaneAvailability, PaneRestartPolicy, PeerAuthChallenge,
-        PeerAuthProof, PlacementIntent, PromotionId, RaftRpcRequest, RaftRpcResponse,
-        WorkerAdoptionSpec, WorkerAuthority, WorkerExecution, WorkerExecutionList,
+        LogicalTabId, LogicalTabRecord, ObservedExecution, PaneAvailability, PaneRestartPolicy,
+        PeerAuthChallenge, PeerAuthProof, PlacementIntent, PromotionId, RaftRpcRequest,
+        RaftRpcResponse, WorkerAdoptionSpec, WorkerAuthority, WorkerExecution, WorkerExecutionList,
         WorkerExecutionState, WorkerLaunchResult, WorkerLaunchSpec, WorkerMutationAck,
-        WorkerOperationClass, WorkerOutput, WorkerQueryResult, WorkerServiceError, WorkerSignal,
-        WorkerTerminalSnapshot, WorkspaceId, WorkspaceRecord,
+        WorkerOperationClass, WorkerQueryResult, WorkerRoute, WorkerServiceError, WorkerSignal,
+        WorkspaceId, WorkspaceRecord,
     },
-    cluster_worker_command, cluster_worker_state,
+    cluster_worker_command, cluster_worker_state, cluster_worker_stream,
 };
 
 #[test]
@@ -253,8 +253,6 @@ fn generated_worker_contract_carries_execution_identity_and_fencing() {
         local_pane_id: uuid::Uuid::new_v4(),
         state: WorkerExecutionState::Ready,
         exit_code: None,
-        output_start: 5,
-        output_end: 9,
     };
     let values = [
         serde_json::to_value(WorkerLaunchSpec {
@@ -289,22 +287,19 @@ fn generated_worker_contract_carries_execution_identity_and_fencing() {
             applied: true,
         })
         .unwrap(),
-        serde_json::to_value(WorkerOutput {
+        serde_json::to_value(WorkerRoute {
             execution_id: execution_id.clone(),
             generation: authority.generation,
-            requested_cursor: 5,
-            retained_start: 5,
-            next_cursor: 9,
-            gap: false,
-            output_still_pending: false,
-            data: b"data".to_vec(),
+            node_id: "worker".to_string(),
+            endpoint: "local".to_string(),
+            authority: authority.clone(),
         })
         .unwrap(),
-        serde_json::to_value(WorkerTerminalSnapshot {
+        serde_json::to_value(ObservedExecution {
             execution_id: execution_id.clone(),
             generation: authority.generation,
-            cursor: 9,
-            encoded: vec![1, 2, 3],
+            session_id: uuid::Uuid::nil(),
+            pane_id: uuid::Uuid::nil(),
         })
         .unwrap(),
         serde_json::to_value(WorkerServiceError::StaleGeneration {
@@ -509,8 +504,7 @@ fn interface_ids_and_operations_match_schema() {
     assert_eq!(cluster_worker_command::OP_RESTART, "restart");
     assert_eq!(cluster_worker_command::OP_CLOSE, "close");
     assert_eq!(cluster_worker_state::OP_GET, "get");
-    assert_eq!(cluster_worker_state::OP_OUTPUT, "output");
-    assert_eq!(cluster_worker_state::OP_SNAPSHOT, "snapshot");
+    assert_eq!(cluster_worker_stream::OP_OBSERVE, "observe");
     assert_eq!(cluster_worker_state::OP_INVENTORY, "inventory");
     assert_eq!(cluster_control_command::OP_MUTATE, "mutate");
     assert_eq!(cluster_control_command_v2::OP_MUTATE, "mutate");
@@ -539,7 +533,7 @@ fn interface_ids_and_operations_match_schema() {
 fn generated_contract_declares_all_services() {
     let services = bmux_cluster_plugin_api::service_declarations()
         .expect("cluster service declarations should be valid");
-    assert_eq!(services.len(), 19);
+    assert_eq!(services.len(), 20);
     let service_ids = services
         .iter()
         .map(|service| service.interface_id.as_str())
@@ -568,6 +562,7 @@ fn generated_contract_declares_all_services() {
         "provide cluster-attach-state;",
         "provide cluster-attach-command;",
         "provide cluster-worker-state;",
+        "provide cluster-worker-stream;",
         "provide cluster-control-command@2;",
         "provide cluster-control-state@2;",
     ] {

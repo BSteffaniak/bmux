@@ -116,11 +116,56 @@ pub struct ClusterPlugin {
     activation_caller: std::sync::RwLock<Option<Arc<bmux_plugin::TypedServiceCaller>>>,
     /// This instance's gateway breaker, cooldown and history state.
     gateway: Arc<gateway::GatewayRuntime>,
+    /// The worker registry, observing executions for connections (`cluster-worker-stream`), set
+    /// when the typed services register.
+    observer: std::sync::RwLock<Option<Arc<dyn worker_runtime::ExecutionObserver>>>,
 }
 
 const NO_ACTIVATION: &str = "cluster consensus requires an active plugin activation";
 
 impl ClusterPlugin {
+    /// `cluster-worker-stream` `observe`: push the caller's connection frames of the executions
+    /// its leases authorize. `None` for any other service.
+    fn invoke_worker_stream(&self, context: &NativeServiceContext) -> Option<ServiceResponse> {
+        ((
+            context.request.service.interface_id.as_str(),
+            context.request.operation.as_str(),
+        ) == ("cluster-worker-stream/v1", "observe"))
+            .then(|| self.invoke_observe(context))
+    }
+
+    fn invoke_observe(&self, context: &NativeServiceContext) -> ServiceResponse {
+        let request = match bmux_plugin_sdk::decode_service_message::<
+            bmux_cluster_plugin_api::cluster_worker_stream::client::ObserveRequest,
+        >(&context.request.payload)
+        {
+            Ok(request) => request,
+            Err(error) => return ServiceResponse::error("observe_invalid", error.to_string()),
+        };
+        let result = (|| {
+            let client_id = context.caller_client_id.ok_or_else(|| {
+                bmux_cluster_plugin_api::cluster_types::WorkerServiceError::InvalidRequest {
+                    reason: "observing needs a client connection to push frames to".to_string(),
+                }
+            })?;
+            let observer = self
+                .observer
+                .read()
+                .ok()
+                .and_then(|observer| observer.clone())
+                .ok_or_else(|| {
+                    bmux_cluster_plugin_api::cluster_types::WorkerServiceError::Unavailable {
+                        reason: "this node is not running a worker".to_string(),
+                    }
+                })?;
+            observer.observe(client_id, &request.authorities, request.max_history_lines)
+        })();
+        match bmux_plugin_sdk::encode_service_message(&result) {
+            Ok(payload) => ServiceResponse::ok(payload),
+            Err(error) => ServiceResponse::error("observe_failed", error.to_string()),
+        }
+    }
+
     fn activation_caller(&self) -> Result<Arc<bmux_plugin::TypedServiceCaller>, String> {
         self.activation_caller
             .read()
@@ -481,6 +526,9 @@ impl ClusterPlugin {
                 + Send
                 + Sync,
         > = worker.clone();
+        if let Ok(mut observer) = self.observer.write() {
+            *observer = Some(worker.clone());
+        }
         let worker_state: Arc<
             dyn bmux_cluster_plugin_api::cluster_worker_state::ClusterWorkerStateService
                 + Send
@@ -602,6 +650,9 @@ impl ClusterPlugin {
             return ServiceResponse::error("storage_authority_unavailable", error);
         }
         if let Some(response) = invoke_native_consensus_service(context, &self.nodes) {
+            return response;
+        }
+        if let Some(response) = self.invoke_worker_stream(context) {
             return response;
         }
         if is_cluster_lifecycle_service(context) {

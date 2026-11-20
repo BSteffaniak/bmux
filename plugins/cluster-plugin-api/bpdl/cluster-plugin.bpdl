@@ -156,6 +156,8 @@ interface cluster-types {
     enum worker-operation-class {
         interactive,
         lifecycle,
+        // Following an execution's screen (frames pushed to the observing connection).
+        observe,
     }
 
     record worker-authority {
@@ -205,8 +207,6 @@ interface cluster-types {
         local_pane_id: uuid,
         state: worker-execution-state,
         exit_code: i32?,
-        output_start: u64,
-        output_end: u64,
     }
 
     record worker-execution-list {
@@ -215,7 +215,6 @@ interface cluster-types {
 
     record worker-registry-stats {
         execution_count: u32,
-        retained_output_bytes: u64,
     }
 
     record worker-mutation-ack {
@@ -224,22 +223,28 @@ interface cluster-types {
         applied: bool,
     }
 
-    record worker-output {
+    // One generation of one execution.
+    record execution-ref {
         execution_id: execution-id,
         generation: u64,
-        requested_cursor: u64,
-        retained_start: u64,
-        next_cursor: u64,
-        gap: bool,
-        output_still_pending: bool,
-        data: bytes,
     }
 
-    record worker-terminal-snapshot {
+    // Where to follow an execution's screen: its worker, and a lease authorizing the caller to
+    // observe it there.
+    record worker-route {
         execution_id: execution-id,
         generation: u64,
-        cursor: u64,
-        encoded: bytes,
+        node_id: string,
+        endpoint: string,
+        authority: worker-authority,
+    }
+
+    // An execution a connection now observes, and the worker-local pane its pushed frames name.
+    record observed-execution {
+        execution_id: execution-id,
+        generation: u64,
+        session_id: uuid,
+        pane_id: uuid,
     }
 
     variant worker-service-error {
@@ -789,8 +794,8 @@ interface cluster-attach-command {
 @interface-version(1)
 interface cluster-attach-state {
     query layout(workspace_id: cluster-types.workspace-id, tab_id: cluster-types.logical-tab-id?, columns: u16, rows: u16) -> result<cluster-types.attach-layout, cluster-types.control-service-error>;
-    query snapshot(workspace_id: cluster-types.workspace-id, execution_id: cluster-types.execution-id, generation: u64) -> result<cluster-types.worker-terminal-snapshot, cluster-types.worker-service-error>;
-    query output(workspace_id: cluster-types.workspace-id, execution_id: cluster-types.execution-id, generation: u64, cursor: u64, max_bytes: u32) -> result<cluster-types.worker-output, cluster-types.worker-service-error>;
+    // Where to follow each execution's screen: its worker's endpoint and an observe lease.
+    query routes(workspace_id: cluster-types.workspace-id, principal_id: string, executions: list<cluster-types.execution-ref>) -> result<list<cluster-types.worker-route>, cluster-types.worker-service-error>;
 }
 
 @capability(CLUSTER_WRITE)
@@ -810,9 +815,16 @@ interface cluster-worker-command {
 @interface-version(1)
 interface cluster-worker-state {
     query get(execution_id: cluster-types.execution-id) -> result<cluster-types.worker-query-result, cluster-types.worker-service-error>;
-    query output(execution_id: cluster-types.execution-id, generation: u64, cursor: u64, max_bytes: u32) -> result<cluster-types.worker-output, cluster-types.worker-service-error>;
-    query snapshot(execution_id: cluster-types.execution-id, generation: u64) -> result<cluster-types.worker-terminal-snapshot, cluster-types.worker-service-error>;
     query inventory() -> cluster-types.worker-execution-list;
+}
+
+// Executions' screens pushed to the observing connection as frames (the pane runtime's frame
+// push), each authorized by an observe lease the ingress signed. Observing a new set replaces
+// the previous one; an empty set stops.
+@capability(CLUSTER_READ)
+@interface-version(1)
+interface cluster-worker-stream {
+    query observe(authorities: list<cluster-types.worker-authority>, max_history_lines: u32) -> result<list<cluster-types.observed-execution>, cluster-types.worker-service-error>;
 }
 
 @capability(CLUSTER_AUTH)
@@ -869,6 +881,7 @@ world cluster {
     provide cluster-attach-state;
     provide cluster-worker-command;
     provide cluster-worker-state;
+    provide cluster-worker-stream;
     provide cluster-peer-auth;
     provide cluster-connection-events;
     provide cluster-control-command@1;

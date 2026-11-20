@@ -1,24 +1,51 @@
 //! Plugin-owned client adapter for native federated attach.
+//!
+//! A `cluster://` attach shows a workspace's logical layout, read from the ingress node, with the
+//! screens of its panes' executions, which run on worker nodes. The ingress names each
+//! execution's worker and signs a lease to observe it (`cluster-attach-state` `routes`); the
+//! session holds one connection per worker and has the worker push frames of the executions it
+//! runs there (`cluster-worker-stream` `observe`). Each stream's screen is a replica grid kept
+//! only by those frames, and frames written from it bring the renderer's replica level with it:
+//! frames relay through the session, which neither polls workers nor parses terminal output.
+//! Replicas follow their source's size: a viewport change resizes the workers' panes, whose
+//! frames then carry the new size.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
 use bmux_client::{
-    AttachDeltaSequence, AttachDetachOutcome, AttachProvider, AttachProviderAck,
-    AttachProviderAction, AttachProviderBackend, AttachProviderError, AttachProviderFuture,
-    AttachProviderInput, AttachProviderSession, AttachProviderSnapshot, AttachProviderViewport,
-    AttachResumeState, AttachSession, AttachSessionError, AttachSessionFuture, AttachStreamCursor,
-    AttachStreamId, AttachStreamSnapshot, AttachTarget, AttachViewRevision, BmuxClient,
-    ResolvedAttachTarget,
+    AttachDeltaSequence, AttachDetachOutcome, AttachEndpointConnector, AttachProvider,
+    AttachProviderAck, AttachProviderAction, AttachProviderBackend, AttachProviderError,
+    AttachProviderFuture, AttachProviderInput, AttachProviderSession, AttachProviderSnapshot,
+    AttachProviderViewport, AttachResumeState, AttachSession, AttachSessionError,
+    AttachSessionFuture, AttachStreamCursor, AttachStreamId, AttachStreamSnapshot, AttachTarget,
+    AttachViewRevision, BmuxClient, ResolvedAttachTarget,
+};
+use bmux_cluster_plugin_api::cluster_types::{
+    ExecutionRef, ObservedExecution, WorkerAuthority, WorkerRoute, WorkerServiceError,
 };
 use bmux_cluster_plugin_api::{
-    cluster_attach_command, cluster_attach_state, cluster_control_state,
+    cluster_attach_command, cluster_attach_state, cluster_control_state, cluster_worker_stream,
 };
+use bmux_pane_runtime_plugin_api::attach_runtime_state::{AttachPaneFrames, PaneFrame};
 use std::any::Any;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot};
 
 const CLUSTER_PROVIDER_ID: &str = "bmux.cluster";
+
+/// How long a new stream's worker has to push its first frame (it pushes one at once).
+const HYDRATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often the session asks the ingress whether the layout changed (see
+/// [`ClusterAttachSession::changed_layout`]).
+const LAYOUT_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How long after a worker could not be observed (unreachable, or not yet running the execution)
+/// the session tries again, unless the layout changes first.
+const OBSERVE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Debug)]
 pub struct ClusterAttachProvider;
@@ -98,16 +125,19 @@ impl AttachProvider for ClusterAttachProvider {
                         resolved.provider_id()
                     ),
                 })?;
-            let client = if let Some(client) = context.fallback_client {
-                client
-            } else {
+            // Workers are dialed directly, so the connector is needed even with a client in hand.
+            let connector =
                 context
                     .endpoint_connector
                     .ok_or_else(|| AttachProviderError::OpenFailed {
                         provider_id: CLUSTER_PROVIDER_ID.to_string(),
                         reason: "cluster provider requires the generic endpoint connector"
                             .to_string(),
-                    })?
+                    })?;
+            let client = if let Some(client) = context.fallback_client {
+                client
+            } else {
+                connector
                     .connect(&target.cluster, "bmux-cli-cluster-attach")
                     .await
                     .map_err(|reason| AttachProviderError::OpenFailed {
@@ -121,6 +151,7 @@ impl AttachProvider for ClusterAttachProvider {
             let principal_id = format!("principal:{}", client.principal_id());
             let session = ClusterAttachSession::open(
                 client,
+                connector,
                 target.cluster.clone(),
                 target.workspace.clone(),
                 principal_id,
@@ -139,22 +170,474 @@ impl AttachProvider for ClusterAttachProvider {
     }
 }
 
-struct ClusterSnapshotBuild {
-    snapshot: AttachProviderSnapshot,
-    protocols:
-        std::collections::BTreeMap<AttachStreamId, bmux_terminal_grid::TerminalProtocolTracker>,
-    grids: std::collections::BTreeMap<AttachStreamId, bmux_terminal_grid::TerminalGridStream>,
-    /// Where the renderer's replica of each stream's grid stands: frames are written since it.
-    replicas: std::collections::BTreeMap<AttachStreamId, bmux_terminal_grid::ReplicaCursor>,
+/// One stream's screen as the session holds it: a grid kept only by its worker's frames, and
+/// where the worker's and the renderer's replicas of it stand.
+struct StreamReplica {
+    generation: u64,
+    grid: bmux_terminal_grid::TerminalGrid,
+    /// The last worker frame applied; `None` until the first.
+    upstream: Option<bmux_terminal_grid::ReplicaCursor>,
+    /// Where the renderer's replica stands: frames for it are written since. Its epoch is the
+    /// stream cursor's offset.
+    downstream: bmux_terminal_grid::ReplicaCursor,
+    /// Where the renderer's replica will stand once it takes the snapshot last built, which may
+    /// never reach it (the view that built it was abandoned).
+    snapshotted: Option<bmux_terminal_grid::ReplicaCursor>,
+    sync_update_active: bool,
 }
 
-struct DecodedClusterTerminalSnapshot {
-    cursor: u64,
-    stream: bmux_terminal_grid::TerminalGridStream,
+impl StreamReplica {
+    fn new(generation: u64) -> Result<Self, AttachSessionError> {
+        Ok(Self {
+            generation,
+            grid: bmux_terminal_grid::TerminalGrid::new(
+                1,
+                1,
+                bmux_terminal_grid::GridLimits::default(),
+            )
+            .map_err(|error| provider_reason(format!("stream grid failed: {error}")))?,
+            upstream: None,
+            downstream: bmux_terminal_grid::ReplicaCursor::default(),
+            snapshotted: None,
+            sync_update_active: false,
+        })
+    }
+
+    const fn hydrated(&self) -> bool {
+        self.upstream.is_some()
+    }
+
+    /// Apply a frame the worker pushed.
+    ///
+    /// # Errors
+    /// The frame was not written for this replica: the worker must send a reset frame.
+    fn apply_upstream(
+        &mut self,
+        frame: &[u8],
+        sync_update_active: bool,
+    ) -> Result<(), bmux_terminal_grid::FrameApplyError> {
+        let mut cursor = self.upstream.unwrap_or_default();
+        self.grid.apply_frame(frame, &mut cursor)?;
+        self.upstream = Some(cursor);
+        self.sync_update_active = sync_update_active;
+        Ok(())
+    }
+
+    /// The whole screen for a renderer's new replica; the renderer's replica stands where it
+    /// leaves it once the snapshot is adopted ([`adopt_snapshot_replicas`]).
+    fn snapshot(
+        &mut self,
+        stream_id: AttachStreamId,
+        surface_id: uuid::Uuid,
+    ) -> AttachStreamSnapshot {
+        let mut frame = Vec::new();
+        let next = self
+            .grid
+            .write_frame_since(bmux_terminal_grid::ReplicaCursor::default(), 0, &mut frame)
+            .next;
+        self.snapshotted = Some(next);
+        AttachStreamSnapshot {
+            cursor: AttachStreamCursor {
+                stream_id,
+                surface_id,
+                generation: self.generation,
+                offset: next.epoch,
+            },
+            sync_update_active: self.sync_update_active,
+            frame,
+        }
+    }
+
+    /// The frame bringing the renderer's replica at `cursor` level with this one; `cursor`
+    /// advances past it.
+    fn relay(&mut self, cursor: &mut AttachStreamCursor) -> bmux_client::AttachStreamFrame {
+        let mut frame = Vec::new();
+        let summary = self.grid.write_frame_since(self.downstream, 0, &mut frame);
+        let base = cursor.clone();
+        self.downstream = summary.next;
+        cursor.offset = summary.next.epoch;
+        bmux_client::AttachStreamFrame {
+            cursor: base,
+            end_offset: summary.next.epoch,
+            reset: summary.reset,
+            sync_update_active: self.sync_update_active,
+            frame,
+        }
+    }
+}
+
+/// The renderer takes `snapshot` (as a snapshot or in a reconciliation delta): its replicas of
+/// the snapshot's streams stand where the snapshot leaves them.
+fn adopt_snapshot_replicas(
+    replicas: &mut BTreeMap<AttachStreamId, StreamReplica>,
+    snapshot: &AttachProviderSnapshot,
+) {
+    for stream in &snapshot.streams {
+        if let Some(replica) = replicas.get_mut(&stream.cursor.stream_id)
+            && let Some(snapshotted) = replica.snapshotted.take()
+        {
+            replica.downstream = snapshotted;
+        }
+    }
+}
+
+/// Frames bringing the renderer's replicas of the `changed` streams level with the session's,
+/// in stream order; their cursors advance.
+fn relay_frames(
+    streams: &mut [AttachStreamCursor],
+    replicas: &mut BTreeMap<AttachStreamId, StreamReplica>,
+    changed: &BTreeSet<AttachStreamId>,
+) -> Vec<bmux_client::AttachProviderChange> {
+    streams
+        .iter_mut()
+        .filter(|cursor| changed.contains(&cursor.stream_id))
+        .filter_map(|cursor| {
+            let replica = replicas
+                .get_mut(&cursor.stream_id)
+                .filter(|replica| replica.generation == cursor.generation)?;
+            Some(bmux_client::AttachProviderChange::StreamFrame(
+                replica.relay(cursor),
+            ))
+        })
+        .collect()
+}
+
+/// A stream to observe: its execution and the lease the ingress signed for it.
+struct ObserveTarget {
+    stream_id: AttachStreamId,
+    execution: ExecutionRef,
+    authority: WorkerAuthority,
+}
+
+/// Why streams could not be observed.
+enum ObserveError {
+    /// The worker refused: the execution moved, ended, or is not running there yet.
+    Worker(WorkerServiceError),
+    /// The worker could not be reached, or its connection closed.
+    Link(String),
+    /// Anything else, which the session cannot recover from.
+    Failed(AttachSessionError),
+}
+
+impl From<AttachSessionError> for ObserveError {
+    fn from(error: AttachSessionError) -> Self {
+        Self::Failed(error)
+    }
+}
+
+impl ObserveError {
+    fn into_session_error(self) -> AttachSessionError {
+        match self {
+            Self::Worker(error) => provider_reason(format!("worker observation failed: {error:?}")),
+            Self::Link(reason) => provider_reason(format!("worker connection failed: {reason}")),
+            Self::Failed(error) => error,
+        }
+    }
+}
+
+enum LinkCommand {
+    Observe {
+        authorities: Vec<WorkerAuthority>,
+        reply: oneshot::Sender<Result<Result<Vec<ObservedExecution>, WorkerServiceError>, String>>,
+    },
+}
+
+/// What a worker connection reports to the session.
+enum LinkEvent {
+    /// Frames the worker pushed, as one batch.
+    Frames { link: u64, frames: Vec<PaneFrame> },
+    /// The connection closed, or can no longer be followed.
+    Closed { link: u64 },
+}
+
+/// One connection to a worker, which pushes it frames of the executions it observes.
+struct WorkerLink {
+    id: u64,
+    commands: mpsc::UnboundedSender<LinkCommand>,
+    /// The worker's panes this connection observes, and the streams they are.
+    observed: BTreeMap<uuid::Uuid, AttachStreamId>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for WorkerLink {
+    fn drop(&mut self) {
+        // Closing the connection ends the worker's observation of it.
+        self.task.abort();
+    }
+}
+
+/// The session's worker connections, by endpoint, and the events they report.
+struct WorkerLinks {
+    connector: Arc<dyn AttachEndpointConnector>,
+    links: BTreeMap<String, WorkerLink>,
+    next_id: u64,
+    events_tx: mpsc::UnboundedSender<LinkEvent>,
+    events: mpsc::UnboundedReceiver<LinkEvent>,
+}
+
+impl WorkerLinks {
+    fn new(connector: Arc<dyn AttachEndpointConnector>) -> Self {
+        let (events_tx, events) = mpsc::unbounded_channel();
+        Self {
+            connector,
+            links: BTreeMap::new(),
+            next_id: 0,
+            events_tx,
+            events,
+        }
+    }
+
+    /// A link, while it is current.
+    fn current(&self, link: u64) -> Option<&WorkerLink> {
+        self.links.values().find(|candidate| candidate.id == link)
+    }
+
+    /// Close a link; false when it was already replaced or closed.
+    fn remove(&mut self, link: u64) -> bool {
+        let before = self.links.len();
+        self.links.retain(|_, candidate| candidate.id != link);
+        self.links.len() != before
+    }
+
+    async fn connect(&mut self, endpoint: &str) -> Result<WorkerLink, String> {
+        let client = self
+            .connector
+            .connect(endpoint, "bmux-cli-cluster-observe")
+            .await?;
+        let mut client =
+            bmux_client::StreamingBmuxClient::from_client(client).map_err(|e| e.to_string())?;
+        client
+            .enable_event_push()
+            .await
+            .map_err(|error| error.to_string())?;
+        self.next_id += 1;
+        let id = self.next_id;
+        let (commands, receiver) = mpsc::unbounded_channel();
+        let task = tokio::spawn(run_worker_link(
+            id,
+            client,
+            receiver,
+            self.events_tx.clone(),
+        ));
+        Ok(WorkerLink {
+            id,
+            commands,
+            observed: BTreeMap::new(),
+            task,
+        })
+    }
+
+    /// Have the worker at `endpoint` push frames of `targets` (replacing what it pushed this
+    /// session before), connecting first if needed.
+    async fn observe(
+        &mut self,
+        endpoint: &str,
+        targets: &[ObserveTarget],
+    ) -> Result<(), ObserveError> {
+        if !self.links.contains_key(endpoint) {
+            let link = self.connect(endpoint).await.map_err(ObserveError::Link)?;
+            self.links.insert(endpoint.to_string(), link);
+        }
+        let (reply, replied) = oneshot::channel();
+        let sent = self.links.get(endpoint).is_some_and(|link| {
+            link.commands
+                .send(LinkCommand::Observe {
+                    authorities: targets
+                        .iter()
+                        .map(|target| target.authority.clone())
+                        .collect(),
+                    reply,
+                })
+                .is_ok()
+        });
+        let replied = if sent {
+            replied
+                .await
+                .unwrap_or_else(|_| Err("worker connection closed".to_string()))
+        } else {
+            Err("worker connection closed".to_string())
+        };
+        let observed = match replied {
+            Ok(Ok(observed)) => observed,
+            Ok(Err(error)) => return Err(ObserveError::Worker(error)),
+            Err(reason) => {
+                self.links.remove(endpoint);
+                return Err(ObserveError::Link(reason));
+            }
+        };
+        let panes = observed_panes(targets, observed)?;
+        if let Some(link) = self.links.get_mut(endpoint) {
+            link.observed = panes;
+        }
+        Ok(())
+    }
+}
+
+/// A worker connection: forwards the frames the worker pushes, and sends the session's requests.
+async fn run_worker_link(
+    id: u64,
+    mut client: bmux_client::StreamingBmuxClient,
+    mut commands: mpsc::UnboundedReceiver<LinkCommand>,
+    events: mpsc::UnboundedSender<LinkEvent>,
+) {
+    loop {
+        tokio::select! {
+            command = commands.recv() => {
+                let Some(LinkCommand::Observe { authorities, reply }) = command else {
+                    return;
+                };
+                let result = cluster_worker_stream::client::observe(&mut client, authorities, 0)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = reply.send(result);
+            }
+            event = client.event_receiver().recv() => {
+                let Some(event) = event else {
+                    let _ = events.send(LinkEvent::Closed { link: id });
+                    return;
+                };
+                let bmux_client::ServerEvent::PluginBusEvent { kind, payload } = event else {
+                    continue;
+                };
+                if kind != bmux_pane_runtime_plugin_api::FRAME_PUSH_KIND {
+                    continue;
+                }
+                // Frames that cannot be read leave the replicas behind: the connection is
+                // replaced, and the new one is sent reset frames.
+                let Ok(batch) = bmux_ipc::decode::<AttachPaneFrames>(&payload) else {
+                    let _ = events.send(LinkEvent::Closed { link: id });
+                    return;
+                };
+                if events
+                    .send(LinkEvent::Frames { link: id, frames: batch.frames })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// The ready executions of a layout's panes, as streams.
+fn ready_executions(
+    layout: &bmux_cluster_plugin_api::cluster_types::AttachLayout,
+) -> Result<Vec<(AttachStreamId, ExecutionRef)>, AttachSessionError> {
+    layout
+        .panes
+        .iter()
+        .filter(|pane| {
+            pane.availability == bmux_cluster_plugin_api::cluster_types::PaneAvailability::Ready
+        })
+        .filter_map(|pane| pane.execution.as_ref())
+        .map(|assignment| {
+            Ok((
+                AttachStreamId::new(format!("execution:{}", assignment.execution_id.value))?,
+                ExecutionRef {
+                    execution_id: assignment.execution_id.clone(),
+                    generation: assignment.generation,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// `routes` for `executions` grouped by worker endpoint, each checked to be for the execution
+/// generation it was asked for.
+fn route_plan(
+    executions: &[(AttachStreamId, ExecutionRef)],
+    routes: Vec<WorkerRoute>,
+) -> Result<BTreeMap<String, Vec<ObserveTarget>>, AttachSessionError> {
+    if routes.len() != executions.len() {
+        return Err(provider_reason(format!(
+            "ingress returned {} worker routes for {} executions",
+            routes.len(),
+            executions.len()
+        )));
+    }
+    let mut plan: BTreeMap<String, Vec<ObserveTarget>> = BTreeMap::new();
+    let mut seen = BTreeSet::new();
+    for route in routes {
+        let (stream_id, execution) = executions
+            .iter()
+            .find(|(_, execution)| execution.execution_id == route.execution_id)
+            .ok_or_else(|| {
+                provider_reason(format!(
+                    "ingress routed execution {} that was not asked for",
+                    route.execution_id.value
+                ))
+            })?;
+        if route.generation != execution.generation
+            || route.authority.execution_id != execution.execution_id
+            || route.authority.generation != execution.generation
+        {
+            return Err(provider_reason(format!(
+                "worker route for execution {} is not for generation {}",
+                execution.execution_id.value, execution.generation
+            )));
+        }
+        if !seen.insert(execution.execution_id.value) {
+            return Err(provider_reason(format!(
+                "ingress routed execution {} twice",
+                execution.execution_id.value
+            )));
+        }
+        plan.entry(route.endpoint).or_default().push(ObserveTarget {
+            stream_id: stream_id.clone(),
+            execution: execution.clone(),
+            authority: route.authority,
+        });
+    }
+    Ok(plan)
+}
+
+/// The worker panes whose pushed frames are `targets`' streams, checked to be exactly the
+/// executions asked for.
+fn observed_panes(
+    targets: &[ObserveTarget],
+    observed: Vec<ObservedExecution>,
+) -> Result<BTreeMap<uuid::Uuid, AttachStreamId>, AttachSessionError> {
+    if observed.len() != targets.len() {
+        return Err(provider_reason(format!(
+            "worker observes {} executions of the {} asked for",
+            observed.len(),
+            targets.len()
+        )));
+    }
+    let mut panes = BTreeMap::new();
+    for execution in observed {
+        let target = targets
+            .iter()
+            .find(|target| {
+                target.execution.execution_id == execution.execution_id
+                    && target.execution.generation == execution.generation
+            })
+            .ok_or_else(|| {
+                provider_reason(format!(
+                    "worker observes execution {} generation {}, which was not asked for",
+                    execution.execution_id.value, execution.generation
+                ))
+            })?;
+        // As many executions as asked for, none twice and no pane twice: exactly those asked.
+        if panes
+            .values()
+            .any(|stream_id| *stream_id == target.stream_id)
+            || panes
+                .insert(execution.pane_id, target.stream_id.clone())
+                .is_some()
+        {
+            return Err(provider_reason(format!(
+                "worker observes execution {} or its pane more than once",
+                execution.execution_id.value
+            )));
+        }
+    }
+    Ok(panes)
 }
 
 struct ClusterAttachSession {
     client: BmuxClient,
+    links: WorkerLinks,
     cluster: String,
     workspace_id: uuid::Uuid,
     tab_id: bmux_cluster_plugin_api::cluster_types::LogicalTabId,
@@ -164,17 +647,15 @@ struct ClusterAttachSession {
     control_revision: u64,
     event_sequence: AttachDeltaSequence,
     streams: Vec<AttachStreamCursor>,
-    protocols:
-        std::collections::BTreeMap<AttachStreamId, bmux_terminal_grid::TerminalProtocolTracker>,
-    grids: std::collections::BTreeMap<AttachStreamId, bmux_terminal_grid::TerminalGridStream>,
-    /// Where the renderer's replica of each stream's grid stands: frames are written since it.
-    replicas: std::collections::BTreeMap<AttachStreamId, bmux_terminal_grid::ReplicaCursor>,
+    replicas: BTreeMap<AttachStreamId, StreamReplica>,
     scene: bmux_attach_layout_protocol::AttachScene,
     pending_events: std::collections::VecDeque<bmux_client::AttachProviderEvent>,
     unzoomed_scene: Option<bmux_attach_layout_protocol::AttachScene>,
     zoomed_pane: Option<uuid::Uuid>,
     viewport: (u16, u16),
-    next_reconcile_at: tokio::time::Instant,
+    next_layout_check: tokio::time::Instant,
+    /// When the streams must be observed again (a worker connection closed or fell out of step).
+    reobserve_at: Option<tokio::time::Instant>,
     detached: bool,
 }
 
@@ -198,6 +679,7 @@ impl std::fmt::Debug for ClusterAttachSession {
 impl ClusterAttachSession {
     async fn open(
         mut client: BmuxClient,
+        connector: Arc<dyn AttachEndpointConnector>,
         cluster: String,
         workspace: String,
         principal_id: String,
@@ -232,40 +714,327 @@ impl ClusterAttachSession {
         .await
         .map_err(provider_error)?
         .map_err(|error| provider_reason(format!("logical layout failed: {error:?}")))?;
-        let (layout, built) =
-            build_consistent_cluster_snapshot(&mut client, layout, (80, 24)).await?;
-        let built = initial_snapshot_for_resume(built, layout.control_revision, resume)?;
-        let streams = built
-            .snapshot
-            .streams
-            .iter()
-            .map(|stream| stream.cursor.clone())
-            .collect();
-        let view_revision = built.snapshot.view_revision;
-        let event_sequence = built.snapshot.event_sequence;
-        let scene = built.snapshot.scene.clone();
-        Ok(Self {
+        let mut session = Self {
             client,
+            links: WorkerLinks::new(connector),
             cluster,
             workspace_id,
             tab_id: layout.tab_id.clone(),
             principal_id,
-            snapshot: Some(built.snapshot),
-            view_revision,
-            control_revision: layout.control_revision,
-            event_sequence,
-            streams,
-            protocols: built.protocols,
-            grids: built.grids,
-            replicas: built.replicas,
-            scene,
+            snapshot: None,
+            view_revision: AttachViewRevision::default(),
+            control_revision: 0,
+            event_sequence: AttachDeltaSequence::default(),
+            streams: Vec::new(),
+            replicas: BTreeMap::new(),
+            scene: bmux_attach_layout_protocol::AttachScene {
+                session_id: workspace_id,
+                focus: bmux_attach_layout_protocol::AttachFocusTarget::None,
+                surfaces: Vec::new(),
+            },
             pending_events: std::collections::VecDeque::new(),
             unzoomed_scene: None,
             zoomed_pane: None,
             viewport: (80, 24),
-            next_reconcile_at: tokio::time::Instant::now(),
+            next_layout_check: tokio::time::Instant::now(),
+            reobserve_at: None,
             detached: false,
-        })
+        };
+        let (layout, built) = session.build_consistent_snapshot(layout).await?;
+        let built = initial_snapshot_for_resume(built, layout.control_revision, resume)?;
+        session.view_revision = built.view_revision;
+        session.event_sequence = built.event_sequence;
+        session.adopt(&layout, &built);
+        session.snapshot = Some(built);
+        Ok(session)
+    }
+
+    /// Take `snapshot` of `layout` as the session's view: its streams, scene, and revisions.
+    fn adopt(
+        &mut self,
+        layout: &bmux_cluster_plugin_api::cluster_types::AttachLayout,
+        snapshot: &AttachProviderSnapshot,
+    ) {
+        self.streams = snapshot
+            .streams
+            .iter()
+            .map(|stream| stream.cursor.clone())
+            .collect();
+        let streams = &self.streams;
+        self.replicas
+            .retain(|id, _| streams.iter().any(|cursor| &cursor.stream_id == id));
+        adopt_snapshot_replicas(&mut self.replicas, snapshot);
+        self.scene = snapshot.scene.clone();
+        self.control_revision = layout.control_revision;
+        self.tab_id = layout.tab_id.clone();
+    }
+
+    fn workspace(&self) -> bmux_cluster_plugin_api::cluster_types::WorkspaceId {
+        bmux_cluster_plugin_api::cluster_types::WorkspaceId {
+            value: self.workspace_id,
+        }
+    }
+
+    async fn current_layout(
+        &mut self,
+    ) -> Result<bmux_cluster_plugin_api::cluster_types::AttachLayout, AttachSessionError> {
+        let workspace = self.workspace();
+        cluster_attach_state::client::layout(
+            &mut self.client,
+            workspace,
+            Some(self.tab_id.clone()),
+            self.viewport.0,
+            self.viewport.1,
+        )
+        .await
+        .map_err(provider_error)?
+        .map_err(|error| provider_reason(format!("logical layout read failed: {error:?}")))
+    }
+
+    /// The layout, when its control revision advanced past the session's.
+    ///
+    /// This is the session's remaining poll: arrangement changes (panes added, moved or closed,
+    /// executions restarted as new generations, availability) are committed through cluster
+    /// consensus on the ingress, and nothing yet pushes them to a client, so the session asks
+    /// every [`LAYOUT_CHECK_INTERVAL`]. Screens are not polled: workers push their frames.
+    async fn changed_layout(
+        &mut self,
+    ) -> Result<Option<bmux_cluster_plugin_api::cluster_types::AttachLayout>, AttachSessionError>
+    {
+        let layout = self.current_layout().await?;
+        if layout.control_revision < self.control_revision {
+            return Err(provider_reason(format!(
+                "cluster control revision regressed from {} to {}",
+                self.control_revision, layout.control_revision
+            )));
+        }
+        Ok((layout.control_revision > self.control_revision).then_some(layout))
+    }
+
+    /// Have each stream's worker push its frames to this session: routes and leases from the
+    /// ingress, then one connection per worker. Connections no stream needs close. Until this
+    /// succeeds, a pending re-observation stays pending (also when the call is cancelled).
+    async fn observe(
+        &mut self,
+        executions: &[(AttachStreamId, ExecutionRef)],
+    ) -> Result<(), ObserveError> {
+        if executions.is_empty() {
+            self.links.links.clear();
+            self.reobserve_at = None;
+            return Ok(());
+        }
+        let workspace = self.workspace();
+        let routes = cluster_attach_state::client::routes(
+            &mut self.client,
+            workspace,
+            self.principal_id.clone(),
+            executions
+                .iter()
+                .map(|(_, execution)| execution.clone())
+                .collect(),
+        )
+        .await
+        .map_err(provider_error)?
+        .map_err(ObserveError::Worker)?;
+        let plan = route_plan(executions, routes)?;
+        self.links
+            .links
+            .retain(|endpoint, _| plan.contains_key(endpoint));
+        for (endpoint, targets) in &plan {
+            self.links.observe(endpoint, targets).await?;
+        }
+        self.reobserve_at = None;
+        Ok(())
+    }
+
+    /// Observe the session's streams again after a worker connection closed or fell out of step:
+    /// a new connection is sent reset frames. When the workers cannot be observed, the layout
+    /// says whether the executions moved on (reconciled at once) or not (tried again later).
+    async fn reobserve(
+        &mut self,
+    ) -> Result<Option<bmux_client::AttachProviderEvent>, AttachSessionError> {
+        let executions = self
+            .streams
+            .iter()
+            .filter(|cursor| cursor.stream_id.as_str().starts_with("execution:"))
+            .map(|cursor| {
+                Ok((
+                    cursor.stream_id.clone(),
+                    ExecutionRef {
+                        execution_id: stream_execution_id(&cursor.stream_id)?,
+                        generation: cursor.generation,
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>, AttachSessionError>>()?;
+        let error = match self.observe(&executions).await {
+            Ok(()) => return Ok(None),
+            Err(ObserveError::Failed(error)) => return Err(error),
+            Err(error) => error,
+        };
+        if let Some(layout) = self.changed_layout().await? {
+            return self.reconcile_layout(layout).await.map(Some);
+        }
+        match error {
+            ObserveError::Worker(
+                WorkerServiceError::NotFound { .. } | WorkerServiceError::StaleGeneration { .. },
+            ) => Err(provider_reason(
+                "worker stream ended without an authoritative control-state transition".to_string(),
+            )),
+            ObserveError::Worker(WorkerServiceError::Unavailable { .. })
+            | ObserveError::Link(_) => {
+                self.reobserve_at = Some(tokio::time::Instant::now() + OBSERVE_RETRY_INTERVAL);
+                Ok(None)
+            }
+            error => Err(error.into_session_error()),
+        }
+    }
+
+    /// Apply what a worker connection reported; streams whose screens changed join `changed`.
+    fn apply_link_event(&mut self, event: LinkEvent, changed: &mut BTreeSet<AttachStreamId>) {
+        match event {
+            LinkEvent::Frames { link, frames } => {
+                // A closed or replaced connection's frames are dropped, as are frames of panes
+                // it no longer observes.
+                let Some(current) = self.links.current(link) else {
+                    return;
+                };
+                let frames: Vec<(AttachStreamId, PaneFrame)> = frames
+                    .into_iter()
+                    .filter_map(|frame| {
+                        let stream_id = current.observed.get(&frame.pane_id)?.clone();
+                        Some((stream_id, frame))
+                    })
+                    .collect();
+                for (stream_id, frame) in frames {
+                    let Some(replica) = self.replicas.get_mut(&stream_id) else {
+                        continue;
+                    };
+                    if replica
+                        .apply_upstream(&frame.encoded, frame.sync_update_active)
+                        .is_err()
+                    {
+                        // The connection's frames no longer follow this replica; a new
+                        // connection is sent reset frames.
+                        self.links.remove(link);
+                        self.reobserve_at = Some(tokio::time::Instant::now());
+                        return;
+                    }
+                    changed.insert(stream_id);
+                }
+            }
+            LinkEvent::Closed { link } => {
+                if self.links.remove(link) {
+                    self.reobserve_at = Some(tokio::time::Instant::now());
+                }
+            }
+        }
+    }
+
+    /// Wait until every stream of `executions` has its first frame (a worker pushes one as soon
+    /// as it observes a pane), observing again if a connection fails meanwhile.
+    async fn await_first_frames(
+        &mut self,
+        executions: &[(AttachStreamId, ExecutionRef)],
+    ) -> Result<(), AttachSessionError> {
+        let deadline = tokio::time::Instant::now() + HYDRATION_TIMEOUT;
+        loop {
+            if self.reobserve_at.is_some() {
+                self.observe(executions)
+                    .await
+                    .map_err(ObserveError::into_session_error)?;
+            }
+            if executions.iter().all(|(stream_id, _)| {
+                self.replicas
+                    .get(stream_id)
+                    .is_some_and(StreamReplica::hydrated)
+            }) {
+                return Ok(());
+            }
+            let event = tokio::time::timeout_at(deadline, self.links.events.recv())
+                .await
+                .map_err(|_| {
+                    provider_reason("workers did not send their panes' screens in time".to_string())
+                })?
+                .ok_or_else(|| provider_reason("worker connections ended".to_string()))?;
+            // The snapshot being built carries these screens whole.
+            self.apply_link_event(event, &mut BTreeSet::new());
+        }
+    }
+
+    /// Observe `layout`'s streams and build its snapshot from their screens.
+    async fn build_snapshot(
+        &mut self,
+        layout: &bmux_cluster_plugin_api::cluster_types::AttachLayout,
+    ) -> Result<AttachProviderSnapshot, AttachSessionError> {
+        if layout.panes.is_empty() {
+            return Err(provider_reason(
+                "workspace has no logical panes".to_string(),
+            ));
+        }
+        validate_unique_snapshot_streams(layout)?;
+        let executions = ready_executions(layout)?;
+        for (stream_id, execution) in &executions {
+            if self
+                .replicas
+                .get(stream_id)
+                .is_none_or(|replica| replica.generation != execution.generation)
+            {
+                self.replicas
+                    .insert(stream_id.clone(), StreamReplica::new(execution.generation)?);
+            }
+        }
+        self.observe(&executions)
+            .await
+            .map_err(ObserveError::into_session_error)?;
+        self.await_first_frames(&executions).await?;
+        assemble_cluster_snapshot(layout, &mut self.replicas)
+    }
+
+    /// A snapshot of `layout`, or of the layout it became if the control state changed while the
+    /// snapshot was built.
+    async fn build_consistent_snapshot(
+        &mut self,
+        mut layout: bmux_cluster_plugin_api::cluster_types::AttachLayout,
+    ) -> Result<
+        (
+            bmux_cluster_plugin_api::cluster_types::AttachLayout,
+            AttachProviderSnapshot,
+        ),
+        AttachSessionError,
+    > {
+        const MAX_ATTEMPTS: usize = 4;
+        for _ in 0..MAX_ATTEMPTS {
+            let built = self.build_snapshot(&layout).await;
+            let confirmed = cluster_attach_state::client::layout(
+                &mut self.client,
+                layout.workspace_id.clone(),
+                Some(layout.tab_id.clone()),
+                self.viewport.0,
+                self.viewport.1,
+            )
+            .await
+            .map_err(provider_error)?
+            .map_err(|error| {
+                provider_reason(format!(
+                    "logical layout confirmation failed during snapshot assembly: {error:?}"
+                ))
+            })?;
+            if confirmed.control_revision < layout.control_revision {
+                return Err(provider_reason(format!(
+                    "cluster control revision regressed from {} to {} during snapshot assembly",
+                    layout.control_revision, confirmed.control_revision
+                )));
+            }
+            if confirmed.control_revision == layout.control_revision {
+                return Ok((layout, built?));
+            }
+            layout = confirmed;
+        }
+        Err(provider_reason(
+            "cluster control state changed continuously during attach snapshot assembly"
+                .to_string(),
+        ))
     }
 
     async fn reconcile_layout(
@@ -285,8 +1054,7 @@ impl ClusterAttachSession {
             } => Some(pane_id),
             bmux_attach_layout_protocol::AttachFocusTarget::None => None,
         };
-        let (layout, mut built) =
-            build_consistent_cluster_snapshot(&mut self.client, layout, self.viewport).await?;
+        let (layout, mut built) = self.build_consistent_snapshot(layout).await?;
         let base_scene = cluster_scene_from_layout(&layout, focused)?;
         let (scene, next_unzoomed_scene, next_zoomed_pane) =
             if let Some(zoomed_pane) = self.zoomed_pane {
@@ -298,11 +1066,11 @@ impl ClusterAttachSession {
                 (base_scene, None, None)
             };
         let reconciliation_id = format!("reconcile:{}", layout.control_revision);
+        // The workers' panes take the scene's sizes; their frames then carry them.
         resize_cluster_scene_workers(
             &mut self.client,
             self.workspace_id,
             &built
-                .snapshot
                 .streams
                 .iter()
                 .map(|stream| stream.cursor.clone())
@@ -312,37 +1080,25 @@ impl ClusterAttachSession {
             &reconciliation_id,
         )
         .await?;
-        built.snapshot.scene = scene;
-        reflow_cluster_build_to_scene(&mut built)?;
+        built.scene = scene;
 
         let base_view_revision = self.view_revision;
         self.view_revision = AttachViewRevision(self.view_revision.0.saturating_add(1));
         self.event_sequence = AttachDeltaSequence(self.event_sequence.0.saturating_add(1));
-        self.control_revision = layout.control_revision;
-        self.tab_id = layout.tab_id;
         let delta = cluster_reconciliation_delta(
             base_view_revision,
             self.view_revision,
             self.event_sequence,
-            self.control_revision,
+            layout.control_revision,
             &self.streams,
-            &built.snapshot,
+            &built,
         );
-
-        self.streams = built
-            .snapshot
-            .streams
-            .iter()
-            .map(|stream| stream.cursor.clone())
-            .collect();
-        self.protocols = built.protocols;
-        self.grids = built.grids;
-        self.replicas = built.replicas;
-        self.scene = built.snapshot.scene;
+        self.adopt(&layout, &built);
         self.unzoomed_scene = next_unzoomed_scene;
         self.zoomed_pane = next_zoomed_pane;
         Ok(bmux_client::AttachProviderEvent::Delta(delta))
     }
+
     async fn replace_attached_tab(
         &mut self,
         tab_id: bmux_cluster_plugin_api::cluster_types::LogicalTabId,
@@ -351,11 +1107,10 @@ impl ClusterAttachSession {
         if tab_id == self.tab_id {
             return Ok(());
         }
+        let workspace = self.workspace();
         let layout = cluster_attach_state::client::layout(
             &mut self.client,
-            bmux_cluster_plugin_api::cluster_types::WorkspaceId {
-                value: self.workspace_id,
-            },
+            workspace,
             Some(tab_id),
             self.viewport.0,
             self.viewport.1,
@@ -369,8 +1124,7 @@ impl ClusterAttachSession {
                 self.control_revision, layout.control_revision
             )));
         }
-        let (layout, built) =
-            build_consistent_cluster_snapshot(&mut self.client, layout, self.viewport).await?;
+        let (layout, built) = self.build_consistent_snapshot(layout).await?;
         resize_cluster_layout_workers(
             &mut self.client,
             &layout,
@@ -381,26 +1135,15 @@ impl ClusterAttachSession {
         let base_view_revision = self.view_revision;
         self.view_revision = AttachViewRevision(self.view_revision.0.saturating_add(1));
         self.event_sequence = AttachDeltaSequence(self.event_sequence.0.saturating_add(1));
-        self.control_revision = layout.control_revision;
-        self.tab_id = layout.tab_id;
         let delta = cluster_reconciliation_delta(
             base_view_revision,
             self.view_revision,
             self.event_sequence,
-            self.control_revision,
+            layout.control_revision,
             &self.streams,
-            &built.snapshot,
+            &built,
         );
-        self.streams = built
-            .snapshot
-            .streams
-            .iter()
-            .map(|stream| stream.cursor.clone())
-            .collect();
-        self.protocols = built.protocols;
-        self.grids = built.grids;
-        self.replicas = built.replicas;
-        self.scene = built.snapshot.scene;
+        self.adopt(&layout, &built);
         self.pending_events
             .push_back(bmux_client::AttachProviderEvent::Delta(delta));
         self.unzoomed_scene = None;
@@ -456,6 +1199,7 @@ impl ClusterAttachSession {
                 .unwrap_or_else(|| self.scene.clone());
             zoom_cluster_scene(&base, pane_id, self.viewport)?
         };
+        // The workers' panes take the zoomed sizes; their frames then carry them.
         resize_cluster_scene_workers(
             &mut self.client,
             self.workspace_id,
@@ -465,13 +1209,6 @@ impl ClusterAttachSession {
             action_command_id,
         )
         .await?;
-        for (cursor, cols, rows) in provider_stream_viewports(&scene, &self.streams)? {
-            if let Some(grid) = self.grids.get_mut(&cursor.stream_id) {
-                grid.resize(cols, rows).map_err(|error| {
-                    provider_reason(format!("cluster terminal grid resize failed: {error}"))
-                })?;
-            }
-        }
         if was_zoomed == Some(pane_id) {
             self.zoomed_pane = None;
             self.unzoomed_scene = None;
@@ -482,32 +1219,14 @@ impl ClusterAttachSession {
         self.enqueue_scene(scene);
         Ok(())
     }
-    /// Frames bringing the renderer's replicas level with grids that changed outside output
-    /// (resized: reset frames), each at its stream's cursor.
-    fn stream_frames(&mut self) -> Vec<bmux_client::AttachProviderChange> {
-        let mut changes = Vec::new();
-        for cursor in &self.streams {
-            let Some(grid) = self.grids.get_mut(&cursor.stream_id) else {
-                continue;
-            };
-            let replica = self.replicas.entry(cursor.stream_id.clone()).or_default();
-            let mut frame = Vec::new();
-            let summary = grid.grid_mut().write_frame_since(*replica, 0, &mut frame);
-            if summary.is_state_only() {
-                continue;
-            }
-            *replica = summary.next;
-            changes.push(bmux_client::AttachProviderChange::StreamFrame(
-                bmux_client::AttachStreamFrame {
-                    cursor: cursor.clone(),
-                    end_offset: cursor.offset,
-                    reset: summary.reset,
-                    sync_update_active: grid.grid().synchronized_update(),
-                    frame,
-                },
-            ));
+
+    fn resume_state(&self) -> AttachResumeState {
+        AttachResumeState {
+            view_revision: self.view_revision,
+            event_sequence: self.event_sequence,
+            streams: self.streams.clone(),
+            provider_token: self.control_revision.to_be_bytes().to_vec(),
         }
-        changes
     }
 
     fn enqueue_scene(&mut self, scene: bmux_attach_layout_protocol::AttachScene) {
@@ -515,24 +1234,70 @@ impl ClusterAttachSession {
         self.view_revision = AttachViewRevision(self.view_revision.0.saturating_add(1));
         self.event_sequence = AttachDeltaSequence(self.event_sequence.0.saturating_add(1));
         self.scene = scene.clone();
-        // Grids resized for the scene reach the renderer as frames with it.
-        let mut changes = vec![bmux_client::AttachProviderChange::Scene(scene)];
-        changes.extend(self.stream_frames());
         self.pending_events
             .push_back(bmux_client::AttachProviderEvent::Delta(
                 bmux_client::AttachProviderDelta {
                     sequence: self.event_sequence,
                     base_view_revision,
                     view_revision: self.view_revision,
-                    changes,
-                    resume: AttachResumeState {
-                        view_revision: self.view_revision,
-                        event_sequence: self.event_sequence,
-                        streams: self.streams.clone(),
-                        provider_token: self.control_revision.to_be_bytes().to_vec(),
-                    },
+                    changes: vec![bmux_client::AttachProviderChange::Scene(scene)],
+                    resume: self.resume_state(),
                 },
             ));
+    }
+
+    /// One delta of frames for the streams whose screens changed, if any did.
+    fn frames_delta(
+        &mut self,
+        changed: &BTreeSet<AttachStreamId>,
+    ) -> Option<bmux_client::AttachProviderEvent> {
+        let frames = relay_frames(&mut self.streams, &mut self.replicas, changed);
+        if frames.is_empty() {
+            return None;
+        }
+        self.event_sequence = AttachDeltaSequence(self.event_sequence.0.saturating_add(1));
+        Some(bmux_client::AttachProviderEvent::Delta(
+            bmux_client::AttachProviderDelta {
+                sequence: self.event_sequence,
+                base_view_revision: self.view_revision,
+                view_revision: self.view_revision,
+                changes: frames,
+                resume: self.resume_state(),
+            },
+        ))
+    }
+
+    /// Wait for the next frames or the next scheduled check, then return the delta it produced.
+    async fn next_change(
+        &mut self,
+    ) -> Result<Option<bmux_client::AttachProviderEvent>, AttachSessionError> {
+        let now = tokio::time::Instant::now();
+        if now >= self.next_layout_check {
+            self.next_layout_check = now + LAYOUT_CHECK_INTERVAL;
+            if let Some(layout) = self.changed_layout().await? {
+                return self.reconcile_layout(layout).await.map(Some);
+            }
+        }
+        if self.reobserve_at.is_some_and(|at| at <= now) {
+            return self.reobserve().await;
+        }
+        let wake_at = self
+            .reobserve_at
+            .map_or(self.next_layout_check, |at| at.min(self.next_layout_check));
+        tokio::select! {
+            event = self.links.events.recv() => {
+                let event = event
+                    .ok_or_else(|| provider_reason("worker connections ended".to_string()))?;
+                // Everything already pushed goes out as one delta.
+                let mut changed = BTreeSet::new();
+                self.apply_link_event(event, &mut changed);
+                while let Ok(event) = self.links.events.try_recv() {
+                    self.apply_link_event(event, &mut changed);
+                }
+                Ok(self.frames_delta(&changed))
+            }
+            () = tokio::time::sleep_until(wake_at) => Ok(None),
+        }
     }
 }
 
@@ -544,197 +1309,18 @@ impl AttachSession for ClusterAttachSession {
         })
     }
 
-    #[allow(clippy::too_many_lines)] // Ordered stream polling and repair must mutate one session state atomically.
     fn next_event(&mut self) -> AttachSessionFuture<'_, bmux_client::AttachProviderEvent> {
         Box::pin(async move {
-            if self.detached {
-                return Ok(bmux_client::AttachProviderEvent::Detached);
-            }
-            if let Some(event) = self.pending_events.pop_front() {
-                return Ok(event);
-            }
             loop {
-                if tokio::time::Instant::now() >= self.next_reconcile_at {
-                    self.next_reconcile_at =
-                        tokio::time::Instant::now() + std::time::Duration::from_millis(100);
-                    let layout = cluster_attach_state::client::layout(
-                        &mut self.client,
-                        bmux_cluster_plugin_api::cluster_types::WorkspaceId {
-                            value: self.workspace_id,
-                        },
-                        Some(self.tab_id.clone()),
-                        self.viewport.0,
-                        self.viewport.1,
-                    )
-                    .await
-                    .map_err(provider_error)?
-                    .map_err(|error| {
-                        provider_reason(format!("logical layout reconciliation failed: {error:?}"))
-                    })?;
-                    if layout.control_revision < self.control_revision {
-                        return Err(provider_reason(format!(
-                            "cluster control revision regressed from {} to {}",
-                            self.control_revision, layout.control_revision
-                        )));
-                    }
-                    if layout.control_revision > self.control_revision {
-                        return self.reconcile_layout(layout).await;
-                    }
+                if self.detached {
+                    return Ok(bmux_client::AttachProviderEvent::Detached);
                 }
-                for index in 0..self.streams.len() {
-                    let cursor = self.streams[index].clone();
-                    if !cursor.stream_id.as_str().starts_with("execution:") {
-                        continue;
-                    }
-                    let execution_id = stream_execution_id(&cursor.stream_id)?;
-                    let output = cluster_attach_state::client::output(
-                        &mut self.client,
-                        bmux_cluster_plugin_api::cluster_types::WorkspaceId {
-                            value: self.workspace_id,
-                        },
-                        execution_id.clone(),
-                        cursor.generation,
-                        cursor.offset,
-                        64 * 1024,
-                    )
-                    .await
-                    .map_err(provider_error)?;
-                    let output = match output {
-                        Ok(output) => output,
-                        Err(
-                            bmux_cluster_plugin_api::cluster_types::WorkerServiceError::NotFound {
-                                ..
-                            }
-                            | bmux_cluster_plugin_api::cluster_types::WorkerServiceError::StaleGeneration {
-                                ..
-                            }
-                            | bmux_cluster_plugin_api::cluster_types::WorkerServiceError::Unavailable {
-                                ..
-                            },
-                        ) => {
-                            let layout = cluster_attach_state::client::layout(
-                                &mut self.client,
-                                bmux_cluster_plugin_api::cluster_types::WorkspaceId {
-                                    value: self.workspace_id,
-                                },
-                                Some(self.tab_id.clone()),
-                                self.viewport.0,
-                                self.viewport.1,
-                            )
-                            .await
-                            .map_err(provider_error)?
-                            .map_err(|error| {
-                                provider_reason(format!(
-                                    "logical layout repair after worker transition failed: {error:?}"
-                                ))
-                            })?;
-                            if layout.control_revision > self.control_revision {
-                                return self.reconcile_layout(layout).await;
-                            }
-                            return Err(provider_reason(
-                                "worker stream became unavailable without an authoritative control-state transition"
-                                    .to_string(),
-                            ));
-                        }
-                        Err(error) => {
-                            return Err(provider_reason(format!(
-                                "worker output failed: {error:?}"
-                            )));
-                        }
-                    };
-                    validate_worker_output(&output, &execution_id, &cursor)?;
-                    let change = if output.gap {
-                        let terminal = cluster_attach_state::client::snapshot(
-                            &mut self.client,
-                            bmux_cluster_plugin_api::cluster_types::WorkspaceId {
-                                value: self.workspace_id,
-                            },
-                            execution_id,
-                            cursor.generation,
-                        )
-                        .await
-                        .map_err(provider_error)?
-                        .map_err(|error| {
-                            provider_reason(format!("worker snapshot repair failed: {error:?}"))
-                        })?;
-                        let mut decoded = decode_cluster_terminal_snapshot(&terminal)?;
-                        let repaired = AttachStreamCursor {
-                            generation: terminal.generation,
-                            offset: decoded.cursor,
-                            ..cursor.clone()
-                        };
-                        self.streams[index] = repaired.clone();
-                        let (frame, replica) = cluster_reset_frame(&mut decoded.stream);
-                        self.protocols.insert(
-                            repaired.stream_id.clone(),
-                            protocol_tracker_from_snapshot(&decoded),
-                        );
-                        self.replicas.insert(repaired.stream_id.clone(), replica);
-                        let sync_update_active = decoded.stream.grid().synchronized_update();
-                        self.grids
-                            .insert(repaired.stream_id.clone(), decoded.stream);
-                        bmux_client::AttachProviderChange::StreamFrame(
-                            bmux_client::AttachStreamFrame {
-                                cursor: AttachStreamCursor {
-                                    offset: cursor.offset,
-                                    ..repaired.clone()
-                                },
-                                end_offset: repaired.offset,
-                                reset: true,
-                                sync_update_active,
-                                frame,
-                            },
-                        )
-                    } else if !output.data.is_empty() {
-                        let end_offset = output.next_cursor;
-                        let appended = AttachStreamCursor {
-                            offset: end_offset,
-                            ..cursor.clone()
-                        };
-                        self.streams[index] = appended;
-                        let grid = self.grids.get_mut(&cursor.stream_id).ok_or_else(|| {
-                            provider_reason(
-                                "cluster terminal grid is unavailable for output".to_string(),
-                            )
-                        })?;
-                        grid.process(&output.data);
-                        self.protocols
-                            .insert(cursor.stream_id.clone(), protocol_tracker_from_grid(grid));
-                        let replica = self.replicas.entry(cursor.stream_id.clone()).or_default();
-                        let mut frame = Vec::new();
-                        let summary = grid.grid_mut().write_frame_since(*replica, 0, &mut frame);
-                        *replica = summary.next;
-                        bmux_client::AttachProviderChange::StreamFrame(
-                            bmux_client::AttachStreamFrame {
-                                cursor,
-                                end_offset,
-                                reset: summary.reset,
-                                sync_update_active: grid.grid().synchronized_update(),
-                                frame,
-                            },
-                        )
-                    } else {
-                        continue;
-                    };
-                    self.event_sequence =
-                        AttachDeltaSequence(self.event_sequence.0.saturating_add(1));
-                    let resume = AttachResumeState {
-                        view_revision: self.view_revision,
-                        event_sequence: self.event_sequence,
-                        streams: self.streams.clone(),
-                        provider_token: self.control_revision.to_be_bytes().to_vec(),
-                    };
-                    return Ok(bmux_client::AttachProviderEvent::Delta(
-                        bmux_client::AttachProviderDelta {
-                            sequence: self.event_sequence,
-                            base_view_revision: self.view_revision,
-                            view_revision: self.view_revision,
-                            changes: vec![change],
-                            resume,
-                        },
-                    ));
+                if let Some(event) = self.pending_events.pop_front() {
+                    return Ok(event);
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                if let Some(event) = self.next_change().await? {
+                    return Ok(event);
+                }
             }
         })
     }
@@ -770,43 +1356,33 @@ impl AttachSession for ClusterAttachSession {
                     "input targets a stale execution generation".to_string(),
                 ));
             }
+            // Input is encoded for the modes the program set, as the stream's screen has them.
+            let protocol = self
+                .replicas
+                .get(&input.stream_id)
+                .filter(|replica| replica.hydrated())
+                .ok_or_else(|| {
+                    provider_reason("stream terminal protocol state is unavailable".to_string())
+                })?
+                .grid
+                .protocol_state();
             let data = match input.payload {
                 bmux_client::AttachInputPayload::Bytes(data) => data,
-                bmux_client::AttachInputPayload::Key { stroke, enhanced } => encode_cluster_key(
-                    &stroke,
-                    enhanced,
-                    self.protocols
-                        .get(&input.stream_id)
-                        .ok_or_else(|| {
-                            provider_reason("key protocol state is unavailable".to_string())
-                        })?
-                        .protocol_state(),
-                )?,
-                bmux_client::AttachInputPayload::Paste(data) => encode_cluster_paste(
-                    data,
-                    self.protocols
-                        .get(&input.stream_id)
-                        .ok_or_else(|| {
-                            provider_reason("paste protocol state is unavailable".to_string())
-                        })?
-                        .protocol_state(),
-                ),
-                bmux_client::AttachInputPayload::Mouse(mouse) => encode_cluster_mouse(
-                    mouse,
-                    self.protocols
-                        .get(&input.stream_id)
-                        .ok_or_else(|| {
-                            provider_reason("mouse protocol state is unavailable".to_string())
-                        })?
-                        .protocol_state(),
-                )?,
+                bmux_client::AttachInputPayload::Key { stroke, enhanced } => {
+                    encode_cluster_key(&stroke, enhanced, protocol)?
+                }
+                bmux_client::AttachInputPayload::Paste(data) => {
+                    encode_cluster_paste(data, protocol)
+                }
+                bmux_client::AttachInputPayload::Mouse(mouse) => {
+                    encode_cluster_mouse(mouse, protocol)?
+                }
             };
             let command_id = command_id(input.command_sequence, &input.stream_id);
+            let workspace = self.workspace();
             cluster_attach_command::client::input(
                 &mut self.client,
-                bmux_cluster_plugin_api::cluster_types::WorkspaceId {
-                    value: self.workspace_id,
-                },
+                workspace,
                 command_id,
                 execution_id,
                 input.generation,
@@ -830,11 +1406,10 @@ impl AttachSession for ClusterAttachSession {
     ) -> AttachSessionFuture<'_, AttachProviderAck> {
         Box::pin(async move {
             let next_viewport = (viewport.columns, viewport.rows);
+            let workspace = self.workspace();
             let layout = cluster_attach_state::client::layout(
                 &mut self.client,
-                bmux_cluster_plugin_api::cluster_types::WorkspaceId {
-                    value: self.workspace_id,
-                },
+                workspace.clone(),
                 Some(self.tab_id.clone()),
                 viewport.columns,
                 viewport.rows,
@@ -861,6 +1436,7 @@ impl AttachSession for ClusterAttachSession {
             } else {
                 base_scene.clone()
             };
+            // The workers' panes take the new sizes; their frames then carry them.
             for (cursor, cols, rows) in provider_stream_viewports(&scene, &self.streams)? {
                 if !cursor.stream_id.as_str().starts_with("execution:") {
                     continue;
@@ -870,9 +1446,7 @@ impl AttachSession for ClusterAttachSession {
                 cluster_attach_command::client::resize(
                     &mut self.client,
                     bmux_cluster_plugin_api::cluster_types::AttachResizeRequest {
-                        workspace_id: bmux_cluster_plugin_api::cluster_types::WorkspaceId {
-                            value: self.workspace_id,
-                        },
+                        workspace_id: workspace.clone(),
                         command_id: resize_id,
                         execution_id,
                         generation: cursor.generation,
@@ -884,13 +1458,6 @@ impl AttachSession for ClusterAttachSession {
                 .await
                 .map_err(provider_error)?
                 .map_err(|error| provider_reason(format!("worker resize failed: {error:?}")))?;
-            }
-            for (cursor, cols, rows) in provider_stream_viewports(&scene, &self.streams)? {
-                if let Some(grid) = self.grids.get_mut(&cursor.stream_id) {
-                    grid.resize(cols, rows).map_err(|error| {
-                        provider_reason(format!("cluster terminal grid resize failed: {error}"))
-                    })?;
-                }
             }
             self.viewport = next_viewport;
             if self.zoomed_pane.is_some() {
@@ -998,6 +1565,8 @@ impl AttachSession for ClusterAttachSession {
 
     fn detach(&mut self) -> AttachSessionFuture<'_, AttachDetachOutcome> {
         let already = std::mem::replace(&mut self.detached, true);
+        // Workers stop pushing once their connections close.
+        self.links.links.clear();
         Box::pin(async move {
             Ok(if already {
                 AttachDetachOutcome::AlreadyDetached
@@ -1006,38 +1575,6 @@ impl AttachSession for ClusterAttachSession {
             })
         })
     }
-}
-
-fn reflow_cluster_build_to_scene(
-    built: &mut ClusterSnapshotBuild,
-) -> Result<(), AttachSessionError> {
-    for stream in &mut built.snapshot.streams {
-        let Some(grid) = built.grids.get_mut(&stream.cursor.stream_id) else {
-            continue;
-        };
-        let surface = built
-            .snapshot
-            .scene
-            .surfaces
-            .iter()
-            .find(|surface| surface.id == stream.cursor.surface_id)
-            .ok_or_else(|| {
-                provider_reason("cluster scene dropped an assembled stream".to_string())
-            })?;
-        grid.resize(surface.content_rect.w.max(1), surface.content_rect.h.max(1))
-            .map_err(|error| provider_reason(format!("cluster grid reflow failed: {error}")))?;
-        let (frame, replica) = cluster_reset_frame(grid);
-        stream.frame = frame;
-        stream.sync_update_active = grid.grid().synchronized_update();
-        built
-            .replicas
-            .insert(stream.cursor.stream_id.clone(), replica);
-        built.protocols.insert(
-            stream.cursor.stream_id.clone(),
-            protocol_tracker_from_grid(grid),
-        );
-    }
-    Ok(())
 }
 
 fn select_cluster_tab<'a>(
@@ -1316,87 +1853,12 @@ fn validate_unique_snapshot_streams(
     Ok(())
 }
 
-async fn build_consistent_cluster_snapshot(
-    client: &mut BmuxClient,
-    mut layout: bmux_cluster_plugin_api::cluster_types::AttachLayout,
-    viewport: (u16, u16),
-) -> Result<
-    (
-        bmux_cluster_plugin_api::cluster_types::AttachLayout,
-        ClusterSnapshotBuild,
-    ),
-    AttachSessionError,
-> {
-    const MAX_ATTEMPTS: usize = 4;
-    for _ in 0..MAX_ATTEMPTS {
-        let built = build_cluster_snapshot(client, &layout, None).await;
-        let confirmed = cluster_attach_state::client::layout(
-            client,
-            layout.workspace_id.clone(),
-            Some(layout.tab_id.clone()),
-            viewport.0,
-            viewport.1,
-        )
-        .await
-        .map_err(provider_error)?
-        .map_err(|error| {
-            provider_reason(format!(
-                "logical layout confirmation failed during snapshot assembly: {error:?}"
-            ))
-        })?;
-        if confirmed.control_revision < layout.control_revision {
-            return Err(provider_reason(format!(
-                "cluster control revision regressed from {} to {} during snapshot assembly",
-                layout.control_revision, confirmed.control_revision
-            )));
-        }
-        if confirmed.control_revision == layout.control_revision {
-            return Ok((layout, built?));
-        }
-        layout = confirmed;
-    }
-    Err(provider_reason(
-        "cluster control state changed continuously during attach snapshot assembly".to_string(),
-    ))
-}
-
-#[allow(clippy::too_many_lines)]
-async fn build_cluster_snapshot(
-    client: &mut BmuxClient,
-    layout: &bmux_cluster_plugin_api::cluster_types::AttachLayout,
-    resume: Option<AttachResumeState>,
-) -> Result<ClusterSnapshotBuild, AttachSessionError> {
-    let mut worker_snapshots = std::collections::BTreeMap::new();
-    for pane in &layout.panes {
-        let Some(assignment) = pane.execution.as_ref() else {
-            continue;
-        };
-        if pane.availability != bmux_cluster_plugin_api::cluster_types::PaneAvailability::Ready {
-            continue;
-        }
-        let terminal = cluster_attach_state::client::snapshot(
-            client,
-            layout.workspace_id.clone(),
-            assignment.execution_id.clone(),
-            assignment.generation,
-        )
-        .await
-        .map_err(provider_error)?
-        .map_err(|error| provider_reason(format!("worker snapshot failed: {error:?}")))?;
-        worker_snapshots.insert(pane.pane_id.value, terminal);
-    }
-    assemble_cluster_snapshot(layout, worker_snapshots, resume)
-}
-
-#[allow(clippy::too_many_lines)]
+/// `layout`'s snapshot: each ready pane's screen from its stream's replica (hydrated), each
+/// other pane's status as a screen of its own.
 fn assemble_cluster_snapshot(
     layout: &bmux_cluster_plugin_api::cluster_types::AttachLayout,
-    mut worker_snapshots: std::collections::BTreeMap<
-        uuid::Uuid,
-        bmux_cluster_plugin_api::cluster_types::WorkerTerminalSnapshot,
-    >,
-    resume: Option<AttachResumeState>,
-) -> Result<ClusterSnapshotBuild, AttachSessionError> {
+    replicas: &mut BTreeMap<AttachStreamId, StreamReplica>,
+) -> Result<AttachProviderSnapshot, AttachSessionError> {
     if layout.panes.is_empty() {
         return Err(provider_reason(
             "workspace has no logical panes".to_string(),
@@ -1404,25 +1866,32 @@ fn assemble_cluster_snapshot(
     }
     validate_unique_snapshot_streams(layout)?;
     let mut streams = Vec::new();
-    let mut protocols = std::collections::BTreeMap::new();
-    let mut grids = std::collections::BTreeMap::new();
-    let mut replicas = std::collections::BTreeMap::new();
     let mut focus_pane = None;
     for pane in &layout.panes {
-        let assignment = pane.execution.as_ref();
-        if let Some(assignment) = assignment
-            && pane.availability == bmux_cluster_plugin_api::cluster_types::PaneAvailability::Ready
-        {
-            let terminal = worker_snapshots
-                .remove(&pane.pane_id.value)
+        let assignment = pane.execution.as_ref().filter(|_| {
+            pane.availability == bmux_cluster_plugin_api::cluster_types::PaneAvailability::Ready
+        });
+        if let Some(assignment) = assignment {
+            let stream_id =
+                AttachStreamId::new(format!("execution:{}", assignment.execution_id.value))?;
+            let replica = replicas
+                .get_mut(&stream_id)
+                .filter(|replica| replica.hydrated())
                 .ok_or_else(|| {
                     provider_reason(format!(
-                        "worker snapshot is missing for ready pane {}",
+                        "screen is missing for ready pane {}",
                         pane.pane_id.value
                     ))
                 })?;
-            validate_worker_snapshot_assignment(&terminal, assignment)?;
-            let mut decoded = decode_cluster_terminal_snapshot(&terminal)?;
+            if replica.generation != assignment.generation {
+                return Err(provider_reason(format!(
+                    "screen of pane {} is of generation {}, not {}",
+                    pane.pane_id.value, replica.generation, assignment.generation
+                )));
+            }
+            streams.push(replica.snapshot(stream_id, pane.pane_id.value));
+            focus_pane.get_or_insert(pane.pane_id.value);
+        } else {
             let rect = layout
                 .rects
                 .iter()
@@ -1433,95 +1902,59 @@ fn assemble_cluster_snapshot(
                         pane.pane_id.value
                     ))
                 })?;
-            decoded
-                .stream
-                .resize(rect.width.max(1), rect.height.max(1))
-                .map_err(|error| {
-                    provider_reason(format!("worker snapshot reflow failed: {error}"))
-                })?;
-            let stream_id =
-                AttachStreamId::new(format!("execution:{}", assignment.execution_id.value))?;
-            let cursor = AttachStreamCursor {
-                stream_id: stream_id.clone(),
-                surface_id: pane.pane_id.value,
-                generation: assignment.generation,
-                offset: decoded.cursor,
-            };
-            let mut decoded = decoded;
-            let (frame, replica) = cluster_reset_frame(&mut decoded.stream);
-            protocols.insert(stream_id.clone(), protocol_tracker_from_snapshot(&decoded));
-            replicas.insert(stream_id.clone(), replica);
-            streams.push(AttachStreamSnapshot {
-                cursor,
-                sync_update_active: decoded.stream.grid().synchronized_update(),
-                frame,
-            });
-            grids.insert(stream_id, decoded.stream);
-            focus_pane.get_or_insert(pane.pane_id.value);
-        } else {
-            let stream_id = AttachStreamId::new(format!("status:{}", pane.pane_id.value))?;
-            let message = format!(
-                "\r\n  pane {} is {:?}{}\r\n",
-                pane.name.as_deref().unwrap_or("unnamed"),
-                pane.availability,
-                pane.availability_reason
-                    .as_deref()
-                    .map_or_else(String::new, |reason| format!(": {reason}"))
-            );
-            // The status shows as the pane's screen: a grid of its message, like any stream's.
-            let mut grid = bmux_terminal_grid::TerminalGridStream::new(
-                80,
-                24,
-                bmux_terminal_grid::GridLimits::default(),
-            )
-            .map_err(|error| provider_reason(format!("status grid failed: {error}")))?;
-            grid.process(message.as_bytes());
-            let (frame, replica) = cluster_reset_frame(&mut grid);
-            protocols.insert(stream_id.clone(), protocol_tracker_from_grid(&grid));
-            replicas.insert(stream_id.clone(), replica);
-            grids.insert(stream_id.clone(), grid);
-            streams.push(AttachStreamSnapshot {
-                cursor: AttachStreamCursor {
-                    stream_id,
-                    surface_id: pane.pane_id.value,
-                    generation: 0,
-                    offset: u64::try_from(message.len()).unwrap_or(u64::MAX),
-                },
-                sync_update_active: false,
-                frame,
-            });
+            streams.push(status_stream(pane, rect)?);
         }
     }
-    if !worker_snapshots.is_empty() {
-        return Err(provider_reason(
-            "worker snapshots include panes outside the selected logical view".to_string(),
-        ));
-    }
     let scene = cluster_scene_from_layout(layout, focus_pane)?;
-    let resume_state = AttachResumeState {
+    let resume = AttachResumeState {
         view_revision: AttachViewRevision(layout.control_revision),
         event_sequence: AttachDeltaSequence(0),
         streams: streams.iter().map(|stream| stream.cursor.clone()).collect(),
         provider_token: layout.control_revision.to_be_bytes().to_vec(),
     };
-    if let Some(resume) = resume
-        && resume != resume_state
-    {
-        return Err(provider_reason(
-            "resume descriptor does not match current cluster state".to_string(),
-        ));
-    }
-    Ok(ClusterSnapshotBuild {
-        snapshot: AttachProviderSnapshot {
-            view_revision: resume_state.view_revision,
-            event_sequence: resume_state.event_sequence,
-            scene,
-            streams,
-            resume: resume_state,
+    Ok(AttachProviderSnapshot {
+        view_revision: resume.view_revision,
+        event_sequence: resume.event_sequence,
+        scene,
+        streams,
+        resume,
+    })
+}
+
+/// A pane without a running execution, shown as a screen of its status at the pane's size.
+fn status_stream(
+    pane: &bmux_cluster_plugin_api::cluster_types::LogicalPaneRecord,
+    rect: &bmux_cluster_plugin_api::cluster_types::AttachLayoutRect,
+) -> Result<AttachStreamSnapshot, AttachSessionError> {
+    let message = format!(
+        "\r\n  pane {} is {:?}{}\r\n",
+        pane.name.as_deref().unwrap_or("unnamed"),
+        pane.availability,
+        pane.availability_reason
+            .as_deref()
+            .map_or_else(String::new, |reason| format!(": {reason}"))
+    );
+    let mut grid = bmux_terminal_grid::TerminalGridStream::new(
+        rect.width.max(1),
+        rect.height.max(1),
+        bmux_terminal_grid::GridLimits::default(),
+    )
+    .map_err(|error| provider_reason(format!("status grid failed: {error}")))?;
+    grid.process(message.as_bytes());
+    let mut frame = Vec::new();
+    let next = grid
+        .grid_mut()
+        .write_frame_since(bmux_terminal_grid::ReplicaCursor::default(), 0, &mut frame)
+        .next;
+    Ok(AttachStreamSnapshot {
+        cursor: AttachStreamCursor {
+            stream_id: AttachStreamId::new(format!("status:{}", pane.pane_id.value))?,
+            surface_id: pane.pane_id.value,
+            generation: 0,
+            offset: next.epoch,
         },
-        protocols,
-        grids,
-        replicas,
+        sync_update_active: false,
+        frame,
     })
 }
 
@@ -1711,102 +2144,46 @@ fn directional_distance(
     Some((primary, secondary))
 }
 
-fn validate_worker_snapshot_assignment(
-    terminal: &bmux_cluster_plugin_api::cluster_types::WorkerTerminalSnapshot,
-    assignment: &bmux_cluster_plugin_api::cluster_types::ExecutionAssignment,
-) -> Result<(), AttachSessionError> {
-    if terminal.execution_id != assignment.execution_id {
-        return Err(provider_reason(format!(
-            "worker snapshot execution mismatch: expected {}, received {}",
-            assignment.execution_id.value, terminal.execution_id.value
-        )));
-    }
-    if terminal.generation != assignment.generation {
-        return Err(provider_reason(format!(
-            "worker snapshot generation mismatch: expected {}, received {}",
-            assignment.generation, terminal.generation
-        )));
-    }
-    Ok(())
-}
-
+/// The snapshot as a resumption of `resume`, which must name the same view: the same control
+/// revision and the same streams at the same generations on the same surfaces. Stream offsets
+/// are not compared: they are epochs of this session's replicas, and a snapshot carries every
+/// stream's screen whole.
 fn initial_snapshot_for_resume(
-    mut built: ClusterSnapshotBuild,
+    mut built: AttachProviderSnapshot,
     control_revision: u64,
     resume: Option<AttachResumeState>,
-) -> Result<ClusterSnapshotBuild, AttachSessionError> {
-    if let Some(resume) = resume {
-        built.snapshot.view_revision = resume.view_revision;
-        built.snapshot.event_sequence = resume.event_sequence;
-        built.snapshot.resume = AttachResumeState {
-            view_revision: resume.view_revision,
-            event_sequence: resume.event_sequence,
-            streams: built
-                .snapshot
-                .streams
-                .iter()
-                .map(|stream| stream.cursor.clone())
-                .collect(),
-            provider_token: control_revision.to_be_bytes().to_vec(),
-        };
-        if built.snapshot.resume != resume {
-            return Err(provider_reason(
-                "resume descriptor does not match current cluster state".to_string(),
-            ));
-        }
+) -> Result<AttachProviderSnapshot, AttachSessionError> {
+    let Some(resume) = resume else {
+        return Ok(built);
+    };
+    let same_streams = resume.streams.len() == built.streams.len()
+        && resume
+            .streams
+            .iter()
+            .zip(&built.streams)
+            .all(|(resumed, stream)| {
+                resumed.stream_id == stream.cursor.stream_id
+                    && resumed.surface_id == stream.cursor.surface_id
+                    && resumed.generation == stream.cursor.generation
+            });
+    if !same_streams || resume.provider_token != control_revision.to_be_bytes() {
+        return Err(provider_reason(
+            "resume descriptor does not match current cluster state".to_string(),
+        ));
     }
+    built.view_revision = resume.view_revision;
+    built.event_sequence = resume.event_sequence;
+    built.resume = AttachResumeState {
+        view_revision: resume.view_revision,
+        event_sequence: resume.event_sequence,
+        streams: built
+            .streams
+            .iter()
+            .map(|stream| stream.cursor.clone())
+            .collect(),
+        provider_token: resume.provider_token,
+    };
     Ok(built)
-}
-
-fn decode_cluster_terminal_snapshot(
-    terminal: &bmux_cluster_plugin_api::cluster_types::WorkerTerminalSnapshot,
-) -> Result<DecodedClusterTerminalSnapshot, AttachSessionError> {
-    let snapshot = serde_json::from_slice::<bmux_terminal_grid::GridSnapshot>(&terminal.encoded)
-        .map_err(|error| {
-            provider_reason(format!(
-                "worker terminal snapshot is not a valid structured grid: {error}"
-            ))
-        })?;
-    let stream = bmux_terminal_grid::TerminalGridStream::from_snapshot(
-        &snapshot,
-        bmux_terminal_grid::GridLimits::default(),
-    )
-    .map_err(|error| {
-        provider_reason(format!(
-            "worker terminal snapshot could not hydrate a terminal grid: {error}"
-        ))
-    })?;
-    Ok(DecodedClusterTerminalSnapshot {
-        cursor: terminal.cursor,
-        stream,
-    })
-}
-
-/// `stream`'s whole state as a reset frame, and the replica cursor it leaves a renderer at.
-fn cluster_reset_frame(
-    stream: &mut bmux_terminal_grid::TerminalGridStream,
-) -> (Vec<u8>, bmux_terminal_grid::ReplicaCursor) {
-    let mut frame = Vec::new();
-    let next = stream
-        .grid_mut()
-        .write_frame_since(bmux_terminal_grid::ReplicaCursor::default(), 0, &mut frame)
-        .next;
-    (frame, next)
-}
-
-fn protocol_tracker_from_snapshot(
-    decoded: &DecodedClusterTerminalSnapshot,
-) -> bmux_terminal_grid::TerminalProtocolTracker {
-    protocol_tracker_from_grid(&decoded.stream)
-}
-
-fn protocol_tracker_from_grid(
-    grid: &bmux_terminal_grid::TerminalGridStream,
-) -> bmux_terminal_grid::TerminalProtocolTracker {
-    let mut tracker = bmux_terminal_grid::TerminalProtocolTracker::new();
-    tracker.set_protocol_state(grid.grid().protocol_state());
-    tracker.set_alternate_screen(grid.grid().mode() == bmux_terminal_grid::GridMode::Alternate);
-    tracker
 }
 
 fn encode_cluster_key(
@@ -1884,56 +2261,6 @@ fn encode_cluster_mouse(
         },
     )
     .ok_or_else(|| provider_reason("mouse event is disabled by terminal protocol mode".to_string()))
-}
-
-fn validate_worker_output(
-    output: &bmux_cluster_plugin_api::cluster_types::WorkerOutput,
-    execution_id: &bmux_cluster_plugin_api::cluster_types::ExecutionId,
-    cursor: &AttachStreamCursor,
-) -> Result<(), AttachSessionError> {
-    if output.execution_id != *execution_id {
-        return Err(provider_reason(
-            "worker output execution identity does not match requested stream".to_string(),
-        ));
-    }
-    if output.generation != cursor.generation {
-        return Err(provider_reason(format!(
-            "worker output generation does not match requested generation {}: received {}",
-            cursor.generation, output.generation
-        )));
-    }
-    if output.requested_cursor != cursor.offset {
-        return Err(provider_reason(format!(
-            "worker output echoed cursor {} for requested cursor {}",
-            output.requested_cursor, cursor.offset
-        )));
-    }
-    if output.next_cursor < cursor.offset {
-        return Err(provider_reason(format!(
-            "worker output returned regressing cursor range {}..{}",
-            cursor.offset, output.next_cursor
-        )));
-    }
-    if output.gap {
-        if !output.data.is_empty() {
-            return Err(provider_reason(
-                "worker output retention gap unexpectedly included bytes".to_string(),
-            ));
-        }
-        return Ok(());
-    }
-    let expected_end = cursor
-        .offset
-        .checked_add(u64::try_from(output.data.len()).unwrap_or(u64::MAX));
-    if expected_end != Some(output.next_cursor) {
-        return Err(provider_reason(format!(
-            "worker output returned invalid cursor range {}..{} for {} bytes",
-            cursor.offset,
-            output.next_cursor,
-            output.data.len()
-        )));
-    }
-    Ok(())
 }
 
 fn action_stream_command_id(action_command_id: &str, stream_id: &AttachStreamId) -> uuid::Uuid {
@@ -2237,26 +2564,34 @@ mod tests {
         );
     }
 
-    #[test]
-    #[allow(clippy::too_many_lines)] // Full snapshot contract fixture intentionally covers every composed field.
-    fn assembles_selected_logical_layout_with_ready_and_unavailable_panes() {
+    fn layout_with(
+        panes: Vec<(
+            uuid::Uuid,
+            bmux_cluster_plugin_api::cluster_types::PaneAvailability,
+            Option<bmux_cluster_plugin_api::cluster_types::ExecutionAssignment>,
+            Option<String>,
+        )>,
+        control_revision: u64,
+    ) -> bmux_cluster_plugin_api::cluster_types::AttachLayout {
         let workspace_id = bmux_cluster_plugin_api::cluster_types::WorkspaceId {
             value: uuid::Uuid::from_u128(1),
         };
         let tab_id = bmux_cluster_plugin_api::cluster_types::LogicalTabId {
             value: uuid::Uuid::from_u128(2),
         };
-        let ready_id = uuid::Uuid::from_u128(3);
-        let unavailable_id = uuid::Uuid::from_u128(4);
-        let assignment = bmux_cluster_plugin_api::cluster_types::ExecutionAssignment {
-            node_id: "node-a".to_string(),
-            generation: 7,
-            execution_id: bmux_cluster_plugin_api::cluster_types::ExecutionId {
-                value: uuid::Uuid::from_u128(5),
-            },
-        };
-        let pane = |id, availability, execution, reason| {
-            bmux_cluster_plugin_api::cluster_types::LogicalPaneRecord {
+        let mut x = 0;
+        let mut rects = Vec::new();
+        let mut records = Vec::new();
+        for (id, availability, execution, reason) in panes {
+            rects.push(bmux_cluster_plugin_api::cluster_types::AttachLayoutRect {
+                pane_id: bmux_cluster_plugin_api::cluster_types::LogicalPaneId { value: id },
+                x,
+                y: 0,
+                width: 30,
+                height: 20,
+            });
+            x += 30;
+            records.push(bmux_cluster_plugin_api::cluster_types::LogicalPaneRecord {
                 pane_id: bmux_cluster_plugin_api::cluster_types::LogicalPaneId { value: id },
                 workspace_id: workspace_id.clone(),
                 tab_id: tab_id.clone(),
@@ -2271,92 +2606,501 @@ mod tests {
                 availability_reason: reason,
                 execution,
                 revision: 9,
+            });
+        }
+        bmux_cluster_plugin_api::cluster_types::AttachLayout {
+            workspace_id,
+            tab_id,
+            control_revision,
+            panes: records,
+            rects,
+        }
+    }
+
+    fn assignment(
+        execution: u128,
+        generation: u64,
+    ) -> bmux_cluster_plugin_api::cluster_types::ExecutionAssignment {
+        bmux_cluster_plugin_api::cluster_types::ExecutionAssignment {
+            node_id: "node-a".to_string(),
+            generation,
+            execution_id: bmux_cluster_plugin_api::cluster_types::ExecutionId {
+                value: uuid::Uuid::from_u128(execution),
+            },
+        }
+    }
+
+    fn execution_stream(execution: u128) -> AttachStreamId {
+        AttachStreamId::new(format!("execution:{}", uuid::Uuid::from_u128(execution))).unwrap()
+    }
+
+    /// A worker's pane: its grid, and where the session's replica of it stands as the worker
+    /// sees it.
+    struct WorkerPane {
+        grid: bmux_terminal_grid::TerminalGridStream,
+        observer: bmux_terminal_grid::ReplicaCursor,
+    }
+
+    impl WorkerPane {
+        fn new(cols: u16, rows: u16) -> Self {
+            Self {
+                grid: bmux_terminal_grid::TerminalGridStream::new(
+                    cols,
+                    rows,
+                    bmux_terminal_grid::GridLimits::default(),
+                )
+                .unwrap(),
+                observer: bmux_terminal_grid::ReplicaCursor::default(),
             }
-        };
-        let layout = bmux_cluster_plugin_api::cluster_types::AttachLayout {
-            workspace_id: workspace_id.clone(),
-            tab_id: tab_id.clone(),
-            control_revision: 11,
-            panes: vec![
-                pane(
+        }
+
+        /// The frame the worker pushes now, as the pane runtime builds it.
+        fn push(&mut self) -> Vec<u8> {
+            let mut frame = Vec::new();
+            self.observer = self
+                .grid
+                .grid_mut()
+                .write_frame_since(self.observer, 0, &mut frame)
+                .next;
+            frame
+        }
+    }
+
+    /// A grid's screen: its whole snapshot but history, which the session does not relay (it
+    /// observes with no history lines), and the parser's unfinished input (replicas do not parse).
+    fn screen(grid: &bmux_terminal_grid::TerminalGrid) -> bmux_terminal_grid::GridSnapshot {
+        let mut snapshot = grid.snapshot(0, grid.height());
+        snapshot.pending_bytes.clear();
+        snapshot.scrollback_rows = 0;
+        snapshot.history_truncated = None;
+        snapshot
+    }
+
+    fn rendered(
+        state: &mut bmux_frontend_runtime::AttachState,
+        surface: uuid::Uuid,
+    ) -> bmux_terminal_grid::GridSnapshot {
+        screen(state.buffers_mut()[&surface].terminal_grid.grid())
+    }
+
+    #[test]
+    fn assembles_selected_logical_layout_with_ready_and_unavailable_panes() {
+        let ready_id = uuid::Uuid::from_u128(3);
+        let unavailable_id = uuid::Uuid::from_u128(4);
+        let layout = layout_with(
+            vec![
+                (
                     ready_id,
                     bmux_cluster_plugin_api::cluster_types::PaneAvailability::Ready,
-                    Some(assignment.clone()),
+                    Some(assignment(5, 7)),
                     None,
                 ),
-                pane(
+                (
                     unavailable_id,
                     bmux_cluster_plugin_api::cluster_types::PaneAvailability::Unavailable,
                     None,
                     Some("worker offline".to_string()),
                 ),
             ],
-            rects: vec![
-                bmux_cluster_plugin_api::cluster_types::AttachLayoutRect {
-                    pane_id: bmux_cluster_plugin_api::cluster_types::LogicalPaneId {
-                        value: ready_id,
-                    },
-                    x: 0,
-                    y: 0,
-                    width: 30,
-                    height: 20,
-                },
-                bmux_cluster_plugin_api::cluster_types::AttachLayoutRect {
-                    pane_id: bmux_cluster_plugin_api::cluster_types::LogicalPaneId {
-                        value: unavailable_id,
-                    },
-                    x: 30,
-                    y: 0,
-                    width: 50,
-                    height: 20,
-                },
-            ],
-        };
-        let mut grid = bmux_terminal_grid::TerminalGridStream::new(
-            80,
-            24,
-            bmux_terminal_grid::GridLimits::default(),
-        )
-        .unwrap();
-        grid.process(b"ready output");
-        let terminal = bmux_cluster_plugin_api::cluster_types::WorkerTerminalSnapshot {
-            execution_id: assignment.execution_id.clone(),
-            generation: assignment.generation,
-            cursor: 12,
-            encoded: serde_json::to_vec(&grid.snapshot(0, 24)).unwrap(),
-        };
-        let built = assemble_cluster_snapshot(
-            &layout,
-            std::collections::BTreeMap::from([(ready_id, terminal)]),
-            None,
-        )
-        .unwrap();
+            11,
+        );
+        let mut worker = WorkerPane::new(30, 20);
+        worker.grid.process(b"ready output");
+        let mut replicas = BTreeMap::from([(execution_stream(5), StreamReplica::new(7).unwrap())]);
+        assert!(
+            assemble_cluster_snapshot(&layout, &mut replicas).is_err(),
+            "a ready pane needs its screen"
+        );
+        replicas
+            .get_mut(&execution_stream(5))
+            .unwrap()
+            .apply_upstream(&worker.push(), false)
+            .unwrap();
+        let built = assemble_cluster_snapshot(&layout, &mut replicas).unwrap();
 
-        assert_eq!(built.snapshot.view_revision, AttachViewRevision(11));
-        assert_eq!(built.snapshot.scene.surfaces.len(), 2);
+        assert_eq!(built.view_revision, AttachViewRevision(11));
+        assert_eq!(built.scene.surfaces.len(), 2);
         assert_eq!(
-            built.snapshot.scene.focus,
+            built.scene.focus,
             bmux_attach_layout_protocol::AttachFocusTarget::Pane { pane_id: ready_id }
         );
-        assert_eq!(built.snapshot.streams.len(), 2);
-        assert_eq!(built.snapshot.streams[0].cursor.generation, 7);
-        assert_eq!(built.snapshot.streams[0].cursor.offset, 12);
+        assert_eq!(built.streams.len(), 2);
+        assert_eq!(built.streams[0].cursor.stream_id, execution_stream(5));
+        assert_eq!(built.streams[0].cursor.generation, 7);
         assert_eq!(
-            built.snapshot.streams[1].cursor.stream_id.as_str(),
+            built.streams[1].cursor.stream_id.as_str(),
             format!("status:{unavailable_id}")
         );
+        assert_eq!(built.resume.streams.len(), 2);
+        let mut state = bmux_frontend_runtime::AttachState::from_snapshot(&built).unwrap();
+        assert_eq!(rendered(&mut state, ready_id), screen(worker.grid.grid()));
+        let status = rendered(&mut state, unavailable_id);
+        assert_eq!((status.width, status.height), (30, 20));
         assert!(
-            String::from_utf8_lossy(&built.snapshot.streams[1].frame).contains("worker offline")
+            bmux_terminal_grid::visible_text(
+                state.buffers_mut()[&unavailable_id].terminal_grid.grid(),
+                0,
+                20
+            )
+            .contains("worker offline")
         );
-        assert_eq!(built.snapshot.resume.streams.len(), 2);
-        let ready_grid = built
-            .grids
-            .get(&built.snapshot.streams[0].cursor.stream_id)
+
+        // A replica of another generation is not this pane's screen.
+        let mut replicas = BTreeMap::from([(execution_stream(5), StreamReplica::new(6).unwrap())]);
+        replicas
+            .get_mut(&execution_stream(5))
+            .unwrap()
+            .apply_upstream(&WorkerPane::new(30, 20).push(), false)
             .unwrap();
-        assert_eq!(
-            (ready_grid.grid().width(), ready_grid.grid().height()),
-            (30, 20)
+        assert!(assemble_cluster_snapshot(&layout, &mut replicas).is_err());
+    }
+
+    /// One ready pane's stream as a session relays it to a renderer.
+    struct Relayed {
+        pane: uuid::Uuid,
+        stream: AttachStreamId,
+        worker: WorkerPane,
+        replicas: BTreeMap<AttachStreamId, StreamReplica>,
+        streams: Vec<AttachStreamCursor>,
+        state: bmux_frontend_runtime::AttachState,
+        delta: bmux_client::AttachProviderDelta,
+    }
+
+    impl Relayed {
+        /// A session hydrated from `worker`'s first frame, its snapshot rendered.
+        fn hydrate(worker: WorkerPane, generation: u64) -> Self {
+            let pane = uuid::Uuid::from_u128(3);
+            let stream = execution_stream(5);
+            let mut relayed = Self {
+                pane,
+                stream: stream.clone(),
+                worker,
+                replicas: BTreeMap::from([(stream, StreamReplica::new(generation).unwrap())]),
+                streams: Vec::new(),
+                state: bmux_frontend_runtime::AttachState::from_snapshot(&AttachProviderSnapshot {
+                    view_revision: AttachViewRevision(1),
+                    event_sequence: AttachDeltaSequence(0),
+                    scene: bmux_attach_layout_protocol::AttachScene {
+                        session_id: uuid::Uuid::nil(),
+                        focus: bmux_attach_layout_protocol::AttachFocusTarget::None,
+                        surfaces: Vec::new(),
+                    },
+                    streams: Vec::new(),
+                    resume: AttachResumeState {
+                        view_revision: AttachViewRevision(1),
+                        ..AttachResumeState::default()
+                    },
+                })
+                .unwrap(),
+                delta: bmux_client::AttachProviderDelta {
+                    sequence: AttachDeltaSequence(0),
+                    base_view_revision: AttachViewRevision(1),
+                    view_revision: AttachViewRevision(1),
+                    changes: Vec::new(),
+                    resume: AttachResumeState::default(),
+                },
+            };
+            relayed.push(false);
+            let snapshot = relayed.snapshot(generation, 11);
+            adopt_snapshot_replicas(&mut relayed.replicas, &snapshot);
+            relayed.state = bmux_frontend_runtime::AttachState::from_snapshot(&snapshot).unwrap();
+            relayed.streams = snapshot.resume.streams.clone();
+            relayed.delta.view_revision = snapshot.view_revision;
+            relayed.delta.resume = snapshot.resume;
+            relayed
+        }
+
+        /// A snapshot of the pane's layout at `generation` and control `revision`.
+        fn snapshot(&mut self, generation: u64, revision: u64) -> AttachProviderSnapshot {
+            assemble_cluster_snapshot(
+                &layout_with(
+                    vec![(
+                        self.pane,
+                        bmux_cluster_plugin_api::cluster_types::PaneAvailability::Ready,
+                        Some(assignment(5, generation)),
+                        None,
+                    )],
+                    revision,
+                ),
+                &mut self.replicas,
+            )
+            .unwrap()
+        }
+
+        /// The worker pushes a frame; the session applies it.
+        fn push(&mut self, sync_update_active: bool) {
+            let frame = self.worker.push();
+            self.replicas
+                .get_mut(&self.stream)
+                .unwrap()
+                .apply_upstream(&frame, sync_update_active)
+                .unwrap();
+        }
+
+        /// The session relays its changed stream as one delta; the renderer applies it.
+        fn deliver(&mut self) -> bmux_client::AttachStreamFrame {
+            let changes = relay_frames(
+                &mut self.streams,
+                &mut self.replicas,
+                &BTreeSet::from([self.stream.clone()]),
+            );
+            let sequence = AttachDeltaSequence(self.delta.sequence.0 + 1);
+            self.delta = bmux_client::AttachProviderDelta {
+                sequence,
+                base_view_revision: self.delta.view_revision,
+                view_revision: self.delta.view_revision,
+                changes,
+                resume: AttachResumeState {
+                    event_sequence: sequence,
+                    streams: self.streams.clone(),
+                    ..self.delta.resume.clone()
+                },
+            };
+            self.state.apply_delta(&self.delta).unwrap();
+            let [bmux_client::AttachProviderChange::StreamFrame(frame)] =
+                self.delta.changes.as_slice()
+            else {
+                panic!("expected one stream frame: {:?}", self.delta.changes);
+            };
+            frame.clone()
+        }
+
+        fn assert_level(&mut self) {
+            assert_eq!(
+                rendered(&mut self.state, self.pane),
+                screen(self.worker.grid.grid())
+            );
+        }
+    }
+
+    /// Worker frames, applied to the session's replica and relayed, keep the renderer's screen
+    /// equal to the worker's across output and a resize (reset frames).
+    #[test]
+    fn worker_frames_relay_through_the_session_to_the_renderer() {
+        let mut worker = WorkerPane::new(30, 20);
+        worker
+            .grid
+            .process(b"\x1b[?1049h\x1b[?2004hhello\r\nworld\x1b[?1049l\r\nmain");
+        let mut relayed = Relayed::hydrate(worker, 7);
+        relayed.assert_level();
+        assert!(
+            relayed.replicas[&relayed.stream]
+                .grid
+                .protocol_state()
+                .bracketed_paste
         );
+
+        // Output: several pushes go out as one incremental frame.
+        for line in 0..30 {
+            relayed
+                .worker
+                .grid
+                .process(format!("line {line}\r\n").as_bytes());
+            if line % 7 == 0 {
+                relayed.push(false);
+            }
+        }
+        relayed.push(true);
+        let frame = relayed.deliver();
+        assert!(!frame.reset);
+        assert!(frame.sync_update_active);
+        relayed.assert_level();
+
+        // A resize: the worker's reset frame reaches the renderer as one.
+        relayed.worker.grid.resize(50, 12).unwrap();
+        relayed.worker.grid.process(b"resized");
+        relayed.push(false);
+        assert!(relayed.deliver().reset);
+        let shown = rendered(&mut relayed.state, relayed.pane);
+        assert_eq!((shown.width, shown.height), (50, 12));
+        relayed.assert_level();
+
+        // A snapshot built for a view the renderer never takes leaves its replica where it was.
+        relayed.snapshot(7, 12);
+        relayed
+            .worker
+            .grid
+            .process(b"\r\nafter an abandoned snapshot");
+        relayed.push(false);
+        assert!(!relayed.deliver().reset);
+        relayed.assert_level();
+
+        // A frame the replica cannot follow is refused and changes nothing.
+        let mut elsewhere = WorkerPane::new(50, 12);
+        elsewhere.push();
+        elsewhere.grid.process(b"other");
+        let replica = relayed.replicas.get_mut(&relayed.stream).unwrap();
+        assert!(replica.apply_upstream(&elsewhere.push(), false).is_err());
+        assert_eq!(screen(&replica.grid), screen(relayed.worker.grid.grid()));
+    }
+
+    /// A new generation replaces the stream with the new execution's screen, which then relays.
+    #[test]
+    fn a_new_generation_replaces_the_relayed_stream() {
+        let mut relayed = Relayed::hydrate(WorkerPane::new(30, 20), 7);
+        relayed.worker.grid.process(b"old");
+        relayed.push(false);
+        relayed.deliver();
+
+        let mut restarted = WorkerPane::new(30, 20);
+        restarted.grid.process(b"restarted");
+        let mut next = Relayed::hydrate(restarted, 8);
+        let rebuilt = next.snapshot(8, 12);
+        let delta = cluster_reconciliation_delta(
+            relayed.delta.view_revision,
+            AttachViewRevision(relayed.delta.view_revision.0 + 1),
+            AttachDeltaSequence(relayed.delta.sequence.0 + 1),
+            12,
+            &relayed.streams,
+            &rebuilt,
+        );
+        relayed.state.apply_delta(&delta).unwrap();
+        adopt_snapshot_replicas(&mut next.replicas, &rebuilt);
+        // The renderer now follows the new generation's replica.
+        next.state = relayed.state;
+        next.streams.clone_from(&delta.resume.streams);
+        next.delta = delta;
+        assert_eq!(next.state.resume_state().streams[0].generation, 8);
+        next.assert_level();
+        next.worker.grid.process(b"\r\nmore");
+        next.push(false);
+        assert!(!next.deliver().reset);
+        next.assert_level();
+    }
+
+    #[test]
+    fn a_new_replica_takes_only_a_reset_frame() {
+        let mut worker = WorkerPane::new(20, 4);
+        worker.push();
+        worker.grid.process(b"later");
+        let mut replica = StreamReplica::new(1).unwrap();
+        assert!(!replica.hydrated());
+        assert!(replica.apply_upstream(&worker.push(), false).is_err());
+        assert!(!replica.hydrated());
+        worker.observer = bmux_terminal_grid::ReplicaCursor::default();
+        replica.apply_upstream(&worker.push(), false).unwrap();
+        assert!(replica.hydrated());
+    }
+
+    fn authority(execution: u128, generation: u64) -> WorkerAuthority {
+        WorkerAuthority {
+            cluster_id: "cluster".to_string(),
+            workspace_id: bmux_cluster_plugin_api::cluster_types::WorkspaceId {
+                value: uuid::Uuid::from_u128(1),
+            },
+            pane_id: bmux_cluster_plugin_api::cluster_types::LogicalPaneId {
+                value: uuid::Uuid::from_u128(execution + 100),
+            },
+            execution_id: bmux_cluster_plugin_api::cluster_types::ExecutionId {
+                value: uuid::Uuid::from_u128(execution),
+            },
+            generation,
+            control_term: 1,
+            lease_sequence: 1,
+            operation_class: bmux_cluster_plugin_api::cluster_types::WorkerOperationClass::Observe,
+            principal_id: "principal:test".to_string(),
+            issuer_node_id: "ingress".to_string(),
+            audience_node_id: "worker".to_string(),
+            lease_id: uuid::Uuid::from_u128(execution + 200),
+            lease_issued_at_unix_ms: 0,
+            lease_duration_ms: 5_000,
+            lease_signature: Vec::new(),
+        }
+    }
+
+    fn route(execution: u128, generation: u64, endpoint: &str) -> WorkerRoute {
+        WorkerRoute {
+            execution_id: bmux_cluster_plugin_api::cluster_types::ExecutionId {
+                value: uuid::Uuid::from_u128(execution),
+            },
+            generation,
+            node_id: "worker".to_string(),
+            endpoint: endpoint.to_string(),
+            authority: authority(execution, generation),
+        }
+    }
+
+    fn execution_ref(execution: u128, generation: u64) -> (AttachStreamId, ExecutionRef) {
+        (
+            execution_stream(execution),
+            ExecutionRef {
+                execution_id: bmux_cluster_plugin_api::cluster_types::ExecutionId {
+                    value: uuid::Uuid::from_u128(execution),
+                },
+                generation,
+            },
+        )
+    }
+
+    #[test]
+    fn worker_routes_are_grouped_by_endpoint_and_fenced_to_requested_generations() {
+        let executions = [
+            execution_ref(1, 4),
+            execution_ref(2, 9),
+            execution_ref(3, 1),
+        ];
+        let plan = route_plan(
+            &executions,
+            vec![route(1, 4, "a"), route(2, 9, "b"), route(3, 1, "a")],
+        )
+        .unwrap();
+        assert_eq!(plan.len(), 2);
+        assert_eq!(
+            plan["a"]
+                .iter()
+                .map(|target| target.stream_id.clone())
+                .collect::<Vec<_>>(),
+            vec![execution_stream(1), execution_stream(3)]
+        );
+        assert_eq!(plan["b"][0].authority, authority(2, 9));
+
+        let fenced = |routes: Vec<WorkerRoute>| route_plan(&executions, routes).is_err();
+        assert!(fenced(vec![route(1, 4, "a"), route(2, 9, "b")]), "missing");
+        assert!(
+            fenced(vec![route(1, 4, "a"), route(2, 8, "b"), route(3, 1, "a")]),
+            "stale generation"
+        );
+        let mut mismatched = route(2, 9, "b");
+        mismatched.authority = authority(2, 8);
+        assert!(
+            fenced(vec![route(1, 4, "a"), mismatched, route(3, 1, "a")]),
+            "lease for another generation"
+        );
+        assert!(
+            fenced(vec![route(1, 4, "a"), route(1, 4, "b"), route(3, 1, "a")]),
+            "duplicate"
+        );
+        assert!(
+            fenced(vec![route(1, 4, "a"), route(7, 9, "b"), route(3, 1, "a")]),
+            "unrequested"
+        );
+    }
+
+    #[test]
+    fn observed_panes_must_be_exactly_the_requested_executions() {
+        let executions = [execution_ref(1, 4), execution_ref(2, 9)];
+        let plan = route_plan(&executions, vec![route(1, 4, "a"), route(2, 9, "a")]).unwrap();
+        let targets = &plan["a"];
+        let observed = |execution: u128, generation: u64, pane: u128| ObservedExecution {
+            execution_id: bmux_cluster_plugin_api::cluster_types::ExecutionId {
+                value: uuid::Uuid::from_u128(execution),
+            },
+            generation,
+            session_id: uuid::Uuid::from_u128(50),
+            pane_id: uuid::Uuid::from_u128(pane),
+        };
+        let panes = observed_panes(targets, vec![observed(2, 9, 20), observed(1, 4, 10)]).unwrap();
+        assert_eq!(
+            panes,
+            BTreeMap::from([
+                (uuid::Uuid::from_u128(10), execution_stream(1)),
+                (uuid::Uuid::from_u128(20), execution_stream(2)),
+            ])
+        );
+        assert!(observed_panes(targets, vec![observed(1, 4, 10)]).is_err());
+        assert!(observed_panes(targets, vec![observed(1, 4, 10), observed(2, 8, 20)]).is_err());
+        assert!(observed_panes(targets, vec![observed(1, 4, 10), observed(1, 4, 20)]).is_err());
+        assert!(observed_panes(targets, vec![observed(1, 4, 10), observed(2, 9, 10)]).is_err());
     }
 
     #[test]
@@ -2399,17 +3143,12 @@ mod tests {
                 pane_id: Some(uuid::Uuid::from_u128(1)),
             }],
         };
-        let built = ClusterSnapshotBuild {
-            snapshot: AttachProviderSnapshot {
-                view_revision: AttachViewRevision(90),
-                event_sequence: AttachDeltaSequence(0),
-                scene,
-                streams: vec![stream.clone()],
-                resume: AttachResumeState::default(),
-            },
-            protocols: std::collections::BTreeMap::new(),
-            grids: std::collections::BTreeMap::new(),
-            replicas: std::collections::BTreeMap::new(),
+        let built = AttachProviderSnapshot {
+            view_revision: AttachViewRevision(90),
+            event_sequence: AttachDeltaSequence(0),
+            scene,
+            streams: vec![stream.clone()],
+            resume: AttachResumeState::default(),
         };
         let resume = AttachResumeState {
             view_revision: AttachViewRevision(7),
@@ -2417,10 +3156,20 @@ mod tests {
             streams: vec![stream.cursor],
             provider_token: 90_u64.to_be_bytes().to_vec(),
         };
-        let resumed = initial_snapshot_for_resume(built, 90, Some(resume.clone())).unwrap();
-        assert_eq!(resumed.snapshot.view_revision, AttachViewRevision(7));
-        assert_eq!(resumed.snapshot.event_sequence, AttachDeltaSequence(12));
-        assert_eq!(resumed.snapshot.resume, resume);
+        assert!(
+            initial_snapshot_for_resume(built.clone(), 91, Some(resume.clone())).is_err(),
+            "the control revision moved on"
+        );
+        let mut other_generation = resume.clone();
+        other_generation.streams[0].generation = 3;
+        assert!(initial_snapshot_for_resume(built.clone(), 90, Some(other_generation)).is_err());
+        // Offsets are this session's replica epochs: a resumed view takes the snapshot's.
+        let mut earlier_offset = resume.clone();
+        earlier_offset.streams[0].offset = 2;
+        let resumed = initial_snapshot_for_resume(built, 90, Some(earlier_offset)).unwrap();
+        assert_eq!(resumed.view_revision, AttachViewRevision(7));
+        assert_eq!(resumed.event_sequence, AttachDeltaSequence(12));
+        assert_eq!(resumed.resume, resume);
     }
 
     #[test]
@@ -2568,205 +3317,6 @@ mod tests {
             rects: Vec::new(),
         };
         assert!(validate_unique_snapshot_streams(&layout).is_err());
-    }
-
-    #[test]
-    fn worker_snapshot_must_match_replicated_assignment() {
-        let expected = bmux_cluster_plugin_api::cluster_types::ExecutionAssignment {
-            node_id: "node-a".to_string(),
-            generation: 4,
-            execution_id: bmux_cluster_plugin_api::cluster_types::ExecutionId {
-                value: uuid::Uuid::from_u128(10),
-            },
-        };
-        let matching = bmux_cluster_plugin_api::cluster_types::WorkerTerminalSnapshot {
-            execution_id: expected.execution_id.clone(),
-            generation: 4,
-            cursor: 0,
-            encoded: Vec::new(),
-        };
-        assert!(validate_worker_snapshot_assignment(&matching, &expected).is_ok());
-        assert!(
-            validate_worker_snapshot_assignment(
-                &bmux_cluster_plugin_api::cluster_types::WorkerTerminalSnapshot {
-                    execution_id: bmux_cluster_plugin_api::cluster_types::ExecutionId {
-                        value: uuid::Uuid::from_u128(11),
-                    },
-                    ..matching.clone()
-                },
-                &expected,
-            )
-            .is_err()
-        );
-        assert!(
-            validate_worker_snapshot_assignment(
-                &bmux_cluster_plugin_api::cluster_types::WorkerTerminalSnapshot {
-                    generation: 5,
-                    ..matching
-                },
-                &expected,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn worker_output_is_fenced_to_requested_execution_generation_and_cursor() {
-        let execution_id = bmux_cluster_plugin_api::cluster_types::ExecutionId {
-            value: uuid::Uuid::from_u128(10),
-        };
-        let cursor = AttachStreamCursor {
-            stream_id: AttachStreamId::new("execution:test").unwrap(),
-            surface_id: uuid::Uuid::from_u128(1),
-            generation: 4,
-            offset: 20,
-        };
-        let output = bmux_cluster_plugin_api::cluster_types::WorkerOutput {
-            execution_id: execution_id.clone(),
-            generation: 4,
-            requested_cursor: 20,
-            retained_start: 0,
-            next_cursor: 23,
-            gap: false,
-            output_still_pending: false,
-            data: b"abc".to_vec(),
-        };
-        assert!(validate_worker_output(&output, &execution_id, &cursor).is_ok());
-        assert!(
-            validate_worker_output(
-                &bmux_cluster_plugin_api::cluster_types::WorkerOutput {
-                    generation: 5,
-                    ..output.clone()
-                },
-                &execution_id,
-                &cursor,
-            )
-            .is_err()
-        );
-        assert!(
-            validate_worker_output(
-                &bmux_cluster_plugin_api::cluster_types::WorkerOutput {
-                    requested_cursor: 19,
-                    ..output.clone()
-                },
-                &execution_id,
-                &cursor,
-            )
-            .is_err()
-        );
-        assert!(
-            validate_worker_output(
-                &bmux_cluster_plugin_api::cluster_types::WorkerOutput {
-                    next_cursor: 20,
-                    ..output.clone()
-                },
-                &execution_id,
-                &cursor,
-            )
-            .is_err()
-        );
-        assert!(
-            validate_worker_output(
-                &bmux_cluster_plugin_api::cluster_types::WorkerOutput {
-                    next_cursor: 24,
-                    ..output.clone()
-                },
-                &execution_id,
-                &cursor,
-            )
-            .is_err()
-        );
-        assert!(
-            validate_worker_output(
-                &bmux_cluster_plugin_api::cluster_types::WorkerOutput {
-                    gap: true,
-                    next_cursor: 30,
-                    ..output.clone()
-                },
-                &execution_id,
-                &cursor,
-            )
-            .is_err()
-        );
-        assert!(
-            validate_worker_output(
-                &bmux_cluster_plugin_api::cluster_types::WorkerOutput {
-                    execution_id: bmux_cluster_plugin_api::cluster_types::ExecutionId {
-                        value: uuid::Uuid::from_u128(11),
-                    },
-                    ..output
-                },
-                &execution_id,
-                &cursor,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn cluster_terminal_snapshot_repairs_grid_protocol_and_delta_continuity() {
-        let mut source = bmux_terminal_grid::TerminalGridStream::new(
-            12,
-            3,
-            bmux_terminal_grid::GridLimits::default(),
-        )
-        .unwrap();
-        source.process(b"\x1b[?1000h\x1b[?1006hhello\x1b[2;4H\x1b[?25l\x1b[");
-        let terminal = bmux_cluster_plugin_api::cluster_types::WorkerTerminalSnapshot {
-            execution_id: bmux_cluster_plugin_api::cluster_types::ExecutionId {
-                value: uuid::Uuid::from_u128(7),
-            },
-            generation: 3,
-            cursor: 41,
-            encoded: serde_json::to_vec(&source.snapshot(0, 3)).unwrap(),
-        };
-
-        let decoded = decode_cluster_terminal_snapshot(&terminal).unwrap();
-        assert_eq!(decoded.cursor, 41);
-        assert_eq!(
-            decoded.stream.grid().protocol_state(),
-            source.grid().protocol_state()
-        );
-        assert_ne!(
-            decoded.stream.grid().mode(),
-            bmux_terminal_grid::GridMode::Alternate
-        );
-
-        let tracker = protocol_tracker_from_snapshot(&decoded);
-        assert_eq!(tracker.protocol_state(), source.grid().protocol_state());
-        assert!(!tracker.alternate_screen());
-
-        let next = b"31m!";
-        source.process(next);
-        let mut replay = decoded.stream;
-        replay.process(next);
-        assert_eq!(
-            bmux_terminal_grid::visible_text(replay.grid(), 0, 3),
-            bmux_terminal_grid::visible_text(source.grid(), 0, 3)
-        );
-        assert_eq!(replay.grid().cursor(), source.grid().cursor());
-        let repaired_style = replay.grid().viewport_rows()[1].cells()[3].style();
-        assert_eq!(
-            replay.grid().palette().get(repaired_style).fg,
-            Some(bmux_terminal_grid::Color::Indexed(1))
-        );
-    }
-
-    #[test]
-    fn cluster_terminal_snapshot_rejects_malformed_structured_state() {
-        let terminal = bmux_cluster_plugin_api::cluster_types::WorkerTerminalSnapshot {
-            execution_id: bmux_cluster_plugin_api::cluster_types::ExecutionId {
-                value: uuid::Uuid::from_u128(7),
-            },
-            generation: 3,
-            cursor: 41,
-            encoded: b"not a structured terminal snapshot".to_vec(),
-        };
-
-        let error = decode_cluster_terminal_snapshot(&terminal)
-            .err()
-            .expect("malformed snapshot must fail");
-        assert!(error.to_string().contains("valid structured grid"));
     }
 
     #[test]

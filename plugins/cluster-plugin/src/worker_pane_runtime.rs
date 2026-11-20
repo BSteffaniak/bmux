@@ -134,33 +134,28 @@ impl WorkerPaneRuntime for TypedPaneRuntime {
         .map_err(|error| Self::service_error("input", error))
     }
 
-    fn output(
+    fn observe(
         &self,
-        session_id: uuid::Uuid,
-        pane_id: uuid::Uuid,
-        cursor: u64,
-        max_bytes: u32,
-    ) -> Result<bmux_pane_runtime_state::OutputRead, WorkerServiceError> {
+        client_id: uuid::Uuid,
+        targets: &[(uuid::Uuid, uuid::Uuid)],
+        max_history_lines: u32,
+    ) -> Result<(), WorkerServiceError> {
         let mut client = self.client();
-        let read = bmux_plugin::block_on_typed_dispatch(
-            attach_runtime_state::client::pane_output_cursor_state(
-                &mut client,
-                session_id,
-                pane_id,
-                cursor,
-                max_bytes,
-            ),
-        )
-        .map_err(|error| Self::dispatch_error("output", error))?
-        .map_err(|error| Self::service_error("output", error))?;
-        Ok(bmux_pane_runtime_state::OutputRead {
-            bytes: read.data,
-            retained_start: read.retained_start,
-            stream_start: read.stream_start,
-            stream_end: read.stream_end,
-            source_end: read.source_end,
-            stream_gap: read.stream_gap,
-        })
+        bmux_plugin::block_on_typed_dispatch(attach_runtime_state::client::observe_pane_frames(
+            &mut client,
+            client_id,
+            targets
+                .iter()
+                .map(|(session_id, pane_id)| attach_runtime_state::ObservedPane {
+                    session_id: *session_id,
+                    pane_id: *pane_id,
+                })
+                .collect(),
+            max_history_lines,
+        ))
+        .map_err(|error| Self::dispatch_error("observe", error))?
+        .map(|_| ())
+        .map_err(|error| Self::service_error("observe", error))
     }
 
     fn resize(
@@ -222,25 +217,6 @@ impl WorkerPaneRuntime for TypedPaneRuntime {
         .map_err(|error| Self::dispatch_error("close", error))?
         .map(|_| ())
         .map_err(|error| Self::service_error("close", error))
-    }
-
-    fn snapshot(
-        &self,
-        session_id: uuid::Uuid,
-        pane_id: uuid::Uuid,
-    ) -> Result<(u64, Vec<u8>), WorkerServiceError> {
-        let mut client = self.client();
-        let snapshot = bmux_plugin::block_on_typed_dispatch(
-            attach_runtime_state::client::pane_grid_snapshot_state(
-                &mut client,
-                session_id,
-                pane_id,
-                u32::MAX,
-            ),
-        )
-        .map_err(|error| Self::dispatch_error("snapshot", error))?
-        .map_err(|error| Self::service_error("snapshot", error))?;
-        Ok((snapshot.stream_end, snapshot.encoded))
     }
 
     fn contains(&self, session_id: uuid::Uuid, pane_id: uuid::Uuid) -> bool {

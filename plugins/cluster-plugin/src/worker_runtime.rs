@@ -6,16 +6,18 @@
 
 use bmux_cluster_plugin_api::cluster_types::{
     CommandId, ExecutionId, WorkerAuthority, WorkerExecution, WorkerExecutionList,
-    WorkerExecutionState, WorkerLaunchResult, WorkerOperationClass, WorkerOutput,
-    WorkerQueryResult, WorkerRegistryStats, WorkerServiceError,
+    WorkerExecutionState, WorkerLaunchResult, WorkerOperationClass, WorkerQueryResult,
+    WorkerRegistryStats, WorkerServiceError,
 };
 use sha2::Digest;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 use std::time::Instant;
 
 pub const MAX_CONTROL_LEASE_DURATION_MS: u64 = 5_000;
-const DEFAULT_REGISTRY_OUTPUT_HARD_MAX_BYTES: usize = 256 * 1024 * 1024;
+/// How long after its issue time (beyond its duration) an observe lease is still accepted, for
+/// clock differences between the issuing node and this one.
+const OBSERVE_CLOCK_SKEW_MS: u64 = 30_000;
 
 pub trait WorkerPaneRuntime: Send + Sync {
     /// Starts a local runtime with the requested command, environment, and PTY
@@ -53,19 +55,18 @@ pub trait WorkerPaneRuntime: Send + Sync {
         data: &[u8],
     ) -> Result<(), WorkerServiceError>;
 
-    /// Reads an absolute output cursor range from the exact local pane.
+    /// Pushes frames of `targets` (local session, pane) to the connection `client_id`, which
+    /// observes them; an empty set stops it.
     ///
     /// # Errors
     ///
-    /// Returns a generated worker error when the binding is missing or output
-    /// cannot be read.
-    fn output(
+    /// Returns a generated worker error when the local runtime refuses the observer.
+    fn observe(
         &self,
-        session_id: uuid::Uuid,
-        pane_id: uuid::Uuid,
-        cursor: u64,
-        max_bytes: u32,
-    ) -> Result<bmux_pane_runtime_state::OutputRead, WorkerServiceError>;
+        client_id: uuid::Uuid,
+        targets: &[(uuid::Uuid, uuid::Uuid)],
+        max_history_lines: u32,
+    ) -> Result<(), WorkerServiceError>;
 
     /// Applies the viewport size to the exact bound local pane/session.
     ///
@@ -111,17 +112,6 @@ pub trait WorkerPaneRuntime: Send + Sync {
     /// Returns a generated worker error when close fails.
     fn close(&self, session_id: uuid::Uuid, pane_id: uuid::Uuid) -> Result<(), WorkerServiceError>;
 
-    /// Returns a complete terminal snapshot and stream cursor for repair.
-    ///
-    /// # Errors
-    ///
-    /// Returns a generated worker error when the runtime cannot snapshot.
-    fn snapshot(
-        &self,
-        session_id: uuid::Uuid,
-        pane_id: uuid::Uuid,
-    ) -> Result<(u64, Vec<u8>), WorkerServiceError>;
-
     /// Reports whether a local runtime binding still exists.
     fn contains(&self, session_id: uuid::Uuid, pane_id: uuid::Uuid) -> bool;
 }
@@ -141,7 +131,6 @@ struct WorkerRegistryInner {
 
 struct WorkerRegistryEntry {
     execution: WorkerExecution,
-    output: WorkerOutputBuffer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,11 +205,6 @@ where
             inner.executions.insert(
                 execution_id,
                 WorkerRegistryEntry {
-                    output: WorkerOutputBuffer::new(
-                        execution.authority.execution_id.clone(),
-                        execution.authority.generation,
-                        WorkerOutputRetention::default(),
-                    ),
                     execution: execution.clone(),
                 },
             );
@@ -270,11 +254,6 @@ where
         inner.executions.insert(
             execution_id,
             WorkerRegistryEntry {
-                output: WorkerOutputBuffer::new(
-                    execution.authority.execution_id.clone(),
-                    execution.authority.generation,
-                    WorkerOutputRetention::default(),
-                ),
                 execution: execution.clone(),
             },
         );
@@ -449,95 +428,50 @@ where
         })
     }
 
-    /// Appends local pane output to the execution's bounded cursor stream.
+    /// Has the local pane runtime push frames of the executions `authorities` authorize to the
+    /// connection `client_id` (replacing what it observed; none stops it), and returns where each
+    /// is, so the observer can tell their frames apart.
     ///
     /// # Errors
     ///
-    /// Returns missing execution, stale generation, cursor, or lock failures.
-    pub fn append_output(
+    /// Returns missing execution, stale generation, invalid lease, local runtime, or lock
+    /// failures; nothing is observed then.
+    pub fn observe(
         &self,
-        execution_id: &ExecutionId,
-        generation: u64,
-        data: Vec<u8>,
-        monotonic_now_ms: u64,
-    ) -> Result<u64, WorkerServiceError> {
-        let mut inner = self.lock()?;
-        let result = {
-            let entry = execution_entry_mut(&mut inner.executions, execution_id, generation)?;
-            let end = entry.output.append(data, monotonic_now_ms)?;
-            entry.execution.output_end = end;
-            entry.execution.output_start = entry.output.start;
-            enforce_registry_output_cap(
-                &mut inner.executions,
-                DEFAULT_REGISTRY_OUTPUT_HARD_MAX_BYTES,
-            );
-            Ok(end)
-        };
-        drop(inner);
-        result
-    }
-
-    /// Reads one bounded output batch for the exact generation.
-    ///
-    /// # Errors
-    ///
-    /// Returns missing execution, stale generation, or lock failures.
-    pub fn output(
-        &self,
-        execution_id: &ExecutionId,
-        generation: u64,
-        cursor: u64,
-        max_bytes: u32,
-    ) -> Result<WorkerOutput, WorkerServiceError> {
-        let inner = self.lock()?;
-        let execution = execution_entry(&inner.executions, execution_id, generation)?
-            .execution
-            .clone();
-        drop(inner);
-        let read = self.runtime.output(
-            execution.local_session_id,
-            execution.local_pane_id,
-            cursor,
-            max_bytes,
-        )?;
-        Ok(WorkerOutput {
-            execution_id: execution_id.clone(),
-            generation,
-            requested_cursor: cursor,
-            retained_start: read.retained_start,
-            next_cursor: read.stream_end,
-            gap: read.stream_gap,
-            output_still_pending: read.stream_end < read.source_end,
-            data: read.bytes,
-        })
-    }
-
-    /// Produces a complete local terminal snapshot for cursor-gap repair.
-    ///
-    /// # Errors
-    ///
-    /// Returns missing execution, stale generation, local runtime, or lock failures.
-    pub fn snapshot(
-        &self,
-        execution_id: &ExecutionId,
-        generation: u64,
-    ) -> Result<bmux_cluster_plugin_api::cluster_types::WorkerTerminalSnapshot, WorkerServiceError>
+        client_id: uuid::Uuid,
+        authorities: &[WorkerAuthority],
+        max_history_lines: u32,
+        now_unix_ms: u64,
+    ) -> Result<Vec<bmux_cluster_plugin_api::cluster_types::ObservedExecution>, WorkerServiceError>
     {
+        let mut observed = Vec::with_capacity(authorities.len());
         let inner = self.lock()?;
-        let entry = execution_entry(&inner.executions, execution_id, generation)?;
-        let execution = entry.execution.clone();
+        for authority in authorities {
+            let entry = execution_entry(
+                &inner.executions,
+                &authority.execution_id,
+                authority.generation,
+            )?;
+            let expected = expected_authority(&self.local_node_id, &entry.execution.authority);
+            inner
+                .fence
+                .validate_observation(&expected, authority, now_unix_ms, &self.verifier)?;
+            observed.push(bmux_cluster_plugin_api::cluster_types::ObservedExecution {
+                execution_id: authority.execution_id.clone(),
+                generation: authority.generation,
+                session_id: entry.execution.local_session_id,
+                pane_id: entry.execution.local_pane_id,
+            });
+        }
+        // The local runtime is called without the registry held.
         drop(inner);
-        let (cursor, encoded) = self
-            .runtime
-            .snapshot(execution.local_session_id, execution.local_pane_id)?;
-        Ok(
-            bmux_cluster_plugin_api::cluster_types::WorkerTerminalSnapshot {
-                execution_id: execution_id.clone(),
-                generation,
-                cursor,
-                encoded,
-            },
-        )
+        let targets: Vec<(uuid::Uuid, uuid::Uuid)> = observed
+            .iter()
+            .map(|execution| (execution.session_id, execution.pane_id))
+            .collect();
+        self.runtime
+            .observe(client_id, &targets, max_history_lines)?;
+        Ok(observed)
     }
 
     /// Reconciles durable execution records against local pane-runtime state,
@@ -572,11 +506,6 @@ where
                 .executions
                 .entry(execution.authority.execution_id.value)
                 .or_insert_with(|| WorkerRegistryEntry {
-                    output: WorkerOutputBuffer::new(
-                        execution.authority.execution_id.clone(),
-                        execution.authority.generation,
-                        WorkerOutputRetention::default(),
-                    ),
                     execution: execution.clone(),
                 });
             if entry.execution.authority == execution.authority {
@@ -695,8 +624,6 @@ const fn worker_execution(
         local_pane_id,
         state: WorkerExecutionState::Ready,
         exit_code: None,
-        output_start: 0,
-        output_end: 0,
     }
 }
 
@@ -708,21 +635,6 @@ fn execution_entry<'a>(
     let entry =
         executions
             .get(&execution_id.value)
-            .ok_or_else(|| WorkerServiceError::NotFound {
-                execution_id: execution_id.clone(),
-            })?;
-    require_entry_generation(entry, generation)?;
-    Ok(entry)
-}
-
-fn execution_entry_mut<'a>(
-    executions: &'a mut BTreeMap<uuid::Uuid, WorkerRegistryEntry>,
-    execution_id: &ExecutionId,
-    generation: u64,
-) -> Result<&'a mut WorkerRegistryEntry, WorkerServiceError> {
-    let entry =
-        executions
-            .get_mut(&execution_id.value)
             .ok_or_else(|| WorkerServiceError::NotFound {
                 execution_id: execution_id.clone(),
             })?;
@@ -800,30 +712,6 @@ fn outcome_mutation(
 fn registry_stats(executions: &BTreeMap<uuid::Uuid, WorkerRegistryEntry>) -> WorkerRegistryStats {
     WorkerRegistryStats {
         execution_count: executions.len().try_into().unwrap_or(u32::MAX),
-        retained_output_bytes: executions
-            .values()
-            .map(|entry| u64::try_from(entry.output.retained_bytes).unwrap_or(u64::MAX))
-            .fold(0_u64, u64::saturating_add),
-    }
-}
-
-fn enforce_registry_output_cap(
-    executions: &mut BTreeMap<uuid::Uuid, WorkerRegistryEntry>,
-    max_bytes: usize,
-) {
-    let total = executions
-        .values()
-        .map(|entry| entry.output.retained_bytes)
-        .fold(0_usize, usize::saturating_add);
-    if total <= max_bytes {
-        return;
-    }
-    let mut remaining = max_bytes;
-    for entry in executions.values_mut().rev() {
-        let allowance = remaining.min(entry.output.retained_bytes);
-        entry.output.enforce_global_cap(allowance);
-        entry.execution.output_start = entry.output.start;
-        remaining = remaining.saturating_sub(entry.output.retained_bytes);
     }
 }
 
@@ -1232,39 +1120,6 @@ where
         Box::pin(async move { self.registry.get(&execution_id) })
     }
 
-    fn output<'a>(
-        &'a self,
-        execution_id: ExecutionId,
-        generation: u64,
-        cursor: u64,
-        max_bytes: u32,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<WorkerOutput, WorkerServiceError>> + Send + 'a>,
-    > {
-        Box::pin(async move {
-            self.registry
-                .output(&execution_id, generation, cursor, max_bytes)
-        })
-    }
-
-    fn snapshot<'a>(
-        &'a self,
-        execution_id: ExecutionId,
-        generation: u64,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<
-                        bmux_cluster_plugin_api::cluster_types::WorkerTerminalSnapshot,
-                        WorkerServiceError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async move { self.registry.snapshot(&execution_id, generation) })
-    }
-
     fn inventory<'a>(
         &'a self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = WorkerExecutionList> + Send + 'a>> {
@@ -1391,6 +1246,95 @@ impl WorkerFenceState {
     }
 }
 
+impl WorkerFenceState {
+    /// Checks an observe lease: in scope, of an allowed duration, issued recently enough (with
+    /// slack for clock differences between nodes), signed by an active voter, and of no older a
+    /// term than the last mutation accepted. It records nothing: observing is not ordered with
+    /// mutations, so it never stales a mutation lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns scope, duration, expiry, signature, or term failures.
+    pub fn validate_observation(
+        &self,
+        expected: &WorkerExecutionAuthority,
+        authority: &WorkerAuthority,
+        now_unix_ms: u64,
+        verifier: &impl WorkerLeaseVerifier,
+    ) -> Result<(), WorkerServiceError> {
+        validate_scope(expected, authority, WorkerOperationClass::Observe)?;
+        if authority.lease_duration_ms == 0
+            || authority.lease_duration_ms > MAX_CONTROL_LEASE_DURATION_MS
+        {
+            return Err(WorkerServiceError::InvalidRequest {
+                reason: format!(
+                    "lease duration must be within 1..={MAX_CONTROL_LEASE_DURATION_MS} ms"
+                ),
+            });
+        }
+        let expires = authority
+            .lease_issued_at_unix_ms
+            .saturating_add(authority.lease_duration_ms)
+            .saturating_add(OBSERVE_CLOCK_SKEW_MS);
+        if now_unix_ms >= expires {
+            return Err(WorkerServiceError::LeaseExpired);
+        }
+        let signed = canonical_unsigned_authority(authority)?;
+        verifier.verify(authority, &signed).map_err(|reason| {
+            WorkerServiceError::InvalidRequest {
+                reason: format!("lease signature is invalid: {reason}"),
+            }
+        })?;
+        if let Some(previous) = self.accepted.get(&authority.execution_id.value)
+            && authority.control_term < previous.term
+        {
+            return Err(WorkerServiceError::StaleTerm {
+                expected_minimum: previous.term,
+                received: authority.control_term,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Observes executions for a connection (`cluster-worker-stream`): the worker side of frame
+/// replication, kept by the plugin for the service that names the caller's connection.
+pub trait ExecutionObserver: Send + Sync {
+    /// See [`WorkerRegistry::observe`].
+    ///
+    /// # Errors
+    ///
+    /// Returns lease, execution, or local runtime failures.
+    fn observe(
+        &self,
+        client_id: uuid::Uuid,
+        authorities: &[WorkerAuthority],
+        max_history_lines: u32,
+    ) -> Result<Vec<bmux_cluster_plugin_api::cluster_types::ObservedExecution>, WorkerServiceError>;
+}
+
+impl<R, V, C> ExecutionObserver for WorkerServiceHandle<R, V, C>
+where
+    R: WorkerPaneRuntime,
+    V: WorkerLeaseVerifier,
+    C: Send + Sync,
+{
+    fn observe(
+        &self,
+        client_id: uuid::Uuid,
+        authorities: &[WorkerAuthority],
+        max_history_lines: u32,
+    ) -> Result<Vec<bmux_cluster_plugin_api::cluster_types::ObservedExecution>, WorkerServiceError>
+    {
+        self.registry.observe(
+            client_id,
+            authorities,
+            max_history_lines,
+            crate::now_unix_ms(),
+        )
+    }
+}
+
 fn validate_scope(
     expected: &WorkerExecutionAuthority,
     authority: &WorkerAuthority,
@@ -1426,179 +1370,6 @@ pub(crate) fn canonical_unsigned_authority(
             reason: format!("authority encoding failed: {error}"),
         }
     })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct OutputChunk {
-    start: u64,
-    end: u64,
-    observed_monotonic_ms: u64,
-    data: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WorkerOutputRetention {
-    pub minimum_bytes: usize,
-    pub minimum_duration_ms: u64,
-    pub hard_max_bytes: usize,
-}
-
-impl Default for WorkerOutputRetention {
-    fn default() -> Self {
-        Self {
-            minimum_bytes: 16 * 1024 * 1024,
-            minimum_duration_ms: 60_000,
-            hard_max_bytes: 64 * 1024 * 1024,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct WorkerOutputBuffer {
-    execution_id: ExecutionId,
-    generation: u64,
-    retention: WorkerOutputRetention,
-    chunks: VecDeque<OutputChunk>,
-    retained_bytes: usize,
-    start: u64,
-    end: u64,
-}
-
-impl WorkerOutputBuffer {
-    #[must_use]
-    pub const fn new(
-        execution_id: ExecutionId,
-        generation: u64,
-        retention: WorkerOutputRetention,
-    ) -> Self {
-        Self {
-            execution_id,
-            generation,
-            retention,
-            chunks: VecDeque::new(),
-            retained_bytes: 0,
-            start: 0,
-            end: 0,
-        }
-    }
-
-    /// Appends one contiguous output segment and returns its exclusive cursor.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the monotonic cursor would overflow.
-    pub fn append(
-        &mut self,
-        data: Vec<u8>,
-        monotonic_now_ms: u64,
-    ) -> Result<u64, WorkerServiceError> {
-        if data.is_empty() {
-            return Ok(self.end);
-        }
-        let length = u64::try_from(data.len()).map_err(|_| WorkerServiceError::InvalidRequest {
-            reason: "output segment length does not fit u64".to_string(),
-        })?;
-        let end = self
-            .end
-            .checked_add(length)
-            .ok_or_else(|| WorkerServiceError::Unavailable {
-                reason: "execution output cursor overflowed".to_string(),
-            })?;
-        let start = self.end;
-        self.end = end;
-        self.retained_bytes = self.retained_bytes.saturating_add(data.len());
-        self.chunks.push_back(OutputChunk {
-            start,
-            end,
-            observed_monotonic_ms: monotonic_now_ms,
-            data,
-        });
-        self.evict(monotonic_now_ms);
-        Ok(end)
-    }
-
-    /// Reads a bounded cursor range. Requests older than retention return an
-    /// explicit gap and no bytes so callers repair from a complete snapshot.
-    #[must_use]
-    pub fn read(&self, cursor: u64, max_bytes: u32) -> WorkerOutput {
-        if cursor < self.start || cursor > self.end {
-            return WorkerOutput {
-                execution_id: self.execution_id.clone(),
-                generation: self.generation,
-                requested_cursor: cursor,
-                retained_start: self.start,
-                next_cursor: self.start,
-                gap: true,
-                output_still_pending: self.start < self.end,
-                data: Vec::new(),
-            };
-        }
-        let limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
-        let mut data = Vec::with_capacity(limit.min(self.retained_bytes));
-        let mut next = cursor;
-        for chunk in &self.chunks {
-            if chunk.end <= cursor || data.len() >= limit {
-                continue;
-            }
-            let offset = usize::try_from(cursor.saturating_sub(chunk.start))
-                .unwrap_or(usize::MAX)
-                .min(chunk.data.len());
-            let available = &chunk.data[offset..];
-            let take = available.len().min(limit.saturating_sub(data.len()));
-            data.extend_from_slice(&available[..take]);
-            next = next.saturating_add(u64::try_from(take).unwrap_or(u64::MAX));
-            if take < available.len() {
-                break;
-            }
-        }
-        WorkerOutput {
-            execution_id: self.execution_id.clone(),
-            generation: self.generation,
-            requested_cursor: cursor,
-            retained_start: self.start,
-            next_cursor: next,
-            gap: false,
-            output_still_pending: next < self.end,
-            data,
-        }
-    }
-
-    /// Forces eviction to a node-wide cap. Subsequent old cursors observe a
-    /// gap; snapshot repair remains the only recovery path.
-    pub fn enforce_global_cap(&mut self, max_bytes: usize) {
-        while self.retained_bytes > max_bytes {
-            if !self.pop_front() {
-                break;
-            }
-        }
-    }
-
-    fn evict(&mut self, monotonic_now_ms: u64) {
-        while self.retained_bytes > self.retention.hard_max_bytes {
-            if !self.pop_front() {
-                break;
-            }
-        }
-        while let Some(front) = self.chunks.front() {
-            let old_enough = monotonic_now_ms.saturating_sub(front.observed_monotonic_ms)
-                >= self.retention.minimum_duration_ms;
-            let above_minimum = self.retained_bytes.saturating_sub(front.data.len())
-                >= self.retention.minimum_bytes;
-            if !old_enough || !above_minimum {
-                break;
-            }
-            self.pop_front();
-        }
-    }
-
-    fn pop_front(&mut self) -> bool {
-        let Some(front) = self.chunks.pop_front() else {
-            return false;
-        };
-        self.retained_bytes = self.retained_bytes.saturating_sub(front.data.len());
-        self.start = front.end;
-        true
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1707,26 +1478,13 @@ mod tests {
             Ok(())
         }
 
-        fn output(
+        fn observe(
             &self,
-            _session_id: uuid::Uuid,
-            _pane_id: uuid::Uuid,
-            cursor: u64,
-            max_bytes: u32,
-        ) -> Result<bmux_pane_runtime_state::OutputRead, WorkerServiceError> {
-            let data = b"data";
-            let start = usize::try_from(cursor.min(data.len() as u64)).unwrap();
-            let end = start
-                .saturating_add(usize::try_from(max_bytes).unwrap())
-                .min(data.len());
-            Ok(bmux_pane_runtime_state::OutputRead {
-                bytes: data[start..end].to_vec(),
-                retained_start: 0,
-                stream_start: cursor,
-                stream_end: u64::try_from(end).unwrap(),
-                source_end: u64::try_from(data.len()).unwrap(),
-                stream_gap: false,
-            })
+            _client_id: uuid::Uuid,
+            _targets: &[(uuid::Uuid, uuid::Uuid)],
+            _max_history_lines: u32,
+        ) -> Result<(), WorkerServiceError> {
+            Ok(())
         }
 
         fn resize(
@@ -1768,14 +1526,6 @@ mod tests {
             self.calls.lock().unwrap().push("close".to_string());
             self.existing.lock().unwrap().remove(&(session_id, pane_id));
             Ok(())
-        }
-
-        fn snapshot(
-            &self,
-            _session_id: uuid::Uuid,
-            _pane_id: uuid::Uuid,
-        ) -> Result<(u64, Vec<u8>), WorkerServiceError> {
-            Ok((7, vec![1, 2, 3]))
         }
 
         fn contains(&self, session_id: uuid::Uuid, pane_id: uuid::Uuid) -> bool {
@@ -1949,56 +1699,6 @@ mod tests {
     }
 
     #[test]
-    fn output_is_monotonic_bounded_and_reports_cursor_gaps() {
-        let mut output = WorkerOutputBuffer::new(
-            ExecutionId {
-                value: uuid::Uuid::from_u128(3),
-            },
-            4,
-            WorkerOutputRetention {
-                minimum_bytes: 4,
-                minimum_duration_ms: 10,
-                hard_max_bytes: 8,
-            },
-        );
-        assert_eq!(output.append(b"abcd".to_vec(), 0).unwrap(), 4);
-        assert_eq!(output.append(b"efgh".to_vec(), 1).unwrap(), 8);
-        let first = output.read(0, 3);
-        assert_eq!(first.data, b"abc");
-        assert_eq!(first.next_cursor, 3);
-        assert!(first.output_still_pending);
-        output.append(b"ijkl".to_vec(), 20).unwrap();
-        let gap = output.read(0, 10);
-        assert!(gap.gap);
-        assert_eq!(gap.retained_start, 8);
-        let repaired = output.read(8, 8);
-        assert_eq!(repaired.data, b"ijkl");
-        assert_eq!(repaired.next_cursor, 12);
-    }
-
-    #[test]
-    fn global_cap_forces_explicit_gap_without_fabricating_continuity() {
-        let mut output = WorkerOutputBuffer::new(
-            ExecutionId {
-                value: uuid::Uuid::from_u128(3),
-            },
-            4,
-            WorkerOutputRetention {
-                minimum_bytes: 100,
-                minimum_duration_ms: 100,
-                hard_max_bytes: 100,
-            },
-        );
-        output.append(b"first".to_vec(), 0).unwrap();
-        output.append(b"second".to_vec(), 0).unwrap();
-        output.enforce_global_cap(6);
-        let gap = output.read(0, 100);
-        assert!(gap.gap);
-        assert_eq!(gap.retained_start, 5);
-        assert_eq!(output.read(5, 100).data, b"second");
-    }
-
-    #[test]
     fn registry_launch_is_idempotent_across_command_and_recovery_retries() {
         let registry =
             WorkerRegistry::new("node:local", FakePaneRuntime::default(), AcceptSignature);
@@ -2101,45 +1801,12 @@ mod tests {
     }
 
     #[test]
-    fn registry_wide_output_cap_evicts_oldest_execution_streams() {
-        let mut executions = BTreeMap::new();
-        for id in 1..=2 {
-            let mut authority = authority(1, id);
-            authority.execution_id.value = uuid::Uuid::from_u128(3 + u128::from(id));
-            let mut output = WorkerOutputBuffer::new(
-                authority.execution_id.clone(),
-                authority.generation,
-                WorkerOutputRetention {
-                    minimum_bytes: 6,
-                    minimum_duration_ms: u64::MAX,
-                    hard_max_bytes: usize::MAX,
-                },
-            );
-            output
-                .append(vec![u8::try_from(id).unwrap(); 6], id)
-                .unwrap();
-            executions.insert(
-                authority.execution_id.value,
-                WorkerRegistryEntry {
-                    execution: worker_execution(
-                        authority,
-                        uuid::Uuid::from_u128(100 + u128::from(id)),
-                        uuid::Uuid::from_u128(200 + u128::from(id)),
-                    ),
-                    output,
-                },
-            );
+    fn registry_observation_and_reconciliation_classify_current_missing_and_orphaned() {
+        fn lifecycle_like(authority: &WorkerAuthority) -> WorkerAuthority {
+            let mut other = authority.clone();
+            other.operation_class = WorkerOperationClass::Lifecycle;
+            other
         }
-        enforce_registry_output_cap(&mut executions, 8);
-        assert_eq!(registry_stats(&executions).retained_output_bytes, 6);
-        let entries = executions.values().collect::<Vec<_>>();
-        assert_eq!(entries[0].output.retained_bytes, 0);
-        assert_eq!(entries[0].execution.output_start, 6);
-        assert_eq!(entries[1].output.retained_bytes, 6);
-    }
-
-    #[test]
-    fn registry_output_snapshot_and_reconciliation_classify_current_missing_and_orphaned() {
         let registry =
             WorkerRegistry::new("node:local", FakePaneRuntime::default(), AcceptSignature);
         let mut lifecycle = authority(1, 1);
@@ -2161,31 +1828,30 @@ mod tests {
                 10,
             )
             .unwrap();
-        registry
-            .append_output(
-                &execution.authority.execution_id,
-                execution.authority.generation,
-                b"data".to_vec(),
-                11,
-            )
+        // An observe lease names the execution's local pane; another class, or a lease issued too
+        // long ago, observes nothing.
+        let mut observe = authority(1, 2);
+        observe.operation_class = WorkerOperationClass::Observe;
+        let client = uuid::Uuid::from_u128(77);
+        let observed = registry
+            .observe(client, std::slice::from_ref(&observe), 0, 100)
             .unwrap();
-        let output = registry
-            .output(
-                &execution.authority.execution_id,
-                execution.authority.generation,
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0].session_id, execution.local_session_id);
+        assert_eq!(observed[0].pane_id, execution.local_pane_id);
+        assert!(matches!(
+            registry.observe(
+                client,
+                std::slice::from_ref(&lifecycle_like(&observe)),
                 0,
-                4,
-            )
-            .unwrap();
-        assert_eq!(output.data, b"data");
-        let snapshot = registry
-            .snapshot(
-                &execution.authority.execution_id,
-                execution.authority.generation,
-            )
-            .unwrap();
-        assert_eq!(snapshot.cursor, 7);
-        assert_eq!(snapshot.encoded, vec![1, 2, 3]);
+                100
+            ),
+            Err(WorkerServiceError::AuthorityMismatch)
+        ));
+        assert!(matches!(
+            registry.observe(client, &[observe], 0, 1_000_000),
+            Err(WorkerServiceError::LeaseExpired)
+        ));
 
         registry.reconcile(vec![execution.clone()]).unwrap();
         let WorkerQueryResult::Found { execution: current } =

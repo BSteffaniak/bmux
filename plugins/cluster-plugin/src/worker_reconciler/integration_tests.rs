@@ -39,21 +39,13 @@ impl WorkerPaneRuntime for RecordingRuntime {
         Ok(())
     }
 
-    fn output(
+    fn observe(
         &self,
-        _: uuid::Uuid,
-        _: uuid::Uuid,
-        cursor: u64,
-        _: u32,
-    ) -> Result<bmux_pane_runtime_state::OutputRead, WorkerServiceError> {
-        Ok(bmux_pane_runtime_state::OutputRead {
-            bytes: Vec::new(),
-            retained_start: cursor,
-            stream_start: cursor,
-            stream_end: cursor,
-            source_end: cursor,
-            stream_gap: false,
-        })
+        _client_id: uuid::Uuid,
+        _targets: &[(uuid::Uuid, uuid::Uuid)],
+        _max_history_lines: u32,
+    ) -> Result<(), WorkerServiceError> {
+        Ok(())
     }
 
     fn resize(
@@ -83,9 +75,6 @@ impl WorkerPaneRuntime for RecordingRuntime {
         _: &WorkerLaunchSpec,
     ) -> Result<(uuid::Uuid, uuid::Uuid), WorkerServiceError> {
         unreachable!()
-    }
-    fn snapshot(&self, _: uuid::Uuid, _: uuid::Uuid) -> Result<(u64, Vec<u8>), WorkerServiceError> {
-        Ok((0, Vec::new()))
     }
     fn contains(&self, _: uuid::Uuid, _: uuid::Uuid) -> bool {
         true
