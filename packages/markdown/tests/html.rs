@@ -5,9 +5,9 @@
 use std::collections::BTreeMap;
 
 use bmux_markdown::{
-    MarkdownContributionKind, MarkdownDestination, MarkdownDocumentContext, MarkdownHtmlMode,
-    MarkdownLinkKind, MarkdownRenderOptions, MarkdownRenderResult, MarkdownSelectionKind,
-    render_markdown,
+    MarkdownColorScheme, MarkdownContributionKind, MarkdownDestination, MarkdownDocumentContext,
+    MarkdownHtmlMode, MarkdownLinkKind, MarkdownRenderOptions, MarkdownRenderResult,
+    MarkdownSelectionKind, render_markdown,
 };
 use bmux_tui::prelude::{Line, Modifier};
 
@@ -323,6 +323,78 @@ fn picture_uses_its_fallback_image() {
     assert_eq!(text(sources_only, 40), "[image: wide.png]");
 }
 
+fn image_sources(result: &MarkdownRenderResult) -> Vec<(String, String)> {
+    result
+        .contributions
+        .iter()
+        .filter_map(|item| match &item.kind {
+            MarkdownContributionKind::Image { image, alt, .. } => {
+                Some((image.source.clone(), alt.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn picture_prefers_the_source_for_the_color_scheme() {
+    let markdown = "<picture>\n  <source media=\"(prefers-color-scheme: dark)\" srcset=\"dark.png 2x, dark-1x.png\">\n  <source media=\"( Prefers-Color-Scheme : LIGHT )\" srcset=\"light.png\">\n  <img alt=\"Logo\" src=\"fallback.png\" width=\"40\">\n</picture>";
+    let render = |scheme: Option<MarkdownColorScheme>| {
+        let mut options = options(40);
+        options.color_scheme = scheme;
+        render_markdown(markdown, &options)
+    };
+    let unset = render(None);
+    assert_eq!(
+        image_sources(&unset),
+        [("fallback.png".to_owned(), "Logo".to_owned())]
+    );
+    let dark = render(Some(MarkdownColorScheme::Dark));
+    // The fallback image's alt text, dimensions, and identity stay; only the
+    // source follows the scheme.
+    assert_eq!(
+        image_sources(&dark),
+        [("dark.png".to_owned(), "Logo".to_owned())]
+    );
+    assert_eq!(rows(&dark), rows(&unset));
+    assert_eq!(dark.contributions[0].id, unset.contributions[0].id);
+    let light = render_markdown(
+        markdown,
+        &options(40).with_color_scheme(MarkdownColorScheme::Light),
+    );
+    assert_eq!(
+        image_sources(&light),
+        [("light.png".to_owned(), "Logo".to_owned())]
+    );
+
+    // Without a source for the scheme, the fallback image is kept.
+    let dark_only = "<picture><source media=\"(prefers-color-scheme: dark)\" srcset=\"dark.png\"><img alt=\"Logo\" src=\"fallback.png\"></picture>";
+    let light = render_markdown(
+        dark_only,
+        &options(40).with_color_scheme(MarkdownColorScheme::Light),
+    );
+    assert_eq!(
+        image_sources(&light),
+        [("fallback.png".to_owned(), "Logo".to_owned())]
+    );
+}
+
+#[test]
+fn picture_without_fallback_prefers_the_scheme_then_unconditional_sources() {
+    let markdown = "<picture><source media=\"(min-width: 9px)\" srcset=\"wide.png\"><source srcset=\"any.png\"><source media=\"(prefers-color-scheme: dark)\" srcset=\"dark.png\"></picture>";
+    let source = |scheme: Option<MarkdownColorScheme>| {
+        let mut options = options(40);
+        options.color_scheme = scheme;
+        image_sources(&render_markdown(markdown, &options))
+            .into_iter()
+            .map(|(source, _)| source)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(source(None), ["any.png"]);
+    assert_eq!(source(Some(MarkdownColorScheme::Light)), ["any.png"]);
+    assert_eq!(source(Some(MarkdownColorScheme::Dark)), ["dark.png"]);
+}
+
 #[test]
 fn inline_semantics_map_to_terminal_styles() {
     let markdown = "Press <kbd>Ctrl</kbd>+<kbd>C</kbd>. H<sub>2</sub>O, x<sup>2</sup>, a<sup>bc</sup>, b<sub>x</sub>, <mark>hot</mark>, <ins>new</ins>, <del>old</del>, <q>quote</q>.";
@@ -352,6 +424,35 @@ fn html_tables_support_headers_alignment_and_colspan() {
     assert_eq!(
         text(markdown, 40),
         "┌──────────┬───────┐\n│ Name     │ Value │\n├──────────┼───────┤\n│ Spanning │       │\n├──────────┼───────┤\n│ a        │     1 │\n└──────────┴───────┘"
+    );
+}
+
+#[test]
+fn html_tables_lay_out_rowspan_as_empty_cells_below() {
+    let markdown = "<table>\n<tr><th>Group</th><th>Item</th><th>Note</th></tr>\n<tr><td rowspan=\"2\">fruit</td><td>apple</td><td>red</td></tr>\n<tr><td>pear</td><td>green</td></tr>\n<tr><td>nut</td><td>almond</td><td>-</td></tr>\n</table>";
+    assert_eq!(
+        text(markdown, 40),
+        "┌───────┬────────┬───────┐\n│ Group │ Item   │ Note  │\n├───────┼────────┼───────┤\n│ fruit │ apple  │ red   │\n├───────┼────────┼───────┤\n│       │ pear   │ green │\n├───────┼────────┼───────┤\n│ nut   │ almond │ -     │\n└───────┴────────┴───────┘"
+    );
+}
+
+#[test]
+fn html_rowspan_in_later_columns_and_with_colspan_keeps_columns_aligned() {
+    // A span in the last column leaves the next row's cells in place; a cell
+    // spanning rows and columns leaves empty cells across both.
+    let markdown = "<table>\n<tr><th>A</th><th>B</th><th>C</th></tr>\n<tr><td>1</td><td>2</td><td rowspan=\"2\">tall</td></tr>\n<tr><td>3</td><td>4</td></tr>\n<tr><td colspan=\"2\" rowspan=\"2\">big</td><td>5</td></tr>\n<tr><td>6</td></tr>\n</table>";
+    assert_eq!(
+        text(markdown, 40),
+        "┌─────┬───┬──────┐\n│ A   │ B │ C    │\n├─────┼───┼──────┤\n│ 1   │ 2 │ tall │\n├─────┼───┼──────┤\n│ 3   │ 4 │      │\n├─────┼───┼──────┤\n│ big │   │ 5    │\n├─────┼───┼──────┤\n│     │   │ 6    │\n└─────┴───┴──────┘"
+    );
+}
+
+#[test]
+fn html_rowspan_ends_with_its_row_group() {
+    let markdown = "<table>\n<thead><tr><th rowspan=\"0\">H</th><th>I</th></tr></thead>\n<tbody><tr><td>a</td><td>b</td></tr></tbody>\n</table>";
+    assert_eq!(
+        text(markdown, 40),
+        "┌───┬───┐\n│ H │ I │\n├───┼───┤\n│ a │ b │\n└───┴───┘"
     );
 }
 

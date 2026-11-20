@@ -50,6 +50,35 @@ pub enum MarkdownHtmlMode {
     Raw,
 }
 
+/// Color scheme a document is shown in.
+///
+/// Chooses between `<picture>` sources whose `media` is
+/// `(prefers-color-scheme: light)` or `(prefers-color-scheme: dark)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MarkdownColorScheme {
+    /// Dark text on a light background.
+    Light,
+    /// Light text on a dark background.
+    Dark,
+}
+
+impl MarkdownColorScheme {
+    /// Whether a `media` attribute is exactly this scheme's
+    /// `prefers-color-scheme` condition, ignoring case and whitespace.
+    fn matches_media(self, media: &str) -> bool {
+        let normalized = media
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let wanted = match self {
+            Self::Light => "(prefers-color-scheme:light)",
+            Self::Dark => "(prefers-color-scheme:dark)",
+        };
+        normalized == wanted
+    }
+}
+
 /// Elements removed together with their contents.
 const DROPPED_WITH_CONTENT: &[&str] = &[
     "applet",
@@ -543,6 +572,7 @@ pub struct HtmlRenderInput<'a> {
     pub document_id: Option<&'a str>,
     pub details_interactive: bool,
     pub details_open: &'a BTreeMap<String, bool>,
+    pub color_scheme: Option<MarkdownColorScheme>,
     pub link_fallbacks: bool,
 }
 
@@ -916,6 +946,7 @@ impl Transformer<'_, '_> {
                 return;
             }
             "img" => {
+                let attributes = self.picture_source_for_scheme(level, attributes);
                 let image = self.image(level, &attributes, range);
                 level.top().children.extend(image);
                 return;
@@ -1211,6 +1242,37 @@ impl Transformer<'_, '_> {
         }]
     }
 
+    /// `<img>` attributes with `src` taken from its `<picture>`'s source for
+    /// the caller's color scheme, when there is one; other attributes such as
+    /// `alt` and the image's source range stay the fallback image's.
+    fn picture_source_for_scheme(
+        &self,
+        level: &Level,
+        mut attributes: Vec<(String, String)>,
+    ) -> Vec<(String, String)> {
+        let Some(scheme) = self.input.color_scheme else {
+            return attributes;
+        };
+        let Some(frame) = level.stack.last().filter(|frame| frame.name == "picture") else {
+            return attributes;
+        };
+        let Some(source) = frame
+            .sources
+            .iter()
+            .find(|(_, media)| {
+                media
+                    .as_deref()
+                    .is_some_and(|media| scheme.matches_media(media))
+            })
+            .and_then(|(srcset, _)| first_srcset_candidate(srcset))
+        else {
+            return attributes;
+        };
+        attributes.retain(|(name, _)| name != "src");
+        attributes.push(("src".to_owned(), source.to_owned()));
+        attributes
+    }
+
     fn picture(
         &mut self,
         level: &Level,
@@ -1225,21 +1287,24 @@ impl Transformer<'_, '_> {
         if images.iter().any(contains_image) {
             return images;
         }
-        // Without a fallback `<img>`, use a source without a media condition,
-        // then the first source.
+        // Without a fallback `<img>`, use the source for the caller's color
+        // scheme, then a source without a media condition, then the first
+        // source.
+        let scheme = self.input.color_scheme;
         let Some((srcset, _)) = frame
             .sources
             .iter()
-            .find(|(_, media)| media.is_none())
+            .find(|(_, media)| {
+                scheme
+                    .zip(media.as_deref())
+                    .is_some_and(|(scheme, media)| scheme.matches_media(media))
+            })
+            .or_else(|| frame.sources.iter().find(|(_, media)| media.is_none()))
             .or_else(|| frame.sources.first())
         else {
             return images;
         };
-        let Some(source) = srcset
-            .split(',')
-            .next()
-            .and_then(|candidate| candidate.split_whitespace().next())
-        else {
+        let Some(source) = first_srcset_candidate(srcset) else {
             return images;
         };
         let attributes = [("src".to_owned(), source.to_owned())];
@@ -1457,6 +1522,14 @@ fn build_stripped(frame: &mut Frame) -> Vec<Container> {
     }
 }
 
+/// URL of the first candidate in a `srcset` attribute.
+fn first_srcset_candidate(srcset: &str) -> Option<&str> {
+    srcset
+        .split(',')
+        .next()
+        .and_then(|candidate| candidate.split_whitespace().next())
+}
+
 fn html_text(value: String) -> Container {
     Container {
         element: Element::Text { value },
@@ -1518,6 +1591,10 @@ fn aligned(frame: &Frame, mut container: Container) -> Container {
 
 /// Marks a caption paragraph that a table moves before itself.
 const HTML_CAPTION: &str = "bmux-html-caption";
+/// A table cell's `rowspan`, resolved when its table is built.
+const HTML_ROWSPAN: &str = "bmux-html-rowspan";
+/// Most rows or columns one table cell spans.
+const MAX_CELL_SPAN: usize = 64;
 
 fn table_cell(frame: &Frame, children: Vec<Container>) -> Vec<Container> {
     let mut data = BTreeMap::new();
@@ -1539,7 +1616,21 @@ fn table_cell(frame: &Frame, children: Vec<Container>) -> Vec<Container> {
         .attribute("colspan")
         .and_then(|value| value.trim().parse::<usize>().ok())
         .unwrap_or(1)
-        .clamp(1, 64);
+        .clamp(1, MAX_CELL_SPAN);
+    // `rowspan="0"` spans the rest of the row group.
+    let row_span = frame
+        .attribute("rowspan")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .map(|rows| if rows == 0 { MAX_CELL_SPAN } else { rows })
+        .filter(|rows| *rows > 1)
+        .map(|rows| rows.min(MAX_CELL_SPAN).to_string());
+    let span_data = || {
+        row_span
+            .iter()
+            .map(|rows| (HTML_ROWSPAN.to_owned(), rows.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    data.extend(span_data());
     let mut output = vec![Container {
         element: element.clone(),
         data,
@@ -1548,9 +1639,68 @@ fn table_cell(frame: &Frame, children: Vec<Container>) -> Vec<Container> {
     }];
     output.extend((1..span_count).map(|_| Container {
         element: element.clone(),
+        data: span_data(),
         ..Container::default()
     }));
     output
+}
+
+/// Lay out `rowspan` within one row group.
+///
+/// The terminal table draws one cell per row and column, so a cell spanning
+/// rows keeps its content in its first row and the rows below get an empty
+/// cell in its columns, the way `colspan` leaves empty cells beside it. Spans
+/// end with their row group.
+fn lay_out_row_spans(section: &mut Container) {
+    // Rows still covered per column, with the element their empty cells use.
+    let mut covered: Vec<(usize, Element)> = Vec::new();
+    let empty = |element: &Element| Container {
+        element: element.clone(),
+        ..Container::default()
+    };
+    for row in &mut section.children {
+        if !matches!(row.element, Element::TR) {
+            continue;
+        }
+        let cells = std::mem::take(&mut row.children);
+        let mut laid_out = Vec::with_capacity(cells.len());
+        let mut cells = cells.into_iter();
+        let mut column = 0;
+        loop {
+            let pending =
+                covered
+                    .get_mut(column)
+                    .filter(|(rows, _)| *rows > 0)
+                    .map(|(rows, element)| {
+                        *rows -= 1;
+                        element.clone()
+                    });
+            if let Some(element) = pending {
+                laid_out.push(empty(&element));
+            } else if let Some(mut cell) = cells.next() {
+                let rows = cell
+                    .data
+                    .remove(HTML_ROWSPAN)
+                    .and_then(|rows| rows.parse::<usize>().ok())
+                    .unwrap_or(1);
+                if covered.len() <= column {
+                    covered.resize(column + 1, (0, cell.element.clone()));
+                }
+                covered[column] = (rows.saturating_sub(1), cell.element.clone());
+                laid_out.push(cell);
+            } else if covered
+                .get(column..)
+                .is_some_and(|rest| rest.iter().any(|(rows, _)| *rows > 0))
+            {
+                // A gap before a covered column keeps later columns aligned.
+                laid_out.push(empty(&covered[column].1));
+            } else {
+                break;
+            }
+            column += 1;
+        }
+        row.children = laid_out;
+    }
 }
 
 /// Build a table, its header section, and per-column alignments.
@@ -1585,6 +1735,7 @@ fn table(children: Vec<Container>) -> Vec<Container> {
             ..Container::default()
         });
     }
+    sections.iter_mut().for_each(lay_out_row_spans);
     let has_head = sections
         .iter()
         .any(|section| matches!(section.element, Element::THead));

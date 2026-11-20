@@ -36,7 +36,7 @@ escaped). The off-by-default `html` Cargo feature adds `MarkdownHtmlMode` and
   blocks `p div h1`–`h6 ul ol li dl dt dd blockquote pre hr table thead tbody
   tfoot tr th td caption figure figcaption details summary`; `img` and
   `picture`/`source`. Attributes read: `href src srcset media alt title width
-  height align open colspan`. Comments and `script style iframe object svg
+  height align open colspan rowspan`. Comments and `script style iframe object svg
   template textarea title …` are removed with their contents; other tags are
   removed and their text kept; character references are decoded with the full
   HTML5 table.
@@ -48,13 +48,21 @@ Rendering maps elements onto the existing renderer: bold/italic/code/strike,
 `kbd` and `mark` through `MarkdownTheme::keyboard` and `highlight`, `ins`/`u`
 underline, `sub`/`sup` as Unicode scripts when every character has one (else
 `_x`/`^(xy)`), headings without document anchors, HTML tables with their own
-column alignment (`align` on the first row's cells) and `colspan` as empty
-cells, and `p`/`div`/`h*` `align="center|right"` shifting each measured row and
+column alignment (`align` on the first row's cells), `colspan` as empty
+cells beside the spanning cell, and `rowspan` as empty cells below it (the
+terminal table draws one cell per row and column, so a spanning cell's content
+stays in its first row; spans end with their row group and `rowspan="0"` spans
+the rest of it), and `p`/`div`/`h*` `align="center|right"` shifting each measured row and
 its geometry. Links and images become `Link`/`Image` contributions with
 `MarkdownLinkKind::Html`, destinations classified by
 `resolve_markdown_destination` under the document context; `img` `width` and
 `height` are exposed on `MarkdownImage`. A `<picture>` shows its fallback `img`,
-else a source without a media condition. `<details>` keeps interactive
+else a source without a media condition, else its first source. With
+`MarkdownRenderOptions::color_scheme` / `with_color_scheme`
+(`MarkdownColorScheme::Light`/`Dark`), a source whose `media` is
+`(prefers-color-scheme: light|dark)` for that scheme is preferred: it replaces
+the fallback image's `src` (keeping its `alt`, dimensions, and contribution
+identity), or is chosen first when there is no fallback image. `<details>` keeps interactive
 disclosure with the same contribution identities (`details:<start>:<end>`) and
 `open` default as the raw projection; Markdown after a blank line inside an
 element (for example a `<details>` body) belongs to it. HTML block lines are

@@ -81,7 +81,7 @@ use url::Url;
 mod html;
 
 #[cfg(feature = "html")]
-pub use html::MarkdownHtmlMode;
+pub use html::{MarkdownColorScheme, MarkdownHtmlMode};
 
 /// Container data key holding the contribution identity a raw HTML element owns.
 const HTML_CONTRIBUTION: &str = "bmux-contribution";
@@ -526,6 +526,11 @@ pub struct MarkdownRenderOptions {
     /// Presentation of raw HTML embedded in the Markdown.
     #[cfg(feature = "html")]
     pub html: MarkdownHtmlMode,
+    /// Color scheme the document is shown in, used to choose between
+    /// `<picture>` sources with a `prefers-color-scheme` media condition.
+    /// `None` keeps the scheme-independent choice.
+    #[cfg(feature = "html")]
+    pub color_scheme: Option<MarkdownColorScheme>,
 }
 
 impl Default for MarkdownRenderOptions {
@@ -549,6 +554,8 @@ impl Default for MarkdownRenderOptions {
             presentation: MarkdownPresentation::default(),
             #[cfg(feature = "html")]
             html: MarkdownHtmlMode::default(),
+            #[cfg(feature = "html")]
+            color_scheme: None,
         }
     }
 }
@@ -649,6 +656,15 @@ impl MarkdownRenderOptions {
     #[must_use]
     pub const fn with_html(mut self, html: MarkdownHtmlMode) -> Self {
         self.html = html;
+        self
+    }
+
+    /// Return options for a document shown in `scheme`, so `<picture>`
+    /// sources for that color scheme are preferred.
+    #[cfg(feature = "html")]
+    #[must_use]
+    pub const fn with_color_scheme(mut self, scheme: MarkdownColorScheme) -> Self {
+        self.color_scheme = Some(scheme);
         self
     }
 
@@ -3713,6 +3729,7 @@ fn render_markdown_projection(
             document_id: options.document_id.as_deref(),
             details_interactive: options.details_interactive,
             details_open: &options.details_open,
+            color_scheme: options.color_scheme,
             link_fallbacks: options.link_destination_presentation
                 == MarkdownLinkDestinationPresentation::ReadableFallback,
         };
