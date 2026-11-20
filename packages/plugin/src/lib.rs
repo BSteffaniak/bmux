@@ -111,7 +111,8 @@ pub use registry::{
 };
 pub use render::{
     AttachInputCodec, AttachInputEndpoint, AttachInputEvent, AttachInputHook,
-    AttachInputHookFilter, AttachInputModifiers, AttachInputPaneContext, AttachInputResult,
+    AttachInputHookFilter, AttachInputKeyModes, AttachInputModifiers, AttachInputMouseModes,
+    AttachInputMouseTracking, AttachInputPaneContext, AttachInputPaneModes, AttachInputResult,
     AttachInputServiceInvocation, AttachRenderExtension, AttachVisualAdapter,
     AttachVisualAdapterOutput, AttachVisualAdapterRequest, AttachVisualCellRef,
     AttachVisualFrameView, AttachVisualProjectionResult, AttachVisualProjectionUpdate,

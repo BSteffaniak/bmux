@@ -93,6 +93,48 @@ fn pane_to_wire(value: &bmux_plugin::AttachInputPaneContext) -> wire::InputPaneC
         rect: rect_to_wire(value.rect),
         content_rect: rect_to_wire(value.content_rect),
         focused: value.focused,
+        modes: modes_to_wire(value.modes),
+    }
+}
+
+fn modes_to_wire(value: bmux_plugin::AttachInputPaneModes) -> wire::InputPaneModes {
+    use bmux_plugin::AttachInputMouseTracking as Tracking;
+    wire::InputPaneModes {
+        mouse_tracking: match value.mouse.tracking {
+            Tracking::None => "none",
+            Tracking::Press => "press",
+            Tracking::PressRelease => "press-release",
+            Tracking::ButtonMotion => "button-motion",
+            Tracking::AnyMotion => "any-motion",
+        }
+        .to_owned(),
+        mouse_sgr: value.mouse.sgr,
+        application_cursor: value.keys.application_cursor,
+        application_keypad: value.keys.application_keypad,
+        bracketed_paste: value.keys.bracketed_paste,
+        alternate_screen: value.alternate_screen,
+    }
+}
+
+fn modes_from_wire(value: &wire::InputPaneModes) -> bmux_plugin::AttachInputPaneModes {
+    use bmux_plugin::AttachInputMouseTracking as Tracking;
+    bmux_plugin::AttachInputPaneModes {
+        mouse: bmux_plugin::AttachInputMouseModes {
+            tracking: match value.mouse_tracking.as_str() {
+                "press" => Tracking::Press,
+                "press-release" => Tracking::PressRelease,
+                "button-motion" => Tracking::ButtonMotion,
+                "any-motion" => Tracking::AnyMotion,
+                _ => Tracking::None,
+            },
+            sgr: value.mouse_sgr,
+        },
+        keys: bmux_plugin::AttachInputKeyModes {
+            application_cursor: value.application_cursor,
+            application_keypad: value.application_keypad,
+            bracketed_paste: value.bracketed_paste,
+        },
+        alternate_screen: value.alternate_screen,
     }
 }
 
@@ -103,6 +145,7 @@ fn pane_from_wire(value: &wire::InputPaneContext) -> bmux_plugin::AttachInputPan
         rect: rect_from_wire(&value.rect),
         content_rect: rect_from_wire(&value.content_rect),
         focused: value.focused,
+        modes: modes_from_wire(&value.modes),
     }
 }
 
@@ -229,6 +272,18 @@ mod tests {
                 rect: bmux_plugin::ExtensionRect::new(1, 2, 30, 40),
                 content_rect: bmux_plugin::ExtensionRect::new(2, 3, 28, 38),
                 focused: true,
+                modes: bmux_plugin::AttachInputPaneModes {
+                    mouse: bmux_plugin::AttachInputMouseModes {
+                        tracking: bmux_plugin::AttachInputMouseTracking::ButtonMotion,
+                        sgr: true,
+                    },
+                    keys: bmux_plugin::AttachInputKeyModes {
+                        application_cursor: true,
+                        application_keypad: false,
+                        bracketed_paste: true,
+                    },
+                    alternate_screen: true,
+                },
             }),
             hovered_pane: None,
         }

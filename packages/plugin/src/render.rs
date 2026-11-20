@@ -221,6 +221,47 @@ pub struct AttachInputPaneContext {
     pub rect: ExtensionRect,
     pub content_rect: ExtensionRect,
     pub focused: bool,
+    /// How the pane's program asked for input, so a hook can tell (for example) whether a
+    /// mouse event belongs to the program.
+    #[serde(default)]
+    pub modes: AttachInputPaneModes,
+}
+
+/// How a pane's program asked its terminal to deliver input, as the client's replica of the
+/// pane holds it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttachInputPaneModes {
+    pub mouse: AttachInputMouseModes,
+    pub keys: AttachInputKeyModes,
+    /// The program is on the alternate screen (a full-screen application).
+    pub alternate_screen: bool,
+}
+
+/// The mouse reporting a pane's program enabled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttachInputMouseModes {
+    pub tracking: AttachInputMouseTracking,
+    /// Reports use SGR encoding.
+    pub sgr: bool,
+}
+
+/// Which mouse events a pane's program asked to receive.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AttachInputMouseTracking {
+    #[default]
+    None,
+    Press,
+    PressRelease,
+    ButtonMotion,
+    AnyMotion,
+}
+
+/// Keyboard and paste modes a pane's program set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttachInputKeyModes {
+    pub application_cursor: bool,
+    pub application_keypad: bool,
+    pub bracketed_paste: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

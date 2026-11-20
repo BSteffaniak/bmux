@@ -15367,7 +15367,39 @@ fn attach_input_pane_context_for_id(
             rect: extension_rect_from_attach_rect(surface.rect),
             content_rect: extension_rect_from_attach_rect(surface.content_rect),
             focused,
+            modes: view_state
+                .pane_buffers
+                .get(&pane_id)
+                .map(|buffer| attach_input_pane_modes(buffer.terminal_grid.grid()))
+                .unwrap_or_default(),
         })
+}
+
+/// How a pane's program asked for input, from the client's replica of the pane.
+fn attach_input_pane_modes(
+    grid: &bmux_terminal_grid::TerminalGrid,
+) -> bmux_plugin::AttachInputPaneModes {
+    use bmux_plugin::AttachInputMouseTracking as Tracking;
+    use bmux_terminal_grid::MouseProtocolMode;
+    let protocol = grid.protocol_state();
+    bmux_plugin::AttachInputPaneModes {
+        mouse: bmux_plugin::AttachInputMouseModes {
+            tracking: match protocol.mouse_mode() {
+                MouseProtocolMode::None => Tracking::None,
+                MouseProtocolMode::Press => Tracking::Press,
+                MouseProtocolMode::PressRelease => Tracking::PressRelease,
+                MouseProtocolMode::ButtonMotion => Tracking::ButtonMotion,
+                MouseProtocolMode::AnyMotion => Tracking::AnyMotion,
+            },
+            sgr: protocol.mouse_sgr,
+        },
+        keys: bmux_plugin::AttachInputKeyModes {
+            application_cursor: protocol.application_cursor,
+            application_keypad: protocol.application_keypad,
+            bracketed_paste: protocol.bracketed_paste,
+        },
+        alternate_screen: grid.mode() == bmux_terminal_grid::GridMode::Alternate,
+    }
 }
 
 fn attach_input_focused_context(view_state: &AttachViewState) -> Option<AttachInputPaneContext> {

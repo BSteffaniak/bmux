@@ -402,9 +402,16 @@ interface decoration-input-hooks {
         shift: bool, alt: bool, control: bool, super-key: bool,
         hyper: bool, meta: bool,
     }
+    // How the pane's program asked for input. mouse-tracking: none, press, press-release,
+    // button-motion or any-motion.
+    record input-pane-modes {
+        mouse-tracking: string, mouse-sgr: bool,
+        application-cursor: bool, application-keypad: bool, bracketed-paste: bool,
+        alternate-screen: bool,
+    }
     record input-pane-context {
         pane-id: uuid, surface-id: uuid, rect: input-rect,
-        content-rect: input-rect, focused: bool,
+        content-rect: input-rect, focused: bool, modes: input-pane-modes,
     }
     record input-event {
         hook-id: string, event-kind: string, phase: string,
