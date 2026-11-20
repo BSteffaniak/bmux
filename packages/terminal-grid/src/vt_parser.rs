@@ -39,9 +39,22 @@ impl Params {
     }
 
     fn clear(&mut self) {
+        // Only the ends up to the open group are ever written.
+        let touched = (self.groups + 1).min(self.ends.len());
+        self.ends[..touched].fill(0);
         self.used = 0;
         self.groups = 0;
-        self.ends.fill(0);
+    }
+
+    /// Group `index`, if there is one.
+    pub(crate) fn group(&self, index: usize) -> Option<&[u16]> {
+        if index >= self.len() {
+            return None;
+        }
+        let start = index
+            .checked_sub(1)
+            .map_or(0, |previous| self.ends[previous]);
+        Some(&self.values[start..self.ends[index]])
     }
 
     // A colon extends the current group; a semicolon or final closes it.

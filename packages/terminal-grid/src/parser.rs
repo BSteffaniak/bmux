@@ -22,6 +22,8 @@ pub struct TerminalGridStream {
     observed_dcs: ObservedDcs,
     /// An OSC payload an observer asked for, collected across chunks.
     observed_osc: ObservedOsc,
+    /// A sequence's parameter values, rewritten for each sequence rather than built anew.
+    param_values: ParamValues,
 }
 
 impl TerminalGridStream {
@@ -44,6 +46,7 @@ impl TerminalGridStream {
             previous_pending: Vec::new(),
             observed_dcs: ObservedDcs::default(),
             observed_osc: ObservedOsc::default(),
+            param_values: ParamValues::new(),
         }
     }
 
@@ -118,6 +121,7 @@ impl TerminalGridStream {
             observer,
             dcs: &mut self.observed_dcs,
             osc: &mut self.observed_osc,
+            values: &mut self.param_values,
         };
         self.parser.advance(&mut performer, bytes);
         // Written into the storage of the prefix before last: normal text writes nothing.
@@ -282,6 +286,7 @@ pub(crate) fn process(grid: &mut TerminalGrid, bytes: &[u8]) {
         observer: &mut IgnoreSequences,
         dcs: &mut ObservedDcs::default(),
         osc: &mut ObservedOsc::default(),
+        values: &mut ParamValues::new(),
     };
     parser.advance(&mut performer, bytes);
 }
@@ -571,6 +576,8 @@ struct GridPerformer<'a, O: SequenceObserver> {
     observer: &'a mut O,
     dcs: &'a mut ObservedDcs,
     osc: &'a mut ObservedOsc,
+    /// Scratch for a sequence's parameter values.
+    values: &'a mut ParamValues,
 }
 
 impl<O: SequenceObserver> Perform for GridPerformer<'_, O> {
@@ -754,10 +761,12 @@ impl<O: SequenceObserver> GridPerformer<'_, O> {
             return;
         }
         if action == 'm' {
-            self.grid.set_graphic_rendition(&sgr_params(params));
+            sgr_params(params, self.values);
+            self.grid.set_graphic_rendition(self.values);
             return;
         }
-        let values = flatten_params(params);
+        flatten_params_into(params, self.values);
+        let values = &*self.values;
         match action {
             'A' => self
                 .grid
@@ -942,6 +951,10 @@ impl ParamValues {
         }
     }
 
+    const fn clear(&mut self) {
+        self.len = 0;
+    }
+
     const fn push(&mut self, value: i64) {
         if self.len < self.values.len() {
             self.values[self.len] = value;
@@ -965,39 +978,28 @@ impl std::ops::Deref for ParamValues {
 /// Normalize SGR groups without interpreting color operands as independent
 /// commands. Colons belong to a single operation; semicolons separate operations
 /// except for the legacy extended-color forms.
-fn sgr_params(params: &Params) -> ParamValues {
-    let mut groups: [&[u16]; 32] = [&[]; 32];
-    let mut count = 0;
-    for group in params {
-        if count == groups.len() {
-            break;
-        }
-        groups[count] = group;
-        count += 1;
-    }
-    let groups = &groups[..count];
-    let mut output = ParamValues::new();
+fn sgr_params(params: &Params, output: &mut ParamValues) {
+    output.clear();
+    let count = params.len();
     let mut index = 0;
-    while let Some(group) = groups.get(index) {
+    while let Some(group) = params.group(index) {
         let code = group[0];
         if matches!(code, 38 | 48 | 58) {
             let mut legacy = [0_u16; 32];
             let (operands, consumed): (&[u16], usize) = if group.len() > 1 {
                 (&group[1..], 0)
             } else {
-                let mode = groups.get(index + 1).and_then(|g| g.first()).copied();
-                let count = match mode {
+                let mode = params.group(index + 1).and_then(|g| g.first()).copied();
+                let operands = match mode {
                     Some(2) => 4,
                     Some(5) => 2,
                     // An unknown legacy color encoding has no known operand
                     // boundary. Ignore its remainder rather than leak styles.
-                    _ => groups.len().saturating_sub(index + 1),
+                    _ => count.saturating_sub(index + 1),
                 };
-                let consumed = count.min(groups.len().saturating_sub(index + 1));
-                for (slot, g) in legacy
-                    .iter_mut()
-                    .zip(&groups[index + 1..index + 1 + consumed])
-                {
+                let consumed = operands.min(count.saturating_sub(index + 1));
+                for (offset, slot) in legacy.iter_mut().take(consumed).enumerate() {
+                    let g = params.group(index + 1 + offset).unwrap_or_default();
                     *slot = if g.len() == 1 { g[0] } else { u16::MAX };
                 }
                 (&legacy[..consumed], consumed)
@@ -1023,7 +1025,7 @@ fn sgr_params(params: &Params) -> ParamValues {
             index += consumed;
         } else if group.len() == 1 {
             output.push(i64::from(code));
-        } else if let [4, kind @ 0..=5] = **group {
+        } else if let [4, kind @ 0..=5] = *group {
             output.push(if kind == 0 { 24 } else { 4 });
         }
         index += 1;
@@ -1032,11 +1034,17 @@ fn sgr_params(params: &Params) -> ParamValues {
     if output.as_slice().is_empty() {
         output.push(-1);
     }
-    output
 }
 
 fn flatten_params(params: &Params) -> ParamValues {
     let mut values = ParamValues::new();
+    flatten_params_into(params, &mut values);
+    values
+}
+
+/// Each parameter value in order, an omitted one as 0.
+fn flatten_params_into(params: &Params, values: &mut ParamValues) {
+    values.clear();
     for param in params {
         let mut pushed = false;
         for subparam in param {
@@ -1047,7 +1055,6 @@ fn flatten_params(params: &Params) -> ParamValues {
             values.push(0);
         }
     }
-    values
 }
 
 fn one_based(value: Option<&i64>) -> usize {
@@ -1121,6 +1128,7 @@ mod tests {
             observer: &mut super::IgnoreSequences,
             dcs: &mut stream.observed_dcs,
             osc: &mut stream.observed_osc,
+            values: &mut stream.param_values,
         };
         stream
             .parser
