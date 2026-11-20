@@ -3477,6 +3477,7 @@ dependencies = [
  "bmux_terminal_protocol",
  "bmux_tui",
  "bmux_unicode_segmentation",
+ "foldhash",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

@@ -15,6 +15,7 @@ bmux_cell_geometry        = { workspace = true }
 bmux_codec                = { workspace = true }
 bmux_terminal_protocol    = { workspace = true }
 bmux_unicode_segmentation = { workspace = true }
+foldhash                  = { workspace = true }
 serde                     = { workspace = true, features = ["derive", "std", "rc"] }
 thiserror                 = { workspace = true }
 

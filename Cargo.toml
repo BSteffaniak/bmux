@@ -203,6 +203,7 @@ bytemuck = { version = "1.25", default-features = false }
 cranelift-codegen = { version = "0.137.0", default-features = false, features = [
     "all-native-arch",
 ] }
+foldhash = { version = "0.2.0", default-features = false, features = ["std"] }
 pollster = { version = "1.0", default-features = false }
 raw-window-handle = { version = "0.6.2", default-features = false, features = [
     "std",

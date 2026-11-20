@@ -19,7 +19,7 @@ impl StyleId {
 }
 
 /// Display attributes for one or more terminal cells.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[allow(clippy::struct_excessive_bools)] // Terminal SGR attributes are independent bit flags.
 pub struct Style {
     pub fg: Option<Color>,
@@ -33,6 +33,30 @@ pub struct Style {
     /// Conceal glyphs while retaining their occupied cells and background.
     #[serde(default)]
     pub hidden: bool,
+}
+
+// Styles are hashed on every interned SGR change: as two words, not field by field.
+impl std::hash::Hash for Style {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let color = |color: Option<Color>| -> u64 {
+            match color {
+                None => 0,
+                Some(Color::Indexed(index)) => 1 << 32 | u64::from(index),
+                Some(Color::Rgb { r, g, b }) => {
+                    2 << 32 | u64::from(r) << 16 | u64::from(g) << 8 | u64::from(b)
+                }
+            }
+        };
+        let flags = u64::from(self.bold)
+            | u64::from(self.italic) << 1
+            | u64::from(self.underline) << 2
+            | u64::from(self.inverse) << 3
+            | u64::from(self.dim) << 4
+            | u64::from(self.strike) << 5
+            | u64::from(self.hidden) << 6;
+        state.write_u64(color(self.fg) | flags << 40);
+        state.write_u64(color(self.bg));
+    }
 }
 
 impl Style {
@@ -94,7 +118,8 @@ pub struct StylePalette {
 
 #[derive(Debug, Clone, Default)]
 struct StyleIndex {
-    ids: std::collections::HashMap<Style, u32>,
+    /// Keyed by styles programs choose: a seeded hasher, but a fast one.
+    ids: std::collections::HashMap<Style, u32, foldhash::fast::RandomState>,
     covered: usize,
 }
 
