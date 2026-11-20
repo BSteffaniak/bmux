@@ -2255,6 +2255,59 @@ mod tests {
         (buffer, hits)
     }
 
+    #[test]
+    fn one_row_panes_end_their_title_row_without_corners_for_every_border_set() {
+        use bmux_tui::chrome::BorderSet;
+
+        let paint_at = |pane: Pane<'_>, height: u16| {
+            let state = Cell::new(PaneState::new(Rect::new(0, 0, 20, height)));
+            let component = PaneComponent::new("pane", pane, &state, TextBlock::new(""));
+            let layout = component.layout(
+                Constraints::new(20, 20, height.into(), Some(height.into())),
+                &mut LayoutCx::new(),
+            );
+            let mut buffer = Buffer::empty(Rect::new(0, 0, 20, height));
+            let mut frame = Frame::new(&mut buffer);
+            component.paint(&layout, &mut PaintCx::new(&mut frame));
+            let actions: Vec<(String, Rect)> = frame
+                .hits()
+                .regions()
+                .iter()
+                .filter(|region| region.id.as_str().contains(".action."))
+                .map(|region| (region.id.as_str().to_owned(), region.area))
+                .collect();
+            drop(frame);
+            (buffer.row_symbols(0).unwrap(), actions)
+        };
+        for (set, start, end) in [
+            (BorderSet::SINGLE, '╶', '╴'),
+            (BorderSet::ROUNDED, '╶', '╴'),
+            (BorderSet::THICK, '╺', '╸'),
+            (BorderSet::DOUBLE, '═', '═'),
+            (BorderSet::ASCII, '+', '+'),
+        ] {
+            let pane = || {
+                with_actions("Files").chrome(crate::theme::ComponentChrome {
+                    border_set: Some(set),
+                    ..crate::theme::ComponentChrome::DEFAULT
+                })
+            };
+            let (tall_row, tall_actions) = paint_at(pane(), 3);
+            let (row, actions) = paint_at(pane(), 1);
+            // The title and actions are where a taller pane has them; only the
+            // ends differ.
+            let inner: String = tall_row
+                .chars()
+                .skip(1)
+                .take(tall_row.chars().count() - 2)
+                .collect();
+            assert_eq!(row, format!("{start}{inner}{end}"), "{set:?}");
+            assert!(row.contains("Files"), "{row}");
+            assert_eq!(actions, tall_actions, "{set:?}");
+            assert_eq!(actions.len(), 2, "{set:?}");
+        }
+    }
+
     fn with_actions(title: &str) -> Pane<'static> {
         Pane::new()
             .title(title.to_owned())

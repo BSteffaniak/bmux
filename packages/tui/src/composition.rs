@@ -3,7 +3,7 @@
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
-use crate::chrome::{Border, BorderSide};
+use crate::chrome::{Border, BorderSet, BorderSide, BorderSides};
 use crate::component::LogicalInsets;
 use crate::component::{
     ChildLayout, Component, ComponentRevision, Constraints, Element, ElementObject,
@@ -1030,39 +1030,67 @@ fn paint_border(
             cx.set_cell(right, y, &vertical, style_at(right_style, right, y));
         }
     }
-    if width > 1 && height > 1 {
-        if sides.top && sides.left {
-            cx.set_cell(
-                0,
-                0,
-                &border.set.top_left.to_string(),
-                style_at(left_style, 0, 0),
-            );
-        }
-        if sides.top && sides.right {
-            cx.set_cell(
+    for (x, y, glyph, side) in border_end_cells(width, height, sides, border.set)
+        .into_iter()
+        .flatten()
+    {
+        let style = if side == BorderSide::Left {
+            left_style
+        } else {
+            right_style
+        };
+        cx.set_cell(x, y, &glyph.to_string(), style_at(style, x, y));
+    }
+}
+
+/// Cells that end a border's edges: corners, or the ends of a frame one row
+/// tall or one column wide, which has no corners. Each carries the vertical
+/// side whose style it takes.
+fn border_end_cells(
+    width: u64,
+    height: u64,
+    sides: BorderSides,
+    set: BorderSet,
+) -> [Option<(i32, i64, char, BorderSide)>; 4] {
+    let right = i32::try_from(width.saturating_sub(1)).unwrap_or(i32::MAX);
+    let bottom = i64::try_from(height.saturating_sub(1)).unwrap_or(i64::MAX);
+    if height == 1 && width > 1 && sides.top {
+        // One row is both the top and bottom edge.
+        let (start, end) = set.single_row_ends();
+        [
+            sides.left.then_some((0, 0, start, BorderSide::Left)),
+            sides.right.then_some((right, 0, end, BorderSide::Right)),
+            None,
+            None,
+        ]
+    } else if width == 1 && height > 1 && (sides.left || sides.right) {
+        // One column is both the left and right edge.
+        let (start, end) = set.single_column_ends();
+        let side = if sides.left {
+            BorderSide::Left
+        } else {
+            BorderSide::Right
+        };
+        [
+            sides.top.then_some((0, 0, start, side)),
+            sides.bottom.then_some((0, bottom, end, side)),
+            None,
+            None,
+        ]
+    } else if width > 1 && height > 1 {
+        [
+            (sides.top && sides.left).then_some((0, 0, set.top_left, BorderSide::Left)),
+            (sides.top && sides.right).then_some((right, 0, set.top_right, BorderSide::Right)),
+            (sides.bottom && sides.left).then_some((0, bottom, set.bottom_left, BorderSide::Left)),
+            (sides.bottom && sides.right).then_some((
                 right,
-                0,
-                &border.set.top_right.to_string(),
-                style_at(right_style, right, 0),
-            );
-        }
-        if sides.bottom && sides.left {
-            cx.set_cell(
-                0,
                 bottom,
-                &border.set.bottom_left.to_string(),
-                style_at(left_style, 0, bottom),
-            );
-        }
-        if sides.bottom && sides.right {
-            cx.set_cell(
-                right,
-                bottom,
-                &border.set.bottom_right.to_string(),
-                style_at(right_style, right, bottom),
-            );
-        }
+                set.bottom_right,
+                BorderSide::Right,
+            )),
+        ]
+    } else {
+        [None; 4]
     }
 }
 
@@ -2584,6 +2612,62 @@ mod tests {
         assert_eq!(cell(width - 1, height - 1).style.fg, Some(Color::from(to)));
         assert_ne!(cell(width - 1, 0).style.fg, cell(0, 0).style.fg);
         assert_eq!(cell(width - 1, 0).style.bg, Some(Color::Blue));
+    }
+
+    /// Paint a bordered surface tightly sized to `width` by `height`.
+    fn bordered(border: Border, width: u16, height: u16) -> Vec<String> {
+        let card = Surface::new(TextBlock::new("")).border(border);
+        let size = crate::geometry::Size::new(width, height);
+        let layout = card.layout(Constraints::tight(size), &mut LayoutCx::new());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, width, height));
+        let mut frame = Frame::new(&mut buffer);
+        card.paint(&layout, &mut PaintCx::new(&mut frame));
+        drop(frame);
+        (0..height)
+            .map(|y| buffer.row_symbols(y).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn one_row_borders_end_without_corners_for_every_set() {
+        use crate::chrome::BorderSet;
+
+        for (set, row) in [
+            (BorderSet::SINGLE, "╶────╴"),
+            (BorderSet::ROUNDED, "╶────╴"),
+            (BorderSet::THICK, "╺━━━━╸"),
+            (BorderSet::DOUBLE, "══════"),
+            (BorderSet::ASCII, "+----+"),
+        ] {
+            let border = Border::new(set, Style::new());
+            assert_eq!(bordered(border.clone(), 6, 1), [row], "{set:?}");
+            // Taller frames keep their corners.
+            let rows = bordered(border, 6, 2);
+            assert!(rows[0].starts_with(set.top_left), "{set:?}: {rows:?}");
+            assert!(rows[1].ends_with(set.bottom_right), "{set:?}: {rows:?}");
+        }
+        // A one-row border without the top edge is just its sides.
+        let sides = Border::single().sides(crate::chrome::BorderSides::vertical());
+        assert_eq!(bordered(sides, 4, 1), ["│  │"]);
+    }
+
+    #[test]
+    fn one_column_borders_end_without_corners_for_every_set() {
+        use crate::chrome::BorderSet;
+
+        for (set, column) in [
+            (BorderSet::SINGLE, ["╷", "│", "╵"]),
+            (BorderSet::ROUNDED, ["╷", "│", "╵"]),
+            (BorderSet::THICK, ["╻", "┃", "╹"]),
+            (BorderSet::DOUBLE, ["║", "║", "║"]),
+            (BorderSet::ASCII, ["+", "|", "+"]),
+        ] {
+            assert_eq!(
+                bordered(Border::new(set, Style::new()), 1, 3),
+                column,
+                "{set:?}"
+            );
+        }
     }
 
     #[test]

@@ -71,6 +71,42 @@ impl BorderSet {
         horizontal: '━',
         vertical: '┃',
     };
+
+    /// Glyphs ending a frame one row tall, at its left and right.
+    ///
+    /// A one-row frame's row is both its top and bottom edge, so a corner,
+    /// which turns toward a side that is not there, does not fit. Sets whose
+    /// top and bottom corners are the same glyph (such as [`Self::ASCII`]'s
+    /// `+`) use that corner; light and heavy lines end in half lines (`╶─╴`,
+    /// `╺━╸`); other sets continue the horizontal edge to the ends.
+    #[must_use]
+    pub const fn single_row_ends(self) -> (char, char) {
+        if self.top_left == self.bottom_left && self.top_right == self.bottom_right {
+            return (self.top_left, self.top_right);
+        }
+        match self.horizontal {
+            '─' => ('╶', '╴'),
+            '━' => ('╺', '╸'),
+            other => (other, other),
+        }
+    }
+
+    /// Glyphs ending a frame one column wide, at its top and bottom.
+    ///
+    /// The counterpart of [`Self::single_row_ends`]: sets whose left and right
+    /// corners are the same glyph use that corner; light and heavy lines end in
+    /// half lines (`╷│╵`, `╻┃╹`); other sets continue the vertical edge.
+    #[must_use]
+    pub const fn single_column_ends(self) -> (char, char) {
+        if self.top_left == self.top_right && self.bottom_left == self.bottom_right {
+            return (self.top_left, self.bottom_left);
+        }
+        match self.vertical {
+            '│' => ('╷', '╵'),
+            '┃' => ('╻', '╹'),
+            other => (other, other),
+        }
+    }
 }
 
 /// Border side selection.
