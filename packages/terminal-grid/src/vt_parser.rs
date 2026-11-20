@@ -231,14 +231,27 @@ impl<const N: usize> Parser<N> {
             State::DcsStart | State::DcsNumbers => State::DcsNumbers,
             _ => return 0,
         };
-        let run = bytes
-            .iter()
-            .position(|byte| !(0x30..=0x3b).contains(byte))
-            .unwrap_or(bytes.len());
-        if run > 0 {
-            for &byte in &bytes[..run] {
-                self.parameter(byte);
+        // One pass, as `parameter` would take each byte, with the number in a register.
+        let mut number = self.number;
+        let mut run = 0;
+        for &byte in bytes {
+            match byte {
+                b'0'..=b'9' | b':' | b';' if self.params.used == 32 => self.ignored = true,
+                b'0'..=b'9' => {
+                    number = number
+                        .saturating_mul(10)
+                        .saturating_add(u16::from(byte - b'0'));
+                }
+                b':' | b';' => {
+                    self.params.append(number, byte == b';');
+                    number = 0;
+                }
+                _ => break,
             }
+            run += 1;
+        }
+        self.number = number;
+        if run > 0 {
             self.state = numbers;
         }
         run
