@@ -388,7 +388,9 @@ impl ProtocolState {
 }
 
 /// Bytes of cell text stored inline, without allocating.
-const INLINE_CELL_TEXT: usize = 15;
+/// Text bytes a cell holds inline: with the length and the variant tag, the text is 16 bytes,
+/// and a cell 24.
+const INLINE_CELL_TEXT: usize = 14;
 
 /// Text of one cell. Nearly always one character, so short text is stored inline: printing
 /// does not allocate per cell. Longer grapheme clusters are stored on the heap.
@@ -398,7 +400,9 @@ enum CellText {
         len: u8,
         bytes: [u8; INLINE_CELL_TEXT],
     },
-    Heap(String),
+    /// Text too long to hold inline (long grapheme clusters, rare): boxed so the variant is one
+    /// pointer.
+    Heap(Box<Box<str>>),
 }
 
 impl CellText {
@@ -423,7 +427,7 @@ impl CellText {
         }
         let mut stored = Self::empty();
         if !stored.push_str(text) {
-            stored = Self::Heap(text.to_owned());
+            stored = Self::Heap(Box::new(text.into()));
         }
         stored
     }
@@ -446,7 +450,7 @@ impl CellText {
         if stored.push_str(&text) {
             stored
         } else {
-            Self::Heap(text)
+            Self::Heap(Box::new(text.into_boxed_str()))
         }
     }
 
@@ -461,7 +465,7 @@ impl CellText {
                 let mut copy = String::new();
                 copy.try_reserve_exact(text.len()).ok()?;
                 copy.push_str(text);
-                Some(Self::Heap(copy))
+                Some(Self::Heap(Box::new(copy.into_boxed_str())))
             }
         }
     }
@@ -487,7 +491,7 @@ impl CellText {
     fn capacity(&self) -> usize {
         match self {
             Self::Inline { .. } => 0,
-            Self::Heap(text) => text.capacity(),
+            Self::Heap(text) => std::mem::size_of::<Box<str>>() + text.len(),
         }
     }
 
@@ -505,7 +509,10 @@ impl CellText {
                 true
             }
             Self::Heap(stored) => {
-                stored.push_str(text);
+                let mut grown = String::with_capacity(stored.len() + text.len());
+                grown.push_str(stored);
+                grown.push_str(text);
+                **stored = grown.into_boxed_str();
                 true
             }
         }
@@ -518,15 +525,14 @@ impl CellText {
             let mut heap = String::with_capacity(self.len() + text.len());
             heap.push_str(self.as_str());
             heap.push_str(text);
-            *self = Self::Heap(heap);
+            *self = Self::Heap(Box::new(heap.into_boxed_str()));
         }
     }
 
+    /// Hold the text on the heap, however short.
     #[cfg(test)]
-    fn reserve_exact(&mut self, additional: usize) {
-        let mut heap = self.as_str().to_owned();
-        heap.reserve_exact(additional);
-        *self = Self::Heap(heap);
+    fn move_to_heap(&mut self) {
+        *self = Self::Heap(Box::new(self.as_str().into()));
     }
 }
 
@@ -553,6 +559,9 @@ pub struct Cell {
     width: u8,
     wide_continuation: bool,
 }
+
+// Cells are most of a grid's memory traffic: keep them this small.
+const _: () = assert!(std::mem::size_of::<Cell>() == 24);
 
 impl Cell {
     #[must_use]
@@ -4700,7 +4709,7 @@ mod tests {
         let old_cells = row.cells.capacity();
         let old_text = row.cells[0].text.capacity();
         row.cells.reserve_exact(100);
-        row.cells[0].text.reserve_exact(1000);
+        row.cells[0].text.move_to_heap();
         let extra = (row.cells.capacity() - old_cells) * std::mem::size_of::<Cell>()
             + row.cells[0].text.capacity()
             - old_text;
