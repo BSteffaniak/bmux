@@ -3742,13 +3742,15 @@ enabled_by_default = false
     }
 
     #[test]
-    fn presentation_defaults_to_bottom_tab_bar_without_sidebar() {
+    fn presentation_defaults_enable_tab_bar_and_sidebar() {
         let mut registry = PluginRegistry::new();
         register_static_bundled_plugins(&mut registry);
 
+        // The sidebar is loaded by default but starts hidden (its own
+        // `visible` setting), so the tab bar stays the visible default.
         let enabled = effective_enabled_plugins(&BmuxConfig::default(), &registry);
         assert!(enabled.iter().any(|plugin| plugin == "bmux.tab_bar"));
-        assert!(!enabled.iter().any(|plugin| plugin == "bmux.sidebar"));
+        assert!(enabled.iter().any(|plugin| plugin == "bmux.sidebar"));
     }
 
     #[test]

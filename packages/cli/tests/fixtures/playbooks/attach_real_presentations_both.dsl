@@ -12,6 +12,8 @@
 new-session
 send-keys keys='printf PRESENTATIONS_BOTH_OK\r'
 wait-for pattern='PRESENTATIONS_BOTH_OK'
+# The sidebar is enabled by default but starts hidden.
+send-attach key='ctrl+alt+s'
 wait-rendered contains=' Tabs '
 wait-rendered contains='INSERT'
 assert-screen contains='PRESENTATIONS_BOTH_OK'

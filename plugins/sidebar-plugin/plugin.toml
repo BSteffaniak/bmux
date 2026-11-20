@@ -1,12 +1,11 @@
-bundled_only       = "uses Tokio tasks and timers directly instead of plug-rt"
-component_roles    = ["backend"]
-enabled_by_default = false
-execution_class    = "native_fast"
-id                 = "bmux.sidebar"
-name               = "bmux Sidebar"
-owns_namespaces    = ["sidebar"]
-provided_features  = ["bmux.sidebar"]
-version            = "0.0.1-alpha.0"
+bundled_only      = "uses Tokio tasks and timers directly instead of plug-rt"
+component_roles   = ["backend"]
+execution_class   = "native_fast"
+id                = "bmux.sidebar"
+name              = "bmux Sidebar"
+owns_namespaces   = ["sidebar"]
+provided_features = ["bmux.sidebar"]
+version           = "0.0.1-alpha.0"
 
 [[dependencies]]
 plugin_id   = "bmux.tabs"

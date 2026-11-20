@@ -77,7 +77,12 @@ impl Default for Settings {
             content_height: false,
             collapse_below_width: 80,
             collapsed_width: 8,
-            visibility: VisibilitySettings::default(),
+            // Enabled by default but closed until a client opens it; the tab
+            // bar is the default visible tab presentation.
+            visibility: VisibilitySettings {
+                visible: false,
+                ..VisibilitySettings::default()
+            },
         }
     }
 }
@@ -1582,6 +1587,28 @@ mod tests {
     }
     use super::*;
 
+    /// Most tests exercise a shown sidebar; the shipped default is hidden.
+    fn shown_toml() -> toml::Value {
+        toml::Value::Table(toml::toml! { visible = true })
+    }
+
+    fn shown_settings() -> Settings {
+        Settings {
+            visibility: VisibilitySettings {
+                visible: true,
+                ..VisibilitySettings::default()
+            },
+            ..Settings::default()
+        }
+    }
+
+    #[test]
+    fn sidebar_starts_hidden_by_default() {
+        assert!(!Settings::default().visibility.visible);
+        assert!(!Settings::parse(None).unwrap().visibility.visible);
+        assert!(!CompanionState::new(Settings::default(), None).visible());
+    }
+
     #[test]
     fn republish_advances_past_retained_owner_revision() {
         let resources = bmux_plugin::AttachPresentationResources::isolated(64);
@@ -1690,12 +1717,12 @@ mod tests {
 
     #[test]
     fn layout_request_places_sidebar_on_configured_edge_and_order() {
-        let left = layout_request(&Settings::default(), true);
+        let left = layout_request(&shown_settings(), true);
         let right = layout_request(
             &Settings {
                 placement: Placement::Right,
                 order: 50,
-                ..Settings::default()
+                ..shown_settings()
             },
             true,
         );
@@ -1805,8 +1832,9 @@ mod tests {
         let tab_id = Uuid::from_u128(0x300);
         let first = runtime_resources(one_tab(tab_id), None);
         let second = runtime_resources(one_tab(tab_id), None);
-        let _first = SidebarPresentation::install_for_runtime(None, &first).unwrap();
-        let _second = SidebarPresentation::install_for_runtime(None, &second).unwrap();
+        let _first = SidebarPresentation::install_for_runtime(Some(&shown_toml()), &first).unwrap();
+        let _second =
+            SidebarPresentation::install_for_runtime(Some(&shown_toml()), &second).unwrap();
         assert!(sidebar_split_visible(&first));
         assert_eq!(sidebar_surface_count(&first), 1);
 
@@ -1829,7 +1857,8 @@ mod tests {
     #[tokio::test]
     async fn hidden_sidebar_ignores_its_empty_allocation() {
         let resources = runtime_resources(one_tab(Uuid::from_u128(0x400)), None);
-        let presentation = SidebarPresentation::install_for_runtime(None, &resources).unwrap();
+        let presentation =
+            SidebarPresentation::install_for_runtime(Some(&shown_toml()), &resources).unwrap();
         let id = PluginLayoutId::new(OWNER, LAYOUT_ID);
         let shown = ExtensionRect::new(0, 0, 28, 20);
         resources.allocations.notify(&id, shown);
@@ -1857,7 +1886,8 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("bmux-sidebar-visibility-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
-        let remember = toml::Value::Table(toml::toml! { remember_visibility = true });
+        let remember = toml::Value::Table(toml::toml! { visible = true
+        remember_visibility = true });
         let resources = runtime_resources(one_tab(Uuid::from_u128(0x500)), Some(directory.clone()));
         let presentation =
             SidebarPresentation::install_for_runtime(Some(&remember), &resources).unwrap();
@@ -1873,7 +1903,8 @@ mod tests {
 
         // Without remembering, the configured default applies.
         let forgetful = runtime_resources(one_tab(Uuid::from_u128(0x500)), Some(directory.clone()));
-        let _forgetful = SidebarPresentation::install_for_runtime(None, &forgetful).unwrap();
+        let _forgetful =
+            SidebarPresentation::install_for_runtime(Some(&shown_toml()), &forgetful).unwrap();
         assert!(sidebar_split_visible(&forgetful));
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -1972,7 +2003,7 @@ mod tests {
 
     #[test]
     fn hover_style_changes_only_the_target_card_title() {
-        let mut state = CompanionState::new(Settings::default(), None);
+        let mut state = CompanionState::new(shown_settings(), None);
         let first = Uuid::from_u128(11);
         let second = Uuid::from_u128(12);
         state.replace_tabs(tabs_list::TabListSnapshot {
@@ -2053,7 +2084,7 @@ mod tests {
             let input = std::sync::Arc::new(bmux_plugin::AttachPresentationInputRegistry::new());
             let surfaces = std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(4));
             let presentation = SidebarPresentation::install(
-                None,
+                Some(&shown_toml()),
                 layouts.clone(),
                 allocations.clone(),
                 input,
@@ -2094,9 +2125,9 @@ mod tests {
             std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(4));
         let second_registry =
             std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(4));
-        let mut first = CompanionState::new(Settings::default(), None);
+        let mut first = CompanionState::new(shown_settings(), None);
         first.surfaces = Some(first_registry.clone());
-        let mut second = CompanionState::new(Settings::default(), None);
+        let mut second = CompanionState::new(shown_settings(), None);
         second.surfaces = Some(second_registry.clone());
         first
             .publish_allocation(ExtensionRect::new(0, 0, 12, 5), publish_companion)
@@ -2132,7 +2163,7 @@ mod tests {
             let (_sender, mut receiver) = tokio::sync::watch::channel(());
             let retained = std::sync::Arc::new(());
             let owned = retained.clone();
-            let mut companion = CompanionState::new(Settings::default(), None);
+            let mut companion = CompanionState::new(shown_settings(), None);
             companion.subscription = Some(tokio::spawn(async move {
                 let _ = receiver.changed().await;
                 drop(owned);
@@ -2147,7 +2178,7 @@ mod tests {
 
     #[test]
     fn allocation_publication_retries_without_reapplying_resize() {
-        let mut state = CompanionState::new(Settings::default(), None);
+        let mut state = CompanionState::new(shown_settings(), None);
         let rect = ExtensionRect::new(0, 0, 12, 5);
         assert!(
             state
@@ -2172,7 +2203,7 @@ mod tests {
 
     #[test]
     fn unpublished_snapshot_consumes_input_until_repaired() {
-        let mut state = CompanionState::new(Settings::default(), None);
+        let mut state = CompanionState::new(shown_settings(), None);
         state.surfaces = Some(std::sync::Arc::new(
             bmux_plugin::surface::PluginSurfaceRegistry::new(0),
         ));
@@ -2253,7 +2284,7 @@ mod tests {
         let mut state = CompanionState::new(
             Settings {
                 maximum_visible_items: 1,
-                ..Settings::default()
+                ..shown_settings()
             },
             None,
         );
@@ -2331,7 +2362,7 @@ mod tests {
             Settings {
                 maximum_visible_items: 1,
                 description_template: "description".to_string(),
-                ..Settings::default()
+                ..shown_settings()
             },
             None,
         );
@@ -2394,7 +2425,7 @@ mod tests {
     fn virtual_tab_realigns_to_active_and_bounds_projected_items() {
         let settings = Settings {
             maximum_visible_items: 2,
-            ..Settings::default()
+            ..shown_settings()
         };
         let mut state = CompanionState::new(settings, None);
         state.replace_tabs(tabs_list::TabListSnapshot {
@@ -2424,7 +2455,7 @@ mod tests {
         let first = Uuid::from_u128(31);
         let second = Uuid::from_u128(32);
         let facts = std::sync::Arc::new(bmux_presentation_state::PresentationFactRegistry::new());
-        let mut state = CompanionState::new(Settings::default(), None);
+        let mut state = CompanionState::new(shown_settings(), None);
         state.facts = Some(FactSource::Registry(facts.clone()));
         state.replace_tabs(tabs_list::TabListSnapshot {
             tabs: vec![
@@ -2476,7 +2507,7 @@ mod tests {
 
         let settings = Settings {
             maximum_visible_items: 32,
-            ..Settings::default()
+            ..shown_settings()
         };
         let mut state = CompanionState::new(settings, None);
         state.replace_tabs(tabs_list::TabListSnapshot {
@@ -2505,7 +2536,7 @@ mod tests {
     fn single_and_large_tab_lists_remain_bounded() {
         let settings = Settings {
             maximum_visible_items: 32,
-            ..Settings::default()
+            ..shown_settings()
         };
         let mut state = CompanionState::new(settings, None);
         state.replace_tabs(tabs_list::TabListSnapshot {
@@ -2542,7 +2573,7 @@ mod tests {
         let mut state = CompanionState::new(
             Settings {
                 content_height: true,
-                ..Settings::default()
+                ..shown_settings()
             },
             None,
         );
@@ -2576,7 +2607,7 @@ mod tests {
 
     #[test]
     fn surface_uses_one_stable_region_per_tab() {
-        let mut state = CompanionState::new(Settings::default(), None);
+        let mut state = CompanionState::new(shown_settings(), None);
         let id = Uuid::from_u128(9);
         state.replace_tabs(tabs_list::TabListSnapshot {
             tabs: vec![tabs_list::TabListEntry {

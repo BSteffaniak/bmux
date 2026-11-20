@@ -4,27 +4,36 @@ BMUX ships two independent tab presentation plugins for normal `bmux attach`:
 
 - `bmux.tab_bar` is enabled by default and owns the full horizontal
   status/tab row at the bottom.
-- `bmux.sidebar` is bundled but opt-in and reserves a bounded vertical region
-  at the left or right.
+- `bmux.sidebar` is also enabled by default but starts hidden; when shown it
+  reserves a bounded vertical region at the left or right.
 
 Both consume the authoritative ordered tab state from `bmux.tabs`;
 presentation enablement does not change tab lifecycle or ordering.
 
 ## Enablement combinations
 
-The default is the full tab/status bar without the sidebar.
+By default both are loaded: the tab/status bar is shown and the sidebar is
+hidden until you open it (`ctrl+alt+s`).
 
 ```toml
-# Enable the optional sidebar as well
-[plugins]
-enabled = ["bmux.sidebar"]
+# Show the sidebar on attach as well
+[plugins.settings."bmux.sidebar"]
+visible = true
 ```
 
 ```toml
 # Sidebar only
 [plugins]
-enabled = ["bmux.sidebar"]
 disabled = ["bmux.tab_bar"]
+
+[plugins.settings."bmux.sidebar"]
+visible = true
+```
+
+```toml
+# Tab bar only, no sidebar at all
+[plugins]
+disabled = ["bmux.sidebar"]
 ```
 
 ```toml
@@ -57,7 +66,7 @@ Both plugins take the same two settings:
 
 ```toml
 [plugins.settings."bmux.sidebar"]   # or "bmux.tab_bar"
-visible = true                     # shown when a client attaches
+visible = true                     # shown on attach (sidebar default: false)
 remember_visibility = false        # start from the last state set on this machine
 ```
 
