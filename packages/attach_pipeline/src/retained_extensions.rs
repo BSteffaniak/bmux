@@ -9,8 +9,8 @@
 //! renderer recognises and neither converts nor diffs again. Unchanged decorations thus cost
 //! nothing per frame beyond the revision queries.
 use bmux_plugin::{
-    AttachRenderExtension, ExtensionRect, RenderDamage, RenderExtensionContext,
-    RenderExtensionLayer, RenderLayerItem, RenderLayerScene, RenderOp, RenderSurfaceChrome,
+    AttachRenderExtension, ExtensionRect, RenderExtensionContext, RenderExtensionLayer,
+    RenderLayerScene, RenderSurfaceChrome,
 };
 use std::sync::Arc;
 use uuid::Uuid;
@@ -19,7 +19,7 @@ use uuid::Uuid;
 const MAX_SOURCES: usize = 64;
 /// Most surfaces sampled per frame.
 const MAX_SURFACES: usize = 128;
-/// Most scene items, render items and operations sampled per frame, across producers.
+/// Most scene items sampled per frame, across producers.
 const MAX_ENTRIES: usize = 131_072;
 
 const LAYERS: [RenderExtensionLayer; 2] = [
@@ -29,11 +29,8 @@ const LAYERS: [RenderExtensionLayer; 2] = [
 
 /// One layer of one surface as sampled from its extension.
 struct Layer {
-    damage: RenderDamage,
     revision: Option<u64>,
     scene: Option<Arc<RenderLayerScene>>,
-    items: Option<Vec<RenderLayerItem>>,
-    ops: Option<Vec<RenderOp>>,
     /// The cells the layer paints, worked out once when sampled.
     painted: Vec<ExtensionRect>,
 }
@@ -41,8 +38,6 @@ struct Layer {
 impl Layer {
     fn entries(&self) -> usize {
         self.scene.as_ref().map_or(0, |scene| scene.items.len())
-            + self.items.as_ref().map_or(0, Vec::len)
-            + self.ops.as_ref().map_or(0, Vec::len)
     }
 }
 
@@ -53,7 +48,6 @@ struct Surface {
     context: RenderExtensionContext,
     chrome: RenderSurfaceChrome,
     content_override: Option<ExtensionRect>,
-    under_cells: Option<Vec<(u16, u16, bmux_plugin::RenderUnderCell)>>,
     /// Indexed by [`layer_index`].
     layers: [Arc<Layer>; 2],
 }
@@ -75,8 +69,8 @@ impl RetainedExtension {
             .iter()
             .find(|surface| {
                 // Intent is sampled in authoritative geometry. Composition may use
-                // a viewport-clipped subrectangle; lowering still owns clipping and
-                // must not mistake that geometry for an imperative-only extension.
+                // a viewport-clipped subrectangle; lowering still owns clipping, so the
+                // clipped rect must still find the surface's scene.
                 surface.id == id
                     && rect.x >= surface.rect.x
                     && rect.y >= surface.rect.y
@@ -105,30 +99,11 @@ impl AttachRenderExtension for RetainedExtension {
         self.surface(id, *rect)
             .map_or(RenderSurfaceChrome::Fallback, |surface| surface.chrome)
     }
-    fn render_before_content_cells_with_context(
-        &self,
-        id: Uuid,
-        rect: &ExtensionRect,
-        _: &RenderDamage,
-        _: &RenderExtensionContext,
-    ) -> Option<Vec<(u16, u16, bmux_plugin::RenderUnderCell)>> {
-        self.surface(id, *rect)
-            .and_then(|surface| surface.under_cells.clone())
-    }
     fn content_rect_override(&self, id: Uuid) -> Option<ExtensionRect> {
         self.surfaces
             .iter()
             .find(|surface| surface.id == id)
             .and_then(|surface| surface.content_override)
-    }
-    fn surface_layer_damage(
-        &self,
-        id: Uuid,
-        rect: &ExtensionRect,
-        layer: RenderExtensionLayer,
-    ) -> RenderDamage {
-        self.layer(id, *rect, layer)
-            .map_or(RenderDamage::None, |value| value.damage.clone())
     }
     fn paints_inside_content(
         &self,
@@ -169,28 +144,6 @@ impl AttachRenderExtension for RetainedExtension {
     ) -> Option<Arc<RenderLayerScene>> {
         self.layer(id, *rect, layer)
             .and_then(|value| value.scene.clone())
-    }
-    fn render_layer_items_with_context(
-        &self,
-        id: Uuid,
-        rect: &ExtensionRect,
-        _: &RenderDamage,
-        layer: RenderExtensionLayer,
-        _: &RenderExtensionContext,
-    ) -> Option<Vec<RenderLayerItem>> {
-        self.layer(id, *rect, layer)
-            .and_then(|value| value.items.clone())
-    }
-    fn render_layer_ops_with_context(
-        &self,
-        id: Uuid,
-        rect: &ExtensionRect,
-        _: &RenderDamage,
-        layer: RenderExtensionLayer,
-        _: &RenderExtensionContext,
-    ) -> Option<Vec<RenderOp>> {
-        self.layer(id, *rect, layer)
-            .and_then(|value| value.ops.clone())
     }
 }
 
@@ -328,12 +281,6 @@ fn sample_surface(
         rect,
         context: context.clone(),
         content_override: source.content_rect_override(id),
-        under_cells: source.render_before_content_cells_with_context(
-            id,
-            &rect,
-            &RenderDamage::FullSurface,
-            context,
-        ),
         chrome: source.surface_chrome_with_context(id, &rect, context),
         layers,
     }))
@@ -354,46 +301,14 @@ fn sample_layer(
         Some(last) if revision.is_some() && last.revision == revision => last.clone(),
         _ => {
             let scene = source.render_layer_scene_shared(id, &rect, layer, context);
-            let items = if scene.is_none() {
-                source.render_layer_items_with_context(
-                    id,
-                    &rect,
-                    &RenderDamage::FullSurface,
-                    layer,
-                    context,
-                )
-            } else {
-                None
-            };
-            let ops = if scene.is_none() && items.is_none() {
-                source.render_layer_ops_with_context(
-                    id,
-                    &rect,
-                    &RenderDamage::FullSurface,
-                    layer,
-                    context,
-                )
-            } else {
-                None
-            };
             let painted = scene
                 .iter()
                 .flat_map(|scene| &scene.items)
                 .flat_map(bmux_plugin::RenderSceneItem::painted_rects)
-                .chain(
-                    items
-                        .iter()
-                        .flatten()
-                        .flat_map(RenderLayerItem::painted_rects),
-                )
-                .chain(ops.iter().flatten().flat_map(RenderOp::painted_rects))
                 .collect();
             Arc::new(Layer {
-                damage: source.surface_layer_damage(id, &rect, layer),
                 revision,
                 scene,
-                items,
-                ops,
                 painted,
             })
         }
@@ -414,9 +329,7 @@ mod tests {
     enum Representation {
         Scene,
         EmptyScene,
-        Items,
-        EmptyOps,
-        ImperativeOnly,
+        NoScene,
     }
 
     struct Source(Representation);
@@ -446,44 +359,7 @@ mod tests {
                     )],
                 )),
                 Representation::EmptyScene => Some(RenderLayerScene::new(Some(7), Vec::new())),
-                _ => None,
-            }
-        }
-
-        fn render_layer_items_with_context(
-            &self,
-            _: Uuid,
-            _: &ExtensionRect,
-            _: &RenderDamage,
-            _: RenderExtensionLayer,
-            _: &RenderExtensionContext,
-        ) -> Option<Vec<RenderLayerItem>> {
-            match self.0 {
-                Representation::Scene | Representation::EmptyScene => {
-                    panic!("a selected retained scene must not probe lower representations")
-                }
-                Representation::Items => Some(vec![RenderLayerItem::Op(RenderOp::text_run(
-                    2,
-                    3,
-                    "kept",
-                    RenderStyle::new(),
-                ))]),
-                _ => None,
-            }
-        }
-
-        fn render_layer_ops_with_context(
-            &self,
-            _: Uuid,
-            _: &ExtensionRect,
-            _: &RenderDamage,
-            _: RenderExtensionLayer,
-            _: &RenderExtensionContext,
-        ) -> Option<Vec<RenderOp>> {
-            match self.0 {
-                Representation::EmptyOps => Some(Vec::new()),
-                Representation::ImperativeOnly => None,
-                _ => panic!("a selected representation must not probe operations"),
+                Representation::NoScene => None,
             }
         }
     }
@@ -504,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn viewport_clipping_preserves_retained_scene_and_items() {
+    fn viewport_clipping_preserves_retained_scene() {
         let id = Uuid::from_u128(1);
         let rect = ExtensionRect::new(2, 3, 38, 17);
         let context = RenderExtensionContext::default();
@@ -522,28 +398,12 @@ mod tests {
                 scene.items[0],
                 RenderSceneItem::text("label", 0, 2, 3, "kept", RenderStyle::new()),
             );
-
-            let retained = snapshot(Representation::Items);
-            assert!(
-                retained
-                    .render_layer_scene_with_context(id, &rect, layer, &context)
-                    .is_none()
-            );
-            let items = retained
-                .render_layer_items_with_context(
-                    id,
-                    &rect,
-                    &RenderDamage::FullSurface,
-                    layer,
-                    &context,
-                )
-                .expect("clipped surface must retain its item representation");
-            assert_eq!(items.len(), 1);
         }
     }
 
+    /// An empty scene is retained as one; an extension without a scene paints nothing.
     #[test]
-    fn empty_retained_output_does_not_select_imperative_fallback() {
+    fn empty_and_absent_scenes_are_kept_apart() {
         let id = Uuid::from_u128(1);
         let rect = ExtensionRect::new(2, 3, 38, 17);
         let context = RenderExtensionContext::default();
@@ -552,10 +412,11 @@ mod tests {
             .render_layer_scene_with_context(id, &rect, layer, &context)
             .expect("empty scene is a supported representation");
         assert_eq!(scene.items, [] as [bmux_plugin::RenderSceneItem; 0]);
-        let ops = snapshot(Representation::EmptyOps)
-            .render_layer_ops_with_context(id, &rect, &RenderDamage::FullSurface, layer, &context)
-            .expect("empty operations are a supported no-op");
-        assert_eq!(ops, [] as [bmux_plugin::RenderOp; 0]);
+        assert!(
+            snapshot(Representation::NoScene)
+                .render_layer_scene_with_context(id, &rect, layer, &context)
+                .is_none()
+        );
     }
 
     #[test]
@@ -605,34 +466,9 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
         let after = retained
             .render_layer_scene_with_context(id, &rect, layer, &context)
-            .expect("blocked delivery must not select imperative rendering");
+            .expect("blocked delivery must keep the retained scene");
         assert_eq!(before.items, after.items);
         assert_eq!(before.revision, after.revision);
-    }
-
-    #[test]
-    fn imperative_only_output_has_no_neutral_representation() {
-        let retained = snapshot(Representation::ImperativeOnly);
-        let id = Uuid::from_u128(1);
-        let rect = ExtensionRect::new(2, 3, 38, 17);
-        let context = RenderExtensionContext::default();
-        let layer = RenderExtensionLayer::AfterPaneContent;
-        assert!(
-            retained
-                .render_layer_scene_with_context(id, &rect, layer, &context)
-                .is_none()
-        );
-        assert!(
-            retained
-                .render_layer_ops_with_context(
-                    id,
-                    &rect,
-                    &RenderDamage::FullSurface,
-                    layer,
-                    &context
-                )
-                .is_none()
-        );
     }
 
     /// A producer counting how often it is sampled, whose scene is its `text` at `revision`.

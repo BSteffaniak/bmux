@@ -487,9 +487,6 @@ pub enum PlaybookRenderTraceOp {
         regions: u16,
         full_surface: bool,
     },
-    ExtensionCachedReplay {
-        surface: u32,
-    },
     StatusLine,
     HelpOverlay,
     PromptOverlay,
@@ -561,9 +558,6 @@ impl PlaybookRenderTraceOp {
                 surface: parse_trace_part(surface, "surface")?,
                 regions: parse_trace_part(regions, "regions")?,
                 full_surface: parse_trace_part(full_surface, "full_surface")?,
-            }),
-            ["extension-cached-replay", surface] => Ok(Self::ExtensionCachedReplay {
-                surface: parse_trace_part(surface, "surface")?,
             }),
             ["damage-overlay", rects, cells] => Ok(Self::DamageOverlay {
                 rects: parse_trace_part(rects, "rects")?,
@@ -1142,9 +1136,6 @@ pub fn render_trace_ops_to_dsl(ops: &[PlaybookRenderTraceOp]) -> String {
                 regions,
                 full_surface,
             } => format!("extension-ops:{surface}:{regions}:{full_surface}"),
-            PlaybookRenderTraceOp::ExtensionCachedReplay { surface } => {
-                format!("extension-cached-replay:{surface}")
-            }
             PlaybookRenderTraceOp::StatusLine => "status-line".to_string(),
             PlaybookRenderTraceOp::HelpOverlay => "help-overlay".to_string(),
             PlaybookRenderTraceOp::PromptOverlay => "prompt-overlay".to_string(),
@@ -1616,7 +1607,11 @@ mod tests {
                         cells: 5,
                     },
                     PlaybookRenderTraceOp::HelpOverlay,
-                    PlaybookRenderTraceOp::ExtensionCachedReplay { surface: 2 },
+                    PlaybookRenderTraceOp::ExtensionOps {
+                        surface: 2,
+                        regions: 1,
+                        full_surface: false,
+                    },
                 ]),
                 ..RenderAssertion::default()
             },
@@ -1655,7 +1650,11 @@ mod tests {
                             cells: 5,
                         },
                         PlaybookRenderTraceOp::HelpOverlay,
-                        PlaybookRenderTraceOp::ExtensionCachedReplay { surface: 2 },
+                        PlaybookRenderTraceOp::ExtensionOps {
+                            surface: 2,
+                            regions: 1,
+                            full_surface: false,
+                        },
                     ])
                 );
             }

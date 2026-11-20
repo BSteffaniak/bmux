@@ -1,7 +1,5 @@
 use bmux_attach_layout_protocol::{AttachInputModeState, AttachMouseProtocolState};
-use bmux_plugin::{
-    ExtensionRect, RenderDamage, RenderExtensionLayer, TerminalGraphicFill, TerminalRgba,
-};
+use bmux_plugin::{ExtensionRect, RenderExtensionLayer, TerminalGraphicFill, TerminalRgba};
 use bmux_terminal_grid::{GridLimits, PhysicalRow, TerminalGridStream, TerminalProtocolTracker};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -206,24 +204,6 @@ impl PaneScrollbackView {
 /// A pane is in scrollback if and only if it has an entry here.
 pub type PaneScrollbackViews = BTreeMap<Uuid, PaneScrollbackView>;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExtensionRenderCacheEntry {
-    pub surface_id: Uuid,
-    pub surface_rect: ExtensionRect,
-    pub damage: RenderDamage,
-    pub revision: u64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExtensionLayerSnapshotCacheEntry {
-    pub surface_id: Uuid,
-    pub surface_rect: ExtensionRect,
-    pub layer: RenderExtensionLayer,
-    pub emitted_damage: RenderDamage,
-    pub full_snapshot_damage: RenderDamage,
-    pub revision: Option<u64>,
-}
-
 /// The retained scene of one extension layer last emitted on a surface.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExtensionRetainedLayerCacheEntry {
@@ -249,9 +229,6 @@ pub struct PaneRenderBuffer {
     pub terminal_grid: TerminalGridStream,
     /// Where the grid is as a replica of the server's (the last frame applied to it).
     pub replica: bmux_terminal_grid::ReplicaCursor,
-    /// Neutral declarative output retained alongside extension byte caches.
-    pub extension_projection_cache:
-        BTreeMap<(String, Uuid), Vec<crate::projection::PaintOperation>>,
     pub protocol_tracker: TerminalProtocolTracker,
     /// The host shows the pane's rows as they were last drawn from its grid, at its size: rows
     /// the grid did not change since need not be drawn again. The host's terminal holds what
@@ -270,8 +247,6 @@ pub struct PaneRenderBuffer {
     /// A caller-owned screen copy, independent of live geometry and history.
     pub retained_screen_copy: bool,
     pub scrollback_window: Option<PaneScrollbackWindow>,
-    pub extension_render_cache: BTreeMap<(String, Uuid), ExtensionRenderCacheEntry>,
-    pub extension_layer_snapshot_cache: BTreeMap<(String, Uuid), ExtensionLayerSnapshotCacheEntry>,
     pub extension_retained_layer_cache: BTreeMap<(String, Uuid), ExtensionRetainedLayerCacheEntry>,
     pub visual_row_fingerprints: PaneVisualRowFingerprintCache,
 }
@@ -730,11 +705,8 @@ impl Default for PaneRenderBuffer {
             sync_update_in_progress: false,
             sync_update_hold: SyncUpdateHold::Untimed,
             expected_stream_start: None,
-            extension_projection_cache: BTreeMap::new(),
             retained_screen_copy: false,
             scrollback_window: None,
-            extension_render_cache: BTreeMap::new(),
-            extension_layer_snapshot_cache: BTreeMap::new(),
             extension_retained_layer_cache: BTreeMap::new(),
             visual_row_fingerprints: PaneVisualRowFingerprintCache::default(),
         }

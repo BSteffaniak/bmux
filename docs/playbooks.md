@@ -717,7 +717,7 @@ raw ANSI bytes or pane text. Exact trace snapshots use compact semantic ops such
 as `full-frame` and `pane-row-segment:<pane>:<row>:<start_col>:<cells>`; the
 same
 compact format also covers actual attach-render trace ops such as `status-line`,
-`help-overlay`, and `extension-cached-replay:<surface>` for trace-backed
+`help-overlay`, and `extension-ops:<surface>:<regions>:<full_surface>` for trace-backed
 summaries. Trace-backed summaries draw pane rows whole (`pane-row-full`): the
 host's terminal writes only the cells that change.
 
@@ -750,7 +750,7 @@ assert-render since='baseline' max_frames=0 max_rows_emitted=0 max_cells_emitted
 | `overlay_rendered`              | bool | no       | -       | Whether overlay rendering was observed                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `expected_emitted_rows`         | str  | no       | -       | Exact normalized pane rows as `pane:row,pane:row`                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `expected_emitted_row_segments` | str  | no       | -       | Exact normalized row segments as `pane:row:start_col:cells`                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `expected_trace_ops`            | str  | no       | -       | Exact semantic trace ops, comma-separated (`full-frame`, `clear-row:row:cells`, `pane-row-full:pane:row:cells`, `pane-row-segment:pane:row:start_col:cells`, `pane-row-cache-skip:pane:row`, `pane-rows-sync-deferred:pane:rows`, `extension-ops:surface:regions:full_surface`, `extension-cached-replay:surface`, `status-line`, `help-overlay`, `prompt-overlay`, `damage-overlay:rects:cells`, `cursor:pane:visible`, `overlay`) |
+| `expected_trace_ops`            | str  | no       | -       | Exact semantic trace ops, comma-separated (`full-frame`, `clear-row:row:cells`, `pane-row-full:pane:row:cells`, `pane-row-segment:pane:row:start_col:cells`, `pane-row-cache-skip:pane:row`, `pane-rows-sync-deferred:pane:rows`, `extension-ops:surface:regions:full_surface`, `status-line`, `help-overlay`, `prompt-overlay`, `damage-overlay:rects:cells`, `cursor:pane:visible`, `overlay`) |
 
 ### Inspection
 

@@ -1033,11 +1033,6 @@ fn record_attach_trace_op(
             regions,
             full_surface,
         },
-        AttachTraceOp::ExtensionCachedReplay { surface_index } => {
-            PlaybookRenderTraceOp::ExtensionCachedReplay {
-                surface: trace_surface_index(surface_index),
-            }
-        }
         AttachTraceOp::StatusLine { .. } => {
             summary.status_rendered_frames = 1;
             PlaybookRenderTraceOp::StatusLine
@@ -5356,7 +5351,11 @@ mod tests {
             row: 2,
             cells: 6,
         });
-        trace.push(AttachTraceOp::ExtensionCachedReplay { surface_index: 2 });
+        trace.push(AttachTraceOp::ExtensionOps {
+            surface_index: 2,
+            regions: 1,
+            full_surface: false,
+        });
         trace.push(AttachTraceOp::HelpOverlay {
             rows: 3,
             cells: 120,
@@ -5409,7 +5408,11 @@ mod tests {
                     row: 2,
                     cells: 6,
                 },
-                PlaybookRenderTraceOp::ExtensionCachedReplay { surface: 2 },
+                PlaybookRenderTraceOp::ExtensionOps {
+                    surface: 2,
+                    regions: 1,
+                    full_surface: false,
+                },
                 PlaybookRenderTraceOp::HelpOverlay,
                 PlaybookRenderTraceOp::Cursor {
                     pane: 1,

@@ -1956,7 +1956,7 @@ use super::prompt_ui::{
 use super::render::{
     AttachRenderTrace, AttachRenderTraceOp, AttachSceneRenderStats, ExtensionRenderStats,
     collect_visual_projection_updates, frame_damage_overlay_rects, frame_damage_overlay_render_ops,
-    plugin_scene_items_to_render_items, queue_render_items_for_surface, queue_render_ops,
+    plugin_scene_items_to_render_items, queue_render_items_for_surface,
     render_attach_scene_with_stats_and_trace_with_capabilities,
     render_attach_scene_with_stats_and_trace_with_capabilities_and_occluders,
     visible_scene_pane_ids,
@@ -10465,7 +10465,7 @@ fn queue_retained_render_ops(
         .context("failed queueing retained render ops")
 }
 
-fn queue_retained_extension_ops(
+fn queue_retained_extension_scenes(
     canvas: &mut Canvas<'_, '_, '_>,
     surface: &RetainedSurface,
     repaint: &RetainedRepaintSurface,
@@ -10487,67 +10487,31 @@ fn queue_retained_extension_ops(
     };
     let mut wrote = false;
     for extension in extensions {
-        if let Some(scene) = extension.render_layer_scene_with_context(
+        let Some(scene) = extension.render_layer_scene_with_context(
             surface.id,
             &surface_rect,
-            RenderExtensionLayer::AfterPaneContent,
-            &context,
-        ) {
-            let items = plugin_scene_items_to_render_items(&scene);
-            wrote |= queue_render_items_for_surface(
-                canvas,
-                surface.id,
-                surface_rect,
-                &damage,
-                &items,
-                graphics_cache,
-                capabilities,
-                None,
-            )
-            .with_context(|| {
-                format!(
-                    "failed queueing retained extension scene {}",
-                    extension.name()
-                )
-            })?;
-            continue;
-        }
-        if let Some(items) = extension.render_layer_items_with_context(
-            surface.id,
-            &surface_rect,
-            &damage,
-            RenderExtensionLayer::AfterPaneContent,
-            &context,
-        ) {
-            wrote |= queue_render_items_for_surface(
-                canvas,
-                surface.id,
-                surface_rect,
-                &damage,
-                &items,
-                graphics_cache,
-                capabilities,
-                None,
-            )
-            .with_context(|| {
-                format!(
-                    "failed queueing retained extension items {}",
-                    extension.name()
-                )
-            })?;
-            continue;
-        }
-        let Some(ops) = extension.render_layer_ops_with_context(
-            surface.id,
-            &surface_rect,
-            &damage,
             RenderExtensionLayer::AfterPaneContent,
             &context,
         ) else {
             continue;
         };
-        wrote |= queue_render_ops(canvas, surface_rect, &damage, &ops)
-            .with_context(|| format!("failed queueing retained extension {}", extension.name()))?;
+        let items = plugin_scene_items_to_render_items(&scene);
+        wrote |= queue_render_items_for_surface(
+            canvas,
+            surface.id,
+            surface_rect,
+            &damage,
+            &items,
+            graphics_cache,
+            capabilities,
+            None,
+        )
+        .with_context(|| {
+            format!(
+                "failed queueing retained extension scene {}",
+                extension.name()
+            )
+        })?;
     }
     Ok(wrote)
 }
@@ -11516,7 +11480,7 @@ fn render_attach_frame_inner(
                 });
             }
             overlay_rendered = true;
-            overlay_rendered |= queue_retained_extension_ops(
+            overlay_rendered |= queue_retained_extension_scenes(
                 canvas,
                 help_surface,
                 repaint,
@@ -11542,7 +11506,7 @@ fn render_attach_frame_inner(
                 });
             }
             overlay_rendered = true;
-            overlay_rendered |= queue_retained_extension_ops(
+            overlay_rendered |= queue_retained_extension_scenes(
                 canvas,
                 prompt_surface,
                 repaint,
@@ -20357,20 +20321,23 @@ mod tests {
             "test.retained-overlay"
         }
 
-        fn render_layer_ops_with_context(
+        fn render_layer_scene_with_context(
             &self,
             _surface_id: Uuid,
             surface_rect: &ExtensionRect,
-            _damage: &RenderDamage,
             layer: RenderExtensionLayer,
             _context: &RenderExtensionContext,
-        ) -> Option<Vec<RenderOp>> {
+        ) -> Option<bmux_plugin::RenderLayerScene> {
             (layer == RenderExtensionLayer::AfterPaneContent).then(|| {
-                vec![RenderOp::border(
-                    *surface_rect,
-                    bmux_plugin::BorderGlyphs::rounded(),
-                    RenderStyle::new().bold(),
-                )]
+                bmux_plugin::RenderLayerScene::builder()
+                    .border(
+                        "frame",
+                        0,
+                        *surface_rect,
+                        bmux_plugin::BorderGlyphs::rounded(),
+                        RenderStyle::new().bold(),
+                    )
+                    .build()
             })
         }
     }
@@ -20413,7 +20380,7 @@ mod tests {
         let mut graphics_cache = TerminalGraphicsCache::new();
 
         let (wrote, lines) = presented_lines((20, 10), |canvas| {
-            queue_retained_extension_ops(
+            queue_retained_extension_scenes(
                 canvas,
                 &surface,
                 &repaint,

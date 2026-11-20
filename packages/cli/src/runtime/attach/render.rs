@@ -2,8 +2,7 @@ pub use bmux_attach_pipeline::render::{
     AttachRenderTrace, AttachRenderTraceOp, AttachSceneRenderStats, ExtensionRenderStats,
     apply_pane_frame, collect_visual_projection_updates, frame_damage_overlay_rects,
     frame_damage_overlay_render_ops, plugin_scene_items_to_render_items,
-    queue_render_items_for_surface, queue_render_ops,
-    render_attach_scene_with_stats_and_trace_with_capabilities,
+    queue_render_items_for_surface, render_attach_scene_with_stats_and_trace_with_capabilities,
     render_attach_scene_with_stats_and_trace_with_capabilities_and_occluders,
     visible_scene_pane_ids,
 };

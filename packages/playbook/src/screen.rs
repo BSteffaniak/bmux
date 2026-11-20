@@ -921,13 +921,11 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)] // Inline fixture keeps the render-buffer sync contract visible in one place.
-    fn sync_attach_render_buffers_preserves_render_caches_and_uses_scene_dimensions() {
+    fn sync_attach_render_buffers_preserves_buffer_state_and_uses_scene_dimensions() {
         use bmux_attach_layout_protocol::{
             AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface,
             AttachSurfaceKind, PaneLayoutNode, PaneState, PaneSummary,
         };
-        use bmux_attach_pipeline::types::ExtensionRenderCacheEntry;
-        use bmux_plugin::{ExtensionRect, RenderDamage};
 
         let session_id = Uuid::from_u128(91);
         let pane_id = Uuid::from_u128(92);
@@ -962,25 +960,13 @@ mod tests {
         );
 
         let mut buffers = BTreeMap::new();
-        let mut buffer = PaneRenderBuffer {
-            rows_drawn: true,
-            ..PaneRenderBuffer::default()
-        };
-        buffer.extension_render_cache.insert(
-            ("test.extension".to_string(), surface_id),
-            ExtensionRenderCacheEntry {
-                surface_id,
-                surface_rect: ExtensionRect {
-                    x: 0,
-                    y: 0,
-                    w: 6,
-                    h: 3,
-                },
-                damage: RenderDamage::FullSurface,
-                revision: 7,
+        buffers.insert(
+            pane_id,
+            PaneRenderBuffer {
+                rows_drawn: true,
+                ..PaneRenderBuffer::default()
             },
         );
-        buffers.insert(pane_id, buffer);
 
         let layout = AttachLayoutState {
             context_id: None,
@@ -1041,7 +1027,6 @@ mod tests {
             "first\nsecond"
         );
         assert!(synced.rows_drawn);
-        assert_eq!(synced.extension_render_cache.len(), 1);
         assert_eq!(synced.expected_stream_start, Some(42));
         assert!(synced.sync_update_in_progress);
     }

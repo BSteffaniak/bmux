@@ -15,23 +15,24 @@
 //!    [`RenderExtensionRegistry`] (there is no process-wide registry).
 //! 2. The attach runtime reads that registry on every frame and queries
 //!    each extension for each visible surface.
-//! 3. Extensions should prefer
+//! 3. Extensions paint through
 //!    [`AttachRenderExtension::render_layer_scene_with_context`], which returns
 //!    a retained description of the current visual intent. The renderer owns
 //!    diffing, stale cleanup, content replay, terminal graphics lifecycle, and
-//!    byte emission for retained scenes.
-//! 4. Older damage-oriented APIs such as [`AttachRenderExtension::render_ops`]
-//!    remain available as compatibility fallbacks. Extensions describe what
-//!    they show; they never write terminal bytes themselves.
+//!    byte emission. Extensions describe what they show; they never write
+//!    terminal bytes themselves.
+//! 4. An extension that can say when its scene changes reports
+//!    [`AttachRenderExtension::render_layer_revision`]; the host then samples
+//!    it again only when the revision, rect or context changes.
 //! 5. When a surface disappears (pane closed, layout recomputed without
 //!    it), the attach runtime calls
 //!    [`AttachRenderExtension::surface_removed`] so the extension can
 //!    evict any cached plugin state.
 //!
 //! Extensions are expected to be lightweight: the registry lookup is
-//! `O(n)` per render, and all render queries are on the hot path. Prefer
-//! caching source state when it changes, then constructing a retained scene
-//! cheaply during frame planning.
+//! `O(n)` per render, and scenes are built before every frame whose revision
+//! changed (every frame without one). Prefer caching source state when it
+//! changes, then constructing a retained scene cheaply.
 //!
 //! # Retained scene example
 //!
@@ -73,20 +74,17 @@
 //! }
 //! ```
 //!
-//! ## Migrating from `render_layer_ops`
+//! ## Writing scenes
 //!
-//! - Move per-frame damage calculations out of the plugin. Return all current
-//!   visual items from [`AttachRenderExtension::render_layer_scene_with_context`]
-//!   and let the renderer diff them against its retained snapshot.
-//! - Convert each logical `RenderOp` into a keyed [`RenderSceneItem`] via
-//!   [`RenderLayerScene::builder`]. Use stable keys such as
-//!   `"header/title"`, `"score/home"`, or `"border/top"` instead of frame-local
-//!   counters.
-//! - Put animation/version information in [`RenderLayerScene::revision`] when it
-//!   is convenient, but do not rely on revisions for cleanup. Cleanup is based
-//!   on retained item key/bounds/content diffs.
-//! - Return `None` only when the extension intentionally wants to use the older
-//!   damage-oriented fallback APIs.
+//! - Keep damage out of the plugin. Return all current visual items and let the
+//!   renderer diff them against its retained snapshot.
+//! - Build keyed [`RenderSceneItem`]s via [`RenderLayerScene::builder`]. Use
+//!   stable keys such as `"header/title"`, `"score/home"`, or `"border/top"`
+//!   instead of frame-local counters.
+//! - [`RenderLayerScene::revision`] is for diagnostics; reuse is gated on
+//!   [`AttachRenderExtension::render_layer_revision`], and cleanup on retained
+//!   item key/bounds/content diffs.
+//! - Return `None` to paint nothing on a surface.
 
 use std::any::Any;
 use std::collections::BTreeMap;
@@ -1627,50 +1625,11 @@ pub trait AttachRenderExtension: Send + Sync {
     /// frame is rendered.
     ///
     /// The attach renderer calls this once per frame, before querying
-    /// damage or render revisions. Implementations should make this a
+    /// render revisions or scenes. Implementations should make this a
     /// cheap non-blocking drain of already-retained state (for example,
     /// `watch::Receiver::borrow_and_update`), not an IPC call or other
     /// unbounded operation.
     fn refresh_state(&self) {}
-
-    /// Return the currently-invalid region for a surface.
-    ///
-    /// This is a compatibility-oriented API for extensions that still render
-    /// from damage-driven methods such as [`Self::render_ops`]. Extensions that implement
-    /// [`Self::render_layer_scene_with_context`] can usually avoid custom
-    /// damage tracking because the renderer diffs retained scene items.
-    ///
-    /// The default is conservative: if the caller asks an extension to repaint
-    /// and the extension cannot provide exact damage, the host treats the whole
-    /// surface as damaged.
-    fn surface_damage(&self, _surface_id: Uuid, _surface_rect: &ExtensionRect) -> RenderDamage {
-        RenderDamage::FullSurface
-    }
-
-    /// Return the currently-invalid region for a surface on a specific layer.
-    ///
-    /// This is the layered compatibility counterpart to
-    /// [`Self::surface_damage`]. Retained-scene extensions should prefer stable
-    /// item keys and let the renderer compute layer damage from retained diffs.
-    /// The default delegates to [`Self::surface_damage`] for backward
-    /// compatibility.
-    fn surface_layer_damage(
-        &self,
-        surface_id: Uuid,
-        surface_rect: &ExtensionRect,
-        _layer: RenderExtensionLayer,
-    ) -> RenderDamage {
-        self.surface_damage(surface_id, surface_rect)
-    }
-
-    /// Return whether this layer must be repainted after pane content is
-    /// emitted for the same surface. Extensions that only draw outside the
-    /// content rect can opt out so ordinary pane output does not promote their
-    /// damage to a full-surface repaint. The default is conservative for
-    /// overlay-style extensions and existing implementations.
-    fn redraws_on_content_damage(&self, _layer: RenderExtensionLayer) -> bool {
-        true
-    }
 
     /// Whether this extension painted, or will paint, cells inside `content` of the surface on
     /// `layer`. The host moves a pane's rows on the terminal with a scroll region only when no
@@ -1686,27 +1645,20 @@ pub trait AttachRenderExtension: Send + Sync {
         true
     }
 
-    /// Return an optional revision token for render output on this surface.
-    ///
-    /// The same contract as [`Self::render_layer_revision`], for both layers at once.
-    fn render_revision(&self, _surface_id: Uuid) -> Option<u64> {
-        None
-    }
-
     /// Return an optional revision token for render output on this surface
-    /// and layer. The default delegates to [`Self::render_revision`].
+    /// and layer. The default is `None`: sampled every frame.
     ///
     /// # Contract
     ///
     /// `Some(revision)` is a promise: while the token stays the same, and the
     /// host asks with the same surface rect and [`RenderExtensionContext`],
     /// everything the extension would answer for this surface and layer stays
-    /// the same — its scene, items, operations and layer damage. The host
+    /// the same: its scene and what it paints inside the content. The host
     /// relies on it: before each frame it samples the layer only when the
     /// token, the rect or the context changed, and otherwise reuses what it
     /// sampled last (it does not call the layer's render methods at all).
-    /// When both of a surface's layers are reused, the surface's
-    /// before-content cells, chrome and content-rect override are reused too.
+    /// When both of a surface's layers are reused, the surface's chrome and
+    /// content-rect override are reused too.
     ///
     /// So an extension that reports a revision must change it whenever any
     /// of that output can change, including for state the host cannot see
@@ -1716,32 +1668,23 @@ pub trait AttachRenderExtension: Send + Sync {
     ///
     /// A revision change alone does not imply stale cleanup: the host still
     /// derives cleanup from retained item keys, bounds and contents.
-    fn render_layer_revision(&self, surface_id: Uuid, _layer: RenderExtensionLayer) -> Option<u64> {
-        self.render_revision(surface_id)
-    }
-
-    /// Return declarative render operations for the damaged region of
-    /// `surface_rect`.
-    ///
-    /// This is a damage-oriented compatibility API. Prefer
-    /// [`Self::render_layer_scene_with_context`] for new extensions. Returning
-    /// `None` paints nothing; `Some(Vec::new())` means the extension has no
-    /// operations for this damage.
-    fn render_ops(
+    fn render_layer_revision(
         &self,
         _surface_id: Uuid,
-        _surface_rect: &ExtensionRect,
-        _damage: &RenderDamage,
-    ) -> Option<Vec<RenderOp>> {
+        _layer: RenderExtensionLayer,
+    ) -> Option<u64> {
         None
     }
 
     /// Return retained declarative visual intent for one layer.
     ///
-    /// Implementations that return a scene let the host renderer own diffing,
-    /// stale cleanup, content replay, z-ordering, terminal graphics lifecycle,
-    /// and byte emission. The default returns `None` so existing damage-oriented
-    /// extension APIs remain the compatibility fallback.
+    /// This is how an extension paints: the scene is everything it shows on
+    /// the surface's layer now, and the host renderer owns diffing, stale
+    /// cleanup, content replay, z-ordering, terminal graphics lifecycle, and
+    /// byte emission. On [`RenderExtensionLayer::BeforePaneContent`], items
+    /// land under the pane's content (as [`RenderSceneItemKind::UnderCells`]
+    /// do), where content cells with text cover them. The default, `None`,
+    /// paints nothing.
     fn render_layer_scene_with_context(
         &self,
         surface_id: Uuid,
@@ -1769,100 +1712,6 @@ pub trait AttachRenderExtension: Send + Sync {
     ) -> Option<Arc<RenderLayerScene>> {
         self.render_layer_scene_with_context(surface_id, surface_rect, layer, context)
             .map(Arc::new)
-    }
-
-    /// Return z-ordered declarative render items for one layer and damaged
-    /// region of `surface_rect`.
-    ///
-    /// This is a damage-oriented compatibility API. Prefer retained scenes for
-    /// new extensions. Returning `None` asks the host to fall back to
-    /// [`Self::render_layer_ops_with_context`]. The default preserves existing
-    /// operation-only extensions.
-    fn render_layer_items_with_context(
-        &self,
-        surface_id: Uuid,
-        surface_rect: &ExtensionRect,
-        damage: &RenderDamage,
-        layer: RenderExtensionLayer,
-        context: &RenderExtensionContext,
-    ) -> Option<Vec<RenderLayerItem>> {
-        let _ = (surface_id, surface_rect, damage, layer, context);
-        None
-    }
-
-    /// Return declarative render operations for one layer and damaged region of
-    /// `surface_rect`.
-    ///
-    /// This is the layered damage-oriented compatibility API. Prefer retained
-    /// scenes for new extensions. Returning `None` paints nothing. The default
-    /// delegates after-content rendering to [`Self::render_ops`] and emits no
-    /// before-content operations.
-    fn render_layer_ops(
-        &self,
-        surface_id: Uuid,
-        surface_rect: &ExtensionRect,
-        damage: &RenderDamage,
-        layer: RenderExtensionLayer,
-    ) -> Option<Vec<RenderOp>> {
-        match layer {
-            RenderExtensionLayer::BeforePaneContent => Some(Vec::new()),
-            RenderExtensionLayer::AfterPaneContent => {
-                self.render_ops(surface_id, surface_rect, damage)
-            }
-        }
-    }
-
-    /// Context-aware counterpart to [`Self::render_ops`]. The default
-    /// preserves existing extension behavior.
-    fn render_ops_with_context(
-        &self,
-        surface_id: Uuid,
-        surface_rect: &ExtensionRect,
-        damage: &RenderDamage,
-        _context: &RenderExtensionContext,
-    ) -> Option<Vec<RenderOp>> {
-        self.render_ops(surface_id, surface_rect, damage)
-    }
-
-    /// Context-aware counterpart to [`Self::render_layer_ops`].
-    fn render_layer_ops_with_context(
-        &self,
-        surface_id: Uuid,
-        surface_rect: &ExtensionRect,
-        damage: &RenderDamage,
-        layer: RenderExtensionLayer,
-        context: &RenderExtensionContext,
-    ) -> Option<Vec<RenderOp>> {
-        match layer {
-            RenderExtensionLayer::BeforePaneContent => Some(Vec::new()),
-            RenderExtensionLayer::AfterPaneContent => {
-                self.render_ops_with_context(surface_id, surface_rect, damage, context)
-            }
-        }
-    }
-
-    /// Return before-content cells for the damaged region of `surface_rect`.
-    /// This is the composited counterpart to [`Self::render_layer_ops`] for
-    /// [`RenderExtensionLayer::BeforePaneContent`]: cells returned here are
-    /// merged into pane row rendering so pane content can repaint over them.
-    fn render_before_content_cells(
-        &self,
-        _surface_id: Uuid,
-        _surface_rect: &ExtensionRect,
-        _damage: &RenderDamage,
-    ) -> Option<Vec<(u16, u16, RenderUnderCell)>> {
-        Some(Vec::new())
-    }
-
-    /// Context-aware counterpart to [`Self::render_before_content_cells`].
-    fn render_before_content_cells_with_context(
-        &self,
-        surface_id: Uuid,
-        surface_rect: &ExtensionRect,
-        damage: &RenderDamage,
-        _context: &RenderExtensionContext,
-    ) -> Option<Vec<(u16, u16, RenderUnderCell)>> {
-        self.render_before_content_cells(surface_id, surface_rect, damage)
     }
 
     /// Override the surface's content-rect inset. Returning `Some`
@@ -2260,24 +2109,26 @@ mod tests {
         assert!(registry.snapshot().is_empty());
     }
 
+    /// An extension that overrides nothing paints nothing and promises no revision, so the host
+    /// samples it every frame.
     #[test]
-    fn extension_default_damage_is_full_surface() {
+    fn extension_defaults_paint_nothing_and_report_no_revision() {
         let ext = RecordingExtension {
             name: "x".to_string(),
             removed: Mutex::new(Vec::new()),
         };
-        assert_eq!(
-            ext.surface_damage(
-                Uuid::nil(),
-                &ExtensionRect {
-                    x: 0,
-                    y: 0,
-                    w: 1,
-                    h: 1,
-                },
-            ),
-            RenderDamage::FullSurface
-        );
+        let rect = ExtensionRect::new(0, 0, 1, 1);
+        let context = RenderExtensionContext::default();
+        for layer in [
+            RenderExtensionLayer::BeforePaneContent,
+            RenderExtensionLayer::AfterPaneContent,
+        ] {
+            assert!(
+                ext.render_layer_scene_shared(Uuid::nil(), &rect, layer, &context)
+                    .is_none()
+            );
+            assert_eq!(ext.render_layer_revision(Uuid::nil(), layer), None);
+        }
     }
 
     #[test]
