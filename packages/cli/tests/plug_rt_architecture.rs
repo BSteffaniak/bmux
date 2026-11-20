@@ -72,12 +72,11 @@ const RUNTIME_CONSTRUCTION: [&str; 3] = [
 /// Remaining legacy executors built by synchronous command and service bridges in
 /// bundled-only plugins, with their exact counts. This list may only shrink:
 /// porting a command to an async entry on plug-rt removes its entry.
-const LEGACY_SYNC_COMMAND_EXECUTORS: [(&str, usize); 8] = [
+const LEGACY_SYNC_COMMAND_EXECUTORS: [(&str, usize); 7] = [
     ("plugins/broadcast-plugin/src/controller.rs", 2),
     ("plugins/broadcast-plugin/src/lib.rs", 1),
     ("plugins/presenter-plugin/src/lib.rs", 1),
     ("plugins/presenter-plugin/src/services.rs", 1),
-    ("plugins/recording-plugin/src/commands.rs", 1),
     ("plugins/recording-plugin/src/interactive_command.rs", 1),
     ("plugins/recording-plugin/src/process_commands.rs", 1),
     ("plugins/recording-plugin/src/process_runtime.rs", 1),
