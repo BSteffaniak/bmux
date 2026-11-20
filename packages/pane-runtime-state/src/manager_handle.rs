@@ -614,6 +614,23 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
         pane_ids: &[Uuid],
     ) -> Result<(), SessionRuntimeError>;
 
+    /// Frames for an observer, as [`Self::attach_pane_frames`] makes them, of `targets`
+    /// (session, pane) the client need not be attached to; targets that no longer exist are
+    /// skipped. The caller authorizes the observer.
+    fn observe_pane_frames(
+        &self,
+        client_id: ClientId,
+        targets: &[(SessionId, Uuid)],
+        max_history_lines: usize,
+    ) -> Result<(Vec<AttachPaneFrame>, bool), SessionRuntimeError>;
+
+    /// Start an observer's replicas of `targets` over: each next frame is a reset frame.
+    fn reset_observed_pane_frames(
+        &self,
+        client_id: ClientId,
+        targets: &[(SessionId, Uuid)],
+    ) -> Result<(), SessionRuntimeError>;
+
     /// Composite: clear `image_dirty` on each pane, then compute image
     /// registry deltas per pane since the provided sequence numbers.
     /// Returns one `AttachPaneImageDelta` per pane in `pane_ids` order.
@@ -1131,6 +1148,23 @@ impl SessionRuntimeManagerApi for NoopSessionRuntimeManager {
         _pane_ids: &[Uuid],
         _max_history_lines: usize,
     ) -> Result<(Vec<AttachPaneFrame>, bool), SessionRuntimeError> {
+        Err(SessionRuntimeError::NotFound)
+    }
+
+    fn observe_pane_frames(
+        &self,
+        _client_id: ClientId,
+        _targets: &[(SessionId, Uuid)],
+        _max_history_lines: usize,
+    ) -> Result<(Vec<AttachPaneFrame>, bool), SessionRuntimeError> {
+        Err(SessionRuntimeError::NotFound)
+    }
+
+    fn reset_observed_pane_frames(
+        &self,
+        _client_id: ClientId,
+        _targets: &[(SessionId, Uuid)],
+    ) -> Result<(), SessionRuntimeError> {
         Err(SessionRuntimeError::NotFound)
     }
 

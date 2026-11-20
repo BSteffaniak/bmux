@@ -1441,6 +1441,27 @@ interface attach-runtime-state {
         max_history_lines: u32,
     ) -> result<attach-pane-output-push, attach-state-error>;
 
+    // A pane a frame observer follows.
+    record observed-pane {
+        session_id: uuid,
+        pane_id: uuid,
+    }
+
+    // Push frames of `targets` to `client_id` as attach-pane-frame-push does, but as an
+    // observer: the client need not be attached to their sessions. Empty `targets` stops it.
+    // Only the cluster plugin, in process, may call it (it authorizes the observer).
+    query observe-pane-frames(
+        client_id: uuid,
+        targets: list<observed-pane>,
+        max_history_lines: u32,
+    ) -> result<attach-pane-output-push, attach-state-error>;
+
+    // Start an observer's replicas of `targets` over: each next frame is a reset frame.
+    query observe-pane-frames-reset(
+        client_id: uuid,
+        targets: list<observed-pane>,
+    ) -> result<attach-pane-frames-reset, attach-state-error>;
+
     record history-images-v1 {
         capture_id: uuid,
         // Complete replacement for this capture/window, including an empty list.

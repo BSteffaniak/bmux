@@ -37,11 +37,12 @@ struct Subscription {
 /// One pane-runtime activation's push subscriptions, pending barrier
 /// notices and pull-source registration. Owned by that activation's host
 /// handles; nothing here is process-wide.
-/// A client's pushed frames: its panes, and the history a reset frame carries at most.
+/// A client's pushed frames: its panes (session, pane), the history a reset frame carries at
+/// most, and whether it observes them (need not be attached to their sessions).
 struct FrameSubscription {
-    session_id: Uuid,
-    pane_ids: Vec<Uuid>,
+    targets: Vec<(Uuid, Uuid)>,
     max_history_lines: usize,
+    observer: bool,
 }
 
 #[derive(Default)]
@@ -183,12 +184,41 @@ pub fn subscribe_frames(
     frame_subscriptions(host).insert(
         client,
         FrameSubscription {
-            session_id,
-            pane_ids,
+            targets: pane_ids
+                .into_iter()
+                .map(|pane_id| (session_id, pane_id))
+                .collect(),
             max_history_lines,
+            observer: false,
         },
     );
     // The panes as they are now are sent at once.
+    wake(host, client)
+}
+
+/// Push `client` frames of `targets` (session, pane) as an observer, authorized by the caller;
+/// empty `targets` stops it.
+pub fn observe_frames(
+    host: &crate::runtime::PaneRuntimeHost,
+    client: Uuid,
+    targets: Vec<(Uuid, Uuid)>,
+    max_history_lines: usize,
+) -> bool {
+    if targets.is_empty() {
+        frame_subscriptions(host).remove(&client);
+        return false;
+    }
+    if !source_registered(host) {
+        return false;
+    }
+    frame_subscriptions(host).insert(
+        client,
+        FrameSubscription {
+            targets,
+            max_history_lines,
+            observer: true,
+        },
+    );
     wake(host, client)
 }
 
@@ -218,9 +248,7 @@ pub fn pane_output_available(
     clients.extend(
         frame_subscriptions(host)
             .iter()
-            .filter(|(_, subscription)| {
-                subscription.session_id == session_id && subscription.pane_ids.contains(&pane_id)
-            })
+            .filter(|(_, subscription)| subscription.targets.contains(&(session_id, pane_id)))
             .map(|(client, _)| *client),
     );
     clients.sort_unstable();
@@ -272,22 +300,38 @@ fn pull(host: &crate::runtime::PaneRuntimeHost, client: Uuid) -> Option<Vec<u8>>
 
 /// The host can send to `client`: frames for its panes that changed, encoded.
 fn pull_frames(host: &crate::runtime::PaneRuntimeHost, client: Uuid) -> Option<Vec<u8>> {
-    let (session_id, pane_ids, max_history_lines) = {
+    let (targets, max_history_lines, observer) = {
         let subscriptions = frame_subscriptions(host);
         let subscription = subscriptions.get(&client)?;
         (
-            subscription.session_id,
-            subscription.pane_ids.clone(),
+            subscription.targets.clone(),
             subscription.max_history_lines,
+            subscription.observer,
         )
     };
     let handle = host.registered_session_runtime()?;
-    let Ok((frames, still_pending)) = handle.0.attach_pane_frames(
-        SessionId(session_id),
-        ClientId(client),
-        &pane_ids,
-        max_history_lines,
-    ) else {
+    let built = if observer {
+        let targets: Vec<(SessionId, Uuid)> = targets
+            .iter()
+            .map(|(session, pane)| (SessionId(*session), *pane))
+            .collect();
+        handle
+            .0
+            .observe_pane_frames(ClientId(client), &targets, max_history_lines)
+    } else {
+        // An attached client's panes are all of one session.
+        let session_id = targets
+            .first()
+            .map_or_else(Uuid::nil, |(session, _)| *session);
+        let pane_ids: Vec<Uuid> = targets.iter().map(|(_, pane)| *pane).collect();
+        handle.0.attach_pane_frames(
+            SessionId(session_id),
+            ClientId(client),
+            &pane_ids,
+            max_history_lines,
+        )
+    };
+    let Ok((frames, still_pending)) = built else {
         // Detached from the session: stop pushing.
         frame_subscriptions(host).remove(&client);
         return None;

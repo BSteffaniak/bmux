@@ -489,6 +489,12 @@ fn route_authorized(
         "attach-runtime-state", "attach-pane-frame-push" => |req: attach_state::AttachPaneFramesArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_state::attach_pane_frame_push(host, &req, ctx))
         },
+        "attach-runtime-state", "observe-pane-frames" => |req: attach_state::ObservePaneFramesArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_state::observe_pane_frames(host, &req, ctx))
+        },
+        "attach-runtime-state", "observe-pane-frames-reset" => |req: attach_state::ObservePaneFramesResetArgs, ctx| {
+            Ok::<_, ServiceResponse>(attach_state::observe_pane_frames_reset(host, &req, ctx))
+        },
         "attach-runtime-state", "attach-history-images-v1" => |req: attach_state::HistoryImagesArgs, ctx| {
             Ok::<_, ServiceResponse>(attach_state::history_images(host, &req, ctx))
         },

@@ -232,6 +232,25 @@ pub struct AttachPaneFramesResetArgs {
     pub pane_ids: Vec<Uuid>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ObservedPaneArg {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservePaneFramesArgs {
+    pub client_id: Uuid,
+    pub targets: Vec<ObservedPaneArg>,
+    pub max_history_lines: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservePaneFramesResetArgs {
+    pub client_id: Uuid,
+    pub targets: Vec<ObservedPaneArg>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttachPaneImagesArgs {
     pub session_id: Uuid,
@@ -747,6 +766,64 @@ pub fn attach_pane_frame_push(
             req.pane_ids.clone(),
             req.max_history_lines as usize,
         ),
+    })
+}
+
+/// The cluster plugin, in process, authorizes frame observers; nothing else may name a client.
+fn authorize_observer(ctx: &NativeServiceContext) -> Result<(), AttachStateError> {
+    match super::spawn::caller_provenance(ctx) {
+        Ok(bmux_plugin::StreamOrigin::HostInternal)
+            if ctx.request.caller_plugin_id == "bmux.cluster" =>
+        {
+            Ok(())
+        }
+        _ => Err(AttachStateError::Failed {
+            reason: "frame observers are registered by the cluster plugin only".to_string(),
+        }),
+    }
+}
+
+/// `observe-pane-frames`: push frames of panes to a client as an observer.
+pub fn observe_pane_frames(
+    host: &crate::runtime::PaneRuntimeHost,
+    req: &ObservePaneFramesArgs,
+    ctx: &NativeServiceContext,
+) -> Result<AttachPaneOutputPush, AttachStateError> {
+    authorize_observer(ctx)?;
+    Ok(AttachPaneOutputPush {
+        enabled: super::output_push::observe_frames(
+            host,
+            req.client_id,
+            req.targets
+                .iter()
+                .map(|target| (target.session_id, target.pane_id))
+                .collect(),
+            req.max_history_lines as usize,
+        ),
+    })
+}
+
+/// `observe-pane-frames-reset`: an observer's replicas start over.
+pub fn observe_pane_frames_reset(
+    host: &crate::runtime::PaneRuntimeHost,
+    req: &ObservePaneFramesResetArgs,
+    ctx: &NativeServiceContext,
+) -> Result<AttachPaneFramesReset, AttachStateError> {
+    authorize_observer(ctx)?;
+    let handle = host
+        .registered_session_runtime()
+        .ok_or(AttachStateError::SessionNotFound)?;
+    let targets: Vec<(SessionId, Uuid)> = req
+        .targets
+        .iter()
+        .map(|target| (SessionId(target.session_id), target.pane_id))
+        .collect();
+    handle
+        .0
+        .reset_observed_pane_frames(ClientId(req.client_id), &targets)
+        .map_err(attach_runtime_error)?;
+    Ok(AttachPaneFramesReset {
+        panes: u32::try_from(targets.len()).unwrap_or(u32::MAX),
     })
 }
 

@@ -10066,6 +10066,17 @@ impl SessionRuntimeManager {
             .collect())
     }
 
+    /// The panes of `targets` (session, pane) that exist, whoever is attached.
+    fn pane_data_refs_for_targets(&self, targets: &[(SessionId, Uuid)]) -> Vec<PaneAttachDataRef> {
+        targets
+            .iter()
+            .filter_map(|(session_id, pane_id)| {
+                let pane = self.runtimes.get(session_id)?.panes.get(pane_id)?;
+                Some(pane_attach_data_ref(*session_id, *pane_id, pane))
+            })
+            .collect()
+    }
+
     fn attach_pane_data_ref_for_push(
         &self,
         session_id: SessionId,
@@ -11079,6 +11090,83 @@ impl ServerSessionRuntimeAdapter {
         };
         boxed.downcast::<SessionRuntimeHandle>().ok().map(|b| *b)
     }
+}
+
+/// Frames bringing `client_id`'s replicas of `panes` level with their grids (see
+/// `attach_pane_frames`), and whether more remain for the next call.
+fn frames_for_panes(
+    panes: &[PaneAttachDataRef],
+    client_id: ClientId,
+    max_history_lines: usize,
+) -> Result<(Vec<bmux_pane_runtime_state::AttachPaneFrame>, bool), SessionRuntimeError> {
+    // As an output read does: output after this wakes the client again.
+    for pane in panes {
+        pane.output_dirty.store(false, Ordering::SeqCst);
+    }
+    let mut frames = Vec::new();
+    let mut remaining = RESPONSE_OUTPUT_BUDGET;
+    let mut still_pending = false;
+    let mut seen = BTreeSet::new();
+    for pane in panes {
+        if !seen.insert(pane.pane_id) {
+            continue;
+        }
+        let mut grid = pane
+            .terminal_grid
+            .lock()
+            .map_err(|_| SessionRuntimeError::Closed)?;
+        let mut replicas = pane
+            .frame_replicas
+            .lock()
+            .map_err(|_| SessionRuntimeError::Closed)?;
+        let replica = replicas.entry(client_id).or_default();
+        let revision = grid.grid().revision();
+        if replica.cursor.epoch != 0
+            && replica.revision == revision
+            && replica.clipboard_writes.is_empty()
+        {
+            continue;
+        }
+        // Sealing a frame not sent loses nothing: the next one is built from the same base.
+        let mut encoded = Vec::new();
+        let frame =
+            grid.grid_mut()
+                .write_frame_since(replica.cursor, max_history_lines, &mut encoded);
+        let sync_update_active = grid.grid().synchronized_update();
+        drop(grid);
+        if encoded.len() > remaining && !frames.is_empty() {
+            still_pending = true;
+            continue;
+        }
+        remaining = remaining.saturating_sub(encoded.len());
+        replica.cursor = frame.next;
+        replica.revision = revision;
+        let replay_markers = replica
+            .replay_markers
+            .drain(..)
+            .flat_map(|(frame, written)| bmux_bench::corpus::marker(frame, written))
+            .collect();
+        let clipboard_writes = replica
+            .clipboard_writes
+            .drain(..)
+            .map(
+                |(selection, text)| bmux_pane_runtime_state::PaneClipboardWrite { selection, text },
+            )
+            .collect();
+        frames.push(bmux_pane_runtime_state::AttachPaneFrame {
+            pane_id: pane.pane_id,
+            sync_update_active,
+            encoded,
+            replay_markers,
+            clipboard_writes,
+        });
+    }
+    // Output that arrived while these frames were built is sent next.
+    let still_pending = still_pending
+        || panes
+            .iter()
+            .any(|pane| pane.output_dirty.load(Ordering::SeqCst));
+    Ok((frames, still_pending))
 }
 
 impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeAdapter {
@@ -12460,77 +12548,40 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                 m.attach_pane_data_refs_for_session_panes(session_id, client_id, pane_ids)
             })
             .unwrap_or(Err(SessionRuntimeError::Closed))?;
-        // As an output read does: output after this wakes the client again.
-        for pane in &panes {
-            pane.output_dirty.store(false, Ordering::SeqCst);
-        }
-        let mut frames = Vec::new();
-        let mut remaining = RESPONSE_OUTPUT_BUDGET;
-        let mut still_pending = false;
-        let mut seen = BTreeSet::new();
-        for pane in &panes {
-            if !seen.insert(pane.pane_id) {
-                continue;
-            }
-            let mut grid = pane
-                .terminal_grid
+        frames_for_panes(&panes, client_id, max_history_lines)
+    }
+
+    fn observe_pane_frames(
+        &self,
+        client_id: ClientId,
+        targets: &[(SessionId, Uuid)],
+        max_history_lines: usize,
+    ) -> Result<(Vec<bmux_pane_runtime_state::AttachPaneFrame>, bool), SessionRuntimeError> {
+        let panes = self
+            .with_lock_read_named("observe_pane_frames.resolve", |m| {
+                m.pane_data_refs_for_targets(targets)
+            })
+            .ok_or(SessionRuntimeError::Closed)?;
+        frames_for_panes(&panes, client_id, max_history_lines)
+    }
+
+    fn reset_observed_pane_frames(
+        &self,
+        client_id: ClientId,
+        targets: &[(SessionId, Uuid)],
+    ) -> Result<(), SessionRuntimeError> {
+        let panes = self
+            .with_lock_read_named("reset_observed_pane_frames.resolve", |m| {
+                m.pane_data_refs_for_targets(targets)
+            })
+            .ok_or(SessionRuntimeError::Closed)?;
+        for pane in panes {
+            pane.frame_replicas
                 .lock()
-                .map_err(|_| SessionRuntimeError::Closed)?;
-            let mut replicas = pane
-                .frame_replicas
-                .lock()
-                .map_err(|_| SessionRuntimeError::Closed)?;
-            let replica = replicas.entry(client_id).or_default();
-            let revision = grid.grid().revision();
-            if replica.cursor.epoch != 0
-                && replica.revision == revision
-                && replica.clipboard_writes.is_empty()
-            {
-                continue;
-            }
-            // Sealing a frame not sent loses nothing: the next one is built from the same base.
-            let mut encoded = Vec::new();
-            let frame =
-                grid.grid_mut()
-                    .write_frame_since(replica.cursor, max_history_lines, &mut encoded);
-            let sync_update_active = grid.grid().synchronized_update();
-            drop(grid);
-            if encoded.len() > remaining && !frames.is_empty() {
-                still_pending = true;
-                continue;
-            }
-            remaining = remaining.saturating_sub(encoded.len());
-            replica.cursor = frame.next;
-            replica.revision = revision;
-            let replay_markers = replica
-                .replay_markers
-                .drain(..)
-                .flat_map(|(frame, written)| bmux_bench::corpus::marker(frame, written))
-                .collect();
-            let clipboard_writes = replica
-                .clipboard_writes
-                .drain(..)
-                .map(
-                    |(selection, text)| bmux_pane_runtime_state::PaneClipboardWrite {
-                        selection,
-                        text,
-                    },
-                )
-                .collect();
-            frames.push(bmux_pane_runtime_state::AttachPaneFrame {
-                pane_id: pane.pane_id,
-                sync_update_active,
-                encoded,
-                replay_markers,
-                clipboard_writes,
-            });
+                .map_err(|_| SessionRuntimeError::Closed)?
+                .remove(&client_id);
         }
-        // Output that arrived while these frames were built is sent next.
-        let still_pending = still_pending
-            || panes
-                .iter()
-                .any(|pane| pane.output_dirty.load(Ordering::SeqCst));
-        Ok((frames, still_pending))
+        Ok(())
     }
 
     fn reset_attach_pane_frames(
@@ -19025,6 +19076,49 @@ exit 7"#
     /// An attached client's frames keep a replica of the pane's grid level with it: a reset frame
     /// first, nothing while the grid is unchanged, then what changed; a reset starts it over, and
     /// detaching forgets it.
+    /// An observer, not attached to the pane's session, gets frames that keep its replica level
+    /// with the grid as an attached client does; a reset starts it over, and a target that does
+    /// not exist is skipped.
+    #[tokio::test]
+    async fn observed_pane_frames_keep_an_unattached_replica_level_with_the_grid() {
+        use bmux_pane_runtime_state::SessionRuntimeManagerApi as Api;
+        let session_id = SessionId(Uuid::new_v4());
+        let observer = ClientId(Uuid::new_v4());
+        let pane_id = Uuid::new_v4();
+        let runtime = runtime_with_panes(&[pane_id]);
+        let pane = runtime.panes.get(&pane_id).expect("pane should exist");
+        set_pane_grid(pane, 20, 4);
+        let grid = Arc::clone(&pane.terminal_grid);
+        grid.lock().unwrap().process(b"one\r\ntwo\r\n");
+        let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
+        let targets = [(session_id, pane_id), (session_id, Uuid::new_v4())];
+        let mut replica = TerminalGrid::new(1, 1, GridLimits::default()).unwrap();
+        let mut cursor = bmux_terminal_grid::ReplicaCursor::default();
+        let mut follow = |adapter: &ServerSessionRuntimeAdapter| {
+            let (frames, pending) = Api::observe_pane_frames(adapter, observer, &targets, 0)
+                .expect("an observer gets frames");
+            assert!(!pending);
+            let mut reset = false;
+            for frame in &frames {
+                reset |= replica
+                    .apply_frame(&frame.encoded, &mut cursor)
+                    .expect("frame applies")
+                    .reset;
+            }
+            assert_eq!(
+                replica.snapshot(0, 100).rows,
+                grid.lock().unwrap().grid().snapshot(0, 100).rows
+            );
+            (frames.len(), reset)
+        };
+        assert_eq!(follow(&adapter), (1, true), "first a reset frame");
+        assert_eq!(follow(&adapter), (0, false), "nothing while unchanged");
+        grid.lock().unwrap().process(b"three");
+        assert_eq!(follow(&adapter), (1, false), "then what changed");
+        Api::reset_observed_pane_frames(&adapter, observer, &targets).unwrap();
+        assert_eq!(follow(&adapter), (1, true), "a reset replica starts over");
+    }
+
     #[tokio::test]
     async fn attach_pane_frames_keep_a_client_replica_level_with_the_pane_grid() {
         use bmux_pane_runtime_state::SessionRuntimeManagerApi as Api;
