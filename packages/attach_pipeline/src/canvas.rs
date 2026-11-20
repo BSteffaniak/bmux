@@ -132,6 +132,13 @@ impl<'canvas, 'frame, 'buffer> Canvas<'canvas, 'frame, 'buffer> {
         self.cx.replace_cells(i32::from(x), i64::from(y), cells);
     }
 
+    /// Paint printable ASCII `bytes` in `style` from column `x` of row `y`, one narrow cell
+    /// each, as [`Self::cells`] paints them.
+    pub fn ascii_run(&mut self, x: u16, y: u16, bytes: &[u8], style: Style) {
+        self.cx
+            .replace_ascii_run(i32::from(x), i64::from(y), bytes, style);
+    }
+
     /// Paint `width` blanks in `style` from column `x` of row `y`, as [`Self::cells`] paints
     /// narrow blank cells.
     pub fn blanks(&mut self, x: u16, y: u16, width: u16, style: Style) {

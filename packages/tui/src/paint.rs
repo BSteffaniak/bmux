@@ -433,6 +433,59 @@ impl<'frame, 'buffer> PaintCx<'frame, 'buffer> {
         }
     }
 
+    /// Paint printable ASCII `bytes` in `style` from a local coordinate, one narrow cell each,
+    /// exactly as [`Self::replace_cells`] paints them (each cell's whole style replaced, only the
+    /// cells that change reported when painting over the last frame), without building cells
+    /// one at a time: the bulk of a terminal row is runs of this kind.
+    pub fn replace_ascii_run(&mut self, x: i32, y: i64, bytes: &[u8], style: Style) {
+        debug_assert!(bytes.iter().all(|byte| matches!(byte, 0x20..=0x7e)));
+        let width = u16::try_from(bytes.len()).unwrap_or(u16::MAX);
+        let Some(row) = self.project_rect(LocalRect::new(x, y, width, 1)) else {
+            return;
+        };
+        // Columns of the run clipped off at the left.
+        let skipped = usize::try_from(i64::from(row.x) - projected_unclipped_x(self.origin_x, x))
+            .unwrap_or(0);
+        let style = self.inherited_style.patch(style);
+        let mut changed = self
+            .frame
+            .reports_changes_only()
+            .then(|| self.frame.take_changed_columns());
+        let buffer = self.frame.buffer_for_write();
+        let mut column = row.x;
+        let mut rest = bytes.get(skipped..).unwrap_or_default();
+        while column < row.right() && !rest.is_empty() {
+            let set =
+                buffer.put_ascii_run(column, row.right(), row.y, rest, style, changed.as_mut());
+            column += set;
+            rest = &rest[usize::from(set)..];
+            if set == 0 {
+                // A wide cell, or the continuation of one, under this column: put this byte as
+                // a cell put alone would be, clearing the wide cell.
+                let point = Point::new(column, row.y);
+                let symbol = [rest[0]];
+                let symbol = std::str::from_utf8(&symbol).unwrap_or(" ");
+                if let Some(changed) = changed.as_mut()
+                    && !buffer.holds_symbol(point, symbol, 1, style)
+                {
+                    changed.note(column, column + 1);
+                }
+                buffer.put_symbol(point, symbol, 1, style);
+                column += 1;
+                rest = &rest[1..];
+            }
+        }
+        if let Some(changed) = changed {
+            for run in changed.runs() {
+                self.frame
+                    .wrote(Rect::new(run.start, row.y, run.end - run.start, 1));
+            }
+            self.frame.return_changed_columns(changed);
+        } else if column > row.x {
+            self.frame.wrote(Rect::new(row.x, row.y, column - row.x, 1));
+        }
+    }
+
     /// Paint `width` blanks in `style` from a local coordinate, exactly as [`Self::replace_cells`]
     /// paints narrow blank cells (each cell's whole style replaced, only the cells that change
     /// reported when painting over the last frame), without building them one at a time: the

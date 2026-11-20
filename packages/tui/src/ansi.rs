@@ -757,13 +757,26 @@ fn emit_row_cells(
         // `Cell::symbol` is public, so defend even against callers bypassing buffer
         // setters. Never let cell text inject terminal protocol or shift the cursor.
         if let [byte] = symbol {
-            // Most cells: one ASCII byte, one column.
-            writer.write_all(if byte.is_ascii_control() {
-                b" "
-            } else {
-                symbol
-            })?;
+            // Most cells: one ASCII byte, one column, in runs sharing a style. Write the run at
+            // once.
+            let printable = |byte: u8| if byte.is_ascii_control() { b' ' } else { byte };
+            let mut run = [0_u8; 128];
+            run[0] = printable(*byte);
+            let mut len = 1;
             x = x.saturating_add(1);
+            while x < end && len < run.len() {
+                let next = &cells[usize::from(x - area.x)];
+                let [byte] = next.symbol.as_bytes() else {
+                    break;
+                };
+                if next.is_wide_continuation() || next.style != *active_style {
+                    break;
+                }
+                run[len] = printable(*byte);
+                len += 1;
+                x = x.saturating_add(1);
+            }
+            writer.write_all(&run[..len])?;
             continue;
         }
         if symbol.is_empty() {

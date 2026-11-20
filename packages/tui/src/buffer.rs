@@ -516,6 +516,48 @@ impl Buffer {
         set
     }
 
+    /// Put printable ASCII `bytes`, one narrow cell each in `style`, from column `x` of row `y`
+    /// up to `end`, as [`Self::put_narrow_run`] puts narrow cells, noting in `changed` the
+    /// columns that change. Stops before a cell that is wide or continues one (the caller puts
+    /// the rest cell by cell); returns the cells put.
+    pub(crate) fn put_ascii_run(
+        &mut self,
+        x: u16,
+        end: u16,
+        y: u16,
+        bytes: &[u8],
+        style: Style,
+        mut changed: Option<&mut ChangedColumns>,
+    ) -> u16 {
+        let Some(start) = self.index(Point::new(x, y)) else {
+            return 0;
+        };
+        let columns = usize::from(end.min(self.area.right()).saturating_sub(x)).min(bytes.len());
+        // Changed columns are noted per contiguous span, as noting each would merge them.
+        let mut span: Option<u16> = None;
+        let mut set = 0_u16;
+        for (cell, &byte) in self.cells[start..start + columns].iter_mut().zip(bytes) {
+            if cell.width != 1 || cell.wide_continuation {
+                break;
+            }
+            let column = x + set;
+            if cell.style == style && cell.symbol.is_byte(byte) {
+                if let (Some(first), Some(changed)) = (span.take(), changed.as_deref_mut()) {
+                    changed.note(first, column);
+                }
+            } else {
+                span.get_or_insert(column);
+                cell.symbol.set_ascii(byte);
+                cell.style = style;
+            }
+            set += 1;
+        }
+        if let (Some(first), Some(changed)) = (span, changed) {
+            changed.note(first, x + set);
+        }
+        set
+    }
+
     /// Set columns `x..end` of row `y` to blanks in `style`, as narrow blanks put one at a time
     /// would (a wide grapheme a blank lands on is cleared), noting in `changed` the columns that
     /// change. Returns the columns set (clipped to the buffer).

@@ -110,6 +110,28 @@ impl Symbol {
     }
 
     /// Whether the text is empty (a wide grapheme's continuation).
+    /// Whether this is the one byte `byte`.
+    #[must_use]
+    pub const fn is_byte(&self, byte: u8) -> bool {
+        matches!(&self.0, Repr::Inline { len: 1, bytes } if bytes[0] == byte)
+    }
+
+    /// Become the one ASCII byte `byte`, in place.
+    pub fn set_ascii(&mut self, byte: u8) {
+        debug_assert!(byte.is_ascii());
+        match &mut self.0 {
+            Repr::Inline { len, bytes } => {
+                // Bytes past `len` stay zero: equality compares the whole array.
+                if *len > 1 {
+                    bytes[1..usize::from(*len)].fill(0);
+                }
+                *len = 1;
+                bytes[0] = byte;
+            }
+            Repr::Heap(_) => *self = Self::ascii(byte),
+        }
+    }
+
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0

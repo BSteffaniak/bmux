@@ -2525,53 +2525,105 @@ fn paint_pane_row(
             .range(col.saturating_add(1)..)
             .next()
             .map_or(width, |(under, _)| (*under).min(width));
-        let mut next = col;
-        let cells = std::iter::from_fn(|| {
-            if next >= end {
-                return None;
-            }
-            let cell = row.cells().get(usize::from(next));
-            let selected =
-                cell_selected(context.selection, context.selection_line, usize::from(next));
-            let style = match (cell, memo) {
-                (Some(cell), Some((key, style))) if key == (cell.style(), selected) => style,
-                _ => {
-                    let style = style_of(cell, selected);
-                    if let Some(cell) = cell {
-                        memo = Some(((cell.style(), selected), style));
-                    }
-                    style
+        while col < end {
+            // Most of a row: printable one-byte cells sharing a style, painted as one run.
+            let mut run = [0_u8; 128];
+            let mut len = 0;
+            let mut key = None;
+            while col + len < end && usize::from(len) < run.len() {
+                let column = col + len;
+                let Some(cell) = row.cells().get(usize::from(column)) else {
+                    break;
+                };
+                let &[byte @ 0x20..=0x7e] = cell.text().as_bytes() else {
+                    break;
+                };
+                if cell.width() != 1 || cell.is_wide_continuation() {
+                    break;
                 }
-            };
-            let Some(cell) = cell.filter(|cell| !cell.is_wide_continuation()) else {
-                // No cell, or the right half of a wide character whose left half is not here.
-                next = next.saturating_add(1);
-                return Some(bmux_tui::paint::SizedCell {
-                    symbol: " ",
-                    width: 1,
-                    style,
-                });
-            };
-            let symbol = match cell.text() {
-                "" => " ",
-                text => text,
-            };
-            // A wide character the row cuts off at its right edge is drawn in its one column.
-            let span = if cell.width() >= 2 && width - next >= 2 {
-                2
-            } else {
-                1
-            };
-            next = next.saturating_add(u16::from(cell.width()).max(1));
-            Some(bmux_tui::paint::SizedCell {
-                symbol,
-                width: span,
-                style,
-            })
-        });
-        canvas.cells(x.saturating_add(col), y, cells);
-        col = next;
+                let selected = cell_selected(
+                    context.selection,
+                    context.selection_line,
+                    usize::from(column),
+                );
+                if key.is_some_and(|key| key != (cell.style(), selected)) {
+                    break;
+                }
+                key = Some((cell.style(), selected));
+                run[usize::from(len)] = byte;
+                len += 1;
+            }
+            if let Some(key) = key {
+                let style = match memo {
+                    Some((memo_key, style)) if memo_key == key => style,
+                    _ => {
+                        let style = style_of(row.cells().get(usize::from(col)), key.1);
+                        memo = Some((key, style));
+                        style
+                    }
+                };
+                canvas.ascii_run(x.saturating_add(col), y, &run[..usize::from(len)], style);
+                col += len;
+                continue;
+            }
+            // Anything else (a wide or multi-byte glyph, an empty or missing cell), cell by cell.
+            let (cell, advance) = sized_pane_cell(context, &mut memo, &style_of, col, width);
+            canvas.cells(x.saturating_add(col), y, std::iter::once(cell));
+            col = col.saturating_add(advance);
+        }
     }
+}
+
+/// The compositor cell for grid column `col` of the row being painted, and the columns it
+/// advances.
+fn sized_pane_cell<'row>(
+    context: &GridRowRenderContext<'row>,
+    memo: &mut Option<((bmux_terminal_grid::StyleId, bool), bmux_tui::style::Style)>,
+    style_of: &impl Fn(Option<&bmux_terminal_grid::Cell>, bool) -> bmux_tui::style::Style,
+    col: u16,
+    width: u16,
+) -> (bmux_tui::paint::SizedCell<'row>, u16) {
+    let cell = context.row.cells().get(usize::from(col));
+    let selected = cell_selected(context.selection, context.selection_line, usize::from(col));
+    let style = match (cell, *memo) {
+        (Some(cell), Some((key, style))) if key == (cell.style(), selected) => style,
+        _ => {
+            let style = style_of(cell, selected);
+            if let Some(cell) = cell {
+                *memo = Some(((cell.style(), selected), style));
+            }
+            style
+        }
+    };
+    let Some(cell) = cell.filter(|cell| !cell.is_wide_continuation()) else {
+        // No cell, or the right half of a wide character whose left half is not here.
+        return (
+            bmux_tui::paint::SizedCell {
+                symbol: " ",
+                width: 1,
+                style,
+            },
+            1,
+        );
+    };
+    let symbol = match cell.text() {
+        "" => " ",
+        text => text,
+    };
+    // A wide character the row cuts off at its right edge is drawn in its one column.
+    let span = if cell.width() >= 2 && width - col >= 2 {
+        2
+    } else {
+        1
+    };
+    (
+        bmux_tui::paint::SizedCell {
+            symbol,
+            width: span,
+            style,
+        },
+        u16::from(cell.width()).max(1),
+    )
 }
 
 fn cell_style_to_tui(value: CellStyle) -> bmux_tui::style::Style {
