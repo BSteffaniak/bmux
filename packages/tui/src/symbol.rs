@@ -13,6 +13,9 @@ use std::ops::Deref;
 #[derive(Clone)]
 pub struct Symbol(Repr);
 
+// Every compositor cell holds one: keep it two words.
+const _: () = assert!(std::mem::size_of::<Symbol>() == 16);
+
 #[derive(Clone)]
 enum Repr {
     /// `bytes[..len]` is the text; the rest is zero, so equal texts have equal arrays.
@@ -20,12 +23,12 @@ enum Repr {
         len: u8,
         bytes: [u8; Symbol::INLINE],
     },
-    Heap(Box<str>),
+    Heap(Box<Box<str>>),
 }
 
 impl Symbol {
     /// Longest text stored inline, in bytes.
-    pub const INLINE: usize = 22;
+    pub const INLINE: usize = 14;
 
     /// A single space, a blank cell's text.
     pub const SPACE: Self = Self::ascii(b' ');
@@ -63,7 +66,7 @@ impl Symbol {
                 bytes,
             })
         } else {
-            Self(Repr::Heap(text.into()))
+            Self(Repr::Heap(Box::new(text.into())))
         }
     }
 
@@ -105,7 +108,7 @@ impl Symbol {
                         &bytes[..len] == text.as_bytes()
                     }
             }
-            Repr::Heap(heap) => **heap == *text,
+            Repr::Heap(heap) => ***heap == *text,
         }
     }
 
@@ -141,7 +144,7 @@ impl Symbol {
     pub fn set(&mut self, text: &str) {
         if let Repr::Heap(current) = &self.0
             && text.len() > Self::INLINE
-            && **current == *text
+            && ***current == *text
         {
             return;
         }
@@ -269,7 +272,7 @@ impl From<String> for Symbol {
         if text.len() <= Self::INLINE {
             Self::new(&text)
         } else {
-            Self(Repr::Heap(text.into_boxed_str()))
+            Self(Repr::Heap(Box::new(text.into_boxed_str())))
         }
     }
 }
@@ -289,7 +292,7 @@ impl From<&Symbol> for String {
 impl From<Symbol> for String {
     fn from(symbol: Symbol) -> Self {
         match symbol.0 {
-            Repr::Heap(text) => text.into_string(),
+            Repr::Heap(text) => (*text).into_string(),
             Repr::Inline { .. } => symbol.as_str().to_owned(),
         }
     }
