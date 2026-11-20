@@ -409,7 +409,18 @@ impl CellText {
         }
     }
 
+    /// One ASCII byte, written without a copy call (most cells).
+    const fn ascii(byte: u8) -> Self {
+        debug_assert!(byte.is_ascii());
+        let mut bytes = [0; INLINE_CELL_TEXT];
+        bytes[0] = byte;
+        Self::Inline { len: 1, bytes }
+    }
+
     fn from_str(text: &str) -> Self {
+        if let [byte] = text.as_bytes() {
+            return Self::ascii(*byte);
+        }
         let mut stored = Self::empty();
         if !stored.push_str(text) {
             stored = Self::Heap(text.to_owned());
@@ -418,6 +429,11 @@ impl CellText {
     }
 
     fn from_char(ch: char) -> Self {
+        if let Ok(byte) = u8::try_from(ch)
+            && byte.is_ascii()
+        {
+            return Self::ascii(byte);
+        }
         let mut stored = Self::empty();
         let mut buffer = [0; 4];
         stored.push_str(ch.encode_utf8(&mut buffer));
@@ -765,7 +781,7 @@ impl PhysicalRow {
                 .resize_with(end, || Cell::blank(StyleId::DEFAULT));
         }
         for (cell, &byte) in self.cells[col..end].iter_mut().zip(text) {
-            *cell = Cell::with_text(CellText::from_char(char::from(byte)), style, 1);
+            *cell = Cell::with_text(CellText::ascii(byte), style, 1);
         }
         self.trim_trailing_blanks();
     }

@@ -51,6 +51,10 @@ impl Symbol {
     /// `text` as a symbol.
     #[must_use]
     pub fn new(text: &str) -> Self {
+        // One byte (most cells) is ASCII: written without a copy call.
+        if let [byte] = text.as_bytes() {
+            return Self::ascii(*byte);
+        }
         if text.len() <= Self::INLINE {
             let mut bytes = [0; Self::INLINE];
             bytes[..text.len()].copy_from_slice(text.as_bytes());
