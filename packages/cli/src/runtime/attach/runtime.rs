@@ -1912,8 +1912,9 @@ use super::super::{
     attach_quit_failure_status, available_capability_providers, available_service_descriptors,
     command_accepts_repeat, effective_enabled_plugins, enter_host_kernel_connection,
     host_kernel_bridge, load_plugin, map_attach_client_error, merged_runtime_keybindings,
-    parse_session_selector, parse_uuid_value, perf_telemetry, plugin_command_policy_hints,
-    plugin_host_metadata, resolve_plugin_search_paths, scan_available_plugins,
+    merged_runtime_keybindings_with_plugin_runtime, parse_session_selector, parse_uuid_value,
+    perf_telemetry, plugin_command_policy_hints, plugin_host_metadata, resolve_plugin_search_paths,
+    scan_available_plugins,
 };
 use super::adapters::{AttachClock, SystemAttachClock};
 use super::display_capture;
@@ -11937,8 +11938,16 @@ async fn refresh_attach_status_catalog_best_effort(
     }
 }
 
+/// The modal mode that takes plugin runtime-scope keybindings: the mode the
+/// default keymap fills with the core runtime bindings.
+const RUNTIME_SCOPE_MODE: &str = "normal";
+
 pub fn attach_keymap_from_config(config: &BmuxConfig) -> crate::input::Keymap {
-    let (_runtime_bindings, global_bindings, scroll_bindings) = filtered_attach_keybindings(config);
+    let ((runtime, global, scroll), plugin_runtime) =
+        merged_runtime_keybindings_with_plugin_runtime(config);
+    let (_runtime_bindings, global_bindings, scroll_bindings) =
+        normalize_attach_keybinding_sets(runtime, global, scroll);
+    let plugin_runtime = normalize_attach_keybindings(plugin_runtime, "runtime");
     let timeout_ms = config
         .keybindings
         .resolve_timeout()
@@ -11948,12 +11957,16 @@ pub fn attach_keymap_from_config(config: &BmuxConfig) -> crate::input::Keymap {
         .modes
         .iter()
         .map(|(mode_id, mode)| {
+            let mut bindings = mode.bindings.clone();
+            if bmux_config::KeyBindingConfig::mode_id_eq(mode_id, RUNTIME_SCOPE_MODE) {
+                add_plugin_runtime_bindings(&mut bindings, &plugin_runtime);
+            }
             (
                 mode_id.clone(),
                 crate::input::ModalModeConfig {
                     label: mode.label.clone(),
                     passthrough: mode.passthrough,
-                    bindings: mode.bindings.clone(),
+                    bindings,
                 },
             )
         })
@@ -11981,12 +11994,41 @@ pub fn filtered_attach_keybindings(
     std::collections::BTreeMap<String, String>,
 ) {
     let (runtime, global, scroll) = merged_runtime_keybindings(config);
+    normalize_attach_keybinding_sets(runtime, global, scroll)
+}
+
+fn normalize_attach_keybinding_sets(
+    runtime: std::collections::BTreeMap<String, String>,
+    global: std::collections::BTreeMap<String, String>,
+    scroll: std::collections::BTreeMap<String, String>,
+) -> (
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+) {
     let runtime = normalize_attach_keybindings(runtime, "runtime");
     let mut global = normalize_attach_keybindings(global, "global");
     let scroll = normalize_attach_keybindings(scroll, "scroll");
 
     inject_attach_global_defaults(&mut global);
     (runtime, global, scroll)
+}
+
+/// Add plugin runtime-scope proposals to a mode without displacing any chord
+/// the mode binds itself, compared in canonical form.
+fn add_plugin_runtime_bindings(
+    bindings: &mut std::collections::BTreeMap<String, String>,
+    plugin_runtime: &std::collections::BTreeMap<String, String>,
+) {
+    let bound = bindings
+        .keys()
+        .map(|chord| crate::input::canonical_chord_key(chord))
+        .collect::<std::collections::BTreeSet<_>>();
+    for (chord, action) in plugin_runtime {
+        if !bound.contains(chord) {
+            bindings.insert(chord.clone(), action.clone());
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26869,6 +26911,67 @@ mod tests {
         assert_eq!(
             cursor.col, 117,
             "cursor col should clamp to pane inner width"
+        );
+    }
+
+    #[test]
+    fn normal_mode_takes_plugin_runtime_bindings_without_displacing_its_own() {
+        let rename = RuntimeAction::PluginCommand {
+            plugin_id: "bmux.tabs".to_string(),
+            command_name: "rename-tab".to_string(),
+            args: Vec::new(),
+        };
+        // The tabs plugin proposes `,` as a runtime-scope binding.
+        let keymap = attach_keymap_from_config(&BmuxConfig::default());
+        assert_eq!(
+            keymap
+                .primary_binding_for_action_in_mode("normal", &rename)
+                .as_deref(),
+            Some(",")
+        );
+        assert_eq!(
+            keymap.primary_binding_for_action_in_mode("insert", &rename),
+            None
+        );
+
+        // A chord the mode binds itself keeps the mode's action.
+        let mut config = BmuxConfig::default();
+        config
+            .keybindings
+            .modes
+            .get_mut("normal")
+            .expect("default normal mode")
+            .bindings
+            .insert(",".to_string(), "detach".to_string());
+        let keymap = attach_keymap_from_config(&config);
+        assert_eq!(
+            keymap.primary_binding_for_action_in_mode("normal", &rename),
+            None
+        );
+        assert_eq!(
+            keymap
+                .primary_binding_for_action_in_mode("normal", &RuntimeAction::Detach)
+                .as_deref(),
+            Some(",")
+        );
+    }
+
+    #[test]
+    fn plugin_runtime_bindings_match_mode_chords_in_canonical_form() {
+        let mut bindings = BTreeMap::from([("shift+left".to_string(), "quit".to_string())]);
+        add_plugin_runtime_bindings(
+            &mut bindings,
+            &BTreeMap::from([
+                ("shift+arrow_left".to_string(), "detach".to_string()),
+                ("x".to_string(), "detach".to_string()),
+            ]),
+        );
+        assert_eq!(
+            bindings,
+            BTreeMap::from([
+                ("shift+left".to_string(), "quit".to_string()),
+                ("x".to_string(), "detach".to_string()),
+            ])
         );
     }
 
