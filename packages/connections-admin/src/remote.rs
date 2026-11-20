@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use bmux_config::{BmuxConfig, ConfigPaths, ConnectionTargetConfig, ConnectionTransport};
+pub use bmux_remote_ssh::parse_host_port_with_default;
 use std::process::Command as ProcessCommand;
 
 pub enum ProbeTarget<'a> {
@@ -249,25 +250,6 @@ fn parse_ssh_target_parts(target: &str) -> Result<(Option<String>, String, Optio
         anyhow::bail!("target must include a host");
     }
     Ok((user, host, port))
-}
-pub fn parse_host_port_with_default(value: &str, default_port: u16) -> Result<(String, u16)> {
-    let raw = value.trim();
-    if let Some((host, port_raw)) = raw.rsplit_once(':') {
-        if port_raw.is_empty() {
-            return Ok((raw.to_string(), default_port));
-        }
-        let port = port_raw
-            .parse::<u16>()
-            .with_context(|| format!("invalid port in '{value}'"))?;
-        if host.trim().is_empty() {
-            anyhow::bail!("host is required");
-        }
-        return Ok((host.to_string(), port));
-    }
-    if raw.is_empty() {
-        anyhow::bail!("host is required");
-    }
-    Ok((raw.to_string(), default_port))
 }
 pub struct RemoteInitOptions<'a> {
     pub name: &'a str,

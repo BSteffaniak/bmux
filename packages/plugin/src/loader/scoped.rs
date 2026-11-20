@@ -127,7 +127,13 @@ pub(super) struct BundledExecutableCache {
 #[derive(Debug)]
 struct BundledExecutableArtifact {
     // Private anonymous snapshot: no caller can mutate these retained bytes.
-    #[cfg_attr(not(test), allow(dead_code))] // Held for the lifetime of this observation.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "held open for the lifetime of this observation; only tests read it back"
+        )
+    )]
     snapshot: std::fs::File,
     identity: String,
     executable_parent: std::path::PathBuf,

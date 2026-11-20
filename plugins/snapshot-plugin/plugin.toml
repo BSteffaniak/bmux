@@ -41,10 +41,11 @@ long    = "dry-run"
 name    = "dry-run"
 summary = "Only validate snapshot readability and schema"
 [[commands.arguments]]
-kind    = "boolean"
-long    = "yes"
-name    = "yes"
-summary = "Confirm replace-restore of current in-memory server state"
+conflicts_with = ["dry-run"]
+kind           = "boolean"
+long           = "yes"
+name           = "yes"
+summary        = "Confirm replace-restore of current in-memory server state"
 
 [cli_help]
 "server restore" = { order = 4 }

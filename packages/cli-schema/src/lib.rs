@@ -1916,60 +1916,62 @@ mod tests {
         assert!(matches!(command, LogsCommand::Level { json: false }));
     }
 
+    /// Plugin-owned command paths are not static leaves: the static grammar
+    /// hands them to the plugin dispatcher unparsed.
     #[test]
-    fn parses_top_level_new_session_command_is_plugin_owned() {
-        let args = ["bmux", "new-session", "dev"];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
-    }
-
-    #[test]
-    fn parses_top_level_list_sessions_command_is_plugin_owned() {
-        let args = ["bmux", "list-sessions"];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
-    }
-
-    #[test]
-    fn parses_top_level_list_sessions_json_flag_is_plugin_owned() {
-        let args = ["bmux", "list-sessions", "--json"];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
-    }
-
-    #[test]
-    fn parses_top_level_kill_session_command_is_plugin_owned() {
-        let args = ["bmux", "kill-session", "dev"];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
-    }
-
-    #[test]
-    fn parses_top_level_kill_session_force_local_flag_is_plugin_owned() {
-        let args = ["bmux", "kill-session", "dev", "--force-local"];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
-    }
-
-    #[test]
-    fn parses_top_level_kill_all_sessions_command_is_plugin_owned() {
-        let args = ["bmux", "kill-all-sessions"];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
-    }
-
-    #[test]
-    fn parses_top_level_kill_all_sessions_force_local_flag_is_plugin_owned() {
-        let args = ["bmux", "kill-all-sessions", "--force-local"];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
+    fn plugin_owned_paths_parse_as_external_commands() {
+        let cases: [&[&str]; 26] = [
+            &["bmux", "new-session", "dev"][..],
+            &["bmux", "list-sessions"][..],
+            &["bmux", "list-sessions", "--json"][..],
+            &["bmux", "kill-session", "dev"][..],
+            &["bmux", "kill-session", "dev", "--force-local"][..],
+            &["bmux", "kill-all-sessions"][..],
+            &["bmux", "kill-all-sessions", "--force-local"][..],
+            &["bmux", "detach"][..],
+            &["bmux", "session", "new", "dev"][..],
+            &["bmux", "session", "list"][..],
+            &["bmux", "session", "list", "--json"][..],
+            &["bmux", "list-clients"][..],
+            &["bmux", "list-clients", "--json"][..],
+            &["bmux", "session", "clients"][..],
+            &["bmux", "session", "clients", "--json"][..],
+            &["bmux", "session", "roles", "--scope", "dev"][..],
+            &["bmux", "session", "kill", "dev"][..],
+            &["bmux", "session", "kill-all"][..],
+            &["bmux", "session", "kill-all", "--force-local"][..],
+            &["bmux", "session", "attach", "dev"][..],
+            &[
+                "bmux",
+                "session",
+                "attach",
+                "--follow",
+                "550e8400-e29b-41d4-a716-446655440000",
+                "--global",
+            ][..],
+            &["bmux", "session", "detach"][..],
+            &[
+                "bmux",
+                "follow",
+                "550e8400-e29b-41d4-a716-446655440000",
+                "--global",
+            ][..],
+            &["bmux", "unfollow"][..],
+            &[
+                "bmux",
+                "session",
+                "follow",
+                "550e8400-e29b-41d4-a716-446655440000",
+                "--global",
+            ][..],
+            &["bmux", "session", "unfollow"][..],
+        ];
+        for args in cases {
+            assert!(
+                matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..]),
+                "{args:?}"
+            );
+        }
     }
 
     #[test]
@@ -2238,14 +2240,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_top_level_detach_command_is_plugin_owned() {
-        let args = ["bmux", "detach"];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
-    }
-
-    #[test]
     fn parses_top_level_external_hyphenated_command() {
         let cli = Cli::try_parse_from(["bmux", "tool-open", "--name", "editor", "--scope", "dev"])
             .expect("valid CLI args");
@@ -2312,46 +2306,6 @@ mod tests {
             cli.command,
             Some(Command::External(args)) if args == vec!["tool-focus", "editor"]
         ));
-    }
-
-    #[test]
-    fn parses_grouped_session_new_command_is_plugin_owned() {
-        let args = ["bmux", "session", "new", "dev"];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
-    }
-
-    #[test]
-    fn parses_grouped_session_list_command_is_plugin_owned() {
-        let args = ["bmux", "session", "list"];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
-    }
-
-    #[test]
-    fn parses_grouped_session_list_json_flag_is_plugin_owned() {
-        let args = ["bmux", "session", "list", "--json"];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
-    }
-
-    #[test]
-    fn parses_top_level_list_clients_command_is_plugin_owned() {
-        let args = ["bmux", "list-clients"];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
-    }
-
-    #[test]
-    fn parses_top_level_list_clients_json_flag_is_plugin_owned() {
-        let args = ["bmux", "list-clients", "--json"];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
     }
 
     #[test]
@@ -2424,128 +2378,6 @@ mod tests {
                     "550e8400-e29b-41d4-a716-446655440000",
                 ]
         ));
-    }
-
-    #[test]
-    fn parses_grouped_session_clients_command_is_plugin_owned() {
-        let args = ["bmux", "session", "clients"];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
-    }
-
-    #[test]
-    fn parses_grouped_session_clients_json_flag_is_plugin_owned() {
-        let args = ["bmux", "session", "clients", "--json"];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
-    }
-
-    #[test]
-    fn static_session_namespace_rejects_plugin_owned_subcommands_is_plugin_owned() {
-        let args = ["bmux", "session", "roles", "--scope", "dev"];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
-    }
-
-    #[test]
-    fn parses_grouped_session_kill_command_is_plugin_owned() {
-        let args = ["bmux", "session", "kill", "dev"];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
-    }
-
-    #[test]
-    fn parses_grouped_session_kill_all_command_is_plugin_owned() {
-        let args = ["bmux", "session", "kill-all"];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
-    }
-
-    #[test]
-    fn parses_grouped_session_kill_all_force_local_flag_is_plugin_owned() {
-        let args = ["bmux", "session", "kill-all", "--force-local"];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
-    }
-
-    #[test]
-    fn parses_grouped_session_attach_command_is_plugin_owned() {
-        let args = ["bmux", "session", "attach", "dev"];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
-    }
-
-    #[test]
-    fn parses_grouped_session_attach_follow_command_is_plugin_owned() {
-        let args = [
-            "bmux",
-            "session",
-            "attach",
-            "--follow",
-            "550e8400-e29b-41d4-a716-446655440000",
-            "--global",
-        ];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
-    }
-
-    #[test]
-    fn parses_grouped_session_detach_command_is_plugin_owned() {
-        let args = ["bmux", "session", "detach"];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
-    }
-
-    #[test]
-    fn parses_top_level_follow_command_is_plugin_owned() {
-        let args = [
-            "bmux",
-            "follow",
-            "550e8400-e29b-41d4-a716-446655440000",
-            "--global",
-        ];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
-    }
-
-    #[test]
-    fn parses_top_level_unfollow_command_is_plugin_owned() {
-        let args = ["bmux", "unfollow"];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
-    }
-
-    #[test]
-    fn parses_grouped_session_follow_command_is_plugin_owned() {
-        let args = [
-            "bmux",
-            "session",
-            "follow",
-            "550e8400-e29b-41d4-a716-446655440000",
-            "--global",
-        ];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
-    }
-
-    #[test]
-    fn parses_grouped_session_unfollow_command_is_plugin_owned() {
-        let args = ["bmux", "session", "unfollow"];
-        assert!(
-            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
-        );
     }
 
     #[test]

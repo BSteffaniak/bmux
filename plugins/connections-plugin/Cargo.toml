@@ -25,6 +25,7 @@ bmux_permissions_plugin_api = { workspace = true }
 bmux_plugin = { workspace = true }
 bmux_plugin_schema_macros = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
+bmux_remote_ssh = { workspace = true }
 bmux_terminal_grid = { workspace = true }
 clap = { workspace = true, features = ["derive", "std", "help", "usage"] }
 git_sshripped_recipient = { workspace = true }
@@ -67,6 +68,7 @@ fail-on-warnings = [
     "bmux_ipc/fail-on-warnings",
     "bmux_plugin_schema_macros/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
+    "bmux_remote_ssh/fail-on-warnings",
 ]
 
 [target.'cfg(windows)'.dependencies]

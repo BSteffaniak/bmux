@@ -1,11 +1,6 @@
 use crate::{RecordingOwner, auto_export_output_path, export};
 use anyhow::{Context, Result};
-use bmux_ipc::InvokeServiceKind;
-use bmux_plugin::ServiceCaller as _;
-use bmux_plugin_sdk::{
-    NativeCommandContext, PluginCommandError, ServiceKind, decode_service_message,
-    encode_service_message,
-};
+use bmux_plugin_sdk::{NativeCommandContext, PluginCommandError};
 use bmux_recording_plugin_api::{recording_commands, recording_state, recording_types};
 use bmux_recording_protocol::{
     RecordingEventEnvelope as ProtocolRecordingEventEnvelope, RecordingEventKind,
@@ -23,16 +18,6 @@ use uuid::Uuid;
 
 type RecordingPayload = ProtocolRecordingPayload<bmux_ipc::Event, bmux_ipc::ErrorCode>;
 type RecordingEventEnvelope = ProtocolRecordingEventEnvelope<bmux_ipc::Event, bmux_ipc::ErrorCode>;
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct DeleteRequest {
-    recording_id: Uuid,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct PruneRequest {
-    older_than_days: Option<u64>,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReplayMode {
@@ -241,36 +226,6 @@ fn run_recording_command_inner(
     }
 }
 
-fn invoke_recording_service<RequestBody, ResponseBody>(
-    context: &NativeCommandContext,
-    capability: &str,
-    kind: InvokeServiceKind,
-    operation: &str,
-    request: &RequestBody,
-) -> Result<ResponseBody>
-where
-    RequestBody: serde::Serialize,
-    ResponseBody: serde::de::DeserializeOwned,
-{
-    let payload = encode_service_message(request)
-        .map_err(|error| anyhow::anyhow!("failed encoding recording service request: {error}"))?;
-    let interface_id = match kind {
-        InvokeServiceKind::Query => "recording-state",
-        InvokeServiceKind::Command => "recording-commands",
-    };
-    // Host calls go through the command's own service port, which every command
-    // backend provides; the raw kernel bridge is withheld from scoped commands.
-    let kind = match kind {
-        InvokeServiceKind::Query => ServiceKind::Query,
-        InvokeServiceKind::Command => ServiceKind::Command,
-    };
-    let response = context
-        .call_service_raw(capability, kind, interface_id, operation, payload)
-        .map_err(|error| anyhow::anyhow!("recording service call failed: {error}"))?;
-    decode_service_message(&response)
-        .map_err(|error| anyhow::anyhow!("failed decoding recording service response: {error}"))
-}
-
 fn run_start(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32> {
     let session_id = args
         .option("session-id")
@@ -384,14 +339,9 @@ fn run_status(
     args: &ArgCursor<'_>,
 ) -> Result<i32> {
     let json = args.has_flag("json");
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
     let runtime_status: RecordingStatus =
-        match invoke_recording_service::<_, recording_types::RecordingStatus>(
-            context,
-            "bmux.recording.read",
-            InvokeServiceKind::Query,
-            "status",
-            &(),
-        ) {
+        match bmux_plugin::block_on_typed_dispatch(recording_state::client::status(&mut client)) {
             Ok(status) => status.into(),
             Err(_) => RecordingStatus {
                 active: None,
@@ -548,13 +498,10 @@ fn run_server_recording_start(context: &NativeCommandContext, args: &ArgCursor<'
     let response: std::result::Result<
         recording_types::RecordingSummary,
         recording_types::RecordingError,
-    > = invoke_recording_service(
-        context,
-        "bmux.recording.write",
-        InvokeServiceKind::Command,
-        "rolling-start",
-        &options,
-    )?;
+    > = bmux_plugin::block_on_typed_dispatch(recording_commands::client::rolling_start(
+        &mut bmux_plugin::ServiceCallerDispatchClient::new(context),
+        options,
+    ))?;
     let recording: RecordingSummary = response.map_err(recording_plugin_error)?.into();
     println!(
         "server rolling recording started: {} name={} path={}",
@@ -567,26 +514,19 @@ fn run_server_recording_start(context: &NativeCommandContext, args: &ArgCursor<'
 
 fn run_server_recording_stop(context: &NativeCommandContext) -> Result<i32> {
     let response: std::result::Result<Uuid, recording_types::RecordingError> =
-        invoke_recording_service(
-            context,
-            "bmux.recording.write",
-            InvokeServiceKind::Command,
-            "rolling-stop",
-            &(),
-        )?;
+        bmux_plugin::block_on_typed_dispatch(recording_commands::client::rolling_stop(
+            &mut bmux_plugin::ServiceCallerDispatchClient::new(context),
+        ))?;
     let recording_id = response.map_err(recording_plugin_error)?;
     println!("server rolling recording stopped: {recording_id}");
     Ok(0)
 }
 
 fn fetch_server_recording_status(context: &NativeCommandContext) -> Result<RecordingRollingStatus> {
-    let status: recording_types::RecordingRollingStatus = invoke_recording_service(
-        context,
-        "bmux.recording.read",
-        InvokeServiceKind::Query,
-        "rolling-status",
-        &(),
-    )?;
+    let status: recording_types::RecordingRollingStatus =
+        bmux_plugin::block_on_typed_dispatch(recording_state::client::rolling_status(
+            &mut bmux_plugin::ServiceCallerDispatchClient::new(context),
+        ))?;
     Ok(status.into())
 }
 
@@ -670,13 +610,10 @@ fn run_server_recording_path(context: &NativeCommandContext, args: &ArgCursor<'_
 fn run_server_recording_clear(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32> {
     let restart_if_active = !args.has_flag("no-restart");
     let report: RecordingRollingClearReport =
-        invoke_recording_service::<_, recording_types::RecordingRollingClearReport>(
-            context,
-            "bmux.recording.write",
-            InvokeServiceKind::Command,
-            "rolling-clear",
-            &restart_if_active,
-        )?
+        bmux_plugin::block_on_typed_dispatch(recording_commands::client::rolling_clear(
+            &mut bmux_plugin::ServiceCallerDispatchClient::new(context),
+            restart_if_active,
+        ))?
         .into();
 
     if args.has_flag("json") {
@@ -766,17 +703,7 @@ fn run_list(
     let limit = args.usize_option("limit")?;
     let all = args.has_flag("all");
     let query = args.option("query");
-    let mut recordings: Vec<RecordingSummary> =
-        match invoke_recording_service::<_, Vec<recording_types::RecordingSummary>>(
-            context,
-            "bmux.recording.read",
-            InvokeServiceKind::Query,
-            "list-recordings",
-            &(),
-        ) {
-            Ok(recordings) => recordings.into_iter().map(Into::into).collect(),
-            Err(_) => list_recordings_from_dir(&owner.recordings_root_for_command(context)?)?,
-        };
+    let mut recordings = list_or_query_recordings(owner, context)?;
     recordings = filter_recordings(recordings, status, query.as_deref());
     sort_recordings(&mut recordings, sort, order);
     let total_count = recordings.len();
@@ -825,17 +752,10 @@ fn run_delete(
     };
     let recordings = list_or_query_recordings(owner, context)?;
     let resolved = resolve_recording_id_prefix(raw, &recordings)?;
-    if let Ok(response) =
-        invoke_recording_service::<_, std::result::Result<Uuid, recording_types::RecordingError>>(
-            context,
-            "bmux.recording.write",
-            InvokeServiceKind::Command,
-            "delete",
-            &DeleteRequest {
-                recording_id: resolved,
-            },
-        )
-    {
+    if let Ok(response) = bmux_plugin::block_on_typed_dispatch(recording_commands::client::delete(
+        &mut bmux_plugin::ServiceCallerDispatchClient::new(context),
+        resolved,
+    )) {
         let deleted = response.map_err(recording_plugin_error)?;
         println!("deleted recording {deleted}");
     } else {
@@ -854,16 +774,13 @@ fn run_delete_all(
         println!("skipped recording delete-all");
         return Ok(0);
     }
-    let deleted_count = match invoke_recording_service::<_, u64>(
-        context,
-        "bmux.recording.write",
-        InvokeServiceKind::Command,
-        "delete-all",
-        &(),
-    ) {
-        Ok(count) => usize::try_from(count).unwrap_or(usize::MAX),
-        Err(_) => delete_all_recordings_from_dir(&owner.recordings_root_for_command(context)?)?,
-    };
+    let deleted_count =
+        match bmux_plugin::block_on_typed_dispatch(recording_commands::client::delete_all(
+            &mut bmux_plugin::ServiceCallerDispatchClient::new(context),
+        )) {
+            Ok(count) => usize::try_from(count).unwrap_or(usize::MAX),
+            Err(_) => delete_all_recordings_from_dir(&owner.recordings_root_for_command(context)?)?,
+        };
     println!("deleted {deleted_count} recordings");
     Ok(0)
 }
@@ -973,21 +890,17 @@ fn run_prune(
         .u64_option("older-than")?
         .or(args.u64_option("older-than-days")?);
     let json = args.has_flag("json");
-    let deleted_count = match invoke_recording_service::<_, u64>(
-        context,
-        "bmux.recording.write",
-        InvokeServiceKind::Command,
-        "prune",
-        &PruneRequest {
-            older_than_days: older_than,
-        },
-    ) {
-        Ok(count) => usize::try_from(count).unwrap_or(usize::MAX),
-        Err(_) => crate::prune_old_recordings(
-            &owner.recordings_root_for_command(context)?,
-            older_than.unwrap_or(30),
-        )?,
-    };
+    let deleted_count =
+        match bmux_plugin::block_on_typed_dispatch(recording_commands::client::prune(
+            &mut bmux_plugin::ServiceCallerDispatchClient::new(context),
+            older_than,
+        )) {
+            Ok(count) => usize::try_from(count).unwrap_or(usize::MAX),
+            Err(_) => crate::prune_old_recordings(
+                &owner.recordings_root_for_command(context)?,
+                older_than.unwrap_or(30),
+            )?,
+        };
     if json {
         println!(
             "{}",

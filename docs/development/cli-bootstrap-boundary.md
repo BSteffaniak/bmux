@@ -23,7 +23,7 @@ sessions, or connections backend.
 
 ## Recording policy removed from startup
 
-`plugins/recording-bootstrap` owns the pre-activation decision to auto-start
+`packages/recording-bootstrap` owns the pre-activation decision to auto-start
 rolling capture and constructs `RecordingPluginConfig` for both server startup
 and standalone command execution. An explicit window of zero is invalid even
 with recording forced off. An implicit configured zero does not start capture; a

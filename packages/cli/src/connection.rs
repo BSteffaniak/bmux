@@ -87,6 +87,7 @@ impl AttachEndpointConnector for CliAttachEndpointConnector {
     }
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 pub async fn connect(
     scope: ConnectionPolicyScope,
     client_name: &'static str,
@@ -103,6 +104,7 @@ pub async fn connect_with_context(
     connect_for_active_target(client_name, context).await
 }
 
+#[cfg(feature = "bundled-plugin-sessions")]
 pub async fn connect_if_running_with_context(
     scope: ConnectionPolicyScope,
     client_name: &'static str,

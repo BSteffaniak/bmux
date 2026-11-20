@@ -1,5 +1,7 @@
+#[cfg(feature = "bundled-plugin-connections")]
+use crate::connection::connect;
 use crate::connection::{
-    ConnectionContext, ConnectionPolicyScope, ServerRuntimeMetadata, connect, connect_raw,
+    ConnectionContext, ConnectionPolicyScope, ServerRuntimeMetadata, connect_raw,
     connect_raw_with_context, connect_with_context, current_cli_build_id,
     expand_bmux_target_if_needed, map_client_connect_error, read_server_runtime_metadata,
     remove_server_runtime_metadata_file, write_server_runtime_metadata,
@@ -35,6 +37,7 @@ mod plugin_commands;
 mod plugin_host;
 mod plugin_kernel;
 mod plugin_runtime;
+#[cfg(feature = "bundled-plugin-playbook")]
 pub use plugin_runtime::RuntimeCommandState;
 #[cfg(feature = "docs-test")]
 pub use plugin_runtime::bundled_cli_command_for_docs;
@@ -95,9 +98,13 @@ pub use prompt::{
     PromptFormValue, PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptSubmitError,
     PromptValidation, PromptValue, PromptWidth,
 };
+#[cfg(feature = "bundled-plugin-connections")]
 use remote_cli::{
     SSH_RECONNECT_MAX_ATTEMPTS, connect_attach_target_with_kernel, reconnect_backoff_ms,
-    run_target_proxy_from_current_argv, should_proxy_to_target,
+};
+use remote_cli::{
+    plugin_command_proxies_to_target, run_target_proxy, run_target_proxy_from_current_argv,
+    should_proxy_to_target, target_is_ssh,
 };
 use sandbox_cli::{
     BundleIncludeOptions, BundleSandboxOptions, InspectTargetOptions, RerunSandboxOptions,
@@ -121,7 +128,9 @@ pub fn is_pid_running_crate(pid: u32) -> anyhow::Result<bool> {
     server_runtime::is_pid_running(pid)
 }
 use session_cli::attach_quit_failure_status;
-use session_follow::{parse_session_selector, parse_uuid_value, run_session_detach};
+#[cfg(feature = "bundled-plugin-sessions")]
+use session_follow::run_session_detach;
+use session_follow::{parse_session_selector, parse_uuid_value};
 use terminal_doctor::{
     check_terminfo_available, merged_runtime_keybindings, resolve_pane_term, run_keymap_doctor,
     run_keymap_explain, run_terminal_doctor, run_terminal_install_terminfo, terminal_profile_name,
@@ -217,30 +226,32 @@ enum TerminalProfile {
     Conservative,
 }
 
-/// Returns `true` for commands that enter raw terminal mode (TUI attach
-/// sessions).  When `command` is `None` the default attach path is taken,
-/// which always enters raw mode.
-fn logging_scope_for_command(command: Option<&bmux_cli_schema::Command>) -> LogProcessScope {
+/// Log scope for a built-in command. The default (no subcommand) path attaches
+/// as a client.
+const fn logging_scope_for_command(command: Option<&bmux_cli_schema::Command>) -> LogProcessScope {
     use bmux_cli_schema::{Command, ServerCommand};
-    let Some(cmd) = command else {
-        return LogProcessScope::Client;
-    };
-    match cmd {
-        Command::External(args)
-            if args
-                .first()
-                .is_some_and(|s| matches!(s.as_str(), "connect" | "join" | "host")) =>
-        {
-            LogProcessScope::Client
-        }
-        Command::Attach { .. } => LogProcessScope::Client,
-        Command::External(args) if matches!(args.as_slice(), [group, leaf, ..] if matches!(group.as_str(), "session" | "kiosk") && leaf == "attach") => {
-            LogProcessScope::Client
-        }
-        Command::Server {
+    match command {
+        None | Some(Command::Attach { .. }) => LogProcessScope::Client,
+        Some(Command::Server {
             command: ServerCommand::Start { .. } | ServerCommand::Gateway { .. },
-        } => LogProcessScope::Server,
-        _ => LogProcessScope::Command,
+        }) => LogProcessScope::Server,
+        Some(_) => LogProcessScope::Command,
+    }
+}
+
+/// How a plugin-owned command runs in this process. These commands were built
+/// in before their owners took them over: interactive sessions draw a terminal
+/// UI, so they log to file only and attach as clients, as they always did.
+fn plugin_command_profile(plugin_id: &str, command_name: &str) -> (bool, LogProcessScope) {
+    match (plugin_id, command_name) {
+        ("bmux.sessions", "session-attach") | ("bmux.connections", "connect" | "join" | "host") => {
+            (true, LogProcessScope::Client)
+        }
+        ("bmux.connections", "kiosk-attach") => (false, LogProcessScope::Client),
+        ("bmux.playbook", "run" | "interactive") | ("bmux.plugin_cli", "logs-watch") => {
+            (true, LogProcessScope::Command)
+        }
+        _ => (false, LogProcessScope::Command),
     }
 }
 
@@ -250,29 +261,14 @@ pub fn set_logging_client_id(client_id: impl Into<String>) {
     }
 }
 
-fn command_enters_raw_mode(command: Option<&bmux_cli_schema::Command>) -> bool {
-    use bmux_cli_schema::Command;
-    let Some(cmd) = command else {
-        // Default path (no subcommand) = attach to server.
-        return true;
-    };
-    if let Command::External(args) = cmd
-        && matches!(args.as_slice(), [group, leaf, ..] if group == "playbook" && matches!(leaf.as_str(), "interactive" | "run"))
-    {
-        return true;
-    }
-    if let Command::External(args) = cmd
-        && args
-            .first()
-            .is_some_and(|s| matches!(s.as_str(), "connect" | "join" | "host"))
-    {
-        return true;
-    }
-    if matches!(cmd, Command::External(args) if matches!(args.as_slice(), [group, leaf, ..] if group == "session" && leaf == "attach"))
-    {
-        return true;
-    }
-    matches!(cmd, Command::Attach { .. })
+/// Built-in commands that enter raw terminal mode: the default (no subcommand)
+/// attach and `attach` itself. Plugin-owned interactive commands are described
+/// by [`plugin_command_profile`].
+const fn command_enters_raw_mode(command: Option<&bmux_cli_schema::Command>) -> bool {
+    matches!(
+        command,
+        None | Some(bmux_cli_schema::Command::Attach { .. })
+    )
 }
 
 /// Print a startup banner on stderr when:
@@ -281,12 +277,12 @@ fn command_enters_raw_mode(command: Option<&bmux_cli_schema::Command>) -> bool {
 /// - the command enters raw-mode (interactive attach-like flows),
 /// - `BMUX_SLOT_BANNER` is not "off",
 /// - stderr is a TTY.
-fn maybe_print_slot_startup_banner(command: Option<&bmux_cli_schema::Command>) {
+fn maybe_print_slot_startup_banner(enters_raw_mode: bool) {
     use std::io::IsTerminal as _;
     if std::env::var("BMUX_SLOT_BANNER").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off")) {
         return;
     }
-    if !command_enters_raw_mode(command) {
+    if !enters_raw_mode {
         return;
     }
     if !std::io::stderr().is_terminal() {
@@ -336,7 +332,7 @@ pub async fn run(runtime_owner: Option<crate::runtime_owner::RuntimeOwner>) -> R
                 core_builtins_only = cli.core_builtins_only,
                 "runtime.cli.builtin_start"
             );
-            maybe_print_slot_startup_banner(cli.command.as_ref());
+            maybe_print_slot_startup_banner(command_enters_raw_mode(cli.command.as_ref()));
             let connection_context = ConnectionContext::new(cli.target.as_deref());
             if should_proxy_to_target(&cli).await? {
                 return run_target_proxy_from_current_argv(&cli).await;
@@ -364,9 +360,18 @@ pub async fn run(runtime_owner: Option<crate::runtime_owner::RuntimeOwner>) -> R
             config_overrides,
         } => {
             let _config_override_guard = push_process_config_overrides(config_overrides);
+            let (enters_raw_mode, logging_scope) =
+                plugin_command_profile(&plugin_id, &command_name);
             let _logging_guard =
-                init_logging(false, Some(log_level), false, LogProcessScope::Command);
+                init_logging(false, Some(log_level), enters_raw_mode, logging_scope);
             tracing::info!(plugin_id, command_name, "runtime.cli.plugin_start");
+            maybe_print_slot_startup_banner(enters_raw_mode);
+            if plugin_command_proxies_to_target(&plugin_id, &command_name)
+                && target_is_ssh(target.as_deref()).await?
+            {
+                let wants_tty = plugin_id == "bmux.sessions" && command_name == "session-attach";
+                return run_target_proxy(target.as_deref(), true, wants_tty).await;
+            }
             plugin_runtime::run_plugin_command_with_target(
                 command_state.as_ref(),
                 &plugin_id,

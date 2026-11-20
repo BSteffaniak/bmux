@@ -34,7 +34,7 @@ bmux_sessions_plugin_api = { workspace = true, optional = true }
 bmux_tabs_plugin_api = { workspace = true, optional = true }
 bmux_terminal = { workspace = true, optional = true }
 bmux_terminal_grid = { workspace = true, optional = true }
-regex = { workspace = true }
+regex = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = [
     "fs",
@@ -52,9 +52,9 @@ anyhow  = { workspace = true, features = ["std"] }
 libc    = { workspace = true }
 serde   = { workspace = true, features = ["derive", "std"] }
 sha2    = { workspace = true }
-toml    = { workspace = true }
+toml    = { workspace = true, features = ["parse"] }
 tracing = { workspace = true }
-uuid    = { workspace = true, features = ["serde", "std"] }
+uuid    = { workspace = true, features = ["serde", "std", "v4"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
@@ -90,6 +90,7 @@ fail-on-warnings = [
 ]
 runtime = [
     "dep:bmux_unicode_segmentation",
+    "dep:regex",
     "dep:bmux_appearance",
     "dep:bmux_attach_layout_protocol",
     "dep:bmux_attach_pipeline",

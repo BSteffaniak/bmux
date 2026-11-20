@@ -2,7 +2,11 @@ use anyhow::{Context, Result};
 use bmux_config::{
     BmuxConfig, ConfigPaths, ConnectionTargetConfig, ConnectionTransport, RemoteServerStartMode,
 };
-use std::{ffi::OsString, path::PathBuf, process::Command as ProcessCommand};
+use bmux_remote_ssh::{
+    SshTarget, build_ssh_command, parse_host_port_with_default, run_ssh_bmux_command,
+    run_ssh_bmux_command_silent, ssh_destination,
+};
+use std::ffi::OsString;
 #[derive(Debug)]
 enum ResolvedTarget {
     Local,
@@ -10,78 +14,8 @@ enum ResolvedTarget {
     Tls,
     Iroh,
 }
-#[derive(Debug, Clone)]
-struct SshTarget {
-    label: String,
-    host: String,
-    user: Option<String>,
-    port: Option<u16>,
-    identity_file: Option<PathBuf>,
-    known_hosts_file: Option<PathBuf>,
-    strict_host_key_checking: bool,
-    jump: Option<String>,
-    remote_bmux_path: String,
-    connect_timeout_ms: u64,
-    server_start_mode: RemoteServerStartMode,
-}
-const DEFAULT_CONTROL_PLANE_URL: &str = "https://api.bmux.run";
-
-#[derive(Debug, Clone, serde::Deserialize)]
-struct AuthState {
-    access_token: String,
-}
-async fn expand_bmux_target_if_needed(config: &BmuxConfig, target: &str) -> Result<String> {
-    let Some(name) = target.strip_prefix("bmux://") else {
-        return Ok(target.to_string());
-    };
-    if let Some(mapped) = config.connections.share_links.get(name) {
-        return Ok(mapped.clone());
-    }
-    let Some(auth_state) = load_auth_state_optional(&ConfigPaths::default())? else {
-        return Ok(target.to_string());
-    };
-    let control_plane = control_plane_url(config);
-    let _ = rustls::crypto::ring::default_provider().install_default();
-    let client = reqwest::Client::new();
-    let response = client
-        .get(format!("{control_plane}/v1/share-links/{name}"))
-        .bearer_auth(auth_state.access_token)
-        .send()
-        .await
-        .with_context(|| format!("failed contacting {control_plane}"))?;
-    if !response.status().is_success() {
-        return Ok(target.to_string());
-    }
-    let payload = response
-        .json::<serde_json::Value>()
-        .await
-        .context("failed parsing share lookup response")?;
-    Ok(payload
-        .get("target")
-        .and_then(|value| value.as_str())
-        .map_or_else(|| target.to_string(), ToString::to_string))
-}
-fn control_plane_url(config: &BmuxConfig) -> String {
-    std::env::var("BMUX_CONTROL_PLANE_URL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| config.connections.control_plane_url.clone())
-        .unwrap_or_else(|| DEFAULT_CONTROL_PLANE_URL.to_string())
-}
-fn load_auth_state_optional(paths: &ConfigPaths) -> Result<Option<AuthState>> {
-    let path = paths.runtime_dir.join("auth-state.json");
-    match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            let state = serde_json::from_str::<AuthState>(&content)
-                .with_context(|| format!("failed parsing auth state {}", path.display()))?;
-            Ok(Some(state))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("failed reading {}", path.display())),
-    }
-}
 async fn resolve_target_reference(config: &BmuxConfig, target: &str) -> Result<ResolvedTarget> {
-    let target = expand_bmux_target_if_needed(config, target).await?;
+    let target = crate::hosted::expand_share_link(config, &ConfigPaths::default(), target).await?;
     resolve_target_reference_inner(config, &target)
 }
 fn resolve_target_reference_inner(config: &BmuxConfig, target: &str) -> Result<ResolvedTarget> {
@@ -154,43 +88,7 @@ fn resolve_named_target(name: &str, target: &ConnectionTargetConfig) -> Result<R
     }
 }
 fn parse_inline_ssh_target(target: &str) -> Result<ResolvedTarget> {
-    let mut raw = target.trim();
-    if let Some(without_scheme) = raw.strip_prefix("ssh://") {
-        raw = without_scheme;
-    }
-    let (user, host_port) = if let Some((user, rest)) = raw.split_once('@') {
-        (Some(user.to_string()), rest)
-    } else {
-        (None, raw)
-    };
-    let (host, port) = if let Some((host, port_raw)) = host_port.rsplit_once(':') {
-        if port_raw.is_empty() {
-            (host_port.to_string(), None)
-        } else {
-            let parsed = port_raw
-                .parse::<u16>()
-                .with_context(|| format!("invalid SSH port in target '{target}'"))?;
-            (host.to_string(), Some(parsed))
-        }
-    } else {
-        (host_port.to_string(), None)
-    };
-    if host.trim().is_empty() {
-        anyhow::bail!("target must include a host");
-    }
-    Ok(ResolvedTarget::Ssh(SshTarget {
-        label: target.to_string(),
-        host,
-        user,
-        port,
-        identity_file: None,
-        known_hosts_file: None,
-        strict_host_key_checking: true,
-        jump: None,
-        remote_bmux_path: "bmux".to_string(),
-        connect_timeout_ms: 8_000,
-        server_start_mode: RemoteServerStartMode::Auto,
-    }))
+    bmux_remote_ssh::parse_inline_ssh_target(target).map(ResolvedTarget::Ssh)
 }
 fn parse_inline_tls_target(target: &str) -> Result<ResolvedTarget> {
     super::trust::validate_tls_target(target)?;
@@ -207,25 +105,6 @@ fn parse_https_target(target: &str) -> Result<ResolvedTarget> {
     }
     parse_host_port_with_default(host, 443)?;
     Ok(ResolvedTarget::Tls)
-}
-fn parse_host_port_with_default(value: &str, default_port: u16) -> Result<(String, u16)> {
-    let raw = value.trim();
-    if let Some((host, port_raw)) = raw.rsplit_once(':') {
-        if port_raw.is_empty() {
-            return Ok((raw.to_string(), default_port));
-        }
-        let port = port_raw
-            .parse::<u16>()
-            .with_context(|| format!("invalid port in '{value}'"))?;
-        if host.trim().is_empty() {
-            anyhow::bail!("host is required");
-        }
-        return Ok((host.to_string(), port));
-    }
-    if raw.is_empty() {
-        anyhow::bail!("host is required");
-    }
-    Ok((raw.to_string(), default_port))
 }
 pub(super) async fn run_remote_install_server(target: &str) -> Result<u8> {
     let config = BmuxConfig::load()?;
@@ -384,129 +263,6 @@ fn ensure_remote_server_ready(target: &SshTarget) -> Result<()> {
             Ok(())
         }
     }
-}
-fn build_ssh_command(target: &SshTarget, args: &[OsString], force_tty: bool) -> ProcessCommand {
-    let mut command = ProcessCommand::new("ssh");
-    if force_tty {
-        command.arg("-t");
-    }
-    if let Some(port) = target.port {
-        command.arg("-p");
-        command.arg(port.to_string());
-    }
-    if let Some(path) = target.identity_file.as_ref() {
-        command.arg("-i");
-        command.arg(path);
-    }
-    if let Some(jump) = target.jump.as_ref() {
-        command.arg("-J");
-        command.arg(jump);
-    }
-    command.arg("-o");
-    command.arg(format!(
-        "StrictHostKeyChecking={}",
-        if target.strict_host_key_checking {
-            "yes"
-        } else {
-            "no"
-        }
-    ));
-    if let Some(known_hosts) = target.known_hosts_file.as_ref() {
-        command.arg("-o");
-        command.arg(format!("UserKnownHostsFile={}", known_hosts.display()));
-    }
-    command.arg("-o");
-    let timeout_secs = (target.connect_timeout_ms.saturating_add(999)) / 1000;
-    command.arg(format!("ConnectTimeout={timeout_secs}"));
-    command.arg("-o");
-    command.arg("ServerAliveInterval=15");
-    command.arg("-o");
-    command.arg("ServerAliveCountMax=3");
-    command.arg("-o");
-    command.arg("BatchMode=yes");
-    let destination = target.user.as_ref().map_or_else(
-        || target.host.clone(),
-        |user| format!("{user}@{}", target.host),
-    );
-    command.arg(destination);
-    command.arg(&target.remote_bmux_path);
-    command.args(args);
-    command
-}
-fn run_ssh_bmux_command(target: &SshTarget, args: &[OsString], force_tty: bool) -> Result<u8> {
-    run_ssh_bmux_command_inner(target, args, force_tty, true)
-}
-fn run_ssh_bmux_command_silent(
-    target: &SshTarget,
-    args: &[OsString],
-    force_tty: bool,
-) -> Result<u8> {
-    run_ssh_bmux_command_inner(target, args, force_tty, false)
-}
-fn run_ssh_bmux_command_inner(
-    target: &SshTarget,
-    args: &[OsString],
-    force_tty: bool,
-    print_stdout: bool,
-) -> Result<u8> {
-    if !force_tty {
-        let output = build_ssh_command(target, args, false)
-            .output()
-            .with_context(|| format!("failed executing ssh target {}", target.label))?;
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if print_stdout && !stdout.trim().is_empty() {
-                print!("{stdout}");
-            }
-            return Ok(0);
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(map_ssh_execution_error(target, stderr.trim()));
-    }
-    let mut command = build_ssh_command(target, args, force_tty);
-    let status = command
-        .status()
-        .with_context(|| format!("failed executing ssh target {}", target.label))?;
-    Ok(exit_code_from_status(status))
-}
-fn exit_code_from_status(status: std::process::ExitStatus) -> u8 {
-    status
-        .code()
-        .and_then(|code| u8::try_from(code).ok())
-        .unwrap_or(1)
-}
-fn map_ssh_execution_error(target: &SshTarget, stderr: &str) -> anyhow::Error {
-    if stderr.contains("Host key verification failed") {
-        return anyhow::anyhow!(
-            "ssh host key verification failed for '{}'. verify known_hosts or set known_hosts_file",
-            target.label
-        );
-    }
-    if stderr.contains("Permission denied") {
-        return anyhow::anyhow!(
-            "ssh authentication failed for '{}'. check user/identity_file and remote access",
-            target.label
-        );
-    }
-    if stderr.contains("Could not resolve hostname") {
-        return anyhow::anyhow!(
-            "ssh target '{}' hostname could not be resolved",
-            target.label
-        );
-    }
-    if stderr.contains("Connection timed out") || stderr.contains("Operation timed out") {
-        return anyhow::anyhow!("ssh connection to '{}' timed out", target.label);
-    }
-    if stderr.is_empty() {
-        return anyhow::anyhow!("ssh command failed for '{}'", target.label);
-    }
-    anyhow::anyhow!("ssh command failed for '{}': {stderr}", target.label)
-}
-fn ssh_destination(target: &SshTarget) -> String {
-    target.user.as_ref().map_or_else(
-        || target.host.clone(),
-        |user| format!("{user}@{}", target.host),
-    )
 }
 fn validate_iroh_target(input: &str) -> Result<()> {
     let trimmed = input.trim();

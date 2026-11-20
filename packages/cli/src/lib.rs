@@ -20,6 +20,7 @@ pub mod attach;
 pub mod input;
 
 /// Playbook system for headless scripted bmux execution.
+#[cfg(feature = "bundled-plugin-playbook")]
 pub mod playbook;
 
 pub(crate) fn reqwest_client() -> reqwest::Client {

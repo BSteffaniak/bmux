@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use bmux_client::{BmuxClient, ClientError};
 use bmux_session_models::SessionSelector;
+use bmux_sessions_plugin_api::DestructiveOpErrorKind;
 use bmux_sessions_plugin_api::sessions_commands;
 use bmux_sessions_plugin_api::sessions_state::{self, SessionSummary as TypedSessionSummary};
 use bmux_snapshot_plugin_api::offline_snapshot::OfflineSessionKillTarget;
@@ -55,14 +56,6 @@ async fn typed_kill_session(
         })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DestructiveOpErrorKind {
-    SessionPolicyDenied,
-    ForceLocalUnauthorized,
-    NotFound,
-    Other,
-}
-
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct KillFailureSummary {
     policy_denied: usize,
@@ -89,21 +82,9 @@ impl KillFailureSummary {
 
 fn classify_destructive_op_error(error: &ClientError) -> DestructiveOpErrorKind {
     match error {
-        ClientError::ServerError { code, message } => match code {
-            bmux_ipc::ErrorCode::InvalidRequest
-                if message.contains("session policy denied for this operation") =>
-            {
-                DestructiveOpErrorKind::SessionPolicyDenied
-            }
-            bmux_ipc::ErrorCode::InvalidRequest
-                if message
-                    .contains("force-local is only allowed for the server control principal") =>
-            {
-                DestructiveOpErrorKind::ForceLocalUnauthorized
-            }
-            bmux_ipc::ErrorCode::NotFound => DestructiveOpErrorKind::NotFound,
-            _ => DestructiveOpErrorKind::Other,
-        },
+        ClientError::ServerError { code, message } => {
+            bmux_sessions_plugin_api::classify_destructive_op_error(*code, message)
+        }
         _ => DestructiveOpErrorKind::Other,
     }
 }

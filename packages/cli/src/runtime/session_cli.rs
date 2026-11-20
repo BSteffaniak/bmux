@@ -1,30 +1,12 @@
 use bmux_client::ClientError;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum DestructiveOpErrorKind {
-    SessionPolicyDenied,
-    ForceLocalUnauthorized,
-    NotFound,
-    Other,
-}
+use bmux_sessions_plugin_api::DestructiveOpErrorKind;
 
-pub(super) fn classify_destructive_op_error(error: &ClientError) -> DestructiveOpErrorKind {
+fn classify_destructive_op_error(error: &ClientError) -> DestructiveOpErrorKind {
     match error {
-        ClientError::ServerError { code, message } => match code {
-            bmux_ipc::ErrorCode::InvalidRequest
-                if message.contains("session policy denied for this operation") =>
-            {
-                DestructiveOpErrorKind::SessionPolicyDenied
-            }
-            bmux_ipc::ErrorCode::InvalidRequest
-                if message
-                    .contains("force-local is only allowed for the server control principal") =>
-            {
-                DestructiveOpErrorKind::ForceLocalUnauthorized
-            }
-            bmux_ipc::ErrorCode::NotFound => DestructiveOpErrorKind::NotFound,
-            _ => DestructiveOpErrorKind::Other,
-        },
+        ClientError::ServerError { code, message } => {
+            bmux_sessions_plugin_api::classify_destructive_op_error(*code, message)
+        }
         _ => DestructiveOpErrorKind::Other,
     }
 }

@@ -1,29 +1,54 @@
-#[cfg(feature = "remote-iroh")]
+#[cfg(feature = "bundled-plugin-connections")]
 use crate::ssh_access::authenticate_client_connection;
 use crate::ssh_access::{IrohTargetCompression, parse_iroh_target as parse_iroh_target_parts};
 use anyhow::{Context, Result};
 use bmux_cli_schema::{Cli, Command, ServerAutostartCommand, ServerCommand};
-use bmux_client::BmuxClient;
-use bmux_config::{BmuxConfig, ConfigPaths, TlsTrustMode};
-use bmux_sessions_plugin_api::sessions_state::{self, SessionSummary};
-use std::collections::BTreeMap;
-use std::fmt::Write as FmtWrite;
-use std::io::{self, IsTerminal, Write};
+use bmux_config::BmuxConfig;
+#[cfg(feature = "bundled-plugin-connections")]
+use bmux_connections_admin::known_gateways::{
+    KnownGatewayState, certificate_fingerprint_sha256, fingerprints_equal,
+    load_known_gateways_store, save_known_gateways_store, tls_gateway_key,
+};
+use bmux_remote_ssh::{
+    SshTarget, parse_host_port_with_default, run_ssh_bmux_command, run_ssh_bmux_command_silent,
+    ssh_destination,
+};
+#[cfg(feature = "bundled-plugin-connections")]
+use bmux_remote_ssh::{build_ssh_command, map_ssh_execution_error};
+use std::io::{self, IsTerminal};
 use std::path::PathBuf;
-use std::process::{Command as ProcessCommand, Stdio};
-#[cfg(feature = "remote-iroh")]
+#[cfg(feature = "bundled-plugin-connections")]
 use std::time::Instant;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use uuid::Uuid;
 
-#[cfg(feature = "remote-iroh")]
+use super::expand_bmux_target_if_needed;
+#[cfg(feature = "bundled-plugin-connections")]
 use super::perf_telemetry;
+
+// The remote attach transports, trust store and admin helpers below are only
+// reachable through the connections plugin; target parsing and SSH proxying
+// above stay in every build.
+#[cfg(feature = "bundled-plugin-connections")]
 use super::{
     AttachExitReason, ConnectionContext, ConnectionPolicyScope, KernelClientFactory, connect,
-    connect_with_context, expand_bmux_target_if_needed, hosted_output::status_not_ready_lines,
-    map_cli_client_error, run_session_attach_with_client,
+    connect_with_context, hosted_output::status_not_ready_lines, map_cli_client_error,
+    run_session_attach_with_client,
 };
+#[cfg(feature = "bundled-plugin-connections")]
+use bmux_client::BmuxClient;
+#[cfg(feature = "bundled-plugin-connections")]
+use bmux_config::{ConfigPaths, TlsTrustMode};
+#[cfg(feature = "bundled-plugin-connections")]
+use bmux_sessions_plugin_api::sessions_state::{self, SessionSummary};
+#[cfg(feature = "bundled-plugin-connections")]
+use std::io::Write;
+#[cfg(feature = "bundled-plugin-connections")]
+use std::process::Stdio;
+#[cfg(feature = "bundled-plugin-connections")]
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(feature = "bundled-plugin-connections")]
+use uuid::Uuid;
 
+#[cfg(feature = "bundled-plugin-connections")]
 /// Typed dispatch wrapper for `sessions-state:list-sessions` via
 /// `BmuxClient::invoke_service_raw`. `BmuxClient` no longer carries a
 /// domain-specific `list_sessions` method — callers route through the
@@ -34,24 +59,26 @@ async fn typed_list_sessions_remote(client: &mut BmuxClient) -> Result<Vec<Sessi
         .context("sessions-state list-sessions dispatch failed")
 }
 use bmux_config::{ConnectionTargetConfig, ConnectionTransport, RemoteServerStartMode};
-use bmux_ipc::transport::ErasedIpcStream;
-#[cfg(feature = "remote-iroh")]
+#[cfg(feature = "bundled-plugin-connections")]
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
-use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::ffi::OsString;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::task::{Context as TaskContext, Poll};
-#[cfg(feature = "remote-iroh")]
+#[cfg(feature = "bundled-plugin-connections")]
 use tokio::io::AsyncWriteExt;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::net::TcpStream;
-use tokio::process::{Child, ChildStdin, ChildStdout, Command as TokioProcessCommand};
-use tokio_rustls::TlsConnector;
+#[cfg(feature = "bundled-plugin-connections")]
+use {
+    bmux_ipc::transport::ErasedIpcStream,
+    rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    rustls::pki_types::{CertificateDer, ServerName, UnixTime},
+    rustls::{DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme},
+    serde::Serialize,
+    std::pin::Pin,
+    std::sync::{Arc, Mutex},
+    std::task::{Context as TaskContext, Poll},
+    tokio::io::{AsyncRead, AsyncWrite, ReadBuf},
+    tokio::net::TcpStream,
+    tokio::process::{Child, ChildStdin, ChildStdout, Command as TokioProcessCommand},
+    tokio_rustls::TlsConnector,
+};
 
 #[derive(Debug, Clone)]
 enum ResolvedTarget {
@@ -62,21 +89,13 @@ enum ResolvedTarget {
 }
 
 #[derive(Debug, Clone)]
-struct SshTarget {
-    label: String,
-    host: String,
-    user: Option<String>,
-    port: Option<u16>,
-    identity_file: Option<PathBuf>,
-    known_hosts_file: Option<PathBuf>,
-    strict_host_key_checking: bool,
-    jump: Option<String>,
-    remote_bmux_path: String,
-    connect_timeout_ms: u64,
-    server_start_mode: RemoteServerStartMode,
-}
-
-#[derive(Debug, Clone)]
+#[cfg_attr(
+    not(feature = "bundled-plugin-connections"),
+    expect(
+        dead_code,
+        reason = "TLS targets are parsed and validated in every build, but only the connections transport reads their endpoint details"
+    )
+)]
 struct TlsTarget {
     label: String,
     host: String,
@@ -86,32 +105,21 @@ struct TlsTarget {
     connect_timeout_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-struct KnownGatewaysStore {
-    gateways: BTreeMap<String, KnownGatewayState>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct KnownGatewayState {
-    fingerprint_sha256: String,
-    trusted_at_unix_ms: u64,
-    server_name: Option<String>,
-    label: Option<String>,
-}
-
+#[cfg(feature = "bundled-plugin-connections")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TlsPinSource {
     Config,
     Local,
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 #[derive(Debug, Clone)]
 struct EffectiveTlsPin {
     fingerprint_sha256: String,
     source: TlsPinSource,
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 #[derive(Debug, Clone)]
 struct TlsTrustDecision {
     key: String,
@@ -119,6 +127,7 @@ struct TlsTrustDecision {
     pin: Option<EffectiveTlsPin>,
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 #[derive(Debug)]
 struct BmuxTlsServerVerifier {
     trust: TlsTrustDecision,
@@ -126,10 +135,10 @@ struct BmuxTlsServerVerifier {
 }
 
 #[cfg_attr(
-    not(feature = "remote-iroh"),
+    not(feature = "bundled-plugin-connections"),
     expect(
         dead_code,
-        reason = "Iroh targets are parsed and validated in every build, but only the `remote-iroh` transport reads their connection details"
+        reason = "Iroh targets are parsed and validated in every build, but only the connections transport reads their connection details"
     )
 )]
 #[derive(Debug, Clone)]
@@ -142,7 +151,7 @@ struct IrohTarget {
     connect_timeout_ms: u64,
 }
 
-#[cfg(feature = "remote-iroh")]
+#[cfg(feature = "bundled-plugin-connections")]
 const fn iroh_target_uses_compression(target: &IrohTarget, config: &BmuxConfig) -> bool {
     match target.transport_compression {
         IrohTargetCompression::Zstd => true,
@@ -157,7 +166,7 @@ const fn iroh_target_uses_compression(target: &IrohTarget, config: &BmuxConfig) 
     }
 }
 
-#[cfg(feature = "remote-iroh")]
+#[cfg(feature = "bundled-plugin-connections")]
 #[derive(Debug, Default, Clone, Serialize)]
 struct IrohConnectPerfSummary {
     bind_ms: u64,
@@ -172,13 +181,13 @@ struct IrohConnectPerfSummary {
     compression_enabled: bool,
 }
 
-#[cfg(feature = "remote-iroh")]
+#[cfg(feature = "bundled-plugin-connections")]
 #[allow(clippy::cast_possible_truncation)]
 fn duration_millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-#[cfg(feature = "remote-iroh")]
+#[cfg(feature = "bundled-plugin-connections")]
 const fn attach_exit_reason_label(reason: AttachExitReason) -> &'static str {
     match reason {
         AttachExitReason::Detached => "detached",
@@ -187,7 +196,7 @@ const fn attach_exit_reason_label(reason: AttachExitReason) -> &'static str {
     }
 }
 
-#[cfg(feature = "remote-iroh")]
+#[cfg(feature = "bundled-plugin-connections")]
 async fn emit_iroh_connect_perf_event(
     perf_emitter: &mut perf_telemetry::PerfEventEmitter,
     client: &mut BmuxClient,
@@ -261,7 +270,7 @@ async fn emit_iroh_connect_perf_event(
         .await
 }
 
-#[cfg(feature = "remote-iroh")]
+#[cfg(feature = "bundled-plugin-connections")]
 async fn refresh_perf_emitter_settings_from_server(
     perf_emitter: &mut perf_telemetry::PerfEventEmitter,
     client: &mut BmuxClient,
@@ -276,7 +285,7 @@ async fn refresh_perf_emitter_settings_from_server(
     }
 }
 
-#[cfg(feature = "remote-iroh")]
+#[cfg(feature = "bundled-plugin-connections")]
 async fn emit_iroh_attach_attempt_perf_event(
     perf_emitter: &mut perf_telemetry::PerfEventEmitter,
     client: &mut BmuxClient,
@@ -316,7 +325,7 @@ async fn emit_iroh_attach_attempt_perf_event(
         .await
 }
 
-#[cfg(feature = "remote-iroh")]
+#[cfg(feature = "bundled-plugin-connections")]
 async fn emit_iroh_reconnect_outage_perf_event(
     perf_emitter: &mut perf_telemetry::PerfEventEmitter,
     client: &mut BmuxClient,
@@ -362,11 +371,15 @@ async fn emit_iroh_reconnect_outage_perf_event(
         .await
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 pub(super) const SSH_RECONNECT_MAX_ATTEMPTS: usize = 4;
+#[cfg(feature = "bundled-plugin-connections")]
 const SSH_RECONNECT_BASE_BACKOFF_MS: u64 = 300;
+#[cfg(feature = "bundled-plugin-connections")]
 const BRIDGE_PREFLIGHT_TOKEN: &str = "BMUX_BRIDGE_READY";
-#[cfg(feature = "remote-iroh")]
+#[cfg(feature = "bundled-plugin-connections")]
 const BMUX_IROH_ALPN: &[u8] = b"bmux/gateway/iroh/1";
+#[cfg(feature = "bundled-plugin-connections")]
 #[derive(Debug)]
 struct SshBridgeStream {
     _child: Child,
@@ -374,6 +387,7 @@ struct SshBridgeStream {
     stdout: ChildStdout,
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 impl AsyncRead for SshBridgeStream {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -385,6 +399,7 @@ impl AsyncRead for SshBridgeStream {
     }
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 impl AsyncWrite for SshBridgeStream {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -410,49 +425,107 @@ pub(super) async fn should_proxy_to_target(cli: &Cli) -> Result<bool> {
     let Some(command) = cli.command.as_ref() else {
         return Ok(false);
     };
+    // Connection management always runs locally. With its plugin absent these
+    // paths arrive as external commands; they still must not run remotely.
     if matches!(
         command,
         Command::Server {
             command: ServerCommand::Autostart { .. },
         }
-    ) {
-        return Ok(false);
-    }
-    if let Command::External(args) = command
-        && args.first().is_some_and(|name| {
-            matches!(
-                name.as_str(),
-                "remote"
-                    | "access"
-                    | "connect"
-                    | "join"
-                    | "auth"
-                    | "share"
-                    | "unshare"
-                    | "host"
-                    | "hosts"
-                    | "setup"
-            )
-        })
+    ) || matches!(command, Command::External(args)
+        if args.first().is_some_and(|name| matches!(name.as_str(), "connect" | "remote" | "access")))
     {
         return Ok(false);
     }
+    target_is_ssh(cli.target.as_deref()).await
+}
+
+/// Whether a plugin-owned command runs on an SSH target by re-invoking bmux
+/// there. These commands were built in, and built-in commands were proxied to
+/// SSH targets; connect, remote and access administration always ran locally.
+pub(super) fn plugin_command_proxies_to_target(plugin_id: &str, command_name: &str) -> bool {
+    match plugin_id {
+        "bmux.clients" => matches!(command_name, "follow" | "list-clients" | "unfollow"),
+        "bmux.connections" => matches!(
+            command_name,
+            "auth-login"
+                | "auth-logout"
+                | "auth-status"
+                | "host"
+                | "hosts"
+                | "join"
+                | "kiosk-attach"
+                | "kiosk-init"
+                | "kiosk-issue-token"
+                | "kiosk-revoke-token"
+                | "kiosk-ssh-print-config"
+                | "kiosk-status"
+                | "setup"
+                | "share"
+                | "unshare"
+        ),
+        "bmux.performance" => matches!(command_name, "perf-off" | "perf-on" | "perf-status"),
+        "bmux.playbook" => matches!(
+            command_name,
+            "cleanup" | "diff" | "dry-run" | "interactive" | "run" | "validate"
+        ),
+        "bmux.plugin_cli" => matches!(
+            command_name,
+            "diagnostics-watch"
+                | "logs-profiles-delete"
+                | "logs-profiles-list"
+                | "logs-profiles-rename"
+                | "logs-profiles-show"
+                | "logs-tail"
+                | "logs-watch"
+        ),
+        "bmux.sessions" => matches!(
+            command_name,
+            "detach"
+                | "kill-all-sessions"
+                | "kill-session"
+                | "list-sessions"
+                | "new-session"
+                | "session-attach"
+                | "session-new"
+        ),
+        "bmux.snapshot" => matches!(command_name, "restore" | "save"),
+        _ => false,
+    }
+}
+
+/// Whether the explicit or configured default target is an SSH target.
+pub(super) async fn target_is_ssh(target: Option<&str>) -> Result<bool> {
     let config = BmuxConfig::load()?;
-    let target = resolve_effective_target(&config, cli.target.as_deref()).await?;
+    let target = resolve_effective_target(&config, target).await?;
     Ok(matches!(target, ResolvedTarget::Ssh(_)))
 }
 
 pub(super) async fn run_target_proxy_from_current_argv(cli: &Cli) -> Result<u8> {
+    run_target_proxy(
+        cli.target.as_deref(),
+        command_requires_remote_server(cli.command.as_ref()),
+        command_needs_tty(cli.command.as_ref()),
+    )
+    .await
+}
+
+/// Re-run the current command line on the selected SSH target.
+pub(super) async fn run_target_proxy(
+    target: Option<&str>,
+    requires_remote_server: bool,
+    wants_tty: bool,
+) -> Result<u8> {
     let config = BmuxConfig::load()?;
-    let target = resolve_effective_target(&config, cli.target.as_deref()).await?;
+    let target = resolve_effective_target(&config, target).await?;
     match target {
         ResolvedTarget::Ssh(target) => {
             let argv = std::env::args_os().collect::<Vec<_>>();
             let remote_args = strip_target_argument(&argv);
-            if command_requires_remote_server(cli.command.as_ref()) {
+            if requires_remote_server {
                 ensure_remote_server_ready(&target).await?;
             }
-            let needs_tty = command_needs_tty(cli.command.as_ref());
+            let needs_tty = wants_tty && io::stdin().is_terminal() && io::stdout().is_terminal();
             run_ssh_bmux_command(&target, &remote_args, needs_tty)
         }
         ResolvedTarget::Tls(target) => {
@@ -582,9 +655,6 @@ pub(super) async fn attach_endpoint(
             .await?;
             Ok((status, tls_target.label, target_session))
         }
-        #[cfg(not(feature = "remote-iroh"))]
-        ResolvedTarget::Iroh(_) => Err(crate::ssh_access::iroh_unavailable()),
-        #[cfg(feature = "remote-iroh")]
         ResolvedTarget::Iroh(iroh_target) => {
             attach_iroh_endpoint(
                 config,
@@ -599,7 +669,7 @@ pub(super) async fn attach_endpoint(
     }
 }
 
-#[cfg(all(feature = "bundled-plugin-connections", feature = "remote-iroh"))]
+#[cfg(feature = "bundled-plugin-connections")]
 async fn attach_iroh_endpoint(
     config: &BmuxConfig,
     iroh_target: IrohTarget,
@@ -647,6 +717,7 @@ async fn attach_iroh_endpoint(
     Ok((status, iroh_target.label, target_session))
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 fn map_connect_target_resolution_error(target: &str, error: anyhow::Error) -> anyhow::Error {
     if target.starts_with("bmux://") && error.to_string().contains("share link not found:") {
         return actionable_error(&error.to_string(), "bmux setup", Some("bmux hosts"));
@@ -654,6 +725,7 @@ fn map_connect_target_resolution_error(target: &str, error: anyhow::Error) -> an
     error
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 pub(super) async fn connect_attach_target_with_kernel(
     target: &str,
     client_name: &'static str,
@@ -684,9 +756,6 @@ pub(super) async fn connect_attach_target_with_kernel(
             let kernel_factory = build_tls_kernel_client_factory(&tls_target);
             Ok((client, Some(kernel_factory)))
         }
-        #[cfg(not(feature = "remote-iroh"))]
-        ResolvedTarget::Iroh(_) => Err(crate::ssh_access::iroh_unavailable()),
-        #[cfg(feature = "remote-iroh")]
         ResolvedTarget::Iroh(iroh_target) => {
             let (client, connection) = connect_iroh_bridge(&iroh_target, client_name, None).await?;
             let kernel_factory = build_iroh_kernel_client_factory(connection, &iroh_target);
@@ -695,6 +764,7 @@ pub(super) async fn connect_attach_target_with_kernel(
     }
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 fn format_actionable_error_lines(reason: &str, fix: &str, advanced: Option<&str>) -> Vec<String> {
     status_not_ready_lines(Some(reason), fix, advanced)
         .into_iter()
@@ -702,13 +772,14 @@ fn format_actionable_error_lines(reason: &str, fix: &str, advanced: Option<&str>
         .collect()
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 fn actionable_error(reason: &str, fix: &str, advanced: Option<&str>) -> anyhow::Error {
     anyhow::anyhow!(format_actionable_error_lines(reason, fix, advanced).join("\n"))
 }
 
 // Only connection establishment is retried. Never wrap attachment, input, or a
 // service mutation in this helper: a lost response does not establish non-execution.
-#[cfg(feature = "remote-iroh")]
+#[cfg(feature = "bundled-plugin-connections")]
 async fn retry_iroh_connection<T, Connect, ConnectFuture, Sleep, SleepFuture>(
     attempts: &mut usize,
     forever: bool,
@@ -736,7 +807,7 @@ where
     Ok(None)
 }
 
-#[cfg(feature = "remote-iroh")]
+#[cfg(feature = "bundled-plugin-connections")]
 fn iroh_connect_error_is_transient(error: &anyhow::Error) -> bool {
     // SSH auth currently exposes anyhow rather than a typed rejection contract.
     // Treat its existing stage boundary as terminal, including local agent I/O;
@@ -784,7 +855,7 @@ fn iroh_connect_error_is_transient(error: &anyhow::Error) -> bool {
     false
 }
 
-#[cfg(feature = "remote-iroh")]
+#[cfg(feature = "bundled-plugin-connections")]
 fn iroh_io_error_is_transient(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -804,7 +875,7 @@ fn iroh_io_error_is_transient(error: &io::Error) -> bool {
     clippy::too_many_arguments,
     reason = "Existing transport attachment passes independent runtime and telemetry state."
 )]
-#[cfg(feature = "remote-iroh")]
+#[cfg(feature = "bundled-plugin-connections")]
 async fn run_iroh_attach_with_reconnect(
     mut client: BmuxClient,
     mut iroh_connection: iroh::endpoint::Connection,
@@ -890,6 +961,7 @@ async fn run_iroh_attach_with_reconnect(
     }
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 async fn run_tls_attach_with_reconnect(
     mut client: BmuxClient,
     target: &TlsTarget,
@@ -925,6 +997,7 @@ async fn run_tls_attach_with_reconnect(
     }
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 async fn run_remote_attach_with_reconnect(
     mut client: BmuxClient,
     mut ssh_control_path: String,
@@ -978,15 +1051,13 @@ async fn run_remote_attach_with_reconnect(
 
 #[cfg(feature = "bundled-plugin-connections")]
 mod standalone_admin {
-    #[cfg(feature = "remote-iroh")]
     use super::connect_iroh_bridge;
     use super::{
         BmuxConfig, ConnectionContext, ConnectionPolicyScope, OsString, ResolvedTarget, Result,
         connect, connect_remote_bridge, connect_tls_bridge, connect_with_context,
-        ensure_remote_server_ready, ensure_tls_gateway_trusted_interactively, map_cli_client_error,
-        parse_iroh_target_parts, resolve_effective_target, resolve_target_reference,
-        run_remote_install_server_for_target, run_ssh_bmux_command, tls_target_from_config,
-        typed_list_sessions_remote,
+        ensure_tls_gateway_trusted_interactively, map_cli_client_error, parse_iroh_target_parts,
+        resolve_target_reference, run_remote_install_server_for_target, run_ssh_bmux_command,
+        tls_target_from_config, typed_list_sessions_remote,
     };
     use bmux_connections_admin::remote::{ProbeTarget, ProbeTransport};
     use std::sync::Arc;
@@ -1011,10 +1082,7 @@ mod standalone_admin {
                 let mut client = match self {
                     Self::Local => connect(ConnectionPolicyScope::Normal, name).await?,
                     Self::Tls(t) => connect_tls_bridge(t, name).await?,
-                    #[cfg(feature = "remote-iroh")]
                     Self::Iroh(t) => connect_iroh_bridge(t, name, None).await?.0,
-                    #[cfg(not(feature = "remote-iroh"))]
-                    Self::Iroh(_) => return Err(crate::ssh_access::iroh_unavailable()),
                     Self::Ssh(_) => anyhow::bail!("SSH probe requires a remote command"),
                 };
                 client.ping().await.map_err(map_cli_client_error)
@@ -1056,9 +1124,6 @@ mod standalone_admin {
             ResolvedTarget::Tls(tls_target) => {
                 connect_tls_bridge(&tls_target, "bmux-cli-complete-sessions-tls").await?
             }
-            #[cfg(not(feature = "remote-iroh"))]
-            ResolvedTarget::Iroh(_) => return Err(crate::ssh_access::iroh_unavailable()),
-            #[cfg(feature = "remote-iroh")]
             ResolvedTarget::Iroh(iroh_target) => {
                 connect_iroh_bridge(&iroh_target, "bmux-cli-complete-sessions-iroh", None)
                     .await?
@@ -1074,7 +1139,6 @@ mod standalone_admin {
     pub(in crate::runtime) fn ports(
         target: Option<String>,
     ) -> bmux_connections_plugin::remote_admin::AdminPorts {
-        let proxy_target = target.clone();
         bmux_connections_plugin::remote_admin::AdminPorts {
             probe: Arc::new(|target| {
                 Ok(Box::new(block_on_admin(resolve_target_reference(
@@ -1097,22 +1161,6 @@ mod standalone_admin {
                 Ok(())
             }),
             sessions: Arc::new(|target| block_on_admin(list_sessions(target))),
-            kiosk_proxy: Arc::new(move |args| {
-                let resolved = block_on_admin(resolve_effective_target(
-                    &BmuxConfig::load()?,
-                    proxy_target.as_deref(),
-                ))?;
-                if let ResolvedTarget::Ssh(t) = resolved {
-                    block_on_admin(ensure_remote_server_ready(&t))?;
-                    return run_ssh_bmux_command(
-                        &t,
-                        &args.iter().map(OsString::from).collect::<Vec<_>>(),
-                        false,
-                    )
-                    .map(Some);
-                }
-                Ok(None)
-            }),
             kiosk_attach: Arc::new(|grant| {
                 block_on_admin(crate::runtime::kiosk_cli::attach_authorized(grant))
             }),
@@ -1122,26 +1170,8 @@ mod standalone_admin {
 }
 #[cfg(feature = "bundled-plugin-connections")]
 pub(super) use standalone_admin::ports as admin_ports;
-fn parse_host_port_with_default(value: &str, default_port: u16) -> Result<(String, u16)> {
-    let raw = value.trim();
-    if let Some((host, port_raw)) = raw.rsplit_once(':') {
-        if port_raw.is_empty() {
-            return Ok((raw.to_string(), default_port));
-        }
-        let port = port_raw
-            .parse::<u16>()
-            .with_context(|| format!("invalid port in '{value}'"))?;
-        if host.trim().is_empty() {
-            anyhow::bail!("host is required");
-        }
-        return Ok((host.to_string(), port));
-    }
-    if raw.is_empty() {
-        anyhow::bail!("host is required");
-    }
-    Ok((raw.to_string(), default_port))
-}
 
+#[cfg(feature = "bundled-plugin-connections")]
 async fn resolve_local_attach_session(
     config: &BmuxConfig,
     selected: Option<&ConfigPaths>,
@@ -1166,6 +1196,7 @@ async fn resolve_local_attach_session(
     select_session_interactively("local", &sessions)
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 async fn resolve_remote_attach_session(
     client: &mut BmuxClient,
     target_label: &str,
@@ -1179,6 +1210,7 @@ async fn resolve_remote_attach_session(
     select_session_interactively(target_label, &sessions)
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 fn select_session_interactively(
     label: &str,
     sessions: &[SessionSummary],
@@ -1233,6 +1265,7 @@ fn select_session_interactively(
     ))
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 fn sessions_ordered_by_recent(
     label: &str,
     sessions: &[SessionSummary],
@@ -1261,6 +1294,7 @@ fn sessions_ordered_by_recent(
     Ok(ordered)
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 async fn connect_remote_bridge(
     target: &SshTarget,
     client_name: &str,
@@ -1308,6 +1342,7 @@ async fn connect_remote_bridge(
     })
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 async fn connect_tls_bridge(target: &TlsTarget, client_name: &str) -> Result<BmuxClient> {
     ensure_tls_gateway_trusted_for_policy(target).await?;
     match try_connect_tls_bridge(target, client_name).await {
@@ -1320,6 +1355,7 @@ async fn connect_tls_bridge(target: &TlsTarget, client_name: &str) -> Result<Bmu
     }
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 async fn try_connect_tls_bridge(target: &TlsTarget, client_name: &str) -> Result<BmuxClient> {
     let config = BmuxConfig::load().unwrap_or_default();
     let connector = build_tls_connector(target, &config)?;
@@ -1360,7 +1396,7 @@ async fn try_connect_tls_bridge(target: &TlsTarget, client_name: &str) -> Result
         .map_err(map_cli_client_error)
 }
 
-#[cfg(feature = "remote-iroh")]
+#[cfg(feature = "bundled-plugin-connections")]
 async fn connect_iroh_bridge(
     target: &IrohTarget,
     client_name: &str,
@@ -1375,7 +1411,7 @@ async fn connect_iroh_bridge(
     .with_context(|| format!("failed establishing iroh target '{}'", target.label))
 }
 
-#[cfg(feature = "remote-iroh")]
+#[cfg(feature = "bundled-plugin-connections")]
 async fn iroh_connect_with_deadline<T>(
     timeout_ms: u64,
     connect: impl std::future::Future<Output = Result<T>>,
@@ -1386,7 +1422,7 @@ async fn iroh_connect_with_deadline<T>(
 }
 
 #[allow(clippy::too_many_lines)] // staged iroh bridge setup is clearer inline for troubleshooting
-#[cfg(feature = "remote-iroh")]
+#[cfg(feature = "bundled-plugin-connections")]
 async fn connect_iroh_bridge_inner(
     target: &IrohTarget,
     client_name: &str,
@@ -1508,7 +1544,7 @@ async fn connect_iroh_bridge_inner(
 /// Build a [`KernelClientFactory`] that opens new QUIC bi-streams on `connection`
 /// for each kernel bridge invocation.  Each call produces a fresh, independently-
 /// handshaked [`BmuxClient`] whose lifetime is a single IPC request/response pair.
-#[cfg(feature = "remote-iroh")]
+#[cfg(feature = "bundled-plugin-connections")]
 fn build_iroh_kernel_client_factory(
     connection: iroh::endpoint::Connection,
     target: &IrohTarget,
@@ -1561,11 +1597,13 @@ fn build_iroh_kernel_client_factory(
     })
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 /// Generate a unique SSH `ControlMaster` socket path for this attach session.
 fn ssh_control_path_for_session() -> String {
     format!("/tmp/bmux-ssh-{}", Uuid::new_v4().as_simple())
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 /// Build a [`KernelClientFactory`] that spawns new SSH bridge processes for
 /// each kernel bridge invocation, reusing the master SSH connection via
 /// `ControlPath` for near-instant channel setup.
@@ -1616,6 +1654,7 @@ fn build_ssh_kernel_client_factory(
     })
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 /// Build a [`KernelClientFactory`] that opens a new TCP+TLS connection for
 /// each kernel bridge invocation.
 ///
@@ -1631,6 +1670,7 @@ fn build_tls_kernel_client_factory(target: &TlsTarget) -> KernelClientFactory {
     })
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 fn build_tls_connector(target: &TlsTarget, config: &BmuxConfig) -> Result<TlsConnector> {
     let verifier = build_tls_server_verifier(target, config)?;
     let config = rustls::ClientConfig::builder()
@@ -1640,6 +1680,7 @@ fn build_tls_connector(target: &TlsTarget, config: &BmuxConfig) -> Result<TlsCon
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 fn build_tls_server_verifier(
     target: &TlsTarget,
     config: &BmuxConfig,
@@ -1689,46 +1730,7 @@ fn build_tls_server_verifier(
     }))
 }
 
-fn tls_gateway_key(host: &str, port: u16) -> String {
-    format!("{}:{port}", host.trim())
-}
-
-fn certificate_fingerprint_sha256(cert: &[u8]) -> String {
-    let digest = Sha256::digest(cert);
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    format!("SHA256:{hex}")
-}
-
-fn load_known_gateways_store(paths: &ConfigPaths) -> Result<KnownGatewaysStore> {
-    let path = paths.known_gateways_file();
-    if !path.exists() {
-        return Ok(KnownGatewaysStore::default());
-    }
-    let contents = std::fs::read_to_string(&path)
-        .with_context(|| format!("failed reading known gateways store {}", path.display()))?;
-    toml::from_str(&contents)
-        .with_context(|| format!("failed parsing known gateways store {}", path.display()))
-}
-
-fn save_known_gateways_store(paths: &ConfigPaths, store: &KnownGatewaysStore) -> Result<()> {
-    let path = paths.known_gateways_file();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed creating known gateways directory {}",
-                parent.display()
-            )
-        })?;
-    }
-    let contents = toml::to_string_pretty(store).context("failed serializing known gateways")?;
-    std::fs::write(&path, contents)
-        .with_context(|| format!("failed writing known gateways store {}", path.display()))?;
-    Ok(())
-}
-
+#[cfg(feature = "bundled-plugin-connections")]
 fn tls_trust_decision(target: &TlsTarget, config: &BmuxConfig) -> Result<TlsTrustDecision> {
     let key = tls_gateway_key(&target.host, target.port);
     let config_pin = config
@@ -1760,6 +1762,7 @@ fn tls_trust_decision(target: &TlsTarget, config: &BmuxConfig) -> Result<TlsTrus
     })
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 impl ServerCertVerifier for BmuxTlsServerVerifier {
     fn verify_server_cert(
         &self,
@@ -1851,14 +1854,12 @@ impl ServerCertVerifier for BmuxTlsServerVerifier {
     }
 }
 
-fn fingerprints_equal(left: &str, right: &str) -> bool {
-    left.trim().eq_ignore_ascii_case(right.trim())
-}
-
+#[cfg(feature = "bundled-plugin-connections")]
 fn should_retry_after_tls_trust_prompt(error: &anyhow::Error) -> bool {
     error.to_string().contains("trust prompt required")
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 async fn ensure_tls_gateway_trusted_for_policy(target: &TlsTarget) -> Result<()> {
     let config = BmuxConfig::load().unwrap_or_default();
     if target.ca_file.is_some() || config.connections.tls_trust.mode != TlsTrustMode::TrustNew {
@@ -1872,6 +1873,7 @@ async fn ensure_tls_gateway_trusted_for_policy(target: &TlsTarget) -> Result<()>
     trust_tls_gateway(target, &fingerprint, None)
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 async fn ensure_tls_gateway_trusted_interactively(target: &TlsTarget) -> Result<()> {
     let peer_fingerprint = probe_tls_gateway_fingerprint(target).await?;
     let config = BmuxConfig::load().unwrap_or_default();
@@ -1926,6 +1928,7 @@ async fn ensure_tls_gateway_trusted_interactively(target: &TlsTarget) -> Result<
     Ok(())
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 fn trust_tls_gateway(target: &TlsTarget, fingerprint: &str, label: Option<&str>) -> Result<()> {
     let paths = ConfigPaths::default();
     let mut store = load_known_gateways_store(&paths)?;
@@ -1949,6 +1952,7 @@ fn trust_tls_gateway(target: &TlsTarget, fingerprint: &str, label: Option<&str>)
     save_known_gateways_store(&paths, &store)
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 async fn probe_tls_gateway_fingerprint(target: &TlsTarget) -> Result<String> {
     let verifier = Arc::new(ProbeTlsServerVerifier::default());
     let connector = TlsConnector::from(Arc::new(
@@ -1989,11 +1993,13 @@ async fn probe_tls_gateway_fingerprint(target: &TlsTarget) -> Result<String> {
         })
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 #[derive(Debug, Default)]
 struct ProbeTlsServerVerifier {
     fingerprint: Mutex<Option<String>>,
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 impl ServerCertVerifier for ProbeTlsServerVerifier {
     fn verify_server_cert(
         &self,
@@ -2105,6 +2111,7 @@ async fn ensure_remote_server_ready(target: &SshTarget) -> Result<()> {
     }
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 #[allow(clippy::unused_async)] // Async signature for caller consistency in async dispatch chain
 async fn ensure_remote_bridge_stdio_clean(target: &SshTarget) -> Result<()> {
     let output = run_ssh_bmux_command_capture(
@@ -2129,6 +2136,7 @@ async fn ensure_remote_bridge_stdio_clean(target: &SshTarget) -> Result<()> {
     );
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 fn load_or_create_local_principal_id(paths: &ConfigPaths) -> Result<Uuid> {
     let path = paths.principal_id_file();
     if let Some(parent) = path.parent() {
@@ -2152,10 +2160,7 @@ fn load_or_create_local_principal_id(paths: &ConfigPaths) -> Result<Uuid> {
     }
 }
 
-fn run_ssh_bmux_command(target: &SshTarget, args: &[OsString], force_tty: bool) -> Result<u8> {
-    run_ssh_bmux_command_inner(target, args, force_tty, true)
-}
-
+#[cfg(feature = "bundled-plugin-connections")]
 fn run_ssh_bmux_command_capture(
     target: &SshTarget,
     args: &[OsString],
@@ -2170,6 +2175,7 @@ fn run_ssh_bmux_command_capture(
     Err(map_ssh_execution_error(target, stderr.trim()))
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 async fn run_remote_install_server_for_target(target: &SshTarget) -> Result<()> {
     let mut command = build_ssh_command(
         target,
@@ -2194,90 +2200,7 @@ async fn run_remote_install_server_for_target(target: &SshTarget) -> Result<()> 
     ensure_remote_server_ready(target).await
 }
 
-fn run_ssh_bmux_command_silent(
-    target: &SshTarget,
-    args: &[OsString],
-    force_tty: bool,
-) -> Result<u8> {
-    run_ssh_bmux_command_inner(target, args, force_tty, false)
-}
-
-fn run_ssh_bmux_command_inner(
-    target: &SshTarget,
-    args: &[OsString],
-    force_tty: bool,
-    print_stdout: bool,
-) -> Result<u8> {
-    if !force_tty {
-        let output = build_ssh_command(target, args, false)
-            .output()
-            .with_context(|| format!("failed executing ssh target {}", target.label))?;
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if print_stdout && !stdout.trim().is_empty() {
-                print!("{stdout}");
-            }
-            return Ok(0);
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(map_ssh_execution_error(target, stderr.trim()));
-    }
-    let mut command = build_ssh_command(target, args, force_tty);
-    let status = command
-        .status()
-        .with_context(|| format!("failed executing ssh target {}", target.label))?;
-    Ok(exit_code_from_status(status))
-}
-
-fn build_ssh_command(target: &SshTarget, args: &[OsString], force_tty: bool) -> ProcessCommand {
-    let mut command = ProcessCommand::new("ssh");
-    if force_tty {
-        command.arg("-t");
-    }
-    if let Some(port) = target.port {
-        command.arg("-p");
-        command.arg(port.to_string());
-    }
-    if let Some(path) = target.identity_file.as_ref() {
-        command.arg("-i");
-        command.arg(path);
-    }
-    if let Some(jump) = target.jump.as_ref() {
-        command.arg("-J");
-        command.arg(jump);
-    }
-    command.arg("-o");
-    command.arg(format!(
-        "StrictHostKeyChecking={}",
-        if target.strict_host_key_checking {
-            "yes"
-        } else {
-            "no"
-        }
-    ));
-    if let Some(known_hosts) = target.known_hosts_file.as_ref() {
-        command.arg("-o");
-        command.arg(format!("UserKnownHostsFile={}", known_hosts.display()));
-    }
-    command.arg("-o");
-    let timeout_secs = (target.connect_timeout_ms.saturating_add(999)) / 1000;
-    command.arg(format!("ConnectTimeout={timeout_secs}"));
-    command.arg("-o");
-    command.arg("ServerAliveInterval=15");
-    command.arg("-o");
-    command.arg("ServerAliveCountMax=3");
-    command.arg("-o");
-    command.arg("BatchMode=yes");
-    let destination = target.user.as_ref().map_or_else(
-        || target.host.clone(),
-        |user| format!("{user}@{}", target.host),
-    );
-    command.arg(destination);
-    command.arg(&target.remote_bmux_path);
-    command.args(args);
-    command
-}
-
+#[cfg(feature = "bundled-plugin-connections")]
 fn build_ssh_bridge_command(target: &SshTarget, control_path: Option<&str>) -> TokioProcessCommand {
     let mut command = TokioProcessCommand::new("ssh");
     command.arg("-T");
@@ -2339,41 +2262,6 @@ fn build_ssh_bridge_command(target: &SshTarget, control_path: Option<&str>) -> T
     command
 }
 
-fn map_ssh_execution_error(target: &SshTarget, stderr: &str) -> anyhow::Error {
-    if stderr.contains("Host key verification failed") {
-        return anyhow::anyhow!(
-            "ssh host key verification failed for '{}'. verify known_hosts or set known_hosts_file",
-            target.label
-        );
-    }
-    if stderr.contains("Permission denied") {
-        return anyhow::anyhow!(
-            "ssh authentication failed for '{}'. check user/identity_file and remote access",
-            target.label
-        );
-    }
-    if stderr.contains("Could not resolve hostname") {
-        return anyhow::anyhow!(
-            "ssh target '{}' hostname could not be resolved",
-            target.label
-        );
-    }
-    if stderr.contains("Connection timed out") || stderr.contains("Operation timed out") {
-        return anyhow::anyhow!("ssh connection to '{}' timed out", target.label);
-    }
-    if stderr.is_empty() {
-        return anyhow::anyhow!("ssh command failed for '{}'", target.label);
-    }
-    anyhow::anyhow!("ssh command failed for '{}': {stderr}", target.label)
-}
-
-fn ssh_destination(target: &SshTarget) -> String {
-    target.user.as_ref().map_or_else(
-        || target.host.clone(),
-        |user| format!("{user}@{}", target.host),
-    )
-}
-
 fn strip_target_argument(argv: &[OsString]) -> Vec<OsString> {
     if argv.len() <= 1 {
         return Vec::new();
@@ -2396,28 +2284,16 @@ fn strip_target_argument(argv: &[OsString]) -> Vec<OsString> {
     filtered
 }
 
-fn command_needs_tty(command: Option<&Command>) -> bool {
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        return false;
-    }
-    if matches!(command, Some(Command::External(args)) if matches!(args.as_slice(), [group, leaf, ..] if group == "session" && leaf == "attach"))
-    {
-        return true;
-    }
+/// Built-in commands that need a remote terminal when proxied: `attach`.
+const fn command_needs_tty(command: Option<&Command>) -> bool {
     matches!(command, Some(Command::Attach { .. }))
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 #[allow(clippy::cast_possible_truncation)] // Attempt count bounded to small values
 pub(super) fn reconnect_backoff_ms(attempt: usize) -> u64 {
     let exponent = attempt.saturating_sub(1).min(10) as u32;
     SSH_RECONNECT_BASE_BACKOFF_MS.saturating_mul(2u64.saturating_pow(exponent))
-}
-
-fn exit_code_from_status(status: std::process::ExitStatus) -> u8 {
-    status
-        .code()
-        .and_then(|code| u8::try_from(code).ok())
-        .unwrap_or(1)
 }
 
 async fn resolve_effective_target(
@@ -2542,43 +2418,7 @@ fn resolve_named_target(name: &str, target: &ConnectionTargetConfig) -> Result<R
 }
 
 fn parse_inline_ssh_target(target: &str) -> Result<ResolvedTarget> {
-    let mut raw = target.trim();
-    if let Some(without_scheme) = raw.strip_prefix("ssh://") {
-        raw = without_scheme;
-    }
-    let (user, host_port) = if let Some((user, rest)) = raw.split_once('@') {
-        (Some(user.to_string()), rest)
-    } else {
-        (None, raw)
-    };
-    let (host, port) = if let Some((host, port_raw)) = host_port.rsplit_once(':') {
-        if port_raw.is_empty() {
-            (host_port.to_string(), None)
-        } else {
-            let parsed = port_raw
-                .parse::<u16>()
-                .with_context(|| format!("invalid SSH port in target '{target}'"))?;
-            (host.to_string(), Some(parsed))
-        }
-    } else {
-        (host_port.to_string(), None)
-    };
-    if host.trim().is_empty() {
-        anyhow::bail!("target must include a host");
-    }
-    Ok(ResolvedTarget::Ssh(SshTarget {
-        label: target.to_string(),
-        host,
-        user,
-        port,
-        identity_file: None,
-        known_hosts_file: None,
-        strict_host_key_checking: true,
-        jump: None,
-        remote_bmux_path: "bmux".to_string(),
-        connect_timeout_ms: 8_000,
-        server_start_mode: RemoteServerStartMode::Auto,
-    }))
+    bmux_remote_ssh::parse_inline_ssh_target(target).map(ResolvedTarget::Ssh)
 }
 
 fn parse_inline_tls_target(target: &str) -> Result<ResolvedTarget> {
@@ -2648,22 +2488,6 @@ mod tests {
     #[allow(clippy::wildcard_imports)]
     use super::*;
     use std::ffi::OsString;
-
-    fn sample_target() -> SshTarget {
-        SshTarget {
-            label: "prod".to_string(),
-            host: "example.com".to_string(),
-            user: Some("bmux".to_string()),
-            port: Some(2222),
-            identity_file: None,
-            known_hosts_file: None,
-            strict_host_key_checking: true,
-            jump: None,
-            remote_bmux_path: "bmux".to_string(),
-            connect_timeout_ms: 8_000,
-            server_start_mode: RemoteServerStartMode::Auto,
-        }
-    }
 
     #[cfg(feature = "bundled-plugin-connections")]
     #[tokio::test]
@@ -2742,12 +2566,6 @@ mod tests {
     }
 
     #[test]
-    fn map_ssh_execution_error_highlights_auth_failures() {
-        let error = map_ssh_execution_error(&sample_target(), "Permission denied (publickey)");
-        assert!(error.to_string().contains("authentication failed"));
-    }
-
-    #[test]
     fn command_requires_remote_server_skips_server_start() {
         let command = Command::Server {
             command: ServerCommand::Start {
@@ -2807,7 +2625,7 @@ mod tests {
         assert!(command_requires_remote_server(Some(&command)));
     }
 
-    #[cfg(feature = "remote-iroh")]
+    #[cfg(feature = "bundled-plugin-connections")]
     #[tokio::test]
     async fn iroh_reconnect_retries_failures_without_reattaching() {
         let mut attempts = 0;
@@ -2834,7 +2652,7 @@ mod tests {
         assert_eq!(delays, [300, 600, 1_200]);
     }
 
-    #[cfg(feature = "remote-iroh")]
+    #[cfg(feature = "bundled-plugin-connections")]
     #[tokio::test]
     async fn iroh_reconnect_exhausts_lifetime_budget() {
         let mut attempts = SSH_RECONNECT_MAX_ATTEMPTS - 1;
@@ -2859,7 +2677,7 @@ mod tests {
         assert_eq!(recovered, None);
     }
 
-    #[cfg(feature = "remote-iroh")]
+    #[cfg(feature = "bundled-plugin-connections")]
     #[tokio::test]
     async fn iroh_reconnect_forever_caps_backoff_and_saturates_attempts() {
         let mut attempts = usize::MAX;
@@ -2887,7 +2705,7 @@ mod tests {
         assert_eq!(attempts, usize::MAX);
     }
 
-    #[cfg(feature = "remote-iroh")]
+    #[cfg(feature = "bundled-plugin-connections")]
     #[tokio::test]
     async fn iroh_reconnect_forever_stops_on_auth_failure() {
         let mut attempts = 0;
@@ -2904,7 +2722,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "remote-iroh")]
+    #[cfg(feature = "bundled-plugin-connections")]
     fn iroh_reconnect_classifies_typed_errors_not_messages() {
         for error in [
             anyhow::Error::from(iroh::endpoint::ConnectionError::TimedOut),
@@ -2938,7 +2756,7 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "remote-iroh")]
+    #[cfg(feature = "bundled-plugin-connections")]
     #[tokio::test]
     async fn iroh_reconnect_deadline_bounds_pending_setup() {
         // No network or live endpoint: a permanently pending online/setup phase
@@ -2960,6 +2778,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "bundled-plugin-connections")]
     #[test]
     fn reconnect_backoff_grows_exponentially() {
         assert_eq!(reconnect_backoff_ms(1), 300);

@@ -47,11 +47,6 @@ pub(super) fn run(
     plugin: &PlaybookPlugin,
     ctx: &NativeCommandContext,
 ) -> Result<i32, PluginCommandError> {
-    if !ctx.invocation_source.is_cli() {
-        return Err(PluginCommandError::failed(
-            "playbook run requires a standalone CLI invocation",
-        ));
-    }
     let args = Args::try_parse_from(
         std::iter::once("bmux playbook run").chain(ctx.arguments.iter().map(String::as_str)),
     )
@@ -65,7 +60,7 @@ pub(super) fn run(
         .map(i32::from)
         .map_err(|e| PluginCommandError::failed(format!("{e:#}")))
 }
-fn execute(ctx: &NativeCommandContext, host: super::BatchHost, args: Args) -> Result<u8> {
+fn execute(ctx: &NativeCommandContext, host: super::ExecutionHost, args: Args) -> Result<u8> {
     let Args {
         source,
         json,
@@ -208,8 +203,10 @@ fn execute(ctx: &NativeCommandContext, host: super::BatchHost, args: Args) -> Re
 #[derive(Parser)]
 #[command(name = "bmux playbook cleanup")]
 struct Cleanup {
+    /// Only list orphaned dirs without deleting
     #[arg(long)]
     dry_run: bool,
+    /// Output as JSON
     #[arg(long)]
     json: bool,
 }
@@ -217,11 +214,6 @@ pub(super) fn cleanup(
     plugin: &PlaybookPlugin,
     ctx: &NativeCommandContext,
 ) -> Result<i32, PluginCommandError> {
-    if !ctx.invocation_source.is_cli() {
-        return Err(PluginCommandError::failed(
-            "playbook cleanup requires a standalone CLI invocation",
-        ));
-    }
     let args = Cleanup::try_parse_from(
         std::iter::once("bmux playbook cleanup").chain(ctx.arguments.iter().map(String::as_str)),
     )

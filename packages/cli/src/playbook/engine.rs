@@ -45,7 +45,6 @@ use bmux_playbook::engine::{reconcile_real_attach_target, typed_new_session_play
 
 #[derive(Debug)]
 pub struct CliHost {
-    reactor: Option<tokio::runtime::Handle>,
     selected: Option<(BmuxConfig, ConfigPaths)>,
     /// Command runtime of the invoking CLI (registry, roots, runtime owner).
     /// Real attachments run caller-process plugin commands with it; it is
@@ -63,7 +62,6 @@ pub(crate) fn command_host(
     command_state: Option<crate::runtime::RuntimeCommandState>,
 ) -> Arc<dyn HostAdapter> {
     Arc::new(CliHost {
-        reactor: tokio::runtime::Handle::try_current().ok(),
         selected,
         command_state,
     })
@@ -241,12 +239,22 @@ impl KeyProcessor for CliKeyProcessor {
 }
 
 impl CliHost {
-    fn drive<T>(&self, work: impl std::future::Future<Output = Result<T>>) -> Result<T> {
-        let reactor = self
-            .reactor
-            .as_ref()
-            .context("playbook command reactor not bound")?;
-        tokio::task::block_in_place(|| reactor.block_on(work))
+    /// Run on the invoking thread's runtime, resolved when the command runs
+    /// (not when the plugin was loaded). A current-thread worker cannot block in
+    /// place; callers outside any runtime get a private current-thread runtime.
+    fn drive<T>(work: impl std::future::Future<Output = Result<T>>) -> Result<T> {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(work))
+            }
+            Ok(_) => {
+                anyhow::bail!("selected playbook executor requires a blocking execution context")
+            }
+            Err(_) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(work),
+        }
     }
 }
 
@@ -257,11 +265,11 @@ impl HostAdapter for CliHost {
         target_server: bool,
         options: RunOptions,
     ) -> Result<bmux_playbook::types::PlaybookResult> {
-        self.drive(run_playbook_with_host(
+        Self::drive(run_playbook_with_host(
             playbook,
             target_server,
             options,
-            self.clone(),
+            self,
         ))
     }
 
@@ -273,14 +281,8 @@ impl HostAdapter for CliHost {
         shell: Option<&str>,
         timeout: Option<std::time::Duration>,
     ) -> Result<u8> {
-        self.drive(bmux_playbook::interactive::run_interactive(
-            self.clone(),
-            socket,
-            record,
-            viewport.0,
-            viewport.1,
-            shell,
-            timeout,
+        Self::drive(bmux_playbook::interactive::run_interactive(
+            self, socket, record, viewport.0, viewport.1, shell, timeout,
         ))
     }
 
@@ -292,7 +294,6 @@ impl HostAdapter for CliHost {
     }
     fn pane_transport(&self) -> Arc<dyn PaneTransport> {
         Arc::new(Self {
-            reactor: self.reactor.clone(),
             selected: self.selected.clone(),
             command_state: self.command_state.clone(),
         })

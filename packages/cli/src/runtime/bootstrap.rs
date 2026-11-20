@@ -42,7 +42,14 @@ pub(super) async fn run_default_server_attach(
     connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
     tracing::info!("attach.bootstrap.default_start");
-    let selected = crate::connection::SelectedTarget::resolve(connection_context).await?;
+    // Bare `bmux` attaches locally unless `--target` is given explicitly;
+    // `BMUX_TARGET` and `connections.default_target` do not redirect it.
+    let attach_connection_context = connection_context
+        .target_override
+        .map_or(ConnectionContext::new(Some("local")), |target| {
+            ConnectionContext::new(Some(target))
+        });
+    let selected = crate::connection::SelectedTarget::resolve(attach_connection_context).await?;
     let mut client = if selected.is_local() {
         ensure_server_running_for_default_attach(ConnectionContext::new(Some("local")), None)
             .await?;

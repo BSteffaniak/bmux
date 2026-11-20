@@ -4,9 +4,10 @@ use bmux_attach_layout_protocol::{
     PaneSummary,
 };
 use bmux_attach_token_state::AttachGrant;
+#[cfg(feature = "bundled-plugin-playbook")]
+use bmux_client::PaneOutputBatchResult;
 use bmux_client::{
     AttachLayoutState, AttachOpenInfo, AttachPaneSnapshotState, AttachSnapshotState, ClientError,
-    PaneOutputBatchResult,
 };
 use bmux_context_state::ContextSelector;
 use bmux_ipc::ErrorCode;
@@ -4044,6 +4045,7 @@ pub trait BmuxPaneRuntimeClientExt {
         selector: ContextSelector,
     ) -> impl Future<Output = ClientResult<AttachGrant>> + Send;
 
+    #[cfg(feature = "bundled-plugin-playbook")]
     fn retarget_attach_context(
         &mut self,
         context_id: Uuid,
@@ -4073,17 +4075,20 @@ pub trait BmuxPaneRuntimeClientExt {
 
     fn detach(&mut self) -> impl Future<Output = ClientResult<()>> + Send;
 
+    #[cfg(feature = "bundled-plugin-connections")]
     fn set_attach_policy(
         &mut self,
         allow_detach: bool,
     ) -> impl Future<Output = ClientResult<()>> + Send;
 
+    #[cfg(feature = "bundled-plugin-playbook")]
     fn attach_input(
         &mut self,
         session_id: Uuid,
         data: Vec<u8>,
     ) -> impl Future<Output = ClientResult<usize>> + Send;
 
+    #[cfg(feature = "bundled-plugin-playbook")]
     fn pane_direct_input(
         &mut self,
         session_id: Uuid,
@@ -4091,6 +4096,7 @@ pub trait BmuxPaneRuntimeClientExt {
         data: Vec<u8>,
     ) -> impl Future<Output = ClientResult<usize>> + Send;
 
+    #[cfg(feature = "bundled-plugin-playbook")]
     fn attach_set_viewport(
         &mut self,
         session_id: Uuid,
@@ -4118,6 +4124,7 @@ pub trait BmuxPaneRuntimeClientExt {
         session_id: Uuid,
     ) -> impl Future<Output = ClientResult<AttachLayoutState>> + Send;
 
+    #[cfg(feature = "bundled-plugin-playbook")]
     fn attach_pane_output_batch(
         &mut self,
         session_id: Uuid,
@@ -4191,6 +4198,7 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
         }
     }
 
+    #[cfg(feature = "bundled-plugin-playbook")]
     async fn retarget_attach_context(
         &mut self,
         context_id: Uuid,
@@ -4260,6 +4268,7 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
         }
     }
 
+    #[cfg(feature = "bundled-plugin-connections")]
     async fn set_attach_policy(&mut self, allow_detach: bool) -> ClientResult<()> {
         match AttachCommands::client::set_client_attach_policy(self, allow_detach).await {
             Ok(Ok(_)) => Ok(()),
@@ -4268,6 +4277,7 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
         }
     }
 
+    #[cfg(feature = "bundled-plugin-playbook")]
     async fn attach_input(&mut self, session_id: Uuid, data: Vec<u8>) -> ClientResult<usize> {
         match AttachCommands::client::attach_input(self, session_id, data).await {
             Ok(Ok(accepted)) => Ok(accepted.bytes as usize),
@@ -4276,6 +4286,7 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
         }
     }
 
+    #[cfg(feature = "bundled-plugin-playbook")]
     async fn pane_direct_input(
         &mut self,
         session_id: Uuid,
@@ -4290,6 +4301,7 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
         }
     }
 
+    #[cfg(feature = "bundled-plugin-playbook")]
     async fn attach_set_viewport(
         &mut self,
         session_id: Uuid,
@@ -4338,6 +4350,7 @@ impl BmuxPaneRuntimeClientExt for bmux_client::BmuxClient {
         }
     }
 
+    #[cfg(feature = "bundled-plugin-playbook")]
     async fn attach_pane_output_batch(
         &mut self,
         session_id: Uuid,
@@ -4757,6 +4770,7 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
         }
     }
 
+    #[cfg(feature = "bundled-plugin-playbook")]
     async fn retarget_attach_context(
         &mut self,
         context_id: Uuid,
@@ -4826,6 +4840,7 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
         }
     }
 
+    #[cfg(feature = "bundled-plugin-connections")]
     async fn set_attach_policy(&mut self, allow_detach: bool) -> ClientResult<()> {
         match AttachCommands::client::set_client_attach_policy(self, allow_detach).await {
             Ok(Ok(_)) => Ok(()),
@@ -4834,6 +4849,7 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
         }
     }
 
+    #[cfg(feature = "bundled-plugin-playbook")]
     async fn attach_input(&mut self, session_id: Uuid, data: Vec<u8>) -> ClientResult<usize> {
         match AttachCommands::client::attach_input(self, session_id, data).await {
             Ok(Ok(accepted)) => Ok(accepted.bytes as usize),
@@ -4842,6 +4858,7 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
         }
     }
 
+    #[cfg(feature = "bundled-plugin-playbook")]
     async fn pane_direct_input(
         &mut self,
         session_id: Uuid,
@@ -4856,6 +4873,7 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
         }
     }
 
+    #[cfg(feature = "bundled-plugin-playbook")]
     async fn attach_set_viewport(
         &mut self,
         session_id: Uuid,
@@ -4904,6 +4922,7 @@ impl BmuxPaneRuntimeClientExt for bmux_client::StreamingBmuxClient {
         }
     }
 
+    #[cfg(feature = "bundled-plugin-playbook")]
     async fn attach_pane_output_batch(
         &mut self,
         session_id: Uuid,

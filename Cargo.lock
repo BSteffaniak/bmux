@@ -1771,6 +1771,7 @@ dependencies = [
  "bmux_recording_plugin_api",
  "bmux_recording_protocol",
  "bmux_recording_runtime",
+ "bmux_remote_ssh",
  "bmux_scene_protocol",
  "bmux_server",
  "bmux_session_models",
@@ -2092,6 +2093,7 @@ version = "0.0.1-alpha.4"
 dependencies = [
  "anyhow",
  "bmux_config",
+ "bmux_remote_ssh",
  "serde",
  "serde_json",
  "sha2 0.11.1",
@@ -2119,6 +2121,7 @@ dependencies = [
  "bmux_plugin",
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
+ "bmux_remote_ssh",
  "bmux_server",
  "bmux_sessions_plugin",
  "bmux_terminal_grid",
@@ -3210,6 +3213,14 @@ dependencies = [
  "bmux_recording_protocol",
  "serde",
  "uuid",
+]
+
+[[package]]
+name = "bmux_remote_ssh"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "anyhow",
+ "bmux_config",
 ]
 
 [[package]]

@@ -1,0 +1,28 @@
+[package]
+authors.workspace    = true
+description          = "Kiosk token and remote target administration shared by bmux connections hosts"
+edition.workspace    = true
+license.workspace    = true
+name                 = "bmux_connections_admin"
+repository.workspace = true
+version.workspace    = true
+
+categories = ["command-line-utilities"]
+keywords   = ["bmux", "connections"]
+readme     = "README.md"
+
+[dependencies]
+anyhow          = { workspace = true, features = ["std"] }
+bmux_config     = { workspace = true }
+bmux_remote_ssh = { workspace = true }
+serde           = { workspace = true, features = ["derive"] }
+serde_json      = { workspace = true }
+sha2            = { workspace = true }
+toml            = { workspace = true }
+uuid            = { workspace = true, features = ["std", "v4"] }
+
+[features]
+fail-on-warnings = [
+    "bmux_config/fail-on-warnings",
+    "bmux_remote_ssh/fail-on-warnings",
+]

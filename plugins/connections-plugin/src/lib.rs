@@ -2298,11 +2298,13 @@ impl ConnectionsInstance {
             client.run(context)
         };
         // Standalone CLI failures keep the diagnostic format of the original
-        // built-in commands. The generic dispatcher prints this message once.
-        run().map_err(|e| PluginCommandError::failed(format!("bmux error: {e}")))
+        // built-in commands, including the cause chain. The generic dispatcher
+        // prints this message once.
+        run().map_err(|e| PluginCommandError::failed(format!("bmux error: {e:#}")))
     }
     fn run_command(context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
-        remote_cli::run(context).map_err(|e| PluginCommandError::failed(e.to_string()))
+        remote_cli::run(context)
+            .map_err(|e| PluginCommandError::failed(format!("bmux error: {e:#}")))
     }
 }
 

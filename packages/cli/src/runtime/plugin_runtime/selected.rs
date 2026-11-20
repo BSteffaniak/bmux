@@ -205,6 +205,58 @@ impl KernelServices {
         )
         .await
     }
+
+    /// Run a plugin command requested from inside another plugin's callback.
+    fn invoke_nested_cli_command(
+        &self,
+        invocation: &bmux_plugin_runtime::InvocationScope,
+        request: bmux_plugin_sdk::HostServiceRequest<'_>,
+    ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+        // Nested commands must inherit this actual entry's issuing route,
+        // never the instance-cached builtin executor or another TLS route.
+        // A server service callback has an authenticated server invocation,
+        // not a CLI transport. Dispatch on that invocation only while its
+        // actual callback entry is live; never fall back to lifecycle roots.
+        if self.command_route.is_none()
+            && let Some(authority) = &self.authority
+        {
+            let _parent = authority.callback_parent()?.ok_or_else(|| {
+                failure("nested plugin command requires live callback dependency")
+            })?;
+            let bytes = bmux_ipc::encode(&bmux_ipc::Request::InvokeService {
+                capability: request.capability.into(),
+                kind: bmux_ipc::InvokeServiceKind::Command,
+                interface_id: request.interface.into(),
+                operation: request.operation.into(),
+                payload: request.payload.to_vec(),
+            })
+            .map_err(|error| failure(error.to_string()))?;
+            return match authority
+                .clone()
+                .with_plugin_caller(&self.declaration.id)
+                .execute_response_scoped(invocation, &bytes)?
+            {
+                bmux_ipc::ResponsePayload::ServiceInvoked { payload } => Ok(payload),
+                _ => Err(failure("unexpected authenticated nested command response")),
+            };
+        }
+        let route = match &self.command_route {
+            Some(route) if route.parent().is_some() => route.clone(),
+            Some(_) => {
+                return Err(failure(
+                    "nested plugin command requires live callback dependency",
+                ));
+            }
+            None => {
+                return Err(failure(
+                    "nested plugin command requires selected invocation transport",
+                ));
+            }
+        };
+        crate::runtime::plugin_kernel::scoped_cli_executor_with_dispatch(Some(route))
+            .map_err(|error| failure(error.to_string()))?
+            .invoke(request)
+    }
 }
 
 impl bmux_plugin_sdk::HostServiceDispatch for KernelServices {
@@ -269,50 +321,7 @@ impl bmux_plugin_sdk::HostServiceDispatch for KernelServices {
             && request.interface == bmux_plugin_sdk::CORE_CLI_COMMAND_INTERFACE_V1
             && request.operation == bmux_plugin_sdk::CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1
         {
-            // Nested commands must inherit this actual entry's issuing route,
-            // never the instance-cached builtin executor or another TLS route.
-            // A server service callback has an authenticated server invocation,
-            // not a CLI transport. Dispatch on that invocation only while its
-            // actual callback entry is live; never fall back to lifecycle roots.
-            if self.command_route.is_none()
-                && let Some(authority) = &self.authority
-            {
-                let _parent = authority.callback_parent()?.ok_or_else(|| {
-                    failure("nested plugin command requires live callback dependency")
-                })?;
-                let bytes = bmux_ipc::encode(&bmux_ipc::Request::InvokeService {
-                    capability: request.capability.into(),
-                    kind: bmux_ipc::InvokeServiceKind::Command,
-                    interface_id: request.interface.into(),
-                    operation: request.operation.into(),
-                    payload: request.payload.to_vec(),
-                })
-                .map_err(|error| failure(error.to_string()))?;
-                return match authority
-                    .clone()
-                    .with_plugin_caller(&self.declaration.id)
-                    .execute_response_scoped(invocation, &bytes)?
-                {
-                    bmux_ipc::ResponsePayload::ServiceInvoked { payload } => Ok(payload),
-                    _ => Err(failure("unexpected authenticated nested command response")),
-                };
-            }
-            let route = match &self.command_route {
-                Some(route) if route.parent().is_some() => route.clone(),
-                Some(_) => {
-                    return Err(failure(
-                        "nested plugin command requires live callback dependency",
-                    ));
-                }
-                None => {
-                    return Err(failure(
-                        "nested plugin command requires selected invocation transport",
-                    ));
-                }
-            };
-            return crate::runtime::plugin_kernel::scoped_cli_executor_with_dispatch(Some(route))
-                .map_err(|error| failure(error.to_string()))?
-                .invoke(request);
+            return self.invoke_nested_cli_command(invocation, request);
         }
         let selected_service = self.services.iter().find(|service| {
             service.capability.as_str() == request.capability

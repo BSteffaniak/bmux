@@ -1,13 +1,14 @@
 use anyhow::{Context, Result};
 use bmux_config::{BmuxConfig, ConfigPaths};
+use bmux_connections_admin::known_gateways::{
+    KnownGatewayState, certificate_fingerprint_sha256, fingerprints_equal,
+    load_known_gateways_store, save_known_gateways_store, tls_gateway_key,
+};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, Error as RustlsError, SignatureScheme};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt::Write as _,
+    collections::BTreeSet,
     io::{self, Write},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -23,19 +24,6 @@ struct TlsTarget {
     connect_timeout_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
-struct KnownGatewaysStore {
-    gateways: BTreeMap<String, KnownGatewayState>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct KnownGatewayState {
-    fingerprint_sha256: String,
-    trusted_at_unix_ms: u64,
-    server_name: Option<String>,
-    label: Option<String>,
-}
 fn parse_inline_tls_target(target: &str) -> Result<TlsTarget> {
     let raw = target
         .trim()
@@ -153,50 +141,6 @@ pub(super) fn run_remote_trust_remove(endpoint: &str) -> Result<u8> {
         return Ok(0);
     }
     anyhow::bail!("local TLS trust pin not found for {endpoint}")
-}
-
-fn tls_gateway_key(host: &str, port: u16) -> String {
-    format!("{}:{port}", host.trim())
-}
-
-fn certificate_fingerprint_sha256(cert: &[u8]) -> String {
-    let digest = Sha256::digest(cert);
-    let mut hex = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(&mut hex, "{byte:02x}").expect("writing to String cannot fail");
-    }
-    format!("SHA256:{hex}")
-}
-
-fn load_known_gateways_store(paths: &ConfigPaths) -> Result<KnownGatewaysStore> {
-    let path = paths.known_gateways_file();
-    if !path.exists() {
-        return Ok(KnownGatewaysStore::default());
-    }
-    let contents = std::fs::read_to_string(&path)
-        .with_context(|| format!("failed reading known gateways store {}", path.display()))?;
-    toml::from_str(&contents)
-        .with_context(|| format!("failed parsing known gateways store {}", path.display()))
-}
-
-fn save_known_gateways_store(paths: &ConfigPaths, store: &KnownGatewaysStore) -> Result<()> {
-    let path = paths.known_gateways_file();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed creating known gateways directory {}",
-                parent.display()
-            )
-        })?;
-    }
-    let contents = toml::to_string_pretty(store).context("failed serializing known gateways")?;
-    std::fs::write(&path, contents)
-        .with_context(|| format!("failed writing known gateways store {}", path.display()))?;
-    Ok(())
-}
-
-fn fingerprints_equal(left: &str, right: &str) -> bool {
-    left.trim().eq_ignore_ascii_case(right.trim())
 }
 
 fn trust_tls_gateway(target: &TlsTarget, fingerprint: &str, label: Option<&str>) -> Result<()> {

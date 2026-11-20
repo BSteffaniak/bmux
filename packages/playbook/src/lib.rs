@@ -28,6 +28,7 @@ pub mod subst;
 #[cfg(feature = "runtime")]
 pub mod transport;
 pub mod types;
+#[cfg(feature = "runtime")]
 pub mod validation;
 pub use report::format_result;
 

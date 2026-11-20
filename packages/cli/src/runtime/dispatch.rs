@@ -366,28 +366,15 @@ pub(super) async fn dispatch_built_in_command(
                 ))
                 .await;
             }
-            // The static attach grammar also serves bare, observer and web
-            // terminals. Only an ordinary named/follow invocation is a
-            // session command; never rerun its argv through the static leaf.
-            if target.is_some() || follow.is_some() {
-                let mut args = Vec::new();
-                args.extend(target.iter().cloned());
-                if let Some(client) = follow {
-                    args.extend(["--follow".to_owned(), client.clone()]);
-                }
-                if *global {
-                    args.push("--global".to_owned());
-                }
-                return Box::pin(super::plugin_runtime::run_plugin_command_with_target(
-                    command_state,
-                    "bmux.sessions",
-                    "session-attach",
-                    &args,
-                    connection_context.target_override,
-                ))
-                .await;
-            }
-            Box::pin(run_session_attach(None, None, false, connection_context)).await
+            // Attach is baseline core behavior: it must work without the
+            // sessions plugin, whose `session-attach` calls this same function.
+            Box::pin(run_session_attach(
+                target.as_deref(),
+                follow.as_deref(),
+                *global,
+                connection_context,
+            ))
+            .await
         }
         (BuiltInHandlerId::ServerStart, _) => {
             dispatch_server_start(command, selected_runtime_owner(command_state)).await

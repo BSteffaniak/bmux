@@ -54,7 +54,7 @@ pub(super) fn run(context: &NativeCommandContext) -> Result<i32, PluginCommandEr
         } => run_playbook_diff(&left, &right, json, timing_threshold),
     }
     .map(i32::from)
-    .map_err(|error| PluginCommandError::from(format!("{error:#}")))
+    .map_err(|error| PluginCommandError::failed(format!("{error:#}")))
 }
 
 fn run_playbook_validate(source: &str, json: bool) -> Result<u8> {

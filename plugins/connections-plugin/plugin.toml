@@ -198,12 +198,13 @@ summary    = "Session name or UUID; if omitted in TTY mode a picker is shown"
 value_name = "SESSION"
 
 [[commands.arguments]]
-kind       = "string"
-long       = "follow"
-name       = "follow"
-required   = false
-summary    = "Follow target client UUID and attach to its selected session"
-value_name = "FOLLOW"
+conflicts_with = ["session"]
+kind           = "string"
+long           = "follow"
+name           = "follow"
+required       = false
+summary        = "Follow target client UUID and attach to its selected session"
+value_name     = "FOLLOW"
 
 [[commands.arguments]]
 kind     = "boolean"
@@ -785,25 +786,28 @@ summary    = "Name for the target profile"
 value_name = "NAME"
 
 [[commands.arguments]]
-kind       = "string"
-long       = "ssh"
-name       = "ssh"
-summary    = "Configure as an SSH target (user@host[:port] or host)"
-value_name = "SSH"
+conflicts_with = ["tls", "iroh"]
+kind           = "string"
+long           = "ssh"
+name           = "ssh"
+summary        = "Configure as an SSH target (user@host[:port] or host)"
+value_name     = "SSH"
 
 [[commands.arguments]]
-kind       = "string"
-long       = "tls"
-name       = "tls"
-summary    = "Configure as a TLS target (host[:port])"
-value_name = "TLS"
+conflicts_with = ["ssh", "iroh"]
+kind           = "string"
+long           = "tls"
+name           = "tls"
+summary        = "Configure as a TLS target (host[:port])"
+value_name     = "TLS"
 
 [[commands.arguments]]
-kind       = "string"
-long       = "iroh"
-name       = "iroh"
-summary    = "Configure as an iroh target (endpoint_id[?relay=https://...][&auth=ssh])"
-value_name = "IROH"
+conflicts_with = ["ssh", "tls"]
+kind           = "string"
+long           = "iroh"
+name           = "iroh"
+summary        = "Configure as an iroh target (endpoint_id[?relay=https://...][&auth=ssh])"
+value_name     = "IROH"
 
 [[commands.arguments]]
 kind       = "string"
@@ -861,18 +865,20 @@ path          = ["kiosk", "init"]
 summary       = "Initialize/update kiosk bootstrap files from config"
 
 [[commands.arguments]]
-kind       = "string"
-long       = "profile"
-multiple   = true
-name       = "profile"
-summary    = "Kiosk profile to reconcile (repeatable)"
-value_name = "PROFILE"
+conflicts_with = ["all-profiles"]
+kind           = "string"
+long           = "profile"
+multiple       = true
+name           = "profile"
+summary        = "Kiosk profile to reconcile (repeatable)"
+value_name     = "PROFILE"
 
 [[commands.arguments]]
-kind    = "boolean"
-long    = "all-profiles"
-name    = "all-profiles"
-summary = "Reconcile all configured profiles"
+conflicts_with = ["profile"]
+kind           = "boolean"
+long           = "all-profiles"
+name           = "all-profiles"
+summary        = "Reconcile all configured profiles"
 
 [[commands.arguments]]
 kind    = "boolean"
@@ -916,16 +922,18 @@ summary    = "Optional token TTL in seconds (defaults to profile/default TTL)"
 value_name = "TTL_SECS"
 
 [[commands.arguments]]
-kind    = "boolean"
-long    = "one-shot"
-name    = "one-shot"
-summary = "Mark token as one-shot (defaults to profile/default one_shot)"
+conflicts_with = ["multi-use"]
+kind           = "boolean"
+long           = "one-shot"
+name           = "one-shot"
+summary        = "Mark token as one-shot (defaults to profile/default one_shot)"
 
 [[commands.arguments]]
-kind    = "boolean"
-long    = "multi-use"
-name    = "multi-use"
-summary = "Mark token as reusable until expiry"
+conflicts_with = ["one-shot"]
+kind           = "boolean"
+long           = "multi-use"
+name           = "multi-use"
+summary        = "Mark token as reusable until expiry"
 
 [[commands]]
 execution     = "caller_process"
@@ -973,18 +981,20 @@ path          = ["kiosk", "ssh-print-config"]
 summary       = "Print generated sshd include text without writing files"
 
 [[commands.arguments]]
-kind       = "string"
-long       = "profile"
-multiple   = true
-name       = "profile"
-summary    = "Kiosk profile to print (repeatable)"
-value_name = "PROFILE"
+conflicts_with = ["all-profiles"]
+kind           = "string"
+long           = "profile"
+multiple       = true
+name           = "profile"
+summary        = "Kiosk profile to print (repeatable)"
+value_name     = "PROFILE"
 
 [[commands.arguments]]
-kind    = "boolean"
-long    = "all-profiles"
-name    = "all-profiles"
-summary = "Print all configured profiles"
+conflicts_with = ["profile"]
+kind           = "boolean"
+long           = "all-profiles"
+name           = "all-profiles"
+summary        = "Print all configured profiles"
 
 [cli_help]
 "access"                   = { summary = "SSH-key access controls for iroh hosting", order = 5 }

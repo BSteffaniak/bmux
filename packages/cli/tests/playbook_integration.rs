@@ -7,6 +7,7 @@
 //!   the JSON output. Tests the real CLI path end-to-end.
 //! - **Direct API tests**: Import `bmux_cli::playbook::*` and call parsers/validators
 //!   directly (lower-level checks).
+#![cfg(feature = "bundled-plugin-playbook")]
 
 use serial_test::serial;
 use std::path::{Path, PathBuf};

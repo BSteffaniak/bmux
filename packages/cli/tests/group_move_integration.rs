@@ -1,4 +1,6 @@
-#![cfg(feature = "bundled-plugin-tab-bar")]
+// Moves tabs between workspaces through the tab bar: needs the tab bar plus
+// the tabs and workspaces backends.
+#![cfg(all(feature = "bundled-plugin-tab-bar", feature = "bundled-plugin-windows"))]
 
 #[allow(dead_code)] // Shared subprocess fixture also supports gateway-specific tests.
 mod support;

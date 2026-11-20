@@ -27,6 +27,13 @@ use bmux_terminal::event::{
 use std::time::Instant;
 use uuid::Uuid;
 
+#[cfg_attr(
+    not(feature = "bundled-plugin-playbook"),
+    expect(
+        dead_code,
+        reason = "the playbook engine queries simulated screens; tests only render them"
+    )
+)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AttachSimLocatedText {
     pub start_col: u16,
@@ -45,6 +52,13 @@ pub struct AttachSimHarness {
     clock: FixedAttachClock,
 }
 
+#[cfg_attr(
+    not(feature = "bundled-plugin-playbook"),
+    expect(
+        dead_code,
+        reason = "the playbook engine queries simulated screens; tests only render them"
+    )
+)]
 impl AttachSimHarness {
     pub fn new(cols: u16, rows: u16) -> Self {
         let session_id = Uuid::from_u128(1);

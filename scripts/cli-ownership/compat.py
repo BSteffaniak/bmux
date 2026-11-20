@@ -48,11 +48,18 @@ def check_catalog():
             kind = 'retain-plugin' if any(d['exposed'] for d in ds) else 'non-cli'
             owner = ds[0]['owner']
         else:
-            kind, owner = 'composed-namespace', None
-            owners = sorted({d['owner'] for p, items in declared.items() if p.startswith(path + ' ')
-                             for d in items if d['exposed']})
-            if not owners or owners != row.get('owners'):
-                raise ValueError(f'{path}: namespace owner set changed')
+            under = [d for p, items in declared.items() if p.startswith(path + ' ') for d in items]
+            owners = sorted({d['owner'] for d in under if d['exposed']})
+            if owners:
+                kind, owner = 'composed-namespace', None
+                if owners != row.get('owners'):
+                    raise ValueError(f'{path}: namespace owner set changed')
+            else:
+                # A namespace holding only hidden commands is not a CLI surface.
+                hidden = sorted({d['owner'] for d in under})
+                if len(hidden) != 1:
+                    raise ValueError(f'{path}: hidden namespace needs exactly one owner')
+                kind, owner = 'non-cli', hidden[0]
         if (kind, owner) != (row['disposition'], row.get('owner')):
             raise ValueError(f'{path}: expected {kind} / {owner}')
 

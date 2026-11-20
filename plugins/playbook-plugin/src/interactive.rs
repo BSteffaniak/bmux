@@ -28,17 +28,12 @@ pub(super) fn run(
     plugin: &PlaybookPlugin,
     ctx: &NativeCommandContext,
 ) -> Result<i32, PluginCommandError> {
-    if !ctx.invocation_source.is_cli() {
-        return Err(PluginCommandError::failed(
-            "interactive playbook requires a standalone CLI invocation",
-        ));
-    }
     let args = Args::try_parse_from(
         std::iter::once("bmux playbook interactive")
             .chain(ctx.arguments.iter().map(String::as_str)),
     )
     .map_err(|e| PluginCommandError::new(e.exit_code(), e.to_string()))?;
-    let host = plugin.host.clone().ok_or_else(|| {
+    let host = plugin.interactive_host.clone().ok_or_else(|| {
         PluginCommandError::unavailable(
             "interactive playbook requires the invoking application's execution adapters",
         )

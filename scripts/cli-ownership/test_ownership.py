@@ -1,4 +1,5 @@
 import json
+import re
 import unittest
 from unittest.mock import patch
 
@@ -15,13 +16,18 @@ class OwnershipTests(unittest.TestCase):
         def drop(path, *args, **kwargs):
             text = original(path, *args, **kwargs)
             if path.as_posix().endswith('connections-plugin/plugin.toml'):
+                # Manifests align their `key = value` columns; match any spacing.
                 blocks = text.split('[[commands]]')
                 for i, block in enumerate(blocks):
-                    if 'name = "access-init"' in block:
-                        blocks[i] = block.replace('expose_in_cli = true', 'expose_in_cli = false')
+                    if re.search(r'^name\s*=\s*"access-init"$', block, re.M):
+                        blocks[i], count = re.subn(r'^expose_in_cli(\s*)=\s*true$',
+                                                   r'expose_in_cli\1= false', block, flags=re.M)
+                        assert count == 1, 'access-init mutation did not apply'
                 return '[[commands]]'.join(blocks)
             if path.as_posix().endswith('connections-plugin/src/lib.rs'):
-                return text.replace('.blocking_command("remote-upgrade",', '.blocking_command("wrong-name",')
+                mutated = text.replace('.blocking_command("remote-upgrade",', '.blocking_command("wrong-name",')
+                assert mutated != text, 'remote-upgrade mutation did not apply'
+                return mutated
             return text
 
         with patch.object(ownership.Path, 'read_text', drop):

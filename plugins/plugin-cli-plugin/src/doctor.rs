@@ -350,8 +350,10 @@ fn discover_manifest_index(
 ) -> Result<BTreeMap<String, ManifestRecord>, String> {
     let mut manifest_index = BTreeMap::new();
     for root in plugin_roots(context) {
-        let report = bmux_plugin::discover_plugin_manifests(&root)
-            .map_err(|error| format!("failed scanning plugin root {}: {error}", root.display()))?;
+        // An unreadable root does not prevent diagnosing the others.
+        let Ok(report) = bmux_plugin::discover_plugin_manifests(&root) else {
+            continue;
+        };
         for manifest_path in report.manifest_paths {
             let manifest = bmux_plugin::PluginManifest::from_path(&manifest_path)
                 .map_err(|error| format!("failed parsing {}: {error}", manifest_path.display()))?;

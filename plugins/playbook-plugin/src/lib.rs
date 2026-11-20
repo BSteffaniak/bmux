@@ -1,6 +1,7 @@
-//! Managed execution owner. The selected native BMUX executable is the actual
-//! executor, with a private generation-fenced control/snapshot channel. stdout
-//! is diagnostics only, never a display transport or lifecycle acknowledgement.
+//! Playbook commands and the managed execution owner. For managed runs the
+//! selected native BMUX executable is the actual executor, with a private
+//! generation-fenced control/snapshot channel; that child's stdout is
+//! diagnostics only, never a display transport or lifecycle acknowledgement.
 /// Plugin declaration generated from the BPDL world and `plugin.toml`.
 pub mod declaration {
     bmux_plugin_schema_macros::plugin_manifest! {
@@ -23,13 +24,13 @@ use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::prelude::{NativeServiceContext, PluginCommandError, ServiceResponse};
 
 pub type SandboxCleanup = fn(bool, bool, Option<u64>, Option<&str>, bool) -> anyhow::Result<u8>;
-pub type BatchHost = Arc<dyn bmux_playbook::host::HostAdapter>;
+pub type ExecutionHost = Arc<dyn bmux_playbook::host::HostAdapter>;
 
 #[derive(Default)]
 pub struct PlaybookPlugin {
     cleanup: Option<SandboxCleanup>,
-    batch_host: Option<BatchHost>,
-    host: Option<BatchHost>,
+    batch_host: Option<ExecutionHost>,
+    interactive_host: Option<ExecutionHost>,
     runner: Arc<Mutex<runner::Owner>>,
     poller: Mutex<Option<Poller>>,
 }
@@ -194,14 +195,18 @@ impl PlaybookPlugin {
     }
 }
 
-/// Bind the caller's terminal, sandbox and process adapters for interactive execution.
+/// Bind the caller's execution adapters: `interactive_host` for `playbook
+/// interactive`, `batch_host` (with the selected runtime) for `playbook run`,
+/// and `cleanup` for `playbook cleanup`.
+///
+/// # Panics
+/// Panics if the embedded playbook declaration is invalid.
 #[must_use]
 pub fn with_execution_host(
-    host: fn() -> Arc<dyn bmux_playbook::host::HostAdapter>,
-    batch_host: BatchHost,
+    interactive_host: ExecutionHost,
+    batch_host: ExecutionHost,
     cleanup: SandboxCleanup,
 ) -> bmux_plugin_sdk::definition::PluginDefinition {
-    let interactive_host = host();
     bmux_plugin_sdk::author::definition::<PlaybookPlugin>(
         declaration::PLUGIN_MANIFEST,
         declaration::SERVICE_CONTRACTS,
@@ -209,7 +214,7 @@ pub fn with_execution_host(
             let mut plugin = PlaybookPlugin::default();
             plugin.cleanup = Some(cleanup);
             plugin.batch_host = Some(batch_host.clone());
-            plugin.host = Some(interactive_host.clone());
+            plugin.interactive_host = Some(interactive_host.clone());
             Ok(plugin)
         },
     )

@@ -1429,12 +1429,21 @@ impl Write for RealAttachTerminal {
     }
 }
 
+#[cfg(any(test, feature = "bundled-plugin-playbook"))]
 struct HeadlessTerminalOutput {
     bytes: Vec<u8>,
     // Byte offsets serialize resize boundaries with writes without duplicating output.
     resizes: Vec<(usize, TerminalGeometry)>,
 }
 
+#[cfg(any(test, feature = "bundled-plugin-playbook"))]
+#[cfg_attr(
+    not(feature = "bundled-plugin-playbook"),
+    expect(
+        dead_code,
+        reason = "tests drive the headless terminal; only the playbook engine reads its captured output"
+    )
+)]
 #[derive(Clone)]
 pub struct HeadlessAttachTerminalHandle {
     #[cfg(test)]
@@ -1448,6 +1457,14 @@ pub struct HeadlessAttachTerminalHandle {
     attached_session_id: Arc<Mutex<Option<Uuid>>>,
 }
 
+#[cfg(any(test, feature = "bundled-plugin-playbook"))]
+#[cfg_attr(
+    not(feature = "bundled-plugin-playbook"),
+    expect(
+        dead_code,
+        reason = "tests drive the headless terminal; only the playbook engine reads its captured output"
+    )
+)]
 impl HeadlessAttachTerminalHandle {
     #[cfg(test)]
     pub fn scrollback_active(&self) -> bool {
@@ -1538,11 +1555,13 @@ impl HeadlessAttachTerminalHandle {
     }
 }
 
+#[cfg(any(test, feature = "bundled-plugin-playbook"))]
 struct HeadlessPointerWriter {
     output: Arc<Mutex<HeadlessTerminalOutput>>,
     pending_output_chunks: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
+#[cfg(any(test, feature = "bundled-plugin-playbook"))]
 impl Write for HeadlessPointerWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.output
@@ -1562,6 +1581,7 @@ impl Write for HeadlessPointerWriter {
     }
 }
 
+#[cfg(any(test, feature = "bundled-plugin-playbook"))]
 pub struct HeadlessAttachTerminal {
     pointer_terminal: bmux_attach_pipeline::terminal::TerminalIo<HeadlessPointerWriter>,
     #[cfg(test)]
@@ -1575,6 +1595,7 @@ pub struct HeadlessAttachTerminal {
     attached_session_id: Arc<Mutex<Option<Uuid>>>,
 }
 
+#[cfg(any(test, feature = "bundled-plugin-playbook"))]
 impl HeadlessAttachTerminal {
     #[must_use]
     pub fn new(cols: u16, rows: u16) -> (Self, HeadlessAttachTerminalHandle) {
@@ -1630,6 +1651,7 @@ impl HeadlessAttachTerminal {
     }
 }
 
+#[cfg(any(test, feature = "bundled-plugin-playbook"))]
 impl Write for HeadlessAttachTerminal {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         #[cfg(test)]
@@ -1654,6 +1676,7 @@ impl Write for HeadlessAttachTerminal {
     }
 }
 
+#[cfg(any(test, feature = "bundled-plugin-playbook"))]
 impl AttachTerminal for HeadlessAttachTerminal {
     fn present_pointer_shape(
         &mut self,

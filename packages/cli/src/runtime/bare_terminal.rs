@@ -193,7 +193,10 @@ pub(super) async fn attach(
         let mut tick = tokio::time::interval(Duration::from_millis(8));
         loop {
             tokio::select! {
-                _ = resize.recv() => {write.write_u8(2).await?;write.write_all(&dimensions()?).await?;}
+                _ = resize.recv() => {
+                    write.write_u8(2).await?;
+                    write.write_all(&dimensions()?).await?;
+                }
                 _ = tick.tick() => {
                     let n = match tty.read(&mut buf) {
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
@@ -201,13 +204,25 @@ pub(super) async fn attach(
                     };
                     // Ctrl-] releases this attachment, never the running shell.
                     let keep = buf[..n].iter().position(|b| *b == 0x1d).unwrap_or(n);
-                    if keep > 0 {write.write_u8(1).await?; write.write_u16(u16::try_from(keep)?).await?; write.write_all(&buf[..keep]).await?;}
-                    if keep<n || n==0 {write.write_u8(0).await?;return Ok::<u8,anyhow::Error>(0);}
+                    if keep > 0 {
+                        write.write_u8(1).await?;
+                        write.write_u16(u16::try_from(keep)?).await?;
+                        write.write_all(&buf[..keep]).await?;
+                    }
+                    if keep < n || n == 0 {
+                        write.write_u8(0).await?;
+                        return Ok::<u8, anyhow::Error>(0);
+                    }
                 }
             }
         }
     };
-    let result = tokio::select! {r=input=>r,r=output=>r,_=terminate.recv()=>Ok(143),_=hangup.recv()=>Ok(129)};
+    let result = tokio::select! {
+        r = input => r,
+        r = output => r,
+        _ = terminate.recv() => Ok(143),
+        _ = hangup.recv() => Ok(129),
+    };
     terminal::disable_raw_mode()?;
     drop(guard);
     result

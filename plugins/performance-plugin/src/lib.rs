@@ -109,6 +109,9 @@ pub struct PerformancePlugin {
     cleanup_pending: Arc<std::sync::atomic::AtomicBool>,
     /// Set for the default composition: it receives the activation's bus.
     activation_host: Option<Arc<ActivationPerformanceHost>>,
+    /// Client-side maintenance a standalone CLI host runs before `perf` talks
+    /// to the server (stale pid cleanup, stale build policy).
+    client_preflight: Option<fn() -> Result<(), PluginCommandError>>,
 }
 struct MetricsWorker {
     stop: Arc<std::sync::atomic::AtomicBool>,
@@ -132,6 +135,7 @@ impl PerformancePlugin {
             worker: Arc::new(Mutex::new(None)),
             cleanup_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             activation_host: None,
+            client_preflight: None,
         }
     }
 
@@ -208,7 +212,14 @@ fn stop_metrics_worker(slot: &Mutex<Option<MetricsWorker>>) -> Result<(), Plugin
 impl Plugin for PerformancePlugin {
     fn declare(d: &mut Declarations<Self>) {
         for name in ["perf-status", "perf-on", "perf-off"] {
-            d.blocking_command(name, |_, context| cli::run(context));
+            d.blocking_command(name, |plugin, context| {
+                if context.invocation_source.is_cli()
+                    && let Some(preflight) = plugin.client_preflight
+                {
+                    preflight()?;
+                }
+                cli::run(context)
+            });
         }
         d.blocking_activate(Self::activate)
             .blocking_deactivate(Self::deactivate)
@@ -1200,6 +1211,27 @@ pub fn plugin_definition_with_host(
         crate::declaration::PLUGIN_MANIFEST,
         crate::declaration::SERVICE_CONTRACTS,
         move |_| Ok(PerformancePlugin::with_host(Arc::clone(&host))),
+    )
+    .expect("embedded performance declaration must be valid")
+}
+
+/// A one-command CLI client for the `perf` leaves. It runs `preflight` before
+/// contacting the server and never starts the metrics worker.
+///
+/// # Panics
+/// Panics if the embedded plugin declaration is rejected.
+#[must_use]
+pub fn client_definition(
+    preflight: fn() -> Result<(), PluginCommandError>,
+) -> bmux_plugin_sdk::definition::PluginDefinition {
+    bmux_plugin_sdk::author::definition::<PerformancePlugin>(
+        crate::declaration::PLUGIN_MANIFEST,
+        crate::declaration::SERVICE_CONTRACTS,
+        move |_| {
+            let mut plugin = PerformancePlugin::default();
+            plugin.client_preflight = Some(preflight);
+            Ok(plugin)
+        },
     )
     .expect("embedded performance declaration must be valid")
 }

@@ -26,6 +26,38 @@ bmux_plugin_schema_macros::schema! {
     export: export_schema,
 }
 
+/// Why the sessions service refused a destructive operation (kill, quit),
+/// recovered from the error code and message it returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestructiveOpErrorKind {
+    SessionPolicyDenied,
+    ForceLocalUnauthorized,
+    NotFound,
+    Other,
+}
+
+/// Classify a sessions service error for a destructive operation.
+#[must_use]
+pub fn classify_destructive_op_error(
+    code: bmux_ipc::ErrorCode,
+    message: &str,
+) -> DestructiveOpErrorKind {
+    match code {
+        bmux_ipc::ErrorCode::InvalidRequest
+            if message.contains("session policy denied for this operation") =>
+        {
+            DestructiveOpErrorKind::SessionPolicyDenied
+        }
+        bmux_ipc::ErrorCode::InvalidRequest
+            if message.contains("force-local is only allowed for the server control principal") =>
+        {
+            DestructiveOpErrorKind::ForceLocalUnauthorized
+        }
+        bmux_ipc::ErrorCode::NotFound => DestructiveOpErrorKind::NotFound,
+        _ => DestructiveOpErrorKind::Other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

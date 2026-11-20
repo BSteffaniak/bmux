@@ -4324,6 +4324,57 @@
       ],
       "frozen_help": true
     },
+    "sidebar": {
+      "disposition": "non-cli",
+      "owner": "bmux.sidebar",
+      "reason": "hidden",
+      "frozen_help": false
+    },
+    "sidebar hide": {
+      "disposition": "non-cli",
+      "owner": "bmux.sidebar",
+      "reason": "hidden",
+      "declarations": [
+        {
+          "owner": "bmux.sidebar",
+          "command": "hide",
+          "manifest": "plugins/sidebar-plugin/plugin.toml",
+          "canonical": "sidebar hide",
+          "exposed": false
+        }
+      ],
+      "frozen_help": false
+    },
+    "sidebar show": {
+      "disposition": "non-cli",
+      "owner": "bmux.sidebar",
+      "reason": "hidden",
+      "declarations": [
+        {
+          "owner": "bmux.sidebar",
+          "command": "show",
+          "manifest": "plugins/sidebar-plugin/plugin.toml",
+          "canonical": "sidebar show",
+          "exposed": false
+        }
+      ],
+      "frozen_help": false
+    },
+    "sidebar toggle": {
+      "disposition": "non-cli",
+      "owner": "bmux.sidebar",
+      "reason": "hidden",
+      "declarations": [
+        {
+          "owner": "bmux.sidebar",
+          "command": "toggle",
+          "manifest": "plugins/sidebar-plugin/plugin.toml",
+          "canonical": "sidebar toggle",
+          "exposed": false
+        }
+      ],
+      "frozen_help": false
+    },
     "slot": {
       "disposition": "retain-core",
       "owner": "core",
@@ -4635,6 +4686,57 @@
         }
       ],
       "frozen_help": true
+    },
+    "tab-bar": {
+      "disposition": "non-cli",
+      "owner": "bmux.tab_bar",
+      "reason": "hidden",
+      "frozen_help": false
+    },
+    "tab-bar hide": {
+      "disposition": "non-cli",
+      "owner": "bmux.tab_bar",
+      "reason": "hidden",
+      "declarations": [
+        {
+          "owner": "bmux.tab_bar",
+          "command": "hide",
+          "manifest": "plugins/tab-bar-plugin/plugin.toml",
+          "canonical": "tab-bar hide",
+          "exposed": false
+        }
+      ],
+      "frozen_help": false
+    },
+    "tab-bar show": {
+      "disposition": "non-cli",
+      "owner": "bmux.tab_bar",
+      "reason": "hidden",
+      "declarations": [
+        {
+          "owner": "bmux.tab_bar",
+          "command": "show",
+          "manifest": "plugins/tab-bar-plugin/plugin.toml",
+          "canonical": "tab-bar show",
+          "exposed": false
+        }
+      ],
+      "frozen_help": false
+    },
+    "tab-bar toggle": {
+      "disposition": "non-cli",
+      "owner": "bmux.tab_bar",
+      "reason": "hidden",
+      "declarations": [
+        {
+          "owner": "bmux.tab_bar",
+          "command": "toggle",
+          "manifest": "plugins/tab-bar-plugin/plugin.toml",
+          "canonical": "tab-bar toggle",
+          "exposed": false
+        }
+      ],
+      "frozen_help": false
     },
     "terminal": {
       "disposition": "retain-core",

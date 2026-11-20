@@ -9,12 +9,23 @@ belongs in core.
 
 ## Where to find the implemented ownership map
 
-[`command-dispositions.json`](../../scripts/cli-ownership/command-dispositions.json) records the disposition of each audited command or namespace: 70 migrated, 190 retained in plugins, 78 retained in core, 29 composed namespaces, and seven non-CLI entries. Use that catalog for current ownership; the family decisions below describe the starting inventory. [`scripts/cli-ownership`](../../scripts/cli-ownership/README.md) contains the frozen reference cases and four-profile comparison. An intentional help or availability change is not a byte-identical match to the historical command.
+[`command-dispositions.json`](../../scripts/cli-ownership/command-dispositions.json) records the disposition of each audited command or namespace: 70 migrated, 190 retained in plugins, 78 retained in core, 29 composed namespaces, and 15 non-CLI entries (hidden commands, including the sidebar and tab-bar show/hide/toggle namespaces). Use that catalog for current ownership; the family decisions below describe the starting inventory. [`scripts/cli-ownership`](../../scripts/cli-ownership/README.md) contains the frozen reference cases and four-profile comparison. An intentional help or availability change is not a byte-identical match to the historical command.
 
 For the build-time dependency boundary, run `scripts/check-cli-qr-features.sh`
 and `scripts/check-cli-iroh-features.sh`. For actual terminal behavior, use the
 isolated PTY checks in `scripts/cli-bootstrap-boundary`; package reachability
 alone does not prove that a shell starts or that a split receives input.
+
+Owner-level acceptance harnesses run a built binary in private roots; none of
+them runs under `cargo test`:
+
+- `python3 plugins/plugin-cli-plugin/tests/admin_recovery.py /path/to/bmux`:
+  plugin administration and repair with `bundled-plugin-cli`.
+- `python3 packages/cli/tests/recording_snapshot_roundtrip.py --binary /path/to/bmux`:
+  Unix PTY attach, recording and snapshot save/restore round trip.
+- `python3 plugins/connections-plugin/src/hosted/acceptance.py /path/to/bmux`:
+  hosted share/join/setup flows against a local fixture control plane (needs an
+  adjacent pane supervisor and `zbarimg` or macOS Vision for QR decoding).
 
 ## Migration decisions
 

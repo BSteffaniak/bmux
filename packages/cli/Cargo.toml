@@ -45,13 +45,14 @@ bmux_pane_runtime_plugin_api = { workspace = true }
 bmux_performance_plugin_api = { workspace = true }
 bmux_performance_state = { workspace = true }
 bmux_permissions_plugin_api = { workspace = true }
-bmux_playbook = { workspace = true, features = ["runtime"] }
+bmux_playbook = { workspace = true, features = ["runtime"], optional = true }
 bmux_plugin = { workspace = true, features = ["tui"] }
 bmux_plugin_sdk = { workspace = true }
 bmux_recording_bootstrap = { workspace = true }
 bmux_recording_plugin_api = { workspace = true }
 bmux_recording_protocol = { workspace = true }
 bmux_recording_runtime = { workspace = true }
+bmux_remote_ssh = { workspace = true }
 bmux_scene_protocol = { workspace = true }
 bmux_server = { workspace = true }
 bmux_session_models = { workspace = true, features = ["serde"] }
@@ -264,9 +265,11 @@ fail-on-warnings = [
     "bmux_pane_runtime_plugin_api/fail-on-warnings",
     "bmux_performance_plugin_api/fail-on-warnings",
     "bmux_performance_state/fail-on-warnings",
-    "bmux_playbook/fail-on-warnings",
+    "bmux_playbook?/fail-on-warnings",
     "bmux_recording_plugin?/fail-on-warnings",
     "bmux_recording_bootstrap/fail-on-warnings",
+    "bmux_remote_ssh/fail-on-warnings",
+    "bmux_connections_admin?/fail-on-warnings",
     "bmux_recording_plugin_api/fail-on-warnings",
     "bmux_recording_protocol/fail-on-warnings",
     "bmux_scene_protocol/fail-on-warnings",
@@ -353,7 +356,7 @@ bundled-plugin-finder = ["dep:bmux_finder_plugin"]
 bundled-plugin-pane-runtime = ["dep:bmux_pane_runtime_plugin"]
 bundled-plugin-performance = ["dep:bmux_performance_plugin"]
 bundled-plugin-permissions = ["dep:bmux_permissions_plugin"]
-bundled-plugin-playbook = ["dep:bmux_playbook_plugin"]
+bundled-plugin-playbook = ["dep:bmux_playbook", "dep:bmux_playbook_plugin"]
 bundled-plugin-presenter = ["dep:bmux_presenter_plugin"]
 bundled-plugin-prompted-actions = ["dep:bmux_prompted_actions_plugin"]
 bundled-plugin-recording = ["dep:bmux_recording_plugin"]

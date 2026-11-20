@@ -1819,16 +1819,26 @@ fn push_recent(list: &mut Vec<String>, value: String) {
 }
 
 async fn expand_attach_target(client: &HostedClient, target: &str) -> Result<String> {
+    expand_share_link(&client.config, &client.paths, target).await
+}
+
+/// Resolve a `bmux://<share>` link to its target: a configured mapping first,
+/// then the control plane when signed in. Other targets pass through.
+pub(crate) async fn expand_share_link(
+    config: &BmuxConfig,
+    paths: &ConfigPaths,
+    target: &str,
+) -> Result<String> {
     let Some(name) = target.strip_prefix("bmux://") else {
         return Ok(target.to_string());
     };
-    if let Some(mapped) = client.config.connections.share_links.get(name) {
+    if let Some(mapped) = config.connections.share_links.get(name) {
         return Ok(mapped.clone());
     }
-    let Some(auth_state) = load_auth_state_optional(&client.paths)? else {
+    let Some(auth_state) = load_auth_state_optional(paths)? else {
         return Ok(target.to_string());
     };
-    let control_plane = control_plane_url(&client.config);
+    let control_plane = control_plane_url(config);
     let client = reqwest_client();
     let response = client
         .get(format!("{control_plane}/v1/share-links/{name}"))

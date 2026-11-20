@@ -135,15 +135,22 @@ pub(super) enum RemoteCommand {
         #[arg(long)]
         set_default: bool,
     },
+    /// Print session names for a target
     CompleteSessions {
+        /// Target name
         target: String,
     },
+    /// Ensure remote bmux runtime is installed and reachable
     InstallServer {
+        /// Target name
         target: String,
     },
+    /// Upgrade remote bmux runtime for one or all targets
     Upgrade {
+        /// Target name (omit to upgrade all configured targets)
         target: Option<String>,
     },
+    /// Print target names for completion
     CompleteTargets,
 }
 

@@ -27,6 +27,7 @@ pub mod runtime;
 pub mod scrollback_cache;
 pub mod scrollback_fetch;
 mod scrollback_modes;
+#[cfg(any(test, feature = "bundled-plugin-playbook"))]
 pub mod sim;
 pub mod state;
 mod tui_surface;

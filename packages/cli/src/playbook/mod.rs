@@ -10,7 +10,6 @@
 pub use bmux_playbook::{diff, parse_dsl, parse_toml, subst, types};
 pub mod display_track;
 pub mod engine;
-pub mod interactive;
 pub mod sandbox;
 pub mod screen;
 
@@ -45,5 +44,3 @@ pub async fn run_with_options(
 }
 
 pub use bmux_playbook::validation::validate;
-
-pub use bmux_playbook::format_result;

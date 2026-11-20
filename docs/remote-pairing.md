@@ -73,7 +73,7 @@ explicitly enables it again. Enabling hosting never enrolls a device by itself.
 Client-side saved-host commands require no local server:
 
 ```sh
-bmux remote list
+bmux remote-list                 # saved paired hosts; `remote list` lists configured targets
 bmux remote status desktop
 bmux remote rename desktop workstation
 bmux remote forget workstation

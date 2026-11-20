@@ -89,7 +89,7 @@ uuid = { workspace = true, features = ["v4"] }
 # Paused-time capture tests must also compile outside workspace feature unification.
 bmux_cli_schema = { workspace = true }
 bmux_ipc        = { workspace = true }
-clap            = { workspace = true }
+clap            = { workspace = true, features = ["std", "string"] }
 tokio           = { workspace = true, features = ["test-util"] }
 ttf-parser      = { workspace = true }
 

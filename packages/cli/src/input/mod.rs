@@ -5,6 +5,7 @@ mod terminal_adapter;
 use anyhow::{Result, bail};
 use bmux_config::{MAX_TIMEOUT_MS, MIN_TIMEOUT_MS};
 pub use bmux_keybind::RuntimeAction;
+#[cfg(any(test, feature = "bundled-plugin-playbook"))]
 use bmux_keybind::action_to_name;
 use bmux_keybind::{action_to_config_name, parse_action};
 use bmux_keyboard::encode::KeyEncodingModes;
@@ -103,14 +104,17 @@ struct PendingChord {
     decoded: Vec<DecodedStroke>,
 }
 
+#[cfg(any(test, feature = "bundled-plugin-playbook"))]
 fn tabs_focus_command(direction: &str) -> String {
     format!("plugin:bmux.tabs:focus-pane-in-direction --direction {direction}")
 }
 
+#[cfg(any(test, feature = "bundled-plugin-playbook"))]
 fn tabs_resize_command(direction: &str) -> String {
     format!("plugin:bmux.tabs:resize-pane --direction {direction}")
 }
 
+#[cfg(any(test, feature = "bundled-plugin-playbook"))]
 fn tabs_split_command(direction: &str) -> String {
     format!("plugin:bmux.tabs:split-pane --direction {direction}")
 }
@@ -120,6 +124,7 @@ fn tabs_split_command(direction: &str) -> String {
 // ============================================================================
 
 impl Keymap {
+    #[cfg(any(test, feature = "bundled-plugin-playbook"))]
     pub(crate) fn default_runtime() -> Self {
         let runtime: BTreeMap<String, String> = [
             ("?", RuntimeAction::ShowHelp),
@@ -623,6 +628,7 @@ impl Keymap {
     }
 }
 
+#[cfg(any(test, feature = "bundled-plugin-playbook"))]
 fn default_scroll_bindings() -> BTreeMap<String, String> {
     [
         ("escape", RuntimeAction::ExitScrollMode),

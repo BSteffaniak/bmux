@@ -51,10 +51,11 @@ fn offline_commands_route_to_sessions_without_starting_a_server() {
         let output = cmd.args(args).output().unwrap();
         let err = String::from_utf8(output.stderr).unwrap();
         assert_eq!(output.status.code(), Some(status), "{args:?}: {err}");
+        // Interactive attach logs to file only, so its routing line is in the
+        // isolated log directory rather than on stderr.
+        let routed = format!("plugin_id=\"bmux.sessions\" command_name=\"{name}\"");
         assert!(
-            err.contains(&format!(
-                "plugin_id=\"bmux.sessions\" command_name=\"{name}\""
-            )),
+            err.contains(&routed) || logs_contain(&root.join("log"), &routed),
             "{args:?}: {err}"
         );
         let text = if status == 0 {
@@ -64,4 +65,19 @@ fn offline_commands_route_to_sessions_without_starting_a_server() {
         };
         assert!(text.contains(message), "{args:?}: {text}");
     }
+}
+
+fn logs_contain(dir: &std::path::Path, needle: &str) -> bool {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                logs_contain(&path, needle)
+            } else {
+                std::fs::read_to_string(&path).is_ok_and(|text| text.contains(needle))
+            }
+        })
 }

@@ -28,7 +28,6 @@ type TrustPort =
 type IrohParser = fn(&str) -> anyhow::Result<(String, Option<String>, bool)>;
 type SessionsPort = Arc<dyn Fn(&str) -> anyhow::Result<Vec<String>> + Send + Sync>;
 type KioskAttachPort = Arc<dyn Fn(kiosk::AuthorizedAttach) -> anyhow::Result<u8> + Send + Sync>;
-type ProxyPort = Arc<dyn Fn(&[String]) -> anyhow::Result<Option<u8>> + Send + Sync>;
 #[derive(Clone)]
 pub struct AdminPorts {
     pub probe: ProbePort,
@@ -36,7 +35,6 @@ pub struct AdminPorts {
     pub parse_iroh: IrohParser,
     pub sessions: SessionsPort,
     pub kiosk_attach: KioskAttachPort,
-    pub kiosk_proxy: ProxyPort,
     pub target: Option<String>,
 }
 fn test(ports: &AdminPorts, target: &str) -> anyhow::Result<u8> {
@@ -49,15 +47,9 @@ fn kiosk_command(
 ) -> Result<anyhow::Result<u8>, PluginCommandError> {
     use args::KioskCommand as K;
     let command = parse::<args::KioskArgs>(leaf, args)?.command;
-    let proxy_arguments = ["kiosk".to_owned(), leaf.to_owned()]
-        .into_iter()
-        .chain(args.iter().cloned())
-        .collect::<Vec<_>>();
+    // SSH targets never reach here: the CLI re-runs kiosk commands on the
+    // target host before dispatching to this plugin.
     Ok((|| -> anyhow::Result<u8> {
-        if let Some(status) = (ports.kiosk_proxy)(&proxy_arguments)? {
-            return Ok(status);
-        }
-
         match command {
             K::Status { json } => kiosk::run_kiosk_status(json),
             K::Init {
@@ -189,7 +181,7 @@ pub(super) fn run(
         }
     };
     code.map(i32::from)
-        .map_err(|e| PluginCommandError::failed(format!("{e:#}")))
+        .map_err(|e| PluginCommandError::failed(format!("bmux error: {e:#}")))
 }
 #[cfg(test)]
 mod tests {
