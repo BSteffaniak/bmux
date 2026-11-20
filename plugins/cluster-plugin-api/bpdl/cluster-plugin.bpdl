@@ -899,6 +899,7 @@ world cluster {
     provide cluster-control-state@1;
     provide cluster-control-state@2;
     provide cluster-raft-rpc@1;
+    require capability bmux.attach_runtime.read;
     require capability bmux.attach_runtime.write;
     require capability bmux.clients.read;
     require capability bmux.commands;

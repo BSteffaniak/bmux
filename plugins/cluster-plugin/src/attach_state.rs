@@ -68,22 +68,19 @@ where
         let assignment = pane.execution.as_ref().expect("matched assignment");
         let identity = crate::membership::load_or_create_node_identity(self.caller.as_ref())
             .map_err(|reason| WorkerServiceError::Unavailable { reason })?;
+        let (control_term, lease_sequence) = self
+            .control
+            .active()
+            .map_err(|error| control_error(&error))?
+            .next_lease();
         let mut authority = bmux_cluster_plugin_api::cluster_types::WorkerAuthority {
             cluster_id: view.cluster_id,
             workspace_id: workspace_id.clone(),
             pane_id: pane.pane_id.clone(),
             execution_id: execution_id.clone(),
             generation,
-            control_term: self
-                .control
-                .active()
-                .map_err(|error| control_error(&error))?
-                .current_term(),
-            lease_sequence: u64::from_be_bytes(
-                command_id.value.as_bytes()[8..]
-                    .try_into()
-                    .expect("UUID suffix length"),
-            ),
+            control_term,
+            lease_sequence,
             operation_class,
             principal_id,
             issuer_node_id: identity.node_id().to_string(),

@@ -142,6 +142,8 @@ pub struct ConsensusNode {
     decoder_admission: Option<Arc<dyn crate::consensus_network::DecoderAdmission>>,
     node_id: NodeId,
     cluster_id: String,
+    /// The last worker lease sequence this node issued.
+    lease_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 fn validate_admission_term(expected: u64, current: u64) -> Result<(), ConsensusWriteError> {
@@ -188,6 +190,7 @@ impl ConsensusNode {
             decoder_admission: None,
             node_id,
             cluster_id: cluster_id.to_string(),
+            lease_sequence: std::sync::Arc::default(),
         })
     }
 
@@ -231,6 +234,21 @@ impl ConsensusNode {
     #[must_use]
     pub fn current_term(&self) -> u64 {
         self.raft.metrics().borrow().current_term
+    }
+
+    /// The control term and a lease sequence above every one this node issued
+    /// before, for a worker lease. A worker keeps the highest (term, sequence)
+    /// it accepted per execution and rejects older authority, so leases this
+    /// node issues within a term must be strictly ordered. A node leads again
+    /// only in a new term, so the count need not survive a restart.
+    #[must_use]
+    pub fn next_lease(&self) -> (u64, u64) {
+        let term = self.current_term();
+        let sequence = self
+            .lease_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(1);
+        (term, sequence)
     }
 
     #[must_use]

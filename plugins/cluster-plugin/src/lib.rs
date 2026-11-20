@@ -124,6 +124,15 @@ pub struct ClusterPlugin {
     control_watch: Arc<control_watch::ControlWatch>,
     /// The activation's plugin state, where the host's push sink is.
     states: std::sync::RwLock<Option<Arc<bmux_plugin::PluginStateRegistry>>>,
+    /// Checked adapters of the typed providers registered for this instance,
+    /// by exact service key. Wire invocations that no hand route serves reach
+    /// the same provider objects in-process callers resolve.
+    wire_providers: std::sync::RwLock<
+        BTreeMap<
+            bmux_plugin_sdk::TypedServiceKey,
+            Arc<dyn bmux_plugin_sdk::PortableServiceProvider>,
+        >,
+    >,
 }
 
 const NO_ACTIVATION: &str = "cluster consensus requires an active plugin activation";
@@ -475,8 +484,76 @@ impl ClusterPlugin {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)] // Registration keeps generated service wiring auditable in one place.
+    /// Register the typed providers into the host registry and retain their
+    /// checked adapters, so the wire reaches exactly the registered providers.
     fn register_typed_services(
+        &self,
+        context: &bmux_plugin_sdk::TypedServiceRegistrationContext<'_>,
+        registry: &mut bmux_plugin_sdk::TypedServiceRegistry,
+    ) {
+        let mut providers = bmux_plugin_sdk::TypedServiceRegistry::new();
+        self.register_typed_providers(context, &mut providers);
+        let wire = providers
+            .iter()
+            .filter_map(|(key, handle)| Some((key.clone(), handle.portable_provider()?)))
+            .collect();
+        if let Ok(mut slot) = self.wire_providers.write() {
+            *slot = wire;
+        }
+        for (_, handle) in providers.into_entries() {
+            registry.insert(handle);
+        }
+    }
+
+    /// Serve a wire invocation with the registered typed provider for its
+    /// exact service key. `None` when no typed provider serves the key.
+    fn invoke_typed_provider(&self, context: &NativeServiceContext) -> Option<ServiceResponse> {
+        let service = &context.request.service;
+        let provider = self
+            .wire_providers
+            .read()
+            .ok()?
+            .get(&(
+                service.capability.clone(),
+                service.kind,
+                bmux_plugin_sdk::InterfaceId::from_owned(service.interface_id.clone()),
+            ))
+            .cloned()?;
+        let result = (|| {
+            // The SDK hands this body the unframed payload and frames the
+            // response again for a checked caller; the adapter only accepts
+            // checked frames, so bind the payload to the provider's contract.
+            let descriptor = provider.descriptor();
+            let request = bmux_plugin_sdk::service_contract::encode(
+                service.interface_id.as_str(),
+                descriptor.contract,
+                &context.request.payload,
+            )
+            .map_err(|error| error.to_string())?;
+            let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+                format!("typed cluster service dispatch requires the host runtime: {error}")
+            })?;
+            let response = tokio::task::block_in_place(|| {
+                runtime.block_on(bmux_plugin_sdk::typed_dispatch::dispatch_portable_checked(
+                    provider.as_ref(),
+                    &context.request.operation,
+                    &request,
+                    None,
+                ))
+            })
+            .map_err(|error| error.to_string())?;
+            bmux_plugin_sdk::service_contract::decode_response(&response)
+                .map(<[u8]>::to_vec)
+                .map_err(|error| error.to_string())
+        })();
+        Some(match result {
+            Ok(payload) => ServiceResponse::ok(payload),
+            Err(error) => ServiceResponse::error("typed_service_failed", error),
+        })
+    }
+
+    #[allow(clippy::too_many_lines)] // Registration keeps generated service wiring auditable in one place.
+    fn register_typed_providers(
         &self,
         context: &bmux_plugin_sdk::TypedServiceRegistrationContext<'_>,
         registry: &mut bmux_plugin_sdk::TypedServiceRegistry,
@@ -691,7 +768,16 @@ impl ClusterPlugin {
             )
     }
 
+    /// Serve one wire invocation. The worker's pane-runtime calls made while
+    /// serving it run under this invocation's caller.
     fn invoke_service(&self, context: &NativeServiceContext) -> ServiceResponse {
+        let caller = Arc::new(bmux_plugin::TypedServiceCaller::from_service_context(
+            context,
+        ));
+        worker_pane_runtime::serving_invocation(caller, || self.serve(context))
+    }
+
+    fn serve(&self, context: &NativeServiceContext) -> ServiceResponse {
         if let Err(response) = admission::authorize(context) {
             return response;
         }
@@ -712,85 +798,93 @@ impl ClusterPlugin {
                 self.activation_caller().ok().as_ref(),
             );
         }
-        bmux_plugin_sdk::route_service!(context, {
-            "cluster-query/v1", "list_clusters" => |(): (), ctx| {
-                let inventory = load_cluster_inventory_for_context(&ctx.connection.config_dir, ctx.settings.clone())
-                    .map_err(|error| ServiceResponse::error("list_clusters_failed", error))?;
-                Ok(ClusterQueryListClustersResponse {
-                    clusters: inventory.clusters,
-                })
-            },
-            "cluster-query/v1", "status" => |req: ClusterQueryStatusRequest, ctx| {
-                let inventory = load_cluster_inventory_for_context(&ctx.connection.config_dir, ctx.settings.clone())
-                    .map_err(|error| ServiceResponse::error("status_failed", error))?;
-                let probe = if req.doctor.unwrap_or(false) {
-                    HealthProbe::Doctor
-                } else {
-                    HealthProbe::Test
-                };
-                let statuses = collect_statuses_for_selector(ctx, &inventory, req.selector.as_deref(), probe)
-                    .map_err(|error| ServiceResponse::error("status_failed", error))?;
-                Ok(ClusterQueryStatusResponse { statuses })
-            },
-            "cluster-command/v1", "up" => |req: ClusterCommandUpRequest, ctx| {
-                let inventory = load_cluster_inventory_for_context(&ctx.connection.config_dir, ctx.settings.clone())
-                    .map_err(|error| ServiceResponse::error("up_failed", error))?;
-                let result = execute_cluster_up(
-                    ctx,
-                    &inventory,
-                    ClusterUpArgs {
-                        cluster: req.cluster,
-                        hosts: req.hosts,
-                        on_failure: RetryFailurePolicy::Continue,
-                        retries: 0,
-                    },
-                )
-                .map_err(|error| ServiceResponse::error("up_failed", error))?;
-                Ok(ClusterCommandUpResponse {
-                    session_id: result.session_id,
-                    statuses: result.statuses,
-                })
-            },
-            "cluster-command/v1", "pane_new" => |req: ClusterCommandPaneNewRequest, ctx| {
-                let result = execute_cluster_pane_new(
-                    ctx,
-                    ClusterPaneNewArgs {
-                        host: req.host,
-                        name: req.name,
-                    },
-                )
-                .map_err(|error| ServiceResponse::error("pane_new_failed", error))?;
-                Ok(result)
-            },
-            "cluster-command/v1", "pane_retry" => |req: ClusterCommandPaneRetryRequest, ctx| {
-                let pane = parse_pane_retry_ref(req.pane.unwrap_or_else(|| "active".to_string()));
-                let result = execute_cluster_pane_retry(ctx, &ClusterPaneRetryArgs {
-                    pane,
-                    on_failure: RetryFailurePolicy::Abort,
-                    retries: 0,
-                })
-                    .map_err(|error| ServiceResponse::error("pane_retry_failed", error))?;
-                Ok(result)
-            },
-            "cluster-command/v1", "pane_move" => |req: ClusterCommandPaneMoveRequest, ctx| {
-                let pane = parse_pane_retry_ref(req.pane.unwrap_or_else(|| "active".to_string()));
-                let result = execute_cluster_pane_move(
-                    ctx,
-                    ClusterPaneMoveArgs {
-                        pane,
-                        host: req.host,
-                    },
-                )
-                .map_err(|error| ServiceResponse::error("pane_move_failed", error))?;
-                Ok(result)
-            },
-            "cluster-connection-events/v1", "list" => |(): (), ctx| {
-                let events = get_cluster_connection_events(ctx)
-                    .map_err(|error| ServiceResponse::error("connection_events_list_failed", error))?;
-                Ok(ClusterConnectionEventsListResponse { events })
-            },
-        })
+        if let Some(response) = self.invoke_typed_provider(context) {
+            return response;
+        }
+        route_cluster_services(context)
     }
+}
+
+/// The hand-routed inventory, command and event services.
+fn route_cluster_services(context: &NativeServiceContext) -> ServiceResponse {
+    bmux_plugin_sdk::route_service!(context, {
+        "cluster-query/v1", "list_clusters" => |(): (), ctx| {
+            let inventory = load_cluster_inventory_for_context(&ctx.connection.config_dir, ctx.settings.clone())
+                .map_err(|error| ServiceResponse::error("list_clusters_failed", error))?;
+            Ok(ClusterQueryListClustersResponse {
+                clusters: inventory.clusters,
+            })
+        },
+        "cluster-query/v1", "status" => |req: ClusterQueryStatusRequest, ctx| {
+            let inventory = load_cluster_inventory_for_context(&ctx.connection.config_dir, ctx.settings.clone())
+                .map_err(|error| ServiceResponse::error("status_failed", error))?;
+            let probe = if req.doctor.unwrap_or(false) {
+                HealthProbe::Doctor
+            } else {
+                HealthProbe::Test
+            };
+            let statuses = collect_statuses_for_selector(ctx, &inventory, req.selector.as_deref(), probe)
+                .map_err(|error| ServiceResponse::error("status_failed", error))?;
+            Ok(ClusterQueryStatusResponse { statuses })
+        },
+        "cluster-command/v1", "up" => |req: ClusterCommandUpRequest, ctx| {
+            let inventory = load_cluster_inventory_for_context(&ctx.connection.config_dir, ctx.settings.clone())
+                .map_err(|error| ServiceResponse::error("up_failed", error))?;
+            let result = execute_cluster_up(
+                ctx,
+                &inventory,
+                ClusterUpArgs {
+                    cluster: req.cluster,
+                    hosts: req.hosts,
+                    on_failure: RetryFailurePolicy::Continue,
+                    retries: 0,
+                },
+            )
+            .map_err(|error| ServiceResponse::error("up_failed", error))?;
+            Ok(ClusterCommandUpResponse {
+                session_id: result.session_id,
+                statuses: result.statuses,
+            })
+        },
+        "cluster-command/v1", "pane_new" => |req: ClusterCommandPaneNewRequest, ctx| {
+            let result = execute_cluster_pane_new(
+                ctx,
+                ClusterPaneNewArgs {
+                    host: req.host,
+                    name: req.name,
+                },
+            )
+            .map_err(|error| ServiceResponse::error("pane_new_failed", error))?;
+            Ok(result)
+        },
+        "cluster-command/v1", "pane_retry" => |req: ClusterCommandPaneRetryRequest, ctx| {
+            let pane = parse_pane_retry_ref(req.pane.unwrap_or_else(|| "active".to_string()));
+            let result = execute_cluster_pane_retry(ctx, &ClusterPaneRetryArgs {
+                pane,
+                on_failure: RetryFailurePolicy::Abort,
+                retries: 0,
+            })
+                .map_err(|error| ServiceResponse::error("pane_retry_failed", error))?;
+            Ok(result)
+        },
+        "cluster-command/v1", "pane_move" => |req: ClusterCommandPaneMoveRequest, ctx| {
+            let pane = parse_pane_retry_ref(req.pane.unwrap_or_else(|| "active".to_string()));
+            let result = execute_cluster_pane_move(
+                ctx,
+                ClusterPaneMoveArgs {
+                    pane,
+                    host: req.host,
+                },
+            )
+            .map_err(|error| ServiceResponse::error("pane_move_failed", error))?;
+            Ok(result)
+        },
+        "cluster-connection-events/v1", "list" => |(): (), ctx| {
+            let events = get_cluster_connection_events(ctx)
+                .map_err(|error| ServiceResponse::error("connection_events_list_failed", error))?;
+            Ok(ClusterConnectionEventsListResponse { events })
+        },
+    })
 }
 
 fn is_cluster_lifecycle_service(context: &NativeServiceContext) -> bool {

@@ -73,11 +73,33 @@ pub(super) fn authorize_route(ctx: &NativeServiceContext) -> Result<(), ServiceR
         {
             Ok(())
         }
+        // The cluster plugin, in process, names the clients that observe frames
+        // (`attach_state::authorize_observer` re-checks this exact pairing).
+        StreamProvenance::HostInternal
+            if ctx.caller_client_id.is_none()
+                && ctx.request.caller_plugin_id == "bmux.cluster"
+                && ctx.request.service.interface_id == "attach-runtime-state"
+                && matches!(
+                    ctx.request.operation.as_str(),
+                    "observe-pane-frames" | "observe-pane-frames-reset"
+                ) =>
+        {
+            Ok(())
+        }
         StreamProvenance::Invalid | StreamProvenance::HostInternal => Err(ServiceResponse::error(
             "authorization_denied",
             "trusted caller provenance invalid or revoked",
         )),
     }
+}
+
+/// The cluster worker writing to an execution pane it runs. Its caller is the
+/// cluster's peer connection, which attaches to no session here: the worker
+/// authorized the write against its signed control lease before sending it.
+fn cluster_execution_input(ctx: &NativeServiceContext) -> bool {
+    ctx.request.caller_plugin_id == "bmux.cluster"
+        && ctx.request.service.interface_id == "pane-runtime-commands"
+        && ctx.request.operation == "execution-pane-input"
 }
 
 pub(crate) fn local_input_authority(
@@ -94,7 +116,9 @@ pub(crate) fn local_input_authority(
         authorize_route(&ctx).map_err(|_| "local input authority ended".to_string())?;
         super::spawn::authorize_session(&ctx, session_id, "pane.direct_input")
             .map_err(|error| format!("{error:?}"))?;
-        if let Some(client) = ctx.caller_client_id {
+        if let Some(client) = ctx.caller_client_id
+            && !cluster_execution_input(&ctx)
+        {
             let runtime = host
                 .registered_session_runtime()
                 .ok_or_else(|| "input runtime unavailable".to_string())?;
@@ -309,7 +333,23 @@ mod tests {
             ctx.host_service_port = None;
             assert!(authorize_route(&ctx).is_err());
         }
+        for operation in ["observe-pane-frames", "observe-pane-frames-reset"] {
+            *origin.lock().unwrap() = StreamProvenance::HostInternal;
+            let mut ctx = context("attach-runtime-state", operation, Vec::new());
+            ctx.caller_client_id = None;
+            // Only the cluster plugin may name frame observers.
+            assert!(authorize_route(&ctx).is_err());
+            ctx.request.caller_plugin_id = "bmux.cluster".into();
+            assert!(authorize_route(&ctx).is_ok());
+            ctx.caller_client_id = Some(Uuid::new_v4());
+            assert!(authorize_route(&ctx).is_err());
+            ctx.caller_client_id = None;
+            *origin.lock().unwrap() = StreamProvenance::Invalid;
+            assert!(authorize_route(&ctx).is_err());
+        }
+        *origin.lock().unwrap() = StreamProvenance::HostInternal;
         for (interface, operation) in [
+            ("attach-runtime-state", "observe-pane-frames-future"),
             ("pane-runtime-readiness-v1", "fence-unhealthy"),
             ("pane-runtime-readiness-v1", "future-operation"),
             ("pane-runtime-execution-v4", "send"),

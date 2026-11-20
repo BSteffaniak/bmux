@@ -444,6 +444,7 @@ async fn launch_execution<W: WorkerWorkflowClient>(
         .iter()
         .find(|pane| pane.pane_id == *pane_id)
         .ok_or_else(|| "assigned pane disappeared during reconciliation".to_string())?;
+    let (control_term, lease_sequence) = node.next_lease();
     let mut authority = WorkerAuthority {
         cluster_id: view.cluster_id.clone(),
         workspace_id: WorkspaceId {
@@ -452,12 +453,8 @@ async fn launch_execution<W: WorkerWorkflowClient>(
         pane_id: pane_id.clone(),
         execution_id: assignment.execution_id.clone(),
         generation: assignment.generation,
-        control_term: node.current_term(),
-        lease_sequence: u64::from_be_bytes(
-            original.command_id.value.as_bytes()[8..]
-                .try_into()
-                .expect("UUID suffix is exactly eight bytes"),
-        ),
+        control_term,
+        lease_sequence,
         operation_class: WorkerOperationClass::Lifecycle,
         principal_id: principal_id.to_string(),
         issuer_node_id: identity.node_id().to_string(),

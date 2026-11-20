@@ -86,6 +86,7 @@ pub struct ClosePaneArgs {
 pub struct ExecutionPaneInputArgs {
     pub session_id: Uuid,
     pub pane_id: Uuid,
+    #[serde(with = "bmux_plugin_sdk::codec::serde_bytes_vec")]
     pub data: Vec<u8>,
 }
 

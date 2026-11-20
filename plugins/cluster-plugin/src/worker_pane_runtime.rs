@@ -12,6 +12,35 @@ use bmux_pane_runtime_plugin_api::{attach_runtime_state, pane_runtime_commands};
 use bmux_plugin::TypedServiceCaller;
 use std::sync::Arc;
 
+tokio::task_local! {
+    /// The caller of the service invocation being served, while it is served.
+    static INVOCATION_CALLER: Arc<TypedServiceCaller>;
+}
+
+/// Run `work` as the body of the service invocation `caller` was captured from.
+///
+/// Pane-runtime calls the worker makes while serving it carry that invocation's
+/// authority and provenance, which pane runtime authorizes; the caller captured
+/// at registration belongs to no invocation and is refused.
+pub fn serving_invocation<R>(caller: Arc<TypedServiceCaller>, work: impl FnOnce() -> R) -> R {
+    INVOCATION_CALLER.sync_scope(caller, work)
+}
+
+/// The local pane an execution runs in. Each execution of a logical pane gets
+/// its own: pane-runtime state keyed by pane (such as an application's
+/// resurrection checkpoint) belongs to one execution and must not be found by
+/// the next generation. Derived, so relaunching an execution finds its pane.
+fn execution_pane_id(execution_id: uuid::Uuid) -> uuid::Uuid {
+    use sha2::Digest;
+    let mut digest = sha2::Sha256::new();
+    digest.update(b"bmux.cluster.execution-pane.v1\0");
+    digest.update(execution_id.as_bytes());
+    let bytes: [u8; 16] = digest.finalize()[..16]
+        .try_into()
+        .expect("SHA-256 prefix length");
+    uuid::Uuid::from_bytes(bytes)
+}
+
 pub struct TypedPaneRuntime {
     caller: Arc<TypedServiceCaller>,
 }
@@ -22,8 +51,11 @@ impl TypedPaneRuntime {
         Self { caller }
     }
 
-    fn client(&self) -> bmux_plugin::ServiceCallerDispatchClient<'_, TypedServiceCaller> {
-        bmux_plugin::ServiceCallerDispatchClient::new(self.caller.as_ref())
+    /// The invocation being served, else the caller this runtime was built with.
+    fn caller(&self) -> Arc<TypedServiceCaller> {
+        INVOCATION_CALLER
+            .try_with(Arc::clone)
+            .unwrap_or_else(|_| Arc::clone(&self.caller))
     }
 
     fn dispatch_error(
@@ -71,14 +103,15 @@ impl WorkerPaneRuntime for TypedPaneRuntime {
                 reason: "worker launch requires an explicit program".to_string(),
             })?;
         let session_id = authority.execution_id.value;
-        let pane_id = authority.pane_id.value;
-        let mut client = self.client();
+        let pane_id = execution_pane_id(session_id);
+        let caller = self.caller();
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(caller.as_ref());
         let launch = bmux_plugin::block_on_typed_dispatch(
             pane_runtime_commands::client::ensure_execution_pane(
                 &mut client,
                 session_id,
                 pane_id,
-                Some(format!("cluster:{pane_id}")),
+                Some(format!("cluster:{}", authority.pane_id.value)),
                 program.to_string(),
                 spec.args.clone(),
                 spec.cwd.clone(),
@@ -103,7 +136,8 @@ impl WorkerPaneRuntime for TypedPaneRuntime {
         _authority: &WorkerAuthority,
         spec: &WorkerAdoptionSpec,
     ) -> Result<(uuid::Uuid, uuid::Uuid), WorkerServiceError> {
-        let mut client = self.client();
+        let caller = self.caller();
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(caller.as_ref());
         let result = bmux_plugin::block_on_typed_dispatch(
             bmux_pane_runtime_plugin_api::pane_runtime_state::client::get_pane(
                 &mut client,
@@ -122,7 +156,8 @@ impl WorkerPaneRuntime for TypedPaneRuntime {
         pane_id: uuid::Uuid,
         data: &[u8],
     ) -> Result<(), WorkerServiceError> {
-        let mut client = self.client();
+        let caller = self.caller();
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(caller.as_ref());
         bmux_plugin::block_on_typed_dispatch(pane_runtime_commands::client::execution_pane_input(
             &mut client,
             session_id,
@@ -140,7 +175,11 @@ impl WorkerPaneRuntime for TypedPaneRuntime {
         targets: &[(uuid::Uuid, uuid::Uuid)],
         max_history_lines: u32,
     ) -> Result<(), WorkerServiceError> {
-        let mut client = self.client();
+        // The cluster plugin itself, in process, names the observing client;
+        // pane runtime admits frame observers only from it, never from the
+        // invocation being served.
+        let caller = Arc::clone(&self.caller);
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(caller.as_ref());
         bmux_plugin::block_on_typed_dispatch(attach_runtime_state::client::observe_pane_frames(
             &mut client,
             client_id,
@@ -165,7 +204,8 @@ impl WorkerPaneRuntime for TypedPaneRuntime {
         cols: u16,
         rows: u16,
     ) -> Result<(), WorkerServiceError> {
-        let mut client = self.client();
+        let caller = self.caller();
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(caller.as_ref());
         bmux_plugin::block_on_typed_dispatch(pane_runtime_commands::client::pane_set_pty_size(
             &mut client,
             session_id,
@@ -184,7 +224,8 @@ impl WorkerPaneRuntime for TypedPaneRuntime {
         pane_id: uuid::Uuid,
         signal: WorkerSignal,
     ) -> Result<(), WorkerServiceError> {
-        let mut client = self.client();
+        let caller = self.caller();
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(caller.as_ref());
         bmux_plugin::block_on_typed_dispatch(pane_runtime_commands::client::pane_signal(
             &mut client,
             session_id,
@@ -208,7 +249,8 @@ impl WorkerPaneRuntime for TypedPaneRuntime {
     }
 
     fn close(&self, session_id: uuid::Uuid, pane_id: uuid::Uuid) -> Result<(), WorkerServiceError> {
-        let mut client = self.client();
+        let caller = self.caller();
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(caller.as_ref());
         bmux_plugin::block_on_typed_dispatch(pane_runtime_commands::client::destroy_execution_pane(
             &mut client,
             session_id,
@@ -220,7 +262,8 @@ impl WorkerPaneRuntime for TypedPaneRuntime {
     }
 
     fn contains(&self, session_id: uuid::Uuid, pane_id: uuid::Uuid) -> bool {
-        let mut client = self.client();
+        let caller = self.caller();
+        let mut client = bmux_plugin::ServiceCallerDispatchClient::new(caller.as_ref());
         bmux_plugin::block_on_typed_dispatch(
             bmux_pane_runtime_plugin_api::pane_runtime_state::client::get_pane(
                 &mut client,
