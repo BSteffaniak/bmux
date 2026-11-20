@@ -1,5 +1,9 @@
 mod support;
 
+// Pane replication through the cluster attach provider runs on this same process harness.
+#[cfg(feature = "bundled-plugin-cluster")]
+mod cluster_frame_replication;
+
 use bmux_connections_plugin_api::{pairing_commands, pairing_state, pairing_types};
 use serial_test::serial;
 use std::path::Path;
