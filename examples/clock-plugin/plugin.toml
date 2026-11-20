@@ -1,5 +1,0 @@
-component_roles = ["backend"]
-id              = "example.clock"
-name            = "Example Clock"
-runtime         = "native"
-version         = "0.0.1"

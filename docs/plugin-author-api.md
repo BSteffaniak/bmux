@@ -15,7 +15,6 @@ plugins, each tested bundled and as a real dylib under `TestHost`:
 | `examples/hello-plugin`   | a BPDL command with typed arguments                                                             |
 | `examples/counter-plugin` | provided services, a retained contract event (`emits`), a command calling back through the host |
 | `examples/watcher-plugin` | required services, a typed event subscription in an activation-owned task, a provided query     |
-| `examples/clock-plugin`   | a contribution to a host-declared extension point (`bmux_extpoints`)                            |
 
 `examples/native-plugin` covers hand-declared (`native_command`) commands.
 Every BMUX workspace plugin is defined this way; the legacy author trait,
@@ -288,28 +287,12 @@ async fn watcher_contract() {
 
 ## Host-declared extension points
 
-A host program declares the extension points it offers. Plugins contribute
-in `declare()`:
+The framework lets a host program declare extension points and plugins contribute to them in
+`declare()` (`Declarations::extend::<Point>(data)`, implementing the point's generated
+`Behavior`). BMUX itself declares none: status-line segments are contributed through the tab
+bar's `status-items` service (`set-status-item`, see `examples/native-plugin`), its one status
+model.
 
-```rust
-// bmux_extpoints (bpdl/bmux-extpoints.bpdl):
-//   extension-point status-item version 1 {
-//     data { id: string, order: u32, label: string? }
-//     interface { query render(width: u16) -> string; }
-//   }
-impl Plugin for Clock {
-    fn declare(d: &mut Declarations<Self>) {
-        d.extend::<status_item_v1::Point>(status_item_v1::Data {
-            id: "clock".into(), order: 100, label: Some("UTC".into()),
-        });
-    }
-}
-impl status_item_v1::Behavior for Clock { /* async fn render(..) */ }
-```
-
-- `packages/extpoints` (`bmux_extpoints`) is the BMUX product layer: BPDL
-  extension points that BMUX declares, starting with `status-item`. It sits
-  above the framework, and no core crate depends on it.
 - `bmux_plugin::ExtensionPoints` is the generic host side. A host declares
   points (`declare::<Point>()`) and collects contributions from each
   instance's registrations (`contribute_registrations`, both packaging
@@ -411,9 +394,8 @@ their paths (`owns_paths`); `plugin.toml` may add paths, never remove them.
   without creating an instance. Deferred: the manifest needs the encoded
   data, and `Declarations::validate` should then match `extend` against it,
   as it does for commands.
-- The BMUX server does not yet declare `bmux_extpoints` points or consume an
-  `ExtensionSet`. Only `TestHost` hosts them today. The existing surface,
-  layout, attach and prompt contracts still live in `packages/plugin` and
-  move to `bmux_extpoints` with the Wave 2 plugin port.
+- The BMUX server declares no extension points and consumes no
+  `ExtensionSet`; only `TestHost` hosts them. The surface, layout, attach and
+  prompt contracts live in `packages/plugin`.
 - `TestHost` has no virtual clock. Plugins use the real plug-rt timers, and
   tests wait with bounded polls.

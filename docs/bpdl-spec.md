@@ -715,8 +715,8 @@ Planned additions, each additive:
 - Rust codegen from the IR instead of the syntax tree.
 - CLI command annotations (aliases, short flags, value names, execution
   kind) so every plugin's `[[commands]]` move into BPDL.
-- Contribution payload encoding into manifest `[[extensions]]` once
-  host extension points (`bmux-extpoints`) consume them.
+- Contribution payload encoding into manifest `[[extensions]]` once a host
+  consumes extension points outside `TestHost`.
 - Default values on record fields (with serde `#[serde(default)]`).
 
 ## Example — windows plugin

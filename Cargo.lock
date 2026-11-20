@@ -2354,17 +2354,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bmux_example_clock_plugin"
-version = "0.0.1-alpha.4"
-dependencies = [
- "bmux_extpoints",
- "bmux_plugin_schema_macros",
- "bmux_plugin_sdk",
- "bmux_plugin_test",
- "tokio",
-]
-
-[[package]]
 name = "bmux_example_counter_plugin"
 version = "0.0.1-alpha.4"
 dependencies = [
@@ -2415,17 +2404,6 @@ dependencies = [
  "bmux_plugin_sdk",
  "bmux_plugin_test",
  "tokio",
-]
-
-[[package]]
-name = "bmux_extpoints"
-version = "0.0.1-alpha.4"
-dependencies = [
- "bmux_codec",
- "bmux_ipc",
- "bmux_plugin_schema_macros",
- "bmux_plugin_sdk",
- "serde",
 ]
 
 [[package]]
