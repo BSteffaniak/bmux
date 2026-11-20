@@ -49,6 +49,7 @@ scripts/perf-render.py check --soak --work    # and the memory soaks and units o
 scripts/perf-render.py update [--work]        # rewrite this OS's baselines after an improvement
 scripts/perf-render.py compare master         # A/B: master against HEAD, every metric and its change
 scripts/perf-render.py work --scenario full-repaint --top 20   # where a scenario's work goes
+scripts/perf-render.py profile pipeline --scenario full-repaint # where its time goes, sampled
 ```
 
 A check prints `improved (the baseline can be lowered)` when a number drops well below its
@@ -66,10 +67,18 @@ target directory named after it, stay as they are). The benchmark library and mo
 of the counts. Units count executions, not instructions: they say what ran and how often, and
 instructions say what it cost.
 
-To find where time goes beyond counts (cache misses, memory waits), sample a scenario with
-[samply](https://github.com/mstange/samply) or Instruments; to find where allocations come from,
-use [dhat](https://docs.rs/dhat). `pipeline_bench_loop` replays one corpus (or, with
-`BMUX_BENCH_IMAGE`, an image scenario) for external profilers.
+Units of work and instruction totals do not say what each function costs: a call into a hasher
+counts as one unit like a getter, an inlined body counts toward its caller, and library code such
+as `memcpy` is not instrumented. `profile` ranks functions by sampled self time instead: it builds
+a bench with symbols, replays one scenario in a loop (`pipeline_bench_loop`,
+`ingest_bench_loop`) and samples it with the system profiler (`sample` on macOS, `perf` on Linux):
+
+```sh
+scripts/perf-render.py profile ingest --scenario full-repaint --top 30
+```
+
+Samples vary from run to run; use them to find what to change, and the gated numbers to prove the
+change. To find where allocations come from, use [dhat](https://docs.rs/dhat).
 
 ## Results
 

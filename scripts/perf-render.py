@@ -15,6 +15,14 @@ See docs/development/render-performance.md.
   scripts/perf-render.py update [--work]                        rewrite this OS's baselines
   scripts/perf-render.py compare BASE [HEAD]                    run two revisions, print the change
   scripts/perf-render.py work [--scenario NAME] [--top N]       print where each scenario's work goes
+  scripts/perf-render.py profile BENCH [--scenario NAME] [--seconds N] [--top N]
+                                                                where the time goes, by function
+
+`work` counts how often code runs, exactly, but not what each call costs (an inlined body counts
+toward its caller, a library call such as memcpy not at all). `profile` samples a release build
+replaying one scenario in a loop and attributes the samples to functions: not reproducible to the
+unit, but it ranks what is expensive. It uses the system sampler (`sample` on macOS, `perf` on
+Linux).
 
 Run inside the Nix development shell (direnv), from the repository root.
 """
@@ -331,6 +339,127 @@ def compare(args: argparse.Namespace) -> int:
     return 0
 
 
+PROFILES = {
+    "pipeline": (["-p", "bmux_attach_pipeline", "--features", "image-kitty,image-sixel", "--lib"],
+                 "bmux_attach_pipeline", "pipeline_bench::pipeline_bench_loop"),
+    "ingest": (["-p", "bmux_pane_runtime_plugin", "--features", "image-registry", "--lib"],
+               "bmux_pane_runtime_plugin", "runtime::ingest_bench::ingest_bench_loop"),
+}
+
+
+def profile_binary(bench: str) -> str:
+    """Build the bench's test binary in release with symbols and line tables (the release
+    profile strips them) and return its path."""
+    args, target, _ = PROFILES[bench]
+    env = {**os.environ, "CARGO_PROFILE_RELEASE_STRIP": "none",
+           "CARGO_PROFILE_RELEASE_DEBUG": "line-tables-only"}
+    built = subprocess.run(
+        ["cargo", "test", "--release", "-j", os.environ.get("PERF_RENDER_JOBS", "4"), *args,
+         "--no-run", "--message-format=json"],
+        cwd=ROOT, env=env, check=True, capture_output=True, text=True)
+    for line in built.stdout.splitlines():
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (message.get("reason") == "compiler-artifact" and message.get("executable")
+                and message["target"]["name"] == target):
+            return message["executable"]
+    raise SystemExit(f"no test binary built for {bench}")
+
+
+def demangle(name: str) -> str:
+    """A readable path for a Rust symbol: the identifiers of a v0 (`_R...`) or legacy (`_ZN...`)
+    mangled name joined by `::`. Not a full demangler (generic arguments read as further path
+    segments), but enough to tell functions apart."""
+    import re
+    if not (name.startswith("_R") or name.startswith("_ZN")):
+        return name
+    legacy = name.startswith("_ZN")
+    if not legacy:
+        # Crate disambiguators (`Cs<base62>_`) and impl/closure disambiguators (`s<base62>_`
+        # after a tag) are hashes, not identifiers.
+        name = re.sub(r"C(s[0-9A-Za-z]*_)", "C", name)
+        name = re.sub(r"([MXYNIB])s[0-9A-Za-z]*_", r"\1", name)
+    parts = []
+    index = 3 if legacy else 2
+    while index < len(name):
+        match = re.compile(r"(\d+)_?").match(name, index)
+        if not match:
+            index += 1
+            continue
+        length = int(match.group(1))
+        start = match.end()
+        ident = name[start:start + length]
+        if length and re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$.]*", ident):
+            if not (legacy and re.fullmatch(r"h[0-9a-f]{16}", ident)):
+                parts.append(ident)
+            index = start + length
+        else:
+            index = match.end()
+    # Crate disambiguators precede crate names in v0 (`Cs<hash>_`); dropping single-letter tags
+    # and repeated segments keeps the path short.
+    path = [part for part in parts if len(part) > 1]
+    collapsed = [part for i, part in enumerate(path) if i == 0 or part != path[i - 1]]
+    return "::".join(collapsed) or name
+
+
+def profile(args: argparse.Namespace) -> int:
+    import collections
+    import re
+    import time
+    binary = profile_binary(args.bench)
+    test = PROFILES[args.bench][2]
+    # Enough rounds to outlast the sampling; the process is stopped once it is done.
+    env = {**os.environ, "BMUX_BENCH_CORPUS": f"generated:{args.scenario}",
+           "BMUX_BENCH_ROUNDS": "1000000"}
+    command = [binary, test, "--ignored", "--exact", "--test-threads", "1"]
+    out = Path(tempfile.mkdtemp(prefix="perf-render-profile-"))
+    counts: collections.Counter[str] = collections.Counter()
+    if platform.system() == "Darwin":
+        process = subprocess.Popen(command, env=env, stdout=subprocess.DEVNULL)
+        time.sleep(2)
+        report = out / "sample.txt"
+        try:
+            subprocess.run(["sample", str(process.pid), str(args.seconds), "1", "-mayDie",
+                            "-file", str(report)], check=True, capture_output=True)
+        finally:
+            process.kill()
+            process.wait()
+        top = report.read_text().split("Sort by top of stack", 1)[1].split("Binary Images", 1)[0]
+        for line in top.splitlines():
+            match = re.match(r"\s+(\S.*?)\s+\(in (\S+)\)\s+(?:load address .*?\s+)?(\d+)$", line)
+            if match and "semaphore_wait" not in match.group(1):
+                counts[match.group(1)] += int(match.group(3))
+        readable: collections.Counter[str] = collections.Counter()
+        for name, count in counts.items():
+            readable[demangle(name)] += count
+        counts = readable
+    else:
+        data = out / "perf.data"
+        process = subprocess.Popen(command, env=env, stdout=subprocess.DEVNULL)
+        try:
+            subprocess.run(["perf", "record", "-F", "999", "-o", str(data), "-p",
+                            str(process.pid), "--", "sleep", str(args.seconds)],
+                           check=True, capture_output=True)
+        finally:
+            process.kill()
+            process.wait()
+        report = subprocess.run(["perf", "report", "-i", str(data), "--stdio", "--no-children",
+                                 "--sort", "symbol", "--percent-limit", "0.3"],
+                                check=True, capture_output=True, text=True).stdout
+        for line in report.splitlines():
+            match = re.match(r"\s+([\d.]+)%.*?\[\.\]\s+(.*)$", line)
+            if match:
+                counts[demangle(match.group(2))] += round(float(match.group(1)) * 100)
+    total = sum(counts.values()) or 1
+    print(f"{args.bench} {args.scenario}: {total} samples (self time)")
+    for name, count in counts.most_common(args.top):
+        print(f"{count:7d} {100 * count / total:5.1f}%  {name[:160]}")
+    print(f"raw: {out}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -348,6 +477,12 @@ def main() -> int:
     work_parser.add_argument("--scenario", help="only this scenario")
     work_parser.add_argument("--top", type=int, default=15, help="functions per scenario")
     work_parser.set_defaults(run=work)
+    profile_parser = commands.add_parser("profile", help="where the time goes, by function")
+    profile_parser.add_argument("bench", choices=sorted(PROFILES))
+    profile_parser.add_argument("--scenario", default="full-repaint")
+    profile_parser.add_argument("--seconds", type=int, default=6)
+    profile_parser.add_argument("--top", type=int, default=30)
+    profile_parser.set_defaults(run=profile)
     compare_parser = commands.add_parser("compare", help="A/B two revisions")
     compare_parser.add_argument("base")
     compare_parser.add_argument("head", nargs="?", default="HEAD")

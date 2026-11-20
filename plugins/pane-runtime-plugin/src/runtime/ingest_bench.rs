@@ -316,6 +316,36 @@ fn ingest_metrics() {
     report.write_and_check();
 }
 
+/// A fixed workload for external profilers, as `pipeline_bench_loop` is for the client: the
+/// corpus `BMUX_BENCH_CORPUS` (a captured file, or `generated:NAME`, or `generated:kitty-images`)
+/// read `BMUX_BENCH_ROUNDS` times (5 by default) as the pane reader does
+/// (`scripts/perf-render.py profile ingest`).
+#[test]
+#[ignore = "instruction-count workload; run explicitly"]
+fn ingest_bench_loop() {
+    let size = size();
+    let path = std::env::var("BMUX_BENCH_CORPUS").expect("BMUX_BENCH_CORPUS");
+    let frames = match path.strip_prefix("generated:") {
+        Some("kitty-images") => kitty_images(size, 300),
+        Some(name) => {
+            corpus::generated(size, 300)
+                .into_iter()
+                .find(|corpus| corpus.name == name)
+                .expect("generated corpus")
+                .frames
+        }
+        None => corpus::read(std::path::Path::new(&path)).expect("corpus"),
+    };
+    let rounds =
+        std::env::var("BMUX_BENCH_ROUNDS").map_or(5, |rounds| rounds.parse().expect("rounds"));
+    for _ in 0..rounds {
+        let mut reader = Pane::new(size);
+        for chunk in frames.iter().flat_map(|frame| frame.chunks(READ)) {
+            reader.read(chunk);
+        }
+    }
+}
+
 /// Memory the pane reader keeps stops growing: replayed ten times over (text, and text with
 /// Kitty images), its live bytes in the second half of the rounds stay within 256 KiB of where
 /// the half started. Run in release:
