@@ -90,15 +90,17 @@ client now keeps its panes current with frames (see
 
 | Scenario | Phase | Allocations | Instructions | Bytes written |
 | --- | --- | --- | --- | --- |
-| Full repaint | client apply | 42,274 → 0 | 65.1M → 6.6M (−90%) | 128,475 → 128,475 |
-| Full repaint | server frame build | — → 4 | — → 3.9M | |
-| Full repaint | client render | 120 → 25 | 22.8M → 22.4M | |
-| Streaming text | client apply | 1,409 → 3 | 2.24M → 0.24M (−89%) | 4,769 → 4,769 |
-| Streaming text | server frame build | — → 3 | — → 0.15M | |
-| Moving sixel image | client apply + render | 7,270 → 52 | 23.6M → 5.1M (−78%) | 104,180 → 85,639 |
-| Full repaint | pane reader | 101,285 → 33 | 136.9M → 28.1M (−79%) | |
-| Streaming text | pane reader | 3,380 → 8 | 4.75M → 1.16M (−76%) | |
-| Text with Kitty images | pane reader | 11,715 → 31 | 8.99M → 2.80M (−69%) | |
+| Full repaint | client apply | 42,274 → 0 | 65.1M → 4.9M (−93%) | 128,475 → 128,475 |
+| Full repaint | server frame build | — → 4 | — → 3.2M | |
+| Full repaint | client render | 120 → 24 | 22.8M → 17.5M (−23%) | |
+| Streaming text | client apply | 1,409 → 3 | 2.24M → 0.18M (−92%) | 4,769 → 4,769 |
+| Streaming text | server frame build | — → 3 | — → 0.13M | |
+| Streaming text | client render | — | 1.35M → 1.11M (−18%) | |
+| Moving sixel image | client apply + render | 7,270 → 52 | 23.6M → 5.0M (−79%) | 104,180 → 85,639 |
+| Full repaint | pane reader | 101,285 → 2.8 | 136.9M → 14.4M (−89%) | |
+| Streaming text | pane reader | 3,380 → 6 | 4.75M → 0.70M (−85%) | |
+| Scrolling (SU) | pane reader | — → 0.02 | 0.91M → 0.49M (−46%) | |
+| Text with Kitty images | pane reader | 11,715 → 29 | 8.99M → 2.35M (−74%) | |
 
 Bytes written change only where intended (a moving raster image repairs its footprint, not the
 screen). Memory: the pane reader keeps one grid instead of two, history lines are stored compactly
@@ -119,13 +121,22 @@ What changed, each its own commit with its numbers:
 - Images: the content cache survives raster repairs; a moved raster image repaints only its old
   footprint.
 - History lines are stored compactly (this one trades about 8% streaming CPU for memory).
+- Found with `profile` (sampled time, which the counts above do not rank): style interning hashed
+  two packed words with foldhash instead of SipHash field by field; one-byte cell text and frame
+  text written without copy calls; frame lines of ASCII decoded a byte per cell; runs of one-byte
+  cells painted and encoded at once; the output buffer's phase scan skips sequence bodies; chunks
+  without an image start skip the image interceptor; escapes are found with memchr; control
+  sequence parameters reuse one buffer in one pass; no per-chunk allocation or per-sequence
+  memset in the reader.
 
 ## Known costs left
 
-- **Client render** is now the client's largest cost (22.4M instructions for a full repaint, about
-  600 a cell): grid cells are converted to the TUI buffer's cells one at a time (symbol checks,
-  style patching, change tracking) and then encoded row by row.
+- **Client render** is still the client's largest cost (17.5M instructions for a full repaint,
+  about 460 a cell), most of it encoding: the SGR changes a colourful screen needs, written cell
+  run by cell run.
 - **The server still runs separate scanners for images and shell metadata**, and the raw output
-  fan-out for its remaining consumers (cluster replication, playbook, recording).
+  fan-out for its remaining consumers (cluster replication, playbook, recording), now with
+  memchr and a pass-through check, but still a scan each. While an image is on screen, a pane's
+  output is fed to its grid a byte at a time.
 - **The render rebuilds a compositor plan every frame** (about 15 small allocations).
 - **Cluster replication** still moves pane output between nodes as bytes.
