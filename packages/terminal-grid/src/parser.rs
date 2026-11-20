@@ -22,8 +22,9 @@ pub struct TerminalGridStream {
     observed_dcs: ObservedDcs,
     /// An OSC payload an observer asked for, collected across chunks.
     observed_osc: ObservedOsc,
-    /// A sequence's parameter values, rewritten for each sequence rather than built anew.
-    param_values: ParamValues,
+    /// A sequence's parameter values, rewritten for each sequence rather than built anew (boxed:
+    /// a stream is held across awaits, and this is half a kilobyte).
+    param_values: Box<ParamValues>,
 }
 
 impl TerminalGridStream {
@@ -46,7 +47,7 @@ impl TerminalGridStream {
             previous_pending: Vec::new(),
             observed_dcs: ObservedDcs::default(),
             observed_osc: ObservedOsc::default(),
-            param_values: ParamValues::new(),
+            param_values: Box::new(ParamValues::new()),
         }
     }
 
