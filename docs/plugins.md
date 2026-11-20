@@ -137,8 +137,8 @@ independent presentation surfaces. `DecorationScene` carries decoration-owned
 semantic borders and terminal-graphics lowering that bounded `RenderOp`
 snapshots deliberately exclude; `decoration-plugin-renderer` is therefore the
 single adapter from that typed contract into retained render-extension scene
-items. Its imperative callbacks are compatibility fallbacks for unsupported
-terminal capabilities, not a second tab/sidebar surface implementation.
+items (terminal-cell fallbacks included for terminals without graphics), not a
+second tab/sidebar surface implementation.
 Generic render extensions likewise remain the lower-level mechanism for
 pane-relative before/after-content effects and capability-aware terminal
 graphics. Product presentation plugins must use owner-scoped layout/surface

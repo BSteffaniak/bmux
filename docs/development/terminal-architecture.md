@@ -280,6 +280,8 @@ Deferred, each until something needs it (measured, not assumed):
 Retained layers cost nothing when unchanged: the attach client samples a layer again only when
 its extension's revision, the surface rect or the render context changed, and the renderer skips
 converting and diffing a scene it already emitted (`AttachRenderExtension::render_layer_revision`
-states the contract). Remaining: the per-frame planning bookkeeping around each extension layer
-(string cache keys, plan structures), and the render extension trait collapsed onto retained
-scenes.
+states the contract). Extensions render only through retained scenes: the damage, operation,
+item and before-content-cell callbacks and their host fallbacks are gone, so every layer is
+planned one way (diff, content replay, commit), and before-content intent lands under the pane's
+content from the scene's items. Remaining: the per-frame planning bookkeeping around each
+extension layer (string cache keys, plan structures).
