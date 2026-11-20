@@ -299,7 +299,8 @@ pub fn make_backend(access: ScriptHostAccess) -> Box<dyn ScriptBackend> {
         feature = "scripting-lua54"
     )))]
     {
-        let _ = access;
+        // No backend to hand the host access to: release it here.
+        drop(access);
         Box::new(StubBackend)
     }
 }
