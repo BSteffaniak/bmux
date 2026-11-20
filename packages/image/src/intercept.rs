@@ -145,37 +145,39 @@ impl ImageInterceptor {
         if !matches!(self.state, State::Ground) {
             return false;
         }
-        let mut rest = input;
-        while let Some(at) = memchr::memchr(0x1B, rest) {
-            // An escape at the end might begin anything.
-            let Some(&next) = rest.get(at + 1) else {
-                return false;
-            };
-            match next {
-                // CAN and SUB cancel the escape, dropping it.
-                0x18 | 0x1A => return false,
-                #[cfg(feature = "sixel")]
-                b'P' => return false,
-                #[cfg(feature = "kitty")]
-                b'_' => return false,
-                #[cfg(feature = "iterm2")]
-                b']' => {
-                    const PREFIX: &[u8] = b"1337;File=";
-                    // Passed through once it diverges from an image's prefix, unless it diverges
-                    // on CAN or SUB, which cancel (and drop) the prefix read so far.
-                    let body = &rest[at + 2..];
-                    match body
-                        .iter()
-                        .zip(PREFIX)
-                        .position(|(byte, expected)| byte != expected)
-                    {
-                        Some(diverges) if !matches!(body[diverges], 0x18 | 0x1A) => {}
-                        _ => return false,
-                    }
-                }
-                _ => {}
+        // Only an escape followed by certain bytes can matter, so search for those pairs (a few
+        // vectorized scans) rather than stepping through every escape, which colourful output
+        // has every few bytes. An escape at the end might begin anything.
+        if input.last() == Some(&0x1B) {
+            return false;
+        }
+        let present = |pair: &[u8]| memchr::memmem::find(input, pair).is_some();
+        // CAN and SUB cancel the escape, dropping it.
+        if present(b"\x1B\x18") || present(b"\x1B\x1A") {
+            return false;
+        }
+        #[cfg(feature = "sixel")]
+        if present(b"\x1BP") {
+            return false;
+        }
+        #[cfg(feature = "kitty")]
+        if present(b"\x1B_") {
+            return false;
+        }
+        #[cfg(feature = "iterm2")]
+        for at in memchr::memmem::find_iter(input, b"\x1B]") {
+            const PREFIX: &[u8] = b"1337;File=";
+            // Passed through once it diverges from an image's prefix, unless it diverges on CAN
+            // or SUB, which cancel (and drop) the prefix read so far.
+            let body = &input[at + 2..];
+            match body
+                .iter()
+                .zip(PREFIX)
+                .position(|(byte, expected)| byte != expected)
+            {
+                Some(diverges) if !matches!(body[diverges], 0x18 | 0x1A) => {}
+                _ => return false,
             }
-            rest = &rest[at + 1..];
         }
         true
     }
