@@ -359,6 +359,37 @@ fn playbook_real_attach_presentation_combinations_reach_shell_and_resize() {
 
 #[test]
 #[serial]
+fn playbook_real_attach_toggles_sidebar_visibility_with_its_keybinding() {
+    // Attach presentations are installed from the playbook process's own
+    // enabled plugins, so the sidebar is enabled in its host config.
+    let fixture = fixtures_dir().join("attach_real_presentation_visibility.dsl");
+    let sandbox = BmuxCommandSandbox::new("presentation-visibility");
+    std::fs::write(
+        sandbox.root.path().join("config").join("bmux.toml"),
+        "[plugins]\nenabled = [\"bmux.sidebar\"]\n",
+    )
+    .expect("write host config");
+    let output = sandbox
+        .command()
+        .args(["playbook", "run", "--json", fixture.to_str().unwrap()])
+        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .env("BMUX_PLAYBOOK_ENV_MODE", "clean")
+        .output()
+        .expect("failed to run bmux playbook");
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "invalid playbook JSON ({error}); stderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    let pass = json["pass"].as_bool().unwrap_or(false);
+    assert!(pass, "sidebar visibility playbook should pass: {json:#}");
+    let steps = json["steps"].as_array().expect("steps should be array");
+    assert!(steps.iter().all(|step| step["status"] == "pass"));
+}
+
+#[test]
+#[serial]
 fn playbook_real_attach_bracketed_paste_reaches_pty_with_exact_mode_encoding() {
     let (json, pass) = run_playbook_fixture("bracketed_paste_real_attach.dsl");
     assert!(

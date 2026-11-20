@@ -18,6 +18,8 @@ maximum_visible_items = 20
 content_height = false
 collapse_below_width = 80
 collapsed_width = 8
+visible = true             # shown when a client attaches
+remember_visibility = false # start from the last state set on this machine
 ```
 
 Templates support `{marker}`, `{index}`, `{name}`, `{id}`, and `{active}`.
@@ -26,3 +28,7 @@ line when configured.
 
 Enable it with `plugins.enabled = ["bmux.sidebar"]`. It composes through the
 generic layout resolver with the independent tab-bar plugin.
+
+Show or hide it in one attach client with `plugin:bmux.sidebar:toggle`
+(`ctrl+alt+s` by default), `plugin:bmux.sidebar:show` or
+`plugin:bmux.sidebar:hide`. See `docs/tab-presentations.md` for details.

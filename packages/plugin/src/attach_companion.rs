@@ -24,9 +24,22 @@ pub struct AttachPresentationResources {
     /// a runtime with its own config (for example a sandbox) is honored
     /// instead of whatever config the process registered companions with.
     pub plugin_settings: Arc<BTreeMap<String, toml::Value>>,
+    /// Root for state the invoking runtime keeps on its own machine across
+    /// attaches and restarts. `None` (an isolated or embedded runtime) means
+    /// companions keep nothing between installations.
+    pub local_state_dir: Option<std::path::PathBuf>,
 }
 
 impl AttachPresentationResources {
+    /// The directory `plugin_id`'s companion may keep local state in, when
+    /// this runtime offers persisted local state at all.
+    #[must_use]
+    pub fn plugin_local_state_dir(&self, plugin_id: &str) -> Option<std::path::PathBuf> {
+        self.local_state_dir
+            .as_ref()
+            .map(|root| root.join("plugins").join(plugin_id))
+    }
+
     /// Allocate an independent frontend scope. No process-global registry is
     /// selected implicitly; companion factories receive these exact handles.
     #[must_use]
@@ -43,6 +56,7 @@ impl AttachPresentationResources {
             events: Arc::new(crate::EventBus::new()),
             states: Arc::new(crate::PluginStateRegistry::new()),
             plugin_settings: Arc::new(BTreeMap::new()),
+            local_state_dir: None,
         }
     }
 

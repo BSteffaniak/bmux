@@ -7224,6 +7224,7 @@ mod tests {
                 surfaces: Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(64)),
                 input: Arc::new(bmux_plugin::AttachPresentationInputRegistry::new()),
                 plugin_settings: Arc::default(),
+                local_state_dir: None,
                 states: Arc::new(bmux_plugin::PluginStateRegistry::new()),
             };
             let settings: toml::Value = toml::from_str("preset = 'classic'\ntab_template = '{name}'").unwrap();

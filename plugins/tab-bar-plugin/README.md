@@ -82,6 +82,12 @@ Migration-era aliases remain accepted when the canonical key is absent:
 `label_template`, `maximum_label_width`, `maximum_visible_tabs`, `show_index`,
 and `show_compact_facts`. Canonical settings take precedence.
 
+Show or hide the bar in one attach client with `plugin:bmux.tab_bar:toggle`
+(`ctrl+alt+b` by default), `plugin:bmux.tab_bar:show` or
+`plugin:bmux.tab_bar:hide`. Set `visible = false` to start hidden and
+`remember_visibility = true` to start from the last state set on this machine.
+Toasts stay visible while the bar is hidden.
+
 Disable the bar with `plugins.disabled = ["bmux.tab_bar"]`. Essential attach
 notifications retain a neutral fallback when it is disabled. The sidebar is an
 independent opt-in plugin.

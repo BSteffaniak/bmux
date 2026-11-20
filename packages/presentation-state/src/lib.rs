@@ -8,6 +8,8 @@
 //! crate owns only lifecycle-safe primitives and registry mechanics; it does
 //! not know what a window, pane, session, agent, or client is.
 
+pub mod visibility;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::RwLock;
 

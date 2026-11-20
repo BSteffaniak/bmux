@@ -103,10 +103,7 @@ pub fn surface(companion: &CompanionState, revision: u64, now_ms: u64) -> Option
         max_visible: settings.max_visible,
         ..ToastStackPolicy::cards()
     };
-    let bar_rows = companion
-        .committed_projection
-        .as_ref()
-        .map_or(companion.settings.height, |projection| projection.height);
+    let bar_rows = companion.bar_rows();
     let available_rows = local
         .viewport_rows
         .saturating_sub(bar_rows)

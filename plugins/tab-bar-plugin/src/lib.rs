@@ -42,6 +42,9 @@ use bmux_plugin::{
 };
 use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::{TypedServiceEndpoint, prelude::*};
+use bmux_presentation_state::visibility::{
+    PresentationVisibility, VisibilityCommand, VisibilitySettings,
+};
 #[cfg(test)]
 use bmux_presentation_state::{
     PresentationEntityRef, PresentationFact, PresentationFactRegistry, PresentationFactRole,
@@ -215,6 +218,7 @@ struct Settings {
     colors: ColorSettings,
     status_items: StatusItemSettings,
     notifications: NotificationSettings,
+    visibility: VisibilitySettings,
 }
 
 impl Default for Settings {
@@ -257,6 +261,7 @@ impl Default for Settings {
             colors: ColorSettings::default(),
             status_items: StatusItemSettings::default(),
             notifications: NotificationSettings::default(),
+            visibility: VisibilitySettings::default(),
         }
     }
 }
@@ -304,6 +309,8 @@ struct CompanionState {
     status_items: Vec<status_items_list::StatusItem>,
     /// Plugin-raised toasts retained by the provider, oldest first.
     notifications: Vec<notifications_list::Notification>,
+    /// Whether this runtime shows the bar. Toasts stay visible either way.
+    visibility: PresentationVisibility,
 }
 
 impl CompanionState {
@@ -321,6 +328,15 @@ impl CompanionState {
     }
 
     fn new(settings: Settings) -> Self {
+        // Installations that remember visibility replace this with one bound
+        // to their runtime's local state directory.
+        let visibility = PresentationVisibility::new(
+            VisibilitySettings {
+                remember: false,
+                ..settings.visibility
+            },
+            None,
+        );
         Self {
             // Private until an installation hands over its runtime's registries.
             surfaces: std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(64)),
@@ -362,7 +378,38 @@ impl CompanionState {
             last_workspace_click: None,
             status_items: Vec::new(),
             notifications: Vec::new(),
+            visibility,
         }
+    }
+
+    /// A companion for one runtime, remembering visibility in the runtime's
+    /// local state directory when its settings ask to.
+    fn for_runtime(
+        settings: Settings,
+        resources: &bmux_plugin::AttachPresentationResources,
+    ) -> Self {
+        let visibility = PresentationVisibility::new(
+            settings.visibility,
+            resources.plugin_local_state_dir(OWNER),
+        );
+        Self {
+            visibility,
+            ..Self::new(settings)
+        }
+    }
+
+    const fn visible(&self) -> bool {
+        self.visibility.visible()
+    }
+
+    /// Rows the bar occupies: none while hidden.
+    fn bar_rows(&self) -> u16 {
+        if !self.visible() {
+            return 0;
+        }
+        self.committed_projection
+            .as_ref()
+            .map_or(self.settings.height, |projection| projection.height)
     }
 
     fn replace_status_items(&mut self, snapshot: &status_items_list::StatusItemSnapshot) -> bool {
@@ -489,7 +536,18 @@ impl Plugin for TabBarPlugin {
                 Ok(())
             })
             .blocking_services(Self::invoke_service, None);
+        for name in VisibilityCommand::NAMES {
+            d.blocking_command(name, |_, _| Err(presentation_only_command()));
+        }
     }
+}
+
+/// Reached only when no tab-bar presentation answered a visibility command,
+/// for example from a shell or in a client without the bar installed.
+fn presentation_only_command() -> PluginCommandError {
+    PluginCommandError::unavailable(
+        "tab bar visibility commands only apply inside an attach client showing the tab bar",
+    )
 }
 
 impl TabBarPlugin {
@@ -572,7 +630,7 @@ struct Fixture {
 impl Fixture {
     fn install(settings: Option<&toml::Value>) -> Result<Self, String> {
         let settings = Settings::parse(settings).map_err(|error| error.to_string())?;
-        let request = layout_request(&settings);
+        let request = companion_layout_request(&settings, settings.visibility.visible);
         let resources = bmux_plugin::AttachPresentationResources::isolated(64);
         let mut companion = CompanionState::new(settings);
         companion.surfaces = resources.surfaces.clone();
@@ -628,6 +686,7 @@ fn register_presentation_input(
     registry: &bmux_plugin::AttachPresentationInputRegistry,
     owner: &CompanionHandle,
 ) {
+    register_visibility_commands(registry, owner);
     registry.register_shortcut(input_endpoint(), {
         let owner = owner.clone();
         std::sync::Arc::new(move |event| handle_local_input(&owner, event))
@@ -693,6 +752,67 @@ fn register_presentation_input(
         input_endpoint(),
         std::sync::Arc::new(move |hook| handle_focus_lost(&focus_owner, hook)),
     );
+}
+
+/// Answer `toggle`, `show` and `hide` in this runtime: what one attach client
+/// shows is presentation state, not plugin state.
+fn register_visibility_commands(
+    registry: &bmux_plugin::AttachPresentationInputRegistry,
+    owner: &CompanionHandle,
+) {
+    for name in VisibilityCommand::NAMES {
+        let Some(command) = VisibilityCommand::from_name(name) else {
+            continue;
+        };
+        let owner = std::sync::Arc::downgrade(owner);
+        registry.register_command(
+            OWNER,
+            name,
+            std::sync::Arc::new(move |_| {
+                let Some(owner) = owner.upgrade() else {
+                    return AttachInputResult::default();
+                };
+                let Ok(mut guard) = owner.lock() else {
+                    return AttachInputResult::default();
+                };
+                guard
+                    .as_mut()
+                    .map_or_else(AttachInputResult::default, |companion| {
+                        apply_visibility(companion, command)
+                    })
+            }),
+        );
+    }
+}
+
+fn apply_visibility(
+    companion: &mut CompanionState,
+    command: VisibilityCommand,
+) -> AttachInputResult {
+    let (changed, status_message) = match companion.visibility.apply(command) {
+        Ok(changed) => (changed, None),
+        // The new state still applies to this client; say it was not kept.
+        Err(error) => (true, Some(error)),
+    };
+    if changed && !companion.visible() {
+        // Nothing of the bar remains to interact with.
+        companion.menu_tab_id = None;
+        companion.menu = menu::MenuInput::default();
+        cancel_rename(companion);
+        companion.hovered_tab_id = None;
+        companion.pointer_source = None;
+        companion.pointer_moved = false;
+        companion.drag_target = None;
+        companion.pending_projection.clear();
+        companion.committed_projection = None;
+    }
+    let dirty = changed && republish_companion(companion);
+    AttachInputResult {
+        consumed: true,
+        dirty,
+        status_message,
+        ..AttachInputResult::default()
+    }
 }
 
 /// Declare an instance-owned frontend factory for the invoking attach runtime.
@@ -791,7 +911,6 @@ impl TabBarPresentation {
         fact_registry: FactSource,
     ) -> Result<Self, String> {
         let settings = Settings::parse(settings).map_err(|error| error.to_string())?;
-        let request = layout_request(&settings);
         let handle = tokio::runtime::Handle::try_current().map_err(|error| error.to_string())?;
         let (tabs, mut tabs_rx) = resources
             .events
@@ -816,7 +935,8 @@ impl TabBarPresentation {
             )
             .ok();
         let mut facts_rx = fact_registry.subscribe()?;
-        let mut companion = CompanionState::new(settings);
+        let mut companion = CompanionState::for_runtime(settings, resources);
+        let request = companion_layout_request(&companion.settings, companion.visible());
         let mut external_feeds = ExternalFeeds::subscribe(&resources.events, &mut companion)?;
         companion.live_indicator = fact_registry.indicator();
         let mut workspaces_rx = workspace_subscription.map(|(snapshot, rx)| {
@@ -897,6 +1017,7 @@ impl Drop for TabBarPresentation {
     fn drop(&mut self) {
         self.task.abort();
         self.input.remove(&input_endpoint());
+        self.input.remove_commands(OWNER);
         if let Ok(mut owner) = self.owner.lock() {
             *owner = None;
         }
@@ -1097,29 +1218,59 @@ fn publish_surface(
         .ok_or_else(|| "published surface is missing".to_string())
 }
 
-fn publish_companion(companion: &mut CompanionState) -> Result<(), String> {
-    let revision = companion.revision.max(1);
-    let (surface, viewport, projection) = build_surface_with_editor(companion, revision);
-    let mut settings = companion.settings.clone();
-    settings.height = projection.height;
+/// The layout request for the bar's visibility: a hidden bar keeps its
+/// identity and order but allocates no rows.
+fn companion_layout_request(settings: &Settings, visible: bool) -> PluginLayoutRequest {
+    if visible {
+        layout_request(settings)
+    } else {
+        PluginLayoutRequest::hidden(PluginLayoutId::new(OWNER, LAYOUT_ID), settings.order)
+    }
+}
+
+fn publish_layout_request(
+    companion: &CompanionState,
+    request: PluginLayoutRequest,
+) -> Result<(), String> {
+    if companion.layouts.requests().contains(&request) {
+        return Ok(());
+    }
     let layout_revision = companion
         .layouts
         .owner_revision(OWNER)
         .unwrap_or(0)
         .saturating_add(1);
-    let request = layout_request(&settings);
-    if !companion.layouts.requests().contains(&request) {
-        companion
-            .layouts
-            .publish(
-                OWNER,
-                PluginLayoutSnapshot {
-                    revision: layout_revision,
-                    requests: vec![request],
-                },
-            )
-            .map_err(|error| format!("publishing tab-bar layout: {error:?}"))?;
+    companion
+        .layouts
+        .publish(
+            OWNER,
+            PluginLayoutSnapshot {
+                revision: layout_revision,
+                requests: vec![request],
+            },
+        )
+        .map_err(|error| format!("publishing tab-bar layout: {error:?}"))?;
+    Ok(())
+}
+
+fn publish_companion(companion: &mut CompanionState) -> Result<(), String> {
+    let revision = companion.revision.max(1);
+    if !companion.visible() {
+        // Only toasts remain; they are not part of the bar's rows.
+        publish_layout_request(
+            companion,
+            companion_layout_request(&companion.settings, false),
+        )?;
+        let surfaces = toasts::surface(companion, revision, external::now_unix_ms())
+            .into_iter()
+            .collect();
+        publish_surface(&companion.surfaces, revision, surfaces)?;
+        return Ok(());
     }
+    let (surface, viewport, projection) = build_surface_with_editor(companion, revision);
+    let mut settings = companion.settings.clone();
+    settings.height = projection.height;
+    publish_layout_request(companion, layout_request(&settings))?;
     let mut surfaces = vec![surface];
     surfaces.extend(menu::surfaces(companion, revision));
     surfaces.extend(toasts::surface(
@@ -2492,7 +2643,128 @@ mod tests {
             events,
             states: std::sync::Arc::new(bmux_plugin::PluginStateRegistry::new()),
             plugin_settings: std::sync::Arc::default(),
+            local_state_dir: None,
         }
+    }
+
+    fn bar_layout_shown(resources: &bmux_plugin::AttachPresentationResources) -> bool {
+        let requests = resources.layouts.requests();
+        assert_eq!(requests.len(), 1);
+        match requests[0].operation {
+            bmux_plugin::layout::LayoutOperation::Split { .. } => true,
+            bmux_plugin::layout::LayoutOperation::Hidden => false,
+            bmux_plugin::layout::LayoutOperation::Overlay => panic!("unexpected overlay"),
+        }
+    }
+
+    fn bar_surface_ids(resources: &bmux_plugin::AttachPresentationResources) -> Vec<String> {
+        resources
+            .surfaces
+            .owner_snapshot(OWNER)
+            .map(|snapshot| {
+                snapshot
+                    .surfaces
+                    .into_iter()
+                    .map(|surface| surface.id.local_id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn visibility_commands_hide_the_bar_but_keep_toasts() {
+        let fixture = Fixture::install(None).expect("install tab bar");
+        let tab = Uuid::from_u128(0x600);
+        seed_input_owner(&fixture.handle, tab);
+        {
+            let mut guard = fixture.handle.lock().unwrap();
+            let companion = guard.as_mut().unwrap();
+            companion.replace_notifications(&notifications_list::NotificationSnapshot {
+                notifications: vec![notifications_list::Notification {
+                    id: Uuid::from_u128(0x601),
+                    owner: "example.native".into(),
+                    title: "built".into(),
+                    body: None,
+                    severity: status_items_list::Severity::Info,
+                    created_at_ms: external::now_unix_ms(),
+                    ttl_ms: 60_000,
+                }],
+                revision: 1,
+            });
+            companion.menu_tab_id = Some(tab);
+            publish_companion(companion).unwrap();
+            drop(guard);
+        }
+        assert!(bar_layout_shown(&fixture.resources));
+        assert!(bar_surface_ids(&fixture.resources).contains(&"toasts".to_string()));
+
+        let hidden = fixture.resources.input.command(OWNER, "hide", &[]).unwrap();
+        assert!(hidden.consumed && hidden.dirty);
+        assert!(!bar_layout_shown(&fixture.resources));
+        assert_eq!(bar_surface_ids(&fixture.resources), ["toasts"]);
+        let guard = fixture.handle.lock().unwrap();
+        let companion = guard.as_ref().unwrap();
+        let (menu, rows) = (companion.menu_tab_id, companion.bar_rows());
+        drop(guard);
+        assert_eq!(menu, None);
+        assert_eq!(rows, 0);
+        // Updates while hidden keep the bar hidden.
+        fixture
+            .publish(tabs_list::TabListSnapshot {
+                tabs: Vec::new(),
+                revision: 2,
+            })
+            .unwrap();
+        assert!(!bar_layout_shown(&fixture.resources));
+        assert_eq!(bar_surface_ids(&fixture.resources), ["toasts"]);
+
+        let shown = fixture
+            .resources
+            .input
+            .command(OWNER, "toggle", &[])
+            .unwrap();
+        assert!(shown.dirty);
+        assert!(bar_layout_shown(&fixture.resources));
+        assert!(bar_surface_ids(&fixture.resources).len() >= 2);
+    }
+
+    #[tokio::test]
+    async fn runtime_install_remembers_visibility_when_configured() {
+        let directory =
+            std::env::temp_dir().join(format!("bmux-tab-bar-visibility-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let remember = toml::Value::Table(toml::toml! { remember_visibility = true });
+        let resources = || {
+            let mut resources = scoped_resources();
+            resources.local_state_dir = Some(directory.clone());
+            resources
+        };
+        let first = resources();
+        let installation = TabBarPresentation::install(Some(&remember), &first).unwrap();
+        assert!(bar_layout_shown(&first));
+        first.input.command(OWNER, "hide", &[]).unwrap();
+        drop(installation);
+        assert!(first.input.command(OWNER, "show", &[]).is_none());
+
+        let restored = resources();
+        let _restored = TabBarPresentation::install(Some(&remember), &restored).unwrap();
+        assert!(!bar_layout_shown(&restored));
+
+        let configured = resources();
+        let _configured = TabBarPresentation::install(None, &configured).unwrap();
+        assert!(bar_layout_shown(&configured));
+
+        let starts_hidden = toml::Value::Table(toml::toml! { visible = false });
+        let hidden = scoped_resources();
+        let _hidden = TabBarPresentation::install(Some(&starts_hidden), &hidden).unwrap();
+        assert!(!bar_layout_shown(&hidden));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn visibility_settings_must_be_booleans() {
+        let invalid = toml::Value::Table(toml::toml! { visible = "no" });
+        assert!(Settings::parse(Some(&invalid)).is_err());
     }
 
     fn seed_input_owner(owner: &CompanionHandle, id: Uuid) {

@@ -145,6 +145,17 @@ pub fn parse_settings(value: Option<&toml::Value>) -> Result<Settings, PluginCom
         }
     }
 
+    for (key, target) in [
+        ("visible", &mut settings.visibility.visible),
+        ("remember_visibility", &mut settings.visibility.remember),
+    ] {
+        if let Some(value) = table.get(key) {
+            *target = value
+                .as_bool()
+                .ok_or_else(|| invalid(key, "must be true or false"))?;
+        }
+    }
+
     if let Some(layout) = table.get("layout").and_then(toml::Value::as_table) {
         settings.density = parse_enum(layout, "density", settings.density, |value| match value {
             "compact" => Some(Density::Compact),

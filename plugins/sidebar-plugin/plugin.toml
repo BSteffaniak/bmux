@@ -4,9 +4,37 @@ enabled_by_default = false
 execution_class    = "native_fast"
 id                 = "bmux.sidebar"
 name               = "bmux Sidebar"
+owns_namespaces    = ["sidebar"]
 provided_features  = ["bmux.sidebar"]
 version            = "0.0.1-alpha.0"
 
 [[dependencies]]
 plugin_id   = "bmux.tabs"
 version_req = ">=0.0.1-alpha.0"
+
+# Visibility commands are answered by the sidebar presentation inside each
+# attach client, so they change only what that client shows.
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = false
+name          = "toggle"
+path          = ["sidebar", "toggle"]
+summary       = "Toggle the sidebar in this client"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = false
+name          = "show"
+path          = ["sidebar", "show"]
+summary       = "Show the sidebar in this client"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = false
+name          = "hide"
+path          = ["sidebar", "hide"]
+summary       = "Hide the sidebar in this client"
+
+# Global so it works in the default modal keymap's INSERT mode.
+[keybindings.global]
+"ctrl+alt+s" = "plugin:bmux.sidebar:toggle"

@@ -33,6 +33,39 @@ disabled = ["bmux.tab_bar"]
 disabled = ["bmux.tab_bar", "bmux.sidebar"]
 ```
 
+## Showing and hiding at runtime
+
+Enabling a presentation loads it; whether it is shown can change while you are
+attached. Each plugin has `toggle`, `show` and `hide` commands:
+
+| Command                      | Default key  |
+| ---------------------------- | ------------ |
+| `plugin:bmux.tab_bar:toggle` | `ctrl+alt+b` |
+| `plugin:bmux.sidebar:toggle` | `ctrl+alt+s` |
+| `plugin:bmux.tab_bar:show`   | (unbound)    |
+| `plugin:bmux.tab_bar:hide`   | (unbound)    |
+| `plugin:bmux.sidebar:show`   | (unbound)    |
+| `plugin:bmux.sidebar:hide`   | (unbound)    |
+
+They are also listed in the command palette. Visibility belongs to one attach
+client: hiding the sidebar in one terminal leaves other clients of the same
+session as they were. A hidden presentation gives its rows or columns back to
+the panes. Tab-bar toasts and attach status messages still appear while the bar
+is hidden.
+
+Both plugins take the same two settings:
+
+```toml
+[plugins.settings."bmux.sidebar"]   # or "bmux.tab_bar"
+visible = true                     # shown when a client attaches
+remember_visibility = false        # start from the last state set on this machine
+```
+
+With `remember_visibility = true`, every toggle is saved under the bmux state
+directory (`plugins/<plugin id>/visibility`), and the next attach on that
+machine starts from it instead of `visible`. Clients on other machines keep
+their own.
+
 ## Full tab/status bar
 
 ```toml
@@ -142,6 +175,8 @@ maximum_visible_items = 20
 content_height = false
 collapse_below_width = 80
 collapsed_width = 8
+visible = true
+remember_visibility = false
 ```
 
 Sidebar templates support `{marker}`, `{index}`, `{name}`, `{id}`, `{active}`,

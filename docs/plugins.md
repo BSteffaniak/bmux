@@ -38,6 +38,18 @@ being called from the terminal frame loop. The canonical path is:
 5. Keep an owner-bound publisher alive for the presentation lifecycle. Dropping
    it removes the owner's retained layout or surfaces automatically; explicit
    owner removal is available for other lifecycle models.
+6. Answer commands that change client-local presentation state (for example
+   showing or hiding a strip in one client) with
+   `AttachPresentationInputRegistry::register_command(plugin_id, name, handler)`.
+   The attach runtime offers a plugin command to a registered presentation
+   handler before running it on a plugin instance, and applies the returned
+   `AttachInputResult` (redraw, status message, service invocation). Declare
+   the command in the plugin manifest as usual so keybindings and the command
+   palette can name it, and remove the handlers with `remove_commands` when the
+   presentation is dropped.
+7. Keep presentation state that should survive reattaching under
+   `AttachPresentationResources::plugin_local_state_dir(plugin_id)`. It is
+   `None` for runtimes that offer no persisted local state.
 
 The selected execution model is an **in-process attach-client companion**.
 Geometry-dependent projection belongs beside the attach host because terminal

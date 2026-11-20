@@ -5447,6 +5447,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         events: view_state.presentation_events.clone(),
         states: std::sync::Arc::new(bmux_plugin::PluginStateRegistry::new()),
         plugin_settings: std::sync::Arc::new(attach_config.plugins.settings.clone()),
+        local_state_dir: Some(attach_config_paths().state_dir()),
     };
     let mut started_companions = Vec::new();
     for companion in super::super::plugin_runtime::host_attach_companions().snapshot() {
@@ -8219,6 +8220,15 @@ pub async fn handle_attach_plugin_command_action(
             Instant::now(),
             ATTACH_TRANSIENT_STATUS_TTL,
         );
+        return Ok(());
+    }
+    // A presentation in this runtime may answer the command itself, for state
+    // only it holds; otherwise the command runs on a plugin instance.
+    if let Some(result) = view_state
+        .presentation_input
+        .command(plugin_id, command_name, args)
+    {
+        apply_presentation_command_result(client, view_state, &result).await;
         return Ok(());
     }
     let total_started = Instant::now();
@@ -15201,6 +15211,30 @@ fn decode_surface_action_response(
     }
 }
 
+/// Apply what a presentation reported for a command it answered: redraw its
+/// surfaces, show its status, and run any service action it requested.
+async fn apply_presentation_command_result(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    result: &bmux_plugin::AttachInputResult,
+) {
+    if result.dirty {
+        view_state
+            .dirty
+            .mark_retained_surfaces_dirty(AttachDirtySource::PluginCommand);
+    }
+    if let Some(message) = result.status_message.as_deref() {
+        view_state.set_transient_status(
+            truncate_attach_status_message(message),
+            Instant::now(),
+            ATTACH_TRANSIENT_STATUS_TTL,
+        );
+    }
+    if let Some(invocation) = result.service_invocation.as_ref() {
+        let _ = execute_surface_action(client, view_state, result.consumed, invocation).await;
+    }
+}
+
 async fn execute_surface_action(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
@@ -18192,6 +18226,7 @@ mod tests {
             input: std::sync::Arc::new(bmux_plugin::AttachPresentationInputRegistry::new()),
             states: std::sync::Arc::new(bmux_plugin::PluginStateRegistry::new()),
             plugin_settings: std::sync::Arc::default(),
+            local_state_dir: None,
         };
         let installation =
             bmux_tab_bar_plugin::TabBarPresentation::install(None, &resources).unwrap();

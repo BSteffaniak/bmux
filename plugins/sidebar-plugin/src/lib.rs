@@ -22,6 +22,9 @@ use bmux_plugin::{
 };
 use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::prelude::*;
+use bmux_presentation_state::visibility::{
+    PresentationVisibility, VisibilityCommand, VisibilitySettings,
+};
 use bmux_presentation_state::{PresentationEntityRef, PresentationFact, PresentationFactRole};
 use bmux_tabs_plugin_api::{tabs_commands, tabs_list};
 use std::sync::Mutex;
@@ -54,6 +57,7 @@ struct Settings {
     content_height: bool,
     collapse_below_width: u16,
     collapsed_width: u16,
+    visibility: VisibilitySettings,
 }
 
 impl Default for Settings {
@@ -73,6 +77,7 @@ impl Default for Settings {
             content_height: false,
             collapse_below_width: 80,
             collapsed_width: 8,
+            visibility: VisibilitySettings::default(),
         }
     }
 }
@@ -148,6 +153,18 @@ impl Settings {
         if let Some(content_height) = table.get("content_height").and_then(toml::Value::as_bool) {
             settings.content_height = content_height;
         }
+        for (key, target) in [
+            ("visible", &mut settings.visibility.visible),
+            ("remember_visibility", &mut settings.visibility.remember),
+        ] {
+            if let Some(value) = table.get(key) {
+                *target = value.as_bool().ok_or_else(|| {
+                    PluginCommandError::invalid_arguments(format!(
+                        "bmux.sidebar {key} must be true or false"
+                    ))
+                })?;
+            }
+        }
         if let Some(count) = table
             .get("maximum_visible_items")
             .and_then(toml::Value::as_integer)
@@ -175,12 +192,52 @@ struct MeasuredSidebarItem {
     layout: bmux_tui::component::LayoutNode,
 }
 
+/// Where a presentation reads semantic facts from.
+enum FactSource {
+    /// A registry shared explicitly with this runtime's producers.
+    Registry(std::sync::Arc<bmux_presentation_state::PresentationFactRegistry>),
+    /// The fact host in this runtime's shared state registry, where other
+    /// companions of the same runtime publish facts.
+    Host(std::sync::Arc<std::sync::RwLock<bmux_presentation_state::PresentationFactHostService>>),
+}
+
+impl FactSource {
+    fn with<R>(
+        &self,
+        read: impl FnOnce(&bmux_presentation_state::PresentationFactRegistry) -> R,
+    ) -> Option<R> {
+        match self {
+            Self::Registry(registry) => Some(read(registry)),
+            Self::Host(host) => host.read().ok().map(|host| read(host.registry())),
+        }
+    }
+
+    fn subscribe(
+        &self,
+    ) -> Result<tokio::sync::watch::Receiver<bmux_presentation_state::PresentationFactChange>, String>
+    {
+        self.with(bmux_presentation_state::PresentationFactRegistry::subscribe_changes)
+            .ok_or_else(|| "presentation facts unavailable".to_string())
+    }
+}
+
+impl std::fmt::Debug for FactSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Registry(_) => "FactSource::Registry",
+            Self::Host(_) => "FactSource::Host",
+        })
+    }
+}
+
 #[derive(Debug)]
 struct CompanionState {
     // None selects the legacy process-local presentation until runtime ownership
     // is threaded through installation; explicit owners never publish globally.
     surfaces: Option<std::sync::Arc<bmux_plugin::surface::PluginSurfaceRegistry>>,
-    facts: Option<std::sync::Arc<bmux_presentation_state::PresentationFactRegistry>>,
+    layouts: Option<std::sync::Arc<bmux_plugin::layout::PluginLayoutRegistry>>,
+    facts: Option<FactSource>,
+    visibility: PresentationVisibility,
     subscription: Option<tokio::task::JoinHandle<()>>,
     allocation: Option<ExtensionRect>,
     allocation_publication_pending: bool,
@@ -205,10 +262,12 @@ impl Drop for CompanionState {
 }
 
 impl CompanionState {
-    const fn new(settings: Settings) -> Self {
+    fn new(settings: Settings, local_state_dir: Option<std::path::PathBuf>) -> Self {
         Self {
             surfaces: None,
+            layouts: None,
             facts: None,
+            visibility: PresentationVisibility::new(settings.visibility, local_state_dir),
             subscription: None,
             allocation: None,
             allocation_publication_pending: false,
@@ -223,6 +282,10 @@ impl CompanionState {
             scroll: bmux_tui_components::scroll_view::ScrollViewState::new(),
             measured_items: std::cell::RefCell::new(std::collections::BTreeMap::new()),
         }
+    }
+
+    const fn visible(&self) -> bool {
+        self.visibility.visible()
     }
 
     const fn allocated_width(&self) -> u16 {
@@ -346,9 +409,16 @@ impl CompanionState {
         std::cell::Ref::map(self.measured_items.borrow(), |items| &items[&id])
     }
 
+    fn tab_fact(&self, tab: &tabs_list::TabListEntry) -> Option<PresentationFact> {
+        self.facts
+            .as_ref()
+            .and_then(|facts| facts.with(|registry| tab_fact(tab, registry)))
+            .flatten()
+    }
+
     fn measured_tab(&self, index: usize) -> std::cell::Ref<'_, MeasuredSidebarItem> {
         let tab = &self.snapshot.tabs[index];
-        let fact = tab_fact(tab, self.facts.as_deref());
+        let fact = self.tab_fact(tab);
         let render = |template: &str| {
             render_template(
                 template,
@@ -441,6 +511,9 @@ impl Plugin for SidebarPlugin {
     fn declare(d: &mut Declarations<Self>) {
         d.blocking_activate(|_, a0, a1| Self::activate(a0, a1))
             .blocking_services(|_, a0| Self::invoke_service(a0), None);
+        for name in VisibilityCommand::NAMES {
+            d.blocking_command(name, |_, _| Err(presentation_only_command()));
+        }
     }
 }
 
@@ -462,6 +535,14 @@ impl SidebarPlugin {
             },
         })
     }
+}
+
+/// Reached only when no sidebar presentation answered a visibility command,
+/// for example from a shell or in a client without the sidebar installed.
+fn presentation_only_command() -> PluginCommandError {
+    PluginCommandError::unavailable(
+        "sidebar visibility commands only apply inside an attach client showing the sidebar",
+    )
 }
 
 const fn input_endpoint_capability() -> &'static str {
@@ -501,6 +582,24 @@ pub struct SidebarPresentation {
 }
 
 impl SidebarPresentation {
+    /// Install and start the sidebar for the invoking attach runtime.
+    ///
+    /// Facts come from the fact host in the runtime's shared state registry,
+    /// where the runtime's other companions publish them, and remembered
+    /// visibility from the runtime's local state directory.
+    ///
+    /// # Errors
+    /// Returns configuration, subscription, publication or runtime errors.
+    pub fn install_for_runtime(
+        settings: Option<&toml::Value>,
+        resources: &bmux_plugin::AttachPresentationResources,
+    ) -> Result<Self, String> {
+        let host = resources
+            .states
+            .get_or_insert_with(bmux_presentation_state::PresentationFactHostService::new);
+        Self::install_with_facts(settings, resources, FactSource::Host(host))
+    }
+
     /// Install and start an instance-owned frontend without global registries.
     ///
     /// Facts must be the registry used by this runtime's backend producer service.
@@ -513,19 +612,28 @@ impl SidebarPresentation {
         resources: &bmux_plugin::AttachPresentationResources,
         facts: std::sync::Arc<bmux_presentation_state::PresentationFactRegistry>,
     ) -> Result<Self, String> {
+        Self::install_with_facts(settings, resources, FactSource::Registry(facts))
+    }
+
+    fn install_with_facts(
+        settings: Option<&toml::Value>,
+        resources: &bmux_plugin::AttachPresentationResources,
+        facts: FactSource,
+    ) -> Result<Self, String> {
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|error| format!("sidebar companion requires an async runtime: {error}"))?;
         let (initial, mut tabs_rx) = resources
             .events
             .subscribe_state::<tabs_list::TabListSnapshot>(&tabs_list::STATE_KIND)
             .map_err(|error| format!("subscribing to tabs list: {error}"))?;
-        let mut facts_rx = facts.subscribe_changes();
-        let presentation = Self::install(
+        let mut facts_rx = facts.subscribe()?;
+        let presentation = Self::install_with_state(
             settings,
             resources.layouts.clone(),
             resources.allocations.clone(),
             resources.input.clone(),
             resources.surfaces.clone(),
+            resources.plugin_local_state_dir(OWNER),
         )?;
         {
             let mut guard = presentation
@@ -584,7 +692,9 @@ impl SidebarPresentation {
         Ok(presentation)
     }
 
-    /// Install into presentation-local registries.
+    /// Install into presentation-local registries, without facts, a state
+    /// subscription or remembered visibility. Callers feed snapshots through
+    /// [`Self::publish`].
     ///
     /// # Errors
     /// Returns invalid settings or layout publication errors.
@@ -595,40 +705,35 @@ impl SidebarPresentation {
         input: std::sync::Arc<bmux_plugin::AttachPresentationInputRegistry>,
         surfaces: std::sync::Arc<bmux_plugin::surface::PluginSurfaceRegistry>,
     ) -> Result<Self, String> {
+        Self::install_with_state(settings, layouts, allocations, input, surfaces, None)
+    }
+
+    fn install_with_state(
+        settings: Option<&toml::Value>,
+        layouts: std::sync::Arc<bmux_plugin::layout::PluginLayoutRegistry>,
+        allocations: std::sync::Arc<bmux_plugin::layout::AllocationRegistry>,
+        input: std::sync::Arc<bmux_plugin::AttachPresentationInputRegistry>,
+        surfaces: std::sync::Arc<bmux_plugin::surface::PluginSurfaceRegistry>,
+        local_state_dir: Option<std::path::PathBuf>,
+    ) -> Result<Self, String> {
         let settings = Settings::parse(settings).map_err(|error| error.to_string())?;
-        let request = layout_request(&settings);
-        let mut companion = CompanionState::new(settings);
+        let mut companion = CompanionState::new(settings, local_state_dir);
         companion.surfaces = Some(surfaces);
+        companion.layouts = Some(layouts.clone());
+        publish_layout(&companion)?;
         let owner = std::sync::Arc::new(Mutex::new(Some(companion)));
-        layouts
-            .publish(
-                OWNER,
-                PluginLayoutSnapshot {
-                    revision: 1,
-                    requests: vec![request],
-                },
-            )
-            .map_err(|error| format!("publishing sidebar layout: {error:?}"))?;
         register_input_callbacks(
             &owner,
             &|id, handler| allocations.register(id, handler),
             &|endpoint, handler| input.register(endpoint, handler),
         );
+        register_visibility_commands(&owner, &input);
         Ok(Self {
             owner,
             layouts,
             allocations,
             input,
         })
-    }
-
-    /// Subscribe this presentation to its host's authoritative state bus.
-    /// Replaces any previous subscription; teardown aborts the owned task.
-    ///
-    /// # Errors
-    /// Returns subscription, publication, or task startup errors.
-    pub fn start(&self, bus: &bmux_plugin::EventBus) -> Result<(), String> {
-        start_for_installation(&self.owner, bus)
     }
 
     /// Apply the authoritative snapshot for this presentation.
@@ -645,6 +750,7 @@ impl Drop for SidebarPresentation {
         self.allocations
             .remove(&PluginLayoutId::new(OWNER, LAYOUT_ID));
         self.input.remove(&input_endpoint());
+        self.input.remove_commands(OWNER);
         if let Ok(mut owner) = self.owner.lock() {
             *owner = None;
         }
@@ -664,7 +770,9 @@ fn register_input_callbacks(
             let Ok(mut guard) = allocation_owner.lock() else {
                 return;
             };
-            if let Some(companion) = guard.as_mut()
+            // A hidden sidebar's request allocates nothing; keep the last
+            // shown geometry so showing it again restores scroll and layout.
+            if let Some(companion) = guard.as_mut().filter(|companion| companion.visible())
                 && let Err(error) = companion.publish_allocation(rect, publish_companion)
             {
                 tracing::warn!(%error, "sidebar resize publication failed");
@@ -678,44 +786,71 @@ fn register_input_callbacks(
     );
 }
 
-fn start_for_installation(
+/// Answer `toggle`, `show` and `hide` in this runtime: what one attach client
+/// shows is presentation state, not plugin state.
+fn register_visibility_commands(
     owner: &CompanionHandle,
-    bus: &bmux_plugin::EventBus,
-) -> Result<(), String> {
-    let handle = tokio::runtime::Handle::try_current()
-        .map_err(|error| format!("sidebar companion requires an async runtime: {error}"))?;
-    let (initial, mut receiver) = bus
-        .subscribe_state::<tabs_list::TabListSnapshot>(&tabs_list::STATE_KIND)
-        .map_err(|error| format!("subscribing to tabs list: {error}"))?;
-    publish_for_installation(owner, initial.as_ref().clone())?;
-    let mut guard = owner
-        .lock()
-        .map_err(|_| "sidebar state lock poisoned".to_string())?;
-    let companion = guard
-        .as_mut()
-        .ok_or_else(|| "sidebar companion is not installed".to_string())?;
-    if let Some(previous) = companion.subscription.take() {
-        previous.abort();
+    input: &bmux_plugin::AttachPresentationInputRegistry,
+) {
+    for name in VisibilityCommand::NAMES {
+        let Some(command) = VisibilityCommand::from_name(name) else {
+            continue;
+        };
+        let owner = std::sync::Arc::downgrade(owner);
+        input.register_command(
+            OWNER,
+            name,
+            std::sync::Arc::new(move |_| {
+                let Some(owner) = owner.upgrade() else {
+                    return AttachInputResult::default();
+                };
+                let Ok(mut guard) = owner.lock() else {
+                    return AttachInputResult::default();
+                };
+                guard
+                    .as_mut()
+                    .map_or_else(AttachInputResult::default, |companion| {
+                        apply_visibility(companion, command)
+                    })
+            }),
+        );
     }
-    let subscriber_owner = std::sync::Arc::downgrade(owner);
-    companion.subscription = Some(handle.spawn(async move {
-        while receiver.changed().await.is_ok() {
-            let snapshot = receiver.borrow_and_update().as_ref().clone();
-            let Some(owner) = subscriber_owner.upgrade() else {
-                break;
-            };
-            if let Err(error) = publish_for_installation(&owner, snapshot) {
-                tracing::warn!(%error, "sidebar publication failed");
-            }
-        }
-    }));
-    drop(guard);
-    Ok(())
 }
 
-fn layout_request(settings: &Settings) -> PluginLayoutRequest {
+fn apply_visibility(
+    companion: &mut CompanionState,
+    command: VisibilityCommand,
+) -> AttachInputResult {
+    let (changed, status_message) = match companion.visibility.apply(command) {
+        Ok(changed) => (changed, None),
+        // The new state still applies to this client; say it was not kept.
+        Err(error) => (true, Some(error)),
+    };
+    if changed {
+        if !companion.visible() {
+            companion.hovered_tab_id = None;
+        }
+        companion.revision = companion.revision.saturating_add(1).max(1);
+        companion.presentation_pending.set(true);
+        if let Err(error) = publish_layout(companion).and_then(|()| publish_companion(companion)) {
+            tracing::warn!(%error, "sidebar visibility publication failed");
+        }
+    }
+    AttachInputResult {
+        consumed: true,
+        dirty: changed,
+        status_message,
+        ..AttachInputResult::default()
+    }
+}
+
+fn layout_request(settings: &Settings, visible: bool) -> PluginLayoutRequest {
+    let id = PluginLayoutId::new(OWNER, LAYOUT_ID);
+    if !visible {
+        return PluginLayoutRequest::hidden(id, settings.order);
+    }
     PluginLayoutRequest::split(
-        PluginLayoutId::new(OWNER, LAYOUT_ID),
+        id,
         settings.order,
         match settings.placement {
             Placement::Left => LayoutEdge::Left,
@@ -727,6 +862,27 @@ fn layout_request(settings: &Settings) -> PluginLayoutRequest {
             collapse_below: settings.collapse_below_width,
         },
     )
+}
+
+/// Publish the layout request for the companion's current visibility.
+fn publish_layout(companion: &CompanionState) -> Result<(), String> {
+    let Some(layouts) = companion.layouts.as_deref() else {
+        return Ok(());
+    };
+    let request = layout_request(&companion.settings, companion.visible());
+    if layouts.requests().contains(&request) {
+        return Ok(());
+    }
+    layouts
+        .publish(
+            OWNER,
+            PluginLayoutSnapshot {
+                revision: layouts.owner_revision(OWNER).unwrap_or(0).saturating_add(1),
+                requests: vec![request],
+            },
+        )
+        .map_err(|error| format!("publishing sidebar layout: {error:?}"))?;
+    Ok(())
 }
 
 fn publish_for_installation(
@@ -745,32 +901,31 @@ fn publish_for_installation(
     Ok(())
 }
 
-fn publish_surface(
+fn publish_surfaces(
     registry: &bmux_plugin::surface::PluginSurfaceRegistry,
     revision: u64,
-    surface: &PluginSurface,
+    surfaces: Vec<PluginSurface>,
 ) -> Result<(), String> {
     registry
-        .publish_advancing(
-            OWNER,
-            PluginSurfaceSnapshot {
-                revision,
-                surfaces: vec![surface.clone()],
-            },
-        )
+        .publish_advancing(OWNER, PluginSurfaceSnapshot { revision, surfaces })
         .map_err(|error| format!("publishing sidebar surface: {error:?}"))?;
     Ok(())
 }
 
 fn publish_companion(companion: &CompanionState) -> Result<(), String> {
     let revision = companion.revision.max(1);
-    let surface = build_surface(companion, revision);
     // A companion publishes only into the registry of the runtime that
     // installed it; an uninstalled one has nowhere to publish.
     let Some(registry) = companion.surfaces.as_deref() else {
         return Ok(());
     };
-    publish_surface(registry, revision, &surface)?;
+    // A hidden sidebar keeps its identity and state but draws nothing.
+    let surfaces = if companion.visible() {
+        vec![build_surface(companion, revision)]
+    } else {
+        Vec::new()
+    };
+    publish_surfaces(registry, revision, surfaces)?;
     companion.presentation_pending.set(false);
     Ok(())
 }
@@ -791,10 +946,10 @@ fn truncate_to_width(value: &str, maximum: usize) -> String {
 
 fn tab_fact(
     tab: &tabs_list::TabListEntry,
-    facts: Option<&bmux_presentation_state::PresentationFactRegistry>,
+    facts: &bmux_presentation_state::PresentationFactRegistry,
 ) -> Option<PresentationFact> {
     let entity = PresentationEntityRef::new("bmux.tabs", tab.id.to_string());
-    facts?
+    facts
         .facts_for_entity(&entity)
         .into_iter()
         .map(|(_, fact)| fact)
@@ -1085,7 +1240,7 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
         else {
             continue;
         };
-        let fact = tab_fact(tab, state.facts.as_deref());
+        let fact = state.tab_fact(tab);
         let start_row = u16::try_from(projected.start + 1).unwrap_or(u16::MAX);
         let measured = state.measured_tab(index);
         let item_style = fact.as_ref().map_or_else(
@@ -1550,12 +1705,15 @@ mod tests {
 
     #[test]
     fn layout_request_places_sidebar_on_configured_edge_and_order() {
-        let left = layout_request(&Settings::default());
-        let right = layout_request(&Settings {
-            placement: Placement::Right,
-            order: 50,
-            ..Settings::default()
-        });
+        let left = layout_request(&Settings::default(), true);
+        let right = layout_request(
+            &Settings {
+                placement: Placement::Right,
+                order: 50,
+                ..Settings::default()
+            },
+            true,
+        );
         assert!(matches!(
             left.operation,
             bmux_plugin::layout::LayoutOperation::Split {
@@ -1571,6 +1729,176 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn runtime_resources(
+        tabs: tabs_list::TabListSnapshot,
+        local_state_dir: Option<std::path::PathBuf>,
+    ) -> bmux_plugin::AttachPresentationResources {
+        let mut resources = bmux_plugin::AttachPresentationResources::isolated(8);
+        resources.local_state_dir = local_state_dir;
+        resources
+            .events
+            .register_state_channel(tabs_list::STATE_KIND, tabs);
+        resources
+    }
+
+    fn one_tab(id: Uuid) -> tabs_list::TabListSnapshot {
+        tabs_list::TabListSnapshot {
+            tabs: vec![tabs_list::TabListEntry {
+                id,
+                name: "one".into(),
+                active: true,
+                workspace: "default".into(),
+                workspace_id: Uuid::nil(),
+            }],
+            revision: 1,
+        }
+    }
+
+    fn sidebar_split_visible(resources: &bmux_plugin::AttachPresentationResources) -> bool {
+        let requests = resources.layouts.requests();
+        assert_eq!(requests.len(), 1);
+        match requests[0].operation {
+            bmux_plugin::layout::LayoutOperation::Split { .. } => true,
+            bmux_plugin::layout::LayoutOperation::Hidden => false,
+            bmux_plugin::layout::LayoutOperation::Overlay => panic!("unexpected overlay"),
+        }
+    }
+
+    fn sidebar_surface_count(resources: &bmux_plugin::AttachPresentationResources) -> usize {
+        resources
+            .surfaces
+            .owner_snapshot(OWNER)
+            .map_or(0, |snapshot| snapshot.surfaces.len())
+    }
+
+    #[tokio::test]
+    async fn runtime_install_reads_facts_from_the_runtime_fact_host() {
+        let tab_id = Uuid::from_u128(0x200);
+        let resources = runtime_resources(one_tab(tab_id), None);
+        let presentation = SidebarPresentation::install_for_runtime(None, &resources).unwrap();
+        let host = resources
+            .states
+            .get_or_insert_with(bmux_presentation_state::PresentationFactHostService::new);
+        host.read()
+            .unwrap()
+            .registry()
+            .publish(
+                "runtime-test",
+                bmux_presentation_state::PresentationFactSnapshot {
+                    revision: 1,
+                    facts: vec![PresentationFact {
+                        entity: PresentationEntityRef::new("bmux.tabs", tab_id.to_string()),
+                        key: "activity".into(),
+                        role: PresentationFactRole::Warning,
+                        short_text: "building".into(),
+                        detail_text: None,
+                        icon_id: None,
+                        priority: 1,
+                    }],
+                },
+            )
+            .unwrap();
+        let guard = presentation.owner.lock().unwrap();
+        let companion = guard.as_ref().unwrap();
+        let tab = companion.snapshot.tabs[0].clone();
+        let fact = companion.tab_fact(&tab);
+        drop(guard);
+        assert_eq!(
+            fact.as_ref().map(|fact| fact.short_text.as_str()),
+            Some("building")
+        );
+        assert_eq!(
+            render_template(concat!("{", "fact}"), &tab, 0, false, fact.as_ref()),
+            "building"
+        );
+    }
+
+    #[tokio::test]
+    async fn visibility_commands_hide_and_show_only_this_runtime() {
+        let tab_id = Uuid::from_u128(0x300);
+        let first = runtime_resources(one_tab(tab_id), None);
+        let second = runtime_resources(one_tab(tab_id), None);
+        let _first = SidebarPresentation::install_for_runtime(None, &first).unwrap();
+        let _second = SidebarPresentation::install_for_runtime(None, &second).unwrap();
+        assert!(sidebar_split_visible(&first));
+        assert_eq!(sidebar_surface_count(&first), 1);
+
+        let hidden = first.input.command(OWNER, "hide", &[]).unwrap();
+        assert!(hidden.consumed && hidden.dirty);
+        assert!(!sidebar_split_visible(&first));
+        assert_eq!(sidebar_surface_count(&first), 0);
+        assert!(sidebar_split_visible(&second));
+        assert_eq!(sidebar_surface_count(&second), 1);
+
+        // Hiding again changes nothing.
+        assert!(!first.input.command(OWNER, "hide", &[]).unwrap().dirty);
+
+        let shown = first.input.command(OWNER, "toggle", &[]).unwrap();
+        assert!(shown.dirty);
+        assert!(sidebar_split_visible(&first));
+        assert_eq!(sidebar_surface_count(&first), 1);
+    }
+
+    #[tokio::test]
+    async fn hidden_sidebar_ignores_its_empty_allocation() {
+        let resources = runtime_resources(one_tab(Uuid::from_u128(0x400)), None);
+        let presentation = SidebarPresentation::install_for_runtime(None, &resources).unwrap();
+        let id = PluginLayoutId::new(OWNER, LAYOUT_ID);
+        let shown = ExtensionRect::new(0, 0, 28, 20);
+        resources.allocations.notify(&id, shown);
+        resources.input.command(OWNER, "hide", &[]).unwrap();
+        resources
+            .allocations
+            .notify(&id, ExtensionRect::new(28, 0, 0, 0));
+        assert_eq!(sidebar_surface_count(&resources), 0);
+        assert_eq!(
+            presentation
+                .owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .allocation,
+            Some(shown)
+        );
+        resources.input.command(OWNER, "show", &[]).unwrap();
+        assert_eq!(sidebar_surface_count(&resources), 1);
+    }
+
+    #[tokio::test]
+    async fn remembered_visibility_restores_on_the_next_install() {
+        let directory =
+            std::env::temp_dir().join(format!("bmux-sidebar-visibility-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let remember = toml::Value::Table(toml::toml! { remember_visibility = true });
+        let resources = runtime_resources(one_tab(Uuid::from_u128(0x500)), Some(directory.clone()));
+        let presentation =
+            SidebarPresentation::install_for_runtime(Some(&remember), &resources).unwrap();
+        resources.input.command(OWNER, "hide", &[]).unwrap();
+        drop(presentation);
+        assert!(resources.input.command(OWNER, "show", &[]).is_none());
+
+        let restored = runtime_resources(one_tab(Uuid::from_u128(0x500)), Some(directory.clone()));
+        let _remembering =
+            SidebarPresentation::install_for_runtime(Some(&remember), &restored).unwrap();
+        assert!(!sidebar_split_visible(&restored));
+        assert_eq!(sidebar_surface_count(&restored), 0);
+
+        // Without remembering, the configured default applies.
+        let forgetful = runtime_resources(one_tab(Uuid::from_u128(0x500)), Some(directory.clone()));
+        let _forgetful = SidebarPresentation::install_for_runtime(None, &forgetful).unwrap();
+        assert!(sidebar_split_visible(&forgetful));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn configured_hidden_sidebar_starts_hidden_and_rejects_non_boolean_settings() {
+        let hidden = toml::Value::Table(toml::toml! { visible = false });
+        assert!(!Settings::parse(Some(&hidden)).unwrap().visibility.visible);
+        let invalid = toml::Value::Table(toml::toml! { remember_visibility = "yes" });
+        assert!(Settings::parse(Some(&invalid)).is_err());
     }
 
     #[test]
@@ -1659,7 +1987,7 @@ mod tests {
 
     #[test]
     fn hover_style_changes_only_the_target_card_title() {
-        let mut state = CompanionState::new(Settings::default());
+        let mut state = CompanionState::new(Settings::default(), None);
         let first = Uuid::from_u128(11);
         let second = Uuid::from_u128(12);
         state.replace_tabs(tabs_list::TabListSnapshot {
@@ -1690,22 +2018,16 @@ mod tests {
 
     #[tokio::test]
     async fn presentation_subscription_uses_local_bus_and_stops_on_drop() {
-        let bus = bmux_plugin::EventBus::new();
+        let resources = bmux_plugin::AttachPresentationResources::isolated(4);
         let snapshot = |revision| tabs_list::TabListSnapshot {
             tabs: Vec::new(),
             revision,
         };
-        bus.register_state_channel(tabs_list::STATE_KIND, snapshot(1));
-        let presentation = SidebarPresentation::install(
-            None,
-            std::sync::Arc::new(bmux_plugin::layout::PluginLayoutRegistry::new(4)),
-            std::sync::Arc::new(bmux_plugin::layout::AllocationRegistry::default()),
-            std::sync::Arc::new(bmux_plugin::AttachPresentationInputRegistry::new()),
-            std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(4)),
-        )
-        .unwrap();
-        presentation.start(&bus).unwrap();
-        assert_eq!(
+        resources
+            .events
+            .register_state_channel(tabs_list::STATE_KIND, snapshot(1));
+        let presentation = SidebarPresentation::install_for_runtime(None, &resources).unwrap();
+        let revision = |presentation: &SidebarPresentation| {
             presentation
                 .owner
                 .lock()
@@ -1713,25 +2035,15 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .snapshot
-                .revision,
-            1
-        );
-        bus.publish_state(&tabs_list::STATE_KIND, snapshot(2))
+                .revision
+        };
+        assert_eq!(revision(&presentation), 1);
+        resources
+            .events
+            .publish_state(&tabs_list::STATE_KIND, snapshot(2))
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if presentation
-                    .owner
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .unwrap()
-                    .snapshot
-                    .revision
-                    == 2
-                {
-                    break;
-                }
+            while revision(&presentation) != 2 {
                 tokio::task::yield_now().await;
             }
         })
@@ -1739,7 +2051,9 @@ mod tests {
         .unwrap();
         let owner = presentation.owner.clone();
         drop(presentation);
-        bus.publish_state(&tabs_list::STATE_KIND, snapshot(3))
+        resources
+            .events
+            .publish_state(&tabs_list::STATE_KIND, snapshot(3))
             .unwrap();
         tokio::task::yield_now().await;
         assert!(owner.lock().unwrap().is_none());
@@ -1795,9 +2109,9 @@ mod tests {
             std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(4));
         let second_registry =
             std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(4));
-        let mut first = CompanionState::new(Settings::default());
+        let mut first = CompanionState::new(Settings::default(), None);
         first.surfaces = Some(first_registry.clone());
-        let mut second = CompanionState::new(Settings::default());
+        let mut second = CompanionState::new(Settings::default(), None);
         second.surfaces = Some(second_registry.clone());
         first
             .publish_allocation(ExtensionRect::new(0, 0, 12, 5), publish_companion)
@@ -1833,7 +2147,7 @@ mod tests {
             let (_sender, mut receiver) = tokio::sync::watch::channel(());
             let retained = std::sync::Arc::new(());
             let owned = retained.clone();
-            let mut companion = CompanionState::new(Settings::default());
+            let mut companion = CompanionState::new(Settings::default(), None);
             companion.subscription = Some(tokio::spawn(async move {
                 let _ = receiver.changed().await;
                 drop(owned);
@@ -1848,7 +2162,7 @@ mod tests {
 
     #[test]
     fn allocation_publication_retries_without_reapplying_resize() {
-        let mut state = CompanionState::new(Settings::default());
+        let mut state = CompanionState::new(Settings::default(), None);
         let rect = ExtensionRect::new(0, 0, 12, 5);
         assert!(
             state
@@ -1873,7 +2187,7 @@ mod tests {
 
     #[test]
     fn unpublished_snapshot_consumes_input_until_repaired() {
-        let mut state = CompanionState::new(Settings::default());
+        let mut state = CompanionState::new(Settings::default(), None);
         state.surfaces = Some(std::sync::Arc::new(
             bmux_plugin::surface::PluginSurfaceRegistry::new(0),
         ));
@@ -1951,10 +2265,13 @@ mod tests {
 
     #[test]
     fn rejected_interaction_publication_restores_scroll_and_hover() {
-        let mut state = CompanionState::new(Settings {
-            maximum_visible_items: 1,
-            ..Settings::default()
-        });
+        let mut state = CompanionState::new(
+            Settings {
+                maximum_visible_items: 1,
+                ..Settings::default()
+            },
+            None,
+        );
         state.replace_tabs(tabs_list::TabListSnapshot {
             tabs: (1..=3)
                 .map(|index| tabs_list::TabListEntry {
@@ -2025,11 +2342,14 @@ mod tests {
 
     #[test]
     fn measured_scroll_clips_partial_items_and_reveals_full_extent() {
-        let mut state = CompanionState::new(Settings {
-            maximum_visible_items: 1,
-            description_template: "description".to_string(),
-            ..Settings::default()
-        });
+        let mut state = CompanionState::new(
+            Settings {
+                maximum_visible_items: 1,
+                description_template: "description".to_string(),
+                ..Settings::default()
+            },
+            None,
+        );
         state.replace_tabs(tabs_list::TabListSnapshot {
             tabs: (0..3)
                 .map(|index| tabs_list::TabListEntry {
@@ -2091,7 +2411,7 @@ mod tests {
             maximum_visible_items: 2,
             ..Settings::default()
         };
-        let mut state = CompanionState::new(settings);
+        let mut state = CompanionState::new(settings, None);
         state.replace_tabs(tabs_list::TabListSnapshot {
             tabs: (0..5)
                 .map(|index| tabs_list::TabListEntry {
@@ -2119,8 +2439,8 @@ mod tests {
         let first = Uuid::from_u128(31);
         let second = Uuid::from_u128(32);
         let facts = std::sync::Arc::new(bmux_presentation_state::PresentationFactRegistry::new());
-        let mut state = CompanionState::new(Settings::default());
-        state.facts = Some(facts.clone());
+        let mut state = CompanionState::new(Settings::default(), None);
+        state.facts = Some(FactSource::Registry(facts.clone()));
         state.replace_tabs(tabs_list::TabListSnapshot {
             tabs: vec![
                 tabs_list::TabListEntry {
@@ -2173,7 +2493,7 @@ mod tests {
             maximum_visible_items: 32,
             ..Settings::default()
         };
-        let mut state = CompanionState::new(settings);
+        let mut state = CompanionState::new(settings, None);
         state.replace_tabs(tabs_list::TabListSnapshot {
             tabs: (0..2_000)
                 .map(|index| tabs_list::TabListEntry {
@@ -2202,7 +2522,7 @@ mod tests {
             maximum_visible_items: 32,
             ..Settings::default()
         };
-        let mut state = CompanionState::new(settings);
+        let mut state = CompanionState::new(settings, None);
         state.replace_tabs(tabs_list::TabListSnapshot {
             tabs: vec![tabs_list::TabListEntry {
                 id: Uuid::from_u128(50),
@@ -2234,10 +2554,13 @@ mod tests {
 
     #[test]
     fn content_height_bounds_background_paint() {
-        let mut state = CompanionState::new(Settings {
-            content_height: true,
-            ..Settings::default()
-        });
+        let mut state = CompanionState::new(
+            Settings {
+                content_height: true,
+                ..Settings::default()
+            },
+            None,
+        );
         state.replace_tabs(tabs_list::TabListSnapshot {
             tabs: vec![tabs_list::TabListEntry {
                 id: Uuid::from_u128(40),
@@ -2268,7 +2591,7 @@ mod tests {
 
     #[test]
     fn surface_uses_one_stable_region_per_tab() {
-        let mut state = CompanionState::new(Settings::default());
+        let mut state = CompanionState::new(Settings::default(), None);
         let id = Uuid::from_u128(9);
         state.replace_tabs(tabs_list::TabListSnapshot {
             tabs: vec![tabs_list::TabListEntry {

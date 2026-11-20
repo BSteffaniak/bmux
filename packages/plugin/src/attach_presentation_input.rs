@@ -21,6 +21,14 @@ pub type AttachPresentationCommittedHandler = Arc<dyn Fn(u64) + Send + Sync>;
 
 pub type AttachPresentationResponseHandler = Arc<dyn Fn(&[u8]) -> AttachInputResult + Send + Sync>;
 
+/// A plugin command answered by one runtime's presentation instead of a plugin
+/// instance. It receives the command's arguments and reports like an input hook.
+pub type AttachPresentationCommandHandler =
+    Arc<dyn Fn(&[String]) -> AttachInputResult + Send + Sync>;
+
+/// Identity of a presentation command: the plugin that declares it and its name.
+type PresentationCommandKey = (String, String);
+
 /// Outcome of dispatch to a process-local presentation input endpoint.
 ///
 /// Only `Unregistered` indicates that no local handler owns the endpoint.
@@ -58,6 +66,7 @@ pub struct AttachPresentationInputRegistry {
     paste: RwLock<BTreeMap<AttachInputEndpoint, AttachPresentationPasteHandler>>,
     handlers: RwLock<BTreeMap<AttachInputEndpoint, AttachPresentationInputHandler>>,
     focus_lost: RwLock<BTreeMap<AttachInputEndpoint, AttachPresentationFocusLostHandler>>,
+    commands: RwLock<BTreeMap<PresentationCommandKey, AttachPresentationCommandHandler>>,
 }
 
 impl AttachPresentationInputRegistry {
@@ -223,6 +232,48 @@ impl AttachPresentationInputRegistry {
         }
     }
 
+    /// Answer `plugin_id`'s `command_name` in this runtime's presentation.
+    ///
+    /// The runtime offers a registered command here before running it on a
+    /// plugin instance, so state that only the presentation holds (such as
+    /// what this one client shows) can be changed by a keybinding.
+    pub fn register_command(
+        &self,
+        plugin_id: impl Into<String>,
+        command_name: impl Into<String>,
+        handler: AttachPresentationCommandHandler,
+    ) {
+        if let Ok(mut handlers) = self.commands.write() {
+            handlers.insert((plugin_id.into(), command_name.into()), handler);
+        }
+    }
+
+    /// Run a registered presentation command. `None` means no presentation in
+    /// this runtime answers it, so the caller runs it on a plugin instance.
+    #[must_use]
+    pub fn command(
+        &self,
+        plugin_id: &str,
+        command_name: &str,
+        arguments: &[String],
+    ) -> Option<AttachInputResult> {
+        // Release the registry lock before invoking plugin code.
+        let handler = self
+            .commands
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(plugin_id.to_string(), command_name.to_string()))
+            .cloned()?;
+        Some(handler(arguments))
+    }
+
+    /// Remove every presentation command `plugin_id` registered.
+    pub fn remove_commands(&self, plugin_id: &str) {
+        if let Ok(mut handlers) = self.commands.write() {
+            handlers.retain(|(owner, _), _| owner != plugin_id);
+        }
+    }
+
     pub fn remove(&self, endpoint: &AttachInputEndpoint) {
         if let Ok(mut handlers) = self.shortcuts.write() {
             handlers.remove(endpoint);
@@ -248,6 +299,36 @@ impl AttachPresentationInputRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presentation_commands_route_by_plugin_and_name_until_removed() {
+        let registry = AttachPresentationInputRegistry::new();
+        assert!(registry.command("example.one", "toggle", &[]).is_none());
+        registry.register_command(
+            "example.one",
+            "toggle",
+            Arc::new(|arguments: &[String]| AttachInputResult {
+                consumed: true,
+                status_message: Some(arguments.join(",")),
+                ..AttachInputResult::default()
+            }),
+        );
+        registry.register_command(
+            "example.two",
+            "toggle",
+            Arc::new(|_: &[String]| AttachInputResult::default()),
+        );
+        let result = registry
+            .command("example.one", "toggle", &["a".into(), "b".into()])
+            .expect("registered command");
+        assert!(result.consumed);
+        assert_eq!(result.status_message.as_deref(), Some("a,b"));
+        assert!(registry.command("example.one", "show", &[]).is_none());
+
+        registry.remove_commands("example.one");
+        assert!(registry.command("example.one", "toggle", &[]).is_none());
+        assert!(registry.command("example.two", "toggle", &[]).is_some());
+    }
 
     #[test]
     fn focus_loss_is_opt_in_and_removed_with_handler() {

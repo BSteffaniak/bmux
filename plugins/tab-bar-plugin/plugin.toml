@@ -3,6 +3,7 @@ component_roles   = ["backend"]
 execution_class   = "native_fast"
 id                = "bmux.tab_bar"
 name              = "bmux Tab Strip"
+owns_namespaces   = ["tab-bar"]
 provided_features = ["bmux.tab_bar"]
 version           = "0.0.1-alpha.0"
 
@@ -26,3 +27,30 @@ kind                         = "bmux.tab_bar/status-items-list"
 delivery                     = "state"
 forward_to_streaming_clients = true
 kind                         = "bmux.tab_bar/notifications-list"
+
+# Visibility commands are answered by the tab-bar presentation inside each
+# attach client, so they change only what that client shows.
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = false
+name          = "toggle"
+path          = ["tab-bar", "toggle"]
+summary       = "Toggle the tab bar in this client"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = false
+name          = "show"
+path          = ["tab-bar", "show"]
+summary       = "Show the tab bar in this client"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = false
+name          = "hide"
+path          = ["tab-bar", "hide"]
+summary       = "Hide the tab bar in this client"
+
+# Global so it works in the default modal keymap's INSERT mode.
+[keybindings.global]
+"ctrl+alt+b" = "plugin:bmux.tab_bar:toggle"

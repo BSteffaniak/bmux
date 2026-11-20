@@ -270,15 +270,12 @@ fn install_bundled_client_adapter(plugin_id: &str, paths: &ConfigPaths) {
         host_attach_companions().register(bmux_plugin::AttachCompanion::from_factory(
             plugin_id,
             std::sync::Arc::new(|resources| {
-                let presentation = bmux_sidebar_plugin::SidebarPresentation::install(
-                    resources.settings_for("bmux.sidebar"),
-                    resources.layouts.clone(),
-                    resources.allocations.clone(),
-                    resources.input.clone(),
-                    resources.surfaces.clone(),
-                )?;
-                presentation.start(&resources.events)?;
-                Ok(Box::new(presentation))
+                Ok(Box::new(
+                    bmux_sidebar_plugin::SidebarPresentation::install_for_runtime(
+                        resources.settings_for("bmux.sidebar"),
+                        resources,
+                    )?,
+                ))
             }),
         ));
     }

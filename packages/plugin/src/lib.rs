@@ -57,9 +57,10 @@ pub use attach_companion::{
     AttachPresentationResources,
 };
 pub use attach_presentation_input::{
-    AttachPresentationCommittedHandler, AttachPresentationFocusLostHandler,
-    AttachPresentationInputDispatch, AttachPresentationInputHandler,
-    AttachPresentationInputRegistry, AttachPresentationPasteHandler,
+    AttachPresentationCommandHandler, AttachPresentationCommittedHandler,
+    AttachPresentationFocusLostHandler, AttachPresentationInputDispatch,
+    AttachPresentationInputHandler, AttachPresentationInputRegistry,
+    AttachPresentationPasteHandler,
 };
 pub use bmux_plugin_runtime::{
     ConcurrencyGate, EffectiveConcurrencyPolicy, PluginConcurrencyConfig,
