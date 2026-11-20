@@ -236,6 +236,13 @@ Done (each a measured commit; see [render-performance.md](render-performance.md)
   (`SequenceObserver::operation`, called after each print run, control, sequence and DCS
   string), where a pane with an image on screen used to be fed to its grid a byte at a time. A
   chunk with no image start skips the interceptor entirely (`ImageInterceptor::passes_through`).
+- Cluster replication on frames, pushed (see "Cluster replication: frames, pushed" above): attach
+  providers hand the renderer frames; workers push frames to observing connections; control
+  changes are pushed from the consensus metrics; nothing in the cluster path polls. A process
+  test runs a one-node cluster end to end (launch, frames, input, resize, a new generation).
+- The raw output buffer works only while someone reads raw bytes: otherwise a chunk only
+  advances its offsets, and a returning reader resynchronizes from a snapshot. Frames take their
+  synchronized-update state from the grid.
 
 Changed from the plan: the image and shell-metadata scanners are folded in after every client
 reads frames, since until then their only other job is producing the filtered byte stream clients
@@ -243,12 +250,14 @@ parsed. Rendering from damage comes before cluster replication, since rendering 
 client's largest cost.
 
 Output filters change what panes display (grids, and so frames), not the raw output stream:
-recording records what the program wrote. Cluster replication and the playbook, which still read
-the raw stream, see filtered output once they move to frames. Filters keep or drop whole
+recording records what the program wrote, and the playbook, which still reads raw bytes for its
+display track and `pane_output` events, sees what was written. Filters keep or drop whole
 sequences; rewriting sequences and filtering text runs come later, with the same interest model.
 
+The playbook stays on raw bytes: its display track and `pane_output` events are defined as what
+the program wrote, and with the buffer retaining only for readers, it costs nothing unless a
+playbook runs.
+
 Remaining: extracting images and shell metadata on the grid's parse instead of scans ahead of it;
-render from damage (phase 4); cluster
-replication and playbook on frames; compact cells (phase 5); the rest of the plugin model
-(rewriting filters and text filters, retained layers with revisioned relays, unified
-render/input/status APIs).
+compact cells (phase 5); the rest of the plugin model (rewriting filters and text filters,
+retained layers with revisioned relays, unified render/input/status APIs).
