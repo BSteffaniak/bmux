@@ -309,6 +309,9 @@ pub trait SequenceObserver {
     /// An OSC 22 pointer-shape query (its query list, without `?`) and the active screen's current
     /// shape. Replies and default/grabbed policy are the observer's.
     fn pointer_query(&mut self, _query: &[u8], _current: Option<PointerShape>) {}
+
+    /// The bell (BEL outside any string, where it terminates nothing).
+    fn bell(&mut self, _grid: &TerminalGrid) {}
 }
 
 /// An observer of nothing.
@@ -544,6 +547,7 @@ impl<O: SequenceObserver> Perform for GridPerformer<'_, O> {
                 self.grid.bump_revision();
             }
             b'\t' => self.grid.tab(),
+            0x07 => self.observer.bell(self.grid),
             _ => {}
         }
     }

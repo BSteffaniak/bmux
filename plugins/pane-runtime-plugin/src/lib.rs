@@ -429,6 +429,9 @@ impl PaneRuntimePlugin {
                 },
             );
             events.register_channel::<PaneEvent>(pane_runtime_events::EVENT_KIND);
+            events.register_channel::<
+                bmux_pane_runtime_plugin_api::pane_runtime_terminal_events::TerminalEvent,
+            >(bmux_pane_runtime_plugin_api::pane_runtime_terminal_events::EVENT_KIND);
         }
         // Publish the initial snapshot so any already-registered
         // subscribers see the current focus state immediately (even

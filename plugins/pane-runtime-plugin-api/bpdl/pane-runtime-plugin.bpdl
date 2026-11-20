@@ -1505,6 +1505,41 @@ interface pane-runtime-events {
     events pane-event;
 }
 
+// What a pane's program signals through its output beyond the screen: its title, its working
+// directory, desktop notifications, the bell, and shell prompt marks (OSC 0/2, 7, 9 and 777,
+// BEL, 133). Taken from the pane's one parse, they cost nothing until a program sends one.
+interface pane-runtime-terminal-events {
+    enum prompt-mark-kind {
+        // OSC 133 A: the prompt begins.
+        prompt-start,
+        // OSC 133 B: the command line begins (the prompt ended).
+        command-start,
+        // OSC 133 C: the command runs; its output follows.
+        command-executed,
+        // OSC 133 D: the command finished.
+        command-finished,
+    }
+
+    variant terminal-event {
+        title { session_id: uuid, pane_id: uuid, title: string },
+        // As the program gave it: usually a file:// URL.
+        working-directory { session_id: uuid, pane_id: uuid, location: string },
+        notification { session_id: uuid, pane_id: uuid, title: string?, body: string },
+        bell { session_id: uuid, pane_id: uuid },
+        // `line` is the absolute line the cursor was on: rows scrolled into history before it,
+        // plus its row.
+        prompt-mark {
+            session_id: uuid,
+            pane_id: uuid,
+            kind: prompt-mark-kind,
+            line: u64,
+            exit_status: u32?,
+        },
+    }
+
+    events terminal-event;
+}
+
 // Reactive state channel announcing the currently-focused pane (and
 // the zoomed pane, if any) for every live session. Pane-runtime is
 // the authoritative owner of this state; it publishes a fresh snapshot
@@ -1559,6 +1594,7 @@ world pane-runtime {
     provide attach-runtime-commands;
     provide attach-runtime-state;
     provide pane-runtime-events capability bmux.pane_runtime.read;
+    provide pane-runtime-terminal-events capability bmux.pane_runtime.read;
     provide pane-runtime-environment-v1;
     provide pane-runtime-spawn-v1;
     require capability bmux.clients.read;

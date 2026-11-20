@@ -37,6 +37,7 @@ use bmux_ipc::{ErrorCode, Event};
 use bmux_pane_runtime_plugin_api::{
     PaneRuntimePluginConfig,
     pane_runtime_events::{self, AttachViewComponent, PaneEvent},
+    pane_runtime_terminal_events::{self, PromptMarkKind},
 };
 use bmux_pane_runtime_state::{
     AttachViewport, FloatingPaneLayer, FloatingPaneRuntimeSummary, FloatingPaneScope,
@@ -295,6 +296,17 @@ impl PaneRuntimeHost {
 
     pub(crate) fn mark_snapshot_dirty(&self) {
         self.snapshot_dirty_flag().mark_dirty();
+    }
+
+    /// Publish what a pane's program signalled through its output (see
+    /// `pane-runtime-terminal-events`).
+    fn publish_terminal_event(&self, event: pane_runtime_terminal_events::TerminalEvent) {
+        let Some(events) = &self.events else {
+            return;
+        };
+        if let Err(error) = events.emit(&pane_runtime_terminal_events::EVENT_KIND, event) {
+            warn!(%error, "failed publishing pane terminal event");
+        }
     }
 
     pub(crate) fn publish_pane_event(&self, event: PaneEvent) {
@@ -2310,6 +2322,8 @@ struct PaneReader {
     /// output buffer publishes.
     visible: Vec<u8>,
     pointer_replies: Vec<u8>,
+    /// What the chunk's program signalled beyond the screen (title, notifications, ...).
+    signals: Vec<PaneSignal>,
     profile: ProtocolProfile,
     /// The grid's viewport scroll revision already applied to image positions, from the first
     /// bytes followed (a grid restored from a snapshot does not start at zero).
@@ -2324,6 +2338,7 @@ impl PaneReader {
             metadata_events: Vec::new(),
             visible: Vec::new(),
             pointer_replies: Vec::new(),
+            signals: Vec::new(),
             profile,
             #[cfg(feature = "image-registry")]
             scrolled: None,
@@ -2335,6 +2350,7 @@ impl PaneReader {
         self.visible.clear();
         self.metadata_events.clear();
         self.pointer_replies.clear();
+        self.signals.clear();
     }
 
     /// Parse `bytes` into `grid`, answering the queries among them as the grid reaches each:
@@ -2352,6 +2368,7 @@ impl PaneReader {
                 engine,
                 replies,
                 pointer_replies: &mut self.pointer_replies,
+                signals: &mut self.signals,
                 profile: self.profile,
             },
         );
@@ -2372,7 +2389,108 @@ struct ReaderObserver<'a> {
     engine: &'a mut TerminalProtocolEngine,
     replies: &'a mut Vec<u8>,
     pointer_replies: &'a mut Vec<u8>,
+    signals: &'a mut Vec<PaneSignal>,
     profile: ProtocolProfile,
+}
+
+/// Something a pane's program signalled through its output beyond the screen, as the reader saw
+/// it (see `pane-runtime-terminal-events`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PaneSignal {
+    Title(String),
+    WorkingDirectory(String),
+    Notification {
+        title: Option<String>,
+        body: String,
+    },
+    Bell,
+    PromptMark {
+        kind: PromptMarkKind,
+        line: u64,
+        exit_status: Option<u32>,
+    },
+}
+
+impl PaneSignal {
+    /// The signal an OSC string carries, if any: OSC 0 and 2 (title), 7 (working directory),
+    /// 9 (a notification; 9;4 reports progress instead), 777;notify (a titled notification) and
+    /// 133 (prompt marks), with the line the cursor is on.
+    fn from_osc(params: &[&[u8]], line: u64) -> Option<Self> {
+        let text = |parts: &[&[u8]]| String::from_utf8_lossy(&parts.join(&b';')).into_owned();
+        match params {
+            [b"0" | b"2", rest @ ..] if !rest.is_empty() => Some(Self::Title(text(rest))),
+            [b"7", rest @ ..] if !rest.is_empty() => Some(Self::WorkingDirectory(text(rest))),
+            [b"9", first, ..] if *first == b"4" => None,
+            [b"9", rest @ ..] if !rest.is_empty() => Some(Self::Notification {
+                title: None,
+                body: text(rest),
+            }),
+            [b"777", b"notify", title, rest @ ..] => Some(Self::Notification {
+                title: Some(String::from_utf8_lossy(title).into_owned()),
+                body: text(rest),
+            }),
+            [b"133", mark, rest @ ..] => {
+                let kind = match *mark {
+                    b"A" => PromptMarkKind::PromptStart,
+                    b"B" => PromptMarkKind::CommandStart,
+                    b"C" => PromptMarkKind::CommandExecuted,
+                    b"D" => PromptMarkKind::CommandFinished,
+                    _ => return None,
+                };
+                let exit_status = (kind == PromptMarkKind::CommandFinished)
+                    .then(|| rest.first())
+                    .flatten()
+                    .and_then(|status| std::str::from_utf8(status).ok()?.parse().ok());
+                Some(Self::PromptMark {
+                    kind,
+                    line,
+                    exit_status,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn into_event(
+        self,
+        session_id: Uuid,
+        pane_id: Uuid,
+    ) -> pane_runtime_terminal_events::TerminalEvent {
+        use pane_runtime_terminal_events::TerminalEvent;
+        match self {
+            Self::Title(title) => TerminalEvent::Title {
+                session_id,
+                pane_id,
+                title,
+            },
+            Self::WorkingDirectory(location) => TerminalEvent::WorkingDirectory {
+                session_id,
+                pane_id,
+                location,
+            },
+            Self::Notification { title, body } => TerminalEvent::Notification {
+                session_id,
+                pane_id,
+                title,
+                body,
+            },
+            Self::Bell => TerminalEvent::Bell {
+                session_id,
+                pane_id,
+            },
+            Self::PromptMark {
+                kind,
+                line,
+                exit_status,
+            } => TerminalEvent::PromptMark {
+                session_id,
+                pane_id,
+                kind,
+                line,
+                exit_status,
+            },
+        }
+    }
 }
 
 impl SequenceObserver for ReaderObserver<'_> {
@@ -2404,8 +2522,18 @@ impl SequenceObserver for ReaderObserver<'_> {
         );
     }
 
-    fn osc(&mut self, _grid: &TerminalGrid, params: &[&[u8]], _bell_terminated: bool) {
+    fn osc(&mut self, grid: &TerminalGrid, params: &[&[u8]], _bell_terminated: bool) {
         self.engine.answer_osc(params, self.replies);
+        let line = grid
+            .total_scrolled_rows()
+            .saturating_add(grid.cursor().row as u64);
+        if let Some(signal) = PaneSignal::from_osc(params, line) {
+            self.signals.push(signal);
+        }
+    }
+
+    fn bell(&mut self, _grid: &TerminalGrid) {
+        self.signals.push(PaneSignal::Bell);
     }
 
     fn wants_dcs(&mut self, introducer: &SequenceHeader<'_>) -> bool {
@@ -8214,6 +8342,11 @@ impl SessionRuntimeManager {
                                     crate::handlers::output_push::pane_output_available(&host,
                                         session_id.0,
                                         pane_id,
+                                    );
+                                }
+                                for signal in reader_state.signals.drain(..) {
+                                    host.publish_terminal_event(
+                                        signal.into_event(session_id.0, pane_id),
                                     );
                                 }
                                 if !reply.is_empty() {
@@ -18404,6 +18537,39 @@ exit 7"#
         );
         assert_eq!(remaining, expected.len() - 1);
         assert_eq!(grid.snapshot(0, 2), snapshot);
+    }
+
+    /// What a program signals beyond the screen reaches the reader in order: titles (even with
+    /// `;` in them), working directories, notifications (not progress reports), the bell, and
+    /// prompt marks with the line they mark and a finished command's status.
+    #[test]
+    fn the_reader_collects_what_programs_signal_beyond_the_screen() {
+        let mut tracker = PaneCursorTracker::new(4, 40);
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        let _ = protocol_reply_for_chunk(
+            &mut engine,
+            &mut tracker.reader,
+            &mut tracker.terminal_grid,
+            b"\x1b]2;build; test\x07\x1b]7;file://host/tmp\x1b\\\x1b]777;notify;Build;done; ok\x07\
+              \x1b]9;4;1;50\x07ding\x07\r\n\r\n\x1b]133;D;2\x07",
+        );
+        assert_eq!(
+            tracker.reader.signals,
+            [
+                PaneSignal::Title("build; test".into()),
+                PaneSignal::WorkingDirectory("file://host/tmp".into()),
+                PaneSignal::Notification {
+                    title: Some("Build".into()),
+                    body: "done; ok".into(),
+                },
+                PaneSignal::Bell,
+                PaneSignal::PromptMark {
+                    kind: PromptMarkKind::CommandFinished,
+                    line: 2,
+                    exit_status: Some(2),
+                },
+            ]
+        );
     }
 
     /// An attached client's frames keep a replica of the pane's grid level with it: a reset frame
