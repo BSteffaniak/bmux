@@ -153,10 +153,10 @@ pub fn run(context: &NativeCommandContext) -> Result<Option<i32>> {
                 pair(context)?
             } else {
                 let Some(name) = positions.first() else {
-                    return forward(context, "connect", args.clone()).map(Some);
+                    return Ok(None);
                 };
                 if preferences::host_target(&paths.state_dir, "default", name)?.is_none() {
-                    return forward(context, "connect", args.clone()).map(Some);
+                    return Ok(None);
                 }
                 name.clone()
             };

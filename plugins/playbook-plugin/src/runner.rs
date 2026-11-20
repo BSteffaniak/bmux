@@ -771,6 +771,9 @@ mod tests {
     }
 
     fn specification(root: &Path) -> Preparation {
+        // Admission requires canonical paths; macOS TMPDIR may use /var instead of /private/var.
+        let canonical_root = root.canonicalize().unwrap();
+        let root = canonical_root.as_path();
         Preparation {
             request_id: uuid::Uuid::new_v4().to_string(),
             source: root.join("deck.playbook").to_string_lossy().into_owned(),

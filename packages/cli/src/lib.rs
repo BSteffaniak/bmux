@@ -10,6 +10,8 @@ mod connection;
 mod pane_runtime_client;
 mod runtime;
 pub mod runtime_owner;
+#[cfg(feature = "docs-test")]
+pub use runtime::bundled_cli_command_for_docs;
 pub(crate) mod sandbox_meta;
 mod ssh_access;
 

@@ -2747,18 +2747,13 @@ pub fn run_health_probe(
     target: &str,
     probe: HealthProbe,
 ) -> Result<(), String> {
-    let command_path = match probe {
-        HealthProbe::Test => vec!["remote".to_string(), "test".to_string()],
-        HealthProbe::Doctor => vec!["remote".to_string(), "doctor".to_string()],
-    };
-    let request = CoreCliCommandRequest::new(command_path, vec![target.to_string()]);
-    let response = caller
-        .core_cli_command_run_path(&request)
+    let status = caller
+        .remote_probe_status(probe, target)
         .map_err(|error| format!("probe failed to run: {error}"))?;
-    if response.exit_code == EXIT_OK {
+    if status == EXIT_OK {
         Ok(())
     } else {
-        Err(format!("probe exited with status {}", response.exit_code))
+        Err(format!("probe exited with status {status}"))
     }
 }
 

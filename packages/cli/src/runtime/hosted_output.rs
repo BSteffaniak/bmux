@@ -1,10 +1,3 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum HostedHostState {
-    Running,
-    Offline,
-    Stale(u32),
-}
-
 pub(super) fn status_ready_lines(next: Option<&str>) -> Vec<String> {
     let mut lines = vec!["Status: ready".to_string()];
     if let Some(value) = next {
@@ -29,35 +22,9 @@ pub(super) fn status_not_ready_lines(
     lines
 }
 
-pub(super) fn hosted_not_ready_reason(
-    auth_missing: bool,
-    host_state: HostedHostState,
-    share_missing: bool,
-) -> String {
-    let mut reasons = Vec::new();
-    if auth_missing {
-        reasons.push("not signed in".to_string());
-    }
-    match host_state {
-        HostedHostState::Running => {}
-        HostedHostState::Offline => reasons.push("host is offline".to_string()),
-        HostedHostState::Stale(pid) => reasons.push(format!("host state is stale (pid {pid})")),
-    }
-    if share_missing && host_state == HostedHostState::Running {
-        reasons.push("share link unavailable".to_string());
-    }
-    if reasons.is_empty() {
-        "not ready".to_string()
-    } else {
-        reasons.join("; ")
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        HostedHostState, hosted_not_ready_reason, status_not_ready_lines, status_ready_lines,
-    };
+    use super::{status_not_ready_lines, status_ready_lines};
 
     #[test]
     fn status_ready_lines_include_next_when_provided() {
@@ -84,11 +51,5 @@ mod tests {
                 "Advanced: bmux host --daemon".to_string(),
             ]
         );
-    }
-
-    #[test]
-    fn hosted_not_ready_reason_combines_auth_host_and_share() {
-        let reason = hosted_not_ready_reason(true, HostedHostState::Stale(42), true);
-        assert_eq!(reason, "not signed in; host state is stale (pid 42)");
     }
 }

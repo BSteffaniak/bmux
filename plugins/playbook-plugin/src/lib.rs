@@ -12,6 +12,9 @@ pub mod declaration {
     }
 }
 
+mod batch;
+mod interactive;
+mod offline;
 mod runner;
 
 use std::sync::{Arc, Mutex};
@@ -19,8 +22,14 @@ use std::sync::{Arc, Mutex};
 use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::prelude::{NativeServiceContext, PluginCommandError, ServiceResponse};
 
+pub type SandboxCleanup = fn(bool, bool, Option<u64>, Option<&str>, bool) -> anyhow::Result<u8>;
+pub type BatchHost = Arc<dyn bmux_playbook::host::HostAdapter>;
+
 #[derive(Default)]
 pub struct PlaybookPlugin {
+    cleanup: Option<SandboxCleanup>,
+    batch_host: Option<BatchHost>,
+    host: Option<BatchHost>,
     runner: Arc<Mutex<runner::Owner>>,
     poller: Mutex<Option<Poller>>,
 }
@@ -46,6 +55,12 @@ impl Drop for PlaybookPlugin {
 // on the host's blocking pool inside the call's callback entry.
 impl Plugin for PlaybookPlugin {
     fn declare(d: &mut Declarations<Self>) {
+        for name in ["validate", "dry-run", "diff"] {
+            d.blocking_command(name, |_, context| offline::run(context));
+        }
+        d.blocking_command("cleanup", batch::cleanup);
+        d.blocking_command("run", batch::run);
+        d.blocking_command("interactive", interactive::run);
         d.blocking_activate(|plugin, _, _| plugin.start_poller())
             .blocking_deactivate(|plugin, _| plugin.drain())
             .blocking_services(Self::service, None);
@@ -177,6 +192,28 @@ impl PlaybookPlugin {
                 },
             )
     }
+}
+
+/// Bind the caller's terminal, sandbox and process adapters for interactive execution.
+#[must_use]
+pub fn with_execution_host(
+    host: fn() -> Arc<dyn bmux_playbook::host::HostAdapter>,
+    batch_host: BatchHost,
+    cleanup: SandboxCleanup,
+) -> bmux_plugin_sdk::definition::PluginDefinition {
+    let interactive_host = host();
+    bmux_plugin_sdk::author::definition::<PlaybookPlugin>(
+        declaration::PLUGIN_MANIFEST,
+        declaration::SERVICE_CONTRACTS,
+        move |_| {
+            let mut plugin = PlaybookPlugin::default();
+            plugin.cleanup = Some(cleanup);
+            plugin.batch_host = Some(batch_host.clone());
+            plugin.host = Some(interactive_host.clone());
+            Ok(plugin)
+        },
+    )
+    .expect("embedded playbook declaration must be valid")
 }
 
 bmux_plugin_sdk::plugin!(PlaybookPlugin);

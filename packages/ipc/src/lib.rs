@@ -87,6 +87,9 @@ pub const CORE_PROTOCOL_CAPABILITIES: &[&str] = &[
     CORE_CAPABILITY_LIFECYCLE,
 ];
 
+/// Optional local-only terminal transport, advertised only by a server with a bound endpoint.
+pub const CAPABILITY_LOCAL_TERMINAL_V1: &str = "core.local_terminal.v1";
+
 // Compression capability strings (non-core, optional).
 pub const CAPABILITY_COMPRESSION_PAYLOAD_ZSTD: &str = "compression.payload.zstd";
 pub const CAPABILITY_COMPRESSION_PAYLOAD_LZ4: &str = "compression.payload.lz4";

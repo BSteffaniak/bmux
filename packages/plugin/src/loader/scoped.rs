@@ -127,7 +127,8 @@ pub(super) struct BundledExecutableCache {
 #[derive(Debug)]
 struct BundledExecutableArtifact {
     // Private anonymous snapshot: no caller can mutate these retained bytes.
-    _snapshot: std::fs::File,
+    #[cfg_attr(not(test), allow(dead_code))] // Held for the lifetime of this observation.
+    snapshot: std::fs::File,
     identity: String,
     executable_parent: std::path::PathBuf,
 }
@@ -167,15 +168,28 @@ impl BundledExecutableArtifact {
         if !before.is_file() {
             return Err(failure("bundled executable is not a regular file"));
         }
-        let mut snapshot = tempfile::tempfile()?;
+        // Hash the retained inode on clone-capable volumes. If cloning fails
+        // (e.g. TMPDIR is on another volume), copy and hash in a single pass.
+        #[cfg(target_os = "macos")]
+        let cloned = super::auxiliary::try_clone_snapshot(&input).ok();
+        #[cfg(not(target_os = "macos"))]
+        let cloned: Option<std::fs::File> = None;
+        let copying = cloned.is_none();
+        let mut snapshot = cloned.map_or_else(tempfile::tempfile, Ok)?;
         let mut hash = Sha256::new();
         let mut buffer = vec![0; 65536];
         loop {
-            let count = input.read(&mut buffer)?;
+            let count = if copying {
+                input.read(&mut buffer)?
+            } else {
+                snapshot.read(&mut buffer)?
+            };
             if count == 0 {
                 break;
             }
-            snapshot.write_all(&buffer[..count])?;
+            if copying {
+                snapshot.write_all(&buffer[..count])?;
+            }
             hash.update(&buffer[..count]);
         }
         let after = input.metadata()?;
@@ -189,7 +203,7 @@ impl BundledExecutableArtifact {
         permissions.set_readonly(true);
         snapshot.set_permissions(permissions)?;
         Ok(Self {
-            _snapshot: snapshot,
+            snapshot,
             identity: hex_digest(&hash.finalize()),
             executable_parent,
         })
@@ -4595,6 +4609,7 @@ mod tests {
 
     #[test]
     fn bundled_owner_reuses_retained_content_not_replacement_path() {
+        use std::io::{Read as _, Seek as _};
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("executable");
         std::fs::write(&path, b"first executable").unwrap();
@@ -4612,6 +4627,11 @@ mod tests {
         );
         assert_eq!(repeated.executable_parent, first.executable_parent);
         assert!(Arc::ptr_eq(&first, &repeated));
+        let mut retained = first.snapshot.try_clone().unwrap();
+        retained.rewind().unwrap();
+        let mut bytes = Vec::new();
+        retained.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"first executable");
         let new_owner = BundledExecutableCache::default();
         let rebuilt = new_owner
             .observe_with(|| BundledExecutableArtifact::capture(&path))

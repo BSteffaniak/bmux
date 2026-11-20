@@ -10,8 +10,12 @@ pub mod declaration {
     }
 }
 
+mod diagnostics_cli;
+mod diagnostics_watch;
 mod doctor;
 mod list_cmd;
+mod logs_tail;
+mod logs_watch;
 mod rebuild;
 mod run_cmd;
 mod suggest;
@@ -39,6 +43,7 @@ impl Plugin for PluginCliPlugin {
             "doctor",
             "logs-path",
             "logs-level",
+            "diagnostics-watch",
             "logs-tail",
             "logs-watch",
             "logs-profiles-list",
@@ -48,12 +53,6 @@ impl Plugin for PluginCliPlugin {
             "keymap-doctor",
             "terminal-doctor",
             "terminal-install-terminfo",
-            "playbook-run",
-            "playbook-validate",
-            "playbook-interactive",
-            "playbook-dry-run",
-            "playbook-diff",
-            "playbook-cleanup",
         ] {
             d.blocking_command(name, |_, context| Self::command(context));
         }
@@ -66,6 +65,14 @@ impl PluginCliPlugin {
         let result = match context.command.as_str() {
             "list" => list_cmd::run_list_command(context).map_err(PluginCommandError::from),
             "run" => run_cmd::run_run_command(context).map_err(PluginCommandError::from),
+            "diagnostics-watch"
+            | "logs-path"
+            | "logs-tail"
+            | "logs-watch"
+            | "logs-profiles-list"
+            | "logs-profiles-show"
+            | "logs-profiles-delete"
+            | "logs-profiles-rename" => diagnostics_cli::run(context),
             "rebuild" => rebuild::run_rebuild_command(context).map_err(PluginCommandError::from),
             "doctor" => doctor::run_doctor_command(context).map_err(PluginCommandError::from),
             _ => core_proxy_command_path(context.command.as_str()).map_or_else(
@@ -93,37 +100,36 @@ fn emit_phase_timing(command: &str, total_us: u128, result: &Result<i32, PluginC
     emit_perf_phase(PhaseChannel::Plugin, &payload);
 }
 
-include!(concat!(env!("OUT_DIR"), "/core_proxy_commands.rs"));
+// These baseline aliases still depend on a core handler. New manifest entries must
+// never acquire core execution authority implicitly. Remove a row and its manifest
+// declaration together when the real owner registers that path.
+const CORE_COMPAT_COMMANDS: &[(&str, &[&str])] = &[
+    ("logs-level", &["logs", "level"]),
+    ("keymap-doctor", &["keymap", "doctor"]),
+    ("terminal-doctor", &["terminal", "doctor"]),
+    (
+        "terminal-install-terminfo",
+        &["terminal", "install-terminfo"],
+    ),
+];
+
+fn core_proxy_command_path(name: &str) -> Option<&'static [&'static str]> {
+    CORE_COMPAT_COMMANDS
+        .iter()
+        .find_map(|&(alias, path)| (alias == name).then_some(path))
+}
 
 fn run_core_proxy_command(
     context: &NativeCommandContext,
     command_path: &[&str],
 ) -> Result<i32, PluginCommandError> {
-    run_core_proxy_command_sync(context, command_path)
-}
-
-fn core_cli_command_request(command_path: &[&str], arguments: &[String]) -> CoreCliCommandRequest {
-    CoreCliCommandRequest::new(
+    let request = CoreCliCommandRequest::new(
         command_path.iter().map(ToString::to_string).collect(),
-        arguments.to_vec(),
-    )
-}
-
-fn run_core_proxy_command_sync(
-    context: &NativeCommandContext,
-    command_path: &[&str],
-) -> Result<i32, PluginCommandError> {
-    let request = core_cli_command_request(command_path, &context.arguments);
-    run_core_proxy_request_sync(context, &request)
-}
-
-fn run_core_proxy_request_sync(
-    context: &NativeCommandContext,
-    request: &CoreCliCommandRequest,
-) -> Result<i32, PluginCommandError> {
+        context.arguments.clone(),
+    );
     let response: CoreCliCommandResponse =
         context
-            .core_cli_command_run_path(request)
+            .core_cli_command_run_path(&request)
             .map_err(|error| {
                 PluginCommandError::from(format!(
                     "failed running core command path via host bridge: {error}"
@@ -357,8 +363,7 @@ mod tests {
             cancellation: bmux_plugin_sdk::ServiceCancellation::new(),
             host_services: None,
         };
-        let mut work =
-            std::pin::pin!(plugin.command(call, test_context("playbook-run", Vec::new())));
+        let mut work = std::pin::pin!(plugin.command(call, test_context("list", Vec::new())));
         let mut context = std::task::Context::from_waker(std::task::Waker::noop());
         let std::task::Poll::Ready(outcome) =
             std::future::Future::poll(work.as_mut(), &mut context)
@@ -419,22 +424,37 @@ mod tests {
     }
 
     #[test]
-    fn generated_proxy_command_mapping_resolves_known_entries() {
-        assert_eq!(
-            core_proxy_command_path("logs-path"),
-            Some(&["logs", "path"] as &[&str])
-        );
-        assert_eq!(
-            core_proxy_command_path("playbook-run"),
-            Some(&["playbook", "run"] as &[&str])
-        );
+    fn logs_path_runs_without_a_host_bridge() {
+        let context = test_context("logs-path", vec!["--json".to_owned()]);
+        assert_eq!(PluginCliPlugin::command(&context).unwrap(), 0);
+        assert!(core_proxy_command_path("logs-path").is_none());
     }
 
     #[test]
-    fn generated_proxy_command_mapping_ignores_non_proxy_commands() {
-        assert!(core_proxy_command_path("list").is_none());
-        assert!(core_proxy_command_path("doctor").is_none());
-        assert!(core_proxy_command_path("does-not-exist").is_none());
+    fn compatibility_routes_match_exact_ownership_claims() {
+        use std::collections::BTreeSet;
+        let manifest =
+            bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml")).unwrap();
+        let mut routed = BTreeSet::new();
+        for command in manifest.commands {
+            let path: Vec<_> = command.path.iter().map(String::as_str).collect();
+            if command.summary.ends_with(" command proxy") {
+                assert_eq!(
+                    core_proxy_command_path(&command.name),
+                    Some(path.as_slice())
+                );
+                assert!(
+                    manifest
+                        .owns_paths
+                        .iter()
+                        .any(|claim| claim.0 == command.path)
+                );
+                assert!(routed.insert(command.path));
+            } else {
+                assert!(core_proxy_command_path(&command.name).is_none());
+            }
+        }
+        assert_eq!(routed.len(), super::CORE_COMPAT_COMMANDS.len());
     }
 
     #[test]

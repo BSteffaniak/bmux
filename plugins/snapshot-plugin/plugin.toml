@@ -1,9 +1,10 @@
 bundled_only      = "uses block_in_place, Tokio tasks and timers directly instead of plug-rt"
-component_roles   = ["backend"]
+component_roles   = ["backend", "frontend"]
 execution_class   = "native_fast"
 id                = "bmux.snapshot"
 name              = "bmux Snapshot"
 owns_namespaces   = []
+owns_paths        = [["server", "save"], ["server", "restore"]]
 provided_features = ["bmux.snapshot"]
 version           = "0.0.1-alpha.0"
 
@@ -21,3 +22,30 @@ version_req = ">=0.0.1-alpha.0"
 
 # Explicit immutable v1 contracts. Route IDs are wire identities, not version
 # syntax: retain legacy names and negotiate their major separately.
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "save"
+path          = ["server", "save"]
+summary       = "Trigger immediate server snapshot save"
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "restore"
+path          = ["server", "restore"]
+summary       = "Validate persisted snapshot without applying restore"
+[[commands.arguments]]
+kind    = "boolean"
+long    = "dry-run"
+name    = "dry-run"
+summary = "Only validate snapshot readability and schema"
+[[commands.arguments]]
+kind    = "boolean"
+long    = "yes"
+name    = "yes"
+summary = "Confirm replace-restore of current in-memory server state"
+
+[cli_help]
+"server restore" = { order = 4 }
+"server save"    = { order = 3 }

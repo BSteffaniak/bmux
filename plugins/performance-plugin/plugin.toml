@@ -3,7 +3,7 @@ component_roles   = ["backend"]
 execution_class   = "native_fast"
 id                = "bmux.performance"
 name              = "bmux Performance"
-owns_namespaces   = []
+owns_namespaces   = ["perf"]
 provided_features = ["bmux.performance"]
 version           = "0.0.1-alpha.0"
 
@@ -11,3 +11,54 @@ version           = "0.0.1-alpha.0"
 delivery                     = "broadcast"
 forward_to_streaming_clients = true
 kind                         = "bmux.performance/performance-events"
+
+[[commands]]
+expose_in_cli = true
+name          = "perf-status"
+path          = ["perf", "status"]
+summary       = "Show current runtime performance telemetry settings"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "json"
+name    = "json"
+summary = "Print output as JSON"
+
+[[commands]]
+expose_in_cli = true
+name          = "perf-on"
+path          = ["perf", "on"]
+summary       = "Enable runtime performance telemetry"
+
+[[commands.arguments]]
+choice_values = ["basic", "detailed", "trace"]
+default_value = "detailed"
+kind          = "choice"
+long          = "profile"
+name          = "profile"
+summary       = "Capture profile level"
+value_name    = "PROFILE"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "json"
+name    = "json"
+summary = "Print output as JSON"
+
+[[commands]]
+expose_in_cli = true
+name          = "perf-off"
+path          = ["perf", "off"]
+summary       = "Disable runtime performance telemetry"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "json"
+name    = "json"
+summary = "Print output as JSON"
+
+[cli_help]
+"perf"        = { summary = "Runtime performance telemetry controls", order = 24 }
+"perf off"    = { order = 2 }
+"perf on"     = { order = 1 }
+"perf status" = { order = 0 }

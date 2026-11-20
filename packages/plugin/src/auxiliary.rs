@@ -10,6 +10,19 @@ mod retained;
 
 pub use retained::retain as retain_executable;
 
+/// An anonymous copy-on-write snapshot of the opened file, never a hard link.
+#[cfg(target_os = "macos")]
+pub(super) fn try_clone_snapshot(input: &File) -> std::io::Result<File> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let directory = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()?;
+    let path = directory.path().join("snapshot");
+    let file = retained::clone(input, &path)?;
+    std::fs::remove_file(path)?;
+    Ok(file)
+}
+
 use crate::manifest::{AuxiliaryExecutableDeclaration, safe_auxiliary_name};
 
 /// Resolve only the declared package, then pin its verified bytes for this runtime.

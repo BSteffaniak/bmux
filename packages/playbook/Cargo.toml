@@ -34,11 +34,12 @@ bmux_sessions_plugin_api = { workspace = true, optional = true }
 bmux_tabs_plugin_api = { workspace = true, optional = true }
 bmux_terminal = { workspace = true, optional = true }
 bmux_terminal_grid = { workspace = true, optional = true }
-regex = { workspace = true, optional = true }
+regex = { workspace = true }
 serde_json = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = [
     "fs",
     "io-util",
+    "signal",
     "macros",
     "rt",
     "sync",
@@ -112,7 +113,6 @@ runtime = [
     "dep:bmux_tabs_plugin_api",
     "dep:bmux_terminal_grid",
     "dep:bmux_terminal",
-    "dep:regex",
     "dep:serde_json",
     "dep:tokio",
 ]

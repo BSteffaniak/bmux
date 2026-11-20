@@ -1,63 +1,10 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltInHandlerId {
-    Setup,
-    Host,
-    Join,
-    Hosts,
-    Auth,
-    AuthLogin,
-    AuthStatus,
-    AuthLogout,
-    Access,
-    Kiosk,
-    KioskStatus,
-    KioskInit,
-    KioskIssueToken,
-    KioskRevokeToken,
-    KioskAttach,
-    KioskSshPrintConfig,
-    Share,
-    Unshare,
-    Connect,
-    NewSession,
-    ListSessions,
-    ListClients,
-    KillSession,
-    KillAllSessions,
     Attach,
-    Detach,
-    Follow,
-    Unfollow,
-    Session,
-    SessionNew,
-    SessionList,
-    SessionClients,
-    SessionKill,
-    SessionKillAll,
-    SessionAttach,
-    SessionDetach,
-    SessionFollow,
-    SessionUnfollow,
-    Remote,
-    RemoteList,
-    RemoteTest,
-    RemoteDoctor,
-    RemoteInit,
-    RemoteInstallServer,
-    RemoteUpgrade,
-    RemoteTrust,
-    RemoteTrustList,
-    RemoteTrustAdd,
-    RemoteTrustRemove,
-    RemoteComplete,
-    RemoteCompleteTargets,
-    RemoteCompleteSessions,
     Server,
     ServerStart,
     ServerStatus,
     ServerWhoamiPrincipal,
-    ServerSave,
-    ServerRestore,
     ServerStop,
     ServerAutostartInstall,
     ServerAutostartUninstall,
@@ -68,15 +15,6 @@ pub enum BuiltInHandlerId {
     Logs,
     LogsPath,
     LogsLevel,
-    LogsTail,
-    LogsWatch,
-    Diagnostics,
-    DiagnosticsWatch,
-    LogsProfiles,
-    LogsProfilesList,
-    LogsProfilesShow,
-    LogsProfilesDelete,
-    LogsProfilesRename,
     Config,
     ConfigPath,
     ConfigShow,
@@ -91,10 +29,6 @@ pub enum BuiltInHandlerId {
     ConfigProfilesDiff,
     ConfigProfilesLint,
     ConfigProfilesEvaluate,
-    Perf,
-    PerfStatus,
-    PerfOn,
-    PerfOff,
     Doctor,
     Keymap,
     KeymapDoctor,
@@ -102,13 +36,6 @@ pub enum BuiltInHandlerId {
     Terminal,
     TerminalDoctor,
     TerminalInstallTerminfo,
-    Playbook,
-    PlaybookRun,
-    PlaybookValidate,
-    PlaybookInteractive,
-    PlaybookDryRun,
-    PlaybookDiff,
-    PlaybookCleanup,
     Sandbox,
     SandboxDev,
     SandboxAttach,
@@ -169,260 +96,9 @@ impl BuiltInExecutionCommand {
 pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
     vec![
         BuiltInExecutionCommand::new(
-            BuiltInHandlerId::Setup,
-            &["setup"],
-            "Run first-time hosted setup",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::Host,
-            &["host"],
-            "Start hosted mode using iroh",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::Join,
-            &["join"],
-            "Join a hosted link quickly",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::Hosts,
-            &["hosts"],
-            "List known hosts and targets",
-        ),
-        BuiltInExecutionCommand::new(BuiltInHandlerId::Auth, &["auth"], "Authentication helpers"),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::AuthLogin,
-            &["auth", "login"],
-            "Login/register local device",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::AuthStatus,
-            &["auth", "status"],
-            "Show current login status",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::AuthLogout,
-            &["auth", "logout"],
-            "Remove local login credentials",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::Access,
-            &["access"],
-            "Manage iroh SSH access keys",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::Kiosk,
-            &["kiosk"],
-            "Manage kiosk profiles and SSH bootstrap",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::KioskStatus,
-            &["kiosk", "status"],
-            "Show kiosk profile status",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::KioskInit,
-            &["kiosk", "init"],
-            "Initialize kiosk SSH/bootstrap files",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::KioskIssueToken,
-            &["kiosk", "issue-token"],
-            "Issue a kiosk attach token",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::KioskRevokeToken,
-            &["kiosk", "revoke-token"],
-            "Revoke an issued kiosk token",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::KioskAttach,
-            &["kiosk", "attach"],
-            "Attach using a kiosk token",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::KioskSshPrintConfig,
-            &["kiosk", "ssh-print-config"],
-            "Print generated kiosk SSH config",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::Share,
-            &["share"],
-            "Create a shareable bmux:// link",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::Unshare,
-            &["unshare"],
-            "Remove a share link",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::Connect,
-            &["connect"],
-            "Connect to a target and attach to a session",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::NewSession,
-            &["new-session"],
-            "Create a new session",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::ListSessions,
-            &["list-sessions"],
-            "List active sessions",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::ListClients,
-            &["list-clients"],
-            "List connected clients",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::KillSession,
-            &["kill-session"],
-            "Kill a session by name or UUID",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::KillAllSessions,
-            &["kill-all-sessions"],
-            "Kill all sessions",
-        ),
-        BuiltInExecutionCommand::new(
             BuiltInHandlerId::Attach,
             &["attach"],
             "Attach to a session by name or UUID",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::Detach,
-            &["detach"],
-            "Detach from the current session",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::Follow,
-            &["follow"],
-            "Follow another client's active target",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::Unfollow,
-            &["unfollow"],
-            "Stop following a client",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::Session,
-            &["session"],
-            "Session management commands",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::SessionNew,
-            &["session", "new"],
-            "Create a new session",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::SessionList,
-            &["session", "list"],
-            "List active sessions",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::SessionClients,
-            &["session", "clients"],
-            "List connected clients",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::SessionKill,
-            &["session", "kill"],
-            "Kill a session by name or UUID",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::SessionKillAll,
-            &["session", "kill-all"],
-            "Kill all sessions",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::SessionAttach,
-            &["session", "attach"],
-            "Attach to a session by name or UUID",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::SessionDetach,
-            &["session", "detach"],
-            "Detach from the current session",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::SessionFollow,
-            &["session", "follow"],
-            "Follow another client's active target",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::SessionUnfollow,
-            &["session", "unfollow"],
-            "Stop following a client",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::Remote,
-            &["remote"],
-            "Remote target utilities",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::RemoteList,
-            &["remote", "list"],
-            "List configured connection targets",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::RemoteTest,
-            &["remote", "test"],
-            "Verify connectivity to a target",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::RemoteDoctor,
-            &["remote", "doctor"],
-            "Diagnose remote connectivity and bmux readiness",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::RemoteInit,
-            &["remote", "init"],
-            "Create and validate remote target profile",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::RemoteInstallServer,
-            &["remote", "install-server"],
-            "Install or validate remote bmux server runtime",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::RemoteUpgrade,
-            &["remote", "upgrade"],
-            "Upgrade remote bmux runtime on targets",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::RemoteTrust,
-            &["remote", "trust"],
-            "Manage TLS gateway trust pins",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::RemoteTrustList,
-            &["remote", "trust", "list"],
-            "List TLS gateway trust pins",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::RemoteTrustAdd,
-            &["remote", "trust", "add"],
-            "Trust and pin a TLS gateway",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::RemoteTrustRemove,
-            &["remote", "trust", "remove"],
-            "Remove a local TLS gateway trust pin",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::RemoteComplete,
-            &["remote", "complete"],
-            "Shell completion helpers",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::RemoteCompleteTargets,
-            &["remote", "complete", "targets"],
-            "Print target completions",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::RemoteCompleteSessions,
-            &["remote", "complete", "sessions"],
-            "Print session completions",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::Server,
@@ -443,16 +119,6 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::ServerWhoamiPrincipal,
             &["server", "whoami-principal"],
             "Show active principal id",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::ServerSave,
-            &["server", "save"],
-            "Save server state",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::ServerRestore,
-            &["server", "restore"],
-            "Restore server state",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::ServerStop,
@@ -503,52 +169,6 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::LogsLevel,
             &["logs", "level"],
             "Show effective runtime log level",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::LogsTail,
-            &["logs", "tail"],
-            "Tail recent log lines",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::LogsWatch,
-            &["logs", "watch"],
-            "Interactive log viewer with live filters",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::Diagnostics,
-            &["diagnostics"],
-            "Structured diagnostics event viewer",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::DiagnosticsWatch,
-            &["diagnostics", "watch"],
-            "Interactive structured diagnostics event viewer",
-        )
-        .with_alias(&["diagnostics", "view"]),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::LogsProfiles,
-            &["logs", "profiles"],
-            "Manage saved log watch profiles",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::LogsProfilesList,
-            &["logs", "profiles", "list"],
-            "List saved watch profiles",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::LogsProfilesShow,
-            &["logs", "profiles", "show"],
-            "Show details for one watch profile",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::LogsProfilesDelete,
-            &["logs", "profiles", "delete"],
-            "Delete a saved watch profile",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::LogsProfilesRename,
-            &["logs", "profiles", "rename"],
-            "Rename a saved watch profile",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::Config,
@@ -621,26 +241,6 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             "Explain scoped config source resolution",
         ),
         BuiltInExecutionCommand::new(
-            BuiltInHandlerId::Perf,
-            &["perf"],
-            "Runtime performance telemetry controls",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::PerfStatus,
-            &["perf", "status"],
-            "Show runtime performance telemetry settings",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::PerfOn,
-            &["perf", "on"],
-            "Enable runtime performance telemetry",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::PerfOff,
-            &["perf", "off"],
-            "Disable runtime performance telemetry",
-        ),
-        BuiltInExecutionCommand::new(
             BuiltInHandlerId::Doctor,
             &["doctor"],
             "Run system-wide health checks",
@@ -674,41 +274,6 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::TerminalInstallTerminfo,
             &["terminal", "install-terminfo"],
             "Install terminfo entry",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::Playbook,
-            &["playbook"],
-            "Headless playbook execution and testing",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::PlaybookRun,
-            &["playbook", "run"],
-            "Run a playbook",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::PlaybookValidate,
-            &["playbook", "validate"],
-            "Validate a playbook without executing",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::PlaybookInteractive,
-            &["playbook", "interactive"],
-            "Start an interactive playbook session",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::PlaybookDryRun,
-            &["playbook", "dry-run"],
-            "Dry-run a playbook: parse, validate, and print the execution plan",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::PlaybookDiff,
-            &["playbook", "diff"],
-            "Compare results from two playbook runs",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::PlaybookCleanup,
-            &["playbook", "cleanup"],
-            "Clean playbook sandbox temp directories",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::Sandbox,
@@ -887,7 +452,6 @@ mod tests {
     fn reserved_built_in_paths() -> BTreeSet<Vec<String>> {
         built_in_execution_commands()
             .into_iter()
-            .filter(|command| !matches!(command.handler, BuiltInHandlerId::Session))
             .flat_map(|command| command.all_paths().cloned().collect::<Vec<_>>())
             .collect()
     }
@@ -895,8 +459,8 @@ mod tests {
     #[test]
     fn reserved_paths_include_current_static_commands() {
         let paths = reserved_built_in_paths();
-        assert!(paths.contains(&vec!["new-session".to_string()]));
-        assert!(paths.contains(&vec!["session".to_string(), "new".to_string()]));
+        assert!(!paths.contains(&vec!["new-session".to_string()]));
+        assert!(!paths.contains(&vec!["session".to_string(), "new".to_string()]));
         assert!(paths.contains(&vec!["terminal".to_string(), "doctor".to_string()]));
     }
 

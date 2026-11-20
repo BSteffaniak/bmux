@@ -88,9 +88,7 @@ pub(crate) use bmux_cluster_plugin_api::{
 pub(crate) use bmux_config::BmuxConfig;
 pub(crate) use bmux_plugin::prompt;
 pub(crate) use bmux_plugin_sdk::prelude::*;
-pub(crate) use bmux_plugin_sdk::{
-    CoreCliCommandRequest, NativeCommandContext, StorageGetRequest, StorageSetRequest,
-};
+pub(crate) use bmux_plugin_sdk::{NativeCommandContext, StorageGetRequest, StorageSetRequest};
 pub(crate) use serde::{Deserialize, Serialize};
 pub(crate) use std::collections::{BTreeMap, BTreeSet};
 pub(crate) use std::path::PathBuf;
@@ -1454,14 +1452,7 @@ mod tests {
     }
 
     impl ClusterRuntimeOps for FakeRuntime {
-        fn core_cli_command_run_path(
-            &self,
-            request: &CoreCliCommandRequest,
-        ) -> Result<bmux_plugin_sdk::CoreCliCommandResponse, String> {
-            let target = request
-                .arguments
-                .first()
-                .ok_or_else(|| "missing target argument".to_string())?;
+        fn remote_probe_status(&self, _: HealthProbe, target: &str) -> Result<i32, String> {
             let healthy = {
                 let mut guard = self.inner.lock().expect("runtime lock poisoned");
                 if let Some(sequence) = guard.health_sequences.get_mut(target)
@@ -1473,9 +1464,7 @@ mod tests {
                     guard.health.get(target).copied().unwrap_or(false)
                 }
             };
-            let mut response = bmux_plugin_sdk::CoreCliCommandResponse::new(i32::from(!healthy));
-            response.protocol_version = request.protocol_version;
-            Ok(response)
+            Ok(i32::from(!healthy))
         }
 
         fn session_list(&self) -> Result<SessionListResponse, String> {

@@ -1,10 +1,8 @@
 use anyhow::Result;
 use bmux_cli_schema::{
-    AccessCommand, AuthCommand, Command, ConfigCommand, ConfigProfilesCommand, ConfigScopeCommand,
-    DiagnosticsCommand, KeymapCommand, KioskCommand, LogsCommand, LogsProfilesCommand, PerfCommand,
-    PlaybookCommand, RecordingEventKindArg, RemoteCommand, RemoteCompleteCommand,
-    RemoteTrustCommand, SandboxCommand, SandboxEnvModeArg, SandboxSourceArg, SandboxStatusArg,
-    ServerAutostartCommand, ServerCommand, SessionCommand, SlotCommand, TerminalCommand,
+    Command, ConfigCommand, ConfigProfilesCommand, ConfigScopeCommand, KeymapCommand, LogsCommand,
+    RecordingEventKindArg, SandboxCommand, SandboxEnvModeArg, SandboxSourceArg, SandboxStatusArg,
+    ServerAutostartCommand, ServerCommand, SlotCommand, TerminalCommand,
 };
 use bmux_config::{BmuxConfig, SandboxCleanupSource};
 use bmux_recording_protocol::{RecordingEventKind, RecordingRollingStartOptions};
@@ -12,31 +10,18 @@ use bmux_recording_protocol::{RecordingEventKind, RecordingRollingStartOptions};
 use super::{
     BuiltInHandlerId, BundleIncludeOptions, BundleSandboxOptions, ConnectionContext,
     InspectTargetOptions, RerunSandboxOptions, RunSandboxOptions, TriageBundleOptions,
-    TriageSandboxOptions, built_in_command_by_handler, run_access_add, run_access_disable,
-    run_access_enable, run_access_init, run_access_list, run_access_remove, run_access_status,
-    run_auth_login, run_auth_logout, run_auth_status, run_client_list, run_config_get,
-    run_config_path, run_config_profiles_diff, run_config_profiles_evaluate,
-    run_config_profiles_explain, run_config_profiles_lint, run_config_profiles_list,
-    run_config_profiles_resolve, run_config_profiles_show, run_config_profiles_switch,
-    run_config_scope_explain, run_config_set, run_config_show, run_connect, run_device_seal_broker,
-    run_diagnostics_watch, run_doctor, run_external_plugin_command, run_follow, run_host,
-    run_hosts, run_join, run_keymap_doctor, run_keymap_explain, run_kiosk_attach, run_kiosk_init,
-    run_kiosk_issue_token, run_kiosk_revoke_token, run_kiosk_ssh_print_config, run_kiosk_status,
-    run_logs_level, run_logs_path, run_logs_profiles_delete, run_logs_profiles_list,
-    run_logs_profiles_rename, run_logs_profiles_show, run_logs_tail, run_logs_watch, run_perf_off,
-    run_perf_on, run_perf_status, run_playbook_cleanup, run_playbook_diff, run_playbook_dry_run,
-    run_playbook_interactive, run_playbook_run, run_playbook_validate,
-    run_remote_complete_sessions, run_remote_complete_targets, run_remote_doctor, run_remote_init,
-    run_remote_install_server, run_remote_list, run_remote_test, run_remote_trust_add,
-    run_remote_trust_list, run_remote_trust_remove, run_remote_upgrade, run_sandbox_bundle,
+    TriageSandboxOptions, built_in_command_by_handler, run_config_get, run_config_path,
+    run_config_profiles_diff, run_config_profiles_evaluate, run_config_profiles_explain,
+    run_config_profiles_lint, run_config_profiles_list, run_config_profiles_resolve,
+    run_config_profiles_show, run_config_profiles_switch, run_config_scope_explain, run_config_set,
+    run_config_show, run_device_seal_broker, run_doctor, run_external_plugin_command,
+    run_keymap_doctor, run_keymap_explain, run_logs_level, run_logs_path, run_sandbox_bundle,
     run_sandbox_cleanup, run_sandbox_doctor, run_sandbox_inspect, run_sandbox_list,
     run_sandbox_open, run_sandbox_rebuild_index, run_sandbox_rerun, run_sandbox_run,
     run_sandbox_status, run_sandbox_tail, run_sandbox_triage, run_sandbox_verify_bundle,
-    run_server_bridge, run_server_gateway, run_server_restore, run_server_save, run_server_start,
-    run_server_status, run_server_stop, run_server_whoami_principal, run_session_attach,
-    run_session_detach, run_session_kill, run_session_kill_all, run_session_list, run_session_new,
-    run_setup, run_share, run_terminal_doctor, run_terminal_install_terminfo, run_unfollow,
-    run_unshare,
+    run_server_bridge, run_server_gateway, run_server_start, run_server_status, run_server_stop,
+    run_server_whoami_principal, run_session_attach, run_terminal_doctor,
+    run_terminal_install_terminfo,
     server_autostart::{
         run_server_autostart_install, run_server_autostart_print, run_server_autostart_status,
         run_server_autostart_uninstall,
@@ -228,70 +213,11 @@ pub(super) async fn run_command(
 #[allow(clippy::too_many_lines)]
 pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
     match command {
-        Command::Setup { .. } => BuiltInHandlerId::Setup,
-        Command::Host { .. } => BuiltInHandlerId::Host,
-        Command::Join { .. } => BuiltInHandlerId::Join,
-        Command::Hosts { .. } => BuiltInHandlerId::Hosts,
-        Command::Auth { command } => match command {
-            AuthCommand::Login { .. } => BuiltInHandlerId::AuthLogin,
-            AuthCommand::Status => BuiltInHandlerId::AuthStatus,
-            AuthCommand::Logout => BuiltInHandlerId::AuthLogout,
-        },
-        Command::Access { .. } => BuiltInHandlerId::Access,
-        Command::Kiosk { command } => match command {
-            KioskCommand::Status { .. } => BuiltInHandlerId::KioskStatus,
-            KioskCommand::Init { .. } => BuiltInHandlerId::KioskInit,
-            KioskCommand::IssueToken { .. } => BuiltInHandlerId::KioskIssueToken,
-            KioskCommand::RevokeToken { .. } => BuiltInHandlerId::KioskRevokeToken,
-            KioskCommand::Attach { .. } => BuiltInHandlerId::KioskAttach,
-            KioskCommand::SshPrintConfig { .. } => BuiltInHandlerId::KioskSshPrintConfig,
-        },
-        Command::Share { .. } => BuiltInHandlerId::Share,
-        Command::Unshare { .. } => BuiltInHandlerId::Unshare,
-        Command::Connect { .. } => BuiltInHandlerId::Connect,
-        Command::NewSession { .. } => BuiltInHandlerId::NewSession,
-        Command::ListSessions { .. } => BuiltInHandlerId::ListSessions,
-        Command::ListClients { .. } => BuiltInHandlerId::ListClients,
-        Command::KillSession { .. } => BuiltInHandlerId::KillSession,
-        Command::KillAllSessions { .. } => BuiltInHandlerId::KillAllSessions,
         Command::Attach { .. } => BuiltInHandlerId::Attach,
-        Command::Detach => BuiltInHandlerId::Detach,
-        Command::Follow { .. } => BuiltInHandlerId::Follow,
-        Command::Unfollow => BuiltInHandlerId::Unfollow,
-        Command::Session { command } => match command {
-            SessionCommand::New { .. } => BuiltInHandlerId::SessionNew,
-            SessionCommand::List { .. } => BuiltInHandlerId::SessionList,
-            SessionCommand::Clients { .. } => BuiltInHandlerId::SessionClients,
-            SessionCommand::Kill { .. } => BuiltInHandlerId::SessionKill,
-            SessionCommand::KillAll { .. } => BuiltInHandlerId::SessionKillAll,
-            SessionCommand::Attach { .. } => BuiltInHandlerId::SessionAttach,
-            SessionCommand::Detach => BuiltInHandlerId::SessionDetach,
-            SessionCommand::Follow { .. } => BuiltInHandlerId::SessionFollow,
-            SessionCommand::Unfollow => BuiltInHandlerId::SessionUnfollow,
-        },
-        Command::Remote { command } => match command {
-            RemoteCommand::List { .. } => BuiltInHandlerId::RemoteList,
-            RemoteCommand::Test { .. } => BuiltInHandlerId::RemoteTest,
-            RemoteCommand::Doctor { .. } => BuiltInHandlerId::RemoteDoctor,
-            RemoteCommand::Init { .. } => BuiltInHandlerId::RemoteInit,
-            RemoteCommand::InstallServer { .. } => BuiltInHandlerId::RemoteInstallServer,
-            RemoteCommand::Upgrade { .. } => BuiltInHandlerId::RemoteUpgrade,
-            RemoteCommand::Trust { command } => match command {
-                RemoteTrustCommand::List => BuiltInHandlerId::RemoteTrustList,
-                RemoteTrustCommand::Add { .. } => BuiltInHandlerId::RemoteTrustAdd,
-                RemoteTrustCommand::Remove { .. } => BuiltInHandlerId::RemoteTrustRemove,
-            },
-            RemoteCommand::Complete { command } => match command {
-                RemoteCompleteCommand::Targets => BuiltInHandlerId::RemoteCompleteTargets,
-                RemoteCompleteCommand::Sessions { .. } => BuiltInHandlerId::RemoteCompleteSessions,
-            },
-        },
         Command::Server { command } => match command {
             ServerCommand::Start { .. } => BuiltInHandlerId::ServerStart,
             ServerCommand::Status { .. } => BuiltInHandlerId::ServerStatus,
             ServerCommand::WhoamiPrincipal { .. } => BuiltInHandlerId::ServerWhoamiPrincipal,
-            ServerCommand::Save => BuiltInHandlerId::ServerSave,
-            ServerCommand::Restore { .. } => BuiltInHandlerId::ServerRestore,
             ServerCommand::Stop => BuiltInHandlerId::ServerStop,
             ServerCommand::Autostart { command } => match command {
                 ServerAutostartCommand::Install { .. } => BuiltInHandlerId::ServerAutostartInstall,
@@ -305,19 +231,6 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
         Command::Logs { command } => match command {
             LogsCommand::Path { .. } => BuiltInHandlerId::LogsPath,
             LogsCommand::Level { .. } => BuiltInHandlerId::LogsLevel,
-            LogsCommand::Tail { .. } => BuiltInHandlerId::LogsTail,
-            LogsCommand::Watch { .. } => BuiltInHandlerId::LogsWatch,
-            LogsCommand::Profiles { command } => match command {
-                LogsProfilesCommand::List { .. } => BuiltInHandlerId::LogsProfilesList,
-                LogsProfilesCommand::Show { .. } => BuiltInHandlerId::LogsProfilesShow,
-                LogsProfilesCommand::Delete { .. } => BuiltInHandlerId::LogsProfilesDelete,
-                LogsProfilesCommand::Rename { .. } => BuiltInHandlerId::LogsProfilesRename,
-            },
-        },
-        Command::Diagnostics { command } => match command {
-            DiagnosticsCommand::Watch { .. } | DiagnosticsCommand::View { .. } => {
-                BuiltInHandlerId::DiagnosticsWatch
-            }
         },
         Command::Config { command } => match command {
             ConfigCommand::Path { .. } => BuiltInHandlerId::ConfigPath,
@@ -338,11 +251,6 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
                 ConfigScopeCommand::Explain { .. } => BuiltInHandlerId::ConfigScopeExplain,
             },
         },
-        Command::Perf { command } => match command {
-            PerfCommand::Status { .. } => BuiltInHandlerId::PerfStatus,
-            PerfCommand::On { .. } => BuiltInHandlerId::PerfOn,
-            PerfCommand::Off { .. } => BuiltInHandlerId::PerfOff,
-        },
         Command::Doctor { .. } => BuiltInHandlerId::Doctor,
         Command::Keymap { command } => match command {
             KeymapCommand::Doctor { .. } => BuiltInHandlerId::KeymapDoctor,
@@ -351,14 +259,6 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
         Command::Terminal { command } => match command {
             TerminalCommand::Doctor { .. } => BuiltInHandlerId::TerminalDoctor,
             TerminalCommand::InstallTerminfo { .. } => BuiltInHandlerId::TerminalInstallTerminfo,
-        },
-        Command::Playbook { command } => match command {
-            PlaybookCommand::Run { .. } => BuiltInHandlerId::PlaybookRun,
-            PlaybookCommand::Validate { .. } => BuiltInHandlerId::PlaybookValidate,
-            PlaybookCommand::Interactive { .. } => BuiltInHandlerId::PlaybookInteractive,
-            PlaybookCommand::DryRun { .. } => BuiltInHandlerId::PlaybookDryRun,
-            PlaybookCommand::Diff { .. } => BuiltInHandlerId::PlaybookDiff,
-            PlaybookCommand::Cleanup { .. } => BuiltInHandlerId::PlaybookCleanup,
         },
         Command::Sandbox { command } => match command {
             SandboxCommand::Dev { .. } => BuiltInHandlerId::SandboxDev,
@@ -409,233 +309,6 @@ pub(super) async fn dispatch_built_in_command(
     let handler = built_in_handler_for_command(command);
     let _descriptor = built_in_command_by_handler(handler);
     match (handler, command) {
-        (BuiltInHandlerId::Setup, Command::Setup { check, mode }) => run_setup(*check, *mode).await,
-        (
-            BuiltInHandlerId::Host,
-            Command::Host {
-                listen,
-                name,
-                copy,
-                daemon,
-                status,
-                stop,
-                restart,
-                mode,
-            },
-        ) => {
-            Box::pin(run_host(
-                listen,
-                name.as_deref(),
-                *copy,
-                *daemon,
-                *status,
-                *stop,
-                *restart,
-                *mode,
-                false,
-            ))
-            .await
-        }
-        (BuiltInHandlerId::Join, Command::Join { link, session }) => {
-            Box::pin(run_join(link.as_deref(), session.as_deref())).await
-        }
-        (BuiltInHandlerId::Hosts, Command::Hosts { verbose }) => run_hosts(*verbose),
-        (
-            BuiltInHandlerId::AuthLogin,
-            Command::Auth {
-                command: AuthCommand::Login { no_browser },
-            },
-        ) => run_auth_login(*no_browser).await,
-        (
-            BuiltInHandlerId::AuthStatus,
-            Command::Auth {
-                command: AuthCommand::Status,
-            },
-        ) => run_auth_status(),
-        (
-            BuiltInHandlerId::AuthLogout,
-            Command::Auth {
-                command: AuthCommand::Logout,
-            },
-        ) => run_auth_logout(),
-        (
-            BuiltInHandlerId::Access,
-            Command::Access {
-                command: AccessCommand::Status,
-            },
-        ) => run_access_status(),
-        (
-            BuiltInHandlerId::Access,
-            Command::Access {
-                command:
-                    AccessCommand::Init {
-                        agent,
-                        key_file,
-                        public_key,
-                        github_user,
-                        yes,
-                    },
-            },
-        ) => run_access_init(*agent, key_file, public_key, github_user, *yes),
-        (
-            BuiltInHandlerId::Access,
-            Command::Access {
-                command:
-                    AccessCommand::Add {
-                        agent,
-                        key_file,
-                        public_key,
-                        github_user,
-                    },
-            },
-        ) => run_access_add(*agent, key_file, public_key, github_user),
-        (
-            BuiltInHandlerId::Access,
-            Command::Access {
-                command: AccessCommand::List { json },
-            },
-        ) => run_access_list(*json),
-        (
-            BuiltInHandlerId::Access,
-            Command::Access {
-                command: AccessCommand::Remove { fingerprint, yes },
-            },
-        ) => run_access_remove(fingerprint, *yes),
-        (
-            BuiltInHandlerId::Access,
-            Command::Access {
-                command: AccessCommand::Enable,
-            },
-        ) => run_access_enable(),
-        (
-            BuiltInHandlerId::Access,
-            Command::Access {
-                command: AccessCommand::Disable,
-            },
-        ) => run_access_disable(),
-        (
-            BuiltInHandlerId::KioskStatus,
-            Command::Kiosk {
-                command: KioskCommand::Status { json },
-            },
-        ) => run_kiosk_status(*json),
-        (
-            BuiltInHandlerId::KioskInit,
-            Command::Kiosk {
-                command:
-                    KioskCommand::Init {
-                        profile,
-                        all_profiles,
-                        dry_run,
-                        yes,
-                    },
-            },
-        ) => run_kiosk_init(profile, *all_profiles, *dry_run, *yes),
-        (
-            BuiltInHandlerId::KioskIssueToken,
-            Command::Kiosk {
-                command:
-                    KioskCommand::IssueToken {
-                        profile,
-                        session,
-                        ttl_secs,
-                        one_shot,
-                        multi_use,
-                    },
-            },
-        ) => run_kiosk_issue_token(
-            profile,
-            session.as_deref(),
-            *ttl_secs,
-            *one_shot,
-            *multi_use,
-        ),
-        (
-            BuiltInHandlerId::KioskRevokeToken,
-            Command::Kiosk {
-                command: KioskCommand::RevokeToken { token_id },
-            },
-        ) => run_kiosk_revoke_token(token_id),
-        (
-            BuiltInHandlerId::KioskAttach,
-            Command::Kiosk {
-                command: KioskCommand::Attach { profile, token },
-            },
-        ) => run_kiosk_attach(profile, token, connection_context).await,
-        (
-            BuiltInHandlerId::KioskSshPrintConfig,
-            Command::Kiosk {
-                command:
-                    KioskCommand::SshPrintConfig {
-                        profile,
-                        all_profiles,
-                    },
-            },
-        ) => run_kiosk_ssh_print_config(profile, *all_profiles),
-        (
-            BuiltInHandlerId::Share,
-            Command::Share {
-                target,
-                secondary,
-                name,
-                role,
-                ttl,
-                one_time,
-                copy,
-                qr,
-            },
-        ) => {
-            run_share(
-                target.as_deref(),
-                secondary.as_deref(),
-                name.as_deref(),
-                role,
-                ttl.as_deref(),
-                *one_time,
-                *copy,
-                *qr,
-            )
-            .await
-        }
-        (BuiltInHandlerId::Unshare, Command::Unshare { name }) => run_unshare(name).await,
-        (
-            BuiltInHandlerId::Connect,
-            Command::Connect {
-                target,
-                session,
-                follow,
-                global,
-                reconnect_forever,
-            },
-        ) => {
-            Box::pin(run_connect(
-                target.as_deref(),
-                session.as_deref(),
-                follow.as_deref(),
-                *global,
-                *reconnect_forever,
-            ))
-            .await
-        }
-        (BuiltInHandlerId::NewSession, Command::NewSession { name }) => {
-            run_session_new(name.clone(), connection_context).await
-        }
-        (BuiltInHandlerId::ListSessions, Command::ListSessions { json }) => {
-            run_session_list(*json, connection_context).await
-        }
-        (BuiltInHandlerId::ListClients, Command::ListClients { json }) => {
-            run_client_list(*json, connection_context).await
-        }
-        (
-            BuiltInHandlerId::KillSession,
-            Command::KillSession {
-                target,
-                force_local,
-            },
-        ) => run_session_kill(target, *force_local, connection_context).await,
-        (BuiltInHandlerId::KillAllSessions, Command::KillAllSessions { force_local }) => {
-            run_session_kill_all(*force_local, connection_context).await
-        }
         (
             BuiltInHandlerId::Attach,
             Command::Attach {
@@ -693,199 +366,29 @@ pub(super) async fn dispatch_built_in_command(
                 ))
                 .await;
             }
-            Box::pin(run_session_attach(
-                target.as_deref(),
-                follow.as_deref(),
-                *global,
-                connection_context,
-            ))
-            .await
+            // The static attach grammar also serves bare, observer and web
+            // terminals. Only an ordinary named/follow invocation is a
+            // session command; never rerun its argv through the static leaf.
+            if target.is_some() || follow.is_some() {
+                let mut args = Vec::new();
+                args.extend(target.iter().cloned());
+                if let Some(client) = follow {
+                    args.extend(["--follow".to_owned(), client.clone()]);
+                }
+                if *global {
+                    args.push("--global".to_owned());
+                }
+                return Box::pin(super::plugin_runtime::run_plugin_command_with_target(
+                    command_state,
+                    "bmux.sessions",
+                    "session-attach",
+                    &args,
+                    connection_context.target_override,
+                ))
+                .await;
+            }
+            Box::pin(run_session_attach(None, None, false, connection_context)).await
         }
-        (BuiltInHandlerId::Detach, Command::Detach) => run_session_detach(connection_context).await,
-        (
-            BuiltInHandlerId::Follow,
-            Command::Follow {
-                target_client_id,
-                global,
-            },
-        ) => run_follow(target_client_id, *global, connection_context).await,
-        (BuiltInHandlerId::Unfollow, Command::Unfollow) => run_unfollow(connection_context).await,
-        (
-            BuiltInHandlerId::SessionNew,
-            Command::Session {
-                command: SessionCommand::New { name },
-            },
-        ) => run_session_new(name.clone(), connection_context).await,
-        (
-            BuiltInHandlerId::SessionList,
-            Command::Session {
-                command: SessionCommand::List { json },
-            },
-        ) => run_session_list(*json, connection_context).await,
-        (
-            BuiltInHandlerId::SessionClients,
-            Command::Session {
-                command: SessionCommand::Clients { json },
-            },
-        ) => run_client_list(*json, connection_context).await,
-        (
-            BuiltInHandlerId::SessionKill,
-            Command::Session {
-                command:
-                    SessionCommand::Kill {
-                        target,
-                        force_local,
-                    },
-            },
-        ) => run_session_kill(target, *force_local, connection_context).await,
-        (
-            BuiltInHandlerId::SessionKillAll,
-            Command::Session {
-                command: SessionCommand::KillAll { force_local },
-            },
-        ) => run_session_kill_all(*force_local, connection_context).await,
-        (
-            BuiltInHandlerId::SessionAttach,
-            Command::Session {
-                command:
-                    SessionCommand::Attach {
-                        target,
-                        follow,
-                        global,
-                    },
-            },
-        ) => {
-            Box::pin(run_session_attach(
-                target.as_deref(),
-                follow.as_deref(),
-                *global,
-                connection_context,
-            ))
-            .await
-        }
-        (
-            BuiltInHandlerId::SessionDetach,
-            Command::Session {
-                command: SessionCommand::Detach,
-            },
-        ) => run_session_detach(connection_context).await,
-        (
-            BuiltInHandlerId::SessionFollow,
-            Command::Session {
-                command:
-                    SessionCommand::Follow {
-                        target_client_id,
-                        global,
-                    },
-            },
-        ) => run_follow(target_client_id, *global, connection_context).await,
-        (
-            BuiltInHandlerId::SessionUnfollow,
-            Command::Session {
-                command: SessionCommand::Unfollow,
-            },
-        ) => run_unfollow(connection_context).await,
-        (
-            BuiltInHandlerId::RemoteList,
-            Command::Remote {
-                command: RemoteCommand::List { json },
-            },
-        ) => run_remote_list(*json),
-        (
-            BuiltInHandlerId::RemoteTest,
-            Command::Remote {
-                command: RemoteCommand::Test { target },
-            },
-        ) => run_remote_test(target).await,
-        (
-            BuiltInHandlerId::RemoteDoctor,
-            Command::Remote {
-                command: RemoteCommand::Doctor { target, fix },
-            },
-        ) => run_remote_doctor(target, *fix).await,
-        (
-            BuiltInHandlerId::RemoteInit,
-            Command::Remote {
-                command:
-                    RemoteCommand::Init {
-                        name,
-                        ssh,
-                        tls,
-                        iroh,
-                        user,
-                        port,
-                        set_default,
-                    },
-            },
-        ) => {
-            run_remote_init(
-                name,
-                ssh.as_deref(),
-                tls.as_deref(),
-                iroh.as_deref(),
-                user.as_deref(),
-                *port,
-                *set_default,
-            )
-            .await
-        }
-        (
-            BuiltInHandlerId::RemoteInstallServer,
-            Command::Remote {
-                command: RemoteCommand::InstallServer { target },
-            },
-        ) => run_remote_install_server(target).await,
-        (
-            BuiltInHandlerId::RemoteUpgrade,
-            Command::Remote {
-                command: RemoteCommand::Upgrade { target },
-            },
-        ) => run_remote_upgrade(target.as_deref()).await,
-        (
-            BuiltInHandlerId::RemoteTrustList,
-            Command::Remote {
-                command:
-                    RemoteCommand::Trust {
-                        command: RemoteTrustCommand::List,
-                    },
-            },
-        ) => run_remote_trust_list(),
-        (
-            BuiltInHandlerId::RemoteTrustAdd,
-            Command::Remote {
-                command:
-                    RemoteCommand::Trust {
-                        command: RemoteTrustCommand::Add { target, yes },
-                    },
-            },
-        ) => run_remote_trust_add(target, *yes).await,
-        (
-            BuiltInHandlerId::RemoteTrustRemove,
-            Command::Remote {
-                command:
-                    RemoteCommand::Trust {
-                        command: RemoteTrustCommand::Remove { endpoint },
-                    },
-            },
-        ) => run_remote_trust_remove(endpoint),
-        (
-            BuiltInHandlerId::RemoteCompleteTargets,
-            Command::Remote {
-                command:
-                    RemoteCommand::Complete {
-                        command: RemoteCompleteCommand::Targets,
-                    },
-            },
-        ) => run_remote_complete_targets(),
-        (
-            BuiltInHandlerId::RemoteCompleteSessions,
-            Command::Remote {
-                command:
-                    RemoteCommand::Complete {
-                        command: RemoteCompleteCommand::Sessions { target },
-                    },
-            },
-        ) => run_remote_complete_sessions(target).await,
         (BuiltInHandlerId::ServerStart, _) => {
             dispatch_server_start(command, selected_runtime_owner(command_state)).await
         }
@@ -901,18 +404,6 @@ pub(super) async fn dispatch_built_in_command(
                 command: ServerCommand::WhoamiPrincipal { json },
             },
         ) => run_server_whoami_principal(*json, connection_context).await,
-        (
-            BuiltInHandlerId::ServerSave,
-            Command::Server {
-                command: ServerCommand::Save,
-            },
-        ) => run_server_save(connection_context).await,
-        (
-            BuiltInHandlerId::ServerRestore,
-            Command::Server {
-                command: ServerCommand::Restore { dry_run, yes },
-            },
-        ) => run_server_restore(*dry_run, *yes, connection_context).await,
         (
             BuiltInHandlerId::ServerStop,
             Command::Server {
@@ -1005,108 +496,6 @@ pub(super) async fn dispatch_built_in_command(
                 command: LogsCommand::Level { json },
             },
         ) => run_logs_level(*json),
-        (
-            BuiltInHandlerId::LogsTail,
-            Command::Logs {
-                command:
-                    LogsCommand::Tail {
-                        lines,
-                        since,
-                        no_follow,
-                    },
-            },
-        ) => run_logs_tail(*lines, since.as_deref(), !*no_follow),
-        (
-            BuiltInHandlerId::LogsWatch,
-            Command::Logs {
-                command:
-                    LogsCommand::Watch {
-                        lines,
-                        since,
-                        profile,
-                        include,
-                        include_i,
-                        exclude,
-                        exclude_i,
-                    },
-            },
-        ) => run_logs_watch(
-            *lines,
-            since.as_deref(),
-            profile.as_deref(),
-            include,
-            include_i,
-            exclude,
-            exclude_i,
-        ),
-        (
-            BuiltInHandlerId::DiagnosticsWatch,
-            Command::Diagnostics {
-                command:
-                    DiagnosticsCommand::Watch {
-                        lines,
-                        since,
-                        profile,
-                        include,
-                        include_i,
-                        exclude,
-                        exclude_i,
-                    }
-                    | DiagnosticsCommand::View {
-                        lines,
-                        since,
-                        profile,
-                        include,
-                        include_i,
-                        exclude,
-                        exclude_i,
-                    },
-            },
-        ) => run_diagnostics_watch(
-            *lines,
-            since.as_deref(),
-            profile.as_deref(),
-            include,
-            include_i,
-            exclude,
-            exclude_i,
-        ),
-        (
-            BuiltInHandlerId::LogsProfilesList,
-            Command::Logs {
-                command:
-                    LogsCommand::Profiles {
-                        command: LogsProfilesCommand::List { json },
-                    },
-            },
-        ) => run_logs_profiles_list(*json),
-        (
-            BuiltInHandlerId::LogsProfilesShow,
-            Command::Logs {
-                command:
-                    LogsCommand::Profiles {
-                        command: LogsProfilesCommand::Show { profile, json },
-                    },
-            },
-        ) => run_logs_profiles_show(profile.as_deref(), *json),
-        (
-            BuiltInHandlerId::LogsProfilesDelete,
-            Command::Logs {
-                command:
-                    LogsCommand::Profiles {
-                        command: LogsProfilesCommand::Delete { profile },
-                    },
-            },
-        ) => run_logs_profiles_delete(profile),
-        (
-            BuiltInHandlerId::LogsProfilesRename,
-            Command::Logs {
-                command:
-                    LogsCommand::Profiles {
-                        command: LogsProfilesCommand::Rename { from, to },
-                    },
-            },
-        ) => run_logs_profiles_rename(from, to),
         (
             BuiltInHandlerId::ConfigPath,
             Command::Config {
@@ -1217,24 +606,6 @@ pub(super) async fn dispatch_built_in_command(
                     },
             },
         ) => run_config_profiles_evaluate(*json),
-        (
-            BuiltInHandlerId::PerfStatus,
-            Command::Perf {
-                command: PerfCommand::Status { json },
-            },
-        ) => run_perf_status(*json, connection_context).await,
-        (
-            BuiltInHandlerId::PerfOn,
-            Command::Perf {
-                command: PerfCommand::On { profile, json },
-            },
-        ) => run_perf_on(*profile, *json, connection_context).await,
-        (
-            BuiltInHandlerId::PerfOff,
-            Command::Perf {
-                command: PerfCommand::Off { json },
-            },
-        ) => run_perf_off(*json, connection_context).await,
         (BuiltInHandlerId::Doctor, Command::Doctor { json, hosted }) => {
             run_doctor(*json, *hosted).await
         }
@@ -1269,96 +640,6 @@ pub(super) async fn dispatch_built_in_command(
                 command: TerminalCommand::InstallTerminfo { yes, check },
             },
         ) => run_terminal_install_terminfo(*yes, *check),
-        (
-            BuiltInHandlerId::PlaybookRun,
-            Command::Playbook {
-                command:
-                    PlaybookCommand::Run {
-                        source,
-                        json,
-                        interactive,
-                        playback_speed,
-                        target_server,
-                        record,
-                        export_gif,
-                        viewport,
-                        timeout,
-                        shell,
-                        vars,
-                        verbose,
-                    },
-            },
-        ) => {
-            run_playbook_run(
-                source,
-                *json,
-                *interactive,
-                playback_speed,
-                *target_server,
-                *record,
-                export_gif.as_deref(),
-                viewport.as_deref(),
-                *timeout,
-                shell.as_deref(),
-                vars,
-                *verbose,
-                None,
-                command_state,
-            )
-            .await
-        }
-        (
-            BuiltInHandlerId::PlaybookValidate,
-            Command::Playbook {
-                command: PlaybookCommand::Validate { source, json },
-            },
-        ) => run_playbook_validate(source, *json),
-        (
-            BuiltInHandlerId::PlaybookInteractive,
-            Command::Playbook {
-                command:
-                    PlaybookCommand::Interactive {
-                        socket,
-                        record,
-                        viewport,
-                        shell,
-                        timeout,
-                    },
-            },
-        ) => {
-            run_playbook_interactive(
-                socket.as_deref(),
-                *record,
-                viewport,
-                shell.as_deref(),
-                *timeout,
-            )
-            .await
-        }
-        (
-            BuiltInHandlerId::PlaybookDryRun,
-            Command::Playbook {
-                command: PlaybookCommand::DryRun { source, json },
-            },
-        ) => run_playbook_dry_run(source, *json),
-        (
-            BuiltInHandlerId::PlaybookDiff,
-            Command::Playbook {
-                command:
-                    PlaybookCommand::Diff {
-                        left,
-                        right,
-                        json,
-                        timing_threshold,
-                    },
-            },
-        ) => run_playbook_diff(left, right, *json, *timing_threshold),
-        (
-            BuiltInHandlerId::PlaybookCleanup,
-            Command::Playbook {
-                command: PlaybookCommand::Cleanup { dry_run, json },
-            },
-        ) => run_playbook_cleanup(*dry_run, *json),
         (
             BuiltInHandlerId::SandboxDev,
             Command::Sandbox {

@@ -106,7 +106,7 @@ fn stage(input: &mut File, directory: &Path) -> Result<tempfile::NamedTempFile, 
 /// Clone the already-opened source (not its path) to `path`. Clones inherit
 /// file flags, so an immutable source must not yield an immutable staging file.
 #[cfg(target_os = "macos")]
-fn clone(input: &File, path: &Path) -> std::io::Result<File> {
+pub(super) fn clone(input: &File, path: &Path) -> std::io::Result<File> {
     use std::os::unix::{ffi::OsStrExt as _, io::AsRawFd as _};
     let invalid = || std::io::Error::from(std::io::ErrorKind::InvalidInput);
     let parent = File::open(path.parent().ok_or_else(invalid)?)?;

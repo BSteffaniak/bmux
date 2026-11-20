@@ -1618,6 +1618,8 @@ struct SessionRuntimeManager {
 
 #[derive(Clone)]
 struct PaneInputHandle {
+    /// Execution identity is fixed before this live entry is published.
+    execution_token: Option<Uuid>,
     session_id: SessionId,
     input_tx: mpsc::UnboundedSender<PaneRuntimeCommand>,
     exited: Arc<AtomicBool>,
@@ -4294,6 +4296,11 @@ impl PaneInputHandle {
 impl PaneRuntimeHandle {
     fn input_handle(&self, session_id: SessionId) -> PaneInputHandle {
         PaneInputHandle {
+            execution_token: self
+                .resurrection_state
+                .lock()
+                .ok()
+                .map(|state| state.observation_execution),
             session_id,
             input_tx: self.input_tx.clone(),
             exited: Arc::clone(&self.exited),
@@ -7013,8 +7020,9 @@ impl SessionRuntimeManager {
     }
 
     fn register_pane_input(&self, session_id: SessionId, pane: &PaneRuntimeHandle) {
+        let handle = pane.input_handle(session_id);
         if let Ok(mut index) = self.pane_input_index.write() {
-            index.insert(pane.meta.id, pane.input_handle(session_id));
+            index.insert(pane.meta.id, handle);
         }
     }
 
@@ -7042,37 +7050,6 @@ impl SessionRuntimeManager {
         if let Ok(mut permissions) = self.client_write_permissions.write() {
             permissions.remove(&session_id);
         }
-    }
-
-    fn capture_spawn_source(
-        &self,
-        session_id: SessionId,
-        pane_id: Uuid,
-    ) -> std::result::Result<
-        bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SourceExecution,
-        bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError,
-    > {
-        use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::{SourceExecution, SpawnError};
-        let pane = self
-            .runtimes
-            .get(&session_id)
-            .and_then(|runtime| runtime.panes.get(&pane_id))
-            .ok_or(SpawnError::SourceUnavailable)?;
-        let observation = pane
-            .resurrection_state
-            .try_lock()
-            .map_err(|error| match error {
-                std::sync::TryLockError::WouldBlock => SpawnError::Busy,
-                std::sync::TryLockError::Poisoned(_) => SpawnError::SourceUnavailable,
-            })?;
-        if pane.exited.load(Ordering::SeqCst) {
-            return Err(SpawnError::SourceUnavailable);
-        }
-        Ok(SourceExecution {
-            session_id: session_id.0,
-            pane_id,
-            execution_token: observation.observation_execution,
-        })
     }
 
     fn prepare_spawn_directory_probe(
@@ -7139,11 +7116,9 @@ impl SessionRuntimeManager {
         // can reject a session observers have already seen.
         publish()?;
         let runtime = prepared.runtime.take().expect("ready runtime ownership");
-        for pane in runtime.panes.values() {
-            self.register_pane_input(session_id, pane);
-        }
         self.runtimes.insert(session_id, runtime);
         for pane in self.runtimes[&session_id].panes.values() {
+            self.register_pane_input(session_id, pane);
             pane.publication.decide(true);
         }
         Ok(())
@@ -7156,11 +7131,9 @@ impl SessionRuntimeManager {
         options: Option<bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions>,
     ) -> Result<()> {
         let runtime = self.prepare_fresh_runtime(session_id, options)?.take()?;
-        for pane in runtime.panes.values() {
-            self.register_pane_input(session_id, pane);
-        }
         self.runtimes.insert(session_id, runtime);
         for pane in self.runtimes[&session_id].panes.values() {
+            self.register_pane_input(session_id, pane);
             pane.publication.decide(true);
         }
         Ok(())
@@ -7379,7 +7352,6 @@ impl SessionRuntimeManager {
                 None,
             );
             let restored_meta = pane.meta.clone();
-            self.register_pane_input(session_id, &pane);
             runtime_panes.insert(restored_meta.id, pane);
         }
 
@@ -7403,6 +7375,9 @@ impl SessionRuntimeManager {
             .get(&session_id)
             .expect("runtime inserted before validation");
         validate_runtime_layout_matches_panes(runtime)?;
+        for pane in runtime.panes.values() {
+            self.register_pane_input(session_id, pane);
+        }
 
         Ok(())
     }
@@ -9363,7 +9338,6 @@ impl SessionRuntimeManager {
             false,
             initial_shell,
         );
-        self.register_pane_input(session_id, &handle);
         for client_id in client_ids {
             anyhow::ensure!(
                 crate::private_input::register_producer(host, pane_id, client_id.0),
@@ -9382,6 +9356,7 @@ impl SessionRuntimeManager {
         session.layout_root = next_layout;
         session.zoomed_pane_id = None;
         session.focused_pane_id = pane_id;
+        self.register_pane_input(session_id, &self.runtimes[&session_id].panes[&pane_id]);
         self.apply_stored_attach_viewport(session_id);
         Ok(pane_id)
     }
@@ -9617,7 +9592,6 @@ impl SessionRuntimeManager {
         let mut new_pane = self.spawn_pane_runtime(session_id, pane_meta, (24, 80));
         new_pane.padding_override = padding_override;
         new_pane.padding_override_persistence = padding_override_persistence;
-        self.register_pane_input(session_id, &new_pane);
         let client_ids = {
             let session = self
                 .runtimes
@@ -9641,6 +9615,10 @@ impl SessionRuntimeManager {
             .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
         session.panes.insert(restarted_pane_id, new_pane);
         session.focused_pane_id = restarted_pane_id;
+        self.register_pane_input(
+            session_id,
+            &self.runtimes[&session_id].panes[&restarted_pane_id],
+        );
         self.apply_stored_attach_viewport(session_id);
         Ok(restarted_pane_id)
     }
@@ -9742,7 +9720,6 @@ impl SessionRuntimeManager {
             resurrection: PaneResurrectionSnapshot::default(),
         };
         let handle = self.spawn_pane_runtime(session_id, pane_meta, (24, 80));
-        self.register_pane_input(session_id, &handle);
         for client_id in client_ids {
             if let Ok(mut output) = handle.output_buffer.lock() {
                 output.register_client_at_tail(client_id);
@@ -9783,6 +9760,7 @@ impl SessionRuntimeManager {
             .for_each(|surface| surface.cursor_owner = false);
         session.floating_surfaces.push(surface);
         session.focused_pane_id = pane_id;
+        self.register_pane_input(session_id, &self.runtimes[&session_id].panes[&pane_id]);
         self.apply_stored_attach_viewport(session_id);
         Ok(floating_summary(surface))
     }
@@ -13280,7 +13258,11 @@ fn encode_captured_image_window(
 }
 
 #[derive(Clone)]
-pub(crate) struct SpawnRuntimeHandle(Arc<Mutex<SessionRuntimeManager>>, tokio::runtime::Handle);
+pub(crate) struct SpawnRuntimeHandle(
+    Arc<Mutex<SessionRuntimeManager>>,
+    tokio::runtime::Handle,
+    Arc<RwLock<BTreeMap<Uuid, PaneInputHandle>>>,
+);
 
 #[derive(Debug)]
 struct SpawnFailure(bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError);
@@ -13437,14 +13419,30 @@ pub(crate) fn capture_spawn_source(
     let handle = host
         .spawn_runtime_handle()
         .ok_or(SpawnError::SourceUnavailable)?;
-    handle
-        .0
-        .try_lock()
-        .map_err(|error| match error {
-            std::sync::TryLockError::WouldBlock => SpawnError::Busy,
-            std::sync::TryLockError::Poisoned(_) => SpawnError::SourceUnavailable,
-        })?
-        .capture_spawn_source(SessionId(session_id), pane_id)
+    indexed_spawn_source(&handle.2, SessionId(session_id), pane_id)
+}
+
+// The snapshot bracket needs only the published incarnation, not mutable shell
+// metadata. Never take the runtime manager or shell observer lock on this path.
+fn indexed_spawn_source(
+    index: &RwLock<BTreeMap<Uuid, PaneInputHandle>>,
+    session_id: SessionId,
+    pane_id: Uuid,
+) -> std::result::Result<
+    bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SourceExecution,
+    bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError,
+> {
+    use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::{SourceExecution, SpawnError};
+    let index = index.read().map_err(|_| SpawnError::SourceUnavailable)?;
+    let entry = index
+        .get(&pane_id)
+        .filter(|entry| entry.session_id == session_id && !entry.exited.load(Ordering::SeqCst))
+        .ok_or(SpawnError::SourceUnavailable)?;
+    Ok(SourceExecution {
+        session_id: session_id.0,
+        pane_id,
+        execution_token: entry.execution_token.ok_or(SpawnError::SourceUnavailable)?,
+    })
 }
 
 pub(crate) fn observe_spawn_directory(
@@ -14248,9 +14246,9 @@ pub(crate) fn activate_pane_runtime(
         manager: Arc::clone(&manager),
         host: host.clone(),
     }))?;
-    let runtime_handle = bmux_pane_runtime_state::SessionRuntimeManagerHandle::new(
-        ServerSessionRuntimeAdapter::new(Arc::clone(&manager)),
-    );
+    let adapter = ServerSessionRuntimeAdapter::new(Arc::clone(&manager));
+    let pane_index = Arc::clone(&adapter.pane_input_index);
+    let runtime_handle = bmux_pane_runtime_state::SessionRuntimeManagerHandle::new(adapter);
     host.states()
         .register::<bmux_pane_runtime_state::SessionRuntimeManagerHandle>(&Arc::new(
             std::sync::RwLock::new(runtime_handle),
@@ -14264,6 +14262,7 @@ pub(crate) fn activate_pane_runtime(
         .register::<SpawnRuntimeHandle>(&Arc::new(std::sync::RwLock::new(SpawnRuntimeHandle(
             Arc::clone(&manager),
             tokio::runtime::Handle::current(),
+            pane_index,
         ))));
     let expiry_manager = Arc::clone(&manager);
     tokio::spawn(async move {
@@ -18044,21 +18043,50 @@ exit 7"#
     }
 
     #[tokio::test]
+    async fn source_capture_reads_published_identity_while_manager_and_metadata_are_busy() {
+        let session = SessionId(Uuid::new_v4());
+        let pane = Uuid::new_v4();
+        let manager = Arc::new(Mutex::new(manager_with_runtime(
+            session,
+            runtime_with_panes(&[pane]),
+        )));
+        let locked = manager.lock().unwrap();
+        let runtime = &locked.runtimes[&session].panes[&pane];
+        locked.register_pane_input(session, runtime);
+        let metadata = runtime.resurrection_state.lock().unwrap();
+        let host = &locked.host;
+        host.states()
+            .register(&Arc::new(RwLock::new(SpawnRuntimeHandle(
+                Arc::clone(&manager),
+                tokio::runtime::Handle::current(),
+                Arc::clone(&locked.pane_input_index),
+            ))));
+        assert_eq!(
+            capture_spawn_source(host, session.0, pane)
+                .unwrap()
+                .execution_token,
+            metadata.observation_execution
+        );
+    }
+
+    #[tokio::test]
     async fn spawn_source_capture_is_explicit_live_and_incarnation_scoped() {
         use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
         let session_id = SessionId(Uuid::new_v4());
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[first, second]));
-        let captured = manager.capture_spawn_source(session_id, second).unwrap();
+        manager.register_pane_input(session_id, &manager.runtimes[&session_id].panes[&second]);
+        let index = Arc::clone(&manager.pane_input_index);
+        let captured = indexed_spawn_source(&index, session_id, second).unwrap();
         {
             let _held = manager.runtimes[&session_id].panes[&second]
                 .resurrection_state
                 .lock()
                 .unwrap();
             assert_eq!(
-                manager.capture_spawn_source(session_id, second),
-                Err(SpawnError::Busy)
+                indexed_spawn_source(&index, session_id, second),
+                Ok(captured.clone())
             );
             assert_eq!(
                 manager.prepare_spawn_directory_probe(&captured),
@@ -18092,11 +18120,11 @@ exit 7"#
         assert_eq!(observed, SpawnDirectoryProbe::Shell("/current".into()));
         assert_eq!(manager.runtimes[&session_id].focused_pane_id, first);
         assert_eq!(
-            manager.capture_spawn_source(session_id, Uuid::new_v4()),
+            indexed_spawn_source(&index, session_id, Uuid::new_v4()),
             Err(SpawnError::SourceUnavailable)
         );
         assert_eq!(
-            manager.capture_spawn_source(SessionId(Uuid::new_v4()), second),
+            indexed_spawn_source(&index, SessionId(Uuid::new_v4()), second),
             Err(SpawnError::SourceUnavailable)
         );
         manager
@@ -18105,7 +18133,8 @@ exit 7"#
             .unwrap()
             .panes
             .insert(second, dummy_pane(second));
-        let replaced = manager.capture_spawn_source(session_id, second).unwrap();
+        manager.register_pane_input(session_id, &manager.runtimes[&session_id].panes[&second]);
+        let replaced = indexed_spawn_source(&index, session_id, second).unwrap();
         assert_ne!(captured.execution_token, replaced.execution_token);
         assert_eq!(
             manager.prepare_spawn_directory_probe(&captured),
@@ -18115,7 +18144,7 @@ exit 7"#
             .exited
             .store(true, Ordering::SeqCst);
         assert_eq!(
-            manager.capture_spawn_source(session_id, second),
+            indexed_spawn_source(&index, session_id, second),
             Err(SpawnError::SourceUnavailable)
         );
     }
@@ -18372,7 +18401,8 @@ exit 7"#
                 .process_start_identity
                 .lock()
                 .unwrap() = Some(ProcessStartIdentity(1, 0));
-            guard.capture_spawn_source(session_id, pane_id).unwrap()
+            guard.register_pane_input(session_id, &guard.runtimes[&session_id].panes[&pane_id]);
+            indexed_spawn_source(&guard.pane_input_index, session_id, pane_id).unwrap()
         };
         let result = observe_spawn_directory_with(&manager, &source, |pid, _identity| {
             assert_eq!(pid, 123);
@@ -18508,6 +18538,7 @@ exit 7"#
         let pane_input_index = Arc::new(RwLock::new(BTreeMap::from([(
             owner_pane_id,
             PaneInputHandle {
+                execution_token: None,
                 host: crate::runtime::PaneRuntimeHost::detached(),
                 session_id: owner_session_id,
                 input_tx,
@@ -23560,6 +23591,7 @@ exit 7"#
     fn pane_input_handle_rejects_exited_pane() {
         let (input_tx, _input_rx) = mpsc::unbounded_channel();
         let handle = PaneInputHandle {
+            execution_token: None,
             host: crate::runtime::PaneRuntimeHost::detached(),
             session_id: SessionId(Uuid::new_v4()),
             input_tx,

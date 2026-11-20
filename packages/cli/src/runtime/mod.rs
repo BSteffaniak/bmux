@@ -1,45 +1,43 @@
 use crate::connection::{
-    ConnectionContext, ConnectionPolicyScope, ServerRuntimeMetadata, connect,
-    connect_if_running_with_context, connect_raw, connect_raw_with_context, connect_with_context,
-    current_cli_build_id, expand_bmux_target_if_needed, map_client_connect_error,
-    read_server_runtime_metadata, remove_server_runtime_metadata_file,
-    write_server_runtime_metadata,
+    ConnectionContext, ConnectionPolicyScope, ServerRuntimeMetadata, connect, connect_raw,
+    connect_raw_with_context, connect_with_context, current_cli_build_id,
+    expand_bmux_target_if_needed, map_client_connect_error, read_server_runtime_metadata,
+    remove_server_runtime_metadata_file, write_server_runtime_metadata,
 };
 use crate::input::{InputProcessor, Keymap, RuntimeAction};
 use anyhow::{Context, Result};
 use bmux_client::BmuxClient;
 use bmux_config::{BmuxConfig, push_process_config_overrides};
-use bmux_snapshot_plugin_api::offline_snapshot::offline_kill_sessions;
-use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-mod access_cli;
 mod action_dispatch;
 pub mod attach;
 mod attach_selected;
+#[cfg(unix)]
+mod bare_terminal;
 mod bootstrap;
 mod built_in_commands;
 mod cli_parse;
 mod config_cli;
 mod device_seal_broker;
 mod diagnostics_layer;
-mod diagnostics_watch;
 mod dispatch;
 mod doctor_cli;
 mod hosted_output;
+#[cfg(feature = "bundled-plugin-connections")]
 mod kiosk_cli;
 mod logs_cli;
 mod logs_watch;
 mod managed_companion;
-mod perf_cli;
 mod perf_telemetry;
-mod playbook_cli;
 mod plugin_commands;
 mod plugin_host;
 mod plugin_kernel;
 mod plugin_runtime;
 pub use plugin_runtime::RuntimeCommandState;
+#[cfg(feature = "docs-test")]
+pub use plugin_runtime::bundled_cli_command_for_docs;
 mod prompt;
 mod remote_cli;
 mod sandbox_cli;
@@ -55,14 +53,7 @@ mod terminal_doctor;
 mod terminal_protocol;
 mod web_attach;
 
-use self::logs_watch::{
-    active_log_file_path, run_logs_profiles_delete, run_logs_profiles_list,
-    run_logs_profiles_rename, run_logs_profiles_show, run_logs_watch,
-};
-use access_cli::{
-    run_access_add, run_access_disable, run_access_enable, run_access_init, run_access_list,
-    run_access_remove, run_access_status,
-};
+use self::logs_watch::active_log_file_path;
 pub use action_dispatch::{ActionDispatchError, ActionDispatchRequest};
 pub use attach::runtime::AttachRunOutcome;
 use attach::runtime::run_session_attach_with_client;
@@ -80,19 +71,9 @@ use config_cli::{
     run_config_profiles_switch, run_config_scope_explain, run_config_set, run_config_show,
 };
 use device_seal_broker::run_device_seal_broker;
-use diagnostics_watch::run_diagnostics_watch;
 use dispatch::run_command;
 use doctor_cli::run_doctor;
-use kiosk_cli::{
-    run_kiosk_attach, run_kiosk_init, run_kiosk_issue_token, run_kiosk_revoke_token,
-    run_kiosk_ssh_print_config, run_kiosk_status,
-};
-use logs_cli::{run_logs_level, run_logs_path, run_logs_tail};
-use perf_cli::{run_perf_off, run_perf_on, run_perf_status};
-use playbook_cli::{
-    run_playbook_cleanup, run_playbook_diff, run_playbook_dry_run, run_playbook_interactive,
-    run_playbook_run, run_playbook_validate,
-};
+use logs_cli::{run_logs_level, run_logs_path};
 pub use plugin_kernel::KernelClientFactory;
 use plugin_kernel::{
     EFFECTIVE_LOG_LEVEL, LOG_CONTROL, available_capability_providers,
@@ -102,12 +83,12 @@ use plugin_kernel::{
 };
 use plugin_runtime::{
     activate_loaded_plugins, build_runtime_command_state, command_accepts_repeat,
-    deactivate_loaded_plugins, discover_bundled_plugin_ids, dispatch_loaded_plugin_event,
-    effective_enabled_plugins, install_enabled_client_adapters, load_enabled_plugins, load_plugin,
+    deactivate_loaded_plugins, dispatch_loaded_plugin_event, effective_enabled_plugins,
+    install_enabled_client_adapters, load_enabled_plugins, load_plugin,
     plugin_command_policy_hints, plugin_event_bridge_loop, plugin_host_metadata,
     plugin_system_event, resolve_plugin_search_paths, run_external_plugin_command,
-    run_plugin_command, run_plugin_command_with_state, run_plugin_keybinding_command,
-    run_plugin_keybinding_command_with_state, scan_available_plugins, validate_enabled_plugins,
+    run_plugin_keybinding_command, run_plugin_keybinding_command_with_state,
+    scan_available_plugins, validate_enabled_plugins,
 };
 pub use prompt::{
     PromptEvent, PromptField, PromptFormField, PromptFormLayout, PromptFormSection,
@@ -116,11 +97,7 @@ pub use prompt::{
 };
 use remote_cli::{
     SSH_RECONNECT_MAX_ATTEMPTS, connect_attach_target_with_kernel, reconnect_backoff_ms,
-    run_auth_login, run_auth_logout, run_auth_status, run_connect, run_host, run_hosts, run_join,
-    run_remote_complete_sessions, run_remote_complete_targets, run_remote_doctor, run_remote_init,
-    run_remote_install_server, run_remote_list, run_remote_test, run_remote_trust_add,
-    run_remote_trust_list, run_remote_trust_remove, run_remote_upgrade, run_setup, run_share,
-    run_target_proxy_from_current_argv, run_unshare, should_proxy_to_target,
+    run_target_proxy_from_current_argv, should_proxy_to_target,
 };
 use sandbox_cli::{
     BundleIncludeOptions, BundleSandboxOptions, InspectTargetOptions, RerunSandboxOptions,
@@ -130,8 +107,8 @@ use sandbox_cli::{
     run_sandbox_status, run_sandbox_tail, run_sandbox_triage, run_sandbox_verify_bundle,
 };
 use server_commands::{
-    run_server_bridge, run_server_gateway, run_server_restore, run_server_save, run_server_status,
-    run_server_stop, run_server_whoami_principal, server_event_name,
+    run_server_bridge, run_server_gateway, run_server_status, run_server_stop,
+    run_server_whoami_principal, server_event_name,
 };
 use server_runtime::{
     cleanup_stale_pid_file, fetch_server_status, read_server_pid_file, remove_server_pid_file,
@@ -143,13 +120,8 @@ use server_runtime::{
 pub fn is_pid_running_crate(pid: u32) -> anyhow::Result<bool> {
     server_runtime::is_pid_running(pid)
 }
-use session_cli::{
-    attach_quit_failure_status, run_client_list, run_session_kill, run_session_kill_all,
-    run_session_list, run_session_new,
-};
-use session_follow::{
-    parse_session_selector, parse_uuid_value, run_follow, run_session_detach, run_unfollow,
-};
+use session_cli::attach_quit_failure_status;
+use session_follow::{parse_session_selector, parse_uuid_value, run_session_detach};
 use terminal_doctor::{
     check_terminfo_available, merged_runtime_keybindings, resolve_pane_term, run_keymap_doctor,
     run_keymap_explain, run_terminal_doctor, run_terminal_install_terminfo, terminal_profile_name,
@@ -175,10 +147,6 @@ pub fn active_runtime_name() -> String {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "default".to_string())
-}
-
-pub fn append_runtime_arg(command: &mut ProcessCommand) {
-    command.arg("--runtime").arg(active_runtime_name());
 }
 
 pub fn initialize_native_plugins(
@@ -252,22 +220,23 @@ enum TerminalProfile {
 /// Returns `true` for commands that enter raw terminal mode (TUI attach
 /// sessions).  When `command` is `None` the default attach path is taken,
 /// which always enters raw mode.
-const fn logging_scope_for_command(command: Option<&bmux_cli_schema::Command>) -> LogProcessScope {
-    use bmux_cli_schema::{Command, KioskCommand, ServerCommand, SessionCommand};
+fn logging_scope_for_command(command: Option<&bmux_cli_schema::Command>) -> LogProcessScope {
+    use bmux_cli_schema::{Command, ServerCommand};
     let Some(cmd) = command else {
         return LogProcessScope::Client;
     };
     match cmd {
-        Command::Attach { .. }
-        | Command::Connect { .. }
-        | Command::Join { .. }
-        | Command::Host { .. }
-        | Command::Kiosk {
-            command: KioskCommand::Attach { .. },
+        Command::External(args)
+            if args
+                .first()
+                .is_some_and(|s| matches!(s.as_str(), "connect" | "join" | "host")) =>
+        {
+            LogProcessScope::Client
         }
-        | Command::Session {
-            command: SessionCommand::Attach { .. },
-        } => LogProcessScope::Client,
+        Command::Attach { .. } => LogProcessScope::Client,
+        Command::External(args) if matches!(args.as_slice(), [group, leaf, ..] if matches!(group.as_str(), "session" | "kiosk") && leaf == "attach") => {
+            LogProcessScope::Client
+        }
         Command::Server {
             command: ServerCommand::Start { .. } | ServerCommand::Gateway { .. },
         } => LogProcessScope::Server,
@@ -281,28 +250,29 @@ pub fn set_logging_client_id(client_id: impl Into<String>) {
     }
 }
 
-const fn command_enters_raw_mode(command: Option<&bmux_cli_schema::Command>) -> bool {
-    use bmux_cli_schema::{Command, LogsCommand, PlaybookCommand, SessionCommand};
+fn command_enters_raw_mode(command: Option<&bmux_cli_schema::Command>) -> bool {
+    use bmux_cli_schema::Command;
     let Some(cmd) = command else {
         // Default path (no subcommand) = attach to server.
         return true;
     };
-    matches!(
-        cmd,
-        Command::Attach { .. }
-            | Command::Connect { .. }
-            | Command::Join { .. }
-            | Command::Host { .. }
-            | Command::Session {
-                command: SessionCommand::Attach { .. }
-            }
-            | Command::Playbook {
-                command: PlaybookCommand::Run { .. } | PlaybookCommand::Interactive { .. }
-            }
-            | Command::Logs {
-                command: LogsCommand::Watch { .. }
-            }
-    )
+    if let Command::External(args) = cmd
+        && matches!(args.as_slice(), [group, leaf, ..] if group == "playbook" && matches!(leaf.as_str(), "interactive" | "run"))
+    {
+        return true;
+    }
+    if let Command::External(args) = cmd
+        && args
+            .first()
+            .is_some_and(|s| matches!(s.as_str(), "connect" | "join" | "host"))
+    {
+        return true;
+    }
+    if matches!(cmd, Command::External(args) if matches!(args.as_slice(), [group, leaf, ..] if group == "session" && leaf == "attach"))
+    {
+        return true;
+    }
+    matches!(cmd, Command::Attach { .. })
 }
 
 /// Print a startup banner on stderr when:
@@ -385,6 +355,7 @@ pub async fn run(runtime_owner: Option<crate::runtime_owner::RuntimeOwner>) -> R
             run_default_server_attach(DefaultAttachOptions, connection_context).await
         }
         ParsedRuntimeCli::Plugin {
+            target,
             log_level,
             plugin_id,
             command_name,
@@ -396,12 +367,14 @@ pub async fn run(runtime_owner: Option<crate::runtime_owner::RuntimeOwner>) -> R
             let _logging_guard =
                 init_logging(false, Some(log_level), false, LogProcessScope::Command);
             tracing::info!(plugin_id, command_name, "runtime.cli.plugin_start");
-            if let Some(command_state) = command_state.as_ref() {
-                run_plugin_command_with_state(command_state, &plugin_id, &command_name, &arguments)
-                    .await
-            } else {
-                run_plugin_command(&plugin_id, &command_name, &arguments).await
-            }
+            plugin_runtime::run_plugin_command_with_target(
+                command_state.as_ref(),
+                &plugin_id,
+                &command_name,
+                &arguments,
+                target.as_deref(),
+            )
+            .await
         }
         ParsedRuntimeCli::ImmediateExit {
             code,

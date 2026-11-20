@@ -1,3 +1,5 @@
+#![cfg(feature = "bundled-plugin-tab-bar")]
+
 #[allow(dead_code)] // Shared subprocess fixture also supports gateway-specific tests.
 mod support;
 

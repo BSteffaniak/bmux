@@ -302,3 +302,13 @@ short = "j"
 
 # Explicit immutable v1 contracts. Route IDs are wire identities, not version
 # syntax: retain legacy names and negotiate their major separately.
+
+[cli_help]
+"session grant"                    = { order = 12 }
+"session grant-hot-path-override"  = { order = 14 }
+"session hot-path-policy"          = { order = 10 }
+"session list-hot-path-overrides"  = { order = 16 }
+"session permissions"              = { order = 9 }
+"session permissions-current"      = { order = 11 }
+"session revoke"                   = { order = 13 }
+"session revoke-hot-path-override" = { order = 15 }

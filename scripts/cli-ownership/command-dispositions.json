@@ -1,0 +1,4944 @@
+{
+  "baseline": "3320b28b58b6276e5c656c5206cd1571982d1370",
+  "scope": "Static parser, execution table, plugin manifest commands/aliases (including hidden) and all parent namespaces. Handler identifiers refer to packages/cli/src/runtime/built_in_commands.rs and dispatch.rs; schema identifiers to packages/cli-schema/src/lib.rs. Structural audit, not a runtime transcript waiver.",
+  "reasons": {
+    "attach": "Neutral local terminal entry point must survive the absence of Sessions. See INVARIANTS.md: Baseline operation survives missing domain plugins.",
+    "config": "Read, inspect or change the configuration that selects plugins and their execution environment. See docs/development/cli-bootstrap-boundary.md: config.",
+    "device-seal-broker": "Pane launcher invokes the current executable as an opaque stdin/stdout credential broker; this is not an interactive domain command. See docs/development/cli-bootstrap-boundary.md: SSHENV_DEVICE_SEAL_COMMAND.",
+    "doctor": "Inspect a broken installation without requiring the plugin being diagnosed. Hosted checks remain a boundary to review; see packages/cli/src/runtime/doctor_cli.rs.",
+    "slot": "Select or repair an executable and its environment before loading its plugins. See docs/development/cli-bootstrap-boundary.md: slot and env.",
+    "logs": "Recover logging configuration/path without requiring the optional log viewer. See packages/cli/src/runtime/logs_cli.rs.",
+    "terminal": "Probe the terminal and its terminfo installation even when optional UX plugins are missing. See packages/cli/src/runtime/terminal_doctor.rs.",
+    "keymap": "Inspect effective input mapping independently of optional command/decoration plugins. See packages/cli/src/runtime/terminal_doctor.rs.",
+    "sandbox": "Provision, inspect or recover an isolated runtime independently of its installed domain owners. See docs/development/cli-bootstrap-boundary.md: sandbox.",
+    "server": "Launch, stop or inspect the server that hosts plugin execution. See docs/development/cli-bootstrap-boundary.md: server lifecycle.",
+    "autostart": "Install or repair the service-manager entry before any server/plugin runtime exists. See packages/cli/src/runtime/server_autostart.rs.",
+    "bridge": "The SSH transport invokes this binary over stdio; preserve preflight and protocol stdout. See docs/development/cli-bootstrap-boundary.md: server bridge.",
+    "gateway": "Retained gateway process/transport launcher, not proof of client authorization. Host policy remains subject to the boundary in docs/development/cli-command-ownership-audit.md.",
+    "plugin": "Manifest declares the native plugin command or alias. Exposure does not imply activation or authorize a core fallback.",
+    "namespace": "Dispatch-only prefix composed from the child owners; do not transfer a whole mixed namespace to one plugin.",
+    "hidden": "Manifest command is not exposed in the CLI. Do not turn an internal binding into a public leaf.",
+    "migration": "Domain behavior belongs to the declared plugin; no parallel static leaf or proxy to the removed handler. See docs/development/cli-command-ownership-audit.md."
+  },
+  "paths": {
+    "access": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.connections"
+      ],
+      "reason": "namespace",
+      "frozen_help": true
+    },
+    "access add": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "access-add",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "access add",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "access disable": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "access-disable",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "access disable",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "access enable": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "access-enable",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "access enable",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "access init": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "access-init",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "access init",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "access list": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "access-list",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "access list",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "access remove": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "access-remove",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "access remove",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "access status": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "access-status",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "access status",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "attach": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "attach",
+      "schema": "Command::Attach",
+      "core": "Attach",
+      "core_callers": [
+        "bmux.connections:connect"
+      ],
+      "frozen_help": true
+    },
+    "auth": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.connections"
+      ],
+      "reason": "namespace",
+      "frozen_help": true
+    },
+    "auth login": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "auth-login",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "auth login",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "auth logout": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "auth-logout",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "auth logout",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "auth status": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "auth-status",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "auth status",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "broadcast": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.broadcast",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.broadcast",
+          "command": "broadcast",
+          "manifest": "plugins/broadcast-plugin/plugin.toml",
+          "canonical": "broadcast",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "broadcast doctor": {
+      "disposition": "non-cli",
+      "owner": "bmux.broadcast",
+      "reason": "hidden",
+      "declarations": [
+        {
+          "owner": "bmux.broadcast",
+          "command": "broadcast-doctor",
+          "manifest": "plugins/broadcast-plugin/plugin.toml",
+          "canonical": "broadcast doctor",
+          "exposed": false
+        }
+      ],
+      "frozen_help": true
+    },
+    "broadcast pause": {
+      "disposition": "non-cli",
+      "owner": "bmux.broadcast",
+      "reason": "hidden",
+      "declarations": [
+        {
+          "owner": "bmux.broadcast",
+          "command": "broadcast-pause",
+          "manifest": "plugins/broadcast-plugin/plugin.toml",
+          "canonical": "broadcast pause",
+          "exposed": false
+        }
+      ],
+      "frozen_help": true
+    },
+    "broadcast resume": {
+      "disposition": "non-cli",
+      "owner": "bmux.broadcast",
+      "reason": "hidden",
+      "declarations": [
+        {
+          "owner": "bmux.broadcast",
+          "command": "broadcast-resume",
+          "manifest": "plugins/broadcast-plugin/plugin.toml",
+          "canonical": "broadcast resume",
+          "exposed": false
+        }
+      ],
+      "frozen_help": true
+    },
+    "broadcast setup": {
+      "disposition": "non-cli",
+      "owner": "bmux.broadcast",
+      "reason": "hidden",
+      "declarations": [
+        {
+          "owner": "bmux.broadcast",
+          "command": "broadcast-setup",
+          "manifest": "plugins/broadcast-plugin/plugin.toml",
+          "canonical": "broadcast setup",
+          "exposed": false
+        }
+      ],
+      "frozen_help": true
+    },
+    "broadcast start": {
+      "disposition": "non-cli",
+      "owner": "bmux.broadcast",
+      "reason": "hidden",
+      "declarations": [
+        {
+          "owner": "bmux.broadcast",
+          "command": "broadcast-start",
+          "manifest": "plugins/broadcast-plugin/plugin.toml",
+          "canonical": "broadcast start",
+          "exposed": false
+        }
+      ],
+      "frozen_help": true
+    },
+    "broadcast stop": {
+      "disposition": "non-cli",
+      "owner": "bmux.broadcast",
+      "reason": "hidden",
+      "declarations": [
+        {
+          "owner": "bmux.broadcast",
+          "command": "broadcast-stop",
+          "manifest": "plugins/broadcast-plugin/plugin.toml",
+          "canonical": "broadcast stop",
+          "exposed": false
+        }
+      ],
+      "frozen_help": true
+    },
+    "close-active-floating-pane": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "close-active-floating-pane",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "close-active-floating-pane",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "close-active-pane": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "close-active-pane",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "close-active-pane",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "close-current-tab": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "close-current-tab",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "close-current-tab",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "close-floating-pane": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "close-floating-pane",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "close-floating-pane",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.cluster"
+      ],
+      "reason": "namespace",
+      "frozen_help": false
+    },
+    "cluster credential": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.cluster"
+      ],
+      "reason": "namespace",
+      "frozen_help": false
+    },
+    "cluster credential rotate": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-credential-rotate",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-credential-rotate",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster doctor": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-doctor",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-doctor",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster enrollment": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.cluster"
+      ],
+      "reason": "namespace",
+      "frozen_help": false
+    },
+    "cluster enrollment list": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-enrollment-list",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-enrollment-list",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster enrollment revoke": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-enrollment-revoke",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-enrollment-revoke",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster enrollment-token": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.cluster"
+      ],
+      "reason": "namespace",
+      "frozen_help": false
+    },
+    "cluster enrollment-token create": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-enrollment-token-create",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-enrollment-token-create",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster events": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-events",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-events",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster gateway": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.cluster"
+      ],
+      "reason": "namespace",
+      "frozen_help": false
+    },
+    "cluster gateway doctor": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-gateway-doctor",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-gateway-doctor",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster gateway explain": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-gateway-explain",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-gateway-explain",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster gateway history": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-gateway-history",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-gateway-history",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster gateway history-clear": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-gateway-history-clear",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-gateway-history-clear",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster gateway history-export": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-gateway-history-export",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-gateway-history-export",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster gateway reset": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-gateway-reset",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-gateway-reset",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster gateway status": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-gateway-status",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-gateway-status",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster gateway why": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-gateway-why",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-gateway-why",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster hosts": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-hosts",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-hosts",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster init": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-init",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-init",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster join": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-join",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-join",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster leave": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-leave",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-leave",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster member": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.cluster"
+      ],
+      "reason": "namespace",
+      "frozen_help": false
+    },
+    "cluster member revoke": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-member-revoke",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-member-revoke",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster members": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-members",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-members",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster pane": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.cluster"
+      ],
+      "reason": "namespace",
+      "frozen_help": false
+    },
+    "cluster pane move": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-pane-move",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-pane-move",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster pane new": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-pane-new",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-pane-new",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster pane retry": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-pane-retry",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-pane-retry",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster status": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-status",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-status",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster up": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-up",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-up",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-credential-rotate": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-credential-rotate",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-credential-rotate",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-doctor": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-doctor",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-doctor",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-enrollment-list": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-enrollment-list",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-enrollment-list",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-enrollment-revoke": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-enrollment-revoke",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-enrollment-revoke",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-enrollment-token-create": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-enrollment-token-create",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-enrollment-token-create",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-events": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-events",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-events",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-gateway-doctor": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-gateway-doctor",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-gateway-doctor",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-gateway-explain": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-gateway-explain",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-gateway-explain",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-gateway-history": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-gateway-history",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-gateway-history",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-gateway-history-clear": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-gateway-history-clear",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-gateway-history-clear",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-gateway-history-export": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-gateway-history-export",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-gateway-history-export",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-gateway-reset": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-gateway-reset",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-gateway-reset",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-gateway-status": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-gateway-status",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-gateway-status",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-gateway-why": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-gateway-why",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-gateway-why",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-hosts": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-hosts",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-hosts",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-init": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-init",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-init",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-join": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-join",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-join",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-leave": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-leave",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-leave",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-member-revoke": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-member-revoke",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-member-revoke",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-members": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-members",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-members",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-pane-move": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-pane-move",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-pane-move",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-pane-new": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-pane-new",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-pane-new",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-pane-retry": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-pane-retry",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-pane-retry",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-status": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-status",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-status",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "cluster-up": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.cluster",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.cluster",
+          "command": "cluster-up",
+          "manifest": "plugins/cluster-plugin/plugin.toml",
+          "canonical": "cluster-up",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "command-palette": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.command_palette"
+      ],
+      "reason": "namespace",
+      "frozen_help": false
+    },
+    "command-palette show": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.command_palette",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.command_palette",
+          "command": "show",
+          "manifest": "plugins/command-palette-plugin/plugin.toml",
+          "canonical": "command-palette show",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "config": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "config",
+      "schema": "Command::Config",
+      "core": "Config",
+      "frozen_help": true
+    },
+    "config get": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "config",
+      "schema": "ConfigCommand::Get",
+      "core": "ConfigGet",
+      "frozen_help": true
+    },
+    "config path": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "config",
+      "schema": "ConfigCommand::Path",
+      "core": "ConfigPath",
+      "frozen_help": true
+    },
+    "config profiles": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "config",
+      "schema": "ConfigCommand::Profiles",
+      "frozen_help": true
+    },
+    "config profiles diff": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "config",
+      "schema": "ConfigProfilesCommand::Diff",
+      "core": "ConfigProfilesDiff",
+      "frozen_help": true
+    },
+    "config profiles evaluate": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "config",
+      "schema": "ConfigProfilesCommand::Evaluate",
+      "core": "ConfigProfilesEvaluate",
+      "frozen_help": true
+    },
+    "config profiles explain": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "config",
+      "schema": "ConfigProfilesCommand::Explain",
+      "core": "ConfigProfilesExplain",
+      "frozen_help": true
+    },
+    "config profiles lint": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "config",
+      "schema": "ConfigProfilesCommand::Lint",
+      "core": "ConfigProfilesLint",
+      "frozen_help": true
+    },
+    "config profiles list": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "config",
+      "schema": "ConfigProfilesCommand::List",
+      "core": "ConfigProfilesList",
+      "frozen_help": true
+    },
+    "config profiles resolve": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "config",
+      "schema": "ConfigProfilesCommand::Resolve",
+      "core": "ConfigProfilesResolve",
+      "frozen_help": true
+    },
+    "config profiles show": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "config",
+      "schema": "ConfigProfilesCommand::Show",
+      "core": "ConfigProfilesShow",
+      "frozen_help": true
+    },
+    "config profiles switch": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "config",
+      "schema": "ConfigProfilesCommand::Switch",
+      "core": "ConfigProfilesSwitch",
+      "frozen_help": true
+    },
+    "config scope": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "config",
+      "schema": "ConfigCommand::Scope",
+      "frozen_help": true
+    },
+    "config scope explain": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "config",
+      "schema": "ConfigScopeCommand::Explain",
+      "core": "ConfigScopeExplain",
+      "frozen_help": true
+    },
+    "config set": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "config",
+      "schema": "ConfigCommand::Set",
+      "core": "ConfigSet",
+      "frozen_help": true
+    },
+    "config show": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "config",
+      "schema": "ConfigCommand::Show",
+      "core": "ConfigShow",
+      "frozen_help": true
+    },
+    "connect": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "connect",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "connect",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "create-floating-pane": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "create-floating-pane",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "create-floating-pane",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "detach": {
+      "disposition": "migrated",
+      "owner": "bmux.sessions",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.sessions",
+          "command": "detach",
+          "manifest": "plugins/sessions-plugin/plugin.toml",
+          "canonical": "detach",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "device-seal-broker": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "device-seal-broker",
+      "schema": "Command::DeviceSealBroker",
+      "core": "DeviceSealBroker",
+      "frozen_help": true
+    },
+    "diagnostics": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.plugin_cli"
+      ],
+      "reason": "namespace",
+      "frozen_help": true
+    },
+    "diagnostics view": {
+      "disposition": "migrated",
+      "owner": "bmux.plugin_cli",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.plugin_cli",
+          "command": "diagnostics-watch",
+          "manifest": "plugins/plugin-cli-plugin/plugin.toml",
+          "canonical": "diagnostics watch",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "diagnostics watch": {
+      "disposition": "migrated",
+      "owner": "bmux.plugin_cli",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.plugin_cli",
+          "command": "diagnostics-watch",
+          "manifest": "plugins/plugin-cli-plugin/plugin.toml",
+          "canonical": "diagnostics watch",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "doctor": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "doctor",
+      "schema": "Command::Doctor",
+      "core": "Doctor",
+      "frozen_help": true
+    },
+    "env": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "slot",
+      "schema": "Command::Env",
+      "frozen_help": true
+    },
+    "env doctor": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "slot",
+      "schema": "SlotCommand::Doctor",
+      "core": "SlotDoctor",
+      "frozen_help": true
+    },
+    "env exec": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "slot",
+      "schema": "SlotCommand::Exec",
+      "core": "SlotExec",
+      "frozen_help": true
+    },
+    "env install": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "slot",
+      "schema": "SlotCommand::Install",
+      "core": "SlotInstall",
+      "frozen_help": true
+    },
+    "env list": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "slot",
+      "schema": "SlotCommand::List",
+      "core": "SlotList",
+      "frozen_help": true
+    },
+    "env paths": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "slot",
+      "schema": "SlotCommand::Paths",
+      "core": "SlotPaths",
+      "frozen_help": true
+    },
+    "env print": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "slot",
+      "schema": "SlotCommand::Print",
+      "core": "SlotPrint",
+      "frozen_help": true
+    },
+    "env shell": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "slot",
+      "schema": "SlotCommand::Shell",
+      "core": "SlotShell",
+      "frozen_help": true
+    },
+    "env show": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "slot",
+      "schema": "SlotCommand::Show",
+      "core": "SlotShow",
+      "frozen_help": true
+    },
+    "env uninstall": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "slot",
+      "schema": "SlotCommand::Uninstall",
+      "core": "SlotUninstall",
+      "frozen_help": true
+    },
+    "explain-spawn-directory": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "explain-spawn-directory",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "explain-spawn-directory",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "finder": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.finder"
+      ],
+      "reason": "namespace",
+      "frozen_help": false
+    },
+    "finder show": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.finder",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.finder",
+          "command": "show",
+          "manifest": "plugins/finder-plugin/plugin.toml",
+          "canonical": "finder show",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "focus-floating-pane": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "focus-floating-pane",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "focus-floating-pane",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "focus-next-floating-pane": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "focus-next-floating-pane",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "focus-next-floating-pane",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "focus-pane-in-direction": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "focus-pane-in-direction",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "focus-pane-in-direction",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "follow": {
+      "disposition": "migrated",
+      "owner": "bmux.clients",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.clients",
+          "command": "follow",
+          "manifest": "plugins/clients-plugin/plugin.toml",
+          "canonical": "follow",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "goto-tab": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "goto-tab",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "goto-tab",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "grant": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.permissions",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.permissions",
+          "command": "grant",
+          "manifest": "plugins/permissions-plugin/plugin.toml",
+          "canonical": "grant",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "grant-hot-path-override": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.permissions",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.permissions",
+          "command": "grant-hot-path-override",
+          "manifest": "plugins/permissions-plugin/plugin.toml",
+          "canonical": "grant-hot-path-override",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "host": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "host",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "host",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "hosts": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "hosts",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "hosts",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "hot-path-policy": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.permissions",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.permissions",
+          "command": "hot-path-policy",
+          "manifest": "plugins/permissions-plugin/plugin.toml",
+          "canonical": "hot-path-policy",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "join": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "join",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "join",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "keymap": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "keymap",
+      "schema": "Command::Keymap",
+      "core": "Keymap",
+      "frozen_help": true
+    },
+    "keymap doctor": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "keymap",
+      "schema": "KeymapCommand::Doctor",
+      "core": "KeymapDoctor",
+      "declarations": [
+        {
+          "owner": "bmux.plugin_cli",
+          "command": "keymap-doctor",
+          "manifest": "plugins/plugin-cli-plugin/plugin.toml",
+          "canonical": "keymap doctor",
+          "exposed": true
+        }
+      ],
+      "core_callers": [
+        "bmux.plugin_cli:keymap-doctor"
+      ],
+      "frozen_help": true
+    },
+    "keymap explain": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "keymap",
+      "schema": "KeymapCommand::Explain",
+      "core": "KeymapExplain",
+      "frozen_help": true
+    },
+    "kill-all-sessions": {
+      "disposition": "migrated",
+      "owner": "bmux.sessions",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.sessions",
+          "command": "kill-all-sessions",
+          "manifest": "plugins/sessions-plugin/plugin.toml",
+          "canonical": "kill-all-sessions",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "kill-all-tabs": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "kill-all-tabs",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "kill-all-tabs",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "kill-session": {
+      "disposition": "migrated",
+      "owner": "bmux.sessions",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.sessions",
+          "command": "kill-session",
+          "manifest": "plugins/sessions-plugin/plugin.toml",
+          "canonical": "kill-session",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "kill-tab": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "kill-tab",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "kill-tab",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "kiosk": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.connections"
+      ],
+      "reason": "namespace",
+      "frozen_help": true
+    },
+    "kiosk attach": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "kiosk-attach",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "kiosk attach",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "kiosk init": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "kiosk-init",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "kiosk init",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "kiosk issue-token": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "kiosk-issue-token",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "kiosk issue-token",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "kiosk revoke-token": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "kiosk-revoke-token",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "kiosk revoke-token",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "kiosk ssh-print-config": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "kiosk-ssh-print-config",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "kiosk ssh-print-config",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "kiosk status": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "kiosk-status",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "kiosk status",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "last-tab": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "last-tab",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "last-tab",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "list-clients": {
+      "disposition": "migrated",
+      "owner": "bmux.clients",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.clients",
+          "command": "list-clients",
+          "manifest": "plugins/clients-plugin/plugin.toml",
+          "canonical": "list-clients",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "list-floating-panes": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "list-floating-panes",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "list-floating-panes",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "list-hot-path-overrides": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.permissions",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.permissions",
+          "command": "list-hot-path-overrides",
+          "manifest": "plugins/permissions-plugin/plugin.toml",
+          "canonical": "list-hot-path-overrides",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "list-sessions": {
+      "disposition": "migrated",
+      "owner": "bmux.sessions",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.sessions",
+          "command": "list-sessions",
+          "manifest": "plugins/sessions-plugin/plugin.toml",
+          "canonical": "list-sessions",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "list-tabs": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "list-tabs",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "list-tabs",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "logs": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "logs",
+      "schema": "Command::Logs",
+      "core": "Logs",
+      "frozen_help": true
+    },
+    "logs level": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "logs",
+      "schema": "LogsCommand::Level",
+      "core": "LogsLevel",
+      "declarations": [
+        {
+          "owner": "bmux.plugin_cli",
+          "command": "logs-level",
+          "manifest": "plugins/plugin-cli-plugin/plugin.toml",
+          "canonical": "logs level",
+          "exposed": true
+        }
+      ],
+      "core_callers": [
+        "bmux.plugin_cli:logs-level"
+      ],
+      "frozen_help": true
+    },
+    "logs path": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "logs",
+      "schema": "LogsCommand::Path",
+      "core": "LogsPath",
+      "declarations": [
+        {
+          "owner": "bmux.plugin_cli",
+          "command": "logs-path",
+          "manifest": "plugins/plugin-cli-plugin/plugin.toml",
+          "canonical": "logs path",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "logs profiles": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.plugin_cli"
+      ],
+      "reason": "namespace",
+      "frozen_help": true
+    },
+    "logs profiles delete": {
+      "disposition": "migrated",
+      "owner": "bmux.plugin_cli",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.plugin_cli",
+          "command": "logs-profiles-delete",
+          "manifest": "plugins/plugin-cli-plugin/plugin.toml",
+          "canonical": "logs profiles delete",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "logs profiles list": {
+      "disposition": "migrated",
+      "owner": "bmux.plugin_cli",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.plugin_cli",
+          "command": "logs-profiles-list",
+          "manifest": "plugins/plugin-cli-plugin/plugin.toml",
+          "canonical": "logs profiles list",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "logs profiles rename": {
+      "disposition": "migrated",
+      "owner": "bmux.plugin_cli",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.plugin_cli",
+          "command": "logs-profiles-rename",
+          "manifest": "plugins/plugin-cli-plugin/plugin.toml",
+          "canonical": "logs profiles rename",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "logs profiles show": {
+      "disposition": "migrated",
+      "owner": "bmux.plugin_cli",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.plugin_cli",
+          "command": "logs-profiles-show",
+          "manifest": "plugins/plugin-cli-plugin/plugin.toml",
+          "canonical": "logs profiles show",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "logs tail": {
+      "disposition": "migrated",
+      "owner": "bmux.plugin_cli",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.plugin_cli",
+          "command": "logs-tail",
+          "manifest": "plugins/plugin-cli-plugin/plugin.toml",
+          "canonical": "logs tail",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "logs watch": {
+      "disposition": "migrated",
+      "owner": "bmux.plugin_cli",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.plugin_cli",
+          "command": "logs-watch",
+          "manifest": "plugins/plugin-cli-plugin/plugin.toml",
+          "canonical": "logs watch",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "lower-active-floating-pane": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "lower-active-floating-pane",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "lower-active-floating-pane",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "lower-floating-pane": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "lower-floating-pane",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "lower-floating-pane",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "move-active-floating-pane": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "move-active-floating-pane",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "move-active-floating-pane",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "move-floating-pane": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "move-floating-pane",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "move-floating-pane",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "move-tab": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "move-tab",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "move-tab",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "new-session": {
+      "disposition": "migrated",
+      "owner": "bmux.sessions",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.sessions",
+          "command": "new-session",
+          "manifest": "plugins/sessions-plugin/plugin.toml",
+          "canonical": "new-session",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "new-tab": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "new-tab",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "new-tab",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "next-tab": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "next-tab",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "next-tab",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "pane-padding": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.pane_runtime"
+      ],
+      "reason": "namespace",
+      "frozen_help": false
+    },
+    "pane-padding configure": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.pane_runtime",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.pane_runtime",
+          "command": "pane-padding-configure",
+          "manifest": "plugins/pane-runtime-plugin/plugin.toml",
+          "canonical": "pane-padding configure",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "pane-padding reset": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.pane_runtime",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.pane_runtime",
+          "command": "pane-padding-reset",
+          "manifest": "plugins/pane-runtime-plugin/plugin.toml",
+          "canonical": "pane-padding reset",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "pane-padding set": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.pane_runtime",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.pane_runtime",
+          "command": "pane-padding-set",
+          "manifest": "plugins/pane-runtime-plugin/plugin.toml",
+          "canonical": "pane-padding set",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "pane-padding show": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.pane_runtime",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.pane_runtime",
+          "command": "pane-padding-show",
+          "manifest": "plugins/pane-runtime-plugin/plugin.toml",
+          "canonical": "pane-padding show",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "perf": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.performance"
+      ],
+      "reason": "namespace",
+      "frozen_help": true
+    },
+    "perf off": {
+      "disposition": "migrated",
+      "owner": "bmux.performance",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.performance",
+          "command": "perf-off",
+          "manifest": "plugins/performance-plugin/plugin.toml",
+          "canonical": "perf off",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "perf on": {
+      "disposition": "migrated",
+      "owner": "bmux.performance",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.performance",
+          "command": "perf-on",
+          "manifest": "plugins/performance-plugin/plugin.toml",
+          "canonical": "perf on",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "perf status": {
+      "disposition": "migrated",
+      "owner": "bmux.performance",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.performance",
+          "command": "perf-status",
+          "manifest": "plugins/performance-plugin/plugin.toml",
+          "canonical": "perf status",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "permissions": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.permissions",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.permissions",
+          "command": "permissions",
+          "manifest": "plugins/permissions-plugin/plugin.toml",
+          "canonical": "permissions",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "permissions-current": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.permissions",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.permissions",
+          "command": "permissions-current",
+          "manifest": "plugins/permissions-plugin/plugin.toml",
+          "canonical": "permissions-current",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "playbook": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.playbook",
+        "bmux.recording"
+      ],
+      "reason": "namespace",
+      "frozen_help": true
+    },
+    "playbook cleanup": {
+      "disposition": "migrated",
+      "owner": "bmux.playbook",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.playbook",
+          "command": "cleanup",
+          "manifest": "plugins/playbook-plugin/plugin.toml",
+          "canonical": "playbook cleanup",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "playbook diff": {
+      "disposition": "migrated",
+      "owner": "bmux.playbook",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.playbook",
+          "command": "diff",
+          "manifest": "plugins/playbook-plugin/plugin.toml",
+          "canonical": "playbook diff",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "playbook dry-run": {
+      "disposition": "migrated",
+      "owner": "bmux.playbook",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.playbook",
+          "command": "dry-run",
+          "manifest": "plugins/playbook-plugin/plugin.toml",
+          "canonical": "playbook dry-run",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "playbook from-recording": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "playbook-from-recording",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "playbook from-recording",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "playbook interactive": {
+      "disposition": "migrated",
+      "owner": "bmux.playbook",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.playbook",
+          "command": "interactive",
+          "manifest": "plugins/playbook-plugin/plugin.toml",
+          "canonical": "playbook interactive",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "playbook run": {
+      "disposition": "migrated",
+      "owner": "bmux.playbook",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.playbook",
+          "command": "run",
+          "manifest": "plugins/playbook-plugin/plugin.toml",
+          "canonical": "playbook run",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "playbook validate": {
+      "disposition": "migrated",
+      "owner": "bmux.playbook",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.playbook",
+          "command": "validate",
+          "manifest": "plugins/playbook-plugin/plugin.toml",
+          "canonical": "playbook validate",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "plugin": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.plugin_cli"
+      ],
+      "reason": "namespace",
+      "frozen_help": false
+    },
+    "plugin doctor": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.plugin_cli",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.plugin_cli",
+          "command": "doctor",
+          "manifest": "plugins/plugin-cli-plugin/plugin.toml",
+          "canonical": "plugin doctor",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "plugin list": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.plugin_cli",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.plugin_cli",
+          "command": "list",
+          "manifest": "plugins/plugin-cli-plugin/plugin.toml",
+          "canonical": "plugin list",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "plugin rebuild": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.plugin_cli",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.plugin_cli",
+          "command": "rebuild",
+          "manifest": "plugins/plugin-cli-plugin/plugin.toml",
+          "canonical": "plugin rebuild",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "plugin run": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.plugin_cli",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.plugin_cli",
+          "command": "run",
+          "manifest": "plugins/plugin-cli-plugin/plugin.toml",
+          "canonical": "plugin run",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "present": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.presenter"
+      ],
+      "reason": "namespace",
+      "frozen_help": false
+    },
+    "present check": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.presenter",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.presenter",
+          "command": "present-check",
+          "manifest": "plugins/presenter-plugin/plugin.toml",
+          "canonical": "present check",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "present host": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.presenter",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.presenter",
+          "command": "present-host",
+          "manifest": "plugins/presenter-plugin/plugin.toml",
+          "canonical": "present host",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "present join": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.presenter",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.presenter",
+          "command": "present-join",
+          "manifest": "plugins/presenter-plugin/plugin.toml",
+          "canonical": "present join",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "present play": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.presenter",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.presenter",
+          "command": "present-play",
+          "manifest": "plugins/presenter-plugin/plugin.toml",
+          "canonical": "present play",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "prev-tab": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "prev-tab",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "prev-tab",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "prompted-action": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.prompted_actions"
+      ],
+      "reason": "namespace",
+      "frozen_help": false
+    },
+    "prompted-action run": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.prompted_actions",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.prompted_actions",
+          "command": "run",
+          "manifest": "plugins/prompted-actions-plugin/plugin.toml",
+          "canonical": "prompted-action run",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "raise-active-floating-pane": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "raise-active-floating-pane",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "raise-active-floating-pane",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "raise-floating-pane": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "raise-floating-pane",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "raise-floating-pane",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "record": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "record",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "record",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "recording": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.recording"
+      ],
+      "reason": "namespace",
+      "frozen_help": false
+    },
+    "recording analyze": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "recording-analyze",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "recording analyze",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "recording cut": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "recording-cut",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "recording cut",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "recording delete": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "recording-delete",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "recording delete",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "recording delete-all": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "recording-delete-all",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "recording delete-all",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "recording export": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "recording-export",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "recording export",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "recording inspect": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "recording-inspect",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "recording inspect",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "recording list": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "recording-list",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "recording list",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "recording path": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "recording-path",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "recording path",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "recording process": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.recording"
+      ],
+      "reason": "namespace",
+      "frozen_help": false
+    },
+    "recording process finish": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "recording-process-finish",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "recording process finish",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "recording process read": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "recording-process-read",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "recording process read",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "recording process run": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "recording-process-run",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "recording process run",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "recording process screen": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "recording-process-screen",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "recording process screen",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "recording process send": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "recording-process-send",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "recording process send",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "recording process start": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "recording-process-start",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "recording process start",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "recording process status": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "recording-process-status",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "recording process status",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "recording process terminate": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "recording-process-terminate",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "recording process terminate",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "recording process wait": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "recording-process-wait",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "recording process wait",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "recording prune": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "recording-prune",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "recording prune",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "recording replay": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "recording-replay",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "recording replay",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "recording start": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "recording-start",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "recording start",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "recording status": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "recording-status",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "recording status",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "recording stop": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "recording-stop",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "recording stop",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "recording verify-smoke": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "recording-verify-smoke",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "recording verify-smoke",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.connections"
+      ],
+      "reason": "namespace",
+      "frozen_help": true
+    },
+    "remote approve": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.connections",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-approve",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote-approve",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote complete": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.connections"
+      ],
+      "reason": "namespace",
+      "frozen_help": true
+    },
+    "remote complete sessions": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-complete-sessions",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote complete sessions",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote complete targets": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-complete-targets",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote complete targets",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote disable": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.connections",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-disable",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote-disable",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote doctor": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-doctor",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote doctor",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote enable": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.connections",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-enable",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote-enable",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote forget": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.connections",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-forget",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote-forget",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote init": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-init",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote init",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote install-server": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-install-server",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote install-server",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote list": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-targets",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote list",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote pair": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.connections",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-pair",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote-pair",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote pair-request": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.connections",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-pair-request",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote-pair-request",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote rename": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.connections",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-rename",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote-rename",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote revoke": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.connections",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-revoke",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote-revoke",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote status": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.connections",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-status",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote-status",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote targets": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.connections",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-targets",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote list",
+          "exposed": true
+        }
+      ],
+      "frozen_help": false
+    },
+    "remote test": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-test",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote test",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote trust": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.connections"
+      ],
+      "reason": "namespace",
+      "frozen_help": true
+    },
+    "remote trust add": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-trust-add",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote trust add",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote trust list": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-trust-list",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote trust list",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote trust remove": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-trust-remove",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote trust remove",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote upgrade": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-upgrade",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote upgrade",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote-approve": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.connections",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-approve",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote-approve",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote-disable": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.connections",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-disable",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote-disable",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote-enable": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.connections",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-enable",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote-enable",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote-forget": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.connections",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-forget",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote-forget",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote-list": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.connections",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-list",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote-list",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote-pair": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.connections",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-pair",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote-pair",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote-pair-request": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.connections",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-pair-request",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote-pair-request",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote-rename": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.connections",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-rename",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote-rename",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote-revoke": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.connections",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-revoke",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote-revoke",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "remote-status": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.connections",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "remote-status",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "remote-status",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "rename-tab": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "rename-tab",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "rename-tab",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "rename-tab-by-id": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "rename-tab-by-id",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "rename-tab-by-id",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "reset-order": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "reset-order",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "reset-order",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "resize-active-floating-pane": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "resize-active-floating-pane",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "resize-active-floating-pane",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "resize-floating-pane": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "resize-floating-pane",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "resize-floating-pane",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "resize-pane": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "resize-pane",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "resize-pane",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "restart-pane": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "restart-pane",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "restart-pane",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "revoke": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.permissions",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.permissions",
+          "command": "revoke",
+          "manifest": "plugins/permissions-plugin/plugin.toml",
+          "canonical": "revoke",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "revoke-hot-path-override": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.permissions",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.permissions",
+          "command": "revoke-hot-path-override",
+          "manifest": "plugins/permissions-plugin/plugin.toml",
+          "canonical": "revoke-hot-path-override",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "sandbox": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "sandbox",
+      "schema": "Command::Sandbox",
+      "core": "Sandbox",
+      "frozen_help": true
+    },
+    "sandbox attach": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "sandbox",
+      "schema": "SandboxCommand::Attach",
+      "core": "SandboxAttach",
+      "frozen_help": true
+    },
+    "sandbox bundle": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "sandbox",
+      "schema": "SandboxCommand::Bundle",
+      "core": "SandboxBundle",
+      "frozen_help": true
+    },
+    "sandbox clean": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "sandbox",
+      "schema": "SandboxCommand::Clean",
+      "core": "SandboxClean",
+      "frozen_help": true
+    },
+    "sandbox cleanup": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "sandbox",
+      "schema": "SandboxCommand::Cleanup",
+      "core": "SandboxCleanup",
+      "frozen_help": true
+    },
+    "sandbox dev": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "sandbox",
+      "schema": "SandboxCommand::Dev",
+      "core": "SandboxDev",
+      "frozen_help": true
+    },
+    "sandbox doctor": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "sandbox",
+      "schema": "SandboxCommand::Doctor",
+      "core": "SandboxDoctor",
+      "frozen_help": true
+    },
+    "sandbox inspect": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "sandbox",
+      "schema": "SandboxCommand::Inspect",
+      "core": "SandboxInspect",
+      "frozen_help": true
+    },
+    "sandbox list": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "sandbox",
+      "schema": "SandboxCommand::List",
+      "core": "SandboxList",
+      "frozen_help": true
+    },
+    "sandbox open": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "sandbox",
+      "schema": "SandboxCommand::Open",
+      "core": "SandboxOpen",
+      "frozen_help": true
+    },
+    "sandbox rebuild-index": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "sandbox",
+      "schema": "SandboxCommand::RebuildIndex",
+      "core": "SandboxRebuildIndex",
+      "frozen_help": true
+    },
+    "sandbox rerun": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "sandbox",
+      "schema": "SandboxCommand::Rerun",
+      "core": "SandboxRerun",
+      "frozen_help": true
+    },
+    "sandbox run": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "sandbox",
+      "schema": "SandboxCommand::Run",
+      "core": "SandboxRun",
+      "frozen_help": true
+    },
+    "sandbox status": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "sandbox",
+      "schema": "SandboxCommand::Status",
+      "core": "SandboxStatus",
+      "frozen_help": true
+    },
+    "sandbox stop": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "sandbox",
+      "schema": "SandboxCommand::Stop",
+      "core": "SandboxStop",
+      "frozen_help": true
+    },
+    "sandbox tail": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "sandbox",
+      "schema": "SandboxCommand::Tail",
+      "core": "SandboxTail",
+      "frozen_help": true
+    },
+    "sandbox triage": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "sandbox",
+      "schema": "SandboxCommand::Triage",
+      "core": "SandboxTriage",
+      "frozen_help": true
+    },
+    "sandbox verify-bundle": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "sandbox",
+      "schema": "SandboxCommand::VerifyBundle",
+      "core": "SandboxVerifyBundle",
+      "frozen_help": true
+    },
+    "server": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "server",
+      "schema": "Command::Server",
+      "core": "Server",
+      "frozen_help": true
+    },
+    "server autostart": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "autostart",
+      "schema": "ServerCommand::Autostart",
+      "frozen_help": true
+    },
+    "server autostart install": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "autostart",
+      "schema": "ServerAutostartCommand::Install",
+      "core": "ServerAutostartInstall",
+      "frozen_help": true
+    },
+    "server autostart print": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "autostart",
+      "schema": "ServerAutostartCommand::Print",
+      "core": "ServerAutostartPrint",
+      "frozen_help": true
+    },
+    "server autostart status": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "autostart",
+      "schema": "ServerAutostartCommand::Status",
+      "core": "ServerAutostartStatus",
+      "frozen_help": true
+    },
+    "server autostart uninstall": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "autostart",
+      "schema": "ServerAutostartCommand::Uninstall",
+      "core": "ServerAutostartUninstall",
+      "frozen_help": true
+    },
+    "server bridge": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "bridge",
+      "schema": "ServerCommand::Bridge",
+      "core": "ServerBridge",
+      "frozen_help": true
+    },
+    "server gateway": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "gateway",
+      "schema": "ServerCommand::Gateway",
+      "core": "ServerGateway",
+      "frozen_help": true
+    },
+    "server recording": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.recording",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.recording",
+          "command": "server-recording",
+          "manifest": "plugins/recording-plugin/plugin.toml",
+          "canonical": "server recording",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "server restore": {
+      "disposition": "migrated",
+      "owner": "bmux.snapshot",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.snapshot",
+          "command": "restore",
+          "manifest": "plugins/snapshot-plugin/plugin.toml",
+          "canonical": "server restore",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "server save": {
+      "disposition": "migrated",
+      "owner": "bmux.snapshot",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.snapshot",
+          "command": "save",
+          "manifest": "plugins/snapshot-plugin/plugin.toml",
+          "canonical": "server save",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "server start": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "server",
+      "schema": "ServerCommand::Start",
+      "core": "ServerStart",
+      "frozen_help": true
+    },
+    "server status": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "server",
+      "schema": "ServerCommand::Status",
+      "core": "ServerStatus",
+      "frozen_help": true
+    },
+    "server stop": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "server",
+      "schema": "ServerCommand::Stop",
+      "core": "ServerStop",
+      "frozen_help": true
+    },
+    "server whoami-principal": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "server",
+      "schema": "ServerCommand::WhoamiPrincipal",
+      "core": "ServerWhoamiPrincipal",
+      "frozen_help": true
+    },
+    "session": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.clients",
+        "bmux.permissions",
+        "bmux.sessions"
+      ],
+      "reason": "namespace",
+      "frozen_help": true
+    },
+    "session attach": {
+      "disposition": "migrated",
+      "owner": "bmux.sessions",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.sessions",
+          "command": "session-attach",
+          "manifest": "plugins/sessions-plugin/plugin.toml",
+          "canonical": "session attach",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "session clients": {
+      "disposition": "migrated",
+      "owner": "bmux.clients",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.clients",
+          "command": "list-clients",
+          "manifest": "plugins/clients-plugin/plugin.toml",
+          "canonical": "list-clients",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "session detach": {
+      "disposition": "migrated",
+      "owner": "bmux.sessions",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.sessions",
+          "command": "detach",
+          "manifest": "plugins/sessions-plugin/plugin.toml",
+          "canonical": "detach",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "session follow": {
+      "disposition": "migrated",
+      "owner": "bmux.clients",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.clients",
+          "command": "follow",
+          "manifest": "plugins/clients-plugin/plugin.toml",
+          "canonical": "follow",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "session grant": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.permissions",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.permissions",
+          "command": "grant",
+          "manifest": "plugins/permissions-plugin/plugin.toml",
+          "canonical": "grant",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "session grant-hot-path-override": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.permissions",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.permissions",
+          "command": "grant-hot-path-override",
+          "manifest": "plugins/permissions-plugin/plugin.toml",
+          "canonical": "grant-hot-path-override",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "session hot-path-policy": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.permissions",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.permissions",
+          "command": "hot-path-policy",
+          "manifest": "plugins/permissions-plugin/plugin.toml",
+          "canonical": "hot-path-policy",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "session kill": {
+      "disposition": "migrated",
+      "owner": "bmux.sessions",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.sessions",
+          "command": "kill-session",
+          "manifest": "plugins/sessions-plugin/plugin.toml",
+          "canonical": "kill-session",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "session kill-all": {
+      "disposition": "migrated",
+      "owner": "bmux.sessions",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.sessions",
+          "command": "kill-all-sessions",
+          "manifest": "plugins/sessions-plugin/plugin.toml",
+          "canonical": "kill-all-sessions",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "session list": {
+      "disposition": "migrated",
+      "owner": "bmux.sessions",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.sessions",
+          "command": "list-sessions",
+          "manifest": "plugins/sessions-plugin/plugin.toml",
+          "canonical": "list-sessions",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "session list-hot-path-overrides": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.permissions",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.permissions",
+          "command": "list-hot-path-overrides",
+          "manifest": "plugins/permissions-plugin/plugin.toml",
+          "canonical": "list-hot-path-overrides",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "session new": {
+      "disposition": "migrated",
+      "owner": "bmux.sessions",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.sessions",
+          "command": "session-new",
+          "manifest": "plugins/sessions-plugin/plugin.toml",
+          "canonical": "session new",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "session permissions": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.permissions",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.permissions",
+          "command": "permissions",
+          "manifest": "plugins/permissions-plugin/plugin.toml",
+          "canonical": "permissions",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "session permissions-current": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.permissions",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.permissions",
+          "command": "permissions-current",
+          "manifest": "plugins/permissions-plugin/plugin.toml",
+          "canonical": "permissions-current",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "session revoke": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.permissions",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.permissions",
+          "command": "revoke",
+          "manifest": "plugins/permissions-plugin/plugin.toml",
+          "canonical": "revoke",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "session revoke-hot-path-override": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.permissions",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.permissions",
+          "command": "revoke-hot-path-override",
+          "manifest": "plugins/permissions-plugin/plugin.toml",
+          "canonical": "revoke-hot-path-override",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "session unfollow": {
+      "disposition": "migrated",
+      "owner": "bmux.clients",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.clients",
+          "command": "unfollow",
+          "manifest": "plugins/clients-plugin/plugin.toml",
+          "canonical": "unfollow",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "set-floating-pane-layer": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "set-floating-pane-layer",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "set-floating-pane-layer",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "set-floating-pane-z": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "set-floating-pane-z",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "set-floating-pane-z",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "setup": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "setup",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "setup",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "share": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "share",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "share",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "slot": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "slot",
+      "schema": "Command::Slot",
+      "frozen_help": true
+    },
+    "slot doctor": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "slot",
+      "schema": "SlotCommand::Doctor",
+      "core": "SlotDoctor",
+      "frozen_help": true
+    },
+    "slot exec": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "slot",
+      "schema": "SlotCommand::Exec",
+      "core": "SlotExec",
+      "frozen_help": true
+    },
+    "slot install": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "slot",
+      "schema": "SlotCommand::Install",
+      "core": "SlotInstall",
+      "frozen_help": true
+    },
+    "slot list": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "slot",
+      "schema": "SlotCommand::List",
+      "core": "SlotList",
+      "frozen_help": true
+    },
+    "slot paths": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "slot",
+      "schema": "SlotCommand::Paths",
+      "core": "SlotPaths",
+      "frozen_help": true
+    },
+    "slot print": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "slot",
+      "schema": "SlotCommand::Print",
+      "core": "SlotPrint",
+      "frozen_help": true
+    },
+    "slot shell": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "slot",
+      "schema": "SlotCommand::Shell",
+      "core": "SlotShell",
+      "frozen_help": true
+    },
+    "slot show": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "slot",
+      "schema": "SlotCommand::Show",
+      "core": "SlotShow",
+      "frozen_help": true
+    },
+    "slot uninstall": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "slot",
+      "schema": "SlotCommand::Uninstall",
+      "core": "SlotUninstall",
+      "frozen_help": true
+    },
+    "split-pane": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "split-pane",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "split-pane",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "switch-tab": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "switch-tab",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "switch-tab",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "tab": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.tabs"
+      ],
+      "reason": "namespace",
+      "frozen_help": false
+    },
+    "tab close-current": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "close-current-tab",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "close-current-tab",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "tab goto": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "goto-tab",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "goto-tab",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "tab kill": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "kill-tab",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "kill-tab",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "tab kill-all": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "kill-all-tabs",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "kill-all-tabs",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "tab last": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "last-tab",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "last-tab",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "tab list": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "list-tabs",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "list-tabs",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "tab move": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "move-tab",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "move-tab",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "tab new": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "new-tab",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "new-tab",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "tab next": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "next-tab",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "next-tab",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "tab prev": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "prev-tab",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "prev-tab",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "tab rename": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "rename-tab",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "rename-tab",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "tab reset-order": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "reset-order",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "reset-order",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "tab switch": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "switch-tab",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "switch-tab",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "terminal": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "terminal",
+      "schema": "Command::Terminal",
+      "core": "Terminal",
+      "frozen_help": true
+    },
+    "terminal doctor": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "terminal",
+      "schema": "TerminalCommand::Doctor",
+      "core": "TerminalDoctor",
+      "declarations": [
+        {
+          "owner": "bmux.plugin_cli",
+          "command": "terminal-doctor",
+          "manifest": "plugins/plugin-cli-plugin/plugin.toml",
+          "canonical": "terminal doctor",
+          "exposed": true
+        }
+      ],
+      "core_callers": [
+        "bmux.plugin_cli:terminal-doctor"
+      ],
+      "frozen_help": true
+    },
+    "terminal install-terminfo": {
+      "disposition": "retain-core",
+      "owner": "core",
+      "reason": "terminal",
+      "schema": "TerminalCommand::InstallTerminfo",
+      "core": "TerminalInstallTerminfo",
+      "declarations": [
+        {
+          "owner": "bmux.plugin_cli",
+          "command": "terminal-install-terminfo",
+          "manifest": "plugins/plugin-cli-plugin/plugin.toml",
+          "canonical": "terminal install-terminfo",
+          "exposed": true
+        }
+      ],
+      "core_callers": [
+        "bmux.plugin_cli:terminal-install-terminfo"
+      ],
+      "frozen_help": true
+    },
+    "theme": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.theme"
+      ],
+      "reason": "namespace",
+      "frozen_help": false
+    },
+    "theme pick": {
+      "disposition": "non-cli",
+      "owner": "bmux.theme",
+      "reason": "hidden",
+      "declarations": [
+        {
+          "owner": "bmux.theme",
+          "command": "pick-theme",
+          "manifest": "plugins/theme-plugin/plugin.toml",
+          "canonical": "theme pick",
+          "exposed": false
+        }
+      ],
+      "frozen_help": true
+    },
+    "theme refresh": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.theme",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.theme",
+          "command": "refresh-theme",
+          "manifest": "plugins/theme-plugin/plugin.toml",
+          "canonical": "theme refresh",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "theme show": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.theme",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.theme",
+          "command": "show-theme",
+          "manifest": "plugins/theme-plugin/plugin.toml",
+          "canonical": "theme show",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "unfollow": {
+      "disposition": "migrated",
+      "owner": "bmux.clients",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.clients",
+          "command": "unfollow",
+          "manifest": "plugins/clients-plugin/plugin.toml",
+          "canonical": "unfollow",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "unshare": {
+      "disposition": "migrated",
+      "owner": "bmux.connections",
+      "reason": "migration",
+      "declarations": [
+        {
+          "owner": "bmux.connections",
+          "command": "unshare",
+          "manifest": "plugins/connections-plugin/plugin.toml",
+          "canonical": "unshare",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "workspace": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.workspaces"
+      ],
+      "reason": "namespace",
+      "frozen_help": false
+    },
+    "workspace activate-tab": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.workspaces",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.workspaces",
+          "command": "activate-tab",
+          "manifest": "plugins/workspaces-plugin/plugin.toml",
+          "canonical": "workspace activate-tab",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "workspace kill": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.workspaces",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.workspaces",
+          "command": "kill-workspace",
+          "manifest": "plugins/workspaces-plugin/plugin.toml",
+          "canonical": "workspace kill",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "workspace last": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.workspaces",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.workspaces",
+          "command": "last-workspace",
+          "manifest": "plugins/workspaces-plugin/plugin.toml",
+          "canonical": "workspace last",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "workspace list": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.workspaces",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.workspaces",
+          "command": "list-workspaces",
+          "manifest": "plugins/workspaces-plugin/plugin.toml",
+          "canonical": "workspace list",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "workspace move-tab": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.workspaces",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.workspaces",
+          "command": "move-tab-to-workspace",
+          "manifest": "plugins/workspaces-plugin/plugin.toml",
+          "canonical": "workspace move-tab",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "workspace new": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.workspaces",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.workspaces",
+          "command": "new-workspace",
+          "manifest": "plugins/workspaces-plugin/plugin.toml",
+          "canonical": "workspace new",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "workspace next": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.workspaces",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.workspaces",
+          "command": "next-workspace",
+          "manifest": "plugins/workspaces-plugin/plugin.toml",
+          "canonical": "workspace next",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "workspace previous": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.workspaces",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.workspaces",
+          "command": "prev-workspace",
+          "manifest": "plugins/workspaces-plugin/plugin.toml",
+          "canonical": "workspace previous",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "workspace rename": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.workspaces",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.workspaces",
+          "command": "rename-workspace",
+          "manifest": "plugins/workspaces-plugin/plugin.toml",
+          "canonical": "workspace rename",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "workspace switch": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.workspaces",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.workspaces",
+          "command": "switch-workspace",
+          "manifest": "plugins/workspaces-plugin/plugin.toml",
+          "canonical": "workspace switch",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    },
+    "zoom-pane": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.tabs",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.tabs",
+          "command": "zoom-pane",
+          "manifest": "plugins/tabs-plugin/plugin.toml",
+          "canonical": "zoom-pane",
+          "exposed": true
+        }
+      ],
+      "frozen_help": true
+    }
+  }
+}

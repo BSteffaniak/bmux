@@ -25,9 +25,18 @@ pub struct RegisteredPluginCommand {
 #[derive(Debug, Default, Clone)]
 pub struct PluginCommandRegistry {
     commands: Vec<RegisteredPluginCommand>,
+    help: BTreeMap<Vec<String>, PathHelp>,
     resolved_by_path: BTreeMap<Vec<String>, ResolvedPathEntry>,
     owned_exact_paths: BTreeMap<Vec<String>, String>,
     owned_namespaces: BTreeMap<String, String>,
+}
+
+/// Presentation only. These entries never create commands or claim dispatch paths.
+#[derive(Debug, Clone)]
+struct PathHelp {
+    before: Option<String>,
+    summary: Option<String>,
+    order: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +76,7 @@ impl PluginCommandRegistry {
                 .iter()
                 .filter(|command| command.expose_in_cli)
             {
+                validate_argument_metadata(command)?;
                 let canonical = command.canonical_path();
                 validate_plugin_owns_path(&plugin.declaration, &canonical, &command.name)?;
                 validate_path_collision(
@@ -136,7 +146,62 @@ impl PluginCommandRegistry {
             }
         }
 
+        registry.collect_help(plugins, &enabled)?;
         Ok(registry)
+    }
+
+    fn collect_help(
+        &mut self,
+        plugins: &PluginRegistry,
+        enabled: &BTreeSet<&String>,
+    ) -> Result<()> {
+        for plugin in plugins
+            .iter()
+            .filter(|plugin| enabled.contains(&plugin.manifest.id))
+        {
+            for (path, help) in &plugin.manifest.cli_help {
+                let segments: Vec<String> = path.split_whitespace().map(str::to_owned).collect();
+                anyhow::ensure!(
+                    path == &segments.join(" ")
+                        && help.before.as_ref().is_none_or(|name| {
+                            help.order.is_some_and(|order| order < 999)
+                                && !name.is_empty()
+                                && !name.contains(char::is_whitespace)
+                                && !name.chars().any(char::is_control)
+                                && segments.last() != Some(name)
+                        })
+                        && (help.order.is_some() || help.summary.is_some())
+                        && help.summary.as_ref().is_none_or(|summary| {
+                            !summary.trim().is_empty() && !summary.chars().any(char::is_control)
+                        }),
+                    "plugin '{}' declares malformed CLI help metadata",
+                    plugin.manifest.id
+                );
+                let contributes = !segments.is_empty()
+                    && self.resolved_by_path.iter().any(|(leaf, entry)| {
+                        leaf.starts_with(&segments) && entry.plugin_id == plugin.manifest.id
+                    });
+                anyhow::ensure!(
+                    contributes,
+                    "plugin '{}' declares help for unrelated path '{path}'",
+                    plugin.manifest.id
+                );
+                let prior = self.help.insert(
+                    segments,
+                    PathHelp {
+                        before: help.before.clone(),
+                        summary: help.summary.clone(),
+                        order: help.order,
+                    },
+                );
+                anyhow::ensure!(
+                    prior.is_none(),
+                    "conflicting help declarations for '{path}'"
+                );
+            }
+        }
+
+        Ok(())
     }
 
     #[must_use]
@@ -215,48 +280,53 @@ impl PluginCommandRegistry {
     ) -> Vec<String> {
         let mut normalized = Vec::new();
         for argument in &command.arguments {
-            // A plugin command can share a path prefix with the host command tree.
-            // When another leaf is selected, its ArgMatches lacks this command's
-            // argument IDs; clap accessors panic on unknown IDs.
-            if matches.try_get_raw(&argument.name).is_err() {
+            // Read validated raw values: integer and static-host parsers do not
+            // store Strings, and a retained host leaf can lack this argument ID.
+            let Ok(Some(values)) = matches.try_get_raw(&argument.name) else {
                 continue;
-            }
-            if let Some(long) = &argument.long {
-                if matches.value_source(&argument.name).is_none() {
-                    continue;
-                }
-                if matches!(argument.kind, PluginCommandArgumentKind::Boolean) {
-                    if matches.get_flag(&argument.name) {
-                        normalized.push(format!("--{long}"));
-                    }
-                    continue;
-                }
-                if argument.multiple {
-                    if let Some(values) = matches.get_many::<String>(&argument.name) {
-                        for value in values {
-                            normalized.push(format!("--{long}"));
-                            normalized.push(value.clone());
-                        }
-                    }
-                } else if let Some(value) = matches.get_one::<String>(&argument.name) {
-                    normalized.push(format!("--{long}"));
-                    normalized.push(value.clone());
+            };
+            let flag = argument
+                .long
+                .as_ref()
+                .map(|name| format!("--{name}"))
+                .or_else(|| argument.short.map(|name| format!("-{name}")));
+            if matches!(argument.kind, PluginCommandArgumentKind::Boolean) {
+                if matches.try_get_one::<bool>(&argument.name).ok().flatten() == Some(&true) {
+                    normalized.extend(flag);
                 }
                 continue;
             }
-
-            if argument.multiple {
-                if let Some(values) = matches.get_many::<String>(&argument.name) {
-                    normalized.extend(values.cloned());
-                }
-            } else if let Some(value) = matches.get_one::<String>(&argument.name) {
-                normalized.push(value.clone());
+            for raw in values {
+                normalized.extend(flag.iter().cloned());
+                let value = raw.to_string_lossy();
+                normalized.push(
+                    argument
+                        .choice_aliases
+                        .get(value.as_ref())
+                        .cloned()
+                        .unwrap_or_else(|| value.into_owned()),
+                );
             }
         }
         normalized
     }
 
+    /// Namespace ownership alone does not replace an existing static clap leaf.
+    pub fn installs_leaf(&self, root: &Command, path: &[String], plugin_id: &str) -> bool {
+        !clap_path_exists(root, path)
+            || self
+                .owned_exact_paths
+                .get(path)
+                .is_some_and(|owner| owner == plugin_id)
+    }
+
     pub fn augment_clap_command(&self, root: Command) -> Result<Command> {
+        let retained: BTreeSet<_> = self
+            .help
+            .keys()
+            .filter(|path| clap_path_exists(&root, path))
+            .cloned()
+            .collect();
         let mut root = root;
         for command in &self.commands {
             for path in std::iter::once(&command.canonical_path).chain(command.aliases.iter()) {
@@ -269,7 +339,73 @@ impl PluginCommandRegistry {
                 insert_plugin_path(&mut root, path, &command.schema)?;
             }
         }
-        Ok(root)
+        Ok(self.apply_help(root, &mut Vec::new(), &retained))
+    }
+
+    fn apply_help(
+        &self,
+        command: Command,
+        path: &mut Vec<String>,
+        retained: &BTreeSet<Vec<String>>,
+    ) -> Command {
+        let mut reserved = BTreeSet::new();
+        let mut lower_bounds = BTreeMap::<&str, usize>::new();
+        for child in command.get_subcommands() {
+            path.push(child.get_name().to_owned());
+            if let Some(order) = self.help.get(path).and_then(|help| help.order) {
+                reserved.insert(order);
+                if let Some(anchor) = self.help.get(path).and_then(|help| help.before.as_deref()) {
+                    lower_bounds
+                        .entry(anchor)
+                        .and_modify(|bound| *bound = (*bound).max(order + 1))
+                        .or_insert(order + 1);
+                }
+            }
+            path.pop();
+        }
+        let mut next = 0;
+        command.mut_subcommands(|mut child| {
+            path.push(child.get_name().to_owned());
+            let help = self.help.get(path);
+            if !reserved.is_empty() {
+                let order = help.and_then(|help| help.order).unwrap_or_else(|| {
+                    if let Some(bound) = lower_bounds.get(child.get_name()) {
+                        next = next.max(*bound);
+                    }
+                    while reserved.contains(&next) {
+                        next += 1;
+                    }
+                    next += 1;
+                    next - 1
+                });
+                child = child.display_order(order);
+            }
+            if let Some(summary) = help.and_then(|help| help.summary.as_ref()) {
+                // An installed alias can have its own short description without changing
+                // the canonical leaf, retained host grammar, or dispatch identity.
+                if !child.has_subcommands()
+                    && self.resolved_by_path.get(path).is_some_and(|entry| {
+                        entry.schema.canonical_path() != *path
+                            && (!retained.contains(path)
+                                || self.owned_exact_paths.get(path) == Some(&entry.plugin_id))
+                    })
+                {
+                    child = child.about(summary.clone());
+                } else if !retained.contains(path)
+                    && child.get_about().is_none()
+                    && child.has_subcommands()
+                {
+                    let auto_help = child.find_subcommand("help").is_none();
+                    child = child
+                        .about(summary.clone())
+                        .subcommand_required(true)
+                        .disable_help_subcommand(!auto_help);
+                }
+            }
+            let child = self.apply_help(child, path, retained);
+            path.pop();
+            child
+        })
     }
 }
 
@@ -347,7 +483,7 @@ fn replace_plugin_path(root: &mut Command, path: &[String], schema: &PluginComma
         .find_subcommand_mut(head)
         .context("missing owned command path")?;
     if tail.is_empty() {
-        *child = build_plugin_leaf_command(head, schema);
+        *child = build_plugin_leaf_command(head, schema).display_order(child.get_display_order());
         Ok(())
     } else {
         replace_plugin_path(child, tail, schema)
@@ -355,17 +491,17 @@ fn replace_plugin_path(root: &mut Command, path: &[String], schema: &PluginComma
 }
 
 fn build_plugin_namespace_command(name: &str) -> Command {
-    Command::new(leak_string(name))
+    Command::new(name.to_owned())
         .disable_help_subcommand(true)
         .arg_required_else_help(true)
 }
 
 fn build_plugin_leaf_command(name: &str, schema: &PluginCommand) -> Command {
-    let mut command = Command::new(leak_string(name))
-        .about(leak_string(&schema.summary))
+    let mut command = Command::new(name.to_owned())
+        .about(schema.summary.clone())
         .disable_help_subcommand(true);
     if let Some(description) = &schema.description {
-        command = command.long_about(leak_string(description));
+        command = command.long_about(description.clone());
     }
     for argument in &schema.arguments {
         command = command.arg(build_clap_arg(argument));
@@ -373,13 +509,66 @@ fn build_plugin_leaf_command(name: &str, schema: &PluginCommand) -> Command {
     command
 }
 
+fn validate_argument_metadata(command: &PluginCommand) -> Result<()> {
+    let has_trailing = command.arguments.iter().any(|arg| arg.trailing_var_arg);
+    for arg in &command.arguments {
+        for other in &arg.conflicts_with {
+            if other == &arg.name
+                || !command
+                    .arguments
+                    .iter()
+                    .any(|sibling| &sibling.name == other)
+            {
+                bail!(
+                    "invalid conflict '{other}' for {}:{}",
+                    command.name,
+                    arg.name
+                );
+            }
+        }
+        for (alias, canonical) in &arg.choice_aliases {
+            if arg.kind != PluginCommandArgumentKind::Choice
+                || alias.is_empty()
+                || arg.choice_values.contains(alias)
+                || !arg.choice_values.contains(canonical)
+            {
+                bail!(
+                    "invalid choice alias '{alias}' for {}:{}",
+                    command.name,
+                    arg.name
+                );
+            }
+        }
+        if let Some(value) = &arg.default_value {
+            let valid = match arg.kind {
+                PluginCommandArgumentKind::Integer => value.parse::<i64>().is_ok(),
+                PluginCommandArgumentKind::Choice => arg.choice_values.contains(value),
+                PluginCommandArgumentKind::Boolean => false,
+                PluginCommandArgumentKind::Path | PluginCommandArgumentKind::String => true,
+            };
+            if !valid {
+                bail!("invalid default for {}:{}", command.name, arg.name);
+            }
+        }
+        if has_trailing && (arg.default_value.is_some() || !arg.choice_aliases.is_empty()) {
+            bail!(
+                "{} cannot normalize defaults or aliases with caller-owned trailing argv",
+                command.name
+            );
+        }
+    }
+    Ok(())
+}
+
 fn build_clap_arg(argument: &PluginCommandArgument) -> Arg {
-    let mut arg = Arg::new(leak_string(&argument.name)).required(argument.required);
+    let mut arg = Arg::new(argument.name.clone())
+        .required(argument.required)
+        .conflicts_with_all(argument.conflicts_with.iter().cloned());
     if let Some(position) = argument.position {
         arg = arg.index(position + 1);
     }
     if let Some(long) = &argument.long {
-        arg = arg.long(leak_string(long));
+        arg = arg.long(long.clone());
     }
     if let Some(short) = argument.short {
         arg = arg.short(short);
@@ -388,7 +577,10 @@ fn build_clap_arg(argument: &PluginCommandArgument) -> Arg {
         arg = arg.help(summary);
     }
     if let Some(value_name) = &argument.value_name {
-        arg = arg.value_name(leak_string(value_name));
+        arg = arg.value_name(value_name.clone());
+    }
+    if let Some(value) = &argument.default_value {
+        arg = arg.default_value(value.clone());
     }
     if argument.multiple {
         arg = arg.action(ArgAction::Append);
@@ -408,22 +600,22 @@ fn build_clap_arg(argument: &PluginCommandArgument) -> Arg {
             arg = arg.value_parser(clap::value_parser!(i64));
         }
         PluginCommandArgumentKind::Choice => {
-            let leaked = argument
-                .choice_values
-                .iter()
-                .map(|value| Box::leak(value.clone().into_boxed_str()) as &'static str)
-                .collect::<Vec<_>>();
-            arg = arg.value_parser(leaked);
+            let choices = argument.choice_values.iter().map(|value| {
+                clap::builder::PossibleValue::new(value.clone()).aliases(
+                    argument
+                        .choice_aliases
+                        .iter()
+                        .filter(|(_, canonical)| *canonical == value)
+                        .map(|(alias, _)| alias.clone()),
+                )
+            });
+            arg = arg.value_parser(clap::builder::PossibleValuesParser::new(choices));
         }
         PluginCommandArgumentKind::String
         | PluginCommandArgumentKind::Boolean
         | PluginCommandArgumentKind::Path => {}
     }
     arg
-}
-
-fn leak_string(value: &str) -> &'static str {
-    Box::leak(value.to_string().into_boxed_str())
 }
 
 fn validate_path_collision(
@@ -544,6 +736,111 @@ mod tests {
         let mut config = BmuxConfig::default();
         config.plugins.enabled.push(plugin_id.to_string());
         config
+    }
+
+    #[test]
+    fn namespace_help_uses_enabled_owner_metadata_and_reserves_sibling_slots() {
+        let mut plugins = PluginRegistry::new();
+        plugins
+            .register_bundled_manifest(
+                r#"
+id = "example.fixture"
+name = "Fixture"
+version = "1.0.0"
+owns_namespaces = ["tools"]
+[cli_help]
+tools = { summary = "Fixture tools", order = 9, before = "existing" }
+"tools inspect" = { order = 0 }
+"tools view" = { summary = "Alias for inspect" }
+[[commands]]
+name = "write"
+path = ["tools", "write"]
+summary = "Write data"
+expose_in_cli = true
+[[commands]]
+name = "inspect"
+path = ["tools", "inspect"]
+summary = "Inspect data"
+aliases = [["tools", "view"]]
+expose_in_cli = true
+"#,
+            )
+            .unwrap();
+        let root =
+            Command::new("fixture").subcommand(Command::new("existing").about("Existing command"));
+        let disabled = PluginCommandRegistry::build(&BmuxConfig::default(), &plugins)
+            .unwrap()
+            .augment_clap_command(root.clone())
+            .unwrap();
+        assert!(disabled.find_subcommand("tools").is_none());
+        let tree = PluginCommandRegistry::build(&config_with_enabled("example.fixture"), &plugins)
+            .unwrap()
+            .augment_clap_command(root)
+            .unwrap();
+        let render = |args: &[&str]| {
+            tree.clone()
+                .try_get_matches_from(args)
+                .unwrap_err()
+                .to_string()
+        };
+        let root_help = render(&["fixture", "--help"]);
+        assert!(
+            root_help.find("Fixture tools").unwrap() < root_help.find("Existing command").unwrap()
+        );
+        let help = render(&["fixture", "tools", "--help"]);
+        assert!(help.starts_with("Fixture tools"));
+        assert!(help.contains("Alias for inspect"));
+        assert!(render(&["fixture", "help", "tools", "view"]).starts_with("Alias for inspect"));
+        assert!(help.contains("tools <COMMAND>"));
+        assert!(help.find("Inspect data").unwrap() < help.find("Write data").unwrap());
+        assert!(render(&["fixture", "tools", "help", "inspect"]).contains("Inspect data"));
+    }
+
+    fn dynamic_help_registry(help: &str) -> anyhow::Result<PluginCommandRegistry> {
+        let manifest = PluginManifest::from_toml_str(&format!(
+            r#"
+id = "example.dynamic"
+name = "Example"
+version = "1.0.0"
+entry = "fixture.dylib"
+owns_paths = [["tools", "inspect"]]
+[[commands]]
+name = "inspect"
+path = ["tools", "inspect"]
+summary = "Inspect"
+expose_in_cli = true
+[cli_help]
+{help}
+"#
+        ))?;
+        let mut plugins = PluginRegistry::new();
+        plugins.register_manifest(Path::new("fixture/plugin.toml"), manifest)?;
+        PluginCommandRegistry::build(&config_with_enabled("example.dynamic"), &plugins)
+    }
+
+    #[test]
+    fn dynamic_help_rejects_malformed_and_unrelated_entries() {
+        for (help, expected) in [
+            (r#"tools = { summary = " " }"#, "malformed CLI help"),
+            (r#"tools = { summary = "one\ntwo" }"#, "malformed CLI help"),
+            ("tools = {}", "malformed CLI help"),
+            (r#""tools  inspect" = { order = 0 }"#, "malformed CLI help"),
+            (r#""tools other" = { order = 0 }"#, "unrelated path"),
+            ("tools = { unexpected = 1 }", "unknown field"),
+        ] {
+            let error = dynamic_help_registry(help).unwrap_err().to_string();
+            assert!(error.contains(expected), "{help}: {error}");
+        }
+    }
+
+    #[test]
+    fn dynamic_help_preserves_optional_retained_namespace_grammar() {
+        let registry =
+            dynamic_help_registry(r#"tools = { summary = "Generated namespace" }"#).unwrap();
+        let root = Command::new("host").subcommand(Command::new("tools"));
+        let tree = registry.augment_clap_command(root).unwrap();
+        assert!(tree.find_subcommand("tools").unwrap().get_about().is_none());
+        assert!(tree.try_get_matches_from(["host", "tools"]).is_ok());
     }
 
     #[test]

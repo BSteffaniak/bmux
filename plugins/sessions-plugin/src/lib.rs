@@ -28,7 +28,10 @@ pub mod declaration {
 // plugins and the server reach it through the domain-agnostic
 // `bmux_session_state::SessionManagerHandle` trait object registered
 // into the plugin state registry during `activate`.
+mod cli;
+mod kill;
 pub mod session_manager;
+pub mod standalone;
 pub use session_manager::SessionManager;
 
 use bmux_plugin::{EventBus, PluginStateRegistry, ServiceCaller, TypedServiceCaller};
@@ -335,6 +338,7 @@ impl SessionEvents {
 }
 
 pub struct SessionsPlugin {
+    terminal: Option<standalone::TerminalClient>,
     events: RwLock<SessionEvents>,
     /// This activation's view of the host state registry; an empty private
     /// registry until activation supplies one.
@@ -344,6 +348,7 @@ pub struct SessionsPlugin {
 impl Default for SessionsPlugin {
     fn default() -> Self {
         Self {
+            terminal: None,
             events: RwLock::new(SessionEvents::default()),
             states: RwLock::new(Arc::new(PluginStateRegistry::new())),
         }
@@ -353,6 +358,14 @@ impl Default for SessionsPlugin {
 impl Plugin for SessionsPlugin {
     fn declare(d: &mut Declarations<Self>) {
         d.blocking_activate(Self::activate)
+            .blocking_command("kill-session", Self::run_terminal_command)
+            .blocking_command("kill-all-sessions", Self::run_terminal_command)
+            .blocking_command("session-attach", Self::run_terminal_command)
+            .blocking_command("detach", Self::run_terminal_command)
+            .blocking_command("session-new", |_, ctx| {
+                cli::new(ctx, ctx.arguments.first().cloned())
+            })
+            .blocking_command("list-sessions", |_, ctx| cli::list(ctx))
             .blocking_command("new-session", |_, a0| Self::run_command(a0))
             .blocking_services(Self::invoke_service, None)
             .typed_services(|plugin, context, registry| {
@@ -450,7 +463,20 @@ impl SessionsPlugin {
     fn run_command(context: &NativeCommandContext) -> std::result::Result<i32, PluginCommandError> {
         match context.command.as_str() {
             "new-session" => {
-                let name = option_value(&context.arguments, "name");
+                let name = option_value(&context.arguments, "name").or_else(|| {
+                    context
+                        .arguments
+                        .windows(2)
+                        .find_map(|v| (v[0] == "-n").then(|| v[1].clone()))
+                });
+                // With the plugin loaded the pre-migration top-level command
+                // selected a context. Keep that behavior for omitted/flag names.
+                if context.invocation_source.is_cli()
+                    && name.is_none()
+                    && let Some(positional) = context.arguments.first()
+                {
+                    return cli::new(context, Some(positional.clone()));
+                }
                 match new_session_with_context(context, name) {
                     Ok(ack) => {
                         record_selected_context_outcome(ack.id);

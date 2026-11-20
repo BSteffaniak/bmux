@@ -87,9 +87,7 @@ pub(crate) fn generate_cli_reference() -> String {
 mod tests {
     use super::{generate_cli_reference, generate_config_reference};
     use bmux_cli::playbook;
-    use bmux_cli_schema::Cli;
     use bmux_config::{BmuxConfig, ConfigDocSchema};
-    use clap::Parser;
     use serde::Serialize;
     use std::collections::{BTreeMap, BTreeSet};
     use std::env;
@@ -184,6 +182,7 @@ mod tests {
 
     #[test]
     fn markdown_opt_in_snippets_are_valid() {
+        let graph = bmux_cli::bundled_cli_command_for_docs().expect("default bundled CLI graph");
         let mut failures = Vec::new();
         let key_patterns = collect_config_key_patterns();
 
@@ -194,7 +193,7 @@ mod tests {
             for block in parse_fenced_blocks(&content) {
                 match block.language.as_str() {
                     "bmux-cli" => {
-                        if let Err(error) = validate_cli_block(&block.content) {
+                        if let Err(error) = validate_cli_block(&graph, &block.content) {
                             failures.push(format!(
                                 "{}:{} [{}] {error}",
                                 file.display(),
@@ -439,7 +438,24 @@ mod tests {
         }
     }
 
-    fn validate_cli_block(content: &str) -> Result<(), String> {
+    #[test]
+    fn cli_snippets_require_declared_commands_and_valid_options() {
+        let graph = bmux_cli::bundled_cli_command_for_docs().unwrap();
+        assert!(validate_cli_block(&graph, "bmux logs tail --lines 10 --no-follow").is_ok());
+        for invalid in [
+            "bmux logs taill",
+            "bmux logs tail --not-an-option",
+            "bmux nonexistent-plugin-command",
+            "bmuxx logs tail",
+        ] {
+            assert!(
+                validate_cli_block(&graph, invalid).is_err(),
+                "accepted: {invalid}"
+            );
+        }
+    }
+
+    fn validate_cli_block(graph: &clap::Command, content: &str) -> Result<(), String> {
         for raw_line in content.lines() {
             let line = raw_line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -451,12 +467,27 @@ mod tests {
                 .or_else(|| line.strip_prefix("# "))
                 .unwrap_or(line);
 
-            if !command.starts_with("bmux") {
+            let args = shell_split(command)?;
+            if args.first().map(String::as_str) != Some("bmux") {
                 return Err(format!("expected command to start with 'bmux': {command}"));
             }
 
-            let args = shell_split(command)?;
-            Cli::try_parse_from(args).map_err(|err| err.to_string())?;
+            // External commands are a runtime escape hatch, not proof that a
+            // documented command is declared in the default installation.
+            match graph.clone().try_get_matches_from(args) {
+                Ok(matches) => {
+                    let mut node = graph;
+                    let mut current = &matches;
+                    while let Some((name, child)) = current.subcommand() {
+                        node = node
+                            .find_subcommand(name)
+                            .ok_or_else(|| format!("undeclared command '{name}' in: {command}"))?;
+                        current = child;
+                    }
+                }
+                Err(err) if err.exit_code() == 0 => (), // Help and version are successful CLI invocations.
+                Err(err) => return Err(format!("{command}: {err}")),
+            }
         }
 
         Ok(())

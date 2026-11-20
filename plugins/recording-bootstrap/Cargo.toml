@@ -1,0 +1,24 @@
+[package]
+authors.workspace    = true
+categories           = ["command-line-utilities"]
+description          = "Recording configuration for bmux hosts before backend activation"
+edition.workspace    = true
+keywords             = ["bmux", "recording"]
+license.workspace    = true
+name                 = "bmux_recording_bootstrap"
+readme               = "README.md"
+repository.workspace = true
+version.workspace    = true
+
+[dependencies]
+anyhow                    = { workspace = true, features = ["std"] }
+bmux_config               = { workspace = true }
+bmux_recording_plugin_api = { workspace = true }
+bmux_recording_protocol   = { workspace = true }
+
+[features]
+fail-on-warnings = [
+    "bmux_config/fail-on-warnings",
+    "bmux_recording_plugin_api/fail-on-warnings",
+    "bmux_recording_protocol/fail-on-warnings",
+]

@@ -120,6 +120,16 @@ impl AuxiliaryExecutableDeclaration {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginCliHelp {
+    /// If present, the named unordered sibling follows this slot, even in sparse installations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    pub summary: Option<String>,
+    pub order: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginManifest {
     /// Requires explicit native ABI 1.1 opt-in. IDs are local to this owner.
     #[serde(default)]
@@ -144,6 +154,9 @@ pub struct PluginManifest {
     pub concurrency: PluginConcurrencyConfig,
     #[serde(default)]
     pub owns_namespaces: BTreeSet<String>,
+    /// Presentation only, keyed by space-separated path to a contributed leaf or namespace.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cli_help: BTreeMap<String, PluginCliHelp>,
     #[serde(default)]
     pub owns_paths: BTreeSet<PluginOwnedPath>,
     #[serde(default)]

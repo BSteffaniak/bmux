@@ -87,22 +87,13 @@ impl bmux_recording_plugin::RecordingHost for RecordingPorts {
 }
 
 pub(super) fn configuration(config: &BmuxConfig, paths: &ConfigPaths) -> RecordingPluginConfig {
-    let auto_export_dir = config.recording_auto_export_dir(paths);
-    RecordingPluginConfig {
-        recordings_dir: config.recordings_dir(paths),
-        rolling_recordings_dir: paths.rolling_recordings_dir(),
-        rolling_segment_mb: config.recording.segment_mb,
-        retention_days: config.recording.retention_days,
-        rolling_defaults: bmux_server::rolling_recording_settings_from_config(config),
-        // This is a standalone command owner, not server capture startup.
-        // Preserve selected capture defaults for explicit recording operations;
-        // bootstrap alone supplies effective server rolling auto-start intent.
-        rolling_auto_start: false,
-        auto_export: config.recording.auto_export || auto_export_dir.is_some(),
-        auto_export_dir,
-        auto_export_fps: config.recording.export.fps.max(1),
-        startup_recording: None,
-    }
+    bmux_recording_bootstrap::recording_plugin_config(
+        config,
+        paths,
+        false,
+        &bmux_server::rolling_recording_settings_from_config(config),
+        None,
+    )
 }
 
 /// Discovery publishes the same author implementation without inventing runtime

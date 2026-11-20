@@ -6,20 +6,15 @@ Bundled plugin CLI plugin for bmux.
 
 Provides the `bmux plugin` command namespace. Implements plugin discovery and
 listing, command dispatch to other plugins, and bundled plugin rebuilding from
-source. Also proxies several core CLI commands (logs, diagnostics, playbook,
-config, server) under the plugin namespace for a consistent user experience.
-Recording commands are owned exclusively by `bmux.recording`.
+source. `plugin run` invokes the selected plugin by ID and command name. It
+rejects self-invocation rather than re-entering the plugin CLI.
 
 ## Commands
 
 - `plugin list` -- discover and display installed plugins with status
 - `plugin run <plugin-id> <command> [args...]` -- dispatch a command to a specific plugin
 - `plugin rebuild [selector...]` -- recompile bundled plugin crates from source
+- `plugin doctor` -- check plugin installation and declarations
 
-### Proxied Commands
-
-- `logs-path`, `logs-level`, `logs-tail`, `logs-watch` -- log management
-- `keymap-doctor`, `terminal-doctor` -- diagnostic tools
-- `playbook-*` -- headless scripted execution
-- `config-*` -- configuration inspection
-- `server-*` -- server lifecycle management
+Compatibility routes to still-built-in commands are enumerated explicitly in
+`src/lib.rs`. The manifest alone cannot create a new core-command route.

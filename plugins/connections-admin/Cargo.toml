@@ -1,0 +1,21 @@
+[package]
+authors.workspace    = true
+description          = "Standalone connections administration and pre-admission policy"
+edition.workspace    = true
+license.workspace    = true
+name                 = "bmux_connections_admin"
+repository.workspace = true
+version.workspace    = true
+
+categories = ["command-line-utilities"]
+keywords   = ["bmux", "connections"]
+readme     = "README.md"
+
+[dependencies]
+anyhow      = { workspace = true, features = ["std"] }
+bmux_config = { workspace = true }
+serde       = { workspace = true, features = ["derive"] }
+serde_json  = { workspace = true }
+sha2        = { workspace = true }
+toml        = { workspace = true }
+uuid        = { workspace = true, features = ["std", "v4"] }

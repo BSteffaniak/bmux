@@ -1,0 +1,1997 @@
+{
+  "claims": {
+    "bmux.application_resurrection": {},
+    "bmux.broadcast": {
+      "owns_namespaces": [
+        "broadcast"
+      ]
+    },
+    "bmux.clients": {},
+    "bmux.clipboard": {},
+    "bmux.cluster": {
+      "owns_namespaces": [
+        "cluster",
+        "cluster-init",
+        "cluster-enrollment-token-create",
+        "cluster-enrollment-list",
+        "cluster-enrollment-revoke",
+        "cluster-credential-rotate",
+        "cluster-member-revoke",
+        "cluster-join",
+        "cluster-leave",
+        "cluster-members",
+        "cluster-up",
+        "cluster-status",
+        "cluster-doctor",
+        "cluster-hosts",
+        "cluster-events",
+        "cluster-pane-new",
+        "cluster-pane-move",
+        "cluster-pane-retry",
+        "cluster-gateway-status",
+        "cluster-gateway-explain",
+        "cluster-gateway-doctor",
+        "cluster-gateway-history",
+        "cluster-gateway-history-export",
+        "cluster-gateway-history-clear",
+        "cluster-gateway-why",
+        "cluster-gateway-reset"
+      ]
+    },
+    "bmux.command_palette": {
+      "owns_namespaces": [
+        "command-palette"
+      ]
+    },
+    "bmux.connections": {
+      "owns_namespaces": [
+        "remote",
+        "remote-enable",
+        "remote-disable",
+        "remote-pair-request",
+        "remote-approve",
+        "remote-pair",
+        "remote-list",
+        "remote-status",
+        "remote-revoke",
+        "remote-rename",
+        "remote-forget"
+      ],
+      "owns_paths": [
+        [
+          "connect"
+        ]
+      ]
+    },
+    "bmux.contexts": {},
+    "bmux.control_catalog": {},
+    "bmux.decoration": {},
+    "bmux.finder": {
+      "owns_namespaces": [
+        "finder"
+      ]
+    },
+    "bmux.pane_runtime": {
+      "owns_namespaces": [
+        "pane-padding"
+      ]
+    },
+    "bmux.performance": {},
+    "bmux.permissions": {
+      "owns_namespaces": [
+        "session",
+        "permissions",
+        "permissions-current",
+        "grant",
+        "revoke",
+        "hot-path-policy",
+        "grant-hot-path-override",
+        "revoke-hot-path-override",
+        "list-hot-path-overrides"
+      ]
+    },
+    "bmux.playbook": {},
+    "bmux.plugin_cli": {
+      "owns_namespaces": [
+        "plugin"
+      ],
+      "owns_paths": [
+        [
+          "logs",
+          "path"
+        ],
+        [
+          "logs",
+          "level"
+        ],
+        [
+          "logs",
+          "tail"
+        ],
+        [
+          "logs",
+          "watch"
+        ],
+        [
+          "logs",
+          "profiles",
+          "list"
+        ],
+        [
+          "logs",
+          "profiles",
+          "show"
+        ],
+        [
+          "logs",
+          "profiles",
+          "delete"
+        ],
+        [
+          "logs",
+          "profiles",
+          "rename"
+        ],
+        [
+          "keymap",
+          "doctor"
+        ],
+        [
+          "terminal",
+          "doctor"
+        ],
+        [
+          "terminal",
+          "install-terminfo"
+        ],
+        [
+          "playbook",
+          "run"
+        ],
+        [
+          "playbook",
+          "validate"
+        ],
+        [
+          "playbook",
+          "interactive"
+        ],
+        [
+          "playbook",
+          "dry-run"
+        ],
+        [
+          "playbook",
+          "diff"
+        ],
+        [
+          "playbook",
+          "cleanup"
+        ]
+      ]
+    },
+    "bmux.presenter": {
+      "owns_namespaces": [
+        "present"
+      ]
+    },
+    "bmux.prompted_actions": {
+      "owns_namespaces": [
+        "prompted-action"
+      ]
+    },
+    "bmux.recording": {
+      "owns_namespaces": [
+        "recording",
+        "record"
+      ],
+      "owns_paths": [
+        [
+          "server",
+          "recording"
+        ],
+        [
+          "playbook",
+          "from-recording"
+        ]
+      ]
+    },
+    "bmux.sessions": {
+      "owns_namespaces": [
+        "new-session"
+      ]
+    },
+    "bmux.sidebar": {},
+    "bmux.snapshot": {},
+    "bmux.tab_bar": {},
+    "bmux.tabs": {
+      "owns_namespaces": [
+        "tab",
+        "new-tab",
+        "explain-spawn-directory",
+        "rename-tab",
+        "rename-tab-by-id",
+        "list-tabs",
+        "kill-tab",
+        "kill-all-tabs",
+        "switch-tab",
+        "move-tab",
+        "next-tab",
+        "prev-tab",
+        "last-tab",
+        "goto-tab",
+        "close-current-tab",
+        "reset-order",
+        "focus-pane-in-direction",
+        "split-pane",
+        "resize-pane",
+        "zoom-pane",
+        "list-floating-panes",
+        "create-floating-pane",
+        "focus-floating-pane",
+        "focus-next-floating-pane",
+        "raise-floating-pane",
+        "raise-active-floating-pane",
+        "lower-floating-pane",
+        "lower-active-floating-pane",
+        "move-floating-pane",
+        "resize-floating-pane",
+        "move-active-floating-pane",
+        "resize-active-floating-pane",
+        "set-floating-pane-z",
+        "set-floating-pane-layer",
+        "close-floating-pane",
+        "close-active-floating-pane",
+        "close-active-pane",
+        "restart-pane"
+      ]
+    },
+    "bmux.theme": {
+      "owns_namespaces": [
+        "theme"
+      ]
+    },
+    "bmux.workspaces": {
+      "owns_namespaces": [
+        "workspace"
+      ]
+    }
+  },
+  "host_api": [
+    "core_cli_command_run_path",
+    "log_write",
+    "plugin_command_run",
+    "storage_get",
+    "storage_set"
+  ],
+  "paths": {
+    "access": {
+      "core": "Access",
+      "schema": "Command::Access"
+    },
+    "access add": {
+      "schema": "AccessCommand::Add"
+    },
+    "access disable": {
+      "schema": "AccessCommand::Disable"
+    },
+    "access enable": {
+      "schema": "AccessCommand::Enable"
+    },
+    "access init": {
+      "schema": "AccessCommand::Init"
+    },
+    "access list": {
+      "schema": "AccessCommand::List"
+    },
+    "access remove": {
+      "schema": "AccessCommand::Remove"
+    },
+    "access status": {
+      "schema": "AccessCommand::Status"
+    },
+    "attach": {
+      "called_by_proxy": [
+        "bmux.connections:connect"
+      ],
+      "core": "Attach",
+      "schema": "Command::Attach"
+    },
+    "auth": {
+      "core": "Auth",
+      "schema": "Command::Auth"
+    },
+    "auth login": {
+      "core": "AuthLogin",
+      "schema": "AuthCommand::Login"
+    },
+    "auth logout": {
+      "core": "AuthLogout",
+      "schema": "AuthCommand::Logout"
+    },
+    "auth status": {
+      "core": "AuthStatus",
+      "schema": "AuthCommand::Status"
+    },
+    "broadcast": {
+      "declarations": [
+        "bmux.broadcast:broadcast"
+      ]
+    },
+    "broadcast doctor": {
+      "declarations": [
+        "bmux.broadcast:broadcast-doctor"
+      ]
+    },
+    "broadcast pause": {
+      "declarations": [
+        "bmux.broadcast:broadcast-pause"
+      ]
+    },
+    "broadcast resume": {
+      "declarations": [
+        "bmux.broadcast:broadcast-resume"
+      ]
+    },
+    "broadcast setup": {
+      "declarations": [
+        "bmux.broadcast:broadcast-setup"
+      ]
+    },
+    "broadcast start": {
+      "declarations": [
+        "bmux.broadcast:broadcast-start"
+      ]
+    },
+    "broadcast stop": {
+      "declarations": [
+        "bmux.broadcast:broadcast-stop"
+      ]
+    },
+    "close-active-floating-pane": {
+      "declarations": [
+        "bmux.tabs:close-active-floating-pane"
+      ]
+    },
+    "close-active-pane": {
+      "declarations": [
+        "bmux.tabs:close-active-pane"
+      ]
+    },
+    "close-current-tab": {
+      "declarations": [
+        "bmux.tabs:close-current-tab"
+      ]
+    },
+    "close-floating-pane": {
+      "declarations": [
+        "bmux.tabs:close-floating-pane"
+      ]
+    },
+    "cluster credential rotate": {
+      "declarations": [
+        "bmux.cluster:cluster-credential-rotate"
+      ]
+    },
+    "cluster doctor": {
+      "declarations": [
+        "bmux.cluster:cluster-doctor"
+      ]
+    },
+    "cluster enrollment list": {
+      "declarations": [
+        "bmux.cluster:cluster-enrollment-list"
+      ]
+    },
+    "cluster enrollment revoke": {
+      "declarations": [
+        "bmux.cluster:cluster-enrollment-revoke"
+      ]
+    },
+    "cluster enrollment-token create": {
+      "declarations": [
+        "bmux.cluster:cluster-enrollment-token-create"
+      ]
+    },
+    "cluster events": {
+      "declarations": [
+        "bmux.cluster:cluster-events"
+      ]
+    },
+    "cluster gateway doctor": {
+      "declarations": [
+        "bmux.cluster:cluster-gateway-doctor"
+      ]
+    },
+    "cluster gateway explain": {
+      "declarations": [
+        "bmux.cluster:cluster-gateway-explain"
+      ]
+    },
+    "cluster gateway history": {
+      "declarations": [
+        "bmux.cluster:cluster-gateway-history"
+      ]
+    },
+    "cluster gateway history-clear": {
+      "declarations": [
+        "bmux.cluster:cluster-gateway-history-clear"
+      ]
+    },
+    "cluster gateway history-export": {
+      "declarations": [
+        "bmux.cluster:cluster-gateway-history-export"
+      ]
+    },
+    "cluster gateway reset": {
+      "declarations": [
+        "bmux.cluster:cluster-gateway-reset"
+      ]
+    },
+    "cluster gateway status": {
+      "declarations": [
+        "bmux.cluster:cluster-gateway-status"
+      ]
+    },
+    "cluster gateway why": {
+      "declarations": [
+        "bmux.cluster:cluster-gateway-why"
+      ]
+    },
+    "cluster hosts": {
+      "declarations": [
+        "bmux.cluster:cluster-hosts"
+      ]
+    },
+    "cluster init": {
+      "declarations": [
+        "bmux.cluster:cluster-init"
+      ]
+    },
+    "cluster join": {
+      "declarations": [
+        "bmux.cluster:cluster-join"
+      ]
+    },
+    "cluster leave": {
+      "declarations": [
+        "bmux.cluster:cluster-leave"
+      ]
+    },
+    "cluster member revoke": {
+      "declarations": [
+        "bmux.cluster:cluster-member-revoke"
+      ]
+    },
+    "cluster members": {
+      "declarations": [
+        "bmux.cluster:cluster-members"
+      ]
+    },
+    "cluster pane move": {
+      "declarations": [
+        "bmux.cluster:cluster-pane-move"
+      ]
+    },
+    "cluster pane new": {
+      "declarations": [
+        "bmux.cluster:cluster-pane-new"
+      ]
+    },
+    "cluster pane retry": {
+      "declarations": [
+        "bmux.cluster:cluster-pane-retry"
+      ]
+    },
+    "cluster status": {
+      "declarations": [
+        "bmux.cluster:cluster-status"
+      ]
+    },
+    "cluster up": {
+      "declarations": [
+        "bmux.cluster:cluster-up"
+      ]
+    },
+    "cluster-credential-rotate": {
+      "declarations": [
+        "bmux.cluster:cluster-credential-rotate"
+      ]
+    },
+    "cluster-doctor": {
+      "declarations": [
+        "bmux.cluster:cluster-doctor"
+      ]
+    },
+    "cluster-enrollment-list": {
+      "declarations": [
+        "bmux.cluster:cluster-enrollment-list"
+      ]
+    },
+    "cluster-enrollment-revoke": {
+      "declarations": [
+        "bmux.cluster:cluster-enrollment-revoke"
+      ]
+    },
+    "cluster-enrollment-token-create": {
+      "declarations": [
+        "bmux.cluster:cluster-enrollment-token-create"
+      ]
+    },
+    "cluster-events": {
+      "declarations": [
+        "bmux.cluster:cluster-events"
+      ]
+    },
+    "cluster-gateway-doctor": {
+      "declarations": [
+        "bmux.cluster:cluster-gateway-doctor"
+      ]
+    },
+    "cluster-gateway-explain": {
+      "declarations": [
+        "bmux.cluster:cluster-gateway-explain"
+      ]
+    },
+    "cluster-gateway-history": {
+      "declarations": [
+        "bmux.cluster:cluster-gateway-history"
+      ]
+    },
+    "cluster-gateway-history-clear": {
+      "declarations": [
+        "bmux.cluster:cluster-gateway-history-clear"
+      ]
+    },
+    "cluster-gateway-history-export": {
+      "declarations": [
+        "bmux.cluster:cluster-gateway-history-export"
+      ]
+    },
+    "cluster-gateway-reset": {
+      "declarations": [
+        "bmux.cluster:cluster-gateway-reset"
+      ]
+    },
+    "cluster-gateway-status": {
+      "declarations": [
+        "bmux.cluster:cluster-gateway-status"
+      ]
+    },
+    "cluster-gateway-why": {
+      "declarations": [
+        "bmux.cluster:cluster-gateway-why"
+      ]
+    },
+    "cluster-hosts": {
+      "declarations": [
+        "bmux.cluster:cluster-hosts"
+      ]
+    },
+    "cluster-init": {
+      "declarations": [
+        "bmux.cluster:cluster-init"
+      ]
+    },
+    "cluster-join": {
+      "declarations": [
+        "bmux.cluster:cluster-join"
+      ]
+    },
+    "cluster-leave": {
+      "declarations": [
+        "bmux.cluster:cluster-leave"
+      ]
+    },
+    "cluster-member-revoke": {
+      "declarations": [
+        "bmux.cluster:cluster-member-revoke"
+      ]
+    },
+    "cluster-members": {
+      "declarations": [
+        "bmux.cluster:cluster-members"
+      ]
+    },
+    "cluster-pane-move": {
+      "declarations": [
+        "bmux.cluster:cluster-pane-move"
+      ]
+    },
+    "cluster-pane-new": {
+      "declarations": [
+        "bmux.cluster:cluster-pane-new"
+      ]
+    },
+    "cluster-pane-retry": {
+      "declarations": [
+        "bmux.cluster:cluster-pane-retry"
+      ]
+    },
+    "cluster-status": {
+      "declarations": [
+        "bmux.cluster:cluster-status"
+      ]
+    },
+    "cluster-up": {
+      "declarations": [
+        "bmux.cluster:cluster-up"
+      ]
+    },
+    "command-palette show": {
+      "declarations": [
+        "bmux.command_palette:show"
+      ]
+    },
+    "config": {
+      "core": "Config",
+      "schema": "Command::Config"
+    },
+    "config get": {
+      "core": "ConfigGet",
+      "schema": "ConfigCommand::Get"
+    },
+    "config path": {
+      "core": "ConfigPath",
+      "schema": "ConfigCommand::Path"
+    },
+    "config profiles": {
+      "schema": "ConfigCommand::Profiles"
+    },
+    "config profiles diff": {
+      "core": "ConfigProfilesDiff",
+      "schema": "ConfigProfilesCommand::Diff"
+    },
+    "config profiles evaluate": {
+      "core": "ConfigProfilesEvaluate",
+      "schema": "ConfigProfilesCommand::Evaluate"
+    },
+    "config profiles explain": {
+      "core": "ConfigProfilesExplain",
+      "schema": "ConfigProfilesCommand::Explain"
+    },
+    "config profiles lint": {
+      "core": "ConfigProfilesLint",
+      "schema": "ConfigProfilesCommand::Lint"
+    },
+    "config profiles list": {
+      "core": "ConfigProfilesList",
+      "schema": "ConfigProfilesCommand::List"
+    },
+    "config profiles resolve": {
+      "core": "ConfigProfilesResolve",
+      "schema": "ConfigProfilesCommand::Resolve"
+    },
+    "config profiles show": {
+      "core": "ConfigProfilesShow",
+      "schema": "ConfigProfilesCommand::Show"
+    },
+    "config profiles switch": {
+      "core": "ConfigProfilesSwitch",
+      "schema": "ConfigProfilesCommand::Switch"
+    },
+    "config scope": {
+      "schema": "ConfigCommand::Scope"
+    },
+    "config scope explain": {
+      "core": "ConfigScopeExplain",
+      "schema": "ConfigScopeCommand::Explain"
+    },
+    "config set": {
+      "core": "ConfigSet",
+      "schema": "ConfigCommand::Set"
+    },
+    "config show": {
+      "core": "ConfigShow",
+      "schema": "ConfigCommand::Show"
+    },
+    "connect": {
+      "called_by_proxy": [
+        "bmux.connections:connect"
+      ],
+      "core": "Connect",
+      "declarations": [
+        "bmux.connections:connect"
+      ],
+      "schema": "Command::Connect"
+    },
+    "create-floating-pane": {
+      "declarations": [
+        "bmux.tabs:create-floating-pane"
+      ]
+    },
+    "detach": {
+      "core": "Detach",
+      "schema": "Command::Detach"
+    },
+    "device-seal-broker": {
+      "core": "DeviceSealBroker",
+      "schema": "Command::DeviceSealBroker"
+    },
+    "diagnostics": {
+      "core": "Diagnostics",
+      "schema": "Command::Diagnostics"
+    },
+    "diagnostics view": {
+      "core": "DiagnosticsWatch",
+      "schema": "DiagnosticsCommand::View"
+    },
+    "diagnostics watch": {
+      "core": "DiagnosticsWatch",
+      "schema": "DiagnosticsCommand::Watch"
+    },
+    "doctor": {
+      "core": "Doctor",
+      "schema": "Command::Doctor"
+    },
+    "env": {
+      "schema": "Command::Env"
+    },
+    "env doctor": {
+      "core": "SlotDoctor",
+      "schema": "SlotCommand::Doctor"
+    },
+    "env exec": {
+      "core": "SlotExec",
+      "schema": "SlotCommand::Exec"
+    },
+    "env install": {
+      "core": "SlotInstall",
+      "schema": "SlotCommand::Install"
+    },
+    "env list": {
+      "core": "SlotList",
+      "schema": "SlotCommand::List"
+    },
+    "env paths": {
+      "core": "SlotPaths",
+      "schema": "SlotCommand::Paths"
+    },
+    "env print": {
+      "core": "SlotPrint",
+      "schema": "SlotCommand::Print"
+    },
+    "env shell": {
+      "core": "SlotShell",
+      "schema": "SlotCommand::Shell"
+    },
+    "env show": {
+      "core": "SlotShow",
+      "schema": "SlotCommand::Show"
+    },
+    "env uninstall": {
+      "core": "SlotUninstall",
+      "schema": "SlotCommand::Uninstall"
+    },
+    "explain-spawn-directory": {
+      "declarations": [
+        "bmux.tabs:explain-spawn-directory"
+      ]
+    },
+    "finder show": {
+      "declarations": [
+        "bmux.finder:show"
+      ]
+    },
+    "focus-floating-pane": {
+      "declarations": [
+        "bmux.tabs:focus-floating-pane"
+      ]
+    },
+    "focus-next-floating-pane": {
+      "declarations": [
+        "bmux.tabs:focus-next-floating-pane"
+      ]
+    },
+    "focus-pane-in-direction": {
+      "declarations": [
+        "bmux.tabs:focus-pane-in-direction"
+      ]
+    },
+    "follow": {
+      "core": "Follow",
+      "schema": "Command::Follow"
+    },
+    "goto-tab": {
+      "declarations": [
+        "bmux.tabs:goto-tab"
+      ]
+    },
+    "grant": {
+      "declarations": [
+        "bmux.permissions:grant"
+      ]
+    },
+    "grant-hot-path-override": {
+      "declarations": [
+        "bmux.permissions:grant-hot-path-override"
+      ]
+    },
+    "host": {
+      "core": "Host",
+      "schema": "Command::Host"
+    },
+    "hosts": {
+      "core": "Hosts",
+      "schema": "Command::Hosts"
+    },
+    "hot-path-policy": {
+      "declarations": [
+        "bmux.permissions:hot-path-policy"
+      ]
+    },
+    "join": {
+      "core": "Join",
+      "schema": "Command::Join"
+    },
+    "keymap": {
+      "core": "Keymap",
+      "schema": "Command::Keymap"
+    },
+    "keymap doctor": {
+      "called_by_proxy": [
+        "bmux.plugin_cli:keymap-doctor"
+      ],
+      "core": "KeymapDoctor",
+      "declarations": [
+        "bmux.plugin_cli:keymap-doctor"
+      ],
+      "schema": "KeymapCommand::Doctor"
+    },
+    "keymap explain": {
+      "core": "KeymapExplain",
+      "schema": "KeymapCommand::Explain"
+    },
+    "kill-all-sessions": {
+      "core": "KillAllSessions",
+      "schema": "Command::KillAllSessions"
+    },
+    "kill-all-tabs": {
+      "declarations": [
+        "bmux.tabs:kill-all-tabs"
+      ]
+    },
+    "kill-session": {
+      "core": "KillSession",
+      "schema": "Command::KillSession"
+    },
+    "kill-tab": {
+      "declarations": [
+        "bmux.tabs:kill-tab"
+      ]
+    },
+    "kiosk": {
+      "core": "Kiosk",
+      "schema": "Command::Kiosk"
+    },
+    "kiosk attach": {
+      "core": "KioskAttach",
+      "schema": "KioskCommand::Attach"
+    },
+    "kiosk init": {
+      "core": "KioskInit",
+      "schema": "KioskCommand::Init"
+    },
+    "kiosk issue-token": {
+      "core": "KioskIssueToken",
+      "schema": "KioskCommand::IssueToken"
+    },
+    "kiosk revoke-token": {
+      "core": "KioskRevokeToken",
+      "schema": "KioskCommand::RevokeToken"
+    },
+    "kiosk ssh-print-config": {
+      "core": "KioskSshPrintConfig",
+      "schema": "KioskCommand::SshPrintConfig"
+    },
+    "kiosk status": {
+      "core": "KioskStatus",
+      "schema": "KioskCommand::Status"
+    },
+    "last-tab": {
+      "declarations": [
+        "bmux.tabs:last-tab"
+      ]
+    },
+    "list-clients": {
+      "core": "ListClients",
+      "schema": "Command::ListClients"
+    },
+    "list-floating-panes": {
+      "declarations": [
+        "bmux.tabs:list-floating-panes"
+      ]
+    },
+    "list-hot-path-overrides": {
+      "declarations": [
+        "bmux.permissions:list-hot-path-overrides"
+      ]
+    },
+    "list-sessions": {
+      "core": "ListSessions",
+      "schema": "Command::ListSessions"
+    },
+    "list-tabs": {
+      "declarations": [
+        "bmux.tabs:list-tabs"
+      ]
+    },
+    "logs": {
+      "core": "Logs",
+      "schema": "Command::Logs"
+    },
+    "logs level": {
+      "called_by_proxy": [
+        "bmux.plugin_cli:logs-level"
+      ],
+      "core": "LogsLevel",
+      "declarations": [
+        "bmux.plugin_cli:logs-level"
+      ],
+      "schema": "LogsCommand::Level"
+    },
+    "logs path": {
+      "called_by_proxy": [
+        "bmux.plugin_cli:logs-path"
+      ],
+      "core": "LogsPath",
+      "declarations": [
+        "bmux.plugin_cli:logs-path"
+      ],
+      "schema": "LogsCommand::Path"
+    },
+    "logs profiles": {
+      "core": "LogsProfiles",
+      "schema": "LogsCommand::Profiles"
+    },
+    "logs profiles delete": {
+      "called_by_proxy": [
+        "bmux.plugin_cli:logs-profiles-delete"
+      ],
+      "core": "LogsProfilesDelete",
+      "declarations": [
+        "bmux.plugin_cli:logs-profiles-delete"
+      ],
+      "schema": "LogsProfilesCommand::Delete"
+    },
+    "logs profiles list": {
+      "called_by_proxy": [
+        "bmux.plugin_cli:logs-profiles-list"
+      ],
+      "core": "LogsProfilesList",
+      "declarations": [
+        "bmux.plugin_cli:logs-profiles-list"
+      ],
+      "schema": "LogsProfilesCommand::List"
+    },
+    "logs profiles rename": {
+      "called_by_proxy": [
+        "bmux.plugin_cli:logs-profiles-rename"
+      ],
+      "core": "LogsProfilesRename",
+      "declarations": [
+        "bmux.plugin_cli:logs-profiles-rename"
+      ],
+      "schema": "LogsProfilesCommand::Rename"
+    },
+    "logs profiles show": {
+      "called_by_proxy": [
+        "bmux.plugin_cli:logs-profiles-show"
+      ],
+      "core": "LogsProfilesShow",
+      "declarations": [
+        "bmux.plugin_cli:logs-profiles-show"
+      ],
+      "schema": "LogsProfilesCommand::Show"
+    },
+    "logs tail": {
+      "called_by_proxy": [
+        "bmux.plugin_cli:logs-tail"
+      ],
+      "core": "LogsTail",
+      "declarations": [
+        "bmux.plugin_cli:logs-tail"
+      ],
+      "schema": "LogsCommand::Tail"
+    },
+    "logs watch": {
+      "called_by_proxy": [
+        "bmux.plugin_cli:logs-watch"
+      ],
+      "core": "LogsWatch",
+      "declarations": [
+        "bmux.plugin_cli:logs-watch"
+      ],
+      "schema": "LogsCommand::Watch"
+    },
+    "lower-active-floating-pane": {
+      "declarations": [
+        "bmux.tabs:lower-active-floating-pane"
+      ]
+    },
+    "lower-floating-pane": {
+      "declarations": [
+        "bmux.tabs:lower-floating-pane"
+      ]
+    },
+    "move-active-floating-pane": {
+      "declarations": [
+        "bmux.tabs:move-active-floating-pane"
+      ]
+    },
+    "move-floating-pane": {
+      "declarations": [
+        "bmux.tabs:move-floating-pane"
+      ]
+    },
+    "move-tab": {
+      "declarations": [
+        "bmux.tabs:move-tab"
+      ]
+    },
+    "new-session": {
+      "core": "NewSession",
+      "declarations": [
+        "bmux.sessions:new-session"
+      ],
+      "schema": "Command::NewSession"
+    },
+    "new-tab": {
+      "declarations": [
+        "bmux.tabs:new-tab"
+      ]
+    },
+    "next-tab": {
+      "declarations": [
+        "bmux.tabs:next-tab"
+      ]
+    },
+    "pane-padding configure": {
+      "declarations": [
+        "bmux.pane_runtime:pane-padding-configure"
+      ]
+    },
+    "pane-padding reset": {
+      "declarations": [
+        "bmux.pane_runtime:pane-padding-reset"
+      ]
+    },
+    "pane-padding set": {
+      "declarations": [
+        "bmux.pane_runtime:pane-padding-set"
+      ]
+    },
+    "pane-padding show": {
+      "declarations": [
+        "bmux.pane_runtime:pane-padding-show"
+      ]
+    },
+    "perf": {
+      "core": "Perf",
+      "schema": "Command::Perf"
+    },
+    "perf off": {
+      "core": "PerfOff",
+      "schema": "PerfCommand::Off"
+    },
+    "perf on": {
+      "core": "PerfOn",
+      "schema": "PerfCommand::On"
+    },
+    "perf status": {
+      "core": "PerfStatus",
+      "schema": "PerfCommand::Status"
+    },
+    "permissions": {
+      "declarations": [
+        "bmux.permissions:permissions"
+      ]
+    },
+    "permissions-current": {
+      "declarations": [
+        "bmux.permissions:permissions-current"
+      ]
+    },
+    "playbook": {
+      "core": "Playbook",
+      "schema": "Command::Playbook"
+    },
+    "playbook cleanup": {
+      "called_by_proxy": [
+        "bmux.plugin_cli:playbook-cleanup"
+      ],
+      "core": "PlaybookCleanup",
+      "declarations": [
+        "bmux.plugin_cli:playbook-cleanup"
+      ],
+      "schema": "PlaybookCommand::Cleanup"
+    },
+    "playbook diff": {
+      "called_by_proxy": [
+        "bmux.plugin_cli:playbook-diff"
+      ],
+      "core": "PlaybookDiff",
+      "declarations": [
+        "bmux.plugin_cli:playbook-diff"
+      ],
+      "schema": "PlaybookCommand::Diff"
+    },
+    "playbook dry-run": {
+      "called_by_proxy": [
+        "bmux.plugin_cli:playbook-dry-run"
+      ],
+      "core": "PlaybookDryRun",
+      "declarations": [
+        "bmux.plugin_cli:playbook-dry-run"
+      ],
+      "schema": "PlaybookCommand::DryRun"
+    },
+    "playbook from-recording": {
+      "declarations": [
+        "bmux.recording:playbook-from-recording"
+      ]
+    },
+    "playbook interactive": {
+      "called_by_proxy": [
+        "bmux.plugin_cli:playbook-interactive"
+      ],
+      "core": "PlaybookInteractive",
+      "declarations": [
+        "bmux.plugin_cli:playbook-interactive"
+      ],
+      "schema": "PlaybookCommand::Interactive"
+    },
+    "playbook run": {
+      "called_by_proxy": [
+        "bmux.plugin_cli:playbook-run"
+      ],
+      "core": "PlaybookRun",
+      "declarations": [
+        "bmux.plugin_cli:playbook-run"
+      ],
+      "schema": "PlaybookCommand::Run"
+    },
+    "playbook validate": {
+      "called_by_proxy": [
+        "bmux.plugin_cli:playbook-validate"
+      ],
+      "core": "PlaybookValidate",
+      "declarations": [
+        "bmux.plugin_cli:playbook-validate"
+      ],
+      "schema": "PlaybookCommand::Validate"
+    },
+    "plugin doctor": {
+      "declarations": [
+        "bmux.plugin_cli:doctor"
+      ]
+    },
+    "plugin list": {
+      "declarations": [
+        "bmux.plugin_cli:list"
+      ]
+    },
+    "plugin rebuild": {
+      "declarations": [
+        "bmux.plugin_cli:rebuild"
+      ]
+    },
+    "plugin run": {
+      "declarations": [
+        "bmux.plugin_cli:run"
+      ]
+    },
+    "present check": {
+      "declarations": [
+        "bmux.presenter:present-check"
+      ]
+    },
+    "present host": {
+      "declarations": [
+        "bmux.presenter:present-host"
+      ]
+    },
+    "present join": {
+      "declarations": [
+        "bmux.presenter:present-join"
+      ]
+    },
+    "present play": {
+      "declarations": [
+        "bmux.presenter:present-play"
+      ]
+    },
+    "prev-tab": {
+      "declarations": [
+        "bmux.tabs:prev-tab"
+      ]
+    },
+    "prompted-action run": {
+      "declarations": [
+        "bmux.prompted_actions:run"
+      ]
+    },
+    "raise-active-floating-pane": {
+      "declarations": [
+        "bmux.tabs:raise-active-floating-pane"
+      ]
+    },
+    "raise-floating-pane": {
+      "declarations": [
+        "bmux.tabs:raise-floating-pane"
+      ]
+    },
+    "record": {
+      "declarations": [
+        "bmux.recording:record"
+      ]
+    },
+    "recording analyze": {
+      "declarations": [
+        "bmux.recording:recording-analyze"
+      ]
+    },
+    "recording cut": {
+      "declarations": [
+        "bmux.recording:recording-cut"
+      ]
+    },
+    "recording delete": {
+      "declarations": [
+        "bmux.recording:recording-delete"
+      ]
+    },
+    "recording delete-all": {
+      "declarations": [
+        "bmux.recording:recording-delete-all"
+      ]
+    },
+    "recording export": {
+      "declarations": [
+        "bmux.recording:recording-export"
+      ]
+    },
+    "recording inspect": {
+      "declarations": [
+        "bmux.recording:recording-inspect"
+      ]
+    },
+    "recording list": {
+      "declarations": [
+        "bmux.recording:recording-list"
+      ]
+    },
+    "recording path": {
+      "declarations": [
+        "bmux.recording:recording-path"
+      ]
+    },
+    "recording process finish": {
+      "declarations": [
+        "bmux.recording:recording-process-finish"
+      ]
+    },
+    "recording process read": {
+      "declarations": [
+        "bmux.recording:recording-process-read"
+      ]
+    },
+    "recording process run": {
+      "declarations": [
+        "bmux.recording:recording-process-run"
+      ]
+    },
+    "recording process screen": {
+      "declarations": [
+        "bmux.recording:recording-process-screen"
+      ]
+    },
+    "recording process send": {
+      "declarations": [
+        "bmux.recording:recording-process-send"
+      ]
+    },
+    "recording process start": {
+      "declarations": [
+        "bmux.recording:recording-process-start"
+      ]
+    },
+    "recording process status": {
+      "declarations": [
+        "bmux.recording:recording-process-status"
+      ]
+    },
+    "recording process terminate": {
+      "declarations": [
+        "bmux.recording:recording-process-terminate"
+      ]
+    },
+    "recording process wait": {
+      "declarations": [
+        "bmux.recording:recording-process-wait"
+      ]
+    },
+    "recording prune": {
+      "declarations": [
+        "bmux.recording:recording-prune"
+      ]
+    },
+    "recording replay": {
+      "declarations": [
+        "bmux.recording:recording-replay"
+      ]
+    },
+    "recording start": {
+      "declarations": [
+        "bmux.recording:recording-start"
+      ]
+    },
+    "recording status": {
+      "declarations": [
+        "bmux.recording:recording-status"
+      ]
+    },
+    "recording stop": {
+      "declarations": [
+        "bmux.recording:recording-stop"
+      ]
+    },
+    "recording verify-smoke": {
+      "declarations": [
+        "bmux.recording:recording-verify-smoke"
+      ]
+    },
+    "remote": {
+      "core": "Remote",
+      "schema": "Command::Remote"
+    },
+    "remote approve": {
+      "declarations": [
+        "bmux.connections:remote-approve"
+      ]
+    },
+    "remote complete": {
+      "core": "RemoteComplete",
+      "schema": "RemoteCommand::Complete"
+    },
+    "remote complete sessions": {
+      "core": "RemoteCompleteSessions",
+      "schema": "RemoteCompleteCommand::Sessions"
+    },
+    "remote complete targets": {
+      "core": "RemoteCompleteTargets",
+      "schema": "RemoteCompleteCommand::Targets"
+    },
+    "remote disable": {
+      "declarations": [
+        "bmux.connections:remote-disable"
+      ]
+    },
+    "remote doctor": {
+      "called_by_proxy": [
+        "bmux.cluster:health-probe"
+      ],
+      "core": "RemoteDoctor",
+      "schema": "RemoteCommand::Doctor"
+    },
+    "remote enable": {
+      "declarations": [
+        "bmux.connections:remote-enable"
+      ]
+    },
+    "remote forget": {
+      "declarations": [
+        "bmux.connections:remote-forget"
+      ]
+    },
+    "remote init": {
+      "core": "RemoteInit",
+      "schema": "RemoteCommand::Init"
+    },
+    "remote install-server": {
+      "core": "RemoteInstallServer",
+      "schema": "RemoteCommand::InstallServer"
+    },
+    "remote list": {
+      "core": "RemoteList",
+      "declarations": [
+        "bmux.connections:remote-list"
+      ],
+      "schema": "RemoteCommand::List"
+    },
+    "remote pair": {
+      "declarations": [
+        "bmux.connections:remote-pair"
+      ]
+    },
+    "remote pair-request": {
+      "declarations": [
+        "bmux.connections:remote-pair-request"
+      ]
+    },
+    "remote rename": {
+      "declarations": [
+        "bmux.connections:remote-rename"
+      ]
+    },
+    "remote revoke": {
+      "declarations": [
+        "bmux.connections:remote-revoke"
+      ]
+    },
+    "remote status": {
+      "declarations": [
+        "bmux.connections:remote-status"
+      ]
+    },
+    "remote test": {
+      "called_by_proxy": [
+        "bmux.cluster:health-probe"
+      ],
+      "core": "RemoteTest",
+      "schema": "RemoteCommand::Test"
+    },
+    "remote trust": {
+      "core": "RemoteTrust",
+      "schema": "RemoteCommand::Trust"
+    },
+    "remote trust add": {
+      "core": "RemoteTrustAdd",
+      "schema": "RemoteTrustCommand::Add"
+    },
+    "remote trust list": {
+      "core": "RemoteTrustList",
+      "schema": "RemoteTrustCommand::List"
+    },
+    "remote trust remove": {
+      "core": "RemoteTrustRemove",
+      "schema": "RemoteTrustCommand::Remove"
+    },
+    "remote upgrade": {
+      "core": "RemoteUpgrade",
+      "schema": "RemoteCommand::Upgrade"
+    },
+    "remote-approve": {
+      "declarations": [
+        "bmux.connections:remote-approve"
+      ]
+    },
+    "remote-disable": {
+      "declarations": [
+        "bmux.connections:remote-disable"
+      ]
+    },
+    "remote-enable": {
+      "declarations": [
+        "bmux.connections:remote-enable"
+      ]
+    },
+    "remote-forget": {
+      "declarations": [
+        "bmux.connections:remote-forget"
+      ]
+    },
+    "remote-list": {
+      "declarations": [
+        "bmux.connections:remote-list"
+      ]
+    },
+    "remote-pair": {
+      "declarations": [
+        "bmux.connections:remote-pair"
+      ]
+    },
+    "remote-pair-request": {
+      "declarations": [
+        "bmux.connections:remote-pair-request"
+      ]
+    },
+    "remote-rename": {
+      "declarations": [
+        "bmux.connections:remote-rename"
+      ]
+    },
+    "remote-revoke": {
+      "declarations": [
+        "bmux.connections:remote-revoke"
+      ]
+    },
+    "remote-status": {
+      "declarations": [
+        "bmux.connections:remote-status"
+      ]
+    },
+    "rename-tab": {
+      "declarations": [
+        "bmux.tabs:rename-tab"
+      ]
+    },
+    "rename-tab-by-id": {
+      "declarations": [
+        "bmux.tabs:rename-tab-by-id"
+      ]
+    },
+    "reset-order": {
+      "declarations": [
+        "bmux.tabs:reset-order"
+      ]
+    },
+    "resize-active-floating-pane": {
+      "declarations": [
+        "bmux.tabs:resize-active-floating-pane"
+      ]
+    },
+    "resize-floating-pane": {
+      "declarations": [
+        "bmux.tabs:resize-floating-pane"
+      ]
+    },
+    "resize-pane": {
+      "declarations": [
+        "bmux.tabs:resize-pane"
+      ]
+    },
+    "restart-pane": {
+      "declarations": [
+        "bmux.tabs:restart-pane"
+      ]
+    },
+    "revoke": {
+      "declarations": [
+        "bmux.permissions:revoke"
+      ]
+    },
+    "revoke-hot-path-override": {
+      "declarations": [
+        "bmux.permissions:revoke-hot-path-override"
+      ]
+    },
+    "sandbox": {
+      "core": "Sandbox",
+      "schema": "Command::Sandbox"
+    },
+    "sandbox attach": {
+      "core": "SandboxAttach",
+      "schema": "SandboxCommand::Attach"
+    },
+    "sandbox bundle": {
+      "core": "SandboxBundle",
+      "schema": "SandboxCommand::Bundle"
+    },
+    "sandbox clean": {
+      "core": "SandboxClean",
+      "schema": "SandboxCommand::Clean"
+    },
+    "sandbox cleanup": {
+      "core": "SandboxCleanup",
+      "schema": "SandboxCommand::Cleanup"
+    },
+    "sandbox dev": {
+      "core": "SandboxDev",
+      "schema": "SandboxCommand::Dev"
+    },
+    "sandbox doctor": {
+      "core": "SandboxDoctor",
+      "schema": "SandboxCommand::Doctor"
+    },
+    "sandbox inspect": {
+      "core": "SandboxInspect",
+      "schema": "SandboxCommand::Inspect"
+    },
+    "sandbox list": {
+      "core": "SandboxList",
+      "schema": "SandboxCommand::List"
+    },
+    "sandbox open": {
+      "core": "SandboxOpen",
+      "schema": "SandboxCommand::Open"
+    },
+    "sandbox rebuild-index": {
+      "core": "SandboxRebuildIndex",
+      "schema": "SandboxCommand::RebuildIndex"
+    },
+    "sandbox rerun": {
+      "core": "SandboxRerun",
+      "schema": "SandboxCommand::Rerun"
+    },
+    "sandbox run": {
+      "core": "SandboxRun",
+      "schema": "SandboxCommand::Run"
+    },
+    "sandbox status": {
+      "core": "SandboxStatus",
+      "schema": "SandboxCommand::Status"
+    },
+    "sandbox stop": {
+      "core": "SandboxStop",
+      "schema": "SandboxCommand::Stop"
+    },
+    "sandbox tail": {
+      "core": "SandboxTail",
+      "schema": "SandboxCommand::Tail"
+    },
+    "sandbox triage": {
+      "core": "SandboxTriage",
+      "schema": "SandboxCommand::Triage"
+    },
+    "sandbox verify-bundle": {
+      "core": "SandboxVerifyBundle",
+      "schema": "SandboxCommand::VerifyBundle"
+    },
+    "server": {
+      "core": "Server",
+      "schema": "Command::Server"
+    },
+    "server autostart": {
+      "schema": "ServerCommand::Autostart"
+    },
+    "server autostart install": {
+      "core": "ServerAutostartInstall",
+      "schema": "ServerAutostartCommand::Install"
+    },
+    "server autostart print": {
+      "core": "ServerAutostartPrint",
+      "schema": "ServerAutostartCommand::Print"
+    },
+    "server autostart status": {
+      "core": "ServerAutostartStatus",
+      "schema": "ServerAutostartCommand::Status"
+    },
+    "server autostart uninstall": {
+      "core": "ServerAutostartUninstall",
+      "schema": "ServerAutostartCommand::Uninstall"
+    },
+    "server bridge": {
+      "core": "ServerBridge",
+      "schema": "ServerCommand::Bridge"
+    },
+    "server gateway": {
+      "core": "ServerGateway",
+      "schema": "ServerCommand::Gateway"
+    },
+    "server recording": {
+      "declarations": [
+        "bmux.recording:server-recording"
+      ]
+    },
+    "server restore": {
+      "core": "ServerRestore",
+      "schema": "ServerCommand::Restore"
+    },
+    "server save": {
+      "core": "ServerSave",
+      "schema": "ServerCommand::Save"
+    },
+    "server start": {
+      "core": "ServerStart",
+      "schema": "ServerCommand::Start"
+    },
+    "server status": {
+      "core": "ServerStatus",
+      "schema": "ServerCommand::Status"
+    },
+    "server stop": {
+      "core": "ServerStop",
+      "schema": "ServerCommand::Stop"
+    },
+    "server whoami-principal": {
+      "core": "ServerWhoamiPrincipal",
+      "schema": "ServerCommand::WhoamiPrincipal"
+    },
+    "session": {
+      "core": "Session",
+      "schema": "Command::Session"
+    },
+    "session attach": {
+      "core": "SessionAttach",
+      "schema": "SessionCommand::Attach"
+    },
+    "session clients": {
+      "core": "SessionClients",
+      "schema": "SessionCommand::Clients"
+    },
+    "session detach": {
+      "core": "SessionDetach",
+      "schema": "SessionCommand::Detach"
+    },
+    "session follow": {
+      "core": "SessionFollow",
+      "schema": "SessionCommand::Follow"
+    },
+    "session grant": {
+      "declarations": [
+        "bmux.permissions:grant"
+      ]
+    },
+    "session grant-hot-path-override": {
+      "declarations": [
+        "bmux.permissions:grant-hot-path-override"
+      ]
+    },
+    "session hot-path-policy": {
+      "declarations": [
+        "bmux.permissions:hot-path-policy"
+      ]
+    },
+    "session kill": {
+      "core": "SessionKill",
+      "schema": "SessionCommand::Kill"
+    },
+    "session kill-all": {
+      "core": "SessionKillAll",
+      "schema": "SessionCommand::KillAll"
+    },
+    "session list": {
+      "core": "SessionList",
+      "schema": "SessionCommand::List"
+    },
+    "session list-hot-path-overrides": {
+      "declarations": [
+        "bmux.permissions:list-hot-path-overrides"
+      ]
+    },
+    "session new": {
+      "core": "SessionNew",
+      "schema": "SessionCommand::New"
+    },
+    "session permissions": {
+      "declarations": [
+        "bmux.permissions:permissions"
+      ]
+    },
+    "session permissions-current": {
+      "declarations": [
+        "bmux.permissions:permissions-current"
+      ]
+    },
+    "session revoke": {
+      "declarations": [
+        "bmux.permissions:revoke"
+      ]
+    },
+    "session revoke-hot-path-override": {
+      "declarations": [
+        "bmux.permissions:revoke-hot-path-override"
+      ]
+    },
+    "session unfollow": {
+      "core": "SessionUnfollow",
+      "schema": "SessionCommand::Unfollow"
+    },
+    "set-floating-pane-layer": {
+      "declarations": [
+        "bmux.tabs:set-floating-pane-layer"
+      ]
+    },
+    "set-floating-pane-z": {
+      "declarations": [
+        "bmux.tabs:set-floating-pane-z"
+      ]
+    },
+    "setup": {
+      "core": "Setup",
+      "schema": "Command::Setup"
+    },
+    "share": {
+      "core": "Share",
+      "schema": "Command::Share"
+    },
+    "slot": {
+      "schema": "Command::Slot"
+    },
+    "slot doctor": {
+      "core": "SlotDoctor",
+      "schema": "SlotCommand::Doctor"
+    },
+    "slot exec": {
+      "core": "SlotExec",
+      "schema": "SlotCommand::Exec"
+    },
+    "slot install": {
+      "core": "SlotInstall",
+      "schema": "SlotCommand::Install"
+    },
+    "slot list": {
+      "core": "SlotList",
+      "schema": "SlotCommand::List"
+    },
+    "slot paths": {
+      "core": "SlotPaths",
+      "schema": "SlotCommand::Paths"
+    },
+    "slot print": {
+      "core": "SlotPrint",
+      "schema": "SlotCommand::Print"
+    },
+    "slot shell": {
+      "core": "SlotShell",
+      "schema": "SlotCommand::Shell"
+    },
+    "slot show": {
+      "core": "SlotShow",
+      "schema": "SlotCommand::Show"
+    },
+    "slot uninstall": {
+      "core": "SlotUninstall",
+      "schema": "SlotCommand::Uninstall"
+    },
+    "split-pane": {
+      "declarations": [
+        "bmux.tabs:split-pane"
+      ]
+    },
+    "switch-tab": {
+      "declarations": [
+        "bmux.tabs:switch-tab"
+      ]
+    },
+    "tab close-current": {
+      "declarations": [
+        "bmux.tabs:close-current-tab"
+      ]
+    },
+    "tab goto": {
+      "declarations": [
+        "bmux.tabs:goto-tab"
+      ]
+    },
+    "tab kill": {
+      "declarations": [
+        "bmux.tabs:kill-tab"
+      ]
+    },
+    "tab kill-all": {
+      "declarations": [
+        "bmux.tabs:kill-all-tabs"
+      ]
+    },
+    "tab last": {
+      "declarations": [
+        "bmux.tabs:last-tab"
+      ]
+    },
+    "tab list": {
+      "declarations": [
+        "bmux.tabs:list-tabs"
+      ]
+    },
+    "tab move": {
+      "declarations": [
+        "bmux.tabs:move-tab"
+      ]
+    },
+    "tab new": {
+      "declarations": [
+        "bmux.tabs:new-tab"
+      ]
+    },
+    "tab next": {
+      "declarations": [
+        "bmux.tabs:next-tab"
+      ]
+    },
+    "tab prev": {
+      "declarations": [
+        "bmux.tabs:prev-tab"
+      ]
+    },
+    "tab rename": {
+      "declarations": [
+        "bmux.tabs:rename-tab"
+      ]
+    },
+    "tab reset-order": {
+      "declarations": [
+        "bmux.tabs:reset-order"
+      ]
+    },
+    "tab switch": {
+      "declarations": [
+        "bmux.tabs:switch-tab"
+      ]
+    },
+    "terminal": {
+      "core": "Terminal",
+      "schema": "Command::Terminal"
+    },
+    "terminal doctor": {
+      "called_by_proxy": [
+        "bmux.plugin_cli:terminal-doctor"
+      ],
+      "core": "TerminalDoctor",
+      "declarations": [
+        "bmux.plugin_cli:terminal-doctor"
+      ],
+      "schema": "TerminalCommand::Doctor"
+    },
+    "terminal install-terminfo": {
+      "called_by_proxy": [
+        "bmux.plugin_cli:terminal-install-terminfo"
+      ],
+      "core": "TerminalInstallTerminfo",
+      "declarations": [
+        "bmux.plugin_cli:terminal-install-terminfo"
+      ],
+      "schema": "TerminalCommand::InstallTerminfo"
+    },
+    "theme pick": {
+      "declarations": [
+        "bmux.theme:pick-theme"
+      ]
+    },
+    "theme refresh": {
+      "declarations": [
+        "bmux.theme:refresh-theme"
+      ]
+    },
+    "theme show": {
+      "declarations": [
+        "bmux.theme:show-theme"
+      ]
+    },
+    "unfollow": {
+      "core": "Unfollow",
+      "schema": "Command::Unfollow"
+    },
+    "unshare": {
+      "core": "Unshare",
+      "schema": "Command::Unshare"
+    },
+    "workspace activate-tab": {
+      "declarations": [
+        "bmux.workspaces:activate-tab"
+      ]
+    },
+    "workspace kill": {
+      "declarations": [
+        "bmux.workspaces:kill-workspace"
+      ]
+    },
+    "workspace last": {
+      "declarations": [
+        "bmux.workspaces:last-workspace"
+      ]
+    },
+    "workspace list": {
+      "declarations": [
+        "bmux.workspaces:list-workspaces"
+      ]
+    },
+    "workspace move-tab": {
+      "declarations": [
+        "bmux.workspaces:move-tab-to-workspace"
+      ]
+    },
+    "workspace new": {
+      "declarations": [
+        "bmux.workspaces:new-workspace"
+      ]
+    },
+    "workspace next": {
+      "declarations": [
+        "bmux.workspaces:next-workspace"
+      ]
+    },
+    "workspace previous": {
+      "declarations": [
+        "bmux.workspaces:prev-workspace"
+      ]
+    },
+    "workspace rename": {
+      "declarations": [
+        "bmux.workspaces:rename-workspace"
+      ]
+    },
+    "workspace switch": {
+      "declarations": [
+        "bmux.workspaces:switch-workspace"
+      ]
+    },
+    "zoom-pane": {
+      "declarations": [
+        "bmux.tabs:zoom-pane"
+      ]
+    }
+  },
+  "revision": "3320b28b58b6276e5c656c5206cd1571982d1370"
+}

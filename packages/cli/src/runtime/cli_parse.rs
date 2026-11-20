@@ -32,6 +32,7 @@ pub(super) enum ParsedRuntimeCli {
         stderr: bool,
     },
     Plugin {
+        target: Option<String>,
         log_level: LogLevel,
         plugin_id: String,
         command_name: String,
@@ -96,6 +97,38 @@ pub(super) fn parse_runtime_cli(
     };
     super::startup_future_marker("parse.after_config", 0);
     let config_us = config_started.elapsed().as_micros();
+    // A broken plugin dependency graph must not strand the local installation.
+    // Require the explicit core-only switch and static Clap validation. Never
+    // retry a plugin callback, synthesize a plugin registry, or invoke an
+    // administration command without the normal selected host authority.
+    if argv.iter().any(|arg| arg == "--core-builtins-only")
+        && let Ok(cli) = <Cli as clap::Parser>::try_parse_from(&argv)
+        && cli.core_builtins_only
+        && cli.target.is_none()
+        && matches!(
+            cli.command,
+            Some(
+                bmux_cli_schema::Command::Doctor { hosted: false, .. }
+                    | bmux_cli_schema::Command::Config {
+                        command: bmux_cli_schema::ConfigCommand::Path { .. }
+                            | bmux_cli_schema::ConfigCommand::Get { .. }
+                            | bmux_cli_schema::ConfigCommand::Set { .. }
+                    }
+            )
+        )
+    {
+        return Ok(ParsedRuntimeCli::BuiltIn {
+            verbose: cli.verbose,
+            log_level: resolve_log_level(
+                cli.verbose,
+                cli.log_level,
+                std::env::var("BMUX_LOG_LEVEL").ok().as_deref(),
+            ),
+            cli,
+            config_overrides,
+            command_state: None,
+        });
+    }
     let scan_started = Instant::now();
     super::startup_future_marker("parse.scan.before", 0);
     let registry = Arc::new(scan_available_plugins(&config, &paths)?);
@@ -260,6 +293,9 @@ pub(super) fn parse_runtime_cli_with_registry(
         .map(|arg| arg.to_str().map(ToString::to_string))
         .collect::<Option<Vec<_>>>()
         && let Some(resolved) = command_registry.resolve(&raw_args)
+        // Installed leaves use the same tree for direct and prefixed invocations,
+        // including inherited globals, help, validation and default handling.
+        && !command_registry.installs_leaf(&Cli::command(), &raw_args[..raw_args.len() - resolved.arguments.len()], &resolved.plugin_id)
     {
         let normalized = match PluginCommandRegistry::validate_arguments(
             &resolved.schema,
@@ -292,6 +328,7 @@ pub(super) fn parse_runtime_cli_with_registry(
                 total_started.elapsed().as_micros(),
             );
             return Ok(ParsedRuntimeCli::Plugin {
+                target: None,
                 log_level,
                 plugin_id: resolved.plugin_id,
                 command_name: resolved.command_name,
@@ -304,7 +341,10 @@ pub(super) fn parse_runtime_cli_with_registry(
     let resolve_us = resolve_started.elapsed().as_micros();
     super::startup_future_marker("parse.before_clap_command", 0);
     let clap_augment_started = Instant::now();
-    let clap_command = Cli::command();
+    // Clap derives arg order and subcommand order from one counter. A global
+    // declared after the subcommand field must remain after local options,
+    // independent of how many commands are static in this build.
+    let clap_command = stable_trailing_globals(Cli::command());
     #[cfg(feature = "bench")]
     let clap_command = clap_command.subcommand(
         clap::Command::new("bench")
@@ -374,7 +414,13 @@ pub(super) fn parse_runtime_cli_with_registry(
                 })
                 .and_then(|raw| command_registry.resolve(&raw))
                 .filter(|raw| {
-                    raw.plugin_id == resolved.plugin_id && raw.command_name == resolved.command_name
+                    resolved
+                        .schema
+                        .arguments
+                        .iter()
+                        .any(|arg| arg.trailing_var_arg)
+                        && raw.plugin_id == resolved.plugin_id
+                        && raw.command_name == resolved.command_name
                 })
                 .map_or_else(
                     || {
@@ -386,6 +432,7 @@ pub(super) fn parse_runtime_cli_with_registry(
                     |raw| raw.arguments,
                 );
             return Ok(ParsedRuntimeCli::Plugin {
+                target: matches.get_one::<String>("connection_target").cloned(),
                 log_level,
                 plugin_id: resolved.plugin_id,
                 command_name: resolved.command_name,
@@ -404,6 +451,32 @@ pub(super) fn parse_runtime_cli_with_registry(
         verbose,
         config_overrides,
         command_state,
+    })
+}
+
+fn stable_trailing_globals(root: clap::Command) -> clap::Command {
+    let Some(last_child) = root
+        .get_subcommands()
+        .map(clap::Command::get_display_order)
+        .max()
+    else {
+        return root;
+    };
+    // Clap gives its generated --help flag order 999. Reserve the preceding
+    // slots for trailing host globals, retaining their relative order.
+    let mut trailing: Vec<_> = root
+        .get_arguments()
+        .filter(|arg| arg.is_global_set() && arg.get_display_order() > last_child)
+        .map(|arg| (arg.get_display_order(), arg.get_id().clone()))
+        .collect();
+    trailing.sort_unstable();
+    let first = 999usize.saturating_sub(trailing.len());
+    root.mut_args(|arg| {
+        if let Some(index) = trailing.iter().position(|(_, id)| id == arg.get_id()) {
+            arg.display_order(first + index)
+        } else {
+            arg
+        }
     })
 }
 
@@ -446,6 +519,108 @@ fn leading_global_prefix_len(argv: &[std::ffi::OsString]) -> Option<usize> {
 #[cfg(test)]
 mod proxy_argument_tests {
     use super::*;
+
+    #[test]
+    fn descriptor_cli_preserves_defaults_repeats_aliases_and_help() {
+        let mut plugins = PluginRegistry::new();
+        plugins
+            .register_bundled_manifest(
+                r#"
+id = "fixture.owner"
+name = "Fixture"
+version = "1.0.0"
+owns_namespaces = ["fixture"]
+[[commands]]
+name = "internal-name"
+path = ["fixture", "inspect"]
+aliases = [["fixture", "show"]]
+summary = "Inspect fixture"
+expose_in_cli = true
+[[commands.arguments]]
+name = "lines"
+long = "lines"
+kind = "integer"
+default_value = "50"
+[[commands.arguments]]
+name = "mode"
+long = "mode"
+kind = "choice"
+choice_values = ["normal", "quick"]
+choice_aliases = { fast = "quick" }
+[[commands.arguments]]
+name = "include"
+long = "include"
+kind = "string"
+multiple = true
+"#,
+            )
+            .unwrap();
+        let mut config = BmuxConfig::default();
+        config.plugins.enabled.push("fixture.owner".into());
+        let parse = |argv: &[&str]| {
+            parse_runtime_cli_with_registry(
+                &argv
+                    .iter()
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>(),
+                &config,
+                &plugins,
+                None,
+                bmux_config::ConfigLoadOverrides::default(),
+            )
+            .unwrap()
+        };
+        for prefix in [vec!["bmux"], vec!["bmux", "--runtime", "default"]] {
+            let mut argv = prefix;
+            argv.extend(["fixture", "show"]);
+            let mut help = argv.clone();
+            help.push("--help");
+            let ParsedRuntimeCli::ImmediateExit {
+                code: 0,
+                stderr: false,
+                output,
+            } = parse(&help)
+            else {
+                panic!("expected help")
+            };
+            assert!(output.contains("bmux fixture show"), "{output}");
+            assert!(output.contains("--runtime"));
+            assert!(output.contains("50"));
+            let mut invalid = argv.clone();
+            invalid.extend(["--mode", "invalid"]);
+            assert!(matches!(
+                parse(&invalid),
+                ParsedRuntimeCli::ImmediateExit {
+                    code: 2,
+                    stderr: true,
+                    ..
+                }
+            ));
+            argv.extend(["--mode=fast", "--include", "first", "--include=last"]);
+            let ParsedRuntimeCli::Plugin {
+                command_name,
+                arguments,
+                ..
+            } = parse(&argv)
+            else {
+                panic!("expected plugin command")
+            };
+            assert_eq!(command_name, "internal-name");
+            assert_eq!(
+                arguments,
+                [
+                    "--lines",
+                    "50",
+                    "--mode",
+                    "quick",
+                    "--include",
+                    "first",
+                    "--include",
+                    "last"
+                ]
+            );
+        }
+    }
 
     #[test]
     fn leading_globals_preserve_host_leaf_proxy_flags() {
@@ -546,6 +721,17 @@ pub(super) const fn tracing_level(level: LogLevel) -> Level {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_start_help_keeps_trailing_global_after_last_local_option() {
+        let help = stable_trailing_globals(Cli::command())
+            .try_get_matches_from(["bmux", "help", "server", "start"])
+            .unwrap_err()
+            .to_string();
+        let local = help.find("--no-rolling-capture-images").unwrap();
+        let global = help.find("--log-level").unwrap();
+        assert!(local < global && global < help.find("-h, --help").unwrap());
+    }
 
     #[test]
     fn raw_arg_config_override_returns_resolved_path() {

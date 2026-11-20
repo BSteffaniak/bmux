@@ -13,6 +13,8 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+mod cli;
+
 /// Plugin declaration generated from the BPDL world and `plugin.toml`.
 pub mod declaration {
     bmux_plugin_schema_macros::plugin_manifest! {
@@ -205,6 +207,9 @@ fn stop_metrics_worker(slot: &Mutex<Option<MetricsWorker>>) -> Result<(), Plugin
 
 impl Plugin for PerformancePlugin {
     fn declare(d: &mut Declarations<Self>) {
+        for name in ["perf-status", "perf-on", "perf-off"] {
+            d.blocking_command(name, |_, context| cli::run(context));
+        }
         d.blocking_activate(Self::activate)
             .blocking_deactivate(Self::deactivate)
             .blocking_services(Self::invoke_service, None)

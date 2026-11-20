@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -49,6 +49,15 @@ pub struct PluginCommandArgument {
     pub kind: PluginCommandArgumentKind,
     #[serde(default, alias = "values")]
     pub choice_values: Vec<String>,
+    /// Hidden input spelling -> canonical entry in `choice_values`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub choice_aliases: BTreeMap<String, String>,
+    /// CLI default for a value-taking argument (not caller-owned trailing argv).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<String>,
+    /// Sibling argument names that cannot be supplied with this argument.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflicts_with: Vec<String>,
     #[serde(default)]
     pub position: Option<usize>,
     #[serde(default)]
@@ -246,6 +255,9 @@ impl PluginCommandArgument {
             name,
             kind,
             choice_values: Vec::new(),
+            choice_aliases: BTreeMap::new(),
+            default_value: None,
+            conflicts_with: Vec::new(),
             position: None,
             short: None,
             required: false,
@@ -263,6 +275,9 @@ impl PluginCommandArgument {
             name: name.clone(),
             kind: PluginCommandArgumentKind::Boolean,
             choice_values: Vec::new(),
+            choice_aliases: BTreeMap::new(),
+            default_value: None,
+            conflicts_with: Vec::new(),
             position: None,
             long: Some(name),
             short: None,
@@ -283,6 +298,9 @@ impl PluginCommandArgument {
             name,
             kind,
             choice_values: Vec::new(),
+            choice_aliases: BTreeMap::new(),
+            default_value: None,
+            conflicts_with: Vec::new(),
             position: Some(0),
             long: None,
             short: None,

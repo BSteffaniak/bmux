@@ -19,6 +19,7 @@ pub mod declaration {
     }
 }
 
+mod cli;
 pub mod follow_state;
 mod identity;
 mod selection;
@@ -451,6 +452,9 @@ impl ClientsPlugin {
 impl Plugin for ClientsPlugin {
     fn declare(d: &mut Declarations<Self>) {
         d.blocking_activate(Self::activate)
+            .blocking_command("list-clients", |_, ctx| cli::list(ctx))
+            .blocking_command("follow", |_, ctx| cli::follow(ctx))
+            .blocking_command("unfollow", |_, ctx| cli::unfollow(ctx))
             .blocking_services(Self::invoke_service, None)
             .typed_services(|plugin, context, registry| {
                 plugin.register_typed_services(&context, registry);

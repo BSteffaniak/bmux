@@ -94,10 +94,7 @@ impl WorkerLeaseVerifier for IdentityVerifier {
 
 struct UnusedRuntimeOps;
 impl crate::ClusterRuntimeOps for UnusedRuntimeOps {
-    fn core_cli_command_run_path(
-        &self,
-        _: &bmux_plugin_sdk::CoreCliCommandRequest,
-    ) -> Result<bmux_plugin_sdk::CoreCliCommandResponse, String> {
+    fn remote_probe_status(&self, _: crate::HealthProbe, _: &str) -> Result<i32, String> {
         unreachable!()
     }
     fn session_list(&self) -> Result<crate::SessionListResponse, String> {

@@ -221,7 +221,9 @@ async fn host_pair(
 }
 
 pub fn run(context: &NativeCommandContext) -> Result<i32> {
-    if let Some(code) = crate::client_cli::run(context)? {
+    if context.command != "connect"
+        && let Some(code) = crate::client_cli::run(context)?
+    {
         return Ok(code);
     }
     let caller = bmux_plugin::TypedServiceCaller::from_command_context(context);

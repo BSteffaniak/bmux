@@ -1730,6 +1730,7 @@ dependencies = [
  "bmux_codec",
  "bmux_command_palette_plugin",
  "bmux_config",
+ "bmux_connections_admin",
  "bmux_connections_plugin",
  "bmux_connections_plugin_api",
  "bmux_context_state",
@@ -1764,6 +1765,8 @@ dependencies = [
  "bmux_plugin_sdk",
  "bmux_presenter_plugin",
  "bmux_prompted_actions_plugin",
+ "bmux_pty",
+ "bmux_recording_bootstrap",
  "bmux_recording_plugin",
  "bmux_recording_plugin_api",
  "bmux_recording_protocol",
@@ -1797,14 +1800,11 @@ dependencies = [
  "clap",
  "futures-util",
  "gif",
- "git_sshripped_recipient",
  "git_sshripped_ssh_agent",
- "git_sshripped_ssh_identity",
  "iroh",
  "libc",
  "moosicbox_log_runtime",
  "moosicbox_log_watch",
- "qrcode",
  "rcgen",
  "regex",
  "reqwest 0.13.5",
@@ -2087,6 +2087,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_connections_admin"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "anyhow",
+ "bmux_config",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "toml 1.1.8+spec-1.1.0",
+ "uuid",
+]
+
+[[package]]
 name = "bmux_connections_plugin"
 version = "0.0.1-alpha.4"
 dependencies = [
@@ -2095,6 +2108,7 @@ dependencies = [
  "bmux_client",
  "bmux_clients_plugin_api",
  "bmux_config",
+ "bmux_connections_admin",
  "bmux_connections_plugin_api",
  "bmux_ipc",
  "bmux_keyboard",
@@ -2108,8 +2122,13 @@ dependencies = [
  "bmux_server",
  "bmux_sessions_plugin",
  "bmux_terminal_grid",
+ "clap",
+ "git_sshripped_recipient",
+ "git_sshripped_ssh_agent",
+ "git_sshripped_ssh_identity",
  "iroh",
  "libc",
+ "qrcode",
  "reqwest 0.13.5",
  "rustls",
  "rustls-native-certs",
@@ -2117,10 +2136,12 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "switchy",
  "tempfile",
  "tokio",
  "tokio-rustls",
  "toml 1.1.8+spec-1.1.0",
+ "tracing",
  "url 2.5.8",
  "uuid",
  "windows-sys 0.61.2",
@@ -2689,6 +2710,7 @@ dependencies = [
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
  "bmux_presentation_state",
+ "clap",
  "serde",
  "serde_json",
  "sysinfo",
@@ -2796,10 +2818,13 @@ dependencies = [
 name = "bmux_playbook_plugin"
 version = "0.0.1-alpha.4"
 dependencies = [
+ "anyhow",
  "bmux_playbook",
  "bmux_playbook_plugin_api",
+ "bmux_plugin",
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
+ "clap",
  "serde",
  "serde_json",
  "tempfile",
@@ -2848,11 +2873,16 @@ dependencies = [
 name = "bmux_plugin_cli_plugin"
 version = "0.0.1-alpha.4"
 dependencies = [
+ "anyhow",
+ "bmux_config",
  "bmux_plugin",
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
+ "clap",
+ "moosicbox_log_watch",
  "serde",
  "serde_json",
+ "time 0.3.55",
 ]
 
 [[package]]
@@ -3096,6 +3126,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_recording_bootstrap"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "anyhow",
+ "bmux_config",
+ "bmux_recording_plugin_api",
+ "bmux_recording_protocol",
+]
+
+[[package]]
 name = "bmux_recording_plugin"
 version = "0.0.1-alpha.4"
 dependencies = [
@@ -3259,6 +3299,7 @@ name = "bmux_sessions_plugin"
 version = "0.0.1-alpha.4"
 dependencies = [
  "anyhow",
+ "bmux_client",
  "bmux_contexts_plugin_api",
  "bmux_ipc",
  "bmux_pane_runtime_plugin_api",
@@ -3269,6 +3310,7 @@ dependencies = [
  "bmux_session_models",
  "bmux_session_state",
  "bmux_sessions_plugin_api",
+ "bmux_snapshot_plugin_api",
  "bmux_snapshot_runtime",
  "serde",
  "serde_json",
@@ -3327,6 +3369,7 @@ dependencies = [
  "bmux_plugin_sdk",
  "bmux_snapshot_plugin_api",
  "bmux_snapshot_runtime",
+ "clap",
  "serde_json",
  "tempfile",
  "tokio",

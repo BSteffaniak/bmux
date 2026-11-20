@@ -105,6 +105,15 @@ fn host_runtime(
 }
 
 impl KernelServices {
+    fn declares_capability(&self, requested: &str) -> bool {
+        self.declaration
+            .required_capabilities
+            .iter()
+            .chain(&self.declaration.optional_capabilities)
+            .chain(&self.declaration.provided_capabilities)
+            .any(|capability| capability.as_str() == requested)
+    }
+
     /// Host dispatch for one command operation bound to `binding`.
     ///
     /// An async command body (and blocking work it awaits) runs outside the
@@ -217,14 +226,7 @@ impl bmux_plugin_sdk::HostServiceDispatch for KernelServices {
             let _admission = invocation
                 .try_admit()
                 .map_err(|error| failure(error.to_string()))?;
-            if !host
-                .declaration
-                .required_capabilities
-                .iter()
-                .chain(host.declaration.optional_capabilities.iter())
-                .chain(host.declaration.provided_capabilities.iter())
-                .any(|capability| capability.as_str() == key.capability)
-            {
+            if !host.declares_capability(&key.capability) {
                 return Err(failure(
                     "host availability capability not declared by caller",
                 ));
@@ -259,14 +261,7 @@ impl bmux_plugin_sdk::HostServiceDispatch for KernelServices {
         if request.capability == bmux_plugin_sdk::CORE_INVOCATION_CAPABILITY {
             return self.invocation_intrinsic(invocation, &request);
         }
-        if !self
-            .declaration
-            .required_capabilities
-            .iter()
-            .chain(self.declaration.optional_capabilities.iter())
-            .chain(self.declaration.provided_capabilities.iter())
-            .any(|capability| capability.as_str() == request.capability)
-        {
+        if !self.declares_capability(request.capability) {
             return Err(failure("host service capability not declared by caller"));
         }
         if request.capability == bmux_plugin_sdk::CORE_CLI_COMMAND_CAPABILITY
@@ -276,6 +271,32 @@ impl bmux_plugin_sdk::HostServiceDispatch for KernelServices {
         {
             // Nested commands must inherit this actual entry's issuing route,
             // never the instance-cached builtin executor or another TLS route.
+            // A server service callback has an authenticated server invocation,
+            // not a CLI transport. Dispatch on that invocation only while its
+            // actual callback entry is live; never fall back to lifecycle roots.
+            if self.command_route.is_none()
+                && let Some(authority) = &self.authority
+            {
+                let _parent = authority.callback_parent()?.ok_or_else(|| {
+                    failure("nested plugin command requires live callback dependency")
+                })?;
+                let bytes = bmux_ipc::encode(&bmux_ipc::Request::InvokeService {
+                    capability: request.capability.into(),
+                    kind: bmux_ipc::InvokeServiceKind::Command,
+                    interface_id: request.interface.into(),
+                    operation: request.operation.into(),
+                    payload: request.payload.to_vec(),
+                })
+                .map_err(|error| failure(error.to_string()))?;
+                return match authority
+                    .clone()
+                    .with_plugin_caller(&self.declaration.id)
+                    .execute_response_scoped(invocation, &bytes)?
+                {
+                    bmux_ipc::ResponsePayload::ServiceInvoked { payload } => Ok(payload),
+                    _ => Err(failure("unexpected authenticated nested command response")),
+                };
+            }
             let route = match &self.command_route {
                 Some(route) if route.parent().is_some() => route.clone(),
                 Some(_) => {

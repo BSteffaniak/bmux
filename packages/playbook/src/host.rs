@@ -122,6 +122,22 @@ pub struct SandboxManifestUpdate<'a> {
 /// Required, caller-owned execution infrastructure. There is intentionally no
 /// default adapter: a non-CLI consumer must supply real capabilities explicitly.
 pub trait HostAdapter: std::fmt::Debug + Send + Sync {
+    /// Execute batch work on the invoking application's reactor.
+    fn run_batch(
+        self: std::sync::Arc<Self>,
+        playbook: crate::types::Playbook,
+        target_server: bool,
+        options: crate::RunOptions,
+    ) -> Result<crate::types::PlaybookResult>;
+    /// Run the socket controller on the invoking application's reactor.
+    fn run_controller(
+        self: std::sync::Arc<Self>,
+        socket: Option<&str>,
+        record: bool,
+        viewport: (u16, u16),
+        shell: Option<&str>,
+        timeout: Option<std::time::Duration>,
+    ) -> Result<u8>;
     /// Explicit caller-selected application runtime. None retains standalone defaults.
     fn selected_runtime(&self) -> Option<(BmuxConfig, ConfigPaths)> {
         None

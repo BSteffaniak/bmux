@@ -19,10 +19,12 @@ mod client_cli;
 mod config;
 mod device_client;
 mod directory;
+pub mod hosted;
 mod identity;
 mod listener;
 mod outbound;
 mod pairing;
+pub mod remote_admin;
 mod remote_cli;
 mod remote_preferences;
 mod storage;
@@ -2155,12 +2157,14 @@ mod tests {
 /// One scoped owner; service reads do not take an exclusive lifecycle lock.
 ///
 pub struct ConnectionsInstance {
+    client: Option<hosted::HostedClient>,
     plugin: std::sync::RwLock<ConnectionsPlugin>,
 }
 impl ConnectionsInstance {
     #[must_use]
     pub fn new(pool: Arc<EndpointConnectionPool<BmuxClient>>) -> Self {
         Self {
+            client: None,
             plugin: std::sync::RwLock::new(ConnectionsPlugin {
                 pool,
                 local_runtime: None,
@@ -2178,33 +2182,74 @@ impl ConnectionsInstance {
 // behind a listener-start service awaiting the host's admission probe.
 impl Plugin for ConnectionsInstance {
     fn declare(d: &mut Declarations<Self>) {
-        d.blocking_activate(|instance, context, _| instance.write()?.activate(context).map(|_| ()))
-            .blocking_deactivate(|instance, context| {
-                instance.write()?.deactivate(context.clone()).map(|_| ())
-            })
-            .blocking_command("remote-enable", |_, a0| Self::run_command(a0))
-            .blocking_command("remote-disable", |_, a0| Self::run_command(a0))
-            .blocking_command("remote-pair-request", |_, a0| Self::run_command(a0))
-            .blocking_command("remote-approve", |_, a0| Self::run_command(a0))
-            .blocking_command("remote-pair", |_, a0| Self::run_command(a0))
-            .blocking_command("remote-list", |_, a0| Self::run_command(a0))
-            .blocking_command("remote-status", |_, a0| Self::run_command(a0))
-            .blocking_command("remote-revoke", |_, a0| Self::run_command(a0))
-            .blocking_command("connect", |_, a0| Self::run_command(a0))
-            .blocking_command("remote-rename", |_, a0| Self::run_command(a0))
-            .blocking_command("remote-forget", |_, a0| Self::run_command(a0))
-            .blocking_services(
-                |instance, context| {
-                    instance.plugin.read().map_or_else(
-                        |_| {
-                            ServiceResponse::error("unavailable", "connections owner lock poisoned")
-                        },
-                        |plugin| plugin.invoke_service(context),
-                    )
-                },
-                None,
-            )
-            .registrations(|_, registrar| ConnectionsPlugin::register_contributions(registrar));
+        // The standalone factory binds client commands, not the server's ingress
+        // authority. Never initialize or tear down host identity/listeners here.
+        d.blocking_activate(|instance, context, _| {
+            if instance.client.is_some() {
+                return Ok(());
+            }
+            instance.write()?.activate(context).map(|_| ())
+        })
+        .blocking_deactivate(|instance, context| {
+            if instance.client.is_some() {
+                return Ok(());
+            }
+            instance.write()?.deactivate(context.clone()).map(|_| ())
+        })
+        .blocking_command("remote-enable", |_, a0| Self::run_command(a0))
+        .blocking_command("remote-disable", |_, a0| Self::run_command(a0))
+        .blocking_command("remote-pair-request", |_, a0| Self::run_command(a0))
+        .blocking_command("remote-approve", |_, a0| Self::run_command(a0))
+        .blocking_command("remote-pair", |_, a0| Self::run_command(a0))
+        .blocking_command("remote-test", Self::admin_command)
+        .blocking_command("remote-doctor", Self::admin_command)
+        .blocking_command("remote-init", Self::admin_command)
+        .blocking_command("remote-complete-sessions", Self::admin_command)
+        .blocking_command("kiosk-status", Self::admin_command)
+        .blocking_command("kiosk-init", Self::admin_command)
+        .blocking_command("kiosk-issue-token", Self::admin_command)
+        .blocking_command("kiosk-revoke-token", Self::admin_command)
+        .blocking_command("kiosk-attach", Self::admin_command)
+        .blocking_command("kiosk-ssh-print-config", Self::admin_command)
+        .blocking_command("access-status", Self::admin_command)
+        .blocking_command("access-init", Self::admin_command)
+        .blocking_command("access-add", Self::admin_command)
+        .blocking_command("access-list", Self::admin_command)
+        .blocking_command("access-remove", Self::admin_command)
+        .blocking_command("access-enable", Self::admin_command)
+        .blocking_command("access-disable", Self::admin_command)
+        .blocking_command("remote-trust-list", Self::admin_command)
+        .blocking_command("remote-trust-add", Self::admin_command)
+        .blocking_command("remote-trust-remove", Self::admin_command)
+        .blocking_command("remote-install-server", Self::admin_command)
+        .blocking_command("remote-upgrade", Self::admin_command)
+        .blocking_command("remote-targets", Self::admin_command)
+        .blocking_command("remote-complete-targets", Self::admin_command)
+        .blocking_command("remote-list", |_, a0| Self::run_command(a0))
+        .blocking_command("remote-status", |_, a0| Self::run_command(a0))
+        .blocking_command("remote-revoke", |_, a0| Self::run_command(a0))
+        .blocking_command("share", Self::hosted_command)
+        .blocking_command("unshare", Self::hosted_command)
+        .blocking_command("setup", Self::hosted_command)
+        .blocking_command("host", Self::hosted_command)
+        .blocking_command("hosts", Self::hosted_command)
+        .blocking_command("join", Self::hosted_command)
+        .blocking_command("auth-login", Self::hosted_command)
+        .blocking_command("auth-status", Self::hosted_command)
+        .blocking_command("auth-logout", Self::hosted_command)
+        .blocking_command("connect", Self::hosted_command)
+        .blocking_command("remote-rename", |_, a0| Self::run_command(a0))
+        .blocking_command("remote-forget", |_, a0| Self::run_command(a0))
+        .blocking_services(
+            |instance, context| {
+                instance.plugin.read().map_or_else(
+                    |_| ServiceResponse::error("unavailable", "connections owner lock poisoned"),
+                    |plugin| plugin.invoke_service(context),
+                )
+            },
+            None,
+        )
+        .registrations(|_, registrar| ConnectionsPlugin::register_contributions(registrar));
     }
 }
 
@@ -2217,6 +2262,45 @@ impl ConnectionsInstance {
             .map_err(|_| PluginCommandError::failed("connections owner lock poisoned"))
     }
 
+    fn admin_command(&self, context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
+        if self.client.is_none()
+            && matches!(context.command.as_str(), "remote-test" | "remote-doctor")
+        {
+            return remote_admin::nested_probe(context);
+        }
+        let ports = self
+            .client
+            .as_ref()
+            .and_then(|c| c.admin.as_ref())
+            .ok_or_else(|| {
+                PluginCommandError::failed("administration requires a standalone local process")
+            })?;
+        remote_admin::run(context, ports)
+    }
+
+    fn hosted_command(&self, context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
+        let run = || -> anyhow::Result<i32> {
+            anyhow::ensure!(
+                context.invocation_source
+                    == bmux_plugin_sdk::NativeCommandInvocationSource::LocalProcess
+                    && context.caller_client_id.is_none(),
+                "hosted commands require a standalone local client"
+            );
+            let client = self
+                .client
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("selected client resources unavailable"))?;
+            if context.command == "connect"
+                && let Some(code) = client_cli::run(context)?
+            {
+                return Ok(code);
+            }
+            client.run(context)
+        };
+        // Standalone CLI failures keep the diagnostic format of the original
+        // built-in commands. The generic dispatcher prints this message once.
+        run().map_err(|e| PluginCommandError::failed(format!("bmux error: {e}")))
+    }
     fn run_command(context: &NativeCommandContext) -> Result<i32, PluginCommandError> {
         remote_cli::run(context).map_err(|e| PluginCommandError::failed(e.to_string()))
     }
@@ -2227,6 +2311,7 @@ impl ConnectionsInstance {
 bmux_plugin_sdk::plugin!(
     ConnectionsInstance,
     create = |_| Ok(ConnectionsInstance {
+        client: None,
         plugin: std::sync::RwLock::new(ConnectionsPlugin::default()),
     })
 );
@@ -2272,4 +2357,24 @@ mod canonical_metadata_tests {
             .validate()
             .expect("canonical embedded identity must validate");
     }
+}
+
+/// Bind standalone commands to this CLI invocation, not a service-side runtime.
+/// # Panics
+/// Panics if the embedded plugin manifest is invalid.
+#[must_use]
+pub fn standalone_definition(
+    client: hosted::HostedClient,
+) -> bmux_plugin_sdk::definition::PluginDefinition {
+    bmux_plugin_sdk::author::definition::<ConnectionsInstance>(
+        crate::declaration::PLUGIN_MANIFEST,
+        crate::declaration::SERVICE_CONTRACTS,
+        move |_| {
+            Ok(ConnectionsInstance {
+                client: Some(client.clone()),
+                plugin: std::sync::RwLock::new(ConnectionsPlugin::default()),
+            })
+        },
+    )
+    .expect("embedded connections declaration must be valid")
 }

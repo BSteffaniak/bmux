@@ -9,7 +9,7 @@ use bmux_pane_runtime_plugin_api::{
     pane_runtime_state as api_pane_runtime_state,
 };
 use bmux_plugin::{HostRuntimeApi, ServiceCaller};
-use bmux_plugin_sdk::{CoreCliCommandRequest, StorageGetRequest, StorageSetRequest};
+use bmux_plugin_sdk::{PluginCliCommandRequest, StorageGetRequest, StorageSetRequest};
 use bmux_sessions_plugin_api::sessions_state as api_sessions_state;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -133,10 +133,7 @@ pub trait ClusterRuntimeOps {
             Err("cluster storage scope unavailable".into())
         }
     }
-    fn core_cli_command_run_path(
-        &self,
-        request: &CoreCliCommandRequest,
-    ) -> Result<bmux_plugin_sdk::CoreCliCommandResponse, String>;
+    fn remote_probe_status(&self, probe: HealthProbe, target: &str) -> Result<i32, String>;
     fn session_list(&self) -> Result<SessionListResponse, String>;
     fn session_create(
         &self,
@@ -166,11 +163,21 @@ impl<T: HostRuntimeApi + Sync> ClusterRuntimeOps for T {
             &std::path::Path::new(&connection.data_dir).join("plugin-storage"),
         ))
     }
-    fn core_cli_command_run_path(
-        &self,
-        request: &CoreCliCommandRequest,
-    ) -> Result<bmux_plugin_sdk::CoreCliCommandResponse, String> {
-        HostRuntimeApi::core_cli_command_run_path(self, request).map_err(|error| error.to_string())
+    fn remote_probe_status(&self, probe: HealthProbe, target: &str) -> Result<i32, String> {
+        // Dispatch on the current caller port. Connections owns target resolution
+        // and authorization; a denial must never trigger a local fallback.
+        let operation = match probe {
+            HealthProbe::Test => "remote-test",
+            HealthProbe::Doctor => "remote-doctor",
+        };
+        let request = PluginCliCommandRequest::new(
+            "bmux.connections".into(),
+            operation.into(),
+            vec![target.into()],
+        );
+        HostRuntimeApi::plugin_command_run(self, &request)
+            .map(|response| response.exit_code)
+            .map_err(|error| error.to_string())
     }
 
     fn session_list(&self) -> Result<SessionListResponse, String> {
@@ -1094,4 +1101,84 @@ pub fn retarget_pane_name(name: Option<&str>, target: &str) -> Option<String> {
         return Some(format!("{}:{target}", prefix.trim()));
     }
     Some(format!("host:{target}"))
+}
+
+#[cfg(test)]
+mod probe_authority_tests {
+    use super::*;
+    use bmux_plugin_sdk::{PluginError, Result as PluginResult, ServiceKind};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ProbePort {
+        calls: AtomicUsize,
+    }
+
+    impl ServiceCaller for ProbePort {
+        fn call_service_raw(
+            &self,
+            capability: &str,
+            kind: ServiceKind,
+            interface: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> PluginResult<Vec<u8>> {
+            assert_eq!(capability, bmux_plugin_sdk::CORE_CLI_COMMAND_CAPABILITY);
+            assert_eq!(kind, ServiceKind::Command);
+            assert_eq!(interface, bmux_plugin_sdk::CORE_CLI_COMMAND_INTERFACE_V1);
+            assert_eq!(
+                operation,
+                bmux_plugin_sdk::CORE_CLI_COMMAND_RUN_PLUGIN_OPERATION_V1
+            );
+            let request: PluginCliCommandRequest =
+                bmux_plugin_sdk::decode_service_message(&payload)?;
+            let index = self.calls.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(request.plugin_id, "bmux.connections");
+            assert_eq!(
+                request.command_name,
+                if index == 0 {
+                    "remote-test"
+                } else {
+                    "remote-doctor"
+                }
+            );
+            assert_eq!(request.arguments, ["fixture target"]);
+            if index == 1 {
+                return Err(PluginError::UnsupportedHostOperation {
+                    operation: "denied",
+                });
+            }
+            bmux_plugin_sdk::encode_service_message(
+                &bmux_plugin_sdk::PluginCliCommandResponse::new(17),
+            )
+        }
+
+        fn execute_kernel_request(
+            &self,
+            _: bmux_ipc::Request,
+        ) -> PluginResult<bmux_ipc::ResponsePayload> {
+            panic!("denied probes must not fall back to kernel access")
+        }
+    }
+
+    #[test]
+    fn probes_preserve_wire_status_and_do_not_retry_a_denied_caller() {
+        let port = ProbePort {
+            calls: AtomicUsize::new(0),
+        };
+        let inventory = ClusterInventory {
+            clusters: BTreeMap::from([("fleet".into(), vec!["fixture target".into()])]),
+            known_targets: BTreeSet::from(["fixture target".into()]),
+        };
+        for (probe, reason) in [
+            (HealthProbe::Test, "probe exited with status 17"),
+            (HealthProbe::Doctor, "probe failed to run:"),
+        ] {
+            let statuses =
+                collect_statuses_for_selector(&port, &inventory, Some("fleet"), probe).unwrap();
+            assert_eq!(statuses.len(), 1);
+            assert_eq!(statuses[0].state, ClusterHostState::Degraded);
+            assert!(statuses[0].reason.as_deref().unwrap().starts_with(reason));
+        }
+        assert_eq!(port.calls.load(Ordering::SeqCst), 2);
+    }
 }

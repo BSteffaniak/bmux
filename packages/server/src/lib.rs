@@ -218,6 +218,7 @@ pub struct BmuxServer {
 }
 
 struct ServerState {
+    local_terminal_bound: std::sync::OnceLock<()>,
     stream_provenance: bmux_plugin::stream_admission::StreamProvenanceRegistry,
     private_admission_routes: Mutex<BTreeSet<ServiceRoute>>,
     admission_backend: Mutex<Option<Arc<SerializedAdmissionAuthority>>>,
@@ -1784,6 +1785,7 @@ impl BmuxServer {
             endpoint,
             ipc_security: bmux_ipc::transport::UnixSecurityPolicy::strict(),
             state: Arc::new(ServerState {
+                local_terminal_bound: std::sync::OnceLock::new(),
                 attach_tokens,
                 performance_settings,
                 operation_lock: AsyncMutex::new(()),
@@ -2040,6 +2042,11 @@ impl BmuxServer {
             .lock()
             .map_err(|_| anyhow::anyhow!("service resolver lock poisoned"))? = Some(wrapped);
         Ok(())
+    }
+
+    /// Advertise the host's bound single-terminal transport in local handshakes.
+    pub fn advertise_local_terminal(&self) {
+        self.state.local_terminal_bound.get_or_init(|| ());
     }
 
     /// Return the configured endpoint.
@@ -3079,7 +3086,11 @@ async fn handle_connection(
         principal_id,
     } = handshake
     {
-        let server_contract = ProtocolContract::current(default_supported_capabilities());
+        let mut capabilities = default_supported_capabilities();
+        if admitted_stream.is_none() && state.local_terminal_bound.get().is_some() {
+            capabilities.push(bmux_ipc::CAPABILITY_LOCAL_TERMINAL_V1.to_owned());
+        }
+        let server_contract = ProtocolContract::current(capabilities);
         match negotiate_protocol(&contract, &server_contract, CORE_PROTOCOL_CAPABILITIES) {
             Ok(negotiated) => {
                 supports_service_contract_v2 = negotiated

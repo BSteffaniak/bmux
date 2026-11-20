@@ -172,11 +172,13 @@ struct IrohTarget {
 #[cfg(feature = "remote-iroh")]
 const BMUX_IROH_ALPN: &[u8] = b"bmux/gateway/iroh/1";
 
-/// A stop operation resolves its target once, so retries cannot switch to a
-/// newly selected default target midway through shutdown.
-pub struct StopTarget(ActiveTarget);
+/// A resolved connection target, pinned across a multi-step operation.
+pub struct SelectedTarget(ActiveTarget);
 
-impl StopTarget {
+/// The pinned target used by the shutdown sequence.
+pub type StopTarget = SelectedTarget;
+
+impl SelectedTarget {
     pub async fn resolve(context: ConnectionContext<'_>) -> Result<Self> {
         Ok(Self(resolve_active_target(context).await?))
     }

@@ -12,11 +12,14 @@ mod escape;
 #[cfg(feature = "runtime")]
 pub mod host;
 #[cfg(feature = "runtime")]
+pub mod interactive;
+#[cfg(feature = "runtime")]
 pub mod managed;
 pub mod managed_display;
 pub mod parse_dsl;
 pub mod parse_toml;
 pub mod parser;
+mod report;
 #[cfg(feature = "runtime")]
 pub mod sandbox;
 #[cfg(feature = "runtime")]
@@ -25,6 +28,29 @@ pub mod subst;
 #[cfg(feature = "runtime")]
 pub mod transport;
 pub mod types;
+pub mod validation;
+pub use report::format_result;
+
+/// Parse the viewport override used by batch and interactive playbooks.
+/// # Errors
+/// Rejects malformed or undersized dimensions.
+pub fn parse_viewport_string(viewport: &str) -> anyhow::Result<(u16, u16)> {
+    use anyhow::Context as _;
+    let parts: Vec<&str> = viewport.split('x').collect();
+    if parts.len() != 2 {
+        anyhow::bail!("invalid viewport format: expected COLSxROWS (e.g. 80x24), got '{viewport}'");
+    }
+    let cols: u16 = parts[0]
+        .parse()
+        .with_context(|| format!("invalid viewport cols: '{}'", parts[0]))?;
+    let rows: u16 = parts[1]
+        .parse()
+        .with_context(|| format!("invalid viewport rows: '{}'", parts[1]))?;
+    if cols < 10 || rows < 5 {
+        anyhow::bail!("viewport too small (minimum 10x5): {cols}x{rows}");
+    }
+    Ok((cols, rows))
+}
 
 #[cfg(feature = "runtime")]
 mod pacing;

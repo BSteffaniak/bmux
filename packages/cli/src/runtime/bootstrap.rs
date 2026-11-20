@@ -6,6 +6,7 @@ use bmux_clients_plugin_api::clients_state;
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_contexts_plugin_api::contexts_commands::{self, ContextAck as ContextAckRecord};
 use bmux_diagnostic_log::{DiagnosticLogConfig, DiagnosticLogMode, DiagnosticLogWriter};
+use bmux_recording_bootstrap::recording_plugin_config;
 use bmux_recording_plugin_api::ManualRecordingStartOptions;
 use bmux_recording_protocol::{RecordingEventKind, RecordingRollingStartOptions};
 use bmux_server::BmuxServer;
@@ -41,22 +42,34 @@ pub(super) async fn run_default_server_attach(
     connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
     tracing::info!("attach.bootstrap.default_start");
-    let attach_connection_context = connection_context
-        .target_override
-        .map_or(ConnectionContext::new(Some("local")), |target| {
-            ConnectionContext::new(Some(target))
-        });
-    ensure_server_running_for_default_attach(attach_connection_context, None).await?;
-    tracing::info!("attach.bootstrap.server_ready");
-
-    tracing::info!("attach.bootstrap.connect_start");
-    let mut client = connect_with_context(
-        ConnectionPolicyScope::Normal,
-        "bmux-cli-default-attach",
-        attach_connection_context,
-    )
-    .await?;
-    tracing::info!("attach.bootstrap.connect_done");
+    let selected = crate::connection::SelectedTarget::resolve(connection_context).await?;
+    let mut client = if selected.is_local() {
+        ensure_server_running_for_default_attach(ConnectionContext::new(Some("local")), None)
+            .await?;
+        crate::connection::apply_stale_build_policy(ConnectionPolicyScope::Normal)?;
+        #[cfg(unix)]
+        let paths = ConfigPaths::default();
+        #[cfg(unix)]
+        let identity = crate::connection::read_server_runtime_metadata()?;
+        let client = selected.connect("bmux-cli-default-attach").await?;
+        #[cfg(unix)]
+        if client.negotiated_protocol().is_some_and(|p| {
+            p.capabilities
+                .iter()
+                .any(|c| c == bmux_ipc::CAPABILITY_LOCAL_TERMINAL_V1)
+        }) {
+            let identity = identity.context("local terminal server identity unavailable")?;
+            anyhow::ensure!(
+                crate::connection::read_server_runtime_metadata()?.as_ref() == Some(&identity),
+                "local terminal server changed during handshake"
+            );
+            return super::bare_terminal::attach(&paths, &identity).await;
+        }
+        client
+    } else {
+        crate::connection::apply_stale_build_policy(ConnectionPolicyScope::Normal)?;
+        selected.connect("bmux-cli-default-attach").await?
+    };
     let target = resolve_default_attach_target(&mut client).await?;
     tracing::info!(session_id = %target, "attach.bootstrap.target_resolved");
     let target = target.to_string();
@@ -447,46 +460,15 @@ async fn run_server_start_inner(
     } else {
         None
     };
-    if let Some(window_secs) = rolling_options.window_secs
-        && window_secs == 0
-    {
-        anyhow::bail!("--rolling-window-secs must be greater than 0")
-    }
     let base_rolling_settings = bmux_server::rolling_recording_settings_from_config(&config);
     let effective_rolling_settings =
         bmux_server::apply_rolling_start_options(&base_rolling_settings, &rolling_options);
-    let explicit_rolling_event_selection = rolling_options.event_kinds.is_some()
-        || rolling_options.capture_input.is_some()
-        || rolling_options.capture_output.is_some()
-        || rolling_options.capture_events.is_some()
-        || rolling_options.capture_protocol_replies.is_some()
-        || rolling_options.capture_images.is_some();
-    let rolling_requested = rolling_enabled_override == Some(true)
-        || rolling_options.window_secs.is_some()
-        || explicit_rolling_event_selection
-        || (rolling_enabled_override.is_none() && config.recording.enabled);
-    if rolling_requested
-        && effective_rolling_settings.window_secs == 0
-        && (rolling_enabled_override == Some(true)
-            || rolling_options.window_secs.is_some()
-            || explicit_rolling_event_selection)
-    {
-        anyhow::bail!(
-            "rolling recording was explicitly enabled but window is 0s; set `recording.rolling_window_secs` in config or pass `--rolling-window-secs <secs>`"
-        )
-    }
-    let effective_rolling_enabled = if rolling_enabled_override == Some(false) {
-        false
-    } else if rolling_options.window_secs.is_some() || explicit_rolling_event_selection {
-        true
-    } else {
-        rolling_enabled_override.unwrap_or(config.recording.enabled)
-    } && effective_rolling_settings.window_secs > 0;
-    if effective_rolling_enabled && effective_rolling_settings.event_kinds.is_empty() {
-        anyhow::bail!(
-            "rolling recording is enabled but no rolling event kinds are selected; enable rolling capture flags or pass --rolling-event-kind/--rolling-event-kind-all"
-        )
-    }
+    let effective_rolling_enabled = bmux_recording_bootstrap::rolling_auto_start(
+        config.recording.enabled,
+        rolling_enabled_override,
+        &rolling_options,
+        &effective_rolling_settings,
+    )?;
     if daemon && !foreground_internal {
         let executable =
             std::env::current_exe().context("failed to resolve bmux executable path")?;
@@ -974,10 +956,38 @@ async fn run_server_start_inner(
     };
     tokio::pin!(managed_idle);
     let listener = ownership.bind_endpoint(server.endpoint())?;
+    #[cfg(unix)]
+    let neutral = if loaded_plugins.iter().all(super::bare_terminal::compatible) {
+        Some(super::bare_terminal::Listener::bind(
+            &paths,
+            server_identity.pid,
+            server_identity.started_at_epoch_ms,
+        )?)
+    } else {
+        None
+    };
+    #[cfg(unix)]
+    if neutral.is_some() {
+        server.advertise_local_terminal();
+    }
     let mut server_loop = Box::pin(server.run_with_listener(listener, Some(server_ready_tx)));
+    let single_terminal = async {
+        #[cfg(unix)]
+        if let Some(listener) = neutral.as_ref() {
+            let shell = config
+                .general
+                .default_shell
+                .clone()
+                .or_else(|| std::env::var("SHELL").ok())
+                .unwrap_or_else(|| "/bin/sh".into());
+            return listener.serve(&shell).await;
+        }
+        std::future::pending::<Result<()>>().await
+    };
     let run_result = if loaded_plugins.is_empty() {
         tokio::select! {
             biased;
+            result = single_terminal => result,
             () = &mut managed_idle => unreachable!("idle watcher remains pending after shutdown request"),
             result = &mut server_loop => result,
             result = &mut gateway_loop => result,
@@ -991,6 +1001,10 @@ async fn run_server_start_inner(
         );
         tokio::pin!(plugin_bridge);
         tokio::select! {
+            result = single_terminal => {
+                let _ = plugin_bridge_shutdown_tx.send(true);
+                result
+            }
             () = &mut managed_idle => unreachable!("idle watcher remains pending after shutdown request"),
             result = &mut server_loop => {
                 let _ = plugin_bridge_shutdown_tx.send(true);
@@ -1096,29 +1110,6 @@ fn register_recording_plugin_config(
     );
     let handle = std::sync::Arc::new(std::sync::RwLock::new(plugin_config));
     registry.register::<bmux_recording_plugin_api::RecordingPluginConfig>(&handle);
-}
-
-fn recording_plugin_config(
-    config: &BmuxConfig,
-    paths: &ConfigPaths,
-    rolling_auto_start: bool,
-    rolling_settings: &bmux_recording_plugin_api::RollingRecordingSettings,
-    startup_recording: Option<ManualRecordingStartOptions>,
-) -> bmux_recording_plugin_api::RecordingPluginConfig {
-    use bmux_recording_plugin_api::RecordingPluginConfig;
-    let auto_export_dir = config.recording_auto_export_dir(paths);
-    RecordingPluginConfig {
-        recordings_dir: config.recordings_dir(paths),
-        rolling_recordings_dir: paths.rolling_recordings_dir(),
-        rolling_segment_mb: config.recording.segment_mb,
-        retention_days: config.recording.retention_days,
-        rolling_defaults: rolling_settings.clone(),
-        rolling_auto_start,
-        auto_export: config.recording.auto_export || auto_export_dir.is_some(),
-        auto_export_dir,
-        auto_export_fps: config.recording.export.fps.max(1),
-        startup_recording,
-    }
 }
 
 fn set_startup_recording_env(

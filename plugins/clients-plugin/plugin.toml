@@ -1,10 +1,24 @@
-component_roles   = ["backend"]
-execution_class   = "native_fast"
-id                = "bmux.clients"
-name              = "bmux Clients"
-owns_namespaces   = []
+component_roles = ["backend"]
+execution_class = "native_fast"
+id = "bmux.clients"
+name = "bmux Clients"
+owns_namespaces = ["list-clients", "follow", "unfollow"]
+owns_paths = [
+    [
+        "session",
+        "clients",
+    ],
+    [
+        "session",
+        "follow",
+    ],
+    [
+        "session",
+        "unfollow",
+    ],
+]
 provided_features = ["bmux.clients"]
-version           = "0.0.1-alpha.0"
+version = "0.0.1-alpha.0"
 
 # clients-plugin's set-following handler dispatches to
 # `contexts-commands::select-context` and
@@ -25,3 +39,52 @@ kind                         = "bmux.clients/clients-events"
 
 # Explicit immutable v1 contracts. Route IDs are wire identities, not version
 # syntax: retain legacy names and negotiate their major separately.
+
+[[commands]]
+aliases       = [["session", "clients"]]
+expose_in_cli = true
+name          = "list-clients"
+path          = ["list-clients"]
+summary       = "List connected clients"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "json"
+name    = "json"
+summary = "Print clients as JSON"
+
+[[commands]]
+aliases       = [["session", "follow"]]
+expose_in_cli = true
+name          = "follow"
+path          = ["follow"]
+summary       = "Follow another client's active target"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "target_client_id"
+position   = 0
+required   = true
+summary    = "Target client UUID to follow"
+value_name = "TARGET_CLIENT_ID"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "global"
+name    = "global"
+summary = "Keep following across target session switches"
+
+[[commands]]
+aliases       = [["session", "unfollow"]]
+expose_in_cli = true
+name          = "unfollow"
+path          = ["unfollow"]
+summary       = "Stop following a client"
+
+[cli_help]
+"follow"           = { order = 16 }
+"list-clients"     = { order = 11 }
+"session clients"  = { order = 2 }
+"session follow"   = { order = 7 }
+"session unfollow" = { order = 8 }
+"unfollow"         = { order = 17 }

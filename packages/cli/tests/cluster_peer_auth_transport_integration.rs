@@ -699,6 +699,7 @@ async fn assert_transport_is_not_cluster_authority(joiner: &ServerEnv, endpoint:
 
 // Reuse only the coordinator's bounded, secret-redacting PTY primitive. Rust
 // retains ownership of the single host daemon and all persistence/revoke checks.
+#[cfg(feature = "bundled-plugin-connections")]
 fn pair_daemonless_cli(host: &ServerEnv, laptop: &ServerEnv) {
     let script =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/smoke-remote-pairing.py");
@@ -753,6 +754,7 @@ finally:
     );
 }
 
+#[cfg(feature = "bundled-plugin-connections")]
 #[test]
 #[serial_test::serial]
 fn account_free_cli_pairs_persists_and_revokes() {

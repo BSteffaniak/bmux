@@ -25,6 +25,7 @@ pub mod declaration {
     }
 }
 
+mod cli;
 mod managed_catalog;
 mod orchestrator;
 mod participants;
@@ -119,6 +120,7 @@ pub struct SnapshotPlugin {
     runtime: SnapshotRuntime,
     orchestrator: std::sync::RwLock<Option<Arc<BmuxSnapshotOrchestrator>>>,
     bound: bool,
+    client_preflight: Option<fn() -> std::result::Result<(), PluginCommandError>>,
 }
 
 fn slot_mut<T>(
@@ -135,6 +137,7 @@ impl SnapshotPlugin {
             runtime,
             orchestrator: std::sync::RwLock::new(None),
             bound: true,
+            client_preflight: None,
         }
     }
 
@@ -208,12 +211,15 @@ impl Default for SnapshotPlugin {
             runtime: SnapshotRuntime::new(Arc::new(bmux_plugin::PluginStateRegistry::new())),
             orchestrator: std::sync::RwLock::new(None),
             bound: false,
+            client_preflight: None,
         }
     }
 }
 
 impl Plugin for SnapshotPlugin {
     fn declare(d: &mut Declarations<Self>) {
+        d.blocking_command("save", cli::run)
+            .blocking_command("restore", cli::run);
         d.blocking_activate(Self::activate)
             .blocking_deactivate(Self::deactivate)
             .blocking_services(Self::invoke_service, None)
@@ -230,6 +236,9 @@ impl SnapshotPlugin {
         _context: &NativeLifecycleContext,
         _tasks: Option<bmux_plugin_sdk::HostAsyncHandle>,
     ) -> std::result::Result<(), PluginCommandError> {
+        if self.client_preflight.is_some() {
+            return Ok(());
+        }
         if !self.bound || self.orchestrator().is_some() {
             return Err(PluginCommandError::unavailable(
                 "snapshot runtime unbound or already activated",
@@ -555,6 +564,32 @@ pub fn plugin_definition_with_runtime(
         crate::declaration::PLUGIN_MANIFEST,
         crate::declaration::SERVICE_CONTRACTS,
         move |_| Ok(SnapshotPlugin::new(runtime.clone())),
+    )
+    .expect("embedded snapshot declaration must be valid")
+}
+
+/// A one-command client: never creates an orchestrator or starts a debounce task.
+///
+/// # Panics
+/// Panics if the embedded snapshot declaration is invalid.
+#[must_use]
+pub fn client_definition(
+    preflight: fn() -> std::result::Result<(), PluginCommandError>,
+) -> bmux_plugin_sdk::definition::PluginDefinition {
+    bmux_plugin_sdk::author::definition::<SnapshotPlugin>(
+        declaration::PLUGIN_MANIFEST,
+        declaration::SERVICE_CONTRACTS,
+        move |scope| {
+            if !matches!(scope.cli_command.as_deref(), Some("save" | "restore")) {
+                return Err(PluginCommandError::unavailable(
+                    "snapshot client requires a standalone command",
+                ));
+            }
+            Ok(SnapshotPlugin {
+                client_preflight: Some(preflight),
+                ..SnapshotPlugin::default()
+            })
+        },
     )
     .expect("embedded snapshot declaration must be valid")
 }

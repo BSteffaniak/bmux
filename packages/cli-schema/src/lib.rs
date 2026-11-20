@@ -260,12 +260,6 @@ pub enum RecordingCursorTextMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum HostedModeArg {
-    P2p,
-    ControlPlane,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum SandboxEnvModeArg {
     Clean,
     Inherit,
@@ -324,147 +318,6 @@ pub struct Cli {
 
 bounded_subcommands! {
 pub enum Command {
-    /// First-run setup wizard for hosted mode (p2p default)
-    Setup {
-        /// Check hosted readiness without starting or changing runtime state
-        #[arg(long)]
-        check: bool,
-        /// Hosted operation mode (`p2p` is infra-light default)
-        #[arg(long, value_enum)]
-        mode: Option<HostedModeArg>,
-    },
-    /// Start hosted mode (p2p default, control-plane opt-in)
-    Host {
-        /// Optional listen address for local gateway bridge
-        #[arg(long, default_value = "127.0.0.1:7443")]
-        listen: String,
-        /// Optional friendly name hint
-        #[arg(long)]
-        name: Option<String>,
-        /// Copy the resulting join link to clipboard
-        #[arg(long)]
-        copy: bool,
-        /// Run host runtime in the background
-        #[arg(long, conflicts_with_all = ["status", "stop", "restart"])]
-        daemon: bool,
-        /// Show hosted-mode runtime status
-        #[arg(long, conflicts_with_all = ["stop", "restart", "daemon"])]
-        status: bool,
-        /// Stop hosted-mode runtime if running
-        #[arg(long, conflicts_with_all = ["status", "restart", "daemon"])]
-        stop: bool,
-        /// Restart hosted-mode runtime in background
-        #[arg(long, conflicts_with_all = ["status", "stop", "daemon"])]
-        restart: bool,
-        /// Hosted operation mode (`p2p` is infra-light default)
-        #[arg(long, value_enum)]
-        mode: Option<HostedModeArg>,
-    },
-    /// Join a hosted link/target quickly
-    Join {
-        /// Link or target name (bmux://, iroh://, https://, or configured target)
-        link: Option<String>,
-        /// Session name or UUID
-        session: Option<String>,
-    },
-    /// List known hosts/targets (recent first)
-    Hosts {
-        /// Include detailed target mappings and diagnostics
-        #[arg(long)]
-        verbose: bool,
-    },
-    /// Authentication commands
-    Auth {
-        #[command(subcommand)]
-        command: AuthCommand,
-    },
-    /// SSH-key access controls for iroh hosting
-    Access {
-        #[command(subcommand)]
-        command: AccessCommand,
-    },
-    /// SSH kiosk profiles and token management
-    Kiosk {
-        #[command(subcommand)]
-        command: KioskCommand,
-    },
-    /// Share helpers for hosted links
-    Share {
-        /// Target/link to share
-        target: Option<String>,
-        /// Optional second positional argument (used by `bmux share revoke <name>`)
-        secondary: Option<String>,
-        /// Optional stable share name
-        #[arg(long)]
-        name: Option<String>,
-        /// Optional access role hint
-        #[arg(long, default_value = "control")]
-        role: String,
-        /// Optional invite TTL (example: 24h, 30m)
-        #[arg(long)]
-        ttl: Option<String>,
-        /// Mark the share as one-time use
-        #[arg(long)]
-        one_time: bool,
-        /// Copy resulting share link to clipboard
-        #[arg(long)]
-        copy: bool,
-        /// Render a terminal QR code for the share link
-        #[arg(long)]
-        qr: bool,
-    },
-    /// Remove a named shared link
-    Unshare {
-        /// Share name/slug to remove
-        name: String,
-    },
-    /// Connect to a target and attach to a session
-    Connect {
-        /// Target name or ssh destination (user@host[:port] or ssh://...)
-        target: Option<String>,
-        /// Session name or UUID; if omitted in TTY mode a picker is shown
-        session: Option<String>,
-        /// Follow target client UUID and attach to its selected session
-        #[arg(long, conflicts_with = "session")]
-        follow: Option<String>,
-        /// Keep following across target session switches (requires --follow)
-        #[arg(long, requires = "follow")]
-        global: bool,
-        /// Keep reconnecting instead of stopping after bounded retries
-        #[arg(long)]
-        reconnect_forever: bool,
-    },
-    /// Create a new session
-    NewSession {
-        /// Optional session name
-        name: Option<String>,
-    },
-    /// List active sessions
-    ListSessions {
-        /// Print sessions as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// List connected clients
-    ListClients {
-        /// Print clients as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Kill a session by name or UUID
-    KillSession {
-        /// Session name or UUID
-        target: String,
-        /// Bypass policy checks for local kill operations
-        #[arg(long)]
-        force_local: bool,
-    },
-    /// Kill all sessions
-    KillAllSessions {
-        /// Bypass policy checks for local kill operations
-        #[arg(long)]
-        force_local: bool,
-    },
     /// Attach to a session by name or UUID
     Attach {
         /// Session name or UUID
@@ -507,28 +360,6 @@ pub enum Command {
         #[arg(long, requires = "follow")]
         global: bool,
     },
-    /// Detach from the current session
-    Detach,
-    /// Follow another client's active target
-    Follow {
-        /// Target client UUID to follow
-        target_client_id: String,
-        /// Keep following across target session switches
-        #[arg(long)]
-        global: bool,
-    },
-    /// Stop following a client
-    Unfollow,
-    /// Session management commands
-    Session {
-        #[command(subcommand)]
-        command: SessionCommand,
-    },
-    /// Remote target utilities
-    Remote {
-        #[command(subcommand)]
-        command: RemoteCommand,
-    },
     /// Server lifecycle and status tools
     Server {
         #[command(subcommand)]
@@ -539,20 +370,10 @@ pub enum Command {
         #[command(subcommand)]
         command: LogsCommand,
     },
-    /// Structured diagnostics event viewer
-    Diagnostics {
-        #[command(subcommand)]
-        command: DiagnosticsCommand,
-    },
     /// Configuration management and inspection
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
-    },
-    /// Runtime performance telemetry controls
-    Perf {
-        #[command(subcommand)]
-        command: PerfCommand,
     },
     /// Run system-wide health checks
     Doctor {
@@ -572,11 +393,6 @@ pub enum Command {
     Terminal {
         #[command(subcommand)]
         command: TerminalCommand,
-    },
-    /// Headless playbook execution and testing
-    Playbook {
-        #[command(subcommand)]
-        command: PlaybookCommand,
     },
     /// Run bmux in an isolated ephemeral sandbox environment
     Sandbox {
@@ -599,20 +415,6 @@ pub enum Command {
     #[command(external_subcommand)]
     External(Vec<String> => external),
 }
-}
-
-#[derive(Clone, Debug, Subcommand)]
-pub enum AuthCommand {
-    /// Login and register this device for hosted mode
-    Login {
-        /// Do not try to open a browser automatically
-        #[arg(long)]
-        no_browser: bool,
-    },
-    /// Show current authentication state
-    Status,
-    /// Clear locally stored authentication state
-    Logout,
 }
 
 /// Slot-management commands.
@@ -750,321 +552,6 @@ pub enum SlotInstallMode {
     Symlink,
     /// Copy into the bin dir.
     Copy,
-}
-
-#[derive(Clone, Debug, Subcommand)]
-pub enum AccessCommand {
-    /// Show iroh SSH access status
-    Status,
-    /// Initialize iroh SSH access and enable it immediately
-    Init {
-        /// Add all currently loaded SSH agent keys
-        #[arg(long)]
-        agent: bool,
-        /// Add a public key from file (repeatable)
-        #[arg(long, value_name = "PATH")]
-        key_file: Vec<String>,
-        /// Add a public key line directly (repeatable)
-        #[arg(long, value_name = "KEY")]
-        public_key: Vec<String>,
-        /// Import public keys from a GitHub username (repeatable)
-        #[arg(long, value_name = "USER")]
-        github_user: Vec<String>,
-        /// Skip interactive confirmation prompts
-        #[arg(long)]
-        yes: bool,
-    },
-    /// Add SSH keys to iroh allowlist
-    Add {
-        /// Add all currently loaded SSH agent keys
-        #[arg(long)]
-        agent: bool,
-        /// Add a public key from file (repeatable)
-        #[arg(long, value_name = "PATH")]
-        key_file: Vec<String>,
-        /// Add a public key line directly (repeatable)
-        #[arg(long, value_name = "KEY")]
-        public_key: Vec<String>,
-        /// Import public keys from a GitHub username (repeatable)
-        #[arg(long, value_name = "USER")]
-        github_user: Vec<String>,
-    },
-    /// List currently authorized SSH keys
-    List {
-        /// Print output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Remove an SSH key from the allowlist
-    Remove {
-        /// Key fingerprint to remove
-        fingerprint: String,
-        /// Skip interactive confirmation prompts
-        #[arg(long)]
-        yes: bool,
-    },
-    /// Enable iroh SSH access enforcement
-    Enable,
-    /// Disable iroh SSH access enforcement
-    Disable,
-}
-
-#[derive(Clone, Debug, Subcommand)]
-pub enum KioskCommand {
-    /// Show kiosk profile status and effective defaults
-    Status {
-        /// Print output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Initialize/update kiosk bootstrap files from config
-    Init {
-        /// Kiosk profile to reconcile (repeatable)
-        #[arg(long, value_name = "PROFILE", conflicts_with = "all_profiles")]
-        profile: Vec<String>,
-        /// Reconcile all configured profiles
-        #[arg(long, conflicts_with = "profile")]
-        all_profiles: bool,
-        /// Preview actions without writing files
-        #[arg(long)]
-        dry_run: bool,
-        /// Skip confirmation prompts
-        #[arg(long)]
-        yes: bool,
-    },
-    /// Issue a kiosk token scoped to a profile
-    IssueToken {
-        /// Kiosk profile name
-        profile: String,
-        /// Optional session override stored in token
-        #[arg(long)]
-        session: Option<String>,
-        /// Optional token TTL in seconds (defaults to profile/default TTL)
-        #[arg(long)]
-        ttl_secs: Option<u64>,
-        /// Mark token as one-shot (defaults to profile/default one_shot)
-        #[arg(long, conflicts_with = "multi_use")]
-        one_shot: bool,
-        /// Mark token as reusable until expiry
-        #[arg(long, conflicts_with = "one_shot")]
-        multi_use: bool,
-    },
-    /// Revoke one issued kiosk token by id
-    RevokeToken {
-        /// Token id to revoke
-        token_id: String,
-    },
-    /// Attach using a kiosk token (intended for forced SSH command)
-    Attach {
-        /// Kiosk profile name
-        profile: String,
-        /// Raw kiosk token
-        #[arg(long)]
-        token: String,
-    },
-    /// Print generated sshd include text without writing files
-    SshPrintConfig {
-        /// Kiosk profile to print (repeatable)
-        #[arg(long, value_name = "PROFILE", conflicts_with = "all_profiles")]
-        profile: Vec<String>,
-        /// Print all configured profiles
-        #[arg(long, conflicts_with = "profile")]
-        all_profiles: bool,
-    },
-}
-
-#[derive(Clone, Debug, Subcommand)]
-pub enum RemoteCommand {
-    /// List configured connection targets
-    List {
-        /// Print output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Verify connectivity to a configured target
-    Test {
-        /// Target name or ssh destination
-        target: String,
-    },
-    /// Diagnose remote connectivity and runtime readiness
-    Doctor {
-        /// Target name or ssh destination
-        target: String,
-        /// Apply safe automatic fixes when possible
-        #[arg(long)]
-        fix: bool,
-    },
-    /// Create and validate a named remote target profile
-    Init {
-        /// Name for the target profile
-        name: String,
-        /// Configure as an SSH target (user@host[:port] or host)
-        #[arg(long, conflicts_with_all = ["tls", "iroh"])]
-        ssh: Option<String>,
-        /// Configure as a TLS target (host[:port])
-        #[arg(long, conflicts_with_all = ["ssh", "iroh"])]
-        tls: Option<String>,
-        /// Configure as an iroh target (endpoint_id[?relay=https://...][&auth=ssh])
-        #[arg(long, conflicts_with_all = ["ssh", "tls"])]
-        iroh: Option<String>,
-        /// SSH username override
-        #[arg(long)]
-        user: Option<String>,
-        /// SSH/TLS port override
-        #[arg(long)]
-        port: Option<u16>,
-        /// Mark as default target
-        #[arg(long)]
-        set_default: bool,
-    },
-    /// Ensure remote bmux runtime is installed and reachable
-    InstallServer {
-        /// Target name
-        target: String,
-    },
-    /// Upgrade remote bmux runtime for one or all targets
-    Upgrade {
-        /// Target name (omit to upgrade all configured targets)
-        target: Option<String>,
-    },
-    /// Manage TLS gateway trust pins
-    Trust {
-        #[command(subcommand)]
-        command: RemoteTrustCommand,
-    },
-    /// Shell completion helpers for targets/sessions
-    Complete {
-        #[command(subcommand)]
-        command: RemoteCompleteCommand,
-    },
-}
-
-#[derive(Clone, Debug, Subcommand)]
-pub enum RemoteTrustCommand {
-    /// List effective TLS gateway trust pins
-    List,
-    /// Probe and trust a TLS gateway
-    Add {
-        /// TLS target URL or host[:port]
-        target: String,
-        /// Trust without an interactive confirmation prompt
-        #[arg(long)]
-        yes: bool,
-    },
-    /// Remove a local TLS gateway trust pin
-    Remove {
-        /// Endpoint key (`host:port`)
-        endpoint: String,
-    },
-}
-
-#[derive(Clone, Debug, Subcommand)]
-pub enum RemoteCompleteCommand {
-    /// Print target names for completion
-    Targets,
-    /// Print session names for a target
-    Sessions {
-        /// Target name
-        target: String,
-    },
-}
-
-#[derive(Clone, Debug, Subcommand)]
-pub enum PlaybookCommand {
-    /// Run a playbook from a file or stdin
-    Run {
-        /// Path to playbook file, or `-` for stdin
-        source: String,
-        /// Output results as JSON
-        #[arg(long)]
-        json: bool,
-        /// Run visual interactive live tour (TTY; non-TTY falls back to prompt controls)
-        #[arg(long)]
-        interactive: bool,
-        /// Deterministic presentation pacing; automation defaults to instant
-        #[arg(long, default_value = "instant", value_parser = ["instant", "half", "normal", "double"])]
-        playback_speed: String,
-        /// Run against the live server instead of an ephemeral sandbox
-        #[arg(long)]
-        target_server: bool,
-        /// Record the playbook execution (overrides playbook config)
-        #[arg(long)]
-        record: bool,
-        /// Export the recording as a GIF to the given path (implies --record)
-        #[arg(long)]
-        export_gif: Option<String>,
-        /// Override viewport dimensions as COLSxROWS (e.g. 120x40)
-        #[arg(long)]
-        viewport: Option<String>,
-        /// Override max playbook timeout in seconds
-        #[arg(long)]
-        timeout: Option<u64>,
-        /// Override shell
-        #[arg(long)]
-        shell: Option<String>,
-        /// Define a variable (repeatable). Format: KEY=VALUE
-        #[arg(long = "var")]
-        vars: Vec<String>,
-        /// Print step-by-step progress to stderr
-        #[arg(long, short)]
-        verbose: bool,
-    },
-    /// Validate a playbook without executing it
-    Validate {
-        /// Path to playbook file, or `-` for stdin
-        source: String,
-        /// Output results as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Start an interactive playbook session with a socket for agent control
-    Interactive {
-        /// Socket path override (default: auto-generated in sandbox temp dir)
-        #[arg(long)]
-        socket: Option<String>,
-        /// Record the session
-        #[arg(long)]
-        record: bool,
-        /// Viewport dimensions as COLSxROWS (default: 80x24)
-        #[arg(long, default_value = "80x24")]
-        viewport: String,
-        /// Shell override
-        #[arg(long)]
-        shell: Option<String>,
-        /// Max session lifetime in seconds (default: no limit)
-        #[arg(long)]
-        timeout: Option<u64>,
-    },
-    /// Dry-run: parse, validate, and print the execution plan without running
-    DryRun {
-        /// Path to playbook file, or `-` for stdin
-        source: String,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Compare results from two playbook runs
-    Diff {
-        /// Path to first (baseline/left) playbook result JSON
-        left: String,
-        /// Path to second (new/right) playbook result JSON
-        right: String,
-        /// Output diff as JSON
-        #[arg(long)]
-        json: bool,
-        /// Timing regression threshold in percent (default: 50)
-        #[arg(long, default_value = "50")]
-        timing_threshold: u64,
-    },
-    /// Clean up sandbox temp directories from previous playbook runs
-    Cleanup {
-        /// Only list orphaned dirs without deleting
-        #[arg(long)]
-        dry_run: bool,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
 }
 
 bounded_subcommands! {
@@ -1413,64 +900,6 @@ pub enum SandboxSourceArg {
     All,
 }
 
-#[derive(Clone, Debug, Subcommand)]
-pub enum SessionCommand {
-    /// Create a new session
-    New {
-        /// Optional session name
-        name: Option<String>,
-    },
-    /// List active sessions
-    List {
-        /// Print sessions as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// List connected clients
-    Clients {
-        /// Print clients as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Kill a session by name or UUID
-    Kill {
-        /// Session name or UUID
-        target: String,
-        /// Bypass policy checks for local kill operations
-        #[arg(long)]
-        force_local: bool,
-    },
-    /// Kill all sessions
-    KillAll {
-        /// Bypass policy checks for local kill operations
-        #[arg(long)]
-        force_local: bool,
-    },
-    /// Attach to a session by name or UUID
-    Attach {
-        /// Session name or UUID
-        target: Option<String>,
-        /// Follow target client UUID and attach to its selected session
-        #[arg(long)]
-        follow: Option<String>,
-        /// Keep following across target session switches (requires --follow)
-        #[arg(long, requires = "follow")]
-        global: bool,
-    },
-    /// Detach from the current session
-    Detach,
-    /// Follow another client's active target
-    Follow {
-        /// Target client UUID to follow
-        target_client_id: String,
-        /// Keep following across target session switches
-        #[arg(long)]
-        global: bool,
-    },
-    /// Stop following a client
-    Unfollow,
-}
-
 bounded_subcommands! {
 pub enum ServerCommand {
     /// Start local bmux server
@@ -1562,17 +991,6 @@ pub enum ServerCommand {
         /// Print principal identity as JSON
         #[arg(long)]
         json: bool,
-    },
-    /// Trigger immediate server snapshot save
-    Save,
-    /// Validate persisted snapshot without applying restore
-    Restore {
-        /// Only validate snapshot readability and schema
-        #[arg(long)]
-        dry_run: bool,
-        /// Confirm replace-restore of current in-memory server state
-        #[arg(long, conflicts_with = "dry_run")]
-        yes: bool,
     },
     /// Request graceful server shutdown
     Stop,
@@ -1673,58 +1091,6 @@ pub enum KeymapCommand {
 }
 
 #[derive(Clone, Debug, Subcommand)]
-pub enum DiagnosticsCommand {
-    /// Interactive structured diagnostics event viewer with dynamic filters
-    Watch {
-        /// Number of recent events to preload (defaults to saved profile value or 200)
-        #[arg(long)]
-        lines: Option<usize>,
-        /// Show entries newer than a relative duration (e.g. 30s, 10m, 2h, 1d)
-        #[arg(long)]
-        since: Option<String>,
-        /// State profile for saved watch filters (default: global `default`)
-        #[arg(long)]
-        profile: Option<String>,
-        /// Include regex filter (case-sensitive, repeatable)
-        #[arg(long = "include")]
-        include: Vec<String>,
-        /// Include regex filter (case-insensitive, repeatable)
-        #[arg(long = "include-i")]
-        include_i: Vec<String>,
-        /// Exclude regex filter (case-sensitive, repeatable)
-        #[arg(long = "exclude")]
-        exclude: Vec<String>,
-        /// Exclude regex filter (case-insensitive, repeatable)
-        #[arg(long = "exclude-i")]
-        exclude_i: Vec<String>,
-    },
-    /// Alias for watch
-    View {
-        /// Number of recent events to preload (defaults to saved profile value or 200)
-        #[arg(long)]
-        lines: Option<usize>,
-        /// Show entries newer than a relative duration (e.g. 30s, 10m, 2h, 1d)
-        #[arg(long)]
-        since: Option<String>,
-        /// State profile for saved watch filters (default: global `default`)
-        #[arg(long)]
-        profile: Option<String>,
-        /// Include regex filter (case-sensitive, repeatable)
-        #[arg(long = "include")]
-        include: Vec<String>,
-        /// Include regex filter (case-insensitive, repeatable)
-        #[arg(long = "include-i")]
-        include_i: Vec<String>,
-        /// Exclude regex filter (case-sensitive, repeatable)
-        #[arg(long = "exclude")]
-        exclude: Vec<String>,
-        /// Exclude regex filter (case-insensitive, repeatable)
-        #[arg(long = "exclude-i")]
-        exclude_i: Vec<String>,
-    },
-}
-
-#[derive(Clone, Debug, Subcommand)]
 pub enum LogsCommand {
     /// Print effective log file path
     Path {
@@ -1737,77 +1103,6 @@ pub enum LogsCommand {
         /// Print output as JSON
         #[arg(long)]
         json: bool,
-    },
-    /// Print recent log lines and optionally follow updates
-    Tail {
-        /// Number of recent lines to show before follow
-        #[arg(long, default_value_t = 50)]
-        lines: usize,
-        /// Show entries newer than a relative duration (e.g. 30s, 10m, 2h, 1d)
-        #[arg(long)]
-        since: Option<String>,
-        /// Print recent lines only (disable follow)
-        #[arg(long)]
-        no_follow: bool,
-    },
-    /// Interactive live log viewer with dynamic filters
-    Watch {
-        /// Number of recent lines to preload (defaults to saved profile value or 200)
-        #[arg(long)]
-        lines: Option<usize>,
-        /// Show entries newer than a relative duration (e.g. 30s, 10m, 2h, 1d)
-        #[arg(long)]
-        since: Option<String>,
-        /// State profile for saved watch filters (default: global `default`)
-        #[arg(long)]
-        profile: Option<String>,
-        /// Include regex filter (case-sensitive, repeatable)
-        #[arg(long = "include")]
-        include: Vec<String>,
-        /// Include regex filter (case-insensitive, repeatable)
-        #[arg(long = "include-i")]
-        include_i: Vec<String>,
-        /// Exclude regex filter (case-sensitive, repeatable)
-        #[arg(long = "exclude")]
-        exclude: Vec<String>,
-        /// Exclude regex filter (case-insensitive, repeatable)
-        #[arg(long = "exclude-i")]
-        exclude_i: Vec<String>,
-    },
-    /// Manage saved log watch profiles
-    Profiles {
-        #[command(subcommand)]
-        command: LogsProfilesCommand,
-    },
-}
-
-#[derive(Clone, Debug, Subcommand)]
-pub enum LogsProfilesCommand {
-    /// List saved watch profiles
-    List {
-        /// Print output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show details for one profile
-    Show {
-        /// Profile name (default: global profile `default`)
-        profile: Option<String>,
-        /// Print output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Delete a saved profile
-    Delete {
-        /// Profile name to delete
-        profile: String,
-    },
-    /// Rename a saved profile
-    Rename {
-        /// Existing profile name
-        from: String,
-        /// New profile name
-        to: String,
     },
 }
 
@@ -1935,38 +1230,6 @@ pub enum ConfigProfilesCommand {
     },
 }
 
-#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
-pub enum PerfProfileArg {
-    Basic,
-    Detailed,
-    Trace,
-}
-
-#[derive(Clone, Debug, Subcommand)]
-pub enum PerfCommand {
-    /// Show current runtime performance telemetry settings
-    Status {
-        /// Print output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Enable runtime performance telemetry
-    On {
-        /// Capture profile level
-        #[arg(long, value_enum, default_value_t = PerfProfileArg::Detailed)]
-        profile: PerfProfileArg,
-        /// Print output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Disable runtime performance telemetry
-    Off {
-        /// Print output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-}
-
 #[derive(Clone, Debug, Subcommand)]
 pub enum TerminalCommand {
     /// Show terminal capability profile used for panes
@@ -2045,12 +1308,9 @@ mod tests {
     }
 
     use super::{
-        AccessCommand, AuthCommand, Cli, Command, ConfigCommand, ConfigProfilesCommand,
-        GatewayHostMode, HostedModeArg, KeymapCommand, KioskCommand, LogsCommand,
-        LogsProfilesCommand, PerfCommand, PerfProfileArg, PlaybookCommand, RecordingEventKindArg,
-        RemoteCommand, RemoteCompleteCommand, SandboxCommand, SandboxEnvModeArg, SandboxSourceArg,
-        SandboxStatusArg, ServerAutostartCommand, ServerCommand, SessionCommand, TerminalCommand,
-        TraceFamily,
+        Cli, Command, ConfigCommand, ConfigProfilesCommand, GatewayHostMode, KeymapCommand,
+        LogsCommand, RecordingEventKindArg, SandboxCommand, SandboxEnvModeArg, SandboxSourceArg,
+        SandboxStatusArg, ServerAutostartCommand, ServerCommand, TerminalCommand, TraceFamily,
     };
     use clap::Parser;
 
@@ -2139,382 +1399,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_connect_command_with_session() {
-        let cli = Cli::try_parse_from(["bmux", "connect", "prod", "app"]).expect("valid CLI args");
-        let Some(Command::Connect {
-            target,
-            session,
-            follow,
-            global,
-            reconnect_forever,
-        }) = cli.command
-        else {
-            panic!("expected connect command");
-        };
-        assert_eq!(target.as_deref(), Some("prod"));
-        assert_eq!(session.as_deref(), Some("app"));
-        assert!(follow.is_none());
-        assert!(!global);
-        assert!(!reconnect_forever);
-    }
-
-    #[test]
-    fn parses_remote_test_command() {
-        let cli = Cli::try_parse_from(["bmux", "remote", "test", "prod"]).expect("valid CLI args");
-        let Some(Command::Remote { command }) = cli.command else {
-            panic!("expected remote command");
-        };
-        assert!(matches!(
-            command,
-            RemoteCommand::Test { target } if target == "prod"
-        ));
-    }
-
-    #[test]
-    fn parses_remote_doctor_fix_flag() {
-        let cli = Cli::try_parse_from(["bmux", "remote", "doctor", "prod", "--fix"])
-            .expect("valid CLI args");
-        let Some(Command::Remote { command }) = cli.command else {
-            panic!("expected remote command");
-        };
-        assert!(matches!(
-            command,
-            RemoteCommand::Doctor { target, fix } if target == "prod" && fix
-        ));
-    }
-
-    #[test]
-    fn parses_remote_complete_sessions_command() {
-        let cli = Cli::try_parse_from(["bmux", "remote", "complete", "sessions", "prod"])
-            .expect("valid CLI args");
-        let Some(Command::Remote { command }) = cli.command else {
-            panic!("expected remote command");
-        };
-        assert!(matches!(
-            command,
-            RemoteCommand::Complete {
-                command: RemoteCompleteCommand::Sessions { target }
-            } if target == "prod"
-        ));
-    }
-
-    #[test]
-    fn parses_setup_command_defaults() {
-        let cli = Cli::try_parse_from(["bmux", "setup"]).expect("valid CLI args");
-        let Some(Command::Setup { check, mode }) = cli.command else {
-            panic!("expected setup command");
-        };
-        assert!(!check);
-        assert!(mode.is_none());
-    }
-
-    #[test]
-    fn parses_setup_check_flag() {
-        let cli = Cli::try_parse_from(["bmux", "setup", "--check"]).expect("valid CLI args");
-        let Some(Command::Setup { check, mode }) = cli.command else {
-            panic!("expected setup command");
-        };
-        assert!(check);
-        assert!(mode.is_none());
-    }
-
-    #[test]
-    fn parses_setup_mode_flag() {
-        let cli = Cli::try_parse_from(["bmux", "setup", "--mode", "control-plane"])
-            .expect("valid CLI args");
-        let Some(Command::Setup { mode, .. }) = cli.command else {
-            panic!("expected setup command");
-        };
-        assert_eq!(mode, Some(HostedModeArg::ControlPlane));
-    }
-
-    #[test]
-    fn parses_hosts_defaults() {
-        let cli = Cli::try_parse_from(["bmux", "hosts"]).expect("valid CLI args");
-        let Some(Command::Hosts { verbose }) = cli.command else {
-            panic!("expected hosts command");
-        };
-        assert!(!verbose);
-    }
-
-    #[test]
-    fn parses_hosts_verbose_flag() {
-        let cli = Cli::try_parse_from(["bmux", "hosts", "--verbose"]).expect("valid CLI args");
-        let Some(Command::Hosts { verbose }) = cli.command else {
-            panic!("expected hosts command");
-        };
-        assert!(verbose);
-    }
-
-    #[test]
-    fn parses_host_command_defaults() {
-        let cli = Cli::try_parse_from(["bmux", "host"]).expect("valid CLI args");
-        let Some(Command::Host {
-            listen,
-            name,
-            copy,
-            daemon,
-            status,
-            stop,
-            restart,
-            mode,
-        }) = cli.command
-        else {
-            panic!("expected host command");
-        };
-        assert_eq!(listen, "127.0.0.1:7443");
-        assert!(name.is_none());
-        assert!(!copy);
-        assert!(!daemon);
-        assert!(!status);
-        assert!(!stop);
-        assert!(!restart);
-        assert!(mode.is_none());
-    }
-
-    #[test]
-    fn parses_host_copy_flag() {
-        let cli = Cli::try_parse_from(["bmux", "host", "--copy"]).expect("valid CLI args");
-        let Some(Command::Host { copy, .. }) = cli.command else {
-            panic!("expected host command");
-        };
-        assert!(copy);
-    }
-
-    #[test]
-    fn parses_host_status_flag() {
-        let cli = Cli::try_parse_from(["bmux", "host", "--status"]).expect("valid CLI args");
-        let Some(Command::Host { status, .. }) = cli.command else {
-            panic!("expected host command");
-        };
-        assert!(status);
-    }
-
-    #[test]
-    fn parses_host_stop_flag() {
-        let cli = Cli::try_parse_from(["bmux", "host", "--stop"]).expect("valid CLI args");
-        let Some(Command::Host { stop, .. }) = cli.command else {
-            panic!("expected host command");
-        };
-        assert!(stop);
-    }
-
-    #[test]
-    fn parses_host_daemon_flag() {
-        let cli = Cli::try_parse_from(["bmux", "host", "--daemon"]).expect("valid CLI args");
-        let Some(Command::Host { daemon, .. }) = cli.command else {
-            panic!("expected host command");
-        };
-        assert!(daemon);
-    }
-
-    #[test]
-    fn parses_host_restart_flag() {
-        let cli = Cli::try_parse_from(["bmux", "host", "--restart"]).expect("valid CLI args");
-        let Some(Command::Host { restart, .. }) = cli.command else {
-            panic!("expected host command");
-        };
-        assert!(restart);
-    }
-
-    #[test]
-    fn parses_host_mode_flag() {
-        let cli = Cli::try_parse_from(["bmux", "host", "--mode", "p2p"]).expect("valid CLI args");
-        let Some(Command::Host { mode, .. }) = cli.command else {
-            panic!("expected host command");
-        };
-        assert_eq!(mode, Some(HostedModeArg::P2p));
-    }
-
-    #[test]
-    fn parses_auth_login_no_browser_flag() {
-        let cli =
-            Cli::try_parse_from(["bmux", "auth", "login", "--no-browser"]).expect("valid CLI args");
-        let Some(Command::Auth { command }) = cli.command else {
-            panic!("expected auth command");
-        };
-        assert!(matches!(command, AuthCommand::Login { no_browser: true }));
-    }
-
-    #[test]
-    fn parses_auth_status_command() {
-        let cli = Cli::try_parse_from(["bmux", "auth", "status"]).expect("valid CLI args");
-        let Some(Command::Auth { command }) = cli.command else {
-            panic!("expected auth command");
-        };
-        assert!(matches!(command, AuthCommand::Status));
-    }
-
-    #[test]
-    fn parses_auth_logout_command() {
-        let cli = Cli::try_parse_from(["bmux", "auth", "logout"]).expect("valid CLI args");
-        let Some(Command::Auth { command }) = cli.command else {
-            panic!("expected auth command");
-        };
-        assert!(matches!(command, AuthCommand::Logout));
-    }
-
-    #[test]
-    fn parses_access_status_command() {
-        let cli = Cli::try_parse_from(["bmux", "access", "status"]).expect("valid CLI args");
-        let Some(Command::Access { command }) = cli.command else {
-            panic!("expected access command");
-        };
-        assert!(matches!(command, AccessCommand::Status));
-    }
-
-    #[test]
-    fn parses_access_init_agent_yes_flags() {
-        let cli = Cli::try_parse_from(["bmux", "access", "init", "--agent", "--yes"])
-            .expect("valid CLI args");
-        let Some(Command::Access { command }) = cli.command else {
-            panic!("expected access command");
-        };
-        assert!(matches!(
-            command,
-            AccessCommand::Init {
-                agent: true,
-                yes: true,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn parses_access_add_key_file() {
-        let cli = Cli::try_parse_from([
-            "bmux",
-            "access",
-            "add",
-            "--key-file",
-            "~/.ssh/id_ed25519.pub",
-        ])
-        .expect("valid CLI args");
-        let Some(Command::Access { command }) = cli.command else {
-            panic!("expected access command");
-        };
-        let AccessCommand::Add { key_file, .. } = command else {
-            panic!("expected access add command");
-        };
-        assert_eq!(key_file, vec!["~/.ssh/id_ed25519.pub".to_string()]);
-    }
-
-    #[test]
-    fn parses_access_remove_with_yes_flag() {
-        let cli = Cli::try_parse_from(["bmux", "access", "remove", "abc123", "--yes"])
-            .expect("valid CLI args");
-        let Some(Command::Access { command }) = cli.command else {
-            panic!("expected access command");
-        };
-        assert!(matches!(
-            command,
-            AccessCommand::Remove {
-                fingerprint,
-                yes: true
-            } if fingerprint == "abc123"
-        ));
-    }
-
-    #[test]
-    fn parses_kiosk_status_json_command() {
-        let cli =
-            Cli::try_parse_from(["bmux", "kiosk", "status", "--json"]).expect("valid CLI args");
-        let Some(Command::Kiosk { command }) = cli.command else {
-            panic!("expected kiosk command");
-        };
-        assert!(matches!(command, KioskCommand::Status { json: true }));
-    }
-
-    #[test]
-    fn parses_kiosk_issue_token_flags() {
-        let cli = Cli::try_parse_from([
-            "bmux",
-            "kiosk",
-            "issue-token",
-            "demo",
-            "--session",
-            "main",
-            "--ttl-secs",
-            "900",
-            "--multi-use",
-        ])
-        .expect("valid CLI args");
-        let Some(Command::Kiosk { command }) = cli.command else {
-            panic!("expected kiosk command");
-        };
-        assert!(matches!(
-            command,
-            KioskCommand::IssueToken {
-                profile,
-                session,
-                ttl_secs,
-                one_shot: false,
-                multi_use: true,
-            } if profile == "demo" && session.as_deref() == Some("main") && ttl_secs == Some(900)
-        ));
-    }
-
-    #[test]
-    fn parses_share_flags() {
-        let cli = Cli::try_parse_from([
-            "bmux",
-            "share",
-            "--name",
-            "demo",
-            "--role",
-            "view",
-            "--ttl",
-            "24h",
-            "--one-time",
-            "--copy",
-        ])
-        .expect("valid CLI args");
-        let Some(Command::Share {
-            target,
-            secondary,
-            name,
-            role,
-            ttl,
-            one_time,
-            copy,
-            qr,
-        }) = cli.command
-        else {
-            panic!("expected share command");
-        };
-        assert!(target.is_none());
-        assert!(secondary.is_none());
-        assert_eq!(name.as_deref(), Some("demo"));
-        assert_eq!(role, "view");
-        assert_eq!(ttl.as_deref(), Some("24h"));
-        assert!(one_time);
-        assert!(copy);
-        assert!(!qr);
-    }
-
-    #[test]
-    fn parses_share_revoke_alias_style() {
-        let cli = Cli::try_parse_from(["bmux", "share", "revoke", "demo"]).expect("valid CLI args");
-        let Some(Command::Share {
-            target, secondary, ..
-        }) = cli.command
-        else {
-            panic!("expected share command");
-        };
-        assert_eq!(target.as_deref(), Some("revoke"));
-        assert_eq!(secondary.as_deref(), Some("demo"));
-    }
-
-    #[test]
-    fn parses_share_qr_flag() {
-        let cli = Cli::try_parse_from(["bmux", "share", "--qr"]).expect("valid CLI args");
-        let Some(Command::Share { qr, .. }) = cli.command else {
-            panic!("expected share command");
-        };
-        assert!(qr);
-    }
-
-    #[test]
     fn parses_doctor_hosted_flag() {
         let cli = Cli::try_parse_from(["bmux", "doctor", "--hosted"]).expect("valid CLI args");
         let Some(Command::Doctor { hosted, json }) = cli.command else {
@@ -2525,25 +1409,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_join_command_with_link() {
-        let cli =
-            Cli::try_parse_from(["bmux", "join", "bmux://demo", "main"]).expect("valid CLI args");
-        let Some(Command::Join { link, session }) = cli.command else {
-            panic!("expected join command");
-        };
-        assert_eq!(link.as_deref(), Some("bmux://demo"));
-        assert_eq!(session.as_deref(), Some("main"));
-    }
-
-    #[test]
     fn parses_global_target_flag() {
         let cli = Cli::try_parse_from(["bmux", "--target", "prod", "list-sessions"])
             .expect("valid CLI args");
         assert_eq!(cli.target.as_deref(), Some("prod"));
-        assert!(matches!(
-            cli.command,
-            Some(Command::ListSessions { json: false })
-        ));
+        assert!(matches!(cli.command, Some(Command::External(raw)) if raw == ["list-sessions"]));
     }
 
     #[test]
@@ -2559,56 +1429,6 @@ mod tests {
             .expect_err("invalid runtime should fail");
         let text = error.to_string();
         assert!(text.contains("invalid value") || text.contains("runtime name"));
-    }
-
-    #[test]
-    fn parses_perf_status_json_flag() {
-        let cli =
-            Cli::try_parse_from(["bmux", "perf", "status", "--json"]).expect("valid CLI args");
-        let Some(Command::Perf { command }) = cli.command else {
-            panic!("expected perf subcommand");
-        };
-        assert!(matches!(command, PerfCommand::Status { json: true }));
-    }
-
-    #[test]
-    fn parses_perf_on_defaults_to_detailed_profile() {
-        let cli = Cli::try_parse_from(["bmux", "perf", "on"]).expect("valid CLI args");
-        let Some(Command::Perf { command }) = cli.command else {
-            panic!("expected perf subcommand");
-        };
-        assert!(matches!(
-            command,
-            PerfCommand::On {
-                profile: PerfProfileArg::Detailed,
-                json: false,
-            }
-        ));
-    }
-
-    #[test]
-    fn parses_perf_on_with_trace_profile() {
-        let cli = Cli::try_parse_from(["bmux", "perf", "on", "--profile", "trace", "--json"])
-            .expect("valid CLI args");
-        let Some(Command::Perf { command }) = cli.command else {
-            panic!("expected perf subcommand");
-        };
-        assert!(matches!(
-            command,
-            PerfCommand::On {
-                profile: PerfProfileArg::Trace,
-                json: true,
-            }
-        ));
-    }
-
-    #[test]
-    fn parses_perf_off_json_flag() {
-        let cli = Cli::try_parse_from(["bmux", "perf", "off", "--json"]).expect("valid CLI args");
-        let Some(Command::Perf { command }) = cli.command else {
-            panic!("expected perf subcommand");
-        };
-        assert!(matches!(command, PerfCommand::Off { json: true }));
     }
 
     #[test]
@@ -2939,47 +1759,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_server_save_subcommand() {
-        let cli = Cli::try_parse_from(["bmux", "server", "save"]).expect("valid CLI args");
-        let Some(Command::Server { command }) = cli.command else {
-            panic!("expected server subcommand");
-        };
-        assert!(matches!(command, ServerCommand::Save));
-    }
-
-    #[test]
-    fn parses_server_restore_dry_run_subcommand() {
-        let cli = Cli::try_parse_from(["bmux", "server", "restore", "--dry-run"])
-            .expect("valid CLI args");
-        let Some(Command::Server { command }) = cli.command else {
-            panic!("expected server subcommand");
-        };
-        assert!(matches!(
-            command,
-            ServerCommand::Restore {
-                dry_run: true,
-                yes: false
-            }
-        ));
-    }
-
-    #[test]
-    fn parses_server_restore_yes_subcommand() {
-        let cli =
-            Cli::try_parse_from(["bmux", "server", "restore", "--yes"]).expect("valid CLI args");
-        let Some(Command::Server { command }) = cli.command else {
-            panic!("expected server subcommand");
-        };
-        assert!(matches!(
-            command,
-            ServerCommand::Restore {
-                dry_run: false,
-                yes: true
-            }
-        ));
-    }
-
-    #[test]
     fn parses_server_stop_subcommand() {
         let cli = Cli::try_parse_from(["bmux", "server", "stop"]).expect("valid CLI args");
         let Some(Command::Server { command }) = cli.command else {
@@ -3138,243 +1917,59 @@ mod tests {
     }
 
     #[test]
-    fn parses_logs_tail_flags() {
-        let cli = Cli::try_parse_from(["bmux", "logs", "tail", "--lines", "10", "--no-follow"])
-            .expect("valid CLI args");
-        let Some(Command::Logs { command }) = cli.command else {
-            panic!("expected logs subcommand");
-        };
-        assert!(matches!(
-            command,
-            LogsCommand::Tail {
-                lines: 10,
-                since: None,
-                no_follow: true
-            }
-        ));
+    fn parses_top_level_new_session_command_is_plugin_owned() {
+        let args = ["bmux", "new-session", "dev"];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
-    fn parses_logs_since_filter() {
-        let cli = Cli::try_parse_from(["bmux", "logs", "tail", "--since", "15m"])
-            .expect("valid CLI args");
-        let Some(Command::Logs { command }) = cli.command else {
-            panic!("expected logs subcommand");
-        };
-        assert!(matches!(
-            command,
-            LogsCommand::Tail {
-                lines: 50,
-                since: Some(ref value),
-                no_follow: false
-            } if value == "15m"
-        ));
+    fn parses_top_level_list_sessions_command_is_plugin_owned() {
+        let args = ["bmux", "list-sessions"];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
-    fn parses_logs_watch_flags() {
-        let cli = Cli::try_parse_from([
-            "bmux",
-            "logs",
-            "watch",
-            "--lines",
-            "150",
-            "--since",
-            "2h",
-            "--include",
-            "server.*listening",
-            "--include-i",
-            "warn",
-            "--exclude",
-            "healthcheck",
-            "--exclude-i",
-            "noise",
-        ])
-        .expect("valid CLI args");
-        let Some(Command::Logs { command }) = cli.command else {
-            panic!("expected logs subcommand");
-        };
-        assert!(matches!(
-            command,
-            LogsCommand::Watch {
-                lines: Some(150),
-                since: Some(ref value),
-                profile: None,
-                include,
-                include_i,
-                exclude,
-                exclude_i,
-            } if value == "2h"
-                && include == vec!["server.*listening"]
-                && include_i == vec!["warn"]
-                && exclude == vec!["healthcheck"]
-                && exclude_i == vec!["noise"]
-        ));
+    fn parses_top_level_list_sessions_json_flag_is_plugin_owned() {
+        let args = ["bmux", "list-sessions", "--json"];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
-    fn parses_logs_watch_profile_flag() {
-        let cli = Cli::try_parse_from(["bmux", "logs", "watch", "--profile", "incident-db"])
-            .expect("valid CLI args");
-        let Some(Command::Logs { command }) = cli.command else {
-            panic!("expected logs subcommand");
-        };
-        assert!(matches!(
-            command,
-            LogsCommand::Watch {
-                lines: None,
-                since: None,
-                profile: Some(ref value),
-                include,
-                include_i,
-                exclude,
-                exclude_i,
-            } if value == "incident-db"
-                && include.is_empty()
-                && include_i.is_empty()
-                && exclude.is_empty()
-                && exclude_i.is_empty()
-        ));
+    fn parses_top_level_kill_session_command_is_plugin_owned() {
+        let args = ["bmux", "kill-session", "dev"];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
-    fn parses_logs_profiles_list_json() {
-        let cli = Cli::try_parse_from(["bmux", "logs", "profiles", "list", "--json"])
-            .expect("valid CLI args");
-        let Some(Command::Logs { command }) = cli.command else {
-            panic!("expected logs subcommand");
-        };
-        assert!(matches!(
-            command,
-            LogsCommand::Profiles {
-                command: LogsProfilesCommand::List { json: true }
-            }
-        ));
+    fn parses_top_level_kill_session_force_local_flag_is_plugin_owned() {
+        let args = ["bmux", "kill-session", "dev", "--force-local"];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
-    fn parses_logs_profiles_show_default() {
-        let cli =
-            Cli::try_parse_from(["bmux", "logs", "profiles", "show"]).expect("valid CLI args");
-        let Some(Command::Logs { command }) = cli.command else {
-            panic!("expected logs subcommand");
-        };
-        assert!(matches!(
-            command,
-            LogsCommand::Profiles {
-                command: LogsProfilesCommand::Show {
-                    profile: None,
-                    json: false
-                }
-            }
-        ));
+    fn parses_top_level_kill_all_sessions_command_is_plugin_owned() {
+        let args = ["bmux", "kill-all-sessions"];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
-    fn parses_logs_profiles_delete_and_rename() {
-        let delete_cli = Cli::try_parse_from(["bmux", "logs", "profiles", "delete", "incident-db"])
-            .expect("valid CLI args");
-        assert!(matches!(
-            delete_cli.command,
-            Some(Command::Logs {
-                command:
-                    LogsCommand::Profiles {
-                        command: LogsProfilesCommand::Delete { profile }
-                    }
-            }) if profile == "incident-db"
-        ));
-
-        let rename_cli = Cli::try_parse_from([
-            "bmux",
-            "logs",
-            "profiles",
-            "rename",
-            "incident-db",
-            "incident-db-2",
-        ])
-        .expect("valid CLI args");
-        assert!(matches!(
-            rename_cli.command,
-            Some(Command::Logs {
-                command:
-                    LogsCommand::Profiles {
-                        command: LogsProfilesCommand::Rename { from, to }
-                    }
-            }) if from == "incident-db" && to == "incident-db-2"
-        ));
-    }
-
-    #[test]
-    fn parses_top_level_new_session_command() {
-        let cli = Cli::try_parse_from(["bmux", "new-session", "dev"]).expect("valid CLI args");
-        let Some(Command::NewSession { name }) = cli.command else {
-            panic!("expected new-session command");
-        };
-        assert_eq!(name.as_deref(), Some("dev"));
-    }
-
-    #[test]
-    fn parses_top_level_list_sessions_command() {
-        let cli = Cli::try_parse_from(["bmux", "list-sessions"]).expect("valid CLI args");
-        assert!(matches!(
-            cli.command,
-            Some(Command::ListSessions { json: false })
-        ));
-    }
-
-    #[test]
-    fn parses_top_level_list_sessions_json_flag() {
-        let cli = Cli::try_parse_from(["bmux", "list-sessions", "--json"]).expect("valid CLI args");
-        assert!(matches!(
-            cli.command,
-            Some(Command::ListSessions { json: true })
-        ));
-    }
-
-    #[test]
-    fn parses_top_level_kill_session_command() {
-        let cli = Cli::try_parse_from(["bmux", "kill-session", "dev"]).expect("valid CLI args");
-        let Some(Command::KillSession {
-            target,
-            force_local,
-        }) = cli.command
-        else {
-            panic!("expected kill-session command");
-        };
-        assert_eq!(target, "dev");
-        assert!(!force_local);
-    }
-
-    #[test]
-    fn parses_top_level_kill_session_force_local_flag() {
-        let cli = Cli::try_parse_from(["bmux", "kill-session", "dev", "--force-local"])
-            .expect("valid CLI args");
-        assert!(matches!(
-            cli.command,
-            Some(Command::KillSession {
-                target,
-                force_local: true
-            }) if target == "dev"
-        ));
-    }
-
-    #[test]
-    fn parses_top_level_kill_all_sessions_command() {
-        let cli = Cli::try_parse_from(["bmux", "kill-all-sessions"]).expect("valid CLI args");
-        assert!(matches!(
-            cli.command,
-            Some(Command::KillAllSessions { force_local: false })
-        ));
-    }
-
-    #[test]
-    fn parses_top_level_kill_all_sessions_force_local_flag() {
-        let cli = Cli::try_parse_from(["bmux", "kill-all-sessions", "--force-local"])
-            .expect("valid CLI args");
-        assert!(matches!(
-            cli.command,
-            Some(Command::KillAllSessions { force_local: true })
-        ));
+    fn parses_top_level_kill_all_sessions_force_local_flag_is_plugin_owned() {
+        let args = ["bmux", "kill-all-sessions", "--force-local"];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
@@ -3643,9 +2238,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_top_level_detach_command() {
-        let cli = Cli::try_parse_from(["bmux", "detach"]).expect("valid CLI args");
-        assert!(matches!(cli.command, Some(Command::Detach)));
+    fn parses_top_level_detach_command_is_plugin_owned() {
+        let args = ["bmux", "detach"];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
@@ -3718,52 +2315,43 @@ mod tests {
     }
 
     #[test]
-    fn parses_grouped_session_new_command() {
-        let cli = Cli::try_parse_from(["bmux", "session", "new", "dev"]).expect("valid CLI args");
-        let Some(Command::Session { command }) = cli.command else {
-            panic!("expected session command");
-        };
-        assert!(matches!(
-            command,
-            SessionCommand::New { name: Some(ref name) } if name == "dev"
-        ));
+    fn parses_grouped_session_new_command_is_plugin_owned() {
+        let args = ["bmux", "session", "new", "dev"];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
-    fn parses_grouped_session_list_command() {
-        let cli = Cli::try_parse_from(["bmux", "session", "list"]).expect("valid CLI args");
-        let Some(Command::Session { command }) = cli.command else {
-            panic!("expected session command");
-        };
-        assert!(matches!(command, SessionCommand::List { json: false }));
+    fn parses_grouped_session_list_command_is_plugin_owned() {
+        let args = ["bmux", "session", "list"];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
-    fn parses_grouped_session_list_json_flag() {
-        let cli =
-            Cli::try_parse_from(["bmux", "session", "list", "--json"]).expect("valid CLI args");
-        let Some(Command::Session { command }) = cli.command else {
-            panic!("expected session command");
-        };
-        assert!(matches!(command, SessionCommand::List { json: true }));
+    fn parses_grouped_session_list_json_flag_is_plugin_owned() {
+        let args = ["bmux", "session", "list", "--json"];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
-    fn parses_top_level_list_clients_command() {
-        let cli = Cli::try_parse_from(["bmux", "list-clients"]).expect("valid CLI args");
-        assert!(matches!(
-            cli.command,
-            Some(Command::ListClients { json: false })
-        ));
+    fn parses_top_level_list_clients_command_is_plugin_owned() {
+        let args = ["bmux", "list-clients"];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
-    fn parses_top_level_list_clients_json_flag() {
-        let cli = Cli::try_parse_from(["bmux", "list-clients", "--json"]).expect("valid CLI args");
-        assert!(matches!(
-            cli.command,
-            Some(Command::ListClients { json: true })
-        ));
+    fn parses_top_level_list_clients_json_flag_is_plugin_owned() {
+        let args = ["bmux", "list-clients", "--json"];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
@@ -3839,174 +2427,125 @@ mod tests {
     }
 
     #[test]
-    fn parses_grouped_session_clients_command() {
-        let cli = Cli::try_parse_from(["bmux", "session", "clients"]).expect("valid CLI args");
-        let Some(Command::Session { command }) = cli.command else {
-            panic!("expected session command");
-        };
-        assert!(matches!(command, SessionCommand::Clients { json: false }));
+    fn parses_grouped_session_clients_command_is_plugin_owned() {
+        let args = ["bmux", "session", "clients"];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
-    fn parses_grouped_session_clients_json_flag() {
-        let cli =
-            Cli::try_parse_from(["bmux", "session", "clients", "--json"]).expect("valid CLI args");
-        let Some(Command::Session { command }) = cli.command else {
-            panic!("expected session command");
-        };
-        assert!(matches!(command, SessionCommand::Clients { json: true }));
+    fn parses_grouped_session_clients_json_flag_is_plugin_owned() {
+        let args = ["bmux", "session", "clients", "--json"];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
-    fn static_session_namespace_rejects_plugin_owned_subcommands() {
-        let error = Cli::try_parse_from(["bmux", "session", "roles", "--scope", "dev"])
-            .expect_err("static CLI should reject plugin-owned session descendant");
-        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+    fn static_session_namespace_rejects_plugin_owned_subcommands_is_plugin_owned() {
+        let args = ["bmux", "session", "roles", "--scope", "dev"];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
-    fn parses_grouped_session_kill_command() {
-        let cli = Cli::try_parse_from(["bmux", "session", "kill", "dev"]).expect("valid CLI args");
-        let Some(Command::Session { command }) = cli.command else {
-            panic!("expected session command");
-        };
-        assert!(matches!(
-            command,
-            SessionCommand::Kill {
-                target,
-                force_local: false
-            } if target == "dev"
-        ));
+    fn parses_grouped_session_kill_command_is_plugin_owned() {
+        let args = ["bmux", "session", "kill", "dev"];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
-    fn parses_grouped_session_kill_all_command() {
-        let cli = Cli::try_parse_from(["bmux", "session", "kill-all"]).expect("valid CLI args");
-        let Some(Command::Session { command }) = cli.command else {
-            panic!("expected session command");
-        };
-        assert!(matches!(
-            command,
-            SessionCommand::KillAll { force_local: false }
-        ));
+    fn parses_grouped_session_kill_all_command_is_plugin_owned() {
+        let args = ["bmux", "session", "kill-all"];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
-    fn parses_grouped_session_kill_all_force_local_flag() {
-        let cli = Cli::try_parse_from(["bmux", "session", "kill-all", "--force-local"])
-            .expect("valid CLI args");
-        let Some(Command::Session { command }) = cli.command else {
-            panic!("expected session command");
-        };
-        assert!(matches!(
-            command,
-            SessionCommand::KillAll { force_local: true }
-        ));
+    fn parses_grouped_session_kill_all_force_local_flag_is_plugin_owned() {
+        let args = ["bmux", "session", "kill-all", "--force-local"];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
-    fn parses_grouped_session_attach_command() {
-        let cli =
-            Cli::try_parse_from(["bmux", "session", "attach", "dev"]).expect("valid CLI args");
-        let Some(Command::Session { command }) = cli.command else {
-            panic!("expected session command");
-        };
-        assert!(matches!(
-            command,
-            SessionCommand::Attach {
-                target: Some(target),
-                follow: None,
-                global: false
-            } if target == "dev"
-        ));
+    fn parses_grouped_session_attach_command_is_plugin_owned() {
+        let args = ["bmux", "session", "attach", "dev"];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
-    fn parses_grouped_session_attach_follow_command() {
-        let cli = Cli::try_parse_from([
+    fn parses_grouped_session_attach_follow_command_is_plugin_owned() {
+        let args = [
             "bmux",
             "session",
             "attach",
             "--follow",
             "550e8400-e29b-41d4-a716-446655440000",
             "--global",
-        ])
-        .expect("valid CLI args");
-        let Some(Command::Session { command }) = cli.command else {
-            panic!("expected session command");
-        };
-        assert!(matches!(
-            command,
-            SessionCommand::Attach {
-                target: None,
-                follow: Some(ref follow),
-                global: true
-            } if follow == "550e8400-e29b-41d4-a716-446655440000"
-        ));
+        ];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
-    fn parses_grouped_session_detach_command() {
-        let cli = Cli::try_parse_from(["bmux", "session", "detach"]).expect("valid CLI args");
-        let Some(Command::Session { command }) = cli.command else {
-            panic!("expected session command");
-        };
-        assert!(matches!(command, SessionCommand::Detach));
+    fn parses_grouped_session_detach_command_is_plugin_owned() {
+        let args = ["bmux", "session", "detach"];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
-    fn parses_top_level_follow_command() {
-        let cli = Cli::try_parse_from([
+    fn parses_top_level_follow_command_is_plugin_owned() {
+        let args = [
             "bmux",
             "follow",
             "550e8400-e29b-41d4-a716-446655440000",
             "--global",
-        ])
-        .expect("valid CLI args");
-        assert!(matches!(
-            cli.command,
-            Some(Command::Follow {
-                ref target_client_id,
-                global: true
-            }) if target_client_id == "550e8400-e29b-41d4-a716-446655440000"
-        ));
+        ];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
-    fn parses_top_level_unfollow_command() {
-        let cli = Cli::try_parse_from(["bmux", "unfollow"]).expect("valid CLI args");
-        assert!(matches!(cli.command, Some(Command::Unfollow)));
+    fn parses_top_level_unfollow_command_is_plugin_owned() {
+        let args = ["bmux", "unfollow"];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
-    fn parses_grouped_session_follow_command() {
-        let cli = Cli::try_parse_from([
+    fn parses_grouped_session_follow_command_is_plugin_owned() {
+        let args = [
             "bmux",
             "session",
             "follow",
             "550e8400-e29b-41d4-a716-446655440000",
             "--global",
-        ])
-        .expect("valid CLI args");
-        let Some(Command::Session { command }) = cli.command else {
-            panic!("expected session command");
-        };
-        assert!(matches!(
-            command,
-            SessionCommand::Follow {
-                ref target_client_id,
-                global: true
-            } if target_client_id == "550e8400-e29b-41d4-a716-446655440000"
-        ));
+        ];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
-    fn parses_grouped_session_unfollow_command() {
-        let cli = Cli::try_parse_from(["bmux", "session", "unfollow"]).expect("valid CLI args");
-        let Some(Command::Session { command }) = cli.command else {
-            panic!("expected session command");
-        };
-        assert!(matches!(command, SessionCommand::Unfollow));
+    fn parses_grouped_session_unfollow_command_is_plugin_owned() {
+        let args = ["bmux", "session", "unfollow"];
+        assert!(
+            matches!(Cli::try_parse_from(args).unwrap().command, Some(Command::External(raw)) if raw == args[1..])
+        );
     }
 
     #[test]
@@ -4123,69 +2662,6 @@ mod tests {
             panic!("expected external plugin command path");
         };
         assert_eq!(args, vec!["vendor", "roles", "dev"]);
-    }
-
-    #[test]
-    fn parses_playbook_playback_speed_and_automation_default() {
-        let cli = Cli::try_parse_from(["bmux", "playbook", "run", "demo.dsl"]).unwrap();
-        let Some(Command::Playbook {
-            command: PlaybookCommand::Run { playback_speed, .. },
-        }) = cli.command
-        else {
-            panic!("expected playbook run");
-        };
-        assert_eq!(playback_speed, "instant");
-        for speed in ["instant", "half", "normal", "double"] {
-            let cli = Cli::try_parse_from([
-                "bmux",
-                "playbook",
-                "run",
-                "demo.dsl",
-                "--playback-speed",
-                speed,
-            ])
-            .unwrap();
-            let Some(Command::Playbook {
-                command: PlaybookCommand::Run { playback_speed, .. },
-            }) = cli.command
-            else {
-                panic!("expected playbook run");
-            };
-            assert_eq!(playback_speed, speed);
-        }
-        assert!(
-            Cli::try_parse_from([
-                "bmux",
-                "playbook",
-                "run",
-                "demo.dsl",
-                "--playback-speed",
-                "fast"
-            ])
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn parses_playbook_run_interactive_flag() {
-        let cli = Cli::try_parse_from([
-            "bmux",
-            "playbook",
-            "run",
-            "fixtures/echo.dsl",
-            "--interactive",
-        ])
-        .expect("valid CLI args");
-        let Some(Command::Playbook { command }) = cli.command else {
-            panic!("expected playbook command");
-        };
-        assert!(matches!(
-            command,
-            PlaybookCommand::Run {
-                interactive: true,
-                ..
-            }
-        ));
     }
 
     #[test]

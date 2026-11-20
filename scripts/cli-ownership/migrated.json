@@ -1,0 +1,86 @@
+{
+  "bmux.clients": [
+    "follow",
+    "list-clients",
+    "session clients",
+    "session follow",
+    "session unfollow",
+    "unfollow"
+  ],
+  "bmux.connections": [
+    "access add",
+    "access disable",
+    "access enable",
+    "access init",
+    "access list",
+    "access remove",
+    "access status",
+    "auth login",
+    "auth logout",
+    "auth status",
+    "connect",
+    "host",
+    "hosts",
+    "join",
+    "kiosk attach",
+    "kiosk init",
+    "kiosk issue-token",
+    "kiosk revoke-token",
+    "kiosk ssh-print-config",
+    "kiosk status",
+    "remote complete sessions",
+    "remote complete targets",
+    "remote doctor",
+    "remote init",
+    "remote install-server",
+    "remote list",
+    "remote test",
+    "remote trust add",
+    "remote trust list",
+    "remote trust remove",
+    "remote upgrade",
+    "setup",
+    "share",
+    "unshare"
+  ],
+  "bmux.performance": [
+    "perf off",
+    "perf on",
+    "perf status"
+  ],
+  "bmux.playbook": [
+    "playbook cleanup",
+    "playbook diff",
+    "playbook dry-run",
+    "playbook interactive",
+    "playbook run",
+    "playbook validate"
+  ],
+  "bmux.plugin_cli": [
+    "diagnostics view",
+    "diagnostics watch",
+    "logs profiles delete",
+    "logs profiles list",
+    "logs profiles rename",
+    "logs profiles show",
+    "logs tail",
+    "logs watch"
+  ],
+  "bmux.snapshot": [
+    "server restore",
+    "server save"
+  ],
+  "bmux.sessions": [
+    "detach",
+    "kill-all-sessions",
+    "kill-session",
+    "list-sessions",
+    "new-session",
+    "session attach",
+    "session detach",
+    "session kill",
+    "session kill-all",
+    "session list",
+    "session new"
+  ]
+}

@@ -296,9 +296,11 @@ impl BmuxClient {
             checked_service_contracts: false,
         };
 
+        let mut capabilities = default_supported_capabilities();
+        capabilities.push(bmux_ipc::CAPABILITY_LOCAL_TERMINAL_V1.to_owned());
         let handshake_attempt = client
             .request(Request::Hello {
-                contract: ProtocolContract::current(default_supported_capabilities()),
+                contract: ProtocolContract::current(capabilities),
                 client_name: client_name.clone(),
                 principal_id,
             })

@@ -1459,11 +1459,7 @@ fn run_selected_core_command(
         bmux_cli_schema::Command::Logs {
             command: bmux_cli_schema::LogsCommand::Level { json },
         } => run_logs_level(json).map(i32::from),
-        command @ bmux_cli_schema::Command::Playbook { .. } => {
-            super::playbook_cli::run_selected(state, &command)
-        }
-        command @ (bmux_cli_schema::Command::Attach { .. }
-        | bmux_cli_schema::Command::Connect { .. }) => {
+        command @ bmux_cli_schema::Command::Attach { .. } => {
             super::attach_selected::run_selected(state, &command)
         }
         _ => anyhow::bail!(

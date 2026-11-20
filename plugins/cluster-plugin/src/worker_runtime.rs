@@ -1894,10 +1894,7 @@ mod tests {
         }
 
         impl crate::ClusterRuntimeOps for MemoryStorage {
-            fn core_cli_command_run_path(
-                &self,
-                _: &bmux_plugin_sdk::CoreCliCommandRequest,
-            ) -> Result<bmux_plugin_sdk::CoreCliCommandResponse, String> {
+            fn remote_probe_status(&self, _: crate::HealthProbe, _: &str) -> Result<i32, String> {
                 Err("unused".to_string())
             }
             fn session_list(&self) -> Result<crate::SessionListResponse, String> {

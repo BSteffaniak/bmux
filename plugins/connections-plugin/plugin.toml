@@ -5,6 +5,9 @@ id = "bmux.connections"
 name = "bmux Connections"
 owns_namespaces = [
     "remote",
+    "access",
+    "kiosk",
+    "auth",
     "remote-enable",
     "remote-disable",
     "remote-pair-request",
@@ -16,7 +19,32 @@ owns_namespaces = [
     "remote-rename",
     "remote-forget",
 ]
-owns_paths = [["connect"]]
+owns_paths = [
+    [
+        "connect",
+    ],
+    [
+        "share",
+    ],
+    [
+        "unshare",
+    ],
+    [
+        "setup",
+    ],
+    [
+        "host",
+    ],
+    [
+        "hosts",
+    ],
+    [
+        "join",
+    ],
+    [
+        "auth",
+    ],
+]
 provided_features = ["bmux.connections"]
 version = "0.0.1-alpha.0"
 
@@ -116,7 +144,6 @@ name     = "stdin"
 required = false
 
 [[commands]]
-aliases       = [["remote", "list"]]
 expose_in_cli = true
 name          = "remote-list"
 path          = ["remote-list"]
@@ -155,34 +182,42 @@ path          = ["connect"]
 summary       = "Connect to a host, or pair this device interactively"
 
 [[commands.arguments]]
-kind     = "string"
-name     = "target"
-position = 0
-required = false
+kind       = "string"
+name       = "target"
+position   = 0
+required   = false
+summary    = "Target name or ssh destination (user@host[:port] or ssh://...)"
+value_name = "TARGET"
 
 [[commands.arguments]]
-kind     = "string"
-name     = "session"
-position = 1
-required = false
+kind       = "string"
+name       = "session"
+position   = 1
+required   = false
+summary    = "Session name or UUID; if omitted in TTY mode a picker is shown"
+value_name = "SESSION"
 
 [[commands.arguments]]
-kind     = "string"
-long     = "follow"
-name     = "follow"
-required = false
+kind       = "string"
+long       = "follow"
+name       = "follow"
+required   = false
+summary    = "Follow target client UUID and attach to its selected session"
+value_name = "FOLLOW"
 
 [[commands.arguments]]
 kind     = "boolean"
 long     = "global"
 name     = "global"
 required = false
+summary  = "Keep following across target session switches (requires --follow)"
 
 [[commands.arguments]]
 kind     = "boolean"
 long     = "reconnect-forever"
 name     = "reconnect-forever"
 required = false
+summary  = "Keep reconnecting instead of stopping after bounded retries"
 
 [[commands.arguments]]
 kind     = "boolean"
@@ -221,6 +256,235 @@ name     = "new"
 position = 1
 required = true
 
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "access-status"
+path          = ["access", "status"]
+summary       = "Show iroh SSH access status"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "access-init"
+path          = ["access", "init"]
+summary       = "Initialize iroh SSH access and enable it immediately"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "agent"
+name    = "agent"
+summary = "Add all currently loaded SSH agent keys"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "key-file"
+multiple   = true
+name       = "key-file"
+summary    = "Add a public key from file (repeatable)"
+value_name = "PATH"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "public-key"
+multiple   = true
+name       = "public-key"
+summary    = "Add a public key line directly (repeatable)"
+value_name = "KEY"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "github-user"
+multiple   = true
+name       = "github-user"
+summary    = "Import public keys from a GitHub username (repeatable)"
+value_name = "USER"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "yes"
+name    = "yes"
+summary = "Skip interactive confirmation prompts"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "access-add"
+path          = ["access", "add"]
+summary       = "Add SSH keys to iroh allowlist"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "agent"
+name    = "agent"
+summary = "Add all currently loaded SSH agent keys"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "key-file"
+multiple   = true
+name       = "key-file"
+summary    = "Add a public key from file (repeatable)"
+value_name = "PATH"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "public-key"
+multiple   = true
+name       = "public-key"
+summary    = "Add a public key line directly (repeatable)"
+value_name = "KEY"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "github-user"
+multiple   = true
+name       = "github-user"
+summary    = "Import public keys from a GitHub username (repeatable)"
+value_name = "USER"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "access-list"
+path          = ["access", "list"]
+summary       = "List currently authorized SSH keys"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "json"
+name    = "json"
+summary = "Print output as JSON"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "access-remove"
+path          = ["access", "remove"]
+summary       = "Remove an SSH key from the allowlist"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "fingerprint"
+position   = 0
+required   = true
+summary    = "Key fingerprint to remove"
+value_name = "FINGERPRINT"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "yes"
+name    = "yes"
+summary = "Skip interactive confirmation prompts"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "access-enable"
+path          = ["access", "enable"]
+summary       = "Enable iroh SSH access enforcement"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "access-disable"
+path          = ["access", "disable"]
+summary       = "Disable iroh SSH access enforcement"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "remote-trust-list"
+path          = ["remote", "trust", "list"]
+summary       = "List effective TLS gateway trust pins"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "remote-trust-add"
+path          = ["remote", "trust", "add"]
+summary       = "Probe and trust a TLS gateway"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "target"
+position   = 0
+required   = true
+summary    = "TLS target URL or host[:port]"
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "yes"
+name    = "yes"
+summary = "Trust without an interactive confirmation prompt"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "remote-trust-remove"
+path          = ["remote", "trust", "remove"]
+summary       = "Remove a local TLS gateway trust pin"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "endpoint"
+position   = 0
+required   = true
+summary    = "Endpoint key (`host:port`)"
+value_name = "ENDPOINT"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "remote-install-server"
+path          = ["remote", "install-server"]
+summary       = "Ensure remote bmux runtime is installed and reachable"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "target"
+position   = 0
+required   = true
+summary    = "Target name"
+value_name = "TARGET"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "remote-upgrade"
+path          = ["remote", "upgrade"]
+summary       = "Upgrade remote bmux runtime for one or all targets"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "target"
+position   = 0
+summary    = "Target name (omit to upgrade all configured targets)"
+value_name = "TARGET"
+
+[[commands]]
+aliases       = [["remote", "targets"]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "remote-targets"
+path          = ["remote", "list"]
+summary       = "List configured connection targets"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "json"
+name    = "json"
+summary = "Print output as JSON"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "remote-complete-targets"
+path          = ["remote", "complete", "targets"]
+summary       = "Print target names for completion"
+
 [[commands]]
 aliases       = [["remote", "forget"]]
 expose_in_cli = true
@@ -233,3 +497,542 @@ kind     = "string"
 name     = "name"
 position = 0
 required = true
+
+[[commands]]
+expose_in_cli = true
+name          = "share"
+path          = ["share"]
+summary       = "Share helpers for hosted links"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "target"
+position   = 0
+required   = false
+summary    = "Target/link to share"
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "secondary"
+position   = 1
+required   = false
+summary    = "Optional second positional argument (used by `bmux share revoke <name>`)"
+value_name = "SECONDARY"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "name"
+name       = "name"
+required   = false
+summary    = "Optional stable share name"
+value_name = "NAME"
+
+[[commands.arguments]]
+default_value = "control"
+kind          = "string"
+long          = "role"
+name          = "role"
+required      = false
+summary       = "Optional access role hint"
+value_name    = "ROLE"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "ttl"
+name       = "ttl"
+required   = false
+summary    = "Optional invite TTL (example: 24h, 30m)"
+value_name = "TTL"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "one-time"
+name     = "one-time"
+required = false
+summary  = "Mark the share as one-time use"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "copy"
+name     = "copy"
+required = false
+summary  = "Copy resulting share link to clipboard"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "qr"
+name     = "qr"
+required = false
+summary  = "Render a terminal QR code for the share link"
+
+[[commands]]
+expose_in_cli = true
+name          = "unshare"
+path          = ["unshare"]
+summary       = "Remove a named shared link"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "name"
+position   = 0
+required   = true
+summary    = "Share name/slug to remove"
+value_name = "NAME"
+
+[[commands]]
+expose_in_cli = true
+name          = "host"
+path          = ["host"]
+summary       = "Start hosted mode (p2p default, control-plane opt-in)"
+
+[[commands.arguments]]
+default_value = "127.0.0.1:7443"
+kind          = "string"
+long          = "listen"
+name          = "listen"
+required      = false
+summary       = "Optional listen address for local gateway bridge"
+value_name    = "LISTEN"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "name"
+name       = "name"
+required   = false
+summary    = "Optional friendly name hint"
+value_name = "NAME"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "copy"
+name     = "copy"
+required = false
+summary  = "Copy the resulting join link to clipboard"
+
+[[commands.arguments]]
+conflicts_with = ["status", "stop", "restart"]
+kind           = "boolean"
+long           = "daemon"
+name           = "daemon"
+required       = false
+summary        = "Run host runtime in the background"
+
+[[commands.arguments]]
+conflicts_with = ["stop", "restart", "daemon"]
+kind           = "boolean"
+long           = "status"
+name           = "status"
+required       = false
+summary        = "Show hosted-mode runtime status"
+
+[[commands.arguments]]
+conflicts_with = ["status", "restart", "daemon"]
+kind           = "boolean"
+long           = "stop"
+name           = "stop"
+required       = false
+summary        = "Stop hosted-mode runtime if running"
+
+[[commands.arguments]]
+conflicts_with = ["status", "stop", "daemon"]
+kind           = "boolean"
+long           = "restart"
+name           = "restart"
+required       = false
+summary        = "Restart hosted-mode runtime in background"
+
+[[commands.arguments]]
+choice_values = ["p2p", "control-plane"]
+kind          = "choice"
+long          = "mode"
+name          = "mode"
+required      = false
+summary       = "Hosted operation mode (`p2p` is infra-light default)"
+value_name    = "MODE"
+
+[[commands]]
+expose_in_cli = true
+name          = "setup"
+path          = ["setup"]
+summary       = "First-run setup wizard for hosted mode (p2p default)"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "check"
+name     = "check"
+required = false
+summary  = "Check hosted readiness without starting or changing runtime state"
+
+[[commands.arguments]]
+choice_values = ["p2p", "control-plane"]
+kind          = "choice"
+long          = "mode"
+name          = "mode"
+required      = false
+summary       = "Hosted operation mode (`p2p` is infra-light default)"
+value_name    = "MODE"
+
+[[commands]]
+expose_in_cli = true
+name          = "hosts"
+path          = ["hosts"]
+summary       = "List known hosts/targets (recent first)"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "verbose"
+name     = "verbose"
+required = false
+summary  = "Include detailed target mappings and diagnostics"
+
+[[commands]]
+expose_in_cli = true
+name          = "join"
+path          = ["join"]
+summary       = "Join a hosted link/target quickly"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "link"
+position   = 0
+required   = false
+summary    = "Link or target name (bmux://, iroh://, https://, or configured target)"
+value_name = "LINK"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "session"
+position   = 1
+required   = false
+summary    = "Session name or UUID"
+value_name = "SESSION"
+
+[[commands]]
+expose_in_cli = true
+name          = "auth-login"
+path          = ["auth", "login"]
+summary       = "Login and register this device for hosted mode"
+
+[[commands.arguments]]
+kind     = "boolean"
+long     = "no-browser"
+name     = "no-browser"
+required = false
+summary  = "Do not try to open a browser automatically"
+
+[[commands]]
+expose_in_cli = true
+name          = "auth-status"
+path          = ["auth", "status"]
+summary       = "Show current authentication state"
+
+[[commands]]
+expose_in_cli = true
+name          = "auth-logout"
+path          = ["auth", "logout"]
+summary       = "Clear locally stored authentication state"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "remote-test"
+path          = ["remote", "test"]
+summary       = "Verify connectivity to a configured target"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "target"
+position   = 0
+required   = true
+summary    = "Target name or ssh destination"
+value_name = "TARGET"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "remote-doctor"
+path          = ["remote", "doctor"]
+summary       = "Diagnose remote connectivity and runtime readiness"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "target"
+position   = 0
+required   = true
+summary    = "Target name or ssh destination"
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "fix"
+name    = "fix"
+summary = "Apply safe automatic fixes when possible"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "remote-init"
+path          = ["remote", "init"]
+summary       = "Create and validate a named remote target profile"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "name"
+position   = 0
+required   = true
+summary    = "Name for the target profile"
+value_name = "NAME"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "ssh"
+name       = "ssh"
+summary    = "Configure as an SSH target (user@host[:port] or host)"
+value_name = "SSH"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "tls"
+name       = "tls"
+summary    = "Configure as a TLS target (host[:port])"
+value_name = "TLS"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "iroh"
+name       = "iroh"
+summary    = "Configure as an iroh target (endpoint_id[?relay=https://...][&auth=ssh])"
+value_name = "IROH"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "user"
+name       = "user"
+summary    = "SSH username override"
+value_name = "USER"
+
+[[commands.arguments]]
+kind       = "integer"
+long       = "port"
+name       = "port"
+summary    = "SSH/TLS port override"
+value_name = "PORT"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "set-default"
+name    = "set-default"
+summary = "Mark as default target"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "remote-complete-sessions"
+path          = ["remote", "complete", "sessions"]
+summary       = "Print session names for a target"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "target"
+position   = 0
+required   = true
+summary    = "Target name"
+value_name = "TARGET"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "kiosk-status"
+path          = ["kiosk", "status"]
+summary       = "Show kiosk profile status and effective defaults"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "json"
+name    = "json"
+summary = "Print output as JSON"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "kiosk-init"
+path          = ["kiosk", "init"]
+summary       = "Initialize/update kiosk bootstrap files from config"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "profile"
+multiple   = true
+name       = "profile"
+summary    = "Kiosk profile to reconcile (repeatable)"
+value_name = "PROFILE"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "all-profiles"
+name    = "all-profiles"
+summary = "Reconcile all configured profiles"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "dry-run"
+name    = "dry-run"
+summary = "Preview actions without writing files"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "yes"
+name    = "yes"
+summary = "Skip confirmation prompts"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "kiosk-issue-token"
+path          = ["kiosk", "issue-token"]
+summary       = "Issue a kiosk token scoped to a profile"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "profile"
+position   = 0
+required   = true
+summary    = "Kiosk profile name"
+value_name = "PROFILE"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "session"
+name       = "session"
+summary    = "Optional session override stored in token"
+value_name = "SESSION"
+
+[[commands.arguments]]
+kind       = "integer"
+long       = "ttl-secs"
+name       = "ttl-secs"
+summary    = "Optional token TTL in seconds (defaults to profile/default TTL)"
+value_name = "TTL_SECS"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "one-shot"
+name    = "one-shot"
+summary = "Mark token as one-shot (defaults to profile/default one_shot)"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "multi-use"
+name    = "multi-use"
+summary = "Mark token as reusable until expiry"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "kiosk-revoke-token"
+path          = ["kiosk", "revoke-token"]
+summary       = "Revoke one issued kiosk token by id"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "token-id"
+position   = 0
+required   = true
+summary    = "Token id to revoke"
+value_name = "TOKEN_ID"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "kiosk-attach"
+path          = ["kiosk", "attach"]
+summary       = "Attach using a kiosk token (intended for forced SSH command)"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "profile"
+position   = 0
+required   = true
+summary    = "Kiosk profile name"
+value_name = "PROFILE"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "token"
+name       = "token"
+required   = true
+summary    = "Raw kiosk token"
+value_name = "TOKEN"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "kiosk-ssh-print-config"
+path          = ["kiosk", "ssh-print-config"]
+summary       = "Print generated sshd include text without writing files"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "profile"
+multiple   = true
+name       = "profile"
+summary    = "Kiosk profile to print (repeatable)"
+value_name = "PROFILE"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "all-profiles"
+name    = "all-profiles"
+summary = "Print all configured profiles"
+
+[cli_help]
+"access"                   = { summary = "SSH-key access controls for iroh hosting", order = 5 }
+"access add"               = { order = 2 }
+"access disable"           = { order = 6 }
+"access enable"            = { order = 5 }
+"access init"              = { order = 1 }
+"access list"              = { order = 3 }
+"access remove"            = { order = 4 }
+"access status"            = { order = 0 }
+"auth"                     = { summary = "Authentication commands", order = 4 }
+"auth login"               = { order = 0 }
+"auth logout"              = { order = 2 }
+"auth status"              = { order = 1 }
+"connect"                  = { order = 126 }
+"host"                     = { order = 1 }
+"hosts"                    = { order = 3 }
+"join"                     = { order = 2 }
+"kiosk"                    = { summary = "SSH kiosk profiles and token management", order = 6 }
+"kiosk attach"             = { order = 4 }
+"kiosk init"               = { order = 1 }
+"kiosk issue-token"        = { order = 2 }
+"kiosk revoke-token"       = { order = 3 }
+"kiosk ssh-print-config"   = { order = 5 }
+"kiosk status"             = { order = 0 }
+"remote"                   = { summary = "Remote target utilities", order = 19 }
+"remote approve"           = { order = 11 }
+"remote complete"          = { summary = "Shell completion helpers for targets/sessions", order = 7 }
+"remote complete sessions" = { order = 1 }
+"remote complete targets"  = { order = 0 }
+"remote disable"           = { order = 9 }
+"remote doctor"            = { order = 2 }
+"remote enable"            = { order = 8 }
+"remote forget"            = { order = 16 }
+"remote init"              = { order = 3 }
+"remote install-server"    = { order = 4 }
+"remote list"              = { order = 0 }
+"remote pair"              = { order = 12 }
+"remote pair-request"      = { order = 10 }
+"remote rename"            = { order = 15 }
+"remote revoke"            = { order = 14 }
+"remote status"            = { order = 13 }
+"remote test"              = { order = 1 }
+"remote trust"             = { summary = "Manage TLS gateway trust pins", order = 6 }
+"remote trust add"         = { order = 1 }
+"remote trust list"        = { order = 0 }
+"remote trust remove"      = { order = 2 }
+"remote upgrade"           = { order = 5 }
+"setup"                    = { order = 0 }
+"share"                    = { order = 7 }
+"unshare"                  = { order = 8 }

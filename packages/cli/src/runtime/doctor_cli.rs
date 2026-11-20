@@ -312,19 +312,8 @@ async fn run_doctor_text(paths: &ConfigPaths) -> Result<bool> {
 
     // 6. Plugin health
     if let Some(config) = &config {
-        match scan_available_plugins(config, paths) {
-            Ok(registry) => {
-                let enabled = effective_enabled_plugins(config, &registry);
-                let host = plugin_host_metadata();
-                let mut compat_issues = Vec::new();
-                for plugin_id in &enabled {
-                    if let Some(plugin) = registry.get(plugin_id) {
-                        let report = PluginRegistry::compatibility_report(plugin, &host);
-                        if !report.is_loadable() {
-                            compat_issues.push(plugin_id.clone());
-                        }
-                    }
-                }
+        match inspect_plugin_activation(config, paths) {
+            Ok((enabled, compat_issues)) => {
                 if compat_issues.is_empty() {
                     if enabled.is_empty() {
                         print_info("plugins", "none enabled");
@@ -471,6 +460,28 @@ impl DoctorTerminalCheck {
     }
 }
 
+// A broken enabled set can prevent `plugin doctor` itself from activating.
+// Inspect registry metadata without loading plugin code or executing commands.
+fn inspect_plugin_activation(
+    config: &BmuxConfig,
+    paths: &ConfigPaths,
+) -> Result<(Vec<String>, Vec<String>)> {
+    let registry = scan_available_plugins(config, paths)?;
+    super::plugin_kernel::available_capability_providers(config, &registry)?;
+    let enabled = effective_enabled_plugins(config, &registry);
+    let host = plugin_host_metadata();
+    let incompatible = enabled
+        .iter()
+        .filter(|id| {
+            registry
+                .get(id)
+                .is_some_and(|p| !PluginRegistry::compatibility_report(p, &host).is_loadable())
+        })
+        .cloned()
+        .collect();
+    Ok((enabled, incompatible))
+}
+
 struct DoctorPluginsCheck {
     enabled: Vec<String>,
     incompatible: Vec<String>,
@@ -577,19 +588,8 @@ async fn build_doctor_report(paths: &ConfigPaths) -> DoctorReport {
     #[allow(clippy::option_if_let_else)]
     // Nested match with side effects reads better than map_or_else
     let (plugin_enabled, plugin_incompatible, plugin_scan_error) = match &config {
-        Some(cfg) => match scan_available_plugins(cfg, paths) {
-            Ok(registry) => {
-                let enabled = effective_enabled_plugins(cfg, &registry);
-                let host = plugin_host_metadata();
-                let incompatible: Vec<String> = enabled
-                    .iter()
-                    .filter(|id| {
-                        registry.get(id).is_some_and(|p| {
-                            !PluginRegistry::compatibility_report(p, &host).is_loadable()
-                        })
-                    })
-                    .cloned()
-                    .collect();
+        Some(cfg) => match inspect_plugin_activation(cfg, paths) {
+            Ok((enabled, incompatible)) => {
                 if !incompatible.is_empty() {
                     has_warnings = true;
                 }

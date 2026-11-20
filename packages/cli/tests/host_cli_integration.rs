@@ -318,3 +318,32 @@ fn doctor_hosted_not_ready_output_contract_is_stable() {
             .any(|line| line.starts_with("share-lookup: fail ("))
     );
 }
+
+#[cfg(feature = "bundled-plugin-connections")]
+#[test]
+fn host_conflicting_modes_report_only_explicit_flags() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    let config = root.join("bmux.toml");
+    std::fs::write(&config, "[plugins]\ndisabled = []\n").unwrap();
+    for (first, second) in [("--daemon", "--stop"), ("--stop", "--daemon")] {
+        let mut command = Command::new(bmux_binary());
+        command
+            .current_dir(root)
+            .env_clear()
+            .env("HOME", root)
+            .env("BMUX_CONFIG", &config)
+            .env("NO_COLOR", "1");
+        for kind in ["config", "runtime", "data", "state", "log"] {
+            command.env(
+                format!("BMUX_{}_DIR", kind.to_ascii_uppercase()),
+                root.join(kind),
+            );
+        }
+        let output = command.args(["host", first, second]).output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        assert_eq!(output.stderr, format!("error: the argument '{first}' cannot be used with '{second}'\n\nUsage: bmux host {first}\n\nFor more information, try '--help'.\n").as_bytes());
+        assert!(!root.join("runtime").exists());
+    }
+}

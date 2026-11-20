@@ -177,6 +177,25 @@ async fn ensure_ssh_server_ready(target: &SshTarget) -> Result<(), ConnectionErr
     }
 }
 
+/// Nested health checks may inspect status, never invoke readiness/start policy.
+pub async fn probe_ssh(target: &SshTarget, doctor: bool) -> Result<(), ConnectionError> {
+    let mut pinned = target.clone();
+    pinned.strict_host_key_checking = true;
+    if doctor && !ssh_bmux_status(&pinned, &["--version"]).await?.success() {
+        return Err(connection_failure(target, "remote bmux unavailable"));
+    }
+    if !ssh_bmux_status(&pinned, &["server", "status", "--json"])
+        .await?
+        .success()
+    {
+        return Err(connection_failure(
+            target,
+            "remote server status check failed",
+        ));
+    }
+    Ok(())
+}
+
 async fn ssh_bmux_status(
     target: &SshTarget,
     arguments: &[&str],

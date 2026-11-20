@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 bmux_bench                  = { workspace = true }
 bmux_bench_cli              = { workspace = true, optional = true }
+bmux_connections_admin      = { workspace = true, optional = true }
 bmux_connections_plugin_api = { workspace = true }
 bmux_frontend_runtime       = { workspace = true }
 bmux_plugin_runtime         = { workspace = true }
@@ -47,6 +48,7 @@ bmux_permissions_plugin_api = { workspace = true }
 bmux_playbook = { workspace = true, features = ["runtime"] }
 bmux_plugin = { workspace = true, features = ["tui"] }
 bmux_plugin_sdk = { workspace = true }
+bmux_recording_bootstrap = { workspace = true }
 bmux_recording_plugin_api = { workspace = true }
 bmux_recording_protocol = { workspace = true }
 bmux_recording_runtime = { workspace = true }
@@ -121,18 +123,21 @@ anyhow = { workspace = true, features = ["std"] }
 bmux_image = { workspace = true, optional = true }
 bmux_terminal = { workspace = true }
 bmux_unicode_segmentation = { workspace = true }
-clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
+clap = { workspace = true, features = [
+    "derive",
+    "help",
+    "std",
+    "string",
+    "usage",
+] }
 futures-util = { workspace = true }
-git_sshripped_recipient = { workspace = true }
 git_sshripped_ssh_agent = { workspace = true }
-git_sshripped_ssh_identity = { workspace = true }
 iroh = { workspace = true, optional = true }
 moosicbox_log_runtime = { workspace = true, features = ["file"] }
 moosicbox_log_watch = { workspace = true, features = [
     "tui",
     "persistence-json",
 ] }
-qrcode = { workspace = true }
 rcgen = { workspace = true }
 regex = { workspace = true }
 reqwest = { workspace = true }
@@ -170,7 +175,8 @@ tracing-subscriber = { workspace = true, features = [
 uuid = { workspace = true, features = ["std"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
+bmux_pty = { workspace = true }
+libc     = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
@@ -183,6 +189,8 @@ windows-sys = { workspace = true, features = [
 ] }
 
 [features]
+# Expose the default bundled declarations for offline documentation tests.
+docs-test = ["bundled-plugins"]
 # Optional portable benchmark frontend; not part of normal terminal startup.
 bench = ["dep:bmux_bench_cli", "bmux_bench_cli/internal"]
 # Default features
@@ -258,6 +266,7 @@ fail-on-warnings = [
     "bmux_performance_state/fail-on-warnings",
     "bmux_playbook/fail-on-warnings",
     "bmux_recording_plugin?/fail-on-warnings",
+    "bmux_recording_bootstrap/fail-on-warnings",
     "bmux_recording_plugin_api/fail-on-warnings",
     "bmux_recording_protocol/fail-on-warnings",
     "bmux_scene_protocol/fail-on-warnings",
@@ -329,7 +338,11 @@ bundled-plugin-cluster = [
     "dep:bmux_cluster_plugin_client",
 ]
 bundled-plugin-command-palette = ["dep:bmux_command_palette_plugin"]
-bundled-plugin-connections = ["remote-iroh", "dep:bmux_connections_plugin"]
+bundled-plugin-connections = [
+    "remote-iroh",
+    "dep:bmux_connections_plugin",
+    "dep:bmux_connections_admin",
+]
 bundled-plugin-contexts = ["dep:bmux_contexts_plugin"]
 bundled-plugin-control-catalog = ["dep:bmux_control_catalog_plugin"]
 bundled-plugin-decoration = [
@@ -349,10 +362,12 @@ bundled-plugin-sidebar = ["dep:bmux_sidebar_plugin"]
 bundled-plugin-snapshot = ["dep:bmux_snapshot_plugin"]
 bundled-plugin-tab-bar = ["dep:bmux_tab_bar_plugin"]
 bundled-plugin-theme = ["dep:bmux_theme_plugin"]
-bundled-plugin-windows = ["dep:bmux_tabs_plugin"]
+# The tabs backend calls the workspaces contract; packaging just the tabs
+# implementation makes an otherwise valid local-splits server fail admission.
+bundled-plugin-windows    = ["dep:bmux_tabs_plugin", "bundled-plugin-workspaces"]
 bundled-plugin-workspaces = ["dep:bmux_workspaces_plugin"]
-bundled-visual-adapters = ["dep:bmux_visual_adapters_plugin_renderer"]
-remote-iroh = ["dep:iroh"]
+bundled-visual-adapters   = ["dep:bmux_visual_adapters_plugin_renderer"]
+remote-iroh               = ["dep:iroh"]
 
 # Optional features
 bundled-fonts = ["bmux_recording_plugin?/bundled-fonts"]

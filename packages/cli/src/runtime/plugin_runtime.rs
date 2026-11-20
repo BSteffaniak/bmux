@@ -34,6 +34,8 @@ use super::{
 /// whoever built it, never rediscovered from task-local or thread context.
 #[derive(Debug, Clone)]
 pub struct RuntimeCommandState {
+    /// Explicit CLI target, retained only for this standalone command invocation.
+    connection_target: Option<String>,
     pub(super) runtime_owner: Option<crate::runtime_owner::WeakRuntimeOwner>,
     pub(super) config: BmuxConfig,
     pub(super) paths: ConfigPaths,
@@ -93,6 +95,21 @@ pub(super) fn plugin_host_for_declaration(
 pub(super) fn validate_configured_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Result<()> {
     let registry = scan_available_plugins(config, paths)?;
     validate_enabled_plugins(config, &registry)
+}
+
+/// Construct the enabled bundled command graph without discovering user plugins or running commands.
+///
+/// # Errors
+/// Returns an error for inconsistent plugin declarations or command ownership.
+#[cfg(feature = "docs-test")]
+pub fn bundled_cli_command_for_docs() -> Result<clap::Command> {
+    use clap::CommandFactory;
+    let mut registry = PluginRegistry::new();
+    let mut config = BmuxConfig::default();
+    register_selected_bundled_plugins(&mut registry, &config.plugins.sources)?;
+    config.plugins.enabled = effective_enabled_plugins(&config, &registry);
+    PluginCommandRegistry::build(&config, &registry)?
+        .augment_clap_command(bmux_cli_schema::Cli::command())
 }
 
 /// Declare statically-linked bundled plugins from a single table.
@@ -831,6 +848,7 @@ pub(super) fn build_runtime_command_state(
         .collect::<Vec<_>>();
     let registered_plugin_infos = registered_plugin_infos_from_registry(&registry);
     let state = RuntimeCommandState {
+        connection_target: None,
         runtime_owner: runtime_owner.map(crate::runtime_owner::RuntimeOwner::downgrade),
         config,
         paths,
@@ -962,28 +980,6 @@ pub fn registered_plugin_entry_exists(plugin: &bmux_plugin::RegisteredPlugin) ->
                 .unwrap_or_else(|| std::path::Path::new(".")),
         )
         .is_some_and(|path| path.is_file())
-}
-
-/// Discover bundled plugin IDs using the same dynamic discovery as the runtime.
-/// Returns an empty vec on failure (non-fatal).
-pub fn discover_bundled_plugin_ids() -> Vec<String> {
-    let config = BmuxConfig::default();
-    let paths = bmux_config::ConfigPaths::default();
-    let roots = bundled_plugin_roots();
-
-    match scan_available_plugins(&config, &paths) {
-        Ok(registry) => registry
-            .iter()
-            .filter(|plugin| {
-                roots.contains(&plugin.search_root) && registered_plugin_entry_exists(plugin)
-            })
-            .map(|plugin| plugin.declaration.id.as_str().to_string())
-            .collect(),
-        Err(e) => {
-            tracing::warn!("failed to discover bundled plugins, using empty list: {e:#}");
-            Vec::new()
-        }
-    }
 }
 
 pub(super) fn effective_enabled_plugins(
@@ -2445,13 +2441,35 @@ pub(super) async fn run_plugin_command_with_state(
     command_name: &str,
     args: &[String],
 ) -> Result<u8> {
+    run_plugin_command_with_target(Some(state), plugin_id, command_name, args, None).await
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Status clamped to 0..255 before cast
+pub(super) async fn run_plugin_command_with_target(
+    state: Option<&RuntimeCommandState>,
+    plugin_id: &str,
+    command_name: &str,
+    args: &[String],
+    target_override: Option<&str>,
+) -> Result<u8> {
+    let owned;
+    let state = if let Some(state) = state {
+        state
+    } else {
+        owned = runtime_command_state()?;
+        &owned
+    };
+    let mut selected = state.clone();
+    selected.connection_target = target_override.map(str::to_owned);
+    let state = &selected;
     // Resolve once without requiring a live daemon. A host-independent command
     // may run without opening any connection; an actual host request must use
     // this exact selected target or fail, never reconnect to a later default.
-    let target =
-        crate::connection::StopTarget::resolve(crate::connection::ConnectionContext::default())
-            .await
-            .map_err(|error| format!("selected command target unavailable: {error:#}"));
+    let target = crate::connection::StopTarget::resolve(crate::connection::ConnectionContext::new(
+        target_override,
+    ))
+    .await
+    .map_err(|error| format!("selected command target unavailable: {error:#}"));
     let execution =
         run_command_on_selected_target(state, plugin_id, command_name, args, target).await?;
     if execution.status != 0
@@ -3098,6 +3116,127 @@ fn standalone_provider_definitions(
 ) -> Result<BTreeMap<String, bmux_plugin_sdk::definition::PluginDefinition>> {
     #[allow(unused_mut)] // Every entry is feature-gated.
     let mut definitions = BTreeMap::new();
+    #[cfg(feature = "bundled-plugin-sessions")]
+    {
+        let target = state.connection_target.clone();
+        let attach_target = target.clone();
+        let detach_target = target.clone();
+        let client = bmux_sessions_plugin::standalone::TerminalClient {
+            drive: |future| {
+                let runtime = tokio::runtime::Handle::try_current()?;
+                tokio::task::block_in_place(|| runtime.block_on(future))
+            },
+            connect_if_running: Arc::new(move |name| {
+                let ctx = crate::connection::ConnectionContext::new(target.as_deref());
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        crate::connection::connect_if_running_with_context(
+                            crate::connection::ConnectionPolicyScope::Normal,
+                            name,
+                            ctx,
+                        ),
+                    )
+                })
+            }),
+            attach: Arc::new(move |target, follow, global| {
+                let ctx = crate::connection::ConnectionContext::new(attach_target.as_deref());
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current()
+                        .block_on(super::run_session_attach(target, follow, global, ctx))
+                })
+            }),
+            detach: Arc::new(move || {
+                let ctx = crate::connection::ConnectionContext::new(detach_target.as_deref());
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(super::run_session_detach(ctx))
+                })
+            }),
+            map_error: super::map_cli_client_error,
+        };
+        definitions.insert(
+            "bmux.sessions".into(),
+            bmux_sessions_plugin::standalone::definition(client),
+        );
+    }
+    #[cfg(feature = "bundled-plugin-snapshot")]
+    definitions.insert(
+        "bmux.snapshot".into(),
+        bmux_snapshot_plugin::client_definition(|| {
+            let cleanup = super::cleanup_stale_pid_file();
+            let result = match tokio::runtime::Handle::try_current() {
+                Ok(handle)
+                    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+                {
+                    tokio::task::block_in_place(|| handle.block_on(cleanup))
+                }
+                Ok(_) => {
+                    return Err(bmux_plugin_sdk::PluginCommandError::failed(
+                        "server maintenance requires a blocking execution context",
+                    ));
+                }
+                Err(_) => tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| bmux_plugin_sdk::PluginCommandError::failed(e.to_string()))?
+                    .block_on(cleanup),
+            };
+            result
+                .and_then(|()| {
+                    crate::connection::apply_stale_build_policy(
+                        crate::connection::ConnectionPolicyScope::Normal,
+                    )
+                })
+                .map_err(|e| bmux_plugin_sdk::PluginCommandError::failed(format!("{e:#}")))
+        }),
+    );
+    #[cfg(feature = "bundled-plugin-playbook")]
+    definitions.insert(
+        "bmux.playbook".into(),
+        bmux_playbook_plugin::with_execution_host(
+            crate::playbook::engine::host,
+            crate::playbook::engine::command_host(
+                Some((state.config.clone(), state.paths.clone())),
+                Some(state.clone()),
+            ),
+            super::sandbox_cli::run_sandbox_cleanup,
+        ),
+    );
+    #[cfg(feature = "bundled-plugin-connections")]
+    {
+        let clipboard_state = state.clone();
+        let attach_state = state.clone();
+        let client = bmux_connections_plugin::hosted::HostedClient {
+            admin: Some(super::remote_cli::admin_ports(
+                state.connection_target.clone(),
+            )),
+            paths: state.paths.clone(),
+            config: state.config.clone(),
+            runtime_name: super::active_runtime_name(),
+            copy: Arc::new(move |text| {
+                let _selected = SelectedCommandStateGuard::enter(&clipboard_state);
+                super::attach::runtime::copy_text_with_clipboard_plugin(text).map_err(|e| {
+                    anyhow::anyhow!(super::attach::runtime::format_clipboard_service_error(&e))
+                })
+            }),
+            attach: Arc::new(move |target, session, follow, global, forever| {
+                let _selected = SelectedCommandStateGuard::enter(&attach_state);
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(super::remote_cli::attach_endpoint(
+                        &attach_state,
+                        &target,
+                        session.as_deref(),
+                        follow.as_deref(),
+                        global,
+                        forever,
+                    ))
+                })
+            }),
+        };
+        definitions.insert(
+            "bmux.connections".into(),
+            bmux_connections_plugin::standalone_definition(client),
+        );
+    }
     // Capture the selected invocation's configuration now. Lifecycle polling may
     // run on another thread; factories must not consult command-state TLS.
     #[cfg(feature = "bundled-plugin-recording")]
@@ -3286,6 +3425,7 @@ mod tests {
     fn selected_command_snapshot_is_available_before_binding_and_restored_after_nesting() {
         std::thread::spawn(|| {
             let state = RuntimeCommandState {
+                connection_target: None,
                 runtime_owner: None,
                 config: BmuxConfig::default(),
                 paths: ConfigPaths::new(
@@ -3434,13 +3574,10 @@ mod tests {
     use crate::runtime::cli_parse::{ParsedRuntimeCli, parse_runtime_cli_with_registry};
     use crate::runtime::dispatch::built_in_handler_for_command;
 
-    use crate::runtime::session_cli::format_destructive_op_error;
     use crate::runtime::terminal_doctor::{filter_trace_events, merged_runtime_keybindings};
     use crate::runtime::terminal_protocol::{ProtocolDirection, ProtocolTraceEvent};
     use bmux_cli_schema::{Command, TraceFamily};
-    use bmux_client::ClientError;
     use bmux_config::{BmuxConfig, ConfigPaths};
-    use bmux_ipc::ErrorCode;
     use bmux_plugin::{PluginManifest, PluginRegistry};
     use std::ffi::OsString;
     use std::fs;
@@ -4884,13 +5021,12 @@ allow_hyphen_values=true
 
     #[test]
     fn built_in_handler_mapping_stays_in_sync_for_core_native_commands() {
-        let command = Command::KillSession {
-            target: "dev".to_string(),
-            force_local: false,
+        let command = Command::Server {
+            command: bmux_cli_schema::ServerCommand::WhoamiPrincipal { json: false },
         };
         assert_eq!(
             built_in_handler_for_command(&command),
-            BuiltInHandlerId::KillSession
+            BuiltInHandlerId::ServerWhoamiPrincipal
         );
     }
 
@@ -4957,35 +5093,6 @@ allow_hyphen_values=true
         let both = filter_trace_events(&events, Some(TraceFamily::Csi), Some(2), 50);
         assert_eq!(both.len(), 1);
         assert_eq!(both[0].timestamp_ms, 3);
-    }
-
-    #[test]
-    fn destructive_op_error_formats_session_policy_guidance() {
-        let message = format_destructive_op_error(
-            "session",
-            ClientError::ServerError {
-                code: ErrorCode::InvalidRequest,
-                message: "session policy denied for this operation".to_string(),
-            },
-            false,
-        );
-
-        assert!(message.contains("not permitted by current session policy"));
-    }
-
-    #[test]
-    fn destructive_op_error_formats_force_local_guidance() {
-        let message = format_destructive_op_error(
-            "window",
-            ClientError::ServerError {
-                code: ErrorCode::InvalidRequest,
-                message: "force-local is only allowed for the server control principal".to_string(),
-            },
-            true,
-        );
-
-        assert!(message.contains("--force-local"));
-        assert!(message.contains("bmux server whoami-principal"));
     }
 
     #[test]

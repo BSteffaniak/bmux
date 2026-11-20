@@ -25,20 +25,6 @@ type RecordingPayload = ProtocolRecordingPayload<bmux_ipc::Event, bmux_ipc::Erro
 type RecordingEventEnvelope = ProtocolRecordingEventEnvelope<bmux_ipc::Event, bmux_ipc::ErrorCode>;
 
 #[derive(Debug, Clone, serde::Serialize)]
-struct StartRequest {
-    session_id: Option<Uuid>,
-    capture_input: bool,
-    name: Option<String>,
-    profile: Option<recording_types::RecordingProfile>,
-    event_kinds: Option<Vec<recording_types::RecordingEventKind>>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-struct StopRequest {
-    recording_id: Option<Uuid>,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
 struct DeleteRequest {
     recording_id: Uuid,
 }
@@ -310,22 +296,15 @@ fn run_start(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32
                 .collect::<Result<Vec<_>>>()?,
         )
     };
-    let response: std::result::Result<
-        recording_types::RecordingSummary,
-        recording_types::RecordingError,
-    > = invoke_recording_service(
-        context,
-        "bmux.recording.write",
-        InvokeServiceKind::Command,
-        "start",
-        &StartRequest {
-            session_id,
-            capture_input,
-            name,
-            profile,
-            event_kinds,
-        },
-    )?;
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
+    let response = bmux_plugin::block_on_typed_dispatch(recording_commands::client::start(
+        &mut client,
+        session_id,
+        capture_input,
+        name,
+        profile,
+        event_kinds,
+    ))?;
     let summary: RecordingSummary = response.map_err(recording_plugin_error)?.into();
     println!(
         "recording started: {} name={} (capture_input={} profile={:?} kinds={})",
@@ -353,14 +332,11 @@ fn run_stop(
         .first()
         .map(|value| Uuid::parse_str(value).context("invalid recording id"))
         .transpose()?;
-    let response: std::result::Result<Uuid, recording_types::RecordingError> =
-        invoke_recording_service(
-            context,
-            "bmux.recording.write",
-            InvokeServiceKind::Command,
-            "stop",
-            &StopRequest { recording_id },
-        )?;
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
+    let response = bmux_plugin::block_on_typed_dispatch(recording_commands::client::stop(
+        &mut client,
+        recording_id,
+    ))?;
     let stopped_id = response.map_err(recording_plugin_error)?;
     println!("recording stopped: {stopped_id}");
     maybe_auto_export_stopped_recording(owner, context, stopped_id);
@@ -1442,13 +1418,10 @@ fn list_or_query_recordings(
     owner: &RecordingOwner,
     context: &NativeCommandContext,
 ) -> Result<Vec<RecordingSummary>> {
-    match invoke_recording_service::<_, Vec<recording_types::RecordingSummary>>(
-        context,
-        "bmux.recording.read",
-        InvokeServiceKind::Query,
-        "list-recordings",
-        &(),
-    ) {
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
+    match bmux_plugin::block_on_typed_dispatch(recording_state::client::list_recordings(
+        &mut client,
+    )) {
         Ok(recordings) => Ok(recordings.into_iter().map(Into::into).collect()),
         Err(_) => list_recordings_from_dir(&owner.recordings_root_for_command(context)?),
     }

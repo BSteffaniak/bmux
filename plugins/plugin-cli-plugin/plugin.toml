@@ -5,6 +5,14 @@ name = "bmux Plugin CLI"
 owns_namespaces = ["plugin"]
 owns_paths = [
     [
+        "diagnostics",
+        "watch",
+    ],
+    [
+        "diagnostics",
+        "view",
+    ],
+    [
         "logs",
         "path",
     ],
@@ -52,30 +60,6 @@ owns_paths = [
         "terminal",
         "install-terminfo",
     ],
-    [
-        "playbook",
-        "run",
-    ],
-    [
-        "playbook",
-        "validate",
-    ],
-    [
-        "playbook",
-        "interactive",
-    ],
-    [
-        "playbook",
-        "dry-run",
-    ],
-    [
-        "playbook",
-        "diff",
-    ],
-    [
-        "playbook",
-        "cleanup",
-    ],
 ]
 version = "0.0.1-alpha.0"
 
@@ -90,6 +74,24 @@ kind  = "boolean"
 long  = "json"
 name  = "json"
 short = "j"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "compact"
+name    = "compact"
+summary = "Print one concise line per plugin"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "enabled-only"
+name    = "enabled-only"
+summary = "List only enabled plugins"
+
+[[commands.arguments]]
+kind    = "string"
+long    = "capability"
+name    = "capability"
+summary = "Filter by required or provided capability"
 
 [[commands]]
 expose_in_cli = true
@@ -197,11 +199,35 @@ kind = "boolean"
 long = "strict"
 name = "strict"
 
+[[commands.arguments]]
+kind    = "boolean"
+long    = "summary-only"
+name    = "summary-only"
+summary = "Print the summary without individual findings"
+
+[[commands.arguments]]
+kind    = "string"
+long    = "severity"
+name    = "severity"
+summary = "Filter findings by error, warning, or info"
+
+[[commands.arguments]]
+kind    = "string"
+long    = "code"
+name    = "code"
+summary = "Filter findings by diagnostic code substring"
+
 [[commands]]
 expose_in_cli = true
 name          = "logs-path"
 path          = ["logs", "path"]
-summary       = "Core logs path command proxy"
+summary       = "Print effective log file path"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "json"
+name    = "json"
+summary = "Print output as JSON"
 
 [[commands]]
 expose_in_cli = true
@@ -209,95 +235,164 @@ name          = "logs-level"
 path          = ["logs", "level"]
 summary       = "Core logs level command proxy"
 
+[[commands.arguments]]
+kind    = "boolean"
+long    = "json"
+name    = "json"
+summary = "Print output as JSON"
+
 [[commands]]
 expose_in_cli = true
 name          = "logs-tail"
 path          = ["logs", "tail"]
-summary       = "Core logs tail command proxy"
+summary       = "Print recent log lines and optionally follow updates"
 
 [[commands.arguments]]
-allow_hyphen_values = true
-kind                = "string"
-multiple            = true
-name                = "args"
-position            = 0
-trailing_var_arg    = true
-value_name          = "ARGS"
+default_value = "50"
+kind          = "string"
+long          = "lines"
+name          = "lines"
+summary       = "Number of recent lines to show before follow"
+value_name    = "LINES"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "since"
+name       = "since"
+summary    = "Show entries newer than a relative duration (e.g. 30s, 10m, 2h, 1d)"
+value_name = "SINCE"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "no-follow"
+name    = "no-follow"
+summary = "Print recent lines only (disable follow)"
 
 [[commands]]
 expose_in_cli = true
 name          = "logs-watch"
 path          = ["logs", "watch"]
-summary       = "Core logs watch command proxy"
+summary       = "Interactive live log viewer with dynamic filters"
 
 [[commands.arguments]]
-allow_hyphen_values = true
-kind                = "string"
-multiple            = true
-name                = "args"
-position            = 0
-trailing_var_arg    = true
-value_name          = "ARGS"
+kind       = "string"
+long       = "lines"
+name       = "lines"
+summary    = "Number of recent lines to preload (defaults to saved profile value or 200)"
+value_name = "LINES"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "since"
+name       = "since"
+summary    = "Show entries newer than a relative duration (e.g. 30s, 10m, 2h, 1d)"
+value_name = "SINCE"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "profile"
+name       = "profile"
+summary    = "State profile for saved watch filters (default: global `default`)"
+value_name = "PROFILE"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "include"
+multiple   = true
+name       = "include"
+summary    = "Include regex filter (case-sensitive, repeatable)"
+value_name = "INCLUDE"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "include-i"
+multiple   = true
+name       = "include-i"
+summary    = "Include regex filter (case-insensitive, repeatable)"
+value_name = "INCLUDE_I"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "exclude"
+multiple   = true
+name       = "exclude"
+summary    = "Exclude regex filter (case-sensitive, repeatable)"
+value_name = "EXCLUDE"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "exclude-i"
+multiple   = true
+name       = "exclude-i"
+summary    = "Exclude regex filter (case-insensitive, repeatable)"
+value_name = "EXCLUDE_I"
 
 [[commands]]
 expose_in_cli = true
 name          = "logs-profiles-list"
 path          = ["logs", "profiles", "list"]
-summary       = "Core logs profiles list command proxy"
+summary       = "List saved watch profiles"
 
 [[commands.arguments]]
-allow_hyphen_values = true
-kind                = "string"
-multiple            = true
-name                = "args"
-position            = 0
-trailing_var_arg    = true
-value_name          = "ARGS"
+kind    = "boolean"
+long    = "json"
+name    = "json"
+summary = "Print output as JSON"
 
 [[commands]]
 expose_in_cli = true
 name          = "logs-profiles-show"
 path          = ["logs", "profiles", "show"]
-summary       = "Core logs profiles show command proxy"
+summary       = "Show details for one profile"
 
 [[commands.arguments]]
-allow_hyphen_values = true
-kind                = "string"
-multiple            = true
-name                = "args"
-position            = 0
-trailing_var_arg    = true
-value_name          = "ARGS"
+kind       = "string"
+name       = "profile"
+position   = 0
+summary    = "Profile name (default: global profile `default`)"
+value_name = "PROFILE"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "json"
+name    = "json"
+summary = "Print output as JSON"
 
 [[commands]]
 expose_in_cli = true
 name          = "logs-profiles-delete"
 path          = ["logs", "profiles", "delete"]
-summary       = "Core logs profiles delete command proxy"
+summary       = "Delete a saved profile"
 
 [[commands.arguments]]
-allow_hyphen_values = true
-kind                = "string"
-multiple            = true
-name                = "args"
-position            = 0
-trailing_var_arg    = true
-value_name          = "ARGS"
+kind       = "string"
+name       = "profile"
+position   = 0
+required   = true
+summary    = "Profile name to delete"
+value_name = "PROFILE"
 
 [[commands]]
 expose_in_cli = true
 name          = "logs-profiles-rename"
 path          = ["logs", "profiles", "rename"]
-summary       = "Core logs profiles rename command proxy"
+summary       = "Rename a saved profile"
 
 [[commands.arguments]]
-allow_hyphen_values = true
-kind                = "string"
-multiple            = true
-name                = "args"
-position            = 0
-trailing_var_arg    = true
-value_name          = "ARGS"
+kind       = "string"
+name       = "from"
+position   = 0
+required   = true
+summary    = "Existing profile name"
+value_name = "FROM"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "to"
+position   = 1
+required   = true
+summary    = "New profile name"
+value_name = "TO"
 
 [[commands]]
 expose_in_cli = true
@@ -344,92 +439,80 @@ position            = 0
 trailing_var_arg    = true
 value_name          = "ARGS"
 
-[[commands]]
-expose_in_cli = true
-name          = "playbook-run"
-path          = ["playbook", "run"]
-summary       = "Core playbook run command proxy"
-
-[[commands.arguments]]
-allow_hyphen_values = true
-kind                = "string"
-multiple            = true
-name                = "args"
-position            = 0
-trailing_var_arg    = true
-value_name          = "ARGS"
 
 [[commands]]
+aliases       = [["diagnostics", "view"]]
 expose_in_cli = true
-name          = "playbook-validate"
-path          = ["playbook", "validate"]
-summary       = "Core playbook validate command proxy"
+name          = "diagnostics-watch"
+path          = ["diagnostics", "watch"]
+summary       = "Interactive structured diagnostics event viewer with dynamic filters"
 
 [[commands.arguments]]
-allow_hyphen_values = true
-kind                = "string"
-multiple            = true
-name                = "args"
-position            = 0
-trailing_var_arg    = true
-value_name          = "ARGS"
-
-[[commands]]
-expose_in_cli = true
-name          = "playbook-interactive"
-path          = ["playbook", "interactive"]
-summary       = "Core playbook interactive command proxy"
+kind       = "string"
+long       = "lines"
+name       = "lines"
+summary    = "Number of recent events to preload (defaults to saved profile value or 200)"
+value_name = "LINES"
 
 [[commands.arguments]]
-allow_hyphen_values = true
-kind                = "string"
-multiple            = true
-name                = "args"
-position            = 0
-trailing_var_arg    = true
-value_name          = "ARGS"
-
-[[commands]]
-expose_in_cli = true
-name          = "playbook-dry-run"
-path          = ["playbook", "dry-run"]
-summary       = "Core playbook dry-run command proxy"
+kind       = "string"
+long       = "since"
+name       = "since"
+summary    = "Show entries newer than a relative duration (e.g. 30s, 10m, 2h, 1d)"
+value_name = "SINCE"
 
 [[commands.arguments]]
-allow_hyphen_values = true
-kind                = "string"
-multiple            = true
-name                = "args"
-position            = 0
-trailing_var_arg    = true
-value_name          = "ARGS"
-
-[[commands]]
-expose_in_cli = true
-name          = "playbook-diff"
-path          = ["playbook", "diff"]
-summary       = "Core playbook diff command proxy"
+kind       = "string"
+long       = "profile"
+name       = "profile"
+summary    = "State profile for saved watch filters (default: global `default`)"
+value_name = "PROFILE"
 
 [[commands.arguments]]
-allow_hyphen_values = true
-kind                = "string"
-multiple            = true
-name                = "args"
-position            = 0
-trailing_var_arg    = true
-value_name          = "ARGS"
-
-[[commands]]
-expose_in_cli = true
-name          = "playbook-cleanup"
-path          = ["playbook", "cleanup"]
-summary       = "Core playbook cleanup command proxy"
+kind       = "string"
+long       = "include"
+multiple   = true
+name       = "include"
+summary    = "Include regex filter (case-sensitive, repeatable)"
+value_name = "INCLUDE"
 
 [[commands.arguments]]
-allow_hyphen_values = true
-kind                = "string"
-multiple            = true
-name                = "args"
-position            = 0
-trailing_var_arg    = true
-value_name          = "ARGS"
+kind       = "string"
+long       = "include-i"
+multiple   = true
+name       = "include-i"
+summary    = "Include regex filter (case-insensitive, repeatable)"
+value_name = "INCLUDE_I"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "exclude"
+multiple   = true
+name       = "exclude"
+summary    = "Exclude regex filter (case-sensitive, repeatable)"
+value_name = "EXCLUDE"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "exclude-i"
+multiple   = true
+name       = "exclude-i"
+summary    = "Exclude regex filter (case-insensitive, repeatable)"
+value_name = "EXCLUDE_I"
+
+[cli_help]
+"diagnostics"               = { summary = "Structured diagnostics event viewer", order = 22 }
+"diagnostics view"          = { summary = "Alias for watch", order = 1 }
+"diagnostics watch"         = { order = 0 }
+"keymap doctor"             = { order = 1 }
+"logs level"                = { order = 1000 }
+"logs path"                 = { order = 1001 }
+"logs profiles"             = { summary = "Manage saved log watch profiles", order = 0 }
+"logs profiles delete"      = { order = 0 }
+"logs profiles list"        = { order = 1000 }
+"logs profiles rename"      = { order = 1001 }
+"logs profiles show"        = { order = 1002 }
+"logs tail"                 = { order = 1002 }
+"logs watch"                = { order = 1003 }
+"terminal doctor"           = { order = 0 }
+"terminal install-terminfo" = { order = 1000 }

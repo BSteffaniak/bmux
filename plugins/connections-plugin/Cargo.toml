@@ -16,6 +16,7 @@ bmux_attach_layout_protocol = { workspace = true }
 bmux_client = { workspace = true }
 bmux_clients_plugin_api = { workspace = true }
 bmux_config = { workspace = true }
+bmux_connections_admin = { workspace = true }
 bmux_connections_plugin_api = { workspace = true }
 bmux_ipc = { workspace = true, features = ["compression-zstd"] }
 bmux_keyboard = { workspace = true }
@@ -25,8 +26,13 @@ bmux_plugin = { workspace = true }
 bmux_plugin_schema_macros = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
 bmux_terminal_grid = { workspace = true }
+clap = { workspace = true, features = ["derive", "std", "help", "usage"] }
+git_sshripped_recipient = { workspace = true }
+git_sshripped_ssh_agent = { workspace = true }
+git_sshripped_ssh_identity = { workspace = true }
 iroh = { workspace = true }
 libc = { workspace = true }
+qrcode = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
@@ -34,6 +40,7 @@ rustls-pemfile = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+switchy = { workspace = true, features = ["fs-native-directories"] }
 tokio = { workspace = true, features = [
     "io-util",
     "net",
@@ -44,6 +51,7 @@ tokio = { workspace = true, features = [
 ] }
 tokio-rustls = { workspace = true }
 toml = { workspace = true }
+tracing = { workspace = true }
 url = { workspace = true, features = ["std"] }
 uuid = { workspace = true, features = ["std", "v4"] }
 

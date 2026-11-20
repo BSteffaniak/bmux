@@ -1,10 +1,42 @@
-component_roles   = ["backend"]
-execution_class   = "native_fast"
-id                = "bmux.sessions"
-name              = "bmux Sessions"
-owns_namespaces   = ["new-session"]
+component_roles = ["backend"]
+execution_class = "native_fast"
+id = "bmux.sessions"
+name = "bmux Sessions"
+owns_namespaces = [
+    "new-session",
+    "list-sessions",
+    "kill-session",
+    "kill-all-sessions",
+    "detach",
+]
+owns_paths = [
+    [
+        "session",
+        "new",
+    ],
+    [
+        "session",
+        "list",
+    ],
+    [
+        "session",
+        "kill",
+    ],
+    [
+        "session",
+        "kill-all",
+    ],
+    [
+        "session",
+        "attach",
+    ],
+    [
+        "session",
+        "detach",
+    ],
+]
 provided_features = ["bmux.sessions"]
-version           = "0.0.1-alpha.0"
+version = "0.0.1-alpha.0"
 
 [[event_publications]]
 delivery                     = "broadcast"
@@ -23,6 +55,13 @@ summary       = "Create a new session"
 
 [[commands.arguments]]
 kind       = "string"
+name       = "session_name"
+position   = 0
+summary    = "Optional session name"
+value_name = "NAME"
+
+[[commands.arguments]]
+kind       = "string"
 long       = "name"
 name       = "name"
 short      = "n"
@@ -30,3 +69,110 @@ value_name = "NAME"
 
 # Explicit immutable v1 contracts. Route IDs are wire identities, not version
 # syntax: retain legacy names and negotiate their major separately.
+
+[[commands]]
+aliases       = [["session", "list"]]
+expose_in_cli = true
+name          = "list-sessions"
+path          = ["list-sessions"]
+summary       = "List active sessions"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "json"
+name    = "json"
+summary = "Print sessions as JSON"
+
+[[commands]]
+expose_in_cli = true
+name          = "session-new"
+path          = ["session", "new"]
+summary       = "Create a new session"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "session_name"
+position   = 0
+summary    = "Optional session name"
+value_name = "NAME"
+
+[[commands]]
+aliases       = [["session", "kill"]]
+expose_in_cli = true
+name          = "kill-session"
+path          = ["kill-session"]
+summary       = "Kill a session by name or UUID"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "target"
+position   = 0
+required   = true
+summary    = "Session name or UUID"
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "force-local"
+name    = "force-local"
+summary = "Bypass policy checks for local kill operations"
+
+[[commands]]
+aliases       = [["session", "kill-all"]]
+expose_in_cli = true
+name          = "kill-all-sessions"
+path          = ["kill-all-sessions"]
+summary       = "Kill all sessions"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "force-local"
+name    = "force-local"
+summary = "Bypass policy checks for local kill operations"
+
+[[commands]]
+expose_in_cli = true
+name          = "session-attach"
+path          = ["session", "attach"]
+summary       = "Attach to a session by name or UUID"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "target"
+position   = 0
+summary    = "Session name or UUID"
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "follow"
+name       = "follow"
+summary    = "Follow target client UUID and attach to its selected session"
+value_name = "FOLLOW"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "global"
+name    = "global"
+summary = "Keep following across target session switches (requires --follow)"
+
+[[commands]]
+aliases       = [["session", "detach"]]
+expose_in_cli = true
+name          = "detach"
+path          = ["detach"]
+summary       = "Detach from the current session"
+
+[cli_help]
+"detach"            = { order = 15 }
+"kill-all-sessions" = { order = 13, before = "attach" }
+"kill-session"      = { order = 12 }
+"list-sessions"     = { order = 10 }
+"new-session"       = { order = 9 }
+"session"           = { summary = "Session management commands", order = 18 }
+"session attach"    = { order = 5 }
+"session detach"    = { order = 6 }
+"session kill"      = { order = 3 }
+"session kill-all"  = { order = 4 }
+"session list"      = { order = 1 }
+"session new"       = { order = 0 }

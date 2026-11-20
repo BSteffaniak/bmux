@@ -8,7 +8,7 @@ use bmux_cli_schema::GatewayHostMode;
 use bmux_config::{ConfigPaths, ServerGatewayConfig};
 use bmux_ipc::IpcEndpoint;
 use bmux_ipc::transport::LocalIpcStream;
-use bmux_snapshot_plugin_api::{snapshot_commands, snapshot_state, snapshot_types};
+use bmux_snapshot_plugin_api::{snapshot_state, snapshot_types};
 #[cfg(feature = "remote-iroh")]
 use iroh::{Endpoint, endpoint::presets};
 use std::process::{Command as ProcessCommand, Stdio};
@@ -251,85 +251,6 @@ pub(super) async fn run_server_whoami_principal(
         }
     );
     Ok(0)
-}
-
-pub(super) async fn run_server_save(connection_context: ConnectionContext<'_>) -> Result<u8> {
-    cleanup_stale_pid_file().await?;
-    let mut client = connect_with_context(
-        ConnectionPolicyScope::Normal,
-        "bmux-cli-server-save",
-        connection_context,
-    )
-    .await?;
-    let result = snapshot_commands::client::save_now(&mut client)
-        .await
-        .context("snapshot save dispatch failed")?
-        .map_err(snapshot_plugin_error)?;
-
-    match result.path {
-        Some(path) => println!("snapshot saved: {path}"),
-        None => println!("snapshot save requested"),
-    }
-    Ok(0)
-}
-
-pub(super) async fn run_server_restore(
-    dry_run: bool,
-    yes: bool,
-    connection_context: ConnectionContext<'_>,
-) -> Result<u8> {
-    if !dry_run && !yes {
-        anyhow::bail!("server restore requires either --dry-run or --yes");
-    }
-    cleanup_stale_pid_file().await?;
-
-    if dry_run {
-        let mut client = connect_with_context(
-            ConnectionPolicyScope::Normal,
-            "bmux-cli-server-restore-dry-run",
-            connection_context,
-        )
-        .await?;
-        let result = snapshot_state::client::restore_dry_run(&mut client)
-            .await
-            .context("snapshot restore dry-run dispatch failed")?
-            .map_err(snapshot_plugin_error)?;
-
-        if result.ok {
-            println!("restore dry-run: OK - {}", result.message);
-            return Ok(0);
-        }
-        println!("restore dry-run: FAIL - {}", result.message);
-        return Ok(1);
-    }
-
-    let mut client = connect_with_context(
-        ConnectionPolicyScope::Normal,
-        "bmux-cli-server-restore-apply",
-        connection_context,
-    )
-    .await?;
-    let summary = snapshot_commands::client::restore_apply(&mut client)
-        .await
-        .context("snapshot restore apply dispatch failed")?
-        .map_err(snapshot_plugin_error)?;
-
-    println!(
-        "restore applied: restored_plugins={}, failed_plugins={}",
-        summary.restored_plugins, summary.failed_plugins
-    );
-    Ok(0)
-}
-
-fn snapshot_plugin_error(error: snapshot_types::SnapshotError) -> anyhow::Error {
-    match error {
-        snapshot_types::SnapshotError::NotRegistered { message }
-        | snapshot_types::SnapshotError::LockPoisoned { message }
-        | snapshot_types::SnapshotError::NoRuntime { message } => anyhow::anyhow!(message),
-        snapshot_types::SnapshotError::Failed { code, message } => {
-            anyhow::anyhow!("snapshot {code}: {message}")
-        }
-    }
 }
 
 pub(super) async fn latest_server_event_name(
@@ -750,7 +671,7 @@ async fn wait_for_shutdown_progress(
 
 const BRIDGE_PREFLIGHT_TOKEN: &str = "BMUX_BRIDGE_READY";
 
-pub(super) fn refuse_unadmitted_remote_ingress(surface: &str) -> Result<()> {
+fn refuse_unadmitted_remote_ingress(surface: &str) -> anyhow::Result<()> {
     anyhow::bail!(
         "{surface} is disabled: legacy remote ingress cannot establish trusted stream admission; use the connections plugin admission protocol (no downgrade)"
     )

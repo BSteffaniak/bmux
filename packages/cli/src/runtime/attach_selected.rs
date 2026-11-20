@@ -43,23 +43,6 @@ pub(super) fn run_selected(
                 ))
                 .await
             }
-            bmux_cli_schema::Command::Connect {
-                target,
-                session,
-                follow,
-                global,
-                reconnect_forever,
-            } => {
-                Box::pin(super::remote_cli::run_connect_selected(
-                    state,
-                    target.as_deref(),
-                    session.as_deref(),
-                    follow.as_deref(),
-                    *global,
-                    *reconnect_forever,
-                ))
-                .await
-            }
             _ => anyhow::bail!("selected attach executor received another command"),
         }
     };

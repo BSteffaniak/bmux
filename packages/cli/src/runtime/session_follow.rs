@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use bmux_clients_plugin_api::clients_commands;
 use bmux_session_models::SessionSelector;
 use uuid::Uuid;
 
@@ -15,45 +14,6 @@ pub(super) async fn run_session_detach(connection_context: ConnectionContext<'_>
     .await?;
     client.detach().await.map_err(map_cli_client_error)?;
     println!("detached");
-    Ok(0)
-}
-
-pub(super) async fn run_follow(
-    target_client_id: &str,
-    global: bool,
-    connection_context: ConnectionContext<'_>,
-) -> Result<u8> {
-    let target_client_id = parse_uuid_value(target_client_id, "target client id")?;
-    let mut client = connect_with_context(
-        ConnectionPolicyScope::Normal,
-        "bmux-cli-follow",
-        connection_context,
-    )
-    .await?;
-    clients_commands::client::set_following(&mut client, Some(target_client_id), global)
-        .await
-        .context("clients-commands set-following dispatch failed")?
-        .map_err(|err| anyhow::anyhow!("clients-commands set-following failed: {err:?}"))?;
-    println!(
-        "following client: {}{}",
-        target_client_id,
-        if global { " (global)" } else { "" }
-    );
-    Ok(0)
-}
-
-pub(super) async fn run_unfollow(connection_context: ConnectionContext<'_>) -> Result<u8> {
-    let mut client = connect_with_context(
-        ConnectionPolicyScope::Normal,
-        "bmux-cli-unfollow",
-        connection_context,
-    )
-    .await?;
-    clients_commands::client::set_following(&mut client, None, false)
-        .await
-        .context("clients-commands set-following dispatch failed")?
-        .map_err(|err| anyhow::anyhow!("clients-commands set-following failed: {err:?}"))?;
-    println!("follow stopped");
     Ok(0)
 }
 
