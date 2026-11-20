@@ -2902,11 +2902,14 @@ impl LoadedExecution {
         }));
         let mut result = result
             .unwrap_or_else(|_| Err(failure("author operation panicked; cleanup required")))
-            .and_then(|polled| match polled {
+            .map(|polled| match polled {
+                // An oversized result is a bounded, per-call author error, not
+                // evidence of unsafe state: fail only this operation so the
+                // instance keeps admitting work.
                 Poll::Ready(outcome) if !outcome_is_bounded(&outcome) => {
-                    Err(failure("final outcome exceeds byte budget"))
+                    Poll::Ready(oversized_outcome_error(&outcome))
                 }
-                value => Ok(value),
+                value => value,
             });
         if !matches!(&result, Ok(Poll::Pending)) {
             // Close callback admission first. Keep the operation admission alive
@@ -3590,7 +3593,23 @@ fn validate_operation_limits(operation: &NativeOperation) -> Result<()> {
 }
 
 fn outcome_is_bounded(outcome: &NativeOutcome) -> bool {
-    let bytes = match outcome {
+    outcome_bytes(outcome) <= abi::MAX_BUFFER_BYTES
+}
+
+/// Bounded replacement for a final outcome over [`abi::MAX_BUFFER_BYTES`].
+fn oversized_outcome_error(outcome: &NativeOutcome) -> NativeOutcome {
+    NativeOutcome::Error {
+        code: 1,
+        message: format!(
+            "final outcome exceeds byte budget ({} > {} bytes)",
+            outcome_bytes(outcome),
+            abi::MAX_BUFFER_BYTES
+        ),
+    }
+}
+
+fn outcome_bytes(outcome: &NativeOutcome) -> usize {
+    match outcome {
         NativeOutcome::Registrations(registrations) => {
             serde_json::to_vec(registrations).map_or(usize::MAX, |bytes| bytes.len())
         }
@@ -3608,8 +3627,7 @@ fn outcome_is_bounded(outcome: &NativeOutcome) -> bool {
                     error.code.len().saturating_add(error.message.len())
                 }))
         }
-    };
-    bytes <= abi::MAX_BUFFER_BYTES
+    }
 }
 
 fn author_result<T>(
@@ -5776,6 +5794,58 @@ mod tests {
         assert!(observed.load(Ordering::Acquire));
         assert!(poll_fixture(&execution, id).unwrap().is_ready());
         execution.acknowledge(id).await.unwrap();
+        activation.close().unwrap();
+        activation.drain().await.unwrap();
+        activation.finish().unwrap();
+        execution.state.lock().unwrap().activation = None;
+        execution.destroy().await.unwrap();
+    }
+    #[tokio::test]
+    async fn oversized_final_outcome_fails_only_that_call() {
+        let execution = fixture();
+        let activation = execution.activation().unwrap();
+        let invocation = activation.begin_invocation().unwrap();
+        let guard = invocation.try_admit().unwrap();
+        let id = execution
+            .insert_call(CallStart {
+                future: Some(Box::pin(async {
+                    NativeOutcome::Service(bmux_plugin_sdk::ServiceResponse::ok(vec![
+                        0;
+                        abi::MAX_BUFFER_BYTES
+                            + 1
+                    ]))
+                })),
+                cancellation: ServiceCancellation::new(),
+                invocation: Some(invocation),
+                lifecycle: None,
+                admission: Some(guard),
+                operation: None,
+                stream_failure: None,
+                deadline_ms: None,
+                table: None,
+            })
+            .unwrap();
+        let outcome = loop {
+            if let Poll::Ready(outcome) = poll_fixture(&execution, id).unwrap() {
+                break outcome;
+            }
+            tokio::task::yield_now().await;
+        };
+        assert!(matches!(
+            &outcome,
+            NativeOutcome::Error { message, .. } if message.contains("exceeds byte budget")
+        ));
+        assert!(outcome_is_bounded(&outcome));
+        assert_eq!(
+            execution.scope.state().unwrap(),
+            bmux_plugin_runtime::LifecycleState::Active
+        );
+        execution.acknowledge(id).await.unwrap();
+        // The instance keeps admitting work after the oversized result.
+        let next = execution.begin_invocation_scope().unwrap();
+        next.close().unwrap();
+        next.drain().await.unwrap();
+        next.finish().unwrap();
         activation.close().unwrap();
         activation.drain().await.unwrap();
         activation.finish().unwrap();

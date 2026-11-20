@@ -113,6 +113,18 @@ const PANE_PADDING_PREVIEW_LEASE: Duration = Duration::from_mins(5);
 const PANE_PADDING_PREVIEW_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 const RESPONSE_OUTPUT_BUDGET: usize =
     bmux_ipc::frame::MAX_FRAME_PAYLOAD_SIZE - RESPONSE_METADATA_HEADROOM;
+/// Encoded bytes one reply may carry. Replies cross both the IPC frame and,
+/// when this plugin runs in-process, the native plugin outcome buffer; the
+/// smaller binds. [`RESPONSE_OUTPUT_BUDGET`] also bounds in-memory projection,
+/// which is far larger per cell than the encoding, so the two stay separate.
+const REPLY_WIRE_BUDGET: usize = {
+    let native = bmux_plugin_sdk::abi::MAX_BUFFER_BYTES - RESPONSE_METADATA_HEADROOM;
+    if native < RESPONSE_OUTPUT_BUDGET {
+        native
+    } else {
+        RESPONSE_OUTPUT_BUDGET
+    }
+};
 
 // Published pin payload across this manager, independent of client/session count.
 const RETAINED_PIN_BUDGET: usize = 64 * 1024 * 1024;
@@ -1940,6 +1952,15 @@ fn acknowledge_grid_snapshots(
         output.acknowledge_snapshot(client_id, *offset);
     }
     Ok(())
+}
+
+fn warn_grid_snapshot_omitted(pane_id: Uuid, remaining: usize) {
+    tracing::warn!(
+        %pane_id,
+        remaining_bytes = remaining,
+        wire_budget_bytes = REPLY_WIRE_BUDGET,
+        "grid snapshot omitted: pane exceeds remaining reply budget"
+    );
 }
 
 fn encode_grid_window(
@@ -12029,7 +12050,9 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         let mut snapshots = Vec::new();
         let mut remaining = RESPONSE_OUTPUT_BUDGET;
         let mut cursor_updates = Vec::new();
+        let mut wire = REPLY_WIRE_BUDGET;
         let mut seen = BTreeSet::new();
+        let mut omitted = false;
         for pane in panes {
             if !seen.insert(pane.pane_id) {
                 continue;
@@ -12038,29 +12061,51 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                 .terminal_grid
                 .lock()
                 .map_err(|_| SessionRuntimeError::Closed)?;
+            // Panes that no longer fit the shared reply budget are omitted, as
+            // missing panes are: callers hydrate what is returned and leave the
+            // rest to live state, instead of losing every pane to one large one.
             // Admit selected aggregate source text before projection clones it.
             if !grid
                 .grid()
                 .snapshot_text_fits(0, max_rows_per_pane, remaining)
             {
-                return Err(SessionRuntimeError::ResponseBudgetExceeded);
+                omitted = true;
+                warn_grid_snapshot_omitted(pane.pane_id, remaining);
+                continue;
             }
-            let snapshot = grid
-                .try_snapshot(0, max_rows_per_pane, remaining)
-                .ok_or(SessionRuntimeError::ResponseBudgetExceeded)?;
+            let Some(snapshot) = grid.try_snapshot(0, max_rows_per_pane, remaining) else {
+                omitted = true;
+                warn_grid_snapshot_omitted(pane.pane_id, remaining);
+                continue;
+            };
             let stream_end = pane
                 .output_buffer
                 .lock()
                 .map_err(|_| SessionRuntimeError::Closed)?
                 .end_offset();
             drop(grid);
-            let encoded = encode_grid_window(&snapshot, &mut remaining)?;
+            let encoded = match encode_grid_window(&snapshot, &mut wire) {
+                Ok(encoded) => encoded,
+                Err(SessionRuntimeError::ResponseBudgetExceeded) => {
+                    omitted = true;
+                    warn_grid_snapshot_omitted(pane.pane_id, wire);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            // Encoded output coexists with later projections.
+            remaining = remaining.saturating_sub(encoded.len());
             cursor_updates.push((Arc::clone(&pane.output_buffer), stream_end));
             snapshots.push(bmux_pane_runtime_state::AttachPaneGridSnapshot {
                 pane_id: pane.pane_id,
                 stream_end,
                 encoded,
             });
+        }
+        // Nothing fit: report the budget instead of an empty success that is
+        // indistinguishable from every requested pane being absent.
+        if snapshots.is_empty() && omitted {
+            return Err(SessionRuntimeError::ResponseBudgetExceeded);
         }
         acknowledge_grid_snapshots(client_id, &mut cursor_updates)?;
         Ok(bmux_pane_runtime_state::AttachGridSnapshotState { snapshots })
@@ -18536,34 +18581,29 @@ exit 7"#
             buffers.push(Arc::clone(&pane.output_buffer));
         }
         let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
-        let rejected =
+        // The aggregate overflows: panes that fit are returned and acknowledged;
+        // omitted panes keep their replay cursors for a later retry.
+        let partial =
             bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_snapshot_state(
                 &adapter, session_id, client_id, &pane_ids, 100,
-            );
-        assert!(matches!(
-            rejected,
-            Err(SessionRuntimeError::ResponseBudgetExceeded)
-        ));
-        for buffer in &buffers {
-            assert_eq!(buffer.lock().unwrap().cursors.get(&client_id), Some(&1));
-        }
-        let retry = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_snapshot_state(
-            &adapter,
-            session_id,
-            client_id,
-            &pane_ids[..1],
-            100,
-        )
-        .unwrap();
-        assert_eq!(retry.snapshots.len(), 1);
-        assert_eq!(retry.snapshots[0].stream_end, 5);
-        assert_eq!(
+            )
+            .unwrap();
+        let returned = partial.snapshots.len();
+        assert!(returned >= 1 && returned < pane_ids.len());
+        assert!(
+            partial
+                .snapshots
+                .iter()
+                .all(|snapshot| snapshot.stream_end == 5)
+        );
+        let cursor_count = |cursor: u64| {
             buffers
                 .iter()
-                .filter(|buffer| buffer.lock().unwrap().cursors.get(&client_id) == Some(&5))
-                .count(),
-            1
-        );
+                .filter(|buffer| buffer.lock().unwrap().cursors.get(&client_id) == Some(&cursor))
+                .count()
+        };
+        assert_eq!(cursor_count(5), returned);
+        assert_eq!(cursor_count(1), pane_ids.len() - returned);
     }
 
     #[tokio::test]
@@ -19230,6 +19270,72 @@ exit 7"#
         assert!(retained.iter().any(|row| row == "line3"));
         assert_eq!(retained.len(), usize::from(snapshot.height));
         assert!(snapshot.scrollback_rows > 0);
+    }
+
+    #[tokio::test]
+    async fn attach_grid_snapshot_state_omits_panes_beyond_reply_budget() {
+        fn fill(pane: &PaneRuntimeHandle) {
+            set_pane_grid(pane, 200, 60);
+            // Alternating styles force one run per cell, inflating the encoding.
+            let mut bytes = Vec::new();
+            for row in 0..60 {
+                for col in 0..200 {
+                    let color = 31 + (row + col) % 6;
+                    bytes.extend_from_slice(format!("\x1b[{color}mx").as_bytes());
+                }
+                bytes.extend_from_slice(b"\r\n");
+            }
+            pane.terminal_grid
+                .lock()
+                .expect("grid lock should be available")
+                .process(&bytes);
+        }
+        let session_id = SessionId(Uuid::new_v4());
+        let client_id = ClientId(Uuid::new_v4());
+
+        // Measure one pane, then request enough identical panes to overflow.
+        let probe = Uuid::new_v4();
+        let mut runtime = runtime_with_panes(&[probe]);
+        runtime.attached_clients.insert(client_id);
+        fill(runtime.panes.get(&probe).expect("pane should exist"));
+        let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
+        let one = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_snapshot_state(
+            &adapter,
+            session_id,
+            client_id,
+            &[probe],
+            usize::MAX,
+        )
+        .expect("one pane fits the reply budget");
+        let pane_bytes = one.snapshots[0].encoded.len();
+        assert!(pane_bytes * 2 < REPLY_WIRE_BUDGET);
+
+        let requested = REPLY_WIRE_BUDGET / pane_bytes + 2;
+        let pane_ids = (0..requested).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+        let mut runtime = runtime_with_panes(&pane_ids);
+        runtime.attached_clients.insert(client_id);
+        for pane_id in &pane_ids {
+            fill(runtime.panes.get(pane_id).expect("pane should exist"));
+        }
+        let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
+        let state = bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_snapshot_state(
+            &adapter,
+            session_id,
+            client_id,
+            &pane_ids,
+            usize::MAX,
+        )
+        .expect("oversized aggregate degrades to the panes that fit");
+
+        assert!(!state.snapshots.is_empty());
+        assert!(state.snapshots.len() < requested);
+        let total = state
+            .snapshots
+            .iter()
+            .map(|snapshot| snapshot.encoded.len())
+            .sum::<usize>();
+        assert!(total <= REPLY_WIRE_BUDGET);
+        const { assert!(REPLY_WIRE_BUDGET < bmux_plugin_sdk::abi::MAX_BUFFER_BYTES) };
     }
 
     #[tokio::test]
