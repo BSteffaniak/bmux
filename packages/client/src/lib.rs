@@ -884,7 +884,16 @@ pub struct StreamingBmuxClient {
     timed_out: TimedOutMap,
     event_rx: tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
     disconnect_reason: Arc<StdMutex<Option<String>>>,
-    _reader_task: tokio::task::JoinHandle<()>,
+    /// Reads the connection; it holds the read half, so it is ended with the client.
+    reader_task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for StreamingBmuxClient {
+    fn drop(&mut self) {
+        // The writer half closes with the client; ending the reader releases the read half, so
+        // the connection closes now rather than when the server next writes or hangs up.
+        self.reader_task.abort();
+    }
 }
 
 #[derive(Debug)]
@@ -1000,17 +1009,17 @@ impl StreamingBmuxClient {
         });
 
         Ok(Self {
+            checked_service_contracts,
             writer,
             timeout,
             next_request_id,
             principal_id,
             negotiated_protocol,
-            checked_service_contracts,
             pending,
             timed_out,
             event_rx,
             disconnect_reason,
-            _reader_task: reader_task,
+            reader_task,
         })
     }
 
