@@ -5718,9 +5718,8 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 let now = Instant::now();
                 let expired: Vec<Uuid> = view_state
                     .pane_buffers
-                    .iter()
-                    .filter(|(_, buffer)| buffer.sync_update_deadline().is_some_and(|at| at <= now))
-                    .map(|(pane_id, _)| *pane_id)
+                    .iter_mut()
+                    .filter_map(|(pane_id, buffer)| buffer.expire_sync_update(now).then_some(*pane_id))
                     .collect();
                 for pane_id in expired {
                     view_state
@@ -10989,14 +10988,13 @@ fn finish_presented_scroll_tracking(view: &mut AttachViewState) {
 /// observer never sees one half drawn; an update left open past its bound stops holding it, as
 /// it stops holding the pane back on the host.
 fn retained_frame_sync_pending(view: &AttachViewState, layout: &AttachLayoutState) -> bool {
-    let now = Instant::now();
     (view.observer.is_some() || view.presentation_only)
         && layout.scene.surfaces.iter().any(|surface| {
             surface.visible
                 && surface.pane_id.is_some_and(|id| {
-                    view.pane_buffers
-                        .get(&id)
-                        .is_some_and(|buffer| buffer.sync_update_deferring(now))
+                    view.pane_buffers.get(&id).is_some_and(
+                        bmux_attach_pipeline::types::PaneRenderBuffer::sync_update_deferring,
+                    )
                 })
         })
 }
@@ -18766,7 +18764,8 @@ mod tests {
             state.set_observer(publisher);
             let buffer = state.pane_buffers.get_mut(&pane_id).unwrap();
             buffer.sync_update_in_progress = true;
-            buffer.sync_update_since = Some(Instant::now());
+            buffer.sync_update_hold =
+                bmux_attach_pipeline::types::SyncUpdateHold::Since(Instant::now());
             render_observed_test_frame(&mut state, &layout);
             assert!(
                 observer.latest().is_none(),
@@ -18776,8 +18775,19 @@ mod tests {
                 .pane_buffers
                 .get_mut(&pane_id)
                 .unwrap()
-                .sync_update_since =
-                Instant::now().checked_sub(bmux_attach_pipeline::types::SYNC_UPDATE_TIMEOUT * 2);
+                .sync_update_hold = bmux_attach_pipeline::types::SyncUpdateHold::Since(
+                Instant::now()
+                    .checked_sub(bmux_attach_pipeline::types::SYNC_UPDATE_TIMEOUT * 2)
+                    .expect("the clock is past twice the bound"),
+            );
+            assert!(
+                state
+                    .pane_buffers
+                    .get_mut(&pane_id)
+                    .unwrap()
+                    .expire_sync_update(Instant::now()),
+                "the update outlived its bound"
+            );
             render_observed_test_frame(&mut state, &layout);
             let frame = observer.latest().expect("published once the bound passed");
             assert!(

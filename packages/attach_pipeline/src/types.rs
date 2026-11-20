@@ -11,6 +11,18 @@ use std::time::{Duration, Instant};
 /// screen before what it has drawn is shown anyway, so an application that never ends one
 /// cannot freeze its pane.
 pub const SYNC_UPDATE_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// How long a pane's open synchronized update holds its frame back.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SyncUpdateHold {
+    /// Until it ends (set without a time, as from a snapshot).
+    #[default]
+    Untimed,
+    /// Until [`SYNC_UPDATE_TIMEOUT`] after it began, when the client expires it.
+    Since(Instant),
+    /// No longer: it outlived its bound.
+    Expired,
+}
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -256,9 +268,9 @@ pub struct PaneRenderBuffer {
     /// The pane's application is inside a synchronized update (DEC mode 2026) at the end of the
     /// output applied so far: it began a frame and has not finished it.
     pub sync_update_in_progress: bool,
-    /// When the open synchronized update began; `None` when none is open, or when the flag was
-    /// set without a time (it then holds until it ends).
-    pub sync_update_since: Option<Instant>,
+    /// How long the open synchronized update holds the pane's frame back. Rendering reads this,
+    /// not the clock: the client expires it ([`Self::expire_sync_update`]).
+    pub sync_update_hold: SyncUpdateHold,
     pub expected_stream_start: Option<u64>,
     /// A caller-owned screen copy, independent of live geometry and history.
     pub retained_screen_copy: bool,
@@ -665,9 +677,9 @@ impl PaneRenderBuffer {
     /// Note whether a synchronized update is open after the output applied so far.
     pub const fn set_sync_update(&mut self, open: bool, now: Instant) {
         if open && !self.sync_update_in_progress {
-            self.sync_update_since = Some(now);
+            self.sync_update_hold = SyncUpdateHold::Since(now);
         } else if !open {
-            self.sync_update_since = None;
+            self.sync_update_hold = SyncUpdateHold::Untimed;
         }
         self.sync_update_in_progress = open;
     }
@@ -680,22 +692,33 @@ impl PaneRenderBuffer {
     }
 
     /// Whether the pane's last finished frame stays on screen: a synchronized update is open
-    /// and has not outlived [`SYNC_UPDATE_TIMEOUT`].
+    /// and has not expired.
     #[must_use]
-    pub fn sync_update_deferring(&self, now: Instant) -> bool {
-        self.sync_update_in_progress
-            && self
-                .sync_update_since
-                .is_none_or(|since| now.saturating_duration_since(since) < SYNC_UPDATE_TIMEOUT)
+    pub const fn sync_update_deferring(&self) -> bool {
+        self.sync_update_in_progress && !matches!(self.sync_update_hold, SyncUpdateHold::Expired)
+    }
+
+    /// Stop the open synchronized update holding the pane's frame back if it has outlived
+    /// [`SYNC_UPDATE_TIMEOUT`] at `now`; whether it just expired.
+    pub fn expire_sync_update(&mut self, now: Instant) -> bool {
+        let due = self
+            .sync_update_deadline()
+            .is_some_and(|deadline| deadline <= now);
+        if due {
+            self.sync_update_hold = SyncUpdateHold::Expired;
+        }
+        due
     }
 
     /// When an open synchronized update stops holding the pane's frame back.
     #[must_use]
     pub fn sync_update_deadline(&self) -> Option<Instant> {
-        self.sync_update_in_progress
-            .then_some(self.sync_update_since)
-            .flatten()
-            .map(|since| since + SYNC_UPDATE_TIMEOUT)
+        match self.sync_update_hold {
+            SyncUpdateHold::Since(since) if self.sync_update_in_progress => {
+                Some(since + SYNC_UPDATE_TIMEOUT)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -710,7 +733,7 @@ impl Default for PaneRenderBuffer {
             rows_drawn: false,
             drawn_appearance: None,
             sync_update_in_progress: false,
-            sync_update_since: None,
+            sync_update_hold: SyncUpdateHold::Untimed,
             expected_stream_start: None,
             extension_projection_cache: BTreeMap::new(),
             retained_screen_copy: false,
@@ -994,19 +1017,28 @@ mod sync_update_tests {
     fn an_open_update_holds_the_frame_until_it_ends_or_times_out() {
         let start = Instant::now();
         let mut buffer = PaneRenderBuffer::default();
-        assert!(!buffer.sync_update_deferring(start));
+        assert!(!buffer.sync_update_deferring());
         buffer.set_sync_update(true, start);
-        assert!(buffer.sync_update_deferring(start + Duration::from_millis(10)));
+        assert!(!buffer.expire_sync_update(start + Duration::from_millis(10)));
+        assert!(buffer.sync_update_deferring());
         assert_eq!(
             buffer.sync_update_deadline(),
             Some(start + SYNC_UPDATE_TIMEOUT)
         );
-        // Staying open does not restart the clock.
+        // Staying open does not restart the clock; only expiring stops the hold, however much
+        // time passes before a render.
         buffer.set_sync_update(true, start + Duration::from_millis(100));
-        assert!(!buffer.sync_update_deferring(start + SYNC_UPDATE_TIMEOUT));
+        assert!(buffer.sync_update_deferring());
+        assert!(buffer.expire_sync_update(start + SYNC_UPDATE_TIMEOUT));
+        assert!(!buffer.sync_update_deferring());
+        assert_eq!(buffer.sync_update_deadline(), None, "no further wake");
+        assert!(!buffer.expire_sync_update(start + SYNC_UPDATE_TIMEOUT * 2));
         buffer.set_sync_update(false, start + SYNC_UPDATE_TIMEOUT);
-        assert!(!buffer.sync_update_deferring(start + SYNC_UPDATE_TIMEOUT));
+        assert!(!buffer.sync_update_deferring());
         assert_eq!(buffer.sync_update_deadline(), None);
+        // A fresh update holds again.
+        buffer.set_sync_update(true, start + SYNC_UPDATE_TIMEOUT * 3);
+        assert!(buffer.sync_update_deferring());
         // A snapshot's state also reaches the parser that follows the stream.
         buffer.adopt_sync_update(true, start);
         assert!(buffer.protocol_tracker.synchronized_update());

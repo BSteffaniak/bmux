@@ -4330,7 +4330,7 @@ fn build_surface_output_plan<'a>(
     // application is mid-frame exposes partially updated pane content.
     let sync_deferred = pane_buffers
         .get(&pane_id)
-        .is_some_and(|b| b.sync_update_deferring(std::time::Instant::now()));
+        .is_some_and(PaneRenderBuffer::sync_update_deferring);
 
     let focused = surface.cursor_owner
         || focused_surface_id == Some(surface.id)
