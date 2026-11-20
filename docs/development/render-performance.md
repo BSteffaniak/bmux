@@ -100,7 +100,7 @@ client now keeps its panes current with frames (see
 | Full repaint | pane reader | 101,285 → 2.8 | 136.9M → 14.4M (−89%) | |
 | Streaming text | pane reader | 3,380 → 6 | 4.75M → 0.70M (−85%) | |
 | Scrolling (SU) | pane reader | — → 0.02 | 0.91M → 0.49M (−46%) | |
-| Text with Kitty images | pane reader | 11,715 → 29 | 8.99M → 2.35M (−74%) | |
+| Text with Kitty images | pane reader | 11,715 → 29 | 8.99M → 0.85M (−91%) | |
 
 Bytes written change only where intended (a moving raster image repairs its footprint, not the
 screen). Memory: the pane reader keeps one grid instead of two, history lines are stored compactly
@@ -127,7 +127,8 @@ What changed, each its own commit with its numbers:
   cells painted and encoded at once; the output buffer's phase scan skips sequence bodies; chunks
   without an image start skip the image interceptor; escapes are found with memchr; control
   sequence parameters reuse one buffer in one pass; no per-chunk allocation or per-sequence
-  memset in the reader.
+  memset in the reader; image positions follow each grid operation in the one parse, not a byte
+  at a time.
 
 ## Known costs left
 
@@ -136,7 +137,6 @@ What changed, each its own commit with its numbers:
   run by cell run.
 - **The server still runs separate scanners for images and shell metadata**, and the raw output
   fan-out for its remaining consumers (cluster replication, playbook, recording), now with
-  memchr and a pass-through check, but still a scan each. While an image is on screen, a pane's
-  output is fed to its grid a byte at a time.
+  memchr and a pass-through check, but still a scan each.
 - **The render rebuilds a compositor plan every frame** (about 15 small allocations).
 - **Cluster replication** still moves pane output between nodes as bytes.

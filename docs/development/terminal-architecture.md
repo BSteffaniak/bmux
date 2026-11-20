@@ -208,7 +208,11 @@ Done (each a measured commit; see [render-performance.md](render-performance.md)
     `SequenceFilters` (plugin state) with a declared `FilterInterest` (CSI and ESC final bytes, OSC
     numbers). The reader asks only interested filters, on the grid's own parse, before the grid
     applies the sequence; a dropped sequence is neither applied nor answered. With no filter
-    registered the cost is one branch per sequence.
+    registered the observer type has no filter check at all.
+- Images, in part: image positions follow the grid's operations in its one pass
+  (`SequenceObserver::operation`, called after each print run, control, sequence and DCS
+  string), where a pane with an image on screen used to be fed to its grid a byte at a time. A
+  chunk with no image start skips the interceptor entirely (`ImageInterceptor::passes_through`).
 
 Changed from the plan: the image and shell-metadata scanners are folded in after every client
 reads frames, since until then their only other job is producing the filtered byte stream clients
@@ -220,7 +224,8 @@ recording records what the program wrote. Cluster replication and the playbook, 
 the raw stream, see filtered output once they move to frames. Filters keep or drop whole
 sequences; rewriting sequences and filtering text runs come later, with the same interest model.
 
-Remaining: the image and shell-metadata transforms; render from damage (phase 4); cluster
+Remaining: extracting images and shell metadata on the grid's parse instead of scans ahead of it;
+render from damage (phase 4); cluster
 replication and playbook on frames; compact cells (phase 5); the rest of the plugin model
 (rewriting filters and text filters, retained layers with revisioned relays, unified
 render/input/status APIs).

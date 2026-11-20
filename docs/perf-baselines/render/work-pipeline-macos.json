@@ -3,7 +3,7 @@
     {
       "name": "su-scroll",
       "frames": 301,
-      "units_per_frame": 246439.39,
+      "units_per_frame": 247054.32,
       "functions": [
         {
           "name": "<bmux_terminal_grid::vt_parser::Parser>::parameter_run",
@@ -210,7 +210,7 @@
     {
       "name": "region-linefeed",
       "frames": 301,
-      "units_per_frame": 246347.81,
+      "units_per_frame": 246964.73,
       "functions": [
         {
           "name": "<bmux_terminal_grid::vt_parser::Parser>::parameter_run",
@@ -417,7 +417,7 @@
     {
       "name": "full-repaint",
       "frames": 301,
-      "units_per_frame": 5670745.27,
+      "units_per_frame": 5687451.43,
       "functions": [
         {
           "name": "<bmux_terminal_grid::vt_parser::Parser>::parameter_run",
@@ -624,7 +624,7 @@
     {
       "name": "full-repaint/no-passthrough",
       "frames": 301,
-      "units_per_frame": 5670739.27,
+      "units_per_frame": 5687445.42,
       "functions": [
         {
           "name": "<bmux_terminal_grid::vt_parser::Parser>::parameter_run",
@@ -831,7 +831,7 @@
     {
       "name": "full-repaint/observed",
       "frames": 301,
-      "units_per_frame": 6523430.81,
+      "units_per_frame": 6540136.96,
       "functions": [
         {
           "name": "<bmux_terminal_grid::vt_parser::Parser>::parameter_run",
@@ -1038,7 +1038,7 @@
     {
       "name": "plain-stream",
       "frames": 301,
-      "units_per_frame": 265803.95,
+      "units_per_frame": 266361.33,
       "functions": [
         {
           "name": "<bmux_terminal_grid::vt_parser::Parser>::parameter_run",
@@ -1245,7 +1245,7 @@
     {
       "name": "plain-stream/no-passthrough",
       "frames": 301,
-      "units_per_frame": 2304771.11,
+      "units_per_frame": 2305328.49,
       "functions": [
         {
           "name": "bmux_attach_pipeline::render::paint_pane_row",
@@ -1452,7 +1452,7 @@
     {
       "name": "plain-stream/observed",
       "frames": 301,
-      "units_per_frame": 948679.32,
+      "units_per_frame": 949236.7,
       "functions": [
         {
           "name": "<bmux_tui::geometry::Rect>::contains",
@@ -1659,7 +1659,7 @@
     {
       "name": "unclosed-sync",
       "frames": 302,
-      "units_per_frame": 166620.17,
+      "units_per_frame": 167230.7,
       "functions": [
         {
           "name": "<bmux_terminal_grid::vt_parser::Parser>::parameter_run",
@@ -1866,7 +1866,7 @@
     {
       "name": "full-repaint/two-panes",
       "frames": 301,
-      "units_per_frame": 5673525.04,
+      "units_per_frame": 5690419.72,
       "functions": [
         {
           "name": "<bmux_terminal_grid::vt_parser::Parser>::parameter_run",
@@ -2073,7 +2073,7 @@
     {
       "name": "plain-stream/two-panes",
       "frames": 301,
-      "units_per_frame": 973448.77,
+      "units_per_frame": 974015.16,
       "functions": [
         {
           "name": "bmux_tui::ansi::emit_row_cells::<alloc::vec::Vec<u8>>",
@@ -2280,7 +2280,7 @@
     {
       "name": "scattered-edits",
       "frames": 301,
-      "units_per_frame": 134135.58,
+      "units_per_frame": 134158.0,
       "functions": [
         {
           "name": "<bmux_bench::allocations::CountingAllocator as core::alloc::global::GlobalAlloc>::realloc",
@@ -2434,13 +2434,13 @@
         },
         {
           "name": "<bmux_bench::allocations::CountingAllocator as core::alloc::global::GlobalAlloc>::alloc",
-          "units_per_frame": 679.86,
-          "entries_per_frame": 679.86
+          "units_per_frame": 679.87,
+          "entries_per_frame": 679.87
         },
         {
           "name": "<bmux_bench::allocations::CountingAllocator as core::alloc::global::GlobalAlloc>::dealloc",
-          "units_per_frame": 679.86,
-          "entries_per_frame": 679.86
+          "units_per_frame": 679.87,
+          "entries_per_frame": 679.87
         },
         {
           "name": "bmux_tui::ansi::emit_row_cells::<alloc::vec::Vec<u8>>",
@@ -2487,7 +2487,7 @@
     {
       "name": "image/kitty/beside-stream",
       "frames": 301,
-      "units_per_frame": 497237.97,
+      "units_per_frame": 497521.17,
       "functions": [
         {
           "name": "bmux_tui::ansi::emit_row_cells::<alloc::vec::Vec<u8>>",
@@ -2694,7 +2694,7 @@
     {
       "name": "image/kitty/moving",
       "frames": 301,
-      "units_per_frame": 497579.96,
+      "units_per_frame": 497863.17,
       "functions": [
         {
           "name": "bmux_tui::ansi::emit_row_cells::<alloc::vec::Vec<u8>>",
@@ -2901,7 +2901,7 @@
     {
       "name": "image/sixel/beside-stream",
       "frames": 301,
-      "units_per_frame": 505025.34,
+      "units_per_frame": 505308.55,
       "functions": [
         {
           "name": "bmux_tui::ansi::emit_row_cells::<alloc::vec::Vec<u8>>",
@@ -3108,7 +3108,7 @@
     {
       "name": "image/sixel/moving",
       "frames": 301,
-      "units_per_frame": 510208.17,
+      "units_per_frame": 510491.38,
       "functions": [
         {
           "name": "bmux_tui::ansi::emit_row_cells::<alloc::vec::Vec<u8>>",

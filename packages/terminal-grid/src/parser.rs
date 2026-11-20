@@ -345,6 +345,11 @@ pub trait SequenceObserver {
     /// The bell (BEL outside any string, where it terminates nothing).
     fn bell(&mut self, _grid: &TerminalGrid) {}
 
+    /// The grid applied one operation (a run of printed text, a control, a sequence, a DCS
+    /// string): what it changed shows in `grid` now, before the next. Its state changes only in
+    /// operations, so following each is following each byte.
+    fn operation(&mut self, _grid: &TerminalGrid) {}
+
     /// Whether to collect the whole payload of OSC strings numbered `number`, for
     /// [`Self::osc_payload`]: [`Self::osc`] shows parameters bounded by the parser's buffer,
     /// which truncates long strings.
@@ -586,6 +591,7 @@ impl<O: SequenceObserver> Perform for GridPerformer<'_, O> {
         let ch = self.grid.characters.translate(c);
         self.grid.characters.last = Some(ch);
         self.grid.print_char(ch);
+        self.observer.operation(self.grid);
     }
 
     fn print_ascii(&mut self, text: &[u8]) {
@@ -599,6 +605,7 @@ impl<O: SequenceObserver> Perform for GridPerformer<'_, O> {
             self.grid.characters.last = Some(char::from(last));
         }
         self.grid.print_ascii(text);
+        self.observer.operation(self.grid);
     }
 
     fn execute(&mut self, byte: u8) {
@@ -614,6 +621,7 @@ impl<O: SequenceObserver> Perform for GridPerformer<'_, O> {
             0x07 => self.observer.bell(self.grid),
             _ => {}
         }
+        self.observer.operation(self.grid);
     }
 
     fn hook(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
@@ -655,6 +663,7 @@ impl<O: SequenceObserver> Perform for GridPerformer<'_, O> {
                 &dcs.data,
             );
         }
+        self.observer.operation(self.grid);
     }
 
     fn osc_start(&mut self) {
@@ -702,6 +711,7 @@ impl<O: SequenceObserver> Perform for GridPerformer<'_, O> {
         if collected && !osc.overflow {
             self.observer.osc_payload(self.grid, osc.number, &osc.data);
         }
+        self.observer.operation(self.grid);
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
@@ -717,6 +727,7 @@ impl<O: SequenceObserver> Perform for GridPerformer<'_, O> {
         if !ignore {
             self.observer.csi(self.grid, &header);
         }
+        self.observer.operation(self.grid);
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
@@ -724,6 +735,7 @@ impl<O: SequenceObserver> Perform for GridPerformer<'_, O> {
             return;
         }
         self.apply_esc(intermediates, ignore, byte);
+        self.observer.operation(self.grid);
     }
 }
 

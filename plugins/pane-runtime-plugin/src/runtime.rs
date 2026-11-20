@@ -2373,13 +2373,15 @@ impl PaneReader {
     /// Parse `bytes` into `grid`, answering the queries among them as the grid reaches each:
     /// the protocol engine's into `replies`, pointer-shape queries into the reader's own.
     /// `filters` are the registered output filters, read once per chunk (`read_filters`).
-    fn feed(
+    /// `images` follows each operation the grid applies (image positions move with it).
+    fn feed<I: ReaderImages>(
         &mut self,
         grid: &mut TerminalGridStream,
         engine: &mut TerminalProtocolEngine,
         bytes: &[u8],
         replies: &mut Vec<u8>,
         filters: Option<&bmux_terminal_grid::SequenceFilters>,
+        images: &mut I,
     ) {
         let mut observer = ReaderObserver {
             engine,
@@ -2388,6 +2390,7 @@ impl PaneReader {
             signals: &mut self.signals,
             profile: self.profile,
             filters: NoFilters,
+            images,
         };
         match filters {
             None => grid.process_observed(bytes, &mut observer),
@@ -2400,17 +2403,91 @@ impl PaneReader {
                     signals: observer.signals,
                     profile: observer.profile,
                     filters,
+                    images: observer.images,
                 },
             ),
         }
     }
+}
 
-    /// Rows scrolled since the last call, to move image positions by.
-    #[cfg(feature = "image-registry")]
-    fn drain_scroll_delta(&mut self, grid: &TerminalGridStream) -> u16 {
-        let total = grid.grid().viewport_scroll_revision();
-        let delta = total.wrapping_sub(self.scrolled.replace(total).unwrap_or(total));
-        u16::try_from(delta).unwrap_or(u16::MAX)
+/// What the pane reader does after each operation its grid applies, statically: [`NoImages`]
+/// does nothing and compiles to nothing.
+trait ReaderImages {
+    fn operation(&mut self, grid: &TerminalGrid);
+}
+
+/// No image on screen to move.
+struct NoImages;
+
+impl ReaderImages for NoImages {
+    #[inline]
+    fn operation(&mut self, _grid: &TerminalGrid) {}
+}
+
+/// Images on screen, moved with each grid operation in order: erased with the display or
+/// history, reset with the terminal, switched with the screen, and scrolled.
+#[cfg(feature = "image-registry")]
+struct FollowImages<'a> {
+    registry: &'a mut bmux_image::ImageRegistry,
+    erase: u64,
+    history_erase: u64,
+    reset: u64,
+    /// The grid's viewport scroll revision already applied to image positions.
+    scrolled: u64,
+    /// The first failure; images are not followed after it.
+    error: Option<std::io::Error>,
+}
+
+#[cfg(feature = "image-registry")]
+impl<'a> FollowImages<'a> {
+    fn new(
+        registry: &'a mut bmux_image::ImageRegistry,
+        grid: &TerminalGrid,
+        scrolled: u64,
+    ) -> Self {
+        Self {
+            registry,
+            erase: grid.display_erase_revision(),
+            history_erase: grid.history_erase_revision(),
+            reset: grid.reset_revision(),
+            scrolled,
+            error: None,
+        }
+    }
+
+    fn follow(&mut self, grid: &TerminalGrid) -> std::io::Result<()> {
+        let registry = &mut *self.registry;
+        if self.reset != grid.reset_revision() {
+            self.reset = grid.reset_revision();
+            registry.reset();
+        }
+        registry.set_alternate_screen(grid.mode() == bmux_terminal_grid::GridMode::Alternate);
+        let (erase, history_erase) = (grid.display_erase_revision(), grid.history_erase_revision());
+        if self.history_erase != history_erase {
+            registry.clear();
+        } else if self.erase != erase {
+            registry.clear_display();
+        }
+        (self.erase, self.history_erase) = (erase, history_erase);
+        let total = grid.viewport_scroll_revision();
+        let rows = u16::try_from(total.wrapping_sub(std::mem::replace(&mut self.scrolled, total)))
+            .unwrap_or(u16::MAX);
+        if rows > 0 {
+            registry.scroll_up(rows)?;
+            registry.evict_history(grid.max_scrollback_offset());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "image-registry")]
+impl ReaderImages for FollowImages<'_> {
+    fn operation(&mut self, grid: &TerminalGrid) {
+        if self.error.is_none()
+            && let Err(error) = self.follow(grid)
+        {
+            self.error = Some(error);
+        }
     }
 }
 
@@ -2433,7 +2510,7 @@ fn active_filters(
 
 /// What the pane reader observes of its grid's parse: queries answered by the protocol engine with
 /// the cursor and modes as of each query, and pointer-shape queries answered for the bmux profile.
-struct ReaderObserver<'a, F> {
+struct ReaderObserver<'a, F, I> {
     engine: &'a mut TerminalProtocolEngine,
     replies: &'a mut Vec<u8>,
     pointer_replies: &'a mut Vec<u8>,
@@ -2441,6 +2518,8 @@ struct ReaderObserver<'a, F> {
     profile: ProtocolProfile,
     /// Plugin output filters: [`NoFilters`] when none is registered.
     filters: F,
+    /// What follows each grid operation: [`NoImages`] with no image on screen.
+    images: &'a mut I,
 }
 
 /// The output filters a pane reader consults, statically: [`NoFilters`] keeps everything and
@@ -2603,7 +2682,11 @@ impl PaneSignal {
     }
 }
 
-impl<F: ReaderFilters> SequenceObserver for ReaderObserver<'_, F> {
+impl<F: ReaderFilters, I: ReaderImages> SequenceObserver for ReaderObserver<'_, F, I> {
+    fn operation(&mut self, grid: &TerminalGrid) {
+        self.images.operation(grid);
+    }
+
     fn keep_csi(&mut self, sequence: &SequenceHeader<'_>) -> bool {
         self.filters.keep_csi(sequence)
     }
@@ -2850,6 +2933,7 @@ fn follow_output(
         &filtered,
         replies,
         active_filters(guard.as_deref()),
+        &mut NoImages,
     );
 }
 
@@ -2981,50 +3065,23 @@ fn image_terminal_bytes(
     bytes: &[u8],
     replies: &mut Vec<u8>,
 ) -> std::io::Result<()> {
-    // With no image anywhere, screen changes only flip registry state: apply the chunk's in
-    // one pass. Images move with each change in order, so then the chunk goes byte by byte.
-    let unit = if registry.holds_nothing() {
-        bytes.len()
-    } else {
-        1
-    };
-    reader
+    let scrolled = *reader
         .scrolled
         .get_or_insert_with(|| grid.grid().viewport_scroll_revision());
-    // Read once for the chunk: with an image on screen it is fed a byte at a time.
     let shared = reader.filters.clone();
     let guard = read_filters(shared.as_ref());
     let filters = active_filters(guard.as_deref());
-    // Units of `unit` bytes in order (one, empty, for empty bytes).
-    let mut start = 0;
-    loop {
-        let end = (start + unit.max(1)).min(bytes.len());
-        let unit = &bytes[start..end];
-        start = end;
-        let erase = grid.grid().display_erase_revision();
-        let history_erase = grid.grid().history_erase_revision();
-        let reset = grid.grid().reset_revision();
-        reader.feed(grid, protocol, unit, replies, filters);
-        if reset != grid.grid().reset_revision() {
-            registry.reset();
-        }
-        registry
-            .set_alternate_screen(grid.grid().mode() == bmux_terminal_grid::GridMode::Alternate);
-        if history_erase != grid.grid().history_erase_revision() {
-            registry.clear();
-        } else if erase != grid.grid().display_erase_revision() {
-            registry.clear_display();
-        }
-        let scrolled = reader.drain_scroll_delta(grid);
-        if scrolled > 0 {
-            registry.scroll_up(scrolled)?;
-            registry.evict_history(grid.grid().max_scrollback_offset());
-        }
-        if start >= bytes.len() {
-            break;
-        }
+    let mut images = FollowImages::new(registry, grid.grid(), scrolled);
+    // Images on screen move with each change in order: follow every operation, in the grid's
+    // one pass. With none, screen changes only flip registry state: follow the chunk's at once.
+    if images.registry.holds_nothing() {
+        reader.feed(grid, protocol, bytes, replies, filters, &mut NoImages);
+    } else {
+        reader.feed(grid, protocol, bytes, replies, filters, &mut images);
     }
-    Ok(())
+    images.operation(grid.grid());
+    reader.scrolled = Some(images.scrolled);
+    images.error.map_or(Ok(()), Err)
 }
 
 #[cfg(all(test, feature = "image-registry"))]
@@ -3151,6 +3208,67 @@ mod image_lifecycle_tests {
             assert_eq!(images[0].position_col, 0);
             assert!(!images[0].raw_data.is_empty());
         }
+    }
+
+    /// Images follow the grid's operations in its one pass exactly as they would byte by byte:
+    /// a stream of images, scrolling, erases and screen switches leaves the same image positions
+    /// (on screen and in history) and the same screen whole or a byte per chunk.
+    #[test]
+    fn images_follow_grid_operations_alike_whole_or_byte_by_byte() {
+        let image = b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\";
+        let mut stream = b"first\r\n".to_vec();
+        stream.extend_from_slice(image);
+        stream.extend_from_slice(b"\r\na\r\nb\r\nc\r\n");
+        stream.extend_from_slice(image);
+        stream.extend_from_slice(b"\r\nwrapping text that runs past the edge of the pane\r\n");
+        stream.extend_from_slice(b"\x1b[?1049h");
+        stream.extend_from_slice(image);
+        stream.extend_from_slice(b"alt\r\n\x1b[2J\x1b[?1049l");
+        stream.extend_from_slice(b"d\r\ne\r\n\x1b[2J");
+        stream.extend_from_slice(image);
+        stream.extend_from_slice(b"\r\nf");
+        let follow = |chunk_size: usize| {
+            let mut tracker = PaneCursorTracker::new(3, 20);
+            let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+            let mut registry = bmux_image::ImageRegistry::default();
+            let mut interceptor = bmux_image::ImageInterceptor::new();
+            for chunk in stream.chunks(chunk_size) {
+                let mut output = interceptor.process(chunk);
+                ordered_image_output(
+                    &mut tracker.reader,
+                    &mut tracker.terminal_grid,
+                    &mut protocol,
+                    &mut registry,
+                    &mut output,
+                    (8, 16),
+                    &mut Vec::new(),
+                )
+                .unwrap();
+            }
+            let place = |image: &bmux_image::PaneImage| {
+                (image.position.row, image.position.col, image.cell_size.rows)
+            };
+            let visible: Vec<_> = registry.images().iter().map(place).collect();
+            let history: Vec<Vec<_>> = (0..8)
+                .map(|offset| {
+                    registry
+                        .images_in_viewport(offset, 3)
+                        .into_iter()
+                        .map(place)
+                        .collect()
+                })
+                .collect();
+            let screen = bmux_terminal_grid::visible_text(tracker.terminal_grid.grid(), 0, 3);
+            (visible, history, screen)
+        };
+        let whole = follow(stream.len());
+        assert!(!whole.0.is_empty(), "an image stays on screen");
+        assert!(
+            whole.1.iter().skip(1).any(|images| !images.is_empty()),
+            "an image scrolled into history: {whole:?}"
+        );
+        assert_eq!(follow(1), whole);
+        assert_eq!(follow(7), whole);
     }
 
     #[test]
@@ -3376,7 +3494,14 @@ fn protocol_reply_for_chunk(
     chunk: &[u8],
 ) -> Vec<u8> {
     let mut replies = Vec::new();
-    reader.feed(grid, protocol_engine, chunk, &mut replies, None);
+    reader.feed(
+        grid,
+        protocol_engine,
+        chunk,
+        &mut replies,
+        None,
+        &mut NoImages,
+    );
     replies
 }
 
@@ -18777,6 +18902,7 @@ exit 7"#
                 bytes,
                 replies,
                 active_filters(guard.as_deref()),
+                &mut NoImages,
             );
         };
         feed(
