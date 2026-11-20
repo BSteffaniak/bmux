@@ -259,6 +259,73 @@ fn replicas_stay_level_with_their_source_through_random_output() {
     }
 }
 
+/// Bring `replica` level with `relay`, itself a replica, through a frame `relay` writes; say
+/// whether it was a reset frame.
+fn relay_sync(relay: &mut TerminalGrid, replica: &mut Replica, context: &str) -> bool {
+    let mut bytes = Vec::new();
+    let summary = relay.write_frame_since(replica.cursor, usize::MAX, &mut bytes);
+    replica
+        .grid
+        .apply_frame(&bytes, &mut replica.cursor)
+        .unwrap_or_else(|error| panic!("{context}: {error}"));
+    assert_eq!(
+        replicated(&replica.grid),
+        replicated(relay),
+        "{context}: relayed replica differs from the relay"
+    );
+    summary.reset
+}
+
+#[test]
+fn frames_relay_through_a_replica_to_replicas_of_its_own() {
+    for seed in 1..=12_u64 {
+        let mut rng = Rng(seed.wrapping_mul(0xD1B5_4A32_D192_ED03) | 1);
+        let limits = GridLimits {
+            scrollback_rows: [0, 3, 500][usize::try_from(seed % 3).unwrap_or(0)],
+        };
+        let mut source = TerminalGridStream::new(90, 30, limits).unwrap();
+        let (mut relay, mut downstream) = (Replica::new(), Replica::new());
+        let mut incremental = 0;
+        let mut out = Vec::new();
+        for step in 0..300 {
+            out.clear();
+            for _ in 0..=rng.below(4) {
+                burst(&mut rng, &mut out);
+            }
+            source.process(&out);
+            if rng.chance(2) {
+                let cols = 20 + u16::try_from(rng.pick(100)).unwrap_or(0);
+                let rows = 5 + u16::try_from(rng.pick(40)).unwrap_or(0);
+                source.resize(cols, rows).unwrap();
+            }
+            let context = format!("seed {seed} step {step}");
+            if rng.chance(70) {
+                relay.sync(&mut source, &format!("{context} relay"));
+            }
+            // The relay's own replica follows it at its own pace, several upstream frames at a
+            // time or one.
+            if rng.chance(40) && !relay_sync(&mut relay.grid, &mut downstream, &context) {
+                incremental += 1;
+            }
+        }
+        relay.sync(&mut source, &format!("seed {seed} final relay"));
+        relay_sync(
+            &mut relay.grid,
+            &mut downstream,
+            &format!("seed {seed} final"),
+        );
+        assert_eq!(
+            replicated(&downstream.grid),
+            replicated(source.grid()),
+            "seed {seed}: relayed replica differs from the source"
+        );
+        assert!(
+            incremental > 0,
+            "seed {seed}: the relay wrote only reset frames"
+        );
+    }
+}
+
 #[test]
 fn a_frame_for_another_base_is_refused_and_a_reset_frame_recovers() {
     let mut source = TerminalGridStream::new(20, 4, GridLimits::default()).unwrap();

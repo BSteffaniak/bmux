@@ -11,6 +11,9 @@
 //! A replica that cannot be brought forward exactly (it is new, its epoch fell out of the move
 //! log, or the grid was reset or resized) is sent a reset frame, which replaces its whole state.
 //!
+//! A replica records the damage its frames bring as a grid that wrote it would, so it can write
+//! frames for replicas of its own: frames relay through it.
+//!
 //! Frames are bytes, written straight into a caller's buffer ([`TerminalGrid::write_frame_since`])
 //! and applied straight from it ([`TerminalGrid::apply_frame`]), each row decoded into the
 //! storage of the row it replaces: building and applying a frame allocates nothing once the
@@ -216,6 +219,22 @@ impl TerminalGrid {
             self.log_reset();
             return;
         };
+        self.log_frame_move(FrameMove {
+            screen,
+            top,
+            bottom,
+            rows,
+        });
+    }
+
+    /// Note a move of rows of either screen, for replicas.
+    fn log_frame_move(&mut self, movement: FrameMove) {
+        let FrameMove {
+            screen,
+            top,
+            bottom,
+            rows,
+        } = movement;
         let open = self.damage.open();
         // Scrolling a region again the same way within an epoch is one longer scroll: rows moved
         // out are gone either way, and every row exposed is sent.
@@ -471,6 +490,8 @@ impl TerminalGrid {
         }
         let styles: Vec<Style> = input.blob()?;
         if reset {
+            // This grid's own replicas (it may relay frames on) are sent a reset frame next.
+            self.log_reset();
             self.palette = StylePalette::from_styles(styles);
             self.width = width;
             self.height = height;
@@ -553,8 +574,11 @@ impl TerminalGrid {
             FrameScreen::Alternate => GridMode::Alternate,
         };
         if active == self.mode {
-            self.note_viewport_scroll(top, bottom, i64::from(movement.rows));
+            self.viewport_scroll = self
+                .viewport_scroll
+                .then(top, bottom, i64::from(movement.rows));
         }
+        self.log_frame_move(movement);
         Ok(())
     }
 
@@ -568,6 +592,7 @@ impl TerminalGrid {
         reset: bool,
     ) -> Result<(), FrameApplyError> {
         if flags & FLAG_HISTORY_CLEARED != 0 {
+            self.log_history_clear();
             let retained: usize = self
                 .main_history
                 .iter()
@@ -605,6 +630,7 @@ impl TerminalGrid {
             }
         }
         if flags & FLAG_PENDING_HISTORY != 0 {
+            self.log_pending_change();
             let mut pending = std::mem::take(&mut self.pending_history_cells);
             self.history_bytes = self
                 .history_bytes
