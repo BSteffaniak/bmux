@@ -701,7 +701,11 @@ fn write_line(out: &mut Vec<u8>, cells: &[Cell]) {
     out.push(u8::from(!shape.single));
     put(out, shape.text as u64);
     for cell in logical() {
-        out.extend_from_slice(cell.text().as_bytes());
+        // One byte (nearly every cell) without a copy call.
+        match cell.text().as_bytes() {
+            [byte] => out.push(*byte),
+            text => out.extend_from_slice(text),
+        }
     }
     let mut current = cells.first().map_or(0, |cell| cell.style.0);
     for (index, cell) in (0_u64..).zip(logical()) {
@@ -824,6 +828,8 @@ fn read_line(
                 wide_left -= 1;
             }
             cells.reserve(len + wide);
+            // Text of single-character cells that is all ASCII is one byte per cell.
+            let ascii = !ends && text.is_ascii();
             let mut chars = text.char_indices();
             let mut start = 0_usize;
             for index in 0..len as u64 {
@@ -837,7 +843,9 @@ fn read_line(
                         runs_left -= 1;
                     }
                 }
-                let end = if ends {
+                let end = if ascii {
+                    start + 1
+                } else if ends {
                     usize::try_from(end_list.number()?).map_err(|_| malformed)?
                 } else {
                     chars
