@@ -5340,16 +5340,17 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     // attachment owns one, plus the frontend instances bound to it.
     let embedder_frontend_bindings = terminal.take_frontend_bindings();
     let compatibility_hosts = embedder_frontend_bindings.is_none();
+    // One typed state registry for this attachment, shared by its frontend
+    // plugin activations and its presentation companions, so state one
+    // publishes (presentation facts, for example) is the state the other reads.
+    let attach_states = std::sync::Arc::new(bmux_plugin::PluginStateRegistry::new());
     let mut frontend_bindings = embedder_frontend_bindings.or_else(|| {
         let (registrar, bindings) = super::frontend_bindings::FrontendBindings::channel();
-        // Frontends see this attachment's presentation bus and their own
-        // state registry, never process-wide copies.
+        // Frontends see this attachment's presentation bus and state
+        // registry, never process-wide copies.
         view_state.owned_frontends = Some(std::sync::Arc::new(
             crate::runtime::plugin_runtime::OwnedFrontends::new(registrar.activation_binder())
-                .with_host_handles(
-                    presentation_events.clone(),
-                    std::sync::Arc::new(bmux_plugin::PluginStateRegistry::new()),
-                ),
+                .with_host_handles(presentation_events.clone(), attach_states.clone()),
         ));
         Some(bindings)
     });
@@ -5446,7 +5447,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         surfaces: view_state.presentation_surfaces.clone(),
         input: view_state.presentation_input.clone(),
         events: view_state.presentation_events.clone(),
-        states: std::sync::Arc::new(bmux_plugin::PluginStateRegistry::new()),
+        states: attach_states,
         plugin_settings: std::sync::Arc::new(attach_config.plugins.settings.clone()),
         local_state_dir: Some(attach_config_paths().state_dir()),
     };
