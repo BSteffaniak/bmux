@@ -73,6 +73,80 @@ fn scene(pane_id: Uuid, (cols, rows): (u16, u16)) -> AttachScene {
     }
 }
 
+/// The decoration plugin's scene for `scene`'s panes, at `revision`: each pane inside a rounded
+/// border (the first focused) with `title(pane)` on it, as the default decoration draws them.
+fn decoration_scene(
+    scene: &AttachScene,
+    revision: u64,
+    title: impl Fn(usize) -> String,
+) -> bmux_scene_protocol::scene_protocol::DecorationScene {
+    use bmux_scene_protocol::scene_protocol::{
+        BorderGlyphs, Color, DecorationScene, NamedColor, PaintCommand, Rect, Style,
+        SurfaceDecoration,
+    };
+    let style = |focused: bool| Style {
+        fg: Some(Color::Named {
+            name: if focused {
+                NamedColor::BrightCyan
+            } else {
+                NamedColor::BrightBlack
+            },
+        }),
+        bg: None,
+        bold: focused,
+        underline: false,
+        italic: false,
+        reverse: false,
+        dim: false,
+        blink: false,
+        strikethrough: false,
+    };
+    let scene_rect = |rect: AttachRect| Rect {
+        x: rect.x,
+        y: rect.y,
+        w: rect.w,
+        h: rect.h,
+    };
+    let surfaces = scene
+        .surfaces
+        .iter()
+        .enumerate()
+        .map(|(index, surface)| {
+            let rect = surface.rect;
+            let decoration = SurfaceDecoration {
+                surface_id: surface.id,
+                rect: scene_rect(rect),
+                content_rect: scene_rect(surface.content_rect),
+                before_content_paint_commands: Vec::new(),
+                paint_commands: vec![
+                    PaintCommand::BoxBorder {
+                        rect: scene_rect(rect),
+                        z: 0,
+                        glyphs: BorderGlyphs::Rounded,
+                        style: style(index == 0),
+                    },
+                    PaintCommand::Text {
+                        col: rect.x + 2,
+                        row: rect.y,
+                        z: 1,
+                        text: title(index),
+                        style: style(index == 0),
+                    },
+                ],
+                interactive_regions: Vec::new(),
+            };
+            (surface.id, decoration)
+        })
+        .collect();
+    DecorationScene {
+        revision,
+        surfaces,
+        animation: None,
+        input_hooks: Vec::new(),
+        visual_adapters: Vec::new(),
+    }
+}
+
 /// Whether a synchronized update is open after `bytes`, given it was `open` before.
 fn sync_after(open: bool, bytes: &[u8]) -> bool {
     let last = |marker: &[u8]| {
@@ -152,7 +226,66 @@ struct Replay {
     appearance: bmux_appearance::RuntimeAppearance,
     graphics: crate::TerminalGraphicsCache,
     scrollback: PaneScrollbackViews,
+    /// Render extensions sampled every frame as the attach client samples them.
+    extensions: Option<Extensions>,
     probe: Probe,
+}
+
+/// Render extensions a replay samples before each frame, as the attach client does: the
+/// producers, and the retained intent sampled from them for the frame being rendered.
+struct Extensions {
+    /// The bus the decoration renderer reads its scene from.
+    bus: bmux_plugin::EventBus,
+    sources: Vec<std::sync::Arc<dyn bmux_plugin::AttachRenderExtension>>,
+    retained: crate::retained_extensions::RetainedExtensions,
+    prepared: std::sync::Arc<[std::sync::Arc<dyn bmux_plugin::AttachRenderExtension>]>,
+}
+
+impl Extensions {
+    /// What `extensions` (when there are any) sampled for this frame of `scene`.
+    fn sampled<'a>(
+        extensions: &'a mut Option<Self>,
+        scene: &AttachScene,
+        capabilities: bmux_plugin::TerminalRenderCapabilities,
+    ) -> &'a [std::sync::Arc<dyn bmux_plugin::AttachRenderExtension>] {
+        extensions.as_mut().map_or(&[][..], |extensions| {
+            extensions.sample(scene, capabilities);
+            &extensions.prepared[..]
+        })
+    }
+
+    /// Sample every visible surface's intent, as the attach client's producer phase does.
+    fn sample(
+        &mut self,
+        scene: &AttachScene,
+        capabilities: bmux_plugin::TerminalRenderCapabilities,
+    ) {
+        let surfaces = scene
+            .surfaces
+            .iter()
+            .filter(|surface| surface.visible)
+            .map(|surface| {
+                (
+                    surface.id,
+                    bmux_plugin::ExtensionRect::new(
+                        surface.rect.x,
+                        surface.rect.y,
+                        surface.rect.w,
+                        surface.rect.h,
+                    ),
+                    bmux_plugin::RenderExtensionContext {
+                        capabilities,
+                        surface_role: bmux_plugin::RenderSurfaceRole::Content,
+                        opaque_occluders: Vec::new(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        self.prepared = self
+            .retained
+            .refresh(&self.sources, &surfaces)
+            .expect("extension intent within budget");
+    }
 }
 
 struct Rendered {
@@ -202,6 +335,7 @@ impl Replay {
             appearance: bmux_appearance::RuntimeAppearance::default(),
             graphics: crate::TerminalGraphicsCache::new(),
             scrollback: PaneScrollbackViews::new(),
+            extensions: None,
             probe: Probe::new(),
         }
     }
@@ -260,6 +394,46 @@ impl Replay {
         replay
     }
 
+    /// `panes` panes side by side, each inside the decoration renderer's border with a title on
+    /// it (as the default decoration draws them), the first fed the frames and the others idle.
+    /// Frames are written for the first pane's content.
+    fn decorated(size: (u16, u16), panes: u16, chunk_size: usize) -> Self {
+        let mut replay = Self::split(size, panes, chunk_size);
+        replay.fed.truncate(1);
+        for surface in &mut replay.scene.surfaces {
+            let rect = surface.rect;
+            surface.content_rect = AttachRect {
+                x: rect.x + 1,
+                y: rect.y + 1,
+                w: rect.w - 2,
+                h: rect.h - 2,
+            };
+            replay
+                .buffers
+                .get_mut(&surface.id)
+                .expect("pane buffer")
+                .terminal_grid
+                .resize(rect.w - 2, rect.h - 2)
+                .expect("grid size");
+        }
+        let bus = bmux_plugin::EventBus::new();
+        let renderer = bmux_decoration_plugin_renderer::renderer_for_bus(
+            &bus,
+            std::sync::Arc::new(bmux_plugin::VisualAdapterRegistry::new()),
+        );
+        bmux_decoration_plugin_renderer::publish_relayed_scene_on(
+            &bus,
+            decoration_scene(&replay.scene, 1, |pane| format!(" {pane}: shell ")),
+        );
+        replay.extensions = Some(Extensions {
+            bus,
+            sources: vec![renderer],
+            retained: crate::retained_extensions::RetainedExtensions::default(),
+            prepared: std::sync::Arc::from(Vec::new()),
+        });
+        replay
+    }
+
     /// Apply `frame` and render, writing what the host terminal receives to `output`.
     fn frame(&mut self, frame: &[u8], output: &mut Vec<u8>) -> Rendered {
         let encoded = self.serve(frame);
@@ -285,6 +459,7 @@ impl Replay {
             margins: self.margins,
             host: false,
         };
+        let extensions = Extensions::sampled(&mut self.extensions, &self.scene, capabilities);
         let (scene, policy, size, buffers) =
             (&self.scene, self.policy, self.size, &mut self.buffers);
         let (graphics, scrollback, appearance, images) = (
@@ -311,7 +486,7 @@ impl Replay {
                         size,
                         appearance,
                         policy,
-                        &[],
+                        extensions,
                         capabilities,
                         &[],
                         None,
@@ -682,6 +857,92 @@ fn a_presenter_shows_the_pane_after_every_frame() {
     );
 }
 
+/// Decorated panes show their borders and titles on the host after every frame, while the
+/// streaming pane's content shows inside its border: an unchanged decoration, whose sample is
+/// reused frame after frame, still renders, and one that changes (a new title halfway through)
+/// shows its change.
+#[test]
+fn decorated_panes_keep_their_borders_and_titles() {
+    let size = (60, 16);
+    let mut replay = Replay::decorated(size, DECORATED_PANES, 97);
+    let content = replay.scene.surfaces[0].content_rect;
+    let frames = corpus::generated((content.w, content.h), 24)
+        .into_iter()
+        .find(|corpus| corpus.name == "plain-stream")
+        .expect("plain-stream corpus")
+        .frames;
+    let mut host = bmux_terminal_grid::TerminalGridStream::new(
+        size.0,
+        size.1,
+        bmux_terminal_grid::GridLimits::default(),
+    )
+    .expect("host terminal");
+    let renamed = frames.len() / 2;
+    let title = |frame: usize, pane: usize| {
+        if frame >= renamed && pane == 2 {
+            format!(" {pane}: vim ")
+        } else {
+            format!(" {pane}: shell ")
+        }
+    };
+    let mut output = Vec::new();
+    for (index, frame) in frames.iter().enumerate() {
+        if index == renamed {
+            let extensions = replay.extensions.as_ref().expect("decorations");
+            bmux_decoration_plugin_renderer::publish_relayed_scene_on(
+                &extensions.bus,
+                decoration_scene(&replay.scene, 2, |pane| title(index, pane)),
+            );
+        }
+        output.clear();
+        let rendered = replay.frame(frame, &mut output);
+        host.process(&output);
+        if rendered.stats.pane_rows_sync_deferred > 0 {
+            continue;
+        }
+        for (pane, surface) in replay.scene.surfaces.iter().enumerate() {
+            let (x, y) = (usize::from(surface.rect.x), usize::from(surface.rect.y));
+            let bottom = y + usize::from(surface.rect.h) - 1;
+            let right = x + usize::from(surface.rect.w) - 1;
+            for (row, col, glyph) in [
+                (y, x, "\u{256d}"),
+                (y, right, "\u{256e}"),
+                (bottom, x, "\u{2570}"),
+                (bottom, right, "\u{256f}"),
+            ] {
+                assert_eq!(
+                    shown(host.grid(), row, col).0,
+                    glyph,
+                    "frame {index}: pane {pane}'s border at row {row} column {col}"
+                );
+            }
+            // The title, then the border up to the corner (where a longer title was).
+            let title = title(index, pane);
+            let title = format!(
+                "{title}{}",
+                "\u{2500}".repeat(right - x - 2 - title.chars().count())
+            );
+            let shown_title = (x + 2..right)
+                .map(|col| shown(host.grid(), y, col).0)
+                .collect::<String>();
+            assert_eq!(shown_title, title, "frame {index}: pane {pane}'s title");
+        }
+        for row in 0..usize::from(content.h) {
+            for col in 0..usize::from(content.w) {
+                assert_eq!(
+                    shown(
+                        host.grid(),
+                        usize::from(content.y) + row,
+                        usize::from(content.x) + col
+                    ),
+                    shown(replay.pane(), row, col),
+                    "frame {index}: host differs from the pane at row {row} column {col}",
+                );
+            }
+        }
+    }
+}
+
 /// An observer paints the frames the host terminal presents into its own published frames: after
 /// every frame both hold the same cells, whether or not the observer still holds earlier frames.
 #[test]
@@ -819,7 +1080,10 @@ fn pipeline_bench() {
 ///     --ignored --exact pipeline_bench::pipeline_bench_loop
 /// ```
 ///
-/// A corpus named `generated:NAME` is that generated corpus. `BMUX_BENCH_MODE` is `terminal`
+/// A corpus named `generated:NAME` is that generated corpus, and `generated:NAME/decorated` that
+/// corpus on the decorated panes of the `plain-stream/decorated` scenario (`generated:idle/decorated`
+/// those panes with none fed, as in `idle/decorated`). `BMUX_BENCH_MODE` is
+/// `terminal`
 /// (rendered and presented, the default), `observed` (presented and also prepared and published
 /// as an observed client does) or `apply` (applying only, to subtract). The first
 /// corpus in `BMUX_BENCH_CORPUS` is played `BMUX_BENCH_ROUNDS` times (5 by default).
@@ -828,11 +1092,18 @@ fn pipeline_bench() {
 fn pipeline_bench_loop() {
     let paths = std::env::var("BMUX_BENCH_CORPUS").expect("BMUX_BENCH_CORPUS");
     let path = paths.split(',').next().expect("a corpus");
+    let decorated = path.ends_with(DECORATED);
+    let path = path.strip_suffix(DECORATED).unwrap_or(path);
+    let idle = decorated && path == "generated:idle";
+    let path = if idle { "generated:plain-stream" } else { path };
     let frames = path.strip_prefix("generated:").map_or_else(
         || corpus::read(std::path::Path::new(path)).expect("corpus"),
         |name| {
-            // An image scenario's frames are written to the left pane of two.
-            let corpus_size = if std::env::var_os("BMUX_BENCH_IMAGE").is_some() {
+            // An image scenario's frames are written to the left pane of two, a decorated one's
+            // to the first decorated pane's content.
+            let corpus_size = if decorated {
+                decorated_pane_content(size())
+            } else if std::env::var_os("BMUX_BENCH_IMAGE").is_some() {
                 (split_pane_width(size().0, 2), size().1)
             } else {
                 size()
@@ -848,8 +1119,15 @@ fn pipeline_bench_loop() {
     let rounds =
         std::env::var("BMUX_BENCH_ROUNDS").map_or(5, |rounds| rounds.parse().expect("rounds"));
     for _ in 0..rounds {
-        let mut replay =
-            image_loop_replay().unwrap_or_else(|| Replay::new(size(), true, delivery()));
+        let mut replay = if decorated {
+            let mut replay = Replay::decorated(size(), DECORATED_PANES, delivery());
+            if idle {
+                replay.fed.clear();
+            }
+            replay
+        } else {
+            image_loop_replay().unwrap_or_else(|| Replay::new(size(), true, delivery()))
+        };
         if mode == "observed" {
             replay.observer = Some(bmux_tui::presentation::PresentationState::new(
                 bmux_tui::geometry::Rect::new(0, 0, replay.size.0, replay.size.1),
@@ -881,6 +1159,16 @@ fn image_loop_replay() -> Option<Replay> {
     }
     #[cfg(not(all(feature = "image-kitty", feature = "image-sixel")))]
     panic!("BMUX_BENCH_IMAGE={protocol} needs the image-kitty and image-sixel features")
+}
+
+/// The suffix naming a corpus's decorated scenario.
+const DECORATED: &str = "/decorated";
+/// Panes of the decorated scenario.
+const DECORATED_PANES: u16 = 4;
+
+/// The content size of each of the decorated scenario's panes, across `size`.
+fn decorated_pane_content(size: (u16, u16)) -> (u16, u16) {
+    (split_pane_width(size.0, DECORATED_PANES) - 2, size.1 - 2)
 }
 
 /// The width of each of `panes` panes side by side across `cols`, one column apart.
@@ -1091,6 +1379,28 @@ fn metrics_report() -> Report {
             ));
         }
     }
+    // Four decorated panes, one streaming: the decorations' retained intent is sampled every
+    // frame as the attach client samples it, and does not change.
+    let decorated_stream = corpus::generated(decorated_pane_content(size), frames)
+        .into_iter()
+        .find(|corpus| corpus.name == "plain-stream")
+        .expect("plain-stream corpus")
+        .frames;
+    report.scenarios.extend(measure(
+        &format!("plain-stream{DECORATED}"),
+        || Replay::decorated(size, DECORATED_PANES, delivery()),
+        &decorated_stream,
+    ));
+    // The same panes with none streaming: what rendering costs when nothing changed at all.
+    report.scenarios.extend(measure(
+        &format!("idle{DECORATED}"),
+        || {
+            let mut replay = Replay::decorated(size, DECORATED_PANES, delivery());
+            replay.fed.clear();
+            replay
+        },
+        &decorated_stream,
+    ));
     report.scenarios.extend(measure(
         "scattered-edits",
         || Replay::new(size, true, delivery()),

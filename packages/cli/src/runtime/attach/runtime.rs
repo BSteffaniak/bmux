@@ -10931,12 +10931,8 @@ fn refresh_retained_extensions(
     preview_surfaces.extend(current_overlays.iter().map(|surface| {
         retained_surface_from_attach_surface(surface, RetainedOpacity::Opaque, Vec::new())
     }));
-    let mut geometry_preview = view.retained_compositor.clone();
-    geometry_preview.replace_surfaces(
-        preview_surfaces,
-        DamageRect::new(0, 0, geometry.cols, geometry.rows),
-        DamageCoalescingPolicy::default(),
-    );
+    let geometry_preview =
+        bmux_attach_pipeline::RetainedCompositor::from_surfaces(preview_surfaces);
     let occluders = geometry_preview
         .content_occluders()
         .into_iter()
@@ -11000,10 +10996,10 @@ fn refresh_retained_extensions(
             },
         ));
     }
-    view.prepared_extensions = Some(super::retained_extensions::refresh(
-        &view.presentation_extensions.snapshot(),
-        &surfaces,
-    )?);
+    view.prepared_extensions = Some(
+        view.retained_extensions
+            .refresh(&view.presentation_extensions.snapshot(), &surfaces)?,
+    );
     Ok(())
 }
 

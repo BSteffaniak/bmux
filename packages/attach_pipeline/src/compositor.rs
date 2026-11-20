@@ -1031,6 +1031,18 @@ impl RetainedCompositor {
         }
     }
 
+    /// A compositor holding `surfaces`, as [`Self::replace_surfaces`] leaves one, without
+    /// computing the damage of the change.
+    #[must_use]
+    pub fn from_surfaces(surfaces: impl IntoIterator<Item = RetainedSurface>) -> Self {
+        Self {
+            surfaces: surfaces
+                .into_iter()
+                .map(|surface| (surface.id, surface))
+                .collect(),
+        }
+    }
+
     #[must_use]
     pub const fn surfaces(&self) -> &BTreeMap<Uuid, RetainedSurface> {
         &self.surfaces

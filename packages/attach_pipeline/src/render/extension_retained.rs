@@ -1,6 +1,4 @@
-use crate::types::{
-    ExtensionRetainedItemCacheEntry, ExtensionRetainedLayerCacheEntry, PaneRect, PaneRenderBuffer,
-};
+use crate::types::{ExtensionRetainedLayerCacheEntry, PaneRect, PaneRenderBuffer};
 use bmux_plugin::{
     BorderGlyphs, ExtensionRect, RenderCell, RenderDamage, RenderLayerItem,
     RenderLayerScene as PluginRenderLayerScene, RenderOp, RenderSceneItem as PluginRenderSceneItem,
@@ -9,6 +7,7 @@ use bmux_plugin::{
 };
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
 use super::{DamageCoalescingPolicy, DamageRect, coalesce_render_damage};
 
@@ -215,7 +214,7 @@ pub(super) enum RenderSceneItemKind {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct ExtensionRetainedLayerSnapshot {
+pub struct ExtensionRetainedLayerSnapshot {
     pub(super) surface_rect: ExtensionRect,
     pub(super) revision: Option<u64>,
     pub(super) items: Vec<RenderSceneItem>,
@@ -244,7 +243,25 @@ pub(super) struct ExtensionLayerDiffPlan {
     pub(super) changed_items: Vec<RenderSceneItemKey>,
     pub(super) added_items: Vec<RenderSceneItemKey>,
     pub(super) removed_items: Vec<RenderSceneItemKey>,
-    pub(super) output_items: Vec<RenderSceneItem>,
+    /// Items of a reused scene: unchanged, without having been compared.
+    pub(super) reused_items: usize,
+}
+
+impl ExtensionLayerDiffPlan {
+    /// The plan of a layer whose extension answered with the very scene it emitted last: nothing
+    /// to update or clean up, its `items` all unchanged.
+    pub(super) const fn reused(items: usize) -> Self {
+        Self {
+            update_damage: RenderDamage::None,
+            stale_cleanup_damage: RenderDamage::None,
+            content_replay_damage: Vec::new(),
+            unchanged_items: Vec::new(),
+            changed_items: Vec::new(),
+            added_items: Vec::new(),
+            removed_items: Vec::new(),
+            reused_items: items,
+        }
+    }
 }
 
 pub(super) fn retained_snapshot_from_plugin_scene(
@@ -262,35 +279,35 @@ pub(super) fn retained_snapshot_from_plugin_scene(
     )
 }
 
-pub(super) fn retained_scene_items_to_render_items(
-    items: &[RenderSceneItem],
+/// `items` in paint order (by z, then key), lowered to render items.
+pub(super) fn retained_scene_items_to_render_items<'a>(
+    items: impl IntoIterator<Item = &'a RenderSceneItem>,
 ) -> Vec<RenderLayerItem> {
-    let mut sorted_items = items.iter().collect::<Vec<_>>();
-    sorted_items.sort_by_key(|item| (item.z, item.key.clone()));
+    let mut sorted_items = items.into_iter().collect::<Vec<_>>();
+    sorted_items.sort_by(|lhs, rhs| (lhs.z, &lhs.key).cmp(&(rhs.z, &rhs.key)));
     sorted_items
         .into_iter()
         .filter_map(retained_scene_item_to_render_item)
         .collect()
 }
 
-pub(super) fn retained_scene_items_for_render_damage(
-    items: &[RenderSceneItem],
+/// The items `damage` repaints: those it touches, and terminal graphics (declared every frame).
+pub(super) fn retained_scene_items_for_render_damage<'a>(
+    items: &'a [RenderSceneItem],
     damage: &RenderDamage,
-) -> Vec<RenderSceneItem> {
+) -> Vec<&'a RenderSceneItem> {
     match damage {
         RenderDamage::None => items
             .iter()
             .filter(|item| matches!(&item.kind, RenderSceneItemKind::TerminalGraphic { .. }))
-            .cloned()
             .collect(),
-        RenderDamage::FullSurface => items.to_vec(),
+        RenderDamage::FullSurface => items.iter().collect(),
         RenderDamage::Regions(regions) => items
             .iter()
             .filter(|item| {
                 matches!(&item.kind, RenderSceneItemKind::TerminalGraphic { .. })
                     || regions.iter().any(|region| item.bounds.intersects(*region))
             })
-            .cloned()
             .collect(),
     }
 }
@@ -470,29 +487,22 @@ pub(super) fn retained_layer_cache_key(
     )
 }
 
-pub(super) fn load_retained_layer_snapshot(
-    pane_buffer: Option<&PaneRenderBuffer>,
+pub(super) fn load_retained_layer_snapshot<'a>(
+    pane_buffer: Option<&'a PaneRenderBuffer>,
     key: &(String, uuid::Uuid),
-) -> Option<ExtensionRetainedLayerSnapshot> {
-    let entry = pane_buffer?.extension_retained_layer_cache.get(key)?;
-    Some(ExtensionRetainedLayerSnapshot::new(
-        entry.surface_rect,
-        entry.revision,
-        entry
-            .items
-            .iter()
-            .map(retained_item_from_cache_entry)
-            .collect(),
-    ))
+) -> Option<&'a ExtensionRetainedLayerCacheEntry> {
+    pane_buffer?.extension_retained_layer_cache.get(key)
 }
 
+/// Retain `snapshot`, built from the extension's `scene`, as what the layer last emitted.
 pub(super) fn commit_retained_layer_snapshot(
     pane_buffers: &mut BTreeMap<uuid::Uuid, PaneRenderBuffer>,
     pane_id: uuid::Uuid,
     key: (String, uuid::Uuid),
     surface_id: uuid::Uuid,
     layer: bmux_plugin::RenderExtensionLayer,
-    snapshot: &ExtensionRetainedLayerSnapshot,
+    snapshot: &Arc<ExtensionRetainedLayerSnapshot>,
+    scene: Option<&Arc<PluginRenderLayerScene>>,
 ) {
     let Some(buffer) = pane_buffers.get_mut(&pane_id) else {
         return;
@@ -501,14 +511,9 @@ pub(super) fn commit_retained_layer_snapshot(
         key,
         ExtensionRetainedLayerCacheEntry {
             surface_id,
-            surface_rect: snapshot.surface_rect,
             layer,
-            revision: snapshot.revision,
-            items: snapshot
-                .items
-                .iter()
-                .map(retained_item_cache_entry)
-                .collect(),
+            scene: scene.cloned(),
+            snapshot: snapshot.clone(),
         },
     );
 }
@@ -643,9 +648,6 @@ pub(super) fn build_extension_layer_diff_plan(
         policy,
     );
     let content_replay_damage = render_damage_content_rects(&stale_cleanup_damage, content_rect);
-    let output_items = current.map_or_else(Vec::new, |snapshot| {
-        retained_scene_items_for_render_damage(snapshot.items.as_slice(), &update_damage)
-    });
     ExtensionLayerDiffPlan {
         update_damage,
         stale_cleanup_damage,
@@ -654,26 +656,7 @@ pub(super) fn build_extension_layer_diff_plan(
         changed_items,
         added_items,
         removed_items,
-        output_items,
-    }
-}
-
-fn retained_item_cache_entry(item: &RenderSceneItem) -> ExtensionRetainedItemCacheEntry {
-    ExtensionRetainedItemCacheEntry {
-        key: item.key.0.clone(),
-        z: item.z,
-        bounds: item.bounds,
-        content_fingerprint: item.content_fingerprint,
-    }
-}
-
-fn retained_item_from_cache_entry(entry: &ExtensionRetainedItemCacheEntry) -> RenderSceneItem {
-    RenderSceneItem {
-        key: RenderSceneItemKey::new(entry.key.clone()),
-        z: entry.z,
-        bounds: entry.bounds,
-        content_fingerprint: entry.content_fingerprint,
-        kind: RenderSceneItemKind::UnderCells { cells: Vec::new() },
+        reused_items: 0,
     }
 }
 
@@ -873,10 +856,12 @@ mod tests {
             key.clone(),
             surface_id,
             bmux_plugin::RenderExtensionLayer::AfterPaneContent,
-            &initial,
+            &Arc::new(initial.clone()),
+            None,
         );
-        let loaded = load_retained_layer_snapshot(pane_buffers.get(&pane_id), &key)
-            .expect("retained snapshot should load from cache");
+        let loaded = &load_retained_layer_snapshot(pane_buffers.get(&pane_id), &key)
+            .expect("retained snapshot should load from cache")
+            .snapshot;
         assert_eq!(loaded.surface_rect, initial.surface_rect);
         assert_eq!(loaded.revision, initial.revision);
         assert_eq!(loaded.items.len(), 1);
@@ -894,10 +879,12 @@ mod tests {
             key.clone(),
             surface_id,
             bmux_plugin::RenderExtensionLayer::AfterPaneContent,
-            &updated,
+            &Arc::new(updated),
+            None,
         );
-        let loaded = load_retained_layer_snapshot(pane_buffers.get(&pane_id), &key)
-            .expect("updated retained snapshot should load from cache");
+        let loaded = &load_retained_layer_snapshot(pane_buffers.get(&pane_id), &key)
+            .expect("updated retained snapshot should load from cache")
+            .snapshot;
         assert_eq!(loaded.revision, Some(2));
         assert_eq!(loaded.items[0].bounds, ExtensionRect::new(1, 0, 6, 1));
 

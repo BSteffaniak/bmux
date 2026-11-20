@@ -32,7 +32,7 @@ use uuid::Uuid;
 mod extension_plans;
 #[allow(dead_code)] // Retained scene primitives are staged before renderer integration and covered by pure diff tests.
 #[path = "render/extension_retained.rs"]
-mod extension_retained;
+pub(crate) mod extension_retained;
 #[path = "render/terminal_graphics.rs"]
 mod terminal_graphics;
 #[path = "render/visible_segments.rs"]
@@ -1356,7 +1356,9 @@ impl AttachSceneRenderStats {
         let added_items = u64::try_from(diff_plan.added_items.len()).unwrap_or(u64::MAX);
         let changed_items = u64::try_from(diff_plan.changed_items.len()).unwrap_or(u64::MAX);
         let removed_items = u64::try_from(diff_plan.removed_items.len()).unwrap_or(u64::MAX);
-        let unchanged_items = u64::try_from(diff_plan.unchanged_items.len()).unwrap_or(u64::MAX);
+        let unchanged_items =
+            u64::try_from(diff_plan.unchanged_items.len() + diff_plan.reused_items)
+                .unwrap_or(u64::MAX);
         let diff_items = added_items
             .saturating_add(changed_items)
             .saturating_add(removed_items)
@@ -3482,6 +3484,7 @@ fn record_before_content_extension_output_plan(
             content_replay_damage,
             output_damage,
             output_items,
+            ..
         } = &plan.action
         {
             stats.record_extension_retained_scene_plan(
@@ -3587,7 +3590,7 @@ fn insert_retained_before_content_under_cells(
     snapshot: &ExtensionRetainedLayerSnapshot,
 ) {
     let mut items = snapshot.items.iter().collect::<Vec<_>>();
-    items.sort_by_key(|item| (item.z, item.key.clone()));
+    items.sort_by(|lhs, rhs| (lhs.z, &lhs.key).cmp(&(rhs.z, &rhs.key)));
     for item in items {
         let RenderSceneItemKind::UnderCells { cells: under_cells } = &item.kind else {
             continue;
@@ -3717,6 +3720,7 @@ fn record_after_content_extension_output_plan(
             content_replay_damage,
             output_damage,
             output_items,
+            ..
         } = &plan.action
         {
             stats.record_extension_retained_scene_plan(
@@ -3821,6 +3825,8 @@ fn execute_after_content_extension_output_plan(
         AfterContentExtensionOutputAction::RetainedScene {
             diff_plan,
             snapshot: retained_snapshot,
+            scene,
+            reused,
             output_damage,
             output_items,
             ..
@@ -3830,6 +3836,7 @@ fn execute_after_content_extension_output_plan(
                 plan,
                 diff_plan,
                 retained_snapshot,
+                (!reused).then_some(scene),
                 output_damage,
                 output_items,
                 render_context,
@@ -3886,7 +3893,9 @@ fn execute_retained_after_content_extension_output_plan(
     canvas: &mut Canvas<'_, '_, '_>,
     plan: &AfterContentExtensionOutputPlan,
     diff_plan: &ExtensionLayerDiffPlan,
-    retained_snapshot: &ExtensionRetainedLayerSnapshot,
+    retained_snapshot: &std::sync::Arc<ExtensionRetainedLayerSnapshot>,
+    // The scene `retained_snapshot` was built from, when it is not the one already retained.
+    changed_scene: Option<&std::sync::Arc<bmux_plugin::RenderLayerScene>>,
     output_damage: &RenderDamage,
     output_items: &[RenderLayerItem],
     render_context: &RenderExtensionContext,
@@ -3924,14 +3933,17 @@ fn execute_retained_after_content_extension_output_plan(
             "retained render extension output failed",
         );
     }
-    commit_retained_layer_snapshot(
-        pane_buffers,
-        snapshot.pane_id,
-        plan.cache_key.clone(),
-        snapshot.surface_id,
-        snapshot.layer,
-        retained_snapshot,
-    );
+    if let Some(scene) = changed_scene {
+        commit_retained_layer_snapshot(
+            pane_buffers,
+            snapshot.pane_id,
+            plan.cache_key.clone(),
+            snapshot.surface_id,
+            snapshot.layer,
+            retained_snapshot,
+            Some(scene),
+        );
+    }
 }
 
 fn cleanup_removed_retained_terminal_graphics(
@@ -4594,6 +4606,8 @@ fn commit_before_content_surface_output_plan(
     for extension_plan in &plan.before_content_output_plan.plans {
         if let BeforeContentExtensionOutputAction::RetainedScene {
             snapshot: retained_snapshot,
+            scene,
+            reused: false,
             ..
         } = &extension_plan.action
             && let Some(cache_key) = &extension_plan.cache_key
@@ -4605,6 +4619,7 @@ fn commit_before_content_surface_output_plan(
                 plan.surface_id,
                 RenderExtensionLayer::BeforePaneContent,
                 retained_snapshot,
+                Some(scene),
             );
         }
     }
@@ -7017,6 +7032,120 @@ mod tests {
                     .build(),
             )
         }
+    }
+
+    /// An extension that answers with a scene it retains: the same allocation until replaced.
+    struct SharedSceneExtension {
+        scene: std::sync::Mutex<std::sync::Arc<bmux_plugin::RenderLayerScene>>,
+    }
+
+    impl SharedSceneExtension {
+        fn scene(text: &str) -> std::sync::Arc<bmux_plugin::RenderLayerScene> {
+            std::sync::Arc::new(bmux_plugin::RenderLayerScene::new(
+                Some(1),
+                vec![bmux_plugin::RenderSceneItem::text(
+                    "label",
+                    0,
+                    1,
+                    1,
+                    text,
+                    RenderStyle::new(),
+                )],
+            ))
+        }
+    }
+
+    impl bmux_plugin::AttachRenderExtension for SharedSceneExtension {
+        fn name(&self) -> &'static str {
+            "test.shared-scene"
+        }
+
+        fn render_layer_scene_with_context(
+            &self,
+            surface_id: Uuid,
+            surface_rect: &ExtensionRect,
+            layer: RenderExtensionLayer,
+            context: &RenderExtensionContext,
+        ) -> Option<bmux_plugin::RenderLayerScene> {
+            self.render_layer_scene_shared(surface_id, surface_rect, layer, context)
+                .map(|scene| scene.as_ref().clone())
+        }
+
+        fn render_layer_scene_shared(
+            &self,
+            _: Uuid,
+            _: &ExtensionRect,
+            layer: RenderExtensionLayer,
+            _: &RenderExtensionContext,
+        ) -> Option<std::sync::Arc<bmux_plugin::RenderLayerScene>> {
+            (layer == RenderExtensionLayer::AfterPaneContent)
+                .then(|| self.scene.lock().expect("scene").clone())
+        }
+    }
+
+    /// The same scene allocation as last frame is neither converted nor diffed again, yet still
+    /// replays over damaged content; a new one is diffed and its change drawn.
+    #[test]
+    fn a_reused_retained_scene_is_not_diffed_but_still_renders() {
+        let pane_id = Uuid::from_u128(4_242);
+        let scene = single_pane_scene(pane_id, 20, 4);
+        let extension = std::sync::Arc::new(SharedSceneExtension {
+            scene: std::sync::Mutex::new(SharedSceneExtension::scene("first")),
+        });
+        let extensions: Vec<std::sync::Arc<dyn bmux_plugin::AttachRenderExtension>> =
+            vec![extension.clone()];
+        let mut host = TestHost::new(20, 4);
+        let mut pane_buffers = BTreeMap::from([(pane_id, PaneRenderBuffer::default())]);
+        let mut cache = TerminalGraphicsCache::new();
+        let mut frame = |host: &mut TestHost, damage: &FrameDamage| {
+            with_graphics(host, |canvas| {
+                render_attach_scene_with_stats_and_trace_with_capabilities(
+                    canvas,
+                    &scene,
+                    &[],
+                    &mut pane_buffers,
+                    &mut cache,
+                    damage,
+                    0,
+                    0,
+                    &PaneScrollbackViews::new(),
+                    false,
+                    (20, 4),
+                    &RuntimeAppearance::default(),
+                    DamageCoalescingPolicy::default(),
+                    &extensions,
+                    TerminalRenderCapabilities::default(),
+                    None,
+                )
+                .expect("frame renders")
+                .1
+            })
+        };
+        let (stats, output) = frame(&mut host, &FrameDamage::full_frame());
+        assert!(output.contains("first"), "{output:?}");
+        assert_eq!(stats.retained_scene_added_items, 1);
+
+        let mut content = FrameDamage::default();
+        content.mark_content_surface(pane_id);
+        let (stats, output) = frame(&mut host, &content);
+        assert!(
+            output.contains("first"),
+            "replayed over the content: {output:?}"
+        );
+        assert_eq!(stats.retained_scene_unchanged_items, 1);
+        assert_eq!(stats.retained_scene_added_items, 0);
+        assert_eq!(stats.retained_scene_update_cells, 0);
+        assert_eq!(stats.retained_scene_stale_cleanup_cells, 0);
+
+        let (stats, output) = frame(&mut host, &FrameDamage::default());
+        assert!(!output.contains("first"), "nothing to redraw: {output:?}");
+        assert_eq!(stats.retained_scene_unchanged_items, 1);
+
+        *extension.scene.lock().expect("scene") = SharedSceneExtension::scene("again");
+        let (stats, output) = frame(&mut host, &FrameDamage::default());
+        assert!(output.contains("again"), "{output:?}");
+        assert_eq!(stats.retained_scene_changed_items, 1);
+        assert_eq!(stats.retained_scene_unchanged_items, 0);
     }
 
     /// Present one frame of [`RetainedGraphicExtension`]'s scene on `host`; returns the Kitty

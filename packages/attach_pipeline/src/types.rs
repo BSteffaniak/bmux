@@ -224,21 +224,16 @@ pub struct ExtensionLayerSnapshotCacheEntry {
     pub revision: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExtensionRetainedItemCacheEntry {
-    pub key: String,
-    pub z: i16,
-    pub bounds: ExtensionRect,
-    pub content_fingerprint: u64,
-}
-
+/// The retained scene of one extension layer last emitted on a surface.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExtensionRetainedLayerCacheEntry {
     pub surface_id: Uuid,
-    pub surface_rect: ExtensionRect,
     pub layer: RenderExtensionLayer,
-    pub revision: Option<u64>,
-    pub items: Vec<ExtensionRetainedItemCacheEntry>,
+    /// The extension's scene the snapshot was built from: when the extension answers with the
+    /// same allocation again, nothing changed and the snapshot is reused as is.
+    pub(crate) scene: Option<std::sync::Arc<bmux_plugin::RenderLayerScene>>,
+    pub(crate) snapshot:
+        std::sync::Arc<crate::render::extension_retained::ExtensionRetainedLayerSnapshot>,
 }
 
 #[derive(Default)]

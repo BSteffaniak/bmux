@@ -25,9 +25,11 @@ instrumentation live in the benchmarks, `bmux_bench` and `scripts/perf-render.py
 | Pane reader | `runtime::ingest_bench::ingest_metrics` (`plugins/pane-runtime-plugin`) | `read`: one PTY read as the reader handles it (`follow_chunk`: images intercepted, shell metadata filtered, queries answered and the pane's grid parsed in one pass; then mode tracking and the output push) |
 
 Scenarios: every generated corpus (`bmux_bench::corpus`) at 420×90; the busiest without scroll
-passthrough, with an observer, and across two panes; scattered edits; Kitty and sixel images beside
-streaming output and moving each frame; and, for the reader, text with a Kitty image every 30
-frames. Each scenario runs 300 frames and measures the 270 after a 30-frame warm-up.
+passthrough, with an observer, and across two panes; scattered edits; four panes decorated by the
+decoration renderer (borders and titles, its intent sampled before every frame as the attach
+client samples it), one streaming (`plain-stream/decorated`) or none (`idle/decorated`); Kitty and
+sixel images beside streaming output and moving each frame; and, for the reader, text with a Kitty
+image every 30 frames. Each scenario runs 300 frames and measures the 270 after a 30-frame warm-up.
 
 `pipeline_soak` and `ingest_soak` replay workloads ten times over and fail when live bytes keep
 growing through the second half: history, caches, retained images and the image registry must be
@@ -75,6 +77,7 @@ a bench with symbols, replays one scenario in a loop (`pipeline_bench_loop`,
 
 ```sh
 scripts/perf-render.py profile ingest --scenario full-repaint --top 30
+scripts/perf-render.py profile pipeline --scenario idle/decorated   # or plain-stream/decorated
 ```
 
 Samples vary from run to run; use them to find what to change, and the gated numbers to prove the
@@ -96,6 +99,7 @@ client now keeps its panes current with frames (see
 | Streaming text | client apply | 1,409 → 3 | 2.24M → 0.18M (−92%) | 4,769 → 4,769 |
 | Streaming text | server frame build | — → 3 | — → 0.13M | |
 | Streaming text | client render | — | 1.35M → 1.01M (−25%) | |
+| Four decorated panes, one streaming | client render | 15,158 → 1,413 | 18.6M → 4.3M (−77%) | 30,929 → 30,929 |
 | Moving sixel image | client apply + render | 7,270 → 52 | 23.6M → 5.0M (−79%) | 104,180 → 85,639 |
 | Full repaint | pane reader | 101,285 → 2.8 | 136.9M → 14.4M (−89%) | |
 | Streaming text | pane reader | 3,380 → 6 | 4.75M → 0.70M (−85%) | |

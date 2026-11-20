@@ -277,5 +277,9 @@ Deferred, each until something needs it (measured, not assumed):
 - Delta relays for decoration scenes (only animated decorations would gain), and merging the
   scene protocol's paint commands with `RenderOp`.
 
-Remaining: retained layers that cost nothing when unchanged (revision-gated reuse); the render
-extension trait collapsed onto retained scenes.
+Retained layers cost nothing when unchanged: the attach client samples a layer again only when
+its extension's revision, the surface rect or the render context changed, and the renderer skips
+converting and diffing a scene it already emitted (`AttachRenderExtension::render_layer_revision`
+states the contract). Remaining: the per-frame planning bookkeeping around each extension layer
+(string cache keys, plan structures), and the render extension trait collapsed onto retained
+scenes.

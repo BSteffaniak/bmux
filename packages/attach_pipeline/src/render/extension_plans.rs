@@ -17,6 +17,7 @@ use super::{
     DamageCoalescingPolicy, DamageRect, FrameDamage, RenderOpsOutputPlan,
     build_render_ops_output_plan, coalesce_render_damage, frame_rects_to_render_damage,
 };
+use bmux_plugin::RenderLayerScene as PluginRenderLayerScene;
 
 fn merge_render_damage(
     lhs: RenderDamage,
@@ -374,7 +375,11 @@ pub(super) struct BeforeContentExtensionOutputPlan {
 pub(super) enum BeforeContentExtensionOutputAction {
     RetainedScene {
         diff_plan: Box<ExtensionLayerDiffPlan>,
-        snapshot: ExtensionRetainedLayerSnapshot,
+        snapshot: Arc<ExtensionRetainedLayerSnapshot>,
+        /// The extension's scene `snapshot` was built from.
+        scene: Arc<PluginRenderLayerScene>,
+        /// `snapshot` is the one already retained: there is nothing to commit.
+        reused: bool,
         content_replay_damage: RenderDamage,
         output_damage: RenderDamage,
         output_items: Vec<RenderLayerItem>,
@@ -421,6 +426,83 @@ pub(super) fn build_before_content_extension_output_plan(
     })
 }
 
+/// A retained-scene layer planned against what it emitted last.
+struct RetainedLayerPlan {
+    cache_key: (String, Uuid),
+    scene: Arc<PluginRenderLayerScene>,
+    snapshot: Arc<ExtensionRetainedLayerSnapshot>,
+    diff_plan: ExtensionLayerDiffPlan,
+    /// The extension answered with the very scene emitted last, which is reused as is.
+    reused: bool,
+    content_replay_damage: RenderDamage,
+}
+
+/// Plan the layer of `snapshot` when its extension answers with a retained scene. A scene that is
+/// the same allocation as the one last emitted on the same surface rect is unchanged: its
+/// converted snapshot is reused and nothing is diffed, leaving only content replay.
+fn retained_layer_plan(
+    snapshot: &ExtensionLayerSnapshot,
+    content: PaneRect,
+    policy: DamageCoalescingPolicy,
+    render_context: &RenderExtensionContext,
+    pane_buffers: &BTreeMap<Uuid, PaneRenderBuffer>,
+) -> Option<RetainedLayerPlan> {
+    let cache_key = retained_layer_cache_key(
+        snapshot.extension.name(),
+        snapshot.surface_id,
+        snapshot.layer,
+        render_context.capabilities,
+    );
+    let scene = snapshot.extension.render_layer_scene_shared(
+        snapshot.surface_id,
+        &snapshot.surface_rect,
+        snapshot.layer,
+        render_context,
+    )?;
+    let previous = load_retained_layer_snapshot(pane_buffers.get(&snapshot.pane_id), &cache_key);
+    let reusable = previous.filter(|previous| {
+        previous.snapshot.surface_rect == snapshot.surface_rect
+            && previous
+                .scene
+                .as_ref()
+                .is_some_and(|previous| Arc::ptr_eq(previous, &scene))
+    });
+    let (retained, diff_plan, reused) = reusable.map_or_else(
+        || {
+            let retained = Arc::new(retained_snapshot_from_plugin_scene(
+                snapshot.surface_rect,
+                &scene,
+            ));
+            let diff_plan = build_extension_layer_diff_plan(
+                previous.map(|previous| previous.snapshot.as_ref()),
+                Some(&retained),
+                content,
+                policy,
+            );
+            (retained, diff_plan, false)
+        },
+        |previous| {
+            let retained = previous.snapshot.clone();
+            let diff_plan = ExtensionLayerDiffPlan::reused(retained.items.len());
+            (retained, diff_plan, true)
+        },
+    );
+    let content_replay_damage = retained_scene_item_damage_for_render_damage(
+        &retained.items,
+        &snapshot.content_replay_damage,
+        snapshot.surface_rect,
+        policy,
+    );
+    Some(RetainedLayerPlan {
+        cache_key,
+        scene,
+        snapshot: retained,
+        diff_plan,
+        reused,
+        content_replay_damage,
+    })
+}
+
 fn build_retained_before_content_extension_output_plan(
     snapshot: &ExtensionLayerSnapshot,
     content: PaneRect,
@@ -428,55 +510,31 @@ fn build_retained_before_content_extension_output_plan(
     render_context: &RenderExtensionContext,
     pane_buffers: &BTreeMap<Uuid, PaneRenderBuffer>,
 ) -> Option<BeforeContentExtensionOutputPlan> {
-    let retained_cache_key = retained_layer_cache_key(
-        snapshot.extension.name(),
-        snapshot.surface_id,
-        snapshot.layer,
-        render_context.capabilities,
-    );
-    let scene = snapshot.extension.render_layer_scene_with_context(
-        snapshot.surface_id,
-        &snapshot.surface_rect,
-        snapshot.layer,
-        render_context,
-    )?;
-    let retained_snapshot = retained_snapshot_from_plugin_scene(snapshot.surface_rect, &scene);
-    let previous_snapshot =
-        load_retained_layer_snapshot(pane_buffers.get(&snapshot.pane_id), &retained_cache_key);
-    let diff_plan = build_extension_layer_diff_plan(
-        previous_snapshot.as_ref(),
-        Some(&retained_snapshot),
-        content,
-        policy,
-    );
-    let content_replay_damage = retained_scene_item_damage_for_render_damage(
-        &retained_snapshot.items,
-        &snapshot.content_replay_damage,
-        snapshot.surface_rect,
-        policy,
-    );
+    let plan = retained_layer_plan(snapshot, content, policy, render_context, pane_buffers)?;
     let output_damage = merge_render_damage(
         merge_render_damage(
-            diff_plan.update_damage.clone(),
-            diff_plan.stale_cleanup_damage.clone(),
+            plan.diff_plan.update_damage.clone(),
+            plan.diff_plan.stale_cleanup_damage.clone(),
             snapshot.surface_rect,
             policy,
         ),
-        content_replay_damage.clone(),
+        plan.content_replay_damage.clone(),
         snapshot.surface_rect,
         policy,
     );
-    let selected_items =
-        retained_scene_items_for_render_damage(retained_snapshot.items.as_slice(), &output_damage);
-    let output_items = retained_scene_items_to_render_items(&selected_items);
+    let output_items = retained_scene_items_to_render_items(
+        retained_scene_items_for_render_damage(&plan.snapshot.items, &output_damage),
+    );
     Some(BeforeContentExtensionOutputPlan {
         snapshot: snapshot.clone(),
-        cache_key: Some(retained_cache_key),
+        cache_key: Some(plan.cache_key),
         damage_rects: before_content_damage_rects(&output_damage, content),
         action: BeforeContentExtensionOutputAction::RetainedScene {
-            diff_plan: Box::new(diff_plan),
-            snapshot: retained_snapshot,
-            content_replay_damage,
+            diff_plan: Box::new(plan.diff_plan),
+            snapshot: plan.snapshot,
+            scene: plan.scene,
+            reused: plan.reused,
+            content_replay_damage: plan.content_replay_damage,
             output_damage,
             output_items,
         },
@@ -558,7 +616,11 @@ pub(super) struct AfterContentExtensionOutputPlan {
 pub(super) enum AfterContentExtensionOutputAction {
     RetainedScene {
         diff_plan: Box<ExtensionLayerDiffPlan>,
-        snapshot: ExtensionRetainedLayerSnapshot,
+        snapshot: Arc<ExtensionRetainedLayerSnapshot>,
+        /// The extension's scene `snapshot` was built from.
+        scene: Arc<PluginRenderLayerScene>,
+        /// `snapshot` is the one already retained: there is nothing to commit.
+        reused: bool,
         content_replay_damage: RenderDamage,
         output_damage: RenderDamage,
         output_items: Vec<RenderLayerItem>,
@@ -636,58 +698,32 @@ fn build_retained_after_content_extension_output_plan(
     render_context: &RenderExtensionContext,
     pane_buffers: &BTreeMap<Uuid, PaneRenderBuffer>,
 ) -> Option<AfterContentExtensionOutputPlan> {
-    let retained_cache_key = retained_layer_cache_key(
-        snapshot.extension.name(),
-        snapshot.surface_id,
-        snapshot.layer,
-        render_context.capabilities,
-    );
-    let scene = snapshot.extension.render_layer_scene_with_context(
-        snapshot.surface_id,
-        &snapshot.surface_rect,
-        snapshot.layer,
-        render_context,
-    )?;
-    let retained_snapshot = retained_snapshot_from_plugin_scene(snapshot.surface_rect, &scene);
-    let previous_snapshot =
-        load_retained_layer_snapshot(pane_buffers.get(&snapshot.pane_id), &retained_cache_key);
-    let diff_plan = build_extension_layer_diff_plan(
-        previous_snapshot.as_ref(),
-        Some(&retained_snapshot),
-        content,
-        policy,
-    );
-    let content_replay_damage = retained_scene_item_damage_for_render_damage(
-        &retained_snapshot.items,
-        &snapshot.content_replay_damage,
-        snapshot.surface_rect,
-        policy,
-    );
+    let plan = retained_layer_plan(snapshot, content, policy, render_context, pane_buffers)?;
     let output_damage = merge_render_damage(
-        diff_plan.update_damage.clone(),
-        content_replay_damage.clone(),
+        plan.diff_plan.update_damage.clone(),
+        plan.content_replay_damage.clone(),
         snapshot.surface_rect,
         policy,
     );
     let retained_output_damage = merge_render_damage(
         output_damage.clone(),
-        diff_plan.stale_cleanup_damage.clone(),
+        plan.diff_plan.stale_cleanup_damage.clone(),
         snapshot.surface_rect,
         policy,
     );
-    let selected_items = retained_scene_items_for_render_damage(
-        retained_snapshot.items.as_slice(),
-        &retained_output_damage,
+    let output_items = retained_scene_items_to_render_items(
+        retained_scene_items_for_render_damage(&plan.snapshot.items, &retained_output_damage),
     );
-    let output_items = retained_scene_items_to_render_items(&selected_items);
     Some(AfterContentExtensionOutputPlan {
         surface_index,
         snapshot: snapshot.clone(),
-        cache_key: retained_cache_key,
+        cache_key: plan.cache_key,
         action: AfterContentExtensionOutputAction::RetainedScene {
-            diff_plan: Box::new(diff_plan),
-            snapshot: retained_snapshot,
-            content_replay_damage,
+            diff_plan: Box::new(plan.diff_plan),
+            snapshot: plan.snapshot,
+            scene: plan.scene,
+            reused: plan.reused,
+            content_replay_damage: plan.content_replay_damage,
             output_damage,
             output_items,
         },

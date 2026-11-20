@@ -268,8 +268,10 @@ pub struct AttachViewState {
     pub(super) terminal_presenter: bmux_attach_pipeline::frame_presenter::FramePresenter,
     /// The frame being rendered is presented through `terminal_presenter`.
     pub(super) presenting: bool,
+    /// Render extensions' retained intent, sampled before each frame.
+    pub(super) retained_extensions: bmux_attach_pipeline::retained_extensions::RetainedExtensions,
     pub(super) prepared_extensions:
-        Option<Vec<std::sync::Arc<dyn bmux_plugin::AttachRenderExtension>>>,
+        Option<std::sync::Arc<[std::sync::Arc<dyn bmux_plugin::AttachRenderExtension>]>>,
     pub(super) presentation_only: bool,
     pub(super) allow_retarget: bool,
     pub(super) viewport_guard: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
@@ -686,6 +688,8 @@ impl AttachViewState {
             replay_log: super::replay_log::ReplayLog::from_env(),
             presenting: false,
             terminal_presenter: bmux_attach_pipeline::frame_presenter::FramePresenter::new(),
+            retained_extensions:
+                bmux_attach_pipeline::retained_extensions::RetainedExtensions::default(),
             prepared_extensions: None,
             presentation_only: false,
             allow_retarget: true,

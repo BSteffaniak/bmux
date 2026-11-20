@@ -22,7 +22,6 @@ pub mod prompt_ui;
 pub mod provider;
 pub mod render;
 mod replay_log;
-mod retained_extensions;
 pub mod runtime;
 pub mod scrollback_cache;
 pub mod scrollback_fetch;

@@ -1442,7 +1442,8 @@ impl RenderSceneItem {
 /// terminal graphics reconciliation, and byte emission.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderLayerScene {
-    /// Optional freshness token for caches and diagnostics.
+    /// Optional freshness token for diagnostics; the host's reuse is gated on
+    /// [`AttachRenderExtension::render_layer_revision`], not on this field.
     ///
     /// Revision changes do not imply stale cleanup. Cleanup is derived from
     /// stable item keys plus item bounds/content fingerprints.
@@ -1687,19 +1688,34 @@ pub trait AttachRenderExtension: Send + Sync {
 
     /// Return an optional revision token for render output on this surface.
     ///
-    /// For compatibility APIs, declarative render ops are cached only when this
-    /// returns `Some`; increment or otherwise change the token whenever the
-    /// extension's output for the surface can change. For retained scenes,
-    /// revisions are freshness hints only: stale cleanup is derived from item
-    /// key/bounds/content diffs, not from revision changes.
+    /// The same contract as [`Self::render_layer_revision`], for both layers at once.
     fn render_revision(&self, _surface_id: Uuid) -> Option<u64> {
         None
     }
 
-    /// Return an optional revision token for render output on this
-    /// surface and layer. Implementations with layered output should
-    /// override this; the default delegates to [`Self::render_revision`]
-    /// for backward compatibility.
+    /// Return an optional revision token for render output on this surface
+    /// and layer. The default delegates to [`Self::render_revision`].
+    ///
+    /// # Contract
+    ///
+    /// `Some(revision)` is a promise: while the token stays the same, and the
+    /// host asks with the same surface rect and [`RenderExtensionContext`],
+    /// everything the extension would answer for this surface and layer stays
+    /// the same — its scene, items, operations and layer damage. The host
+    /// relies on it: before each frame it samples the layer only when the
+    /// token, the rect or the context changed, and otherwise reuses what it
+    /// sampled last (it does not call the layer's render methods at all).
+    /// When both of a surface's layers are reused, the surface's
+    /// before-content cells, chrome and content-rect override are reused too.
+    ///
+    /// So an extension that reports a revision must change it whenever any
+    /// of that output can change, including for state the host cannot see
+    /// (animation, time, focus, a newly arrived scene). A content hash of the
+    /// inputs the output is built from is a good token. Return `None` when
+    /// that cannot be promised: the host then samples the layer every frame.
+    ///
+    /// A revision change alone does not imply stale cleanup: the host still
+    /// derives cleanup from retained item keys, bounds and contents.
     fn render_layer_revision(&self, surface_id: Uuid, _layer: RenderExtensionLayer) -> Option<u64> {
         self.render_revision(surface_id)
     }
@@ -1735,6 +1751,24 @@ pub trait AttachRenderExtension: Send + Sync {
     ) -> Option<RenderLayerScene> {
         let _ = (surface_id, surface_rect, layer, context);
         None
+    }
+
+    /// [`Self::render_layer_scene_with_context`] behind a shared pointer.
+    ///
+    /// The host compares the pointers of consecutive frames' scenes: the same
+    /// allocation means the same scene, which it then neither converts nor
+    /// diffs again. Implementations that retain scenes across frames (as the
+    /// host's own sampled snapshots do) should return the retained `Arc`; the
+    /// default wraps a freshly built scene.
+    fn render_layer_scene_shared(
+        &self,
+        surface_id: Uuid,
+        surface_rect: &ExtensionRect,
+        layer: RenderExtensionLayer,
+        context: &RenderExtensionContext,
+    ) -> Option<Arc<RenderLayerScene>> {
+        self.render_layer_scene_with_context(surface_id, surface_rect, layer, context)
+            .map(Arc::new)
     }
 
     /// Return z-ordered declarative render items for one layer and damaged

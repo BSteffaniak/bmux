@@ -14,6 +14,7 @@ pub mod pointer_shape;
 pub mod projection;
 pub mod projection_images;
 pub mod reconcile;
+pub mod retained_extensions;
 pub mod render;
 pub mod scene_pipeline;
 pub mod terminal;

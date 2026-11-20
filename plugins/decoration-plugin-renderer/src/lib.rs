@@ -67,6 +67,9 @@ const VISUAL_STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
 struct DecorationRendererCache {
     revision: u64,
     surfaces: BTreeMap<Uuid, SurfaceDecoration>,
+    /// Each surface's layer revisions ([`surface_layer_revision`], before-content then
+    /// after-content), hashed once per scene rather than at every frame's revision query.
+    layer_revisions: BTreeMap<Uuid, [u64; 2]>,
     rendered_surfaces: BTreeMap<(Uuid, RenderExtensionLayer), SurfaceDecoration>,
     scene_rx: Option<tokio::sync::watch::Receiver<Arc<DecorationScene>>>,
     visual_last_at: BTreeMap<String, Instant>,
@@ -119,7 +122,34 @@ impl DecorationRendererCache {
         }
         self.revision = scene.revision;
         self.surfaces = scene.surfaces;
+        self.layer_revisions = self
+            .surfaces
+            .iter()
+            .map(|(id, surface)| {
+                (
+                    *id,
+                    [
+                        surface_layer_revision(surface, RenderExtensionLayer::BeforePaneContent),
+                        surface_layer_revision(surface, RenderExtensionLayer::AfterPaneContent),
+                    ],
+                )
+            })
+            .collect();
         true
+    }
+
+    /// The revision of a surface's layer: a hash of everything its scene is built from besides
+    /// the rect and context the host asks with, so it changes whenever the scene can.
+    fn layer_revision(&self, surface_id: &Uuid, layer: RenderExtensionLayer) -> Option<u64> {
+        let surface = self.surfaces.get(surface_id)?;
+        let index = match layer {
+            RenderExtensionLayer::BeforePaneContent => 0,
+            RenderExtensionLayer::AfterPaneContent => 1,
+        };
+        Some(self.layer_revisions.get(surface_id).map_or_else(
+            || surface_layer_revision(surface, layer),
+            |revisions| revisions[index],
+        ))
     }
 
     fn set_scene_receiver(&mut self, rx: tokio::sync::watch::Receiver<Arc<DecorationScene>>) {
@@ -186,6 +216,7 @@ impl DecorationRendererCache {
         self.rendered_surfaces
             .retain(|(rendered_id, _), _| rendered_id != surface_id);
         self.surfaces.remove(surface_id);
+        self.layer_revisions.remove(surface_id);
         let suffix = format!(":{surface_id}");
         self.visual_last_revision
             .retain(|key, _| !key.ends_with(&suffix));
@@ -376,9 +407,7 @@ impl AttachRenderExtension for DecorationRenderExtension {
 
     fn render_layer_revision(&self, surface_id: Uuid, layer: RenderExtensionLayer) -> Option<u64> {
         let cache = self.cache.lock().ok()?;
-        cache
-            .surface(&surface_id)
-            .map(|surface| surface_layer_revision(surface, layer))
+        cache.layer_revision(&surface_id, layer)
     }
 
     fn redraws_on_content_damage(&self, layer: RenderExtensionLayer) -> bool {
@@ -2670,6 +2699,7 @@ mod tests {
         let cache = Arc::new(Mutex::new(DecorationRendererCache {
             revision: 1,
             surfaces: BTreeMap::from([(surface_id, decoration)]),
+            layer_revisions: BTreeMap::new(),
             rendered_surfaces: BTreeMap::new(),
             scene_rx: None,
             visual_last_at: BTreeMap::new(),
@@ -2754,6 +2784,7 @@ mod tests {
         let cache = Arc::new(Mutex::new(DecorationRendererCache {
             revision: 1,
             surfaces: BTreeMap::from([(surface_id, decoration)]),
+            layer_revisions: BTreeMap::new(),
             rendered_surfaces: BTreeMap::new(),
             scene_rx: None,
             visual_last_at: BTreeMap::new(),
@@ -2839,6 +2870,7 @@ mod tests {
         let cache = Arc::new(Mutex::new(DecorationRendererCache {
             revision: 7,
             surfaces: BTreeMap::from([(surface_id, surface(surface_id, paint_commands))]),
+            layer_revisions: BTreeMap::new(),
             rendered_surfaces: BTreeMap::new(),
             scene_rx: None,
             visual_last_at: BTreeMap::new(),
@@ -3623,6 +3655,7 @@ mod tests {
         let cache = Arc::new(Mutex::new(DecorationRendererCache {
             revision: 7,
             surfaces: BTreeMap::from([(surface_id, decoration)]),
+            layer_revisions: BTreeMap::new(),
             rendered_surfaces: BTreeMap::new(),
             scene_rx: None,
             visual_last_at: BTreeMap::new(),
@@ -3675,6 +3708,7 @@ mod tests {
         let cache = Arc::new(Mutex::new(DecorationRendererCache {
             revision: 7,
             surfaces: BTreeMap::from([(surface_id, decoration)]),
+            layer_revisions: BTreeMap::new(),
             rendered_surfaces: BTreeMap::new(),
             scene_rx: None,
             visual_last_at: BTreeMap::new(),
