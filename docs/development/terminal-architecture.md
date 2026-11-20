@@ -258,6 +258,24 @@ The playbook stays on raw bytes: its display track and `pane_output` events are 
 the program wrote, and with the buffer retaining only for readers, it costs nothing unless a
 playbook runs.
 
-Remaining: extracting images and shell metadata on the grid's parse instead of scans ahead of it;
-compact cells (phase 5); the rest of the plugin model (rewriting filters and text filters,
-retained layers with revisioned relays, unified render/input/status APIs).
+Compact cells (phase 5), as far as measured gains justified: grid cells 24 bytes (from 32),
+compositor symbols 16 (from 24), both without `unsafe` or API changes. A 12-byte `Copy` cell with
+a per-grid grapheme table would move about 60 `text()` callers for a few more percent; not done.
+
+One status model: the host-declared `status-item` extension point (never declared by the
+server) is gone; status-line segments go through the tab bar's `status-items` service.
+
+Deferred, each until something needs it (measured, not assumed):
+
+- Rewriting filters and text filters. No plugin uses even the keep/drop filters yet; a text-run
+  hook would sit in the hottest path (`print_ascii`). Should a consumer appear, the first step is
+  `Replace` for CSI and OSC, re-parsed with filters skipped; text redaction belongs at the replica
+  or render, not the PTY parse.
+- Shell metadata on the grid's parse: its scan is now about 0.6% of the reader. Images on the
+  grid's parse: the parser has no APC dispatch and observed strings are capped; the pass-through
+  check (escape-pair searches) is what remains of their cost.
+- Delta relays for decoration scenes (only animated decorations would gain), and merging the
+  scene protocol's paint commands with `RenderOp`.
+
+Remaining: retained layers that cost nothing when unchanged (revision-gated reuse); the render
+extension trait collapsed onto retained scenes.
