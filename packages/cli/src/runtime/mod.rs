@@ -151,8 +151,7 @@ use session_follow::{
     parse_session_selector, parse_uuid_value, run_follow, run_session_detach, run_unfollow,
 };
 use terminal_doctor::{
-    check_terminfo_available, merged_runtime_keybindings,
-    merged_runtime_keybindings_with_plugin_runtime, resolve_pane_term, run_keymap_doctor,
+    check_terminfo_available, merged_runtime_keybindings, resolve_pane_term, run_keymap_doctor,
     run_keymap_explain, run_terminal_doctor, run_terminal_install_terminfo, terminal_profile_name,
 };
 use terminal_protocol::{

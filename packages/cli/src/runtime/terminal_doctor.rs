@@ -454,36 +454,12 @@ fn merged_keybindings_from_registry(
     config: &BmuxConfig,
     registry: Option<&bmux_plugin::PluginRegistry>,
 ) -> KeybindingProposals {
-    let proposals = registry.map_or_else(
+    let defaults = BmuxConfig::default();
+    let (plugin_runtime, plugin_global, plugin_scroll) = registry.map_or_else(
         || plugin_keybinding_proposals(config),
         |registry| plugin_keybinding_proposals_from_registry(config, registry),
     );
-    merge_keybinding_proposals(config, proposals)
-}
 
-/// The merged runtime, global and scroll bindings, plus the runtime-scope
-/// bindings enabled plugins propose on their own (canonicalized). A modal
-/// keymap has no prefix scope, so it adds those plugin proposals to its
-/// normal mode; core runtime defaults already live there.
-pub(super) fn merged_runtime_keybindings_with_plugin_runtime(
-    config: &BmuxConfig,
-) -> (
-    KeybindingProposals,
-    std::collections::BTreeMap<String, String>,
-) {
-    let proposals = plugin_keybinding_proposals(config);
-    let plugin_runtime = canonicalize_keybindings(proposals.0.clone());
-    (
-        merge_keybinding_proposals(config, proposals),
-        plugin_runtime,
-    )
-}
-
-fn merge_keybinding_proposals(
-    config: &BmuxConfig,
-    (plugin_runtime, plugin_global, plugin_scroll): KeybindingProposals,
-) -> KeybindingProposals {
-    let defaults = BmuxConfig::default();
     let mut runtime = canonicalize_keybindings(defaults.keybindings.runtime);
     runtime.extend(canonicalize_keybindings(plugin_runtime));
     runtime.extend(canonicalize_keybindings(config.keybindings.runtime.clone()));
