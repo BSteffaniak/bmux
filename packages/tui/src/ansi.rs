@@ -1092,6 +1092,34 @@ fn write_ansi_style_change(
     depth: TerminalColorDepth,
 ) -> io::Result<()> {
     let (from, to) = (from.quantized(depth), to.quantized(depth));
+    // Most changes between runs are of colors alone, to colors shown. The difference's codes are
+    // then the reset's less its `0`: always the shorter, so written directly.
+    let shown = |color: Option<Color>| color.filter(|color| *color != Color::Default);
+    let set =
+        |from: Option<Color>, to: Option<Color>| (shown(from) != shown(to)).then(|| shown(to));
+    if from != Style::new()
+        && from.modifiers == to.modifiers
+        && set(from.fg, to.fg).is_none_or(|color| color.is_some())
+        && set(from.bg, to.bg).is_none_or(|color| color.is_some())
+    {
+        let (fg, bg) = (set(from.fg, to.fg).flatten(), set(from.bg, to.bg).flatten());
+        if fg.is_none() && bg.is_none() {
+            return Ok(());
+        }
+        writer.write_all(b"\x1b[")?;
+        if let Some(fg) = fg {
+            write_color_code(writer, fg, ColorRole::Foreground, false)?;
+        }
+        if let Some(bg) = bg {
+            write_color_code(writer, bg, ColorRole::Background, fg.is_some())?;
+        }
+        return writer.write_all(b"m");
+    }
+    write_shorter_style_change(writer, from, to)
+}
+
+/// Of the reset to quantized `to` and the difference from quantized `from`, write the shorter.
+fn write_shorter_style_change(writer: &mut impl Write, from: Style, to: Style) -> io::Result<()> {
     let mut reset = io::Cursor::new([0_u8; 96]);
     write_quantized_style(&mut reset, to)?;
     let reset_len = usize::try_from(reset.position()).unwrap_or(usize::MAX);
@@ -1229,6 +1257,17 @@ enum ColorRole {
 }
 
 fn write_ansi_color(writer: &mut impl Write, color: Color, role: ColorRole) -> io::Result<()> {
+    write_color_code(writer, color, role, true)
+}
+
+/// The SGR code for `color` in `role`, after a `;` when `separated`.
+fn write_color_code(
+    writer: &mut impl Write,
+    color: Color,
+    role: ColorRole,
+    separated: bool,
+) -> io::Result<()> {
+    let separator: &[u8] = if separated { b";" } else { b"" };
     let named = |offset: u8| (color_base(role) + offset, false);
     let bright = |offset: u8| (bright_color_base(role) + offset, false);
     let (code, _) = match color {
@@ -1250,16 +1289,18 @@ fn write_ansi_color(writer: &mut impl Write, color: Color, role: ColorRole) -> i
         Color::BrightCyan => bright(6),
         Color::BrightWhite => bright(7),
         Color::Indexed(index) => {
+            writer.write_all(separator)?;
             writer.write_all(match role {
-                ColorRole::Foreground => b";38;5;",
-                ColorRole::Background => b";48;5;",
+                ColorRole::Foreground => b"38;5;",
+                ColorRole::Background => b"48;5;",
             })?;
             return write_decimal(writer, index);
         }
         Color::Rgb(red, green, blue) => {
+            writer.write_all(separator)?;
             writer.write_all(match role {
-                ColorRole::Foreground => b";38;2;",
-                ColorRole::Background => b";48;2;",
+                ColorRole::Foreground => b"38;2;",
+                ColorRole::Background => b"48;2;",
             })?;
             write_decimal(writer, red)?;
             writer.write_all(b";")?;
@@ -1268,7 +1309,7 @@ fn write_ansi_color(writer: &mut impl Write, color: Color, role: ColorRole) -> i
             return write_decimal(writer, blue);
         }
     };
-    writer.write_all(b";")?;
+    writer.write_all(separator)?;
     write_decimal(writer, code)
 }
 
@@ -1311,6 +1352,57 @@ mod tests {
     use crate::geometry::{Point, Rect};
     use crate::style::{Color, Modifier, Style};
     use crate::text::Line;
+
+    /// A style change writes exactly what choosing the shorter of a reset and a difference
+    /// writes, for every pair of a spread of styles at every color depth.
+    #[test]
+    fn style_changes_write_the_shorter_form() {
+        use super::{TerminalColorDepth, write_ansi_style_change, write_shorter_style_change};
+        let colors = [
+            None,
+            Some(Color::Default),
+            Some(Color::Red),
+            Some(Color::BrightCyan),
+            Some(Color::Indexed(7)),
+            Some(Color::Indexed(200)),
+            Some(Color::Rgb(1, 2, 3)),
+            Some(Color::Rgb(250, 128, 0)),
+        ];
+        let modifiers = [
+            Modifier::EMPTY,
+            Modifier::BOLD,
+            Modifier::BOLD.union(Modifier::ITALIC),
+        ];
+        let mut styles = Vec::new();
+        for fg in colors {
+            for bg in colors {
+                for modifiers in modifiers {
+                    styles.push(Style { fg, bg, modifiers });
+                }
+            }
+        }
+        for depth in [
+            TerminalColorDepth::TrueColor,
+            TerminalColorDepth::Ansi256,
+            TerminalColorDepth::Ansi16,
+            TerminalColorDepth::Monochrome,
+        ] {
+            for &from in &styles {
+                for &to in &styles {
+                    let mut written = Vec::new();
+                    write_ansi_style_change(&mut written, from, to, depth).unwrap();
+                    let mut shorter = Vec::new();
+                    write_shorter_style_change(
+                        &mut shorter,
+                        from.quantized(depth),
+                        to.quantized(depth),
+                    )
+                    .unwrap();
+                    assert_eq!(written, shorter, "{from:?} -> {to:?} at {depth:?}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn color_depth_reduces_emitted_colors_without_changing_defaults() {
