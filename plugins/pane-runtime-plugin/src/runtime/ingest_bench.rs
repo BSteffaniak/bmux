@@ -38,10 +38,25 @@ struct Pane {
     #[cfg(feature = "image-registry")]
     interceptor: bmux_image::ImageInterceptor,
     replies: Vec<u8>,
+    /// A reader follows the pane's raw output (as the playbook does), so the output buffer
+    /// retains it; attach clients take frames and read none.
+    raw_reader: bool,
 }
 
 impl Pane {
-    fn new((cols, rows): (u16, u16)) -> Self {
+    /// A pane no one reads raw output from (attach clients take frames): its output buffer only
+    /// advances.
+    fn new(size: (u16, u16)) -> Self {
+        let pane = Self::with_reader(size, false);
+        pane.output.last_read.set(
+            Instant::now()
+                .checked_sub(super::RAW_READ_LEASE * 2)
+                .expect("clock past the lease"),
+        );
+        pane
+    }
+
+    fn with_reader((cols, rows): (u16, u16), raw_reader: bool) -> Self {
         Self {
             grid: TerminalGridStream::new(cols, rows, GridLimits::default()).expect("grid"),
             output: OutputFanoutBuffer::new(1 << 20),
@@ -56,6 +71,7 @@ impl Pane {
             #[cfg(feature = "image-registry")]
             interceptor: bmux_image::ImageInterceptor::new(),
             replies: Vec::new(),
+            raw_reader,
         }
     }
 
@@ -90,7 +106,11 @@ impl Pane {
         );
         let modes = self.grid.grid().protocol_state();
         self.modes = (attach_mouse_protocol(modes), attach_input_modes(modes));
-        self.output.push_chunk(&self.reader.visible);
+        if self.raw_reader {
+            self.output.note_read(READ);
+        }
+        self.output
+            .push_parsed(&self.reader.visible, super::ChunkBoundary::of(&self.grid));
         self.replies.extend_from_slice(&self.reader.pointer_replies);
     }
 }
@@ -169,9 +189,17 @@ fn ingest_bench() {
 const WARMUP: usize = 30;
 
 /// Read `frames` as the pane reader does and measure each frame's reading after warm-up.
-fn ingest_once(size: (u16, u16), frames: &[Frame]) -> (BTreeMap<String, PhaseRecorder>, u64, i64) {
+fn ingest_once(
+    size: (u16, u16),
+    frames: &[Frame],
+    raw_reader: bool,
+) -> (BTreeMap<String, PhaseRecorder>, u64, i64) {
     let probe = Probe::new();
-    let mut reader = Pane::new(size);
+    let mut reader = if raw_reader {
+        Pane::with_reader(size, true)
+    } else {
+        Pane::new(size)
+    };
     let mut read = PhaseRecorder::default();
     let mut live_after_warmup = 0;
     let mut measured = 0_u64;
@@ -202,12 +230,21 @@ fn ingest_once(size: (u16, u16), frames: &[Frame]) -> (BTreeMap<String, PhaseRec
 /// fresh reader [`bmux_bench::metrics::repeats`] times, which must allocate identically, each
 /// frame keeping its fewest instructions.
 fn ingest(name: &str, size: (u16, u16), frames: &[Frame]) -> Option<Scenario> {
+    ingest_with(name, size, frames, false)
+}
+
+fn ingest_with(
+    name: &str,
+    size: (u16, u16),
+    frames: &[Frame],
+    raw_reader: bool,
+) -> Option<Scenario> {
     if !bmux_bench::metrics::selected(name) {
         return None;
     }
-    let (mut stages, measured, live_growth) = ingest_once(size, frames);
+    let (mut stages, measured, live_growth) = ingest_once(size, frames, raw_reader);
     for _ in 1..bmux_bench::metrics::repeats() {
-        let (repeat, _, _) = ingest_once(size, frames);
+        let (repeat, _, _) = ingest_once(size, frames, raw_reader);
         for (stage, recorder) in &mut stages {
             let other = repeat
                 .get(stage)
@@ -294,6 +331,13 @@ fn ingest_metrics() {
     report
         .scenarios
         .extend(ingest("kitty-images", size, &kitty_images(size, 300)));
+    // A pane whose raw output is followed (as the playbook does): the output buffer retains it.
+    report.scenarios.extend(ingest_with(
+        "plain-stream/raw-reader",
+        size,
+        &corpus::plain_stream(size, 300),
+        true,
+    ));
     for scenario in &report.scenarios {
         let stages: Vec<String> = scenario
             .phases

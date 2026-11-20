@@ -5492,6 +5492,14 @@ struct SyncUpdateMarks {
 impl SyncUpdateMarks {
     const PREFIX: &'static [u8] = b"\x1b[?2026";
 
+    /// Marks from a point where an update is `open` or not.
+    fn starting(open: bool) -> Self {
+        Self {
+            base: open,
+            ..Self::default()
+        }
+    }
+
     /// Whether no part of the sequence is matched: a byte other than ESC then matches nothing.
     const fn idle(&self) -> bool {
         self.matched == 0
@@ -5536,6 +5544,28 @@ impl SyncUpdateMarks {
     }
 }
 
+/// How long after the last read asking for bytes an output buffer keeps retaining output. Byte
+/// readers (the playbook, snapshot chunks) read on and on while they follow a pane; attach clients
+/// take frames and read none.
+const RAW_READ_LEASE: Duration = Duration::from_secs(30);
+
+/// A pane grid's parser after a chunk: between sequences (a reader may start after it), and
+/// whether a synchronized update is open.
+#[derive(Debug, Clone, Copy)]
+struct ChunkBoundary {
+    between_sequences: bool,
+    sync_update_open: bool,
+}
+
+impl ChunkBoundary {
+    fn of(grid: &TerminalGridStream) -> Self {
+        Self {
+            between_sequences: grid.between_sequences(),
+            sync_update_open: grid.grid().synchronized_update(),
+        }
+    }
+}
+
 struct OutputFanoutBuffer {
     max_bytes: usize,
     start_offset: u64,
@@ -5552,6 +5582,14 @@ struct OutputFanoutBuffer {
     /// (Ground state).  An open (incomplete) span has `safe_resume == u64::MAX`.
     /// Sorted ascending by `esc_start`.
     esc_spans: VecDeque<(u64, u64)>,
+    /// When a reader last asked for bytes (creation counts as one). While that is within
+    /// [`RAW_READ_LEASE`] output is retained; otherwise pushing it only advances the offsets, and
+    /// a reader that returns is told of the gap and resynchronizes from a snapshot.
+    last_read: std::cell::Cell<Instant>,
+    /// Retaining output, and following its sequences.
+    retaining: bool,
+    /// The grid's parser after the last chunk pushed.
+    boundary: ChunkBoundary,
 }
 
 struct OutputRead {
@@ -5584,7 +5622,52 @@ impl OutputFanoutBuffer {
             esc_phase: EscSeqPhase::Ground,
             esc_spans: VecDeque::new(),
             sync_updates: SyncUpdateMarks::default(),
+            last_read: std::cell::Cell::new(Instant::now()),
+            retaining: true,
+            boundary: ChunkBoundary {
+                between_sequences: true,
+                sync_update_open: false,
+            },
         }
+    }
+
+    /// A reader asked for up to `max_bytes`: when that is any, output is retained for it.
+    fn note_read(&self, max_bytes: usize) {
+        if max_bytes > 0 {
+            self.last_read.set(Instant::now());
+        }
+    }
+
+    /// Push a chunk the pane's grid has parsed, `after` being its parser then. It is retained
+    /// while a reader asks for bytes; retention resumes only where the grid was between
+    /// sequences, so the escape phase and synchronized-update state start exact (the grid's).
+    fn push_parsed(&mut self, chunk: &[u8], after: ChunkBoundary) {
+        let demanded = self.last_read.get().elapsed() < RAW_READ_LEASE;
+        if demanded && !self.retaining && self.boundary.between_sequences {
+            self.retaining = true;
+            self.esc_phase = EscSeqPhase::Ground;
+            self.esc_spans.clear();
+            self.sync_updates = SyncUpdateMarks::starting(self.boundary.sync_update_open);
+        }
+        if demanded && self.retaining {
+            self.push_chunk(chunk);
+        } else {
+            self.skip(chunk.len());
+        }
+        self.boundary = after;
+    }
+
+    /// Advance past `len` bytes without retaining them (or what is retained): no reader wants
+    /// them.
+    fn skip(&mut self, len: usize) {
+        self.retaining = false;
+        let dropped = self.data.len();
+        self.data.clear();
+        self.retained_output_bytes
+            .fetch_sub(dropped, Ordering::SeqCst);
+        self.start_offset = self.start_offset.saturating_add((dropped + len) as u64);
+        self.esc_spans.clear();
+        self.sync_updates = SyncUpdateMarks::starting(false);
     }
 
     /// Whether a synchronized update is open at stream `offset` (after the bytes before it).
@@ -5731,6 +5814,7 @@ impl OutputFanoutBuffer {
     }
 
     fn read_for_client(&mut self, client_id: ClientId, max_bytes: usize) -> OutputRead {
+        self.note_read(max_bytes);
         let limit = max_bytes.max(1);
         let end = self.end_offset();
 
@@ -5785,6 +5869,7 @@ impl OutputFanoutBuffer {
     }
 
     fn read_at(&self, cursor: u64, limit: usize) -> OutputRead {
+        self.note_read(limit);
         let end = self.end_offset();
         let stream_gap = cursor < self.start_offset || cursor > end;
         let stream_start = cursor.clamp(self.start_offset, end);
@@ -5816,6 +5901,7 @@ impl OutputFanoutBuffer {
     }
 
     fn read_recent_with_offsets(&self, max_bytes: usize) -> OutputRead {
+        self.note_read(max_bytes);
         let end = self.end_offset();
         if self.data.is_empty() || max_bytes == 0 {
             return OutputRead {
@@ -8552,7 +8638,7 @@ impl SessionRuntimeManager {
                                     *mode_state = attach_input_modes(modes);
                                 }
                                 let Ok(mut output) = reader_output.lock() else { break; };
-                                output.push_chunk(chunk);
+                                output.push_parsed(chunk, ChunkBoundary::of(&grid));
                                 drop(output);
                                 drop(grid);
                                 reply.extend_from_slice(&reader_state.pointer_replies);
@@ -23750,6 +23836,52 @@ exit 7"#
         )
         .unwrap();
         assert_eq!(std::fs::read_to_string(capture).unwrap(), "-INT\n--\n-42\n");
+    }
+
+    /// Output is retained only while a reader asks for bytes: without one, chunks only advance
+    /// the offsets (a returning reader is told of the gap); retention resumes at the first
+    /// boundary between sequences, with the synchronized-update state the grid had there.
+    #[test]
+    fn output_is_retained_only_while_bytes_are_read() {
+        let client = ClientId(Uuid::new_v4());
+        let mut output = OutputFanoutBuffer::new(1024);
+        output.register_client_at_tail(client);
+        let between = |sync_update_open| ChunkBoundary {
+            between_sequences: true,
+            sync_update_open,
+        };
+        let stale = || Instant::now().checked_sub(RAW_READ_LEASE * 2).unwrap();
+        output.last_read.set(stale());
+        output.push_parsed(b"\x1b[?2026hnobody", between(true));
+        assert!(output.data.is_empty(), "no reader: nothing is kept");
+        assert_eq!(output.end_offset(), 14);
+
+        // A reader returns: it is told of the gap, and output is kept again from the next chunk,
+        // the update open as the grid had it.
+        let read = output.read_for_client(client, 64);
+        assert!(read.stream_gap);
+        output.push_parsed(b"kept", between(true));
+        let read = output.read_for_client(client, 64);
+        assert_eq!(read.bytes, b"kept");
+        assert!(!read.stream_gap);
+        assert!(output.sync_update_open_at(read.stream_end));
+
+        // Retention stops without readers, and resumes only where the grid was between
+        // sequences.
+        output.last_read.set(stale());
+        output.push_parsed(
+            b"\x1b[3",
+            ChunkBoundary {
+                between_sequences: false,
+                sync_update_open: true,
+            },
+        );
+        output.note_read(1);
+        output.push_parsed(b"1mred", between(false));
+        assert!(output.data.is_empty(), "the chunk began mid-sequence");
+        output.push_parsed(b"plain", between(false));
+        assert_eq!(output.read_recent_with_offsets(64).bytes, b"plain");
+        assert!(!output.sync_update_open_at(output.end_offset()));
     }
 
     #[test]

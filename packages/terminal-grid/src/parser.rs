@@ -109,6 +109,13 @@ impl TerminalGridStream {
         self.process_observed(bytes, &mut PointerQueries(on_query));
     }
 
+    /// Whether the bytes processed so far end between sequences, with no partial character: a
+    /// reader starting at the next byte parses it as the grid does.
+    #[must_use]
+    pub fn between_sequences(&self) -> bool {
+        self.pending_bytes.is_empty()
+    }
+
     /// Process output, showing `observer` each sequence in order as the grid applies it (see
     /// [`SequenceObserver`]). Snapshot restoration never shows an observer anything.
     pub fn process_observed<O: SequenceObserver>(&mut self, bytes: &[u8], observer: &mut O) {

@@ -5,28 +5,28 @@
       "frames": 271,
       "phases": {
         "read": {
-          "allocations_per_frame": 0.02,
-          "max_allocations": 1,
-          "allocated_bytes_per_frame": 25203,
-          "instructions_per_frame": 487075
+          "allocations_per_frame": 0.0,
+          "max_allocations": 0,
+          "allocated_bytes_per_frame": 0,
+          "instructions_per_frame": 395559
         }
       },
       "output_bytes_per_frame": 0,
-      "live_growth_bytes": 3423232
+      "live_growth_bytes": 8192
     },
     {
       "name": "region-linefeed",
       "frames": 271,
       "phases": {
         "read": {
-          "allocations_per_frame": 0.02,
-          "max_allocations": 1,
-          "allocated_bytes_per_frame": 25203,
-          "instructions_per_frame": 487255
+          "allocations_per_frame": 0.0,
+          "max_allocations": 0,
+          "allocated_bytes_per_frame": 0,
+          "instructions_per_frame": 396886
         }
       },
       "output_bytes_per_frame": 0,
-      "live_growth_bytes": 3423232
+      "live_growth_bytes": 8192
     },
     {
       "name": "full-repaint",
@@ -36,7 +36,7 @@
           "allocations_per_frame": 2.76,
           "max_allocations": 15,
           "allocated_bytes_per_frame": 29881,
-          "instructions_per_frame": 14427446
+          "instructions_per_frame": 11670846
         }
       },
       "output_bytes_per_frame": 0,
@@ -47,42 +47,56 @@
       "frames": 271,
       "phases": {
         "read": {
-          "allocations_per_frame": 6.08,
-          "max_allocations": 16,
-          "allocated_bytes_per_frame": 26107,
-          "instructions_per_frame": 694609
+          "allocations_per_frame": 6.06,
+          "max_allocations": 15,
+          "allocated_bytes_per_frame": 4532,
+          "instructions_per_frame": 607134
         }
       },
       "output_bytes_per_frame": 0,
-      "live_growth_bytes": 3807578
+      "live_growth_bytes": 884122
     },
     {
       "name": "unclosed-sync",
       "frames": 272,
       "phases": {
         "read": {
-          "allocations_per_frame": 6.05,
+          "allocations_per_frame": 6.02,
           "max_allocations": 12,
-          "allocated_bytes_per_frame": 31353,
-          "instructions_per_frame": 695571
+          "allocated_bytes_per_frame": 4367,
+          "instructions_per_frame": 606262
         }
       },
       "output_bytes_per_frame": 0,
-      "live_growth_bytes": 4513818
+      "live_growth_bytes": 843802
     },
     {
       "name": "kitty-images",
       "frames": 271,
       "phases": {
         "read": {
-          "allocations_per_frame": 29.31,
+          "allocations_per_frame": 29.29,
           "max_allocations": 88,
-          "allocated_bytes_per_frame": 165321,
-          "instructions_per_frame": 854531
+          "allocated_bytes_per_frame": 143746,
+          "instructions_per_frame": 767460
         }
       },
       "output_bytes_per_frame": 0,
-      "live_growth_bytes": 21284160
+      "live_growth_bytes": 18360704
+    },
+    {
+      "name": "plain-stream/raw-reader",
+      "frames": 271,
+      "phases": {
+        "read": {
+          "allocations_per_frame": 6.08,
+          "max_allocations": 16,
+          "allocated_bytes_per_frame": 26107,
+          "instructions_per_frame": 694979
+        }
+      },
+      "output_bytes_per_frame": 0,
+      "live_growth_bytes": 3807578
     }
   ]
 }

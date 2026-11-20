@@ -37,7 +37,9 @@ const DEFAULT_IROH_CONNECT_TIMEOUT_MS: u64 = 7_500;
 const DEFAULT_IROH_HELLO_PROBE_TIMEOUT_MS: u64 = 2_500;
 const IROH_COMPRESSED_RETRY_COUNT: usize = 0;
 const OUTPUT_QUEUE_MAX_BYTES: usize = 4 * 1024 * 1024;
-const EVENT_TRIGGER_FETCH_MAX_BYTES: usize = 256 * 1024;
+/// Raw output bytes a snapshot asks for: none. Panes are hydrated from grid snapshots and kept by
+/// frames, which carry their input modes too.
+const EVENT_TRIGGER_FETCH_MAX_BYTES: usize = 0;
 const GRID_SNAPSHOT_MAX_ROWS_PER_PANE: usize = 100_000;
 /// History lines a pane's first frame carries at most; older lines stay on the server.
 const FRAME_MAX_HISTORY_LINES: usize = 2_000;
