@@ -182,6 +182,29 @@ Each phase is independently shippable, measured, and keeps every invariant.
    relays; the duplicated APIs replaced in place, with every in-repo plugin migrated in the same
    change.
 
+## Cluster replication: frames, pushed
+
+Cluster panes used to replicate as raw bytes polled every 25 ms per pane (each poll a
+linearizable read plus peer-authentication round trips), repaired with whole-grid JSON
+snapshots, and parsed twice on the viewing node; the layout was polled every 100 ms. The cluster
+has no users yet, so its protocol is replaced, not kept alongside:
+
+- **Frames end to end.** Attach providers hand the renderer frames (`AttachProviderChange`
+  frame changes replace byte appends and repaint repairs), applied with `apply_pane_frame`, so a
+  remote pane is parsed once, on the node that runs it.
+- **Pushed, not polled.** The CLI holds one push-capable connection per worker node (admitted
+  once), and subscribes, as a frame observer, to the panes it shows: the pane runtime's existing
+  frame push (wake, then build frames from the grid as it is when the connection can take a
+  message: never a backlog). Each subscription is authorized by a lease the ingress signs and the
+  worker verifies, and fenced to the execution's generation.
+- **Replicas follow their source.** The controller keeps a replica grid per remote pane (from
+  frames: size, content and input modes), forwards frames from it to its renderer, and only
+  resizes the worker's PTY; it no longer parses, reflows or tracks protocol state itself.
+- **Layout pushed too.** The ingress wakes subscribed clients when the cluster's control state
+  advances (the consensus metrics watch); clients then read the layout once.
+- Removed with it: the raw cursor reads, JSON terminal snapshots, gap repair, the worker's unused
+  output buffers, and both polls.
+
 ## Status
 
 Done (each a measured commit; see [render-performance.md](render-performance.md) for numbers):

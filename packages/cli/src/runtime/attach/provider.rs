@@ -170,7 +170,7 @@ mod tests {
         AttachDeltaSequence, AttachDetachOutcome, AttachInputPayload, AttachProviderAck,
         AttachProviderBackend, AttachProviderChange, AttachProviderDelta, AttachProviderEvent,
         AttachProviderInput, AttachProviderSnapshot, AttachProviderViewport, AttachResumeState,
-        AttachSession, AttachSessionFuture, AttachStreamCursor, AttachStreamId,
+        AttachSession, AttachSessionFuture, AttachStreamCursor, AttachStreamFrame, AttachStreamId,
         AttachStreamSnapshot, AttachViewRevision, BmuxClient,
     };
     use std::sync::Mutex;
@@ -245,19 +245,40 @@ mod tests {
         }
     }
 
+    /// The synthetic stream's frames and the epochs they bring a replica to: "hello" whole, then
+    /// "!" after it.
+    fn synthetic_frames() -> ((Vec<u8>, u64), (Vec<u8>, u64)) {
+        use bmux_terminal_grid::{GridLimits, ReplicaCursor, TerminalGridStream};
+        let mut source = TerminalGridStream::new(80, 24, GridLimits::default()).unwrap();
+        source.process(b"hello");
+        let mut first = Vec::new();
+        let one = source
+            .grid_mut()
+            .write_frame_since(ReplicaCursor::default(), 0, &mut first)
+            .next;
+        source.process(b"!");
+        let mut second = Vec::new();
+        let two = source
+            .grid_mut()
+            .write_frame_since(one, 0, &mut second)
+            .next;
+        ((first, one.epoch), (second, two.epoch))
+    }
+
     fn synthetic_snapshot() -> AttachProviderSnapshot {
         AttachProviderSnapshot {
             view_revision: AttachViewRevision(1),
             event_sequence: AttachDeltaSequence(1),
             scene: synthetic_scene(),
             streams: vec![AttachStreamSnapshot {
-                cursor: synthetic_cursor(5),
-                snapshot: b"hello".to_vec(),
+                cursor: synthetic_cursor(synthetic_frames().0.1),
+                sync_update_active: false,
+                frame: synthetic_frames().0.0,
             }],
             resume: AttachResumeState {
                 view_revision: AttachViewRevision(1),
                 event_sequence: AttachDeltaSequence(1),
-                streams: vec![synthetic_cursor(5)],
+                streams: vec![synthetic_cursor(synthetic_frames().0.1)],
                 provider_token: b"resume".to_vec(),
             },
         }
@@ -277,15 +298,17 @@ mod tests {
                         sequence: AttachDeltaSequence(2),
                         base_view_revision: AttachViewRevision(1),
                         view_revision: AttachViewRevision(1),
-                        changes: vec![AttachProviderChange::StreamAppend {
-                            cursor: synthetic_cursor(5),
-                            end_offset: 6,
-                            bytes: b"!".to_vec(),
-                        }],
+                        changes: vec![AttachProviderChange::StreamFrame(AttachStreamFrame {
+                            cursor: synthetic_cursor(synthetic_frames().0.1),
+                            end_offset: synthetic_frames().1.1,
+                            reset: false,
+                            sync_update_active: false,
+                            frame: synthetic_frames().1.0,
+                        })],
                         resume: AttachResumeState {
                             view_revision: AttachViewRevision(1),
                             event_sequence: AttachDeltaSequence(2),
-                            streams: vec![synthetic_cursor(6)],
+                            streams: vec![synthetic_cursor(synthetic_frames().1.1)],
                             provider_token: b"resume-2".to_vec(),
                         },
                     }))
@@ -361,7 +384,7 @@ mod tests {
                 let mut resume = AttachResumeState {
                     view_revision: AttachViewRevision(1),
                     event_sequence: AttachDeltaSequence(1),
-                    streams: vec![synthetic_cursor(5)],
+                    streams: vec![synthetic_cursor(synthetic_frames().0.1)],
                     provider_token: b"resume".to_vec(),
                 };
                 if mismatch {
@@ -431,7 +454,10 @@ mod tests {
         assert_eq!(outcome.status_code, 0);
         let resume = outcome.resume.expect("resume state");
         assert_eq!(resume.provider_token, b"resume");
-        assert_eq!(resume.streams, vec![synthetic_cursor(5)]);
+        assert_eq!(
+            resume.streams,
+            vec![synthetic_cursor(synthetic_frames().0.1)]
+        );
         assert_eq!(*detached.lock().unwrap(), 1);
     }
 

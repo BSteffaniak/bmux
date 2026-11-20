@@ -7,8 +7,8 @@ use bmux_client::{
     AttachDeltaSequence, AttachDetachOutcome, AttachInputPayload, AttachProviderAck,
     AttachProviderAction, AttachProviderChange, AttachProviderDelta, AttachProviderEvent,
     AttachProviderInput, AttachProviderSnapshot, AttachProviderViewport, AttachResumeState,
-    AttachSession, AttachSessionError, AttachSessionFuture, AttachStreamCursor, AttachStreamId,
-    AttachStreamSnapshot, AttachViewRevision, BmuxClient,
+    AttachSession, AttachSessionError, AttachSessionFuture, AttachStreamCursor, AttachStreamFrame,
+    AttachStreamId, AttachStreamSnapshot, AttachViewRevision, BmuxClient,
 };
 use bmux_config::ConfigPaths;
 use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::{
@@ -684,6 +684,14 @@ impl RemoteTerminal {
         Ok(())
     }
 }
+/// `grid`'s whole state as a reset frame.
+fn reset_frame(grid: &mut bmux_terminal_grid::TerminalGridStream) -> Vec<u8> {
+    let mut frame = Vec::new();
+    grid.grid_mut()
+        .write_frame_since(bmux_terminal_grid::ReplicaCursor::default(), 0, &mut frame);
+    frame
+}
+
 impl AttachSession for RemoteTerminal {
     fn initial_snapshot(&mut self) -> AttachSessionFuture<'_, AttachProviderSnapshot> {
         Box::pin(async move {
@@ -694,7 +702,8 @@ impl AttachSession for RemoteTerminal {
                 scene: self.scene(),
                 streams: vec![AttachStreamSnapshot {
                     cursor: self.cursor()?,
-                    snapshot: bmux_terminal_grid::full_screen_repaint_bytes(self.grid.grid()),
+                    sync_update_active: false,
+                    frame: reset_frame(&mut self.grid),
                 }],
                 resume: self.resume()?,
             };
@@ -776,10 +785,15 @@ impl AttachSession for RemoteTerminal {
                 self.scene_dirty = false;
                 changes.push(AttachProviderChange::Scene(self.scene()));
             }
+            // Each read is the whole screen anew: a reset frame, labelled by the event sequence.
+            let base = self.cursor()?;
             self.sequence += 1;
-            changes.push(AttachProviderChange::StreamRepair(AttachStreamSnapshot {
-                cursor: self.cursor()?,
-                snapshot: bmux_terminal_grid::full_screen_repaint_bytes(self.grid.grid()),
+            changes.push(AttachProviderChange::StreamFrame(AttachStreamFrame {
+                cursor: base,
+                end_offset: self.sequence,
+                reset: true,
+                sync_update_active: false,
+                frame: reset_frame(&mut self.grid),
             }));
             let delta = AttachProviderDelta {
                 sequence: AttachDeltaSequence(self.sequence),

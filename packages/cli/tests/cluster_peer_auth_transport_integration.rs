@@ -813,7 +813,7 @@ fn account_free_cli_pairs_persists_and_revokes() {
         loop {
             let event = terminal.next_event().await.unwrap();
             if let bmux_client::AttachProviderEvent::Delta(delta) = event
-                && delta.changes.iter().any(|change| matches!(change, bmux_client::AttachProviderChange::StreamRepair(stream) if String::from_utf8_lossy(&stream.snapshot).contains("REMOTE_UX_PROOF"))) { break; }
+                && delta.changes.iter().any(|change| matches!(change, bmux_client::AttachProviderChange::StreamFrame(stream) if String::from_utf8_lossy(&stream.frame).contains("REMOTE_UX_PROOF"))) { break; }
             assert!(
                 std::time::Instant::now() < deadline,
                 "remote PTY output not observed"

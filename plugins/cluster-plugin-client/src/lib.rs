@@ -144,6 +144,8 @@ struct ClusterSnapshotBuild {
     protocols:
         std::collections::BTreeMap<AttachStreamId, bmux_terminal_grid::TerminalProtocolTracker>,
     grids: std::collections::BTreeMap<AttachStreamId, bmux_terminal_grid::TerminalGridStream>,
+    /// Where the renderer's replica of each stream's grid stands: frames are written since it.
+    replicas: std::collections::BTreeMap<AttachStreamId, bmux_terminal_grid::ReplicaCursor>,
 }
 
 struct DecodedClusterTerminalSnapshot {
@@ -165,6 +167,8 @@ struct ClusterAttachSession {
     protocols:
         std::collections::BTreeMap<AttachStreamId, bmux_terminal_grid::TerminalProtocolTracker>,
     grids: std::collections::BTreeMap<AttachStreamId, bmux_terminal_grid::TerminalGridStream>,
+    /// Where the renderer's replica of each stream's grid stands: frames are written since it.
+    replicas: std::collections::BTreeMap<AttachStreamId, bmux_terminal_grid::ReplicaCursor>,
     scene: bmux_attach_layout_protocol::AttachScene,
     pending_events: std::collections::VecDeque<bmux_client::AttachProviderEvent>,
     unzoomed_scene: Option<bmux_attach_layout_protocol::AttachScene>,
@@ -253,6 +257,7 @@ impl ClusterAttachSession {
             streams,
             protocols: built.protocols,
             grids: built.grids,
+            replicas: built.replicas,
             scene,
             pending_events: std::collections::VecDeque::new(),
             unzoomed_scene: None,
@@ -332,6 +337,7 @@ impl ClusterAttachSession {
             .collect();
         self.protocols = built.protocols;
         self.grids = built.grids;
+        self.replicas = built.replicas;
         self.scene = built.snapshot.scene;
         self.unzoomed_scene = next_unzoomed_scene;
         self.zoomed_pane = next_zoomed_pane;
@@ -393,6 +399,7 @@ impl ClusterAttachSession {
             .collect();
         self.protocols = built.protocols;
         self.grids = built.grids;
+        self.replicas = built.replicas;
         self.scene = built.snapshot.scene;
         self.pending_events
             .push_back(bmux_client::AttachProviderEvent::Delta(delta));
@@ -475,18 +482,49 @@ impl ClusterAttachSession {
         self.enqueue_scene(scene);
         Ok(())
     }
+    /// Frames bringing the renderer's replicas level with grids that changed outside output
+    /// (resized: reset frames), each at its stream's cursor.
+    fn stream_frames(&mut self) -> Vec<bmux_client::AttachProviderChange> {
+        let mut changes = Vec::new();
+        for cursor in &self.streams {
+            let Some(grid) = self.grids.get_mut(&cursor.stream_id) else {
+                continue;
+            };
+            let replica = self.replicas.entry(cursor.stream_id.clone()).or_default();
+            let mut frame = Vec::new();
+            let summary = grid.grid_mut().write_frame_since(*replica, 0, &mut frame);
+            if summary.is_state_only() {
+                continue;
+            }
+            *replica = summary.next;
+            changes.push(bmux_client::AttachProviderChange::StreamFrame(
+                bmux_client::AttachStreamFrame {
+                    cursor: cursor.clone(),
+                    end_offset: cursor.offset,
+                    reset: summary.reset,
+                    sync_update_active: grid.grid().synchronized_update(),
+                    frame,
+                },
+            ));
+        }
+        changes
+    }
+
     fn enqueue_scene(&mut self, scene: bmux_attach_layout_protocol::AttachScene) {
         let base_view_revision = self.view_revision;
         self.view_revision = AttachViewRevision(self.view_revision.0.saturating_add(1));
         self.event_sequence = AttachDeltaSequence(self.event_sequence.0.saturating_add(1));
         self.scene = scene.clone();
+        // Grids resized for the scene reach the renderer as frames with it.
+        let mut changes = vec![bmux_client::AttachProviderChange::Scene(scene)];
+        changes.extend(self.stream_frames());
         self.pending_events
             .push_back(bmux_client::AttachProviderEvent::Delta(
                 bmux_client::AttachProviderDelta {
                     sequence: self.event_sequence,
                     base_view_revision,
                     view_revision: self.view_revision,
-                    changes: vec![bmux_client::AttachProviderChange::Scene(scene)],
+                    changes,
                     resume: AttachResumeState {
                         view_revision: self.view_revision,
                         event_sequence: self.event_sequence,
@@ -619,24 +657,34 @@ impl AttachSession for ClusterAttachSession {
                         .map_err(|error| {
                             provider_reason(format!("worker snapshot repair failed: {error:?}"))
                         })?;
-                        let decoded = decode_cluster_terminal_snapshot(&terminal)?;
+                        let mut decoded = decode_cluster_terminal_snapshot(&terminal)?;
                         let repaired = AttachStreamCursor {
                             generation: terminal.generation,
                             offset: decoded.cursor,
-                            ..cursor
+                            ..cursor.clone()
                         };
                         self.streams[index] = repaired.clone();
-                        let repaint = cluster_terminal_repaint(&decoded.stream);
+                        let (frame, replica) = cluster_reset_frame(&mut decoded.stream);
                         self.protocols.insert(
                             repaired.stream_id.clone(),
                             protocol_tracker_from_snapshot(&decoded),
                         );
+                        self.replicas.insert(repaired.stream_id.clone(), replica);
+                        let sync_update_active = decoded.stream.grid().synchronized_update();
                         self.grids
                             .insert(repaired.stream_id.clone(), decoded.stream);
-                        bmux_client::AttachProviderChange::StreamRepair(AttachStreamSnapshot {
-                            cursor: repaired,
-                            snapshot: repaint,
-                        })
+                        bmux_client::AttachProviderChange::StreamFrame(
+                            bmux_client::AttachStreamFrame {
+                                cursor: AttachStreamCursor {
+                                    offset: cursor.offset,
+                                    ..repaired.clone()
+                                },
+                                end_offset: repaired.offset,
+                                reset: true,
+                                sync_update_active,
+                                frame,
+                            },
+                        )
                     } else if !output.data.is_empty() {
                         let end_offset = output.next_cursor;
                         let appended = AttachStreamCursor {
@@ -652,11 +700,19 @@ impl AttachSession for ClusterAttachSession {
                         grid.process(&output.data);
                         self.protocols
                             .insert(cursor.stream_id.clone(), protocol_tracker_from_grid(grid));
-                        bmux_client::AttachProviderChange::StreamAppend {
-                            cursor,
-                            end_offset,
-                            bytes: output.data,
-                        }
+                        let replica = self.replicas.entry(cursor.stream_id.clone()).or_default();
+                        let mut frame = Vec::new();
+                        let summary = grid.grid_mut().write_frame_since(*replica, 0, &mut frame);
+                        *replica = summary.next;
+                        bmux_client::AttachProviderChange::StreamFrame(
+                            bmux_client::AttachStreamFrame {
+                                cursor,
+                                end_offset,
+                                reset: summary.reset,
+                                sync_update_active: grid.grid().synchronized_update(),
+                                frame,
+                            },
+                        )
                     } else {
                         continue;
                     };
@@ -970,7 +1026,12 @@ fn reflow_cluster_build_to_scene(
             })?;
         grid.resize(surface.content_rect.w.max(1), surface.content_rect.h.max(1))
             .map_err(|error| provider_reason(format!("cluster grid reflow failed: {error}")))?;
-        stream.snapshot = cluster_terminal_repaint(grid);
+        let (frame, replica) = cluster_reset_frame(grid);
+        stream.frame = frame;
+        stream.sync_update_active = grid.grid().synchronized_update();
+        built
+            .replicas
+            .insert(stream.cursor.stream_id.clone(), replica);
         built.protocols.insert(
             stream.cursor.stream_id.clone(),
             protocol_tracker_from_grid(grid),
@@ -1345,6 +1406,7 @@ fn assemble_cluster_snapshot(
     let mut streams = Vec::new();
     let mut protocols = std::collections::BTreeMap::new();
     let mut grids = std::collections::BTreeMap::new();
+    let mut replicas = std::collections::BTreeMap::new();
     let mut focus_pane = None;
     for pane in &layout.panes {
         let assignment = pane.execution.as_ref();
@@ -1385,13 +1447,16 @@ fn assemble_cluster_snapshot(
                 generation: assignment.generation,
                 offset: decoded.cursor,
             };
-            let repaint = cluster_terminal_repaint(&decoded.stream);
+            let mut decoded = decoded;
+            let (frame, replica) = cluster_reset_frame(&mut decoded.stream);
             protocols.insert(stream_id.clone(), protocol_tracker_from_snapshot(&decoded));
-            grids.insert(stream_id, decoded.stream);
+            replicas.insert(stream_id.clone(), replica);
             streams.push(AttachStreamSnapshot {
                 cursor,
-                snapshot: repaint,
+                sync_update_active: decoded.stream.grid().synchronized_update(),
+                frame,
             });
+            grids.insert(stream_id, decoded.stream);
             focus_pane.get_or_insert(pane.pane_id.value);
         } else {
             let stream_id = AttachStreamId::new(format!("status:{}", pane.pane_id.value))?;
@@ -1403,6 +1468,18 @@ fn assemble_cluster_snapshot(
                     .as_deref()
                     .map_or_else(String::new, |reason| format!(": {reason}"))
             );
+            // The status shows as the pane's screen: a grid of its message, like any stream's.
+            let mut grid = bmux_terminal_grid::TerminalGridStream::new(
+                80,
+                24,
+                bmux_terminal_grid::GridLimits::default(),
+            )
+            .map_err(|error| provider_reason(format!("status grid failed: {error}")))?;
+            grid.process(message.as_bytes());
+            let (frame, replica) = cluster_reset_frame(&mut grid);
+            protocols.insert(stream_id.clone(), protocol_tracker_from_grid(&grid));
+            replicas.insert(stream_id.clone(), replica);
+            grids.insert(stream_id.clone(), grid);
             streams.push(AttachStreamSnapshot {
                 cursor: AttachStreamCursor {
                     stream_id,
@@ -1410,7 +1487,8 @@ fn assemble_cluster_snapshot(
                     generation: 0,
                     offset: u64::try_from(message.len()).unwrap_or(u64::MAX),
                 },
-                snapshot: message.into_bytes(),
+                sync_update_active: false,
+                frame,
             });
         }
     }
@@ -1443,6 +1521,18 @@ fn assemble_cluster_snapshot(
         },
         protocols,
         grids,
+        replicas,
+    })
+}
+
+/// A snapshot stream as the reset frame that brings a renderer's replica to it.
+fn stream_reset_change(stream: &AttachStreamSnapshot) -> bmux_client::AttachProviderChange {
+    bmux_client::AttachProviderChange::StreamFrame(bmux_client::AttachStreamFrame {
+        cursor: stream.cursor.clone(),
+        end_offset: stream.cursor.offset,
+        reset: true,
+        sync_update_active: stream.sync_update_active,
+        frame: stream.frame.clone(),
     })
 }
 
@@ -1463,13 +1553,7 @@ fn cluster_reconciliation_delta(
     changes.push(bmux_client::AttachProviderChange::Scene(
         snapshot.scene.clone(),
     ));
-    changes.extend(
-        snapshot
-            .streams
-            .iter()
-            .cloned()
-            .map(bmux_client::AttachProviderChange::StreamRepair),
-    );
+    changes.extend(snapshot.streams.iter().map(stream_reset_change));
     let streams = snapshot
         .streams
         .iter()
@@ -1698,8 +1782,16 @@ fn decode_cluster_terminal_snapshot(
     })
 }
 
-fn cluster_terminal_repaint(stream: &bmux_terminal_grid::TerminalGridStream) -> Vec<u8> {
-    bmux_terminal_grid::full_screen_repaint_bytes(stream.grid())
+/// `stream`'s whole state as a reset frame, and the replica cursor it leaves a renderer at.
+fn cluster_reset_frame(
+    stream: &mut bmux_terminal_grid::TerminalGridStream,
+) -> (Vec<u8>, bmux_terminal_grid::ReplicaCursor) {
+    let mut frame = Vec::new();
+    let next = stream
+        .grid_mut()
+        .write_frame_since(bmux_terminal_grid::ReplicaCursor::default(), 0, &mut frame)
+        .next;
+    (frame, next)
 }
 
 fn protocol_tracker_from_snapshot(
@@ -2254,7 +2346,7 @@ mod tests {
             format!("status:{unavailable_id}")
         );
         assert!(
-            String::from_utf8_lossy(&built.snapshot.streams[1].snapshot).contains("worker offline")
+            String::from_utf8_lossy(&built.snapshot.streams[1].frame).contains("worker offline")
         );
         assert_eq!(built.snapshot.resume.streams.len(), 2);
         let ready_grid = built
@@ -2276,7 +2368,8 @@ mod tests {
                 generation: 2,
                 offset: 8,
             },
-            snapshot: b"state".to_vec(),
+            sync_update_active: false,
+            frame: b"state".to_vec(),
         };
         let scene = bmux_attach_layout_protocol::AttachScene {
             session_id: uuid::Uuid::from_u128(9),
@@ -2316,6 +2409,7 @@ mod tests {
             },
             protocols: std::collections::BTreeMap::new(),
             grids: std::collections::BTreeMap::new(),
+            replicas: std::collections::BTreeMap::new(),
         };
         let resume = AttachResumeState {
             view_revision: AttachViewRevision(7),
@@ -2344,7 +2438,8 @@ mod tests {
                 generation: 5,
                 offset: 3,
             },
-            snapshot: b"new".to_vec(),
+            sync_update_active: false,
+            frame: b"new".to_vec(),
         };
         let scene = bmux_attach_layout_protocol::AttachScene {
             session_id: uuid::Uuid::from_u128(2),
@@ -2402,7 +2497,7 @@ mod tests {
                     stream_id: old_stream.stream_id.clone(),
                 },
                 bmux_client::AttachProviderChange::Scene(scene.clone()),
-                bmux_client::AttachProviderChange::StreamRepair(new_stream.clone()),
+                super::stream_reset_change(&new_stream),
             ]
         );
         assert_eq!(delta.resume.streams, vec![new_stream.cursor]);
@@ -2414,7 +2509,8 @@ mod tests {
             scene,
             streams: vec![AttachStreamSnapshot {
                 cursor: old_stream.clone(),
-                snapshot: Vec::new(),
+                sync_update_active: false,
+                frame: Vec::new(),
             }],
             resume: AttachResumeState {
                 view_revision: AttachViewRevision(7),

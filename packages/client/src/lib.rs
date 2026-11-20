@@ -21,7 +21,7 @@ pub use attach_session::{
     AttachProviderAction, AttachProviderChange, AttachProviderDelta, AttachProviderDisconnect,
     AttachProviderEvent, AttachProviderInput, AttachProviderSnapshot, AttachProviderViewport,
     AttachResumeState, AttachSession, AttachSessionError, AttachSessionFuture, AttachStreamCursor,
-    AttachStreamId, AttachStreamSnapshot, AttachViewRevision,
+    AttachStreamFrame, AttachStreamId, AttachStreamSnapshot, AttachViewRevision,
 };
 pub use connection_pool::{
     ConnectionPoolAcquireError, ConnectionPoolConfigError, ConnectionPoolLimits,

@@ -44,22 +44,42 @@ impl AttachStreamId {
     }
 }
 
-/// Cursor in one generation of one output stream.
+/// Where one generation of one stream's replica stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachStreamCursor {
     pub stream_id: AttachStreamId,
     /// Neutral attach surface receiving this stream's terminal state.
     pub surface_id: uuid::Uuid,
     pub generation: u64,
+    /// The damage epoch the stream's replica is current to (its replica cursor's epoch).
     pub offset: u64,
 }
 
-/// Complete parser-repair snapshot for one stream.
+/// One stream's terminal state, whole.
+///
+/// A reset frame (`TerminalGrid::write_frame_since` from an unknown base) that brings an empty
+/// replica to the stream as of `cursor.offset`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachStreamSnapshot {
     pub cursor: AttachStreamCursor,
-    /// Full terminal/parser state bytes at `cursor.offset`.
-    pub snapshot: Vec<u8>,
+    /// The program is mid synchronized update (DEC mode 2026).
+    pub sync_update_active: bool,
+    pub frame: Vec<u8>,
+}
+
+/// A frame bringing a stream's replica level with its source.
+///
+/// It is written since the replica's epoch `cursor.offset`, after which the replica is at
+/// `end_offset`. A reset frame replaces the replica whatever it held, and may begin a new
+/// generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachStreamFrame {
+    pub cursor: AttachStreamCursor,
+    pub end_offset: u64,
+    pub reset: bool,
+    /// The program is mid synchronized update (DEC mode 2026).
+    pub sync_update_active: bool,
+    pub frame: Vec<u8>,
 }
 
 /// Provider-independent state needed to resume after a recoverable disconnect.
@@ -97,14 +117,8 @@ pub struct AttachProviderDelta {
 pub enum AttachProviderChange {
     /// Replace the neutral retained scene/layout.
     Scene(AttachScene),
-    /// Append contiguous output bytes to one stream generation.
-    StreamAppend {
-        cursor: AttachStreamCursor,
-        end_offset: u64,
-        bytes: Vec<u8>,
-    },
-    /// Replace parser state after retention loss or execution-generation change.
-    StreamRepair(AttachStreamSnapshot),
+    /// Bring one stream's replica level with its source.
+    StreamFrame(AttachStreamFrame),
     /// Remove a stream from the attached view.
     StreamRemoved { stream_id: AttachStreamId },
     /// Provider-defined status text for diagnostics and degraded state.
@@ -258,13 +272,6 @@ pub enum AttachSessionError {
         stream_id: String,
         expected: u64,
         actual: u64,
-    },
-    #[error("stream '{stream_id}' malformed range {start}..{end} for {bytes} bytes")]
-    MalformedRange {
-        stream_id: String,
-        start: u64,
-        end: u64,
-        bytes: usize,
     },
     #[error("resume state does not match validated provider state: {reason}")]
     InvalidResume { reason: String },
@@ -539,29 +546,33 @@ fn apply_change(
             streams.remove(stream_id);
             Ok(())
         }
-        AttachProviderChange::StreamRepair(snapshot) => {
-            if let Some(current) = streams.get(&snapshot.cursor.stream_id) {
-                if snapshot.cursor.surface_id != current.surface_id {
+        AttachProviderChange::StreamFrame(frame) if frame.reset => {
+            let cursor = &frame.cursor;
+            if let Some(current) = streams.get(&cursor.stream_id) {
+                if cursor.surface_id != current.surface_id {
                     return Err(AttachSessionError::SurfaceMismatch {
-                        stream_id: snapshot.cursor.stream_id.as_str().to_string(),
+                        stream_id: cursor.stream_id.as_str().to_string(),
                     });
                 }
-                if snapshot.cursor.generation < current.generation {
+                if cursor.generation < current.generation {
                     return Err(AttachSessionError::GenerationRegression {
-                        stream_id: snapshot.cursor.stream_id.as_str().to_string(),
+                        stream_id: cursor.stream_id.as_str().to_string(),
                         current: current.generation,
-                        received: snapshot.cursor.generation,
+                        received: cursor.generation,
                     });
                 }
             }
-            streams.insert(snapshot.cursor.stream_id.clone(), snapshot.cursor.clone());
+            streams.insert(
+                cursor.stream_id.clone(),
+                AttachStreamCursor {
+                    offset: frame.end_offset,
+                    ..cursor.clone()
+                },
+            );
             Ok(())
         }
-        AttachProviderChange::StreamAppend {
-            cursor,
-            end_offset,
-            bytes,
-        } => {
+        AttachProviderChange::StreamFrame(frame) => {
+            let cursor = &frame.cursor;
             let current = streams.get(&cursor.stream_id).ok_or_else(|| {
                 AttachSessionError::UnknownStream {
                     stream_id: cursor.stream_id.as_str().to_string(),
@@ -572,13 +583,6 @@ fn apply_change(
                     stream_id: cursor.stream_id.as_str().to_string(),
                 });
             }
-            if cursor.generation < current.generation {
-                return Err(AttachSessionError::GenerationRegression {
-                    stream_id: cursor.stream_id.as_str().to_string(),
-                    current: current.generation,
-                    received: cursor.generation,
-                });
-            }
             if cursor.generation != current.generation {
                 return Err(AttachSessionError::GenerationRegression {
                     stream_id: cursor.stream_id.as_str().to_string(),
@@ -586,6 +590,7 @@ fn apply_change(
                     received: cursor.generation,
                 });
             }
+            // A frame is written for the epoch the replica is at; any other is not its next.
             if cursor.offset != current.offset {
                 return Err(AttachSessionError::CursorGap {
                     stream_id: cursor.stream_id.as_str().to_string(),
@@ -593,24 +598,11 @@ fn apply_change(
                     actual: cursor.offset,
                 });
             }
-            let expected_end = cursor
-                .offset
-                .checked_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
-            if expected_end != Some(*end_offset) {
-                return Err(AttachSessionError::MalformedRange {
-                    stream_id: cursor.stream_id.as_str().to_string(),
-                    start: cursor.offset,
-                    end: *end_offset,
-                    bytes: bytes.len(),
-                });
-            }
             streams.insert(
                 cursor.stream_id.clone(),
                 AttachStreamCursor {
-                    stream_id: cursor.stream_id.clone(),
-                    surface_id: cursor.surface_id,
-                    generation: cursor.generation,
-                    offset: *end_offset,
+                    offset: frame.end_offset,
+                    ..cursor.clone()
                 },
             );
             Ok(())
@@ -741,7 +733,8 @@ mod tests {
             scene: scene(),
             streams: vec![AttachStreamSnapshot {
                 cursor: cursor(5),
-                snapshot: b"state".to_vec(),
+                sync_update_active: false,
+                frame: b"state".to_vec(),
             }],
             resume: AttachResumeState {
                 view_revision: AttachViewRevision(2),
@@ -752,6 +745,16 @@ mod tests {
         }
     }
 
+    fn frame(cursor: AttachStreamCursor, end_offset: u64, reset: bool) -> AttachProviderChange {
+        AttachProviderChange::StreamFrame(AttachStreamFrame {
+            cursor,
+            end_offset,
+            reset,
+            sync_update_active: false,
+            frame: b"frame".to_vec(),
+        })
+    }
+
     #[test]
     fn snapshot_and_contiguous_output_delta_advance_resume_state() {
         let mut validator = AttachContinuityValidator::default();
@@ -760,11 +763,7 @@ mod tests {
             sequence: AttachDeltaSequence(8),
             base_view_revision: AttachViewRevision(2),
             view_revision: AttachViewRevision(2),
-            changes: vec![AttachProviderChange::StreamAppend {
-                cursor: cursor(5),
-                end_offset: 8,
-                bytes: b"abc".to_vec(),
-            }],
+            changes: vec![frame(cursor(5), 8, false)],
             resume: AttachResumeState {
                 view_revision: AttachViewRevision(2),
                 event_sequence: AttachDeltaSequence(8),
@@ -797,35 +796,21 @@ mod tests {
         assert_eq!(validator.resume_state(), before);
     }
 
+    /// A frame written for another epoch than the replica's is not its next.
     #[test]
-    fn cursor_gap_and_malformed_range_are_rejected() {
+    fn frames_from_another_epoch_are_rejected() {
         let mut validator = AttachContinuityValidator::default();
         validator.apply_snapshot(&snapshot()).unwrap();
-        let mut delta = AttachProviderDelta {
+        let delta = AttachProviderDelta {
             sequence: AttachDeltaSequence(8),
             base_view_revision: AttachViewRevision(2),
             view_revision: AttachViewRevision(2),
-            changes: vec![AttachProviderChange::StreamAppend {
-                cursor: cursor(6),
-                end_offset: 7,
-                bytes: b"x".to_vec(),
-            }],
+            changes: vec![frame(cursor(6), 7, false)],
             resume: AttachResumeState::default(),
         };
         assert!(matches!(
             validator.apply_delta(&delta),
             Err(AttachSessionError::CursorGap { .. })
-        ));
-        if let AttachProviderChange::StreamAppend {
-            cursor, end_offset, ..
-        } = &mut delta.changes[0]
-        {
-            cursor.offset = 5;
-            *end_offset = 99;
-        }
-        assert!(matches!(
-            validator.apply_delta(&delta),
-            Err(AttachSessionError::MalformedRange { .. })
         ));
     }
 
@@ -876,7 +861,7 @@ mod tests {
     }
 
     #[test]
-    fn repair_allows_generation_advance_but_not_regression() {
+    fn reset_frames_allow_generation_advance_but_not_regression() {
         let mut validator = AttachContinuityValidator::default();
         validator.apply_snapshot(&snapshot()).unwrap();
         let repaired = AttachStreamCursor {
@@ -891,10 +876,7 @@ mod tests {
             view_revision: AttachViewRevision(3),
             changes: vec![
                 AttachProviderChange::Scene(scene()),
-                AttachProviderChange::StreamRepair(AttachStreamSnapshot {
-                    cursor: repaired.clone(),
-                    snapshot: b"full".to_vec(),
-                }),
+                frame(repaired.clone(), 10, true),
             ],
             resume: AttachResumeState {
                 view_revision: AttachViewRevision(3),
@@ -909,10 +891,7 @@ mod tests {
             sequence: AttachDeltaSequence(9),
             base_view_revision: AttachViewRevision(3),
             view_revision: AttachViewRevision(3),
-            changes: vec![AttachProviderChange::StreamRepair(AttachStreamSnapshot {
-                cursor: cursor(11),
-                snapshot: Vec::new(),
-            })],
+            changes: vec![frame(cursor(11), 11, true)],
             resume: AttachResumeState::default(),
         };
         assert!(matches!(

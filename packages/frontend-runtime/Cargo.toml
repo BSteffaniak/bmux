@@ -18,6 +18,9 @@ bmux_client                 = { workspace = true }
 bmux_tui                    = { workspace = true }
 uuid                        = { workspace = true }
 
+[dev-dependencies]
+bmux_terminal_grid = { workspace = true }
+
 [features]
 default          = []
 fail-on-warnings = []

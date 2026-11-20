@@ -1,14 +1,14 @@
 //! Provider-neutral parser state shared by terminal and native frontends.
 //!
-//! Stream bytes update the existing terminal grids; this module neither executes
-//! PTYs nor constructs an alternate layout, image registry, or hit map.
+//! Stream frames keep each pane's replica grid level with its source; this module neither
+//! executes PTYs nor constructs an alternate layout, image registry, or hit map.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result};
 use bmux_attach_layout_protocol::AttachScene;
 use bmux_attach_pipeline::PaneRenderBuffer;
-use bmux_attach_pipeline::render::append_pane_output;
+use bmux_attach_pipeline::render::apply_pane_frame;
 use bmux_client::{
     AttachContinuityValidator, AttachProviderChange, AttachProviderDelta, AttachProviderSnapshot,
     AttachResumeState, AttachStreamCursor,
@@ -95,17 +95,29 @@ impl AttachState {
     }
 }
 
-/// Build grids from complete provider repair bytes. Shared with the CLI adapter.
+/// Build replica grids from a snapshot's reset frames. Shared with the CLI adapter.
 pub fn pane_buffers_from_snapshot(
     snapshot: &AttachProviderSnapshot,
 ) -> Result<BTreeMap<Uuid, PaneRenderBuffer>> {
     let mut buffers = BTreeMap::new();
     for stream in &snapshot.streams {
         let mut buffer = render_buffer(&snapshot.scene, stream.cursor.surface_id)?;
-        append_pane_output(&mut buffer, &stream.snapshot);
+        apply_stream_frame(&mut buffer, &stream.frame, stream.sync_update_active)?;
         buffers.insert(stream.cursor.surface_id, buffer);
     }
     Ok(buffers)
+}
+
+/// Apply one stream frame to its replica.
+fn apply_stream_frame(
+    buffer: &mut PaneRenderBuffer,
+    frame: &[u8],
+    sync_update_active: bool,
+) -> Result<()> {
+    apply_pane_frame(buffer, frame)
+        .map_err(|error| anyhow::anyhow!("attach provider frame does not apply: {error}"))?;
+    buffer.set_sync_update(sync_update_active, std::time::Instant::now());
+    Ok(())
 }
 
 /// Allocate a parser using execution-cell geometry, never native pixel geometry.
@@ -131,35 +143,19 @@ pub fn apply_delta_to_buffers(
 ) -> Result<()> {
     for change in &delta.changes {
         match change {
-            AttachProviderChange::StreamAppend { cursor, bytes, .. } => {
-                if let std::collections::btree_map::Entry::Vacant(entry) =
-                    buffers.entry(cursor.surface_id)
-                {
-                    entry.insert(render_buffer(scene, cursor.surface_id)?);
+            AttachProviderChange::StreamFrame(frame) => {
+                let surface_id = frame.cursor.surface_id;
+                if frame.reset {
+                    // Whatever the replica held, it starts over.
+                    buffers.insert(surface_id, render_buffer(scene, surface_id)?);
                 }
-                if let Some(buffer) = buffers.get_mut(&cursor.surface_id) {
-                    append_pane_output(buffer, bytes);
-                }
+                let buffer = buffers.get_mut(&surface_id).with_context(|| {
+                    format!("attach provider frame for unknown surface {surface_id}")
+                })?;
+                apply_stream_frame(buffer, &frame.frame, frame.sync_update_active)?;
             }
-            AttachProviderChange::StreamRepair(snapshot) => {
-                let mut buffer = render_buffer(scene, snapshot.cursor.surface_id)?;
-                append_pane_output(&mut buffer, &snapshot.snapshot);
-                buffers.insert(snapshot.cursor.surface_id, buffer);
-            }
-            AttachProviderChange::Scene(replacement) => {
-                for surface in &replacement.surfaces {
-                    if let Some(buffer) = buffers.get_mut(&surface.id) {
-                        buffer
-                            .terminal_grid
-                            .resize(surface.content_rect.w.max(1), surface.content_rect.h.max(1))
-                            .map_err(|error| {
-                                anyhow::anyhow!(
-                                    "attach provider replacement surface grid is invalid: {error}"
-                                )
-                            })?;
-                    }
-                }
-            }
+            // Replicas take their size from their frames, not from the scene.
+            AttachProviderChange::Scene(_) => {}
             AttachProviderChange::StreamRemoved { stream_id } => {
                 if let Some(cursor) = delta
                     .resume
@@ -226,6 +222,112 @@ mod tests {
         assert_eq!(state.resume_state(), before);
         assert_eq!(state.scene(), &snapshot.scene);
         assert!(state.focused_stream().is_none());
+    }
+
+    /// Frames from a source grid, through output, scrolling, a resize and the alternate screen,
+    /// leave the attach state's replica equal to the source.
+    #[test]
+    fn stream_frames_keep_the_replica_level_with_its_source() {
+        use bmux_attach_layout_protocol::{
+            AttachLayer, AttachRect, AttachSurface, AttachSurfaceKind,
+        };
+        use bmux_client::{AttachStreamFrame, AttachStreamId, AttachStreamSnapshot};
+        use bmux_terminal_grid::{GridLimits, ReplicaCursor, TerminalGridStream};
+        let surface_id = Uuid::new_v4();
+        let rect = AttachRect {
+            x: 0,
+            y: 0,
+            w: 20,
+            h: 4,
+        };
+        let mut snapshot = snapshot();
+        snapshot.scene.surfaces.push(AttachSurface {
+            id: surface_id,
+            kind: AttachSurfaceKind::Pane,
+            layer: AttachLayer::Pane,
+            z: 0,
+            rect,
+            content_rect: rect,
+            interactive_regions: Vec::new(),
+            opaque: true,
+            visible: true,
+            accepts_input: true,
+            cursor_owner: true,
+            pane_id: Some(surface_id),
+        });
+        let cursor = |offset| AttachStreamCursor {
+            stream_id: AttachStreamId::new("stream").unwrap(),
+            surface_id,
+            generation: 1,
+            offset,
+        };
+        let mut source = TerminalGridStream::new(20, 4, GridLimits::default()).unwrap();
+        source.process(b"hello\r\nworld");
+        let mut downstream = ReplicaCursor::default();
+        let write = |source: &mut TerminalGridStream, downstream: &mut ReplicaCursor| {
+            let mut frame = Vec::new();
+            let base = downstream.epoch;
+            let summary = source
+                .grid_mut()
+                .write_frame_since(*downstream, 0, &mut frame);
+            *downstream = summary.next;
+            (base, summary, frame)
+        };
+        let (_, first, frame) = write(&mut source, &mut downstream);
+        assert!(first.reset);
+        snapshot.streams.push(AttachStreamSnapshot {
+            cursor: cursor(first.next.epoch),
+            sync_update_active: false,
+            frame,
+        });
+        snapshot.resume.streams.push(cursor(first.next.epoch));
+        let mut state = AttachState::from_snapshot(&snapshot).unwrap();
+        let mut sequence = 0;
+        let mut send = |state: &mut AttachState, source: &mut TerminalGridStream| {
+            let (base, summary, frame) = write(source, &mut downstream);
+            sequence += 1;
+            state.apply_delta(&AttachProviderDelta {
+                sequence: AttachDeltaSequence(sequence),
+                base_view_revision: AttachViewRevision(1),
+                view_revision: AttachViewRevision(1),
+                changes: vec![AttachProviderChange::StreamFrame(AttachStreamFrame {
+                    cursor: cursor(base),
+                    end_offset: summary.next.epoch,
+                    reset: summary.reset,
+                    sync_update_active: source.grid().synchronized_update(),
+                    frame,
+                })],
+                resume: AttachResumeState {
+                    view_revision: AttachViewRevision(1),
+                    event_sequence: AttachDeltaSequence(sequence),
+                    streams: vec![cursor(summary.next.epoch)],
+                    provider_token: Vec::new(),
+                },
+            })
+        };
+        let level = |state: &mut AttachState, source: &TerminalGridStream| {
+            let replica = state.buffers_mut()[&surface_id].terminal_grid.grid();
+            assert_eq!(replica.width(), source.grid().width());
+            assert_eq!(
+                bmux_terminal_grid::visible_text(replica, 0, replica.height()),
+                bmux_terminal_grid::visible_text(source.grid(), 0, source.grid().height())
+            );
+            assert_eq!(replica.protocol_state(), source.grid().protocol_state());
+        };
+        level(&mut state, &source);
+        for step in [
+            &b"\r\none\r\ntwo\r\nthree"[..],
+            b"\x1b[?1049h\x1b[?1002h\x1b[?2026hfull screen",
+            b"\x1b[?2026l\x1b[?1049l",
+        ] {
+            source.process(step);
+            send(&mut state, &mut source).unwrap();
+            level(&mut state, &source);
+        }
+        source.resize(30, 6).unwrap();
+        source.process(b"wider");
+        send(&mut state, &mut source).unwrap();
+        level(&mut state, &source);
     }
 
     #[test]

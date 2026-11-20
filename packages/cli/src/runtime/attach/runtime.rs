@@ -20603,14 +20603,35 @@ mod tests {
                 },
             ],
         };
-        let stream = |name: &str, surface_id, bytes: &[u8]| bmux_client::AttachStreamSnapshot {
-            cursor: bmux_client::AttachStreamCursor {
-                stream_id: bmux_client::AttachStreamId::new(name).unwrap(),
-                surface_id,
-                generation: 1,
-                offset: u64::try_from(bytes.len()).unwrap(),
-            },
-            snapshot: bytes.to_vec(),
+        // A pane's whole state as a reset frame, and the epoch it brings a replica to.
+        let reset_frame = |bytes: &[u8]| {
+            let mut source = bmux_terminal_grid::TerminalGridStream::new(
+                5,
+                2,
+                bmux_terminal_grid::GridLimits::default(),
+            )
+            .unwrap();
+            source.process(bytes);
+            let mut frame = Vec::new();
+            let epoch = source
+                .grid_mut()
+                .write_frame_since(bmux_terminal_grid::ReplicaCursor::default(), 0, &mut frame)
+                .next
+                .epoch;
+            (frame, epoch)
+        };
+        let stream = |name: &str, surface_id, bytes: &[u8]| {
+            let (frame, epoch) = reset_frame(bytes);
+            bmux_client::AttachStreamSnapshot {
+                cursor: bmux_client::AttachStreamCursor {
+                    stream_id: bmux_client::AttachStreamId::new(name).unwrap(),
+                    surface_id,
+                    generation: 1,
+                    offset: epoch,
+                },
+                sync_update_active: false,
+                frame,
+            }
         };
         let left_stream = stream("left", left, b"left");
         let right_stream = stream("right", right, b"right");
@@ -20631,18 +20652,22 @@ mod tests {
         let mut graphics = TerminalGraphicsCache::new();
         render_native_provider_scene(&mut terminal, &scene, &mut buffers, &mut graphics).unwrap();
 
+        let (fixed, fixed_epoch) = reset_frame(b"fixed");
         let repaired_cursor = bmux_client::AttachStreamCursor {
-            offset: 8,
-            ..left_stream.cursor
+            offset: fixed_epoch,
+            ..left_stream.cursor.clone()
         };
         let delta = bmux_client::AttachProviderDelta {
             sequence: bmux_client::AttachDeltaSequence(1),
             base_view_revision: bmux_client::AttachViewRevision(1),
             view_revision: bmux_client::AttachViewRevision(1),
-            changes: vec![AttachProviderChange::StreamRepair(
-                bmux_client::AttachStreamSnapshot {
-                    cursor: repaired_cursor.clone(),
-                    snapshot: b"fixed".to_vec(),
+            changes: vec![AttachProviderChange::StreamFrame(
+                bmux_client::AttachStreamFrame {
+                    cursor: left_stream.cursor,
+                    end_offset: fixed_epoch,
+                    reset: true,
+                    sync_update_active: false,
+                    frame: fixed,
                 },
             )],
             resume: bmux_client::AttachResumeState {

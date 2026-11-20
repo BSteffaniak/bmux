@@ -2435,6 +2435,7 @@ dependencies = [
  "bmux_attach_layout_protocol",
  "bmux_attach_pipeline",
  "bmux_client",
+ "bmux_terminal_grid",
  "bmux_tui",
  "uuid",
 ]
