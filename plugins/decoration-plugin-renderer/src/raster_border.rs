@@ -45,24 +45,6 @@ pub fn semantic_border_terminal_graphic_z(_scene_z: i16) -> i16 {
 }
 
 #[must_use]
-pub fn semantic_border_graphic_items(
-    surface_id: Uuid,
-    semantic_key: u64,
-    command: &PaintCommand,
-    capabilities: TerminalRenderCapabilities,
-    scene_capabilities: SceneRenderCapabilities,
-) -> Option<Vec<RenderLayerItem>> {
-    semantic_border_graphic_items_with_occlusion(
-        surface_id,
-        semantic_key,
-        command,
-        capabilities,
-        scene_capabilities,
-        &[],
-    )
-}
-
-#[must_use]
 pub fn semantic_border_graphic_items_with_occlusion(
     surface_id: Uuid,
     semantic_key: u64,
@@ -379,7 +361,7 @@ mod tests {
             when: None,
         };
         assert!(
-            semantic_border_graphic_items(
+            semantic_border_graphic_items_with_occlusion(
                 Uuid::from_u128(1),
                 0,
                 &command,
@@ -391,11 +373,12 @@ mod tests {
                     ..TerminalRenderCapabilities::default()
                 },
                 SceneRenderCapabilities::default(),
+                &[],
             )
             .is_some()
         );
         assert!(
-            semantic_border_graphic_items(
+            semantic_border_graphic_items_with_occlusion(
                 Uuid::from_u128(1),
                 0,
                 &command,
@@ -406,6 +389,7 @@ mod tests {
                     ..TerminalRenderCapabilities::default()
                 },
                 SceneRenderCapabilities::default(),
+                &[],
             )
             .is_none()
         );
@@ -444,7 +428,7 @@ mod tests {
             radius_px: 0,
             when: None,
         };
-        let items = semantic_border_graphic_items(
+        let items = semantic_border_graphic_items_with_occlusion(
             Uuid::from_u128(1),
             0,
             &command,
@@ -456,6 +440,7 @@ mod tests {
                 ..TerminalRenderCapabilities::default()
             },
             SceneRenderCapabilities::default(),
+            &[],
         )
         .expect("semantic border should lower to graphics");
 

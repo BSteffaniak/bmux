@@ -15,8 +15,9 @@ scenes:
   consults the decoration scene for each visible surface.
 - Subscribes to the client-side retained `bmux.scene/scene-protocol` state
   channel and caches the latest `DecorationScene`.
-- Delegates per-surface paint to
-  \[`bmux_scene_protocol_render::paint::apply_paint_commands`\].
+- Publishes each surface's paint commands as retained scene layers
+  (before and after pane content), each with a revision hashed from its
+  inputs, for the attach renderer to diff and paint.
 
 Call \[`install`\] once during CLI bootstrap to register the extension
 and set up the subscriber. The function is idempotent; repeat

@@ -17,9 +17,8 @@
 //!    every subsequent scene replacement is drained by
 //!    [`AttachRenderExtension::refresh_state`] before the next frame renders
 //!    (revision-guarded so stale wire events can't downgrade).
-//! 3. On every attach-render pass, the extension publishes retained scene items
-//!    for the attach renderer to diff and emit. Legacy damage/render callbacks
-//!    remain as fallback paths and keep their own rendered-surface cache.
+//! 3. Each surface's layers are published as retained scenes, with a revision
+//!    hashed from the scene's inputs, for the attach renderer to diff and emit.
 //!
 //! The CLI's streaming loop is responsible for decoding the IPC
 //! `PluginBusEvent` payloads and re-emitting them onto the local
@@ -39,10 +38,9 @@ use bmux_plugin::{
     AttachInputEndpoint, AttachInputHook, AttachInputHookFilter, AttachRenderExtension,
     AttachVisualAdapterRequest, AttachVisualFrameView, AttachVisualProjectionResult,
     AttachVisualProjectionUpdate, BorderGlyphs as RenderBorderGlyphs, ExtensionRect, RenderCell,
-    RenderColor, RenderDamage, RenderExtensionContext, RenderExtensionLayer, RenderLayerItem,
-    RenderLayerScene, RenderNamedColor, RenderOp, RenderSceneItem, RenderSceneItemKey, RenderStyle,
-    RenderUnderCell, TerminalRenderCapabilities, render_single_display_cell_char,
-    render_text_width_u16,
+    RenderColor, RenderExtensionContext, RenderExtensionLayer, RenderLayerItem, RenderLayerScene,
+    RenderNamedColor, RenderOp, RenderSceneItem, RenderSceneItemKey, RenderStyle,
+    TerminalRenderCapabilities, render_single_display_cell_char, render_text_width_u16,
 };
 use bmux_scene_protocol::glyphs::border_glyphs_corners_or_custom;
 use bmux_scene_protocol::scene_protocol::{
@@ -70,7 +68,6 @@ struct DecorationRendererCache {
     /// Each surface's layer revisions ([`surface_layer_revision`], before-content then
     /// after-content), hashed once per scene rather than at every frame's revision query.
     layer_revisions: BTreeMap<Uuid, [u64; 2]>,
-    rendered_surfaces: BTreeMap<(Uuid, RenderExtensionLayer), SurfaceDecoration>,
     scene_rx: Option<tokio::sync::watch::Receiver<Arc<DecorationScene>>>,
     visual_last_at: BTreeMap<String, Instant>,
     visual_last_revision: BTreeMap<String, u64>,
@@ -170,51 +167,7 @@ impl DecorationRendererCache {
         self.surfaces.get(surface_id)
     }
 
-    fn rendered_surface(&self, surface_id: &Uuid) -> Option<&SurfaceDecoration> {
-        self.rendered_surface_layer(surface_id, RenderExtensionLayer::AfterPaneContent)
-    }
-
-    fn rendered_surface_layer(
-        &self,
-        surface_id: &Uuid,
-        layer: RenderExtensionLayer,
-    ) -> Option<&SurfaceDecoration> {
-        self.rendered_surfaces.get(&(*surface_id, layer))
-    }
-
-    fn mark_layer_rendered(&mut self, surface_id: Uuid, layer: RenderExtensionLayer) {
-        if let Some(surface) = self.surfaces.get(&surface_id) {
-            self.mark_layer_rendered_snapshot(surface_id, layer, surface.clone());
-        } else {
-            self.rendered_surfaces
-                .retain(|(rendered_id, _), _| rendered_id != &surface_id);
-        }
-    }
-
-    fn mark_layer_rendered_snapshot(
-        &mut self,
-        surface_id: Uuid,
-        layer: RenderExtensionLayer,
-        surface: SurfaceDecoration,
-    ) {
-        self.rendered_surfaces.insert((surface_id, layer), surface);
-    }
-
-    fn mark_rendered(&mut self, surface_id: Uuid) {
-        self.mark_layer_rendered(surface_id, RenderExtensionLayer::AfterPaneContent);
-    }
-
-    fn mark_rendered_snapshot(&mut self, surface_id: Uuid, surface: SurfaceDecoration) {
-        self.mark_layer_rendered_snapshot(
-            surface_id,
-            RenderExtensionLayer::AfterPaneContent,
-            surface,
-        );
-    }
-
     fn forget_surface(&mut self, surface_id: &Uuid) {
-        self.rendered_surfaces
-            .retain(|(rendered_id, _), _| rendered_id != surface_id);
         self.surfaces.remove(surface_id);
         self.layer_revisions.remove(surface_id);
         let suffix = format!(":{surface_id}");
@@ -233,102 +186,6 @@ impl DecorationRendererCache {
 struct DecorationRenderExtension {
     name: String,
     cache: Arc<Mutex<DecorationRendererCache>>,
-}
-
-impl DecorationRenderExtension {
-    fn render_layer_ops_with_terminal_capabilities(
-        &self,
-        surface_id: Uuid,
-        damage: &RenderDamage,
-        layer: RenderExtensionLayer,
-        capabilities: TerminalRenderCapabilities,
-    ) -> Option<Vec<RenderOp>> {
-        let Ok(mut cache) = self.cache.lock() else {
-            return Some(Vec::new());
-        };
-        let Some(surface) = cache.surface(&surface_id) else {
-            cache.mark_layer_rendered(surface_id, layer);
-            return Some(Vec::new());
-        };
-        if layer_paint_commands(surface, layer).is_empty() || damage.is_none() {
-            cache.mark_layer_rendered(surface_id, layer);
-            return Some(Vec::new());
-        }
-        let rendered_surface = surface.clone();
-        let damaged_surface = filter_surface_layer_for_damage(surface, damage, layer);
-        if layer_paint_commands(&damaged_surface, layer).is_empty() {
-            cache.mark_layer_rendered_snapshot(surface_id, layer, rendered_surface);
-            return Some(Vec::new());
-        }
-        let scene_capabilities = scene_capabilities_from_terminal(capabilities);
-        let graphics_semantic_border_active = surface_has_graphics_semantic_border(
-            surface_id,
-            surface,
-            capabilities,
-            scene_capabilities,
-        );
-        let mut render_surface;
-        let surface_for_ops =
-            if layer == RenderExtensionLayer::AfterPaneContent && graphics_semantic_border_active {
-                render_surface = surface.clone();
-                render_surface
-                    .paint_commands
-                    .retain(|command| !matches!(command, PaintCommand::BoxBorder { .. }));
-                &render_surface
-            } else {
-                surface
-            };
-        // If terminal graphics are unavailable, semantic borders fall back to
-        // terminal-cell drawing. Render the full layer, not only the damaged
-        // subset, so higher-z text decorations are replayed after lower-z
-        // border/paddle clears in the same synchronized frame. Filtering the
-        // command list here was the real-terminal flicker path: a dirty border
-        // could be emitted without the header/score command that normally
-        // occludes it.
-        let ops = render_ops_for_surface_layer_with_capabilities(
-            surface_for_ops,
-            layer,
-            scene_capabilities,
-        )?;
-        cache.mark_layer_rendered_snapshot(surface_id, layer, rendered_surface);
-        Some(ops)
-    }
-
-    fn render_before_content_cells_with_capabilities(
-        &self,
-        surface_id: Uuid,
-        damage: &RenderDamage,
-        capabilities: SceneRenderCapabilities,
-    ) -> Option<Vec<(u16, u16, RenderUnderCell)>> {
-        let Ok(mut cache) = self.cache.lock() else {
-            return Some(Vec::new());
-        };
-        let Some(surface) = cache.surface(&surface_id) else {
-            cache.mark_layer_rendered(surface_id, RenderExtensionLayer::BeforePaneContent);
-            return Some(Vec::new());
-        };
-        if surface.before_content_paint_commands.is_empty() || damage.is_none() {
-            cache.mark_layer_rendered(surface_id, RenderExtensionLayer::BeforePaneContent);
-            return Some(Vec::new());
-        }
-        let rendered_surface = surface.clone();
-        let surface = filter_surface_layer_for_damage(
-            surface,
-            damage,
-            RenderExtensionLayer::BeforePaneContent,
-        );
-        let ops = render_ops_for_surface_layer_with_capabilities(
-            &surface,
-            RenderExtensionLayer::BeforePaneContent,
-            capabilities,
-        )?;
-        cache.mark_layer_rendered_snapshot(
-            surface_id,
-            RenderExtensionLayer::BeforePaneContent,
-            rendered_surface,
-        );
-        Some(render_ops_to_under_cells(&ops))
-    }
 }
 
 impl AttachRenderExtension for DecorationRenderExtension {
@@ -355,83 +212,9 @@ impl AttachRenderExtension for DecorationRenderExtension {
         }
     }
 
-    fn surface_layer_damage(
-        &self,
-        surface_id: Uuid,
-        _surface_rect: &ExtensionRect,
-        layer: RenderExtensionLayer,
-    ) -> RenderDamage {
-        let Ok(cache) = self.cache.lock() else {
-            return RenderDamage::None;
-        };
-        let current = cache.surface(&surface_id);
-        let previous = cache.rendered_surface_layer(&surface_id, layer);
-        decoration_surface_layer_damage(previous, current, layer)
-    }
-
-    fn paints_inside_content(
-        &self,
-        surface_id: Uuid,
-        _surface_rect: &ExtensionRect,
-        layer: RenderExtensionLayer,
-        content: &ExtensionRect,
-    ) -> bool {
-        let Ok(cache) = self.cache.lock() else {
-            return true;
-        };
-        // What is on the terminal now and what the next render draws.
-        [
-            cache.rendered_surface_layer(&surface_id, layer),
-            cache.surface(&surface_id),
-        ]
-        .into_iter()
-        .flatten()
-        .flat_map(|surface| layer_paint_commands(surface, layer))
-        .flat_map(paint_command_damage)
-        .any(|rect| rect.intersects(*content))
-    }
-
-    fn surface_damage(&self, surface_id: Uuid, _surface_rect: &ExtensionRect) -> RenderDamage {
-        let Ok(cache) = self.cache.lock() else {
-            return RenderDamage::None;
-        };
-        let current = cache.surface(&surface_id);
-        let previous = cache.rendered_surface(&surface_id);
-        decoration_surface_damage(previous, current)
-    }
-
-    fn render_revision(&self, surface_id: Uuid) -> Option<u64> {
-        let cache = self.cache.lock().ok()?;
-        cache.surface(&surface_id).map(surface_revision)
-    }
-
     fn render_layer_revision(&self, surface_id: Uuid, layer: RenderExtensionLayer) -> Option<u64> {
         let cache = self.cache.lock().ok()?;
         cache.layer_revision(&surface_id, layer)
-    }
-
-    fn redraws_on_content_damage(&self, layer: RenderExtensionLayer) -> bool {
-        // Decoration commands frequently occupy border/title cells that real
-        // pane output can still clear during full-row/full-screen terminal
-        // repaints. Replaying the after-content layer on pane content damage is
-        // required to keep headers, scores, paddles, and fallback borders from
-        // disappearing until the next decoration tick.
-        layer == RenderExtensionLayer::AfterPaneContent
-    }
-
-    fn render_layer_ops(
-        &self,
-        surface_id: Uuid,
-        _surface_rect: &ExtensionRect,
-        damage: &RenderDamage,
-        layer: RenderExtensionLayer,
-    ) -> Option<Vec<RenderOp>> {
-        self.render_layer_ops_with_terminal_capabilities(
-            surface_id,
-            damage,
-            layer,
-            TerminalRenderCapabilities::default(),
-        )
     }
 
     fn render_layer_scene_with_context(
@@ -471,155 +254,6 @@ impl AttachRenderExtension for DecorationRenderExtension {
             scene_capabilities,
             &context.opaque_occluders,
         ))
-    }
-
-    fn render_layer_items_with_context(
-        &self,
-        surface_id: Uuid,
-        _surface_rect: &ExtensionRect,
-        damage: &RenderDamage,
-        layer: RenderExtensionLayer,
-        context: &RenderExtensionContext,
-    ) -> Option<Vec<RenderLayerItem>> {
-        let Ok(mut cache) = self.cache.lock() else {
-            return Some(Vec::new());
-        };
-        let Some(surface) = cache.surface(&surface_id) else {
-            cache.mark_layer_rendered(surface_id, layer);
-            return Some(Vec::new());
-        };
-        let rendered_surface = surface.clone();
-        let previous_surface = cache.rendered_surface_layer(&surface_id, layer).cloned();
-        if layer_paint_commands(surface, layer).is_empty() && previous_surface.is_none()
-            || damage.is_none()
-        {
-            cache.mark_layer_rendered(surface_id, layer);
-            return Some(Vec::new());
-        }
-
-        let scene_capabilities = scene_capabilities_from_terminal(context.capabilities);
-        let global_occluders = &context.opaque_occluders;
-        let previous_used_graphics = previous_surface.as_ref().is_some_and(|previous| {
-            layer_paint_commands(previous, layer)
-                .iter()
-                .enumerate()
-                .any(|(semantic_index, command)| {
-                    raster_border::semantic_border_graphic_items_with_occlusion(
-                        surface_id,
-                        u64::try_from(semantic_index).unwrap_or(u64::MAX),
-                        command,
-                        context.capabilities,
-                        scene_capabilities,
-                        global_occluders,
-                    )
-                    .is_some()
-                })
-        });
-
-        let layer_commands = layer_paint_commands(surface, layer);
-        let mut ordered: Vec<(usize, &PaintCommand)> = layer_commands.iter().enumerate().collect();
-        ordered.sort_by_key(|(index, command)| paint_command_sort_key(*index, command));
-
-        let mut used_graphics = previous_used_graphics;
-        let mut items = Vec::new();
-        for (command_index, command) in ordered {
-            if let Some(graphics) = raster_border::semantic_border_graphic_items_with_occlusion(
-                surface_id,
-                u64::try_from(command_index).unwrap_or(u64::MAX),
-                command,
-                context.capabilities,
-                scene_capabilities,
-                global_occluders,
-            ) {
-                used_graphics = true;
-                items.extend(graphics);
-                continue;
-            }
-            if !paint_command_intersects_render_damage(command, damage) {
-                continue;
-            }
-            let ops = render_ops_for_paint_commands_with_capabilities(
-                std::slice::from_ref(command),
-                scene_capabilities,
-            )?;
-            items.extend(ops.into_iter().map(RenderLayerItem::Op));
-        }
-        if !used_graphics {
-            return None;
-        }
-        cache.mark_layer_rendered_snapshot(surface_id, layer, rendered_surface);
-        Some(items)
-    }
-
-    fn render_layer_ops_with_context(
-        &self,
-        surface_id: Uuid,
-        _surface_rect: &ExtensionRect,
-        damage: &RenderDamage,
-        layer: RenderExtensionLayer,
-        context: &RenderExtensionContext,
-    ) -> Option<Vec<RenderOp>> {
-        self.render_layer_ops_with_terminal_capabilities(
-            surface_id,
-            damage,
-            layer,
-            context.capabilities,
-        )
-    }
-
-    fn render_before_content_cells(
-        &self,
-        surface_id: Uuid,
-        _surface_rect: &ExtensionRect,
-        damage: &RenderDamage,
-    ) -> Option<Vec<(u16, u16, RenderUnderCell)>> {
-        self.render_before_content_cells_with_capabilities(
-            surface_id,
-            damage,
-            SceneRenderCapabilities::default(),
-        )
-    }
-
-    fn render_before_content_cells_with_context(
-        &self,
-        surface_id: Uuid,
-        _surface_rect: &ExtensionRect,
-        damage: &RenderDamage,
-        context: &RenderExtensionContext,
-    ) -> Option<Vec<(u16, u16, RenderUnderCell)>> {
-        self.render_before_content_cells_with_capabilities(
-            surface_id,
-            damage,
-            scene_capabilities_from_terminal(context.capabilities),
-        )
-    }
-
-    fn render_ops(
-        &self,
-        surface_id: Uuid,
-        _surface_rect: &ExtensionRect,
-        damage: &RenderDamage,
-    ) -> Option<Vec<RenderOp>> {
-        let Ok(mut cache) = self.cache.lock() else {
-            return Some(Vec::new());
-        };
-        let Some(surface) = cache.surface(&surface_id) else {
-            cache.mark_rendered(surface_id);
-            return Some(Vec::new());
-        };
-        if surface.paint_commands.is_empty() || damage.is_none() {
-            cache.mark_rendered(surface_id);
-            return Some(Vec::new());
-        }
-        let rendered_surface = surface.clone();
-        let surface = filter_surface_for_damage(surface, damage);
-        if surface.paint_commands.is_empty() {
-            cache.mark_rendered_snapshot(surface_id, rendered_surface);
-            return Some(Vec::new());
-        }
-        let ops = render_ops_for_surface(&surface)?;
-        cache.mark_rendered_snapshot(surface_id, rendered_surface);
-        Some(ops)
     }
 
     fn content_rect_override(&self, surface_id: Uuid) -> Option<ExtensionRect> {
@@ -702,29 +336,6 @@ impl AttachRenderExtension for DecorationRenderExtension {
     }
 }
 
-fn surface_has_graphics_semantic_border(
-    surface_id: Uuid,
-    surface: &SurfaceDecoration,
-    capabilities: TerminalRenderCapabilities,
-    scene_capabilities: SceneRenderCapabilities,
-) -> bool {
-    surface
-        .before_content_paint_commands
-        .iter()
-        .chain(surface.paint_commands.iter())
-        .enumerate()
-        .any(|(index, command)| {
-            raster_border::semantic_border_graphic_items(
-                surface_id,
-                u64::try_from(index).unwrap_or(u64::MAX),
-                command,
-                capabilities,
-                scene_capabilities,
-            )
-            .is_some()
-        })
-}
-
 fn layer_paint_commands(
     surface: &SurfaceDecoration,
     layer: RenderExtensionLayer,
@@ -732,16 +343,6 @@ fn layer_paint_commands(
     match layer {
         RenderExtensionLayer::BeforePaneContent => &surface.before_content_paint_commands,
         RenderExtensionLayer::AfterPaneContent => &surface.paint_commands,
-    }
-}
-
-fn layer_paint_commands_mut(
-    surface: &mut SurfaceDecoration,
-    layer: RenderExtensionLayer,
-) -> &mut Vec<PaintCommand> {
-    match layer {
-        RenderExtensionLayer::BeforePaneContent => &mut surface.before_content_paint_commands,
-        RenderExtensionLayer::AfterPaneContent => &mut surface.paint_commands,
     }
 }
 
@@ -1154,61 +755,6 @@ fn scene_input_hook_to_attach(
     }
 }
 
-fn decoration_surface_layer_damage(
-    previous: Option<&SurfaceDecoration>,
-    current: Option<&SurfaceDecoration>,
-    layer: RenderExtensionLayer,
-) -> RenderDamage {
-    match (previous, current) {
-        (None, None) | (Some(_), Some(_)) if previous == current => RenderDamage::None,
-        (previous, current) => paint_command_list_damage(
-            previous.map(|surface| layer_paint_commands(surface, layer)),
-            current.map(|surface| layer_paint_commands(surface, layer)),
-        ),
-    }
-}
-
-fn decoration_surface_damage(
-    previous: Option<&SurfaceDecoration>,
-    current: Option<&SurfaceDecoration>,
-) -> RenderDamage {
-    match (previous, current) {
-        (None, None) | (Some(_), Some(_)) if previous == current => RenderDamage::None,
-        (previous, current) => paint_command_list_damage(
-            previous.map(|surface| surface.paint_commands.as_slice()),
-            current.map(|surface| surface.paint_commands.as_slice()),
-        ),
-    }
-}
-
-fn paint_command_list_damage(
-    previous: Option<&[PaintCommand]>,
-    current: Option<&[PaintCommand]>,
-) -> RenderDamage {
-    let previous = previous.unwrap_or_default();
-    let current = current.unwrap_or_default();
-    let max_len = previous.len().max(current.len());
-    RenderDamage::from_rects((0..max_len).flat_map(|index| {
-        match (previous.get(index), current.get(index)) {
-            (Some(previous), Some(current)) if previous == current => Vec::new(),
-            (previous, current) => previous
-                .into_iter()
-                .chain(current)
-                .flat_map(paint_command_damage)
-                .collect(),
-        }
-    }))
-}
-
-fn surface_revision(surface: &SurfaceDecoration) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    hash_revision_part(&mut hasher, &surface.rect);
-    hash_revision_part(&mut hasher, &surface.content_rect);
-    hash_revision_part(&mut hasher, &surface.before_content_paint_commands);
-    hash_revision_part(&mut hasher, &surface.paint_commands);
-    hasher.finish()
-}
-
 fn surface_layer_revision(surface: &SurfaceDecoration, layer: RenderExtensionLayer) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     hash_revision_part(&mut hasher, &surface.rect);
@@ -1402,101 +948,6 @@ fn cell_occluded(col: u16, row: u16, occluders: &[ExtensionRect]) -> bool {
     occluders.iter().any(|occluder| occluder.intersects(cell))
 }
 
-fn paint_command_intersects_render_damage(command: &PaintCommand, damage: &RenderDamage) -> bool {
-    match damage {
-        RenderDamage::None => false,
-        RenderDamage::FullSurface => true,
-        RenderDamage::Regions(regions) => paint_command_damage(command)
-            .any(|rect| regions.iter().any(|region| region.intersects(rect))),
-    }
-}
-
-fn filter_surface_layer_for_damage(
-    surface: &SurfaceDecoration,
-    damage: &RenderDamage,
-    layer: RenderExtensionLayer,
-) -> SurfaceDecoration {
-    let mut filtered = surface.clone();
-    if matches!(damage, RenderDamage::FullSurface) {
-        return filtered;
-    }
-    let RenderDamage::Regions(regions) = damage else {
-        layer_paint_commands_mut(&mut filtered, layer).clear();
-        return filtered;
-    };
-    *layer_paint_commands_mut(&mut filtered, layer) = layer_paint_commands(surface, layer)
-        .iter()
-        .filter(|command| {
-            paint_command_damage(command)
-                .any(|rect| regions.iter().any(|region| region.intersects(rect)))
-        })
-        .cloned()
-        .collect();
-    filtered
-}
-
-fn filter_surface_for_damage(
-    surface: &SurfaceDecoration,
-    damage: &RenderDamage,
-) -> SurfaceDecoration {
-    if matches!(damage, RenderDamage::FullSurface) {
-        return surface.clone();
-    }
-    let RenderDamage::Regions(regions) = damage else {
-        let mut filtered = surface.clone();
-        filtered.paint_commands.clear();
-        return filtered;
-    };
-    let mut filtered = surface.clone();
-    filtered.paint_commands = surface
-        .paint_commands
-        .iter()
-        .filter(|command| {
-            paint_command_damage(command)
-                .any(|rect| regions.iter().any(|region| region.intersects(rect)))
-        })
-        .cloned()
-        .collect();
-    filtered
-}
-
-#[must_use]
-pub fn render_ops_for_surface_layer(
-    surface: &SurfaceDecoration,
-    layer: RenderExtensionLayer,
-) -> Option<Vec<RenderOp>> {
-    render_ops_for_surface_layer_with_capabilities(
-        surface,
-        layer,
-        SceneRenderCapabilities::default(),
-    )
-}
-
-#[must_use]
-pub fn render_ops_for_surface_layer_with_capabilities(
-    surface: &SurfaceDecoration,
-    layer: RenderExtensionLayer,
-    capabilities: SceneRenderCapabilities,
-) -> Option<Vec<RenderOp>> {
-    render_ops_for_paint_commands_with_capabilities(
-        layer_paint_commands(surface, layer),
-        capabilities,
-    )
-}
-
-#[must_use]
-pub fn render_ops_for_surface(surface: &SurfaceDecoration) -> Option<Vec<RenderOp>> {
-    render_ops_for_paint_commands(&surface.paint_commands)
-}
-
-#[must_use]
-pub fn render_ops_for_paint_commands(paint_commands: &[PaintCommand]) -> Option<Vec<RenderOp>> {
-    render_ops_for_paint_commands_with_capabilities(
-        paint_commands,
-        SceneRenderCapabilities::default(),
-    )
-}
-
 #[must_use]
 pub fn render_ops_for_paint_commands_with_capabilities(
     paint_commands: &[PaintCommand],
@@ -1636,58 +1087,6 @@ fn render_scene_item_from_op(key: String, z: i16, op: RenderOp) -> RenderSceneIt
         } => RenderSceneItem::border(RenderSceneItemKey::new(key), z, rect, glyphs, style),
         RenderOp::CellGrid { x, y, rows } => RenderSceneItem::cell_grid(key, z, x, y, rows),
     }
-}
-
-fn render_ops_to_under_cells(ops: &[RenderOp]) -> Vec<(u16, u16, RenderUnderCell)> {
-    let mut cells = Vec::new();
-    for op in ops {
-        match op {
-            RenderOp::TextRun { x, y, text, style } => {
-                let mut col = *x;
-                for ch in text.chars() {
-                    cells.push((col, *y, RenderUnderCell { ch, style: *style }));
-                    col = col.saturating_add(1);
-                }
-            }
-            RenderOp::FillRect { rect, ch, style } => {
-                for row in rect.y..rect.bottom() {
-                    for col in rect.x..rect.right() {
-                        cells.push((
-                            col,
-                            row,
-                            RenderUnderCell {
-                                ch: *ch,
-                                style: *style,
-                            },
-                        ));
-                    }
-                }
-            }
-            RenderOp::CellGrid { x, y, rows } => {
-                for (row_offset, row) in rows.iter().enumerate() {
-                    let Ok(row_offset) = u16::try_from(row_offset) else {
-                        break;
-                    };
-                    for (col_offset, cell) in row.iter().enumerate() {
-                        let Ok(col_offset) = u16::try_from(col_offset) else {
-                            break;
-                        };
-                        let Some(ch) = cell.ch else { continue };
-                        cells.push((
-                            x.saturating_add(col_offset),
-                            y.saturating_add(row_offset),
-                            RenderUnderCell {
-                                ch,
-                                style: cell.style,
-                            },
-                        ));
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    cells
 }
 
 fn push_render_ops_for_command_with_occluders(
@@ -2577,15 +1976,13 @@ mod tests {
                     layer,
                     &RenderExtensionContext::default(),
                 )
-                .expect(
-                    "missing decoration must select an empty retained scene, not imperative output",
-                );
+                .expect("missing decoration must answer with an empty retained scene");
             assert_eq!(scene.items, [] as [bmux_plugin::RenderSceneItem; 0]);
         }
     }
 
     #[test]
-    fn empty_decoration_publishes_retained_revision_without_legacy_rendering() {
+    fn empty_decoration_publishes_retained_revision() {
         let (extension, cache) = extension_with_visual_request();
         let id = Uuid::from_u128(42);
         cache
@@ -2608,13 +2005,6 @@ mod tests {
             assert_eq!(scene.items, [] as [bmux_plugin::RenderSceneItem; 0]);
             assert!(scene.revision.is_some());
         }
-        assert!(
-            cache
-                .lock()
-                .expect("cache lock")
-                .rendered_surfaces
-                .is_empty()
-        );
     }
 
     #[test]
@@ -2700,7 +2090,6 @@ mod tests {
             revision: 1,
             surfaces: BTreeMap::from([(surface_id, decoration)]),
             layer_revisions: BTreeMap::new(),
-            rendered_surfaces: BTreeMap::new(),
             scene_rx: None,
             visual_last_at: BTreeMap::new(),
             visual_last_revision: BTreeMap::new(),
@@ -2718,103 +2107,6 @@ mod tests {
             extension.content_rect_override(surface_id),
             Some(ExtensionRect::new(4, 2, 11, 6))
         );
-    }
-
-    #[test]
-    fn decoration_damage_uses_paint_regions_when_content_rect_changes() {
-        let surface_id = Uuid::from_u128(100);
-        let mut previous = surface(
-            surface_id,
-            vec![PaintCommand::BoxBorder {
-                rect: SceneRect {
-                    x: 0,
-                    y: 0,
-                    w: 20,
-                    h: 10,
-                },
-                z: 0,
-                glyphs: SceneBorderGlyphs::Ascii,
-                style: scene_style(),
-            }],
-        );
-        let mut current = previous.clone();
-        previous.content_rect.w = 18;
-        current.content_rect.w = 16;
-        current.paint_commands = vec![PaintCommand::BoxBorder {
-            rect: SceneRect {
-                x: 0,
-                y: 0,
-                w: 16,
-                h: 10,
-            },
-            z: 0,
-            glyphs: SceneBorderGlyphs::Ascii,
-            style: scene_style(),
-        }];
-
-        let damage = decoration_surface_layer_damage(
-            Some(&previous),
-            Some(&current),
-            RenderExtensionLayer::AfterPaneContent,
-        );
-
-        assert!(matches!(damage, RenderDamage::Regions(_)));
-    }
-
-    #[test]
-    fn rendering_before_layer_does_not_suppress_after_layer_damage() {
-        let surface_id = Uuid::from_u128(102);
-        let mut decoration = surface(
-            surface_id,
-            vec![PaintCommand::Text {
-                col: 1,
-                row: 1,
-                z: 0,
-                text: "after".to_string(),
-                style: scene_style(),
-            }],
-        );
-        decoration.before_content_paint_commands = vec![PaintCommand::Text {
-            col: 1,
-            row: 0,
-            z: 0,
-            text: "before".to_string(),
-            style: scene_style(),
-        }];
-        let cache = Arc::new(Mutex::new(DecorationRendererCache {
-            revision: 1,
-            surfaces: BTreeMap::from([(surface_id, decoration)]),
-            layer_revisions: BTreeMap::new(),
-            rendered_surfaces: BTreeMap::new(),
-            scene_rx: None,
-            visual_last_at: BTreeMap::new(),
-            visual_last_revision: BTreeMap::new(),
-            visual_last_payload_hash: BTreeMap::new(),
-            visual_adapter_cache: BTreeMap::new(),
-            visual_stats: BTreeMap::new(),
-            visual_adapters: Arc::default(),
-        }));
-        let extension = DecorationRenderExtension {
-            name: "test.decoration.renderer".to_string(),
-            cache,
-        };
-
-        assert!(
-            extension
-                .render_before_content_cells(
-                    surface_id,
-                    &ExtensionRect::new(0, 0, 10, 5),
-                    &RenderDamage::FullSurface,
-                )
-                .is_some()
-        );
-        let after_damage = extension.surface_layer_damage(
-            surface_id,
-            &ExtensionRect::new(0, 0, 10, 5),
-            RenderExtensionLayer::AfterPaneContent,
-        );
-
-        assert!(!after_damage.is_none());
     }
 
     #[test]
@@ -2871,7 +2163,6 @@ mod tests {
             revision: 7,
             surfaces: BTreeMap::from([(surface_id, surface(surface_id, paint_commands))]),
             layer_revisions: BTreeMap::new(),
-            rendered_surfaces: BTreeMap::new(),
             scene_rx: None,
             visual_last_at: BTreeMap::new(),
             visual_last_revision: BTreeMap::new(),
@@ -2888,9 +2179,9 @@ mod tests {
     }
 
     #[test]
-    fn retained_scene_converts_text_commands_without_marking_legacy_rendered_cache() {
+    fn retained_scene_converts_text_commands() {
         let surface_id = Uuid::from_u128(201);
-        let (extension, cache) = extension_with_surface(
+        let (extension, _cache) = extension_with_surface(
             surface_id,
             vec![PaintCommand::Text {
                 col: 2,
@@ -2914,14 +2205,6 @@ mod tests {
             &scene.items[0].kind,
             bmux_plugin::RenderSceneItemKind::Text { x: 2, y: 3, text, .. } if text == "perf"
         ));
-        assert!(
-            cache
-                .lock()
-                .expect("cache lock")
-                .rendered_surface_layer(&surface_id, RenderExtensionLayer::AfterPaneContent)
-                .is_none(),
-            "retained scene diffing is renderer-owned; decoration only keeps legacy rendered snapshots for fallback APIs"
-        );
     }
 
     #[test]
@@ -2954,14 +2237,6 @@ mod tests {
             &scene.items[0].kind,
             bmux_plugin::RenderSceneItemKind::Text { x: 1, y: 0, text, .. } if text == "under"
         ));
-        assert!(
-            cache
-                .lock()
-                .expect("cache lock")
-                .rendered_surface_layer(&surface_id, RenderExtensionLayer::BeforePaneContent)
-                .is_none(),
-            "retained before-content scenes do not update the legacy fallback rendered-surface cache"
-        );
     }
 
     #[test]
@@ -3090,58 +2365,6 @@ mod tests {
                 .iter()
                 .any(|item| matches!(item.kind, bmux_plugin::RenderSceneItemKind::Border { .. }))
         );
-    }
-
-    #[test]
-    fn partial_render_snapshot_preserves_full_surface_after_successful_emit() {
-        let surface_id = Uuid::from_u128(103);
-        let (extension, cache) = extension_with_surface(
-            surface_id,
-            vec![
-                PaintCommand::Text {
-                    col: 1,
-                    row: 1,
-                    z: 0,
-                    text: "dirty".to_string(),
-                    style: scene_style(),
-                },
-                PaintCommand::Text {
-                    col: 1,
-                    row: 3,
-                    z: 0,
-                    text: "later".to_string(),
-                    style: scene_style(),
-                },
-            ],
-        );
-
-        let ops = extension
-            .render_ops(
-                surface_id,
-                &ExtensionRect::new(0, 0, 20, 10),
-                &RenderDamage::Regions(vec![ExtensionRect::new(1, 1, 5, 1)]),
-            )
-            .expect("partial render should use declarative ops");
-        assert_eq!(ops.len(), 1);
-        assert!(matches!(&ops[0], RenderOp::TextRun { text, .. } if text == "dirty"));
-
-        let rendered = cache
-            .lock()
-            .expect("cache should lock")
-            .rendered_surface(&surface_id)
-            .expect("partial snapshot recorded")
-            .clone();
-        assert_eq!(rendered.paint_commands.len(), 2);
-        assert!(
-            matches!(&rendered.paint_commands[0], PaintCommand::Text { text, .. } if text == "dirty")
-        );
-        assert!(
-            matches!(&rendered.paint_commands[1], PaintCommand::Text { text, .. } if text == "later")
-        );
-
-        let followup_damage =
-            extension.surface_damage(surface_id, &ExtensionRect::new(0, 0, 20, 10));
-        assert_eq!(followup_damage, RenderDamage::None);
     }
 
     #[test]
@@ -3304,14 +2527,15 @@ mod tests {
             assert!(guard.surfaces.contains_key(&surface_id));
         }
         assert!(
-            !extension
-                .surface_damage(surface_id, &ExtensionRect::new(0, 0, 10, 5))
-                .is_none()
+            scene_ops(&extension, surface_id)
+                .iter()
+                .any(|op| matches!(op, RenderOp::TextRun { text, .. } if text == "decorated")),
+            "the drained scene is what the next frame paints"
         );
     }
 
     #[test]
-    fn render_ops_converts_supported_text_and_marks_rendered() {
+    fn scene_converts_supported_text_and_reports_its_layer_revision() {
         let surface_id = Uuid::from_u128(1);
         let paint_commands = vec![PaintCommand::Text {
             col: 2,
@@ -3320,25 +2544,17 @@ mod tests {
             text: "hello".to_string(),
             style: scene_style(),
         }];
-        let expected_revision = surface_revision(&surface(surface_id, paint_commands.clone()));
-        let (extension, cache) = extension_with_surface(surface_id, paint_commands);
+        let expected_revision = surface_layer_revision(
+            &surface(surface_id, paint_commands.clone()),
+            RenderExtensionLayer::AfterPaneContent,
+        );
+        let (extension, _cache) = extension_with_surface(surface_id, paint_commands);
 
         assert_eq!(
-            extension.render_revision(surface_id),
+            extension.render_layer_revision(surface_id, RenderExtensionLayer::AfterPaneContent),
             Some(expected_revision)
         );
-        let ops = extension
-            .render_ops(
-                surface_id,
-                &ExtensionRect {
-                    x: 0,
-                    y: 0,
-                    w: 20,
-                    h: 10,
-                },
-                &RenderDamage::FullSurface,
-            )
-            .expect("supported decoration should use declarative ops");
+        let ops = scene_ops(&extension, surface_id);
 
         assert_eq!(
             ops,
@@ -3349,17 +2565,10 @@ mod tests {
                 style: RenderStyle::default(),
             }]
         );
-        assert!(
-            cache
-                .lock()
-                .expect("cache should lock")
-                .rendered_surface(&surface_id)
-                .is_some()
-        );
     }
 
     #[test]
-    fn render_ops_converts_space_fill_to_clear_rect() {
+    fn scene_paints_space_fills_as_blank_cells() {
         let surface_id = Uuid::from_u128(6);
         let rect = SceneRect {
             x: 1,
@@ -3377,35 +2586,25 @@ mod tests {
             }],
         );
 
-        let ops = extension
-            .render_ops(
-                surface_id,
-                &ExtensionRect {
-                    x: 0,
-                    y: 0,
-                    w: 20,
-                    h: 10,
-                },
-                &RenderDamage::FullSurface,
-            )
-            .expect("space fills should be declarative clears");
+        let ops = scene_ops(&extension, surface_id);
 
         assert_eq!(
             ops,
-            vec![RenderOp::ClearRect {
+            vec![RenderOp::FillRect {
                 rect: ExtensionRect {
                     x: 1,
                     y: 2,
                     w: 3,
                     h: 4,
                 },
+                ch: ' ',
                 style: RenderStyle::default(),
             }]
         );
     }
 
     #[test]
-    fn render_ops_converts_empty_cell_grid_cells_to_sparse_cells() {
+    fn scene_converts_empty_cell_grid_cells_to_sparse_cells() {
         let surface_id = Uuid::from_u128(11);
         let (extension, _cache) = extension_with_surface(
             surface_id,
@@ -3427,18 +2626,7 @@ mod tests {
             }],
         );
 
-        let ops = extension
-            .render_ops(
-                surface_id,
-                &ExtensionRect {
-                    x: 0,
-                    y: 0,
-                    w: 20,
-                    h: 10,
-                },
-                &RenderDamage::FullSurface,
-            )
-            .expect("empty grid cells should be sparse declarative cells");
+        let ops = scene_ops(&extension, surface_id);
 
         assert!(matches!(
             &ops[..],
@@ -3451,7 +2639,7 @@ mod tests {
     }
 
     #[test]
-    fn render_ops_filters_semantic_border_by_capability_context() {
+    fn scene_filters_semantic_border_by_capability_context() {
         let surface_id = Uuid::from_u128(17);
         let (extension, _cache) = extension_with_surface(
             surface_id,
@@ -3475,21 +2663,12 @@ mod tests {
             }],
         );
 
-        let rect = ExtensionRect {
-            x: 0,
-            y: 0,
-            w: 20,
-            h: 10,
-        };
-        let no_graphics = extension
-            .render_layer_ops_with_context(
-                surface_id,
-                &rect,
-                &RenderDamage::FullSurface,
-                RenderExtensionLayer::AfterPaneContent,
-                &RenderExtensionContext::default(),
-            )
-            .expect("semantic borders should remain declarative");
+        let no_graphics = ops_of(scene_items(
+            &extension,
+            surface_id,
+            RenderExtensionLayer::AfterPaneContent,
+            &RenderExtensionContext::default(),
+        ));
         assert_eq!(no_graphics, [] as [bmux_plugin::RenderOp; 0]);
 
         let kitty_capabilities = TerminalRenderCapabilities {
@@ -3498,39 +2677,33 @@ mod tests {
             cell_pixel_height: 16,
             ..TerminalRenderCapabilities::default()
         };
-        let kitty = extension
-            .render_layer_ops_with_context(
-                surface_id,
-                &rect,
-                &RenderDamage::FullSurface,
-                RenderExtensionLayer::AfterPaneContent,
-                &RenderExtensionContext {
-                    capabilities: kitty_capabilities,
-                    ..RenderExtensionContext::default()
-                },
-            )
-            .expect("operation path remains a deterministic text fallback");
+        let kitty = ops_of(scene_items(
+            &extension,
+            surface_id,
+            RenderExtensionLayer::AfterPaneContent,
+            &RenderExtensionContext {
+                capabilities: kitty_capabilities,
+                ..RenderExtensionContext::default()
+            },
+        ));
         assert!(matches!(
             &kitty[..],
             [RenderOp::Border { glyphs, .. }]
                 if glyphs.top_left == '┏' && glyphs.horizontal == '━' && glyphs.vertical == '┃'
         ));
 
-        let graphics = extension
-            .render_layer_items_with_context(
-                surface_id,
-                &rect,
-                &RenderDamage::FullSurface,
-                RenderExtensionLayer::AfterPaneContent,
-                &RenderExtensionContext {
-                    capabilities: TerminalRenderCapabilities {
-                        graphics_alpha: true,
-                        ..kitty_capabilities
-                    },
-                    ..RenderExtensionContext::default()
+        let graphics = scene_items(
+            &extension,
+            surface_id,
+            RenderExtensionLayer::AfterPaneContent,
+            &RenderExtensionContext {
+                capabilities: TerminalRenderCapabilities {
+                    graphics_alpha: true,
+                    ..kitty_capabilities
                 },
-            )
-            .expect("kitty alpha terminals should use graphics items");
+                ..RenderExtensionContext::default()
+            },
+        );
         assert!(
             graphics
                 .iter()
@@ -3656,7 +2829,6 @@ mod tests {
             revision: 7,
             surfaces: BTreeMap::from([(surface_id, decoration)]),
             layer_revisions: BTreeMap::new(),
-            rendered_surfaces: BTreeMap::new(),
             scene_rx: None,
             visual_last_at: BTreeMap::new(),
             visual_last_revision: BTreeMap::new(),
@@ -3670,15 +2842,12 @@ mod tests {
             cache,
         };
 
-        let ops = extension
-            .render_layer_ops_with_context(
-                surface_id,
-                &ExtensionRect::new(0, 0, 20, 8),
-                &RenderDamage::FullSurface,
-                RenderExtensionLayer::AfterPaneContent,
-                &kitty_alpha_context(),
-            )
-            .expect("after layer should render header ops");
+        let ops = ops_of(scene_items(
+            &extension,
+            surface_id,
+            RenderExtensionLayer::AfterPaneContent,
+            &kitty_alpha_context(),
+        ));
 
         assert!(
             ops.iter()
@@ -3709,7 +2878,6 @@ mod tests {
             revision: 7,
             surfaces: BTreeMap::from([(surface_id, decoration)]),
             layer_revisions: BTreeMap::new(),
-            rendered_surfaces: BTreeMap::new(),
             scene_rx: None,
             visual_last_at: BTreeMap::new(),
             visual_last_revision: BTreeMap::new(),
@@ -3723,15 +2891,12 @@ mod tests {
             cache,
         };
 
-        let items = extension
-            .render_layer_items_with_context(
-                surface_id,
-                &ExtensionRect::new(0, 0, 20, 8),
-                &RenderDamage::FullSurface,
-                RenderExtensionLayer::BeforePaneContent,
-                &kitty_alpha_context(),
-            )
-            .expect("before-content semantic border should use graphics items");
+        let items = scene_items(
+            &extension,
+            surface_id,
+            RenderExtensionLayer::BeforePaneContent,
+            &kitty_alpha_context(),
+        );
 
         assert!(
             items
@@ -3770,15 +2935,12 @@ mod tests {
             ],
         );
 
-        let items = extension
-            .render_layer_items_with_context(
-                surface_id,
-                &ExtensionRect::new(0, 0, 20, 5),
-                &RenderDamage::FullSurface,
-                RenderExtensionLayer::AfterPaneContent,
-                &kitty_alpha_context(),
-            )
-            .expect("semantic border should use graphics items");
+        let items = scene_items(
+            &extension,
+            surface_id,
+            RenderExtensionLayer::AfterPaneContent,
+            &kitty_alpha_context(),
+        );
         let header_rect = ExtensionRect::new(2, 0, 6, 1);
 
         assert!(items.iter().any(|item| {
@@ -3838,15 +3000,12 @@ mod tests {
             ],
         );
 
-        let items = extension
-            .render_layer_items_with_context(
-                surface_id,
-                &ExtensionRect::new(0, 0, 20, 8),
-                &RenderDamage::FullSurface,
-                RenderExtensionLayer::AfterPaneContent,
-                &kitty_alpha_context(),
-            )
-            .expect("semantic border should use graphics items");
+        let items = scene_items(
+            &extension,
+            surface_id,
+            RenderExtensionLayer::AfterPaneContent,
+            &kitty_alpha_context(),
+        );
         assert!(items.iter().any(|item| {
             matches!(item, RenderLayerItem::Op(RenderOp::TextRun { text, .. }) if text == "1 : 0")
         }));
@@ -4082,6 +3241,90 @@ mod tests {
         )));
     }
 
+    /// What the decoration paints on `layer` of `surface_id` (a 20x10 surface) with `context`:
+    /// its scene's items lowered as the attach host lowers them, in paint order (z, then key).
+    fn scene_items(
+        extension: &DecorationRenderExtension,
+        surface_id: Uuid,
+        layer: RenderExtensionLayer,
+        context: &RenderExtensionContext,
+    ) -> Vec<RenderLayerItem> {
+        let scene = extension
+            .render_layer_scene_with_context(
+                surface_id,
+                &ExtensionRect::new(0, 0, 20, 10),
+                layer,
+                context,
+            )
+            .expect("the decoration answers every surface with a scene");
+        let mut items = scene.items.iter().collect::<Vec<_>>();
+        items.sort_by(|lhs, rhs| (lhs.z, &lhs.key).cmp(&(rhs.z, &rhs.key)));
+        items
+            .into_iter()
+            .filter_map(|item| match &item.kind {
+                bmux_plugin::RenderSceneItemKind::Text { x, y, text, style } => Some(
+                    RenderLayerItem::Op(RenderOp::text_run(*x, *y, text.clone(), *style)),
+                ),
+                bmux_plugin::RenderSceneItemKind::StyledText { x, y, spans } => {
+                    Some(RenderLayerItem::Op(RenderOp::StyledText {
+                        x: *x,
+                        y: *y,
+                        spans: spans.clone(),
+                    }))
+                }
+                bmux_plugin::RenderSceneItemKind::FillRect { rect, ch, style } => {
+                    Some(RenderLayerItem::Op(RenderOp::FillRect {
+                        rect: *rect,
+                        ch: *ch,
+                        style: *style,
+                    }))
+                }
+                bmux_plugin::RenderSceneItemKind::Border {
+                    rect,
+                    glyphs,
+                    style,
+                } => Some(RenderLayerItem::Op(RenderOp::Border {
+                    rect: *rect,
+                    glyphs: *glyphs,
+                    style: *style,
+                })),
+                bmux_plugin::RenderSceneItemKind::CellGrid { x, y, rows } => {
+                    Some(RenderLayerItem::Op(RenderOp::CellGrid {
+                        x: *x,
+                        y: *y,
+                        rows: rows.clone(),
+                    }))
+                }
+                bmux_plugin::RenderSceneItemKind::TerminalGraphic { graphic } => {
+                    Some(RenderLayerItem::Graphic(graphic.clone()))
+                }
+                bmux_plugin::RenderSceneItemKind::UnderCells { .. } => None,
+            })
+            .collect()
+    }
+
+    /// The cell operations among `items`.
+    fn ops_of(items: Vec<RenderLayerItem>) -> Vec<RenderOp> {
+        items
+            .into_iter()
+            .filter_map(|item| match item {
+                RenderLayerItem::Op(op) => Some(op),
+                RenderLayerItem::Graphic(_) => None,
+            })
+            .collect()
+    }
+
+    /// The cell operations of [`scene_items`] on the after-content layer, without terminal
+    /// capabilities.
+    fn scene_ops(extension: &DecorationRenderExtension, surface_id: Uuid) -> Vec<RenderOp> {
+        ops_of(scene_items(
+            extension,
+            surface_id,
+            RenderExtensionLayer::AfterPaneContent,
+            &RenderExtensionContext::default(),
+        ))
+    }
+
     fn kitty_alpha_context() -> RenderExtensionContext {
         RenderExtensionContext {
             capabilities: TerminalRenderCapabilities {
@@ -4096,7 +3339,7 @@ mod tests {
     }
 
     #[test]
-    fn render_ops_falls_back_for_wide_cell_grid_glyphs() {
+    fn scene_omits_wide_cell_grid_glyphs() {
         let surface_id = Uuid::from_u128(7);
         let (extension, _cache) = extension_with_surface(
             surface_id,
@@ -4112,24 +3355,11 @@ mod tests {
             }],
         );
 
-        assert!(
-            extension
-                .render_ops(
-                    surface_id,
-                    &ExtensionRect {
-                        x: 0,
-                        y: 0,
-                        w: 20,
-                        h: 10,
-                    },
-                    &RenderDamage::FullSurface,
-                )
-                .is_none()
-        );
+        assert_eq!(scene_ops(&extension, surface_id), [] as [RenderOp; 0]);
     }
 
     #[test]
-    fn render_ops_falls_back_for_wide_border_glyphs() {
+    fn scene_omits_wide_border_glyphs() {
         let surface_id = Uuid::from_u128(8);
         let (extension, _cache) = extension_with_surface(
             surface_id,
@@ -4153,24 +3383,11 @@ mod tests {
             }],
         );
 
-        assert!(
-            extension
-                .render_ops(
-                    surface_id,
-                    &ExtensionRect {
-                        x: 0,
-                        y: 0,
-                        w: 20,
-                        h: 10,
-                    },
-                    &RenderDamage::FullSurface,
-                )
-                .is_none()
-        );
+        assert_eq!(scene_ops(&extension, surface_id), [] as [RenderOp; 0]);
     }
 
     #[test]
-    fn render_ops_preserves_named_color() {
+    fn scene_preserves_named_color() {
         let surface_id = Uuid::from_u128(5);
         let mut style = scene_style();
         style.fg = Some(SceneColor::Named {
@@ -4187,18 +3404,7 @@ mod tests {
             }],
         );
 
-        let ops = extension
-            .render_ops(
-                surface_id,
-                &ExtensionRect {
-                    x: 0,
-                    y: 0,
-                    w: 20,
-                    h: 10,
-                },
-                &RenderDamage::FullSurface,
-            )
-            .expect("named colors should be declarative");
+        let ops = scene_ops(&extension, surface_id);
 
         assert!(matches!(
             &ops[..],
@@ -4208,7 +3414,7 @@ mod tests {
     }
 
     #[test]
-    fn surface_damage_uses_display_width_for_text_commands() {
+    fn scene_text_paints_by_display_width() {
         let surface_id = Uuid::from_u128(4);
         let (extension, _cache) = extension_with_surface(
             surface_id,
@@ -4221,27 +3427,22 @@ mod tests {
             }],
         );
 
+        let ops = scene_ops(&extension, surface_id);
         assert_eq!(
-            extension.surface_damage(
-                surface_id,
-                &ExtensionRect {
-                    x: 0,
-                    y: 0,
-                    w: 20,
-                    h: 10,
-                },
-            ),
-            RenderDamage::Regions(vec![ExtensionRect {
+            ops.iter()
+                .flat_map(RenderOp::painted_rects)
+                .collect::<Vec<_>>(),
+            [ExtensionRect {
                 x: 2,
                 y: 3,
                 w: 2,
                 h: 1,
-            }])
+            }]
         );
     }
 
     #[test]
-    fn render_ops_sorts_by_z_before_returning_ops() {
+    fn scene_paints_by_z() {
         let surface_id = Uuid::from_u128(2);
         let (extension, _cache) = extension_with_surface(
             surface_id,
@@ -4263,18 +3464,7 @@ mod tests {
             ],
         );
 
-        let ops = extension
-            .render_ops(
-                surface_id,
-                &ExtensionRect {
-                    x: 0,
-                    y: 0,
-                    w: 20,
-                    h: 10,
-                },
-                &RenderDamage::FullSurface,
-            )
-            .expect("supported decoration should use declarative ops");
+        let ops = scene_ops(&extension, surface_id);
 
         assert!(matches!(
             &ops[..],
@@ -4284,7 +3474,7 @@ mod tests {
     }
 
     #[test]
-    fn render_ops_lowers_horizontal_gradient_runs() {
+    fn scene_lowers_horizontal_gradient_runs() {
         let surface_id = Uuid::from_u128(9);
         let mut from_style = scene_style();
         from_style.fg = Some(SceneColor::Rgb { r: 0, g: 0, b: 0 });
@@ -4303,18 +3493,7 @@ mod tests {
             }],
         );
 
-        let ops = extension
-            .render_ops(
-                surface_id,
-                &ExtensionRect {
-                    x: 0,
-                    y: 0,
-                    w: 20,
-                    h: 10,
-                },
-                &RenderDamage::FullSurface,
-            )
-            .expect("gradient runs should lower to text ops");
+        let ops = scene_ops(&extension, surface_id);
 
         assert!(matches!(
             &ops[..],
@@ -4332,7 +3511,7 @@ mod tests {
     }
 
     #[test]
-    fn render_ops_lowers_vertical_gradient_runs() {
+    fn scene_lowers_vertical_gradient_runs() {
         let surface_id = Uuid::from_u128(10);
         let (extension, _cache) = extension_with_surface(
             surface_id,
@@ -4347,18 +3526,7 @@ mod tests {
             }],
         );
 
-        let ops = extension
-            .render_ops(
-                surface_id,
-                &ExtensionRect {
-                    x: 0,
-                    y: 0,
-                    w: 20,
-                    h: 10,
-                },
-                &RenderDamage::FullSurface,
-            )
-            .expect("vertical gradients should lower to text ops");
+        let ops = scene_ops(&extension, surface_id);
 
         assert!(matches!(
             &ops[..],
@@ -4370,7 +3538,7 @@ mod tests {
     }
 
     #[test]
-    fn render_ops_converts_full_style_flags_and_marks_rendered() {
+    fn scene_converts_full_style_flags() {
         let surface_id = Uuid::from_u128(3);
         let mut style = scene_style();
         style.underline = true;
@@ -4379,7 +3547,7 @@ mod tests {
         style.dim = true;
         style.blink = true;
         style.strikethrough = true;
-        let (extension, cache) = extension_with_surface(
+        let (extension, _cache) = extension_with_surface(
             surface_id,
             vec![PaintCommand::Text {
                 col: 2,
@@ -4390,18 +3558,7 @@ mod tests {
             }],
         );
 
-        let ops = extension
-            .render_ops(
-                surface_id,
-                &ExtensionRect {
-                    x: 0,
-                    y: 0,
-                    w: 20,
-                    h: 10,
-                },
-                &RenderDamage::FullSurface,
-            )
-            .expect("full style flags should be declarative");
+        let ops = scene_ops(&extension, surface_id);
 
         assert!(matches!(
             &ops[..],
@@ -4413,12 +3570,5 @@ mod tests {
                     && style.blink
                     && style.strikethrough
         ));
-        assert!(
-            cache
-                .lock()
-                .expect("cache should lock")
-                .rendered_surface(&surface_id)
-                .is_some()
-        );
     }
 }
