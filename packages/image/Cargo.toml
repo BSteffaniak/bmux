@@ -16,6 +16,7 @@ bmux_ipc                   = { workspace = true }
 bmux_raster                = { workspace = true, features = ["formats"] }
 bmux_tui                   = { workspace = true }
 flate2                     = { workspace = true, optional = true }
+memchr                     = { workspace = true }
 png                        = { workspace = true }
 serde                      = { workspace = true, features = ["derive", "std"] }
 uuid                       = { workspace = true, features = ["std"] }

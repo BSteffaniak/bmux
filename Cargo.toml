@@ -203,7 +203,6 @@ bytemuck = { version = "1.25", default-features = false }
 cranelift-codegen = { version = "0.137.0", default-features = false, features = [
     "all-native-arch",
 ] }
-foldhash = { version = "0.2.0", default-features = false, features = ["std"] }
 pollster = { version = "1.0", default-features = false }
 raw-window-handle = { version = "0.6.2", default-features = false, features = [
     "std",
@@ -416,6 +415,7 @@ clap = { version = "4.6.7", default-features = false }
 flate2 = { version = "1", default-features = false, features = [
     "rust_backend",
 ] }
+foldhash = { version = "0.2.0", default-features = false, features = ["std"] }
 font8x8 = { version = "0.3.1", features = ["unicode"] }
 fontdb = { version = "0.24.0" }
 futures-core = { version = "0.3.34", default-features = false }
@@ -428,6 +428,7 @@ libc = { version = "0.2" }
 libloading = { version = "0.9.0", default-features = false, features = ["std"] }
 log = { version = "0.4.34", default-features = false }
 lz4_flex = { version = "0.14", default-features = false }
+memchr = { version = "2.8.3", default-features = false, features = ["std"] }
 png = { version = "0.18.1", default-features = false }
 proc-macro2 = { version = "1.0.107", default-features = false }
 proptest = { version = "1.12.0", default-features = false, features = ["std"] }

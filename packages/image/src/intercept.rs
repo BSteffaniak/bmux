@@ -146,7 +146,7 @@ impl ImageInterceptor {
             return false;
         }
         let mut rest = input;
-        while let Some(at) = rest.iter().position(|&byte| byte == 0x1B) {
+        while let Some(at) = memchr::memchr(0x1B, rest) {
             // An escape at the end might begin anything.
             let Some(&next) = rest.get(at + 1) else {
                 return false;
@@ -193,9 +193,7 @@ impl ImageInterceptor {
             // Text in ground passes through as it is: copy it up to the next ESC, CAN or SUB at
             // once rather than byte by byte.
             if matches!(self.state, State::Ground) {
-                let run = input[index..]
-                    .iter()
-                    .position(|byte| matches!(byte, 0x1B | 0x18 | 0x1A))
+                let run = memchr::memchr3(0x1B, 0x18, 0x1A, &input[index..])
                     .unwrap_or(input.len() - index);
                 filtered.extend_from_slice(&input[index..index + run]);
                 index += run;

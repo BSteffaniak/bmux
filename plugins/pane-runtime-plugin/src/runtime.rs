@@ -3423,7 +3423,7 @@ impl PaneShellMetadataParser {
         // carries no metadata and leaves the parser as it was: it passes through as is.
         if matches!(self.state, PaneShellMetadataParserState::Ground)
             && chunk.last() != Some(&0x1b)
-            && !chunk.windows(2).any(|pair| pair == b"\x1b]")
+            && memchr::memmem::find(chunk, b"\x1b]").is_none()
         {
             return PaneShellMetadataParseOutput {
                 filtered: std::borrow::Cow::Borrowed(chunk),
@@ -5303,16 +5303,16 @@ impl EscSeqPhase {
     fn next_significant(self, bytes: &[u8]) -> Option<usize> {
         // CAN and SUB abort a sequence in any state; text has no sequence to abort.
         let found = match self {
-            Self::Ground => bytes.iter().position(|&byte| byte == 0x1b),
+            Self::Ground => memchr::memchr(0x1b, bytes),
             Self::Csi => bytes
                 .iter()
                 .position(|&byte| matches!(byte, 0x40..=0x7e | 0x1b | 0x18 | 0x1a)),
-            Self::Osc => bytes
-                .iter()
-                .position(|&byte| matches!(byte, 0x07 | 0x1b | 0x18 | 0x1a)),
-            Self::Dcs | Self::Sos => bytes
-                .iter()
-                .position(|&byte| matches!(byte, 0x1b | 0x18 | 0x1a)),
+            Self::Osc => {
+                let end = memchr::memchr3(0x07, 0x1b, 0x18, bytes);
+                let sub = memchr::memchr(0x1a, &bytes[..end.unwrap_or(bytes.len())]);
+                sub.or(end)
+            }
+            Self::Dcs | Self::Sos => memchr::memchr3(0x1b, 0x18, 0x1a, bytes),
             Self::Escape | Self::OscEsc | Self::DcsEsc | Self::SosEsc => Some(0),
         };
         found.filter(|_| !bytes.is_empty())
