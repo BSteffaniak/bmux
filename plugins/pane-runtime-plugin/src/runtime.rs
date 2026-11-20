@@ -5292,6 +5292,26 @@ impl EscSeqPhase {
     const fn is_ground(self) -> bool {
         matches!(self, Self::Ground)
     }
+
+    /// The index of the first byte in `bytes` that can change this phase (all of them in the
+    /// short states after an ESC), or `None` when none can.
+    fn next_significant(self, bytes: &[u8]) -> Option<usize> {
+        // CAN and SUB abort a sequence in any state; text has no sequence to abort.
+        let found = match self {
+            Self::Ground => bytes.iter().position(|&byte| byte == 0x1b),
+            Self::Csi => bytes
+                .iter()
+                .position(|&byte| matches!(byte, 0x40..=0x7e | 0x1b | 0x18 | 0x1a)),
+            Self::Osc => bytes
+                .iter()
+                .position(|&byte| matches!(byte, 0x07 | 0x1b | 0x18 | 0x1a)),
+            Self::Dcs | Self::Sos => bytes
+                .iter()
+                .position(|&byte| matches!(byte, 0x1b | 0x18 | 0x1a)),
+            Self::Escape | Self::OscEsc | Self::DcsEsc | Self::SosEsc => Some(0),
+        };
+        found.filter(|_| !bytes.is_empty())
+    }
 }
 
 /// Where synchronized updates (DEC mode 2026) open and close in a pane's output stream, so a
@@ -5451,7 +5471,7 @@ impl OutputFanoutBuffer {
         let base_offset = self.end_offset();
         self.retained_output_bytes
             .fetch_add(chunk.len(), Ordering::SeqCst);
-        self.data.extend(chunk.iter().copied());
+        self.data.extend(chunk);
 
         // Track escape-sequence phase for every byte.  Record spans
         // so that `first_safe_offset_at_or_after` can determine whether
@@ -5465,8 +5485,10 @@ impl OutputFanoutBuffer {
         while i < chunk.len() {
             // Text between escapes changes neither the phase nor the marks: jump to the next
             // ESC (CAN and SUB abort only sequences, and ground is no sequence).
-            if self.esc_phase.is_ground() && self.sync_updates.idle() {
-                match chunk[i..].iter().position(|&byte| byte == 0x1b) {
+            // Bytes that cannot change the phase (text between escapes, a sequence's body) are
+            // skipped to the next one that can, unless a synchronized-update mark is mid-match.
+            if self.sync_updates.idle() {
+                match self.esc_phase.next_significant(&chunk[i..]) {
                     Some(skip) => i += skip,
                     None => break,
                 }
