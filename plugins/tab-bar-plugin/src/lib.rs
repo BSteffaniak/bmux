@@ -815,22 +815,6 @@ fn apply_visibility(
     }
 }
 
-/// Declare an instance-owned frontend factory for the invoking attach runtime.
-/// The caller binds the same fact registry to its backend producer service.
-#[must_use]
-pub fn frontend_companion(
-    settings: Option<toml::Value>,
-    facts: std::sync::Arc<bmux_presentation_state::PresentationFactRegistry>,
-) -> bmux_plugin::AttachCompanion {
-    bmux_plugin::AttachCompanion::from_factory(
-        OWNER,
-        std::sync::Arc::new(move |resources| {
-            TabBarPresentation::install_scoped(settings.as_ref(), resources, facts.clone())
-                .map(|presentation| Box::new(presentation) as Box<dyn Send + Sync>)
-        }),
-    )
-}
-
 /// One runtime-owned tab-bar installation and its subscriptions.
 pub struct TabBarPresentation {
     owner: CompanionHandle,

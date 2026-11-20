@@ -557,21 +557,6 @@ fn input_endpoint() -> bmux_plugin::AttachInputEndpoint {
     }
 }
 
-/// Declare a frontend factory whose registrations and task belong to one runtime.
-#[must_use]
-pub fn frontend_companion(
-    settings: Option<toml::Value>,
-    facts: std::sync::Arc<bmux_presentation_state::PresentationFactRegistry>,
-) -> bmux_plugin::AttachCompanion {
-    bmux_plugin::AttachCompanion::from_factory(
-        OWNER,
-        std::sync::Arc::new(move |resources| {
-            SidebarPresentation::install_scoped(settings.as_ref(), resources, facts.clone())
-                .map(|presentation| Box::new(presentation) as Box<dyn Send + Sync>)
-        }),
-    )
-}
-
 /// An independently owned sidebar presentation. Hosts retain this value until
 /// teardown and route geometry/input through the supplied registries.
 pub struct SidebarPresentation {
