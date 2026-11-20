@@ -5451,7 +5451,10 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         local_state_dir: Some(attach_config_paths().state_dir()),
     };
     let mut started_companions = Vec::new();
-    for companion in super::super::plugin_runtime::host_attach_companions().snapshot() {
+    for companion in super::super::plugin_runtime::attach_companions_for_config(
+        &attach_config,
+        &attach_config_paths(),
+    ) {
         let id = companion.id().to_owned();
         match companion.start_with_resources(&presentation_resources) {
             Ok(started) => started_companions.push(started),

@@ -1077,6 +1077,35 @@ pub(super) fn install_enabled_client_adapters(
     install_static_bundled_client_adapters(&bundled_enabled, paths);
 }
 
+/// The attach companions for the plugins `config` enables.
+///
+/// An attach runtime may run with a config other than the one this process
+/// started with (a playbook sandbox, for example). Client adapters of bundled
+/// plugins it enables are installed here if the process has not installed them
+/// yet, and companions of plugins it does not enable are left out.
+pub(in crate::runtime) fn attach_companions_for_config(
+    config: &BmuxConfig,
+    paths: &ConfigPaths,
+) -> Vec<bmux_plugin::AttachCompanion> {
+    let companions = host_attach_companions().snapshot();
+    let registry = match scan_available_plugins(config, paths) {
+        Ok(registry) => registry,
+        Err(error) => {
+            tracing::warn!(%error, "attach could not scan its plugins; starting installed companions");
+            return companions;
+        }
+    };
+    install_enabled_client_adapters(config, &registry, paths);
+    let enabled = effective_enabled_plugins(config, &registry)
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    host_attach_companions()
+        .snapshot()
+        .into_iter()
+        .filter(|companion| enabled.contains(companion.id()))
+        .collect()
+}
+
 pub(super) fn validate_enabled_plugins(
     config: &BmuxConfig,
     registry: &PluginRegistry,

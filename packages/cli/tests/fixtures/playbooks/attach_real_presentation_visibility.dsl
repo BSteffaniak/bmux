@@ -1,5 +1,3 @@
-# The test runs this with a host config enabling bmux.sidebar: attach
-# presentations come from the host process's enabled plugins.
 @driver real-attach
 @timeout 60000
 @viewport cols=100 rows=30

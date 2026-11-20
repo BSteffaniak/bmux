@@ -11,6 +11,8 @@
 new-session
 send-keys keys='printf TAB_ONLY_OK\r'
 wait-for pattern='TAB_ONLY_OK'
+# The bar shows the input mode.
+wait-rendered contains='INSERT'
 assert-screen contains='TAB_ONLY_OK'
 send-attach key='ctrl+a c'
 send-attach key='ctrl+s'

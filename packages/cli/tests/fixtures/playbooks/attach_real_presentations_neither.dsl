@@ -7,6 +7,7 @@
 @plugin enable=bmux.contexts
 @plugin enable=bmux.clients
 @plugin enable=bmux.permissions
+@plugin disable=bmux.tab_bar
 new-session
 send-keys keys='printf PRESENTATIONS_NEITHER_OK\r'
 wait-for pattern='PRESENTATIONS_NEITHER_OK'

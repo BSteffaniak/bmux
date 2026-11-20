@@ -12,6 +12,8 @@
 new-session
 send-keys keys='printf PRESENTATIONS_BOTH_OK\r'
 wait-for pattern='PRESENTATIONS_BOTH_OK'
+wait-rendered contains=' Tabs '
+wait-rendered contains='INSERT'
 assert-screen contains='PRESENTATIONS_BOTH_OK'
 send-attach key='ctrl+a c'
 send-attach key='ctrl+s'
