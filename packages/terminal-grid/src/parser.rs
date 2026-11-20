@@ -299,6 +299,23 @@ pub const MAX_OBSERVED_OSC_BYTES: usize = 1024 * 1024;
 /// defaults to nothing, so a stream that observes nothing ([`TerminalGridStream::process`])
 /// costs what it did without them.
 pub trait SequenceObserver {
+    /// Whether the grid applies a complete CSI sequence; `false` drops it before the grid or
+    /// [`Self::csi`] sees it (an output filter).
+    fn keep_csi(&mut self, _sequence: &SequenceHeader<'_>) -> bool {
+        true
+    }
+
+    /// Whether the grid applies a complete OSC string; `false` drops it before the grid,
+    /// [`Self::osc`] or [`Self::osc_payload`] sees it.
+    fn keep_osc(&mut self, _params: &[&[u8]]) -> bool {
+        true
+    }
+
+    /// Whether the grid applies a complete ESC sequence; `false` drops it.
+    fn keep_esc(&mut self, _intermediates: &[u8], _byte: u8) -> bool {
+        true
+    }
+
     /// A complete CSI sequence the parser did not ignore.
     fn csi(&mut self, _grid: &TerminalGrid, _sequence: &SequenceHeader<'_>) {}
 
@@ -667,29 +684,37 @@ impl<O: SequenceObserver> Perform for GridPerformer<'_, O> {
     }
 
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
+        let collected = std::mem::take(&mut self.osc.phase) == OscPhase::Collecting;
+        if !self.observer.keep_osc(params) {
+            return;
+        }
         self.apply_osc(params);
         self.observer.osc(self.grid, params, bell_terminated);
         let osc = &mut *self.osc;
-        if std::mem::take(&mut osc.phase) == OscPhase::Collecting && !osc.overflow {
+        if collected && !osc.overflow {
             self.observer.osc_payload(self.grid, osc.number, &osc.data);
         }
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        let header = SequenceHeader {
+            params,
+            intermediates,
+            action,
+        };
+        if !ignore && !self.observer.keep_csi(&header) {
+            return;
+        }
         self.apply_csi(params, intermediates, ignore, action);
         if !ignore {
-            self.observer.csi(
-                self.grid,
-                &SequenceHeader {
-                    params,
-                    intermediates,
-                    action,
-                },
-            );
+            self.observer.csi(self.grid, &header);
         }
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+        if !ignore && !self.observer.keep_esc(intermediates, byte) {
+            return;
+        }
         self.apply_esc(intermediates, ignore, byte);
     }
 }
@@ -2011,6 +2036,76 @@ mod tests {
         assert!(!protocol.application_cursor);
         assert!(!protocol.application_keypad);
         assert!(!protocol.bracketed_paste);
+    }
+
+    /// Filters drop the sequences they decline before the grid applies them; sequences no filter
+    /// is interested in apply as usual, and dropped ones are not observed.
+    #[test]
+    fn filters_drop_declined_sequences_before_the_grid() {
+        use crate::{FilterInterest, SequenceFilter, SequenceFilters, SequenceHeader};
+        struct NoClearing;
+        impl SequenceFilter for NoClearing {
+            fn interest(&self) -> FilterInterest {
+                FilterInterest::none().csi(b'J').esc(b'c').osc(52)
+            }
+            fn keep_csi(&self, sequence: &SequenceHeader<'_>) -> bool {
+                sequence
+                    .values()
+                    .is_none_or(|values| values.first() != Some(&2))
+            }
+            fn keep_esc(&self, _intermediates: &[u8], _byte: u8) -> bool {
+                false
+            }
+            fn keep_osc(&self, _params: &[&[u8]]) -> bool {
+                false
+            }
+        }
+        struct Filtered {
+            filters: SequenceFilters,
+            seen: Vec<char>,
+            payloads: usize,
+        }
+        impl super::SequenceObserver for Filtered {
+            fn keep_csi(&mut self, sequence: &SequenceHeader<'_>) -> bool {
+                self.filters.keep_csi(sequence)
+            }
+            fn keep_osc(&mut self, params: &[&[u8]]) -> bool {
+                self.filters.keep_osc(params)
+            }
+            fn keep_esc(&mut self, intermediates: &[u8], byte: u8) -> bool {
+                self.filters.keep_esc(intermediates, byte)
+            }
+            fn csi(&mut self, _grid: &TerminalGrid, sequence: &SequenceHeader<'_>) {
+                self.seen.push(sequence.action());
+            }
+            fn wants_osc(&mut self, _number: u32) -> bool {
+                true
+            }
+            fn osc_payload(&mut self, _grid: &TerminalGrid, _number: u32, _payload: &[u8]) {
+                self.payloads += 1;
+            }
+        }
+        let mut filters = SequenceFilters::default();
+        filters.register(std::sync::Arc::new(NoClearing));
+        let mut observer = Filtered {
+            filters,
+            seen: Vec::new(),
+            payloads: 0,
+        };
+        let mut stream = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+        stream.process_observed(
+            b"keep\x1b[2J\x1bc\x1b]52;c;eA==\x07\x1b]2;t\x07\x1b[2Hdone\x1b[0J",
+            &mut observer,
+        );
+        let text = crate::visible_text(stream.grid(), 0, 2);
+        let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
+        assert_eq!(
+            lines,
+            ["keep", "done"],
+            "neither the clear nor the reset applied"
+        );
+        assert_eq!(observer.seen, ['H', 'J'], "the dropped CSI is not observed");
+        assert_eq!(observer.payloads, 1, "only the kept OSC 2 payload");
     }
 
     /// An observer wanting an OSC number gets its whole payload, however long and however split

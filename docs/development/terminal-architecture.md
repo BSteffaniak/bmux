@@ -196,11 +196,31 @@ Done (each a measured commit; see [render-performance.md](render-performance.md)
   applied to replicas; the client no longer parses pane output, and the unused delta format is
   gone. Frames carry the source's revisions, synchronized-update state and benchmark replay
   markers; a grid resize wakes its clients.
+- Phase 6, in part:
+  - Pane terminal events (title, working directory, notifications, bell, prompt marks) are
+    published on the event bus (`pane-runtime-terminal-events`) from the reader's one pass.
+  - Input hooks receive the pane's input modes (mouse tracking and encoding, cursor and keypad
+    modes, bracketed paste, alternate screen) from the client's replica.
+  - OSC 52 clipboard writes travel only in the frames of clients viewing the pane, which apply
+    `clipboard.osc52` (`ask` per pane while attached, the default; `allow`; `deny`). Queries stay
+    unanswered. The grid collects whole payloads an observer asks for (`wants_osc`).
+  - Output filters: native plugins register a `SequenceFilter` in the shared
+    `SequenceFilters` (plugin state) with a declared `FilterInterest` (CSI and ESC final bytes, OSC
+    numbers). The reader asks only interested filters, on the grid's own parse, before the grid
+    applies the sequence; a dropped sequence is neither applied nor answered. With no filter
+    registered the cost is one branch per sequence.
 
 Changed from the plan: the image and shell-metadata scanners are folded in after every client
 reads frames, since until then their only other job is producing the filtered byte stream clients
 parsed. Rendering from damage comes before cluster replication, since rendering is now the
 client's largest cost.
 
+Output filters change what panes display (grids, and so frames), not the raw output stream:
+recording records what the program wrote. Cluster replication and the playbook, which still read
+the raw stream, see filtered output once they move to frames. Filters keep or drop whole
+sequences; rewriting sequences and filtering text runs come later, with the same interest model.
+
 Remaining: the image and shell-metadata transforms; render from damage (phase 4); cluster
-replication and playbook on frames; compact cells (phase 5); the plugin model (phase 6).
+replication and playbook on frames; compact cells (phase 5); the rest of the plugin model
+(rewriting filters and text filters, retained layers with revisioned relays, unified
+render/input/status APIs).

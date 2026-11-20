@@ -2310,6 +2310,13 @@ const fn attach_input_modes(modes: ProtocolState) -> AttachInputModeState {
     }
 }
 
+/// The output filters native plugins register for every pane (see
+/// [`bmux_terminal_grid::SequenceFilters`]), shared plugin state created by whichever side asks
+/// first.
+fn pane_output_filters(states: &bmux_plugin::PluginStateRegistry) -> SharedFilters {
+    states.get_or_insert_with(bmux_terminal_grid::SequenceFilters::default)
+}
+
 /// What the pane reader keeps from chunk to chunk while it follows the pane's output through the
 /// pane's grid: the shell metadata filter, the rows already scrolled out of image positions, and
 /// the buffers one chunk's visible bytes, metadata events and pointer-shape replies collect in.
@@ -2325,6 +2332,9 @@ struct PaneReader {
     /// What the chunk's program signalled beyond the screen (title, notifications, ...).
     signals: Vec<PaneSignal>,
     profile: ProtocolProfile,
+    /// The output filters plugins registered ([`pane_output_filters`]), consulted as the grid
+    /// parses each sequence.
+    filters: Option<SharedFilters>,
     /// The grid's viewport scroll revision already applied to image positions, from the first
     /// bytes followed (a grid restored from a snapshot does not start at zero).
     #[cfg(feature = "image-registry")]
@@ -2340,9 +2350,16 @@ impl PaneReader {
             pointer_replies: Vec::new(),
             signals: Vec::new(),
             profile,
+            filters: None,
             #[cfg(feature = "image-registry")]
             scrolled: None,
         }
+    }
+
+    /// Consult `filters` for every sequence the pane's program writes.
+    fn with_filters(mut self, filters: SharedFilters) -> Self {
+        self.filters = Some(filters);
+        self
     }
 
     /// Start a chunk: its visible bytes, metadata events and pointer replies start empty.
@@ -2355,23 +2372,37 @@ impl PaneReader {
 
     /// Parse `bytes` into `grid`, answering the queries among them as the grid reaches each:
     /// the protocol engine's into `replies`, pointer-shape queries into the reader's own.
+    /// `filters` are the registered output filters, read once per chunk (`read_filters`).
     fn feed(
         &mut self,
         grid: &mut TerminalGridStream,
         engine: &mut TerminalProtocolEngine,
         bytes: &[u8],
         replies: &mut Vec<u8>,
+        filters: Option<&bmux_terminal_grid::SequenceFilters>,
     ) {
-        grid.process_observed(
-            bytes,
-            &mut ReaderObserver {
-                engine,
-                replies,
-                pointer_replies: &mut self.pointer_replies,
-                signals: &mut self.signals,
-                profile: self.profile,
-            },
-        );
+        let mut observer = ReaderObserver {
+            engine,
+            replies,
+            pointer_replies: &mut self.pointer_replies,
+            signals: &mut self.signals,
+            profile: self.profile,
+            filters: NoFilters,
+        };
+        match filters {
+            None => grid.process_observed(bytes, &mut observer),
+            Some(filters) => grid.process_observed(
+                bytes,
+                &mut ReaderObserver {
+                    engine: observer.engine,
+                    replies: observer.replies,
+                    pointer_replies: observer.pointer_replies,
+                    signals: observer.signals,
+                    profile: observer.profile,
+                    filters,
+                },
+            ),
+        }
     }
 
     /// Rows scrolled since the last call, to move image positions by.
@@ -2383,14 +2414,71 @@ impl PaneReader {
     }
 }
 
+type SharedFilters = Arc<std::sync::RwLock<bmux_terminal_grid::SequenceFilters>>;
+
+/// The registered filters, read for one chunk (a poisoned lock reads as none: filters shape what
+/// panes show, they gate no access).
+fn read_filters(
+    shared: Option<&SharedFilters>,
+) -> Option<std::sync::RwLockReadGuard<'_, bmux_terminal_grid::SequenceFilters>> {
+    shared.and_then(|filters| filters.read().ok())
+}
+
+/// The filters to consult, when any is registered.
+fn active_filters(
+    filters: Option<&bmux_terminal_grid::SequenceFilters>,
+) -> Option<&bmux_terminal_grid::SequenceFilters> {
+    filters.filter(|filters| !filters.is_empty())
+}
+
 /// What the pane reader observes of its grid's parse: queries answered by the protocol engine with
 /// the cursor and modes as of each query, and pointer-shape queries answered for the bmux profile.
-struct ReaderObserver<'a> {
+struct ReaderObserver<'a, F> {
     engine: &'a mut TerminalProtocolEngine,
     replies: &'a mut Vec<u8>,
     pointer_replies: &'a mut Vec<u8>,
     signals: &'a mut Vec<PaneSignal>,
     profile: ProtocolProfile,
+    /// Plugin output filters: [`NoFilters`] when none is registered.
+    filters: F,
+}
+
+/// The output filters a pane reader consults, statically: [`NoFilters`] keeps everything and
+/// compiles to nothing.
+trait ReaderFilters {
+    fn keep_csi(&self, sequence: &SequenceHeader<'_>) -> bool;
+    fn keep_osc(&self, params: &[&[u8]]) -> bool;
+    fn keep_esc(&self, intermediates: &[u8], byte: u8) -> bool;
+}
+
+/// No output filter is registered.
+struct NoFilters;
+
+impl ReaderFilters for NoFilters {
+    #[inline]
+    fn keep_csi(&self, _sequence: &SequenceHeader<'_>) -> bool {
+        true
+    }
+    #[inline]
+    fn keep_osc(&self, _params: &[&[u8]]) -> bool {
+        true
+    }
+    #[inline]
+    fn keep_esc(&self, _intermediates: &[u8], _byte: u8) -> bool {
+        true
+    }
+}
+
+impl ReaderFilters for &bmux_terminal_grid::SequenceFilters {
+    fn keep_csi(&self, sequence: &SequenceHeader<'_>) -> bool {
+        bmux_terminal_grid::SequenceFilters::keep_csi(self, sequence)
+    }
+    fn keep_osc(&self, params: &[&[u8]]) -> bool {
+        bmux_terminal_grid::SequenceFilters::keep_osc(self, params)
+    }
+    fn keep_esc(&self, intermediates: &[u8], byte: u8) -> bool {
+        bmux_terminal_grid::SequenceFilters::keep_esc(self, intermediates, byte)
+    }
 }
 
 /// Something a pane's program signalled through its output beyond the screen, as the reader saw
@@ -2515,7 +2603,19 @@ impl PaneSignal {
     }
 }
 
-impl SequenceObserver for ReaderObserver<'_> {
+impl<F: ReaderFilters> SequenceObserver for ReaderObserver<'_, F> {
+    fn keep_csi(&mut self, sequence: &SequenceHeader<'_>) -> bool {
+        self.filters.keep_csi(sequence)
+    }
+
+    fn keep_osc(&mut self, params: &[&[u8]]) -> bool {
+        self.filters.keep_osc(params)
+    }
+
+    fn keep_esc(&mut self, intermediates: &[u8], byte: u8) -> bool {
+        self.filters.keep_esc(intermediates, byte)
+    }
+
     fn csi(&mut self, grid: &TerminalGrid, sequence: &SequenceHeader<'_>) {
         if !TerminalProtocolEngine::may_answer_csi(sequence.action()) {
             return;
@@ -2737,7 +2837,15 @@ fn follow_output(
     replies: &mut Vec<u8>,
 ) {
     let filtered = visible_output(reader, bytes);
-    reader.feed(grid, protocol, &filtered, replies);
+    let shared = reader.filters.clone();
+    let guard = read_filters(shared.as_ref());
+    reader.feed(
+        grid,
+        protocol,
+        &filtered,
+        replies,
+        active_filters(guard.as_deref()),
+    );
 }
 
 fn sanitize_pty_size(rows: u16, cols: u16) -> (u16, u16) {
@@ -2878,11 +2986,15 @@ fn image_terminal_bytes(
     reader
         .scrolled
         .get_or_insert_with(|| grid.grid().viewport_scroll_revision());
+    // Read once for the chunk: with an image on screen it is fed a byte at a time.
+    let shared = reader.filters.clone();
+    let guard = read_filters(shared.as_ref());
+    let filters = active_filters(guard.as_deref());
     for unit in units {
         let erase = grid.grid().display_erase_revision();
         let history_erase = grid.grid().history_erase_revision();
         let reset = grid.grid().reset_revision();
-        reader.feed(grid, protocol, unit, replies);
+        reader.feed(grid, protocol, unit, replies, filters);
         if reset != grid.grid().reset_revision() {
             registry.reset();
         }
@@ -3251,7 +3363,7 @@ fn protocol_reply_for_chunk(
     chunk: &[u8],
 ) -> Vec<u8> {
     let mut replies = Vec::new();
-    reader.feed(grid, protocol_engine, chunk, &mut replies);
+    reader.feed(grid, protocol_engine, chunk, &mut replies, None);
     replies
 }
 
@@ -8113,7 +8225,8 @@ impl SessionRuntimeManager {
                             token: Some(shell_marker_token),
                             ..PaneShellMetadataParser::default()
                         }),
-                    );
+                    )
+                    .with_filters(pane_output_filters(host.states()));
 
                     // Image interceptor: detects and extracts image escape sequences
                     // (Sixel, Kitty, iTerm2) from PTY output before they reach the
@@ -18594,6 +18707,72 @@ exit 7"#
         );
         assert_eq!(remaining, expected.len() - 1);
         assert_eq!(grid.snapshot(0, 2), snapshot);
+    }
+
+    /// A filter registered in plugin state reaches readers made before it: the sequences it
+    /// declines neither change the grid nor get answered, and the rest apply as usual.
+    #[test]
+    fn registered_output_filters_apply_to_pane_readers() {
+        use bmux_terminal_grid::{FilterInterest, SequenceFilter};
+        struct NoQueriesOrClears;
+        impl SequenceFilter for NoQueriesOrClears {
+            fn interest(&self) -> FilterInterest {
+                FilterInterest::none().csi(b'n').csi(b'J')
+            }
+            fn keep_csi(&self, _sequence: &SequenceHeader<'_>) -> bool {
+                false
+            }
+        }
+        let states = bmux_plugin::PluginStateRegistry::new();
+        let mut reader =
+            PaneReader::new(ProtocolProfile::Bmux, None).with_filters(pane_output_filters(&states));
+        let mut grid = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        let mut replies = Vec::new();
+        let feed = |reader: &mut PaneReader,
+                    grid: &mut TerminalGridStream,
+                    engine: &mut TerminalProtocolEngine,
+                    bytes: &[u8],
+                    replies: &mut Vec<u8>| {
+            let shared = reader.filters.clone();
+            let guard = read_filters(shared.as_ref());
+            reader.feed(
+                grid,
+                engine,
+                bytes,
+                replies,
+                active_filters(guard.as_deref()),
+            );
+        };
+        feed(
+            &mut reader,
+            &mut grid,
+            &mut engine,
+            b"a\x1b[6n",
+            &mut replies,
+        );
+        assert!(
+            !replies.is_empty(),
+            "no filter yet: the cursor report is answered"
+        );
+        pane_output_filters(&states)
+            .write()
+            .unwrap()
+            .register(Arc::new(NoQueriesOrClears));
+        replies.clear();
+        feed(
+            &mut reader,
+            &mut grid,
+            &mut engine,
+            b"\x1b[6n\x1b[2Jb",
+            &mut replies,
+        );
+        assert!(replies.is_empty(), "the filtered query is not answered");
+        assert_eq!(
+            bmux_terminal_grid::visible_text(grid.grid(), 0, 1).trim_end(),
+            "ab",
+            "the filtered clear did not apply"
+        );
     }
 
     /// OSC 52 writes are recognized (selection kept, text decoded); queries and malformed or
