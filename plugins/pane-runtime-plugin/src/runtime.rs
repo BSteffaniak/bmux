@@ -52,7 +52,8 @@ use bmux_session_models::{ClientId, SessionId};
 use bmux_session_state::SessionManagerHandle;
 use bmux_snapshot_runtime::{SnapshotDirtyFlag, SnapshotDirtyFlagHandle};
 use bmux_terminal_grid::{
-    GridLimits, ProtocolState, SequenceHeader, SequenceObserver, TerminalGrid, TerminalGridStream,
+    ChunkMark, GridLimits, ProtocolState, SequenceHeader, SequenceObserver, StreamedString,
+    TerminalGrid, TerminalGridStream,
 };
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
 use pty::Slave as _;
@@ -1168,29 +1169,28 @@ mod pointer_query_tests {
     #[cfg(feature = "image-registry")]
     #[test]
     fn image_filtered_path_preserves_cpr_color_and_pointer_queries() {
-        use super::{PaneCursorTracker, TerminalProtocolEngine, ordered_image_output};
+        use super::{
+            PaneCursorTracker, TerminalProtocolEngine, follow_image_chunk, image_collector,
+        };
 
-        let mut interceptor = bmux_image::ImageInterceptor::new();
-        let mut output = interceptor.process(
-            b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\\x1b[4;7H\x1b[6n\x1b]10;?\x07\x1b]22;pointer\x07\x1b]22;?__current__\x07",
-        );
-        assert!(!output.events.is_empty());
+        let mut collector = image_collector();
         let mut tracker = PaneCursorTracker::new(24, 80);
         let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
         let mut registry = bmux_image::ImageRegistry::default();
         let mut replies = Vec::new();
-        ordered_image_output(
+        let events = follow_image_chunk(
             &mut tracker.reader,
             &mut tracker.terminal_grid,
             &mut engine,
             &mut registry,
-            &mut output,
-            (8, 16),
+            &mut collector,
+            b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\\x1b[4;7H\x1b[6n\x1b]10;?\x07\x1b]22;pointer\x07\x1b]22;?__current__\x07",
             &mut replies,
         )
         .unwrap();
+        assert!(!events.is_empty());
         let grid = grid();
-        let pointer = process(&grid, &output.filtered);
+        let pointer = process(&grid, &tracker.reader.visible);
         assert!(replies.starts_with(b"\x1b[4;7R"));
         assert!(replies.windows(5).any(|bytes| bytes == b"\x1b]10;"));
         replies.extend(pointer);
@@ -1202,21 +1202,22 @@ mod pointer_query_tests {
     #[cfg(feature = "image-registry")]
     #[test]
     fn kitty_queries_are_answered_in_order_with_other_replies() {
-        use super::{PaneCursorTracker, TerminalProtocolEngine, ordered_image_output};
+        use super::{
+            PaneCursorTracker, TerminalProtocolEngine, follow_image_chunk, image_collector,
+        };
 
-        let mut interceptor = bmux_image::ImageInterceptor::new();
-        let mut output = interceptor.process(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[6n");
+        let mut collector = image_collector();
         let mut tracker = PaneCursorTracker::new(24, 80);
         let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
         let mut registry = bmux_image::ImageRegistry::default();
         let mut replies = Vec::new();
-        ordered_image_output(
+        follow_image_chunk(
             &mut tracker.reader,
             &mut tracker.terminal_grid,
             &mut engine,
             &mut registry,
-            &mut output,
-            (8, 16),
+            &mut collector,
+            b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[6n",
             &mut replies,
         )
         .unwrap();
@@ -2351,6 +2352,9 @@ struct PaneReader {
     /// The chunk's bytes as the grid sees them (images and shell metadata removed): what the
     /// output buffer publishes.
     visible: Vec<u8>,
+    /// The start of a sequence that might yet begin an image, held from earlier chunks until what
+    /// follows decides whether it is output ([`SequenceObserver::hold`]).
+    held: Vec<u8>,
     pointer_replies: Vec<u8>,
     /// What the chunk's program signalled beyond the screen (title, notifications, ...).
     signals: Vec<PaneSignal>,
@@ -2370,6 +2374,7 @@ impl PaneReader {
             metadata,
             metadata_events: Vec::new(),
             visible: Vec::new(),
+            held: Vec::new(),
             pointer_replies: Vec::new(),
             signals: Vec::new(),
             profile,
@@ -2406,7 +2411,7 @@ impl PaneReader {
         filters: Option<&bmux_terminal_grid::SequenceFilters>,
         images: &mut I,
     ) {
-        let mut observer = ReaderObserver {
+        let observer = ReaderObserver {
             engine,
             replies,
             pointer_replies: &mut self.pointer_replies,
@@ -2414,72 +2419,106 @@ impl PaneReader {
             profile: self.profile,
             filters: NoFilters,
             images,
+            bytes,
+            visible: &mut self.visible,
+            held: &mut self.held,
+            cursor: 0,
+            holding: false,
         };
         match filters {
-            None => grid.process_observed(bytes, &mut observer),
-            Some(filters) => grid.process_observed(
+            None => observer.follow(grid),
+            Some(filters) => ReaderObserver {
+                engine: observer.engine,
+                replies: observer.replies,
+                pointer_replies: observer.pointer_replies,
+                signals: observer.signals,
+                profile: observer.profile,
+                filters,
+                images: observer.images,
                 bytes,
-                &mut ReaderObserver {
-                    engine: observer.engine,
-                    replies: observer.replies,
-                    pointer_replies: observer.pointer_replies,
-                    signals: observer.signals,
-                    profile: observer.profile,
-                    filters,
-                    images: observer.images,
-                },
-            ),
+                visible: observer.visible,
+                held: observer.held,
+                cursor: 0,
+                holding: false,
+            }
+            .follow(grid),
         }
     }
 }
 
-/// What the pane reader does after each operation its grid applies, statically: [`NoImages`]
-/// does nothing and compiles to nothing.
+/// How the pane reader follows images, statically: [`NoImages`] recognises none and compiles to
+/// nothing.
 trait ReaderImages {
+    /// Whether the grid's parse streams image strings (Sixel, Kitty graphics, iTerm2) here.
+    const STREAMS: bool = false;
+    /// The grid applied an operation: images on screen move with it.
     fn operation(&mut self, grid: &TerminalGrid);
+    /// Whether the DCS string `introducer` begins is a Sixel image.
+    fn stream_dcs(&mut self, _introducer: &SequenceHeader<'_>) -> bool {
+        false
+    }
+    fn string_start(&mut self, _kind: StreamedString) {}
+    fn string_data(&mut self, _data: &[u8]) {}
+    /// An image string ended: a complete image is placed at the cursor, its replies in order with
+    /// the program's others.
+    fn string_end(&mut self, _grid: &TerminalGrid, _completed: bool, _replies: &mut Vec<u8>) {}
 }
 
-/// No image on screen to move.
+/// No image support (a build without it, and tests of what does not concern images).
+#[cfg(any(test, not(feature = "image-registry")))]
 struct NoImages;
 
+#[cfg(any(test, not(feature = "image-registry")))]
 impl ReaderImages for NoImages {
     #[inline]
     fn operation(&mut self, _grid: &TerminalGrid) {}
 }
 
-/// Images on screen, moved with each grid operation in order: erased with the display or
-/// history, reset with the terminal, switched with the screen, and scrolled.
+/// The image state one PTY read is followed with, and the image events it held.
 #[cfg(feature = "image-registry")]
-struct FollowImages<'a> {
+struct ChunkImages<'a> {
     registry: &'a mut bmux_image::ImageRegistry,
+    /// The image string in progress, kept from read to read.
+    collector: &'a mut bmux_image::ImageCollector,
+    cell_pixels: (u16, u16),
+    events: Vec<bmux_image::ImageEvent>,
+}
+
+/// Images as the grid's parse finds them, placed at the cursor as of each, and images on screen
+/// moved with each grid operation in order: erased with the display or history, reset with the
+/// terminal, switched with the screen, and scrolled.
+#[cfg(feature = "image-registry")]
+struct FollowImages<'a, 'b> {
+    images: &'a mut ChunkImages<'b>,
     erase: u64,
     history_erase: u64,
     reset: u64,
     /// The grid's viewport scroll revision already applied to image positions.
     scrolled: u64,
+    /// Whether any image is held, so operations must move it; with none, screen changes only
+    /// flip registry state, caught up before the next image and at the end of the read.
+    following: bool,
     /// The first failure; images are not followed after it.
     error: Option<std::io::Error>,
 }
 
 #[cfg(feature = "image-registry")]
-impl<'a> FollowImages<'a> {
-    fn new(
-        registry: &'a mut bmux_image::ImageRegistry,
-        grid: &TerminalGrid,
-        scrolled: u64,
-    ) -> Self {
+impl<'a, 'b> FollowImages<'a, 'b> {
+    fn new(images: &'a mut ChunkImages<'b>, grid: &TerminalGrid, scrolled: u64) -> Self {
+        let following = !images.registry.holds_nothing();
         Self {
-            registry,
+            images,
             erase: grid.display_erase_revision(),
             history_erase: grid.history_erase_revision(),
             reset: grid.reset_revision(),
             scrolled,
+            following,
             error: None,
         }
     }
 
     fn follow(&mut self, grid: &TerminalGrid) -> std::io::Result<()> {
-        let registry = &mut *self.registry;
+        let registry = &mut *self.images.registry;
         if self.reset != grid.reset_revision() {
             self.reset = grid.reset_revision();
             registry.reset();
@@ -2501,16 +2540,57 @@ impl<'a> FollowImages<'a> {
         }
         Ok(())
     }
-}
 
-#[cfg(feature = "image-registry")]
-impl ReaderImages for FollowImages<'_> {
-    fn operation(&mut self, grid: &TerminalGrid) {
+    /// Bring image state up to `grid`, whether or not any image is held.
+    fn catch_up(&mut self, grid: &TerminalGrid) {
         if self.error.is_none()
             && let Err(error) = self.follow(grid)
         {
             self.error = Some(error);
         }
+    }
+}
+
+#[cfg(feature = "image-registry")]
+impl ReaderImages for FollowImages<'_, '_> {
+    const STREAMS: bool = true;
+
+    fn operation(&mut self, grid: &TerminalGrid) {
+        if self.following {
+            self.catch_up(grid);
+        }
+    }
+
+    fn stream_dcs(&mut self, introducer: &SequenceHeader<'_>) -> bool {
+        introducer.action() == 'q' && introducer.intermediates().is_empty()
+    }
+
+    fn string_start(&mut self, kind: StreamedString) {
+        self.images.collector.start(match kind {
+            StreamedString::Apc => bmux_image::ImageString::Kitty,
+            StreamedString::Dcs => bmux_image::ImageString::Sixel,
+            StreamedString::Osc => bmux_image::ImageString::ITerm2,
+        });
+    }
+
+    fn string_data(&mut self, data: &[u8]) {
+        self.images.collector.push(data);
+    }
+
+    fn string_end(&mut self, grid: &TerminalGrid, completed: bool, replies: &mut Vec<u8>) {
+        let Some(mut event) = self.images.collector.finish(completed) else {
+            return;
+        };
+        self.catch_up(grid);
+        let (row, col) = grid_cursor_position(grid);
+        event.set_position(bmux_image::ImagePosition { row, col });
+        let (width, height) = self.images.cell_pixels;
+        let registry = &mut *self.images.registry;
+        registry.handle_event(event.clone(), width, height);
+        // Kitty graphics answers go back to the program in order with its other replies.
+        replies.extend(registry.take_replies());
+        self.following = !registry.holds_nothing();
+        self.images.events.push(event);
     }
 }
 
@@ -2541,8 +2621,35 @@ struct ReaderObserver<'a, F, I> {
     profile: ProtocolProfile,
     /// Plugin output filters: [`NoFilters`] when none is registered.
     filters: F,
-    /// What follows each grid operation: [`NoImages`] with no image on screen.
+    /// How images are followed: [`NoImages`] without image support.
     images: &'a mut I,
+    /// The chunk being followed, and where what of it is output collects: everything but image
+    /// strings ([`SequenceObserver::cut`]), with a possible image start held to the next chunk
+    /// ([`SequenceObserver::hold`]).
+    bytes: &'a [u8],
+    visible: &'a mut Vec<u8>,
+    held: &'a mut Vec<u8>,
+    /// How far into `bytes` output is decided.
+    cursor: usize,
+    /// Whether the chunk's end is held.
+    holding: bool,
+}
+
+impl<F: ReaderFilters, I: ReaderImages> ReaderObserver<'_, F, I> {
+    /// Follow the chunk through `grid`, then add what of it is output to the visible bytes.
+    fn follow(mut self, grid: &mut TerminalGridStream) {
+        grid.process_observed(self.bytes, &mut self);
+        if !self.holding {
+            self.release(self.bytes.len());
+        }
+    }
+
+    /// The chunk's bytes from the cursor to `end` are output, after any held start.
+    fn release(&mut self, end: usize) {
+        self.visible.append(self.held);
+        self.visible
+            .extend_from_slice(&self.bytes[self.cursor..end]);
+    }
 }
 
 /// The output filters a pane reader consults, statically: [`NoFilters`] keeps everything and
@@ -2706,8 +2813,48 @@ impl PaneSignal {
 }
 
 impl<F: ReaderFilters, I: ReaderImages> SequenceObserver for ReaderObserver<'_, F, I> {
+    const STREAMS_APC: bool = I::STREAMS;
+    const STREAMS_DCS: bool = I::STREAMS;
+    const STREAMED_OSC_PREFIX: &'static [u8] = if I::STREAMS { b"1337;File=" } else { b"" };
+
     fn operation(&mut self, grid: &TerminalGrid) {
         self.images.operation(grid);
+    }
+
+    fn stream_dcs(&mut self, introducer: &SequenceHeader<'_>) -> bool {
+        self.images.stream_dcs(introducer)
+    }
+
+    fn string_start(&mut self, kind: StreamedString) {
+        self.images.string_start(kind);
+    }
+
+    fn string_data(&mut self, data: &[u8]) {
+        self.images.string_data(data);
+    }
+
+    fn string_end(&mut self, grid: &TerminalGrid, completed: bool) {
+        self.images.string_end(grid, completed, self.replies);
+    }
+
+    fn cut(&mut self, from: ChunkMark, to: usize) {
+        match from {
+            ChunkMark::Before => self.held.clear(),
+            ChunkMark::At(start) => self.release(start),
+        }
+        self.cursor = to;
+    }
+
+    fn hold(&mut self, from: ChunkMark) {
+        match from {
+            ChunkMark::Before => self.held.extend_from_slice(&self.bytes[self.cursor..]),
+            ChunkMark::At(start) => {
+                self.release(start);
+                self.held.extend_from_slice(&self.bytes[start..]);
+            }
+        }
+        self.cursor = self.bytes.len();
+        self.holding = true;
     }
 
     fn keep_csi(&mut self, sequence: &SequenceHeader<'_>) -> bool {
@@ -2850,18 +2997,11 @@ fn grid_cursor_position(grid: &TerminalGrid) -> (u16, u16) {
     )
 }
 
-/// The image state one PTY read is intercepted and placed with, and the image events it held.
-#[cfg(feature = "image-registry")]
-struct ChunkImages<'a> {
-    registry: &'a mut bmux_image::ImageRegistry,
-    interceptor: &'a mut bmux_image::ImageInterceptor,
-    cell_pixels: (u16, u16),
-    events: Vec<bmux_image::ImageEvent>,
-}
-
-/// One PTY read as the pane reader follows it: the interceptor extracts image sequences first,
-/// and the rest is followed through the pane's grid in order with the images
-/// ([`follow_output`]); the bytes the grid saw collect in the reader's `visible`.
+/// One PTY read as the pane reader follows it: shell metadata is removed first, then the rest is
+/// parsed by the pane's grid while the protocol engine answers queries (cursor reports as of each
+/// query), and images, recognised by the same parse, are placed at the cursor as of each and move
+/// with the grid's erases, resets, screen switches and scrolls. The bytes the grid saw, without
+/// image strings, collect in the reader's `visible`.
 #[cfg(feature = "image-registry")]
 fn follow_chunk(
     reader: &mut PaneReader,
@@ -2872,27 +3012,30 @@ fn follow_chunk(
     replies: &mut Vec<u8>,
 ) -> std::io::Result<()> {
     reader.begin_chunk();
-    // Most chunks hold no image: follow them as they are.
-    if images.interceptor.passes_through(chunk) {
-        images.events.clear();
-        return follow_output(reader, grid, protocol, images.registry, chunk, replies);
-    }
-    let mut intercepted = images.interceptor.process(chunk);
-    let followed = ordered_image_output(
-        reader,
+    images.events.clear();
+    let filtered = metadata_filtered(reader, chunk);
+    let scrolled = *reader
+        .scrolled
+        .get_or_insert_with(|| grid.grid().viewport_scroll_revision());
+    let shared = reader.filters.clone();
+    let guard = read_filters(shared.as_ref());
+    let mut follow = FollowImages::new(images, grid.grid(), scrolled);
+    reader.feed(
         grid,
         protocol,
-        images.registry,
-        &mut intercepted,
-        images.cell_pixels,
+        &filtered,
         replies,
+        active_filters(guard.as_deref()),
+        &mut follow,
     );
-    images.events = intercepted.events;
-    followed
+    follow.catch_up(grid.grid());
+    reader.scrolled = Some(follow.scrolled);
+    follow.error.map_or(Ok(()), Err)
 }
 
-/// One PTY read as the pane reader follows it through the pane's grid ([`follow_output`]); the
-/// bytes the grid saw collect in the reader's `visible`.
+/// One PTY read as the pane reader follows it: shell metadata is removed first, then the rest is
+/// parsed by the pane's grid while the protocol engine answers queries (cursor reports as of each
+/// query). The bytes the grid saw collect in the reader's `visible`.
 #[cfg(not(feature = "image-registry"))]
 fn follow_chunk(
     reader: &mut PaneReader,
@@ -2902,52 +3045,7 @@ fn follow_chunk(
     replies: &mut Vec<u8>,
 ) {
     reader.begin_chunk();
-    follow_output(reader, grid, protocol, chunk, replies);
-}
-
-/// `bytes` without the shell metadata they carry (collected in the reader's metadata events),
-/// added to what the grid sees and the output buffer publishes.
-fn visible_output<'b>(reader: &mut PaneReader, bytes: &'b [u8]) -> std::borrow::Cow<'b, [u8]> {
-    let filtered = match reader.metadata.as_mut() {
-        Some(parser) => {
-            let parsed = parser.process_chunk(bytes);
-            reader.metadata_events.extend(parsed.events);
-            parsed.filtered
-        }
-        None => std::borrow::Cow::Borrowed(bytes),
-    };
-    reader.visible.extend_from_slice(&filtered);
-    filtered
-}
-
-/// Follow `bytes` of pane output (images already intercepted) through the pane's grid: shell
-/// metadata is removed first, then the protocol engine answers queries (cursor reports as of each
-/// query) while the grid parses, and image positions follow the grid's erases, resets, screen
-/// switches and scrolls.
-#[cfg(feature = "image-registry")]
-fn follow_output(
-    reader: &mut PaneReader,
-    grid: &mut TerminalGridStream,
-    protocol: &mut TerminalProtocolEngine,
-    registry: &mut bmux_image::ImageRegistry,
-    bytes: &[u8],
-    replies: &mut Vec<u8>,
-) -> std::io::Result<()> {
-    let filtered = visible_output(reader, bytes);
-    image_terminal_bytes(reader, grid, protocol, registry, &filtered, replies)
-}
-
-/// Follow `bytes` of pane output through the pane's grid: shell metadata is removed first, then
-/// the protocol engine answers queries (cursor reports as of each query) while the grid parses.
-#[cfg(not(feature = "image-registry"))]
-fn follow_output(
-    reader: &mut PaneReader,
-    grid: &mut TerminalGridStream,
-    protocol: &mut TerminalProtocolEngine,
-    bytes: &[u8],
-    replies: &mut Vec<u8>,
-) {
-    let filtered = visible_output(reader, bytes);
+    let filtered = metadata_filtered(reader, chunk);
     let shared = reader.filters.clone();
     let guard = read_filters(shared.as_ref());
     reader.feed(
@@ -2958,6 +3056,18 @@ fn follow_output(
         active_filters(guard.as_deref()),
         &mut NoImages,
     );
+}
+
+/// `bytes` without the shell metadata they carry (collected in the reader's metadata events).
+fn metadata_filtered<'b>(reader: &mut PaneReader, bytes: &'b [u8]) -> std::borrow::Cow<'b, [u8]> {
+    match reader.metadata.as_mut() {
+        Some(parser) => {
+            let parsed = parser.process_chunk(bytes);
+            reader.metadata_events.extend(parsed.events);
+            parsed.filtered
+        }
+        None => std::borrow::Cow::Borrowed(bytes),
+    }
 }
 
 fn sanitize_pty_size(rows: u16, cols: u16) -> (u16, u16) {
@@ -3038,73 +3148,32 @@ fn image_event_to_recording_payload(event: &bmux_image::ImageEvent) -> Recording
     }
 }
 
-/// Follow an intercepted chunk through the pane's grid in order: the bytes before each image are
-/// followed first, so the image is placed where the grid's cursor then is and its replies come in
-/// order with the program's other replies.
-#[cfg(feature = "image-registry")]
-fn ordered_image_output(
-    reader: &mut PaneReader,
-    grid: &mut TerminalGridStream,
-    protocol: &mut TerminalProtocolEngine,
-    registry: &mut bmux_image::ImageRegistry,
-    output: &mut bmux_image::intercept::InterceptResult,
-    cell_pixels: (u16, u16),
-    replies: &mut Vec<u8>,
-) -> std::io::Result<()> {
-    let mut fed = 0;
-    for event in &mut output.events {
-        let offset = event.filtered_byte_offset();
-        follow_output(
-            reader,
-            grid,
-            protocol,
-            registry,
-            &output.filtered[fed..offset],
-            replies,
-        )?;
-        fed = offset;
-        let (row, col) = grid_cursor_position(grid.grid());
-        event.set_position(bmux_image::ImagePosition { row, col });
-        registry.handle_event(event.clone(), cell_pixels.0, cell_pixels.1);
-        // Kitty graphics answers go back to the program in order with its other replies.
-        replies.extend(registry.take_replies());
-    }
-    follow_output(
-        reader,
-        grid,
-        protocol,
-        registry,
-        &output.filtered[fed..],
-        replies,
-    )
+/// A collector for image strings, as the reader thread keeps one.
+#[cfg(all(test, feature = "image-registry"))]
+fn image_collector() -> bmux_image::ImageCollector {
+    bmux_image::ImageCollector::with_max_encoded_bytes(16 * 1024 * 1024)
 }
 
-#[cfg(feature = "image-registry")]
-fn image_terminal_bytes(
+/// Follow `chunk` with image support as the reader thread does (8 by 16 pixel cells), without a
+/// pane; returns the image events it held.
+#[cfg(all(test, feature = "image-registry"))]
+fn follow_image_chunk(
     reader: &mut PaneReader,
     grid: &mut TerminalGridStream,
     protocol: &mut TerminalProtocolEngine,
     registry: &mut bmux_image::ImageRegistry,
-    bytes: &[u8],
+    collector: &mut bmux_image::ImageCollector,
+    chunk: &[u8],
     replies: &mut Vec<u8>,
-) -> std::io::Result<()> {
-    let scrolled = *reader
-        .scrolled
-        .get_or_insert_with(|| grid.grid().viewport_scroll_revision());
-    let shared = reader.filters.clone();
-    let guard = read_filters(shared.as_ref());
-    let filters = active_filters(guard.as_deref());
-    let mut images = FollowImages::new(registry, grid.grid(), scrolled);
-    // Images on screen move with each change in order: follow every operation, in the grid's
-    // one pass. With none, screen changes only flip registry state: follow the chunk's at once.
-    if images.registry.holds_nothing() {
-        reader.feed(grid, protocol, bytes, replies, filters, &mut NoImages);
-    } else {
-        reader.feed(grid, protocol, bytes, replies, filters, &mut images);
-    }
-    images.operation(grid.grid());
-    reader.scrolled = Some(images.scrolled);
-    images.error.map_or(Ok(()), Err)
+) -> std::io::Result<Vec<bmux_image::ImageEvent>> {
+    let mut images = ChunkImages {
+        registry,
+        collector,
+        cell_pixels: (8, 16),
+        events: Vec::new(),
+    };
+    follow_chunk(reader, grid, protocol, &mut images, chunk, replies)?;
+    Ok(images.events)
 }
 
 #[cfg(all(test, feature = "image-registry"))]
@@ -3116,15 +3185,14 @@ mod image_lifecycle_tests {
         let mut tracker = PaneCursorTracker::new(3, 80);
         let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
         let mut registry = bmux_image::ImageRegistry::default();
-        let mut interceptor = bmux_image::ImageInterceptor::new();
-        let mut output = interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\\r\n\r\n\r\n");
-        ordered_image_output(
+        let mut collector = image_collector();
+        follow_image_chunk(
             &mut tracker.reader,
             &mut tracker.terminal_grid,
             &mut protocol,
             &mut registry,
-            &mut output,
-            (8, 16),
+            &mut collector,
+            b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\\r\n\r\n\r\n",
             &mut Vec::new(),
         )
         .unwrap();
@@ -3185,15 +3253,14 @@ mod image_lifecycle_tests {
         let mut tracker = PaneCursorTracker::new(1, 4);
         let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
         let mut registry = bmux_image::ImageRegistry::default().with_viewport_height(1);
-        let mut interceptor = bmux_image::ImageInterceptor::new();
-        let mut output = interceptor.process("\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\ab界".as_bytes());
-        ordered_image_output(
+        let mut collector = image_collector();
+        follow_image_chunk(
             &mut tracker.reader,
             &mut tracker.terminal_grid,
             &mut protocol,
             &mut registry,
-            &mut output,
-            (8, 16),
+            &mut collector,
+            "\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\ab界".as_bytes(),
             &mut Vec::new(),
         )
         .unwrap();
@@ -3254,16 +3321,15 @@ mod image_lifecycle_tests {
             let mut tracker = PaneCursorTracker::new(3, 20);
             let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
             let mut registry = bmux_image::ImageRegistry::default();
-            let mut interceptor = bmux_image::ImageInterceptor::new();
+            let mut collector = image_collector();
             for chunk in stream.chunks(chunk_size) {
-                let mut output = interceptor.process(chunk);
-                ordered_image_output(
+                follow_image_chunk(
                     &mut tracker.reader,
                     &mut tracker.terminal_grid,
                     &mut protocol,
                     &mut registry,
-                    &mut output,
-                    (8, 16),
+                    &mut collector,
+                    chunk,
                     &mut Vec::new(),
                 )
                 .unwrap();
@@ -3303,16 +3369,15 @@ mod image_lifecycle_tests {
             let mut tracker = PaneCursorTracker::new(3, 80);
             let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
             let mut registry = bmux_image::ImageRegistry::default();
-            let mut interceptor = bmux_image::ImageInterceptor::new();
+            let mut collector = image_collector();
             for chunk in [&bytes[..split], &bytes[split..]] {
-                let mut output = interceptor.process(chunk);
-                ordered_image_output(
+                follow_image_chunk(
                     &mut tracker.reader,
                     &mut tracker.terminal_grid,
                     &mut protocol,
                     &mut registry,
-                    &mut output,
-                    (8, 16),
+                    &mut collector,
+                    chunk,
                     &mut Vec::new(),
                 )
                 .unwrap();
@@ -3320,14 +3385,13 @@ mod image_lifecycle_tests {
             assert_eq!(registry.images().len(), 1, "split {split}");
             assert_eq!(registry.images()[0].position.row, 2, "split {split}");
             for _ in 0..3 {
-                let mut output = interceptor.process(b"\r\n");
-                ordered_image_output(
+                follow_image_chunk(
                     &mut tracker.reader,
                     &mut tracker.terminal_grid,
                     &mut protocol,
                     &mut registry,
-                    &mut output,
-                    (8, 16),
+                    &mut collector,
+                    b"\r\n",
                     &mut Vec::new(),
                 )
                 .unwrap();
@@ -3350,16 +3414,15 @@ mod image_lifecycle_tests {
             let mut tracker = PaneCursorTracker::new(3, 80);
             let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
             let mut registry = bmux_image::ImageRegistry::default();
-            let mut interceptor = bmux_image::ImageInterceptor::new();
+            let mut collector = image_collector();
             for chunk in [&bytes[..split], &bytes[split..]] {
-                let mut output = interceptor.process(chunk);
-                ordered_image_output(
+                follow_image_chunk(
                     &mut tracker.reader,
                     &mut tracker.terminal_grid,
                     &mut protocol,
                     &mut registry,
-                    &mut output,
-                    (8, 16),
+                    &mut collector,
+                    chunk,
                     &mut Vec::new(),
                 )
                 .unwrap();
@@ -3377,19 +3440,18 @@ mod image_lifecycle_tests {
         let mut tracker = PaneCursorTracker::new(3, 80);
         let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
         let mut registry = bmux_image::ImageRegistry::default().with_viewport_height(3);
-        let mut interceptor = bmux_image::ImageInterceptor::new();
+        let mut collector = image_collector();
         for bytes in [
             b"\x1b[?1049h\x1b[3;1H\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\".as_slice(),
             b"\r\n",
         ] {
-            let mut output = interceptor.process(bytes);
-            ordered_image_output(
+            follow_image_chunk(
                 &mut tracker.reader,
                 &mut tracker.terminal_grid,
                 &mut protocol,
                 &mut registry,
-                &mut output,
-                (8, 16),
+                &mut collector,
+                bytes,
                 &mut Vec::new(),
             )
             .unwrap();
@@ -3404,17 +3466,14 @@ mod image_lifecycle_tests {
         let mut tracker = PaneCursorTracker::new(3, 80);
         let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
         let mut registry = bmux_image::ImageRegistry::default().with_viewport_height(3);
-        let mut interceptor = bmux_image::ImageInterceptor::new();
-        let mut output = interceptor.process(
-            b"normal\r\n\r\n\r\n\r\n\x1b[?1049h\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\\r\n\r\n\r\n",
-        );
-        ordered_image_output(
+        let mut collector = image_collector();
+        follow_image_chunk(
             &mut tracker.reader,
             &mut tracker.terminal_grid,
             &mut protocol,
             &mut registry,
-            &mut output,
-            (8, 16),
+            &mut collector,
+            b"normal\r\n\r\n\r\n\r\n\x1b[?1049h\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\\r\n\r\n\r\n",
             &mut Vec::new(),
         )
         .unwrap();
@@ -3438,16 +3497,15 @@ mod image_lifecycle_tests {
             let mut tracker = PaneCursorTracker::new(3, 80);
             let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
             let mut registry = bmux_image::ImageRegistry::default();
-            let mut interceptor = bmux_image::ImageInterceptor::new();
+            let mut collector = image_collector();
             for chunk in [&bytes[..split], &bytes[split..]] {
-                let mut output = interceptor.process(chunk);
-                ordered_image_output(
+                follow_image_chunk(
                     &mut tracker.reader,
                     &mut tracker.terminal_grid,
                     &mut protocol,
                     &mut registry,
-                    &mut output,
-                    (8, 16),
+                    &mut collector,
+                    chunk,
                     &mut Vec::new(),
                 )
                 .unwrap();
@@ -3471,16 +3529,15 @@ mod image_lifecycle_tests {
             let mut tracker = PaneCursorTracker::new(24, 80);
             let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
             let mut registry = bmux_image::ImageRegistry::default();
-            let mut interceptor = bmux_image::ImageInterceptor::new();
+            let mut collector = image_collector();
             for chunk in [&bytes[..split], &bytes[split..]] {
-                let mut output = interceptor.process(chunk);
-                ordered_image_output(
+                follow_image_chunk(
                     &mut tracker.reader,
                     &mut tracker.terminal_grid,
                     &mut protocol,
                     &mut registry,
-                    &mut output,
-                    (8, 16),
+                    &mut collector,
+                    chunk,
                     &mut Vec::new(),
                 )
                 .unwrap();
@@ -3491,18 +3548,120 @@ mod image_lifecycle_tests {
                 1,
                 "normal screen restored at split {split}"
             );
-            let mut output = interceptor.process(b"\x1b[2J");
-            ordered_image_output(
+            follow_image_chunk(
                 &mut tracker.reader,
                 &mut tracker.terminal_grid,
                 &mut protocol,
                 &mut registry,
-                &mut output,
-                (8, 16),
+                &mut collector,
+                b"\x1b[2J",
                 &mut Vec::new(),
             )
             .unwrap();
             assert_eq!(registry.images(), []);
+        }
+    }
+
+    /// A status request (DECRQSS, `DCS $ q`) is answered with image support too: only a DCS
+    /// string with no intermediates is Sixel (the interceptor took this one for an image).
+    #[test]
+    fn status_requests_are_answered_not_taken_for_sixel() {
+        let mut tracker = PaneCursorTracker::new(24, 80);
+        let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        let mut registry = bmux_image::ImageRegistry::default();
+        let mut replies = Vec::new();
+        let events = follow_image_chunk(
+            &mut tracker.reader,
+            &mut tracker.terminal_grid,
+            &mut protocol,
+            &mut registry,
+            &mut image_collector(),
+            b"\x1bP$qm\x1b\\",
+            &mut replies,
+        )
+        .unwrap();
+        assert!(events.is_empty());
+        assert!(replies.starts_with(b"\x1bP1$r"), "{replies:?}");
+        assert_eq!(tracker.reader.visible, b"\x1bP$qm\x1b\\");
+    }
+
+    /// What an image event carries, without where it was placed.
+    fn payload(event: &bmux_image::ImageEvent) -> (u8, Vec<u8>) {
+        match event {
+            bmux_image::ImageEvent::SixelImage { data, .. } => (0, data.clone()),
+            bmux_image::ImageEvent::KittyCommand { command, .. } => {
+                (1, format!("{command:?}").into_bytes())
+            }
+            bmux_image::ImageEvent::ITerm2Image { data, .. } => (2, data.clone()),
+        }
+    }
+
+    /// The grid's parse finds the images the interceptor found ahead of it, in the same reads, and
+    /// leaves raw readers the same bytes wherever reads split the output: image strings removed,
+    /// and a start that might yet be one held to a later read (a DCS header with intermediates,
+    /// which cannot begin Sixel, is released as they arrive, where the interceptor held it to its
+    /// final byte).
+    #[test]
+    fn the_parse_finds_images_and_output_as_the_interceptor_did() {
+        let pieces: &[&[u8]] = &[
+            b"plain",
+            b"\x1b[1;31mred\x1b[0m",
+            b"\x1b]0;title\x07",
+            b"\x1b]133;A\x1b\\",
+            b"\x1b]1337;SetUserVar=a=b\x07",
+            b"\x1bPq#0;2;0;0;0~-\x07~\x1b\\",
+            b"\x1bPq#0~\x1b[m",
+            b"\x1bP1$r0m\x1b\\",
+            b"\x1b_Gi=7,a=q,s=1,v=1,f=24;AAAA\x1b\\",
+            b"\x1b_Gi=8,a=q,s=1,v=1,f=24;AAAA\x07",
+            b"\x1b_Gi=9,a=q;AA\x18",
+            b"\x1b_x\x1b\\",
+            b"\x1b_\x07",
+            b"\x1b]1337;File=inline=1:AAAA\x07",
+            b"\x1b]1337;File=inline=1:BBBB\x1b\\",
+            b"\x1b]13\x18",
+            b"\x1b\x1b[2J",
+            b"\x18\x1a",
+        ];
+        for first in pieces {
+            for second in pieces {
+                let stream = [*first, *second, b"end"].concat();
+                for split in 0..=stream.len() {
+                    let mut interceptor = bmux_image::ImageInterceptor::new();
+                    let mut tracker = PaneCursorTracker::new(24, 80);
+                    let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+                    let mut registry = bmux_image::ImageRegistry::default();
+                    let mut collector = image_collector();
+                    let (mut visible, mut filtered) = (Vec::new(), Vec::new());
+                    let context =
+                        format!("{:?} split at {split}", String::from_utf8_lossy(&stream));
+                    for chunk in [&stream[..split], &stream[split..]] {
+                        let expected = interceptor.process(chunk);
+                        let events = follow_image_chunk(
+                            &mut tracker.reader,
+                            &mut tracker.terminal_grid,
+                            &mut protocol,
+                            &mut registry,
+                            &mut collector,
+                            chunk,
+                            &mut Vec::new(),
+                        )
+                        .unwrap();
+                        visible.extend_from_slice(&tracker.reader.visible);
+                        filtered.extend_from_slice(&expected.filtered);
+                        assert_eq!(
+                            events.iter().map(payload).collect::<Vec<_>>(),
+                            expected.events.iter().map(payload).collect::<Vec<_>>(),
+                            "{context}"
+                        );
+                    }
+                    assert_eq!(
+                        String::from_utf8_lossy(&visible),
+                        String::from_utf8_lossy(&filtered),
+                        "{context}"
+                    );
+                }
+            }
         }
     }
 }
@@ -8470,13 +8629,12 @@ impl SessionRuntimeManager {
                     )
                     .with_filters(pane_output_filters(host.states()));
 
-                    // Image interceptor: detects and extracts image escape sequences
-                    // (Sixel, Kitty, iTerm2) from PTY output before they reach the
-                    // output buffer.  Feature-gated to compile away when no image
-                    // protocols are enabled.
+                    // The image string in progress (Sixel, Kitty, iTerm2), which the grid's parse
+                    // recognises and streams here, kept from read to read. Feature-gated to
+                    // compile away when no image protocols are enabled.
                     #[cfg(feature = "image-registry")]
-                    let mut image_interceptor =
-                        bmux_image::ImageInterceptor::with_max_encoded_bytes(
+                    let mut image_collector =
+                        bmux_image::ImageCollector::with_max_encoded_bytes(
                             usize::try_from(image_config.max_image_bytes.saturating_mul(2))
                                 .unwrap_or(usize::MAX),
                         );
@@ -8541,9 +8699,8 @@ impl SessionRuntimeManager {
                                 );
                                 // The size lock (held through the chunk) keeps resizes out
                                 // until image state and the grid have consumed this chunk.
-                                // With image support the interceptor first extracts image
-                                // sequences; the bytes left are followed through the pane's
-                                // grid in order with the images.
+                                // With image support the grid's parse also recognises image
+                                // sequences, placed in order with the rest of the output.
                                 let mut reply = Vec::new();
                                 #[cfg(feature = "image-registry")]
                                 let Ok(mut registry) = image_registry_for_reader.lock() else { break; };
@@ -8562,7 +8719,7 @@ impl SessionRuntimeManager {
                                         cell_pixel_size_for_reader.lock().map_or((8, 16), |s| *s);
                                     ChunkImages {
                                         registry: &mut registry,
-                                        interceptor: &mut image_interceptor,
+                                        collector: &mut image_collector,
                                         cell_pixels: (
                                             if cpw == 0 { 8 } else { cpw },
                                             if cph == 0 { 16 } else { cph },
@@ -19927,15 +20084,14 @@ exit 7"#
         let images = Arc::clone(&runtime.panes[&pane].image_registry);
         let mut tracker = PaneCursorTracker::new(3, 80);
         let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
-        let mut interceptor = bmux_image::ImageInterceptor::new();
-        let mut output = interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\\r\n\r\n\r\n");
-        ordered_image_output(
+        let mut collector = image_collector();
+        follow_image_chunk(
             &mut tracker.reader,
             &mut tracker.terminal_grid,
             &mut protocol,
             &mut images.lock().unwrap(),
-            &mut output,
-            (8, 16),
+            &mut collector,
+            b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\\r\n\r\n\r\n",
             &mut Vec::new(),
         )
         .unwrap();
@@ -20863,15 +21019,14 @@ exit 7"#
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).unwrap();
         pane.resize_pty(3, 80);
-        let mut interceptor = bmux_image::ImageInterceptor::new();
-        let mut output = interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\\r\n\r\n\r\n");
-        ordered_image_output(
+        let mut collector = image_collector();
+        follow_image_chunk(
             &mut PaneReader::new(ProtocolProfile::Bmux, None),
             &mut pane.terminal_grid.lock().unwrap(),
             &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
             &mut pane.image_registry.lock().unwrap(),
-            &mut output,
-            (8, 16),
+            &mut collector,
+            b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\\r\n\r\n\r\n",
             &mut Vec::new(),
         )
         .unwrap();
@@ -20930,16 +21085,14 @@ exit 7"#
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).unwrap();
         pane.resize_pty(5, 80);
-        let mut interceptor = bmux_image::ImageInterceptor::new();
-        let mut output =
-            interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\a\r\nb\r\nc\r\nd\r\ne");
-        ordered_image_output(
+        let mut collector = image_collector();
+        follow_image_chunk(
             &mut PaneReader::new(ProtocolProfile::Bmux, None),
             &mut pane.terminal_grid.lock().unwrap(),
             &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
             &mut pane.image_registry.lock().unwrap(),
-            &mut output,
-            (8, 16),
+            &mut collector,
+            b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\a\r\nb\r\nc\r\nd\r\ne",
             &mut Vec::new(),
         )
         .unwrap();
@@ -20959,16 +21112,14 @@ exit 7"#
         pane.resize_pty(5, 80);
         *pane.terminal_grid.lock().unwrap() =
             TerminalGridStream::new(80, 5, GridLimits { scrollback_rows: 0 }).unwrap();
-        let mut interceptor = bmux_image::ImageInterceptor::new();
-        let mut output =
-            interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\a\r\nb\r\nc\r\nd\r\ne");
-        ordered_image_output(
+        let mut collector = image_collector();
+        follow_image_chunk(
             &mut PaneReader::new(ProtocolProfile::Bmux, None),
             &mut pane.terminal_grid.lock().unwrap(),
             &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
             &mut pane.image_registry.lock().unwrap(),
-            &mut output,
-            (8, 16),
+            &mut collector,
+            b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\a\r\nb\r\nc\r\nd\r\ne",
             &mut Vec::new(),
         )
         .unwrap();
@@ -20999,15 +21150,14 @@ exit 7"#
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).unwrap();
         pane.resize_pty(2, 4);
-        let mut interceptor = bmux_image::ImageInterceptor::new();
-        let mut output = interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\abcdefghijkl");
-        ordered_image_output(
+        let mut collector = image_collector();
+        follow_image_chunk(
             &mut PaneReader::new(ProtocolProfile::Bmux, None),
             &mut pane.terminal_grid.lock().unwrap(),
             &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
             &mut pane.image_registry.lock().unwrap(),
-            &mut output,
-            (8, 16),
+            &mut collector,
+            b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\abcdefghijkl",
             &mut Vec::new(),
         )
         .unwrap();
@@ -21034,31 +21184,28 @@ exit 7"#
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).unwrap();
         pane.resize_pty(2, 4);
-        let mut interceptor = bmux_image::ImageInterceptor::new();
+        let mut collector = image_collector();
         let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
-        let mut output =
-            interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\abcdefghijkl\x1b[?1049h");
-        ordered_image_output(
+        follow_image_chunk(
             &mut PaneReader::new(ProtocolProfile::Bmux, None),
             &mut pane.terminal_grid.lock().unwrap(),
             &mut protocol,
             &mut pane.image_registry.lock().unwrap(),
-            &mut output,
-            (8, 16),
+            &mut collector,
+            b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\abcdefghijkl\x1b[?1049h",
             &mut Vec::new(),
         )
         .unwrap();
         pane.resize_pty(2, 8);
         assert_eq!(*pane.last_requested_size.lock().unwrap(), (2, 8));
         assert_eq!(pane.image_registry.lock().unwrap().images(), []);
-        let mut output = interceptor.process(b"\x1b[?1049l");
-        ordered_image_output(
+        follow_image_chunk(
             &mut PaneReader::new(ProtocolProfile::Bmux, None),
             &mut pane.terminal_grid.lock().unwrap(),
             &mut protocol,
             &mut pane.image_registry.lock().unwrap(),
-            &mut output,
-            (8, 16),
+            &mut collector,
+            b"\x1b[?1049l",
             &mut Vec::new(),
         )
         .unwrap();
@@ -21075,15 +21222,14 @@ exit 7"#
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).unwrap();
         pane.resize_pty(2, 5);
-        let mut interceptor = bmux_image::ImageInterceptor::new();
-        let mut output = interceptor.process(b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\abcdefghijklmnop");
-        ordered_image_output(
+        let mut collector = image_collector();
+        follow_image_chunk(
             &mut PaneReader::new(ProtocolProfile::Bmux, None),
             &mut pane.terminal_grid.lock().unwrap(),
             &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
             &mut pane.image_registry.lock().unwrap(),
-            &mut output,
-            (8, 16),
+            &mut collector,
+            b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\abcdefghijklmnop",
             &mut Vec::new(),
         )
         .unwrap();
@@ -21132,20 +21278,19 @@ exit 7"#
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).unwrap();
         pane.resize_pty(2, 5);
-        let mut interceptor = bmux_image::ImageInterceptor::new();
+        let mut collector = image_collector();
         let mut protocol = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
         let image = b"\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\";
         let mut bytes = image.to_vec();
         bytes.extend_from_slice(b"abcdefghijklmnop\x1b[?1049h");
         bytes.extend_from_slice(image);
-        let mut output = interceptor.process(&bytes);
-        ordered_image_output(
+        follow_image_chunk(
             &mut PaneReader::new(ProtocolProfile::Bmux, None),
             &mut pane.terminal_grid.lock().unwrap(),
             &mut protocol,
             &mut pane.image_registry.lock().unwrap(),
-            &mut output,
-            (8, 16),
+            &mut collector,
+            &bytes,
             &mut Vec::new(),
         )
         .unwrap();
@@ -21153,14 +21298,13 @@ exit 7"#
         assert_eq!(alternate.len(), 1);
         pane.resize_pty(4, 5);
         assert_eq!(pane.image_registry.lock().unwrap().images(), alternate);
-        let mut output = interceptor.process(b"\x1b[?1049l");
-        ordered_image_output(
+        follow_image_chunk(
             &mut PaneReader::new(ProtocolProfile::Bmux, None),
             &mut pane.terminal_grid.lock().unwrap(),
             &mut protocol,
             &mut pane.image_registry.lock().unwrap(),
-            &mut output,
-            (8, 16),
+            &mut collector,
+            b"\x1b[?1049l",
             &mut Vec::new(),
         )
         .unwrap();
@@ -21178,16 +21322,14 @@ exit 7"#
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).unwrap();
         pane.resize_pty(5, 80);
-        let mut interceptor = bmux_image::ImageInterceptor::new();
-        let mut output =
-            interceptor.process(b"\x1b[?1049h\x1b[5;1H\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\");
-        ordered_image_output(
+        let mut collector = image_collector();
+        follow_image_chunk(
             &mut PaneReader::new(ProtocolProfile::Bmux, None),
             &mut pane.terminal_grid.lock().unwrap(),
             &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
             &mut pane.image_registry.lock().unwrap(),
-            &mut output,
-            (8, 16),
+            &mut collector,
+            b"\x1b[?1049h\x1b[5;1H\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\",
             &mut Vec::new(),
         )
         .unwrap();
@@ -21207,16 +21349,15 @@ exit 7"#
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).unwrap();
         pane.resize_pty(2, 8);
-        let mut interceptor = bmux_image::ImageInterceptor::new();
+        let mut collector = image_collector();
         // Placement in trailing blank cells has no retained text anchor.
-        let mut output = interceptor.process(b"\x1b[1;7H\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\");
-        ordered_image_output(
+        follow_image_chunk(
             &mut PaneReader::new(ProtocolProfile::Bmux, None),
             &mut pane.terminal_grid.lock().unwrap(),
             &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
             &mut pane.image_registry.lock().unwrap(),
-            &mut output,
-            (8, 16),
+            &mut collector,
+            b"\x1b[1;7H\x1bPq\"1;1;1;6#1;2;100;0;0~\x1b\\",
             &mut Vec::new(),
         )
         .unwrap();

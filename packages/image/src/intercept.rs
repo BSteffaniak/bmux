@@ -5,7 +5,9 @@
 //! from the byte stream, returning filtered bytes (images stripped) and
 //! structured [`ImageEvent`]s.
 
-use crate::model::{ImageEvent, ImagePosition};
+use crate::model::ImageEvent;
+#[cfg(any(feature = "sixel", feature = "kitty", feature = "iterm2"))]
+use crate::stream::{ImageString, image_event};
 
 const DEFAULT_MAX_ENCODED_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -67,8 +69,6 @@ pub struct InterceptResult {
 pub struct ImageInterceptor {
     state: State,
     buf: Vec<u8>,
-    #[allow(dead_code)]
-    capture_position: ImagePosition,
     /// Byte offset in the filtered output when the current image's ESC was seen.
     capture_filtered_offset: usize,
     max_encoded_image_bytes: usize,
@@ -87,7 +87,6 @@ impl ImageInterceptor {
         Self {
             state: State::Ground,
             buf: Vec::with_capacity(4096),
-            capture_position: ImagePosition { row: 0, col: 0 },
             capture_filtered_offset: 0,
             max_encoded_image_bytes: DEFAULT_MAX_ENCODED_IMAGE_BYTES,
             discarding_oversized: false,
@@ -250,8 +249,6 @@ impl ImageInterceptor {
                             self.state = State::DcsEntry;
                             self.dcs_intermediates.clear();
                             self.buf.clear();
-                            // Position will be set by the caller using filtered_byte_offset.
-                            self.capture_position = ImagePosition { row: 0, col: 0 };
                         }
 
                         // APC: ESC _ — potential kitty graphics
@@ -260,7 +257,6 @@ impl ImageInterceptor {
                             self.state = State::KittyBody;
                             self.buf.clear();
                             self.discarding_oversized = false;
-                            self.capture_position = ImagePosition { row: 0, col: 0 };
                         }
 
                         // OSC: ESC ] — potential iTerm2 inline image
@@ -269,7 +265,6 @@ impl ImageInterceptor {
                             self.state = State::OscEntry;
                             self.osc_prefix.clear();
                             self.buf.clear();
-                            self.capture_position = ImagePosition { row: 0, col: 0 };
                         }
 
                         0x1B => {
@@ -330,14 +325,10 @@ impl ImageInterceptor {
                 #[cfg(feature = "sixel")]
                 State::SixelEscape => {
                     if byte == b'\\' {
-                        if let Some(data) = self.take_image_bytes() {
-                            let pixel_size = crate::codec::sixel::estimate_pixel_size(&data);
-                            events.push(ImageEvent::SixelImage {
-                                data,
-                                position: self.capture_position,
-                                pixel_size,
-                                filtered_byte_offset: self.capture_filtered_offset,
-                            });
+                        if let Some(event) = self.take_image_bytes().and_then(|data| {
+                            image_event(ImageString::Sixel, data, self.capture_filtered_offset)
+                        }) {
+                            events.push(event);
                         }
                         self.state = State::Ground;
                     } else {
@@ -355,14 +346,10 @@ impl ImageInterceptor {
                         0x1B => self.state = State::KittyEscape,
                         0x07 => {
                             // BEL terminates APC in some terminals.
-                            if let Some(body) = self.take_image_bytes()
-                                && let Some(cmd) =
-                                    crate::codec::kitty::parse_command(&body, self.capture_position)
-                            {
-                                events.push(ImageEvent::KittyCommand {
-                                    command: cmd,
-                                    filtered_byte_offset: self.capture_filtered_offset,
-                                });
+                            if let Some(event) = self.take_image_bytes().and_then(|body| {
+                                image_event(ImageString::Kitty, body, self.capture_filtered_offset)
+                            }) {
+                                events.push(event);
                             }
                             self.state = State::Ground;
                         }
@@ -385,14 +372,10 @@ impl ImageInterceptor {
                 State::KittyEscape => {
                     if byte == b'\\' {
                         // ST — kitty command complete.
-                        if let Some(body) = self.take_image_bytes()
-                            && let Some(cmd) =
-                                crate::codec::kitty::parse_command(&body, self.capture_position)
-                        {
-                            events.push(ImageEvent::KittyCommand {
-                                command: cmd,
-                                filtered_byte_offset: self.capture_filtered_offset,
-                            });
+                        if let Some(event) = self.take_image_bytes().and_then(|body| {
+                            image_event(ImageString::Kitty, body, self.capture_filtered_offset)
+                        }) {
+                            events.push(event);
                         }
                         self.state = State::Ground;
                     } else {
@@ -441,12 +424,10 @@ impl ImageInterceptor {
                         0x1B => self.state = State::ITerm2Escape,
                         0x07 => {
                             // BEL terminates OSC.
-                            if let Some(data) = self.take_image_bytes() {
-                                events.push(ImageEvent::ITerm2Image {
-                                    data,
-                                    position: self.capture_position,
-                                    filtered_byte_offset: self.capture_filtered_offset,
-                                });
+                            if let Some(event) = self.take_image_bytes().and_then(|data| {
+                                image_event(ImageString::ITerm2, data, self.capture_filtered_offset)
+                            }) {
+                                events.push(event);
                             }
                             self.state = State::Ground;
                         }
@@ -457,12 +438,10 @@ impl ImageInterceptor {
                 #[cfg(feature = "iterm2")]
                 State::ITerm2Escape => {
                     if byte == b'\\' {
-                        if let Some(data) = self.take_image_bytes() {
-                            events.push(ImageEvent::ITerm2Image {
-                                data,
-                                position: self.capture_position,
-                                filtered_byte_offset: self.capture_filtered_offset,
-                            });
+                        if let Some(event) = self.take_image_bytes().and_then(|data| {
+                            image_event(ImageString::ITerm2, data, self.capture_filtered_offset)
+                        }) {
+                            events.push(event);
                         }
                         self.state = State::Ground;
                     } else {

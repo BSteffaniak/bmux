@@ -22,7 +22,7 @@ instrumentation live in the benchmarks, `bmux_bench` and `scripts/perf-render.py
 | Benchmark | Where | Phases per frame |
 | --- | --- | --- |
 | Client pipeline | `pipeline_bench::pipeline_metrics` (`packages/attach_pipeline`) | `apply` (pane output into the client's grids), `render` (painting and presenting), `observe` (preparing and publishing for an observer) |
-| Pane reader | `runtime::ingest_bench::ingest_metrics` (`plugins/pane-runtime-plugin`) | `read`: one PTY read as the reader handles it (`follow_chunk`: images intercepted, shell metadata filtered, queries answered and the pane's grid parsed in one pass; then mode tracking and the output push) |
+| Pane reader | `runtime::ingest_bench::ingest_metrics` (`plugins/pane-runtime-plugin`) | `read`: one PTY read as the reader handles it (`follow_chunk`: shell metadata filtered, then the pane's grid parsed in one pass that also answers queries and finds images; then mode tracking and the output push) |
 
 Scenarios: every generated corpus (`bmux_bench::corpus`) at 420×90; the busiest without scroll
 passthrough, with an observer, and across two panes; scattered edits; four panes decorated by the
@@ -104,7 +104,7 @@ client now keeps its panes current with frames (see
 | Full repaint | pane reader | 101,285 → 2.8 | 136.9M → 14.4M (−89%) | |
 | Streaming text | pane reader | 3,380 → 6 | 4.75M → 0.70M (−85%) | |
 | Scrolling (SU) | pane reader | — → 0.02 | 0.91M → 0.49M (−46%) | |
-| Text with Kitty images | pane reader | 11,715 → 29 | 8.99M → 0.85M (−91%) | |
+| Text with Kitty images | pane reader | 11,715 → 29 | 8.99M → 0.71M (−92%) | |
 
 Bytes written change only where intended (a moving raster image repairs its footprint, not the
 screen). Memory: the pane reader keeps one grid instead of two, history lines are stored compactly
@@ -132,7 +132,8 @@ What changed, each its own commit with its numbers:
   without an image start skip the image interceptor; escapes are found with memchr; control
   sequence parameters reuse one buffer in one pass; no per-chunk allocation or per-sequence
   memset in the reader; image positions follow each grid operation in the one parse, not a byte
-  at a time. Colour-only SGR changes are written directly, without building the reset and
+  at a time; image strings are found by the grid's own parse instead of a scan ahead of it (text
+  reads 1–3% fewer instructions, Kitty image reads 6%). Colour-only SGR changes are written directly, without building the reset and
   difference forms to compare.
 
 ## Known costs left
@@ -140,8 +141,8 @@ What changed, each its own commit with its numbers:
 - **Client render** is still the client's largest cost (14.5M instructions for a full repaint,
   about 380 a cell): comparing and writing the compositor's 40-byte cells, and encoding the SGR
   changes a colourful screen needs. Compact cells (phase 5) would shrink both.
-- **The server still runs separate scanners for images and shell metadata**, and the raw output
-  fan-out for its remaining consumers (cluster replication, playbook, recording), now with
-  memchr and a pass-through check, but still a scan each.
+- **The server still runs a separate scanner for shell metadata** (about 0.6% of a read, and only
+  where a read holds an OSC), and the raw output fan-out for the readers that remain (playbook,
+  recording).
 - **The render rebuilds a compositor plan every frame** (about 15 small allocations).
 - **Cluster replication** still moves pane output between nodes as bytes.

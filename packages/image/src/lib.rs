@@ -15,6 +15,8 @@ pub mod intercept;
 pub mod ipc_convert;
 pub mod model;
 pub mod registry;
+#[cfg(any(feature = "sixel", feature = "kitty", feature = "iterm2"))]
+pub mod stream;
 pub mod tui;
 
 pub use config::ImageConfig;
@@ -22,3 +24,5 @@ pub use host_caps::HostImageCapabilities;
 pub use intercept::{ImageInterceptor, InterceptResult};
 pub use model::*;
 pub use registry::ImageRegistry;
+#[cfg(any(feature = "sixel", feature = "kitty", feature = "iterm2"))]
+pub use stream::{ImageCollector, ImageString};

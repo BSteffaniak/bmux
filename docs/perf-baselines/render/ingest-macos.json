@@ -8,7 +8,7 @@
           "allocations_per_frame": 0.0,
           "max_allocations": 0,
           "allocated_bytes_per_frame": 0,
-          "instructions_per_frame": 399305
+          "instructions_per_frame": 387865
         }
       },
       "output_bytes_per_frame": 0,
@@ -22,7 +22,7 @@
           "allocations_per_frame": 0.0,
           "max_allocations": 0,
           "allocated_bytes_per_frame": 0,
-          "instructions_per_frame": 400704
+          "instructions_per_frame": 389284
         }
       },
       "output_bytes_per_frame": 0,
@@ -36,7 +36,7 @@
           "allocations_per_frame": 2.76,
           "max_allocations": 15,
           "allocated_bytes_per_frame": 29881,
-          "instructions_per_frame": 11733761
+          "instructions_per_frame": 11601961
         }
       },
       "output_bytes_per_frame": 0,
@@ -50,7 +50,7 @@
           "allocations_per_frame": 6.06,
           "max_allocations": 15,
           "allocated_bytes_per_frame": 4465,
-          "instructions_per_frame": 599501
+          "instructions_per_frame": 587973
         }
       },
       "output_bytes_per_frame": 0,
@@ -64,7 +64,7 @@
           "allocations_per_frame": 6.02,
           "max_allocations": 12,
           "allocated_bytes_per_frame": 4337,
-          "instructions_per_frame": 598828
+          "instructions_per_frame": 587143
         }
       },
       "output_bytes_per_frame": 0,
@@ -75,10 +75,10 @@
       "frames": 271,
       "phases": {
         "read": {
-          "allocations_per_frame": 29.29,
-          "max_allocations": 88,
-          "allocated_bytes_per_frame": 143678,
-          "instructions_per_frame": 759529
+          "allocations_per_frame": 28.81,
+          "max_allocations": 75,
+          "allocated_bytes_per_frame": 141781,
+          "instructions_per_frame": 711240
         }
       },
       "output_bytes_per_frame": 0,
@@ -92,7 +92,7 @@
           "allocations_per_frame": 6.08,
           "max_allocations": 16,
           "allocated_bytes_per_frame": 26040,
-          "instructions_per_frame": 689192
+          "instructions_per_frame": 677477
         }
       },
       "output_bytes_per_frame": 0,

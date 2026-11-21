@@ -2,6 +2,7 @@ use crate::model::{
     GridLimits, GridMode, MouseProtocolEncoding, MouseProtocolMode, ProtocolState, TerminalGrid,
     TerminalGridError,
 };
+pub use crate::vt_parser::{ChunkMark, StreamedString};
 use crate::vt_parser::{Params, Parser, Perform};
 use bmux_terminal_protocol::pointer_shape::{
     PointerShape, PointerShapeOperation, parse_pointer_shape,
@@ -367,6 +368,40 @@ pub trait SequenceObserver {
     /// The whole payload (after the number and its `;`, at most [`MAX_OBSERVED_OSC_BYTES`]) of a
     /// complete OSC string [`Self::wants_osc`] asked for.
     fn osc_payload(&mut self, _grid: &TerminalGrid, _number: u32, _payload: &[u8]) {}
+
+    /// Whether APC strings beginning `G` (Kitty graphics) are streamed to this observer
+    /// ([`Self::string_start`], [`Self::string_data`], [`Self::string_end`]) rather than
+    /// discarded. The grid applies none of a streamed string.
+    const STREAMS_APC: bool = false;
+    /// Whether DCS strings may be streamed: [`Self::stream_dcs`] is asked for each.
+    const STREAMS_DCS: bool = false;
+    /// OSC strings beginning with this prefix (empty: none) are streamed from the byte after it.
+    const STREAMED_OSC_PREFIX: &'static [u8] = b"";
+
+    /// Whether to stream the DCS string `introducer` begins (instead of the grid and
+    /// [`Self::wants_dcs`] seeing it).
+    fn stream_dcs(&mut self, _introducer: &SequenceHeader<'_>) -> bool {
+        false
+    }
+
+    /// A streamed string begins.
+    fn string_start(&mut self, _kind: StreamedString) {}
+
+    /// Payload of the streamed string, in order and unbounded, as it arrives.
+    fn string_data(&mut self, _data: &[u8]) {}
+
+    /// The streamed string ended: `completed` by its terminator, or cancelled (CAN, SUB, or an ESC
+    /// beginning something else). `grid` is as the bytes before the string left it.
+    fn string_end(&mut self, _grid: &TerminalGrid, _completed: bool) {}
+
+    /// The bytes of this chunk from `from` to `to` were no output the grid applied: a streamed
+    /// string with its introducer and terminator, or the start of a sequence that might have begun
+    /// one, cancelled by CAN or SUB. Told only to observers that stream.
+    fn cut(&mut self, _from: ChunkMark, _to: usize) {}
+
+    /// The chunk ends inside a sequence, begun at `from`, that might yet begin a streamed string;
+    /// what follows decides whether its bytes are output. Told only to observers that stream.
+    fn hold(&mut self, _from: ChunkMark) {}
 }
 
 /// An observer of nothing.
@@ -594,6 +629,44 @@ struct GridPerformer<'a, O: SequenceObserver> {
 }
 
 impl<O: SequenceObserver> Perform for GridPerformer<'_, O> {
+    const STREAMS_APC: bool = O::STREAMS_APC;
+    const STREAMS_DCS: bool = O::STREAMS_DCS;
+    const STREAMED_OSC_PREFIX: &'static [u8] = O::STREAMED_OSC_PREFIX;
+
+    fn stream_dcs(
+        &mut self,
+        params: &Params,
+        intermediates: &[u8],
+        _ignore: bool,
+        action: char,
+    ) -> bool {
+        self.observer.stream_dcs(&SequenceHeader {
+            params,
+            intermediates,
+            action,
+        })
+    }
+
+    fn string_start(&mut self, kind: StreamedString) {
+        self.observer.string_start(kind);
+    }
+
+    fn string_data(&mut self, data: &[u8]) {
+        self.observer.string_data(data);
+    }
+
+    fn string_end(&mut self, completed: bool) {
+        self.observer.string_end(self.grid, completed);
+    }
+
+    fn cut(&mut self, from: ChunkMark, to: usize) {
+        self.observer.cut(from, to);
+    }
+
+    fn hold(&mut self, from: ChunkMark) {
+        self.observer.hold(from);
+    }
+
     fn print(&mut self, c: char) {
         let ch = self.grid.characters.translate(c);
         self.grid.characters.last = Some(ch);

@@ -1587,3 +1587,157 @@ fn compact_varint(encoded: &[u8], offset: &mut usize) -> Result<usize, String> {
     }
     Err("unterminated varint".into())
 }
+
+/// A streamed string: its kind, payload, and whether it completed.
+type Streamed = (crate::vt_parser::StreamedString, Vec<u8>, bool);
+
+/// A performer that streams image-like strings (APC `G`, DCS `q` without intermediates, OSC
+/// `1337;File=`), recording each with how it ended, every other callback, and the input it was
+/// told was output (all but streamed strings, with held starts carried to the next chunk).
+#[derive(Default)]
+struct Streamer {
+    recorder: Recorder,
+    strings: Vec<Streamed>,
+    current: Option<(crate::vt_parser::StreamedString, Vec<u8>)>,
+    output: Vec<u8>,
+    held: Vec<u8>,
+    chunk: Vec<u8>,
+    cursor: usize,
+    holding: bool,
+}
+
+impl Streamer {
+    fn release(&mut self, end: usize) {
+        self.output.append(&mut self.held);
+        self.output.extend_from_slice(&self.chunk[self.cursor..end]);
+    }
+}
+
+impl Perform for Streamer {
+    const STREAMS_APC: bool = true;
+    const STREAMS_DCS: bool = true;
+    const STREAMED_OSC_PREFIX: &'static [u8] = b"1337;File=";
+
+    fn stream_dcs(&mut self, _: &Params, intermediates: &[u8], _: bool, action: char) -> bool {
+        action == 'q' && intermediates.is_empty()
+    }
+    fn string_start(&mut self, kind: crate::vt_parser::StreamedString) {
+        self.current = Some((kind, Vec::new()));
+    }
+    fn string_data(&mut self, data: &[u8]) {
+        self.current
+            .as_mut()
+            .expect("a string")
+            .1
+            .extend_from_slice(data);
+    }
+    fn string_end(&mut self, completed: bool) {
+        let (kind, data) = self.current.take().expect("a string");
+        self.strings.push((kind, data, completed));
+    }
+    fn cut(&mut self, from: crate::vt_parser::ChunkMark, to: usize) {
+        match from {
+            crate::vt_parser::ChunkMark::Before => self.held.clear(),
+            crate::vt_parser::ChunkMark::At(start) => self.release(start),
+        }
+        self.cursor = to;
+    }
+    fn hold(&mut self, from: crate::vt_parser::ChunkMark) {
+        match from {
+            crate::vt_parser::ChunkMark::Before => {
+                let rest = self.chunk[self.cursor..].to_vec();
+                self.held.extend_from_slice(&rest);
+            }
+            crate::vt_parser::ChunkMark::At(start) => {
+                self.release(start);
+                let rest = self.chunk[start..].to_vec();
+                self.held.extend_from_slice(&rest);
+            }
+        }
+        self.cursor = self.chunk.len();
+        self.holding = true;
+    }
+    fn osc_dispatch(&mut self, params: &[&[u8]], bell: bool) {
+        self.recorder.osc_dispatch(params, bell);
+    }
+    fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, c: char) {
+        self.recorder.csi_dispatch(params, intermediates, ignore, c);
+    }
+    fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
+        self.recorder.esc_dispatch(intermediates, ignore, byte);
+    }
+    fn hook(&mut self, params: &Params, intermediates: &[u8], ignore: bool, c: char) {
+        self.recorder.hook(params, intermediates, ignore, c);
+    }
+    fn put(&mut self, byte: u8) {
+        self.recorder.put(byte);
+    }
+    fn unhook(&mut self) {
+        self.recorder.unhook();
+    }
+    fn print(&mut self, c: char) {
+        self.recorder.print(c);
+    }
+    fn execute(&mut self, byte: u8) {
+        self.recorder.execute(byte);
+    }
+}
+
+/// `bytes` streamed in `chunk`-sized pieces: the strings, the other callbacks, and the output.
+fn stream_trace(
+    bytes: &[u8],
+    chunk: usize,
+    per_byte: bool,
+) -> (Vec<Streamed>, Vec<Event>, Vec<u8>) {
+    let mut parser = Parser::new();
+    parser.per_byte = per_byte;
+    let mut streamer = Streamer::default();
+    for piece in bytes.chunks(chunk.max(1)) {
+        streamer.chunk = piece.to_vec();
+        streamer.cursor = 0;
+        streamer.holding = false;
+        parser.advance(&mut streamer, piece);
+        if !streamer.holding {
+            streamer.release(piece.len());
+        }
+    }
+    (
+        streamer.strings,
+        streamer.recorder.dispatched,
+        streamer.output,
+    )
+}
+
+/// Streamed strings arrive whole and in order, cut from the output with their introducers and
+/// terminators, however the input is split and whether runs are taken at once or byte by byte;
+/// a cancelled string ends there, and what cancelled it is parsed as usual.
+#[test]
+fn streamed_strings_are_whole_and_cut_from_output_at_every_split() {
+    use crate::vt_parser::StreamedString::{Apc, Dcs, Osc};
+    let stream: &[u8] = b"a\x1b_Gf=1;AAAA\x1b\\b\x1bPq#0~-\x07~\x1b\\c\x1b]1337;File=x:YQ==\x07d\
+\x1b]1337;Set=1\x07e\x1bP$qm\x1b\\f\x1b_x\x1b\\g\x1b_GAB\x18h\x1bPq~\x1b[1mi\x1b]0;t\x07j\x1b_\x07k";
+    let expected_strings = vec![
+        (Apc, b"Gf=1;AAAA".to_vec(), true),
+        (Dcs, b"#0~-\x07~".to_vec(), true),
+        (Osc, b"x:YQ==".to_vec(), true),
+        (Apc, b"GAB".to_vec(), false),
+        (Dcs, b"~".to_vec(), false),
+    ];
+    let expected_output: &[u8] = b"abc\
+d\x1b]1337;Set=1\x07e\x1bP$qm\x1b\\f\x1b_x\x1b\\g\x18h\x1b[1mi\x1b]0;t\x07jk";
+    let whole = stream_trace(stream, stream.len(), false);
+    assert_eq!(whole.0, expected_strings);
+    assert_eq!(
+        String::from_utf8_lossy(&whole.2),
+        String::from_utf8_lossy(expected_output)
+    );
+    for chunk in 1..=stream.len() {
+        for per_byte in [false, true] {
+            assert_eq!(
+                stream_trace(stream, chunk, per_byte),
+                whole,
+                "chunk {chunk} {per_byte}"
+            );
+        }
+    }
+}

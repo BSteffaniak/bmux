@@ -232,10 +232,17 @@ Done (each a measured commit; see [render-performance.md](render-performance.md)
     numbers). The reader asks only interested filters, on the grid's own parse, before the grid
     applies the sequence; a dropped sequence is neither applied nor answered. With no filter
     registered the observer type has no filter check at all.
-- Images, in part: image positions follow the grid's operations in its one pass
-  (`SequenceObserver::operation`, called after each print run, control, sequence and DCS
-  string), where a pane with an image on screen used to be fed to its grid a byte at a time. A
-  chunk with no image start skips the interceptor entirely (`ImageInterceptor::passes_through`).
+- Images on the grid's parse: the parser recognises Sixel DCS strings, Kitty graphics APC strings
+  (`ESC _ G`, an APC dispatch it did not have) and iTerm2 `OSC 1337;File=` strings itself and
+  streams their payload, unbounded, to the observer (`SequenceObserver::string_*`), which hands it
+  to an `ImageCollector` and places the image at the grid's cursor when the string ends. Image
+  positions follow the grid's operations in the same pass (`SequenceObserver::operation`). The
+  parser also tells the observer which bytes of each read were image strings (`cut`) and where a
+  read ends inside a start that might yet become one (`hold`), so raw readers get exactly what the
+  interceptor used to leave them; a test checks the two agree at every split of a corpus. The
+  interceptor stays as a library type, off the reader's path. One correction: only a DCS string
+  without intermediates is Sixel, so a status request (`DCS $ q`) is now answered with image
+  support on instead of being taken for an image.
 - Cluster replication on frames, pushed (see "Cluster replication: frames, pushed" above): attach
   providers hand the renderer frames; workers push frames to observing connections; control
   changes are pushed from the consensus metrics; nothing in the cluster path polls. A process
@@ -271,9 +278,7 @@ Deferred, each until something needs it (measured, not assumed):
   hook would sit in the hottest path (`print_ascii`). Should a consumer appear, the first step is
   `Replace` for CSI and OSC, re-parsed with filters skipped; text redaction belongs at the replica
   or render, not the PTY parse.
-- Shell metadata on the grid's parse: its scan is now about 0.6% of the reader. Images on the
-  grid's parse: the parser has no APC dispatch and observed strings are capped; the pass-through
-  check (escape-pair searches) is what remains of their cost.
+- Shell metadata on the grid's parse: its scan is now about 0.6% of the reader.
 - Delta relays for decoration scenes (only animated decorations would gain), and merging the
   scene protocol's paint commands with `RenderOp`.
 

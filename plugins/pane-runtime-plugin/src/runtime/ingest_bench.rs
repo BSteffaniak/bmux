@@ -36,7 +36,7 @@ struct Pane {
     #[cfg(feature = "image-registry")]
     registry: bmux_image::ImageRegistry,
     #[cfg(feature = "image-registry")]
-    interceptor: bmux_image::ImageInterceptor,
+    collector: bmux_image::ImageCollector,
     replies: Vec<u8>,
     /// A reader follows the pane's raw output (as the playbook does), so the output buffer
     /// retains it; attach clients take frames and read none.
@@ -69,7 +69,7 @@ impl Pane {
             #[cfg(feature = "image-registry")]
             registry: bmux_image::ImageRegistry::default(),
             #[cfg(feature = "image-registry")]
-            interceptor: bmux_image::ImageInterceptor::new(),
+            collector: bmux_image::ImageCollector::with_max_encoded_bytes(16 * 1024 * 1024),
             replies: Vec::new(),
             raw_reader,
         }
@@ -82,7 +82,7 @@ impl Pane {
         #[cfg(feature = "image-registry")]
         let mut images = super::ChunkImages {
             registry: &mut self.registry,
-            interceptor: &mut self.interceptor,
+            collector: &mut self.collector,
             cell_pixels: (8, 16),
             events: Vec::new(),
         };

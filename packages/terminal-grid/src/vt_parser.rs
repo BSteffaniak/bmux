@@ -118,6 +118,27 @@ impl<'a> IntoIterator for &'a Params {
     }
 }
 
+/// Where something in a chunk of input begins: at an offset in the chunk, or in an earlier chunk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChunkMark {
+    /// In an earlier chunk (bytes a performer still holds, if any).
+    Before,
+    /// At this offset in the chunk.
+    At(usize),
+}
+
+/// A string a performer streams instead of the parser handling it: its payload goes to the
+/// performer as it arrives, unbounded, and the parser applies none of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamedString {
+    /// An APC string beginning `G` (Kitty graphics), ended by ST or BEL.
+    Apc,
+    /// A DCS string the performer accepted ([`Perform::stream_dcs`]), ended by ST (BEL is data).
+    Dcs,
+    /// An OSC string beginning with [`Perform::STREAMED_OSC_PREFIX`], ended by ST or BEL.
+    Osc,
+}
+
 pub(crate) trait Perform {
     /// Whether text and the controls within it ([`Self::print`], [`Self::execute`] in the text
     /// state) mean anything to this performer. One that ignores them lets the parser skip from
@@ -128,6 +149,40 @@ pub(crate) trait Perform {
     /// One that ignores them lets the parser discard such a sequence from its first byte instead
     /// of parsing its parameters.
     const OBSERVES_PLAIN_CSI: bool = true;
+
+    /// Whether APC strings beginning `G` are streamed ([`StreamedString::Apc`]); otherwise APC
+    /// strings are discarded.
+    const STREAMS_APC: bool = false;
+    /// Whether DCS strings may be streamed: [`Self::stream_dcs`] is asked for each.
+    const STREAMS_DCS: bool = false;
+    /// OSC strings beginning with this prefix (empty: none) are streamed from the byte after it.
+    const STREAMED_OSC_PREFIX: &'static [u8] = b"";
+
+    /// Whether to stream the DCS string this header begins instead of [`Self::hook`]ing it.
+    fn stream_dcs(
+        &mut self,
+        _params: &Params,
+        _intermediates: &[u8],
+        _ignore: bool,
+        _action: char,
+    ) -> bool {
+        false
+    }
+    /// A streamed string begins; its payload follows in [`Self::string_data`].
+    fn string_start(&mut self, _kind: StreamedString) {}
+    /// Payload of the streamed string, in order, as it arrives.
+    fn string_data(&mut self, _data: &[u8]) {}
+    /// The streamed string ended: `completed` by its terminator, or cancelled (CAN, SUB, or an
+    /// ESC beginning something else).
+    fn string_end(&mut self, _completed: bool) {}
+    /// The input from `from` to `to` (an offset in this chunk) was not output the parser applied:
+    /// a streamed string with its introducer and terminator, or the start of a sequence that might
+    /// have begun one, cancelled by CAN or SUB. Only performers that stream are told.
+    fn cut(&mut self, _from: ChunkMark, _to: usize) {}
+    /// The chunk ends inside a sequence, begun at `from`, that might yet begin a streamed string:
+    /// whether its bytes are output is decided by what follows. Only performers that stream are
+    /// told.
+    fn hold(&mut self, _from: ChunkMark) {}
 
     fn print(&mut self, _character: char) {}
     /// Print a run of printable ASCII (`0x20..=0x7e`), each byte as [`Self::print`] would: a
@@ -175,6 +230,12 @@ enum State {
     Osc,
     OscEscape,
     StringDiscard,
+    /// After `ESC _`, for a performer that streams APC strings: the next byte decides.
+    ApcStart,
+    /// Inside a streamed string.
+    Stream(StreamedString),
+    /// An ESC inside a streamed string: ST if `\` follows, else the string is cancelled.
+    StreamEscape(StreamedString),
 }
 
 pub(crate) struct Parser<const OSC_RAW_BUF_SIZE: usize = 1024> {
@@ -192,6 +253,17 @@ pub(crate) struct Parser<const OSC_RAW_BUF_SIZE: usize = 1024> {
     utf8: [u8; 4],
     utf8_len: usize,
     utf8_expected: usize,
+    /// The offset in the current chunk of the byte being consumed.
+    at: usize,
+    /// Where the escape sequence in progress began (its ESC).
+    sequence_start: ChunkMark,
+    /// Where the streamed string in progress began (its introducer's ESC).
+    stream_start: ChunkMark,
+    /// The ESC inside a streamed string ([`State::StreamEscape`]).
+    stream_escape: ChunkMark,
+    /// Bytes of the performer's streamed OSC prefix the OSC string in progress matches so far
+    /// (`usize::MAX`: it does not).
+    osc_match: usize,
     /// Consume every byte through the general state machine, with no runs taken at once: the
     /// reference the fast paths are tested against.
     #[cfg(test)]
@@ -221,6 +293,11 @@ impl<const N: usize> Parser<N> {
             utf8: [0; 4],
             utf8_len: 0,
             utf8_expected: 0,
+            at: 0,
+            sequence_start: ChunkMark::Before,
+            stream_start: ChunkMark::Before,
+            stream_escape: ChunkMark::Before,
+            osc_match: usize::MAX,
             #[cfg(test)]
             per_byte: false,
         }
@@ -260,7 +337,23 @@ impl<const N: usize> Parser<N> {
         run
     }
 
+    /// Whether the performer streams any string: only then are spans cut and held.
+    const fn streams<P: Perform>() -> bool {
+        P::STREAMS_APC || P::STREAMS_DCS || !P::STREAMED_OSC_PREFIX.is_empty()
+    }
+
     pub(crate) fn advance<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) {
+        // Whatever is in progress began before this chunk.
+        self.sequence_start = ChunkMark::Before;
+        self.stream_start = ChunkMark::Before;
+        self.stream_escape = ChunkMark::Before;
+        self.advance_bytes(performer, bytes);
+        if Self::streams::<P>() {
+            self.finish_chunk(performer, bytes.len());
+        }
+    }
+
+    fn advance_bytes<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) {
         let mut offset = 0;
         if self.utf8_len != 0 {
             let count = (4 - self.utf8_len).min(bytes.len());
@@ -270,7 +363,8 @@ impl<const N: usize> Parser<N> {
         }
         #[cfg(test)]
         if self.per_byte {
-            for &byte in &bytes[offset..] {
+            for (index, &byte) in bytes.iter().enumerate().skip(offset) {
+                self.at = index;
                 self.consume(performer, byte);
             }
             return;
@@ -294,12 +388,27 @@ impl<const N: usize> Parser<N> {
                     State::CsiStart | State::CsiNumbers | State::DcsStart | State::DcsNumbers => {
                         self.parameter_run(&bytes[index..])
                     }
+                    // A streamed string's payload runs to the next byte that could end it.
+                    State::Stream(kind) => {
+                        let rest = &bytes[index..];
+                        let mut run = memchr::memchr3(0x1b, 0x18, 0x1a, rest).unwrap_or(rest.len());
+                        if kind != StreamedString::Dcs
+                            && let Some(bell) = memchr::memchr(0x07, &rest[..run])
+                        {
+                            run = bell;
+                        }
+                        if run > 0 {
+                            performer.string_data(&rest[..run]);
+                        }
+                        run
+                    }
                     _ => 0,
                 };
                 if run > 0 {
                     index += run;
                     continue;
                 }
+                self.at = index;
                 self.consume(performer, bytes[index]);
                 index += 1;
             }
@@ -316,9 +425,133 @@ impl<const N: usize> Parser<N> {
                     None => return,
                 }
             }
+            self.at = index;
             self.consume(performer, bytes[index]);
             index += 1;
         }
+    }
+
+    /// At the end of a chunk: what a streamed string in progress took of it is cut, and a sequence
+    /// that might yet begin one is held.
+    fn finish_chunk<P: Perform>(&mut self, performer: &mut P, len: usize) {
+        match self.state {
+            State::Stream(_) => performer.cut(self.stream_start, len),
+            State::StreamEscape(_) => {
+                // The ESC decides with the next byte: ST, or the start of something else.
+                if let ChunkMark::At(escape) = self.stream_escape {
+                    performer.cut(self.stream_start, escape);
+                }
+                performer.hold(self.stream_escape);
+            }
+            _ if self.undecided::<P>() => performer.hold(self.sequence_start),
+            _ => {}
+        }
+    }
+
+    /// Whether the sequence in progress might yet begin a string the performer streams.
+    fn undecided<P: Perform>(&self) -> bool {
+        match self.state {
+            State::Escape | State::ApcStart => true,
+            State::DcsStart | State::DcsNumbers => P::STREAMS_DCS && self.intermediate_len == 0,
+            State::Osc => self.osc_match < P::STREAMED_OSC_PREFIX.len(),
+            _ => false,
+        }
+    }
+
+    /// One byte of a streamed string, or of the APC introducer before it. Returns whether it was
+    /// consumed; otherwise (an ESC that began something else) it is consumed as in an escape.
+    fn stream_byte<P: Perform>(&mut self, performer: &mut P, byte: u8) -> bool {
+        match self.state {
+            State::ApcStart => match byte {
+                b'G' | 0x1b => {
+                    self.stream_start = self.sequence_start;
+                    performer.string_start(StreamedString::Apc);
+                    if byte == b'G' {
+                        self.state = State::Stream(StreamedString::Apc);
+                        performer.string_data(b"G");
+                    } else {
+                        self.stream_escape = ChunkMark::At(self.at);
+                        self.state = State::StreamEscape(StreamedString::Apc);
+                    }
+                    true
+                }
+                // An empty string, ended.
+                0x07 => {
+                    performer.cut(self.sequence_start, self.at + 1);
+                    self.state = State::Text;
+                    true
+                }
+                0x18 | 0x1a => false,
+                // Not Kitty graphics: discarded as any other APC string.
+                _ => {
+                    self.state = State::StringDiscard;
+                    true
+                }
+            },
+            State::Stream(kind) => {
+                match byte {
+                    0x1b => {
+                        self.stream_escape = ChunkMark::At(self.at);
+                        self.state = State::StreamEscape(kind);
+                    }
+                    0x07 if kind != StreamedString::Dcs => {
+                        self.end_stream(performer, true, self.at + 1);
+                    }
+                    0x18 | 0x1a => {
+                        performer.string_end(false);
+                        performer.cut(self.stream_start, self.at);
+                        performer.execute(byte);
+                        self.state = State::Text;
+                    }
+                    _ => performer.string_data(&[byte]),
+                }
+                true
+            }
+            State::StreamEscape(_) => {
+                if byte == b'\\' {
+                    self.end_stream(performer, true, self.at + 1);
+                    return true;
+                }
+                // The ESC begins something else: the string is cancelled before it.
+                performer.string_end(false);
+                if let ChunkMark::At(escape) = self.stream_escape {
+                    performer.cut(self.stream_start, escape);
+                }
+                self.sequence_start = self.stream_escape;
+                self.clear_header();
+                self.state = State::Escape;
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// While an OSC string matches the performer's streamed prefix, `byte` extends the match (and
+    /// completing it starts streaming the string); a mismatch leaves an ordinary string. Returns
+    /// whether the string is now streamed.
+    fn streamed_osc_prefix<P: Perform>(&mut self, performer: &mut P, byte: u8) -> bool {
+        let prefix = P::STREAMED_OSC_PREFIX;
+        if self.osc_match >= prefix.len() {
+            return false;
+        }
+        if prefix[self.osc_match] != byte {
+            self.osc_match = usize::MAX;
+            return false;
+        }
+        self.osc_match += 1;
+        if self.osc_match < prefix.len() {
+            return false;
+        }
+        self.stream_start = self.sequence_start;
+        self.state = State::Stream(StreamedString::Osc);
+        performer.string_start(StreamedString::Osc);
+        true
+    }
+
+    fn end_stream<P: Perform>(&mut self, performer: &mut P, completed: bool, to: usize) {
+        performer.string_end(completed);
+        performer.cut(self.stream_start, to);
+        self.state = State::Text;
     }
 
     /// A bounded, normalized syntax prefix for semantic restoration.
@@ -336,8 +569,20 @@ impl<const N: usize> Parser<N> {
         match self.state {
             State::Text => prefix.extend_from_slice(&self.utf8[..self.utf8_len]),
             State::Osc | State::OscEscape => self.write_osc_prefix(prefix),
-            State::StringDiscard => prefix.extend_from_slice(b"\x1b_"),
-            State::DcsData => prefix.extend_from_slice(b"\x1bPq"),
+            State::StringDiscard | State::ApcStart | State::Stream(StreamedString::Apc) => {
+                prefix.extend_from_slice(b"\x1b_");
+            }
+            State::Stream(StreamedString::Osc) => prefix.extend_from_slice(b"\x1b]"),
+            State::StreamEscape(kind) => {
+                prefix.extend_from_slice(match kind {
+                    StreamedString::Apc => b"\x1b_\x1b",
+                    StreamedString::Dcs => b"\x1bPq\x1b",
+                    StreamedString::Osc => b"\x1b]\x1b",
+                });
+            }
+            State::DcsData | State::Stream(StreamedString::Dcs) => {
+                prefix.extend_from_slice(b"\x1bPq");
+            }
             State::DcsDiscard => prefix.extend_from_slice(b"\x1bP $0"),
             State::CsiDiscard => prefix.extend_from_slice(b"\x1b[ $0"),
             State::Escape | State::EscapeCollect => {
@@ -552,6 +797,7 @@ impl<const N: usize> Parser<N> {
             self.clear_header();
         } else if self.state == State::Osc && self.is_pointer_osc() {
             if byte == 0x1b {
+                self.sequence_start = ChunkMark::At(self.at);
                 self.state = State::OscEscape;
                 return true;
             }
@@ -567,12 +813,25 @@ impl<const N: usize> Parser<N> {
         if self.state == State::Text && self.utf8_len != 0 && self.continue_utf8(performer, byte) {
             return;
         }
+        if Self::streams::<P>()
+            && matches!(
+                self.state,
+                State::ApcStart | State::Stream(_) | State::StreamEscape(_)
+            )
+            && self.stream_byte(performer, byte)
+        {
+            return;
+        }
         if self.pointer_string_control(performer, byte) {
             return;
         }
         // These interruptions run exit callbacks before the incoming action.
         match byte {
             0x18 | 0x1a => {
+                // A start that might have begun a streamed string is cancelled with it.
+                if Self::streams::<P>() && self.undecided::<P>() {
+                    performer.cut(self.sequence_start, self.at);
+                }
                 self.end_string(performer, false);
                 performer.execute(byte);
                 self.state = State::Text;
@@ -581,10 +840,14 @@ impl<const N: usize> Parser<N> {
             0x1b => {
                 self.end_string(performer, false);
                 self.clear_header();
+                self.sequence_start = ChunkMark::At(self.at);
                 self.state = State::Escape;
                 return;
             }
             _ => {}
+        }
+        if self.state == State::Osc && self.streamed_osc_prefix(performer, byte) {
+            return;
         }
         match self.state {
             State::Text => self.text(performer, byte),
@@ -643,7 +906,8 @@ impl<const N: usize> Parser<N> {
                     self.state = State::Text;
                 }
             }
-            State::StringDiscard => {}
+            // Consumed by `stream_byte`.
+            State::StringDiscard | State::ApcStart | State::Stream(_) | State::StreamEscape(_) => {}
         }
     }
 
@@ -666,9 +930,15 @@ impl<const N: usize> Parser<N> {
                 self.osc_len = 0;
                 self.osc_args = 0;
                 self.osc_overflow = false;
+                self.osc_match = if P::STREAMED_OSC_PREFIX.is_empty() {
+                    usize::MAX
+                } else {
+                    0
+                };
                 self.state = State::Osc;
                 performer.osc_start();
             }
+            b'_' if self.state == State::Escape && P::STREAMS_APC => self.state = State::ApcStart,
             b'X' | b'^' | b'_' if self.state == State::Escape => self.state = State::StringDiscard,
             0x30..=0x7e => {
                 performer.esc_dispatch(
@@ -745,8 +1015,17 @@ impl<const N: usize> Parser<N> {
                 self.finish_header();
                 let intermediates = &self.intermediates[..self.intermediate_len];
                 if dcs {
-                    performer.hook(&self.params, intermediates, self.ignored, char::from(byte));
-                    self.state = State::DcsData;
+                    let action = char::from(byte);
+                    if P::STREAMS_DCS
+                        && performer.stream_dcs(&self.params, intermediates, self.ignored, action)
+                    {
+                        self.stream_start = self.sequence_start;
+                        self.state = State::Stream(StreamedString::Dcs);
+                        performer.string_start(StreamedString::Dcs);
+                    } else {
+                        performer.hook(&self.params, intermediates, self.ignored, action);
+                        self.state = State::DcsData;
+                    }
                 } else {
                     performer.csi_dispatch(
                         &self.params,
