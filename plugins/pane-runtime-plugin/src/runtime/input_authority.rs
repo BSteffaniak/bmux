@@ -1,9 +1,10 @@
 //! Retained request authority for queued terminal input.
 use std::io::{self, Write};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+use switchy_thread::sync::Arc;
 
-type WriteReceipt = std::sync::mpsc::Receiver<Result<(), String>>;
+type WriteReceipt = switchy_thread::sync::mpsc::Receiver<Result<(), String>>;
 const MAX_PENDING_WRITES: usize = 64;
 const MAX_INPUT_BYTES: usize = 65_536;
 const WRITE_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -33,7 +34,9 @@ struct InvocationScope {
 /// authorizes or collects writes for another instance on the same thread.
 #[derive(Default)]
 pub(crate) struct InputScopes(
-    std::sync::Mutex<std::collections::HashMap<std::thread::ThreadId, InvocationScope>>,
+    switchy_thread::sync::Mutex<
+        std::collections::HashMap<switchy_thread::thread::ThreadId, InvocationScope>,
+    >,
 );
 
 impl InputScopes {
@@ -41,8 +44,8 @@ impl InputScopes {
         let mut scopes = self
             .0
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let id = std::thread::current().id();
+            .unwrap_or_else(switchy_thread::sync::PoisonError::into_inner);
+        let id = switchy_thread::thread::current().id();
         let scope = scopes.entry(id).or_default();
         let result = f(scope);
         if scope.context.is_none() && scope.receipts.is_none() {
@@ -121,7 +124,7 @@ fn settle(receipts: Vec<Result<WriteReceipt, String>>) -> Result<(), String> {
 /// unsettled write would be re-authorized after its invocation closed.
 pub(crate) fn settlement_receipt(
     host: &crate::runtime::PaneRuntimeHost,
-) -> Result<std::sync::mpsc::SyncSender<Result<(), String>>, String> {
+) -> Result<switchy_thread::sync::mpsc::SyncSender<Result<(), String>>, String> {
     host.input_scopes().with(|scope| {
         let receipts = scope
             .receipts
@@ -130,7 +133,7 @@ pub(crate) fn settlement_receipt(
         if receipts.len() >= MAX_PENDING_WRITES - 1 {
             return Err("PTY input admission bound exceeded".to_string());
         }
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (sender, receiver) = switchy_thread::sync::mpsc::sync_channel(1);
         receipts.push(Ok(receiver));
         Ok(sender)
     })
@@ -167,7 +170,7 @@ pub(crate) fn settled_local_command(
                 crate::handlers::execution::local_input_authority(host, context, session.0)
             })
             .ok_or_else(|| "PTY input invocation missing".to_string())?;
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (sender, receiver) = switchy_thread::sync::mpsc::sync_channel(1);
         Ok((
             super::PaneRuntimeCommand::AdmittedInput(bytes, sender, permit, authority),
             receiver,
@@ -262,7 +265,7 @@ impl InputAuthority {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use switchy_thread::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn queued_revocation_and_cancellation_prevent_writes() {
@@ -276,7 +279,7 @@ mod tests {
                     .ok_or(reason.into())
             });
             authority.check().unwrap(); // ingress, before enqueue
-            let (tx, rx) = std::sync::mpsc::channel();
+            let (tx, rx) = switchy_thread::sync::mpsc::channel();
             tx.send((authority, b"queued".to_vec())).unwrap();
             allowed.store(false, Ordering::SeqCst);
             let (authority, bytes) = rx.recv().unwrap();
@@ -288,10 +291,10 @@ mod tests {
 
     #[test]
     fn settlement_preserves_success_and_reports_unconfirmed_completion() {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (sender, receiver) = switchy_thread::sync::mpsc::sync_channel(1);
         sender.send(Ok(())).unwrap();
         assert!(settle(vec![Ok(receiver)]).is_ok());
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (sender, receiver) = switchy_thread::sync::mpsc::sync_channel(1);
         drop(sender);
         let error = settle(vec![Ok(receiver)]).unwrap_err();
         assert!(error.contains("completion unconfirmed"));
@@ -300,8 +303,8 @@ mod tests {
 
     #[test]
     fn settlement_drains_other_chunks_after_known_failure() {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(0);
-        let worker = std::thread::spawn(move || sender.send(Ok(())).unwrap());
+        let (sender, receiver) = switchy_thread::sync::mpsc::sync_channel(0);
+        let worker = switchy_thread::thread::spawn(move || sender.send(Ok(())).unwrap());
         assert_eq!(
             settle(vec![Err("denied".into()), Ok(receiver)]).unwrap_err(),
             "denied"

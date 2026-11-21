@@ -1,7 +1,7 @@
 //! Bounded raw capture, independent of publication and terminal projection.
 use std::io::{self, Read};
-use std::sync::mpsc::{Receiver, sync_channel};
-use std::thread::JoinHandle;
+use switchy_thread::sync::mpsc::{Receiver, sync_channel};
+use switchy_thread::thread::JoinHandle;
 
 pub(super) struct CaptureOwner {
     threads: Vec<JoinHandle<()>>,
@@ -106,16 +106,16 @@ impl Read for StartupReader {
 pub(super) fn start(raw: Box<dyn Read + Send>) -> io::Result<(StartupReader, JoinHandle<()>)> {
     start_captured(
         raw,
-        std::sync::Arc::new(super::execution::ExecutionCapture::default()),
+        switchy_thread::sync::Arc::new(super::execution::ExecutionCapture::default()),
     )
 }
 pub(super) fn start_captured(
     mut raw: Box<dyn Read + Send>,
-    execution: std::sync::Arc<super::execution::ExecutionCapture>,
+    execution: switchy_thread::sync::Arc<super::execution::ExecutionCapture>,
 ) -> io::Result<(StartupReader, JoinHandle<()>)> {
     // At most 32 * 8192 raw bytes queued; saturation backpressures the PTY.
     let (sender, receiver) = sync_channel(32);
-    let thread = std::thread::Builder::new()
+    let thread = switchy_thread::thread::Builder::new()
         .name("bmux-pty-startup-capture".into())
         .spawn(move || {
             let mut buffer = [0; 8192];
@@ -170,7 +170,7 @@ pub(super) fn start_captured(
 /// to be projected before changing geometry. Disk waits never hold that gate.
 pub(super) fn start_ordered(
     mut raw: Box<dyn Read + Send>,
-    execution: std::sync::Arc<super::execution::ExecutionCapture>,
+    execution: switchy_thread::sync::Arc<super::execution::ExecutionCapture>,
     writer: super::capture_writer::CaptureWriter,
 ) -> io::Result<(StartupReader, JoinHandle<()>)> {
     if execution
@@ -184,7 +184,7 @@ pub(super) fn start_ordered(
         ));
     }
     let (sender, receiver) = sync_channel(32);
-    let thread = std::thread::Builder::new()
+    let thread = switchy_thread::thread::Builder::new()
         .name("bmux-pty-ordered-capture".into())
         .spawn(move || {
             let mut buffer = [0; 8192];
@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn channel_disconnect_is_not_eof_and_explicit_eof_is_sticky() {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (sender, receiver) = switchy_thread::sync::mpsc::sync_channel(1);
         let mut reader = super::StartupReader {
             receiver,
             pending: Vec::new(),
@@ -318,7 +318,7 @@ mod tests {
         };
         drop(sender);
         assert!(reader.read(&mut [0; 1]).is_err());
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (sender, receiver) = switchy_thread::sync::mpsc::sync_channel(1);
         let mut reader = super::StartupReader {
             receiver,
             pending: Vec::new(),
@@ -340,7 +340,7 @@ mod tests {
 
     #[test]
     fn partial_reads_do_not_publish_a_whole_chunk_ticket() {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (sender, receiver) = switchy_thread::sync::mpsc::sync_channel(1);
         let ticket = super::super::capture_writer::Ticket {
             sequence: 1,
             raw_end: 4,
@@ -373,7 +373,7 @@ mod tests {
             super::super::capture_writer::CaptureWriter::start(capture).unwrap();
         let (mut reader, raw_thread) = super::start_ordered(
             Box::new(std::io::Cursor::new(b"tail".to_vec())),
-            std::sync::Arc::new(super::super::execution::ExecutionCapture::default()),
+            switchy_thread::sync::Arc::new(super::super::execution::ExecutionCapture::default()),
             writer.clone(),
         )
         .unwrap();
@@ -401,7 +401,7 @@ mod tests {
             super::super::capture_writer::CaptureWriter::start(capture).unwrap();
         let (mut reader, raw_thread) = super::start_ordered(
             Box::new(ClosedPty),
-            std::sync::Arc::new(super::super::execution::ExecutionCapture::default()),
+            switchy_thread::sync::Arc::new(super::super::execution::ExecutionCapture::default()),
             writer.clone(),
         )
         .unwrap();
@@ -415,9 +415,9 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_capture_owner_retains_blocked_thread_until_release() {
-        let (release, blocked) = std::sync::mpsc::channel();
+        let (release, blocked) = switchy_thread::sync::mpsc::channel();
         let (done, finished) = tokio::sync::oneshot::channel();
-        let thread = std::thread::spawn(move || {
+        let thread = switchy_thread::thread::spawn(move || {
             blocked.recv().unwrap();
             let _ = done.send(());
         });
@@ -435,7 +435,7 @@ mod tests {
     async fn capture_cleanup_preserves_prior_failure_after_real_join() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let thread = std::thread::spawn(|| {});
+        let thread = switchy_thread::thread::spawn(|| {});
         let (cleanup, mut acknowledged) = tokio::sync::watch::channel(None);
         let reason = super::acknowledge_cleanup(
             host,

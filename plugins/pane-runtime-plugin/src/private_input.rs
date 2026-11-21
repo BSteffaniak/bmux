@@ -5,7 +5,7 @@
 //! does not attest to external recorders, or permit a frontend to skip its ingress
 //! drain/focus barrier. No timer automatically re-enables recording.
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Mutex;
+use switchy_thread::sync::Mutex;
 use uuid::Uuid;
 
 /// One activation's capture barriers and producer membership, owned by its
@@ -361,9 +361,9 @@ mod tests {
         let (recorder_host, owner_host) = (host.clone(), host.clone());
         let host = &host;
         let pane = Uuid::new_v4();
-        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let recorder = std::thread::spawn(move || {
+        let (entered_tx, entered_rx) = switchy_thread::sync::mpsc::channel();
+        let (release_tx, release_rx) = switchy_thread::sync::mpsc::channel();
+        let recorder = switchy_thread::thread::spawn(move || {
             with_capture_barrier(&recorder_host, pane, |capture| {
                 assert!(capture);
                 entered_tx.send(()).unwrap();
@@ -371,13 +371,13 @@ mod tests {
             })
         });
         entered_rx.recv().unwrap();
-        let (ack_tx, ack_rx) = std::sync::mpsc::channel();
-        let owner = std::thread::spawn(move || {
+        let (ack_tx, ack_rx) = switchy_thread::sync::mpsc::channel();
+        let owner = switchy_thread::thread::spawn(move || {
             ack_tx.send(suppress(&owner_host, pane)).unwrap();
         });
         assert!(matches!(
             ack_rx.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty)
+            Err(switchy_thread::sync::mpsc::TryRecvError::Empty)
         ));
         release_tx.send(()).unwrap();
         assert_eq!(recorder.join().unwrap(), Some(()));

@@ -3,7 +3,7 @@ use bmux_client::{
     AttachProvider, AttachProviderBackend, AttachProviderError, AttachProviderFuture,
     AttachProviderSession, AttachTarget, ResolvedAttachTarget,
 };
-use std::sync::Arc;
+use switchy_thread::sync::Arc;
 
 #[derive(Debug)]
 struct ObservationProvider;

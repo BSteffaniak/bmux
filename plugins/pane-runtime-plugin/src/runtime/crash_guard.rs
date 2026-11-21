@@ -16,7 +16,7 @@
 //! wasmtime handles traps through those signals on Linux, and a handler placed in
 //! front of it would kill every pane on an ordinary guest trap.
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicI32, Ordering};
+use switchy_thread::sync::atomic::{AtomicI32, Ordering};
 
 const SLOTS: usize = 4096;
 

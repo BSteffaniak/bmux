@@ -6,7 +6,7 @@
 //! query so the ordinary terminal parser cannot answer it a second time later.
 use std::borrow::Cow;
 use std::io::{self, Read, Write};
-use std::sync::{Arc, Mutex};
+use switchy_thread::sync::{Arc, Mutex};
 
 pub(in super::super) type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
 const QUERY: &[u8] = b"\x1b[6n";
@@ -149,8 +149,8 @@ pub(in super::super) async fn close_retired_console<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::mpsc;
     use std::time::Duration;
+    use switchy_thread::sync::mpsc;
 
     struct ReplyWriter(mpsc::SyncSender<Vec<u8>>);
     impl Write for ReplyWriter {
@@ -233,7 +233,7 @@ mod tests {
         }
         let (started, read_close) = mpsc::sync_channel(1);
         let (drained, read_drain) = mpsc::sync_channel(1);
-        let reader = std::thread::spawn(move || {
+        let reader = switchy_thread::thread::spawn(move || {
             read_close.recv_timeout(Duration::from_secs(1)).unwrap();
             // The real read owner, not the close operation, reports drain.
             drained.send(()).unwrap();

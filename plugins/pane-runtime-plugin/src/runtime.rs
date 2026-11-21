@@ -66,10 +66,10 @@ use pty::Slave as _;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use switchy_async::task::JoinHandle;
+use switchy_thread::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use switchy_thread::sync::{Arc, Mutex, RwLock};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{trace, warn};
 
@@ -437,7 +437,8 @@ impl PaneRuntimeHost {
     /// The host's communal presentation fact service.
     pub(crate) fn fact_service(
         &self,
-    ) -> Arc<std::sync::RwLock<bmux_presentation_state::PresentationFactHostService>> {
+    ) -> Arc<switchy_thread::sync::RwLock<bmux_presentation_state::PresentationFactHostService>>
+    {
         self.states
             .get_or_insert_with(bmux_presentation_state::PresentationFactHostService::new)
     }
@@ -932,7 +933,7 @@ struct SupervisionCompletion {
 
 impl Drop for SupervisionCompletion {
     fn drop(&mut self) {
-        if std::thread::panicking() {
+        if switchy_thread::thread::panicking() {
             self.execution
                 .record_error("pane supervision thread panicked".into());
         }
@@ -942,7 +943,7 @@ impl Drop for SupervisionCompletion {
 }
 
 fn supervision_join(
-    threads: &mut [Option<std::thread::JoinHandle<()>>],
+    threads: &mut [Option<switchy_thread::thread::JoinHandle<()>>],
 ) -> switchy_async::task::JoinHandle<std::result::Result<(), String>> {
     let handles: Vec<_> = threads.iter_mut().filter_map(Option::take).collect();
     // This owner retains every unreaped handle across the observer deadline.
@@ -991,8 +992,8 @@ async fn shutdown_pane_handle(host: &crate::runtime::PaneRuntimeHost, pane: Pane
 }
 
 fn process_pane_output(
-    terminal_grid: &std::sync::Mutex<TerminalGridStream>,
-    output_buffer: &std::sync::Mutex<OutputFanoutBuffer>,
+    terminal_grid: &switchy_thread::sync::Mutex<TerminalGridStream>,
+    output_buffer: &switchy_thread::sync::Mutex<OutputFanoutBuffer>,
     bytes: &[u8],
 ) -> Result<(), SessionRuntimeError> {
     process_pane_output_with_pointer_queries(
@@ -1005,8 +1006,8 @@ fn process_pane_output(
 }
 
 fn process_pane_output_with_pointer_queries(
-    terminal_grid: &std::sync::Mutex<TerminalGridStream>,
-    output_buffer: &std::sync::Mutex<OutputFanoutBuffer>,
+    terminal_grid: &switchy_thread::sync::Mutex<TerminalGridStream>,
+    output_buffer: &switchy_thread::sync::Mutex<OutputFanoutBuffer>,
     bytes: &[u8],
     profile: ProtocolProfile,
 ) -> Result<Vec<u8>, SessionRuntimeError> {
@@ -1051,7 +1052,7 @@ mod pointer_query_tests {
         GridLimits, OutputFanoutBuffer, ProtocolProfile, TerminalGridStream,
         process_pane_output_with_pointer_queries,
     };
-    use std::sync::Mutex;
+    use switchy_thread::sync::Mutex;
 
     fn grid() -> Mutex<TerminalGridStream> {
         Mutex::new(TerminalGridStream::new(80, 24, GridLimits::default()).unwrap())
@@ -1265,7 +1266,7 @@ mod pointer_query_tests {
 fn note_replay_markers_read(bytes: &[u8]) -> Vec<(u64, u128)> {
     // Process-wide debug log file opened from the process environment; a
     // diagnostic sink, not per-instance state.
-    static LOG: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+    static LOG: std::sync::OnceLock<Option<switchy_thread::sync::Mutex<std::fs::File>>> =
         std::sync::OnceLock::new();
     let Some(file) = LOG.get_or_init(|| {
         let path = std::env::var_os("BMUX_REPLAY_LOG")?;
@@ -1274,7 +1275,7 @@ fn note_replay_markers_read(bytes: &[u8]) -> Vec<(u64, u128)> {
             .append(true)
             .open(path)
             .ok()
-            .map(std::sync::Mutex::new)
+            .map(switchy_thread::sync::Mutex::new)
     }) else {
         return Vec::new();
     };
@@ -1299,8 +1300,8 @@ fn push_pane_runtime_notice(
     host: &PaneRuntimeHost,
     session_id: SessionId,
     pane_id: Uuid,
-    output_buffer: &Arc<std::sync::Mutex<OutputFanoutBuffer>>,
-    terminal_grid: &Arc<std::sync::Mutex<TerminalGridStream>>,
+    output_buffer: &Arc<switchy_thread::sync::Mutex<OutputFanoutBuffer>>,
+    terminal_grid: &Arc<switchy_thread::sync::Mutex<TerminalGridStream>>,
     output_dirty: &Arc<AtomicBool>,
     message: impl AsRef<str>,
 ) {
@@ -1317,12 +1318,12 @@ fn push_pane_runtime_notice(
 }
 
 struct PaneFailureTargets<'a> {
-    process_id: &'a Arc<std::sync::Mutex<Option<u32>>>,
-    process_group_id: &'a Arc<std::sync::Mutex<Option<i32>>>,
-    exit_reason: &'a Arc<std::sync::Mutex<Option<String>>>,
+    process_id: &'a Arc<switchy_thread::sync::Mutex<Option<u32>>>,
+    process_group_id: &'a Arc<switchy_thread::sync::Mutex<Option<i32>>>,
+    exit_reason: &'a Arc<switchy_thread::sync::Mutex<Option<String>>>,
     exited: &'a Arc<AtomicBool>,
-    output_buffer: &'a Arc<std::sync::Mutex<OutputFanoutBuffer>>,
-    terminal_grid: &'a Arc<std::sync::Mutex<TerminalGridStream>>,
+    output_buffer: &'a Arc<switchy_thread::sync::Mutex<OutputFanoutBuffer>>,
+    terminal_grid: &'a Arc<switchy_thread::sync::Mutex<TerminalGridStream>>,
     output_dirty: &'a Arc<AtomicBool>,
     pane_exit_tx: &'a mpsc::UnboundedSender<PaneExitEvent>,
 }
@@ -1622,7 +1623,7 @@ struct PaneInputHandle {
 #[derive(Default)]
 struct StartupPublication {
     decision: Mutex<Option<bool>>,
-    changed: std::sync::Condvar,
+    changed: switchy_thread::sync::Condvar,
 }
 
 impl StartupPublication {
@@ -1630,7 +1631,7 @@ impl StartupPublication {
         let mut decision = self
             .decision
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(switchy_thread::sync::PoisonError::into_inner);
         if decision.is_none() {
             *decision = Some(committed);
             self.changed.notify_all();
@@ -1641,11 +1642,11 @@ impl StartupPublication {
         let decision = self
             .decision
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(switchy_thread::sync::PoisonError::into_inner);
         let decision = self
             .changed
             .wait_while(decision, |decision| decision.is_none())
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(switchy_thread::sync::PoisonError::into_inner);
         *decision == Some(true)
     }
 }
@@ -1916,7 +1917,7 @@ impl std::io::Write for EncodedByteCount {
 
 fn acknowledge_grid_snapshots(
     client_id: ClientId,
-    updates: &mut [(Arc<std::sync::Mutex<OutputFanoutBuffer>>, u64)],
+    updates: &mut [(Arc<switchy_thread::sync::Mutex<OutputFanoutBuffer>>, u64)],
 ) -> Result<(), SessionRuntimeError> {
     // Concurrent multi-pane snapshots must acquire locks in the same order.
     updates.sort_unstable_by_key(|(output, _)| Arc::as_ptr(output));
@@ -2182,7 +2183,7 @@ enum SpawnDirectoryProbe {
 
 struct PaneLifetime {
     execution: Arc<execution::ExecutionCapture>,
-    resurrection: Arc<std::sync::Mutex<PaneResurrectionRuntime>>,
+    resurrection: Arc<switchy_thread::sync::Mutex<PaneResurrectionRuntime>>,
 }
 
 impl PaneLifetime {
@@ -2224,34 +2225,34 @@ struct PaneRuntimeHandle {
     startup: watch::Receiver<Option<std::result::Result<(), String>>>,
     session_id: SessionId,
     meta: PaneRuntimeMeta,
-    process_start_identity: Arc<std::sync::Mutex<Option<ProcessStartIdentity>>>,
-    process_id: Arc<std::sync::Mutex<Option<u32>>>,
-    process_group_id: Arc<std::sync::Mutex<Option<i32>>>,
-    resurrection_state: Arc<std::sync::Mutex<PaneResurrectionRuntime>>,
-    exit_reason: Arc<std::sync::Mutex<Option<String>>>,
+    process_start_identity: Arc<switchy_thread::sync::Mutex<Option<ProcessStartIdentity>>>,
+    process_id: Arc<switchy_thread::sync::Mutex<Option<u32>>>,
+    process_group_id: Arc<switchy_thread::sync::Mutex<Option<i32>>>,
+    resurrection_state: Arc<switchy_thread::sync::Mutex<PaneResurrectionRuntime>>,
+    exit_reason: Arc<switchy_thread::sync::Mutex<Option<String>>>,
     stop_tx: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
     input_tx: mpsc::UnboundedSender<PaneRuntimeCommand>,
-    output_buffer: Arc<std::sync::Mutex<OutputFanoutBuffer>>,
-    terminal_grid: Arc<std::sync::Mutex<TerminalGridStream>>,
+    output_buffer: Arc<switchy_thread::sync::Mutex<OutputFanoutBuffer>>,
+    terminal_grid: Arc<switchy_thread::sync::Mutex<TerminalGridStream>>,
     /// Each attached client's replica of the grid: what it was last sent frames from.
-    frame_replicas: Arc<std::sync::Mutex<BTreeMap<ClientId, PaneFrameReplica>>>,
+    frame_replicas: Arc<switchy_thread::sync::Mutex<BTreeMap<ClientId, PaneFrameReplica>>>,
     exited: Arc<AtomicBool>,
-    last_requested_size: Arc<std::sync::Mutex<(u16, u16)>>,
+    last_requested_size: Arc<switchy_thread::sync::Mutex<(u16, u16)>>,
     /// Set to `true` by the PTY reader when new output arrives. The broadcast
     /// event is only emitted on the `false→true` transition, coalescing
     /// thousands of per-chunk writes into ~1 event per fetch cycle.
     output_dirty: Arc<AtomicBool>,
-    mouse_protocol_state: Arc<std::sync::Mutex<AttachMouseProtocolState>>,
-    input_mode_state: Arc<std::sync::Mutex<AttachInputModeState>>,
+    mouse_protocol_state: Arc<switchy_thread::sync::Mutex<AttachMouseProtocolState>>,
+    input_mode_state: Arc<switchy_thread::sync::Mutex<AttachInputModeState>>,
     padding_override: Option<PanePaddingSpec>,
     padding_preview: Option<PanePaddingSpec>,
     padding_override_persistence: PanePaddingOverridePersistence,
     #[cfg(feature = "image-registry")]
-    image_registry: Arc<std::sync::Mutex<bmux_image::ImageRegistry>>,
+    image_registry: Arc<switchy_thread::sync::Mutex<bmux_image::ImageRegistry>>,
     /// Cell pixel dimensions reported by the client (width, height).
     #[cfg(feature = "image-registry")]
-    cell_pixel_size: Arc<std::sync::Mutex<(u16, u16)>>,
+    cell_pixel_size: Arc<switchy_thread::sync::Mutex<(u16, u16)>>,
     /// Set to `true` when the image registry has new content.
     #[cfg(feature = "image-registry")]
     image_dirty: Arc<AtomicBool>,
@@ -2260,7 +2261,7 @@ struct PaneRuntimeHandle {
 pub(crate) enum PaneRuntimeCommand {
     AdmittedInput(
         Vec<u8>,
-        std::sync::mpsc::SyncSender<Result<(), String>>,
+        switchy_thread::sync::mpsc::SyncSender<Result<(), String>>,
         tokio::sync::OwnedSemaphorePermit,
         input_authority::InputAuthority,
     ),
@@ -2271,7 +2272,7 @@ pub(crate) enum PaneRuntimeCommand {
     },
     AuthorizedInput(Vec<u8>, input_authority::InputAuthority),
     /// A producer fence must be ordered behind every already-admitted PTY write.
-    InputFence(std::sync::mpsc::SyncSender<()>),
+    InputFence(switchy_thread::sync::mpsc::SyncSender<()>),
     Input(Vec<u8>),
     Resize {
         rows: u16,
@@ -2572,13 +2573,13 @@ impl ReaderImages for FollowImages<'_, '_> {
     }
 }
 
-type SharedFilters = Arc<std::sync::RwLock<bmux_terminal_grid::SequenceFilters>>;
+type SharedFilters = Arc<switchy_thread::sync::RwLock<bmux_terminal_grid::SequenceFilters>>;
 
 /// The registered filters, read for one chunk (a poisoned lock reads as none: filters shape what
 /// panes show, they gate no access).
 fn read_filters(
     shared: Option<&SharedFilters>,
-) -> Option<std::sync::RwLockReadGuard<'_, bmux_terminal_grid::SequenceFilters>> {
+) -> Option<switchy_thread::sync::RwLockReadGuard<'_, bmux_terminal_grid::SequenceFilters>> {
     shared.and_then(|filters| filters.read().ok())
 }
 
@@ -4604,7 +4605,9 @@ impl PaneRuntimeHandle {
         }
     }
 
-    fn lock_resize_capture_order(&self) -> std::io::Result<std::sync::MutexGuard<'_, ()>> {
+    fn lock_resize_capture_order(
+        &self,
+    ) -> std::io::Result<switchy_thread::sync::MutexGuard<'_, ()>> {
         let order = self
             .execution
             .capture_order
@@ -4867,16 +4870,16 @@ struct PaneAttachDataRef {
     pane_id: Uuid,
     name: Option<String>,
     exited: Arc<AtomicBool>,
-    exit_reason: Arc<std::sync::Mutex<Option<String>>>,
-    output_buffer: Arc<std::sync::Mutex<OutputFanoutBuffer>>,
-    terminal_grid: Arc<std::sync::Mutex<TerminalGridStream>>,
+    exit_reason: Arc<switchy_thread::sync::Mutex<Option<String>>>,
+    output_buffer: Arc<switchy_thread::sync::Mutex<OutputFanoutBuffer>>,
+    terminal_grid: Arc<switchy_thread::sync::Mutex<TerminalGridStream>>,
     /// Each attached client's replica of the grid: what it was last sent frames from.
-    frame_replicas: Arc<std::sync::Mutex<BTreeMap<ClientId, PaneFrameReplica>>>,
+    frame_replicas: Arc<switchy_thread::sync::Mutex<BTreeMap<ClientId, PaneFrameReplica>>>,
     output_dirty: Arc<AtomicBool>,
-    mouse_protocol_state: Arc<std::sync::Mutex<AttachMouseProtocolState>>,
-    input_mode_state: Arc<std::sync::Mutex<AttachInputModeState>>,
+    mouse_protocol_state: Arc<switchy_thread::sync::Mutex<AttachMouseProtocolState>>,
+    input_mode_state: Arc<switchy_thread::sync::Mutex<AttachInputModeState>>,
     #[cfg(feature = "image-registry")]
-    image_registry: Arc<std::sync::Mutex<bmux_image::ImageRegistry>>,
+    image_registry: Arc<switchy_thread::sync::Mutex<bmux_image::ImageRegistry>>,
     #[cfg(feature = "image-registry")]
     image_dirty: Arc<AtomicBool>,
 }
@@ -4893,10 +4896,10 @@ struct AttachSceneDataSnapshot {
 struct PanePersistenceDataRef {
     meta: PaneRuntimeMeta,
     exited: Arc<AtomicBool>,
-    process_id: Arc<std::sync::Mutex<Option<u32>>>,
-    process_group_id: Arc<std::sync::Mutex<Option<i32>>>,
-    process_start_identity: Arc<std::sync::Mutex<Option<ProcessStartIdentity>>>,
-    resurrection_state: Arc<std::sync::Mutex<PaneResurrectionRuntime>>,
+    process_id: Arc<switchy_thread::sync::Mutex<Option<u32>>>,
+    process_group_id: Arc<switchy_thread::sync::Mutex<Option<i32>>>,
+    process_start_identity: Arc<switchy_thread::sync::Mutex<Option<ProcessStartIdentity>>>,
+    resurrection_state: Arc<switchy_thread::sync::Mutex<PaneResurrectionRuntime>>,
 }
 
 struct PersistenceSnapshotParts {
@@ -7002,7 +7005,7 @@ async fn bounded_start_identity_probe(
         .ok()?;
     let permit = Permit;
     let (sender, receiver) = oneshot::channel();
-    std::thread::Builder::new()
+    switchy_thread::thread::Builder::new()
         .name("bmux-process-identity".into())
         .spawn(move || {
             let _permit = permit;
@@ -7173,7 +7176,7 @@ impl SessionRuntimeManager {
             runtimes: BTreeMap::new(),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
-            retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            retained_output_bytes: Arc::new(switchy_thread::sync::atomic::AtomicUsize::new(0)),
             retained_pin_bytes: Arc::new(AtomicUsize::new(0)),
             shell,
             pane_term,
@@ -7239,8 +7242,8 @@ impl SessionRuntimeManager {
             .resurrection_state
             .try_lock()
             .map_err(|error| match error {
-                std::sync::TryLockError::WouldBlock => SpawnError::Busy,
-                std::sync::TryLockError::Poisoned(_) => SpawnError::SourceUnavailable,
+                switchy_thread::sync::TryLockError::WouldBlock => SpawnError::Busy,
+                switchy_thread::sync::TryLockError::Poisoned(_) => SpawnError::SourceUnavailable,
             })?;
         if observation.observation_execution != source.execution_token {
             return Err(SpawnError::StaleExecution);
@@ -7634,20 +7637,25 @@ impl SessionRuntimeManager {
         }
         let (stop_tx, mut stop_rx) = oneshot::channel();
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<PaneRuntimeCommand>();
-        let output_buffer = Arc::new(std::sync::Mutex::new(OutputFanoutBuffer::with_accounting(
-            MAX_WINDOW_OUTPUT_BUFFER_BYTES,
-            Arc::clone(&self.retained_output_bytes),
-        )));
+        let output_buffer = Arc::new(switchy_thread::sync::Mutex::new(
+            OutputFanoutBuffer::with_accounting(
+                MAX_WINDOW_OUTPUT_BUFFER_BYTES,
+                Arc::clone(&self.retained_output_bytes),
+            ),
+        ));
         let (initial_rows, initial_cols) = sanitize_pty_size(initial_size.0, initial_size.1);
-        let terminal_grid = Arc::new(std::sync::Mutex::new(
+        let terminal_grid = Arc::new(switchy_thread::sync::Mutex::new(
             TerminalGridStream::new(initial_cols, initial_rows, GridLimits::default())
                 .expect("initial pane terminal grid dimensions are valid"),
         ));
         let terminal_grid_for_reader = Arc::clone(&terminal_grid);
-        let frame_replicas: Arc<std::sync::Mutex<BTreeMap<ClientId, PaneFrameReplica>>> =
-            Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let frame_replicas: Arc<switchy_thread::sync::Mutex<BTreeMap<ClientId, PaneFrameReplica>>> =
+            Arc::new(switchy_thread::sync::Mutex::new(BTreeMap::new()));
         let frame_replicas_for_reader = Arc::clone(&frame_replicas);
-        let last_requested_size = Arc::new(std::sync::Mutex::new((initial_rows, initial_cols)));
+        let last_requested_size = Arc::new(switchy_thread::sync::Mutex::new((
+            initial_rows,
+            initial_cols,
+        )));
         let shell = pane_meta.shell.clone();
         let launch = pane_meta.launch.clone();
         let launch_resolution_error = resolved_launch.err().map(|error| error.to_string());
@@ -7670,20 +7678,20 @@ impl SessionRuntimeManager {
             .as_deref()
             .map(|root| shell_callback::prepare(root).map_err(|error| error.to_string()));
         let output_buffer_for_reader = Arc::clone(&output_buffer);
-        let process_start_identity = Arc::new(std::sync::Mutex::new(None));
+        let process_start_identity = Arc::new(switchy_thread::sync::Mutex::new(None));
         let process_start_identity_for_task = Arc::clone(&process_start_identity);
-        let process_id = Arc::new(std::sync::Mutex::new(None));
+        let process_id = Arc::new(switchy_thread::sync::Mutex::new(None));
         let process_id_for_task = Arc::clone(&process_id);
-        let process_group_id = Arc::new(std::sync::Mutex::new(None));
+        let process_group_id = Arc::new(switchy_thread::sync::Mutex::new(None));
         let process_group_id_for_task = Arc::clone(&process_group_id);
-        let resurrection_state = Arc::new(std::sync::Mutex::new(
+        let resurrection_state = Arc::new(switchy_thread::sync::Mutex::new(
             PaneResurrectionRuntime::from_snapshot(&pane_meta.resurrection),
         ));
         let resurrection_state_for_reader = Arc::clone(&resurrection_state);
         let resurrection_state_for_waiter_seed = Arc::clone(&resurrection_state);
-        let pending_prompt_replay = Arc::new(std::sync::Mutex::new(None::<String>));
+        let pending_prompt_replay = Arc::new(switchy_thread::sync::Mutex::new(None::<String>));
         let pending_prompt_replay_for_reader = Arc::clone(&pending_prompt_replay);
-        let exit_reason = Arc::new(std::sync::Mutex::new(None::<String>));
+        let exit_reason = Arc::new(switchy_thread::sync::Mutex::new(None::<String>));
         let exit_reason_for_task = Arc::clone(&exit_reason);
         let exited = Arc::new(AtomicBool::new(false));
         let exited_for_task = Arc::clone(&exited);
@@ -7692,10 +7700,13 @@ impl SessionRuntimeManager {
         let output_dirty_for_reader = Arc::clone(&output_dirty);
         let last_requested_size_for_reader = Arc::clone(&last_requested_size);
         let last_requested_size_for_input = Arc::clone(&last_requested_size);
-        let mouse_protocol_state =
-            Arc::new(std::sync::Mutex::new(AttachMouseProtocolState::default()));
+        let mouse_protocol_state = Arc::new(switchy_thread::sync::Mutex::new(
+            AttachMouseProtocolState::default(),
+        ));
         let mouse_protocol_state_for_reader = Arc::clone(&mouse_protocol_state);
-        let input_mode_state = Arc::new(std::sync::Mutex::new(AttachInputModeState::default()));
+        let input_mode_state = Arc::new(switchy_thread::sync::Mutex::new(
+            AttachInputModeState::default(),
+        ));
         let input_mode_state_for_reader = Arc::clone(&input_mode_state);
 
         #[cfg(feature = "image-registry")]
@@ -7711,7 +7722,7 @@ impl SessionRuntimeManager {
         #[cfg(feature = "image-registry")]
         let image_registry = {
             let img_config = image_config.clone();
-            Arc::new(std::sync::Mutex::new(
+            Arc::new(switchy_thread::sync::Mutex::new(
                 (if img_config.enabled {
                     #[allow(clippy::cast_possible_truncation)]
                     bmux_image::ImageRegistry::new(
@@ -7728,7 +7739,7 @@ impl SessionRuntimeManager {
         #[cfg(feature = "image-registry")]
         let image_registry_for_reader = Arc::clone(&image_registry);
         #[cfg(feature = "image-registry")]
-        let cell_pixel_size = Arc::new(std::sync::Mutex::new((0u16, 0u16)));
+        let cell_pixel_size = Arc::new(switchy_thread::sync::Mutex::new((0u16, 0u16)));
         #[cfg(feature = "image-registry")]
         let cell_pixel_size_for_reader = Arc::clone(&cell_pixel_size);
         #[cfg(feature = "image-registry")]
@@ -8021,7 +8032,7 @@ impl SessionRuntimeManager {
             // the bootstrap reader can answer before the spawn below.
             #[cfg(windows)]
             let early_writer = match pty_pair.master.take_writer() {
-                Ok(writer) => Arc::new(std::sync::Mutex::new(
+                Ok(writer) => Arc::new(switchy_thread::sync::Mutex::new(
                     Box::new(writer) as Box<dyn std::io::Write + Send>
                 )),
                 Err(error) => {
@@ -8303,7 +8314,7 @@ impl SessionRuntimeManager {
                 }
             };
             #[cfg(not(windows))]
-            let writer = Arc::new(std::sync::Mutex::new(writer));
+            let writer = Arc::new(switchy_thread::sync::Mutex::new(writer));
             #[cfg(windows)]
             let writer = early_writer;
             *execution_for_task
@@ -8338,7 +8349,7 @@ impl SessionRuntimeManager {
             let child_waiter_done = Arc::new(AtomicBool::new(false));
             let child_waiter_done_for_thread = Arc::clone(&child_waiter_done);
             let publication_for_waiter = Arc::clone(&publication_for_task);
-            let child_waiter = std::thread::Builder::new()
+            let child_waiter = switchy_thread::thread::Builder::new()
                 .name(format!("bmux-server-pane-{pane_id}-wait"))
                 .spawn({ let host = host.clone(); move || {
                     let _thread_guard = PaneBlockingThreadGuard::new(pane_id, "waiter");
@@ -8414,7 +8425,7 @@ impl SessionRuntimeManager {
             // prompt/output can otherwise reset the saved invocation after the
             // server has finalized the restoration snapshot.
             let resurrection_state_for_shutdown = Arc::clone(&resurrection_state_for_reader);
-            let reader_thread = std::thread::Builder::new()
+            let reader_thread = switchy_thread::thread::Builder::new()
                 .name(format!("bmux-server-pane-{pane_id}"))
                 .spawn({ let host = host.clone(); move || {
                     let _thread_guard = PaneBlockingThreadGuard::new(pane_id, "reader");
@@ -8493,7 +8504,7 @@ impl SessionRuntimeManager {
                                 #[cfg(not(windows))]
                                 let protocol_chunk = &buffer[..bytes_read];
                                 let (capture_output, capture_reply) = capture_handshake.process_with_fence(&host, protocol_chunk, pane_id, || {
-                                    let (sent, received) = std::sync::mpsc::sync_channel(1);
+                                    let (sent, received) = switchy_thread::sync::mpsc::sync_channel(1);
                                     fence_input_for_reader.send(PaneRuntimeCommand::InputFence(sent)).is_ok()
                                         && received.recv_timeout(Duration::from_secs(2)).is_ok()
                                 });
@@ -13435,8 +13446,8 @@ fn bounded_directory_probe<T: Send + 'static>(
         })
         .map_err(|_| SpawnError::Busy)?;
     let permit = Permit(active);
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
+    let (sender, receiver) = switchy_thread::sync::mpsc::sync_channel(1);
+    switchy_thread::thread::Builder::new()
         .name("bmux-cwd-probe".into())
         .spawn(move || {
             let _permit = permit;
@@ -13445,13 +13456,15 @@ fn bounded_directory_probe<T: Send + 'static>(
         })
         .map_err(|_| SpawnError::ObservationUnavailable)?;
     receiver.recv_timeout(timeout).map_err(|error| match error {
-        std::sync::mpsc::RecvTimeoutError::Timeout => SpawnError::ObservationTimeout,
-        std::sync::mpsc::RecvTimeoutError::Disconnected => SpawnError::ObservationUnavailable,
+        switchy_thread::sync::mpsc::RecvTimeoutError::Timeout => SpawnError::ObservationTimeout,
+        switchy_thread::sync::mpsc::RecvTimeoutError::Disconnected => {
+            SpawnError::ObservationUnavailable
+        }
     })
 }
 
 fn observe_spawn_directory_with(
-    manager: &std::sync::Mutex<SessionRuntimeManager>,
+    manager: &switchy_thread::sync::Mutex<SessionRuntimeManager>,
     source: &bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SourceExecution,
     probe: impl FnOnce(
         u32,
@@ -13471,8 +13484,8 @@ fn observe_spawn_directory_with(
         manager
             .try_lock()
             .map_err(|error| match error {
-                std::sync::TryLockError::WouldBlock => SpawnError::Busy,
-                std::sync::TryLockError::Poisoned(_) => SpawnError::SourceUnavailable,
+                switchy_thread::sync::TryLockError::WouldBlock => SpawnError::Busy,
+                switchy_thread::sync::TryLockError::Poisoned(_) => SpawnError::SourceUnavailable,
             })?
             .prepare_spawn_directory_probe(source)
     };
@@ -13701,7 +13714,7 @@ fn retire_inspection_child(
     if matches!(child.try_wait(), Ok(Some(_))) {
         return;
     }
-    std::thread::spawn(move || {
+    switchy_thread::thread::spawn(move || {
         let _permit = permit;
         let _ = child.wait();
     });
@@ -13744,7 +13757,7 @@ fn bounded_probe_output(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(2));
+                switchy_thread::thread::sleep(Duration::from_millis(2));
             }
             result => {
                 return Err(match result {
@@ -14174,19 +14187,21 @@ pub(crate) fn activate_pane_runtime(
     let runtime_handle = bmux_pane_runtime_state::SessionRuntimeManagerHandle::new(adapter);
     host.states()
         .register::<bmux_pane_runtime_state::SessionRuntimeManagerHandle>(&Arc::new(
-            std::sync::RwLock::new(runtime_handle),
+            switchy_thread::sync::RwLock::new(runtime_handle),
         ));
     host.states()
-        .register::<PanePaddingRuntimeHandle>(&Arc::new(std::sync::RwLock::new(
+        .register::<PanePaddingRuntimeHandle>(&Arc::new(switchy_thread::sync::RwLock::new(
             PanePaddingRuntimeHandle(Arc::clone(&manager)),
         )));
 
     host.states()
-        .register::<SpawnRuntimeHandle>(&Arc::new(std::sync::RwLock::new(SpawnRuntimeHandle(
-            Arc::clone(&manager),
-            switchy_async::runtime::Handle::current(),
-            pane_index,
-        ))));
+        .register::<SpawnRuntimeHandle>(&Arc::new(switchy_thread::sync::RwLock::new(
+            SpawnRuntimeHandle(
+                Arc::clone(&manager),
+                switchy_async::runtime::Handle::current(),
+                pane_index,
+            ),
+        )));
     let expiry_manager = Arc::clone(&manager);
     switchy_async::task::spawn(async move {
         let mut interval = switchy_async::time::interval(PANE_PADDING_PREVIEW_SWEEP_INTERVAL);
@@ -15208,9 +15223,9 @@ exit 7"#
 
     #[tokio::test]
     async fn supervision_join_reports_live_thread_deadline_without_blocking_executor() {
-        let (release, blocked) = std::sync::mpsc::channel();
+        let (release, blocked) = switchy_thread::sync::mpsc::channel();
         let (done, finished) = tokio::sync::oneshot::channel();
-        let thread = std::thread::spawn(move || {
+        let thread = switchy_thread::thread::spawn(move || {
             let _ = blocked.recv();
             let _ = done.send(());
         });
@@ -15232,14 +15247,14 @@ exit 7"#
 
     #[tokio::test]
     async fn supervision_join_acknowledges_completion_and_reports_panics() {
-        let thread = std::thread::spawn(|| {});
+        let thread = switchy_thread::thread::spawn(|| {});
         super::join_supervision_threads(
             &mut super::supervision_join(&mut [Some(thread), None]),
             std::time::Duration::from_secs(2),
         )
         .await
         .unwrap();
-        let thread = std::thread::spawn(|| panic!("supervision failure"));
+        let thread = switchy_thread::thread::spawn(|| panic!("supervision failure"));
         assert!(
             super::join_supervision_threads(
                 &mut super::supervision_join(&mut [Some(thread), None]),
@@ -17584,7 +17599,7 @@ exit 7"#
                 break;
             }
             assert!(Instant::now() < deadline, "inspection child was not reaped");
-            std::thread::sleep(Duration::from_millis(2));
+            switchy_thread::thread::sleep(Duration::from_millis(2));
         }
     }
 
@@ -17645,8 +17660,9 @@ exit 7"#
             let _ = stop_rx.await;
         });
         let execution = Arc::new(execution::ExecutionCapture::default());
-        let resurrection_state =
-            Arc::new(std::sync::Mutex::new(PaneResurrectionRuntime::default()));
+        let resurrection_state = Arc::new(switchy_thread::sync::Mutex::new(
+            PaneResurrectionRuntime::default(),
+        ));
         PaneRuntimeHandle {
             host: crate::runtime::PaneRuntimeHost::detached(),
             lifetime: PaneLifetime {
@@ -17665,36 +17681,40 @@ exit 7"#
                 launch: None,
                 resurrection: PaneResurrectionSnapshot::default(),
             },
-            process_start_identity: Arc::new(std::sync::Mutex::new(None)),
-            process_id: Arc::new(std::sync::Mutex::new(None)),
-            process_group_id: Arc::new(std::sync::Mutex::new(None)),
+            process_start_identity: Arc::new(switchy_thread::sync::Mutex::new(None)),
+            process_id: Arc::new(switchy_thread::sync::Mutex::new(None)),
+            process_group_id: Arc::new(switchy_thread::sync::Mutex::new(None)),
             resurrection_state,
-            exit_reason: Arc::new(std::sync::Mutex::new(None)),
+            exit_reason: Arc::new(switchy_thread::sync::Mutex::new(None)),
             stop_tx: Some(stop_tx),
             task,
             input_tx,
-            output_buffer: Arc::new(std::sync::Mutex::new(OutputFanoutBuffer::new(
+            output_buffer: Arc::new(switchy_thread::sync::Mutex::new(OutputFanoutBuffer::new(
                 MAX_WINDOW_OUTPUT_BUFFER_BYTES,
             ))),
-            terminal_grid: Arc::new(std::sync::Mutex::new(
+            terminal_grid: Arc::new(switchy_thread::sync::Mutex::new(
                 TerminalGridStream::new(1, 1, GridLimits::default())
                     .expect("dummy pane terminal grid dimensions are valid"),
             )),
-            frame_replicas: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            frame_replicas: Arc::new(switchy_thread::sync::Mutex::new(BTreeMap::new())),
             exited: Arc::new(AtomicBool::new(false)),
-            last_requested_size: Arc::new(std::sync::Mutex::new((1, 1))),
+            last_requested_size: Arc::new(switchy_thread::sync::Mutex::new((1, 1))),
             output_dirty: Arc::new(AtomicBool::new(false)),
-            mouse_protocol_state: Arc::new(std::sync::Mutex::new(
+            mouse_protocol_state: Arc::new(switchy_thread::sync::Mutex::new(
                 AttachMouseProtocolState::default(),
             )),
-            input_mode_state: Arc::new(std::sync::Mutex::new(AttachInputModeState::default())),
+            input_mode_state: Arc::new(switchy_thread::sync::Mutex::new(
+                AttachInputModeState::default(),
+            )),
             padding_override: None,
             padding_preview: None,
             padding_override_persistence: PanePaddingOverridePersistence::Snapshot,
             #[cfg(feature = "image-registry")]
-            image_registry: Arc::new(std::sync::Mutex::new(bmux_image::ImageRegistry::default())),
+            image_registry: Arc::new(switchy_thread::sync::Mutex::new(
+                bmux_image::ImageRegistry::default(),
+            )),
             #[cfg(feature = "image-registry")]
-            cell_pixel_size: Arc::new(std::sync::Mutex::new((1, 1))),
+            cell_pixel_size: Arc::new(switchy_thread::sync::Mutex::new((1, 1))),
             #[cfg(feature = "image-registry")]
             image_dirty: Arc::new(AtomicBool::new(false)),
         }
@@ -18008,7 +18028,9 @@ exit 7"#
         let pid = child.process_id().unwrap();
         let identity = process_start_identity_for_pid(pid).unwrap();
         let guard = StartupChild::new(host, child);
-        std::thread::spawn(move || drop(guard)).join().unwrap();
+        switchy_thread::thread::spawn(move || drop(guard))
+            .join()
+            .unwrap();
         let deadline = switchy_async::time::Instant::now() + Duration::from_secs(3);
         while process_start_identity_for_pid(pid) == Some(identity) {
             assert!(
@@ -18021,7 +18043,7 @@ exit 7"#
 
     #[tokio::test(flavor = "current_thread")]
     async fn process_identity_probe_does_not_block_async_runtime() {
-        let (release, blocked) = std::sync::mpsc::channel();
+        let (release, blocked) = switchy_thread::sync::mpsc::channel();
         let (started, ready) = oneshot::channel();
         let query = switchy_async::task::spawn(bounded_start_identity_probe(move || {
             started.send(()).unwrap();
@@ -18065,7 +18087,7 @@ exit 7"#
     fn directory_probe_deadline_retains_admission_until_worker_finishes() {
         use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
         static ACTIVE: AtomicUsize = AtomicUsize::new(0);
-        let (release, blocked) = std::sync::mpsc::channel();
+        let (release, blocked) = switchy_thread::sync::mpsc::channel();
         assert_eq!(
             bounded_directory_probe::<String>(&ACTIVE, Duration::ZERO, move || {
                 blocked.recv().unwrap();
@@ -18081,7 +18103,7 @@ exit 7"#
                 std::time::Instant::now() < deadline,
                 "worker leaked admission"
             );
-            std::thread::yield_now();
+            switchy_thread::thread::yield_now();
         }
         assert_eq!(
             bounded_directory_probe::<String>(&ACTIVE, Duration::from_secs(2), || Some(
@@ -18109,7 +18131,7 @@ exit 7"#
         use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
         let session_id = SessionId(Uuid::new_v4());
         let pane_id = Uuid::new_v4();
-        let manager = std::sync::Mutex::new(manager_with_runtime(
+        let manager = switchy_thread::sync::Mutex::new(manager_with_runtime(
             session_id,
             runtime_with_panes(&[pane_id]),
         ));
@@ -18191,7 +18213,7 @@ exit 7"#
             runtimes: BTreeMap::from([(session_id, runtime)]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
-            retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            retained_output_bytes: Arc::new(switchy_thread::sync::atomic::AtomicUsize::new(0)),
             retained_pin_bytes: Arc::new(AtomicUsize::new(0)),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
@@ -18280,7 +18302,7 @@ exit 7"#
             ]),
             pane_input_index,
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
-            retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            retained_output_bytes: Arc::new(switchy_thread::sync::atomic::AtomicUsize::new(0)),
             retained_pin_bytes: Arc::new(AtomicUsize::new(0)),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
@@ -18330,11 +18352,11 @@ exit 7"#
         let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let writer_barrier = Arc::clone(&barrier);
-        let writer = std::thread::spawn(move || {
+        let writer = switchy_thread::thread::spawn(move || {
             writer_barrier.wait();
             for _ in 0..1000 {
                 process_pane_output(&grid, &output, b"x").unwrap();
-                std::thread::yield_now();
+                switchy_thread::thread::yield_now();
             }
         });
         barrier.wait();
@@ -18410,7 +18432,7 @@ exit 7"#
         runtime.attached_clients.insert(client_id);
         // Share immutable terminal content to keep this aggregate-budget fixture
         // small; each pane still owns an independent raw replay buffer.
-        let grid = Arc::new(std::sync::Mutex::new(grid));
+        let grid = Arc::new(switchy_thread::sync::Mutex::new(grid));
         let mut buffers = Vec::new();
         for pane in runtime.panes.values_mut() {
             pane.terminal_grid = Arc::clone(&grid);
@@ -19632,7 +19654,7 @@ exit 7"#
             // grid lock held above, establishing the race without a sleep.
             let deadline = Instant::now() + Duration::from_secs(5);
             while Arc::strong_count(&grid) == initial_handles && Instant::now() < deadline {
-                std::thread::yield_now();
+                switchy_thread::thread::yield_now();
             }
             let resolved = Arc::strong_count(&grid) > initial_handles;
             {
@@ -19845,13 +19867,13 @@ exit 7"#
         .unwrap();
         *runtime.panes[&pane].terminal_grid.lock().unwrap() = tracker.terminal_grid;
         let manager = Arc::new(Mutex::new(manager_with_runtime(session, runtime)));
-        let padding = Arc::new(std::sync::RwLock::new(PanePaddingRuntimeHandle(
+        let padding = Arc::new(switchy_thread::sync::RwLock::new(PanePaddingRuntimeHandle(
             Arc::clone(&manager),
         )));
         let host = PaneRuntimeHost::detached();
         host.states().register(&padding);
         let adapter = ServerSessionRuntimeAdapter::new(manager);
-        let handle = Arc::new(std::sync::RwLock::new(
+        let handle = Arc::new(switchy_thread::sync::RwLock::new(
             bmux_pane_runtime_state::SessionRuntimeManagerHandle::new(adapter),
         ));
         host.states().register(&handle);
@@ -20074,7 +20096,7 @@ exit 7"#
                 .process(b"first\r\n");
         }
         let adapter = adapter_for_manager(manager_with_runtime(session, runtime));
-        let handle = Arc::new(std::sync::RwLock::new(
+        let handle = Arc::new(switchy_thread::sync::RwLock::new(
             bmux_pane_runtime_state::SessionRuntimeManagerHandle::new(adapter),
         ));
         let host = PaneRuntimeHost::detached();
@@ -20684,8 +20706,8 @@ exit 7"#
         pane.resize_pty(2, 10);
         let size = pane.last_requested_size.lock().unwrap();
         std::thread::scope(|scope| {
-            let (started_tx, started_rx) = std::sync::mpsc::channel();
-            let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+            let (started_tx, started_rx) = switchy_thread::sync::mpsc::channel();
+            let (finished_tx, finished_rx) = switchy_thread::sync::mpsc::channel();
             scope.spawn(move || {
                 started_tx.send(()).unwrap();
                 pane.resize_pty(4, 20);
@@ -20697,7 +20719,7 @@ exit 7"#
             drop(size);
             assert!(matches!(
                 blocked,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                Err(switchy_thread::sync::mpsc::RecvTimeoutError::Timeout)
             ));
             assert_eq!(width_during_output, 10);
             finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -20717,8 +20739,8 @@ exit 7"#
         pane.resize_pty(2, 10);
         let images = pane.image_registry.lock().unwrap();
         std::thread::scope(|scope| {
-            let (started_tx, started_rx) = std::sync::mpsc::channel();
-            let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+            let (started_tx, started_rx) = switchy_thread::sync::mpsc::channel();
+            let (finished_tx, finished_rx) = switchy_thread::sync::mpsc::channel();
             scope.spawn(move || {
                 started_tx.send(()).unwrap();
                 pane.resize_pty(4, 20);
@@ -20730,7 +20752,7 @@ exit 7"#
             drop(images);
             assert!(matches!(
                 blocked,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                Err(switchy_thread::sync::mpsc::RecvTimeoutError::Timeout)
             ));
             assert_eq!(width_during_capture, 10);
             finished_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -21178,7 +21200,7 @@ exit 7"#
             ]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
-            retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            retained_output_bytes: Arc::new(switchy_thread::sync::atomic::AtomicUsize::new(0)),
             retained_pin_bytes: Arc::new(AtomicUsize::new(0)),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
@@ -21233,7 +21255,7 @@ exit 7"#
             ]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
-            retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            retained_output_bytes: Arc::new(switchy_thread::sync::atomic::AtomicUsize::new(0)),
             retained_pin_bytes: Arc::new(AtomicUsize::new(0)),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
@@ -21277,7 +21299,7 @@ exit 7"#
             runtimes: BTreeMap::from([(session_id, runtime)]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
-            retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            retained_output_bytes: Arc::new(switchy_thread::sync::atomic::AtomicUsize::new(0)),
             retained_pin_bytes: Arc::new(AtomicUsize::new(0)),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
@@ -21328,7 +21350,7 @@ exit 7"#
             runtimes: BTreeMap::from([(session_id, runtime)]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
-            retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            retained_output_bytes: Arc::new(switchy_thread::sync::atomic::AtomicUsize::new(0)),
             retained_pin_bytes: Arc::new(AtomicUsize::new(0)),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
@@ -21371,7 +21393,7 @@ exit 7"#
             runtimes: BTreeMap::from([(session_id, runtime)]),
             pane_input_index: Arc::new(RwLock::new(BTreeMap::new())),
             client_write_permissions: Arc::new(RwLock::new(BTreeMap::new())),
-            retained_output_bytes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            retained_output_bytes: Arc::new(switchy_thread::sync::atomic::AtomicUsize::new(0)),
             retained_pin_bytes: Arc::new(AtomicUsize::new(0)),
             shell: "sh".to_string(),
             pane_term: "xterm-256color".to_string(),
@@ -22169,8 +22191,10 @@ exit 7"#
     fn runtime_notice_updates_grid_and_fanout() {
         let pane_id = Uuid::new_v4();
         let session_id = SessionId(Uuid::new_v4());
-        let output = Arc::new(std::sync::Mutex::new(OutputFanoutBuffer::new(4096)));
-        let grid = Arc::new(std::sync::Mutex::new(
+        let output = Arc::new(switchy_thread::sync::Mutex::new(OutputFanoutBuffer::new(
+            4096,
+        )));
+        let grid = Arc::new(switchy_thread::sync::Mutex::new(
             TerminalGridStream::new(80, 24, GridLimits::default()).unwrap(),
         ));
         let dirty = Arc::new(AtomicBool::new(false));
@@ -22420,7 +22444,7 @@ exit 7"#
         let runtime = tokio::runtime::Handle::current();
         let thread = {
             let guard = manager.lock().unwrap();
-            let thread = std::thread::spawn(move || {
+            let thread = switchy_thread::thread::spawn(move || {
                 let _runtime = runtime.enter();
                 competing.wait();
                 contender
@@ -22543,8 +22567,8 @@ exit 7"#
     fn startup_publication_waits_for_commit() {
         let publication = Arc::new(StartupPublication::default());
         let waiter = Arc::clone(&publication);
-        let (result, receive) = std::sync::mpsc::channel();
-        let thread = std::thread::spawn(move || result.send(waiter.wait()).unwrap());
+        let (result, receive) = switchy_thread::sync::mpsc::channel();
+        let thread = switchy_thread::thread::spawn(move || result.send(waiter.wait()).unwrap());
         assert!(receive.try_recv().is_err());
         publication.decide(true);
         assert!(receive.recv_timeout(Duration::from_secs(2)).unwrap());
@@ -22606,7 +22630,10 @@ exit 7"#
 
     #[derive(Debug, Clone)]
     struct DelayedCleanupChild {
-        exited: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        exited: Arc<(
+            switchy_thread::sync::Mutex<bool>,
+            switchy_thread::sync::Condvar,
+        )>,
         dropped: Arc<AtomicBool>,
     }
 
@@ -22649,7 +22676,10 @@ exit 7"#
     async fn failed_child_cleanup_retains_owner_until_observed_exit() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let exited = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let exited = Arc::new((
+            switchy_thread::sync::Mutex::new(false),
+            switchy_thread::sync::Condvar::new(),
+        ));
         let dropped = Arc::new(AtomicBool::new(false));
         let child = Box::new(DelayedCleanupChild {
             exited: Arc::clone(&exited),
@@ -23114,12 +23144,12 @@ exit 7"#
                     assert!(adapter.pane_input_index.read().unwrap().is_empty());
                     let deadline = std::time::Instant::now() + Duration::from_secs(5);
                     while !ready.exists() && std::time::Instant::now() < deadline {
-                        std::thread::sleep(Duration::from_millis(5));
+                        switchy_thread::thread::sleep(Duration::from_millis(5));
                     }
                     assert!(ready.exists(), "shell must queue output before rollback");
                     // Let the bounded startup capture queue fill while the
                     // publication gate still excludes its projection reader.
-                    std::thread::sleep(Duration::from_millis(200));
+                    switchy_thread::thread::sleep(Duration::from_millis(200));
                     published.store(true, Ordering::SeqCst);
                     anyhow::bail!("injected roster persistence failure")
                 },
@@ -23455,7 +23485,7 @@ exit 7"#
                 let mut output = OutputFanoutBuffer::new(1024);
                 output.register_client_at_tail(client);
                 output.push_chunk(b"0123456789");
-                Arc::new(std::sync::Mutex::new(output))
+                Arc::new(switchy_thread::sync::Mutex::new(output))
             })
             .collect::<Vec<_>>();
         let barrier = Arc::new(std::sync::Barrier::new(2));
@@ -23468,7 +23498,7 @@ exit 7"#
                 updates.reverse();
             }
             let barrier = Arc::clone(&barrier);
-            std::thread::spawn(move || {
+            switchy_thread::thread::spawn(move || {
                 barrier.wait();
                 acknowledge_grid_snapshots(client, &mut updates).unwrap();
             })
@@ -23496,7 +23526,7 @@ exit 7"#
         let mut output = OutputFanoutBuffer::new(1024);
         output.register_client_at_tail(client);
         output.push_chunk(b"hello");
-        let output = Arc::new(std::sync::Mutex::new(output));
+        let output = Arc::new(switchy_thread::sync::Mutex::new(output));
         let mut updates = [(Arc::clone(&output), 2), (Arc::clone(&output), 5)];
         assert_eq!(
             acknowledge_grid_snapshots(client, &mut updates),
@@ -23518,13 +23548,13 @@ exit 7"#
                 let mut output = OutputFanoutBuffer::new(1024);
                 output.register_client_at_tail(client);
                 output.push_chunk(b"hello");
-                (Arc::new(std::sync::Mutex::new(output)), 5)
+                (Arc::new(switchy_thread::sync::Mutex::new(output)), 5)
             })
             .collect::<Vec<_>>();
         updates.sort_unstable_by_key(|(output, _)| Arc::as_ptr(output));
         let poisoned = Arc::clone(&updates[1].0);
         assert!(
-            std::thread::spawn(move || {
+            switchy_thread::thread::spawn(move || {
                 let _guard = poisoned.lock().unwrap();
                 panic!("poison output for atomic commit test");
             })

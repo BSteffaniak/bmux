@@ -73,7 +73,7 @@ impl CaptureHandshake {
                             if std::time::Instant::now() >= deadline {
                                 break;
                             }
-                            std::thread::sleep(std::time::Duration::from_millis(2));
+                            switchy_thread::thread::sleep(std::time::Duration::from_millis(2));
                         }
                     }
                     replies.extend_from_slice(

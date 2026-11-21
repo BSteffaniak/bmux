@@ -95,7 +95,7 @@ fn sweep_with(
                 "live terminal-session members remain after cleanup: {pids:?}"
             )));
         }
-        std::thread::sleep(Duration::from_millis(10));
+        switchy_thread::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -450,7 +450,7 @@ mod tests {
         let ready = Instant::now() + Duration::from_secs(5);
         while members(sid, Instant::now() + SWEEP_BUDGET).unwrap().len() < 3 {
             assert!(Instant::now() < ready, "session never populated");
-            std::thread::sleep(Duration::from_millis(10));
+            switchy_thread::thread::sleep(Duration::from_millis(10));
         }
         let groups: BTreeSet<i32> = members(sid, Instant::now() + SWEEP_BUDGET)
             .unwrap()

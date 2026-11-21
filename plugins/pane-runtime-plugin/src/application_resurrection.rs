@@ -1,7 +1,7 @@
 //! Invocation-specific client of the optional application-resurrection plugin.
 use bmux_application_resurrection_plugin_api::resurrection_launch_v1::client;
 use bmux_plugin::{ServiceCallerDispatchClient, TypedServiceCaller, block_on_typed_dispatch};
-use std::sync::{Arc, RwLock};
+use switchy_thread::sync::{Arc, RwLock};
 
 /// One activation's client of the optional application-resurrection plugin.
 #[derive(Default)]

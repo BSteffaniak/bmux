@@ -52,6 +52,7 @@ switchy_async = { workspace = true, features = [
     "time",
     "tokio",
 ] }
+switchy_thread = { workspace = true, features = ["std"] }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = [
     "macros",

@@ -6,11 +6,11 @@ use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::{
     TerminalExecutionStatus as ExecutionStatus, TerminalProgramOptions as ProgramOptions,
 };
 use bmux_session_models::SessionId;
-use std::sync::{
+use std::time::Duration;
+use switchy_thread::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-use std::time::Duration;
 use tokio::sync::Semaphore;
 
 use super::native_process::{self, StopAction};
@@ -38,7 +38,7 @@ pub(super) struct ExecutionCapture {
     pub(super) inject_reader_failure: AtomicBool,
     pub(super) capture_order: Mutex<()>,
     projection_progress: Mutex<u64>,
-    projection_changed: std::sync::Condvar,
+    projection_changed: switchy_thread::sync::Condvar,
     pub(super) durable_capture: Mutex<Option<super::durable_capture::DurableCapture>>,
     pub(super) capture_writer: Mutex<Option<super::capture_writer::CaptureWriter>>,
     pub(super) master: Mutex<Option<bmux_pty::PtyMaster>>,
@@ -67,7 +67,7 @@ impl Default for ExecutionCapture {
             inject_reader_failure: AtomicBool::new(false),
             capture_order: Mutex::new(()),
             projection_progress: Mutex::new(0),
-            projection_changed: std::sync::Condvar::new(),
+            projection_changed: switchy_thread::sync::Condvar::new(),
             durable_capture: Mutex::new(None),
             capture_writer: Mutex::new(None),
             master: Mutex::new(None),
@@ -957,15 +957,18 @@ where
         ));
     }
     // Caller runtimes are transient; pane tasks inherit the persistent owner.
-    if switchy_async::runtime::Handle::try_current()
-        .is_ok_and(|current| current.runtime_flavor() == switchy_async::RuntimeFlavor::MultiThread)
-    {
-        Ok(switchy_async::task::block_in_place(|| {
-            runtime.block_on(future)
-        }))
-    } else {
-        std::thread::scope(|scope| scope.spawn(|| runtime.block_on(future)).join())
-            .map_err(|_| failed("pane startup bridge thread panicked"))
+    match switchy_async::runtime::Handle::try_current() {
+        Ok(current) if current.runtime_flavor() == switchy_async::RuntimeFlavor::MultiThread => {
+            Ok(switchy_async::task::block_in_place(|| {
+                runtime.block_on(future)
+            }))
+        }
+        // No runtime on this thread: drive the owner from it.
+        Err(_) => Ok(runtime.block_on(future)),
+        // native-only: a current-thread runtime cannot block in place, so another thread
+        // drives the owner (simulated runtimes report MultiThread).
+        Ok(_) => std::thread::scope(|scope| scope.spawn(|| runtime.block_on(future)).join())
+            .map_err(|_| failed("pane startup bridge thread panicked")),
     }
 }
 
@@ -1564,7 +1567,7 @@ pub(super) fn send_acknowledged(
     authority: super::input_authority::InputAuthority,
 ) -> Result<(), ExecutionError> {
     authority.check().map_err(failed)?;
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let (sender, receiver) = switchy_thread::sync::mpsc::sync_channel(1);
     with_pane(host, reference, |pane| {
         if pane.exited.load(Ordering::SeqCst)
             || pane.execution.terminal_session_ended.load(Ordering::SeqCst)
@@ -1719,11 +1722,11 @@ mod tests {
 
     #[test]
     fn resize_barrier_waits_for_committed_projection_not_capture_or_early_watermark() {
-        let execution = std::sync::Arc::new(super::ExecutionCapture::default());
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let worker = std::sync::Arc::clone(&execution);
-        let thread = std::thread::spawn(move || {
+        let execution = switchy_thread::sync::Arc::new(super::ExecutionCapture::default());
+        let (started_tx, started_rx) = switchy_thread::sync::mpsc::channel();
+        let (done_tx, done_rx) = switchy_thread::sync::mpsc::channel();
+        let worker = switchy_thread::sync::Arc::clone(&execution);
+        let thread = switchy_thread::thread::spawn(move || {
             let _order = worker.capture_order.lock().unwrap();
             started_tx.send(()).unwrap();
             worker.wait_for_projection(1024).unwrap();
@@ -1912,16 +1915,17 @@ mod tests {
     fn concurrent_termination_after_natural_session_end_does_not_dispatch() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let capture = std::sync::Arc::new(super::ExecutionCapture::default());
+        let capture = switchy_thread::sync::Arc::new(super::ExecutionCapture::default());
         // A missing PTY would be a recovery error if signaling fell through.
         capture.managed_program.store(true, super::Ordering::SeqCst);
         let fence = capture.session.lock().unwrap();
-        let first = std::sync::Arc::clone(&capture);
-        let second = std::sync::Arc::clone(&capture);
+        let first = switchy_thread::sync::Arc::clone(&capture);
+        let second = switchy_thread::sync::Arc::clone(&capture);
         let (first_host, second_host) = (host.clone(), host.clone());
-        let a =
-            std::thread::spawn(move || first.signal_owned_group(&first_host, StopAction::Force));
-        let b = std::thread::spawn(move || {
+        let a = switchy_thread::thread::spawn(move || {
+            first.signal_owned_group(&first_host, StopAction::Force)
+        });
+        let b = switchy_thread::thread::spawn(move || {
             second.signal_owned_group(&second_host, StopAction::Cooperative)
         });
         capture
@@ -1942,14 +1946,15 @@ mod tests {
     fn concurrent_termination_after_natural_retirement_does_not_dispatch() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let capture = std::sync::Arc::new(super::ExecutionCapture::default());
+        let capture = switchy_thread::sync::Arc::new(super::ExecutionCapture::default());
         let fence = capture.session.lock().unwrap();
-        let first = std::sync::Arc::clone(&capture);
-        let second = std::sync::Arc::clone(&capture);
+        let first = switchy_thread::sync::Arc::clone(&capture);
+        let second = switchy_thread::sync::Arc::clone(&capture);
         let (first_host, second_host) = (host.clone(), host.clone());
-        let a =
-            std::thread::spawn(move || first.signal_owned_group(&first_host, StopAction::Force));
-        let b = std::thread::spawn(move || {
+        let a = switchy_thread::thread::spawn(move || {
+            first.signal_owned_group(&first_host, StopAction::Force)
+        });
+        let b = switchy_thread::thread::spawn(move || {
             second.signal_owned_group(&second_host, StopAction::Cooperative)
         });
         // Same fence used by natural retirement and side-effect authorization.
@@ -2043,7 +2048,7 @@ mod tests {
             .build()
             .unwrap();
         let handle = owner_handle(&owner);
-        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let cancelled = switchy_thread::sync::atomic::AtomicBool::new(true);
         let authorize = || {
             assert!(cancelled.load(super::Ordering::SeqCst));
             Err::<(), _>(super::ExecutionError::OperationFailed {

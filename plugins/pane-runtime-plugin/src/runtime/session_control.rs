@@ -10,8 +10,8 @@
 //! session (SIGKILL, OOM), the next activation for the same runtime sweeps the
 //! recorded sessions before admitting new panes; see [`recover`].
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use switchy_thread::sync::Mutex;
+use switchy_thread::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(unix)]
 #[path = "session_control/unix.rs"]

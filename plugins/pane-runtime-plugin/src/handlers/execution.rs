@@ -185,7 +185,7 @@ mod tests {
         ServiceKind, ServiceRequest, encode_service_message,
     };
     use std::collections::BTreeMap;
-    use std::sync::{Arc, Mutex};
+    use switchy_thread::sync::{Arc, Mutex};
     use uuid::Uuid;
 
     thread_local! {
@@ -385,7 +385,7 @@ mod tests {
         let mut output = Vec::new();
         authority.write(&mut output, b"local").unwrap();
         assert_eq!(output, b"local");
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = switchy_thread::sync::mpsc::channel();
         tx.send(authority).unwrap();
         *origin.lock().unwrap() = StreamProvenance::Invalid;
         assert!(rx.recv().unwrap().write(&mut output, b"revoked").is_err());
@@ -450,9 +450,9 @@ mod tests {
         ctx.caller_client_id = None;
         let session = bmux_session_models::SessionId(Uuid::new_v4());
         let manager = Arc::new(Mutex::new(()));
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let (sender, receiver) = switchy_thread::sync::mpsc::sync_channel(1);
         let writer_manager = manager.clone();
-        let writer = std::thread::spawn(move || {
+        let writer = switchy_thread::thread::spawn(move || {
             let crate::runtime::PaneRuntimeCommand::AdmittedInput(
                 bytes,
                 acknowledgement,

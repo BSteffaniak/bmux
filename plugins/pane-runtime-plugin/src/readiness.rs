@@ -3,7 +3,8 @@ use bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::RuntimeReadiness;
 use bmux_plugin_sdk::NativeLifecycleContext;
 use sha2::{Digest as _, Sha256};
 use std::fmt::Write as _;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use switchy_thread::sync::Mutex;
 
 /// One activation's readiness: published once by `activate`, owned by that
 /// activation's host handles (never process-wide).

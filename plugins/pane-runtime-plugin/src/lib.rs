@@ -222,12 +222,15 @@ bmux_plugin_sdk::plugin!(PaneRuntimePlugin);
 #[derive(Default)]
 pub struct PaneRuntimePlugin {
     /// The host handles this instance's activation received.
-    host: std::sync::RwLock<runtime::PaneRuntimeHost>,
+    host: switchy_thread::sync::RwLock<runtime::PaneRuntimeHost>,
 }
 
 fn slot_mut<T>(
-    slot: &std::sync::RwLock<T>,
-) -> std::result::Result<std::sync::RwLockWriteGuard<'_, T>, bmux_plugin_sdk::PluginCommandError> {
+    slot: &switchy_thread::sync::RwLock<T>,
+) -> std::result::Result<
+    switchy_thread::sync::RwLockWriteGuard<'_, T>,
+    bmux_plugin_sdk::PluginCommandError,
+> {
     slot.write()
         .map_err(|_| bmux_plugin_sdk::PluginCommandError::failed("plugin state lock poisoned"))
 }

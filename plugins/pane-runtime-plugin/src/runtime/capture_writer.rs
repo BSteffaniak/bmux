@@ -8,8 +8,8 @@ use super::durable_capture::{Boundary, DurableCapture};
 use bmux_pane_runtime_plugin_api::pane_runtime_presentation_v1::TerminalCaptureEventKind;
 use std::collections::VecDeque;
 use std::io;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::thread::JoinHandle;
+use switchy_thread::sync::{Arc, Condvar, Mutex, MutexGuard};
+use switchy_thread::thread::JoinHandle;
 
 const OUTPUT_SLOTS: usize = 32;
 const CONTROL_SLOTS: usize = 8;
@@ -137,7 +137,7 @@ impl CaptureWriter {
             changes: tokio::sync::watch::channel(()).0,
         }));
         let worker = writer.clone();
-        let thread = std::thread::Builder::new()
+        let thread = switchy_thread::thread::Builder::new()
             .name("bmux-capture-writer".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -308,7 +308,7 @@ impl CaptureWriter {
             .0
             .state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(switchy_thread::sync::PoisonError::into_inner);
         if state.progress.failure.is_none() {
             state.progress.failure = Some(bounded_message(reason));
         }
@@ -468,7 +468,7 @@ impl Drop for Reservation {
                 .0
                 .state
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                .unwrap_or_else(switchy_thread::sync::PoisonError::into_inner);
             release(&mut state, self.class);
             self.writer.0.changed.notify_all();
         }
@@ -515,7 +515,7 @@ mod writer_tests {
     #[tokio::test]
     async fn live_admission_precedes_storage_and_timestamps_are_not_writer_time() {
         let root = tempfile::tempdir().unwrap();
-        let (release, blocked) = std::sync::mpsc::channel();
+        let (release, blocked) = switchy_thread::sync::mpsc::channel();
         let (writer, mut owner) =
             CaptureWriter::start_with(DurableCapture::create(root.path()).unwrap(), move || {
                 blocked.recv().unwrap();
@@ -595,9 +595,9 @@ mod writer_tests {
             .collect();
         // Terminal capacity does not compete with saturated output or controls.
         let terminal = writer.reserve_end().unwrap();
-        let (entered, ready) = std::sync::mpsc::channel();
+        let (entered, ready) = switchy_thread::sync::mpsc::channel();
         let waiting = writer.clone();
-        let thread = std::thread::spawn(move || {
+        let thread = switchy_thread::thread::spawn(move || {
             entered.send(()).unwrap();
             waiting.reserve_output().is_err()
         });

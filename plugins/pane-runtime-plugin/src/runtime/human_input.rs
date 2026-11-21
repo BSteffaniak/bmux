@@ -9,8 +9,8 @@ use bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::{
     HumanInputAck, HumanInputCapabilities, HumanInputError, HumanInputStream,
 };
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Mutex, TryLockError};
 use std::time::{Duration, Instant};
+use switchy_thread::sync::{Arc, Mutex, TryLockError};
 use uuid::Uuid;
 
 const MAX_PAYLOAD_BYTES: usize = 16 * 1024;
@@ -309,7 +309,7 @@ pub(crate) fn open_unvalidated_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use switchy_thread::sync::atomic::{AtomicUsize, Ordering};
 
     fn execution() -> TerminalExecutionRef {
         TerminalExecutionRef {
@@ -508,8 +508,8 @@ mod tests {
     fn pty_wait_does_not_hold_registry_and_concurrent_requests_fail_busy() {
         let registry = Registry::default();
         let stream = registry.open(execution()).unwrap();
-        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
-        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let (started_tx, started_rx) = switchy_thread::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = switchy_thread::sync::mpsc::sync_channel(1);
         std::thread::scope(|scope| {
             let worker_registry = &registry;
             let worker_stream = &stream;

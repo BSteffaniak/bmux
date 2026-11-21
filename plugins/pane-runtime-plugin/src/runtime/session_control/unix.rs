@@ -3,7 +3,7 @@ use crate::runtime::session_sweep;
 use serde::{Deserialize, Serialize};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use switchy_thread::sync::Mutex;
 
 /// Nothing has to exist before a Unix spawn: `setsid` happens in the child.
 #[derive(Debug)]

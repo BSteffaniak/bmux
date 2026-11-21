@@ -11,7 +11,7 @@ use bmux_pane_runtime_plugin_api::pane_runtime_output_filters_v1::{
 use bmux_terminal_grid::{
     FilterInterest, FilterVerdict, SequenceFilter, SequenceFilters, SequenceHeader,
 };
-use std::sync::Arc;
+use switchy_thread::sync::Arc;
 
 /// Most rules one caller may set.
 pub(crate) const MAX_RULES: usize = 256;
@@ -21,7 +21,7 @@ const MAX_REPLACEMENT_BYTES: usize = 4096;
 /// Set `caller`'s rules for every pane in `filters` (an empty list removes them), after checking
 /// each.
 pub(crate) fn set_rules(
-    filters: &std::sync::RwLock<SequenceFilters>,
+    filters: &switchy_thread::sync::RwLock<SequenceFilters>,
     caller: &str,
     rules: Vec<OutputRule>,
 ) -> Result<(), OutputFilterError> {
@@ -33,7 +33,7 @@ pub(crate) fn set_rules(
     let filter = RuleFilter::new(rules)?;
     let mut filters = filters
         .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .unwrap_or_else(switchy_thread::sync::PoisonError::into_inner);
     filters.set(
         caller,
         (!filter.rules.is_empty()).then(|| Arc::new(filter) as Arc<dyn SequenceFilter>),

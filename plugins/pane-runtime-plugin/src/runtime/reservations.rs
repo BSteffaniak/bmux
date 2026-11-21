@@ -7,7 +7,8 @@ use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::{
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
+use switchy_thread::sync::Mutex;
 
 #[derive(Deserialize, Serialize)]
 struct StoredReservation {

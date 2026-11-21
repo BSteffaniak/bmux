@@ -8,10 +8,10 @@ pub(super) fn prepare(root: &Path) -> Result<PathBuf> {
     // which may have been removed or replaced since this process started.
     // Process-wide by design: it pins this process's own executable images.
     static IMAGES: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::BTreeMap<PathBuf, (PathBuf, String)>>,
+        switchy_thread::sync::Mutex<std::collections::BTreeMap<PathBuf, (PathBuf, String)>>,
     > = std::sync::OnceLock::new();
     let mut images = IMAGES
-        .get_or_init(std::sync::Mutex::default)
+        .get_or_init(switchy_thread::sync::Mutex::default)
         .lock()
         .map_err(|_| anyhow::anyhow!("shell callback image lock poisoned"))?;
     std::fs::create_dir_all(root)?;

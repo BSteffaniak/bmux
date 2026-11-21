@@ -8,8 +8,8 @@ use std::io;
 use std::os::windows::io::{AsHandle as _, AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use switchy_thread::sync::Mutex;
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -199,7 +199,7 @@ impl Session {
                         ),
                     ));
                 }
-                std::thread::sleep(Duration::from_millis(10));
+                switchy_thread::thread::sleep(Duration::from_millis(10));
             }
         })
     }
@@ -269,7 +269,7 @@ mod tests {
         let pair = bmux_pty::PtyPair::open(bmux_pty::PtySize::new(80, 24)).unwrap();
         let mut reader = pair.master.try_clone_reader().unwrap();
         let mut input = pair.master.take_writer().unwrap();
-        std::thread::spawn(move || {
+        switchy_thread::thread::spawn(move || {
             let mut buffer = [0; 4096];
             while let Ok(read) = reader.read(&mut buffer) {
                 if read == 0 {
@@ -303,7 +303,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         while session.with_job(active_processes).unwrap() < 2 {
             assert!(Instant::now() < deadline, "ping never started");
-            std::thread::sleep(Duration::from_millis(10));
+            switchy_thread::thread::sleep(Duration::from_millis(10));
         }
         assert!(session.occupied().unwrap());
         session.sweep().unwrap();
@@ -321,7 +321,7 @@ mod tests {
             Session::adopt(preparation, child.process_id().unwrap(), &pair.master).unwrap();
         session.release_survivors();
         session.release();
-        std::thread::sleep(Duration::from_millis(200));
+        switchy_thread::thread::sleep(Duration::from_millis(200));
         assert!(
             child.try_wait().unwrap().is_none(),
             "kill-on-close still fired"
@@ -341,7 +341,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(10);
         while child.try_wait().unwrap().is_none() {
             assert!(Instant::now() < deadline, "kill-on-close did not fire");
-            std::thread::sleep(Duration::from_millis(10));
+            switchy_thread::thread::sleep(Duration::from_millis(10));
         }
     }
 }

@@ -3,7 +3,7 @@ use super::execution;
 use bmux_pane_runtime_plugin_api::{
     pane_runtime_execution_v1 as v1, pane_runtime_execution_v3 as v3,
 };
-use std::sync::atomic::Ordering;
+use switchy_thread::sync::atomic::Ordering;
 
 fn legacy(reference: &v3::TerminalExecutionRef) -> v1::ExecutionRef {
     v1::ExecutionRef {
@@ -178,7 +178,7 @@ pub(crate) fn wait(
         {
             return Ok(current);
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        switchy_thread::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 

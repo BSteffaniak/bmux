@@ -16,8 +16,9 @@
 //! when they do instead of polling.
 
 use std::collections::BTreeMap;
-use std::sync::MutexGuard;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::OnceLock;
+use switchy_thread::sync::MutexGuard;
+use switchy_thread::sync::{Arc, Mutex, PoisonError};
 
 use bmux_pane_runtime_plugin_api::attach_runtime_state::AttachPaneOutputBatch;
 use bmux_plugin_sdk::WireEventSink;
