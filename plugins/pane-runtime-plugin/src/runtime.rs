@@ -70,7 +70,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
+use switchy_async::task::JoinHandle;
 use tracing::{trace, warn};
 
 pub(crate) fn managed_target_identity(host: &PaneRuntimeHost) -> Result<Option<String>, String> {
@@ -736,7 +736,7 @@ async fn await_pane_cleanup(
         .collect::<Vec<_>>();
     let mut acknowledged = vec![false; panes.len()];
     let mut pending = vec![true; panes.len()];
-    let mut diagnostic = Box::pin(tokio::time::sleep(Duration::from_secs(5)));
+    let mut diagnostic = Box::pin(switchy_async::time::sleep(Duration::from_secs(5)));
     std::future::poll_fn(|cx| {
         use std::future::Future;
         if diagnostic.as_mut().poll(cx).is_ready() {
@@ -744,9 +744,7 @@ async fn await_pane_cleanup(
                 pending_tasks = pending.iter().filter(|pending| **pending).count(),
                 errors = ?errors,
                 "pane cleanup still waiting; owners/reapers retained, plugin unload fenced");
-            diagnostic
-                .as_mut()
-                .reset(tokio::time::Instant::now() + Duration::from_secs(5));
+            diagnostic.set(switchy_async::time::sleep(Duration::from_secs(5)));
             let _ = diagnostic.as_mut().poll(cx);
         }
         for (index, (pane, pending)) in panes.iter_mut().zip(&mut pending).enumerate() {
@@ -824,7 +822,7 @@ async fn shutdown_panes_owned(
     let (begin, admission) = oneshot::channel();
     let (settled, settlement) = oneshot::channel();
     let task_host = host.clone();
-    let owner = tokio::spawn(async move {
+    let owner = switchy_async::task::spawn(async move {
         let host = &task_host;
         if admission.await.is_err() {
             return Ok(());
@@ -856,7 +854,7 @@ async fn shutdown_panes_owned(
         let mut revocations = Vec::with_capacity(lifetimes.len());
         for lifetime in lifetimes {
             let worker_host = host.clone();
-            revocations.push(tokio::task::spawn_blocking(move || {
+            revocations.push(switchy_async::task::spawn_blocking(move || {
                 let host = &worker_host;
                 let frozen = lifetime
                     .resurrection
@@ -945,10 +943,10 @@ impl Drop for SupervisionCompletion {
 
 fn supervision_join(
     threads: &mut [Option<std::thread::JoinHandle<()>>],
-) -> tokio::task::JoinHandle<std::result::Result<(), String>> {
+) -> switchy_async::task::JoinHandle<std::result::Result<(), String>> {
     let handles: Vec<_> = threads.iter_mut().filter_map(Option::take).collect();
     // This owner retains every unreaped handle across the observer deadline.
-    tokio::task::spawn_blocking(move || {
+    switchy_async::task::spawn_blocking(move || {
         let mut panicked = false;
         for thread in handles {
             panicked |= thread.join().is_err();
@@ -963,10 +961,10 @@ fn supervision_join(
 
 #[cfg(test)]
 async fn join_supervision_threads(
-    join: &mut tokio::task::JoinHandle<std::result::Result<(), String>>,
+    join: &mut switchy_async::task::JoinHandle<std::result::Result<(), String>>,
     timeout: Duration,
 ) -> std::result::Result<(), String> {
-    tokio::time::timeout(timeout, join)
+    switchy_async::time::timeout(timeout, join)
         .await
         .map_err(|_| "pane supervision threads did not exit before cleanup deadline".to_string())?
         .map_err(|error| format!("pane supervision join failed: {error}"))?
@@ -977,7 +975,7 @@ async fn stop_unpublished_pane(pane: &mut PaneRuntimeHandle) -> Result<()> {
     if let Some(stop) = pane.stop_tx.take() {
         let _ = stop.send(());
     }
-    tokio::time::timeout(Duration::from_secs(5), &mut pane.task)
+    switchy_async::time::timeout(Duration::from_secs(5), &mut pane.task)
         .await
         .map_err(|_| anyhow::anyhow!("unpublished pane cleanup timed out"))?
         .map_err(|error| anyhow::anyhow!("unpublished pane task cleanup failed: {error}"))?;
@@ -1413,7 +1411,7 @@ const fn wait_for_exit_without_reaping(_pid: u32) {}
 
 struct StartupChild {
     child: Option<Box<dyn crate::runtime::pty::Child + Send + Sync>>,
-    runtime: tokio::runtime::Handle,
+    runtime: switchy_async::runtime::Handle,
     host: PaneRuntimeHost,
 }
 
@@ -1424,7 +1422,7 @@ impl StartupChild {
     ) -> Self {
         Self {
             child: Some(child),
-            runtime: tokio::runtime::Handle::current(),
+            runtime: switchy_async::runtime::Handle::current(),
             host: host.clone(),
         }
     }
@@ -1474,7 +1472,7 @@ fn cleanup_failed_startup_child(
 ) -> impl std::future::Future<Output = String> {
     let cleanup = cleanup_failed_startup_child_on(
         host,
-        &tokio::runtime::Handle::current(),
+        &switchy_async::runtime::Handle::current(),
         child,
         failure,
         None,
@@ -1490,7 +1488,7 @@ fn cleanup_failed_startup_child_acknowledged(
 ) -> impl std::future::Future<Output = String> + use<> {
     let cleanup = cleanup_failed_startup_child_on(
         host,
-        &tokio::runtime::Handle::current(),
+        &switchy_async::runtime::Handle::current(),
         child,
         failure,
         Some(acknowledgement.clone()),
@@ -1500,7 +1498,7 @@ fn cleanup_failed_startup_child_acknowledged(
 
 fn cleanup_failed_startup_child_on(
     host: &crate::runtime::PaneRuntimeHost,
-    runtime: &tokio::runtime::Handle,
+    runtime: &switchy_async::runtime::Handle,
     mut child: Box<dyn crate::runtime::pty::Child + Send + Sync>,
     failure: String,
     acknowledgement: Option<watch::Sender<Option<std::result::Result<(), String>>>>,
@@ -1511,7 +1509,7 @@ fn cleanup_failed_startup_child_on(
     let host = host.clone();
     let cleanup = runtime.spawn(async move {
         let host = &host;
-        let reaper = tokio::task::spawn_blocking(move || {
+        let reaper = switchy_async::task::spawn_blocking(move || {
             let kill_error = child.kill().err();
             (child.wait(), kill_error)
         });
@@ -1554,17 +1552,17 @@ async fn poll_failed_startup_child(
     kill_error: Option<std::io::Error>,
     timeout: Duration,
 ) -> Result<(), String> {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = switchy_async::time::Instant::now() + timeout;
     loop {
         match poll() {
             Ok(true) => return Ok(()),
             Err(error) => return Err(format!("wait failed: {error}; kill error: {kill_error:?}")),
             Ok(false) => {}
         }
-        if tokio::time::Instant::now() >= deadline {
+        if switchy_async::time::Instant::now() >= deadline {
             return Err(format!("timed out; kill error: {kill_error:?}"));
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        switchy_async::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -1662,7 +1660,7 @@ impl Drop for PendingPublicationGuard {
 
 struct PreparedCleanup {
     _admission: managed_idle::Admission,
-    runtime: tokio::runtime::Handle,
+    runtime: switchy_async::runtime::Handle,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -1681,7 +1679,7 @@ impl PreparedCleanup {
         host: &PaneRuntimeHost,
         slots: Arc<tokio::sync::Semaphore>,
     ) -> Result<Arc<Self>> {
-        let runtime = tokio::runtime::Handle::try_current()?;
+        let runtime = switchy_async::runtime::Handle::try_current()?;
         let permit = slots.try_acquire_owned().map_err(|_| {
             spawn_failure(bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError::Busy)
         })?;
@@ -6977,7 +6975,7 @@ async fn startup_identity_or_stop(
     identity: impl std::future::Future<Output = Option<ProcessStartIdentity>>,
     stop: &mut oneshot::Receiver<()>,
 ) -> Result<Option<ProcessStartIdentity>, ()> {
-    tokio::select! {
+    switchy_async::select! {
         biased;
         _ = stop => Err(()),
         identity = identity => Ok(identity),
@@ -7014,7 +7012,7 @@ async fn bounded_start_identity_probe(
         .ok()?;
     // Dropping this future abandons the result, not the admission permit.
     // A stalled native query continues to occupy one of the four slots.
-    tokio::time::timeout(Duration::from_millis(250), receiver)
+    switchy_async::time::timeout(Duration::from_millis(250), receiver)
         .await
         .ok()?
         .ok()?
@@ -7742,11 +7740,11 @@ impl SessionRuntimeManager {
         let (cleanup_tx, cleanup) = watch::channel(None);
         let fence_input_for_reader = input_tx.clone();
         let task_host = host.clone();
-        let task = tokio::spawn(async move {
+        let task = switchy_async::task::spawn(async move {
             let host = task_host;
             let _publication_guard = PendingPublicationGuard(Arc::clone(&publication_for_task));
             if let Some(permit) = launch_permit {
-                tokio::select! {
+                switchy_async::select! {
                     biased;
                     _ = &mut stop_rx => { cleanup_tx.send_replace(Some(Ok(()))); return; },
                     result = permit => if result.is_err() { cleanup_tx.send_replace(Some(Ok(()))); return; },
@@ -7999,7 +7997,7 @@ impl SessionRuntimeManager {
             }
             let spawn_authorization = Arc::clone(&execution_for_task);
             let authorization =
-                tokio::task::spawn_blocking(move || spawn_authorization.authorize_spawn())
+                switchy_async::task::spawn_blocking(move || spawn_authorization.authorize_spawn())
                     .await
                     .map_err(|error| anyhow::anyhow!("spawn authorization worker failed: {error}"))
                     .and_then(std::convert::identity);
@@ -8056,7 +8054,7 @@ impl SessionRuntimeManager {
                         let mut changes = writer.subscribe();
                         let execution = Arc::downgrade(&execution_for_task);
                         let observed = writer.clone();
-                        tokio::spawn(async move {
+                        switchy_async::task::spawn(async move {
                             loop {
                                 let Some(execution) = execution.upgrade() else {
                                     break;
@@ -8777,7 +8775,7 @@ impl SessionRuntimeManager {
                 if !startup_ready {
                     break;
                 }
-                tokio::select! {
+                switchy_async::select! {
                     changed = execution_changes.changed() => {
                         if changed.is_err() {
                             execution_for_task.record_error("execution lifecycle publisher disconnected".into());
@@ -8798,7 +8796,7 @@ impl SessionRuntimeManager {
                                 execution: Arc::clone(&execution_for_task),
                                 resurrection: Arc::clone(&resurrection_state_for_shutdown),
                             };
-                            let cleanup = tokio::task::spawn_blocking({ let host = host.clone(); move || {
+                            let cleanup = switchy_async::task::spawn_blocking({ let host = host.clone(); move || {
                                 if let Err(error) = lifetime.execution.signal_owned_group(&host, native_process::StopAction::Force) {
                                     lifetime.execution.record_cleanup_error(format!("reader-failure group cleanup failed: {error}"));
                                 }
@@ -8817,7 +8815,7 @@ impl SessionRuntimeManager {
                         // Checkpoint/service IO and helper cleanup must not block
                         // executor workers, otherwise multipane shutdown is serial
                         // even when every pane received stop concurrently.
-                        let stopped = tokio::task::spawn_blocking({ let host = host.clone(); move || {
+                        let stopped = switchy_async::task::spawn_blocking({ let host = host.clone(); move || {
                             let frozen = resurrection.lock()
                                 .map_err(|_| anyhow::anyhow!("resurrection lock poisoned"))
                                 .and_then(|mut state| state.freeze());
@@ -9439,7 +9437,7 @@ impl SessionRuntimeManager {
                     index.remove(&floating_pane_id);
                 }
                 let shutdown_host = host.clone();
-                tokio::spawn(async move {
+                switchy_async::task::spawn(async move {
                     shutdown_pane_handle(&shutdown_host, floating_pane).await;
                 });
             }
@@ -9469,7 +9467,7 @@ impl SessionRuntimeManager {
         }
 
         let shutdown_host = host.clone();
-        tokio::spawn(async move {
+        switchy_async::task::spawn(async move {
             shutdown_pane_handle(&shutdown_host, pane).await;
         });
         self.apply_stored_attach_viewport(session_id);
@@ -9532,7 +9530,7 @@ impl SessionRuntimeManager {
         };
         self.unregister_pane_input(pane_meta.id);
         let shutdown_host = host.clone();
-        tokio::spawn(async move {
+        switchy_async::task::spawn(async move {
             shutdown_pane_handle(&shutdown_host, old_pane).await;
         });
 
@@ -10838,16 +10836,16 @@ impl ServerSessionRuntimeAdapter {
         ratio: f32,
         authorize: impl Fn() -> Result<()>,
     ) -> Result<Uuid> {
-        let runtime = tokio::runtime::Handle::try_current()?;
+        let runtime = switchy_async::runtime::Handle::try_current()?;
         anyhow::ensure!(
-            runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread,
+            runtime.runtime_flavor() == switchy_async::RuntimeFlavor::MultiThread,
             "synchronous split requires the server's multi-thread runtime"
         );
         authorize()?;
         let mut prepared = self
             .with_lock(|m| m.prepare_split(session_id, target, direction, options))
             .ok_or_else(Self::lock_poisoned_anyhow)??;
-        tokio::task::block_in_place(|| {
+        switchy_async::task::block_in_place(|| {
             runtime.block_on(async {
                 let readiness = async {
                     prepared
@@ -10857,7 +10855,7 @@ impl ServerSessionRuntimeAdapter {
                         .send(())
                         .map_err(|()| anyhow::anyhow!("split startup task ended"))?;
                     let mut startup = prepared.pane.as_ref().expect("split owner").startup.clone();
-                    tokio::time::timeout(Duration::from_secs(10), async {
+                    switchy_async::time::timeout(Duration::from_secs(10), async {
                         loop {
                             if let Some(result) = startup.borrow_and_update().clone() {
                                 return result.map_err(anyhow::Error::msg);
@@ -10918,7 +10916,7 @@ impl ServerSessionRuntimeAdapter {
             .ok_or_else(Self::lock_poisoned_anyhow)??;
         // Startup must be driven without holding the manager: readers and
         // unrelated service requests need to make progress while the PTY starts.
-        let startup = tokio::time::timeout(Duration::from_secs(10), prepared.wait_until_ready())
+        let startup = switchy_async::time::timeout(Duration::from_secs(10), prepared.wait_until_ready())
             .await
             .map_err(|_| anyhow::anyhow!("pane startup readiness timed out"))
             .and_then(std::convert::identity);
@@ -11203,12 +11201,12 @@ fn frames_for_panes(
 
 impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeAdapter {
     fn start_runtime(&self, session_id: SessionId) -> anyhow::Result<()> {
-        let runtime = tokio::runtime::Handle::try_current()?;
+        let runtime = switchy_async::runtime::Handle::try_current()?;
         anyhow::ensure!(
-            runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread,
+            runtime.runtime_flavor() == switchy_async::RuntimeFlavor::MultiThread,
             "synchronous runtime creation requires the server's multi-thread runtime"
         );
-        tokio::task::block_in_place(|| runtime.block_on(self.start_fresh_runtime(session_id)))
+        switchy_async::task::block_in_place(|| runtime.block_on(self.start_fresh_runtime(session_id)))
     }
 
     fn restore_runtime(
@@ -12867,8 +12865,8 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         let Some(handle) = Self::take_shutdown_handle(&info) else {
             return;
         };
-        if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            tokio::task::block_in_place(|| {
+        if let Ok(rt) = switchy_async::runtime::Handle::try_current() {
+            switchy_async::task::block_in_place(|| {
                 rt.block_on(shutdown_runtime_handle(
                     host,
                     RemovedRuntime {
@@ -13207,7 +13205,7 @@ fn encode_captured_image_window(
 #[derive(Clone)]
 pub(crate) struct SpawnRuntimeHandle(
     Arc<Mutex<SessionRuntimeManager>>,
-    tokio::runtime::Handle,
+    switchy_async::runtime::Handle,
     Arc<RwLock<BTreeMap<Uuid, PaneInputHandle>>>,
 );
 
@@ -13282,14 +13280,14 @@ pub(crate) fn new_session_v1(
     let sessions = host
         .handle::<bmux_session_state::SessionManagerHandle>()
         .ok_or_else(|| spawn_failure(SpawnError::SourceUnavailable))?;
-    let runtime = tokio::runtime::Handle::try_current()?;
+    let runtime = switchy_async::runtime::Handle::try_current()?;
     anyhow::ensure!(
-        runtime.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread,
+        runtime.runtime_flavor() == switchy_async::RuntimeFlavor::MultiThread,
         "new-session requires multi-thread runtime"
     );
     let inserted = std::cell::Cell::new(false);
     let adapter = ServerSessionRuntimeAdapter::new(handle.0);
-    let result = tokio::task::block_in_place(|| {
+    let result = switchy_async::task::block_in_place(|| {
         runtime.block_on(adapter.start_fresh_runtime_transaction(
             id,
             Some(request.options),
@@ -13572,7 +13570,7 @@ async fn process_pane_exit_events(
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     loop {
-        tokio::select! {
+        switchy_async::select! {
             changed = shutdown_rx.changed() => {
                 if changed.is_ok() && *shutdown_rx.borrow() {
                     break;
@@ -14091,7 +14089,7 @@ impl bmux_plugin_runtime::shutdown::ShutdownParticipant for PaneRuntimeShutdown 
             let mut errors = result.err().into_iter().collect::<Vec<_>>();
             for (id, mut owner) in owners {
                 loop {
-                    match tokio::time::timeout(Duration::from_secs(5), &mut owner).await {
+                    match switchy_async::time::timeout(Duration::from_secs(5), &mut owner).await {
                         Ok(Ok(Ok(()))) => break,
                         Ok(Ok(Err(error))) => {
                             errors.push(error);
@@ -14183,13 +14181,13 @@ pub(crate) fn activate_pane_runtime(
     host.states()
         .register::<SpawnRuntimeHandle>(&Arc::new(std::sync::RwLock::new(SpawnRuntimeHandle(
             Arc::clone(&manager),
-            tokio::runtime::Handle::current(),
+            switchy_async::runtime::Handle::current(),
             pane_index,
         ))));
     let expiry_manager = Arc::clone(&manager);
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(PANE_PADDING_PREVIEW_SWEEP_INTERVAL);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    switchy_async::task::spawn(async move {
+        let mut interval = switchy_async::time::interval(PANE_PADDING_PREVIEW_SWEEP_INTERVAL);
+        interval.set_missed_tick_behavior(switchy_async::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
             if with_padding_manager(&expiry_manager, |manager| {
@@ -14205,7 +14203,7 @@ pub(crate) fn activate_pane_runtime(
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let exit_manager = Arc::clone(&manager);
-    tokio::spawn(async move {
+    switchy_async::task::spawn(async move {
         // No external shutdown owner is wired here. Keep the sender alive for
         // this task's scope: exit_rx closure or runtime abort owns its lifetime.
         // A named binding (not `let _ = ...`) drops only after the await ends.
@@ -14378,7 +14376,7 @@ mod tests {
         };
         // Let the activation task poll its shutdown receiver before enqueueing
         // exit. The old disconnected watch sender closes this listener here.
-        tokio::task::yield_now().await;
+        switchy_async::task::yield_now().await;
         assert!(
             !exit_tx.is_closed(),
             "activation dropped the pane exit listener"
@@ -14389,7 +14387,7 @@ mod tests {
                 pane_id,
             })
             .unwrap();
-        let event = tokio::time::timeout(Duration::from_secs(1), async {
+        let event = switchy_async::time::timeout(Duration::from_secs(1), async {
             loop {
                 let event = events.recv().await.unwrap();
                 if matches!(&*event, PaneEvent::Exited { session_id: sid, pane_id: pid, .. }
@@ -14455,9 +14453,9 @@ mod tests {
             pane.input_tx
                 .send(PaneRuntimeCommand::Input(b"printf DIRECT_INPUT\n".to_vec()))
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), async {
+            switchy_async::time::timeout(Duration::from_secs(5), async {
                 while execution.output_watermark.load(Ordering::SeqCst) < 12 {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    switchy_async::time::sleep(Duration::from_millis(10)).await;
                 }
             })
             .await
@@ -14465,7 +14463,7 @@ mod tests {
             assert!(execution.session.lock().unwrap().is_some());
             assert!(!pane.exited.load(Ordering::SeqCst));
             let removed = manager.remove_runtime(session_id).unwrap();
-            tokio::time::timeout(
+            switchy_async::time::timeout(
                 Duration::from_secs(5),
                 shutdown_runtime_handle(host, removed),
             )
@@ -14518,7 +14516,7 @@ mod tests {
                 .execution,
         );
         let _cleanup = ExecutionTestCleanup(Arc::clone(&execution));
-        tokio::time::timeout(Duration::from_secs(5), prepared.wait_until_ready())
+        switchy_async::time::timeout(Duration::from_secs(5), prepared.wait_until_ready())
             .await
             .expect("ConPTY cursor negotiation must not block program startup")
             .unwrap();
@@ -14526,12 +14524,12 @@ mod tests {
             .commit_fresh_runtime(session_id, &mut prepared, || Ok(()))
             .unwrap();
         let pane = manager.runtimes[&session_id].panes.values().next().unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        switchy_async::time::timeout(Duration::from_secs(5), async {
             while !execution.output_drained.load(Ordering::SeqCst)
                 || !pane.exited.load(Ordering::SeqCst)
                 || !execution.terminal_owner_retired.load(Ordering::SeqCst)
             {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                switchy_async::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -14598,11 +14596,11 @@ mod tests {
             .unwrap();
         let pane = manager.runtimes[&session_id].panes.values().next().unwrap();
         let _cleanup = ExecutionTestCleanup(Arc::clone(&pane.execution));
-        tokio::time::timeout(Duration::from_secs(5), async {
+        switchy_async::time::timeout(Duration::from_secs(5), async {
             while !pane.execution.output_drained.load(Ordering::SeqCst)
                 || !pane.exited.load(Ordering::SeqCst)
             {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                switchy_async::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -14663,9 +14661,9 @@ mod tests {
             .commit_fresh_runtime(session_id, &mut prepared, || Ok(()))
             .unwrap();
         let pane = manager.runtimes[&session_id].panes.values().next().unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        switchy_async::time::timeout(Duration::from_secs(5), async {
             while pane.cleanup.borrow().is_none() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                switchy_async::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -14728,11 +14726,11 @@ mod tests {
             .unwrap();
         let pane = manager.runtimes[&session_id].panes.values().next().unwrap();
         assert!(execution.session.lock().unwrap().is_some());
-        let drained = tokio::time::timeout(Duration::from_secs(5), async {
+        let drained = switchy_async::time::timeout(Duration::from_secs(5), async {
             while !execution.output_drained.load(Ordering::SeqCst)
                 || !pane.exited.load(Ordering::SeqCst)
             {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                switchy_async::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await;
@@ -14750,9 +14748,9 @@ mod tests {
         );
         assert_eq!(execution.outcome.lock().unwrap().0, Some(0));
         assert!(!execution.group_kill_issued.load(Ordering::SeqCst));
-        tokio::time::timeout(Duration::from_secs(5), async {
+        switchy_async::time::timeout(Duration::from_secs(5), async {
             while pane.cleanup.borrow().is_none() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                switchy_async::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -14805,11 +14803,11 @@ mod tests {
             .unwrap();
         let pane = manager.runtimes[&session_id].panes.values().next().unwrap();
         assert!(execution.session.lock().unwrap().is_some());
-        let drained = tokio::time::timeout(Duration::from_secs(5), async {
+        let drained = switchy_async::time::timeout(Duration::from_secs(5), async {
             while execution.output_watermark.load(Ordering::SeqCst) != 40 * 8192 + 4
                 || !pane.exited.load(Ordering::SeqCst)
             {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                switchy_async::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await;
@@ -14829,11 +14827,11 @@ mod tests {
         // Conventional owner retirement must yield natural EOF without Sweep.
         // Completion is the reader watermark, never target exit or tcdrain.
         assert!(!execution.group_kill_issued.load(Ordering::SeqCst));
-        tokio::time::timeout(Duration::from_secs(5), async {
+        switchy_async::time::timeout(Duration::from_secs(5), async {
             while !execution.output_drained.load(Ordering::SeqCst)
                 || pane.cleanup.borrow().is_none()
             {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                switchy_async::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -14844,9 +14842,9 @@ mod tests {
         );
         assert_eq!(execution.outcome.lock().unwrap().0, Some(0));
         assert!(pane.cleanup.borrow().as_ref().unwrap().is_ok());
-        tokio::time::timeout(Duration::from_secs(5), async {
+        switchy_async::time::timeout(Duration::from_secs(5), async {
             while pane.cleanup.borrow().is_none() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                switchy_async::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -14986,9 +14984,9 @@ exit 7"#
             .commit_fresh_runtime(session_id, &mut prepared, || Ok(()))
             .unwrap();
         let pane = manager.runtimes[&session_id].panes.values().next().unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        switchy_async::time::timeout(Duration::from_secs(5), async {
             while !pane.exited.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                switchy_async::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -15015,9 +15013,9 @@ exit 7"#
         };
         // Retiring the exact owner must not depend on a descendant closing the
         // PTY. Neither retirement nor session end is a capture EOF receipt.
-        tokio::time::timeout(Duration::from_secs(5), async {
+        switchy_async::time::timeout(Duration::from_secs(5), async {
             while !pane.execution.terminal_owner_retired.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                switchy_async::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -15039,9 +15037,9 @@ exit 7"#
         );
         assert_eq!(process_start_identity_for_pid(descendant), Some(identity));
         std::fs::write(witness.path().join("probe"), b"").unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        switchy_async::time::timeout(Duration::from_secs(5), async {
             while !witness.path().join("late-result").exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                switchy_async::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -15065,11 +15063,11 @@ exit 7"#
         );
         assert_eq!(process_start_identity_for_pid(descendant), Some(identity));
         std::fs::write(witness.path().join("release"), b"").unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        switchy_async::time::timeout(Duration::from_secs(5), async {
             while !witness.path().join("released").exists()
                 || !matches!(&*pane.cleanup.borrow(), Some(Ok(())))
             {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                switchy_async::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -15147,9 +15145,9 @@ exit 7"#
             .commit_fresh_runtime(session_id, &mut prepared, || Ok(()))
             .unwrap();
         let pane = manager.runtimes[&session_id].panes.values().next().unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        switchy_async::time::timeout(Duration::from_secs(5), async {
             while pane.cleanup.borrow().is_none() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                switchy_async::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
@@ -17285,7 +17283,7 @@ exit 7"#
         let state = Arc::clone(&pane.resurrection_state);
         let (stop, stopped) = oneshot::channel();
         pane.stop_tx = Some(stop);
-        let task = tokio::spawn(async move {
+        let task = switchy_async::task::spawn(async move {
             stopped.await.unwrap();
         });
         let old = std::mem::replace(&mut pane.task, task);
@@ -17309,7 +17307,7 @@ exit 7"#
             let (stop, stopped) = oneshot::channel();
             pane.stop_tx = Some(stop);
             let barrier = Arc::clone(&barrier);
-            let task = tokio::spawn(async move {
+            let task = switchy_async::task::spawn(async move {
                 stopped.await.unwrap();
                 barrier.wait().await;
             });
@@ -17321,7 +17319,7 @@ exit 7"#
                 handle: runtime,
             });
         }
-        tokio::time::timeout(
+        switchy_async::time::timeout(
             Duration::from_secs(2),
             shutdown_removed_runtimes(host, removed),
         )
@@ -17339,14 +17337,14 @@ exit 7"#
         let (cleanup, receiver) = watch::channel(None);
         pane.cleanup = receiver;
         let (finish, finished) = oneshot::channel();
-        let task = tokio::spawn(async move {
+        let task = switchy_async::task::spawn(async move {
             cleanup.send_replace(Some(Err("injected acknowledgement failure".into())));
             let _ = finished.await;
         });
         let old = std::mem::replace(&mut pane.task, task);
         old.abort();
         let _ = old.await;
-        let error = tokio::time::timeout(
+        let error = switchy_async::time::timeout(
             Duration::from_secs(2),
             shutdown_panes_result(host, vec![pane]),
         )
@@ -17359,9 +17357,9 @@ exit 7"#
             "cleanup owner dropped before reaper settled"
         );
         finish.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
+        switchy_async::time::timeout(Duration::from_secs(2), async {
             while execution.upgrade().is_some() {
-                tokio::task::yield_now().await;
+                switchy_async::task::yield_now().await;
             }
         })
         .await
@@ -17379,7 +17377,7 @@ exit 7"#
         pane.cleanup = receiver;
         let (acknowledged, acknowledgement) = oneshot::channel();
         let (finish, finished) = oneshot::channel();
-        let task = tokio::spawn(async move {
+        let task = switchy_async::task::spawn(async move {
             cleanup.send_replace(Some(Err("late reaper".into())));
             acknowledged.send(()).unwrap();
             let _ = finished.await;
@@ -17388,7 +17386,7 @@ exit 7"#
         old.abort();
         let _ = old.await;
         let release_host = host.clone();
-        let mut release = tokio::spawn(async move {
+        let mut release = switchy_async::task::spawn(async move {
             shutdown_removed_runtimes(
                 &release_host,
                 vec![RemovedRuntime {
@@ -17400,7 +17398,7 @@ exit 7"#
         });
         acknowledgement.await.unwrap();
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut release)
+            switchy_async::time::timeout(Duration::from_millis(20), &mut release)
                 .await
                 .is_err(),
             "release authorized unloading before reaper settlement"
@@ -17420,7 +17418,7 @@ exit 7"#
             let (stop, stopped) = oneshot::channel();
             pane.stop_tx = Some(stop);
             let barrier = Arc::clone(&barrier);
-            let task = tokio::spawn(async move {
+            let task = switchy_async::task::spawn(async move {
                 stopped.await.unwrap();
                 barrier.wait().await;
             });
@@ -17429,7 +17427,7 @@ exit 7"#
             let _ = old.await;
             panes.push(pane);
         }
-        tokio::time::timeout(Duration::from_secs(2), shutdown_panes(host, panes))
+        switchy_async::time::timeout(Duration::from_secs(2), shutdown_panes(host, panes))
             .await
             .expect("serial shutdown deadlocks at the pane barrier");
     }
@@ -17445,7 +17443,7 @@ exit 7"#
         let (started, start) = oneshot::channel();
         let (finish, finished) = oneshot::channel();
         pane.stop_tx = Some(stop);
-        let task = tokio::spawn(async move {
+        let task = switchy_async::task::spawn(async move {
             stopped.await.unwrap();
             let _ = started.send(());
             let _ = finished.await;
@@ -17454,7 +17452,7 @@ exit 7"#
         old.abort();
         let _ = old.await;
         let waiter_host = host.clone();
-        let waiter = tokio::spawn(async move { shutdown_pane_handle(&waiter_host, pane).await });
+        let waiter = switchy_async::task::spawn(async move { shutdown_pane_handle(&waiter_host, pane).await });
         start.await.unwrap();
         waiter.abort();
         let _ = waiter.await;
@@ -17463,9 +17461,9 @@ exit 7"#
             "cancellation dropped cleanup ownership"
         );
         finish.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
+        switchy_async::time::timeout(Duration::from_secs(2), async {
             while execution.upgrade().is_some() {
-                tokio::task::yield_now().await;
+                switchy_async::task::yield_now().await;
             }
         })
         .await
@@ -17637,7 +17635,7 @@ exit 7"#
     fn dummy_pane(id: Uuid) -> PaneRuntimeHandle {
         let (input_tx, _input_rx) = mpsc::unbounded_channel();
         let (stop_tx, stop_rx) = oneshot::channel();
-        let task = tokio::spawn(async move {
+        let task = switchy_async::task::spawn(async move {
             let _ = stop_rx.await;
         });
         let execution = Arc::new(execution::ExecutionCapture::default());
@@ -17774,7 +17772,7 @@ exit 7"#
         host.states()
             .register(&Arc::new(RwLock::new(SpawnRuntimeHandle(
                 Arc::clone(&manager),
-                tokio::runtime::Handle::current(),
+                switchy_async::runtime::Handle::current(),
                 Arc::clone(&locked.pane_input_index),
             ))));
         assert_eq!(
@@ -17946,18 +17944,18 @@ exit 7"#
             "cancelled request".into(),
             &acknowledgement,
         ));
-        tokio::time::timeout(Duration::from_secs(3), cleanup.changed())
+        switchy_async::time::timeout(Duration::from_secs(3), cleanup.changed())
             .await
             .unwrap()
             .unwrap();
         assert_eq!(*cleanup.borrow(), Some(Ok(())));
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = switchy_async::time::Instant::now() + Duration::from_secs(3);
         while process_start_identity_for_pid(pid) == Some(identity) {
             assert!(
-                tokio::time::Instant::now() < deadline,
+                switchy_async::time::Instant::now() < deadline,
                 "child was not reaped"
             );
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            switchy_async::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -17974,7 +17972,7 @@ exit 7"#
         let identity = process_start_identity_for_pid(pid).unwrap();
         let guard = StartupChild::new(host, child);
         let (started, ready) = oneshot::channel();
-        let task = tokio::spawn(async move {
+        let task = switchy_async::task::spawn(async move {
             let _guard = guard;
             started.send(()).unwrap();
             std::future::pending::<()>().await;
@@ -17982,13 +17980,13 @@ exit 7"#
         ready.await.unwrap();
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = switchy_async::time::Instant::now() + Duration::from_secs(3);
         while process_start_identity_for_pid(pid) == Some(identity) {
             assert!(
-                tokio::time::Instant::now() < deadline,
+                switchy_async::time::Instant::now() < deadline,
                 "aborted child was not reaped"
             );
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            switchy_async::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -18005,13 +18003,13 @@ exit 7"#
         let identity = process_start_identity_for_pid(pid).unwrap();
         let guard = StartupChild::new(host, child);
         std::thread::spawn(move || drop(guard)).join().unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let deadline = switchy_async::time::Instant::now() + Duration::from_secs(3);
         while process_start_identity_for_pid(pid) == Some(identity) {
             assert!(
-                tokio::time::Instant::now() < deadline,
+                switchy_async::time::Instant::now() < deadline,
                 "child was not reaped"
             );
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            switchy_async::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -18019,7 +18017,7 @@ exit 7"#
     async fn process_identity_probe_does_not_block_async_runtime() {
         let (release, blocked) = std::sync::mpsc::channel();
         let (started, ready) = oneshot::channel();
-        let query = tokio::spawn(bounded_start_identity_probe(move || {
+        let query = switchy_async::task::spawn(bounded_start_identity_probe(move || {
             started.send(()).unwrap();
             blocked.recv().unwrap();
             Some(ProcessStartIdentity(42, 0))
@@ -22335,7 +22333,7 @@ exit 7"#
 
         let mut pane = dummy_pane(Uuid::new_v4());
         pane.task.abort();
-        pane.task = tokio::spawn(async { panic!("injected cleanup failure") });
+        pane.task = switchy_async::task::spawn(async { panic!("injected cleanup failure") });
         let error = stop_unpublished_pane(&mut pane).await.unwrap_err();
         assert!(error.to_string().contains("task cleanup failed"));
     }
@@ -22504,7 +22502,7 @@ exit 7"#
                 Instant::now() < deadline,
                 "startup cleanup failed to settle"
             );
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            switchy_async::time::sleep(Duration::from_millis(5)).await;
         }
         let manager = Arc::new(Mutex::new(manager));
         assert_managed_idle_rejects_racing_preparation(&manager, session);
@@ -22582,7 +22580,7 @@ exit 7"#
             launch: None,
         };
         assert!(
-            tokio::time::timeout(Duration::from_millis(10), prepared.wait_until_ready())
+            switchy_async::time::timeout(Duration::from_millis(10), prepared.wait_until_ready())
                 .await
                 .is_err()
         );
@@ -22654,13 +22652,13 @@ exit 7"#
         let (ack, mut observation) = watch::channel(None);
         let waiter = cleanup_failed_startup_child_on(
             host,
-            &tokio::runtime::Handle::current(),
+            &switchy_async::runtime::Handle::current(),
             child,
             "injected startup failure".into(),
             Some(ack),
         );
         assert!(
-            tokio::time::timeout(Duration::from_millis(20), observation.changed())
+            switchy_async::time::timeout(Duration::from_millis(20), observation.changed())
                 .await
                 .is_err()
         );
@@ -22669,7 +22667,7 @@ exit 7"#
         // leave a blocking reaper hanging during runtime teardown.
         *exited.0.lock().unwrap() = true;
         exited.1.notify_all();
-        let (reason, result) = tokio::time::timeout(Duration::from_secs(2), waiter)
+        let (reason, result) = switchy_async::time::timeout(Duration::from_secs(2), waiter)
             .await
             .unwrap();
         assert!(still_owned);
@@ -22722,7 +22720,7 @@ exit 7"#
             .cleanup
             .clone();
         drop(prepared);
-        tokio::time::timeout(Duration::from_secs(2), async {
+        switchy_async::time::timeout(Duration::from_secs(2), async {
             loop {
                 if let Some(result) = cleanup.borrow_and_update().clone() {
                     result.expect("unlaunched resource cleanup must be acknowledged");
@@ -22780,9 +22778,9 @@ exit 7"#
             panic!("dead startup must not transfer ownership");
         };
         assert!(error.to_string().contains("exited before launch"));
-        tokio::time::timeout(Duration::from_secs(2), async {
+        switchy_async::time::timeout(Duration::from_secs(2), async {
             while !task.is_finished() {
-                tokio::task::yield_now().await;
+                switchy_async::task::yield_now().await;
             }
         })
         .await
@@ -22805,9 +22803,9 @@ exit 7"#
             runtime: Some(runtime),
             launch: None,
         });
-        tokio::time::timeout(Duration::from_secs(2), async {
+        switchy_async::time::timeout(Duration::from_secs(2), async {
             while finished.iter().any(|task| !task.is_finished()) {
-                tokio::task::yield_now().await;
+                switchy_async::task::yield_now().await;
             }
         })
         .await
@@ -22837,12 +22835,12 @@ exit 7"#
             .values()
             .map(|pane| pane.task.abort_handle())
             .collect::<Vec<_>>();
-        tokio::task::yield_now().await;
+        switchy_async::task::yield_now().await;
         assert!(!marker.exists());
         drop(prepared);
-        tokio::time::timeout(Duration::from_secs(2), async {
+        switchy_async::time::timeout(Duration::from_secs(2), async {
             while tasks.iter().any(|task| !task.is_finished()) {
-                tokio::task::yield_now().await;
+                switchy_async::task::yield_now().await;
             }
         })
         .await
@@ -22862,7 +22860,7 @@ exit 7"#
         let manager = manager_with_runtime(existing, runtime_with_panes(&[pane_id]));
         let created = SessionId(Uuid::new_v4());
         let prepared = manager.prepare_fresh_runtime(created, None).unwrap();
-        tokio::task::yield_now().await;
+        switchy_async::task::yield_now().await;
         let pending = prepared.runtime.as_ref().unwrap();
         for pane in pending.panes.values() {
             assert!(pane.startup.borrow().is_none());
@@ -22977,7 +22975,7 @@ exit 7"#
         let mut panes = runtime.panes;
         let first_pane = panes.remove(&first).unwrap();
         let pane = panes.remove(&split).unwrap();
-        let (first_result, split_result) = tokio::join!(
+        let (first_result, split_result) = switchy_async::join!(
             reported_shell_directory(&first_pane, directory.path()),
             reported_shell_directory(&pane, split_directory.path()),
         );
@@ -23180,7 +23178,7 @@ exit 7"#
         directory: &Path,
     ) -> Result<std::path::PathBuf> {
         let mut startup = pane.startup.clone();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        switchy_async::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Some(result) = startup.borrow_and_update().clone() {
                     break result.map_err(anyhow::Error::msg);
@@ -23197,14 +23195,14 @@ exit 7"#
         pane.input_tx
             .send(PaneRuntimeCommand::Input(b"pwd -P > actual-cwd\n".to_vec()))
             .unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(5), async {
+        let result = switchy_async::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(value) = std::fs::read_to_string(directory.join("actual-cwd"))
                     && !value.trim().is_empty()
                 {
                     break value;
                 }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                switchy_async::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await?;

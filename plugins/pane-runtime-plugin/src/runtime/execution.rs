@@ -944,23 +944,23 @@ where
 }
 
 fn drive_startup<F>(
-    runtime: &tokio::runtime::Handle,
+    runtime: &switchy_async::runtime::Handle,
     future: F,
 ) -> Result<F::Output, ExecutionError>
 where
     F: std::future::Future + Send,
     F::Output: Send,
 {
-    if runtime.runtime_flavor() != tokio::runtime::RuntimeFlavor::MultiThread {
+    if runtime.runtime_flavor() != switchy_async::RuntimeFlavor::MultiThread {
         return Err(failed(
             "pane owner requires a persistent multi-thread runtime",
         ));
     }
     // Caller runtimes are transient; pane tasks inherit the persistent owner.
-    if tokio::runtime::Handle::try_current()
-        .is_ok_and(|current| current.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    if switchy_async::runtime::Handle::try_current()
+        .is_ok_and(|current| current.runtime_flavor() == switchy_async::RuntimeFlavor::MultiThread)
     {
-        Ok(tokio::task::block_in_place(|| runtime.block_on(future)))
+        Ok(switchy_async::task::block_in_place(|| runtime.block_on(future)))
     } else {
         std::thread::scope(|scope| scope.spawn(|| runtime.block_on(future)).join())
             .map_err(|_| failed("pane startup bridge thread panicked"))
@@ -968,7 +968,7 @@ where
 }
 
 async fn await_startup(prepared: &mut super::PreparedFreshRuntime) -> Result<(), ExecutionError> {
-    match tokio::time::timeout(Duration::from_secs(10), prepared.wait_until_ready()).await {
+    match switchy_async::time::timeout(Duration::from_secs(10), prepared.wait_until_ready()).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(ExecutionError::LaunchFailed {
             reason: error.to_string(),
@@ -1348,7 +1348,7 @@ pub(crate) fn wait_present(
     drive_startup(&owner.1, async {
         let mut changes =
             with_pane(host, reference, |pane| Ok(pane.execution.subscribe())).map_err(authority)?;
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+        let deadline = switchy_async::time::Instant::now() + Duration::from_millis(u64::from(timeout_ms));
         loop {
             authorize().map_err(authority)?;
             let screen = screen(host, reference).map_err(|error| match error {
@@ -1371,10 +1371,10 @@ pub(crate) fn wait_present(
                 }
                 return Ok(Some(frame));
             }
-            if tokio::time::Instant::now() >= deadline {
+            if switchy_async::time::Instant::now() >= deadline {
                 return Ok(None);
             }
-            tokio::time::timeout_at(deadline, changes.changed())
+            switchy_async::time::timeout_at(deadline, changes.changed())
                 .await
                 .map_or(Ok(()), |result| {
                     result.map_err(|error| authority(failed(error)))
@@ -1402,7 +1402,7 @@ pub(crate) fn wait(
         // Subscribe before inspecting authority: a change racing the initial
         // snapshot remains pending, even before changed() is first awaited.
         let mut changes = with_pane(host, reference, |pane| Ok(pane.execution.subscribe()))?;
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+        let deadline = switchy_async::time::Instant::now() + Duration::from_millis(u64::from(timeout_ms));
         loop {
             authorize()?;
             let current = status(host, reference)?;
@@ -1410,11 +1410,11 @@ pub(crate) fn wait(
                 || (!matches!(current.phase, ExecutionPhase::Running)
                     && current.output_drained
                     && current.terminal_session_ended)
-                || tokio::time::Instant::now() >= deadline
+                || switchy_async::time::Instant::now() >= deadline
             {
                 return Ok(current);
             }
-            tokio::time::timeout_at(deadline, changes.changed())
+            switchy_async::time::timeout_at(deadline, changes.changed())
                 .await
                 .map_or(Ok(()), |result| result.map_err(failed))?;
         }
@@ -1446,17 +1446,17 @@ pub(crate) fn terminate(
             })
         };
         signal(StopAction::Cooperative)?;
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(grace_ms));
+        let deadline = switchy_async::time::Instant::now() + Duration::from_millis(u64::from(grace_ms));
         loop {
             authorize()?;
             let settled = with_pane(host, reference, |pane| {
                 Ok(pane.exited.load(Ordering::SeqCst)
                     && pane.execution.output_drained.load(Ordering::SeqCst))
             })?;
-            if settled || tokio::time::Instant::now() >= deadline {
+            if settled || switchy_async::time::Instant::now() >= deadline {
                 break;
             }
-            tokio::time::timeout_at(deadline, changes.changed())
+            switchy_async::time::timeout_at(deadline, changes.changed())
                 .await
                 .map_or(Ok(()), |result| result.map_err(failed))?;
         }
@@ -1474,7 +1474,7 @@ async fn await_cleanup_acknowledgement(
     authorize: impl Fn() -> Result<(), ExecutionError>,
 ) -> Result<(), ExecutionError> {
     let mut cleanup = with_pane(host, reference, |pane| Ok(pane.cleanup.clone()))?;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let deadline = switchy_async::time::Instant::now() + Duration::from_secs(30);
     loop {
         authorize()?;
         // Revalidate the generation and session after every wake.
@@ -1484,7 +1484,7 @@ async fn await_cleanup_acknowledgement(
             Some(Err(error)) => return Err(failed(error)),
             None => {}
         }
-        if tokio::time::timeout_at(deadline, cleanup.changed())
+        if switchy_async::time::timeout_at(deadline, cleanup.changed())
             .await
             .is_err()
         {
@@ -1975,7 +1975,7 @@ mod tests {
         let mut first = capture.subscribe();
         let mut second = capture.subscribe();
         capture.notify();
-        let (a, b) = tokio::join!(first.changed(), second.changed());
+        let (a, b) = switchy_async::join!(first.changed(), second.changed());
         a.unwrap();
         b.unwrap();
         assert!(!first.has_changed().unwrap());
@@ -1986,9 +1986,9 @@ mod tests {
     async fn idle_capture_has_only_one_deadline_and_no_lifecycle_wake() {
         let capture = super::ExecutionCapture::default();
         let mut changes = capture.subscribe();
-        let deadline = tokio::time::Instant::now() + super::Duration::from_millis(20);
+        let deadline = switchy_async::time::Instant::now() + super::Duration::from_millis(20);
         assert!(
-            tokio::time::timeout_at(deadline, changes.changed())
+            switchy_async::time::timeout_at(deadline, changes.changed())
                 .await
                 .is_err()
         );
@@ -2021,6 +2021,11 @@ mod tests {
         );
     }
 
+    /// The switchy handle of a tokio runtime.
+    fn owner_handle(owner: &tokio::runtime::Runtime) -> switchy_async::runtime::Handle {
+        owner.block_on(async { switchy_async::runtime::Handle::current() })
+    }
+
     #[test]
     fn current_thread_control_preserves_cancellation_error() {
         let owner = tokio::runtime::Builder::new_multi_thread()
@@ -2032,6 +2037,7 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        let handle = owner_handle(&owner);
         let cancelled = std::sync::atomic::AtomicBool::new(true);
         let authorize = || {
             assert!(cancelled.load(super::Ordering::SeqCst));
@@ -2040,7 +2046,7 @@ mod tests {
             })
         };
         let result = caller.block_on(async {
-            super::drive_startup(owner.handle(), async { authorize() }).unwrap()
+            super::drive_startup(&handle, async { authorize() }).unwrap()
         });
         assert!(
             matches!(result, Err(super::ExecutionError::OperationFailed { reason }) if reason == "execution request cancelled")
@@ -2058,11 +2064,12 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
+        let handle = owner_handle(&owner);
         let (sender, receiver) = tokio::sync::oneshot::channel();
         caller.block_on(async {
-            super::drive_startup(owner.handle(), async {
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            super::drive_startup(&handle, async {
+                switchy_async::task::spawn(async move {
+                    switchy_async::time::sleep(std::time::Duration::from_millis(20)).await;
                     sender.send(()).unwrap();
                 });
             })
@@ -2070,7 +2077,7 @@ mod tests {
         });
         drop(caller);
         owner.block_on(async {
-            tokio::time::timeout(std::time::Duration::from_secs(2), receiver)
+            switchy_async::time::timeout(std::time::Duration::from_secs(2), receiver)
                 .await
                 .unwrap()
                 .unwrap();

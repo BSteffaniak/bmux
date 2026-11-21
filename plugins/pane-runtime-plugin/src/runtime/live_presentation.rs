@@ -210,17 +210,17 @@ async fn wait_on_owner(
     // Subscribe before checking state; changes committed during reads remain
     // observable. Cancellation never advances server-side delivery state.
     let mut changes = execution::subscribe(host, reference).map_err(authority)?;
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+    let deadline = switchy_async::time::Instant::now() + Duration::from_millis(u64::from(timeout_ms));
     loop {
         authorize().map_err(authority)?;
         if let Some(frame) = read_current(host, reference, after, max_bytes)? {
             authorize().map_err(authority)?;
             return Ok(Some(frame));
         }
-        if tokio::time::Instant::now() >= deadline {
+        if switchy_async::time::Instant::now() >= deadline {
             return Ok(None);
         }
-        match tokio::time::timeout_at(deadline, changes.changed()).await {
+        match switchy_async::time::timeout_at(deadline, changes.changed()).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => return Err(failed(&error)),
             Err(_) => {

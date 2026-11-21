@@ -142,7 +142,7 @@ impl Read for BootstrapReader {
 pub(in super::super) async fn close_retired_console<T: Send + 'static>(
     console: T,
 ) -> anyhow::Result<()> {
-    tokio::task::spawn_blocking(move || drop(console)).await?;
+    switchy_async::task::spawn_blocking(move || drop(console)).await?;
     Ok(())
 }
 

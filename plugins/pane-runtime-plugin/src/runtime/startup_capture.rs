@@ -6,14 +6,14 @@ use std::thread::JoinHandle;
 pub(super) struct CaptureOwner {
     threads: Vec<JoinHandle<()>>,
     writer: Option<super::capture_writer::CaptureWriter>,
-    runtime: tokio::runtime::Handle,
+    runtime: switchy_async::runtime::Handle,
 }
 impl CaptureOwner {
     pub(super) fn new(thread: JoinHandle<()>) -> Self {
         Self {
             threads: vec![thread],
             writer: None,
-            runtime: tokio::runtime::Handle::current(),
+            runtime: switchy_async::runtime::Handle::current(),
         }
     }
     pub(super) fn add_writer(
@@ -423,9 +423,9 @@ mod tests {
         });
         let owner = super::CaptureOwner::new(thread);
         drop(owner);
-        tokio::task::yield_now().await;
+        switchy_async::task::yield_now().await;
         release.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), finished)
+        switchy_async::time::timeout(std::time::Duration::from_secs(2), finished)
             .await
             .unwrap()
             .unwrap();

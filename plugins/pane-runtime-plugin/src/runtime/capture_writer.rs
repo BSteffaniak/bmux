@@ -82,7 +82,7 @@ pub(super) struct Reservation {
 pub(super) struct WriterOwner {
     writer: CaptureWriter,
     thread: Option<JoinHandle<()>>,
-    runtime: tokio::runtime::Handle,
+    runtime: switchy_async::runtime::Handle,
 }
 
 fn failed(message: impl Into<String>) -> io::Error {
@@ -102,7 +102,7 @@ impl CaptureWriter {
         capture: DurableCapture,
         before_run: impl FnOnce() + Send + 'static,
     ) -> io::Result<(Self, WriterOwner)> {
-        let runtime = tokio::runtime::Handle::try_current().map_err(io::Error::other)?;
+        let runtime = switchy_async::runtime::Handle::try_current().map_err(io::Error::other)?;
         let boundary = capture.committed_boundary();
         if boundary.bytes != 0
             || boundary.stream_bytes != 0

@@ -876,7 +876,7 @@ async fn install_global_padding(
 
 const NUMERIC_PREVIEW_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(60);
 
-fn numeric_preview_deadline(now: tokio::time::Instant) -> tokio::time::Instant {
+fn numeric_preview_deadline(now: switchy_async::time::Instant) -> switchy_async::time::Instant {
     now + NUMERIC_PREVIEW_DEBOUNCE
 }
 
@@ -944,7 +944,7 @@ impl Drop for PreviewCancelGuard {
             return;
         };
         let token = self.token;
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+        if let Ok(runtime) = switchy_async::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 let result =
                     pane_runtime_commands::client::cancel_pane_padding_preview(&mut route, token)
@@ -982,7 +982,7 @@ fn configure(
             ))
         })?
         .with_backpressure();
-    let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
+    let runtime = switchy_async::runtime::Handle::try_current().map_err(|_| {
         PluginCommandError::unavailable("pane padding configurator requires the attach runtime")
     })?;
     let session_id = selected_session(host, context)?;
@@ -1073,10 +1073,9 @@ impl ConfigureTransaction {
     ) {
         let mut events_open = true;
         let mut pending_numeric: Option<(String, BTreeMap<String, PromptFormValue>)> = None;
-        let numeric_debounce = tokio::time::sleep(std::time::Duration::MAX);
-        tokio::pin!(numeric_debounce);
+        let mut numeric_debounce = Box::pin(switchy_async::time::sleep(std::time::Duration::MAX));
         loop {
-            tokio::select! {
+            switchy_async::select! {
                 response = &mut responses => {
                     self.finish(response.ok()).await;
                     return;
@@ -1103,9 +1102,9 @@ impl ConfigureTransaction {
                     };
                     if is_numeric_configure_field(&field_id) {
                         pending_numeric = Some((field_id, values));
-                        numeric_debounce
-                            .as_mut()
-                            .reset(numeric_preview_deadline(tokio::time::Instant::now()));
+                        numeric_debounce.set(switchy_async::time::sleep_until(
+                            numeric_preview_deadline(switchy_async::time::Instant::now()),
+                        ));
                         continue;
                     }
                     pending_numeric = None;
@@ -1443,17 +1442,17 @@ mod tests {
         let mut guard = PreviewCancelGuard::new(route, Uuid::new_v4());
         guard.disarm();
         drop(guard);
-        tokio::task::yield_now().await;
+        switchy_async::task::yield_now().await;
         assert!(requests.try_recv().is_err());
     }
 
     #[tokio::test]
     async fn numeric_preview_deadline_waits_for_the_settle_window() {
-        let start = tokio::time::Instant::now();
+        let start = switchy_async::time::Instant::now();
         let deadline = numeric_preview_deadline(start);
         assert_eq!(deadline.duration_since(start), NUMERIC_PREVIEW_DEBOUNCE);
-        tokio::time::sleep_until(deadline).await;
-        assert!(tokio::time::Instant::now() >= deadline);
+        switchy_async::time::sleep_until(deadline).await;
+        assert!(switchy_async::time::Instant::now() >= deadline);
     }
 
     #[test]

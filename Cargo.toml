@@ -409,6 +409,7 @@ switchy = { version = "0.5.0", package = "switchy", default-features = false }
 moosicbox_log_runtime = { version = "0.5.0", package = "moosicbox_log_runtime", default-features = false }
 moosicbox_log_watch   = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
 simvar_observer       = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
+switchy_async         = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
 switchy_pty           = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
 switchy_simulation    = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
 switchy_thread        = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
