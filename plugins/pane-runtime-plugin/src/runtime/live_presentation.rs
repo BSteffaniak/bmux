@@ -210,7 +210,8 @@ async fn wait_on_owner(
     // Subscribe before checking state; changes committed during reads remain
     // observable. Cancellation never advances server-side delivery state.
     let mut changes = execution::subscribe(host, reference).map_err(authority)?;
-    let deadline = switchy_async::time::Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+    let deadline =
+        switchy_async::time::Instant::now() + Duration::from_millis(u64::from(timeout_ms));
     loop {
         authorize().map_err(authority)?;
         if let Some(frame) = read_current(host, reference, after, max_bytes)? {

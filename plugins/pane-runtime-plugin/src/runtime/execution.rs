@@ -960,7 +960,9 @@ where
     if switchy_async::runtime::Handle::try_current()
         .is_ok_and(|current| current.runtime_flavor() == switchy_async::RuntimeFlavor::MultiThread)
     {
-        Ok(switchy_async::task::block_in_place(|| runtime.block_on(future)))
+        Ok(switchy_async::task::block_in_place(|| {
+            runtime.block_on(future)
+        }))
     } else {
         std::thread::scope(|scope| scope.spawn(|| runtime.block_on(future)).join())
             .map_err(|_| failed("pane startup bridge thread panicked"))
@@ -1348,7 +1350,8 @@ pub(crate) fn wait_present(
     drive_startup(&owner.1, async {
         let mut changes =
             with_pane(host, reference, |pane| Ok(pane.execution.subscribe())).map_err(authority)?;
-        let deadline = switchy_async::time::Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+        let deadline =
+            switchy_async::time::Instant::now() + Duration::from_millis(u64::from(timeout_ms));
         loop {
             authorize().map_err(authority)?;
             let screen = screen(host, reference).map_err(|error| match error {
@@ -1402,7 +1405,8 @@ pub(crate) fn wait(
         // Subscribe before inspecting authority: a change racing the initial
         // snapshot remains pending, even before changed() is first awaited.
         let mut changes = with_pane(host, reference, |pane| Ok(pane.execution.subscribe()))?;
-        let deadline = switchy_async::time::Instant::now() + Duration::from_millis(u64::from(timeout_ms));
+        let deadline =
+            switchy_async::time::Instant::now() + Duration::from_millis(u64::from(timeout_ms));
         loop {
             authorize()?;
             let current = status(host, reference)?;
@@ -1446,7 +1450,8 @@ pub(crate) fn terminate(
             })
         };
         signal(StopAction::Cooperative)?;
-        let deadline = switchy_async::time::Instant::now() + Duration::from_millis(u64::from(grace_ms));
+        let deadline =
+            switchy_async::time::Instant::now() + Duration::from_millis(u64::from(grace_ms));
         loop {
             authorize()?;
             let settled = with_pane(host, reference, |pane| {
@@ -2045,9 +2050,8 @@ mod tests {
                 reason: "execution request cancelled".into(),
             })
         };
-        let result = caller.block_on(async {
-            super::drive_startup(&handle, async { authorize() }).unwrap()
-        });
+        let result = caller
+            .block_on(async { super::drive_startup(&handle, async { authorize() }).unwrap() });
         assert!(
             matches!(result, Err(super::ExecutionError::OperationFailed { reason }) if reason == "execution request cancelled")
         );

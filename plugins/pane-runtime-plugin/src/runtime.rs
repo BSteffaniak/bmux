@@ -69,8 +69,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{mpsc, oneshot, watch};
 use switchy_async::task::JoinHandle;
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{trace, warn};
 
 pub(crate) fn managed_target_identity(host: &PaneRuntimeHost) -> Result<Option<String>, String> {
@@ -10916,10 +10916,11 @@ impl ServerSessionRuntimeAdapter {
             .ok_or_else(Self::lock_poisoned_anyhow)??;
         // Startup must be driven without holding the manager: readers and
         // unrelated service requests need to make progress while the PTY starts.
-        let startup = switchy_async::time::timeout(Duration::from_secs(10), prepared.wait_until_ready())
-            .await
-            .map_err(|_| anyhow::anyhow!("pane startup readiness timed out"))
-            .and_then(std::convert::identity);
+        let startup =
+            switchy_async::time::timeout(Duration::from_secs(10), prepared.wait_until_ready())
+                .await
+                .map_err(|_| anyhow::anyhow!("pane startup readiness timed out"))
+                .and_then(std::convert::identity);
         if let Err(error) = startup {
             let mut cleanup_errors = Vec::new();
             for pane in prepared
@@ -11206,7 +11207,9 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             runtime.runtime_flavor() == switchy_async::RuntimeFlavor::MultiThread,
             "synchronous runtime creation requires the server's multi-thread runtime"
         );
-        switchy_async::task::block_in_place(|| runtime.block_on(self.start_fresh_runtime(session_id)))
+        switchy_async::task::block_in_place(|| {
+            runtime.block_on(self.start_fresh_runtime(session_id))
+        })
     }
 
     fn restore_runtime(
@@ -17452,7 +17455,10 @@ exit 7"#
         old.abort();
         let _ = old.await;
         let waiter_host = host.clone();
-        let waiter = switchy_async::task::spawn(async move { shutdown_pane_handle(&waiter_host, pane).await });
+        let waiter =
+            switchy_async::task::spawn(
+                async move { shutdown_pane_handle(&waiter_host, pane).await },
+            );
         start.await.unwrap();
         waiter.abort();
         let _ = waiter.await;
