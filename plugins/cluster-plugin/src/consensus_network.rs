@@ -1949,7 +1949,7 @@ impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static> OwnedAppendService<C> 
 }
 
 impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static>
-    bmux_cluster_plugin_api::cluster_consensus_vote::ClusterConsensusVoteService
+    bmux_cluster_plugin_api::cluster_consensus_rpc::ClusterConsensusRpcService
     for OwnedAppendService<C>
 {
     fn vote<'a>(
@@ -1993,12 +1993,7 @@ impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static>
             Ok(response)
         })
     }
-}
 
-impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static>
-    bmux_cluster_plugin_api::cluster_consensus_rpc::ClusterConsensusRpcService
-    for OwnedAppendService<C>
-{
     fn append<'a>(
         &'a self,
         request: bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,

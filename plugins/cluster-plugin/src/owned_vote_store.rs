@@ -42,6 +42,43 @@ impl From<&str> for AuthenticatedAppendError {
     }
 }
 
+fn owned_vote_endpoint(
+    state: &crate::control_state::ControlState,
+    cluster: &str,
+    recipient: NodeId,
+) -> Result<String, bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError> {
+    use bmux_cluster_plugin_api::{
+        cluster_consensus_rpc_types::RpcError, cluster_types::ClusterMemberState,
+    };
+    let member = state
+        .members
+        .get(&recipient.to_string())
+        .ok_or(RpcError::Unauthorized)?;
+    if member.cluster_id != cluster || member.state != ClusterMemberState::Active {
+        return Err(RpcError::Unauthorized);
+    }
+    if ![
+        bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID,
+        bmux_cluster_plugin_api::cluster_consensus_transfer::INTERFACE_ID,
+    ]
+    .iter()
+    .all(|interface| {
+        member
+            .negotiated_protocol
+            .features
+            .iter()
+            .any(|feature| feature == interface.as_str())
+    }) {
+        return Err(RpcError::Incompatible);
+    }
+    member
+        .endpoint
+        .as_ref()
+        .filter(|endpoint| !endpoint.is_empty())
+        .cloned()
+        .ok_or(RpcError::Unauthorized)
+}
+
 const TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("owned_authority");
 const EMPTY_POSITIONS: [&str; 5] = [
     "commit",
@@ -1392,14 +1429,13 @@ impl VoteExecutor {
     }
 
     /// Send one locally signed vote request and verify its bound response before
-    /// observing election authority. The lifecycle owner selects only endpoints
-    /// that explicitly negotiated cluster-consensus-vote/v1.
+    /// observing election authority. Endpoint and negotiated interfaces are resolved
+    /// from durable control membership under the authority executor.
     /// # Errors
     /// Transport failure or timeout has no vote outcome; callers must not count it.
     pub async fn request_campaign_vote<C: bmux_plugin::ServiceCaller + Send + Sync + 'static>(
         &self,
         caller: &C,
-        endpoint: &str,
         local: NodeId,
         request: bmux_cluster_plugin_api::cluster_consensus_vote_types::VoteRequest,
     ) -> Result<bool, bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError> {
@@ -1425,10 +1461,53 @@ impl VoteExecutor {
             &request.proof.signature,
         )
         .map_err(|_| RpcError::Unauthorized)?;
+        let recipient = NodeId::from_bytes(
+            request
+                .recipient
+                .as_slice()
+                .try_into()
+                .map_err(|_| RpcError::InvalidRequest)?,
+        );
+        let cluster = request.cluster_id.clone();
+        let term = Term(request.term);
+        let endpoint = self
+            .run(move |gate| {
+                if !gate
+                    .campaign
+                    .as_ref()
+                    .is_some_and(|(campaign, membership, _)| {
+                        campaign.term == term
+                            && campaign.candidate == local
+                            && membership
+                                .configurations()
+                                .iter()
+                                .any(|voters| voters.contains(&recipient))
+                    })
+                {
+                    return Ok(Err(RpcError::Unauthorized));
+                }
+                gate.store.failed = true;
+                let endpoint = (|| -> io::Result<_> {
+                    let tx = gate.store.database.begin_read().map_err(io::Error::other)?;
+                    let meta = tx.open_table(TABLE).map_err(io::Error::other)?;
+                    let bytes = meta
+                        .get("control")
+                        .map_err(io::Error::other)?
+                        .ok_or_else(|| invalid("missing control authority"))?;
+                    let state = crate::control_state::ControlState::decode_snapshot(bytes.value())
+                        .map_err(io::Error::other)?;
+                    Ok(owned_vote_endpoint(&state, &cluster, recipient))
+                })()
+                .map_err(|_| VoteGateError::StorageFailure)?;
+                gate.store.failed = false;
+                Ok(endpoint)
+            })
+            .await
+            .map_err(vote_rpc_error)??;
         let mut remote = crate::endpoint::EndpointDispatchClient::new(caller, endpoint);
         let response = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            bmux_cluster_plugin_api::cluster_consensus_vote::client::vote(
+            bmux_cluster_plugin_api::cluster_consensus_rpc::client::vote(
                 &mut remote,
                 request.clone(),
             ),
@@ -2764,6 +2843,51 @@ mod tests {
                 .value()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn outbound_vote_requires_both_negotiated_interfaces() {
+        use bmux_cluster_plugin_api::cluster_types::{
+            ClusterConsensusRole, ClusterMemberState, ClusterNodeCapabilities,
+        };
+        let identity = crate::membership::NodeIdentity::new_for_test(1);
+        let cluster = crate::membership::ClusterId::generate();
+        let mut member = crate::membership::issue_test_member(
+            &identity,
+            cluster,
+            &identity,
+            "memory://node",
+            ClusterNodeCapabilities {
+                consensus_role: ClusterConsensusRole::Voter,
+                worker: false,
+                ingress: false,
+            },
+            crate::now_unix_ms(),
+        );
+        let mut state = crate::control_state::ControlState::new(member.cluster_id.clone());
+        let id = *identity.node_id();
+        for feature in [
+            None,
+            Some(bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID),
+            Some(bmux_cluster_plugin_api::cluster_consensus_transfer::INTERFACE_ID),
+        ] {
+            if let Some(ref feature) = feature {
+                member
+                    .negotiated_protocol
+                    .features
+                    .push(feature.to_string());
+            }
+            state.members.insert(id.to_string(), member.clone());
+            let result = owned_vote_endpoint(&state, &member.cluster_id, id);
+            if feature == Some(bmux_cluster_plugin_api::cluster_consensus_transfer::INTERFACE_ID) {
+                assert_eq!(result.unwrap(), "memory://node");
+            } else {
+                assert!(matches!(result, Err(bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError::Incompatible)));
+            }
+        }
+        member.state = ClusterMemberState::Revoked;
+        state.members.insert(id.to_string(), member.clone());
+        assert!(owned_vote_endpoint(&state, &member.cluster_id, id).is_err());
     }
 
     #[test]

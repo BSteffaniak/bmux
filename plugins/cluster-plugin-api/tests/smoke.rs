@@ -26,14 +26,14 @@ use bmux_cluster_plugin_api::{
 #[test]
 fn owned_vote_contract_is_distinct_from_legacy_raft() {
     use bmux_cluster_plugin_api::{
-        cluster_consensus_vote, cluster_consensus_vote_types::VoteResponse,
+        cluster_consensus_rpc, cluster_consensus_vote_types::VoteResponse,
     };
     assert_eq!(
-        cluster_consensus_vote::INTERFACE_ID,
-        "cluster-consensus-vote/v1"
+        cluster_consensus_rpc::INTERFACE_ID,
+        "cluster-consensus-rpc/v1"
     );
     assert_ne!(
-        cluster_consensus_vote::INTERFACE_ID,
+        cluster_consensus_rpc::INTERFACE_ID,
         cluster_raft_rpc::INTERFACE_ID
     );
     let response = VoteResponse {

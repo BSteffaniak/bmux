@@ -1007,6 +1007,7 @@ interface cluster-consensus-rpc-types {
 @capability(CLUSTER_AUTH)
 @interface-version(1)
 interface cluster-consensus-rpc {
+    command vote(request: cluster-consensus-vote-types.vote-request) -> result<cluster-consensus-vote-types.vote-response, cluster-consensus-rpc-types.rpc-error>;
     // Durable means the log transaction committed, not application or quorum commit.
     command append(request: cluster-consensus-rpc-types.append-request) -> result<cluster-consensus-rpc-types.append-response, cluster-consensus-rpc-types.rpc-error>;
 }
@@ -1032,12 +1033,6 @@ interface cluster-consensus-vote-types {
         granted: bool,
         signature: bytes,
     }
-}
-
-@capability(CLUSTER_AUTH)
-@interface-version(1)
-interface cluster-consensus-vote {
-    command vote(request: cluster-consensus-vote-types.vote-request) -> result<cluster-consensus-vote-types.vote-response, cluster-consensus-rpc-types.rpc-error>;
 }
 
 @capability(CLUSTER_AUTH)

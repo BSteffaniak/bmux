@@ -2705,7 +2705,7 @@ mod tests {
             executor: executor.clone(),
         };
         let response =
-            bmux_cluster_plugin_api::cluster_consensus_vote::ClusterConsensusVoteService::vote(
+            bmux_cluster_plugin_api::cluster_consensus_rpc::ClusterConsensusRpcService::vote(
                 &provider,
                 vote.clone(),
             )
@@ -2720,7 +2720,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            bmux_cluster_plugin_api::cluster_consensus_vote::ClusterConsensusVoteService::vote(
+            bmux_cluster_plugin_api::cluster_consensus_rpc::ClusterConsensusRpcService::vote(
                 &provider, vote
             )
             .await,
