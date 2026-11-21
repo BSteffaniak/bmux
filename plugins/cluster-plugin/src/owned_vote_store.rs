@@ -130,7 +130,11 @@ const EMPTY_POSITIONS: [&str; 5] = [
     "membership",
     "applied_membership",
 ];
-const FORMAT: &[u8] = b"BMOWNV05";
+const FORMAT: &[u8] = b"BMOWNV06";
+// Install receipts are node-local protocol recovery authority, not application
+// state copied from a remote snapshot. Retain the last 64 successful installs.
+const INSTALL_RECEIPT_BYTES: usize = 160;
+const MAX_INSTALL_RECEIPTS: usize = 64;
 const LOG: TableDefinition<u64, &[u8]> = TableDefinition::new("owned_log");
 const MEMBERSHIPS: TableDefinition<u64, &[u8]> = TableDefinition::new("owned_memberships");
 const HEADER_LEN: u64 = 4096;
@@ -200,6 +204,9 @@ const MAX_VOTE_PAYLOAD: u64 = 64 * 1024 * 1024;
 // Until compaction is integrated, stop accepting growth at a fixed log budget.
 // This also bounds suffix removal work in one transaction.
 const MAX_RETAINED_ENTRIES: u64 = 4096;
+// Shared by local proposal admission and each bounded application turn. The
+// budget counts the complete canonical log entry, not just command payload.
+const APPLICATION_ENTRY_BUDGET: usize = 1024 * 1024;
 
 // Bound aggregate scratch use in this process, not just each file. Never queue
 // startup attempts behind slow recovery; the caller may retry explicit Busy.
@@ -289,6 +296,23 @@ fn application_membership_bytes(meta: &redb::Table<&str, &[u8]>) -> io::Result<V
         .ok_or_else(|| invalid("missing applied membership"))?
         .value()
         .to_vec())
+}
+
+// Installation duplicates the snapshot twice plus its canonical control and
+// membership state, and may rebuild both suffix tables in a copy-on-write tx.
+// Reserve 8 MiB for metadata/transaction bookkeeping, charge twice every new
+// byte for page slack/COW, and admit only within half the backend ceiling to
+// leave room for redb geometric file growth. This intentionally conservative
+// prototype limit is NOT a negotiated snapshot-format/workspace-size limit.
+fn snapshot_install_fits(existing: u64, snapshot: u64, membership: u64, suffix: u64) -> bool {
+    snapshot
+        .checked_mul(3)
+        .and_then(|bytes| membership.checked_mul(3).and_then(|m| bytes.checked_add(m)))
+        .and_then(|bytes| suffix.checked_mul(2).and_then(|s| bytes.checked_add(s)))
+        .and_then(|bytes| bytes.checked_mul(2))
+        .and_then(|bytes| bytes.checked_add(existing))
+        .and_then(|bytes| bytes.checked_add(8 * 1024 * 1024))
+        .is_some_and(|bytes| bytes <= MAX_VOTE_PAYLOAD / 2)
 }
 
 fn compact_table(
@@ -393,8 +417,7 @@ fn decode_position(bytes: &[u8]) -> io::Result<Option<LogIdentity>> {
     }))
 }
 
-// This format supports uncompacted logs only. Nonempty snapshot metadata is an
-// explicit unsupported recovery state until snapshot installation is integrated.
+// Canonical control state is validated independently of retained log framing.
 fn validate_control_recovery(meta: &redb::ReadOnlyTable<&str, &[u8]>) -> io::Result<()> {
     let control = crate::control_state::ControlState::decode_snapshot(
         meta.get("control")
@@ -447,8 +470,17 @@ fn recovered_snapshot_membership(
         .get("compacted_snapshot")
         .map_err(io::Error::other)?
         .ok_or_else(|| invalid("missing compacted snapshot"))?;
-    let (descriptor, _) =
+    let (descriptor, control) =
         crate::consensus_storage::decode_owned_snapshot(bytes.value()).map_err(io::Error::other)?;
+    if snapshot == applied {
+        let current = meta
+            .get("control")
+            .map_err(io::Error::other)?
+            .ok_or_else(|| invalid("missing installed control state"))?;
+        if current.value() != control {
+            return Err(invalid("installed snapshot/control mismatch"));
+        }
+    }
     let cluster = meta
         .get("cluster")
         .map_err(io::Error::other)?
@@ -470,8 +502,200 @@ fn recovered_snapshot_membership(
     .map_err(io::Error::other)
 }
 
+fn validate_install_receipts(bytes: &[u8]) -> io::Result<()> {
+    if !bytes.len().is_multiple_of(INSTALL_RECEIPT_BYTES)
+        || bytes.len() > MAX_INSTALL_RECEIPTS * INSTALL_RECEIPT_BYTES
+    {
+        return Err(invalid("invalid install receipt framing"));
+    }
+    for (index, receipt) in bytes.chunks_exact(INSTALL_RECEIPT_BYTES).enumerate() {
+        let boundary = decode_position(&receipt[104..152])?
+            .ok_or_else(|| invalid("missing receipt boundary"))?;
+        let term = u64::from_le_bytes(receipt[152..160].try_into().map_err(io::Error::other)?);
+        if boundary.term.0 > term
+            || bytes[..index * INSTALL_RECEIPT_BYTES]
+                .chunks_exact(INSTALL_RECEIPT_BYTES)
+                .any(|old| old[..48] == receipt[..48] || (old[16..72] == receipt[16..72]))
+        {
+            return Err(invalid("conflicting install receipt authority"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_install_receipt_coverage(
+    bytes: &[u8],
+    applied: Option<LogIdentity>,
+    hard_state: HardState,
+) -> io::Result<()> {
+    validate_install_receipts(bytes)?;
+    for receipt in bytes.chunks_exact(INSTALL_RECEIPT_BYTES) {
+        let boundary = decode_position(&receipt[104..152])?
+            .ok_or_else(|| invalid("missing receipt boundary"))?;
+        let term = Term(u64::from_le_bytes(
+            receipt[152..160].try_into().map_err(io::Error::other)?,
+        ));
+        if term > hard_state.term
+            || crate::consensus_model::validate_position_prefix(Some(boundary), applied).is_err()
+            || applied.is_some_and(|applied| {
+                applied.term == boundary.term && applied.leader != boundary.leader
+            })
+        {
+            return Err(invalid(
+                "install receipt exceeds durable applied or term authority",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_read_install_receipts(meta: &redb::ReadOnlyTable<&str, &[u8]>) -> io::Result<()> {
+    let get = |key| -> io::Result<Vec<u8>> {
+        Ok(meta
+            .get(key)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| invalid("missing receipt authority"))?
+            .value()
+            .to_vec())
+    };
+    validate_install_receipt_coverage(
+        &get("install_receipts")?,
+        decode_position(&get("applied")?)?,
+        decode(&get("vote")?)?,
+    )
+}
+
+fn stored_membership(bytes: &[u8]) -> io::Result<crate::consensus_model::StoredMembership> {
+    let entry = crate::consensus_storage::decode_owned_entry(bytes).map_err(io::Error::other)?;
+    let EntryPayload::Membership(membership) = entry.payload else {
+        return Err(invalid("expected membership entry"));
+    };
+    Ok(crate::consensus_model::StoredMembership {
+        introduced_at: Some(entry.identity),
+        membership,
+    })
+}
+
+fn validate_owned_genesis(entry: &Entry) -> io::Result<()> {
+    let EntryPayload::Membership(membership) = &entry.payload else {
+        return Err(invalid("invalid genesis payload"));
+    };
+    crate::consensus_model::validate_membership_genesis(&crate::consensus_model::StoredMembership {
+        introduced_at: Some(entry.identity),
+        membership: membership.clone(),
+    })
+    .map_err(|_| invalid("invalid owned genesis membership"))
+}
+
+fn encode_owned_genesis(genesis: Option<Entry>) -> io::Result<Option<(LogIdentity, Vec<u8>)>> {
+    let encoded = genesis
+        .map(|entry| {
+            validate_owned_genesis(&entry)?;
+            crate::consensus_storage::encode_owned_entry(&entry)
+                .map(|bytes| (entry.identity, bytes))
+                .map_err(io::Error::other)
+        })
+        .transpose()?;
+    if encoded
+        .as_ref()
+        .is_some_and(|(_, bytes)| bytes.len() > APPLICATION_ENTRY_BUDGET)
+    {
+        return Err(invalid("bootstrap membership exceeds size limit"));
+    }
+    Ok(encoded)
+}
+
+fn validate_owned_membership_chain(
+    seed: Option<&crate::consensus_model::StoredMembership>,
+    entries: &[crate::consensus_model::StoredMembership],
+    confirmed: Option<LogIdentity>,
+) -> io::Result<()> {
+    let (previous, tail) = if let Some(seed) = seed {
+        (seed, entries)
+    } else if let Some((genesis, tail)) = entries.split_first() {
+        crate::consensus_model::validate_membership_genesis(genesis)
+            .map_err(|_| invalid("invalid owned membership genesis"))?;
+        (genesis, tail)
+    } else {
+        return Ok(());
+    };
+    crate::consensus_model::validate_membership_sequence(previous, tail.iter(), confirmed)
+        .map_err(|_| invalid("invalid owned membership transition chain"))
+}
+
+fn append_lookup_entries(
+    log: &redb::Table<u64, &[u8]>,
+    request: &AppendRequest,
+    committed: Option<LogIdentity>,
+) -> io::Result<std::collections::BTreeMap<u64, Entry>> {
+    let mut entries = std::collections::BTreeMap::new();
+    for identity in request
+        .entries
+        .iter()
+        .map(|entry| entry.identity)
+        .chain(request.previous)
+        .chain(committed)
+        .chain(request.leader_commit)
+    {
+        if let Some(bytes) = log.get(identity.index.0).map_err(io::Error::other)? {
+            entries.insert(
+                identity.index.0,
+                crate::consensus_storage::decode_owned_entry(bytes.value())
+                    .map_err(io::Error::other)?,
+            );
+        }
+    }
+    Ok(entries)
+}
+
+fn validate_candidate_memberships(
+    meta: &redb::Table<&str, &[u8]>,
+    memberships: &redb::Table<u64, &[u8]>,
+    request: &AppendRequest,
+    replace_from: Option<usize>,
+    confirmed: Option<LogIdentity>,
+) -> io::Result<()> {
+    let seed = if write_position(meta, "snapshot")?.is_some() {
+        let bytes = meta
+            .get("compacted_snapshot")
+            .map_err(io::Error::other)?
+            .ok_or_else(|| invalid("missing membership seed"))?;
+        crate::consensus_storage::decode_owned_snapshot(bytes.value())
+            .map_err(io::Error::other)?
+            .0
+            .membership
+    } else {
+        None
+    };
+    let first_replaced = replace_from.map(|offset| request.entries[offset].identity.index.0);
+    let mut chain = Vec::new();
+    for record in memberships.iter().map_err(io::Error::other)? {
+        let (index, bytes) = record.map_err(io::Error::other)?;
+        if first_replaced.is_none_or(|first| index.value() < first) {
+            chain.push(stored_membership(bytes.value())?);
+        }
+    }
+    if let Some(offset) = replace_from {
+        for entry in &request.entries[offset..] {
+            if let EntryPayload::Membership(membership) = &entry.payload {
+                chain.push(crate::consensus_model::StoredMembership {
+                    introduced_at: Some(entry.identity),
+                    membership: membership.clone(),
+                });
+            }
+        }
+    }
+    validate_owned_membership_chain(seed.as_ref(), &chain, confirmed).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid candidate membership chain",
+        )
+    })
+}
+
 fn validate_log_recovery(transaction: &redb::ReadTransaction) -> io::Result<()> {
     let meta = transaction.open_table(TABLE).map_err(io::Error::other)?;
+    validate_read_install_receipts(&meta)?;
     let position = |key| -> io::Result<Option<LogIdentity>> {
         decode_position(
             meta.get(key)
@@ -499,6 +723,12 @@ fn validate_log_recovery(transaction: &redb::ReadTransaction) -> io::Result<()> 
     if log.len().map_err(io::Error::other)? > MAX_RETAINED_ENTRIES {
         return Err(invalid("owned retained log limit exceeded"));
     }
+    let mut chain = Vec::new();
+    let chain_seed = if seed.is_empty() {
+        None
+    } else {
+        Some(stored_membership(&seed)?)
+    };
     let mut previous: Option<LogIdentity> = snapshot;
     let mut latest_membership = seed.clone();
     let mut latest_applied_membership = seed;
@@ -524,6 +754,7 @@ fn validate_log_recovery(transaction: &redb::ReadTransaction) -> io::Result<()> 
             if indexed.value() != bytes.value() {
                 return Err(invalid("conflicting membership index"));
             }
+            chain.push(stored_membership(bytes.value())?);
             latest_membership = bytes.value().to_vec();
             if applied.is_some_and(|applied| entry.identity.index <= applied.index) {
                 latest_applied_membership.clone_from(&latest_membership);
@@ -532,6 +763,7 @@ fn validate_log_recovery(transaction: &redb::ReadTransaction) -> io::Result<()> 
         }
         previous = Some(entry.identity);
     }
+    validate_owned_membership_chain(chain_seed.as_ref(), &chain, commit)?;
     if applied_membership.value() != latest_applied_membership {
         return Err(invalid("applied membership mismatch"));
     }
@@ -547,6 +779,15 @@ fn validate_log_recovery(transaction: &redb::ReadTransaction) -> io::Result<()> 
     {
         return Err(invalid("inconsistent effective membership"));
     }
+    validate_recovery_coverage(&log, snapshot, commit, applied)
+}
+
+fn validate_recovery_coverage(
+    log: &redb::ReadOnlyTable<u64, &[u8]>,
+    snapshot: Option<LogIdentity>,
+    commit: Option<LogIdentity>,
+    applied: Option<LogIdentity>,
+) -> io::Result<()> {
     for position in [commit, applied].into_iter().flatten() {
         if Some(position) == snapshot {
             continue;
@@ -656,6 +897,56 @@ pub struct OwnedVoteStore {
     failed: bool,
 }
 
+/// Coherent local durable positions and execution-local leadership. This is
+/// diagnostic state, not a quorum-confirmed read or an authority lease.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedObservation {
+    pub hard_state: HardState,
+    pub local_leader: bool,
+    pub effective_membership: Option<crate::consensus_model::StoredMembership>,
+    pub committed_membership: Option<crate::consensus_model::StoredMembership>,
+    pub last_log: Option<LogIdentity>,
+    pub committed: Option<LogIdentity>,
+    pub applied: Option<LogIdentity>,
+}
+
+/// Canonical state captured under consumed quorum read authority. The watermark
+/// is the round's committed position, not a lease or a reusable credential.
+#[derive(Debug)]
+pub struct AuthorizedRead {
+    pub state: crate::control_state::ControlState,
+    pub watermark: LogIdentity,
+}
+
+/// One durably applied entry; only application entries carry response bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedOutcome {
+    pub identity: LogIdentity,
+    pub response: Option<Vec<u8>>,
+}
+
+/// A bounded transaction result, published only after canonical state commits.
+/// `more` means the committed watermark exceeds this resulting applied position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedBatch {
+    pub outcomes: Vec<AppliedOutcome>,
+    pub applied: Option<LogIdentity>,
+    pub more: bool,
+}
+
+#[derive(Debug)]
+pub enum ProposalError {
+    InvalidCommand(String),
+    Unauthorized(String),
+    StaleAuthority,
+    NotReady,
+    IndexExhausted,
+    /// Predictable retained-log exhaustion; compact applied state and retry.
+    Capacity,
+    Append(AppendExecutionError),
+    Executor(VoteGateError),
+}
+
 /// Serial storage adapter for the deterministic vote gate.
 ///
 /// The owner must run
@@ -668,13 +959,80 @@ pub struct DurableVoteGate {
     store: OwnedVoteStore,
     campaign: Option<crate::consensus_model::Campaign>,
     leader: Option<crate::consensus_model::LeaderProgress>,
+    initialized_noop: Option<LogIdentity>,
+    read_barrier: crate::consensus_model::ReadBarrier,
+    read_context: Option<crate::consensus_model::ReadContext>,
+    read_membership: Option<crate::consensus_model::StoredMembership>,
     staging: Option<(std::fs::File, crate::transfer_staging::TransferStaging)>,
 }
 
 impl DurableVoteGate {
+    fn observe_verified_term(&mut self, peer: NodeId, term: Term) -> Result<bool, VoteGateError> {
+        let (_, membership) = self.store.election_context()?;
+        let eligible = membership.as_ref().is_some_and(|membership| {
+            membership
+                .configurations()
+                .iter()
+                .any(|set| set.contains(&peer))
+        });
+        if eligible && term > self.store.state.term {
+            self.cancel_read();
+            self.leader = None;
+            self.campaign = None;
+            self.initialized_noop = None;
+            self.store
+                .persist(HardState {
+                    term,
+                    voted_for: None,
+                })
+                .map_err(|_| VoteGateError::StorageFailure)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Called only after exact signed-response verification (or by unit tests
+    /// exercising the deterministic adapter boundary).
+    fn observe_read_confirmation(
+        &mut self,
+        peer: NodeId,
+        response: crate::consensus_model::ReadConfirmation,
+    ) -> Result<(), VoteGateError> {
+        let observation = self.store.observe()?;
+        let Some(membership) = observation.effective_membership else {
+            self.cancel_read();
+            return Ok(());
+        };
+        if let Some(term) = self.read_barrier.observe(
+            self.leader.as_ref(),
+            observation.hard_state,
+            &membership,
+            peer,
+            response,
+        ) {
+            self.cancel_read();
+            self.leader = None;
+            self.campaign = None;
+            self.initialized_noop = None;
+            self.store
+                .persist(HardState {
+                    term,
+                    voted_for: None,
+                })
+                .map_err(|_| VoteGateError::StorageFailure)?;
+        }
+        Ok(())
+    }
+
+    fn cancel_read(&mut self) {
+        self.read_barrier.cancel();
+        self.read_context = None;
+        self.read_membership = None;
+    }
+
     /// Construct only from recovered durable authority and a fresh incarnation.
     #[must_use]
-    pub const fn new(incarnation: u128, store: OwnedVoteStore) -> Self {
+    pub fn new(incarnation: u128, store: OwnedVoteStore) -> Self {
         let _ = incarnation;
         Self {
             #[cfg(test)]
@@ -682,6 +1040,10 @@ impl DurableVoteGate {
             store,
             campaign: None,
             leader: None,
+            initialized_noop: None,
+            read_barrier: crate::consensus_model::ReadBarrier::default(),
+            read_context: None,
+            read_membership: None,
             staging: None,
         }
     }
@@ -723,6 +1085,8 @@ pub struct VoteExecutor {
     closing: std::sync::Arc<std::sync::atomic::AtomicBool>,
     validation: std::sync::Arc<tokio::sync::Semaphore>,
     outbound_votes: std::sync::Arc<tokio::sync::Semaphore>,
+    response_pending: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    read_outbound: std::sync::Arc<tokio::sync::Semaphore>,
     status: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
 
@@ -816,6 +1180,8 @@ impl VoteExecutor {
             gate: std::sync::Arc::new(tokio::sync::Mutex::new(Some(gate))),
             closing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             outbound_votes: std::sync::Arc::new(tokio::sync::Semaphore::new(16)),
+            response_pending: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            read_outbound: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             validation: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
@@ -926,6 +1292,8 @@ impl VoteExecutor {
             gate: self.gate.clone(),
             closing: self.closing.clone(),
             outbound_votes: self.outbound_votes.clone(),
+            response_pending: self.response_pending.clone(),
+            read_outbound: self.read_outbound.clone(),
             validation: self.validation.clone(),
             status: self.status.clone(),
         };
@@ -1491,9 +1859,10 @@ impl VoteExecutor {
         if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(RpcError::Stopped);
         }
-        let _outbound = self
+        let outbound = self
             .outbound_votes
-            .try_acquire()
+            .clone()
+            .try_acquire_owned()
             .map_err(|_| RpcError::CapacityUnavailable)?;
         if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(RpcError::Stopped);
@@ -1519,7 +1888,7 @@ impl VoteExecutor {
         let cluster = request.cluster_id.clone();
         let term = Term(request.term);
         let endpoint = self
-            .run(move |gate| {
+            .prepare_outbound(&outbound, move |gate| {
                 if !gate.campaign.as_ref().is_some_and(|campaign| {
                     campaign.request.term == term
                         && campaign.request.candidate == local
@@ -1560,7 +1929,7 @@ impl VoteExecutor {
         .await
         .map_err(|_| RpcError::ExecutionFailed)?
         .map_err(|_| RpcError::ExecutionFailed)??;
-        self.campaign_signed_response(local, &request, &response)
+        self.campaign_signed_response_admitted(local, &request, &response, outbound)
             .await
     }
 
@@ -1734,12 +2103,11 @@ impl VoteExecutor {
         local: NodeId,
         request: bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
     ) -> Result<(), bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError> {
-        use bmux_cluster_plugin_api::cluster_consensus_rpc_types::{
-            AppendOutcome as WireOutcome, RpcError,
-        };
-        let _outbound = self
+        use bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError;
+        let outbound = self
             .outbound_votes
-            .try_acquire()
+            .clone()
+            .try_acquire_owned()
             .map_err(|_| RpcError::CapacityUnavailable)?;
         if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(RpcError::Stopped);
@@ -1766,7 +2134,33 @@ impl VoteExecutor {
         .map_err(|_| RpcError::ExecutionFailed)??;
         crate::consensus_network::verify_owned_append_response(&request, &response)
             .map_err(|_| RpcError::Unauthorized)?;
-        self.run(move |gate| {
+        self.replicate_response_admitted(
+            local, request, response, endpoint, peer, expected, membership, outbound,
+        )
+        .await
+    }
+
+    // The exact response has passed signature verification before this boundary.
+    // Keep higher-term persistence ahead of every old-probe eligibility check.
+    #[allow(clippy::too_many_arguments)]
+    async fn replicate_response_admitted(
+        &self,
+        local: NodeId,
+        request: bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
+        response: bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendResponse,
+        endpoint: String,
+        peer: NodeId,
+        expected: Option<LogIdentity>,
+        membership: Membership,
+        outbound: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<(), bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError> {
+        use bmux_cluster_plugin_api::cluster_consensus_rpc_types::{
+            AppendOutcome as WireOutcome, RpcError,
+        };
+        self.settle_response(outbound, move |gate| {
+            if gate.observe_verified_term(peer, Term(response.term))? {
+                return Ok(Err(RpcError::StaleTerm));
+            }
             let admission = gate
                 .store
                 .admit_replication(gate.leader.as_ref(), local, &request)?;
@@ -1776,17 +2170,7 @@ impl VoteExecutor {
             if current_endpoint != endpoint || current_membership != membership {
                 return Ok(Err(RpcError::Unauthorized));
             }
-            if response.term > gate.store.state.term.0 {
-                gate.leader = None;
-                gate.campaign = None;
-                gate.store
-                    .persist(HardState {
-                        term: Term(response.term),
-                        voted_for: None,
-                    })
-                    .map_err(|_| VoteGateError::StorageFailure)?;
-                return Ok(Err(RpcError::StaleTerm));
-            }
+
             if response.term != request.term {
                 return Ok(Err(RpcError::StaleTerm));
             }
@@ -1837,6 +2221,24 @@ impl VoteExecutor {
         request: &bmux_cluster_plugin_api::cluster_consensus_vote_types::VoteRequest,
         response: &bmux_cluster_plugin_api::cluster_consensus_vote_types::VoteResponse,
     ) -> Result<bool, bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError> {
+        let permit = self
+            .outbound_votes
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| {
+                bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError::CapacityUnavailable
+            })?;
+        self.campaign_signed_response_admitted(local, request, response, permit)
+            .await
+    }
+
+    async fn campaign_signed_response_admitted(
+        &self,
+        local: NodeId,
+        request: &bmux_cluster_plugin_api::cluster_consensus_vote_types::VoteRequest,
+        response: &bmux_cluster_plugin_api::cluster_consensus_vote_types::VoteResponse,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<bool, bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError> {
         use bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError;
         if request.sender.as_slice() != local.as_bytes() || response.signature.len() != 64 {
             return Err(RpcError::Unauthorized);
@@ -1853,13 +2255,14 @@ impl VoteExecutor {
         );
         crate::membership::verify_node_signature(&peer.to_string(), &signed, &response.signature)
             .map_err(|_| RpcError::Unauthorized)?;
-        self.campaign_response(
+        self.campaign_response_admitted(
             Term(request.term),
             peer,
             VoteResponse {
                 term: Term(response.term),
                 granted: response.granted,
             },
+            permit,
         )
         .await
         .map_err(vote_rpc_error)
@@ -1877,7 +2280,26 @@ impl VoteExecutor {
         peer: NodeId,
         response: VoteResponse,
     ) -> Result<bool, VoteGateError> {
-        self.run(move |gate| {
+        let permit = self
+            .outbound_votes
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| VoteGateError::Busy)?;
+        self.campaign_response_admitted(campaign_term, peer, response, permit)
+            .await
+    }
+
+    async fn campaign_response_admitted(
+        &self,
+        campaign_term: Term,
+        peer: NodeId,
+        response: VoteResponse,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> Result<bool, VoteGateError> {
+        self.settle_response(permit, move |gate| {
+            if gate.observe_verified_term(peer, response.term)? {
+                return Ok(false);
+            }
             let (_, membership) = gate.store.election_context()?;
             let decision = crate::consensus_model::Campaign::observe(
                 &mut gate.campaign,
@@ -1913,10 +2335,16 @@ impl VoteExecutor {
             else {
                 return Ok(None);
             };
-            let decision = gate
-                .store
-                .append(&request, (1, 1024))
-                .map_err(|_| VoteGateError::StorageFailure)?;
+            if !gate.store.has_local_append_capacity(1024)? {
+                return Err(VoteGateError::Busy);
+            }
+            let decision = gate.store.append(&request, (1, 1024)).map_err(|error| {
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    VoteGateError::Busy
+                } else {
+                    VoteGateError::StorageFailure
+                }
+            })?;
             if !matches!(
                 decision.outcome,
                 Ok(AppendOutcome::Reconciled(
@@ -1932,10 +2360,395 @@ impl VoteExecutor {
                     request.entries[0].identity,
                 ),
             );
+            gate.initialized_noop = Some(request.entries[0].identity);
             gate.campaign = None;
             Ok(Some(request))
         })
         .await
+    }
+
+    /// Begin one fresh round, superseding any prior unfinished context.
+    /// # Errors
+    /// Busy/stopped storage or exhausted context sequence.
+    pub async fn begin_read(
+        &self,
+        local: NodeId,
+    ) -> Result<Option<crate::consensus_model::ReadContext>, VoteGateError> {
+        self.run(move |gate| {
+            gate.read_barrier.cancel();
+            gate.read_context = None;
+            gate.read_membership = None;
+            let observation = gate.store.observe()?;
+            let (Some(leader), Some(membership)) =
+                (gate.leader.as_ref(), observation.effective_membership)
+            else {
+                return Ok(None);
+            };
+            if observation.hard_state.voted_for != Some(local) {
+                return Ok(None);
+            }
+            let context = gate
+                .read_barrier
+                .begin(
+                    leader,
+                    observation.hard_state,
+                    &membership,
+                    observation.committed,
+                )
+                .map_err(|_| VoteGateError::EffectExhausted)?;
+            gate.read_context = context;
+            gate.read_membership = context.map(|_| membership);
+            Ok(context)
+        })
+        .await
+    }
+
+    /// Consume a confirmed round once and capture canonical state under the
+    /// SAME serialized authority scope. Product authorization remains required.
+    /// # Errors
+    /// Busy/stopped admission or canonical storage/decode failure.
+    pub async fn complete_read(
+        &self,
+        local: NodeId,
+        context: crate::consensus_model::ReadContext,
+    ) -> Result<Option<AuthorizedRead>, AppendExecutionError> {
+        self.run(move |gate| {
+            if gate.read_context != Some(context) || context.leader != local {
+                return Ok(Ok(None));
+            }
+            let observation = gate.store.observe()?;
+            let Some(membership) = observation.effective_membership else {
+                gate.cancel_read();
+                return Ok(Ok(None));
+            };
+            let watermark = gate.read_barrier.complete(
+                gate.leader.as_ref(),
+                observation.hard_state,
+                &membership,
+                observation.committed,
+                observation.applied,
+            );
+            let Some(watermark) = watermark else {
+                return Ok(Ok(None));
+            };
+            gate.cancel_read();
+            Ok(gate
+                .store
+                .read_control_state()
+                .map(|state| Some(AuthorizedRead { state, watermark })))
+        })
+        .await
+        .map_err(AppendExecutionError::Executor)?
+        .map_err(AppendExecutionError::Storage)
+    }
+
+    /// Confirm a round through one fresh authenticated signed append heartbeat.
+    /// Exact request UUID/body remain local until verification; no context is
+    /// trusted from the wire. Uses the shared bounded outbound task permit.
+    /// # Errors
+    /// Returns explicit stale authority, authentication, timeout or storage errors.
+    // Keep request binding, authentication and durable higher-term handling auditable.
+    #[allow(clippy::too_many_lines)]
+    pub async fn confirm_read<C>(
+        &self,
+        caller: &C,
+        context: crate::consensus_model::ReadContext,
+        peer: NodeId,
+    ) -> Result<(), bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError>
+    where
+        C: crate::ClusterRuntimeOps + bmux_plugin::ServiceCaller + Send + Sync + 'static,
+    {
+        use bmux_cluster_plugin_api::{
+            cluster_consensus_rpc_types::{
+                AppendOutcome as WireOutcome, AppendRequest as WireRequest, RpcError,
+            },
+            cluster_consensus_transfer_types::TransferProof,
+        };
+        let read_permit = self
+            .read_outbound
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| RpcError::CapacityUnavailable)?;
+        let permit = self
+            .outbound_votes
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| RpcError::CapacityUnavailable)?;
+        let identity =
+            crate::load_or_create_node_identity(caller).map_err(|_| RpcError::Unauthorized)?;
+        let local = *identity.node_id();
+        if local != context.leader || local == peer {
+            return Err(RpcError::Unauthorized);
+        }
+        let batch = self
+            .run(move |gate| {
+                if gate.read_context != Some(context) {
+                    return Ok(Err(RpcError::StaleTerm));
+                }
+                // Reuse canonical endpoint/member admission but send no entries.
+                gate.store
+                    .outbound_batch_inner(gate.leader.as_ref(), local, peer, true)
+            })
+            .await
+            .map_err(vote_rpc_error)??;
+        let proof = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::endpoint::peer_authentication_proof(
+                caller,
+                &batch.endpoint,
+                &local.to_string(),
+                &peer.to_string(),
+            ),
+        )
+        .await
+        .map_err(|_| RpcError::ExecutionFailed)?
+        .map_err(|_| RpcError::Unauthorized)?;
+        let mut request = WireRequest {
+            cluster_id: batch.cluster,
+            sender: local.as_bytes().to_vec(),
+            recipient: peer.as_bytes().to_vec(),
+            request_id: uuid::Uuid::new_v4(),
+            term: context.term.0,
+            previous: batch.append.previous.map(wire_log_identity),
+            entries: Vec::new(),
+            leader_commit: batch.append.leader_commit.map(wire_log_identity),
+            proof: TransferProof {
+                credential_serial: batch.credential_serial,
+                signature: Vec::new(),
+                peer: proof,
+            },
+        };
+        request.proof.signature = identity.sign(
+            &crate::consensus_network::owned_append_signing_payload(&request)
+                .map_err(|_| RpcError::InvalidRequest)?,
+        );
+        let admitted = request.clone();
+        let (endpoint, _, expected, membership) = self
+            .run(move |gate| {
+                if gate.read_context != Some(context) {
+                    return Ok(Err(RpcError::StaleTerm));
+                }
+                gate.store
+                    .admit_replication(gate.leader.as_ref(), local, &admitted)
+            })
+            .await
+            .map_err(vote_rpc_error)??;
+        let mut remote = crate::endpoint::EndpointDispatchClient::new(caller, endpoint.clone());
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bmux_cluster_plugin_api::cluster_consensus_rpc::client::append(
+                &mut remote,
+                request.clone(),
+            ),
+        )
+        .await
+        .map_err(|_| RpcError::ExecutionFailed)?
+        .map_err(|_| RpcError::ExecutionFailed)??;
+        crate::consensus_network::verify_owned_append_response(&request, &response)
+            .map_err(|_| RpcError::Unauthorized)?;
+        self.settle_response(permit, move |gate| {
+            let _read_permit = read_permit;
+            // Process a verified eligible-peer higher term even when this round
+            // was superseded while I/O was in flight. Never revive its authority.
+            let observation = gate.store.observe()?;
+            let Some(current_membership) = observation.effective_membership else { gate.cancel_read(); return Ok(Err(RpcError::StaleTerm)); };
+            let state = gate.store.read_control_state().map_err(|_| VoteGateError::StorageFailure)?;
+            let current_endpoint = match owned_vote_endpoint(&state, &request.cluster_id, peer) {
+                Ok(endpoint) => endpoint,
+                Err(error) => return Ok(Err(error)),
+            };
+            if current_endpoint != endpoint { return Ok(Err(RpcError::Unauthorized)); }
+            let eligible = current_membership.membership.configurations().iter().any(|set| set.contains(&peer));
+            if eligible && response.term > observation.hard_state.term.0 {
+                gate.cancel_read(); gate.leader = None; gate.campaign = None; gate.initialized_noop = None;
+                gate.store.persist(HardState { term: Term(response.term), voted_for: None }).map_err(|_| VoteGateError::StorageFailure)?;
+                return Ok(Err(RpcError::StaleTerm));
+            }
+            if gate.read_context != Some(context) || current_membership.membership != membership { return Ok(Err(RpcError::StaleTerm)); }
+            let admission = gate.store.admit_replication(gate.leader.as_ref(), local, &request)?;
+            let Ok((current_endpoint, _, _, _)) = admission else { return Ok(Err(RpcError::StaleTerm)); };
+            if current_endpoint != endpoint { return Ok(Err(RpcError::Unauthorized)); }
+            let accepted = matches!(response.outcome, WireOutcome::Durable { matched } if matched == expected.map(wire_log_identity));
+            gate.observe_read_confirmation(peer, crate::consensus_model::ReadConfirmation { context, term: Term(response.term), accepted })?;
+            Ok(Ok(()))
+        }).await.map_err(vote_rpc_error)?
+    }
+
+    /// Read coherent local positions; this does not establish a read barrier.
+    /// # Errors
+    /// Rejects busy/stopped admission or invalid durable state.
+    pub async fn observe(&self, local: NodeId) -> Result<OwnedObservation, VoteGateError> {
+        self.run(move |gate| {
+            let mut observation = gate.store.observe()?;
+            observation.local_leader = gate.leader.as_ref().is_some_and(|leader| {
+                leader.term == observation.hard_state.term
+                    && observation.hard_state.voted_for == Some(local)
+                    && observation
+                        .effective_membership
+                        .as_ref()
+                        .is_some_and(|m| m.membership == leader.membership)
+                    && leader.matched.contains_key(&local)
+            });
+            Ok(observation)
+        })
+        .await
+    }
+
+    /// Read canonical applied state, not a cache. Linearizable callers must
+    /// separately establish a quorum barrier and wait for its applied watermark.
+    /// # Errors
+    /// Rejects busy/stopped admission or canonical storage/decode failure.
+    pub async fn read_control_state(
+        &self,
+    ) -> Result<crate::control_state::ControlState, AppendExecutionError> {
+        self.run(|gate| Ok(gate.store.read_control_state()))
+            .await
+            .map_err(AppendExecutionError::Executor)?
+            .map_err(AppendExecutionError::Storage)
+    }
+
+    /// Admit an authenticated local command. The caller supplies the actual
+    /// authenticated principal, NEVER a principal copied from untrusted input.
+    /// `authorize` must revalidate product/resource permissions against canonical
+    /// state inside this admission. It must be bounded, nonblocking and without
+    /// side effects. Codec/principal validation is not product authorization.
+    /// Success means durable local append, NOT quorum commit or application.
+    /// Retry ambiguous completion with the same command identity for dedup.
+    /// # Errors
+    /// Rejects invalid allocation, denied authorization, stale authority, absent
+    /// current-term committed no-op, unapplied committed work, capacity pressure,
+    /// or uncertain persistence. `Capacity` is retryable after compaction; it
+    /// never represents an uncertain storage outcome.
+    // Keep authority admission, authorization and durable self-match publication
+    // in one auditable single-flight operation.
+    #[allow(clippy::too_many_lines)]
+    pub async fn propose_authorized<F>(
+        &self,
+        local: NodeId,
+        expected: HardState,
+        authenticated_principal: String,
+        command: bmux_cluster_plugin_api::cluster_types::ControlCommand,
+        authorize: F,
+    ) -> Result<LogIdentity, ProposalError>
+    where
+        F: FnOnce(
+                &crate::control_state::ControlState,
+                &bmux_cluster_plugin_api::cluster_types::ControlCommand,
+            ) -> Result<(), String>
+            + Send
+            + 'static,
+    {
+        crate::control_codec::control_command_encoded_len(&command, 1_048_576)
+            .map_err(|error| ProposalError::InvalidCommand(error.to_string()))?;
+        if command.schema_version != 1 {
+            return Err(ProposalError::InvalidCommand(
+                "unsupported control command schema".into(),
+            ));
+        }
+        if authenticated_principal.is_empty() || command.principal_id != authenticated_principal {
+            return Err(ProposalError::Unauthorized(
+                "authenticated principal mismatch".into(),
+            ));
+        }
+        self.run(move |gate| {
+            if gate.store.state != expected {
+                return Ok(Err(ProposalError::StaleAuthority));
+            }
+            let observation = gate.store.observe()?;
+            let eligible = gate.leader.as_ref().is_some_and(|leader| {
+                leader.term == expected.term
+                    && expected.voted_for == Some(local)
+                    && observation
+                        .effective_membership
+                        .as_ref()
+                        .is_some_and(|m| m.membership == leader.membership)
+                    && leader.matched.contains_key(&local)
+            });
+            let ready = gate.initialized_noop.is_some_and(|noop| {
+                noop.term == expected.term
+                    && noop.leader == local
+                    && crate::consensus_model::validate_position_prefix(
+                        Some(noop),
+                        observation.committed,
+                    )
+                    .is_ok()
+            });
+            if !eligible || !ready || observation.applied != observation.committed {
+                return Ok(Err(ProposalError::NotReady));
+            }
+            let state = match gate.store.read_control_state() {
+                Ok(state) => state,
+                Err(error) => {
+                    return Ok(Err(ProposalError::Append(AppendExecutionError::Storage(
+                        error,
+                    ))));
+                }
+            };
+            if let Err(error) = authorize(&state, &command) {
+                return Ok(Err(ProposalError::Unauthorized(error)));
+            }
+            let Some(index) = observation
+                .last_log
+                .map_or(Some(0), |last| last.index.0.checked_add(1))
+            else {
+                return Ok(Err(ProposalError::IndexExhausted));
+            };
+            let identity = LogIdentity {
+                term: expected.term,
+                leader: local,
+                index: crate::consensus_model::LogIndex(index),
+            };
+            let entry = Entry {
+                identity,
+                payload: EntryPayload::Application(crate::control_codec::encode_control_command(
+                    &command,
+                )),
+            };
+            let canonical = crate::consensus_storage::encode_owned_entry(&entry)
+                .map_err(|_| VoteGateError::StorageFailure)?;
+            if canonical.len() > APPLICATION_ENTRY_BUDGET {
+                return Ok(Err(ProposalError::InvalidCommand(
+                    "framed entry exceeds application budget".into(),
+                )));
+            }
+            if !gate.store.has_local_append_capacity(canonical.len())? {
+                return Ok(Err(ProposalError::Capacity));
+            }
+            let request = AppendRequest {
+                term: expected.term,
+                leader: local,
+                previous: observation.last_log,
+                entries: vec![entry],
+                leader_commit: observation.committed,
+            };
+            match gate.store.append(&request, (1, 1_048_576)) {
+                Ok(decision)
+                    if matches!(
+                        decision.outcome,
+                        Ok(AppendOutcome::Reconciled(
+                            AppendReconciliation::Matched { .. }
+                        ))
+                    ) =>
+                {
+                    if let Some(leader) = gate.leader.as_mut() {
+                        leader.acknowledge_probe(local, Some(identity));
+                    }
+                    Ok(Ok(identity))
+                }
+                Ok(_) => {
+                    gate.store.failed = true;
+                    Err(VoteGateError::Stopped)
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    Ok(Err(ProposalError::Capacity))
+                }
+                Err(error) => Ok(Err(ProposalError::Append(AppendExecutionError::Storage(
+                    error,
+                )))),
+            }
+        })
+        .await
+        .map_err(ProposalError::Executor)?
     }
 
     /// Advance commit from current retained replication evidence without applying
@@ -1962,6 +2775,18 @@ impl VoteExecutor {
             .map_err(AppendExecutionError::Storage)
     }
 
+    /// Apply one identity-tagged bounded batch under the same single-flight
+    /// owner as append, votes and canonical reads. Responses and the resulting
+    /// watermark are released only after the canonical transaction commits.
+    /// # Errors
+    /// Busy/stopped admission or uncertain decode/storage suppresses the batch.
+    pub async fn apply_committed_batch(&self) -> Result<AppliedBatch, AppendExecutionError> {
+        self.run(|gate| Ok(gate.store.apply_committed_batch()))
+            .await
+            .map_err(AppendExecutionError::Executor)?
+            .map_err(AppendExecutionError::Storage)
+    }
+
     /// Publish a coherent durable snapshot without compacting the retained log.
     /// # Errors
     /// Storage or encoding failure stops this owner before returning a snapshot.
@@ -1970,6 +2795,294 @@ impl VoteExecutor {
             .await
             .map_err(AppendExecutionError::Executor)?
             .map_err(AppendExecutionError::Storage)
+    }
+
+    /// Authenticate and consume an exact sealed snapshot under canonical owner
+    /// authority. Replay receipts survive staging loss/restart and are retained
+    /// for the last 64 successful installs. Every retry authenticates again.
+    /// # Errors
+    /// Authentication, executor and uncertain storage errors never claim install.
+    // Keep authentication, replay lookup, sealing and atomic persistence together.
+    #[allow(clippy::too_many_lines)]
+    pub async fn install_snapshot_authenticated<C>(
+        &self,
+        caller: std::sync::Arc<C>,
+        local: NodeId,
+        request: bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallRequest,
+    ) -> Result<
+        bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallResponse,
+        bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallError,
+    >
+    where
+        C: crate::ClusterRuntimeOps + Send + Sync + 'static,
+    {
+        use bmux_cluster_plugin_api::cluster_consensus_snapshot_types::{
+            InstallError, InstallOutcome, InstallRejection, InstallResponse,
+        };
+        use bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferPurpose;
+        crate::consensus_network::owned_snapshot_install_signing_payload(&request)
+            .map_err(|_| InstallError::InvalidRequest)?;
+        self.run(move |gate| {
+            let outcome = (|| -> Result<_, InstallError> {
+                let state = gate
+                    .store
+                    .read_control_state()
+                    .map_err(|_| InstallError::StorageFailure)?;
+                if state.cluster_id != request.reference.cluster_id {
+                    return Err(InstallError::Unauthorized);
+                }
+                let members = state.members.into_values().collect::<Vec<_>>();
+                let source = crate::consensus_network::authenticate_owned_snapshot_install(
+                    caller.as_ref(),
+                    local,
+                    &members,
+                    &request,
+                )
+                .map_err(|_| InstallError::Unauthorized)?;
+                if !members.iter().any(|member| {
+                    member.node_id == local.to_string()
+                        && member.state
+                            == bmux_cluster_plugin_api::cluster_types::ClusterMemberState::Active
+                        && crate::consensus_network::supports_owned_snapshot_install(member)
+                }) {
+                    return Err(InstallError::Incompatible);
+                }
+                let observation = gate
+                    .store
+                    .observe()
+                    .map_err(|_| InstallError::StorageFailure)?;
+                if observation.applied != observation.committed {
+                    // Canonical product membership may lag committed admission
+                    // or revocation intent. Apply first; never authenticate from
+                    // a projection known to trail the committed watermark.
+                    return Err(InstallError::CapacityUnavailable);
+                }
+                let eligible =
+                    observation
+                        .effective_membership
+                        .as_ref()
+                        .is_some_and(|membership| {
+                            membership.membership.nodes().contains_key(&local)
+                                && membership
+                                    .membership
+                                    .configurations()
+                                    .iter()
+                                    .any(|set| set.contains(&source))
+                        });
+                if !eligible {
+                    return Err(InstallError::Unauthorized);
+                }
+                let identity = crate::load_or_create_node_identity(caller.as_ref())
+                    .map_err(|_| InstallError::Unauthorized)?;
+                if *identity.node_id() != local {
+                    return Err(InstallError::Unauthorized);
+                }
+                let TransferPurpose::Snapshot { value } = &request.reference.purpose else {
+                    return Err(InstallError::InvalidRequest);
+                };
+                let boundary = value
+                    .last_included
+                    .as_ref()
+                    .ok_or(InstallError::InvalidRequest)?;
+                let canonical_boundary = decode_replication_identity(boundary)
+                    .map_err(|_| InstallError::InvalidRequest)?;
+                let binding: [u8; 32] = Sha256::digest(
+                    bmux_plugin_sdk::encode_service_message(&request.reference)
+                        .map_err(|_| InstallError::InvalidRequest)?,
+                )
+                .into();
+                let key = crate::transfer_staging::TransferKey {
+                    peer: *source.as_bytes(),
+                    incarnation: request.reference.sender_incarnation,
+                    sequence: request.reference.sequence,
+                };
+                let mut receipt = [0; INSTALL_RECEIPT_BYTES];
+                receipt[..16].copy_from_slice(request.request_id.as_bytes());
+                receipt[16..48].copy_from_slice(source.as_bytes());
+                receipt[48..64].copy_from_slice(key.incarnation.as_bytes());
+                receipt[64..72].copy_from_slice(&key.sequence.to_le_bytes());
+                receipt[72..104].copy_from_slice(&binding);
+                receipt[104..152].copy_from_slice(&encode_position(Some(canonical_boundary)));
+                receipt[152..160].copy_from_slice(&request.reference.leader_term.to_le_bytes());
+                gate.observe_verified_term(source, Term(request.reference.leader_term))
+                    .map_err(|_| InstallError::StorageFailure)?;
+                let replay = gate
+                    .store
+                    .install_replay(&receipt)
+                    .map_err(|_| InstallError::StorageFailure)?;
+                let result = if let Some(matches) = replay {
+                    if matches {
+                        InstallOutcome::Installed {
+                            boundary: boundary.clone(),
+                        }
+                    } else {
+                        InstallOutcome::Rejected {
+                            reason: InstallRejection::ConflictingReference,
+                        }
+                    }
+                } else if request.reference.leader_term < observation.hard_state.term.0 {
+                    InstallOutcome::Rejected {
+                        reason: InstallRejection::StaleTerm,
+                    }
+                } else {
+                    if request.reference.leader_term > gate.store.state.term.0 {
+                        gate.store
+                            .persist(HardState {
+                                term: Term(request.reference.leader_term),
+                                voted_for: None,
+                            })
+                            .map_err(|_| InstallError::StorageFailure)?;
+                    }
+                    gate.leader = None;
+                    gate.campaign = None;
+                    gate.initialized_noop = None;
+                    gate.cancel_read();
+                    if snapshot_install_fits(0, request.reference.total_bytes, 0, 0) {
+                        let bytes = (|| -> Result<Vec<u8>, InstallRejection> {
+                            let (_, staging) = gate
+                                .staging
+                                .as_mut()
+                                .ok_or(InstallRejection::UnknownTransfer)?;
+                            let (file, total) =
+                                staging
+                                    .sealed_reader(key, binding)
+                                    .map_err(|error| match error.kind() {
+                                        io::ErrorKind::NotFound => {
+                                            InstallRejection::UnknownTransfer
+                                        }
+                                        io::ErrorKind::WouldBlock => InstallRejection::NotSealed,
+                                        _ => InstallRejection::ConflictingReference,
+                                    })?;
+                            if total != request.reference.total_bytes {
+                                return Err(InstallRejection::ConflictingReference);
+                            }
+                            // This is bounded whole-object decoding, NOT streaming:
+                            // cap permits <4 MiB input; canonical decoder/control
+                            // validation and transaction copies may hold ~8 copies
+                            // concurrently (<32 MiB plus bounded metadata/state).
+                            // No second unbounded staging Vec or peer-sized task.
+                            let mut bytes = vec![
+                                0;
+                                usize::try_from(total).map_err(|_| {
+                                    InstallRejection::CapacityUnavailable
+                                })?
+                            ];
+                            file.read_exact(&mut bytes)
+                                .map_err(|_| InstallRejection::InvalidSnapshot)?;
+                            if Sha256::digest(&bytes).as_slice() != request.reference.checksum {
+                                return Err(InstallRejection::InvalidSnapshot);
+                            }
+                            crate::consensus_network::validate_staged_object(
+                                file,
+                                total,
+                                &request.reference,
+                                &gate.store.status,
+                                &std::sync::atomic::AtomicBool::new(false),
+                            )
+                            .map_err(|_| InstallRejection::InvalidSnapshot)?;
+                            Ok(bytes)
+                        })();
+                        match bytes {
+                            Err(reason) => InstallOutcome::Rejected { reason },
+                            Ok(bytes) => match gate.store.install_snapshot_recorded(
+                                gate.store.state,
+                                &bytes,
+                                Some(&receipt),
+                            ) {
+                                Ok(()) => {
+                                    // Cleanup cannot downgrade durable install.
+                                    // Failed deletion retains staging reservation;
+                                    // the durable receipt remains retry authority.
+                                    if let Some((_, staging)) = gate.staging.as_mut() {
+                                        let _ = staging.abort(key);
+                                    }
+                                    InstallOutcome::Installed {
+                                        boundary: boundary.clone(),
+                                    }
+                                }
+                                Err(error) if !gate.store.failed => InstallOutcome::Rejected {
+                                    reason: if error.kind() == io::ErrorKind::StorageFull {
+                                        InstallRejection::CapacityUnavailable
+                                    } else {
+                                        InstallRejection::InvalidSnapshot
+                                    },
+                                },
+                                Err(_) => return Err(InstallError::StorageFailure),
+                            },
+                        }
+                    } else {
+                        InstallOutcome::Rejected {
+                            reason: InstallRejection::CapacityUnavailable,
+                        }
+                    }
+                };
+                // A receipt labels the original durable term, even if local
+                // authority advanced since install. This preserves exact replay.
+                let term = if matches!(result, InstallOutcome::Installed { .. }) {
+                    request.reference.leader_term
+                } else {
+                    gate.store.state.term.0
+                };
+                let mut response = InstallResponse {
+                    request_id: request.request_id,
+                    source: local.as_bytes().to_vec(),
+                    term,
+                    outcome: result,
+                    signature: Vec::new(),
+                };
+                response.signature = identity.sign(
+                    &crate::consensus_network::owned_snapshot_install_response_signing_payload(
+                        &request, &response,
+                    )
+                    .map_err(|_| InstallError::ExecutionFailed)?,
+                );
+                Ok(response)
+            })();
+            Ok(outcome)
+        })
+        .await
+        .map_err(|error| match error {
+            VoteGateError::Busy => InstallError::CapacityUnavailable,
+            VoteGateError::StorageFailure => InstallError::StorageFailure,
+            VoteGateError::Stopped => InstallError::Stopped,
+            VoteGateError::EffectExhausted => InstallError::ExecutionFailed,
+        })?
+    }
+
+    /// Install canonical snapshot bytes under the single-flight storage owner.
+    ///
+    /// This is a local persistence primitive, NOT a remote RPC or proof of peer
+    /// authorization. A future authenticated install boundary must consume a
+    /// sealed snapshot-purpose transfer and revalidate its complete immutable
+    /// header before calling this. Transfer `finish` must never call this API.
+    /// `expected` fences work prepared against superseded term/vote authority.
+    /// # Errors
+    /// Rejects stale authority, unsupported/corrupt snapshots and rollback of
+    /// acknowledged commit. Storage uncertainty permanently stops this owner.
+    pub async fn install_snapshot(
+        &self,
+        expected: HardState,
+        canonical: Vec<u8>,
+    ) -> Result<(), AppendExecutionError> {
+        if !snapshot_install_fits(0, canonical.len() as u64, 0, 0) {
+            return Err(AppendExecutionError::Storage(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "snapshot exceeds owned install capacity",
+            )));
+        }
+        self.run(move |gate| {
+            let result = gate.store.install_snapshot(expected, &canonical);
+            if result.is_ok() {
+                gate.campaign = None;
+                gate.leader = None;
+                gate.initialized_noop = None;
+                gate.cancel_read();
+            }
+            Ok(result)
+        })
+        .await
+        .map_err(AppendExecutionError::Executor)?
+        .map_err(AppendExecutionError::Storage)
     }
 
     /// Compact through the latest published snapshot without installing remote state.
@@ -1982,6 +3095,42 @@ impl VoteExecutor {
             .map_err(AppendExecutionError::Storage)
     }
 
+    /// Verified peer authority must settle even if its caller is cancelled or
+    /// ordinary single-flight admission is busy. Fence subsequent admission
+    /// synchronously, then retain one bounded outbound slot through settlement.
+    async fn settle_response<T: Send + 'static>(
+        &self,
+        permit: tokio::sync::OwnedSemaphorePermit,
+        operation: impl FnOnce(&mut DurableVoteGate) -> Result<T, VoteGateError> + Send + 'static,
+    ) -> Result<T, VoteGateError> {
+        self.response_pending
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let pending = self.response_pending.clone();
+        let owner = self.gate.clone();
+        tokio::spawn(async move {
+            let guard = owner.lock_owned().await;
+            tokio::task::spawn_blocking(move || {
+                struct Settlement(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+                impl Drop for Settlement {
+                    fn drop(&mut self) {
+                        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                let _settlement = Settlement(pending);
+                let _permit = permit;
+                let mut guard = guard;
+                let mut gate = guard.take().ok_or(VoteGateError::Stopped)?;
+                let result = operation(&mut gate);
+                *guard = Some(gate);
+                result
+            })
+            .await
+            .map_err(|_| VoteGateError::Stopped)?
+        })
+        .await
+        .map_err(|_| VoteGateError::Stopped)?
+    }
+
     async fn run<T: Send + 'static>(
         &self,
         operation: impl FnOnce(&mut DurableVoteGate) -> Result<T, VoteGateError> + Send + 'static,
@@ -1989,13 +3138,32 @@ impl VoteExecutor {
         self.run_admitted(false, operation).await
     }
 
-    // Only a finish workflow already holding the single validation permit may
-    // wait. Ordinary requests retain immediate Busy admission with no queue.
+    /// FIFO preparation is available only to work already holding a bounded
+    /// outbound slot. At most 16 such preparations can wait; cancellation removes
+    /// the lock waiter. No peer I/O occurs under the gate. Response settlement
+    /// fences still take precedence and return Busy rather than stale authority.
+    async fn prepare_outbound<T: Send + 'static>(
+        &self,
+        _permit: &tokio::sync::OwnedSemaphorePermit,
+        operation: impl FnOnce(&mut DurableVoteGate) -> Result<T, VoteGateError> + Send + 'static,
+    ) -> Result<T, VoteGateError> {
+        self.run_admitted(true, operation).await
+    }
+
+    // Only workflows already holding validation or outbound permits may wait.
+    // Ordinary requests retain immediate Busy admission with no queue.
     async fn run_admitted<T: Send + 'static>(
         &self,
         finishing: bool,
         operation: impl FnOnce(&mut DurableVoteGate) -> Result<T, VoteGateError> + Send + 'static,
     ) -> Result<T, VoteGateError> {
+        if self
+            .response_pending
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != 0
+        {
+            return Err(VoteGateError::Busy);
+        }
         if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(VoteGateError::Stopped);
         }
@@ -2012,6 +3180,13 @@ impl VoteExecutor {
                 .try_lock_owned()
                 .map_err(|_| VoteGateError::Busy)?
         };
+        if self
+            .response_pending
+            .load(std::sync::atomic::Ordering::SeqCst)
+            != 0
+        {
+            return Err(VoteGateError::Busy);
+        }
         if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(VoteGateError::Stopped);
         }
@@ -2028,6 +3203,22 @@ impl VoteExecutor {
                     Ok(_) => gate.leader = None,
                     Err(error) => {
                         gate.leader = None;
+                        response = Err(error);
+                    }
+                }
+            }
+            if gate.read_context.is_some() {
+                match gate.store.observe() {
+                    Ok(observation)
+                        if gate.leader.is_some()
+                            && observation.effective_membership == gate.read_membership
+                            && gate.read_context.is_some_and(|context| {
+                                context.term == observation.hard_state.term
+                                    && Some(context.leader) == observation.hard_state.voted_for
+                            }) => {}
+                    Ok(_) => gate.cancel_read(),
+                    Err(error) => {
+                        gate.cancel_read();
                         response = Err(error);
                     }
                 }
@@ -2135,19 +3326,7 @@ impl OwnedVoteStore {
     }
 
     fn initialize(path: &Path, cluster: &str, genesis: Option<Entry>) -> io::Result<Self> {
-        let genesis = genesis
-            .map(|entry| {
-                crate::consensus_storage::encode_owned_entry(&entry)
-                    .map(|bytes| (entry.identity, bytes))
-                    .map_err(io::Error::other)
-            })
-            .transpose()?;
-        if genesis
-            .as_ref()
-            .is_some_and(|(_, bytes)| bytes.len() > 1024 * 1024)
-        {
-            return Err(invalid("bootstrap membership exceeds size limit"));
-        }
+        let genesis = encode_owned_genesis(genesis)?;
         if cluster.is_empty() || cluster.len() > 1024 {
             return Err(invalid("invalid cluster identity"));
         }
@@ -2186,6 +3365,9 @@ impl OwnedVoteStore {
                 )
                 .map_err(io::Error::other)?;
             table.insert("format", FORMAT).map_err(io::Error::other)?;
+            table
+                .insert("install_receipts", &[][..])
+                .map_err(io::Error::other)?;
             for key in EMPTY_POSITIONS {
                 table.insert(key, &[][..]).map_err(io::Error::other)?;
             }
@@ -2291,6 +3473,384 @@ impl OwnedVoteStore {
         self.state
     }
 
+    // Keep the immediate transaction and its rejection/poisoning boundary
+    // together so partial authority publication remains auditable.
+    #[allow(clippy::too_many_lines)]
+    fn install_replay(
+        &mut self,
+        candidate: &[u8; INSTALL_RECEIPT_BYTES],
+    ) -> io::Result<Option<bool>> {
+        if self.failed || self.status.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return Err(io::Error::other("owned authority stopped"));
+        }
+        self.failed = true;
+        let tx = self.database.begin_read().map_err(io::Error::other)?;
+        let meta = tx.open_table(TABLE).map_err(io::Error::other)?;
+        let receipts = meta
+            .get("install_receipts")
+            .map_err(io::Error::other)?
+            .ok_or_else(|| invalid("missing install receipts"))?;
+        validate_read_install_receipts(&meta)?;
+        let result = receipts
+            .value()
+            .chunks_exact(INSTALL_RECEIPT_BYTES)
+            .find(|old| old[..48] == candidate[..48] || old[16..72] == candidate[16..72])
+            .map(|old| old == candidate);
+        self.failed = false;
+        Ok(result)
+    }
+
+    fn install_snapshot(&mut self, expected: HardState, bytes: &[u8]) -> io::Result<()> {
+        self.install_snapshot_recorded(expected, bytes, None)
+    }
+
+    // Canonical state and the optional authenticated install receipt share ONE
+    // immediate transaction. Local snapshot callers use the same implementation.
+    #[allow(clippy::too_many_lines)]
+    fn install_snapshot_recorded(
+        &mut self,
+        expected: HardState,
+        bytes: &[u8],
+        receipt: Option<&[u8; INSTALL_RECEIPT_BYTES]>,
+    ) -> io::Result<()> {
+        if self.failed || self.status.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return Err(io::Error::other("owned authority stopped"));
+        }
+        if self.state != expected {
+            return Err(invalid("snapshot prepared against stale hard state"));
+        }
+        if !snapshot_install_fits(0, bytes.len() as u64, 0, 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "snapshot exceeds owned install capacity",
+            ));
+        }
+        // Decode with the canonical codec, including all control/dedup/workflow
+        // state. Never reconstruct an application projection from a descriptor.
+        let (descriptor, control) =
+            crate::consensus_storage::decode_owned_snapshot(bytes).map_err(io::Error::other)?;
+        let boundary = descriptor
+            .last_included
+            .ok_or_else(|| invalid("empty snapshot"))?;
+        if boundary.term > expected.term {
+            return Err(invalid("snapshot exceeds current term"));
+        }
+        let membership = descriptor
+            .membership
+            .ok_or_else(|| invalid("missing snapshot membership"))?;
+        let introduced = membership
+            .introduced_at
+            .ok_or_else(|| invalid("unpositioned snapshot membership"))?;
+        let membership_bytes = crate::consensus_storage::encode_owned_entry(&Entry {
+            identity: membership
+                .introduced_at
+                .ok_or_else(|| invalid("unpositioned snapshot membership"))?,
+            payload: EntryPayload::Membership(membership.membership),
+        })
+        .map_err(io::Error::other)?;
+        let membership_size = u64::try_from(membership_bytes.len()).map_err(io::Error::other)?;
+        // Reject obvious oversize before even opening a write transaction.
+        if !snapshot_install_fits(0, bytes.len() as u64, membership_size, 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "snapshot exceeds owned install capacity",
+            ));
+        }
+        self.failed = true;
+        let mut tx = self.database.begin_write().map_err(io::Error::other)?;
+        tx.set_durability(Durability::Immediate)
+            .map_err(io::Error::other)?;
+        let stats = tx.stats().map_err(io::Error::other)?;
+        let existing = stats
+            .allocated_pages()
+            .checked_mul(stats.page_size() as u64)
+            .and_then(|bytes| bytes.checked_add(stats.fragmented_bytes()))
+            .ok_or_else(|| invalid("install capacity accounting overflow"))?;
+        {
+            let mut meta = tx.open_table(TABLE).map_err(io::Error::other)?;
+            let get = |key| -> io::Result<Vec<u8>> {
+                Ok(meta
+                    .get(key)
+                    .map_err(io::Error::other)?
+                    .ok_or_else(|| invalid("missing snapshot install authority"))?
+                    .value()
+                    .to_vec())
+            };
+            let committed = decode_position(&get("commit")?)?;
+            let applied = decode_position(&get("applied")?)?;
+            let snapshot = decode_position(&get("snapshot")?)?;
+            // An equal term has exactly one leader throughout its prefix, even
+            // when the incoming boundary is not present in the retained log.
+            if [committed, applied, snapshot]
+                .into_iter()
+                .flatten()
+                .any(|known| known.term == boundary.term && known.leader != boundary.leader)
+                || (introduced.term == boundary.term && introduced.leader != boundary.leader)
+            {
+                self.failed = false;
+                return Err(invalid("snapshot contradicts equal-term leader authority"));
+            }
+            // Membership identities fix their payload, independently of whether
+            // the snapshot boundary matches a local log entry. Include applied
+            // authority and the compacted prefix, not just retained entries.
+            let mut known_memberships = vec![get("applied_membership")?];
+            if snapshot.is_some() {
+                let (old, _) =
+                    crate::consensus_storage::decode_owned_snapshot(&get("compacted_snapshot")?)
+                        .map_err(io::Error::other)?;
+                let old = old
+                    .membership
+                    .ok_or_else(|| invalid("missing compacted membership"))?;
+                known_memberships.push(
+                    crate::consensus_storage::encode_owned_entry(&Entry {
+                        identity: old
+                            .introduced_at
+                            .ok_or_else(|| invalid("unpositioned compacted membership"))?,
+                        payload: EntryPayload::Membership(old.membership),
+                    })
+                    .map_err(io::Error::other)?,
+                );
+            }
+            {
+                let memberships = tx.open_table(MEMBERSHIPS).map_err(io::Error::other)?;
+                if let Some(committed) = committed {
+                    for record in memberships
+                        .range(..=committed.index.0)
+                        .map_err(io::Error::other)?
+                    {
+                        known_memberships
+                            .push(record.map_err(io::Error::other)?.1.value().to_vec());
+                    }
+                }
+            }
+            for bytes in known_memberships.iter().filter(|bytes| !bytes.is_empty()) {
+                let known = crate::consensus_storage::decode_owned_entry(bytes)
+                    .map_err(io::Error::other)?;
+                if known.identity.index > boundary.index {
+                    // A later committed membership may survive in a matching
+                    // suffix; the commit-conflict check below proves coverage.
+                    continue;
+                }
+                if (known.identity.term == boundary.term
+                    && known.identity.leader != boundary.leader)
+                    || (known.identity.index == introduced.index
+                        && (known.identity != introduced || bytes != &membership_bytes))
+                    || (known.identity.index > introduced.index)
+                    || crate::consensus_model::validate_position_prefix(
+                        Some(known.identity),
+                        Some(introduced),
+                    )
+                    .is_err()
+                    || (known.identity.term == introduced.term
+                        && known.identity.leader != introduced.leader)
+                {
+                    self.failed = false;
+                    return Err(invalid(
+                        "snapshot contradicts authoritative membership history",
+                    ));
+                }
+            }
+            // A request rejection is not uncertain storage. Leave the owner
+            // usable, with the uncommitted write transaction dropped unchanged.
+            if descriptor.cluster_id.as_bytes() != get("cluster")?
+                || crate::consensus_model::validate_position_prefix(applied, Some(boundary))
+                    .is_err()
+            {
+                self.failed = false;
+                return Err(invalid("snapshot cluster mismatch or applied rollback"));
+            }
+            let matches = if snapshot == Some(boundary) {
+                true
+            } else {
+                let log = tx.open_table(LOG).map_err(io::Error::other)?;
+                log.get(boundary.index.0)
+                    .map_err(io::Error::other)?
+                    .map(|entry| crate::consensus_storage::decode_owned_entry(entry.value()))
+                    .transpose()
+                    .map_err(io::Error::other)?
+                    .is_some_and(|entry| entry.identity == boundary)
+            };
+            // Preserve committed suffixes only when the exact full boundary
+            // identity matches; index equality alone never licenses truncation.
+            if committed.is_some_and(|c| c.index >= boundary.index)
+                && (!matches
+                    || crate::consensus_model::validate_position_prefix(Some(boundary), committed)
+                        .is_err())
+            {
+                self.failed = false;
+                return Err(invalid("snapshot conflicts with acknowledged commit"));
+            }
+            if committed.is_some_and(|c| c.index < boundary.index)
+                && crate::consensus_model::validate_position_prefix(committed, Some(boundary))
+                    .is_err()
+            {
+                self.failed = false;
+                return Err(invalid("snapshot term regresses committed prefix"));
+            }
+            if applied == Some(boundary)
+                && (get("control")? != control || get("applied_membership")? != membership_bytes)
+            {
+                self.failed = false;
+                return Err(invalid("snapshot conflicts with applied canonical state"));
+            }
+            let candidate_commit = if matches && committed.is_some_and(|c| c.index > boundary.index)
+            {
+                committed
+            } else {
+                Some(boundary)
+            };
+            let incoming_membership = stored_membership(&membership_bytes)?;
+            let mut retained_memberships = Vec::new();
+            if matches {
+                let table = tx.open_table(MEMBERSHIPS).map_err(io::Error::other)?;
+                for record in table
+                    .range((
+                        std::ops::Bound::Excluded(boundary.index.0),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .map_err(io::Error::other)?
+                {
+                    retained_memberships.push(stored_membership(
+                        record.map_err(io::Error::other)?.1.value(),
+                    )?);
+                }
+            }
+            if validate_owned_membership_chain(
+                Some(&incoming_membership),
+                &retained_memberships,
+                candidate_commit,
+            )
+            .is_err()
+            {
+                self.failed = false;
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "snapshot leaves invalid retained membership chain",
+                ));
+            }
+            let mut suffix_bytes = 0u64;
+            if matches {
+                for definition in [LOG, MEMBERSHIPS] {
+                    let table = tx.open_table(definition).map_err(io::Error::other)?;
+                    for record in table
+                        .range((
+                            std::ops::Bound::Excluded(boundary.index.0),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .map_err(io::Error::other)?
+                    {
+                        suffix_bytes = suffix_bytes
+                            .checked_add(record.map_err(io::Error::other)?.1.value().len() as u64)
+                            .ok_or_else(|| invalid("install suffix capacity overflow"))?;
+                    }
+                }
+            }
+            if !snapshot_install_fits(existing, bytes.len() as u64, membership_size, suffix_bytes) {
+                self.failed = false;
+                return Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "snapshot and retained suffix exceed owned install capacity",
+                ));
+            }
+            if matches {
+                // A matching log identity also fixes the membership prefix. Do
+                // not let a validly framed remote object rewrite that history.
+                let local_membership = {
+                    let memberships = tx.open_table(MEMBERSHIPS).map_err(io::Error::other)?;
+                    let mut prefix = memberships
+                        .range(..=boundary.index.0)
+                        .map_err(io::Error::other)?;
+                    if let Some(record) = prefix.next_back() {
+                        record.map_err(io::Error::other)?.1.value().to_vec()
+                    } else if snapshot.is_some() {
+                        let (old, _) = crate::consensus_storage::decode_owned_snapshot(&get(
+                            "compacted_snapshot",
+                        )?)
+                        .map_err(io::Error::other)?;
+                        let old = old
+                            .membership
+                            .ok_or_else(|| invalid("missing compacted membership"))?;
+                        crate::consensus_storage::encode_owned_entry(&Entry {
+                            identity: old
+                                .introduced_at
+                                .ok_or_else(|| invalid("unpositioned compacted membership"))?,
+                            payload: EntryPayload::Membership(old.membership),
+                        })
+                        .map_err(io::Error::other)?
+                    } else {
+                        Vec::new()
+                    }
+                };
+                if local_membership != membership_bytes {
+                    self.failed = false;
+                    return Err(invalid(
+                        "snapshot conflicts with matching membership prefix",
+                    ));
+                }
+                compact_table(&tx, LOG, boundary.index.0)?;
+                compact_table(&tx, MEMBERSHIPS, boundary.index.0)?;
+            } else {
+                // No common boundary: only an uncommitted suffix may be lost.
+                tx.delete_table(LOG).map_err(io::Error::other)?;
+                tx.delete_table(MEMBERSHIPS).map_err(io::Error::other)?;
+                tx.open_table(LOG).map_err(io::Error::other)?;
+                tx.open_table(MEMBERSHIPS).map_err(io::Error::other)?;
+            }
+            let effective = {
+                let memberships = tx.open_table(MEMBERSHIPS).map_err(io::Error::other)?;
+                memberships.last().map_err(io::Error::other)?.map_or_else(
+                    || membership_bytes.clone(),
+                    |(_, value)| value.value().to_vec(),
+                )
+            };
+            let commit = if matches && committed.is_some_and(|c| c.index > boundary.index) {
+                committed
+            } else {
+                Some(boundary)
+            };
+            for (key, value) in [
+                ("control", control.as_slice()),
+                ("applied_membership", membership_bytes.as_slice()),
+                ("membership", effective.as_slice()),
+                ("published_snapshot", bytes),
+                ("compacted_snapshot", bytes),
+            ] {
+                meta.insert(key, value).map_err(io::Error::other)?;
+            }
+            meta.insert("snapshot", encode_position(Some(boundary)).as_slice())
+                .map_err(io::Error::other)?;
+            meta.insert("applied", encode_position(Some(boundary)).as_slice())
+                .map_err(io::Error::other)?;
+            meta.insert("commit", encode_position(commit).as_slice())
+                .map_err(io::Error::other)?;
+            if let Some(receipt) = receipt {
+                let mut receipts = meta
+                    .get("install_receipts")
+                    .map_err(io::Error::other)?
+                    .ok_or_else(|| invalid("missing install receipts"))?
+                    .value()
+                    .to_vec();
+                validate_install_receipts(&receipts)?;
+                if receipts.len() == MAX_INSTALL_RECEIPTS * INSTALL_RECEIPT_BYTES {
+                    receipts.drain(..INSTALL_RECEIPT_BYTES);
+                }
+                receipts.extend_from_slice(receipt);
+                meta.insert("install_receipts", receipts.as_slice())
+                    .map_err(io::Error::other)?;
+            }
+        }
+        // All install authority lives in this one immediate transaction. A
+        // crash can expose the old state or the complete new state, never a
+        // snapshot marker with old control state or a lost acknowledged suffix.
+        #[cfg(test)]
+        snapshot_install_crash("before-commit");
+        tx.commit().map_err(io::Error::other)?;
+        #[cfg(test)]
+        snapshot_install_crash("after-commit");
+        self.failed = false;
+        Ok(())
+    }
+
     fn compact_snapshot(&mut self) -> io::Result<()> {
         if self.failed || self.status.load(std::sync::atomic::Ordering::SeqCst) != 0 {
             return Err(io::Error::other("owned authority stopped"));
@@ -2320,6 +3880,20 @@ impl OwnedVoteStore {
             compact_table(&tx, MEMBERSHIPS, boundary.index.0)?;
         }
         tx.commit().map_err(io::Error::other)?;
+        // redb defers freeing deleted pages until later durable transactions.
+        // Dropping the read-only capacity preflight cannot advance that horizon.
+        // Follow the fixed drain sequence used at the start of redb 4.1's
+        // Database::compact, without its unbounded physical page relocation.
+        // No read transactions/savepoints escape this exclusive store owner.
+        for _ in 0..2 {
+            let mut maintenance = self.database.begin_write().map_err(io::Error::other)?;
+            maintenance
+                .set_durability(Durability::Immediate)
+                .map_err(io::Error::other)?;
+            maintenance.set_two_phase_commit(true);
+            maintenance.commit().map_err(io::Error::other)?;
+        }
+        // Do not report successful maintenance if either durable drain failed.
         self.failed = false;
         Ok(())
     }
@@ -2373,6 +3947,18 @@ impl OwnedVoteStore {
     }
 
     fn apply_committed(&mut self) -> io::Result<Vec<Vec<u8>>> {
+        self.apply_committed_batch().map(|batch| {
+            batch
+                .outcomes
+                .into_iter()
+                .map(|outcome| outcome.response.unwrap_or_default())
+                .collect()
+        })
+    }
+
+    // One dispatcher and one transaction serve both legacy and tagged callers.
+    #[allow(clippy::too_many_lines)]
+    fn apply_committed_batch(&mut self) -> io::Result<AppliedBatch> {
         if self.failed || self.status.load(std::sync::atomic::Ordering::SeqCst) != 0 {
             return Err(io::Error::other("owned authority stopped"));
         }
@@ -2381,6 +3967,8 @@ impl OwnedVoteStore {
         tx.set_durability(Durability::Immediate)
             .map_err(io::Error::other)?;
         let mut replies = Vec::new();
+        let resulting_applied;
+        let more;
         {
             let mut meta = tx.open_table(TABLE).map_err(io::Error::other)?;
             let get = |key| -> io::Result<Vec<u8>> {
@@ -2399,7 +3987,7 @@ impl OwnedVoteStore {
             let log = tx.open_table(LOG).map_err(io::Error::other)?;
             let start = applied.map_or(Some(0), |position| position.index.0.checked_add(1));
             if let (Some(start), Some(committed)) = (start, committed) {
-                let mut budget = 1024 * 1024usize;
+                let mut budget = APPLICATION_ENTRY_BUDGET;
                 let mut expected = start;
                 let mut bounded = false;
                 for record in log
@@ -2425,10 +4013,10 @@ impl OwnedVoteStore {
                     let entry = crate::consensus_storage::decode_owned_entry(bytes.value())
                         .map_err(io::Error::other)?;
                     let reply = match entry.payload {
-                        EntryPayload::NoOp => Vec::new(),
+                        EntryPayload::NoOp => None,
                         EntryPayload::Membership(_) => {
                             membership_bytes = bytes.value().to_vec();
-                            Vec::new()
+                            None
                         }
                         EntryPayload::Application(command) => {
                             let membership =
@@ -2441,21 +4029,26 @@ impl OwnedVoteStore {
                                 introduced_at: Some(membership.identity),
                                 membership: configuration,
                             };
-                            crate::consensus_storage::apply_control_command(
+                            Some(crate::consensus_storage::apply_control_command(
                                 &mut state,
                                 crate::consensus_storage::ApplicationMembership::Owned(&membership),
                                 &command,
-                            )?
+                            )?)
                         }
                     };
                     applied = Some(entry.identity);
                     expected = expected.saturating_add(1);
-                    replies.push(reply);
+                    replies.push(AppliedOutcome {
+                        identity: entry.identity,
+                        response: reply,
+                    });
                 }
                 if !bounded && applied != Some(committed) {
                     return Err(invalid("missing committed application suffix"));
                 }
             }
+            resulting_applied = applied;
+            more = applied != committed;
             let bytes = state.encode_snapshot().map_err(io::Error::other)?;
             meta.insert("control", bytes.as_slice())
                 .map_err(io::Error::other)?;
@@ -2470,7 +4063,11 @@ impl OwnedVoteStore {
         #[cfg(test)]
         application_crash("after-commit");
         self.failed = false;
-        Ok(replies)
+        Ok(AppliedBatch {
+            outcomes: replies,
+            applied: resulting_applied,
+            more,
+        })
     }
 
     fn outbound_batch(
@@ -2478,6 +4075,22 @@ impl OwnedVoteStore {
         leader: Option<&crate::consensus_model::LeaderProgress>,
         local: NodeId,
         peer: NodeId,
+    ) -> Result<
+        Result<OutboundAppendBatch, bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError>,
+        VoteGateError,
+    > {
+        self.outbound_batch_inner(leader, local, peer, false)
+    }
+
+    // Keep authoritative endpoint, predecessor and bounded encoding selection
+    // together for the replication and heartbeat views of this same log.
+    #[allow(clippy::too_many_lines)]
+    fn outbound_batch_inner(
+        &mut self,
+        leader: Option<&crate::consensus_model::LeaderProgress>,
+        local: NodeId,
+        peer: NodeId,
+        heartbeat: bool,
     ) -> Result<
         Result<OutboundAppendBatch, bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError>,
         VoteGateError,
@@ -2541,7 +4154,11 @@ impl OwnedVoteStore {
             };
             let mut entries = Vec::new();
             let mut bytes_left = 256 * 1024usize;
-            for item in log.range(next.0..).map_err(io::Error::other)?.take(64) {
+            for item in log
+                .range(next.0..)
+                .map_err(io::Error::other)?
+                .take(if heartbeat { 0 } else { 64 })
+            {
                 let (_, bytes) = item.map_err(io::Error::other)?;
                 if bytes.value().len() > bytes_left {
                     if entries.is_empty() {
@@ -2739,6 +4356,160 @@ impl OwnedVoteStore {
         Ok(committed)
     }
 
+    /// Check predictable local growth before the append transaction. redb exposes
+    /// allocation statistics on a write handle, but this preflight makes NO
+    /// mutations and drops that handle before returning. Refusal is not an I/O
+    /// failure and must leave admission usable for compaction and retry.
+    fn has_local_append_capacity(&mut self, entry_bytes: usize) -> Result<bool, VoteGateError> {
+        if self.failed || self.status.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return Err(VoteGateError::Stopped);
+        }
+        self.failed = true;
+        let capacity = (|| -> io::Result<bool> {
+            let tx = self.database.begin_write().map_err(io::Error::other)?;
+            let stats = tx.stats().map_err(io::Error::other)?;
+            let allocated = stats
+                .allocated_pages()
+                .checked_mul(stats.page_size() as u64)
+                .ok_or_else(|| invalid("proposal allocation overflow"))?;
+            let meta = tx.open_table(TABLE).map_err(io::Error::other)?;
+            let control = meta
+                .get("control")
+                .map_err(io::Error::other)?
+                .ok_or_else(|| invalid("missing proposal control state"))?;
+            let log = tx.open_table(LOG).map_err(io::Error::other)?;
+            let applied = write_position(&meta, "applied")?;
+            let mut pending = entry_bytes as u64;
+            let start = applied.map_or(Some(0), |position| position.index.0.checked_add(1));
+            if let Some(start) = start {
+                for record in log.range(start..).map_err(io::Error::other)? {
+                    pending = pending
+                        .checked_add(record.map_err(io::Error::other)?.1.value().len() as u64)
+                        .ok_or_else(|| invalid("pending proposal byte overflow"))?;
+                }
+            }
+            // Leave half the backend ceiling for geometric allocation growth.
+            // Charge 8 copies of the incoming entry: append framing/COW, its
+            // possible dedup+workflow response growth and later snapshot copies.
+            // Existing canonical control needs six copies of headroom across
+            // application, publication and compaction transactions. Add fixed
+            // metadata/COW slack; this is a conservative local implementation
+            // budget, NOT a negotiated command or workspace-size contract.
+            let fits = allocated
+                .checked_add(8 * 1024 * 1024)
+                .and_then(|bytes| {
+                    pending
+                        .checked_mul(8)
+                        .and_then(|entry| bytes.checked_add(entry))
+                })
+                .and_then(|bytes| {
+                    (control.value().len() as u64)
+                        .checked_mul(6)
+                        .and_then(|state| bytes.checked_add(state))
+                })
+                .is_some_and(|bytes| bytes <= MAX_VOTE_PAYLOAD / 2);
+            Ok(fits && log.len().map_err(io::Error::other)? < MAX_RETAINED_ENTRIES)
+        })()
+        .map_err(|_| VoteGateError::StorageFailure)?;
+        self.failed = false;
+        Ok(capacity)
+    }
+
+    fn read_control_state(&mut self) -> io::Result<crate::control_state::ControlState> {
+        if self.failed || self.status.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return Err(io::Error::other("owned authority stopped"));
+        }
+        self.failed = true;
+        let tx = self.database.begin_read().map_err(io::Error::other)?;
+        let meta = tx.open_table(TABLE).map_err(io::Error::other)?;
+        let bytes = meta
+            .get("control")
+            .map_err(io::Error::other)?
+            .ok_or_else(|| invalid("missing canonical control state"))?;
+        let state = crate::control_state::ControlState::decode_snapshot(bytes.value())
+            .map_err(io::Error::other)?;
+        self.failed = false;
+        Ok(state)
+    }
+
+    fn observe(&mut self) -> Result<OwnedObservation, VoteGateError> {
+        if self.failed || self.status.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return Err(VoteGateError::Stopped);
+        }
+        self.failed = true;
+        let observation = (|| -> io::Result<_> {
+            let tx = self.database.begin_read().map_err(io::Error::other)?;
+            let meta = tx.open_table(TABLE).map_err(io::Error::other)?;
+            let get = |key| -> io::Result<Vec<u8>> {
+                Ok(meta
+                    .get(key)
+                    .map_err(io::Error::other)?
+                    .ok_or_else(|| invalid("missing observation authority"))?
+                    .value()
+                    .to_vec())
+            };
+            let committed = decode_position(&get("commit")?)?;
+            let snapshot = decode_position(&get("snapshot")?)?;
+            let decode_membership =
+                |bytes: &[u8]| -> io::Result<Option<crate::consensus_model::StoredMembership>> {
+                    if bytes.is_empty() {
+                        return Ok(None);
+                    }
+                    let entry = crate::consensus_storage::decode_owned_entry(bytes)
+                        .map_err(io::Error::other)?;
+                    let EntryPayload::Membership(membership) = entry.payload else {
+                        return Err(invalid("invalid observation membership"));
+                    };
+                    Ok(Some(crate::consensus_model::StoredMembership {
+                        introduced_at: Some(entry.identity),
+                        membership,
+                    }))
+                };
+            let effective_membership = decode_membership(&get("membership")?)?;
+            let mut committed_membership = None;
+            if let Some(boundary) = committed {
+                let memberships = tx.open_table(MEMBERSHIPS).map_err(io::Error::other)?;
+                if let Some(record) = memberships
+                    .range(..=boundary.index.0)
+                    .map_err(io::Error::other)?
+                    .next_back()
+                {
+                    committed_membership =
+                        decode_membership(record.map_err(io::Error::other)?.1.value())?;
+                } else if snapshot.is_some() {
+                    let (descriptor, _) = crate::consensus_storage::decode_owned_snapshot(&get(
+                        "compacted_snapshot",
+                    )?)
+                    .map_err(io::Error::other)?;
+                    committed_membership = descriptor.membership;
+                }
+            }
+            let log = tx.open_table(LOG).map_err(io::Error::other)?;
+            let last_log = log
+                .last()
+                .map_err(io::Error::other)?
+                .map(|(_, bytes)| {
+                    crate::consensus_storage::decode_owned_entry(bytes.value())
+                        .map(|entry| entry.identity)
+                })
+                .transpose()
+                .map_err(io::Error::other)?
+                .or(snapshot);
+            Ok(OwnedObservation {
+                hard_state: self.state,
+                local_leader: false,
+                effective_membership,
+                committed_membership,
+                last_log,
+                committed,
+                applied: decode_position(&get("applied")?)?,
+            })
+        })()
+        .map_err(|_| VoteGateError::StorageFailure)?;
+        self.failed = false;
+        Ok(observation)
+    }
+
     fn election_context(
         &mut self,
     ) -> Result<(Option<LogIdentity>, Option<Membership>), VoteGateError> {
@@ -2903,33 +4674,12 @@ impl OwnedVoteStore {
         let decision;
         {
             let mut meta = transaction.open_table(TABLE).map_err(io::Error::other)?;
-            let committed = decode_position(
-                meta.get("commit")
-                    .map_err(io::Error::other)?
-                    .ok_or_else(|| invalid("missing commit"))?
-                    .value(),
-            )?;
+            let committed = write_position(&meta, "commit")?;
             let mut log = transaction.open_table(LOG).map_err(io::Error::other)?;
             let mut memberships = transaction
                 .open_table(MEMBERSHIPS)
                 .map_err(io::Error::other)?;
-            let mut entries = std::collections::BTreeMap::<u64, Entry>::new();
-            for identity in request
-                .entries
-                .iter()
-                .map(|entry| entry.identity)
-                .chain(request.previous)
-                .chain(committed)
-                .chain(request.leader_commit)
-            {
-                if let Some(bytes) = log.get(identity.index.0).map_err(io::Error::other)? {
-                    entries.insert(
-                        identity.index.0,
-                        crate::consensus_storage::decode_owned_entry(bytes.value())
-                            .map_err(io::Error::other)?,
-                    );
-                }
-            }
+            let entries = append_lookup_entries(&log, request, committed)?;
             let snapshot = write_position(&meta, "snapshot")?;
             decision = self.state.evaluate_append(
                 request,
@@ -2937,6 +4687,25 @@ impl OwnedVoteStore {
                 |index| Ok(entries.get(&index.0)),
                 limits,
             );
+            if let Ok(AppendOutcome::Reconciled(AppendReconciliation::Matched {
+                replace_from,
+                ..
+            })) = decision.outcome
+            {
+                // Only the reconciled commit is verified coverage.
+                if let Err(error) = validate_candidate_memberships(
+                    &meta,
+                    &memberships,
+                    request,
+                    replace_from,
+                    decision.commit,
+                ) {
+                    if error.kind() == io::ErrorKind::InvalidInput {
+                        self.failed = false;
+                    }
+                    return Err(error);
+                }
+            }
             if let Some(state) = decision.persist {
                 meta.insert("vote", encode(state)?.as_slice())
                     .map_err(io::Error::other)?;
@@ -3057,6 +4826,13 @@ fn decode(bytes: &[u8]) -> io::Result<HardState> {
 }
 
 #[cfg(test)]
+fn snapshot_install_crash(point: &str) {
+    if std::env::var("BMUX_OWNED_INSTALL_CRASH").as_deref() == Ok(point) {
+        std::process::exit(75);
+    }
+}
+
+#[cfg(test)]
 fn application_crash(point: &str) {
     if std::env::var("BMUX_OWNED_APPLY_CRASH").as_deref() == Ok(point) {
         std::process::exit(74);
@@ -3065,6 +4841,67 @@ fn application_crash(point: &str) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn outbound_vote_preparation_waits_fairly_without_queueing_inbound() {
+        let root = tempfile::tempdir().unwrap();
+        let store = OwnedVoteStore::create(&root.path().join("authority"), "cluster").unwrap();
+        let executor = std::sync::Arc::new(VoteExecutor::new(DurableVoteGate::new(1, store)));
+        let guard = executor.gate.clone().lock_owned().await;
+        let permit = executor.outbound_votes.clone().try_acquire_owned().unwrap();
+        let owner = executor.clone();
+        let (ready, started) = tokio::sync::oneshot::channel();
+        let preparation = tokio::spawn(async move {
+            let _ = ready.send(());
+            owner
+                .prepare_outbound(&permit, |gate| Ok(gate.store.state()))
+                .await
+        });
+        started.await.unwrap();
+        // Give the preparation a chance to enter its bounded FIFO wait while
+        // the gate is held; immediate admission would already return Busy.
+        tokio::task::yield_now().await;
+        assert!(!preparation.is_finished());
+        assert!(matches!(
+            executor.observe(NodeId::from(1)).await,
+            Err(VoteGateError::Busy)
+        ));
+        drop(guard);
+        let state = preparation.await.unwrap().unwrap();
+        assert_eq!(
+            state,
+            HardState {
+                term: Term(0),
+                voted_for: None
+            }
+        );
+        assert_eq!(executor.outbound_votes.available_permits(), 16);
+        executor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn outbound_preparation_cancellation_releases_bounded_slot_and_waiter() {
+        let root = tempfile::tempdir().unwrap();
+        let store = OwnedVoteStore::create(&root.path().join("authority"), "cluster").unwrap();
+        let executor = std::sync::Arc::new(VoteExecutor::new(DurableVoteGate::new(1, store)));
+        let guard = executor.gate.clone().lock_owned().await;
+        let permit = executor.outbound_votes.clone().try_acquire_owned().unwrap();
+        let owner = executor.clone();
+        let preparation = tokio::spawn(async move {
+            owner
+                .prepare_outbound(&permit, |_| -> Result<(), VoteGateError> {
+                    panic!("cancelled preparation ran")
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        preparation.abort();
+        assert!(preparation.await.unwrap_err().is_cancelled());
+        assert_eq!(executor.outbound_votes.available_permits(), 16);
+        drop(guard);
+        executor.observe(NodeId::from(1)).await.unwrap();
+        executor.shutdown().await.unwrap();
+    }
+
     #[test]
     fn staging_directory_rejects_leftovers_without_deleting_them() {
         let parent = std::env::temp_dir().canonicalize().unwrap();
@@ -3138,6 +4975,2892 @@ mod tests {
     use super::*;
 
     #[test]
+    fn remote_snapshot_receipts_reject_future_applied_conflict_and_term_on_read_and_reopen() {
+        for corruption in 0..3 {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("authority");
+            let (mut store, _, boundary) = snapshot_install_fixture(&path);
+            let mut receipt = [0; INSTALL_RECEIPT_BYTES];
+            let invalid_boundary = match corruption {
+                0 => LogIdentity {
+                    index: crate::consensus_model::LogIndex(boundary.index.0 + 1),
+                    ..boundary
+                },
+                1 => LogIdentity {
+                    leader: NodeId::from(2),
+                    ..boundary
+                },
+                _ => boundary,
+            };
+            receipt[104..152].copy_from_slice(&encode_position(Some(invalid_boundary)));
+            let term = store.state().term.0 + u64::from(corruption == 2);
+            receipt[152..160].copy_from_slice(&term.to_le_bytes());
+            validate_install_receipts(&receipt).unwrap();
+            let tx = store.database.begin_write().unwrap();
+            tx.open_table(TABLE)
+                .unwrap()
+                .insert("install_receipts", receipt.as_slice())
+                .unwrap();
+            tx.commit().unwrap();
+            assert!(store.install_replay(&receipt).is_err());
+            assert!(store.failed);
+            drop(store);
+            assert!(OwnedVoteStore::open(&path, "cluster").is_err());
+        }
+    }
+
+    #[test]
+    fn remote_snapshot_receipt_window_corruption_and_old_format_fail_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let (mut store, bytes, boundary) = snapshot_install_fixture(&path);
+        let mut first = [0; INSTALL_RECEIPT_BYTES];
+        let mut latest = first;
+        for sequence in 0..=MAX_INSTALL_RECEIPTS as u64 {
+            let mut receipt = [0; INSTALL_RECEIPT_BYTES];
+            receipt[..16].copy_from_slice(uuid::Uuid::from_u128(u128::from(sequence)).as_bytes());
+            receipt[16..48].copy_from_slice(boundary.leader.as_bytes());
+            receipt[64..72].copy_from_slice(&sequence.to_le_bytes());
+            receipt[72..104].copy_from_slice(&Sha256::digest(&bytes));
+            receipt[104..152].copy_from_slice(&encode_position(Some(boundary)));
+            receipt[152..160].copy_from_slice(&store.state().term.0.to_le_bytes());
+            if sequence == 0 {
+                first = receipt;
+            }
+            store
+                .install_snapshot_recorded(store.state(), &bytes, Some(&receipt))
+                .unwrap();
+            latest = receipt;
+        }
+        assert_eq!(store.install_replay(&first).unwrap(), None);
+        assert_eq!(store.install_replay(&latest).unwrap(), Some(true));
+        let mut conflict = latest;
+        conflict[72] ^= 1;
+        assert_eq!(store.install_replay(&conflict).unwrap(), Some(false));
+        drop(store);
+        let mut store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        assert_eq!(store.install_replay(&latest).unwrap(), Some(true));
+        {
+            let tx = store.database.begin_write().unwrap();
+            tx.open_table(TABLE)
+                .unwrap()
+                .insert("format", &b"BMOWNV05"[..])
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        drop(store);
+        assert!(OwnedVoteStore::open(&path, "cluster").is_err());
+        assert!(validate_install_receipts(&[0; 1]).is_err());
+        assert!(
+            validate_install_receipts(&[0; INSTALL_RECEIPT_BYTES * (MAX_INSTALL_RECEIPTS + 1)])
+                .is_err()
+        );
+    }
+
+    // Exercise candidate reconstruction, confirmed coverage and snapshot seeding
+    // through the actual append/install/recovery owners, not only pure validators.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn membership_chain_rejects_illegal_changes_and_preserves_legal_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let node = NodeId::from(1);
+        let other = NodeId::from(2);
+        let old = Membership::new(
+            vec![vec![node]],
+            vec![(node, String::new()), (other, String::new())],
+        )
+        .unwrap();
+        let joint = Membership::new(
+            vec![vec![node], vec![node, other]],
+            vec![(node, String::new()), (other, String::new())],
+        )
+        .unwrap();
+        let final_config = Membership::new(
+            vec![vec![node, other]],
+            vec![(node, String::new()), (other, String::new())],
+        )
+        .unwrap();
+        let mut store = OwnedVoteStore::bootstrap(&path, "cluster", node, old.clone()).unwrap();
+        store.apply_committed().unwrap();
+        let identity = |term, index| LogIdentity {
+            term: Term(term),
+            leader: node,
+            index: crate::consensus_model::LogIndex(index),
+        };
+        let genesis = identity(0, 0);
+        let request = |entries, commit| AppendRequest {
+            term: Term(1),
+            leader: node,
+            previous: Some(genesis),
+            entries,
+            leader_commit: commit,
+        };
+        let member = |identity, membership| Entry {
+            identity,
+            payload: EntryPayload::Membership(membership),
+        };
+        let before = store.observe().unwrap();
+        assert!(
+            store
+                .append(
+                    &request(
+                        vec![member(identity(1, 1), final_config.clone())],
+                        Some(identity(1, 1))
+                    ),
+                    (8, 8192)
+                )
+                .is_err()
+        );
+        assert!(!store.failed);
+        assert_eq!(store.observe().unwrap(), before);
+        // Future index 99 is NOT verified coverage of joint entry 1: only
+        // the predecessor of an empty heartbeat is matched.
+        store
+            .append(
+                &request(vec![member(identity(1, 1), joint.clone())], Some(genesis)),
+                (8, 8192),
+            )
+            .unwrap();
+        let before = store.observe().unwrap();
+        let nested = AppendRequest {
+            term: Term(1),
+            leader: node,
+            previous: Some(identity(1, 1)),
+            entries: vec![member(identity(1, 2), joint.clone())],
+            leader_commit: Some(identity(1, 2)),
+        };
+        assert!(store.append(&nested, (8, 8192)).is_err());
+        let wrong_final = AppendRequest {
+            entries: vec![member(identity(1, 2), old.clone())],
+            ..nested.clone()
+        };
+        assert!(store.append(&wrong_final, (8, 8192)).is_err());
+        let unconfirmed = AppendRequest {
+            previous: Some(genesis),
+            entries: vec![
+                member(identity(1, 1), joint),
+                member(identity(1, 2), final_config.clone()),
+            ],
+            leader_commit: Some(genesis),
+            ..nested.clone()
+        };
+        assert!(store.append(&unconfirmed, (8, 8192)).is_err());
+        assert_eq!(store.observe().unwrap(), before);
+        // A lagging follower may accept joint + final together when the exact
+        // joint identity is covered by the reconciled leader commit.
+        let valid = AppendRequest {
+            leader_commit: Some(identity(1, 1)),
+            ..unconfirmed
+        };
+        assert!(store.append(&valid, (8, 8192)).unwrap().outcome.is_ok());
+        assert!(store.append(&valid, (8, 8192)).unwrap().outcome.is_ok());
+        // Replace only the uncommitted final suffix, preserving the joint.
+        let replacement = AppendRequest {
+            term: Term(2),
+            leader: node,
+            previous: Some(identity(1, 1)),
+            entries: vec![member(identity(2, 2), final_config)],
+            leader_commit: Some(identity(1, 1)),
+        };
+        store.append(&replacement, (8, 8192)).unwrap();
+        store.apply_committed().unwrap();
+        let snapshot = store.publish_snapshot().unwrap();
+        store.compact_snapshot().unwrap();
+        // The compacted joint seed legally precedes retained uniform final.
+        store.install_snapshot(store.state(), &snapshot).unwrap();
+        drop(store);
+        let mut store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        assert_eq!(
+            store
+                .observe()
+                .unwrap()
+                .effective_membership
+                .unwrap()
+                .introduced_at,
+            Some(identity(2, 2))
+        );
+        // Corrupt the indexed and canonical entry consistently: recovery must
+        // reject the illegal chain even though both tables agree byte-for-byte.
+        let corrupt =
+            crate::consensus_storage::encode_owned_entry(&member(identity(2, 2), old)).unwrap();
+        let tx = store.database.begin_write().unwrap();
+        tx.open_table(LOG)
+            .unwrap()
+            .insert(2, corrupt.as_slice())
+            .unwrap();
+        tx.open_table(MEMBERSHIPS)
+            .unwrap()
+            .insert(2, corrupt.as_slice())
+            .unwrap();
+        tx.open_table(TABLE)
+            .unwrap()
+            .insert("membership", corrupt.as_slice())
+            .unwrap();
+        tx.commit().unwrap();
+        drop(store);
+        assert!(OwnedVoteStore::open(&path, "cluster").is_err());
+    }
+
+    #[test]
+    fn membership_chain_verified_commit_not_advertised_future_index() {
+        let root = tempfile::tempdir().unwrap();
+        let node = NodeId::from(1);
+        let other = NodeId::from(2);
+        let old = Membership::new(
+            vec![vec![node]],
+            vec![(node, String::new()), (other, String::new())],
+        )
+        .unwrap();
+        let joint = Membership::new(
+            vec![vec![node], vec![node, other]],
+            vec![(node, String::new()), (other, String::new())],
+        )
+        .unwrap();
+        let mut store =
+            OwnedVoteStore::bootstrap(&root.path().join("authority"), "cluster", node, old)
+                .unwrap();
+        let identity = |index| LogIdentity {
+            term: Term(1),
+            leader: node,
+            index: crate::consensus_model::LogIndex(index),
+        };
+        store
+            .append(
+                &AppendRequest {
+                    term: Term(1),
+                    leader: node,
+                    previous: Some(LogIdentity {
+                        term: Term(0),
+                        ..identity(0)
+                    }),
+                    entries: vec![Entry {
+                        identity: identity(1),
+                        payload: EntryPayload::Membership(joint),
+                    }],
+                    leader_commit: None,
+                },
+                (8, 8192),
+            )
+            .unwrap();
+        let before = store.observe().unwrap();
+        // This heartbeat matches genesis only. A future advertised commit must
+        // not retroactively validate a nested/unfinished transition.
+        store
+            .append(
+                &AppendRequest {
+                    term: Term(1),
+                    leader: node,
+                    previous: Some(LogIdentity {
+                        term: Term(0),
+                        ..identity(0)
+                    }),
+                    entries: Vec::new(),
+                    leader_commit: Some(identity(99)),
+                },
+                (8, 8192),
+            )
+            .unwrap();
+        assert_eq!(store.observe().unwrap().committed, before.committed);
+        let final_config = Membership::new(
+            vec![vec![node, other]],
+            vec![(node, String::new()), (other, String::new())],
+        )
+        .unwrap();
+        let request = AppendRequest {
+            term: Term(1),
+            leader: node,
+            previous: Some(identity(1)),
+            entries: vec![Entry {
+                identity: identity(2),
+                payload: EntryPayload::Membership(final_config),
+            }],
+            leader_commit: None,
+        };
+        assert!(store.append(&request, (8, 8192)).is_err());
+        assert!(!store.failed);
+    }
+
+    #[derive(Default)]
+    struct InstallCaller(std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>);
+    impl bmux_plugin::ServiceCaller for InstallCaller {
+        fn call_service_raw(
+            &self,
+            _: &str,
+            _: bmux_plugin_sdk::ServiceKind,
+            interface: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+            use bmux_plugin_sdk::{decode_service_message, encode_service_message};
+            match (interface, operation) {
+                ("storage-query/v1", "get") => {
+                    let request: bmux_plugin_sdk::StorageGetRequest =
+                        decode_service_message(&payload)?;
+                    encode_service_message(&bmux_plugin_sdk::StorageGetResponse {
+                        value: self.0.lock().unwrap().get(request.key.as_str()).cloned(),
+                    })
+                }
+                ("storage-command/v1", "set") => {
+                    let request: bmux_plugin_sdk::StorageSetRequest =
+                        decode_service_message(&payload)?;
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .insert(request.key.as_str().into(), request.value);
+                    encode_service_message(&())
+                }
+                _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                    operation: "install test",
+                }),
+            }
+        }
+        fn execute_kernel_request(
+            &self,
+            _: bmux_ipc::Request,
+        ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
+            Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                operation: "install test kernel",
+            })
+        }
+    }
+
+    fn fresh_install_proof(
+        caller: &InstallCaller,
+        members: &[bmux_cluster_plugin_api::cluster_types::ClusterMember],
+        identity: &crate::membership::NodeIdentity,
+        request: &mut bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallRequest,
+    ) {
+        let challenge = crate::membership::create_peer_auth_challenge_for_members(
+            caller,
+            &crate::ClusterPeerChallengeRequest {
+                claimant_node_id: identity.node_id().to_string(),
+            },
+            members,
+        )
+        .unwrap();
+        let mut proof = request.proof.peer.clone();
+        proof.challenge = challenge;
+        proof.claimant_signature = crate::membership::encode_hex(
+            &identity.sign(&crate::membership::canonical_peer_proof(&proof).unwrap()),
+        );
+        request.proof.peer = proof;
+        request.proof.signature = identity.sign(
+            &crate::consensus_network::owned_snapshot_install_signing_payload(request).unwrap(),
+        );
+    }
+
+    fn assert_install_replay(
+        request: &bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallRequest,
+        actual: &bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallResponse,
+        original: &bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallResponse,
+    ) {
+        crate::consensus_network::verify_owned_snapshot_install_response(request, actual).unwrap();
+        assert_eq!(actual.request_id, original.request_id);
+        assert_eq!(actual.source, original.source);
+        assert_eq!(actual.term, original.term);
+        assert_eq!(actual.outcome, original.outcome);
+        // Fresh peer-auth proofs intentionally yield different response signatures.
+    }
+
+    // Exercise the actual authenticated executor, sealed reader and durable
+    // replay transaction together, without a network/runtime surrogate store.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn remote_snapshot_signed_sealed_install_replay_reopen_and_conflict() {
+        use bmux_cluster_plugin_api::{
+            cluster_consensus_snapshot_types::{InstallOutcome, InstallRejection, InstallRequest},
+            cluster_consensus_transfer_types::{
+                NodeAddress, SnapshotDescriptor, StoredMembership, TransferHeader, TransferProof,
+                TransferPurpose, VoterConfiguration,
+            },
+            cluster_types::PeerAuthProof,
+        };
+        let caller = std::sync::Arc::new(InstallCaller::default());
+        let identity = crate::membership::load_or_create_node_identity(caller.as_ref()).unwrap();
+        crate::membership::initialize_cluster(caller.as_ref()).unwrap();
+        let local = *identity.node_id();
+        let mut members = crate::membership::list_members(caller.as_ref())
+            .unwrap()
+            .members;
+        let member = members
+            .iter_mut()
+            .find(|m| m.node_id == local.to_string())
+            .unwrap();
+        member.negotiated_protocol.features = vec![
+            bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID.to_string(),
+            bmux_cluster_plugin_api::cluster_consensus_transfer::INTERFACE_ID.to_string(),
+            bmux_cluster_plugin_api::cluster_consensus_snapshot::INTERFACE_ID.to_string(),
+        ];
+        *member = crate::membership::issue_membership_credential(
+            &identity,
+            member.cluster_id.parse().unwrap(),
+            member.node_id.clone(),
+            member.public_key.clone(),
+            member.capabilities.clone(),
+            member.negotiated_protocol.clone(),
+            crate::now_unix_ms(),
+        )
+        .unwrap();
+        let cluster = member.cluster_id.clone();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let mut store = OwnedVoteStore::bootstrap(
+            &path,
+            &cluster,
+            local,
+            Membership::new(vec![vec![local]], vec![(local, String::new())]).unwrap(),
+        )
+        .unwrap();
+        store.apply_committed().unwrap();
+        let mut state = store.read_control_state().unwrap();
+        state.members = members
+            .iter()
+            .cloned()
+            .map(|m| (m.node_id.clone(), m))
+            .collect();
+        {
+            let tx = store.database.begin_write().unwrap();
+            tx.open_table(TABLE)
+                .unwrap()
+                .insert("control", state.encode_snapshot().unwrap().as_slice())
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let bytes = store.publish_snapshot().unwrap();
+        let (descriptor, _) = crate::consensus_storage::decode_owned_snapshot(&bytes).unwrap();
+        let boundary = descriptor.last_included.unwrap();
+        let introduced = descriptor
+            .membership
+            .as_ref()
+            .unwrap()
+            .introduced_at
+            .unwrap();
+        let challenge = crate::membership::create_peer_auth_challenge_for_members(
+            caller.as_ref(),
+            &crate::ClusterPeerChallengeRequest {
+                claimant_node_id: local.to_string(),
+            },
+            &members,
+        )
+        .unwrap();
+        let mut proof = PeerAuthProof {
+            challenge,
+            claimant_node_id: local.to_string(),
+            claimant_credential_serial: members[0].credential_serial.clone(),
+            claimant_signature: String::new(),
+        };
+        proof.claimant_signature = crate::membership::encode_hex(
+            &identity.sign(&crate::membership::canonical_peer_proof(&proof).unwrap()),
+        );
+        let mut request = InstallRequest {
+            request_id: uuid::Uuid::new_v4(),
+            reference: TransferHeader {
+                cluster_id: cluster.clone(),
+                sender: local.as_bytes().to_vec(),
+                recipient: local.as_bytes().to_vec(),
+                leader_term: 0,
+                sender_incarnation: uuid::Uuid::new_v4(),
+                sequence: 1,
+                purpose: TransferPurpose::Snapshot {
+                    value: SnapshotDescriptor {
+                        format_version: descriptor.format_version,
+                        cluster_id: cluster.clone(),
+                        snapshot_id: descriptor.snapshot_id,
+                        last_included: Some(wire_log_identity(boundary)),
+                        membership: Some(StoredMembership {
+                            introduced_at: wire_log_identity(introduced),
+                            configurations: vec![VoterConfiguration {
+                                voters: vec![local.as_bytes().to_vec()],
+                            }],
+                            nodes: vec![NodeAddress {
+                                node: local.as_bytes().to_vec(),
+                                endpoint: String::new(),
+                            }],
+                        }),
+                        total_bytes: bytes.len() as u64,
+                        checksum: descriptor.checksum.to_vec(),
+                    },
+                },
+                total_bytes: bytes.len() as u64,
+                checksum: Sha256::digest(&bytes).to_vec(),
+            },
+            proof: TransferProof {
+                credential_serial: members[0].credential_serial.clone(),
+                peer: proof,
+                signature: Vec::new(),
+            },
+        };
+        request.proof.signature = identity.sign(
+            &crate::consensus_network::owned_snapshot_install_signing_payload(&request).unwrap(),
+        );
+        let executor = VoteExecutor::new(DurableVoteGate::new(1, store));
+        let rejected = executor
+            .install_snapshot_authenticated(caller.clone(), local, request.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            rejected.outcome,
+            InstallOutcome::Rejected {
+                reason: InstallRejection::UnknownTransfer
+            }
+        ));
+        assert!(matches!(executor.install_snapshot_authenticated(caller.clone(), local, request.clone()).await,
+            Err(bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallError::Unauthorized)));
+        let directory = std::fs::File::open(root.path()).unwrap();
+        let binding: [u8; 32] =
+            Sha256::digest(bmux_plugin_sdk::encode_service_message(&request.reference).unwrap())
+                .into();
+        let key = crate::transfer_staging::TransferKey {
+            peer: *local.as_bytes(),
+            incarnation: request.reference.sender_incarnation,
+            sequence: 1,
+        };
+        let staged = bytes.clone();
+        executor
+            .run(move |gate| {
+                let mut staging =
+                    crate::transfer_staging::TransferStaging::new(1024 * 1024, 1024 * 1024)
+                        .unwrap();
+                let now = std::time::Instant::now();
+                staging
+                    .begin(
+                        &directory,
+                        key,
+                        binding,
+                        staged.len() as u64,
+                        Sha256::digest(&staged).into(),
+                        now,
+                    )
+                    .unwrap();
+                for (offset, chunk) in staged.chunks(64 * 1024).enumerate() {
+                    staging
+                        .chunk(key, (offset * 64 * 1024) as u64, chunk, now)
+                        .unwrap();
+                }
+                gate.staging = Some((directory, staging));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        fresh_install_proof(caller.as_ref(), &members, &identity, &mut request);
+        assert!(matches!(
+            executor
+                .install_snapshot_authenticated(caller.clone(), local, request.clone())
+                .await
+                .unwrap()
+                .outcome,
+            InstallOutcome::Rejected {
+                reason: InstallRejection::NotSealed
+            }
+        ));
+        executor
+            .run(move |gate| {
+                gate.staging.as_mut().unwrap().1.finish(key).unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        fresh_install_proof(caller.as_ref(), &members, &identity, &mut request);
+        let installed = executor
+            .install_snapshot_authenticated(caller.clone(), local, request.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            installed.outcome,
+            InstallOutcome::Installed { .. }
+        ));
+        crate::consensus_network::verify_owned_snapshot_install_response(&request, &installed)
+            .unwrap();
+        fresh_install_proof(caller.as_ref(), &members, &identity, &mut request);
+        let replay = executor
+            .install_snapshot_authenticated(caller.clone(), local, request.clone())
+            .await
+            .unwrap();
+        assert_install_replay(&request, &replay, &installed);
+        executor.shutdown().await.unwrap();
+        let executor = VoteExecutor::new(DurableVoteGate::new(
+            2,
+            OwnedVoteStore::open(&path, &cluster).unwrap(),
+        ));
+        fresh_install_proof(caller.as_ref(), &members, &identity, &mut request);
+        let replay = executor
+            .install_snapshot_authenticated(caller.clone(), local, request.clone())
+            .await
+            .unwrap();
+        assert_install_replay(&request, &replay, &installed);
+        let mut conflict = request.clone();
+        conflict.reference.sequence += 1;
+        conflict.proof.signature = identity.sign(
+            &crate::consensus_network::owned_snapshot_install_signing_payload(&conflict).unwrap(),
+        );
+        fresh_install_proof(caller.as_ref(), &members, &identity, &mut conflict);
+        assert!(matches!(
+            executor
+                .install_snapshot_authenticated(caller.clone(), local, conflict)
+                .await
+                .unwrap()
+                .outcome,
+            InstallOutcome::Rejected {
+                reason: InstallRejection::ConflictingReference
+            }
+        ));
+        let mut generation = request.clone();
+        generation.reference.sender_incarnation = uuid::Uuid::new_v4();
+        generation.proof.signature = identity.sign(
+            &crate::consensus_network::owned_snapshot_install_signing_payload(&generation).unwrap(),
+        );
+        fresh_install_proof(caller.as_ref(), &members, &identity, &mut generation);
+        assert!(matches!(
+            executor
+                .install_snapshot_authenticated(caller.clone(), local, generation)
+                .await
+                .unwrap()
+                .outcome,
+            InstallOutcome::Rejected {
+                reason: InstallRejection::ConflictingReference
+            }
+        ));
+        let mut capacity = request.clone();
+        capacity.request_id = uuid::Uuid::new_v4();
+        capacity.reference.sequence = 8;
+        capacity.reference.total_bytes = 24 * 1024 * 1024;
+        if let TransferPurpose::Snapshot { value } = &mut capacity.reference.purpose {
+            value.total_bytes = capacity.reference.total_bytes;
+        }
+        capacity.proof.signature = identity.sign(
+            &crate::consensus_network::owned_snapshot_install_signing_payload(&capacity).unwrap(),
+        );
+        fresh_install_proof(caller.as_ref(), &members, &identity, &mut capacity);
+        assert!(matches!(
+            executor
+                .install_snapshot_authenticated(caller.clone(), local, capacity)
+                .await
+                .unwrap()
+                .outcome,
+            InstallOutcome::Rejected {
+                reason: InstallRejection::CapacityUnavailable
+            }
+        ));
+        executor
+            .run(|gate| {
+                gate.store
+                    .persist(HardState {
+                        term: Term(1),
+                        voted_for: None,
+                    })
+                    .map_err(|_| VoteGateError::StorageFailure)
+            })
+            .await
+            .unwrap();
+        let mut stale_request = request.clone();
+        stale_request.request_id = uuid::Uuid::new_v4();
+        stale_request.reference.sequence = 9;
+        stale_request.proof.signature = identity.sign(
+            &crate::consensus_network::owned_snapshot_install_signing_payload(&stale_request)
+                .unwrap(),
+        );
+        fresh_install_proof(caller.as_ref(), &members, &identity, &mut stale_request);
+        assert!(matches!(
+            executor
+                .install_snapshot_authenticated(caller.clone(), local, stale_request)
+                .await
+                .unwrap()
+                .outcome,
+            InstallOutcome::Rejected {
+                reason: InstallRejection::StaleTerm
+            }
+        ));
+        // Receipt replay stays durable after a term advance; fresh authorization
+        // is still mandatory and revocation cannot revive old install authority.
+        fresh_install_proof(caller.as_ref(), &members, &identity, &mut request);
+        let replay = executor
+            .install_snapshot_authenticated(caller.clone(), local, request.clone())
+            .await
+            .unwrap();
+        assert_install_replay(&request, &replay, &installed);
+        // A conflicting reuse must still settle authenticated higher authority
+        // before reporting conflict, cancelling old leadership/read admission.
+        executor
+            .run(move |gate| {
+                let observation = gate.store.observe()?;
+                let membership = observation.effective_membership.unwrap();
+                gate.store
+                    .persist(HardState {
+                        term: Term(1),
+                        voted_for: Some(local),
+                    })
+                    .map_err(|_| VoteGateError::StorageFailure)?;
+                let entry = LogIdentity {
+                    term: Term(1),
+                    leader: local,
+                    index: crate::consensus_model::LogIndex(1),
+                };
+                gate.store
+                    .append(
+                        &AppendRequest {
+                            term: Term(1),
+                            leader: local,
+                            previous: observation.last_log,
+                            entries: vec![Entry {
+                                identity: entry,
+                                payload: EntryPayload::NoOp,
+                            }],
+                            leader_commit: Some(entry),
+                        },
+                        (1, 1024),
+                    )
+                    .map_err(|_| VoteGateError::StorageFailure)?;
+                gate.store
+                    .apply_committed()
+                    .map_err(|_| VoteGateError::StorageFailure)?;
+                gate.leader = Some(
+                    crate::consensus_model::LeaderProgress::after_durable_initialization(
+                        membership.membership,
+                        entry,
+                    ),
+                );
+                gate.initialized_noop = Some(entry);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let context = executor.begin_read(local).await.unwrap().unwrap();
+        let mut higher_conflict = request.clone();
+        higher_conflict.reference.leader_term = 2;
+        fresh_install_proof(caller.as_ref(), &members, &identity, &mut higher_conflict);
+        let response = executor
+            .install_snapshot_authenticated(caller.clone(), local, higher_conflict)
+            .await
+            .unwrap();
+        assert!(matches!(
+            response.outcome,
+            InstallOutcome::Rejected {
+                reason: InstallRejection::ConflictingReference
+            }
+        ));
+        assert_eq!(
+            executor.observe(local).await.unwrap().hard_state,
+            HardState {
+                term: Term(2),
+                voted_for: None
+            }
+        );
+        assert!(!executor.observe(local).await.unwrap().local_leader);
+        assert!(
+            executor
+                .complete_read(local, context)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        executor
+            .run(|gate| {
+                assert!(gate.campaign.is_none());
+                assert!(gate.initialized_noop.is_none());
+                Ok(())
+            })
+            .await
+            .unwrap();
+        // Issue while the committed member is active, then revoke canonically:
+        // rejection must be current membership auth, not reused challenge auth.
+        fresh_install_proof(caller.as_ref(), &members, &identity, &mut request);
+        let saved = executor
+            .read_control_state()
+            .await
+            .unwrap()
+            .encode_snapshot()
+            .unwrap();
+        executor
+            .run(move |gate| {
+                let mut state = gate.store.read_control_state().unwrap();
+                state.members.get_mut(&local.to_string()).unwrap().state =
+                    bmux_cluster_plugin_api::cluster_types::ClusterMemberState::Revoked;
+                let tx = gate.store.database.begin_write().unwrap();
+                tx.open_table(TABLE)
+                    .unwrap()
+                    .insert("control", state.encode_snapshot().unwrap().as_slice())
+                    .unwrap();
+                tx.commit().unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(
+            executor
+                .install_snapshot_authenticated(caller, local, request)
+                .await
+                .is_err()
+        );
+        executor
+            .run(move |gate| {
+                let tx = gate.store.database.begin_write().unwrap();
+                tx.open_table(TABLE)
+                    .unwrap()
+                    .insert("control", saved.as_slice())
+                    .unwrap();
+                tx.commit().unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        executor.shutdown().await.unwrap();
+        assert_eq!(
+            OwnedVoteStore::open(&path, &cluster).unwrap().state(),
+            HardState {
+                term: Term(2),
+                voted_for: None
+            }
+        );
+    }
+
+    fn read_fixture_genesis(membership: &Membership) -> Membership {
+        if membership.configurations().len() != 2 {
+            return membership.clone();
+        }
+        Membership::new(
+            vec![membership.configurations()[0].iter().copied().collect()],
+            membership
+                .nodes()
+                .iter()
+                .map(|(node, endpoint)| (*node, endpoint.clone()))
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn read_barrier_fixture(
+        path: &Path,
+        configurations: Vec<Vec<NodeId>>,
+        apply: bool,
+    ) -> (VoteExecutor, NodeId, LogIdentity) {
+        let local = NodeId::from(1);
+        let nodes = configurations
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let membership = Membership::new(
+            configurations,
+            nodes
+                .into_iter()
+                .map(|node| (node, String::new()))
+                .collect(),
+        )
+        .unwrap();
+        let genesis = LogIdentity {
+            term: Term(0),
+            leader: local,
+            index: crate::consensus_model::LogIndex(0),
+        };
+        let mut store = OwnedVoteStore::initialize(
+            path,
+            "cluster",
+            Some(Entry {
+                identity: genesis,
+                payload: EntryPayload::Membership(read_fixture_genesis(&membership)),
+            }),
+        )
+        .unwrap();
+        store.apply_committed().unwrap();
+        let previous = if membership.configurations().len() == 2 {
+            let joint = LogIdentity {
+                term: Term(1),
+                index: crate::consensus_model::LogIndex(1),
+                ..genesis
+            };
+            store
+                .append(
+                    &AppendRequest {
+                        term: Term(1),
+                        leader: local,
+                        previous: Some(genesis),
+                        entries: vec![Entry {
+                            identity: joint,
+                            payload: EntryPayload::Membership(membership.clone()),
+                        }],
+                        leader_commit: Some(joint),
+                    },
+                    (1, 4096),
+                )
+                .unwrap();
+            store.apply_committed().unwrap();
+            joint
+        } else {
+            genesis
+        };
+        let noop = LogIdentity {
+            term: Term(1),
+            index: crate::consensus_model::LogIndex(previous.index.0 + 1),
+            ..genesis
+        };
+        store
+            .append(
+                &AppendRequest {
+                    term: Term(1),
+                    leader: local,
+                    previous: Some(previous),
+                    entries: vec![Entry {
+                        identity: noop,
+                        payload: EntryPayload::NoOp,
+                    }],
+                    leader_commit: Some(noop),
+                },
+                (1, 1024),
+            )
+            .unwrap();
+        store
+            .persist(HardState {
+                term: Term(1),
+                voted_for: Some(local),
+            })
+            .unwrap();
+        if apply {
+            store.apply_committed().unwrap();
+        }
+        let mut gate = DurableVoteGate::new(1, store);
+        gate.leader = Some(
+            crate::consensus_model::LeaderProgress::after_durable_initialization(membership, noop),
+        );
+        gate.initialized_noop = Some(noop);
+        (VoteExecutor::new(gate), local, noop)
+    }
+
+    async fn acknowledge_read(
+        executor: &VoteExecutor,
+        context: crate::consensus_model::ReadContext,
+        peer: NodeId,
+        term: Term,
+        accepted: bool,
+    ) {
+        executor
+            .run(move |gate| {
+                gate.observe_read_confirmation(
+                    peer,
+                    crate::consensus_model::ReadConfirmation {
+                        context,
+                        term,
+                        accepted,
+                    },
+                )
+            })
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn owned_read_signed_heartbeat_reply_cannot_bind_another_request() {
+        use bmux_cluster_plugin_api::cluster_consensus_rpc_types::{
+            AppendOutcome as WireOutcome, AppendResponse,
+        };
+        let local = NodeId::from(1);
+        let identity = crate::membership::NodeIdentity::new_for_test(2);
+        let peer = *identity.node_id();
+        let mut request = append_admission_request(local, peer, "cluster".into());
+        let mut response = AppendResponse {
+            request_id: request.request_id,
+            source: peer.as_bytes().to_vec(),
+            term: request.term,
+            outcome: WireOutcome::Durable {
+                matched: request.previous.clone(),
+            },
+            signature: Vec::new(),
+        };
+        response.signature = identity.sign(
+            &crate::consensus_network::owned_append_response_signing_payload(&request, &response)
+                .unwrap(),
+        );
+        crate::consensus_network::verify_owned_append_response(&request, &response).unwrap();
+        request.request_id = uuid::Uuid::new_v4();
+        assert!(
+            crate::consensus_network::verify_owned_append_response(&request, &response).is_err()
+        );
+        request.request_id = response.request_id;
+        request.leader_commit = None;
+        assert!(
+            crate::consensus_network::verify_owned_append_response(&request, &response).is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_read_single_voter_applied_lag_stale_and_once() {
+        let root = tempfile::tempdir().unwrap();
+        let (executor, local, noop) = read_barrier_fixture(
+            &root.path().join("authority"),
+            vec![vec![NodeId::from(1)]],
+            false,
+        );
+        let stale = executor.begin_read(local).await.unwrap().unwrap();
+        let context = executor.begin_read(local).await.unwrap().unwrap();
+        assert_ne!(stale, context);
+        assert!(
+            executor
+                .complete_read(local, stale)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            executor
+                .complete_read(local, context)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        executor.apply_committed_batch().await.unwrap();
+        let result = executor
+            .complete_read(local, context)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.watermark, noop);
+        assert_eq!(result.state.revision, 0);
+        assert!(
+            executor
+                .complete_read(local, context)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        executor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn owned_read_joint_quorum_requires_both_majorities() {
+        let root = tempfile::tempdir().unwrap();
+        let nodes = [
+            NodeId::from(1),
+            NodeId::from(2),
+            NodeId::from(3),
+            NodeId::from(4),
+            NodeId::from(5),
+        ];
+        let (executor, local, noop) = read_barrier_fixture(
+            &root.path().join("authority"),
+            vec![
+                vec![nodes[0], nodes[1], nodes[2]],
+                vec![nodes[0], nodes[3], nodes[4]],
+            ],
+            true,
+        );
+        let stale = executor.begin_read(local).await.unwrap().unwrap();
+        let context = executor.begin_read(local).await.unwrap().unwrap();
+        acknowledge_read(&executor, stale, nodes[1], context.term, true).await;
+        acknowledge_read(&executor, context, nodes[3], context.term, false).await;
+        assert!(
+            executor
+                .complete_read(local, context)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        acknowledge_read(&executor, context, nodes[1], context.term, true).await;
+        acknowledge_read(&executor, context, nodes[2], context.term, true).await;
+        assert!(
+            executor
+                .complete_read(local, context)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        acknowledge_read(&executor, context, nodes[3], context.term, true).await;
+        assert_eq!(
+            executor
+                .complete_read(local, context)
+                .await
+                .unwrap()
+                .unwrap()
+                .watermark,
+            noop
+        );
+        executor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn owned_read_higher_term_persists_even_for_stale_context() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let (executor, local, _) = read_barrier_fixture(
+            &path,
+            vec![vec![NodeId::from(1), NodeId::from(2), NodeId::from(3)]],
+            true,
+        );
+        let stale = executor.begin_read(local).await.unwrap().unwrap();
+        let current = executor.begin_read(local).await.unwrap().unwrap();
+        acknowledge_read(&executor, stale, NodeId::from(2), Term(2), false).await;
+        assert!(
+            executor
+                .complete_read(local, current)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!executor.observe(local).await.unwrap().local_leader);
+        executor.shutdown().await.unwrap();
+        let store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        assert_eq!(
+            store.state(),
+            HardState {
+                term: Term(2),
+                voted_for: None
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn owned_read_verified_higher_term_settlement_survives_cancelled_waiter() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let (executor, local, _) = read_barrier_fixture(
+            &path,
+            vec![vec![NodeId::from(1), NodeId::from(2), NodeId::from(3)]],
+            true,
+        );
+        let executor = std::sync::Arc::new(executor);
+        let context = executor.begin_read(local).await.unwrap().unwrap();
+        let guard = executor.gate.clone().lock_owned().await;
+        let owner = executor.clone();
+        let permit = executor.outbound_votes.clone().try_acquire_owned().unwrap();
+        let task = tokio::spawn(async move {
+            owner
+                .settle_response(permit, move |gate| {
+                    gate.observe_read_confirmation(
+                        NodeId::from(2),
+                        crate::consensus_model::ReadConfirmation {
+                            context,
+                            term: Term(2),
+                            accepted: false,
+                        },
+                    )
+                })
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while executor
+                .response_pending
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            executor.begin_read(local).await,
+            Err(VoteGateError::Busy)
+        ));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while executor
+                .response_pending
+                .load(std::sync::atomic::Ordering::SeqCst)
+                != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            executor.observe(local).await.unwrap().hard_state.term,
+            Term(2)
+        );
+        assert!(
+            executor
+                .complete_read(local, context)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        executor.shutdown().await.unwrap();
+        assert_eq!(
+            OwnedVoteStore::open(&path, "cluster").unwrap().state().term,
+            Term(2)
+        );
+    }
+
+    // Both production response boundaries must retain their already-reserved
+    // task through durable settlement, even after the requesting task is gone.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn verified_vote_and_append_higher_terms_survive_busy_cancelled_waiters() {
+        use bmux_cluster_plugin_api::{
+            cluster_consensus_rpc_types as wire, cluster_consensus_vote_types as vote,
+        };
+        for append in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("authority");
+            let (executor, local, noop) = read_barrier_fixture(
+                &path,
+                vec![vec![NodeId::from(1), NodeId::from(2), NodeId::from(3)]],
+                true,
+            );
+            let executor = std::sync::Arc::new(executor);
+            let context = executor.begin_read(local).await.unwrap().unwrap();
+            let previous = executor.observe(local).await.unwrap().hard_state;
+            let remote = crate::membership::NodeIdentity::new_for_test(2);
+            let peer = *remote.node_id();
+            let mut request = append_admission_request(local, peer, "cluster".into());
+            // Deliberately stale probe: persistence must precede its rejection.
+            request.term = 0;
+            let permit = executor.outbound_votes.clone().try_acquire_owned().unwrap();
+            let guard = executor.gate.clone().lock_owned().await;
+            let owner = executor.clone();
+            let task = tokio::spawn(async move {
+                if append {
+                    let mut response = wire::AppendResponse {
+                        request_id: request.request_id,
+                        source: peer.as_bytes().to_vec(),
+                        term: 2,
+                        outcome: wire::AppendOutcome::Conflict { next_index: 0 },
+                        signature: Vec::new(),
+                    };
+                    response.signature = remote.sign(
+                        &crate::consensus_network::owned_append_response_signing_payload(
+                            &request, &response,
+                        )
+                        .unwrap(),
+                    );
+                    crate::consensus_network::verify_owned_append_response(&request, &response)
+                        .unwrap();
+                    owner
+                        .replicate_response_admitted(
+                            local,
+                            request,
+                            response,
+                            "obsolete".into(),
+                            peer,
+                            Some(noop),
+                            Membership::new(vec![vec![local]], vec![(local, String::new())])
+                                .unwrap(),
+                            permit,
+                        )
+                        .await
+                        .unwrap_err();
+                } else {
+                    let request = vote::VoteRequest {
+                        cluster_id: request.cluster_id,
+                        sender: request.sender,
+                        recipient: request.recipient,
+                        request_id: request.request_id,
+                        term: request.term,
+                        last_log: request.previous,
+                        proof: request.proof,
+                    };
+                    let mut response = vote::VoteResponse {
+                        request_id: request.request_id,
+                        source: peer.as_bytes().to_vec(),
+                        term: 2,
+                        granted: false,
+                        signature: Vec::new(),
+                    };
+                    response.signature = remote.sign(
+                        &crate::consensus_network::owned_vote_response_signing_payload(
+                            &request, &response,
+                        )
+                        .unwrap(),
+                    );
+                    owner
+                        .campaign_signed_response_admitted(local, &request, &response, permit)
+                        .await
+                        .unwrap();
+                }
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while executor
+                    .response_pending
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    == 0
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(matches!(
+                executor.begin_read(local).await,
+                Err(VoteGateError::Busy)
+            ));
+            assert!(matches!(
+                executor
+                    .propose_authorized(
+                        local,
+                        previous,
+                        "principal:test".into(),
+                        proposal_command(),
+                        |_, _| Ok(())
+                    )
+                    .await,
+                Err(ProposalError::Executor(VoteGateError::Busy))
+            ));
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            drop(guard);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while executor
+                    .response_pending
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    != 0
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                executor.observe(local).await.unwrap().hard_state,
+                HardState {
+                    term: Term(2),
+                    voted_for: None
+                }
+            );
+            assert!(!executor.observe(local).await.unwrap().local_leader);
+            assert!(
+                executor
+                    .complete_read(local, context)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(executor.begin_read(local).await.unwrap().is_none());
+            assert!(matches!(
+                executor
+                    .propose_authorized(
+                        local,
+                        previous,
+                        "principal:test".into(),
+                        proposal_command(),
+                        |_, _| Ok(())
+                    )
+                    .await,
+                Err(ProposalError::StaleAuthority)
+            ));
+            executor
+                .run(|gate| {
+                    assert!(gate.campaign.is_none());
+                    assert!(gate.initialized_noop.is_none());
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            executor.shutdown().await.unwrap();
+            assert_eq!(
+                OwnedVoteStore::open(&path, "cluster").unwrap().state(),
+                HardState {
+                    term: Term(2),
+                    voted_for: None
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_read_membership_publication_cancels_even_after_restoration() {
+        let root = tempfile::tempdir().unwrap();
+        let (executor, local, noop) = read_barrier_fixture(
+            &root.path().join("authority"),
+            vec![vec![NodeId::from(1)]],
+            true,
+        );
+        let context = executor.begin_read(local).await.unwrap().unwrap();
+        executor
+            .run(move |gate| {
+                let membership = gate.leader.as_ref().unwrap().membership.clone();
+                let identity = LogIdentity {
+                    index: crate::consensus_model::LogIndex(2),
+                    ..noop
+                };
+                gate.store
+                    .append(
+                        &AppendRequest {
+                            term: noop.term,
+                            leader: local,
+                            previous: Some(noop),
+                            entries: vec![Entry {
+                                identity,
+                                payload: EntryPayload::Membership(membership),
+                            }],
+                            leader_commit: Some(noop),
+                        },
+                        (1, 1024),
+                    )
+                    .map_err(|_| VoteGateError::StorageFailure)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(
+            executor
+                .complete_read(local, context)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        executor
+            .run(move |gate| {
+                gate.store
+                    .append(
+                        &AppendRequest {
+                            term: Term(2),
+                            leader: local,
+                            previous: Some(noop),
+                            entries: vec![Entry {
+                                identity: LogIdentity {
+                                    term: Term(2),
+                                    index: crate::consensus_model::LogIndex(2),
+                                    ..noop
+                                },
+                                payload: EntryPayload::NoOp,
+                            }],
+                            leader_commit: Some(noop),
+                        },
+                        (1, 1024),
+                    )
+                    .map_err(|_| VoteGateError::StorageFailure)?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(
+            executor
+                .complete_read(local, context)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        executor.shutdown().await.unwrap();
+    }
+
+    // Validate exact identities across mixed entries and a count-boundary turn,
+    // including canonical dedup/conflict outcomes and restart continuity.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn applied_batch_mixed_entries_boundary_dedup_conflict_and_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let node = NodeId::from(1);
+        let membership = Membership::new(vec![vec![node]], vec![(node, String::new())]).unwrap();
+        let mut store =
+            OwnedVoteStore::bootstrap(&path, "cluster", node, membership.clone()).unwrap();
+        let first = store.apply_committed_batch().unwrap();
+        let genesis = first.applied.unwrap();
+        assert_eq!(
+            first.outcomes,
+            vec![AppliedOutcome {
+                identity: genesis,
+                response: None
+            }]
+        );
+        assert!(!first.more);
+        let identity = |index| LogIdentity {
+            term: Term(1),
+            index: crate::consensus_model::LogIndex(index),
+            leader: node,
+        };
+        let command = proposal_command();
+        let mut conflict = command.clone();
+        conflict.request =
+            bmux_cluster_plugin_api::cluster_types::ControlCommandRequest::CreateWorkspace {
+                workspace_id: bmux_cluster_plugin_api::cluster_types::WorkspaceId {
+                    value: uuid::Uuid::from_u128(99),
+                },
+                name: None,
+            };
+        let mut entries = vec![
+            Entry {
+                identity: identity(1),
+                payload: EntryPayload::NoOp,
+            },
+            Entry {
+                identity: identity(2),
+                payload: EntryPayload::Membership(membership),
+            },
+            Entry {
+                identity: identity(3),
+                payload: EntryPayload::Application(crate::control_codec::encode_control_command(
+                    &command,
+                )),
+            },
+            Entry {
+                identity: identity(4),
+                payload: EntryPayload::Application(crate::control_codec::encode_control_command(
+                    &command,
+                )),
+            },
+            Entry {
+                identity: identity(5),
+                payload: EntryPayload::Application(crate::control_codec::encode_control_command(
+                    &conflict,
+                )),
+            },
+        ];
+        entries.extend((6..=65).map(|index| Entry {
+            identity: identity(index),
+            payload: EntryPayload::NoOp,
+        }));
+        assert!(
+            store
+                .append(
+                    &AppendRequest {
+                        term: Term(1),
+                        leader: node,
+                        previous: Some(genesis),
+                        entries,
+                        leader_commit: Some(identity(65)),
+                    },
+                    (128, APPLICATION_ENTRY_BUDGET)
+                )
+                .unwrap()
+                .outcome
+                .is_ok()
+        );
+        let executor = VoteExecutor::new(DurableVoteGate::new(1, store));
+        let batch = executor.apply_committed_batch().await.unwrap();
+        assert_eq!(batch.outcomes.len(), 64);
+        assert_eq!(batch.applied, Some(identity(64)));
+        assert!(batch.more);
+        let mut expected_state = crate::control_state::ControlState::new("cluster");
+        let expected =
+            crate::control_codec::encode_control_response(&expected_state.apply(&command));
+        let conflicting =
+            crate::control_codec::encode_control_response(&expected_state.apply(&conflict));
+        assert_ne!(expected, conflicting);
+        for (index, outcome) in (1..=64).zip(&batch.outcomes) {
+            assert_eq!(outcome.identity, identity(index));
+            let response = match index {
+                3 | 4 => Some(expected.clone()),
+                5 => Some(conflicting.clone()),
+                _ => None,
+            };
+            assert_eq!(outcome.response, response);
+        }
+        let state = executor.read_control_state().await.unwrap();
+        assert_eq!(state.revision, 1);
+        assert_eq!(executor.observe(node).await.unwrap().applied, batch.applied);
+        executor.shutdown().await.unwrap();
+        let executor = VoteExecutor::new(DurableVoteGate::new(
+            2,
+            OwnedVoteStore::open(&path, "cluster").unwrap(),
+        ));
+        let batch = executor.apply_committed_batch().await.unwrap();
+        assert_eq!(
+            batch,
+            AppliedBatch {
+                outcomes: vec![AppliedOutcome {
+                    identity: identity(65),
+                    response: None
+                }],
+                applied: Some(identity(65)),
+                more: false
+            }
+        );
+        assert!(executor.apply_committed().await.unwrap().is_empty());
+        assert_eq!(
+            executor
+                .read_control_state()
+                .await
+                .unwrap()
+                .encode_snapshot()
+                .unwrap(),
+            state.encode_snapshot().unwrap()
+        );
+        executor.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn applied_batch_byte_boundary_preserves_next_exact_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut store, _, previous) = snapshot_install_fixture(&root.path().join("authority"));
+        let identity = |index| LogIdentity {
+            index: crate::consensus_model::LogIndex(index),
+            ..previous
+        };
+        let command = proposal_at_framed_size(identity(2), 600 * 1024);
+        let canonical = crate::control_codec::encode_control_command(&command);
+        store
+            .append(
+                &AppendRequest {
+                    term: previous.term,
+                    leader: previous.leader,
+                    previous: Some(previous),
+                    entries: vec![
+                        Entry {
+                            identity: identity(2),
+                            payload: EntryPayload::Application(canonical.clone()),
+                        },
+                        Entry {
+                            identity: identity(3),
+                            payload: EntryPayload::Application(canonical),
+                        },
+                    ],
+                    leader_commit: Some(identity(3)),
+                },
+                (2, 2 * APPLICATION_ENTRY_BUDGET),
+            )
+            .unwrap();
+        let first = store.apply_committed_batch().unwrap();
+        assert_eq!(first.outcomes.len(), 1);
+        assert_eq!(first.outcomes[0].identity, identity(2));
+        assert_eq!(first.applied, Some(identity(2)));
+        assert!(first.more);
+        let second = store.apply_committed_batch().unwrap();
+        assert_eq!(second.outcomes.len(), 1);
+        assert_eq!(second.outcomes[0].identity, identity(3));
+        assert_eq!(second.outcomes[0].response, first.outcomes[0].response);
+        assert_eq!(second.applied, Some(identity(3)));
+        assert!(!second.more);
+        let empty = store.apply_committed_batch().unwrap();
+        assert!(empty.outcomes.is_empty());
+        assert_eq!(empty.applied, second.applied);
+        assert!(!empty.more);
+    }
+
+    #[test]
+    fn applied_batch_decode_failure_never_acknowledges_partial_transaction() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let (mut store, _, previous) = snapshot_install_fixture(&path);
+        let identity = |index| LogIdentity {
+            index: crate::consensus_model::LogIndex(index),
+            ..previous
+        };
+        let before = store
+            .read_control_state()
+            .unwrap()
+            .encode_snapshot()
+            .unwrap();
+        store
+            .append(
+                &AppendRequest {
+                    term: previous.term,
+                    leader: previous.leader,
+                    previous: Some(previous),
+                    entries: vec![
+                        Entry {
+                            identity: identity(2),
+                            payload: EntryPayload::NoOp,
+                        },
+                        Entry {
+                            identity: identity(3),
+                            payload: EntryPayload::Application(vec![255]),
+                        },
+                    ],
+                    leader_commit: Some(identity(3)),
+                },
+                (2, 1024),
+            )
+            .unwrap();
+        assert!(store.apply_committed_batch().is_err());
+        assert!(store.failed);
+        drop(store);
+        let mut store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        assert_eq!(store.observe().unwrap().applied, Some(previous));
+        assert_eq!(
+            store
+                .read_control_state()
+                .unwrap()
+                .encode_snapshot()
+                .unwrap(),
+            before
+        );
+        assert!(store.apply_committed_batch().is_err());
+        assert!(store.apply_committed().is_err());
+    }
+
+    fn proposal_command() -> bmux_cluster_plugin_api::cluster_types::ControlCommand {
+        use bmux_cluster_plugin_api::cluster_types::{
+            CommandId, ControlCommand, ControlCommandRequest, WorkspaceId,
+        };
+        ControlCommand {
+            schema_version: 1,
+            principal_id: "principal:test".into(),
+            command_id: CommandId {
+                value: uuid::Uuid::from_u128(11),
+            },
+            issued_at_unix_ms: 50,
+            request: ControlCommandRequest::CreateWorkspace {
+                workspace_id: WorkspaceId {
+                    value: uuid::Uuid::from_u128(21),
+                },
+                name: Some("owned".into()),
+            },
+        }
+    }
+
+    // Keep the proposal/commit/application/restart/dedup lifecycle together.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn local_proposal_single_voter_commit_apply_reopen_dedup() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let node = NodeId::from(1);
+        let store = OwnedVoteStore::bootstrap(
+            &path,
+            "cluster",
+            node,
+            Membership::new(vec![vec![node]], vec![(node, String::new())]).unwrap(),
+        )
+        .unwrap();
+        let executor = VoteExecutor::new(DurableVoteGate::new(1, store));
+        executor.campaign(node).await.unwrap().unwrap();
+        let initial = executor.initialize_leader().await.unwrap().unwrap();
+        let expected = executor.observe(node).await.unwrap().hard_state;
+        assert!(matches!(
+            executor
+                .propose_authorized(
+                    node,
+                    expected,
+                    "principal:test".into(),
+                    proposal_command(),
+                    |_, _| Ok(())
+                )
+                .await,
+            Err(ProposalError::NotReady)
+        ));
+        assert_eq!(
+            executor.commit_replicated().await.unwrap(),
+            Some(initial.entries[0].identity)
+        );
+        executor.apply_committed().await.unwrap();
+        let observation = executor.observe(node).await.unwrap();
+        assert!(observation.local_leader);
+        assert_eq!(
+            observation.effective_membership,
+            observation.committed_membership
+        );
+        let first = executor
+            .propose_authorized(
+                node,
+                expected,
+                "principal:test".into(),
+                proposal_command(),
+                |state, command| {
+                    assert_eq!(state.revision, 0);
+                    assert_eq!(command.principal_id, "principal:test");
+                    Ok(())
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            executor.observe(node).await.unwrap().committed,
+            observation.committed
+        );
+        assert_eq!(executor.commit_replicated().await.unwrap(), Some(first));
+        let first_reply = executor.apply_committed().await.unwrap();
+        assert_eq!(executor.read_control_state().await.unwrap().revision, 1);
+        let duplicate = executor
+            .propose_authorized(
+                node,
+                expected,
+                "principal:test".into(),
+                proposal_command(),
+                |_, _| Ok(()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(duplicate.index.0, first.index.0 + 1);
+        assert_eq!(executor.commit_replicated().await.unwrap(), Some(duplicate));
+        assert_eq!(executor.apply_committed().await.unwrap(), first_reply);
+        assert_eq!(executor.read_control_state().await.unwrap().revision, 1);
+        executor.shutdown().await.unwrap();
+        let reopened = VoteExecutor::new(DurableVoteGate::new(
+            2,
+            OwnedVoteStore::open(&path, "cluster").unwrap(),
+        ));
+        let observation = reopened.observe(node).await.unwrap();
+        assert!(!observation.local_leader);
+        assert_eq!(observation.hard_state, expected);
+        assert_eq!(observation.last_log, Some(duplicate));
+        assert_eq!(observation.committed, Some(duplicate));
+        assert_eq!(observation.applied, Some(duplicate));
+        let mut state = reopened.read_control_state().await.unwrap();
+        let reply = state.apply(&proposal_command());
+        assert_eq!(reply.control_revision, 1);
+        assert_eq!(state.revision, 1);
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_proposal_rejects_stale_denied_and_invalid_without_append() {
+        let root = tempfile::tempdir().unwrap();
+        let node = NodeId::from(1);
+        let store = OwnedVoteStore::bootstrap(
+            &root.path().join("authority"),
+            "cluster",
+            node,
+            Membership::new(vec![vec![node]], vec![(node, String::new())]).unwrap(),
+        )
+        .unwrap();
+        let executor = VoteExecutor::new(DurableVoteGate::new(1, store));
+        let stale = executor.observe(node).await.unwrap().hard_state;
+        executor.campaign(node).await.unwrap().unwrap();
+        executor.initialize_leader().await.unwrap().unwrap();
+        executor.commit_replicated().await.unwrap();
+        executor.apply_committed().await.unwrap();
+        let before = executor.observe(node).await.unwrap();
+        assert!(matches!(
+            executor
+                .propose_authorized(
+                    node,
+                    stale,
+                    "principal:test".into(),
+                    proposal_command(),
+                    |_, _| panic!("stale authorization ran")
+                )
+                .await,
+            Err(ProposalError::StaleAuthority)
+        ));
+        assert!(matches!(
+            executor
+                .propose_authorized(
+                    node,
+                    before.hard_state,
+                    "other".into(),
+                    proposal_command(),
+                    |_, _| Ok(())
+                )
+                .await,
+            Err(ProposalError::Unauthorized(_))
+        ));
+        assert!(matches!(
+            executor
+                .propose_authorized(
+                    node,
+                    before.hard_state,
+                    "principal:test".into(),
+                    proposal_command(),
+                    |_, _| Err("denied".into())
+                )
+                .await,
+            Err(ProposalError::Unauthorized(_))
+        ));
+        let mut invalid = proposal_command();
+        invalid.schema_version = u16::MAX;
+        assert!(matches!(
+            executor
+                .propose_authorized(
+                    node,
+                    before.hard_state,
+                    "principal:test".into(),
+                    invalid,
+                    |_, _| Ok(())
+                )
+                .await,
+            Err(ProposalError::InvalidCommand(_))
+        ));
+        let mut oversized = proposal_command();
+        oversized.principal_id = "x".repeat(1_048_577);
+        assert!(matches!(
+            executor
+                .propose_authorized(
+                    node,
+                    before.hard_state,
+                    "principal:test".into(),
+                    oversized,
+                    |_, _| Ok(())
+                )
+                .await,
+            Err(ProposalError::InvalidCommand(_))
+        ));
+        assert_eq!(executor.observe(node).await.unwrap(), before);
+        executor.shutdown().await.unwrap();
+    }
+
+    fn proposal_at_framed_size(
+        identity: LogIdentity,
+        size: usize,
+    ) -> bmux_cluster_plugin_api::cluster_types::ControlCommand {
+        let mut command = proposal_command();
+        command.request =
+            bmux_cluster_plugin_api::cluster_types::ControlCommandRequest::CompleteWorkflow {
+                original_command_id: command.command_id.clone(),
+                response: Vec::new(),
+            };
+        let overhead = crate::consensus_storage::encode_owned_entry(&Entry {
+            identity,
+            payload: EntryPayload::Application(crate::control_codec::encode_control_command(
+                &command,
+            )),
+        })
+        .unwrap()
+        .len();
+        if let bmux_cluster_plugin_api::cluster_types::ControlCommandRequest::CompleteWorkflow {
+            response,
+            ..
+        } = &mut command.request
+        {
+            response.resize(size.checked_sub(overhead).unwrap(), 0);
+        }
+        command
+    }
+
+    // Keep the boundary admission, committed-but-unapplied restart and recovery
+    // together: an accepted command must always remain applicable after reopen.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn local_proposal_framed_boundary_is_applicable_after_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let node = NodeId::from(1);
+        let store = OwnedVoteStore::bootstrap(
+            &path,
+            "cluster",
+            node,
+            Membership::new(vec![vec![node]], vec![(node, String::new())]).unwrap(),
+        )
+        .unwrap();
+        let executor = VoteExecutor::new(DurableVoteGate::new(1, store));
+        executor.campaign(node).await.unwrap().unwrap();
+        executor.initialize_leader().await.unwrap().unwrap();
+        executor.commit_replicated().await.unwrap();
+        executor.apply_committed().await.unwrap();
+        let before = executor.observe(node).await.unwrap();
+        let identity = LogIdentity {
+            term: before.hard_state.term,
+            leader: node,
+            index: crate::consensus_model::LogIndex(before.last_log.unwrap().index.0 + 1),
+        };
+        let oversized = proposal_at_framed_size(identity, APPLICATION_ENTRY_BUDGET + 1);
+        assert!(
+            crate::control_codec::control_command_encoded_len(&oversized, APPLICATION_ENTRY_BUDGET)
+                .is_ok()
+        );
+        assert!(matches!(
+            executor
+                .propose_authorized(
+                    node,
+                    before.hard_state,
+                    "principal:test".into(),
+                    oversized,
+                    |_, _| Ok(())
+                )
+                .await,
+            Err(ProposalError::InvalidCommand(_))
+        ));
+        assert_eq!(executor.observe(node).await.unwrap(), before);
+        let command = proposal_at_framed_size(identity, APPLICATION_ENTRY_BUDGET);
+        assert_eq!(
+            crate::consensus_storage::encode_owned_entry(&Entry {
+                identity,
+                payload: EntryPayload::Application(crate::control_codec::encode_control_command(
+                    &command
+                )),
+            })
+            .unwrap()
+            .len(),
+            APPLICATION_ENTRY_BUDGET
+        );
+        assert_eq!(
+            executor
+                .propose_authorized(
+                    node,
+                    before.hard_state,
+                    "principal:test".into(),
+                    command.clone(),
+                    |_, _| Ok(())
+                )
+                .await
+                .unwrap(),
+            identity
+        );
+        assert_eq!(executor.commit_replicated().await.unwrap(), Some(identity));
+        executor.shutdown().await.unwrap();
+        let executor = VoteExecutor::new(DurableVoteGate::new(
+            2,
+            OwnedVoteStore::open(&path, "cluster").unwrap(),
+        ));
+        let replies = executor.apply_committed().await.unwrap();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            executor.observe(node).await.unwrap().applied,
+            Some(identity)
+        );
+        let mut state = executor.read_control_state().await.unwrap();
+        let response = state.apply(&command);
+        assert_eq!(
+            crate::control_codec::encode_control_response(&response),
+            replies[0]
+        );
+        executor.shutdown().await.unwrap();
+        let mut store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        assert_eq!(store.observe().unwrap().applied, Some(identity));
+    }
+
+    // Exercise capacity rejection, continued observation and recovery after
+    // compaction on one authority rather than simulating a generic I/O error.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn local_proposal_capacity_is_retryable_before_transaction() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let node = NodeId::from(1);
+        let store = OwnedVoteStore::bootstrap(
+            &path,
+            "cluster",
+            node,
+            Membership::new(vec![vec![node]], vec![(node, String::new())]).unwrap(),
+        )
+        .unwrap();
+        let executor = VoteExecutor::new(DurableVoteGate::new(1, store));
+        executor.campaign(node).await.unwrap().unwrap();
+        executor.initialize_leader().await.unwrap().unwrap();
+        executor.commit_replicated().await.unwrap();
+        executor.apply_committed().await.unwrap();
+        executor
+            .run(move |gate| {
+                let last = gate.store.observe()?.last_log.unwrap();
+                let entries = (last.index.0 + 1..MAX_RETAINED_ENTRIES)
+                    .map(|index| Entry {
+                        identity: LogIdentity {
+                            index: crate::consensus_model::LogIndex(index),
+                            ..last
+                        },
+                        payload: EntryPayload::NoOp,
+                    })
+                    .collect::<Vec<_>>();
+                let through = entries.last().unwrap().identity;
+                gate.store
+                    .append(
+                        &AppendRequest {
+                            term: last.term,
+                            leader: node,
+                            previous: Some(last),
+                            entries,
+                            leader_commit: Some(through),
+                        },
+                        (4096, 1024),
+                    )
+                    .map_err(|_| VoteGateError::StorageFailure)?;
+                gate.leader
+                    .as_mut()
+                    .unwrap()
+                    .acknowledge_probe(node, Some(through));
+                Ok(())
+            })
+            .await
+            .unwrap();
+        loop {
+            let observation = executor.observe(node).await.unwrap();
+            if observation.applied == observation.committed {
+                break;
+            }
+            executor.apply_committed().await.unwrap();
+        }
+        let before = executor.observe(node).await.unwrap();
+        assert!(matches!(
+            executor
+                .propose_authorized(
+                    node,
+                    before.hard_state,
+                    "principal:test".into(),
+                    proposal_command(),
+                    |_, _| Ok(())
+                )
+                .await,
+            Err(ProposalError::Capacity)
+        ));
+        assert_eq!(executor.observe(node).await.unwrap(), before);
+        executor.publish_snapshot().await.unwrap();
+        executor.compact_snapshot().await.unwrap();
+        let identity = executor
+            .propose_authorized(
+                node,
+                before.hard_state,
+                "principal:test".into(),
+                proposal_command(),
+                |_, _| Ok(()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(identity.index.0, MAX_RETAINED_ENTRIES);
+        executor.commit_replicated().await.unwrap();
+        executor.apply_committed().await.unwrap();
+        executor.shutdown().await.unwrap();
+        let mut store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        assert_eq!(store.observe().unwrap().applied, Some(identity));
+        assert_eq!(store.read_control_state().unwrap().revision, 1);
+    }
+
+    // Large retries used to exhaust the backend well before the periodic
+    // entry-count compactor ran. Cover pressure, nonpoisoning refusal, restart,
+    // explicit compaction and another acknowledged/application cycle together.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn local_proposal_byte_capacity_large_retries_restart_and_compact() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let node = NodeId::from(1);
+        let store = OwnedVoteStore::bootstrap(
+            &path,
+            "cluster",
+            node,
+            Membership::new(vec![vec![node]], vec![(node, String::new())]).unwrap(),
+        )
+        .unwrap();
+        let executor = VoteExecutor::new(DurableVoteGate::new(1, store));
+        executor.campaign(node).await.unwrap().unwrap();
+        executor.initialize_leader().await.unwrap().unwrap();
+        executor.commit_replicated().await.unwrap();
+        executor.apply_committed().await.unwrap();
+        let before = executor.observe(node).await.unwrap();
+        let command = proposal_at_framed_size(before.last_log.unwrap(), 900 * 1024);
+        let mut accepted = 0;
+        let mut original_reply = None;
+        loop {
+            let before = executor.observe(node).await.unwrap();
+            match executor
+                .propose_authorized(
+                    node,
+                    before.hard_state,
+                    "principal:test".into(),
+                    command.clone(),
+                    |_, _| Ok(()),
+                )
+                .await
+            {
+                Ok(identity) => {
+                    accepted += 1;
+                    assert!(
+                        accepted < 70,
+                        "byte admission failed to stop growth before backend exhaustion"
+                    );
+                    assert_eq!(executor.commit_replicated().await.unwrap(), Some(identity));
+                    let replies = executor.apply_committed().await.unwrap();
+                    if let Some(original) = &original_reply {
+                        assert_eq!(&replies, original);
+                    } else {
+                        original_reply = Some(replies);
+                    }
+                }
+                Err(ProposalError::Capacity) => {
+                    assert_eq!(executor.observe(node).await.unwrap(), before);
+                    break;
+                }
+                Err(error) => panic!("byte pressure became an ambiguous error: {error:?}"),
+            }
+        }
+        assert!(accepted > 1);
+        let full = executor.observe(node).await.unwrap();
+        let canonical = executor
+            .read_control_state()
+            .await
+            .unwrap()
+            .encode_snapshot()
+            .unwrap();
+        executor.shutdown().await.unwrap();
+        let executor = VoteExecutor::new(DurableVoteGate::new(
+            2,
+            OwnedVoteStore::open(&path, "cluster").unwrap(),
+        ));
+        let reopened = executor.observe(node).await.unwrap();
+        assert_eq!(reopened.applied, full.applied);
+        assert_eq!(reopened.committed, full.committed);
+        assert_eq!(
+            executor
+                .read_control_state()
+                .await
+                .unwrap()
+                .encode_snapshot()
+                .unwrap(),
+            canonical
+        );
+        executor.publish_snapshot().await.unwrap();
+        executor.compact_snapshot().await.unwrap();
+        executor.campaign(node).await.unwrap().unwrap();
+        executor.initialize_leader().await.unwrap().unwrap();
+        executor.commit_replicated().await.unwrap();
+        executor.apply_committed().await.unwrap();
+        let current = executor.observe(node).await.unwrap();
+        // Authorization still runs after reclaim, even for a known retry.
+        assert!(matches!(
+            executor
+                .propose_authorized(
+                    node,
+                    current.hard_state,
+                    "principal:test".into(),
+                    command.clone(),
+                    |_, _| Err("revoked".into())
+                )
+                .await,
+            Err(ProposalError::Unauthorized(_))
+        ));
+        let identity = executor
+            .propose_authorized(
+                node,
+                current.hard_state,
+                "principal:test".into(),
+                command,
+                |_, _| Ok(()),
+            )
+            .await
+            .unwrap();
+        executor.commit_replicated().await.unwrap();
+        assert_eq!(
+            executor.apply_committed().await.unwrap(),
+            original_reply.unwrap()
+        );
+        executor.shutdown().await.unwrap();
+        let mut reopened = OwnedVoteStore::open(&path, "cluster").unwrap();
+        assert_eq!(reopened.observe().unwrap().applied, Some(identity));
+        assert_eq!(
+            reopened
+                .read_control_state()
+                .unwrap()
+                .encode_snapshot()
+                .unwrap(),
+            canonical
+        );
+    }
+
+    // Keep pressure and retry in one live owner: reopening would itself drain
+    // deferred pages and hide the compaction lifecycle bug this test targets.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn local_proposal_compaction_drains_deferred_pages_before_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let node = NodeId::from(1);
+        let store = OwnedVoteStore::bootstrap(
+            &path,
+            "cluster",
+            node,
+            Membership::new(vec![vec![node]], vec![(node, String::new())]).unwrap(),
+        )
+        .unwrap();
+        let executor = VoteExecutor::new(DurableVoteGate::new(1, store));
+        executor.campaign(node).await.unwrap().unwrap();
+        executor.initialize_leader().await.unwrap().unwrap();
+        executor.commit_replicated().await.unwrap();
+        executor.apply_committed().await.unwrap();
+        let initial = executor.observe(node).await.unwrap();
+        let command = proposal_at_framed_size(initial.last_log.unwrap(), 900 * 1024);
+        let mut accepted = 0;
+        loop {
+            let before = executor.observe(node).await.unwrap();
+            match executor
+                .propose_authorized(
+                    node,
+                    before.hard_state,
+                    "principal:test".into(),
+                    command.clone(),
+                    |_, _| Ok(()),
+                )
+                .await
+            {
+                Ok(identity) => {
+                    accepted += 1;
+                    assert!(accepted < 70);
+                    assert_eq!(executor.commit_replicated().await.unwrap(), Some(identity));
+                    executor.apply_committed_batch().await.unwrap();
+                }
+                Err(ProposalError::Capacity) => {
+                    assert_eq!(executor.observe(node).await.unwrap(), before);
+                    break;
+                }
+                Err(error) => panic!("unexpected pressure error: {error:?}"),
+            }
+        }
+        assert!(accepted > 1);
+        let allocated_before = executor
+            .run(|gate| {
+                let tx = gate
+                    .store
+                    .database
+                    .begin_write()
+                    .map_err(|_| VoteGateError::StorageFailure)?;
+                let stats = tx.stats().map_err(|_| VoteGateError::StorageFailure)?;
+                Ok(stats.allocated_pages() * stats.page_size() as u64)
+            })
+            .await
+            .unwrap();
+        let full = executor.observe(node).await.unwrap();
+        let control = executor
+            .read_control_state()
+            .await
+            .unwrap()
+            .encode_snapshot()
+            .unwrap();
+        executor.publish_snapshot().await.unwrap();
+        executor.compact_snapshot().await.unwrap();
+        let allocated_after = executor
+            .run(|gate| {
+                let tx = gate
+                    .store
+                    .database
+                    .begin_write()
+                    .map_err(|_| VoteGateError::StorageFailure)?;
+                let stats = tx.stats().map_err(|_| VoteGateError::StorageFailure)?;
+                Ok(stats.allocated_pages() * stats.page_size() as u64)
+            })
+            .await
+            .unwrap();
+        assert!(
+            allocated_after < allocated_before,
+            "deferred allocation not reclaimed: {allocated_before} -> {allocated_after}"
+        );
+        assert_eq!(executor.observe(node).await.unwrap().applied, full.applied);
+        let identity = executor
+            .propose_authorized(
+                node,
+                full.hard_state,
+                "principal:test".into(),
+                command,
+                |_, _| Ok(()),
+            )
+            .await
+            .unwrap();
+        executor.commit_replicated().await.unwrap();
+        executor.apply_committed_batch().await.unwrap();
+        assert_eq!(
+            executor
+                .read_control_state()
+                .await
+                .unwrap()
+                .encode_snapshot()
+                .unwrap(),
+            control
+        );
+        executor.shutdown().await.unwrap();
+        let mut reopened = OwnedVoteStore::open(&path, "cluster").unwrap();
+        assert_eq!(reopened.observe().unwrap().applied, Some(identity));
+        assert_eq!(
+            reopened
+                .read_control_state()
+                .unwrap()
+                .encode_snapshot()
+                .unwrap(),
+            control
+        );
+    }
+
+    fn rewrite_install_snapshot(
+        bytes: &[u8],
+        boundary: LogIdentity,
+        membership: &crate::consensus_model::StoredMembership,
+    ) -> Vec<u8> {
+        let (_, control) = crate::consensus_storage::decode_owned_snapshot(bytes).unwrap();
+        crate::consensus_storage::encode_owned_snapshot(
+            "cluster",
+            "replacement",
+            boundary,
+            membership,
+            &control,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn snapshot_install_rejects_membership_rewrite_at_matching_and_missing_boundaries() {
+        for compact in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("authority");
+            let (mut store, bytes, boundary) = snapshot_install_fixture(&path);
+            if compact {
+                store.compact_snapshot().unwrap();
+            }
+            let (descriptor, _) = crate::consensus_storage::decode_owned_snapshot(&bytes).unwrap();
+            let mut membership = descriptor.membership.unwrap();
+            let node = boundary.leader;
+            membership.membership =
+                Membership::new(vec![vec![node]], vec![(node, "changed".into())]).unwrap();
+            for boundary in [
+                boundary,
+                LogIdentity {
+                    index: crate::consensus_model::LogIndex(4),
+                    ..boundary
+                },
+            ] {
+                let altered = rewrite_install_snapshot(&bytes, boundary, &membership);
+                assert!(store.install_snapshot(store.state(), &altered).is_err());
+                assert!(!store.failed);
+                validate_log_recovery(&store.database.begin_read().unwrap()).unwrap();
+            }
+            drop(store);
+            OwnedVoteStore::open(&path, "cluster").unwrap();
+        }
+    }
+
+    #[test]
+    fn snapshot_install_rejects_equal_term_other_leader_and_replaces_uncommitted_suffix() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let (mut store, bytes, boundary) = snapshot_install_fixture(&path);
+        let (descriptor, _) = crate::consensus_storage::decode_owned_snapshot(&bytes).unwrap();
+        let membership = descriptor.membership.unwrap();
+        let other = LogIdentity {
+            leader: NodeId::from(2),
+            index: crate::consensus_model::LogIndex(2),
+            ..boundary
+        };
+        let contradiction = rewrite_install_snapshot(&bytes, other, &membership);
+        assert!(
+            store
+                .install_snapshot(store.state(), &contradiction)
+                .is_err()
+        );
+        assert!(!store.failed);
+        let uncommitted = LogIdentity {
+            index: crate::consensus_model::LogIndex(2),
+            ..boundary
+        };
+        store
+            .append(
+                &AppendRequest {
+                    term: boundary.term,
+                    leader: boundary.leader,
+                    previous: Some(boundary),
+                    entries: vec![Entry {
+                        identity: uncommitted,
+                        payload: EntryPayload::NoOp,
+                    }],
+                    leader_commit: Some(boundary),
+                },
+                (1, 1024),
+            )
+            .unwrap();
+        store
+            .persist(HardState {
+                term: Term(2),
+                voted_for: None,
+            })
+            .unwrap();
+        let replacement = LogIdentity {
+            term: Term(2),
+            ..uncommitted
+        };
+        let replacement_bytes = rewrite_install_snapshot(&bytes, replacement, &membership);
+        store
+            .install_snapshot(store.state(), &replacement_bytes)
+            .unwrap();
+        drop(store);
+        let mut store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        let observation = store.observe().unwrap();
+        assert_eq!(observation.committed, Some(replacement));
+        assert_eq!(observation.applied, Some(replacement));
+        assert_eq!(observation.last_log, Some(replacement));
+        assert_eq!(
+            store
+                .database
+                .begin_read()
+                .unwrap()
+                .open_table(LOG)
+                .unwrap()
+                .len()
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn snapshot_install_capacity_is_conservative_checked_and_nonpoisoning() {
+        assert!(!snapshot_install_fits(0, 24 * 1024 * 1024, 0, 0));
+        assert!(!snapshot_install_fits(u64::MAX, 1, 1, 1));
+        assert!(!snapshot_install_fits(0, u64::MAX, 0, 0));
+        assert!(!snapshot_install_fits(24 * 1024 * 1024, 1, 1, 1));
+        assert!(!snapshot_install_fits(0, 1, 1, 8 * 1024 * 1024));
+        assert!(snapshot_install_fits(1024 * 1024, 1024, 1024, 1024));
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let (mut store, bytes, _) = snapshot_install_fixture(&path);
+        // A large canonical control state: many individually bounded names,
+        // not a malformed oversized field that the codec would reject first.
+        let (descriptor, control) =
+            crate::consensus_storage::decode_owned_snapshot(&bytes).unwrap();
+        let mut control = crate::control_state::ControlState::decode_snapshot(&control).unwrap();
+        for index in 0..6144u128 {
+            let value = uuid::Uuid::from_u128(index + 100);
+            control.workspaces.insert(
+                value,
+                bmux_cluster_plugin_api::cluster_types::WorkspaceRecord {
+                    workspace_id: bmux_cluster_plugin_api::cluster_types::WorkspaceId { value },
+                    name: Some("x".repeat(4096)),
+                    revision: 0,
+                },
+            );
+        }
+        let large = crate::consensus_storage::encode_owned_snapshot(
+            "cluster",
+            "large",
+            descriptor
+                .last_included
+                .expect("fixture snapshot is nonempty"),
+            &descriptor.membership.unwrap(),
+            &control.encode_snapshot().unwrap(),
+        )
+        .unwrap();
+        assert!(large.len() > 24 * 1024 * 1024);
+        assert_eq!(
+            store
+                .install_snapshot(store.state(), &large)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::StorageFull
+        );
+        assert!(!store.failed);
+        store.install_snapshot(store.state(), &bytes).unwrap();
+        drop(store);
+        OwnedVoteStore::open(&path, "cluster").unwrap();
+    }
+
+    #[test]
+    fn snapshot_install_capacity_counts_retained_suffix_without_poisoning() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let (mut store, bytes, boundary) = snapshot_install_fixture(&path);
+        let suffix = LogIdentity {
+            index: crate::consensus_model::LogIndex(2),
+            ..boundary
+        };
+        store
+            .append(
+                &AppendRequest {
+                    term: boundary.term,
+                    leader: boundary.leader,
+                    previous: Some(boundary),
+                    entries: vec![Entry {
+                        identity: suffix,
+                        payload: EntryPayload::Application(vec![0; 6 * 1024 * 1024]),
+                    }],
+                    leader_commit: Some(boundary),
+                },
+                (1, 6 * 1024 * 1024),
+            )
+            .unwrap();
+        let before = store.observe().unwrap();
+        assert_eq!(
+            store
+                .install_snapshot(store.state(), &bytes)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::StorageFull
+        );
+        assert!(!store.failed);
+        assert_eq!(store.observe().unwrap(), before);
+        drop(store);
+        let mut store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        assert_eq!(store.observe().unwrap(), before);
+    }
+
+    fn snapshot_install_fixture(path: &Path) -> (OwnedVoteStore, Vec<u8>, LogIdentity) {
+        let node = NodeId::from(1);
+        let mut store = OwnedVoteStore::bootstrap(
+            path,
+            "cluster",
+            node,
+            Membership::new(vec![vec![node]], vec![(node, String::new())]).unwrap(),
+        )
+        .unwrap();
+        store.apply_committed().unwrap();
+        let boundary = LogIdentity {
+            term: Term(1),
+            index: crate::consensus_model::LogIndex(1),
+            leader: node,
+        };
+        store
+            .append(
+                &AppendRequest {
+                    term: Term(1),
+                    leader: node,
+                    previous: Some(LogIdentity {
+                        term: Term(0),
+                        index: crate::consensus_model::LogIndex(0),
+                        leader: node,
+                    }),
+                    entries: vec![Entry {
+                        identity: boundary,
+                        payload: EntryPayload::NoOp,
+                    }],
+                    leader_commit: Some(boundary),
+                },
+                (64, 1024 * 1024),
+            )
+            .unwrap();
+        store.apply_committed().unwrap();
+        let bytes = store.publish_snapshot().unwrap();
+        (store, bytes, boundary)
+    }
+
+    #[test]
+    fn snapshot_install_roundtrip_preserves_vote_and_continuation() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, bytes, boundary) = snapshot_install_fixture(&root.path().join("source"));
+        let path = root.path().join("target");
+        let mut target = OwnedVoteStore::create(&path, "cluster").unwrap();
+        target.persist(source.state()).unwrap();
+        let expected = target.state();
+        target.install_snapshot(expected, &bytes).unwrap();
+        target.install_snapshot(expected, &bytes).unwrap();
+        drop(target);
+        let mut target = OwnedVoteStore::open(&path, "cluster").unwrap();
+        assert_eq!(target.state(), expected);
+        let tx = target.database.begin_read().unwrap();
+        validate_log_recovery(&tx).unwrap();
+        let meta = tx.open_table(TABLE).unwrap();
+        assert_eq!(
+            meta.get("compacted_snapshot").unwrap().unwrap().value(),
+            bytes
+        );
+        for key in ["snapshot", "commit", "applied"] {
+            assert_eq!(
+                decode_position(meta.get(key).unwrap().unwrap().value()).unwrap(),
+                Some(boundary)
+            );
+        }
+        drop(meta);
+        drop(tx);
+        let next = LogIdentity {
+            index: crate::consensus_model::LogIndex(2),
+            ..boundary
+        };
+        target
+            .append(
+                &AppendRequest {
+                    term: expected.term,
+                    leader: boundary.leader,
+                    previous: Some(boundary),
+                    entries: vec![Entry {
+                        identity: next,
+                        payload: EntryPayload::NoOp,
+                    }],
+                    leader_commit: Some(next),
+                },
+                (64, 1024 * 1024),
+            )
+            .unwrap();
+        target.apply_committed().unwrap();
+        validate_log_recovery(&target.database.begin_read().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn snapshot_install_preserves_committed_suffix_and_rejects_rollback() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let (mut store, bytes, boundary) = snapshot_install_fixture(&path);
+        let next = LogIdentity {
+            index: crate::consensus_model::LogIndex(2),
+            ..boundary
+        };
+        store
+            .append(
+                &AppendRequest {
+                    term: store.state().term,
+                    leader: boundary.leader,
+                    previous: Some(boundary),
+                    entries: vec![Entry {
+                        identity: next,
+                        payload: EntryPayload::NoOp,
+                    }],
+                    leader_commit: Some(next),
+                },
+                (64, 1024 * 1024),
+            )
+            .unwrap();
+        let expected = store.state();
+        store.install_snapshot(expected, &bytes).unwrap();
+        drop(store);
+        let mut store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        {
+            let tx = store.database.begin_read().unwrap();
+            validate_log_recovery(&tx).unwrap();
+            let meta = tx.open_table(TABLE).unwrap();
+            assert_eq!(
+                decode_position(meta.get("commit").unwrap().unwrap().value()).unwrap(),
+                Some(next)
+            );
+            assert_eq!(tx.open_table(LOG).unwrap().len().unwrap(), 1);
+        }
+        store.apply_committed().unwrap();
+        assert!(store.install_snapshot(expected, &bytes).is_err());
+        assert!(!store.failed);
+        validate_log_recovery(&store.database.begin_read().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn snapshot_install_rejects_stale_corrupt_and_foreign_objects() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut source, bytes, _) = snapshot_install_fixture(&root.path().join("source"));
+        assert!(
+            source
+                .install_snapshot(
+                    HardState {
+                        term: Term(0),
+                        voted_for: None
+                    },
+                    &bytes
+                )
+                .is_err()
+        );
+        let expected = source.state();
+        let mut corrupt = bytes.clone();
+        corrupt[0] ^= 1;
+        assert!(source.install_snapshot(expected, &corrupt).is_err());
+        let mut unsupported = bytes.clone();
+        // Durable header: eight-byte magic, then the u16 format version.
+        unsupported[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
+        let payload = unsupported.len() - 32;
+        let checksum = Sha256::digest(&unsupported[..payload]);
+        unsupported[payload..].copy_from_slice(&checksum);
+        assert!(source.install_snapshot(expected, &unsupported).is_err());
+        source.install_snapshot(expected, &bytes).unwrap();
+        let mut foreign = OwnedVoteStore::create(&root.path().join("foreign"), "other").unwrap();
+        foreign.persist(expected).unwrap();
+        assert!(foreign.install_snapshot(expected, &bytes).is_err());
+        assert!(!foreign.failed);
+        validate_log_recovery(&foreign.database.begin_read().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn snapshot_install_crash_child() {
+        let Some(path) = std::env::var_os("BMUX_OWNED_INSTALL_PATH") else {
+            return;
+        };
+        let bytes = std::fs::read(std::env::var_os("BMUX_OWNED_INSTALL_BYTES").unwrap()).unwrap();
+        let mut store = OwnedVoteStore::open(Path::new(&path), "cluster").unwrap();
+        store.install_snapshot(store.state(), &bytes).unwrap();
+        panic!("snapshot install crash hook not reached");
+    }
+
+    #[test]
+    fn snapshot_install_crash_recovers_one_atomic_authority() {
+        for point in ["before-commit", "after-commit"] {
+            let root = tempfile::tempdir().unwrap();
+            let (source, bytes, boundary) = snapshot_install_fixture(&root.path().join("source"));
+            let snapshot = root.path().join("snapshot");
+            std::fs::write(&snapshot, &bytes).unwrap();
+            let path = root.path().join("target");
+            let mut target = OwnedVoteStore::create(&path, "cluster").unwrap();
+            target.persist(source.state()).unwrap();
+            drop(target);
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "owned_vote_store::tests::snapshot_install_crash_child",
+                    "--nocapture",
+                ])
+                .env("BMUX_OWNED_INSTALL_PATH", &path)
+                .env("BMUX_OWNED_INSTALL_BYTES", &snapshot)
+                .env("BMUX_OWNED_INSTALL_CRASH", point)
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(75));
+            let target = OwnedVoteStore::open(&path, "cluster").unwrap();
+            assert_eq!(target.state(), source.state());
+            let tx = target.database.begin_read().unwrap();
+            validate_log_recovery(&tx).unwrap();
+            let meta = tx.open_table(TABLE).unwrap();
+            let installed = point == "after-commit";
+            for key in ["snapshot", "commit", "applied"] {
+                assert_eq!(
+                    decode_position(meta.get(key).unwrap().unwrap().value()).unwrap(),
+                    installed.then_some(boundary)
+                );
+            }
+            assert_eq!(meta.get("compacted_snapshot").unwrap().is_some(), installed);
+        }
+    }
+
+    // Keep process-exit recovery of acknowledged application state together.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn snapshot_install_crash_replacement_preserves_acknowledged_state() {
+        for point in ["before-commit", "after-commit"] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("target");
+            let (mut target, _, boundary) = snapshot_install_fixture(&path);
+            let command = proposal_command();
+            let applied = LogIdentity {
+                index: crate::consensus_model::LogIndex(2),
+                ..boundary
+            };
+            target
+                .append(
+                    &AppendRequest {
+                        term: boundary.term,
+                        leader: boundary.leader,
+                        previous: Some(boundary),
+                        entries: vec![Entry {
+                            identity: applied,
+                            payload: EntryPayload::Application(
+                                crate::control_codec::encode_control_command(&command),
+                            ),
+                        }],
+                        leader_commit: Some(applied),
+                    },
+                    (1, 1_048_576),
+                )
+                .unwrap();
+            target.apply_committed().unwrap();
+            let old_control = target
+                .read_control_state()
+                .unwrap()
+                .encode_snapshot()
+                .unwrap();
+            let old_snapshot = target.publish_snapshot().unwrap();
+            target.compact_snapshot().unwrap();
+            let (descriptor, _) =
+                crate::consensus_storage::decode_owned_snapshot(&old_snapshot).unwrap();
+            target
+                .persist(HardState {
+                    term: Term(2),
+                    voted_for: None,
+                })
+                .unwrap();
+            let expected = target.state();
+            let replacement = LogIdentity {
+                term: Term(2),
+                index: crate::consensus_model::LogIndex(3),
+                ..boundary
+            };
+            let bytes = rewrite_install_snapshot(
+                &old_snapshot,
+                replacement,
+                &descriptor.membership.unwrap(),
+            );
+            let snapshot = root.path().join("snapshot");
+            std::fs::write(&snapshot, &bytes).unwrap();
+            drop(target);
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "owned_vote_store::tests::snapshot_install_crash_child",
+                    "--nocapture",
+                ])
+                .env("BMUX_OWNED_INSTALL_PATH", &path)
+                .env("BMUX_OWNED_INSTALL_BYTES", &snapshot)
+                .env("BMUX_OWNED_INSTALL_CRASH", point)
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(75));
+            let mut target = OwnedVoteStore::open(&path, "cluster").unwrap();
+            assert_eq!(target.state(), expected);
+            let observation = target.observe().unwrap();
+            let position = if point == "before-commit" {
+                applied
+            } else {
+                replacement
+            };
+            assert_eq!(observation.applied, Some(position));
+            assert_eq!(observation.committed, Some(position));
+            assert_eq!(
+                target
+                    .read_control_state()
+                    .unwrap()
+                    .encode_snapshot()
+                    .unwrap(),
+                old_control
+            );
+            let mut state = target.read_control_state().unwrap();
+            assert_eq!(state.apply(&command).control_revision, 1);
+            assert_eq!(state.revision, 1);
+            validate_log_recovery(&target.database.begin_read().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
     fn application_crash_child() {
         let Some(path) = std::env::var_os("BMUX_OWNED_APPLY_PATH") else {
             return;
@@ -3170,6 +7893,21 @@ mod tests {
         assert_eq!(descriptor.last_included, Some(position));
         let restored = crate::control_state::ControlState::decode_snapshot(&control).unwrap();
         assert_eq!(restored.revision, 1);
+        // Exercise installation of the real canonical mutation/dedup state,
+        // not just an empty control snapshot or reconstructed projection.
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("installed");
+        let mut installed = OwnedVoteStore::create(&path, "cluster").unwrap();
+        installed.persist(store.state()).unwrap();
+        installed
+            .install_snapshot(installed.state(), &snapshot)
+            .unwrap();
+        drop(installed);
+        let installed = OwnedVoteStore::open(&path, "cluster").unwrap();
+        let tx = installed.database.begin_read().unwrap();
+        validate_log_recovery(&tx).unwrap();
+        let meta = tx.open_table(TABLE).unwrap();
+        assert_eq!(meta.get("control").unwrap().unwrap().value(), control);
     }
 
     #[test]
@@ -3935,14 +8673,32 @@ mod tests {
                     term: Term(0),
                     leader: nodes[0],
                     previous: Some(previous),
-                    entries: vec![crate::consensus_model::Entry {
-                        identity: LogIdentity {
-                            index: crate::consensus_model::LogIndex(1),
-                            ..previous
+                    entries: vec![
+                        crate::consensus_model::Entry {
+                            identity: LogIdentity {
+                                index: crate::consensus_model::LogIndex(1),
+                                ..previous
+                            },
+                            payload: EntryPayload::Membership(
+                                Membership::new(
+                                    vec![vec![nodes[0]], nodes.to_vec()],
+                                    nodes.iter().map(|node| (*node, String::new())).collect(),
+                                )
+                                .unwrap(),
+                            ),
                         },
-                        payload: EntryPayload::Membership(membership),
-                    }],
-                    leader_commit: None,
+                        crate::consensus_model::Entry {
+                            identity: LogIdentity {
+                                index: crate::consensus_model::LogIndex(2),
+                                ..previous
+                            },
+                            payload: EntryPayload::Membership(membership),
+                        },
+                    ],
+                    leader_commit: Some(LogIdentity {
+                        index: crate::consensus_model::LogIndex(1),
+                        ..previous
+                    }),
                 },
                 (16, 1024 * 1024),
             )
@@ -4397,7 +9153,7 @@ mod tests {
             entries: vec![
                 Entry {
                     identity: identity(1, 0),
-                    payload: EntryPayload::NoOp,
+                    payload: EntryPayload::Membership(membership.clone()),
                 },
                 Entry {
                     identity: identity(1, 1),
@@ -4427,14 +9183,14 @@ mod tests {
         let transaction = store.database.begin_read().unwrap();
         assert_eq!(
             transaction.open_table(MEMBERSHIPS).unwrap().len().unwrap(),
-            0
+            1
         );
         let meta = transaction.open_table(TABLE).unwrap();
         assert_eq!(
             decode_position(meta.get("commit").unwrap().unwrap().value()).unwrap(),
             Some(identity(2, 1))
         );
-        assert!(meta.get("membership").unwrap().unwrap().value().is_empty());
+        assert!(!meta.get("membership").unwrap().unwrap().value().is_empty());
     }
     #[test]
     fn retained_transfer_retry_survives_reopen_without_staging() {

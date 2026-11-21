@@ -593,10 +593,69 @@ fn transfer_contract_preserves_full_node_keys() {
 }
 
 #[test]
+fn owned_snapshot_install_contract_is_separate_and_round_trips() {
+    use bmux_cluster_plugin_api::cluster_consensus_transfer_types::LogIdentity;
+    use bmux_cluster_plugin_api::{
+        cluster_consensus_snapshot,
+        cluster_consensus_snapshot_types::{
+            InstallError, InstallOutcome, InstallRejection, InstallResponse,
+        },
+    };
+    assert_eq!(
+        cluster_consensus_snapshot::INTERFACE_ID,
+        "cluster-consensus-snapshot/v1"
+    );
+    assert_eq!(cluster_consensus_snapshot::OP_INSTALL, "install");
+    for outcome in [
+        InstallOutcome::Installed {
+            boundary: LogIdentity {
+                term: 7,
+                leader: vec![3; 32],
+                index: 19,
+            },
+        },
+        InstallOutcome::Rejected {
+            reason: InstallRejection::NotSealed,
+        },
+        InstallOutcome::Rejected {
+            reason: InstallRejection::ConflictingReference,
+        },
+    ] {
+        let response = InstallResponse {
+            request_id: uuid::Uuid::from_u128(1),
+            source: vec![2; 32],
+            term: 7,
+            outcome,
+            signature: vec![5; 64],
+        };
+        let bytes = bmux_plugin_sdk::encode_service_message(&response).unwrap();
+        assert_eq!(
+            bmux_plugin_sdk::decode_service_message::<InstallResponse>(&bytes).unwrap(),
+            response
+        );
+    }
+    let bytes = bmux_plugin_sdk::encode_service_message(&InstallError::StorageFailure).unwrap();
+    assert_eq!(
+        bmux_plugin_sdk::decode_service_message::<InstallError>(&bytes).unwrap(),
+        InstallError::StorageFailure
+    );
+    assert_eq!(
+        bmux_cluster_plugin_api::cluster_consensus_transfer_types::FinishOutcome::Sealed,
+        bmux_plugin_sdk::decode_service_message(
+            &bmux_plugin_sdk::encode_service_message(
+                &bmux_cluster_plugin_api::cluster_consensus_transfer_types::FinishOutcome::Sealed
+            )
+            .unwrap()
+        )
+        .unwrap()
+    );
+}
+
+#[test]
 fn generated_contract_declares_all_services() {
     let services = bmux_cluster_plugin_api::service_declarations()
         .expect("cluster service declarations should be valid");
-    assert_eq!(services.len(), 24);
+    assert_eq!(services.len(), 25);
     let service_ids = services
         .iter()
         .map(|service| service.interface_id.as_str())
@@ -605,6 +664,7 @@ fn generated_contract_declares_all_services() {
         "cluster-peer-read/v1",
         "cluster-consensus-rpc/v1",
         "cluster-consensus-transfer/v1",
+        "cluster-consensus-snapshot/v1",
         "cluster-bounded-control-command/v1",
         "cluster-raft-rpc/v2",
         "cluster-raft-decoder/v1",
@@ -637,7 +697,7 @@ fn generated_contract_declares_all_services() {
         assert!(package.contains(provided), "world must {provided}");
     }
     // Owned-consensus contracts are modeled but not served until ADR-0015 cutover.
-    for unprovided in ["cluster-consensus-transfer", "cluster-consensus-rpc"] {
+    for unprovided in ["cluster-consensus-transfer", "cluster-consensus-rpc", "cluster-consensus-snapshot"] {
         assert!(
             !package.contains(&format!("provide {unprovided}")),
             "world must not provide {unprovided}"

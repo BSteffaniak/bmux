@@ -1014,6 +1014,57 @@ interface cluster-consensus-rpc {
     command append(request: cluster-consensus-rpc-types.append-request) -> result<cluster-consensus-rpc-types.append-response, cluster-consensus-rpc-types.rpc-error>;
 }
 
+// Separate owned installation contract. Transfer v1 finish remains seal-only;
+// neither legacy Raft RPC nor owned append meanings change. Not advertised.
+interface cluster-consensus-snapshot-types {
+    record install-request {
+        request-id: uuid,
+        // Complete immutable header; purpose MUST be snapshot. Both checksums
+        // retain their distinct transfer-object and canonical-envelope meanings.
+        reference: cluster-consensus-transfer-types.transfer-header,
+        proof: cluster-consensus-transfer-types.transfer-proof,
+    }
+    enum install-rejection {
+        stale-term,
+        unknown-transfer,
+        not-sealed,
+        conflicting-reference,
+        invalid-snapshot,
+        incompatible,
+        capacity-unavailable,
+    }
+    variant install-outcome {
+        // Only an immediately committed installation can return this outcome.
+        installed { boundary: cluster-consensus-transfer-types.log-identity },
+        rejected { reason: install-rejection },
+    }
+    record install-response {
+        request-id: uuid,
+        source: bytes,
+        term: u64,
+        outcome: install-outcome,
+        // Signs the exact signed request and all response fields except itself.
+        signature: bytes,
+    }
+    enum install-error {
+        unauthorized,
+        incompatible,
+        invalid-request,
+        capacity-unavailable,
+        storage-failure,
+        stopped,
+        execution-failed,
+    }
+}
+
+@capability(CLUSTER_AUTH)
+@interface-version(1)
+interface cluster-consensus-snapshot {
+    // Requires explicit negotiation of snapshot v1, transfer v1 AND owned RPC
+    // v1. No fallback to finish or legacy install-snapshot is permitted.
+    command install(request: cluster-consensus-snapshot-types.install-request) -> result<cluster-consensus-snapshot-types.install-response, cluster-consensus-snapshot-types.install-error>;
+}
+
 interface cluster-consensus-vote-types {
     // Sender is the candidate. The request signature binds all fields except
     // itself, with a vote-specific operation/version domain separator.

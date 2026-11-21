@@ -386,8 +386,15 @@ unsupported versions, wrong clusters, corrupt headers, and missing payloads fail
 before writable redb recovery. The checksum detects corruption, not
 authentication. The file is exclusively locked before reading the header, and
 that same lock remains held through database recovery and operation. The
-payload's metadata format is `BMOWNV03`; earlier unactivated prototype files are
+payload's metadata format is `BMOWNV06`; earlier unactivated prototype files are
 unsupported and are not rewritten or imported.
+
+Authenticated owned snapshot installation retains the last 64 successful install
+receipts in the same durable authority. Within that bounded receipt window,
+reusing a request identity with the same signed reference returns the retained
+outcome after reauthentication; conflicting reuse is rejected. Transfer sealing
+alone does not acknowledge installation. Capability selection for the snapshot
+service is explicit and does not fall back to legacy snapshot RPCs.
 
 A private redb storage backend translates payload offsets by 4,096 bytes using
 checked arithmetic and never exposes the immutable header to redb writes or

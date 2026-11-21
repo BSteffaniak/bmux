@@ -38,9 +38,34 @@ async fn start_admitted_listener(server: &ServerEnv) -> String {
         .expect("listener advertises a pinned loopback target")
 }
 
+fn assert_listener_identity(
+    status: &pairing_types::ListenerStatus,
+    expected_endpoint_id: &str,
+    pinned_target: &str,
+) {
+    assert!(status.enabled);
+    assert_eq!(status.endpoint_id, expected_endpoint_id);
+    assert!(
+        status
+            .endpoint_targets
+            .iter()
+            .any(|target| target == pinned_target)
+    );
+    // Reflexive/discovered address hints can change even within one process.
+    // Every advertised target must still identify the same authenticated node.
+    let identity = format!("device://{expected_endpoint_id}");
+    assert!(
+        status
+            .endpoint_targets
+            .iter()
+            .all(|target| { target.split('?').next() == Some(identity.as_str()) })
+    );
+}
+
 async fn assert_idempotent_listener_start(
     connection: &mut bmux_client::BmuxClient,
-    expected_targets: &[String],
+    expected_endpoint_id: &str,
+    pinned_target: &str,
 ) {
     for _ in 0..2 {
         let status = tokio::time::timeout(
@@ -50,8 +75,7 @@ async fn assert_idempotent_listener_start(
         .await
         .expect("listener start completes within five seconds with active Raft")
         .expect("owner idempotent listener start");
-        assert!(status.enabled);
-        assert_eq!(status.endpoint_targets, expected_targets);
+        assert_listener_identity(&status, expected_endpoint_id, pinned_target);
     }
 }
 
@@ -478,7 +502,8 @@ fn three_admitted_voters_form_membership_and_survive_one_node_restart() {
     assert!(owner_status.endpoint_targets.contains(&endpoints[2]));
     runtime.block_on(assert_idempotent_listener_start(
         &mut owner_connection,
-        &owner_status.endpoint_targets,
+        &owner_status.endpoint_id,
+        &endpoints[2],
     ));
     drop(owner_connection);
 
@@ -504,14 +529,11 @@ fn three_admitted_voters_form_membership_and_survive_one_node_restart() {
             &mut restarted_connection,
         ))
         .expect("restart restores admitted listener without manual intervention");
-    assert!(restarted_status.enabled);
-    assert_eq!(
-        restarted_status.endpoint_targets,
-        owner_status.endpoint_targets
-    );
+    assert_listener_identity(&restarted_status, &owner_status.endpoint_id, &endpoints[2]);
     runtime.block_on(assert_idempotent_listener_start(
         &mut restarted_connection,
-        &owner_status.endpoint_targets,
+        &owner_status.endpoint_id,
+        &endpoints[2],
     ));
     // IPC readiness precedes Raft leader discovery after restart.
     let recovered = read_members_through_leader_change(harness.node(2));
@@ -528,7 +550,8 @@ fn three_admitted_voters_form_membership_and_survive_one_node_restart() {
     );
     runtime.block_on(assert_idempotent_listener_start(
         &mut restarted_connection,
-        &owner_status.endpoint_targets,
+        &owner_status.endpoint_id,
+        &endpoints[2],
     ));
 }
 

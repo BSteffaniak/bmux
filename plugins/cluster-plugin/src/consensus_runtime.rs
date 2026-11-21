@@ -22,6 +22,11 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+// Qualification-only owned lifecycle. Production remains OpenRaft until the
+// multi-voter and product-integration gates in ADR-0015 are satisfied.
+#[cfg(test)]
+mod owned;
+
 const SNAPSHOT_LOG_THRESHOLD: u64 = 1_024;
 
 #[derive(Debug)]

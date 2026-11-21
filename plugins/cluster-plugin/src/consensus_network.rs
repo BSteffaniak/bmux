@@ -243,6 +243,130 @@ pub(crate) fn supports_owned_consensus(
     })
 }
 
+/// Snapshot installation requires its own explicit selection, in addition to
+/// the unchanged owned RPC/transfer selection. No legacy fallback is permitted.
+pub(crate) fn supports_owned_snapshot_install(
+    member: &bmux_cluster_plugin_api::cluster_types::ClusterMember,
+) -> bool {
+    supports_owned_consensus(member)
+        && member.negotiated_protocol.features.iter().any(|feature| {
+            feature == bmux_cluster_plugin_api::cluster_consensus_snapshot::INTERFACE_ID.as_str()
+        })
+}
+
+/// Bounded operation-specific input; this is not a transfer finish signature.
+/// The complete immutable reference is signed, including both checksum domains.
+pub(crate) fn owned_snapshot_install_signing_payload(
+    request: &bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallRequest,
+) -> Result<Vec<u8>, String> {
+    use bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferPurpose;
+    let header = &request.reference;
+    validate_transfer_metadata_allocation(header, &request.proof, &[])?;
+    validate_transfer_descriptor(header)?;
+    let TransferPurpose::Snapshot { value } = &header.purpose else {
+        return Err("install requires snapshot-purpose transfer".into());
+    };
+    if value.last_included.is_none()
+        || value.membership.is_none()
+        || header.total_bytes > 300 * 1024 * 1024
+        || request.proof.signature.len() > 64
+    {
+        return Err("invalid install snapshot reference".into());
+    }
+    let mut unsigned = request.clone();
+    unsigned.proof.signature.clear();
+    let encoded = encode_service_message(&unsigned).map_err(|error| error.to_string())?;
+    if encoded.len() > 1024 * 1024 - 1024 {
+        return Err("install envelope exceeds limit".into());
+    }
+    let mut signed = b"bmux.cluster.consensus-snapshot.v1\0install\0".to_vec();
+    signed.extend(encoded);
+    Ok(signed)
+}
+
+/// Authenticate using canonical members supplied by the owning executor.
+/// This does not establish effective voter eligibility, term fencing, sealed
+/// transfer ownership, or durable installation; the executor must check those
+/// in the same authoritative admission as its side effect.
+pub(crate) fn authenticate_owned_snapshot_install(
+    caller: &impl crate::ClusterRuntimeOps,
+    local: NodeId,
+    members: &[bmux_cluster_plugin_api::cluster_types::ClusterMember],
+    request: &bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallRequest,
+) -> Result<NodeId, String> {
+    let signed = owned_snapshot_install_signing_payload(request)?;
+    let source = request.proof.peer.claimant_node_id.parse::<NodeId>()?;
+    if !members.iter().any(|member| {
+        member.node_id == source.to_string() && supports_owned_snapshot_install(member)
+    }) {
+        return Err("peer has not negotiated owned snapshot installation".into());
+    }
+    let header = &request.reference;
+    if header.recipient.as_slice() != local.as_bytes()
+        || header.sender.as_slice() != source.as_bytes()
+        || header.cluster_id != request.proof.peer.challenge.cluster_id
+        || request.proof.credential_serial != request.proof.peer.claimant_credential_serial
+        || request.proof.signature.len() != 64
+    {
+        return Err("invalid install identity or proof binding".into());
+    }
+    verify_node_signature(&source.to_string(), &signed, &request.proof.signature)?;
+    crate::membership::authenticate_peer_for_members(
+        caller,
+        &crate::ClusterPeerAuthenticateRequest {
+            proof: request.proof.peer.clone(),
+        },
+        members,
+    )?;
+    Ok(source)
+}
+
+/// Response binding proves the exact request, origin and outcome, not a quorum.
+pub(crate) fn owned_snapshot_install_response_signing_payload(
+    request: &bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallRequest,
+    response: &bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallResponse,
+) -> Result<Vec<u8>, String> {
+    use bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallOutcome;
+    use bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferPurpose;
+    let request_bytes = owned_snapshot_install_signing_payload(request)?;
+    if response.source != request.reference.recipient
+        || response.request_id != request.request_id
+        || response.signature.len() > 64
+    {
+        return Err("install response binding mismatch".into());
+    }
+    if let InstallOutcome::Installed { boundary } = &response.outcome {
+        let TransferPurpose::Snapshot { value } = &request.reference.purpose else {
+            return Err("install requires snapshot reference".into());
+        };
+        if value.last_included.as_ref() != Some(boundary)
+            || response.term != request.reference.leader_term
+        {
+            return Err("install durable boundary or term mismatch".into());
+        }
+    }
+    let mut unsigned = response.clone();
+    unsigned.signature.clear();
+    let mut signed = b"bmux.cluster.consensus-snapshot.v1\0response\0".to_vec();
+    signed.extend(
+        encode_service_message(&(request_bytes, &request.proof.signature, unsigned))
+            .map_err(|error| error.to_string())?,
+    );
+    Ok(signed)
+}
+
+pub(crate) fn verify_owned_snapshot_install_response(
+    request: &bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallRequest,
+    response: &bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallResponse,
+) -> Result<(), String> {
+    if response.signature.len() != 64 {
+        return Err("invalid install response signature length".into());
+    }
+    let payload = owned_snapshot_install_response_signing_payload(request, response)?;
+    let peer = transfer_node(&request.reference.recipient)?;
+    verify_node_signature(&peer.to_string(), &payload, &response.signature)
+}
+
 fn require_owned_consensus(
     members: &[bmux_cluster_plugin_api::cluster_types::ClusterMember],
     source: NodeId,
@@ -607,6 +731,14 @@ fn validate_transfer_descriptor(
 fn validate_transfer_allocation(
     request: &bmux_cluster_plugin_api::cluster_consensus_transfer_types::ChunkRequest,
 ) -> Result<(), String> {
+    validate_transfer_metadata_allocation(&request.header, &request.proof, &request.data)
+}
+
+fn validate_transfer_metadata_allocation(
+    header: &bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferHeader,
+    proof: &bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferProof,
+    data: &[u8],
+) -> Result<(), String> {
     use bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferPurpose;
     // Charge per-field overhead as well as bytes, before any clone/encoding.
     // This bounds work for this helper, not allocations in the wire decoder.
@@ -617,8 +749,8 @@ fn validate_transfer_allocation(
             .ok_or("transfer metadata exceeds allocation budget")?;
         Ok(())
     };
-    let h = &request.header;
-    let p = &request.proof;
+    let h = header;
+    let p = proof;
     let c = &p.peer.challenge;
     for field in [
         &h.cluster_id,
@@ -635,13 +767,7 @@ fn validate_transfer_allocation(
     ] {
         charge(field.len())?;
     }
-    for bytes in [
-        &h.sender,
-        &h.recipient,
-        &h.checksum,
-        &p.signature,
-        &request.data,
-    ] {
+    for bytes in [&h.sender, &h.recipient, &h.checksum, &p.signature, data] {
         charge(bytes.len())?;
     }
     match &h.purpose {
@@ -2012,6 +2138,90 @@ pub struct OwnedAppendService<C> {
 }
 
 impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static> OwnedAppendService<C> {
+    /// Send an explicitly selected owned snapshot install using generated transport.
+    ///
+    /// The executor owner must admit the outbound request before calling and
+    /// revalidate authority before counting the returned boundary. This method
+    /// verifies transport evidence only; it never advances local progress.
+    /// # Errors
+    /// Rejects unsupported/revoked targets, bad local signatures, and unbound replies.
+    pub async fn send_snapshot_install(
+        &self,
+        member: &bmux_cluster_plugin_api::cluster_types::ClusterMember,
+        request: bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallRequest,
+    ) -> Result<
+        bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallResponse,
+        bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallError,
+    >
+    where
+        C: bmux_plugin::ServiceCaller,
+    {
+        use bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallError;
+        if !supports_owned_snapshot_install(member) {
+            return Err(InstallError::Incompatible);
+        }
+        let peer = transfer_node(&request.reference.recipient)
+            .map_err(|_| InstallError::InvalidRequest)?;
+        if member.node_id != peer.to_string()
+            || request.reference.sender.as_slice() != self.local.as_bytes()
+            || request.reference.cluster_id != member.cluster_id
+        {
+            return Err(InstallError::Unauthorized);
+        }
+        crate::membership::verify_membership_credential(member, crate::now_unix_ms())
+            .map_err(|_| InstallError::Unauthorized)?;
+        if member.state != bmux_cluster_plugin_api::cluster_types::ClusterMemberState::Active {
+            return Err(InstallError::Unauthorized);
+        }
+        let payload = owned_snapshot_install_signing_payload(&request)
+            .map_err(|_| InstallError::InvalidRequest)?;
+        verify_node_signature(&self.local.to_string(), &payload, &request.proof.signature)
+            .map_err(|_| InstallError::Unauthorized)?;
+        let endpoint = member
+            .endpoint
+            .as_ref()
+            .filter(|endpoint| !endpoint.trim().is_empty())
+            .ok_or(InstallError::InvalidRequest)?;
+        let mut remote = EndpointDispatchClient::new(self.caller.as_ref(), endpoint.clone());
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bmux_cluster_plugin_api::cluster_consensus_snapshot::client::install(
+                &mut remote,
+                request.clone(),
+            ),
+        )
+        .await
+        .map_err(|_| InstallError::ExecutionFailed)?
+        .map_err(|_| InstallError::ExecutionFailed)??;
+        verify_owned_snapshot_install_response(&request, &response)
+            .map_err(|_| InstallError::Unauthorized)?;
+        Ok(response)
+    }
+
+    /// Register snapshot v1 separately against the SAME lifecycle-owned executor.
+    ///
+    /// This does not register RPC v1, advertise compatibility, or open storage.
+    /// The owner must explicitly select this provider and stop its admission
+    /// before shutting down the supplied executor.
+    /// # Errors
+    /// Returns generated descriptor registration failures.
+    pub fn register_snapshot(
+        registry: &mut bmux_plugin_sdk::TypedServiceRegistry,
+        caller: Arc<C>,
+        local: NodeId,
+        executor: Arc<crate::owned_vote_store::VoteExecutor>,
+    ) -> Result<(), Box<bmux_plugin_sdk::PluginError>> {
+        bmux_cluster_plugin_api::cluster_consensus_snapshot::register_provider(
+            registry,
+            Arc::new(Self {
+                caller,
+                local,
+                executor,
+            }),
+        )
+        .map_err(Box::new)
+    }
+
     /// Register generated dispatch against an executor supplied by its lifecycle owner.
     ///
     /// This neither opens storage nor advertises negotiation support. The owner
@@ -2033,6 +2243,34 @@ impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static> OwnedAppendService<C> 
             }),
         )
         .map_err(Box::new)
+    }
+}
+
+impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static>
+    bmux_cluster_plugin_api::cluster_consensus_snapshot::ClusterConsensusSnapshotService
+    for OwnedAppendService<C>
+{
+    fn install<'a>(
+        &'a self,
+        request: bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallResponse,
+                        bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        // Authentication, sealed-object ownership, fencing, durable replay and
+        // response signing all stay in the supplied executor's serialized scope.
+        Box::pin(self.executor.install_snapshot_authenticated(
+            self.caller.clone(),
+            self.local,
+            request,
+        ))
     }
 }
 
@@ -2250,6 +2488,631 @@ mod tests {
         ClusterConsensusRole, ClusterNodeCapabilities, ControlCommandError, PeerAuthChallenge,
         PeerAuthProof,
     };
+
+    struct SnapshotEndpointCaller {
+        mode: u8,
+        invocations: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl bmux_plugin::ServiceCaller for SnapshotEndpointCaller {
+        fn call_service_raw(
+            &self,
+            _capability: &str,
+            _kind: bmux_plugin_sdk::ServiceKind,
+            interface: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+            use bmux_cluster_plugin_api::cluster_consensus_snapshot_types::{
+                InstallError, InstallOutcome, InstallRequest, InstallResponse,
+            };
+            use bmux_connections_plugin_api::{
+                connection_types::ConnectionError, connections_commands,
+            };
+            assert_eq!(interface, connections_commands::INTERFACE_ID.as_str());
+            assert_eq!(operation, connections_commands::OP_INVOKE_SERVICE.as_str());
+            let request: connections_commands::client::InvokeServiceRequest =
+                decode_service_message(bmux_plugin_sdk::service_contract::decode_for(
+                    interface,
+                    connections_commands::SERVICE_CONTRACT,
+                    &payload,
+                )?)?;
+            let invocation = request.invocation;
+            assert_eq!(
+                invocation.interface_id,
+                bmux_cluster_plugin_api::cluster_consensus_snapshot::INTERFACE_ID.as_str()
+            );
+            assert_eq!(invocation.operation, "install");
+            self.invocations.lock().unwrap().push((
+                invocation.target,
+                invocation.interface_id,
+                invocation.operation,
+            ));
+            let request: bmux_cluster_plugin_api::cluster_consensus_snapshot::client::InstallRequest = decode_service_message(&invocation.payload)?;
+            let request: InstallRequest = request.request;
+            let bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferPurpose::Snapshot { value } = &request.reference.purpose else { unreachable!() };
+            let mut response = InstallResponse {
+                request_id: request.request_id,
+                source: request.reference.recipient.clone(),
+                term: request.reference.leader_term,
+                outcome: InstallOutcome::Installed {
+                    boundary: value.last_included.clone().unwrap(),
+                },
+                signature: Vec::new(),
+            };
+            response.signature = NodeIdentity::new_for_test(2).sign(
+                &owned_snapshot_install_response_signing_payload(&request, &response).unwrap(),
+            );
+            match self.mode {
+                1 => response.request_id = uuid::Uuid::from_u128(99),
+                2 => response.source = NodeIdentity::new_for_test(3).node_id().as_bytes().to_vec(),
+                3 => response.term += 1,
+                4 => {
+                    response.signature = NodeIdentity::new_for_test(3).sign(
+                        &owned_snapshot_install_response_signing_payload(&request, &response)
+                            .unwrap(),
+                    );
+                }
+                _ => {}
+            }
+            let encoded =
+                encode_service_message(&Result::<InstallResponse, InstallError>::Ok(response))?;
+            let result = encode_service_message(&Result::<Vec<u8>, ConnectionError>::Ok(encoded))?;
+            Ok(bmux_plugin_sdk::service_contract::encode_response(&result))
+        }
+
+        fn execute_kernel_request(
+            &self,
+            _request: bmux_ipc::Request,
+        ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
+            Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                operation: "snapshot sender test",
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_generated_sender_verifies_endpoint_responses() {
+        use crate::owned_vote_store::{DurableVoteGate, OwnedVoteStore, VoteExecutor};
+        use bmux_cluster_plugin_api::cluster_consensus_snapshot_types::{
+            InstallError, InstallOutcome,
+        };
+        let source = NodeIdentity::new_for_test(1);
+        let target = NodeIdentity::new_for_test(2);
+        let cluster = crate::membership::ClusterId::generate();
+        let mut selected = activation_member(&source, cluster, &target, crate::now_unix_ms());
+        selected.negotiated_protocol.features = vec![
+            bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID.to_string(),
+            bmux_cluster_plugin_api::cluster_consensus_transfer::INTERFACE_ID.to_string(),
+            bmux_cluster_plugin_api::cluster_consensus_snapshot::INTERFACE_ID.to_string(),
+        ];
+        let mut member = crate::membership::issue_membership_credential(
+            &source,
+            cluster,
+            selected.node_id,
+            selected.public_key,
+            selected.capabilities,
+            selected.negotiated_protocol,
+            crate::now_unix_ms(),
+        )
+        .unwrap();
+        member.endpoint = Some("tls://snapshot-target:7443".into());
+        let mut request = snapshot_install_request();
+        request.reference.cluster_id = cluster.to_string();
+        request.proof.peer.challenge.cluster_id = cluster.to_string();
+        let bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferPurpose::Snapshot {
+            value,
+        } = &mut request.reference.purpose
+        else {
+            unreachable!()
+        };
+        value.cluster_id = cluster.to_string();
+        request.proof.signature =
+            source.sign(&owned_snapshot_install_signing_payload(&request).unwrap());
+        for mode in 0..5 {
+            let root = tempfile::tempdir().unwrap();
+            let store =
+                OwnedVoteStore::create(&root.path().join("sender"), &cluster.to_string()).unwrap();
+            let executor = Arc::new(VoteExecutor::new(DurableVoteGate::new(1, store)));
+            let caller = Arc::new(SnapshotEndpointCaller {
+                mode,
+                invocations: std::sync::Mutex::new(Vec::new()),
+            });
+            let service = OwnedAppendService {
+                caller: caller.clone(),
+                local: *source.node_id(),
+                executor: executor.clone(),
+            };
+            let result = service
+                .send_snapshot_install(&member, request.clone())
+                .await;
+            if mode == 0 {
+                let response = result.unwrap();
+                assert!(matches!(response.outcome, InstallOutcome::Installed { .. }));
+                verify_owned_snapshot_install_response(&request, &response).unwrap();
+            } else {
+                assert_eq!(
+                    result,
+                    Err(InstallError::Unauthorized),
+                    "invalid response mode {mode}"
+                );
+            }
+            assert_eq!(
+                *caller.invocations.lock().unwrap(),
+                vec![(
+                    "tls://snapshot-target:7443".into(),
+                    "cluster-consensus-snapshot/v1".into(),
+                    "install".into()
+                )]
+            );
+            let before = caller.invocations.lock().unwrap().len();
+            let mut unsupported = member.clone();
+            unsupported.negotiated_protocol.features.pop();
+            assert_eq!(
+                service
+                    .send_snapshot_install(&unsupported, request.clone())
+                    .await,
+                Err(InstallError::Incompatible)
+            );
+            assert_eq!(
+                caller.invocations.lock().unwrap().len(),
+                before,
+                "no fallback invocation"
+            );
+            executor.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_install_provider_registration_is_explicit_and_uses_supplied_executor() {
+        use crate::owned_vote_store::{DurableVoteGate, OwnedVoteStore, VoteExecutor};
+        use bmux_cluster_plugin_api::cluster_consensus_snapshot::{
+            self, ClusterConsensusSnapshotService,
+        };
+        use bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallError;
+        let root = tempfile::tempdir().unwrap();
+        let store = OwnedVoteStore::create(&root.path().join("provider"), "cluster").unwrap();
+        let executor = Arc::new(VoteExecutor::new(DurableVoteGate::new(1, store)));
+        let caller = Arc::new(SnapshotAuthCaller::default());
+        let local = *NodeIdentity::new_for_test(2).node_id();
+        let mut registry = bmux_plugin_sdk::TypedServiceRegistry::new();
+        OwnedAppendService::register_snapshot(
+            &mut registry,
+            caller.clone(),
+            local,
+            executor.clone(),
+        )
+        .unwrap();
+        assert_eq!(registry.len(), 1);
+        assert_eq!(
+            registry.iter().next().unwrap().0.2.as_str(),
+            cluster_consensus_snapshot::INTERFACE_ID.as_str()
+        );
+        OwnedAppendService::register(&mut registry, caller.clone(), local, executor.clone())
+            .unwrap();
+        assert_eq!(
+            registry.len(),
+            2,
+            "RPC registration remains a separate owner decision"
+        );
+        executor.shutdown().await.unwrap();
+        let service = OwnedAppendService {
+            caller,
+            local,
+            executor,
+        };
+        assert_eq!(
+            ClusterConsensusSnapshotService::install(&service, snapshot_install_request()).await,
+            Err(InstallError::Stopped),
+            "provider must call the supplied stopped executor, not open another authority"
+        );
+    }
+
+    #[derive(Default)]
+    struct SnapshotAuthCaller {
+        storage: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+    }
+
+    impl bmux_plugin::ServiceCaller for SnapshotAuthCaller {
+        fn call_service_raw(
+            &self,
+            _capability: &str,
+            _kind: bmux_plugin_sdk::ServiceKind,
+            interface: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+            match (interface, operation) {
+                ("storage-query/v1", "get") => {
+                    let request: bmux_plugin_sdk::StorageGetRequest =
+                        decode_service_message(&payload)?;
+                    encode_service_message(&bmux_plugin_sdk::StorageGetResponse {
+                        value: self
+                            .storage
+                            .lock()
+                            .unwrap()
+                            .get(request.key.as_str())
+                            .cloned(),
+                    })
+                }
+                ("storage-command/v1", "set") => {
+                    let request: bmux_plugin_sdk::StorageSetRequest =
+                        decode_service_message(&payload)?;
+                    self.storage
+                        .lock()
+                        .unwrap()
+                        .insert(request.key.as_str().into(), request.value);
+                    encode_service_message(&())
+                }
+                _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                    operation: "snapshot auth test",
+                }),
+            }
+        }
+        fn execute_kernel_request(
+            &self,
+            _request: bmux_ipc::Request,
+        ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
+            Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
+                operation: "snapshot auth test kernel",
+            })
+        }
+    }
+
+    fn authenticated_snapshot_install_fixture() -> (
+        SnapshotAuthCaller,
+        NodeIdentity,
+        Vec<bmux_cluster_plugin_api::cluster_types::ClusterMember>,
+        bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallRequest,
+    ) {
+        let caller = SnapshotAuthCaller::default();
+        let identity = crate::membership::load_or_create_node_identity(&caller).unwrap();
+        crate::membership::initialize_cluster(&caller).unwrap();
+        let mut members = crate::membership::list_members(&caller).unwrap().members;
+        let member = members
+            .iter_mut()
+            .find(|member| member.node_id == identity.node_id().to_string())
+            .unwrap();
+        member.negotiated_protocol.features = vec![
+            bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID.to_string(),
+            bmux_cluster_plugin_api::cluster_consensus_transfer::INTERFACE_ID.to_string(),
+            bmux_cluster_plugin_api::cluster_consensus_snapshot::INTERFACE_ID.to_string(),
+        ];
+        *member = crate::membership::issue_membership_credential(
+            &identity,
+            member.cluster_id.parse().unwrap(),
+            member.node_id.clone(),
+            member.public_key.clone(),
+            member.capabilities.clone(),
+            member.negotiated_protocol.clone(),
+            crate::now_unix_ms(),
+        )
+        .unwrap();
+        let challenge = crate::membership::create_peer_auth_challenge_for_members(
+            &caller,
+            &crate::ClusterPeerChallengeRequest {
+                claimant_node_id: identity.node_id().to_string(),
+            },
+            &members,
+        )
+        .unwrap();
+        let mut proof = PeerAuthProof {
+            challenge,
+            claimant_node_id: identity.node_id().to_string(),
+            claimant_credential_serial: members[0].credential_serial.clone(),
+            claimant_signature: String::new(),
+        };
+        proof.claimant_signature = crate::membership::encode_hex(
+            &identity.sign(&crate::membership::canonical_peer_proof(&proof).unwrap()),
+        );
+        let mut request = snapshot_install_request();
+        request.reference.sender = identity.node_id().as_bytes().to_vec();
+        request.reference.recipient = identity.node_id().as_bytes().to_vec();
+        request
+            .reference
+            .cluster_id
+            .clone_from(&members[0].cluster_id);
+        let bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferPurpose::Snapshot {
+            value,
+        } = &mut request.reference.purpose
+        else {
+            unreachable!()
+        };
+        value.cluster_id.clone_from(&members[0].cluster_id);
+        request.proof.peer = proof;
+        request
+            .proof
+            .credential_serial
+            .clone_from(&request.proof.peer.claimant_credential_serial);
+        request.proof.signature =
+            identity.sign(&owned_snapshot_install_signing_payload(&request).unwrap());
+        (caller, identity, members, request)
+    }
+
+    #[test]
+    fn snapshot_install_auth_rejects_wrong_origin_revocation_and_missing_selection() {
+        let (caller, identity, members, request) = authenticated_snapshot_install_fixture();
+        let mut unsupported = members.clone();
+        unsupported[0].negotiated_protocol.features.pop();
+        assert!(
+            authenticate_owned_snapshot_install(
+                &caller,
+                *identity.node_id(),
+                &unsupported,
+                &request
+            )
+            .is_err()
+        );
+        let mut revoked = members.clone();
+        revoked[0].state = bmux_cluster_plugin_api::cluster_types::ClusterMemberState::Revoked;
+        assert!(
+            authenticate_owned_snapshot_install(&caller, *identity.node_id(), &revoked, &request)
+                .is_err()
+        );
+        let wrong_target = NodeIdentity::new_for_test(9);
+        assert!(
+            authenticate_owned_snapshot_install(
+                &caller,
+                *wrong_target.node_id(),
+                &members,
+                &request
+            )
+            .is_err()
+        );
+        let mut forged = request.clone();
+        forged.proof.signature =
+            wrong_target.sign(&owned_snapshot_install_signing_payload(&forged).unwrap());
+        assert!(
+            authenticate_owned_snapshot_install(&caller, *identity.node_id(), &members, &forged)
+                .is_err()
+        );
+        assert_eq!(
+            authenticate_owned_snapshot_install(&caller, *identity.node_id(), &members, &request)
+                .unwrap(),
+            *identity.node_id()
+        );
+        assert!(
+            authenticate_owned_snapshot_install(&caller, *identity.node_id(), &members, &request)
+                .is_err(),
+            "consumed challenge is not reusable install authority"
+        );
+    }
+
+    fn snapshot_install_request()
+    -> bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallRequest {
+        use bmux_cluster_plugin_api::cluster_consensus_transfer_types::{
+            LogIdentity, NodeAddress, SnapshotDescriptor, StoredMembership, TransferHeader,
+            TransferProof, TransferPurpose, VoterConfiguration,
+        };
+        let source = NodeIdentity::new_for_test(1);
+        let target = NodeIdentity::new_for_test(2);
+        let position = LogIdentity {
+            term: 3,
+            leader: source.node_id().as_bytes().to_vec(),
+            index: 10,
+        };
+        bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallRequest {
+            request_id: uuid::Uuid::from_u128(3),
+            reference: TransferHeader {
+                cluster_id: "cluster".into(),
+                sender: source.node_id().as_bytes().to_vec(),
+                recipient: target.node_id().as_bytes().to_vec(),
+                leader_term: 3,
+                sender_incarnation: uuid::Uuid::from_u128(1),
+                sequence: 7,
+                purpose: TransferPurpose::Snapshot {
+                    value: SnapshotDescriptor {
+                        format_version: 1,
+                        cluster_id: "cluster".into(),
+                        snapshot_id: "snapshot".into(),
+                        last_included: Some(position.clone()),
+                        total_bytes: 1024,
+                        checksum: vec![8; 32],
+                        membership: Some(StoredMembership {
+                            introduced_at: position,
+                            configurations: vec![VoterConfiguration {
+                                voters: vec![source.node_id().as_bytes().to_vec()],
+                            }],
+                            nodes: vec![NodeAddress {
+                                node: source.node_id().as_bytes().to_vec(),
+                                endpoint: "memory://source".into(),
+                            }],
+                        }),
+                    },
+                },
+                total_bytes: 1024,
+                checksum: vec![9; 32],
+            },
+            proof: TransferProof {
+                credential_serial: "serial".into(),
+                signature: Vec::new(),
+                peer: PeerAuthProof {
+                    challenge: PeerAuthChallenge {
+                        protocol_version: 1,
+                        cluster_id: "cluster".into(),
+                        verifier_node_id: target.node_id().to_string(),
+                        verifier_credential_serial: "target-serial".into(),
+                        audience_node_id: source.node_id().to_string(),
+                        nonce: "nonce".into(),
+                        issued_at_unix_ms: 1,
+                        expires_at_unix_ms: 2,
+                        signature: String::new(),
+                    },
+                    claimant_node_id: source.node_id().to_string(),
+                    claimant_credential_serial: "serial".into(),
+                    claimant_signature: String::new(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn snapshot_install_signatures_bind_operation_reference_and_response() {
+        use bmux_cluster_plugin_api::cluster_consensus_snapshot_types::{
+            InstallOutcome, InstallRejection, InstallResponse,
+        };
+        use bmux_cluster_plugin_api::cluster_consensus_transfer_types::{
+            ChunkRequest, TransferPurpose,
+        };
+        let source = NodeIdentity::new_for_test(1);
+        let target = NodeIdentity::new_for_test(2);
+        let mut request = snapshot_install_request();
+        let encoded = encode_service_message(&request).unwrap();
+        assert_eq!(
+            decode_service_message::<
+                bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallRequest,
+            >(&encoded)
+            .unwrap(),
+            request
+        );
+        let original = owned_snapshot_install_signing_payload(&request).unwrap();
+        request.proof.signature = source.sign(&original);
+        let transfer = ChunkRequest {
+            header: request.reference.clone(),
+            offset: 0,
+            data: Vec::new(),
+            proof: request.proof.clone(),
+        };
+        let finish_payload = transfer_signing_payload("finish", &transfer).unwrap();
+        assert_ne!(original, finish_payload);
+        assert!(
+            verify_node_signature(
+                &source.node_id().to_string(),
+                &finish_payload,
+                &request.proof.signature
+            )
+            .is_err(),
+            "install signature must not authorize finish"
+        );
+        let TransferPurpose::Snapshot { value } = &request.reference.purpose else {
+            unreachable!()
+        };
+        let mut response = InstallResponse {
+            request_id: request.request_id,
+            source: request.reference.recipient.clone(),
+            term: 3,
+            outcome: InstallOutcome::Installed {
+                boundary: value.last_included.clone().unwrap(),
+            },
+            signature: Vec::new(),
+        };
+        response.signature = target
+            .sign(&owned_snapshot_install_response_signing_payload(&request, &response).unwrap());
+        assert!(verify_owned_snapshot_install_response(&request, &response).is_ok());
+        for change in 0..6 {
+            let mut changed = request.clone();
+            match change {
+                0 => changed.request_id = uuid::Uuid::from_u128(4),
+                1 => changed.reference.sequence += 1,
+                2 => changed.reference.sender_incarnation = uuid::Uuid::from_u128(4),
+                3 => changed.reference.checksum[0] ^= 1,
+                4 => changed.proof.signature[0] ^= 1,
+                _ => {
+                    let TransferPurpose::Snapshot { value } = &mut changed.reference.purpose else {
+                        unreachable!()
+                    };
+                    value.checksum[0] ^= 1;
+                }
+            }
+            assert!(
+                verify_owned_snapshot_install_response(&changed, &response).is_err(),
+                "mutation {change}"
+            );
+        }
+        let mut changed = response.clone();
+        changed.signature = source
+            .sign(&owned_snapshot_install_response_signing_payload(&request, &changed).unwrap());
+        assert!(
+            verify_owned_snapshot_install_response(&request, &changed).is_err(),
+            "wrong signer"
+        );
+        changed = response.clone();
+        changed.source = request.reference.sender.clone();
+        assert!(verify_owned_snapshot_install_response(&request, &changed).is_err());
+        changed = response.clone();
+        changed.term += 1;
+        assert!(verify_owned_snapshot_install_response(&request, &changed).is_err());
+        changed = response;
+        changed.outcome = InstallOutcome::Rejected {
+            reason: InstallRejection::UnknownTransfer,
+        };
+        assert!(
+            verify_owned_snapshot_install_response(&request, &changed).is_err(),
+            "outcome substitution"
+        );
+    }
+
+    #[test]
+    fn snapshot_install_reference_rejects_missing_boundary_and_oversize() {
+        use bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferPurpose;
+        for mode in 0..5 {
+            let mut request = snapshot_install_request();
+            let TransferPurpose::Snapshot { value } = &mut request.reference.purpose else {
+                unreachable!()
+            };
+            match mode {
+                0 => value.last_included = None,
+                1 => value.membership = None,
+                2 => {
+                    value.total_bytes = 301 * 1024 * 1024;
+                    request.reference.total_bytes = value.total_bytes;
+                }
+                3 => value.cluster_id = "foreign".into(),
+                _ => value.membership.as_mut().unwrap().introduced_at.index = 11,
+            }
+            assert!(
+                owned_snapshot_install_signing_payload(&request).is_err(),
+                "invalid reference {mode}"
+            );
+        }
+        let mut request = snapshot_install_request();
+        request.reference.sender.pop();
+        assert!(owned_snapshot_install_signing_payload(&request).is_err());
+    }
+
+    #[test]
+    fn snapshot_install_bounds_and_explicit_selection() {
+        use bmux_cluster_plugin_api::cluster_consensus_transfer_types::{
+            EntryPurpose, TransferPurpose,
+        };
+        let mut request = snapshot_install_request();
+        let TransferPurpose::Snapshot { value } = &request.reference.purpose else {
+            unreachable!()
+        };
+        request.reference.purpose = TransferPurpose::Entry {
+            value: EntryPurpose {
+                identity: value.last_included.clone().unwrap(),
+                previous: None,
+            },
+        };
+        assert!(owned_snapshot_install_signing_payload(&request).is_err());
+        request = snapshot_install_request();
+        request.proof.peer.claimant_node_id = "x".repeat(512 * 1024);
+        assert!(owned_snapshot_install_signing_payload(&request).is_err());
+        request = snapshot_install_request();
+        request.reference.checksum.pop();
+        assert!(owned_snapshot_install_signing_payload(&request).is_err());
+        let source = NodeIdentity::new_for_test(1);
+        let mut member = activation_member(
+            &source,
+            crate::membership::ClusterId::generate(),
+            &source,
+            crate::now_unix_ms(),
+        );
+        member.negotiated_protocol.features = vec![
+            bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID.to_string(),
+            bmux_cluster_plugin_api::cluster_consensus_transfer::INTERFACE_ID.to_string(),
+        ];
+        assert!(supports_owned_consensus(&member));
+        assert!(!supports_owned_snapshot_install(&member));
+        member
+            .negotiated_protocol
+            .features
+            .push(bmux_cluster_plugin_api::cluster_consensus_snapshot::INTERFACE_ID.to_string());
+        assert!(supports_owned_snapshot_install(&member));
+        member.negotiated_protocol.features.remove(0);
+        assert!(!supports_owned_snapshot_install(&member));
+    }
 
     #[test]
     fn transfer_signing_rejects_oversized_proof_and_invalid_descriptor() {

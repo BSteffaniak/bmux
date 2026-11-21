@@ -134,6 +134,181 @@ pub struct StoredMembership {
     pub membership: Membership,
 }
 
+/// Rejected membership-log transition or stale proposal precondition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MembershipTransitionError {
+    MissingPosition,
+    NonAdvancingPosition,
+    ConflictingIdentity,
+    InvalidPosition,
+    InvalidGenesis,
+    DirectVoterChange,
+    JointPredecessorMismatch,
+    NestedJoint,
+    FinalVotersMismatch,
+    PredecessorNotCommitted,
+    StalePrecondition,
+    PendingMembership,
+}
+
+/// Validate the explicit first membership; snapshots are not genesis entries.
+///
+/// Standalone primitive: append, recovery, and proposal owners do not yet call
+/// these transition checks. This does not enforce authorization or catch-up.
+/// # Errors
+/// Rejects unpositioned, nonzero-index, or joint genesis configurations.
+pub fn validate_membership_genesis(
+    genesis: &StoredMembership,
+) -> Result<(), MembershipTransitionError> {
+    let position = genesis
+        .introduced_at
+        .ok_or(MembershipTransitionError::MissingPosition)?;
+    if position.index != LogIndex(0) || genesis.membership.configurations().len() != 1 {
+        return Err(MembershipTransitionError::InvalidGenesis);
+    }
+    Ok(())
+}
+
+/// Validate one strictly advancing membership-log entry.
+///
+/// `confirmed` must be a commit watermark verified against the same accepted log
+/// prefix by the adapter, not an unchecked peer claim. A follower may use the
+/// incoming leader's verified commit coverage, including for a predecessor in
+/// the same received batch. Recovery supplies its durable commit watermark.
+/// Authorization, learner catch-up, log contiguity, and durable publication are
+/// separate owner obligations. This primitive is not wired into those owners.
+/// # Errors
+/// Rejects illegal voter changes, ambiguous identities, and unconfirmed phases.
+pub fn validate_membership_successor(
+    previous: &StoredMembership,
+    next: &StoredMembership,
+    confirmed: Option<LogIdentity>,
+) -> Result<(), MembershipTransitionError> {
+    let before = previous
+        .introduced_at
+        .ok_or(MembershipTransitionError::MissingPosition)?;
+    let after = next
+        .introduced_at
+        .ok_or(MembershipTransitionError::MissingPosition)?;
+    if before == after && previous.membership != next.membership {
+        return Err(MembershipTransitionError::ConflictingIdentity);
+    }
+    if after.index <= before.index {
+        return Err(MembershipTransitionError::NonAdvancingPosition);
+    }
+    validate_position_prefix(Some(before), Some(after))
+        .map_err(|_| MembershipTransitionError::InvalidPosition)?;
+    if before.term == after.term && before.leader != after.leader {
+        return Err(MembershipTransitionError::ConflictingIdentity);
+    }
+    let old = previous.membership.configurations();
+    let new = next.membership.configurations();
+    match (old.len(), new.len()) {
+        (1, 1) if old[0] != new[0] => {
+            return Err(MembershipTransitionError::DirectVoterChange);
+        }
+        (1, 2) if old[0] != new[0] => {
+            return Err(MembershipTransitionError::JointPredecessorMismatch);
+        }
+        (2, 2) => return Err(MembershipTransitionError::NestedJoint),
+        (2, 1) if old[1] != new[0] => {
+            return Err(MembershipTransitionError::FinalVotersMismatch);
+        }
+        _ => {}
+    }
+    // Uniform node/learner updates preserve voters. Starting a joint phase or
+    // finalizing one must not overlap an uncommitted membership phase.
+    if (old.len() == 2 || new.len() == 2)
+        && validate_position_prefix(Some(before), confirmed).is_err()
+    {
+        return Err(MembershipTransitionError::PredecessorNotCommitted);
+    }
+    Ok(())
+}
+
+/// Validate membership records in an accepted append suffix or recovered log.
+///
+/// `previous` is the configuration at the surviving prefix/snapshot, NOT the
+/// configuration in a suffix being replaced. Skip already matched membership
+/// records; exact duplicates are not advancing successors. The caller bounds
+/// iteration and verifies commit coverage against its reconciled log. Ordinary
+/// application entries need not be materialized here.
+/// # Errors
+/// Rejects illegal successors or commit identities inconsistent with known
+/// membership positions. Genesis must be admitted separately.
+pub fn validate_membership_sequence<'a>(
+    previous: &'a StoredMembership,
+    successors: impl IntoIterator<Item = &'a StoredMembership>,
+    confirmed: Option<LogIdentity>,
+) -> Result<(), MembershipTransitionError> {
+    let mut previous = previous;
+    for (offset, next) in std::iter::once(previous).chain(successors).enumerate() {
+        let position = next
+            .introduced_at
+            .ok_or(MembershipTransitionError::MissingPosition)?;
+        if let Some(confirmed) = confirmed {
+            let (prefix, boundary) = if position.index <= confirmed.index {
+                (position, confirmed)
+            } else {
+                (confirmed, position)
+            };
+            validate_position_prefix(Some(prefix), Some(boundary))
+                .map_err(|_| MembershipTransitionError::InvalidPosition)?;
+            if position.term == confirmed.term && position.leader != confirmed.leader {
+                return Err(MembershipTransitionError::ConflictingIdentity);
+            }
+        }
+        if offset != 0 {
+            validate_membership_successor(previous, next, confirmed)?;
+        }
+        previous = next;
+    }
+    Ok(())
+}
+
+/// Plan one membership proposal against exact authoritative preconditions.
+///
+/// All membership proposals are serialized behind the preceding membership's
+/// commit. Full records (position AND content), not voter-set equality, prevent
+/// ABA. The owner still checks term/leadership, authorization, catch-up, and
+/// atomically compares these preconditions when persisting the returned record.
+/// This standalone planner does not activate production enforcement.
+/// # Errors
+/// Rejects stale expectations, uncommitted preceding membership, or an illegal
+/// successor. Uninitialized state must use explicit genesis admission instead.
+pub fn plan_membership_successor(
+    effective: &StoredMembership,
+    committed: &StoredMembership,
+    expected_effective: &StoredMembership,
+    expected_committed: &StoredMembership,
+    proposed: Membership,
+    introduced_at: LogIdentity,
+) -> Result<StoredMembership, MembershipTransitionError> {
+    if effective != expected_effective || committed != expected_committed {
+        return Err(MembershipTransitionError::StalePrecondition);
+    }
+    let effective_position = effective
+        .introduced_at
+        .ok_or(MembershipTransitionError::MissingPosition)?;
+    let committed_position = committed
+        .introduced_at
+        .ok_or(MembershipTransitionError::MissingPosition)?;
+    if effective_position == committed_position && effective != committed {
+        return Err(MembershipTransitionError::ConflictingIdentity);
+    }
+    validate_position_prefix(Some(committed_position), Some(effective_position))
+        .map_err(|_| MembershipTransitionError::InvalidPosition)?;
+    if effective != committed {
+        return Err(MembershipTransitionError::PendingMembership);
+    }
+    let next = StoredMembership {
+        introduced_at: Some(introduced_at),
+        membership: proposed,
+    };
+    validate_membership_successor(effective, &next, Some(committed_position))?;
+    Ok(next)
+}
+
 /// Metadata for the supported durable snapshot envelope.
 ///
 /// Format 1 checksums the envelope excluding its trailing checksum; `total_bytes`
@@ -556,8 +731,11 @@ pub struct VoteResponse {
 
 /// Execution-local leader progress, never recovered as leadership after restart.
 /// Remote matches start unknown: election votes are not replication evidence.
+///
+/// Public as an input to the pure read-barrier model, like `Campaign`; runtime
+/// ownership, persistence, and transport remain outside this type.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LeaderProgress {
+pub struct LeaderProgress {
     pub term: Term,
     pub membership: Membership,
     pub matched: BTreeMap<NodeId, Option<LogIdentity>>,
@@ -606,6 +784,7 @@ impl LeaderProgress {
     }
     /// Highest index covered by each voter majority. This is only a candidate;
     /// the storage owner must check the current-term rule and commit durably.
+    #[must_use]
     pub fn quorum_index(&self) -> Option<LogIndex> {
         self.membership
             .configurations()
@@ -627,6 +806,7 @@ impl LeaderProgress {
             .min()
     }
 
+    #[must_use]
     pub fn after_durable_initialization(membership: Membership, entry: LogIdentity) -> Self {
         let matched = membership
             .nodes()
@@ -644,6 +824,200 @@ impl LeaderProgress {
             matched,
             next,
         }
+    }
+}
+
+/// Execution-local correlation, not a credential or a durable consensus record.
+///
+/// The transport must echo this context from an authenticated heartbeat reply.
+/// `sequence` is allocated by `ReadBarrier`, never taken from a peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadContext {
+    pub sequence: u64,
+    pub term: Term,
+    pub leader: NodeId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadConfirmation {
+    pub context: ReadContext,
+    pub term: Term,
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadRound {
+    context: ReadContext,
+    membership: StoredMembership,
+    committed: LogIdentity,
+    acknowledged: BTreeSet<NodeId>,
+}
+
+impl ReadRound {
+    fn is_current(
+        &self,
+        leader: Option<&LeaderProgress>,
+        hard_state: HardState,
+        membership: &StoredMembership,
+    ) -> bool {
+        leader.is_some_and(|leader| {
+            leader.term == self.context.term
+                && leader.membership == membership.membership
+                && hard_state.term == self.context.term
+                && hard_state.voted_for == Some(self.context.leader)
+                && membership == &self.membership
+        })
+    }
+}
+
+/// Pure, single-flight read confirmation.
+///
+/// Keep one owner across leader changes; replacing it within a term could reuse
+/// a sequence. Restart requires a new
+/// election term before admitting reads. No clock, lease, or replication match
+/// substitutes for fresh heartbeat acknowledgments.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ReadBarrier {
+    next_sequence: Option<u64>,
+    pending: Option<ReadRound>,
+}
+
+impl Default for ReadBarrier {
+    fn default() -> Self {
+        Self {
+            next_sequence: Some(0),
+            pending: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadSequenceExhausted;
+
+impl ReadBarrier {
+    /// Cancel on leadership loss or every effective-configuration publication,
+    /// including a change that later restores the same configuration. Preserve
+    /// the sequence allocator so delayed replies never revive a cancelled read.
+    pub fn cancel(&mut self) {
+        self.pending = None;
+    }
+
+    /// Start after the existing leader no-op (or another current-term entry)
+    /// commits durably. Supersedes any unfinished read, including on rejection.
+    /// `membership` is the latest durable effective configuration, not merely
+    /// the committed configuration. Positions come from authoritative storage.
+    /// # Errors
+    /// Sequence exhaustion requires a new owner/election, never identity reuse.
+    pub fn begin(
+        &mut self,
+        leader: &LeaderProgress,
+        hard_state: HardState,
+        membership: &StoredMembership,
+        committed: Option<LogIdentity>,
+    ) -> Result<Option<ReadContext>, ReadSequenceExhausted> {
+        self.pending = None;
+        let Some(committed) = committed else {
+            return Ok(None);
+        };
+        if committed.term != leader.term
+            || hard_state.term != leader.term
+            || hard_state.voted_for != Some(committed.leader)
+            || membership.membership != leader.membership
+            || validate_position_prefix(
+                Some(committed),
+                leader.matched.get(&committed.leader).copied().flatten(),
+            )
+            .is_err()
+        {
+            return Ok(None);
+        }
+        let sequence = self.next_sequence.ok_or(ReadSequenceExhausted)?;
+        self.next_sequence = sequence.checked_add(1);
+        let context = ReadContext {
+            sequence,
+            term: leader.term,
+            leader: committed.leader,
+        };
+        self.pending = Some(ReadRound {
+            context,
+            membership: membership.clone(),
+            committed,
+            acknowledged: BTreeSet::from([committed.leader]),
+        });
+        Ok(Some(context))
+    }
+
+    /// Count only authenticated voter replies for this exact round and term.
+    /// Returns a higher eligible-peer term for the adapter's normal durable
+    /// step-down path; this never persists or grants authority. Even an old
+    /// round's higher-term reply invalidates pending reads. Ordinary same-term
+    /// stale, foreign, rejected, and duplicate replies cannot add quorum weight.
+    pub fn observe(
+        &mut self,
+        leader: Option<&LeaderProgress>,
+        hard_state: HardState,
+        membership: &StoredMembership,
+        peer: NodeId,
+        response: ReadConfirmation,
+    ) -> Option<Term> {
+        // Authority changes cancel even when this particular reply is ineligible.
+        // Do not let a later restoration revive evidence from the old round.
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|round| !round.is_current(leader, hard_state, membership))
+        {
+            self.cancel();
+        }
+        if !membership
+            .membership
+            .configurations()
+            .iter()
+            .any(|voters| voters.contains(&peer))
+        {
+            return None;
+        }
+        if response.term > hard_state.term {
+            self.pending = None;
+            return Some(response.term);
+        }
+        let round = self.pending.as_mut()?;
+        if response.context == round.context
+            && response.term == round.context.term
+            && response.accepted
+        {
+            round.acknowledged.insert(peer);
+        }
+        None
+    }
+
+    /// Consume read authority once, only after application reaches the captured
+    /// committed watermark. Revalidate leadership and effective membership even
+    /// after quorum confirmation. Missing leadership cancels the round.
+    /// The returned position labels the authorized read; callers must read the
+    /// corresponding applied state in the same serialized authority scope.
+    pub fn complete(
+        &mut self,
+        leader: Option<&LeaderProgress>,
+        hard_state: HardState,
+        membership: &StoredMembership,
+        committed: Option<LogIdentity>,
+        applied: Option<LogIdentity>,
+    ) -> Option<LogIdentity> {
+        let round = self.pending.as_ref()?;
+        if !round.is_current(leader, hard_state, membership)
+            || validate_position_prefix(Some(round.committed), committed).is_err()
+            || validate_position_prefix(applied, committed).is_err()
+        {
+            self.pending = None;
+            return None;
+        }
+        if !round.membership.membership.has_quorum(&round.acknowledged)
+            || validate_position_prefix(Some(round.committed), applied).is_err()
+        {
+            return None;
+        }
+        self.pending.take().map(|round| round.committed)
     }
 }
 
@@ -1697,6 +2071,1211 @@ mod tests {
             }),
         );
         assert_eq!(progress.quorum_index(), Some(LogIndex(5)));
+    }
+
+    fn transition_record(index: u64, voters: Vec<Vec<u64>>) -> StoredMembership {
+        StoredMembership {
+            introduced_at: Some(LogIdentity {
+                term: Term(3),
+                leader: NodeId::from(1),
+                index: LogIndex(index),
+            }),
+            membership: Membership::new(
+                voters
+                    .into_iter()
+                    .map(|set| set.into_iter().map(NodeId::from).collect())
+                    .collect(),
+                (1..=5)
+                    .map(|id| (NodeId::from(id), String::new()))
+                    .collect(),
+            )
+            .unwrap(),
+        }
+    }
+
+    #[test]
+    fn membership_transition_accepts_lagging_follower_joint_and_final_batch() {
+        let old = transition_record(10, vec![vec![1, 2, 3]]);
+        let joint = transition_record(12, vec![vec![1, 2, 3], vec![2, 3, 4]]);
+        let final_config = transition_record(14, vec![vec![2, 3, 4]]);
+        assert_eq!(
+            validate_membership_sequence(&old, [&joint, &final_config], joint.introduced_at),
+            Ok(())
+        );
+        assert_eq!(
+            validate_membership_sequence(&old, [&joint, &final_config], old.introduced_at),
+            Err(MembershipTransitionError::PredecessorNotCommitted),
+            "final cannot be justified by the follower's stale commit"
+        );
+        assert_eq!(
+            validate_membership_sequence(&old, [&joint], old.introduced_at),
+            Ok(())
+        );
+        // A later application entry can confirm the joint without itself being
+        // supplied as a membership record.
+        let later = LogIdentity {
+            index: LogIndex(13),
+            ..joint.introduced_at.unwrap()
+        };
+        assert_eq!(
+            validate_membership_sequence(&old, [&joint, &final_config], Some(later)),
+            Ok(())
+        );
+        let forged = LogIdentity {
+            leader: NodeId::from(5),
+            ..joint.introduced_at.unwrap()
+        };
+        assert_eq!(
+            validate_membership_sequence(&old, [&joint, &final_config], Some(forged)),
+            Err(MembershipTransitionError::ConflictingIdentity)
+        );
+    }
+
+    #[test]
+    fn membership_transition_follower_coverage_is_not_proposal_authority() {
+        let old = transition_record(10, vec![vec![1, 2, 3]]);
+        let joint = transition_record(12, vec![vec![1, 2, 3], vec![2, 3, 4]]);
+        let final_config = transition_record(14, vec![vec![2, 3, 4]]);
+        let next_joint = transition_record(16, vec![vec![2, 3, 4], vec![3, 4, 5]]);
+        // A lagging follower can receive both entries with the leader's verified
+        // joint commit. That coverage does NOT let a leader whose authoritative
+        // committed membership is still old propose a final configuration.
+        assert_eq!(
+            validate_membership_sequence(&old, [&joint, &final_config], joint.introduced_at),
+            Ok(())
+        );
+        let plan = |effective: &StoredMembership,
+                    committed: &StoredMembership,
+                    next: &StoredMembership| {
+            plan_membership_successor(
+                effective,
+                committed,
+                effective,
+                committed,
+                next.membership.clone(),
+                next.introduced_at.unwrap(),
+            )
+        };
+        assert_eq!(
+            plan(&joint, &old, &final_config),
+            Err(MembershipTransitionError::PendingMembership)
+        );
+        assert_eq!(
+            plan(&joint, &joint, &final_config),
+            Ok(final_config.clone())
+        );
+        // Joint is committed but final is merely effective: neither the batch
+        // validator nor the planner may begin the following transition yet.
+        assert_eq!(
+            validate_membership_sequence(
+                &old,
+                [&joint, &final_config, &next_joint],
+                joint.introduced_at
+            ),
+            Err(MembershipTransitionError::PredecessorNotCommitted)
+        );
+        assert_eq!(
+            plan(&final_config, &joint, &next_joint),
+            Err(MembershipTransitionError::PendingMembership)
+        );
+        assert_eq!(
+            validate_membership_sequence(
+                &old,
+                [&joint, &final_config, &next_joint],
+                final_config.introduced_at
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            plan(&final_config, &final_config, &next_joint),
+            Ok(next_joint)
+        );
+    }
+
+    #[test]
+    fn membership_transition_rejects_illegal_voter_chains() {
+        let old = transition_record(10, vec![vec![1, 2, 3]]);
+        let direct = transition_record(11, vec![vec![2, 3, 4]]);
+        assert_eq!(
+            validate_membership_successor(&old, &direct, old.introduced_at),
+            Err(MembershipTransitionError::DirectVoterChange)
+        );
+        let wrong_joint = transition_record(11, vec![vec![1, 2], vec![2, 3, 4]]);
+        assert_eq!(
+            validate_membership_successor(&old, &wrong_joint, old.introduced_at),
+            Err(MembershipTransitionError::JointPredecessorMismatch)
+        );
+        let joint = transition_record(11, vec![vec![1, 2, 3], vec![2, 3, 4]]);
+        let nested = transition_record(12, vec![vec![2, 3, 4], vec![3, 4, 5]]);
+        assert_eq!(
+            validate_membership_successor(&joint, &nested, joint.introduced_at),
+            Err(MembershipTransitionError::NestedJoint)
+        );
+        let wrong_final = transition_record(12, vec![vec![1, 2, 3]]);
+        assert_eq!(
+            validate_membership_successor(&joint, &wrong_final, joint.introduced_at),
+            Err(MembershipTransitionError::FinalVotersMismatch)
+        );
+        let final_config = transition_record(12, vec![vec![2, 3, 4]]);
+        let next_joint = transition_record(13, vec![vec![2, 3, 4], vec![3, 4, 5]]);
+        assert_eq!(
+            validate_membership_sequence(
+                &old,
+                [&joint, &final_config, &next_joint],
+                joint.introduced_at
+            ),
+            Err(MembershipTransitionError::PredecessorNotCommitted)
+        );
+        assert_eq!(
+            validate_membership_sequence(
+                &old,
+                [&joint, &final_config, &next_joint],
+                final_config.introduced_at
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn membership_transition_checks_genesis_positions_and_content() {
+        let genesis = transition_record(0, vec![vec![1]]);
+        assert_eq!(validate_membership_genesis(&genesis), Ok(()));
+        assert_eq!(
+            validate_membership_genesis(&transition_record(1, vec![vec![1]])),
+            Err(MembershipTransitionError::InvalidGenesis)
+        );
+        assert_eq!(
+            validate_membership_genesis(&transition_record(0, vec![vec![1], vec![2]])),
+            Err(MembershipTransitionError::InvalidGenesis)
+        );
+        let mut missing = genesis;
+        missing.introduced_at = None;
+        assert_eq!(
+            validate_membership_genesis(&missing),
+            Err(MembershipTransitionError::MissingPosition)
+        );
+        let old = transition_record(10, vec![vec![1, 2, 3]]);
+        let mut altered = old.clone();
+        altered
+            .membership
+            .nodes
+            .insert(NodeId::from(5), "changed".into());
+        assert_eq!(
+            validate_membership_successor(&old, &altered, old.introduced_at),
+            Err(MembershipTransitionError::ConflictingIdentity)
+        );
+        assert_eq!(
+            validate_membership_sequence(&old, [&old], old.introduced_at),
+            Err(MembershipTransitionError::NonAdvancingPosition)
+        );
+        let earlier = transition_record(9, vec![vec![1, 2, 3]]);
+        assert_eq!(
+            validate_membership_successor(&old, &earlier, old.introduced_at),
+            Err(MembershipTransitionError::NonAdvancingPosition)
+        );
+        altered.introduced_at = Some(LogIdentity {
+            index: LogIndex(11),
+            ..old.introduced_at.unwrap()
+        });
+        assert_eq!(
+            validate_membership_successor(&old, &altered, old.introduced_at),
+            Ok(()),
+            "node-only change preserves voters"
+        );
+        let mut invalid = altered.clone();
+        invalid.introduced_at.as_mut().unwrap().term = Term(2);
+        assert_eq!(
+            validate_membership_successor(&old, &invalid, old.introduced_at),
+            Err(MembershipTransitionError::InvalidPosition)
+        );
+        invalid.introduced_at = Some(LogIdentity {
+            leader: NodeId::from(2),
+            ..altered.introduced_at.unwrap()
+        });
+        assert_eq!(
+            validate_membership_successor(&old, &invalid, old.introduced_at),
+            Err(MembershipTransitionError::ConflictingIdentity)
+        );
+    }
+
+    #[test]
+    fn membership_transition_planner_checks_commit_phases_and_full_identity_aba() {
+        let old = transition_record(10, vec![vec![1, 2, 3]]);
+        let joint = transition_record(11, vec![vec![1, 2, 3], vec![2, 3, 4]]);
+        let final_config = transition_record(12, vec![vec![2, 3, 4]]);
+        let plan = |effective: &StoredMembership,
+                    committed: &StoredMembership,
+                    expected: &StoredMembership,
+                    next: &StoredMembership| {
+            plan_membership_successor(
+                effective,
+                committed,
+                expected,
+                committed,
+                next.membership.clone(),
+                next.introduced_at.unwrap(),
+            )
+        };
+        assert_eq!(plan(&old, &old, &old, &joint), Ok(joint.clone()));
+        assert_eq!(
+            plan(&joint, &old, &joint, &final_config),
+            Err(MembershipTransitionError::PendingMembership)
+        );
+        assert_eq!(
+            plan(&joint, &joint, &joint, &final_config),
+            Ok(final_config.clone())
+        );
+        let next_joint = transition_record(13, vec![vec![2, 3, 4], vec![3, 4, 5]]);
+        assert_eq!(
+            plan(&final_config, &joint, &final_config, &next_joint),
+            Err(MembershipTransitionError::PendingMembership)
+        );
+        assert_eq!(
+            plan(&final_config, &final_config, &final_config, &next_joint),
+            Ok(next_joint)
+        );
+        let same_voters_new_epoch = transition_record(20, vec![vec![1, 2, 3]]);
+        assert_eq!(
+            plan(&same_voters_new_epoch, &same_voters_new_epoch, &old, &joint),
+            Err(MembershipTransitionError::StalePrecondition)
+        );
+        assert_eq!(
+            plan_membership_successor(
+                &same_voters_new_epoch,
+                &same_voters_new_epoch,
+                &same_voters_new_epoch,
+                &old,
+                joint.membership.clone(),
+                joint.introduced_at.unwrap()
+            ),
+            Err(MembershipTransitionError::StalePrecondition),
+            "committed expectation must also compare the full identity"
+        );
+        let mut changed_content = old.clone();
+        changed_content
+            .membership
+            .nodes
+            .insert(NodeId::from(5), "replacement".into());
+        assert_eq!(
+            plan(&old, &changed_content, &old, &joint),
+            Err(MembershipTransitionError::ConflictingIdentity)
+        );
+    }
+
+    fn read_barrier_fixture(
+        configurations: Vec<Vec<u64>>,
+    ) -> (LeaderProgress, HardState, StoredMembership, LogIdentity) {
+        let membership = Membership::new(
+            configurations
+                .into_iter()
+                .map(|voters| voters.into_iter().map(NodeId::from).collect())
+                .collect(),
+            (1..=6)
+                .map(|id| (NodeId::from(id), String::new()))
+                .collect(),
+        )
+        .unwrap();
+        let committed = LogIdentity {
+            term: Term(3),
+            leader: NodeId::from(1),
+            index: LogIndex(10),
+        };
+        let leader = LeaderProgress::after_durable_initialization(membership.clone(), committed);
+        let state = HardState {
+            term: committed.term,
+            voted_for: Some(committed.leader),
+        };
+        let stored = StoredMembership {
+            introduced_at: None,
+            membership,
+        };
+        (leader, state, stored, committed)
+    }
+
+    // Fixed xorshift ordering is reproducible without clocks, OS randomness, or
+    // dependencies. Each schedule has a finite explicit message budget.
+    fn fault_schedule_shuffle<T>(messages: &mut [T], seed: &mut u64) {
+        messages.sort_by_cached_key(|_| {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed
+        });
+    }
+
+    fn fault_schedule_elect(
+        membership: &StoredMembership,
+        state: HardState,
+        previous: LogIdentity,
+        minority: &[u64],
+        seed: &mut u64,
+    ) -> LeaderProgress {
+        let request = RequestVote {
+            term: state.term,
+            candidate: previous.leader,
+            last_log: Some(previous),
+        };
+        let mut campaign = Some(Campaign::new(request, membership.membership.clone()));
+        let voters: BTreeSet<_> = membership
+            .membership
+            .configurations()
+            .iter()
+            .flatten()
+            .copied()
+            .collect();
+        let mut messages = Vec::new();
+        for peer in &voters {
+            let available = minority.iter().any(|id| NodeId::from(*id) == *peer);
+            // Old grants from the unreachable majority must not manufacture an
+            // election. Reachable votes are duplicated and independently ordered.
+            for _ in 0..3 {
+                messages.push((
+                    *peer,
+                    VoteResponse {
+                        term: if available {
+                            state.term
+                        } else {
+                            Term(state.term.0 - 1)
+                        },
+                        granted: true,
+                    },
+                ));
+            }
+        }
+        fault_schedule_shuffle(&mut messages, seed);
+        for (peer, response) in messages {
+            let decision = Campaign::observe(
+                &mut campaign,
+                state,
+                Some(&membership.membership),
+                state.term,
+                peer,
+                response,
+            );
+            assert!(!decision.quorum, "minority election at seed {seed}");
+            assert_eq!(decision.persist, None);
+            assert_eq!(
+                campaign
+                    .as_ref()
+                    .unwrap()
+                    .leader_initialization(state, &membership.membership, Some(previous))
+                    .unwrap(),
+                None
+            );
+        }
+        let mut healed: Vec<_> = voters.into_iter().collect();
+        fault_schedule_shuffle(&mut healed, seed);
+        let mut quorum = false;
+        for peer in healed {
+            quorum = Campaign::observe(
+                &mut campaign,
+                state,
+                Some(&membership.membership),
+                state.term,
+                peer,
+                VoteResponse {
+                    term: state.term,
+                    granted: true,
+                },
+            )
+            .quorum;
+        }
+        assert!(quorum, "healed election must progress");
+        let initialization = campaign
+            .unwrap()
+            .leader_initialization(state, &membership.membership, Some(previous))
+            .unwrap()
+            .unwrap();
+        assert_eq!(initialization.entries.len(), 1);
+        assert_eq!(initialization.entries[0].payload, EntryPayload::NoOp);
+        assert_eq!(
+            initialization.entries[0].identity.index,
+            previous.index.successor().unwrap()
+        );
+        // Model an adapter's successful durable initialization, not an election
+        // vote being treated as durable remote replication.
+        LeaderProgress::after_durable_initialization(
+            membership.membership.clone(),
+            initialization.entries[0].identity,
+        )
+    }
+
+    fn fault_schedule_replicate(
+        leader: &mut LeaderProgress,
+        minority: &[u64],
+        entry: LogIdentity,
+        seed: &mut u64,
+    ) {
+        let older = LogIdentity {
+            index: LogIndex(entry.index.0 - 1),
+            term: Term(entry.term.0 - 1),
+            ..entry
+        };
+        assert_eq!(leader.quorum_index(), None, "votes are not replication");
+        let mut messages = Vec::new();
+        for id in minority {
+            for _ in 0..3 {
+                messages.push((NodeId::from(*id), Some(entry)));
+                messages.push((NodeId::from(*id), Some(older)));
+            }
+        }
+        fault_schedule_shuffle(&mut messages, seed);
+        for (peer, matched) in messages {
+            leader.acknowledge_probe(peer, matched);
+            assert_eq!(
+                leader.quorum_index(),
+                None,
+                "minority cannot produce a commit candidate at seed {seed}"
+            );
+        }
+        let mut healed: Vec<_> = leader.membership.nodes().keys().copied().collect();
+        fault_schedule_shuffle(&mut healed, seed);
+        for peer in healed {
+            leader.acknowledge_probe(peer, Some(entry));
+            leader.acknowledge_probe(peer, Some(older));
+            assert_eq!(
+                leader.matched[&peer],
+                Some(entry),
+                "delayed older success must not regress match"
+            );
+        }
+        assert_eq!(leader.quorum_index(), Some(entry.index));
+        // This is a quorum candidate, not a simulated durable commit. The real
+        // store owns current-term validation and persistence of that decision.
+        assert_eq!(entry.term, leader.term);
+    }
+
+    fn fault_schedule_reads(
+        leader: &LeaderProgress,
+        state: HardState,
+        membership: &StoredMembership,
+        entry: LogIdentity,
+        minority: &[u64],
+        seed: &mut u64,
+    ) {
+        let mut barrier = ReadBarrier::default();
+        let old = barrier
+            .begin(leader, state, membership, Some(entry))
+            .unwrap()
+            .unwrap();
+        let context = barrier
+            .begin(leader, state, membership, Some(entry))
+            .unwrap()
+            .unwrap();
+        let mut messages = Vec::new();
+        for peer in membership.membership.nodes().keys() {
+            for _ in 0..3 {
+                messages.push((
+                    *peer,
+                    ReadConfirmation {
+                        context: old,
+                        term: state.term,
+                        accepted: true,
+                    },
+                ));
+                let available = minority.iter().any(|id| NodeId::from(*id) == *peer);
+                messages.push((
+                    *peer,
+                    ReadConfirmation {
+                        context,
+                        term: state.term,
+                        accepted: available,
+                    },
+                ));
+                messages.push((
+                    *peer,
+                    ReadConfirmation {
+                        context,
+                        term: Term(state.term.0 - 1),
+                        accepted: true,
+                    },
+                ));
+            }
+        }
+        fault_schedule_shuffle(&mut messages, seed);
+        for (peer, response) in messages {
+            assert_eq!(
+                barrier.observe(Some(leader), state, membership, peer, response),
+                None
+            );
+            assert_eq!(
+                barrier.complete(Some(leader), state, membership, Some(entry), Some(entry)),
+                None,
+                "minority read despite fully applied committed state at seed {seed}"
+            );
+        }
+        let mut healed: Vec<_> = membership.membership.nodes().keys().copied().collect();
+        fault_schedule_shuffle(&mut healed, seed);
+        let behind = LogIdentity {
+            index: LogIndex(entry.index.0 - 1),
+            ..entry
+        };
+        for peer in healed {
+            barrier.observe(
+                Some(leader),
+                state,
+                membership,
+                peer,
+                ReadConfirmation {
+                    context,
+                    term: state.term,
+                    accepted: true,
+                },
+            );
+            assert_eq!(
+                barrier.complete(Some(leader), state, membership, Some(entry), Some(behind)),
+                None,
+                "quorum cannot bypass application lag"
+            );
+        }
+        assert_eq!(
+            barrier.complete(Some(leader), state, membership, Some(entry), Some(entry)),
+            Some(entry)
+        );
+        assert_eq!(
+            barrier.complete(Some(leader), state, membership, Some(entry), Some(entry)),
+            None
+        );
+    }
+
+    #[test]
+    fn seeded_fault_schedule_minority_election_replication_and_reads() {
+        // Joint case deliberately reaches an old-set majority (1,2) but not
+        // the new-set majority (3,4,5): union-majority counting would fail here.
+        let cases = [
+            (vec![vec![1, 2, 3]], vec![1]),
+            (vec![vec![1, 2, 3, 4, 5]], vec![1, 2]),
+            (vec![vec![1, 2, 3], vec![3, 4, 5]], vec![1, 2]),
+        ];
+        for initial_seed in [1, 0x0015_5eed, 0xdead_beef, 0x0123_4567_89ab_cdef] {
+            for (configurations, minority) in &cases {
+                let mut seed = initial_seed;
+                let (_, state, membership, previous) = read_barrier_fixture(configurations.clone());
+                let previous = LogIdentity {
+                    term: Term(2),
+                    ..previous
+                };
+                let mut leader =
+                    fault_schedule_elect(&membership, state, previous, minority, &mut seed);
+                let entry = leader.matched[&previous.leader].unwrap();
+                fault_schedule_replicate(&mut leader, minority, entry, &mut seed);
+                // Supply the current-term watermark only after replication has
+                // produced a quorum candidate. Persistence itself is not tested.
+                fault_schedule_reads(&leader, state, &membership, entry, minority, &mut seed);
+            }
+        }
+    }
+
+    fn fault_schedule_invalidate(
+        barrier: &mut ReadBarrier,
+        leader: &LeaderProgress,
+        state: HardState,
+        membership: &StoredMembership,
+        entry: LogIdentity,
+        context: ReadContext,
+        mode: u8,
+    ) {
+        match mode {
+            0 => {
+                let higher = state.term.successor().unwrap();
+                let request = RequestVote {
+                    term: state.term,
+                    candidate: entry.leader,
+                    last_log: Some(entry),
+                };
+                let mut campaign = Some(Campaign::new(request, membership.membership.clone()));
+                let decision = Campaign::observe(
+                    &mut campaign,
+                    state,
+                    Some(&membership.membership),
+                    state.term,
+                    NodeId::from(2),
+                    VoteResponse {
+                        term: higher,
+                        granted: false,
+                    },
+                );
+                assert_eq!(
+                    decision.persist,
+                    Some(HardState {
+                        term: higher,
+                        voted_for: None
+                    })
+                );
+                assert!(campaign.is_none());
+                assert_eq!(
+                    barrier.observe(
+                        Some(leader),
+                        state,
+                        membership,
+                        NodeId::from(2),
+                        ReadConfirmation {
+                            context,
+                            term: higher,
+                            accepted: false
+                        },
+                    ),
+                    Some(higher)
+                );
+            }
+            1 => {
+                let mut changed = membership.clone();
+                changed.introduced_at = Some(entry);
+                assert_eq!(
+                    barrier.complete(Some(leader), state, &changed, Some(entry), Some(entry)),
+                    None
+                );
+            }
+            _ => {
+                assert_eq!(
+                    barrier.complete(None, state, membership, Some(entry), Some(entry)),
+                    None
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn seeded_fault_schedule_authority_changes_cannot_revive_reads() {
+        for initial_seed in [1, 0x0015_5eed, 0xdead_beef, 0x0123_4567_89ab_cdef] {
+            for configurations in [
+                vec![vec![1, 2, 3]],
+                vec![vec![1, 2, 3, 4, 5]],
+                vec![vec![1, 2, 3], vec![3, 4, 5]],
+            ] {
+                let mut seed = initial_seed;
+                let (_, state, membership, previous) = read_barrier_fixture(configurations);
+                let previous = LogIdentity {
+                    term: Term(2),
+                    ..previous
+                };
+                let mut leader =
+                    fault_schedule_elect(&membership, state, previous, &[1], &mut seed);
+                let entry = leader.matched[&previous.leader].unwrap();
+                fault_schedule_replicate(&mut leader, &[1], entry, &mut seed);
+                let mut barrier = ReadBarrier::default();
+                for mode in 0..3 {
+                    let context = barrier
+                        .begin(&leader, state, &membership, Some(entry))
+                        .unwrap()
+                        .unwrap();
+                    let mut delayed: Vec<_> = membership
+                        .membership
+                        .nodes()
+                        .keys()
+                        .map(|peer| {
+                            (
+                                *peer,
+                                ReadConfirmation {
+                                    context,
+                                    term: state.term,
+                                    accepted: true,
+                                },
+                            )
+                        })
+                        .collect();
+                    fault_schedule_shuffle(&mut delayed, &mut seed);
+                    for (peer, response) in &delayed {
+                        barrier.observe(Some(&leader), state, &membership, *peer, *response);
+                    }
+                    // Quorum is already confirmed but application is behind.
+                    let round = barrier.pending.as_ref().unwrap();
+                    assert!(round.membership.membership.has_quorum(&round.acknowledged));
+                    assert_eq!(
+                        barrier.complete(Some(&leader), state, &membership, Some(entry), None),
+                        None
+                    );
+                    fault_schedule_invalidate(
+                        &mut barrier,
+                        &leader,
+                        state,
+                        &membership,
+                        entry,
+                        context,
+                        mode,
+                    );
+                    // Even restoring the old caller inputs and delivering every
+                    // delayed/duplicate reply cannot resurrect cancelled authority.
+                    for (peer, response) in delayed.into_iter().rev() {
+                        barrier.observe(Some(&leader), state, &membership, peer, response);
+                        barrier.observe(Some(&leader), state, &membership, peer, response);
+                        assert_eq!(
+                            barrier.complete(
+                                Some(&leader),
+                                state,
+                                &membership,
+                                Some(entry),
+                                Some(entry)
+                            ),
+                            None,
+                            "cancelled read revived: seed {initial_seed}, mode {mode}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn read_barrier_requires_current_term_committed_leader_entry() {
+        let (leader, state, membership, committed) = read_barrier_fixture(vec![vec![1]]);
+        let mut barrier = ReadBarrier::default();
+        for position in [
+            None,
+            Some(LogIdentity {
+                term: Term(2),
+                ..committed
+            }),
+            Some(LogIdentity {
+                leader: NodeId::from(2),
+                ..committed
+            }),
+            Some(LogIdentity {
+                index: LogIndex(11),
+                ..committed
+            }),
+        ] {
+            assert_eq!(
+                barrier.begin(&leader, state, &membership, position),
+                Ok(None)
+            );
+        }
+        assert_eq!(
+            barrier.begin(
+                &leader,
+                HardState {
+                    term: Term(4),
+                    ..state
+                },
+                &membership,
+                Some(committed)
+            ),
+            Ok(None)
+        );
+        assert!(
+            barrier
+                .begin(&leader, state, &membership, Some(committed))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            barrier.complete(Some(&leader), state, &membership, Some(committed), None),
+            None
+        );
+        assert_eq!(
+            barrier.complete(
+                Some(&leader),
+                state,
+                &membership,
+                Some(committed),
+                Some(committed)
+            ),
+            Some(committed)
+        );
+        assert_eq!(
+            barrier.complete(
+                Some(&leader),
+                state,
+                &membership,
+                Some(committed),
+                Some(committed)
+            ),
+            None,
+            "authority is consumed once"
+        );
+    }
+
+    #[test]
+    fn read_barrier_waits_for_joint_quorum_and_applied_watermark() {
+        let (mut leader, state, membership, committed) =
+            read_barrier_fixture(vec![vec![1, 2, 3], vec![3, 4, 5]]);
+        for peer in 2..=6 {
+            leader.acknowledge_probe(NodeId::from(peer), Some(committed));
+        }
+        let mut barrier = ReadBarrier::default();
+        let context = barrier
+            .begin(&leader, state, &membership, Some(committed))
+            .unwrap()
+            .unwrap();
+        let response = ReadConfirmation {
+            context,
+            term: state.term,
+            accepted: true,
+        };
+        for peer in [2, 2, 6, 99] {
+            assert_eq!(
+                barrier.observe(
+                    Some(&leader),
+                    state,
+                    &membership,
+                    NodeId::from(peer),
+                    response
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            barrier.complete(
+                Some(&leader),
+                state,
+                &membership,
+                Some(committed),
+                Some(committed)
+            ),
+            None,
+            "replication progress, learners, and duplicate replies do not confirm reads"
+        );
+        barrier.observe(Some(&leader), state, &membership, NodeId::from(3), response);
+        assert_eq!(
+            barrier.complete(
+                Some(&leader),
+                state,
+                &membership,
+                Some(committed),
+                Some(committed)
+            ),
+            None
+        );
+        barrier.observe(Some(&leader), state, &membership, NodeId::from(4), response);
+        let behind = LogIdentity {
+            index: LogIndex(9),
+            ..committed
+        };
+        assert_eq!(
+            barrier.complete(
+                Some(&leader),
+                state,
+                &membership,
+                Some(committed),
+                Some(behind)
+            ),
+            None
+        );
+        let later = LogIdentity {
+            index: LogIndex(11),
+            ..committed
+        };
+        assert_eq!(
+            barrier.complete(Some(&leader), state, &membership, Some(later), Some(later)),
+            Some(committed),
+            "application may pass the captured watermark"
+        );
+    }
+
+    #[test]
+    fn read_barrier_rejects_stale_foreign_and_rejected_confirmations() {
+        let (leader, state, membership, committed) = read_barrier_fixture(vec![vec![1, 2, 3]]);
+        let mut barrier = ReadBarrier::default();
+        let old = barrier
+            .begin(&leader, state, &membership, Some(committed))
+            .unwrap()
+            .unwrap();
+        let context = barrier
+            .begin(&leader, state, &membership, Some(committed))
+            .unwrap()
+            .unwrap();
+        assert_ne!(old, context);
+        let response = ReadConfirmation {
+            context,
+            term: state.term,
+            accepted: true,
+        };
+        for invalid in [
+            ReadConfirmation {
+                context: old,
+                ..response
+            },
+            ReadConfirmation {
+                context: ReadContext {
+                    term: Term(2),
+                    ..context
+                },
+                ..response
+            },
+            ReadConfirmation {
+                context: ReadContext {
+                    leader: NodeId::from(2),
+                    ..context
+                },
+                ..response
+            },
+            ReadConfirmation {
+                term: Term(2),
+                ..response
+            },
+            ReadConfirmation {
+                accepted: false,
+                ..response
+            },
+        ] {
+            barrier.observe(Some(&leader), state, &membership, NodeId::from(2), invalid);
+            assert_eq!(
+                barrier.complete(
+                    Some(&leader),
+                    state,
+                    &membership,
+                    Some(committed),
+                    Some(committed)
+                ),
+                None
+            );
+        }
+        barrier.observe(Some(&leader), state, &membership, NodeId::from(2), response);
+        assert_eq!(
+            barrier.complete(
+                Some(&leader),
+                state,
+                &membership,
+                Some(committed),
+                Some(committed)
+            ),
+            Some(committed)
+        );
+    }
+
+    #[test]
+    fn read_barrier_invalidates_on_term_membership_or_leadership_change() {
+        let (leader, state, membership, committed) = read_barrier_fixture(vec![vec![1, 2, 3]]);
+        let mut barrier = ReadBarrier::default();
+        let context = barrier
+            .begin(&leader, state, &membership, Some(committed))
+            .unwrap()
+            .unwrap();
+        let response = ReadConfirmation {
+            context,
+            term: state.term,
+            accepted: true,
+        };
+        barrier.observe(Some(&leader), state, &membership, NodeId::from(2), response);
+        let mut changed = membership.clone();
+        changed.introduced_at = Some(committed);
+        assert_eq!(
+            barrier.complete(
+                Some(&leader),
+                state,
+                &changed,
+                Some(committed),
+                Some(committed)
+            ),
+            None
+        );
+        assert_eq!(
+            barrier.complete(
+                Some(&leader),
+                state,
+                &membership,
+                Some(committed),
+                Some(committed)
+            ),
+            None
+        );
+
+        for newer_term in [false, true] {
+            barrier
+                .begin(&leader, state, &membership, Some(committed))
+                .unwrap();
+            let next_state = HardState {
+                term: Term(4),
+                voted_for: None,
+            };
+            assert_eq!(
+                barrier.complete(
+                    newer_term.then_some(&leader),
+                    if newer_term { next_state } else { state },
+                    &membership,
+                    Some(committed),
+                    Some(committed),
+                ),
+                None
+            );
+            assert!(barrier.pending.is_none());
+        }
+        let context = barrier
+            .begin(&leader, state, &membership, Some(committed))
+            .unwrap()
+            .unwrap();
+        let higher = ReadConfirmation {
+            context: ReadContext {
+                sequence: 0,
+                ..context
+            },
+            term: Term(4),
+            accepted: true,
+        };
+        assert_eq!(
+            barrier.observe(Some(&leader), state, &membership, NodeId::from(6), higher),
+            None
+        );
+        assert!(
+            barrier.pending.is_some(),
+            "learner cannot change term authority"
+        );
+        assert_eq!(
+            barrier.observe(Some(&leader), state, &membership, NodeId::from(2), higher),
+            Some(Term(4))
+        );
+        assert!(
+            barrier.pending.is_none(),
+            "even stale higher-term replies cancel reads"
+        );
+    }
+
+    #[test]
+    fn read_barrier_does_not_mix_effective_configurations() {
+        let (leader, state, membership, committed) = read_barrier_fixture(vec![vec![1, 2, 3]]);
+        let (changed_leader, _, changed_membership, _) = read_barrier_fixture(vec![vec![1, 3, 4]]);
+        let mut barrier = ReadBarrier::default();
+        assert_eq!(
+            barrier.begin(&leader, state, &changed_membership, Some(committed)),
+            Ok(None)
+        );
+        let context = barrier
+            .begin(&leader, state, &membership, Some(committed))
+            .unwrap()
+            .unwrap();
+        let response = ReadConfirmation {
+            context,
+            term: state.term,
+            accepted: true,
+        };
+        barrier.observe(Some(&leader), state, &membership, NodeId::from(2), response);
+        barrier.observe(
+            Some(&changed_leader),
+            state,
+            &changed_membership,
+            NodeId::from(2),
+            response,
+        );
+        assert!(
+            barrier.pending.is_none(),
+            "a removed voter's reply still observes the configuration change"
+        );
+        assert_eq!(
+            barrier.complete(
+                Some(&leader),
+                state,
+                &membership,
+                Some(committed),
+                Some(committed)
+            ),
+            None,
+            "restoring the configuration cannot revive the cancelled round"
+        );
+        let next = barrier
+            .begin(&changed_leader, state, &changed_membership, Some(committed))
+            .unwrap()
+            .unwrap();
+        barrier.observe(
+            Some(&changed_leader),
+            state,
+            &changed_membership,
+            NodeId::from(3),
+            response,
+        );
+        assert_eq!(
+            barrier.complete(
+                Some(&changed_leader),
+                state,
+                &changed_membership,
+                Some(committed),
+                Some(committed)
+            ),
+            None
+        );
+        barrier.observe(
+            Some(&changed_leader),
+            state,
+            &changed_membership,
+            NodeId::from(3),
+            ReadConfirmation {
+                context: next,
+                ..response
+            },
+        );
+        assert_eq!(
+            barrier.complete(
+                Some(&changed_leader),
+                state,
+                &changed_membership,
+                Some(committed),
+                Some(committed)
+            ),
+            Some(committed)
+        );
+    }
+
+    #[test]
+    fn read_barrier_cancellation_and_exhaustion_never_reuse_context() {
+        let (leader, state, membership, committed) = read_barrier_fixture(vec![vec![1]]);
+        let mut barrier = ReadBarrier::default();
+        let old = barrier
+            .begin(&leader, state, &membership, Some(committed))
+            .unwrap()
+            .unwrap();
+        barrier.cancel();
+        assert_eq!(
+            barrier.complete(
+                Some(&leader),
+                state,
+                &membership,
+                Some(committed),
+                Some(committed)
+            ),
+            None
+        );
+        let next = barrier
+            .begin(&leader, state, &membership, Some(committed))
+            .unwrap()
+            .unwrap();
+        assert_ne!(old, next);
+        barrier.next_sequence = Some(u64::MAX);
+        assert_eq!(
+            barrier
+                .begin(&leader, state, &membership, Some(committed))
+                .unwrap()
+                .unwrap()
+                .sequence,
+            u64::MAX
+        );
+        assert_eq!(
+            barrier.begin(&leader, state, &membership, Some(committed)),
+            Err(ReadSequenceExhausted)
+        );
+        assert!(barrier.pending.is_none());
+    }
+
+    #[test]
+    fn read_barrier_rejects_conflicting_or_regressed_storage_watermarks() {
+        let (leader, state, membership, committed) = read_barrier_fixture(vec![vec![1]]);
+        let mut barrier = ReadBarrier::default();
+        let conflicting = LogIdentity {
+            leader: NodeId::from(2),
+            ..committed
+        };
+        let earlier = LogIdentity {
+            index: LogIndex(9),
+            ..committed
+        };
+        let later = LogIdentity {
+            index: LogIndex(11),
+            ..committed
+        };
+        for (commit, applied) in [
+            (None, None),
+            (Some(earlier), Some(earlier)),
+            (Some(conflicting), Some(conflicting)),
+            (Some(committed), Some(conflicting)),
+            (Some(committed), Some(later)),
+        ] {
+            barrier
+                .begin(&leader, state, &membership, Some(committed))
+                .unwrap();
+            assert_eq!(
+                barrier.complete(Some(&leader), state, &membership, commit, applied),
+                None
+            );
+            assert!(barrier.pending.is_none());
+        }
     }
 
     #[test]

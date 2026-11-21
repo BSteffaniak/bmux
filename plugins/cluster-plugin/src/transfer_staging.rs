@@ -442,6 +442,28 @@ impl TransferStaging {
         transfer.file.read(buffer)
     }
 
+    /// Borrow the exact immutable sealed object under the caller's exclusive
+    /// staging owner. The borrowed reader cannot outlive header binding checks.
+    pub(crate) fn sealed_reader(
+        &mut self,
+        key: TransferKey,
+        binding: [u8; 32],
+    ) -> io::Result<(&mut File, u64)> {
+        self.validate_binding(key, binding)?;
+        let transfer = self
+            .transfers
+            .get_mut(&key)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "unknown transfer"))?;
+        if !transfer.sealed || transfer.failed {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "snapshot is not sealed",
+            ));
+        }
+        transfer.file.rewind()?;
+        Ok((&mut transfer.file, transfer.total))
+    }
+
     /// # Errors
     /// Failed deletion keeps the object and its reservation for a later retry.
     pub fn abort(&mut self, key: TransferKey) -> io::Result<()> {
