@@ -8,7 +8,6 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_pane_runtime_plugin = { workspace = true, features = ["simulator"] }
 bmux_simvar_tui          = { workspace = true }
 bmux_tui                 = { workspace = true }
 sim_support              = { workspace = true }
@@ -18,6 +17,10 @@ switchy_pty              = { workspace = true, features = ["simulator"] }
 switchy_simulation       = { workspace = true }
 switchy_thread           = { workspace = true, features = ["simulator"] }
 switchy_time             = { workspace = true, features = ["simulator"] }
+
+# The simulated pane runtime models Unix sessions (as the pty conformance suite does).
+[target.'cfg(unix)'.dependencies]
+bmux_pane_runtime_plugin = { workspace = true, features = ["simulator"] }
 
 [features]
 default = []

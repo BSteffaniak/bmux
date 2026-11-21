@@ -15,6 +15,7 @@
 //! 5. The workload finishes within a budget of simulated time (no livelock), with no deadlock
 //!    or leaked simulated thread (checked by the scheduler and simvar).
 
+#![cfg(unix)]
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 

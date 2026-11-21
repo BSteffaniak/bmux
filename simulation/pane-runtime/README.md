@@ -2,7 +2,8 @@
 
 Deterministic simulation testing for the pane runtime plugin
 (`plugins/pane-runtime-plugin`), the code that runs bmux's panes. Run it with
-`cargo sim pane-runtime`; see [the simulation README](../README.md).
+`cargo sim pane-runtime`; see [the simulation README](../README.md). It runs
+on Unix hosts: the simulated pane runtime models Unix sessions.
 
 Each run starts a pane runtime through the plugin's `simulation` driver (its
 real tasks, threads, terminals and process control, built with its

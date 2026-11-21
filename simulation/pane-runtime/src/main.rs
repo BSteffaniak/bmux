@@ -7,8 +7,16 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
+#[cfg(unix)]
 use pane_runtime::{PaneRuntimeBootstrap, telemetry};
 
+/// The simulated pane runtime models Unix sessions.
+#[cfg(not(unix))]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    Err("the pane runtime simulation runs on Unix hosts only".into())
+}
+
+#[cfg(unix)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flags: Vec<String> = std::env::args().skip(1).collect();
     if let Some(unknown) = flags.iter().find(|flag| *flag != "--tui") {
