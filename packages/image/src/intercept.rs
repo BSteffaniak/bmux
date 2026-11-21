@@ -9,6 +9,7 @@ use crate::model::ImageEvent;
 #[cfg(any(feature = "sixel", feature = "kitty", feature = "iterm2"))]
 use crate::stream::{ImageString, image_event};
 
+#[cfg(any(feature = "sixel", feature = "kitty", feature = "iterm2"))]
 const DEFAULT_MAX_ENCODED_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
@@ -62,17 +63,27 @@ pub struct InterceptResult {
     pub events: Vec<ImageEvent>,
 }
 
+/// The payload of an image sequence being collected: bounded, a larger one discarded whole.
+#[cfg(any(feature = "sixel", feature = "kitty", feature = "iterm2"))]
+struct Payload {
+    buf: Vec<u8>,
+    /// Most encoded bytes kept.
+    max: usize,
+    /// The sequence outgrew `max` and is being discarded through its end.
+    discarding: bool,
+}
+
 /// Detects and extracts image escape sequences from raw PTY output.
 ///
 /// Designed as a concrete struct today; the public API surface matches a
 /// trait shape suitable for future plugin extraction.
 pub struct ImageInterceptor {
     state: State,
-    buf: Vec<u8>,
     /// Byte offset in the filtered output when the current image's ESC was seen.
     capture_filtered_offset: usize,
-    max_encoded_image_bytes: usize,
-    discarding_oversized: bool,
+    /// The payload of the image sequence in progress (there is none without an image protocol).
+    #[cfg(any(feature = "sixel", feature = "kitty", feature = "iterm2"))]
+    payload: Payload,
 
     #[cfg(feature = "sixel")]
     dcs_intermediates: Vec<u8>,
@@ -86,10 +97,13 @@ impl ImageInterceptor {
     pub fn new() -> Self {
         Self {
             state: State::Ground,
-            buf: Vec::with_capacity(4096),
             capture_filtered_offset: 0,
-            max_encoded_image_bytes: DEFAULT_MAX_ENCODED_IMAGE_BYTES,
-            discarding_oversized: false,
+            #[cfg(any(feature = "sixel", feature = "kitty", feature = "iterm2"))]
+            payload: Payload {
+                buf: Vec::with_capacity(4096),
+                max: DEFAULT_MAX_ENCODED_IMAGE_BYTES,
+                discarding: false,
+            },
             #[cfg(feature = "sixel")]
             dcs_intermediates: Vec::new(),
             #[cfg(feature = "iterm2")]
@@ -99,32 +113,44 @@ impl ImageInterceptor {
 
     /// Create an interceptor with an encoded image sequence byte limit.
     #[must_use]
+    #[cfg(any(feature = "sixel", feature = "kitty", feature = "iterm2"))]
     pub fn with_max_encoded_bytes(max_encoded_image_bytes: usize) -> Self {
-        Self {
-            max_encoded_image_bytes: max_encoded_image_bytes.max(1),
-            ..Self::new()
-        }
+        let mut interceptor = Self::new();
+        interceptor.payload.max = max_encoded_image_bytes.max(1);
+        interceptor
     }
 
+    /// Create an interceptor with an encoded image sequence byte limit: with no image protocol
+    /// nothing is collected, so there is nothing to bound.
+    #[must_use]
+    #[cfg(not(any(feature = "sixel", feature = "kitty", feature = "iterm2")))]
+    pub fn with_max_encoded_bytes(_max_encoded_image_bytes: usize) -> Self {
+        Self::new()
+    }
+
+    #[cfg(any(feature = "sixel", feature = "kitty", feature = "iterm2"))]
     fn push_image_byte(&mut self, byte: u8) {
-        if self.discarding_oversized {
+        let payload = &mut self.payload;
+        if payload.discarding {
             return;
         }
-        if self.buf.len() >= self.max_encoded_image_bytes {
-            self.buf.clear();
-            self.discarding_oversized = true;
+        if payload.buf.len() >= payload.max {
+            payload.buf.clear();
+            payload.discarding = true;
         } else {
-            self.buf.push(byte);
+            payload.buf.push(byte);
         }
     }
 
+    #[cfg(any(feature = "sixel", feature = "kitty", feature = "iterm2"))]
     fn take_image_bytes(&mut self) -> Option<Vec<u8>> {
-        if self.discarding_oversized {
-            self.discarding_oversized = false;
-            self.buf.clear();
+        let payload = &mut self.payload;
+        if payload.discarding {
+            payload.discarding = false;
+            payload.buf.clear();
             None
         } else {
-            Some(std::mem::take(&mut self.buf))
+            Some(std::mem::take(&mut payload.buf))
         }
     }
 
@@ -248,15 +274,15 @@ impl ImageInterceptor {
                         b'P' => {
                             self.state = State::DcsEntry;
                             self.dcs_intermediates.clear();
-                            self.buf.clear();
+                            self.payload.buf.clear();
                         }
 
                         // APC: ESC _ — potential kitty graphics
                         #[cfg(feature = "kitty")]
                         b'_' => {
                             self.state = State::KittyBody;
-                            self.buf.clear();
-                            self.discarding_oversized = false;
+                            self.payload.buf.clear();
+                            self.payload.discarding = false;
                         }
 
                         // OSC: ESC ] — potential iTerm2 inline image
@@ -264,7 +290,7 @@ impl ImageInterceptor {
                         b']' => {
                             self.state = State::OscEntry;
                             self.osc_prefix.clear();
-                            self.buf.clear();
+                            self.payload.buf.clear();
                         }
 
                         0x1B => {
@@ -287,12 +313,12 @@ impl ImageInterceptor {
                     // Accumulate DCS parameter/intermediate bytes until the
                     // final byte.  Sixel's final byte is 'q'.
                     if (0x20..=0x3F).contains(&byte) {
-                        if self.dcs_intermediates.len() >= self.max_encoded_image_bytes {
+                        if self.dcs_intermediates.len() >= self.payload.max {
                             // Discard the entire oversized DCS through ST, not
                             // just its header: its body must not become text.
                             self.dcs_intermediates.clear();
-                            self.buf.clear();
-                            self.discarding_oversized = true;
+                            self.payload.buf.clear();
+                            self.payload.discarding = true;
                             self.state = State::SixelBody;
                         } else {
                             self.dcs_intermediates.push(byte);
@@ -300,8 +326,8 @@ impl ImageInterceptor {
                     } else if byte == b'q' {
                         // Final byte = sixel!  Enter body accumulation.
                         self.state = State::SixelBody;
-                        self.buf.clear();
-                        self.discarding_oversized = false;
+                        self.payload.buf.clear();
+                        self.payload.discarding = false;
                     } else {
                         // Not sixel — pass through the original DCS sequence.
                         filtered.push(0x1B);
@@ -355,7 +381,10 @@ impl ImageInterceptor {
                         }
                         _ => {
                             // Only accumulate if it starts with 'G' (kitty graphics).
-                            if self.buf.is_empty() && !self.discarding_oversized && byte != b'G' {
+                            if self.payload.buf.is_empty()
+                                && !self.payload.discarding
+                                && byte != b'G'
+                            {
                                 // Not a kitty graphics APC — pass through.
                                 filtered.push(0x1B);
                                 filtered.push(b'_');
@@ -396,8 +425,8 @@ impl ImageInterceptor {
                             if self.osc_prefix.len() == PREFIX.len() {
                                 // Matched "1337;File=" — enter body.
                                 self.state = State::ITerm2Body;
-                                self.buf.clear();
-                                self.discarding_oversized = false;
+                                self.payload.buf.clear();
+                                self.payload.discarding = false;
                             }
                             // else: keep accumulating prefix bytes
                         } else {
@@ -459,8 +488,11 @@ impl ImageInterceptor {
     /// Reset to ground state, discarding any partially-accumulated data.
     pub fn reset(&mut self) {
         self.state = State::Ground;
-        self.buf.clear();
-        self.discarding_oversized = false;
+        #[cfg(any(feature = "sixel", feature = "kitty", feature = "iterm2"))]
+        {
+            self.payload.buf.clear();
+            self.payload.discarding = false;
+        }
         #[cfg(feature = "sixel")]
         self.dcs_intermediates.clear();
         #[cfg(feature = "iterm2")]
@@ -544,7 +576,7 @@ mod tests {
                 for chunk in [&wire[..split], &wire[split..]] {
                     let result = interceptor.process(chunk);
                     assert!(interceptor.dcs_intermediates.len() <= 4);
-                    assert!(interceptor.buf.len() <= 4);
+                    assert!(interceptor.payload.buf.len() <= 4);
                     filtered.extend(result.filtered);
                     events.extend(result.events);
                 }
