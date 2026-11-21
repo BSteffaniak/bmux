@@ -33,8 +33,12 @@ cargo sim pty --regression                         # its pinned seeds
 | `SIMULATOR_VERIFY_DETERMINISM` | `1`: replay every run, fail if it differs |
 | `SIMULATOR_SCHEDULE_STRATEGY` | `random`, `pct` or `alternate` (default) |
 | `SIMULATOR_WEAK_MEMORY` | `1`: model weak memory for atomics |
+| `SIMULATOR_SHRINK` | `1`: shrink a failing run's thread schedule |
+| `SIMULATOR_SCHEDULE` | Replay a thread schedule `SIMULATOR_SHRINK` printed |
 
-Each simulation documents its own variables and flags.
+Each simulation documents its own variables and flags. A simulation's `--tui`
+dashboard (`bmux_simvar_tui`) pauses, steps, runs to decisions, breaks on
+conditions and goes back; see the [pty simulation](pty/README.md).
 
 ## Linting
 

@@ -36,7 +36,41 @@ cargo sim pty --regression                         # the seeds in regression-see
 SIMULATOR_PTY_PID_REUSE=1 cargo sim pty            # reuse every freed process id
 SIMULATOR_PTY_FAULTS=0.1 cargo sim pty             # more injected faults
 SIMULATOR_WEAK_MEMORY=1 cargo sim pty              # weak memory for atomics
+SIMULATOR_SHRINK=1 SIMULATOR_SEED=42 cargo sim pty # shrink a failure's thread schedule
 ```
+
+## Watching and debugging a run
+
+`--tui` shows the runs in a dashboard on bmux's TUI stack:
+
+- **Runs**: seeds, progress, results, and each failure's report with its replay
+  command.
+- **Scheduler**: the simulated threads and recent decisions, the decision rate,
+  and each invariant above with how often it was checked and how it failed.
+- **Processes & terminals**: processes by session and process group, the signal
+  log, and each terminal's screen (through `bmux_terminal_grid`) as programs
+  wrote it next to what `bmux_pty` delivered, with how much output is buffered
+  over time.
+
+Space pauses and resumes at scheduling decisions, `n` and `N` step one and a
+hundred, and `b` and `B` go back one and a hundred. `:` opens a command line:
+
+| Command | Does |
+| --- | --- |
+| `goto N` | Run to decision N, or go back to it |
+| `back N` | Go back N decisions |
+| `break decision N`, `break step N` | Pause there |
+| `break block THREAD [ON]` | Pause when a thread blocks (on something) |
+| `break fail` | Pause whenever an invariant fails, where it fails |
+| `clear` | Remove the breakpoints |
+
+Going back reruns the run's seed from the start in a fresh process that pauses
+at the target decision (`SIMVAR_TUI_PAUSE_AT`); determinism makes it exact.
+
+`SIMULATOR_SHRINK=1` shrinks a failing run's thread schedule (the switches it
+made beyond the ones it had to) and prints the smallest failing schedule with
+its replay command, `SIMULATOR_SCHEDULE=… cargo sim pty`. Add `--tui` to watch
+the shrunk run.
 
 Bugs found so far: a kill or interrupt after the process was reaped could reach
 an unrelated newer process that reused its id (fixed in `bmux_pty`: the exited

@@ -3,7 +3,8 @@
 //! `cargo sim pty` runs it, configured like any simvar simulation through `SIMULATOR_*`
 //! environment variables. Its own flags:
 //!
-//! * `--tui`: watch the runs in a dashboard (pause and step with space, `n`, `N`).
+//! * `--tui`: watch the runs in a dashboard: pause and step with space, `n` and `N`, go back
+//!   with `b` and `B`, and run to decisions or set breakpoints from its `:` command line.
 //! * `--regression`: run every seed in `regression-seeds`, each in a fresh process and
 //!   replayed to verify it is deterministic.
 
@@ -12,8 +13,8 @@
 
 use std::{path::Path, process::Command, sync::Arc};
 
+use bmux_simvar_tui::Exit;
 use pty::{PtyBootstrap, telemetry};
-use simvar::observer::ReplayControl;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let flags: Vec<String> = std::env::args().skip(1).collect();
@@ -43,8 +44,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Run the simulation on another thread while a dashboard shows it, then return its results.
+/// Going back in a run replaces this process with a rerun of its seed.
 fn with_tui() -> Result<Vec<simvar::SimResult>, Box<dyn std::error::Error>> {
-    let replay = Arc::new(ReplayControl::default());
+    let replay = bmux_simvar_tui::replay_control();
     telemetry::enable(Arc::clone(&replay));
     let (observer, events) = bmux_simvar_tui::observer();
     simvar::add_observer(observer);
@@ -52,13 +54,16 @@ fn with_tui() -> Result<Vec<simvar::SimResult>, Box<dyn std::error::Error>> {
     let simulation = std::thread::spawn(|| {
         simvar::run_simulation(PtyBootstrap).map_err(|error| error.to_string())
     });
-    bmux_simvar_tui::Dashboard::new(
+    let exit = bmux_simvar_tui::Dashboard::new(
         "bmux_pty simulation",
         events,
         vec![Box::new(telemetry::PtyPanel::default())],
         Some(replay),
     )
     .run()?;
+    if let Exit::Seek { seed, decision } = exit {
+        return Err(bmux_simvar_tui::seek(seed, decision).into());
+    }
     // The user left: start no more runs, and let the current ones finish.
     simvar::end_sim();
     Ok(simulation
@@ -86,7 +91,9 @@ fn regression() -> Result<(), Box<dyn std::error::Error>> {
             .stdout(std::process::Stdio::null())
             .status()?;
         if !status.success() {
-            eprintln!("regression seed {seed} failed; replay with: SIMULATOR_SEED={seed} cargo sim pty");
+            eprintln!(
+                "regression seed {seed} failed; replay with: SIMULATOR_SEED={seed} cargo sim pty"
+            );
             failed.push(seed.to_owned());
         }
     }

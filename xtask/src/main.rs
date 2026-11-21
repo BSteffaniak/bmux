@@ -235,7 +235,9 @@ mod tests;
 /// Configuration is simvar's `SIMULATOR_*` environment, which passes through.
 fn simulate(args: &[String]) -> Result<()> {
     let Some(name) = args.first() else {
-        return Err(error("usage: cargo sim NAME [ARGS]; see simulation/README.md"));
+        return Err(error(
+            "usage: cargo sim NAME [ARGS]; see simulation/README.md",
+        ));
     };
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

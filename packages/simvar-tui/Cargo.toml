@@ -11,11 +11,12 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_keyboard    = { workspace = true }
-bmux_tui         = { workspace = true, features = ["terminal-io"] }
-bmux_tui_runtime = { workspace = true }
-futures-util     = { workspace = true }
-simvar_observer  = { workspace = true }
+bmux_keyboard       = { workspace = true }
+bmux_tui            = { workspace = true, features = ["terminal-io"] }
+bmux_tui_components = { workspace = true, features = ["sparkline"] }
+bmux_tui_runtime    = { workspace = true }
+futures-util        = { workspace = true }
+simvar_observer     = { workspace = true }
 
 [features]
 default = []
@@ -23,6 +24,7 @@ default = []
 fail-on-warnings = [
     "bmux_keyboard/fail-on-warnings",
     "bmux_tui/fail-on-warnings",
+    "bmux_tui_components/fail-on-warnings",
     "bmux_tui_runtime/fail-on-warnings",
     "simvar_observer/fail-on-warnings",
 ]

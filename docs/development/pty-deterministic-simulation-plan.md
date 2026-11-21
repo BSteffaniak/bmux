@@ -689,9 +689,24 @@ The TUI (phases 10–14), as built:
   (threads, states, recent decisions, trace hash) and simulation panels; space
   pauses and resumes at decisions, `n`/`N` step one or a hundred.
 - **The bmux_pty simulator's panel** shows the kernel's processes and each
-  terminal's state and recent output (escape sequences dropped). Rendering the
-  screens through `bmux_terminal_grid` and `terminal_view`, and seeking
-  backwards by rerunning a seed up to a decision, are not built yet.
+  terminal's state, the process tree by session and group, the signal log, and
+  each terminal's screen through `bmux_terminal_grid` (`TerminalState`) as
+  programs wrote it next to what `bmux_pty` delivered.
+- **Finishing the TUI (after phase 14):** simvar's ratatui display moved into
+  `simvar_ratatui`, an observer like any other, so simvar's run loop only sends
+  events (`Started`, run lengths, steps). `ReplayControl` gained breakpoints
+  (decision, step, a thread blocking on something, any failure) and
+  `arrive`/`wait`, so a run sends its state before it pauses. The dashboard
+  shows a decision-rate sparkline and each invariant's status (the simulation
+  emits `Invariants`), runs to a decision, sets breakpoints from a `:` command
+  line, and goes back by rerunning the seed in a fresh process
+  (`SIMVAR_TUI_PAUSE_AT`). A run paused at a decision has the same trace hash
+  however it got there.
+- **Schedules:** every `switchy_thread` run records its schedule (the
+  non-default picks at choice points); `SIMULATOR_SCHEDULE` replays one without
+  the scheduling generator, and `SIMULATOR_SHRINK` shrinks a failure's by delta
+  debugging to a schedule where dropping any choice makes the run pass (a racy
+  example in simvar shrank from 136 choices to 1).
 
 Weak memory (phase 9), as built: `SIMULATOR_WEAK_MEMORY=1` gives every
 simulated thread a vector clock and every atomic a 32-store history; a load

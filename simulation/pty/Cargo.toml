@@ -11,6 +11,7 @@ version     = { workspace = true }
 bmux_pty           = { workspace = true, features = ["simulator"] }
 bmux_simvar_tui    = { workspace = true }
 bmux_tui           = { workspace = true }
+bmux_tui_components = { workspace = true, features = ["terminal-view"] }
 simvar             = { workspace = true, features = ["random", "thread", "time"] }
 switchy_pty        = { workspace = true, features = ["simulator"] }
 switchy_simulation = { workspace = true }

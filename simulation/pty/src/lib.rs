@@ -25,7 +25,12 @@
 
 pub mod telemetry;
 
-use std::{collections::BTreeSet, fmt::Write as _, io, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
+    io,
+    time::Duration,
+};
 
 use bmux_pty::{PtyCommand, PtyEvent, PtyExit, PtySize};
 use simvar::{Sim, SimBootstrap, SimConfig};
@@ -37,6 +42,104 @@ use switchy_thread::{
     sync::{Arc, Mutex, mpsc},
     thread,
 };
+
+/// What a run checks: the numbered invariants of the crate documentation, and that
+/// `bmux_pty`'s calls succeed as documented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Invariant {
+    /// 1. Exactly one `Exited`, last.
+    OneExit,
+    /// 2. Output delivered is what programs wrote.
+    Delivered,
+    /// 3. The control handle knows the exit first.
+    ControlKnowsExit,
+    /// 4. A killed or dropped process's group ends.
+    GroupEnds,
+    /// 5. Ending signals reach only signalled sessions.
+    SignalsContained,
+    /// 6. Programs report the last resize.
+    ResizeReported,
+    /// 7. The drivers finish, without panicking.
+    Finishes,
+    /// `bmux_pty`'s calls succeed as documented.
+    Api,
+}
+
+impl Invariant {
+    /// Every invariant, in order.
+    pub const ALL: [Self; 8] = [
+        Self::OneExit,
+        Self::Delivered,
+        Self::ControlKnowsExit,
+        Self::GroupEnds,
+        Self::SignalsContained,
+        Self::ResizeReported,
+        Self::Finishes,
+        Self::Api,
+    ];
+
+    /// What it says, briefly.
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::OneExit => "1. exactly one Exited per process, last",
+            Self::Delivered => "2. output delivered is what programs wrote",
+            Self::ControlKnowsExit => "3. the control handle knows the exit first",
+            Self::GroupEnds => "4. a killed or dropped process's group ends",
+            Self::SignalsContained => "5. ending signals reach only signalled sessions",
+            Self::ResizeReported => "6. programs report the last resize",
+            Self::Finishes => "7. the drivers finish, without panicking",
+            Self::Api => "bmux_pty calls succeed as documented",
+        }
+    }
+}
+
+/// Each invariant's checks and failures in the current run. A std mutex is never a switch
+/// point, so keeping count never changes the run.
+#[derive(Default)]
+struct Checks(std::sync::Mutex<BTreeMap<Invariant, (u64, Vec<String>)>>);
+
+fn with_checks<R>(f: impl FnOnce(&mut BTreeMap<Invariant, (u64, Vec<String>)>) -> R) -> R {
+    let checks = switchy_simulation::state::<Checks>();
+    let mut checks = checks
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    f(&mut checks)
+}
+
+/// Count a check of `invariant` in the current run.
+fn checked(invariant: Invariant) {
+    with_checks(|checks| checks.entry(invariant).or_default().0 += 1);
+}
+
+/// Every invariant's checks and failures in the current run so far.
+#[must_use]
+pub fn invariants() -> bmux_simvar_tui::Invariants {
+    with_checks(|checks| {
+        bmux_simvar_tui::Invariants(
+            Invariant::ALL
+                .iter()
+                .map(|invariant| {
+                    let (checked, failures) = checks.get(invariant).cloned().unwrap_or_default();
+                    bmux_simvar_tui::InvariantStatus {
+                        name: invariant.describe().to_owned(),
+                        checked,
+                        failures,
+                    }
+                })
+                .collect(),
+        )
+    })
+}
+
+/// Record that `invariant` failed with `message`: as a violation of the run, in the
+/// invariants' status, and to a watching dashboard (which may pause here).
+fn violated(shared: &Mutex<Shared>, invariant: Invariant, message: String) {
+    with_checks(|checks| checks.entry(invariant).or_default().1.push(message.clone()));
+    telemetry::failure(&message);
+    lock(shared).violations.push(message);
+}
 
 /// Simulated time the drivers have to finish in; more means a livelock.
 const BUDGET: Duration = Duration::from_secs(120);
@@ -162,12 +265,17 @@ pub fn run_workload() -> Result<(), Vec<String>> {
         .collect();
     drop(finished);
     let deadline = switchy_time::instant_now() + BUDGET;
+    checked(Invariant::Finishes);
     for _ in 0..drivers {
         let left = deadline.saturating_duration_since(switchy_time::instant_now());
         if finishing.recv_timeout(left).is_err() {
-            lock(&shared).violations.push(format!(
-                "the drivers did not finish within {BUDGET:?} of simulated time (livelock?)"
-            ));
+            violated(
+                &shared,
+                Invariant::Finishes,
+                format!(
+                    "the drivers did not finish within {BUDGET:?} of simulated time (livelock?)"
+                ),
+            );
             break;
         }
     }
@@ -180,9 +288,11 @@ pub fn run_workload() -> Result<(), Vec<String>> {
             continue;
         }
         if handle.join().is_err() {
-            lock(&shared)
-                .violations
-                .push(format!("driver {index} panicked"));
+            violated(
+                &shared,
+                Invariant::Finishes,
+                format!("driver {index} panicked"),
+            );
         }
     }
 
@@ -193,6 +303,9 @@ pub fn run_workload() -> Result<(), Vec<String>> {
             record.signal,
             Signal::Interrupt | Signal::Kill | Signal::Terminate | Signal::Quit
         );
+        if ending {
+            checked(Invariant::SignalsContained);
+        }
         if ending && !signalled.contains(&record.session_serial) {
             let suspects: Vec<String> = lock(&shared)
                 .signal_calls
@@ -206,16 +319,20 @@ pub fn run_workload() -> Result<(), Vec<String>> {
                     )
                 })
                 .collect();
-            lock(&shared).violations.push(format!(
-                "{:?} reached process {} (serial {}) of session {}, which no driver signalled; \
-                 drivers that signalled id {}: [{}]",
-                record.signal,
-                record.pid,
-                record.serial,
-                record.session_serial,
-                record.pid,
-                suspects.join("; ")
-            ));
+            violated(
+                &shared,
+                Invariant::SignalsContained,
+                format!(
+                    "{:?} reached process {} (serial {}) of session {}, which no driver \
+                     signalled; drivers that signalled id {}: [{}]",
+                    record.signal,
+                    record.pid,
+                    record.serial,
+                    record.session_serial,
+                    record.pid,
+                    suspects.join("; ")
+                ),
+            );
         }
     }
 
@@ -338,6 +455,8 @@ fn action(stream: &std::sync::Mutex<switchy_simulation::Rng>) -> Action {
 /// What a driver collected from its process.
 #[derive(Default)]
 struct Observed {
+    /// The process's terminal, to show what was delivered from it.
+    terminal: Option<String>,
     output: Vec<u8>,
     stdout: Vec<u8>,
     exits: Vec<PtyExit>,
@@ -350,6 +469,9 @@ impl Observed {
             Some(PtyEvent::Output(bytes)) => {
                 if !self.exits.is_empty() {
                     self.after_exit += 1;
+                }
+                if let Some(terminal) = &self.terminal {
+                    telemetry::delivered(terminal, &bytes);
                 }
                 self.output.extend(bytes);
             }
@@ -367,6 +489,7 @@ impl Observed {
 
 /// Whether `delivered` is all of `written` (when `complete`) or a prefix of it.
 fn check_stream(name: &str, delivered: &[u8], written: &[u8], complete: bool) -> Option<String> {
+    checked(Invariant::Delivered);
     let ok = if complete {
         delivered == written
     } else {
@@ -390,18 +513,20 @@ fn check_stream(name: &str, delivered: &[u8], written: &[u8], complete: bool) ->
 fn drive(index: u64, shared: &Mutex<Shared>) {
     let stream = switchy_simulation::stream(&format!("bmux_pty_driver_{index}"));
     let scenario = scenario(&stream);
-    let violation = |message: String| {
-        lock(shared).violations.push(format!(
-            "driver {index} ({}): {message}",
-            scenario.description
-        ));
+    let violation = |invariant: Invariant, message: String| {
+        violated(
+            shared,
+            invariant,
+            format!("driver {index} ({}): {message}", scenario.description),
+        );
     };
+    checked(Invariant::Api);
     let mut process = match scenario.command.clone().spawn(random_size(&stream)) {
         Ok(process) => process,
         Err(error) => {
             // Spawn faults are injected; anything else is a failure.
             if error.kind() != io::ErrorKind::WouldBlock {
-                violation(format!("spawn failed: {error}"));
+                violation(Invariant::Api, format!("spawn failed: {error}"));
             }
             return;
         }
@@ -409,10 +534,12 @@ fn drive(index: u64, shared: &Mutex<Shared>) {
     let pid = process.id();
     // Exact even if the process already exited and its id was reused by another driver.
     let spawned = simulator::last_spawned().filter(|s| s.pid == pid);
+    checked(Invariant::Api);
     if spawned.is_none() {
-        violation(format!(
-            "the kernel has no record of spawning {pid} from this driver"
-        ));
+        violation(
+            Invariant::Api,
+            format!("the kernel has no record of spawning {pid} from this driver"),
+        );
     }
     let serial = spawned.as_ref().map(|s| s.serial);
     let io = spawned.map(|s| s.io);
@@ -427,7 +554,10 @@ fn drive(index: u64, shared: &Mutex<Shared>) {
             .signal_calls
             .push((index, pid, serial, action, exited));
     };
-    let mut observed = Observed::default();
+    let mut observed = Observed {
+        terminal: io.as_ref().and_then(|io| io.terminal.clone()),
+        ..Observed::default()
+    };
     let mut typed = false;
     let mut killed = false;
     let mut output_stopped = false;
@@ -442,8 +572,12 @@ fn drive(index: u64, shared: &Mutex<Shared>) {
             Action::Try => observed.take(process.try_event()),
             Action::Ready(limit) => {
                 let events = process.ready_events(limit);
+                checked(Invariant::Api);
                 if events.len() > limit {
-                    violation(format!("ready_events({limit}) returned {}", events.len()));
+                    violation(
+                        Invariant::Api,
+                        format!("ready_events({limit}) returned {}", events.len()),
+                    );
                 }
                 for event in events {
                     observed.take(Some(event));
@@ -466,19 +600,21 @@ fn drive(index: u64, shared: &Mutex<Shared>) {
             Action::Type => {}
             Action::Resize => {
                 let size = random_size(&stream);
+                checked(Invariant::Api);
                 if let Err(error) = control.resize(size) {
-                    violation(format!("resize failed: {error}"));
+                    violation(Invariant::Api, format!("resize failed: {error}"));
                 }
                 if control.size() != size {
-                    violation(format!(
-                        "size is {:?} after resizing to {size:?}",
-                        control.size()
-                    ));
+                    violation(
+                        Invariant::Api,
+                        format!("size is {:?} after resizing to {size:?}", control.size()),
+                    );
                 }
                 // A captured process has no controlling terminal, so no window changes; and
                 // after stop_output nothing more is delivered.
                 if scenario.reports_resizes && !scenario.captured && !output_stopped {
                     // 6. The program reports the new size.
+                    checked(Invariant::ResizeReported);
                     let wanted = if scenario.captured {
                         format!("{}x{}\n", size.cols, size.rows)
                     } else {
@@ -500,23 +636,26 @@ fn drive(index: u64, shared: &Mutex<Shared>) {
                         observed.take(process.next_event_timeout(Duration::from_millis(100)));
                     }
                     if observed.exits.is_empty() && !reported(&observed) {
-                        violation(format!(
-                            "the program never reported the resize to {wanted:?}"
-                        ));
+                        violation(
+                            Invariant::ResizeReported,
+                            format!("the program never reported the resize to {wanted:?}"),
+                        );
                     }
                 }
             }
             Action::Interrupt => {
                 signal_self("interrupted");
+                checked(Invariant::Api);
                 if let Err(error) = control.interrupt() {
-                    violation(format!("interrupt failed: {error}"));
+                    violation(Invariant::Api, format!("interrupt failed: {error}"));
                 }
             }
             Action::Kill => {
                 signal_self("killed");
                 killed = true;
+                checked(Invariant::Api);
                 if let Err(error) = control.kill() {
-                    violation(format!("kill failed: {error}"));
+                    violation(Invariant::Api, format!("kill failed: {error}"));
                 }
             }
             Action::StopOutput => {
@@ -537,8 +676,9 @@ fn drive(index: u64, shared: &Mutex<Shared>) {
         // Done experimenting: end it and collect everything left.
         signal_self("finally killed");
         killed = true;
+        checked(Invariant::Api);
         if let Err(error) = control.kill() {
-            violation(format!("final kill failed: {error}"));
+            violation(Invariant::Api, format!("final kill failed: {error}"));
         }
     }
     while observed.exits.is_empty() {
@@ -547,24 +687,32 @@ fn drive(index: u64, shared: &Mutex<Shared>) {
     drop(writer);
 
     // 1. Exactly one exit, last, and nothing after it.
+    checked(Invariant::OneExit);
     if observed.exits.len() != 1 || observed.after_exit > 0 {
-        violation(format!(
-            "{} exits, {} events after the exit",
-            observed.exits.len(),
-            observed.after_exit
-        ));
+        violation(
+            Invariant::OneExit,
+            format!(
+                "{} exits, {} events after the exit",
+                observed.exits.len(),
+                observed.after_exit
+            ),
+        );
     }
     if process.next_event().is_some() || !process.has_exited() {
-        violation("events continue after the exit".into());
+        violation(Invariant::OneExit, "events continue after the exit".into());
     }
     let exit = observed.exits[0];
 
     // 3. The control handle already knows the exit.
+    checked(Invariant::ControlKnowsExit);
     if control.exit_status() != Some(exit) {
-        violation(format!(
-            "control reports {:?}, the event {exit:?}",
-            control.exit_status()
-        ));
+        violation(
+            Invariant::ControlKnowsExit,
+            format!(
+                "control reports {:?}, the event {exit:?}",
+                control.exit_status()
+            ),
+        );
     }
 
     // 2. What was delivered is what was written.
@@ -578,13 +726,13 @@ fn drive(index: u64, shared: &Mutex<Shared>) {
                 exit.output_complete(),
             )
         {
-            violation(problem);
+            violation(Invariant::Delivered, problem);
         }
         if let Some(written) = io.stdout_pipe.and_then(simulator::pipe_written)
             && let Some(problem) =
                 check_stream("stdout", &observed.stdout, &written, exit.output_complete())
         {
-            violation(problem);
+            violation(Invariant::Delivered, problem);
         }
     }
 
@@ -603,10 +751,11 @@ fn drive(index: u64, shared: &Mutex<Shared>) {
 }
 
 /// 4. Shortly after a kill, nothing in the killed process's group is still running.
-fn check_group_ended(pid: u32, serial: Option<u64>, violation: &impl Fn(String)) {
+fn check_group_ended(pid: u32, serial: Option<u64>, violation: &impl Fn(Invariant, String)) {
     let Some(serial) = serial else {
         return;
     };
+    checked(Invariant::GroupEnds);
     thread::sleep(Duration::from_secs(1));
     let survivors: Vec<String> = simulator::snapshot()
         .processes
@@ -622,10 +771,13 @@ fn check_group_ended(pid: u32, serial: Option<u64>, violation: &impl Fn(String))
             .filter(|r| r.session_serial == serial)
             .map(|r| format!("{:?}->{}", r.signal, r.pid))
             .collect();
-        violation(format!(
-            "still running a second after the kill: {}; signals to the session: [{}]",
-            survivors.join(", "),
-            delivered.join(", ")
-        ));
+        violation(
+            Invariant::GroupEnds,
+            format!(
+                "still running a second after the kill: {}; signals to the session: [{}]",
+                survivors.join(", "),
+                delivered.join(", ")
+            ),
+        );
     }
 }
