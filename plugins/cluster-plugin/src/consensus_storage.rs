@@ -517,6 +517,7 @@ impl ConsensusStateMachine {
             decode_stored_membership,
         )?
         .unwrap_or_default();
+        validate_membership_position(&last_membership, last_applied)?;
         let state_machine = Self {
             database,
             cluster_id: cluster_id.to_owned(),
@@ -827,6 +828,8 @@ impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
                 },
             ));
         }
+        validate_membership_position(&meta.last_membership, meta.last_log_id)
+            .map_err(storage_write_error)?;
         let mut next = self.clone();
         next.control_state = control_state;
         next.last_applied = meta.last_log_id;
@@ -1019,25 +1022,55 @@ fn decode_snapshot_envelope(bytes: &[u8]) -> Result<SnapshotEnvelope, ConsensusS
     let snapshot_id = String::from_utf8(reader.bytes()?)
         .map_err(|_| ConsensusStorageError::CorruptRecord("snapshot ID"))?;
     validate_snapshot_id(&snapshot_id)?;
-    let last_log_id = if reader.boolean()? {
-        Some(decode_log_id_fields(&mut reader)?)
+    let last_included = if reader.boolean()? {
+        Some(decode_owned_log_identity(&mut reader)?)
     } else {
         None
     };
-    let last_membership = decode_stored_membership(&reader.bytes()?)?;
+    let membership = decode_owned_stored_membership(&reader.bytes()?)?;
+    let descriptor = crate::consensus_model::SnapshotDescriptor {
+        format_version: version,
+        cluster_id,
+        snapshot_id,
+        last_included,
+        membership,
+        total_bytes: u64::try_from(bytes.len())
+            .map_err(|_| ConsensusStorageError::CorruptRecord("snapshot size"))?,
+        checksum: checksum
+            .try_into()
+            .map_err(|_| ConsensusStorageError::CorruptRecord("snapshot checksum"))?,
+    };
+    descriptor
+        .validate_positions()
+        .map_err(|_| ConsensusStorageError::CorruptRecord("snapshot membership position"))?;
     let control_bytes = reader.bytes()?;
     reader.finish()?;
     let control = ControlState::decode_snapshot(&control_bytes)
         .map_err(|_| ConsensusStorageError::CorruptRecord("snapshot control state"))?;
-    if control.cluster_id != cluster_id {
+    if control.cluster_id != descriptor.cluster_id {
         return Err(ConsensusStorageError::CorruptRecord(
             "snapshot cluster mismatch",
         ));
     }
+    let legacy_position = |identity: crate::consensus_model::LogIdentity| {
+        LogId::new(
+            CommittedLeaderId::new(identity.term.0, identity.leader),
+            identity.index.0,
+        )
+    };
+    let last_membership =
+        descriptor
+            .membership
+            .map_or_else(StoredMembership::default, |membership| {
+                StoredMembership::new(
+                    membership.introduced_at.map(legacy_position),
+                    legacy_membership(&membership.membership),
+                )
+            });
     Ok(SnapshotEnvelope {
-        cluster_id,
-        snapshot_id,
-        last_log_id,
+        cluster_id: descriptor.cluster_id,
+        snapshot_id: descriptor.snapshot_id,
+        last_log_id: descriptor.last_included.map(legacy_position),
         last_membership,
         control_bytes,
     })
@@ -1359,9 +1392,13 @@ fn read_optional_bytes<T>(
 
 fn encode_vote(vote: &Vote<NodeId>) -> Vec<u8> {
     let mut writer = DurableWriter::new(*b"BMVOT001");
-    writer.u64(vote.leader_id.term);
-    writer.boolean(vote.leader_id.voted_for().is_some());
-    if let Some(node_id) = vote.leader_id.voted_for() {
+    let hard_state = crate::consensus_model::HardState {
+        term: crate::consensus_model::Term(vote.leader_id.term),
+        voted_for: vote.leader_id.voted_for(),
+    };
+    writer.u64(hard_state.term.0);
+    writer.boolean(hard_state.voted_for.is_some());
+    if let Some(node_id) = hard_state.voted_for {
         writer.raw(node_id.as_bytes());
     }
     writer.boolean(vote.committed);
@@ -1378,10 +1415,16 @@ fn decode_vote(bytes: &[u8]) -> Result<Vote<NodeId>, ConsensusStorageError> {
     };
     let committed = reader.boolean()?;
     reader.finish()?;
+    let hard_state = crate::consensus_model::HardState {
+        term: crate::consensus_model::Term(term),
+        voted_for,
+    };
     let vote = Vote {
         leader_id: LeaderId::new(
-            term,
-            voted_for.ok_or(ConsensusStorageError::CorruptRecord("vote"))?,
+            hard_state.term.0,
+            hard_state
+                .voted_for
+                .ok_or(ConsensusStorageError::CorruptRecord("vote"))?,
         ),
         committed,
     };
@@ -1421,18 +1464,65 @@ fn encode_stored_membership(
     Ok(writer.finish())
 }
 
+fn validate_membership_position(
+    membership: &StoredMembership<NodeId, BasicNode>,
+    boundary: Option<LogId<NodeId>>,
+) -> Result<(), ConsensusStorageError> {
+    let owned = |id: LogId<NodeId>| crate::consensus_model::LogIdentity {
+        term: crate::consensus_model::Term(id.leader_id.term),
+        leader: id.leader_id.node_id,
+        index: crate::consensus_model::LogIndex(id.index),
+    };
+    crate::consensus_model::validate_position_prefix(
+        membership.log_id().map(owned),
+        boundary.map(owned),
+    )
+    .map_err(|_| {
+        ConsensusStorageError::CorruptRecord(
+            "membership position exceeds or conflicts with applied boundary",
+        )
+    })
+}
+
 fn decode_stored_membership(
     bytes: &[u8],
 ) -> Result<StoredMembership<NodeId, BasicNode>, ConsensusStorageError> {
+    let Some(owned) = decode_owned_stored_membership(bytes)? else {
+        return Ok(StoredMembership::default());
+    };
+    let log_id = owned.introduced_at.map(|identity| {
+        LogId::new(
+            CommittedLeaderId::new(identity.term.0, identity.leader),
+            identity.index.0,
+        )
+    });
+    Ok(StoredMembership::new(
+        log_id,
+        legacy_membership(&owned.membership),
+    ))
+}
+
+fn decode_owned_stored_membership(
+    bytes: &[u8],
+) -> Result<Option<crate::consensus_model::StoredMembership>, ConsensusStorageError> {
     let mut reader = DurableReader::new(bytes, *b"BMMEM001", "membership")?;
-    let log_id = if reader.boolean()? {
-        Some(decode_log_id_fields(&mut reader)?)
+    let introduced_at = if reader.boolean()? {
+        Some(decode_owned_log_identity(&mut reader)?)
     } else {
         None
     };
-    let membership = decode_membership_fields(&mut reader)?;
+    let membership = decode_owned_membership(&mut reader)?;
     reader.finish()?;
-    Ok(StoredMembership::new(log_id, membership))
+    match membership {
+        Some(membership) => Ok(Some(crate::consensus_model::StoredMembership {
+            introduced_at,
+            membership,
+        })),
+        None if introduced_at.is_none() => Ok(None),
+        None => Err(ConsensusStorageError::CorruptRecord(
+            "empty positioned membership",
+        )),
+    }
 }
 
 fn encode_membership_fields(
@@ -1455,14 +1545,14 @@ fn encode_membership_fields(
     Ok(())
 }
 
-fn decode_membership_fields(
+fn decode_owned_membership(
     reader: &mut DurableReader<'_>,
-) -> Result<Membership<NodeId, BasicNode>, ConsensusStorageError> {
+) -> Result<Option<crate::consensus_model::Membership>, ConsensusStorageError> {
     let configs = (0..reader.count()?)
         .map(|_| {
             (0..reader.count()?)
                 .map(|_| reader.node_id())
-                .collect::<Result<std::collections::BTreeSet<_>, _>>()
+                .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>()?;
     let nodes = (0..reader.count()?)
@@ -1470,10 +1560,27 @@ fn decode_membership_fields(
             let node_id = reader.node_id()?;
             let address = String::from_utf8(reader.bytes()?)
                 .map_err(|_| ConsensusStorageError::CorruptRecord("membership"))?;
-            Ok::<_, ConsensusStorageError>((node_id, BasicNode::new(address)))
+            Ok::<_, ConsensusStorageError>((node_id, address))
         })
-        .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
-    Ok(Membership::new(configs, nodes))
+        .collect::<Result<Vec<_>, _>>()?;
+    // The legacy empty installation is a representation, never a voting quorum.
+    if configs.is_empty() && nodes.is_empty() {
+        return Ok(None);
+    }
+    crate::consensus_model::Membership::new(configs, nodes)
+        .map(Some)
+        .map_err(|_| ConsensusStorageError::CorruptRecord("membership"))
+}
+
+fn legacy_membership(owned: &crate::consensus_model::Membership) -> Membership<NodeId, BasicNode> {
+    Membership::new(
+        owned.configurations().to_vec(),
+        owned
+            .nodes()
+            .iter()
+            .map(|(id, address)| (*id, BasicNode::new(address.clone())))
+            .collect::<std::collections::BTreeMap<_, _>>(),
+    )
 }
 
 fn encode_entry(entry: &Entry<ControlRaftConfig>) -> Result<Vec<u8>, ConsensusStorageError> {
@@ -1494,31 +1601,77 @@ fn encode_entry(entry: &Entry<ControlRaftConfig>) -> Result<Vec<u8>, ConsensusSt
 }
 
 fn decode_entry(bytes: &[u8]) -> Result<Entry<ControlRaftConfig>, ConsensusStorageError> {
-    let mut reader = DurableReader::new(bytes, *b"BMENT001", "log entry")?;
-    let log_id = decode_log_id_fields(&mut reader)?;
-    let payload = match reader.u8()? {
-        0 => EntryPayload::Blank,
-        1 => EntryPayload::Normal(ControlRequest(reader.bytes()?)),
-        2 => EntryPayload::Membership(decode_membership_fields(&mut reader)?),
-        _ => return Err(ConsensusStorageError::CorruptRecord("log entry")),
+    let owned = decode_owned_entry(bytes)?;
+    let log_id = LogId::new(
+        CommittedLeaderId::new(owned.identity.term.0, owned.identity.leader),
+        owned.identity.index.0,
+    );
+    let payload = match owned.payload {
+        crate::consensus_model::EntryPayload::NoOp => EntryPayload::Blank,
+        crate::consensus_model::EntryPayload::Application(bytes) => {
+            EntryPayload::Normal(ControlRequest(bytes))
+        }
+        crate::consensus_model::EntryPayload::Membership(membership) => {
+            EntryPayload::Membership(legacy_membership(&membership))
+        }
     };
-    reader.finish()?;
     Ok(Entry { log_id, payload })
 }
 
+fn decode_owned_entry(
+    bytes: &[u8],
+) -> Result<crate::consensus_model::Entry, ConsensusStorageError> {
+    use crate::consensus_model::{Entry, EntryPayload};
+    let mut reader = DurableReader::new(bytes, *b"BMENT001", "log entry")?;
+    let identity = decode_owned_log_identity(&mut reader)?;
+    let payload = match reader.u8()? {
+        0 => EntryPayload::NoOp,
+        1 => EntryPayload::Application(reader.bytes()?),
+        2 => EntryPayload::Membership(decode_owned_membership(&mut reader)?.ok_or(
+            ConsensusStorageError::CorruptRecord("empty membership entry"),
+        )?),
+        _ => return Err(ConsensusStorageError::CorruptRecord("log entry")),
+    };
+    reader.finish()?;
+    Ok(Entry { identity, payload })
+}
+
 fn encode_log_id_fields(writer: &mut DurableWriter, log_id: &LogId<NodeId>) {
-    writer.u64(log_id.leader_id.term);
-    writer.raw(log_id.leader_id.node_id.as_bytes());
-    writer.u64(log_id.index);
+    let identity = crate::consensus_model::LogIdentity {
+        term: crate::consensus_model::Term(log_id.leader_id.term),
+        leader: log_id.leader_id.node_id,
+        index: crate::consensus_model::LogIndex(log_id.index),
+    };
+    encode_owned_log_identity(writer, identity);
+}
+
+fn encode_owned_log_identity(
+    writer: &mut DurableWriter,
+    identity: crate::consensus_model::LogIdentity,
+) {
+    writer.u64(identity.term.0);
+    writer.raw(identity.leader.as_bytes());
+    writer.u64(identity.index.0);
 }
 
 fn decode_log_id_fields(
     reader: &mut DurableReader<'_>,
 ) -> Result<LogId<NodeId>, ConsensusStorageError> {
+    let identity = decode_owned_log_identity(reader)?;
     Ok(LogId::new(
-        CommittedLeaderId::new(reader.u64()?, reader.node_id()?),
-        reader.u64()?,
+        CommittedLeaderId::new(identity.term.0, identity.leader),
+        identity.index.0,
     ))
+}
+
+fn decode_owned_log_identity(
+    reader: &mut DurableReader<'_>,
+) -> Result<crate::consensus_model::LogIdentity, ConsensusStorageError> {
+    Ok(crate::consensus_model::LogIdentity {
+        term: crate::consensus_model::Term(reader.u64()?),
+        leader: reader.node_id()?,
+        index: crate::consensus_model::LogIndex(reader.u64()?),
+    })
 }
 
 struct DurableWriter {
@@ -1884,6 +2037,122 @@ mod tests {
 
     fn test_node_id(value: u64) -> NodeId {
         NodeId::from(value)
+    }
+
+    #[test]
+    fn snapshot_rejects_membership_beyond_its_boundary() {
+        let node = NodeId::from(17);
+        let membership = Membership::new(
+            vec![std::collections::BTreeSet::from([node])],
+            std::collections::BTreeMap::from([(node, BasicNode::new("memory://member"))]),
+        );
+        let meta = SnapshotMeta {
+            last_log_id: Some(log_id(1, 0)),
+            last_membership: StoredMembership::new(Some(log_id(1, 1)), membership),
+            snapshot_id: "position-test".into(),
+        };
+        let control = ControlState::new("position-test")
+            .encode_snapshot()
+            .unwrap();
+        let bytes = encode_snapshot_envelope("position-test", &meta, &control).unwrap();
+        assert!(decode_snapshot_envelope(&bytes).is_err());
+    }
+
+    #[test]
+    fn stored_membership_distinguishes_absence_from_positioned_empty_state() {
+        let node = NodeId::from(17);
+        let configuration = Membership::new(
+            vec![std::collections::BTreeSet::from([node])],
+            std::collections::BTreeMap::from([(node, BasicNode::new("memory://member"))]),
+        );
+        for position in [None, Some(log_id(1, 0))] {
+            let stored = StoredMembership::new(position, configuration.clone());
+            let bytes = encode_stored_membership(&stored).unwrap();
+            let owned = decode_owned_stored_membership(&bytes).unwrap().unwrap();
+            assert_eq!(
+                owned.introduced_at.map(|id| id.index.0),
+                position.map(|id| id.index)
+            );
+            assert_eq!(decode_stored_membership(&bytes).unwrap(), stored);
+        }
+        let invalid = StoredMembership::new(Some(log_id(1, 0)), Membership::default());
+        assert!(decode_stored_membership(&encode_stored_membership(&invalid).unwrap()).is_err());
+        assert!(
+            decode_owned_stored_membership(
+                &encode_stored_membership(&StoredMembership::default()).unwrap()
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn owned_entry_preserves_payload_and_rejects_empty_configuration() {
+        let entry = Entry {
+            log_id: log_id(1, 0),
+            payload: EntryPayload::Normal(ControlRequest(vec![0, 255, 42])),
+        };
+        let bytes = encode_entry(&entry).unwrap();
+        let owned = decode_owned_entry(&bytes).unwrap();
+        assert_eq!(owned.identity.index.0, 0);
+        assert_eq!(
+            owned.payload,
+            crate::consensus_model::EntryPayload::Application(vec![0, 255, 42])
+        );
+        assert_eq!(encode_entry(&decode_entry(&bytes).unwrap()).unwrap(), bytes);
+        let empty = Entry {
+            log_id: log_id(1, 0),
+            payload: EntryPayload::Membership(Membership::default()),
+        };
+        assert!(decode_entry(&encode_entry(&empty).unwrap()).is_err());
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(decode_owned_entry(&trailing).is_err());
+    }
+
+    #[test]
+    fn durable_membership_rejects_duplicate_identities() {
+        let node = NodeId::from(17);
+        for (voter_count, record_count) in [(2, 1), (1, 2), (1, 0)] {
+            let mut writer = DurableWriter::new(*b"BMMEM001");
+            writer.boolean(false);
+            writer.count(1).unwrap();
+            writer.count(voter_count).unwrap();
+            for _ in 0..voter_count {
+                writer.raw(node.as_bytes());
+            }
+            writer.count(record_count).unwrap();
+            for _ in 0..record_count {
+                writer.raw(node.as_bytes());
+                writer.bytes(b"memory://member").unwrap();
+            }
+            assert!(decode_stored_membership(&writer.finish()).is_err());
+        }
+        let empty = StoredMembership::default();
+        assert_eq!(
+            decode_stored_membership(&encode_stored_membership(&empty).unwrap()).unwrap(),
+            empty
+        );
+    }
+
+    #[test]
+    fn owned_identity_preserves_legacy_bytes_and_zero_index() {
+        let node = NodeId::from(17);
+        for (term, index) in [(0, 0), (u64::MAX, u64::MAX)] {
+            let legacy = LogId::new(CommittedLeaderId::new(term, node), index);
+            let mut expected = b"BMLOGID1".to_vec();
+            expected.extend_from_slice(&term.to_le_bytes());
+            expected.extend_from_slice(node.as_bytes());
+            expected.extend_from_slice(&index.to_le_bytes());
+            assert_eq!(encode_log_id(&legacy), expected);
+            assert_eq!(decode_log_id(&expected).unwrap(), legacy);
+            let mut reader = DurableReader::new(&expected, *b"BMLOGID1", "log identity").unwrap();
+            let owned = decode_owned_log_identity(&mut reader).unwrap();
+            assert_eq!(owned.term.0, term);
+            assert_eq!(owned.index.0, index);
+            assert_eq!(owned.leader, node);
+            reader.finish().unwrap();
+        }
     }
 
     fn log_id(term: u64, index: u64) -> LogId<NodeId> {

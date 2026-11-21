@@ -727,6 +727,34 @@ impl ControlState {
                 "feature activation floors or feature identity are invalid",
             ));
         }
+        if command.feature == "bounded-control-command-v1" {
+            let membership = membership.ok_or_else(|| {
+                invalid_transition("bounded admission requires consensus membership")
+            })?;
+            if membership.membership().voter_ids().next().is_none() {
+                return Err(invalid_transition("bounded admission requires voters"));
+            }
+            for (node_id, _) in membership.membership().nodes() {
+                let compatible = self
+                    .members
+                    .get(&node_id.to_string())
+                    .is_some_and(|member| {
+                        member.state == ClusterMemberState::Active
+                            && member.cluster_id == self.cluster_id
+                            && member.negotiated_protocol.schema_version
+                                >= u32::from(command.write_schema_floor)
+                            && member
+                                .negotiated_protocol
+                                .features
+                                .contains(&command.feature)
+                    });
+                if !compatible {
+                    return Err(invalid_transition(
+                        "bounded admission requires compatible active consensus members",
+                    ));
+                }
+            }
+        }
         if matches!(
             command.feature.as_str(),
             "principal-bootstrap-v1" | "protocol-refresh-v1"

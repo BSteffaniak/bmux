@@ -806,7 +806,49 @@ where
     ) -> std::pin::Pin<
         Box<dyn Future<Output = Result<ControlResponse, ControlServiceError>> + Send + 'a>,
     > {
-        // Return leader guidance: forwarding through v1 would lose the contract.
+        Box::pin(async move {
+            match self.active()?.mutate_bounded(request.clone()).await {
+                Err(ControlServiceError::NotLeader {
+                    leader_endpoint: Some(endpoint),
+                    ..
+                }) => {
+                    let mut remote = EndpointDispatchClient::new(self.caller.as_ref(), &endpoint);
+                    let protocol = bmux_cluster_plugin_api::cluster_bounded_control_command::client::forwarding_protocol(&mut remote)
+                        .await.map_err(|error| ControlServiceError::RuntimeUnavailable {
+                            reason: format!("bounded forwarding negotiation failed before mutation submission: {error}"),
+                        })?;
+                    if protocol != 1 {
+                        return Err(ControlServiceError::RuntimeUnavailable {
+                            reason: format!(
+                                "unsupported bounded forwarding protocol {protocol}; mutation not submitted"
+                            ),
+                        });
+                    }
+                    bmux_cluster_plugin_api::cluster_bounded_control_command::client::mutate_local(
+                        &mut remote, request,
+                    ).await.map_err(|error| ControlServiceError::RuntimeUnavailable {
+                        reason: format!("bounded leader forwarding failed before a response was received; retry the same CommandId: {error}"),
+                    })?
+                }
+                result => result,
+            }
+        })
+    }
+
+    fn forwarding_protocol<'a>(
+        &'a self,
+    ) -> std::pin::Pin<Box<dyn Future<Output = u16> + Send + 'a>> {
+        Box::pin(async { 1 })
+    }
+
+    fn mutate_local<'a>(
+        &'a self,
+        request: bmux_cluster_plugin_api::cluster_types::ControlCommand,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<ControlResponse, ControlServiceError>> + Send + 'a>,
+    > {
+        // A forwarded receiver never follows another hint, even if leadership
+        // changed while the request was in flight.
         Box::pin(async move { self.active()?.mutate_bounded(request).await })
     }
 }

@@ -19,6 +19,7 @@ pub(crate) mod attach_state;
 pub mod capability_publication;
 pub(crate) mod commands;
 pub mod consensus_membership;
+pub mod consensus_model;
 pub mod consensus_network;
 pub mod consensus_runtime;
 pub mod consensus_storage;

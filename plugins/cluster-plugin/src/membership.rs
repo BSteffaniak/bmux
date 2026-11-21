@@ -40,6 +40,7 @@ const CLUSTER_PROTOCOL_FEATURES: &[&str] = &[
     "node-possession-proof-v1",
     "single-use-enrollment-v1",
     ATOMIC_LAYOUT_FEATURE,
+    "bounded-control-command-v1",
     "principal-bootstrap-v1",
 ];
 

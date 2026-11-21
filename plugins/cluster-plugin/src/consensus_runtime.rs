@@ -1088,15 +1088,19 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn bounded_submission_requires_activation_and_preserves_legacy_path() {
         let root = TempDir::new().unwrap();
+        let identity = crate::membership::NodeIdentity::new_for_test(93);
+        let cluster: crate::membership::ClusterId = "cluster:00000000-0000-0000-0000-000000000093"
+            .parse()
+            .unwrap();
         let node = ConsensusNode::start(
             root.path(),
-            "bounded-test",
-            NodeId::from(93),
+            &cluster.to_string(),
+            *identity.node_id(),
             InMemoryNetworkFactory::default(),
         )
         .await
         .unwrap();
-        node.initialize_single(NodeId::from(93), "memory://bounded")
+        node.initialize_single(*identity.node_id(), "memory://bounded")
             .await
             .unwrap();
         wait_for_leader(&[&node]).await;
@@ -1107,6 +1111,61 @@ pub(crate) mod tests {
         assert_eq!(node.persisted_control_state().unwrap().revision, 0);
         // The old path does not implicitly opt into the new feature.
         node.mutate(command(1, 0)).await.unwrap();
+        assert!(matches!(
+            node.activate_feature(FeatureActivationCommand {
+                principal_id: "principal:test".into(),
+                command_id: CommandId {
+                    value: uuid::Uuid::from_u128(898)
+                },
+                issued_at_unix_ms: 0,
+                expected_control_revision: 1,
+                read_schema_floor: 2,
+                write_schema_floor: 2,
+                feature: "bounded-control-command-v1".into(),
+            })
+            .await,
+            Err(ControlServiceError::Rejected { .. })
+        ));
+        let member = crate::membership::issue_test_member(
+            &identity,
+            cluster,
+            &identity,
+            "tls://127.0.0.1:49993",
+            crate::membership::initializer_capabilities(),
+            42,
+        );
+        let mut publish = command(899, 0);
+        publish.request = ControlCommandRequest::UpsertMember { member };
+        node.mutate(publish).await.unwrap();
+        node.activate_feature(FeatureActivationCommand {
+            principal_id: "principal:test".into(),
+            command_id: CommandId {
+                value: uuid::Uuid::from_u128(900),
+            },
+            issued_at_unix_ms: 0,
+            expected_control_revision: 2,
+            read_schema_floor: 2,
+            write_schema_floor: 2,
+            feature: "bounded-control-command-v1".into(),
+        })
+        .await
+        .unwrap();
+        let accepted = node.mutate_bounded(command(2, 2)).await.unwrap();
+        let retried = node.mutate_bounded(command(2, 2)).await.unwrap();
+        assert_eq!(accepted, retried);
+        let revision = node.persisted_control_state().unwrap().revision;
+        let mut oversized = command(3, 3);
+        oversized.request = ControlCommandRequest::CompleteWorkflow {
+            original_command_id: CommandId {
+                value: uuid::Uuid::from_u128(99),
+            },
+            response: vec![0; 1_048_576],
+        };
+        assert!(matches!(
+            node.mutate_bounded(oversized).await,
+            Err(ControlServiceError::Rejected { .. })
+        ));
+        assert_eq!(node.persisted_control_state().unwrap().revision, revision);
         node.shutdown().await.unwrap();
     }
 

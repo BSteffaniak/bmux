@@ -17,6 +17,7 @@ struct ForwardingCaller {
     leader: Mutex<Option<Arc<ControlServiceHandle<Self>>>>,
     forwarded: Mutex<Vec<String>>,
     drop_next_mutation_response: std::sync::atomic::AtomicBool,
+    incompatible_protocol: std::sync::atomic::AtomicBool,
 }
 
 impl Default for ForwardingCaller {
@@ -36,11 +37,54 @@ impl Default for ForwardingCaller {
             leader: Mutex::default(),
             forwarded: Mutex::default(),
             drop_next_mutation_response: std::sync::atomic::AtomicBool::new(false),
+            incompatible_protocol: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
 
 impl ForwardingCaller {
+    fn bounded_forwarding_response(
+        &self,
+        leader: &ControlServiceHandle<Self>,
+        runtime: &tokio::runtime::Handle,
+        operation: &str,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, Box<PluginError>> {
+        use bmux_cluster_plugin_api::cluster_bounded_control_command::{
+            ClusterBoundedControlCommandService, client::MutateLocalRequest,
+        };
+        if operation == "forwarding-protocol" {
+            let protocol = if self
+                .incompatible_protocol
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                0u16
+            } else {
+                tokio::task::block_in_place(|| {
+                    runtime.block_on(ClusterBoundedControlCommandService::forwarding_protocol(
+                        leader,
+                    ))
+                })
+            };
+            return Ok(encode_service_message(&protocol)?);
+        }
+        let request: MutateLocalRequest = decode_service_message(payload)?;
+        let response = tokio::task::block_in_place(|| {
+            runtime.block_on(ClusterBoundedControlCommandService::mutate_local(
+                leader,
+                request.request,
+            ))
+        });
+        if self
+            .drop_next_mutation_response
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Box::new(PluginError::UnsupportedHostOperation {
+                operation: "injected bounded response loss",
+            }));
+        }
+        Ok(encode_service_message(&response)?)
+    }
     fn storage_get_for_test(&self, payload: &[u8]) -> Result<Vec<u8>, Box<PluginError>> {
         let request: bmux_plugin_sdk::StorageGetRequest = decode_service_message(payload)?;
         Ok(encode_service_message(
@@ -84,6 +128,14 @@ impl ForwardingCaller {
     fn set_leader(&self, leader: Arc<ControlServiceHandle<Self>>) {
         *self.leader.lock().unwrap() = Some(leader);
     }
+}
+
+fn forwarding_runtime() -> Result<tokio::runtime::Handle, Box<PluginError>> {
+    tokio::runtime::Handle::try_current().map_err(|_| {
+        Box::new(PluginError::UnsupportedHostOperation {
+            operation: "missing runtime",
+        })
+    })
 }
 
 impl ServiceCaller for ForwardingCaller {
@@ -130,11 +182,7 @@ impl ServiceCaller for ForwardingCaller {
                 .ok_or(PluginError::UnsupportedHostOperation {
                     operation: "missing leader",
                 })?;
-        let runtime = tokio::runtime::Handle::try_current().map_err(|_| {
-            PluginError::UnsupportedHostOperation {
-                operation: "missing runtime",
-            }
-        })?;
+        let runtime = forwarding_runtime().map_err(|error| *error)?;
         let response_payload = match (
             invocation.interface_id.as_str(),
             invocation.operation.as_str(),
@@ -155,6 +203,17 @@ impl ServiceCaller for ForwardingCaller {
                 }
                 bmux_plugin_sdk::encode_service_message(&response)?
             }
+            (
+                "cluster-bounded-control-command/v1",
+                operation @ ("forwarding-protocol" | "mutate-local"),
+            ) => self
+                .bounded_forwarding_response(
+                    leader.as_ref(),
+                    &runtime,
+                    operation,
+                    &invocation.payload,
+                )
+                .map_err(|error| *error)?,
             ("cluster-peer-auth/v1", "challenge") => {
                 let request: bmux_cluster_plugin_api::cluster_peer_auth::client::ChallengeRequest =
                     decode_service_message(&invocation.payload)?;
@@ -367,7 +426,7 @@ async fn follower_forwards_mutations_and_linearizable_reads_once() {
         registry.clone(),
     ));
     caller.set_leader(leader_service);
-    let follower_service = ControlServiceHandle::new(caller.clone(), follower_id, registry);
+    let follower_service = ControlServiceHandle::new(caller.clone(), follower_id, registry.clone());
 
     let before = leader.read_linearizable_view().await.unwrap();
     let mut metadata_bypass = command(99, 999);
@@ -427,6 +486,159 @@ async fn follower_forwards_mutations_and_linearizable_reads_once() {
         ]
     );
 
+    assert_bounded_forwarding(&caller, &follower_service, &leader).await;
+    activate_bounded_members(&leader).await;
+    assert_activated_forwarding(&caller, &follower_service, &leader).await;
+    assert_incompatible_forwarding(&caller, &follower_service).await;
+    assert_redirect_stops(&caller, &follower_service, follower_id, registry).await;
     leader.shutdown().await.unwrap();
     follower.shutdown().await.unwrap();
+}
+
+fn bounded_invocations(count: usize) -> Vec<String> {
+    (0..count)
+        .flat_map(|_| ["forwarding-protocol", "mutate-local"])
+        .map(|operation| format!("cluster-bounded-control-command/v1/{operation}"))
+        .collect()
+}
+
+async fn assert_incompatible_forwarding(
+    caller: &ForwardingCaller,
+    service: &ControlServiceHandle<ForwardingCaller>,
+) {
+    caller.forwarded.lock().unwrap().clear();
+    caller
+        .incompatible_protocol
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let result = bmux_cluster_plugin_api::cluster_bounded_control_command::ClusterBoundedControlCommandService::mutate(service, command(800, 800)).await;
+    assert!(
+        matches!(result, Err(ControlServiceError::RuntimeUnavailable { reason }) if reason.contains("unsupported bounded forwarding protocol"))
+    );
+    assert_eq!(
+        *caller.forwarded.lock().unwrap(),
+        vec!["cluster-bounded-control-command/v1/forwarding-protocol".to_string()]
+    );
+    caller
+        .incompatible_protocol
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+async fn assert_redirect_stops(
+    caller: &Arc<ForwardingCaller>,
+    service: &ControlServiceHandle<ForwardingCaller>,
+    follower_id: NodeId,
+    registry: ConsensusNodeRegistry,
+) {
+    caller.set_leader(Arc::new(ControlServiceHandle::new(
+        caller.clone(),
+        follower_id,
+        registry,
+    )));
+    caller.forwarded.lock().unwrap().clear();
+    // Route the forwarded hop back to a follower with the same leader hint.
+    // It must return guidance instead of recursively issuing another RPC.
+    let result = bmux_cluster_plugin_api::cluster_bounded_control_command::ClusterBoundedControlCommandService::mutate(service, command(700, 700)).await;
+    assert!(matches!(result, Err(ControlServiceError::NotLeader { .. })));
+    assert_eq!(*caller.forwarded.lock().unwrap(), bounded_invocations(1));
+}
+
+async fn activate_bounded_members(leader: &ConsensusNode) {
+    let issuer = crate::membership::NodeIdentity::new_for_test(51);
+    for seed in [51, 52] {
+        let identity = crate::membership::NodeIdentity::new_for_test(seed);
+        let member = crate::membership::issue_test_member(
+            &issuer,
+            leader.cluster_id().parse().unwrap(),
+            &identity,
+            &format!("tls://127.0.0.1:{}", 49000 + seed),
+            crate::membership::initializer_capabilities(),
+            42,
+        );
+        let mut publish = command(u128::from(seed), 0);
+        publish.request = ControlCommandRequest::UpsertMember { member };
+        leader.mutate(publish).await.unwrap();
+    }
+    leader
+        .activate_feature(crate::control_codec::FeatureActivationCommand {
+            principal_id: "principal:forward".into(),
+            command_id: CommandId {
+                value: uuid::Uuid::from_u128(500),
+            },
+            issued_at_unix_ms: 500,
+            expected_control_revision: leader.persisted_control_state().unwrap().revision,
+            read_schema_floor: 2,
+            write_schema_floor: 2,
+            feature: "bounded-control-command-v1".into(),
+        })
+        .await
+        .unwrap();
+}
+
+async fn assert_activated_forwarding(
+    caller: &ForwardingCaller,
+    service: &ControlServiceHandle<ForwardingCaller>,
+    leader: &ConsensusNode,
+) {
+    use bmux_cluster_plugin_api::cluster_bounded_control_command::ClusterBoundedControlCommandService;
+    caller.forwarded.lock().unwrap().clear();
+    caller
+        .drop_next_mutation_response
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(
+        ClusterBoundedControlCommandService::mutate(service, command(600, 600)).await,
+        Err(ControlServiceError::RuntimeUnavailable { .. })
+    ));
+    let revision = leader.persisted_control_state().unwrap().revision;
+    let response = ClusterBoundedControlCommandService::mutate(service, command(600, 600))
+        .await
+        .unwrap();
+    assert_eq!(response.control_revision, revision);
+    assert_eq!(leader.persisted_control_state().unwrap().revision, revision);
+    let mut oversized = command(601, 0);
+    oversized.request = ControlCommandRequest::CompleteWorkflow {
+        original_command_id: CommandId {
+            value: uuid::Uuid::from_u128(600),
+        },
+        response: vec![0; 1_048_576],
+    };
+    assert!(matches!(
+        ClusterBoundedControlCommandService::mutate(service, oversized).await,
+        Err(ControlServiceError::Rejected { .. })
+    ));
+    assert_eq!(leader.persisted_control_state().unwrap().revision, revision);
+    assert_eq!(*caller.forwarded.lock().unwrap(), bounded_invocations(3));
+}
+
+async fn assert_bounded_forwarding(
+    caller: &ForwardingCaller,
+    follower_service: &ControlServiceHandle<ForwardingCaller>,
+    leader: &ConsensusNode,
+) {
+    caller.forwarded.lock().unwrap().clear();
+    let bounded = || {
+        bmux_cluster_plugin_api::cluster_bounded_control_command::ClusterBoundedControlCommandService::mutate(follower_service, command(3, 300))
+    };
+    assert!(matches!(
+        bounded().await,
+        Err(ControlServiceError::Rejected { .. })
+    ));
+    caller
+        .drop_next_mutation_response
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(matches!(
+        bounded().await,
+        Err(ControlServiceError::RuntimeUnavailable { .. })
+    ));
+    assert!(matches!(
+        bounded().await,
+        Err(ControlServiceError::Rejected { .. })
+    ));
+    assert_eq!(*caller.forwarded.lock().unwrap(), bounded_invocations(3),);
+    assert!(
+        !leader
+            .persisted_control_state()
+            .unwrap()
+            .workspaces
+            .contains_key(&uuid::Uuid::from_u128(300))
+    );
 }

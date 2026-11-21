@@ -766,7 +766,14 @@ interface cluster-control-command {
 @capability(CLUSTER_WRITE)
 @interface-version(1)
 interface cluster-bounded-control-command {
+    // Protocol 1 guarantees the canonical 1 MiB admission limit and a
+    // non-forwarding mutate-local operation. Unknown protocols are rejected.
+    command forwarding-protocol() -> u16;
+    // At most one forwarded hop. A missing local operation is an explicit
+    // compatibility error, never permission to fall back to mutate or v1.
     command mutate(request: cluster-types.control-command) -> result<cluster-types.control-response, cluster-types.control-service-error>;
+    // Same admission and authorization, but never forwards to another node.
+    command mutate-local(request: cluster-types.control-command) -> result<cluster-types.control-response, cluster-types.control-service-error>;
 }
 
 @capability(CLUSTER_WRITE)
