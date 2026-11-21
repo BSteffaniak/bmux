@@ -574,7 +574,7 @@ Each phase ends with its acceptance check passing.
 | 12 | Scheduler and trace view (C2) | bmux | Shows live thread states and decisions for a running PTY simulation. |
 | 13 | Live PTY views (C3) | bmux | The terminal screens of fake programs render live. The process tree and signal log match the oracle. |
 | 14 | Replay debugger (C4) and replay control in simvar (A6) | both | Step and seek through a failing seed. A paused-and-resumed replay has the same trace hash as an uninterrupted run. |
-| 15 | Next targets: `switchy_async` `spawn_blocking` on simulated threads, then the pane runtime's reader loop and session control | both | Separate plan. |
+| 15 | Next targets: `switchy_async` `spawn_blocking` on simulated threads, then the pane runtime's reader loop and session control | both | Separate plan: [pane runtime](pane-runtime-deterministic-simulation-plan.md). |
 
 Phases 0–2 (MoosicBox) and phase 3 can proceed in parallel. Phase 3 is a pure
 refactor and is useful on its own. The TUI comes last (phases 10–14): until
