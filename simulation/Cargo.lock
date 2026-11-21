@@ -1872,6 +1872,9 @@ name = "pane-runtime"
 version = "0.0.0"
 dependencies = [
  "bmux_pane_runtime_plugin",
+ "bmux_simvar_tui",
+ "bmux_tui",
+ "sim_support",
  "simvar",
  "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "switchy_pty",
@@ -2029,8 +2032,7 @@ version = "0.0.0"
 dependencies = [
  "bmux_pty",
  "bmux_simvar_tui",
- "bmux_tui",
- "bmux_tui_components",
+ "sim_support",
  "simvar",
  "switchy_pty",
  "switchy_simulation",
@@ -2357,6 +2359,19 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "sim_support"
+version = "0.0.0"
+dependencies = [
+ "bmux_simvar_tui",
+ "bmux_tui",
+ "bmux_tui_components",
+ "simvar",
+ "switchy_pty",
+ "switchy_simulation",
+ "switchy_thread",
+]
 
 [[package]]
 name = "simd-adler32"

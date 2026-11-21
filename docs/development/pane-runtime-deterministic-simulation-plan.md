@@ -211,6 +211,11 @@ Phases 15.1–15.5 as built (2026-11-21):
   `bmux_local_terminal` (generic over its stream, on `switchy_async`), which
   the CLI serves on its socket and `simulation/local-terminal` serves over
   in-memory duplex streams through attach, detach and reattach.
+- **15.7 (bmux):** what the pty simulation's dashboard support was became
+  `simulation/support` (`sim_support`), shared by the simulations;
+  `cargo sim pane-runtime --tui` shows the scheduler, the invariants, a Panes
+  tab and the kernel's processes, signals and terminal screens, with pausing,
+  stepping, going back and breaking on failures.
 - **Not yet:** crash recovery and restart in the simulation (a detached host
-  writes no crash records), and a `--tui`/`--regression` mode for these
-  simulations.
+  writes no crash records), regression seeds for the new simulations, and
+  files on `switchy_fs`.

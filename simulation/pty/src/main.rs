@@ -11,9 +11,8 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
-use std::{path::Path, process::Command, sync::Arc};
+use std::{path::Path, process::Command};
 
-use bmux_simvar_tui::Exit;
 use pty::{PtyBootstrap, telemetry};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -43,32 +42,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Run the simulation on another thread while a dashboard shows it, then return its results.
-/// Going back in a run replaces this process with a rerun of its seed.
+/// Run the simulation while a dashboard shows it, then return its results.
 fn with_tui() -> Result<Vec<simvar::SimResult>, Box<dyn std::error::Error>> {
-    let replay = bmux_simvar_tui::replay_control();
-    telemetry::enable(Arc::clone(&replay));
-    let (observer, events) = bmux_simvar_tui::observer();
-    simvar::add_observer(observer);
-    simvar::set_quiet(true);
-    let simulation = std::thread::spawn(|| {
-        simvar::run_simulation(PtyBootstrap).map_err(|error| error.to_string())
-    });
-    let exit = bmux_simvar_tui::Dashboard::new(
+    sim_support::run_with_tui(
+        PtyBootstrap,
         "bmux_pty simulation",
-        events,
         vec![Box::new(telemetry::PtyPanel::default())],
-        Some(replay),
+        telemetry::extra,
     )
-    .run()?;
-    if let Exit::Seek { seed, decision } = exit {
-        return Err(bmux_simvar_tui::seek(seed, decision).into());
-    }
-    // The user left: start no more runs, and let the current ones finish.
-    simvar::end_sim();
-    Ok(simulation
-        .join()
-        .map_err(|_| "the simulation thread panicked")??)
 }
 
 /// Run every seed in `regression-seeds` (the first word of each line that is not blank or a

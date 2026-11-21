@@ -18,11 +18,14 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
+pub mod telemetry;
+
 use std::{collections::BTreeMap, io, time::Duration};
 
 use bmux_pane_runtime_plugin::simulation::{Pane, Panes};
 use simvar::{Sim, SimBootstrap, SimConfig};
 use switchy_pty::simulator::{self, Config, Faults, Personality, Process, ProcessState};
+use telemetry::{Board, PaneView};
 
 /// Simulated time the workload has to finish in; more means a livelock.
 const BUDGET: Duration = Duration::from_secs(300);
@@ -120,6 +123,15 @@ fn trace_decisions() {
     )));
 }
 
+/// Record that an invariant failed with `message` (which starts with the invariant's number):
+/// as a violation of the run, in the dashboard's invariants, and to a dashboard breaking on
+/// failures (which may pause here).
+fn violated(violations: &mut Vec<String>, message: String) {
+    Board::failed(&message);
+    sim_support::failure(&message);
+    violations.push(message);
+}
+
 /// What a run did, recorded in its trace (and printed with `PANE_RUNTIME_SIM_STATS`).
 #[derive(Debug, Default)]
 struct Stats {
@@ -200,18 +212,29 @@ impl Workload {
         match self.panes.open(rows, cols).await {
             Ok(pane) => {
                 let Some(pid) = self.panes.pid(pane) else {
-                    self.violations
-                        .push("1. an opened pane has no process".into());
+                    violated(
+                        &mut self.violations,
+                        "1. an opened pane has no process".into(),
+                    );
                     return;
                 };
                 // 1. Its program runs and leads its own session.
+                Board::checked(1);
                 match running(pid) {
                     Some((session, _)) if session == pid => {}
-                    other => self.violations.push(format!(
-                        "1. pane process {pid} does not lead its own session: {other:?}"
-                    )),
+                    other => violated(
+                        &mut self.violations,
+                        format!("1. pane process {pid} does not lead its own session: {other:?}"),
+                    ),
                 }
                 self.stats.opened += 1;
+                Board::pane(PaneView {
+                    pane: format!("{pane:?}"),
+                    pid,
+                    size: (rows, cols),
+                    typed: 0,
+                    open: true,
+                });
                 self.open.insert(
                     pane,
                     Opened {
@@ -220,9 +243,10 @@ impl Workload {
                     },
                 );
             }
-            Err(error) => self
-                .violations
-                .push(format!("1. opening a pane failed: {error:#}")),
+            Err(error) => violated(
+                &mut self.violations,
+                format!("1. opening a pane failed: {error:#}"),
+            ),
         }
     }
 
@@ -236,6 +260,7 @@ impl Workload {
             if self.panes.input(pane, format!("{line}\r").as_bytes()) {
                 self.stats.typed += 1;
                 opened.typed.push(line);
+                Board::typed(&format!("{pane:?}"));
             }
         }
     }
@@ -251,7 +276,9 @@ impl Workload {
             return;
         }
         self.stats.resized += 1;
+        Board::resized(&format!("{pane:?}"), (rows, cols));
         // 3. The terminal ends up the requested size.
+        Board::checked(3);
         let sized = settle(|| {
             let terminal = running(pid).and_then(|(_, terminal)| terminal);
             simulator::snapshot().terminals.iter().any(|t| {
@@ -261,9 +288,10 @@ impl Workload {
         })
         .await;
         if !sized && running(pid).is_some() {
-            self.violations.push(format!(
-                "3. pane process {pid}'s terminal never became {rows}x{cols}"
-            ));
+            violated(
+                &mut self.violations,
+                format!("3. pane process {pid}'s terminal never became {rows}x{cols}"),
+            );
         }
     }
 
@@ -272,6 +300,7 @@ impl Workload {
         if let Some((pane, opened)) = self.open.pop_first() {
             self.stats.closed += 1;
             close(&mut self.panes, pane, &opened, &mut self.violations).await;
+            Board::closed(&format!("{pane:?}"));
         }
     }
 
@@ -283,7 +312,8 @@ impl Workload {
         self.stats.record();
         let _ = self.panes.take_exits();
         simulator::kill_all();
-        // Let the panes' threads see their processes end before the run does.
+        // 5. Let the panes' threads see their processes end before the run does.
+        Board::checked(5);
         let drained = settle(|| {
             switchy_thread::simulator::try_scheduler()
                 .is_none_or(|scheduler| !scheduler.others_alive())
@@ -298,9 +328,10 @@ impl Workload {
                 .filter(|thread| thread.state != switchy_thread::simulator::ThreadState::Finished)
                 .map(|thread| format!("{} ({:?})", thread.name, thread.state))
                 .collect();
-            self.violations.push(format!(
-                "5. threads still running after every pane closed: {left:?}"
-            ));
+            violated(
+                &mut self.violations,
+                format!("5. threads still running after every pane closed: {left:?}"),
+            );
         }
         if self.violations.is_empty() {
             Ok(())
@@ -318,6 +349,7 @@ impl Workload {
 pub async fn run_workload() -> Result<(), Vec<String>> {
     switchy_time::simulator::set_step_multiplier(1);
     trace_decisions();
+    sim_support::watch_run();
     simulator::configure(Config {
         personality: Personality::Linux,
         pid_reuse: 0.3,
@@ -335,9 +367,10 @@ pub async fn run_workload() -> Result<(), Vec<String>> {
     };
     for _ in 0..5 + draw(25) {
         if switchy_time::Instant::now() >= deadline {
-            workload.violations.push(format!(
-                "5. the workload did not finish within {BUDGET:?} (livelock?)"
-            ));
+            violated(
+                &mut workload.violations,
+                format!("5. the workload did not finish within {BUDGET:?} (livelock?)"),
+            );
             break;
         }
         match draw(6) {
@@ -354,20 +387,28 @@ pub async fn run_workload() -> Result<(), Vec<String>> {
 /// Close `pane`, checking invariants 2 and 4.
 async fn close(panes: &mut Panes, pane: Pane, opened: &Opened, violations: &mut Vec<String>) {
     // 2. Every typed line reached the program, in order (unless it ended meanwhile).
+    Board::checked(2);
     let pid = opened.pid;
     let reached = settle(|| answered(pid, &opened.typed) || running(pid).is_none()).await;
     if !reached {
-        violations.push(format!(
-            "2. pane process {pid} never answered all of {:?}",
-            opened.typed
-        ));
+        violated(
+            violations,
+            format!(
+                "2. pane process {pid} never answered all of {:?}",
+                opened.typed
+            ),
+        );
     }
     let session = running(pid).map(|(session, _)| session);
     match panes.close(pane).await {
         Ok(closed) => {
             // 4. Closing drains, cleans up, and leaves nothing running in the session.
+            Board::checked(4);
             if closed.cleanup_failed {
-                violations.push(format!("4. closing pane process {pid} failed to clean up"));
+                violated(
+                    violations,
+                    format!("4. closing pane process {pid} failed to clean up"),
+                );
             }
             if let Some(session) = session {
                 let survivors: Vec<u32> = simulator::snapshot()
@@ -377,12 +418,15 @@ async fn close(panes: &mut Panes, pane: Pane, opened: &Opened, violations: &mut 
                     .map(|p| p.pid)
                     .collect();
                 if !survivors.is_empty() {
-                    violations.push(format!(
-                        "4. session {session} still runs {survivors:?} after its pane closed"
-                    ));
+                    violated(
+                        violations,
+                        format!(
+                            "4. session {session} still runs {survivors:?} after its pane closed"
+                        ),
+                    );
                 }
             }
         }
-        Err(error) => violations.push(format!("4. closing a pane failed: {error:#}")),
+        Err(error) => violated(violations, format!("4. closing a pane failed: {error:#}")),
     }
 }

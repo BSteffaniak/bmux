@@ -2,7 +2,7 @@
 # `cargo sim <name>`. A workspace of its own (excluded from the main one) so the
 # `simulator` features its members enable never reach bmux's real builds.
 [workspace]
-members  = ["local-terminal", "pane-runtime", "pty"]
+members  = ["local-terminal", "pane-runtime", "pty", "support"]
 resolver = "3"
 
 [workspace.package]
@@ -13,6 +13,7 @@ repository = "https://github.com/BSteffaniak/bmux"
 version    = "0.0.0"
 
 [workspace.dependencies]
+sim_support = { path = "support" }
 bmux_local_terminal = { path = "../packages/local-terminal", default-features = false }
 bmux_pane_runtime_plugin = { path = "../plugins/pane-runtime-plugin", default-features = false }
 bmux_pty            = { path = "../packages/pty", default-features = false }

@@ -1,0 +1,22 @@
+[package]
+description = "Telemetry and dashboards shared by bmux's simulations"
+edition     = { workspace = true }
+license     = { workspace = true }
+name        = "sim_support"
+publish     = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_simvar_tui     = { workspace = true }
+bmux_tui            = { workspace = true }
+bmux_tui_components = { workspace = true, features = ["terminal-view"] }
+simvar              = { workspace = true, features = ["random", "thread", "time"] }
+switchy_pty         = { workspace = true, features = ["simulator"] }
+switchy_simulation  = { workspace = true }
+switchy_thread      = { workspace = true, features = ["simulator"] }
+
+[features]
+default = []
+
+fail-on-warnings = []

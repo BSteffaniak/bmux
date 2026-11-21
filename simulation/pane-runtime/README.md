@@ -26,9 +26,15 @@ cargo sim pane-runtime                                       # one random run
 SIMULATOR_RUNS=300 SIMULATOR_VERIFY_DETERMINISM=1 cargo sim pane-runtime
 SIMULATOR_SEED=42 SIMULATOR_RUNS=1 cargo sim pane-runtime    # replay one run
 PANE_RUNTIME_SIM_STATS=1 cargo sim pane-runtime              # what each run did
+SIMULATOR_SEED=42 SIMULATOR_RUNS=1 cargo sim pane-runtime --tui   # watch it
 PANE_RUNTIME_SIM_TRACE=1 SIMULATOR_SEED=42 SIMULATOR_RUNS=1 \
   SIMULATOR_VERIFY_DETERMINISM=1 cargo sim pane-runtime      # every decision
 ```
+
+`--tui` shows the runs in the same dashboard as the pty simulation (scheduler,
+invariants, pause, step, go back, breakpoints), with a Panes tab (each pane's
+process, size, lines typed and state) and the simulated kernel's processes,
+signals and terminal screens.
 
 `PANE_RUNTIME_SIM_TRACE` prints every scheduling decision, so diffing a run
 against its replay shows where they part when a seed does not replay;

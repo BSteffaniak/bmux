@@ -38,7 +38,10 @@ cargo sim pty --regression                         # its pinned seeds
 | `SIMULATOR_SHRINK` | `1`: shrink a failing run's thread schedule |
 | `SIMULATOR_SCHEDULE` | Replay a thread schedule `SIMULATOR_SHRINK` printed |
 
-Each simulation documents its own variables and flags. A simulation's `--tui`
+Each simulation documents its own variables and flags. `support` (crate
+`sim_support`) holds what they share: scheduler and kernel telemetry, pausing
+at decisions and failures, the processes-and-terminals panel, and
+`run_with_tui`. A simulation's `--tui`
 dashboard (`bmux_simvar_tui`) pauses, steps, runs to decisions, breaks on
 conditions and goes back; see the [pty simulation](pty/README.md).
 
