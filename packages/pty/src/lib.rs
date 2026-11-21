@@ -28,14 +28,14 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, mpsc};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use switchy_thread::sync::atomic::{AtomicBool, Ordering};
+use switchy_thread::sync::{Arc, Mutex, PoisonError, mpsc};
+
+pub use switchy_pty::PtySize;
 #[cfg(any(unix, windows))]
-mod pair;
-#[cfg(any(unix, windows))]
-pub use pair::{
+pub use switchy_pty::{
     ChildExit, PtyChild, PtyChildKiller, PtyInput, PtyMaster, PtyPair, PtyReader, PtySlave,
     SpawnCommand,
 };
@@ -50,26 +50,6 @@ pub const DEFAULT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 /// How often blocked reads and writes look up whether they should stop.
 #[cfg(unix)]
 const POLL: Duration = Duration::from_millis(10);
-
-/// Terminal size in character cells.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PtySize {
-    /// Columns.
-    pub cols: u16,
-    /// Rows.
-    pub rows: u16,
-}
-
-impl PtySize {
-    /// A size of `cols` columns by `rows` rows; zero is raised to one.
-    #[must_use]
-    pub const fn new(cols: u16, rows: u16) -> Self {
-        Self {
-            cols: if cols == 0 { 1 } else { cols },
-            rows: if rows == 0 { 1 } else { rows },
-        }
-    }
-}
 
 /// How a process ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -107,6 +87,20 @@ impl PtyExit {
         self.complete
     }
 
+    #[cfg(unix)]
+    fn from_child_exit(exit: &ChildExit) -> Self {
+        Self {
+            code: if exit.signal_number().is_some() {
+                None
+            } else {
+                Some(i32::from_ne_bytes(exit.exit_code().to_ne_bytes()))
+            },
+            signal: exit.signal_number(),
+            complete: true,
+        }
+    }
+
+    #[cfg(not(unix))]
     fn from_status(status: std::process::ExitStatus) -> Self {
         #[cfg(unix)]
         let signal = std::os::unix::process::ExitStatusExt::signal(&status);
@@ -255,6 +249,28 @@ impl PtyCommand {
         platform::spawn(&self, size)
     }
 
+    /// The process to start on a terminal: the caller's environment with this command's
+    /// changes, and `TERM` unless set.
+    #[cfg(unix)]
+    fn spawn_command(&self) -> SpawnCommand {
+        let mut command = SpawnCommand::new(&self.program);
+        command.args(&self.args);
+        if let Some(cwd) = &self.cwd {
+            command.cwd(cwd);
+        }
+        if !self.env.iter().any(|(key, _)| key == "TERM") {
+            command.env("TERM", "xterm-256color");
+        }
+        for (key, value) in &self.env {
+            match value {
+                Some(value) => command.env(key, value),
+                None => command.env_remove(key),
+            };
+        }
+        command
+    }
+
+    #[cfg(not(unix))]
     fn std_command(&self) -> std::process::Command {
         let mut command = std::process::Command::new(&self.program);
         command.args(&self.args);
@@ -528,10 +544,11 @@ impl PtyWriter {
 
 /// Write `input` to the child's standard input on its own thread (so a full pipe cannot
 /// block the caller), then close it.
+#[cfg(not(unix))]
 fn feed_input(child: &mut std::process::Child, input: Option<&Vec<u8>>) {
     if let (Some(input), Some(mut pipe)) = (input, child.stdin.take()) {
         let input = input.clone();
-        std::thread::spawn(move || {
+        spawn_named("bmux-pty-input", move || {
             use std::io::Write as _;
             let _ = pipe.write_all(&input);
         });
@@ -568,7 +585,7 @@ impl Events {
         done: mpsc::Sender<bool>,
     ) {
         let events = self.clone();
-        std::thread::spawn(move || {
+        spawn_named("bmux-pty-reader", move || {
             let mut buffer = vec![0; CHUNK];
             loop {
                 match reader.read(&mut buffer) {
@@ -593,15 +610,14 @@ impl Events {
 #[cfg(unix)]
 mod platform {
     use std::io;
-    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
-    use std::os::unix::process::CommandExt;
-    use std::process::Stdio;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex, PoisonError, mpsc};
+
+    use switchy_pty::{PtyInput, PtyMaster, PtyPair, PtyPipeReader, PtyReader, Signal, Stdio};
+    use switchy_thread::sync::atomic::{AtomicBool, Ordering};
+    use switchy_thread::sync::{Arc, Mutex, PoisonError, mpsc};
 
     use super::{
-        Events, Exit, PtyCapabilities, PtyCommand, PtyControl, PtyEvent, PtyProcess, PtySize,
-        PtyWriter, QUEUE,
+        Events, Exit, POLL, PtyCapabilities, PtyCommand, PtyControl, PtyEvent, PtyExit, PtyProcess,
+        PtySize, PtyWriter, QUEUE, spawn_named,
     };
 
     pub const CAPABILITIES: PtyCapabilities = PtyCapabilities {
@@ -614,7 +630,7 @@ mod platform {
     #[derive(Debug)]
     pub struct Control {
         /// The terminal's near side, non-blocking.
-        master: Arc<OwnedFd>,
+        master: Arc<PtyMaster>,
         pid: u32,
         exited: Arc<AtomicBool>,
         /// Set once the exit is reported; the reader and writer threads then stop.
@@ -634,11 +650,11 @@ mod platform {
         }
 
         pub fn resize(&self, size: PtySize) -> io::Result<()> {
-            set_size(self.master.as_raw_fd(), size)
+            self.master.resize(size)
         }
 
         pub fn interrupt(&self) -> io::Result<()> {
-            self.signal(libc::SIGINT)
+            self.signal(Signal::Interrupt)
         }
 
         pub fn stop_output(&self) {
@@ -646,21 +662,19 @@ mod platform {
         }
 
         pub fn kill(&self) -> io::Result<()> {
-            self.signal(libc::SIGKILL)
+            self.signal(Signal::Kill)
         }
 
-        // Fallible on every platform: where processes run on pipes, nothing can be written.
-        #[allow(clippy::unnecessary_wraps)]
         pub fn writer(&self) -> io::Result<PtyWriter> {
             let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(writer) = writer.as_ref() {
                 return Ok(writer.clone());
             }
+            let mut input = self.master.clone_writer()?;
             let (sender, queued) = mpsc::sync_channel::<Vec<u8>>(QUEUE);
-            let master = Arc::clone(&self.master);
-            std::thread::spawn(move || {
+            spawn_named("bmux-pty-writer", move || {
                 for bytes in queued {
-                    if write_all(master.as_fd(), &bytes).is_err() {
+                    if write_all(&mut input, &bytes).is_err() {
                         break;
                     }
                 }
@@ -672,22 +686,13 @@ mod platform {
         }
 
         /// Signal the process group the process leads (it started its own session).
-        fn signal(&self, signal: libc::c_int) -> io::Result<()> {
+        fn signal(&self, signal: Signal) -> io::Result<()> {
             // Once the process is reaped its id may be reused, but not while its group still
             // has members: something holding the terminal open is taken as one.
-            if self.exited.load(Ordering::Acquire) && !terminal_open(self.master.as_fd()) {
+            if self.exited.load(Ordering::Acquire) && !self.master.has_peer() {
                 return Ok(());
             }
-            let group = libc::pid_t::try_from(self.pid)
-                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
-            // SAFETY: kill has no memory-safety preconditions.
-            if unsafe { libc::kill(-group, signal) } == -1 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    return Err(error);
-                }
-            }
-            Ok(())
+            switchy_pty::signal_group(self.pid, signal)
         }
     }
 
@@ -697,68 +702,34 @@ mod platform {
         }
     }
 
-    /// Whether anything still holds the terminal's far side open.
-    fn terminal_open(master: BorrowedFd<'_>) -> bool {
-        let mut poll = libc::pollfd {
-            fd: master.as_raw_fd(),
-            events: 0,
-            revents: 0,
-        };
-        // SAFETY: one valid pollfd, no waiting.
-        let ready = unsafe { libc::poll(&raw mut poll, 1, 0) };
-        ready == 0 || (poll.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) == 0
-    }
-
-    /// Wait until `fd` is ready for `events`, at most [`POLL`]; whether it is.
-    fn wait_ready(fd: BorrowedFd<'_>, events: libc::c_short) -> io::Result<bool> {
-        let mut poll = libc::pollfd {
-            fd: fd.as_raw_fd(),
-            events,
-            revents: 0,
-        };
-        let timeout = libc::c_int::try_from(super::POLL.as_millis()).unwrap_or(10);
-        // SAFETY: one valid pollfd.
-        match unsafe { libc::poll(&raw mut poll, 1, timeout) } {
-            -1 => {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    Ok(false)
-                } else {
-                    Err(error)
-                }
-            }
-            0 => Ok(false),
-            _ => Ok(true),
-        }
-    }
-
-    /// Write all of `bytes` to the non-blocking `fd`, waiting while it is full.
-    fn write_all(fd: BorrowedFd<'_>, mut bytes: &[u8]) -> io::Result<()> {
+    /// Write all of `bytes` to the non-blocking terminal, waiting while it is full.
+    fn write_all(input: &mut PtyInput, mut bytes: &[u8]) -> io::Result<()> {
+        use std::io::Write as _;
         while !bytes.is_empty() {
-            // SAFETY: `bytes` is valid for reads of its length.
-            let written =
-                unsafe { libc::write(fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
-            if written >= 0 {
-                bytes = &bytes[usize::try_from(written).unwrap_or(0)..];
-                continue;
-            }
-            let error = io::Error::last_os_error();
-            match error.kind() {
-                io::ErrorKind::WouldBlock => {
-                    wait_ready(fd, libc::POLLOUT)?;
+            match input.write(bytes) {
+                Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+                Ok(written) => bytes = &bytes[written..],
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    input.wait_writable(POLL)?;
                 }
-                io::ErrorKind::Interrupted => {}
-                _ => return Err(error),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
             }
         }
         Ok(())
     }
 
-    /// Reads a non-blocking descriptor, returning end of file once output is `closed` and the
+    /// A non-blocking stream a reader thread drains.
+    enum Source {
+        Terminal(PtyReader),
+        Stdout(PtyPipeReader),
+    }
+
+    /// Reads a non-blocking stream, returning end of file once output is `closed` and the
     /// process has `exited`: a reader thread never outlives the reported exit, even while
     /// descendants keep the far side open, yet keeps draining while the process runs.
     struct Polled {
-        fd: OwnedFd,
+        source: Source,
         closed: Arc<AtomicBool>,
         exited: Arc<AtomicBool>,
     }
@@ -769,236 +740,70 @@ mod platform {
                 if self.closed.load(Ordering::Acquire) && self.exited.load(Ordering::Acquire) {
                     return Ok(0);
                 }
-                // SAFETY: `buffer` is valid for writes of its length.
-                let read = unsafe {
-                    libc::read(
-                        self.fd.as_raw_fd(),
-                        buffer.as_mut_ptr().cast(),
-                        buffer.len(),
-                    )
+                let read = match &mut self.source {
+                    Source::Terminal(reader) => reader.read(buffer),
+                    Source::Stdout(reader) => reader.read(buffer),
                 };
-                if read >= 0 {
-                    return Ok(usize::try_from(read).unwrap_or(0));
-                }
-                let error = io::Error::last_os_error();
-                match error.kind() {
-                    io::ErrorKind::WouldBlock => {
-                        wait_ready(self.fd.as_fd(), libc::POLLIN)?;
+                match read {
+                    Ok(read) => return Ok(read),
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        match &self.source {
+                            Source::Terminal(reader) => reader.wait_readable(POLL)?,
+                            Source::Stdout(reader) => reader.wait_readable(POLL)?,
+                        };
                     }
-                    io::ErrorKind::Interrupted => {}
-                    _ => return Err(error),
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    Err(error) => return Err(error),
                 }
             }
         }
-    }
-
-    fn set_nonblocking(fd: RawFd) -> io::Result<()> {
-        // SAFETY: fcntl on an owned, open descriptor.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        // SAFETY: as above.
-        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
-        {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    pub(crate) fn set_size(fd: RawFd, size: PtySize) -> io::Result<()> {
-        let size = libc::winsize {
-            ws_row: size.rows,
-            ws_col: size.cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        // SAFETY: `fd` is an open terminal and `size` outlives the call.
-        if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &raw const size) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    /// Make the terminal at `fd` the calling process's controlling terminal. Async-signal-safe.
-    // The ioctl request's integer type differs between platforms (`u32` constant against a
-    // `c_ulong` parameter on macOS, matching types on Linux), so no single conversion is lossless
-    // everywhere without a lint; the value always fits.
-    #[allow(clippy::cast_lossless)]
-    fn take_controlling_terminal(fd: RawFd) -> io::Result<()> {
-        // SAFETY: ioctl on an open terminal descriptor with an integer argument.
-        if unsafe { libc::ioctl(fd, libc::TIOCSCTTY as _, 0) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    /// Most descriptors scanned for [`close_inherited_on_exec`] where they cannot be closed in
-    /// one call.
-    const DESCRIPTOR_SCAN_LIMIT: libc::c_int = 65_536;
-
-    /// Mark every descriptor above standard error close-on-exec, so descriptors the caller left
-    /// inheritable do not leak into the program. Marked rather than closed: a failed exec still
-    /// reports its error through the spawning library's own descriptor. Async-signal-safe.
-    fn close_inherited_on_exec() {
-        #[cfg(target_os = "linux")]
-        {
-            const CLOSE_RANGE_CLOEXEC: libc::c_uint = 1 << 2;
-            // SAFETY: close_range with the close-on-exec flag only changes descriptor flags.
-            if unsafe {
-                libc::syscall(
-                    libc::SYS_close_range,
-                    3,
-                    libc::c_uint::MAX,
-                    CLOSE_RANGE_CLOEXEC,
-                )
-            } == 0
-            {
-                return;
-            }
-        }
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: getrlimit writes one rlimit.
-        let highest = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } == 0 {
-            libc::c_int::try_from(limit.rlim_cur)
-                .unwrap_or(DESCRIPTOR_SCAN_LIMIT)
-                .min(DESCRIPTOR_SCAN_LIMIT)
-        } else {
-            DESCRIPTOR_SCAN_LIMIT
-        };
-        for fd in 3..highest {
-            // SAFETY: fcntl on a descriptor number; unused numbers fail harmlessly.
-            unsafe {
-                let flags = libc::fcntl(fd, libc::F_GETFD);
-                if flags != -1 && flags & libc::FD_CLOEXEC == 0 {
-                    libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
-                }
-            }
-        }
-    }
-
-    fn close_on_exec(fd: RawFd) -> io::Result<()> {
-        // SAFETY: fcntl on an owned, open descriptor.
-        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
-    pub(crate) fn open(size: PtySize) -> io::Result<(OwnedFd, OwnedFd)> {
-        let mut master: libc::c_int = -1;
-        let mut slave: libc::c_int = -1;
-        let mut size = libc::winsize {
-            ws_row: size.rows,
-            ws_col: size.cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-        // SAFETY: the out-pointers are valid for writes; null name and termios are allowed.
-        let result = unsafe {
-            libc::openpty(
-                &raw mut master,
-                &raw mut slave,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                &raw mut size,
-            )
-        };
-        if result == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: openpty returned two new descriptors that nothing else owns.
-        let (master, slave) =
-            unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-        close_on_exec(master.as_raw_fd())?;
-        close_on_exec(slave.as_raw_fd())?;
-        Ok((master, slave))
-    }
-
-    /// Set up the child between fork and exec. Async-signal-safe (signal, setsid, ioctl,
-    /// getrlimit, fcntl, syscall only).
-    pub(crate) fn prepare_child(slave_fd: RawFd, controlling: bool) -> io::Result<()> {
-        // Start from default handling: dispositions the caller ignores (a terminal UI often
-        // ignores interrupts) would otherwise be inherited. The signal mask and SIGPIPE are
-        // already reset.
-        for signal in [
-            libc::SIGCHLD,
-            libc::SIGHUP,
-            libc::SIGINT,
-            libc::SIGQUIT,
-            libc::SIGTERM,
-            libc::SIGALRM,
-            libc::SIGTSTP,
-            libc::SIGTTIN,
-            libc::SIGTTOU,
-        ] {
-            // SAFETY: restoring a valid signal's default disposition.
-            unsafe { libc::signal(signal, libc::SIG_DFL) };
-        }
-        // A new session: the process leads its own group, so signals reach everything it
-        // starts, and it is detached from the caller's terminal.
-        // SAFETY: setsid has no memory-safety preconditions.
-        if unsafe { libc::setsid() } == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        if controlling {
-            take_controlling_terminal(slave_fd)?;
-        }
-        close_inherited_on_exec();
-        Ok(())
     }
 
     pub fn spawn(spec: &PtyCommand, size: PtySize) -> io::Result<PtyProcess> {
-        let (master, slave) = open(size)?;
-        let mut command = spec.std_command();
-        let controlling = !spec.capture_stdout;
+        let PtyPair { slave, master } = PtyPair::open(size)?;
+        let mut command = spec.spawn_command();
         if spec.capture_stdout {
             command
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::from(slave.try_clone()?));
-        } else {
-            command
-                .stdin(Stdio::from(slave.try_clone()?))
-                .stdout(Stdio::from(slave.try_clone()?))
-                .stderr(Stdio::from(slave.try_clone()?));
+                .stdin(Stdio::Null)
+                .stdout(Stdio::Piped)
+                .stderr(Stdio::Terminal)
+                .controlling_terminal(false);
         }
         if spec.input.is_some() {
-            command.stdin(Stdio::piped());
+            command.stdin(Stdio::Piped);
         }
-        let slave_fd = slave.as_raw_fd();
-        // SAFETY: `prepare_child` makes only async-signal-safe calls.
-        unsafe {
-            command.pre_exec(move || prepare_child(slave_fd, controlling));
+        let mut child = slave.spawn(&command)?;
+        if let (Some(input), Some(mut pipe)) = (spec.input.clone(), child.take_stdin()) {
+            // On its own thread, so a full pipe cannot block the caller; then closed.
+            spawn_named("bmux-pty-input", move || {
+                use std::io::Write as _;
+                let _ = pipe.write_all(&input);
+            });
         }
-        let mut child = command.spawn()?;
-        super::feed_input(&mut child, spec.input.as_ref());
         // Only the process may keep the terminal's far side open, so its exit closes it.
         drop(command);
         drop(slave);
         // Reads and writes poll, so neither can wedge on a terminal kept open elsewhere.
-        set_nonblocking(master.as_raw_fd())?;
-        let master = Arc::new(master);
+        master.set_nonblocking(true)?;
         let exited = Arc::new(AtomicBool::new(false));
         let (events, receiver) = Events::new();
         let (done, finished) = mpsc::channel();
         let mut readers = 1;
         events.read(
             Polled {
-                fd: master.try_clone()?,
+                source: Source::Terminal(master.try_clone_reader()?),
                 closed: Arc::clone(&events.closed),
                 exited: Arc::clone(&exited),
             },
             PtyEvent::Output,
             done.clone(),
         );
-        if let Some(stdout) = child.stdout.take() {
-            let stdout = OwnedFd::from(stdout);
-            set_nonblocking(stdout.as_raw_fd())?;
+        if let Some(stdout) = child.take_stdout() {
+            stdout.set_nonblocking(true)?;
             readers += 1;
             events.read(
                 Polled {
-                    fd: stdout,
+                    source: Source::Stdout(stdout),
                     closed: Arc::clone(&events.closed),
                     exited: Arc::clone(&exited),
                 },
@@ -1012,7 +817,7 @@ mod platform {
         let pid = child.id();
         let control = PtyControl::new(
             Control {
-                master,
+                master: Arc::new(master),
                 pid,
                 exited: Arc::clone(&exited),
                 closed,
@@ -1031,7 +836,10 @@ mod platform {
             },
             move || {
                 let mut child = child;
-                child.wait().map(super::PtyExit::from_status).ok()
+                child
+                    .wait()
+                    .ok()
+                    .map(|exit| PtyExit::from_child_exit(&exit))
             },
         );
         Ok(PtyProcess {
@@ -1286,7 +1094,7 @@ fn report_exit(
     exit: Exit,
     wait: impl FnOnce() -> Option<PtyExit> + Send + 'static,
 ) {
-    std::thread::spawn(move || {
+    spawn_named("bmux-pty-exit", move || {
         let mut status = wait().unwrap_or(PtyExit {
             code: None,
             signal: None,
@@ -1297,9 +1105,9 @@ fn report_exit(
             ..status
         });
         exit.exited.store(true, Ordering::Release);
-        let deadline = Instant::now() + exit.grace;
+        let deadline = switchy_time::instant_now() + exit.grace;
         for _ in 0..exit.readers {
-            let left = deadline.saturating_duration_since(Instant::now());
+            let left = deadline.saturating_duration_since(switchy_time::instant_now());
             match exit.finished.recv_timeout(left) {
                 Ok(true) => {}
                 Ok(false) => status.complete = false,
@@ -1313,4 +1121,17 @@ fn report_exit(
         *exit.status.lock().unwrap_or_else(PoisonError::into_inner) = Some(status);
         let _ = events.sender.send(PtyEvent::Exited(status));
     });
+}
+
+/// Start a named thread, as [`std::thread::spawn`] does. Names show in traces and in
+/// simulation deadlock reports.
+fn spawn_named<F, T>(name: &str, f: F) -> switchy_thread::thread::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    switchy_thread::thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(f)
+        .expect("failed to spawn thread")
 }

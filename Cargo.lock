@@ -3094,6 +3094,9 @@ name = "bmux_pty"
 version = "0.0.1-alpha.4"
 dependencies = [
  "libc",
+ "switchy_pty",
+ "switchy_thread",
+ "switchy_time 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "windows-sys 0.61.2",
 ]
 
@@ -4849,7 +4852,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.9",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -6546,7 +6549,7 @@ dependencies = [
  "moosicbox_assert",
  "serde",
  "serde_json",
- "switchy_time",
+ "switchy_time 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -6908,7 +6911,7 @@ dependencies = [
  "serde_json",
  "strum 0.28.0",
  "switchy_env",
- "switchy_time",
+ "switchy_time 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.21",
  "tl",
 ]
@@ -8366,7 +8369,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_log_watch"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#31ff9fc4e9e4c27a786715daa31335c42110d9cd"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#15a54d473e313c3c7cb3b9fee1fe7a4111cec6f1"
 dependencies = [
  "anyhow",
  "bmux_terminal",
@@ -8400,7 +8403,7 @@ dependencies = [
  "futures-util",
  "log 0.4.34",
  "moosicbox_assert",
- "switchy_time",
+ "switchy_time 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "tracing",
 ]
 
@@ -12734,11 +12737,11 @@ dependencies = [
  "switchy_http",
  "switchy_http_models",
  "switchy_mdns",
- "switchy_random",
+ "switchy_random 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "switchy_schema",
  "switchy_tcp",
  "switchy_telemetry",
- "switchy_time",
+ "switchy_time 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "switchy_upnp",
  "switchy_uuid",
  "switchy_web_server",
@@ -12768,8 +12771,8 @@ dependencies = [
  "pin-project-lite",
  "scoped-tls",
  "switchy_async_macros",
- "switchy_random",
- "switchy_time",
+ "switchy_random 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "switchy_time 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
@@ -12802,7 +12805,7 @@ dependencies = [
  "regex",
  "rusqlite",
  "switchy_async",
- "switchy_time",
+ "switchy_time 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.21",
  "tokio",
 ]
@@ -12887,6 +12890,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "switchy_pty"
+version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#15a54d473e313c3c7cb3b9fee1fe7a4111cec6f1"
+dependencies = [
+ "libc",
+ "switchy_simulation",
+ "switchy_thread",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "switchy_random"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12894,6 +12908,16 @@ checksum = "a0bb656d3a75379c438a030a39292c7590c736468168406ec7d44764148f6178"
 dependencies = [
  "log 0.4.34",
  "rand 0.8.5",
+]
+
+[[package]]
+name = "switchy_random"
+version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#15a54d473e313c3c7cb3b9fee1fe7a4111cec6f1"
+dependencies = [
+ "log 0.4.34",
+ "rand 0.8.5",
+ "switchy_simulation",
 ]
 
 [[package]]
@@ -12914,6 +12938,11 @@ dependencies = [
  "switchy_fs",
  "thiserror 2.0.21",
 ]
+
+[[package]]
+name = "switchy_simulation"
+version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#15a54d473e313c3c7cb3b9fee1fe7a4111cec6f1"
 
 [[package]]
 name = "switchy_tcp"
@@ -12952,6 +12981,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "switchy_thread"
+version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#15a54d473e313c3c7cb3b9fee1fe7a4111cec6f1"
+dependencies = [
+ "switchy_simulation",
+ "switchy_time 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
+]
+
+[[package]]
 name = "switchy_time"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12960,7 +12998,16 @@ dependencies = [
  "chrono",
  "log 0.4.34",
  "scoped-tls",
- "switchy_random",
+ "switchy_random 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "switchy_time"
+version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#15a54d473e313c3c7cb3b9fee1fe7a4111cec6f1"
+dependencies = [
+ "switchy_random 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
+ "switchy_simulation",
 ]
 
 [[package]]
@@ -12994,7 +13041,7 @@ checksum = "eeda3002cfdcc9d2c62906555819397c1f39306e268b311e5a067c80f382840b"
 dependencies = [
  "log 0.4.34",
  "switchy_env",
- "switchy_random",
+ "switchy_random 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "uuid",
 ]
 

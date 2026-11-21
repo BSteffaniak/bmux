@@ -176,7 +176,7 @@ tracing-subscriber = { workspace = true, features = [
 uuid = { workspace = true, features = ["std"] }
 
 [target.'cfg(unix)'.dependencies]
-bmux_pty = { workspace = true }
+bmux_pty = { workspace = true, features = ["native"] }
 libc     = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]

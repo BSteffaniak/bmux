@@ -10,8 +10,10 @@ readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 
-[target.'cfg(unix)'.dependencies]
-libc = { workspace = true }
+[dependencies]
+switchy_pty    = { workspace = true }
+switchy_thread = { workspace = true }
+switchy_time   = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
@@ -27,6 +29,17 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Threading",
 ] }
 
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
+
 [features]
-default          = []
-fail-on-warnings = []
+default = ["native"]
+
+fail-on-warnings = [
+    "switchy_pty/fail-on-warnings",
+    "switchy_thread/fail-on-warnings",
+    "switchy_time/fail-on-warnings",
+]
+
+# Real pseudo-terminals, threads and time.
+native = ["switchy_pty/native", "switchy_thread/std", "switchy_time/std"]

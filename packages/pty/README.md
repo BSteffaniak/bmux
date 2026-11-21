@@ -63,6 +63,12 @@ for event in process.events() {
 
 ## Terminal pairs
 
+The terminal pairs, and everything this crate asks of the operating system on
+Unix, come from [`switchy_pty`](https://github.com/MoosicBox/MoosicBox/tree/master/packages/switchy/pty),
+re-exported here; threads and time come from `switchy_thread` and
+`switchy_time`. With the default `native` feature they are the real thing; a
+simulator build swaps all three for deterministic simulations.
+
 For a caller that supervises processes itself, `PtyPair::open(size)` returns both ends of a new
 terminal and runs nothing in the background:
 
