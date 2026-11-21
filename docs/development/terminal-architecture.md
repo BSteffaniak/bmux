@@ -286,8 +286,7 @@ Deferred, each until something needs it (measured, not assumed):
 - Text filters. A text-run hook would sit in the hottest path (`print_ascii`); text redaction
   belongs at the replica or render, not the PTY parse.
 - Shell metadata on the grid's parse: its scan is now about 0.6% of the reader.
-- Delta relays for decoration scenes (only animated decorations would gain), and merging the
-  scene protocol's paint commands with `RenderOp`.
+- Delta relays for decoration scenes (only animated decorations would gain).
 
 Retained layers cost nothing when unchanged: the attach client samples a layer again only when
 its extension's revision, the surface rect or the render context changed, and the renderer skips
@@ -297,3 +296,11 @@ item and before-content-cell callbacks and their host fallbacks are gone, so eve
 planned one way (diff, content replay, commit), and before-content intent lands under the pane's
 content from the scene's items. Remaining: the per-frame planning bookkeeping around each
 extension layer (string cache keys, plan structures).
+
+One paint vocabulary from extension to terminal: a retained scene item is a keyed, z-ordered
+`RenderLayerItem` (a `RenderOp` or a terminal graphic), the same type the renderer paints, so the
+host keeps no parallel item kinds and converts nothing between planning and painting; item
+fingerprints hash the item itself. Scene-protocol paint commands stay as what they are, the
+authoring contract themes and scripts write (`bmux.scene`): gradients, capability-gated semantic
+borders and occlusion are lowered once, per attached terminal's capabilities, by the decoration
+renderer into those items. The unused terminal-ANSI executor for paint commands is gone.

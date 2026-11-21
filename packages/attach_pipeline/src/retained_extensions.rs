@@ -563,8 +563,8 @@ mod tests {
     }
 
     fn text(scene: &RenderLayerScene) -> &str {
-        match &scene.items[0].kind {
-            bmux_plugin::RenderSceneItemKind::Text { text, .. } => text,
+        match &scene.items[0].item {
+            bmux_plugin::RenderLayerItem::Op(bmux_plugin::RenderOp::TextRun { text, .. }) => text,
             other => panic!("unexpected item {other:?}"),
         }
     }

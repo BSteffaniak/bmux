@@ -531,7 +531,7 @@ pub fn clip_render_text_run_to_rect(
     clipped_x.map(|x| (x, clipped))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RenderColor {
     Default,
     Named(RenderNamedColor),
@@ -561,7 +561,7 @@ fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
     u8::try_from(indexed).expect("ANSI 256-color cube index is bounded")
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RenderNamedColor {
     Black,
     Red,
@@ -582,7 +582,7 @@ pub enum RenderNamedColor {
 }
 
 #[allow(clippy::struct_excessive_bools)] // Terminal SGR flags are independent style attributes.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct RenderStyle {
     pub fg: Option<RenderColor>,
     pub bg: Option<RenderColor>,
@@ -704,7 +704,7 @@ impl RenderStyle {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RenderTextSpan {
     pub text: String,
     pub style: RenderStyle,
@@ -720,7 +720,7 @@ impl RenderTextSpan {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RenderCell {
     /// Display-cell glyph to paint. `None` represents a transparent/sparse
     /// cell: it reserves a grid position but emits no terminal bytes.
@@ -743,7 +743,7 @@ impl RenderCell {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BorderGlyphs {
     pub top_left: char,
     pub top_right: char,
@@ -835,7 +835,7 @@ pub struct RenderUnderCell {
 /// Text bounds and clipping are measured in Unicode display cells, not UTF-8
 /// bytes or scalar count. Implementations should prefer `TextRun` for strings
 /// and use `CellGrid` only for already-cell-addressed one-column glyphs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RenderOp {
     TextRun {
         x: u16,
@@ -1168,21 +1168,32 @@ impl RenderSceneItemKey {
 /// Text/cell items and terminal graphics share one ordering stream so
 /// extensions do not need an imperative raw-protocol escape hatch to preserve
 /// paint order.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RenderLayerItem {
     Op(RenderOp),
     Graphic(TerminalGraphicOverlay),
 }
 
-/// Retained declarative scene item for renderer-owned diffing.
+/// Retained declarative scene item for renderer-owned diffing: a keyed, z-ordered
+/// [`RenderLayerItem`], the same vocabulary the host paints with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderSceneItem {
     pub key: RenderSceneItemKey,
     pub z: i16,
-    pub kind: RenderSceneItemKind,
+    pub item: RenderLayerItem,
 }
 
 impl RenderSceneItem {
+    /// A keyed item painting `op`.
+    #[must_use]
+    pub const fn op(key: RenderSceneItemKey, z: i16, op: RenderOp) -> Self {
+        Self {
+            key,
+            z,
+            item: RenderLayerItem::Op(op),
+        }
+    }
+
     #[must_use]
     pub fn text(
         key: impl Into<String>,
@@ -1192,16 +1203,11 @@ impl RenderSceneItem {
         text: impl Into<String>,
         style: RenderStyle,
     ) -> Self {
-        Self {
-            key: RenderSceneItemKey::new(key),
+        Self::op(
+            RenderSceneItemKey::new(key),
             z,
-            kind: RenderSceneItemKind::Text {
-                x,
-                y,
-                text: text.into(),
-                style,
-            },
-        }
+            RenderOp::text_run(x, y, text, style),
+        )
     }
 
     #[must_use]
@@ -1212,15 +1218,11 @@ impl RenderSceneItem {
         y: u16,
         spans: impl Into<Vec<RenderTextSpan>>,
     ) -> Self {
-        Self {
-            key: RenderSceneItemKey::new(key),
+        Self::op(
+            RenderSceneItemKey::new(key),
             z,
-            kind: RenderSceneItemKind::StyledText {
-                x,
-                y,
-                spans: spans.into(),
-            },
-        }
+            RenderOp::styled_text(x, y, spans),
+        )
     }
 
     #[must_use]
@@ -1231,11 +1233,7 @@ impl RenderSceneItem {
         ch: char,
         style: RenderStyle,
     ) -> Self {
-        Self {
-            key,
-            z,
-            kind: RenderSceneItemKind::FillRect { rect, ch, style },
-        }
+        Self::op(key, z, RenderOp::fill_rect(rect, ch, style))
     }
 
     #[must_use]
@@ -1246,15 +1244,7 @@ impl RenderSceneItem {
         glyphs: BorderGlyphs,
         style: RenderStyle,
     ) -> Self {
-        Self {
-            key,
-            z,
-            kind: RenderSceneItemKind::Border {
-                rect,
-                glyphs,
-                style,
-            },
-        }
+        Self::op(key, z, RenderOp::border(rect, glyphs, style))
     }
 
     #[must_use]
@@ -1265,15 +1255,11 @@ impl RenderSceneItem {
         y: u16,
         rows: impl Into<Vec<Vec<RenderCell>>>,
     ) -> Self {
-        Self {
-            key: RenderSceneItemKey::new(key),
+        Self::op(
+            RenderSceneItemKey::new(key),
             z,
-            kind: RenderSceneItemKind::CellGrid {
-                x,
-                y,
-                rows: rows.into(),
-            },
-        }
+            RenderOp::cell_grid(x, y, rows),
+        )
     }
 
     #[must_use]
@@ -1285,61 +1271,9 @@ impl RenderSceneItem {
         Self {
             key,
             z,
-            kind: RenderSceneItemKind::TerminalGraphic { graphic },
+            item: RenderLayerItem::Graphic(graphic),
         }
     }
-
-    #[must_use]
-    pub fn under_cells(
-        key: impl Into<String>,
-        z: i16,
-        cells: impl Into<Vec<(u16, u16, RenderUnderCell)>>,
-    ) -> Self {
-        Self {
-            key: RenderSceneItemKey::new(key),
-            z,
-            kind: RenderSceneItemKind::UnderCells {
-                cells: cells.into(),
-            },
-        }
-    }
-}
-
-/// Retained scene item payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RenderSceneItemKind {
-    Text {
-        x: u16,
-        y: u16,
-        text: String,
-        style: RenderStyle,
-    },
-    StyledText {
-        x: u16,
-        y: u16,
-        spans: Vec<RenderTextSpan>,
-    },
-    FillRect {
-        rect: ExtensionRect,
-        ch: char,
-        style: RenderStyle,
-    },
-    Border {
-        rect: ExtensionRect,
-        glyphs: BorderGlyphs,
-        style: RenderStyle,
-    },
-    CellGrid {
-        x: u16,
-        y: u16,
-        rows: Vec<Vec<RenderCell>>,
-    },
-    TerminalGraphic {
-        graphic: TerminalGraphicOverlay,
-    },
-    UnderCells {
-        cells: Vec<(u16, u16, RenderUnderCell)>,
-    },
 }
 
 /// The cells a border around `rect` paints: its outline, not its inside.
@@ -1413,22 +1347,7 @@ impl RenderSceneItem {
     /// The cells this item paints (a border paints only its outline).
     #[must_use]
     pub fn painted_rects(&self) -> Vec<ExtensionRect> {
-        match &self.kind {
-            RenderSceneItemKind::Text { x, y, text, .. } => {
-                vec![text_rect(*x, *y, render_text_width_u16(text))]
-            }
-            RenderSceneItemKind::StyledText { x, y, spans } => {
-                vec![text_rect(*x, *y, spans_width(spans))]
-            }
-            RenderSceneItemKind::FillRect { rect, .. } => vec![*rect],
-            RenderSceneItemKind::Border { rect, .. } => border_outline_rects(*rect),
-            RenderSceneItemKind::CellGrid { x, y, rows } => vec![grid_rect(*x, *y, rows)],
-            RenderSceneItemKind::TerminalGraphic { graphic } => vec![graphic.cell_rect],
-            RenderSceneItemKind::UnderCells { cells } => cells
-                .iter()
-                .map(|(x, y, _)| ExtensionRect::new(*x, *y, 1, 1))
-                .collect(),
-        }
+        self.item.painted_rects()
     }
 }
 
@@ -1682,8 +1601,8 @@ pub trait AttachRenderExtension: Send + Sync {
     /// the surface's layer now, and the host renderer owns diffing, stale
     /// cleanup, content replay, z-ordering, terminal graphics lifecycle, and
     /// byte emission. On [`RenderExtensionLayer::BeforePaneContent`], items
-    /// land under the pane's content (as [`RenderSceneItemKind::UnderCells`]
-    /// do), where content cells with text cover them. The default, `None`,
+    /// land under the pane's content, where content cells with text cover
+    /// them. The default, `None`,
     /// paints nothing.
     fn render_layer_scene_with_context(
         &self,
@@ -2047,20 +1966,20 @@ mod tests {
         assert_eq!(scene.items.len(), 4);
         assert_eq!(scene.items[0].key, RenderSceneItemKey::new("header"));
         assert!(matches!(
-            scene.items[0].kind,
-            RenderSceneItemKind::Text { .. }
+            scene.items[0].item,
+            RenderLayerItem::Op(RenderOp::TextRun { .. })
         ));
         assert!(matches!(
-            scene.items[1].kind,
-            RenderSceneItemKind::FillRect { .. }
+            scene.items[1].item,
+            RenderLayerItem::Op(RenderOp::FillRect { .. })
         ));
         assert!(matches!(
-            scene.items[2].kind,
-            RenderSceneItemKind::Border { .. }
+            scene.items[2].item,
+            RenderLayerItem::Op(RenderOp::Border { .. })
         ));
         assert!(matches!(
-            scene.items[3].kind,
-            RenderSceneItemKind::CellGrid { .. }
+            scene.items[3].item,
+            RenderLayerItem::Op(RenderOp::CellGrid { .. })
         ));
     }
 

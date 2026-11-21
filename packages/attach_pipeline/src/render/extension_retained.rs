@@ -1,9 +1,8 @@
 use crate::types::{ExtensionRetainedLayerCacheEntry, PaneRect, PaneRenderBuffer};
 use bmux_plugin::{
-    BorderGlyphs, ExtensionRect, RenderCell, RenderDamage, RenderLayerItem,
-    RenderLayerScene as PluginRenderLayerScene, RenderOp, RenderSceneItem as PluginRenderSceneItem,
-    RenderSceneItemKind as PluginRenderSceneItemKind, RenderStyle, RenderTextSpan, RenderUnderCell,
-    TerminalGraphicOverlay, TerminalRenderCapabilities, render_text_width_u16,
+    ExtensionRect, RenderDamage, RenderLayerItem, RenderLayerScene as PluginRenderLayerScene,
+    RenderOp, RenderSceneItem as PluginRenderSceneItem, TerminalRenderCapabilities,
+    render_text_width_u16,
 };
 use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
@@ -32,185 +31,39 @@ impl RenderLayerScene {
     }
 }
 
+/// One retained item: the extension's keyed render item, with the bounds and fingerprint the
+/// diff compares.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct RenderSceneItem {
     pub(super) key: RenderSceneItemKey,
     pub(super) z: i16,
     pub(super) bounds: ExtensionRect,
     pub(super) content_fingerprint: u64,
-    pub(super) kind: RenderSceneItemKind,
+    pub(super) item: RenderLayerItem,
 }
 
 impl RenderSceneItem {
-    pub(super) fn text(
-        key: impl Into<String>,
-        z: i16,
-        x: u16,
-        y: u16,
-        text: impl Into<String>,
-        style: RenderStyle,
-    ) -> Self {
-        let text = text.into();
-        let bounds = ExtensionRect::new(
-            x,
-            y,
-            render_text_width_u16(&text),
-            u16::from(!text.is_empty()),
-        );
-        Self::new(
-            key,
-            z,
-            bounds,
-            RenderSceneItemKind::Text { x, y, text, style },
-        )
-    }
-
-    pub(super) fn styled_text(
-        key: impl Into<String>,
-        z: i16,
-        x: u16,
-        y: u16,
-        spans: Vec<RenderTextSpan>,
-    ) -> Self {
-        let width = spans
-            .iter()
-            .map(|span| render_text_width_u16(&span.text))
-            .fold(0_u16, u16::saturating_add);
-        let bounds = ExtensionRect::new(x, y, width, u16::from(width > 0));
-        Self::new(
-            key,
-            z,
-            bounds,
-            RenderSceneItemKind::StyledText { x, y, spans },
-        )
-    }
-
-    pub(super) fn fill_rect(
-        key: impl Into<String>,
-        z: i16,
-        rect: ExtensionRect,
-        ch: char,
-        style: RenderStyle,
-    ) -> Self {
-        Self::new(
-            key,
-            z,
-            rect,
-            RenderSceneItemKind::FillRect { rect, ch, style },
-        )
-    }
-
-    pub(super) fn border(
-        key: impl Into<String>,
-        z: i16,
-        rect: ExtensionRect,
-        glyphs: BorderGlyphs,
-        style: RenderStyle,
-    ) -> Self {
-        Self::new(
-            key,
-            z,
-            rect,
-            RenderSceneItemKind::Border {
-                rect,
-                glyphs,
-                style,
-            },
-        )
-    }
-
-    pub(super) fn cell_grid(
-        key: impl Into<String>,
-        z: i16,
-        x: u16,
-        y: u16,
-        rows: Vec<Vec<RenderCell>>,
-    ) -> Self {
-        let height = u16::try_from(rows.len()).unwrap_or(u16::MAX);
-        let width = rows
-            .iter()
-            .map(|row| u16::try_from(row.len()).unwrap_or(u16::MAX))
-            .max()
-            .unwrap_or(0);
-        let bounds = ExtensionRect::new(x, y, width, height);
-        Self::new(key, z, bounds, RenderSceneItemKind::CellGrid { x, y, rows })
-    }
-
-    pub(super) fn terminal_graphic(
-        key: impl Into<String>,
-        z: i16,
-        graphic: TerminalGraphicOverlay,
-    ) -> Self {
-        let bounds = graphic.cell_rect;
-        Self::new(
-            key,
-            z,
-            bounds,
-            RenderSceneItemKind::TerminalGraphic { graphic },
-        )
-    }
-
-    pub(super) fn under_cells(
-        key: impl Into<String>,
-        z: i16,
-        cells: Vec<(u16, u16, RenderUnderCell)>,
-    ) -> Self {
-        let bounds = under_cell_bounds(&cells);
-        Self::new(key, z, bounds, RenderSceneItemKind::UnderCells { cells })
-    }
-
-    fn new(
-        key: impl Into<String>,
-        z: i16,
-        bounds: ExtensionRect,
-        kind: RenderSceneItemKind,
-    ) -> Self {
+    /// Retain `item` under `key`; a terminal graphic's protocol key is derived from `key`, so
+    /// one item keeps one terminal image across frames.
+    pub(super) fn new(key: impl Into<String>, z: i16, mut item: RenderLayerItem) -> Self {
         let key = RenderSceneItemKey::new(key);
-        let content_fingerprint = retained_item_content_fingerprint(z, bounds, &kind);
+        if let RenderLayerItem::Graphic(graphic) = &mut item {
+            graphic.key = retained_graphic_key_from_item_key(&key);
+        }
+        let bounds = item_bounds(&item);
+        let content_fingerprint = retained_item_content_fingerprint(z, bounds, &item);
         Self {
             key,
             z,
             bounds,
             content_fingerprint,
-            kind,
+            item,
         }
     }
-}
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum RenderSceneItemKind {
-    Text {
-        x: u16,
-        y: u16,
-        text: String,
-        style: RenderStyle,
-    },
-    StyledText {
-        x: u16,
-        y: u16,
-        spans: Vec<RenderTextSpan>,
-    },
-    FillRect {
-        rect: ExtensionRect,
-        ch: char,
-        style: RenderStyle,
-    },
-    Border {
-        rect: ExtensionRect,
-        glyphs: BorderGlyphs,
-        style: RenderStyle,
-    },
-    CellGrid {
-        x: u16,
-        y: u16,
-        rows: Vec<Vec<RenderCell>>,
-    },
-    TerminalGraphic {
-        graphic: TerminalGraphicOverlay,
-    },
-    UnderCells {
-        cells: Vec<(u16, u16, RenderUnderCell)>,
-    },
+    const fn is_graphic(&self) -> bool {
+        matches!(self.item, RenderLayerItem::Graphic(_))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -287,7 +140,7 @@ pub(super) fn retained_scene_items_to_render_items<'a>(
     sorted_items.sort_by(|lhs, rhs| (lhs.z, &lhs.key).cmp(&(rhs.z, &rhs.key)));
     sorted_items
         .into_iter()
-        .filter_map(retained_scene_item_to_render_item)
+        .map(|item| item.item.clone())
         .collect()
 }
 
@@ -297,16 +150,12 @@ pub(super) fn retained_scene_items_for_render_damage<'a>(
     damage: &RenderDamage,
 ) -> Vec<&'a RenderSceneItem> {
     match damage {
-        RenderDamage::None => items
-            .iter()
-            .filter(|item| matches!(&item.kind, RenderSceneItemKind::TerminalGraphic { .. }))
-            .collect(),
+        RenderDamage::None => items.iter().filter(|item| item.is_graphic()).collect(),
         RenderDamage::FullSurface => items.iter().collect(),
         RenderDamage::Regions(regions) => items
             .iter()
             .filter(|item| {
-                matches!(&item.kind, RenderSceneItemKind::TerminalGraphic { .. })
-                    || regions.iter().any(|region| item.bounds.intersects(*region))
+                item.is_graphic() || regions.iter().any(|region| item.bounds.intersects(*region))
             })
             .collect(),
     }
@@ -336,29 +185,34 @@ pub(super) fn retained_scene_item_damage_for_render_damage(
 }
 
 fn retained_item_from_plugin_item(item: &PluginRenderSceneItem) -> RenderSceneItem {
-    let bounds = plugin_scene_item_bounds(item);
-    let kind = retained_item_kind_from_plugin_kind(&item.kind);
-    RenderSceneItem::new(item.key.0.clone(), item.z, bounds, kind)
+    RenderSceneItem::new(item.key.0.clone(), item.z, item.item.clone())
 }
 
-fn plugin_scene_item_bounds(item: &PluginRenderSceneItem) -> ExtensionRect {
-    match &item.kind {
-        PluginRenderSceneItemKind::Text { x, y, text, .. } => ExtensionRect::new(
+/// The rectangle that bounds what `item` paints.
+fn item_bounds(item: &RenderLayerItem) -> ExtensionRect {
+    match item {
+        RenderLayerItem::Op(RenderOp::TextRun { x, y, text, .. }) => ExtensionRect::new(
             *x,
             *y,
             render_text_width_u16(text),
             u16::from(!text.is_empty()),
         ),
-        PluginRenderSceneItemKind::StyledText { x, y, spans } => {
+        RenderLayerItem::Op(RenderOp::StyledText { x, y, spans }) => {
             let width = spans
                 .iter()
                 .map(|span| render_text_width_u16(&span.text))
                 .fold(0_u16, u16::saturating_add);
             ExtensionRect::new(*x, *y, width, u16::from(width > 0))
         }
-        PluginRenderSceneItemKind::FillRect { rect, .. }
-        | PluginRenderSceneItemKind::Border { rect, .. } => *rect,
-        PluginRenderSceneItemKind::CellGrid { x, y, rows } => {
+        RenderLayerItem::Op(
+            RenderOp::FillRect { rect, .. }
+            | RenderOp::ClearRect { rect, .. }
+            | RenderOp::Border { rect, .. },
+        ) => *rect,
+        RenderLayerItem::Op(RenderOp::EraseRowSegment { x, y, width, .. }) => {
+            ExtensionRect::new(*x, *y, *width, 1)
+        }
+        RenderLayerItem::Op(RenderOp::CellGrid { x, y, rows }) => {
             let height = u16::try_from(rows.len()).unwrap_or(u16::MAX);
             let width = rows
                 .iter()
@@ -367,51 +221,7 @@ fn plugin_scene_item_bounds(item: &PluginRenderSceneItem) -> ExtensionRect {
                 .unwrap_or(0);
             ExtensionRect::new(*x, *y, width, height)
         }
-        PluginRenderSceneItemKind::TerminalGraphic { graphic } => graphic.cell_rect,
-        PluginRenderSceneItemKind::UnderCells { cells } => under_cell_bounds(cells),
-    }
-}
-
-fn retained_item_kind_from_plugin_kind(kind: &PluginRenderSceneItemKind) -> RenderSceneItemKind {
-    match kind {
-        PluginRenderSceneItemKind::Text { x, y, text, style } => RenderSceneItemKind::Text {
-            x: *x,
-            y: *y,
-            text: text.clone(),
-            style: *style,
-        },
-        PluginRenderSceneItemKind::StyledText { x, y, spans } => RenderSceneItemKind::StyledText {
-            x: *x,
-            y: *y,
-            spans: spans.clone(),
-        },
-        PluginRenderSceneItemKind::FillRect { rect, ch, style } => RenderSceneItemKind::FillRect {
-            rect: *rect,
-            ch: *ch,
-            style: *style,
-        },
-        PluginRenderSceneItemKind::Border {
-            rect,
-            glyphs,
-            style,
-        } => RenderSceneItemKind::Border {
-            rect: *rect,
-            glyphs: *glyphs,
-            style: *style,
-        },
-        PluginRenderSceneItemKind::CellGrid { x, y, rows } => RenderSceneItemKind::CellGrid {
-            x: *x,
-            y: *y,
-            rows: rows.clone(),
-        },
-        PluginRenderSceneItemKind::TerminalGraphic { graphic } => {
-            RenderSceneItemKind::TerminalGraphic {
-                graphic: graphic.clone(),
-            }
-        }
-        PluginRenderSceneItemKind::UnderCells { cells } => RenderSceneItemKind::UnderCells {
-            cells: cells.clone(),
-        },
+        RenderLayerItem::Graphic(graphic) => graphic.cell_rect,
     }
 }
 
@@ -419,55 +229,6 @@ pub(super) fn retained_graphic_key_from_item_key(key: &RenderSceneItemKey) -> u6
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     key.hash(&mut hasher);
     hasher.finish().max(1)
-}
-
-fn retained_scene_item_to_render_item(item: &RenderSceneItem) -> Option<RenderLayerItem> {
-    match &item.kind {
-        RenderSceneItemKind::Text { x, y, text, style } => {
-            Some(RenderLayerItem::Op(RenderOp::TextRun {
-                x: *x,
-                y: *y,
-                text: text.clone(),
-                style: *style,
-            }))
-        }
-        RenderSceneItemKind::StyledText { x, y, spans } => {
-            Some(RenderLayerItem::Op(RenderOp::StyledText {
-                x: *x,
-                y: *y,
-                spans: spans.clone(),
-            }))
-        }
-        RenderSceneItemKind::FillRect { rect, ch, style } => {
-            Some(RenderLayerItem::Op(RenderOp::FillRect {
-                rect: *rect,
-                ch: *ch,
-                style: *style,
-            }))
-        }
-        RenderSceneItemKind::Border {
-            rect,
-            glyphs,
-            style,
-        } => Some(RenderLayerItem::Op(RenderOp::Border {
-            rect: *rect,
-            glyphs: *glyphs,
-            style: *style,
-        })),
-        RenderSceneItemKind::CellGrid { x, y, rows } => {
-            Some(RenderLayerItem::Op(RenderOp::CellGrid {
-                x: *x,
-                y: *y,
-                rows: rows.clone(),
-            }))
-        }
-        RenderSceneItemKind::TerminalGraphic { graphic } => {
-            let mut graphic = graphic.clone();
-            graphic.key = retained_graphic_key_from_item_key(&item.key);
-            Some(RenderLayerItem::Graphic(graphic))
-        }
-        RenderSceneItemKind::UnderCells { .. } => None,
-    }
 }
 
 pub(super) fn retained_layer_cache_key(
@@ -534,7 +295,7 @@ pub(super) fn evict_retained_layer_snapshots_for_surface(
 // Borders paint a perimeter, not their interior bounding box. Preserve that
 // footprint for updates and cleanup before any downstream coalescing.
 fn item_damage(item: &RenderSceneItem) -> Vec<ExtensionRect> {
-    if let RenderSceneItemKind::Border { rect, .. } = &item.kind
+    if let RenderLayerItem::Op(RenderOp::Border { rect, .. }) = &item.item
         && rect.w >= 2
         && rect.h >= 2
     {
@@ -605,7 +366,10 @@ pub(super) fn build_extension_layer_diff_plan(
                     }
                     Some(previous_item) => {
                         update_rects.extend(item_damage(item));
-                        if matches!(previous_item.kind, RenderSceneItemKind::Border { .. }) {
+                        if matches!(
+                            previous_item.item,
+                            RenderLayerItem::Op(RenderOp::Border { .. })
+                        ) {
                             cleanup_rects.extend(item_damage(previous_item));
                         } else {
                             cleanup_rects
@@ -739,50 +503,12 @@ fn render_damage_content_rects(damage: &RenderDamage, content: PaneRect) -> Vec<
         .collect()
 }
 
-fn under_cell_bounds(cells: &[(u16, u16, RenderUnderCell)]) -> ExtensionRect {
-    let Some((first_x, first_y, _)) = cells.first() else {
-        return ExtensionRect::new(0, 0, 0, 0);
-    };
-    let (mut min_x, mut min_y, mut max_x, mut max_y) = (*first_x, *first_y, *first_x, *first_y);
-    for (x, y, _) in cells {
-        min_x = min_x.min(*x);
-        min_y = min_y.min(*y);
-        max_x = max_x.max(*x);
-        max_y = max_y.max(*y);
-    }
-    ExtensionRect::new(
-        min_x,
-        min_y,
-        max_x.saturating_sub(min_x).saturating_add(1),
-        max_y.saturating_sub(min_y).saturating_add(1),
-    )
-}
-
-fn retained_item_content_fingerprint(
-    z: i16,
-    bounds: ExtensionRect,
-    kind: &RenderSceneItemKind,
-) -> u64 {
+fn retained_item_content_fingerprint(z: i16, bounds: ExtensionRect, item: &RenderLayerItem) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     z.hash(&mut hasher);
     hash_rect(&mut hasher, bounds);
-    hash_retained_item_kind(&mut hasher, kind);
+    item.hash(&mut hasher);
     hasher.finish()
-}
-
-fn hash_retained_item_kind(hasher: &mut impl Hasher, kind: &RenderSceneItemKind) {
-    match kind {
-        RenderSceneItemKind::TerminalGraphic { graphic } => {
-            "terminal_graphic".hash(hasher);
-            hash_rect(hasher, graphic.cell_rect);
-            graphic.pixel_width.hash(hasher);
-            graphic.pixel_height.hash(hasher);
-            graphic.color.hash(hasher);
-            graphic.fill.hash(hasher);
-            graphic.z_index.hash(hasher);
-        }
-        _ => format!("{kind:?}").hash(hasher),
-    }
 }
 
 fn hash_rect(hasher: &mut impl Hasher, rect: ExtensionRect) {
@@ -795,6 +521,7 @@ fn hash_rect(hasher: &mut impl Hasher, rect: ExtensionRect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bmux_plugin::RenderStyle;
 
     fn content_rect() -> PaneRect {
         PaneRect {
@@ -810,7 +537,11 @@ mod tests {
     }
 
     fn text_item(key: &str, x: u16, y: u16, text: &str) -> RenderSceneItem {
-        RenderSceneItem::text(key, 0, x, y, text, RenderStyle::default())
+        RenderSceneItem::new(
+            key,
+            0,
+            RenderLayerItem::Op(RenderOp::text_run(x, y, text, RenderStyle::default())),
+        )
     }
 
     fn snapshot(items: Vec<RenderSceneItem>) -> ExtensionRetainedLayerSnapshot {
@@ -900,12 +631,14 @@ mod tests {
         let changed = text_item("text", 2, 3, "HELLO");
         assert_ne!(text.content_fingerprint, changed.content_fingerprint);
 
-        let fill = RenderSceneItem::fill_rect(
+        let fill = RenderSceneItem::new(
             "fill",
             0,
-            ExtensionRect::new(4, 1, 3, 2),
-            '#',
-            RenderStyle::default(),
+            RenderLayerItem::Op(RenderOp::fill_rect(
+                ExtensionRect::new(4, 1, 3, 2),
+                '#',
+                RenderStyle::default(),
+            )),
         );
         assert_eq!(fill.bounds, ExtensionRect::new(4, 1, 3, 2));
     }

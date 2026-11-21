@@ -1055,37 +1055,11 @@ fn push_render_scene_items_for_command(
         return;
     };
     for (op_index, op) in ops.into_iter().enumerate() {
-        items.push(render_scene_item_from_op(
-            format!("{key_prefix}:op-{op_index:02}"),
+        items.push(RenderSceneItem::op(
+            RenderSceneItemKey::new(format!("{key_prefix}:op-{op_index:02}")),
             z,
             op,
         ));
-    }
-}
-
-fn render_scene_item_from_op(key: String, z: i16, op: RenderOp) -> RenderSceneItem {
-    match op {
-        RenderOp::TextRun { x, y, text, style } => RenderSceneItem::text(key, z, x, y, text, style),
-        RenderOp::StyledText { x, y, spans } => RenderSceneItem::styled_text(key, z, x, y, spans),
-        RenderOp::ClearRect { rect, style } => {
-            RenderSceneItem::fill_rect(RenderSceneItemKey::new(key), z, rect, ' ', style)
-        }
-        RenderOp::EraseRowSegment { x, y, width, style } => RenderSceneItem::fill_rect(
-            RenderSceneItemKey::new(key),
-            z,
-            ExtensionRect::new(x, y, width, 1),
-            ' ',
-            style,
-        ),
-        RenderOp::FillRect { rect, ch, style } => {
-            RenderSceneItem::fill_rect(RenderSceneItemKey::new(key), z, rect, ch, style)
-        }
-        RenderOp::Border {
-            rect,
-            glyphs,
-            style,
-        } => RenderSceneItem::border(RenderSceneItemKey::new(key), z, rect, glyphs, style),
-        RenderOp::CellGrid { x, y, rows } => RenderSceneItem::cell_grid(key, z, x, y, rows),
     }
 }
 
@@ -2025,8 +1999,8 @@ mod tests {
             .expect("overlay scene");
 
         assert!(matches!(
-            &scene.items[0].kind,
-            bmux_plugin::RenderSceneItemKind::Border { rect: actual, glyphs, .. }
+            &scene.items[0].item,
+            bmux_plugin::RenderLayerItem::Op(bmux_plugin::RenderOp::Border { rect: actual, glyphs, .. })
                 if *actual == rect && *glyphs == bmux_plugin::BorderGlyphs::rounded()
         ));
     }
@@ -2202,8 +2176,8 @@ mod tests {
 
         assert_eq!(scene.items.len(), 1);
         assert!(matches!(
-            &scene.items[0].kind,
-            bmux_plugin::RenderSceneItemKind::Text { x: 2, y: 3, text, .. } if text == "perf"
+            &scene.items[0].item,
+            bmux_plugin::RenderLayerItem::Op(bmux_plugin::RenderOp::TextRun { x: 2, y: 3, text, .. }) if text == "perf"
         ));
     }
 
@@ -2234,8 +2208,8 @@ mod tests {
             .expect("retained scene should be available");
 
         assert!(matches!(
-            &scene.items[0].kind,
-            bmux_plugin::RenderSceneItemKind::Text { x: 1, y: 0, text, .. } if text == "under"
+            &scene.items[0].item,
+            bmux_plugin::RenderLayerItem::Op(bmux_plugin::RenderOp::TextRun { x: 1, y: 0, text, .. }) if text == "under"
         ));
     }
 
@@ -2272,10 +2246,12 @@ mod tests {
             .expect("retained scene should be available");
 
         assert_eq!(scene.items.len(), 4);
-        assert!(scene.items.iter().all(|item| matches!(
-            item.kind,
-            bmux_plugin::RenderSceneItemKind::TerminalGraphic { .. }
-        )));
+        assert!(
+            scene
+                .items
+                .iter()
+                .all(|item| matches!(item.item, bmux_plugin::RenderLayerItem::Graphic(_)))
+        );
     }
 
     #[test]
@@ -2324,10 +2300,12 @@ mod tests {
             .expect("retained scene should be available");
 
         assert_eq!(scene.items.len(), 4);
-        assert!(scene.items.iter().all(|item| matches!(
-            item.kind,
-            bmux_plugin::RenderSceneItemKind::TerminalGraphic { .. }
-        )));
+        assert!(
+            scene
+                .items
+                .iter()
+                .all(|item| matches!(item.item, bmux_plugin::RenderLayerItem::Graphic(_)))
+        );
     }
 
     #[test]
@@ -2359,12 +2337,10 @@ mod tests {
             )
             .expect("retained scene should be available");
 
-        assert!(
-            scene
-                .items
-                .iter()
-                .any(|item| matches!(item.kind, bmux_plugin::RenderSceneItemKind::Border { .. }))
-        );
+        assert!(scene.items.iter().any(|item| matches!(
+            item.item,
+            bmux_plugin::RenderLayerItem::Op(bmux_plugin::RenderOp::Border { .. })
+        )));
     }
 
     #[test]
@@ -2588,16 +2564,16 @@ mod tests {
 
         let ops = scene_ops(&extension, surface_id);
 
+        // A space fill is a clear: the host paints it as blank cells in the style.
         assert_eq!(
             ops,
-            vec![RenderOp::FillRect {
+            vec![RenderOp::ClearRect {
                 rect: ExtensionRect {
                     x: 1,
                     y: 2,
                     w: 3,
                     h: 4,
                 },
-                ch: ' ',
                 style: RenderStyle::default(),
             }]
         );
@@ -3042,11 +3018,11 @@ mod tests {
         scene
             .items
             .iter()
-            .filter_map(|item| match &item.kind {
-                bmux_plugin::RenderSceneItemKind::TerminalGraphic { graphic } => {
+            .filter_map(|item| match &item.item {
+                bmux_plugin::RenderLayerItem::Graphic(graphic) => {
                     Some((item.key.clone(), graphic.cell_rect))
                 }
-                _ => None,
+                bmux_plugin::RenderLayerItem::Op(_) => None,
             })
             .collect()
     }
@@ -3187,12 +3163,13 @@ mod tests {
         let snake_columns = global_scene
             .items
             .iter()
-            .filter_map(|item| match &item.kind {
-                bmux_plugin::RenderSceneItemKind::Text { x, y, text, .. }
-                    if text == "◆" && *y == 0 =>
-                {
-                    Some(*x)
-                }
+            .filter_map(|item| match &item.item {
+                bmux_plugin::RenderLayerItem::Op(bmux_plugin::RenderOp::TextRun {
+                    x,
+                    y,
+                    text,
+                    ..
+                }) if text == "◆" && *y == 0 => Some(*x),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -3222,11 +3199,13 @@ mod tests {
             &[occluder],
         );
 
-        assert!(scene.items.iter().all(|item| match &item.kind {
-            bmux_plugin::RenderSceneItemKind::Text { x, y, text, .. } => {
+        assert!(scene.items.iter().all(|item| match &item.item {
+            bmux_plugin::RenderLayerItem::Op(bmux_plugin::RenderOp::TextRun {
+                x, y, text, ..
+            }) => {
                 !ExtensionRect::new(*x, *y, render_text_width_u16(text), 1).intersects(occluder)
             }
-            bmux_plugin::RenderSceneItemKind::StyledText { x, y, spans } => {
+            bmux_plugin::RenderLayerItem::Op(bmux_plugin::RenderOp::StyledText { x, y, spans }) => {
                 let width = spans
                     .iter()
                     .map(|span| render_text_width_u16(&span.text))
@@ -3236,8 +3215,8 @@ mod tests {
             _ => true,
         }));
         assert!(scene.items.iter().any(|item| matches!(
-            &item.kind,
-            bmux_plugin::RenderSceneItemKind::Text { text, .. } if text == "◆"
+            &item.item,
+            bmux_plugin::RenderLayerItem::Op(bmux_plugin::RenderOp::TextRun { text, .. }) if text == "◆"
         )));
     }
 
@@ -3259,48 +3238,7 @@ mod tests {
             .expect("the decoration answers every surface with a scene");
         let mut items = scene.items.iter().collect::<Vec<_>>();
         items.sort_by(|lhs, rhs| (lhs.z, &lhs.key).cmp(&(rhs.z, &rhs.key)));
-        items
-            .into_iter()
-            .filter_map(|item| match &item.kind {
-                bmux_plugin::RenderSceneItemKind::Text { x, y, text, style } => Some(
-                    RenderLayerItem::Op(RenderOp::text_run(*x, *y, text.clone(), *style)),
-                ),
-                bmux_plugin::RenderSceneItemKind::StyledText { x, y, spans } => {
-                    Some(RenderLayerItem::Op(RenderOp::StyledText {
-                        x: *x,
-                        y: *y,
-                        spans: spans.clone(),
-                    }))
-                }
-                bmux_plugin::RenderSceneItemKind::FillRect { rect, ch, style } => {
-                    Some(RenderLayerItem::Op(RenderOp::FillRect {
-                        rect: *rect,
-                        ch: *ch,
-                        style: *style,
-                    }))
-                }
-                bmux_plugin::RenderSceneItemKind::Border {
-                    rect,
-                    glyphs,
-                    style,
-                } => Some(RenderLayerItem::Op(RenderOp::Border {
-                    rect: *rect,
-                    glyphs: *glyphs,
-                    style: *style,
-                })),
-                bmux_plugin::RenderSceneItemKind::CellGrid { x, y, rows } => {
-                    Some(RenderLayerItem::Op(RenderOp::CellGrid {
-                        x: *x,
-                        y: *y,
-                        rows: rows.clone(),
-                    }))
-                }
-                bmux_plugin::RenderSceneItemKind::TerminalGraphic { graphic } => {
-                    Some(RenderLayerItem::Graphic(graphic.clone()))
-                }
-                bmux_plugin::RenderSceneItemKind::UnderCells { .. } => None,
-            })
-            .collect()
+        items.into_iter().map(|item| item.item.clone()).collect()
     }
 
     /// The cell operations among `items`.

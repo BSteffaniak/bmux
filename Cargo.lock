@@ -3230,11 +3230,7 @@ dependencies = [
 name = "bmux_scene_protocol_render"
 version = "0.0.1-alpha.4"
 dependencies = [
- "anyhow",
- "bmux_cell_geometry",
  "bmux_scene_protocol",
- "bmux_terminal",
- "uuid",
 ]
 
 [[package]]

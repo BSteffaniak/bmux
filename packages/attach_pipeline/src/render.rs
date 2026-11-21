@@ -49,8 +49,8 @@ use extension_plans::{
     build_after_content_extension_output_plan, build_before_content_extension_output_plan,
 };
 use extension_retained::{
-    ExtensionLayerDiffPlan, ExtensionRetainedLayerSnapshot, RenderSceneItemKind,
-    commit_retained_layer_snapshot, retained_graphic_key_from_item_key,
+    ExtensionLayerDiffPlan, ExtensionRetainedLayerSnapshot, commit_retained_layer_snapshot,
+    retained_graphic_key_from_item_key,
 };
 use terminal_graphics::TerminalGraphicsFrameResources;
 #[cfg(test)]
@@ -1412,7 +1412,7 @@ fn retained_scene_graphic_item_count(snapshot: &ExtensionRetainedLayerSnapshot) 
     snapshot
         .items
         .iter()
-        .filter(|item| matches!(&item.kind, RenderSceneItemKind::TerminalGraphic { .. }))
+        .filter(|item| matches!(item.item, RenderLayerItem::Graphic(_)))
         .count()
 }
 
@@ -3394,7 +3394,6 @@ fn execute_before_content_extension_output_plan(
         content,
         render_ops_to_cells(plan.snapshot.surface_rect, &ops),
     );
-    insert_retained_before_content_under_cells(cells, content, &output.snapshot);
 }
 
 fn insert_before_content_cells(
@@ -3403,31 +3402,6 @@ fn insert_before_content_cells(
     layer_cells: BTreeMap<(u16, u16), RenderUnderCell>,
 ) {
     for ((col, row), cell) in layer_cells {
-        insert_before_content_cell(cells, content, col, row, cell);
-    }
-}
-
-fn insert_retained_before_content_under_cells(
-    cells: &mut BTreeMap<(u16, u16), RenderUnderCell>,
-    content: PaneRect,
-    snapshot: &ExtensionRetainedLayerSnapshot,
-) {
-    let mut items = snapshot.items.iter().collect::<Vec<_>>();
-    items.sort_by(|lhs, rhs| (lhs.z, &lhs.key).cmp(&(rhs.z, &rhs.key)));
-    for item in items {
-        let RenderSceneItemKind::UnderCells { cells: under_cells } = &item.kind else {
-            continue;
-        };
-        insert_before_content_layer_cells(cells, content, under_cells.clone());
-    }
-}
-
-fn insert_before_content_layer_cells(
-    cells: &mut BTreeMap<(u16, u16), RenderUnderCell>,
-    content: PaneRect,
-    layer_cells: Vec<(u16, u16, RenderUnderCell)>,
-) {
-    for (col, row, cell) in layer_cells {
         insert_before_content_cell(cells, content, col, row, cell);
     }
 }
@@ -5686,15 +5660,15 @@ mod tests {
         ));
     }
 
-    /// A before-content scene's under-cells are planned, with the cells they newly cover as the
+    /// A before-content scene's items are planned, with the cells they newly cover as the
     /// damage under the content, before anything is emitted.
     #[test]
-    fn before_content_extension_output_plan_selects_scene_under_cells_before_emit() {
+    fn before_content_extension_output_plan_selects_scene_items_before_emit() {
         struct PlannedUnderCellsExtension;
 
         impl bmux_plugin::AttachRenderExtension for PlannedUnderCellsExtension {
             fn name(&self) -> &'static str {
-                "test.planned_under_cells"
+                "test.planned_before_content"
             }
 
             fn render_layer_scene_with_context(
@@ -5706,17 +5680,13 @@ mod tests {
             ) -> Option<bmux_plugin::RenderLayerScene> {
                 Some(bmux_plugin::RenderLayerScene::new(
                     None,
-                    vec![bmux_plugin::RenderSceneItem::under_cells(
+                    vec![bmux_plugin::RenderSceneItem::text(
                         "under",
                         0,
-                        vec![(
-                            1,
-                            0,
-                            RenderUnderCell {
-                                ch: 'u',
-                                style: RenderStyle::default(),
-                            },
-                        )],
+                        1,
+                        0,
+                        "u",
+                        RenderStyle::default(),
                     )],
                 ))
             }
@@ -5750,9 +5720,8 @@ mod tests {
         assert_eq!(plan.damage_rects, vec![DamageRect::new(1, 0, 1, 1)]);
         assert!(!plan.output.reused);
         assert!(plan.output.snapshot.items.iter().any(|item| matches!(
-            &item.kind,
-            super::RenderSceneItemKind::UnderCells { cells }
-                if cells.len() == 1 && cells[0].2.ch == 'u'
+            &item.item,
+            bmux_plugin::RenderLayerItem::Op(RenderOp::TextRun { text, .. }) if text == "u"
         )));
     }
 

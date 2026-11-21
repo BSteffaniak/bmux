@@ -1,19 +1,11 @@
 # bmux_scene_protocol_render
 
-Terminal-ANSI renderer for \[`bmux_scene_protocol`\] paint commands.
+Shared helpers for renderers of \[`bmux_scene_protocol`\] paint commands.
 
-The scene-protocol crate defines the wire schema for decoration
-output (paint commands, border glyphs, styles). This crate turns a
-`SurfaceDecoration` value into the corresponding ANSI/VT-sequence
-bytes on a `std::io::Write` target.
+Paint commands are the decoration authoring vocabulary: the `bmux.scene` contract that themes
+and scripts write. The decoration renderer lowers them once, per attached terminal's
+capabilities, into the host's retained render items (`RenderSceneItem`, a keyed `RenderOp` or
+terminal graphic), which is the one vocabulary the attach renderer paints.
 
-Consumers:
-
-- `bmux_attach_pipeline` uses the paint-command executor during frame
-  assembly to apply plugin-published decoration output.
-- Render extensions (`AttachRenderExtension` implementors in each
-  plugin's renderer crate) call `apply_paint_commands` directly to
-  paint their surface decoration on top of the pane content.
-
-No decoration-plugin-specific knowledge lives here; this crate is a
-generic helper for anything that produces scene-protocol output.
+This crate holds what that lowering shares: terminal capability matching for capability-gated
+commands, and style interpolation for gradients.

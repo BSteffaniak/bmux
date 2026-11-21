@@ -120,9 +120,9 @@ pub use render::{
     AttachVisualSurfaceView, BorderGlyphs, ExtensionRect, RenderCell, RenderColor, RenderDamage,
     RenderExtensionContext, RenderExtensionLayer, RenderExtensionRegistry, RenderLayerItem,
     RenderLayerScene, RenderLayerSceneBuilder, RenderNamedColor, RenderOp, RenderSceneItem,
-    RenderSceneItemKey, RenderSceneItemKind, RenderStyle, RenderSurfaceChrome, RenderSurfaceRole,
-    RenderTextSpan, RenderUnderCell, TerminalGraphicFill, TerminalGraphicOverlay,
-    TerminalRenderCapabilities, TerminalRgba, VisualAdapterRegistry, clip_render_text_run_to_rect,
+    RenderSceneItemKey, RenderStyle, RenderSurfaceChrome, RenderSurfaceRole, RenderTextSpan,
+    RenderUnderCell, TerminalGraphicFill, TerminalGraphicOverlay, TerminalRenderCapabilities,
+    TerminalRgba, VisualAdapterRegistry, clip_render_text_run_to_rect,
     render_char_display_width_u16, render_single_display_cell_char, render_text_width_u16,
 };
 pub use service_location::{
