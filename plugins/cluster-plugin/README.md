@@ -185,8 +185,8 @@ gateway_mode = "auto"
 
 - **`cluster-query/v1`**
 - **`cluster-command/v1`**
-- **`cluster-worker-command/v1`** — generated launch/adopt/input/resize/signal/restart/close contracts; every mutation carries typed execution identity, generation, control term, and bounded lease authority.
-- **`cluster-worker-state/v1`** — generated execution query/inventory plus cursor-based output and full terminal snapshot repair contracts.
+- **`cluster-worker-command/v2`** — generated launch/adopt/input/resize/signal/restart/close contracts; every mutation carries typed execution identity, generation, control term, and bounded lease authority.
+- **`cluster-worker-state/v2`** — generated execution query/inventory; screens are pushed as frames through `cluster-worker-stream/v1`.
 - **`cluster-peer-auth/v1`**
 - **`cluster-connection-events/v1`**
 

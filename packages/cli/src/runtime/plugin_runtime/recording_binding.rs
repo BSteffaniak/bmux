@@ -140,7 +140,7 @@ fn bind_configuration(
                 capability: bmux_plugin_sdk::HostScope::new("bmux.recording")
                     .map_err(|error| PluginCommandError::failed(error.to_string()))?,
                 kind: bmux_plugin_sdk::ServiceKind::Command,
-                interface_id: "recording-commands".into(),
+                interface_id: "recording-commands/v2".into(),
                 provider: bmux_plugin_sdk::ProviderId::Plugin(native.plugin_id.clone()),
             },
             operation: "activation".into(),

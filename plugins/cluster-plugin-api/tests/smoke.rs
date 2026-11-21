@@ -61,7 +61,7 @@ fn generated_control_services_expose_consistency_and_structured_errors() {
     );
     assert_eq!(
         bmux_cluster_plugin_api::cluster_attach_state::INTERFACE_ID,
-        "cluster-attach-state/v1"
+        "cluster-attach-state/v2"
     );
 }
 
@@ -490,11 +490,11 @@ fn interface_ids_and_operations_match_schema() {
     assert_eq!(cluster_raft_rpc::INTERFACE_ID, "cluster-raft-rpc/v1");
     assert_eq!(
         cluster_worker_command::INTERFACE_ID,
-        "cluster-worker-command/v1"
+        "cluster-worker-command/v2"
     );
     assert_eq!(
         cluster_worker_state::INTERFACE_ID,
-        "cluster-worker-state/v1"
+        "cluster-worker-state/v2"
     );
     assert_eq!(cluster_worker_command::OP_LAUNCH, "launch");
     assert_eq!(cluster_worker_command::OP_ADOPT, "adopt");

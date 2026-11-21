@@ -791,7 +791,8 @@ interface cluster-attach-command {
 }
 
 @capability(CLUSTER_READ)
-@interface-version(1)
+// v2: `snapshot` and `output` gave way to `routes` (observe leases; frames are pushed).
+@interface-version(2)
 interface cluster-attach-state {
     query layout(workspace_id: cluster-types.workspace-id, tab_id: cluster-types.logical-tab-id?, columns: u16, rows: u16) -> result<cluster-types.attach-layout, cluster-types.control-service-error>;
     // Where to follow each execution's screen: its worker's endpoint and an observe lease.
@@ -799,7 +800,8 @@ interface cluster-attach-state {
 }
 
 @capability(CLUSTER_WRITE)
-@interface-version(1)
+// v2: leases gained the `observe` class and executions lost their output cursors.
+@interface-version(2)
 interface cluster-worker-command {
     command launch(command_id: cluster-types.command-id, authority: cluster-types.worker-authority, spec: cluster-types.worker-launch-spec) -> result<cluster-types.worker-launch-result, cluster-types.worker-service-error>;
     command adopt(command_id: cluster-types.command-id, authority: cluster-types.worker-authority, spec: cluster-types.worker-adoption-spec) -> result<cluster-types.worker-launch-result, cluster-types.worker-service-error>;
@@ -812,7 +814,8 @@ interface cluster-worker-command {
 }
 
 @capability(CLUSTER_READ)
-@interface-version(1)
+// v2: `output` and `snapshot` are gone; workers push frames (`cluster-worker-stream`).
+@interface-version(2)
 interface cluster-worker-state {
     query get(execution_id: cluster-types.execution-id) -> result<cluster-types.worker-query-result, cluster-types.worker-service-error>;
     query inventory() -> cluster-types.worker-execution-list;

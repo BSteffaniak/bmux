@@ -1729,7 +1729,7 @@ fn empty_surface_for(state: &State, pane_id: Uuid) -> SurfaceDecoration {
 
 /// Identifier the decoration plugin attributes to its own generic hooks.
 const DECORATION_PLUGIN_ID: &str = "bmux.decoration";
-const DECORATION_INPUT_INTERFACE_ID: &str = "decoration-input-hooks/v2";
+const DECORATION_INPUT_INTERFACE_ID: &str = "decoration-input-hooks/v3";
 const DECORATION_INPUT_OPERATION: &str = "handle-input";
 const DECORATION_VISUAL_PROJECTION_KIND: &str = "bmux.decoration/visual-projection";
 
@@ -3377,7 +3377,7 @@ impl DecorationPlugin {
                 }));
                 Ok::<_, bmux_plugin_sdk::ServiceResponse>(outcome)
             },
-            "decoration-input-hooks/v2", "handle-input" => |req: bmux_decoration_plugin_api::decoration_input_hooks::client::HandleInputRequest, _ctx| {
+            "decoration-input-hooks/v3", "handle-input" => |req: bmux_decoration_plugin_api::decoration_input_hooks::client::HandleInputRequest, _ctx| {
                 let req = input::event_from_wire(req.event);
                 let result = match send_attach_input_soft(&state, req.clone(), INPUT_HOOK_SOFT_WAIT) {
                     SoftInputReply::Replied(result) => result,

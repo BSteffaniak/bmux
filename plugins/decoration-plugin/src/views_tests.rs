@@ -235,7 +235,7 @@ fn hiding_surface_preserves_explicit_pane_override() {
 fn generated_versioned_input_dispatch_never_reaches_global_vm() {
     let plugin = DecorationPlugin::new();
     let interface = bmux_decoration_plugin_api::decoration_input_hooks::INTERFACE_ID;
-    assert_eq!(interface.as_str(), "decoration-input-hooks/v2");
+    assert_eq!(interface.as_str(), "decoration-input-hooks/v3");
     // A malformed private request must fail decoding in the private dispatcher,
     // not be treated as an unknown interface and fall through to legacy state.
     let response = plugin.views.dispatch(

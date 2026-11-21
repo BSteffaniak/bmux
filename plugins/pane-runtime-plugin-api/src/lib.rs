@@ -9,7 +9,7 @@
 //! - [`attach_runtime_commands`] — per-client attach lifecycle.
 //! - [`attach_runtime_state`] — attach-view queries.
 //! - [`pane_runtime_events`] — lifecycle event stream.
-//! - [`pane_runtime_pointer_grid_v1`] — explicitly selected pointer-aware
+//! - [`pane_runtime_pointer_grid_v2`] — explicitly selected pointer-aware
 //!   snapshot/delta/window and execution presentation representation.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
@@ -126,7 +126,7 @@ mod tests {
     #[test]
     fn pointer_grid_selection_is_a_distinct_generated_contract() {
         use super::pane_runtime_execution_v4::TerminalExecutionRef;
-        use super::pane_runtime_pointer_grid_v1::{
+        use super::pane_runtime_pointer_grid_v2::{
             GridCapabilities,
             client::{FramesRequest, ScreenRequest, SnapshotsRequest},
         };

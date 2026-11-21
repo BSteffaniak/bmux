@@ -35,7 +35,7 @@ pub(crate) fn migrated_route(interface: &str, operation: &str) -> bool {
             "pane-runtime-presentation-wait-v1",
             "capabilities" | "wait-present"
         ) | (
-            "pane-runtime-pointer-grid-v1",
+            "pane-runtime-pointer-grid-v2",
             "capabilities" | "screen" | "wait-present"
         ) | (
             "pane-runtime-spawn-commands-v1",
@@ -78,7 +78,7 @@ pub(super) fn authorize_route(ctx: &NativeServiceContext) -> Result<(), ServiceR
         StreamProvenance::HostInternal
             if ctx.caller_client_id.is_none()
                 && ctx.request.caller_plugin_id == "bmux.cluster"
-                && ctx.request.service.interface_id == "attach-runtime-state"
+                && ctx.request.service.interface_id == "attach-runtime-state/v2"
                 && matches!(
                     ctx.request.operation.as_str(),
                     "observe-pane-frames" | "observe-pane-frames-reset"
@@ -335,7 +335,7 @@ mod tests {
         }
         for operation in ["observe-pane-frames", "observe-pane-frames-reset"] {
             *origin.lock().unwrap() = StreamProvenance::HostInternal;
-            let mut ctx = context("attach-runtime-state", operation, Vec::new());
+            let mut ctx = context("attach-runtime-state/v2", operation, Vec::new());
             ctx.caller_client_id = None;
             // Only the cluster plugin may name frame observers.
             assert!(authorize_route(&ctx).is_err());
@@ -349,7 +349,7 @@ mod tests {
         }
         *origin.lock().unwrap() = StreamProvenance::HostInternal;
         for (interface, operation) in [
-            ("attach-runtime-state", "observe-pane-frames-future"),
+            ("attach-runtime-state/v2", "observe-pane-frames-future"),
             ("pane-runtime-readiness-v1", "fence-unhealthy"),
             ("pane-runtime-readiness-v1", "future-operation"),
             ("pane-runtime-execution-v4", "send"),

@@ -923,53 +923,53 @@ impl RecordingOwner {
             "recording-state", "list-jobs" => |_req: (), _ctx| {
                 Ok::<Vec<recording_types::RecordingJob>, ServiceResponse>(self.recording_list_jobs_generated())
             },
-            "recording-commands", "start" => |req: StartRequest, _ctx| {
+            "recording-commands/v2", "start" => |req: StartRequest, _ctx| {
                 Ok::<Result<recording_types::RecordingSummary, recording_types::RecordingError>, ServiceResponse>(
                     self.recording_start_generated(req),
                 )
             },
-            "recording-commands", "stop" => |req: StopRequest, _ctx| {
+            "recording-commands/v2", "stop" => |req: StopRequest, _ctx| {
                 Ok::<Result<uuid::Uuid, recording_types::RecordingError>, ServiceResponse>(
                     self.recording_stop_generated(req.recording_id),
                 )
             },
-            "recording-commands", "write-custom-event" => |req: WriteCustomEventRequest, _ctx| {
+            "recording-commands/v2", "write-custom-event" => |req: WriteCustomEventRequest, _ctx| {
                 Ok::<Result<(), recording_types::RecordingError>, ServiceResponse>(
                     self.recording_write_custom_event_generated(req),
                 )
             },
-            "recording-commands", "delete" => |req: DeleteRequest, _ctx| {
+            "recording-commands/v2", "delete" => |req: DeleteRequest, _ctx| {
                 Ok::<Result<uuid::Uuid, recording_types::RecordingError>, ServiceResponse>(
                     self.recording_delete_generated(req.recording_id),
                 )
             },
-            "recording-commands", "delete-all" => |_req: (), _ctx| {
+            "recording-commands/v2", "delete-all" => |_req: (), _ctx| {
                 Ok::<u64, ServiceResponse>(self.recording_delete_all_generated())
             },
-            "recording-commands", "cut" => |req: CutRequest, _ctx| {
+            "recording-commands/v2", "cut" => |req: CutRequest, _ctx| {
                 Ok::<Result<recording_types::RecordingSummary, recording_types::RecordingError>, ServiceResponse>(
                     self.recording_cut_generated(req),
                 )
             },
-            "recording-commands", "queue-cut" => |req: QueueCutRequest, _ctx| {
+            "recording-commands/v2", "queue-cut" => |req: QueueCutRequest, _ctx| {
                 self.recording_queue_cut_generated(req).map_err(|error| recording_error_response(&error))
             },
-            "recording-commands", "rolling-start" => |req: RollingStartRequest, _ctx| {
+            "recording-commands/v2", "rolling-start" => |req: RollingStartRequest, _ctx| {
                 Ok::<Result<recording_types::RecordingSummary, recording_types::RecordingError>, ServiceResponse>(
                     self.recording_rolling_start_generated(req.options),
                 )
             },
-            "recording-commands", "rolling-stop" => |_req: (), _ctx| {
+            "recording-commands/v2", "rolling-stop" => |_req: (), _ctx| {
                 Ok::<Result<uuid::Uuid, recording_types::RecordingError>, ServiceResponse>(
                     self.recording_rolling_stop_generated(),
                 )
             },
-            "recording-commands", "rolling-clear" => |req: RollingClearRequest, _ctx| {
+            "recording-commands/v2", "rolling-clear" => |req: RollingClearRequest, _ctx| {
                 Ok::<recording_types::RecordingRollingClearReport, ServiceResponse>(
                     self.recording_rolling_clear_generated(req.restart_if_active),
                 )
             },
-            "recording-commands", "prune" => |req: PruneRequest, _ctx| {
+            "recording-commands/v2", "prune" => |req: PruneRequest, _ctx| {
                 Ok::<u64, ServiceResponse>(self.recording_prune_generated(req.older_than_days))
             },
         })
@@ -2586,7 +2586,7 @@ mod tests {
                 service: bmux_plugin_sdk::RegisteredService {
                     capability: bmux_plugin_sdk::HostScope::new("bmux.recording.write").unwrap(),
                     kind: bmux_plugin_sdk::ServiceKind::Command,
-                    interface_id: "recording-commands".into(),
+                    interface_id: "recording-commands/v2".into(),
                     provider: bmux_plugin_sdk::ProviderId::Plugin(context.plugin_id.clone()),
                 },
                 operation: "queue-cut".into(),

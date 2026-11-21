@@ -395,7 +395,8 @@ interface decoration-events {
 // Checked v2 only. The generated operation envelope replaces the historical
 // unmodeled, bare attach event payload. The host-local input model is not wire.
 @capability(DECORATION_WRITE)
-@interface-version(2)
+// v3: input surfaces carry the pane's input modes (`modes`).
+@interface-version(3)
 interface decoration-input-hooks {
     record input-rect { x: u16, y: u16, w: u16, h: u16 }
     record input-modifiers {

@@ -7,7 +7,7 @@ use bmux_client::{AttachLayoutState, AttachOpenInfo, AttachSnapshotState, Client
 use bmux_ipc::ErrorCode;
 use bmux_pane_runtime_plugin_api::{
     attach_runtime_commands as attach_commands, attach_runtime_state as attach_state,
-    pane_runtime_pointer_grid_v1 as pointer_grid,
+    pane_runtime_pointer_grid_v2 as pointer_grid,
 };
 use bmux_session_models::SessionSelector;
 use std::future::Future;
@@ -62,8 +62,8 @@ pub async fn attach_pane_grid_snapshot_state_streaming(
                 encoded: snapshot.encoded,
             })
             .collect()),
-        Ok(Err(err)) => typed_server_error("pointer-grid-v1 snapshots", err),
-        Err(err) => typed_dispatch_error("pointer-grid-v1 snapshots", err),
+        Ok(Err(err)) => typed_server_error("pointer-grid-v2 snapshots", err),
+        Err(err) => typed_dispatch_error("pointer-grid-v2 snapshots", err),
     }
 }
 
@@ -97,8 +97,8 @@ pub async fn attach_pane_frames_streaming(
                 .collect(),
             state.frames_still_pending,
         )),
-        Ok(Err(err)) => typed_server_error("pointer-grid-v1 frames", err),
-        Err(err) => typed_dispatch_error("pointer-grid-v1 frames", err),
+        Ok(Err(err)) => typed_server_error("pointer-grid-v2 frames", err),
+        Err(err) => typed_dispatch_error("pointer-grid-v2 frames", err),
     }
 }
 

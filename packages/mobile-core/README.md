@@ -27,7 +27,7 @@ never emulator input. Unchanged pointer state is not repeatedly delivered.
 The remote actor resolves through `attach_pipeline::resolve_pointer_shape` using
 `retained_surfaces_from_attach_scene` and authoritative terminal-grid protocol
 state. Snapshot/delta hydration explicitly uses the generated
-`pane_runtime_pointer_grid_v1` service with `format_version=1`; unsupported
+`pane_runtime_pointer_grid_v2` service with `format_version=1`; unsupported
 providers fail rather than retry a legacy representation that could lose stacks.
 Failed initial hydration or repair terminates the stream explicitly. Hover and
 leave use structured mouse events, independent of application

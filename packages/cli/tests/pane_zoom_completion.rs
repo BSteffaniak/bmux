@@ -28,7 +28,7 @@ use bmux_frontend_runtime::{
     presentation::PreparedDelivery,
 };
 use bmux_pane_runtime_plugin_api::{
-    pane_runtime_commands::client as commands, pane_runtime_pointer_grid_v1::client as grids,
+    pane_runtime_commands::client as commands, pane_runtime_pointer_grid_v2::client as grids,
     pane_runtime_state::client as state,
 };
 

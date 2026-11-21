@@ -74,7 +74,7 @@ impl ProcessService {
     ) -> Result<Option<LiveFrame>, LiveError> {
         let reference = self.live_reference(run_id)?;
         let mut client = ProcessDispatchClient::new(&self.caller);
-        let frame = bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::client::live_read(
+        let frame = bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v2::client::live_read(
             &mut client,
             1,
             reference.clone(),
@@ -100,7 +100,7 @@ impl ProcessService {
         let reference = self.live_reference(run_id)?;
         let mut client = ProcessDispatchClient::new(&self.caller);
         let frame =
-            bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::client::live_wait_present(
+            bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v2::client::live_wait_present(
                 &mut client,
                 1,
                 reference.clone(),

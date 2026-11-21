@@ -32,7 +32,7 @@ fn check(value: &Value) -> Result<(), &'static str> {
                 let state: PointerShapeState = serde_json::from_value(state.clone())
                     .map_err(|_| "invalid pointer recovery state")?;
                 if state != PointerShapeState::default() {
-                    return Err("pointer stacks require pane-runtime-pointer-grid-v1");
+                    return Err("pointer stacks require pane-runtime-pointer-grid-v2");
                 }
             }
             for (key, child) in fields {
@@ -53,7 +53,7 @@ fn check(value: &Value) -> Result<(), &'static str> {
                                     || bytes.starts_with(c1_osc22)
                                     || c1_osc22.starts_with(&bytes))
                             {
-                                return Err("pending OSC 22 requires pane-runtime-pointer-grid-v1");
+                                return Err("pending OSC 22 requires pane-runtime-pointer-grid-v2");
                             }
                         } else if !bytes.is_empty() {
                             let payload: Value = serde_json::from_slice(&bytes)

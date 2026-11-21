@@ -116,8 +116,8 @@ pub(crate) fn observer_operation_allowed(
         return true;
     }
     match interface {
-        "attach-runtime-state" | "pane-runtime-state" => true,
-        "pane-runtime-pointer-grid-v1" => matches!(
+        "attach-runtime-state/v2" | "pane-runtime-state" => true,
+        "pane-runtime-pointer-grid-v2" => matches!(
             operation,
             "capabilities" | "snapshots" | "snapshot" | "deltas" | "windows"
         ),
@@ -1378,7 +1378,7 @@ mod selection_tests {
         assert!(observer_operation_allowed(
             host,
             observer,
-            "attach-runtime-state",
+            "attach-runtime-state/v2",
             "attach-snapshot"
         ));
         assert!(observer_operation_allowed(

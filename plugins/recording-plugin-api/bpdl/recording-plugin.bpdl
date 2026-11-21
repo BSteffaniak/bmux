@@ -252,6 +252,8 @@ interface recording-types {
     }
 }
 
+// v2: `cut-started` carries the cut's wall-clock range.
+@interface-version(2)
 interface recording-events {
     variant recording-event {
         started { target: recording-types.recording-capture-target },
@@ -279,6 +281,8 @@ interface recording-state {
 }
 
 @capability(RECORDING_WRITE)
+// v2: `cut` and `queue-cut` take a wall-clock range.
+@interface-version(2)
 interface recording-commands {
     command start(
         session_id: uuid?,

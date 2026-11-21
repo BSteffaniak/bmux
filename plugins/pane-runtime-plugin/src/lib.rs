@@ -84,7 +84,7 @@ mod contract_tests {
         }));
         let pointer_routes: std::collections::BTreeSet<_> = routes
             .iter()
-            .filter(|route| route.interface_id == "pane-runtime-pointer-grid-v1")
+            .filter(|route| route.interface_id == "pane-runtime-pointer-grid-v2")
             .map(|route| route.operation.as_str())
             .collect();
         assert_eq!(
@@ -180,11 +180,11 @@ mod contract_tests {
             bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
                 .unwrap();
         assert!(services.iter().any(|service| service.interface_id
-            == "pane-runtime-pointer-grid-v1"
+            == "pane-runtime-pointer-grid-v2"
             && service.capability.as_str() == "bmux.pane_runtime.pointer_grid.v1"
             && service.kind == bmux_plugin_sdk::ServiceKind::Command));
         assert!(manifest.services.iter().any(|service| service.interface_id
-            == "pane-runtime-pointer-grid-v1"
+            == "pane-runtime-pointer-grid-v2"
             && service.kind == bmux_plugin_sdk::ServiceKind::Command));
     }
 
@@ -344,7 +344,7 @@ impl PaneRuntimePlugin {
             (
                 "bmux.pane_runtime.pointer_grid.v1",
                 ServiceKind::Command,
-                "pane-runtime-pointer-grid-v1",
+                "pane-runtime-pointer-grid-v2",
                 &["capabilities", "screen", "wait-present"][..],
             ),
             (
@@ -562,7 +562,17 @@ mod definition_contract_tests {
                 .iter()
                 .find(|contract| contract.interface_id == service.interface_id)
                 .expect("every retained route requires explicit compatibility metadata");
-            assert_eq!((contract.major, contract.minor), (1, 0));
+            // A versioned route (`name/vN`) negotiates major N; the rest are v1.
+            let major = service
+                .interface_id
+                .rsplit_once("/v")
+                .map_or(1, |(_, version)| version.parse::<u16>().unwrap());
+            assert_eq!(
+                (contract.major, contract.minor),
+                (major, 0),
+                "{}",
+                service.interface_id
+            );
         }
     }
 }

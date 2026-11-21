@@ -385,7 +385,7 @@ impl ProcessService {
         client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
         reference: pane::TerminalExecutionRef,
     ) -> Result<String> {
-        bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::client::screen(
+        bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v2::client::screen(
             client, 1, reference,
         )
         .await?
@@ -549,7 +549,7 @@ impl ProcessService {
         let reference = execution(&value).map_err(unavailable)?;
         let mut client = ProcessDispatchClient::new(&self.caller);
         let frame =
-            bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::client::wait_present(
+            bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v2::client::wait_present(
                 &mut client,
                 1,
                 reference.clone(),
@@ -1346,7 +1346,7 @@ impl bmux_recording_plugin_api::recording_process_presentation_v1::RecordingProc
             let value = self.load(run_id).map_err(failure)?;
             let reference = execution(&value).map_err(failure)?;
             let mut client = ProcessDispatchClient::new(&self.caller);
-            let screen = bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v1::client::screen(
+            let screen = bmux_pane_runtime_plugin_api::pane_runtime_pointer_grid_v2::client::screen(
                 &mut client,
                 1,
                 reference.clone(),

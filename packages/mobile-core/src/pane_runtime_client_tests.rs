@@ -24,7 +24,7 @@ impl TypedDispatchClient for GridDispatch {
                 let payload = payload.take().expect("transport polled after completion");
                 self.calls += 1;
                 assert_eq!(capability, "bmux.pane_runtime.pointer_grid.v1");
-                assert_eq!(interface, "pane-runtime-pointer-grid-v1");
+                assert_eq!(interface, "pane-runtime-pointer-grid-v2");
                 assert!(matches!(kind, bmux_ipc::InvokeServiceKind::Command));
                 match operation {
                     "snapshots" => {

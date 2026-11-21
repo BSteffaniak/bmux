@@ -1809,7 +1809,7 @@ mod tests {
         let registry = bmux_plugin::RenderExtensionRegistry::new();
         let endpoint = bmux_plugin::AttachInputEndpoint {
             capability: "bmux.decoration.write".into(),
-            interface_id: "decoration-input-hooks/v2".into(),
+            interface_id: "decoration-input-hooks/v3".into(),
             operation: "handle-input".into(),
         };
         assert!(registry.input_codec(&endpoint).is_none());
@@ -1823,7 +1823,7 @@ mod tests {
         assert_eq!(codec.endpoint(), endpoint);
         assert!(codec.decode_result(b"legacy response").is_err());
         let mut old = endpoint;
-        old.interface_id = "decoration-input-hooks".into();
+        old.interface_id = "decoration-input-hooks/v2".into();
         assert!(registry.input_codec(&old).is_none());
     }
 

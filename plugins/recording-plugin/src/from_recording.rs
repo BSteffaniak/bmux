@@ -550,7 +550,11 @@ fn request_to_dsl(
                     _ => {}
                 }
             }
-            if interface_id == "attach-runtime-state" {
+            // Recordings made before the interface's v2 name it without a version.
+            if matches!(
+                interface_id.as_str(),
+                "attach-runtime-state" | "attach-runtime-state/v2"
+            ) {
                 return RequestDslResult::Skip;
             }
             RequestDslResult::Line(format!(

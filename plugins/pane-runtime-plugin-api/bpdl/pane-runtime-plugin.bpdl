@@ -49,7 +49,7 @@ interface pane-runtime-environment-v1 {
 // services reject nonempty pointer recovery state; their meaning is unchanged.
 // Read operations use command dispatch, like the existing presentation services.
 @capability(PANE_RUNTIME_POINTER_GRID_V1)
-interface pane-runtime-pointer-grid-v1 {
+interface pane-runtime-pointer-grid-v2 {
     record grid-capabilities { format_versions: list<u32> }
     command capabilities() -> grid-capabilities;
     command snapshots(format_version: u32, session_id: uuid, pane_ids: list<uuid>, max_rows_per_pane: u32)
@@ -1132,6 +1132,9 @@ interface attach-runtime-commands {
 }
 
 @capability(ATTACH_RUNTIME_READ)
+// v2: frames replaced grid deltas; frame pushes carry clipboard writes and replay markers;
+// observers follow panes with `observe-pane-frames`.
+@interface-version(2)
 interface attach-runtime-state {
     record pane-chunk {
         pane_id: uuid,
@@ -1612,7 +1615,7 @@ interface pane-runtime-focus {
 /// unexported: only its read-only queries are provided.
 world pane-runtime {
     provide pane-runtime-view-size-v1;
-    provide pane-runtime-pointer-grid-v1;
+    provide pane-runtime-pointer-grid-v2;
     provide pane-runtime-live-presentation-v1;
     provide pane-runtime-human-input-v1;
     provide pane-runtime-presentation-v1;

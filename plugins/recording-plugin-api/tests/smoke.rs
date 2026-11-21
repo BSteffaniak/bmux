@@ -5,7 +5,7 @@ use bmux_recording_plugin_api::{
 #[test]
 fn interface_ids_match_bpdl_source() {
     assert_eq!(recording_state::INTERFACE_ID, "recording-state");
-    assert_eq!(recording_commands::INTERFACE_ID, "recording-commands");
+    assert_eq!(recording_commands::INTERFACE_ID, "recording-commands/v2");
     assert_eq!(capabilities::RECORDING_READ, "bmux.recording.read");
     assert_eq!(capabilities::RECORDING_WRITE, "bmux.recording.write");
 }

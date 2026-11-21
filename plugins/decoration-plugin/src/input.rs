@@ -295,7 +295,7 @@ mod tests {
         let event = event();
         let framed = codec.encode_event(&event).unwrap();
         let interface = codec.endpoint().interface_id;
-        assert_eq!(interface, "decoration-input-hooks/v2");
+        assert_eq!(interface, "decoration-input-hooks/v3");
         let contract = bmux_decoration_plugin_api::Contract::service_contract_for(&interface)
             .expect("owning provider declares input interface");
         let payload =

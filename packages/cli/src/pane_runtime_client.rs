@@ -13,7 +13,7 @@ use bmux_context_state::ContextSelector;
 use bmux_ipc::ErrorCode;
 use bmux_pane_runtime_plugin_api::{
     attach_runtime_commands as AttachCommands, attach_runtime_state as AttachState,
-    pane_runtime_commands as PaneCommands, pane_runtime_pointer_grid_v1 as PointerGrid,
+    pane_runtime_commands as PaneCommands, pane_runtime_pointer_grid_v2 as PointerGrid,
     pane_runtime_state as PaneState,
 };
 use bmux_session_models::SessionSelector;
@@ -36,7 +36,7 @@ async fn pointer_grid_available(
         Err(bmux_plugin_sdk::TypedServiceClientError::Dispatch(
             bmux_plugin_sdk::TypedDispatchClientError::Server { details, .. },
         ))
-            if details.contains("no provider for service capability='bmux.pane_runtime.pointer_grid.v1' kind='Command' interface='pane-runtime-pointer-grid-v1' operation='capabilities'") => Ok(false),
+            if details.contains("no provider for service capability='bmux.pane_runtime.pointer_grid.v1' kind='Command' interface='pane-runtime-pointer-grid-v2' operation='capabilities'") => Ok(false),
         Err(error) => typed_dispatch_error("pointer-grid capabilities", error),
     }
 }
@@ -58,7 +58,7 @@ mod pointer_grid_negotiation_tests {
         {
             futures_util::future::lazy(move |_| {
                 assert_eq!(capability, "bmux.pane_runtime.pointer_grid.v1");
-                assert_eq!(interface, "pane-runtime-pointer-grid-v1");
+                assert_eq!(interface, "pane-runtime-pointer-grid-v2");
                 assert_eq!(operation, "capabilities");
                 match self.0 {
                     0 | 1 => Ok(bmux_plugin_sdk::encode_service_message(
@@ -70,7 +70,7 @@ mod pointer_grid_negotiation_tests {
                     2 => Err(bmux_plugin_sdk::TypedDispatchClientError::server(
                         interface,
                         operation,
-                        "no provider for service capability='bmux.pane_runtime.pointer_grid.v1' kind='Command' interface='pane-runtime-pointer-grid-v1' operation='capabilities'",
+                        "no provider for service capability='bmux.pane_runtime.pointer_grid.v1' kind='Command' interface='pane-runtime-pointer-grid-v2' operation='capabilities'",
                     )),
                     _ => Err(bmux_plugin_sdk::TypedDispatchClientError::transport(
                         interface,
