@@ -4285,7 +4285,7 @@ version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "faf9468729b8cbcea668e36183cb69d317348c2e08e994829fb56ebfdfbaac34"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5358,7 +5358,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8381,7 +8381,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_log_watch"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e4dfef512eb895517b22a96ebfacc74b0968a811"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#f27d106e6513eda10b28e96c37a764e332a969cf"
 dependencies = [
  "anyhow",
  "bmux_terminal",
@@ -11202,7 +11202,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -11215,7 +11215,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11282,7 +11282,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11839,7 +11839,7 @@ dependencies = [
 [[package]]
 name = "simvar_observer"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e4dfef512eb895517b22a96ebfacc74b0968a811"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#f27d106e6513eda10b28e96c37a764e332a969cf"
 
 [[package]]
 name = "simvar_utils"
@@ -12909,7 +12909,7 @@ dependencies = [
 [[package]]
 name = "switchy_pty"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e4dfef512eb895517b22a96ebfacc74b0968a811"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#f27d106e6513eda10b28e96c37a764e332a969cf"
 dependencies = [
  "libc",
  "switchy_simulation",
@@ -12930,7 +12930,7 @@ dependencies = [
 [[package]]
 name = "switchy_random"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e4dfef512eb895517b22a96ebfacc74b0968a811"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#f27d106e6513eda10b28e96c37a764e332a969cf"
 dependencies = [
  "log 0.4.34",
  "rand 0.8.5",
@@ -12959,7 +12959,7 @@ dependencies = [
 [[package]]
 name = "switchy_simulation"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e4dfef512eb895517b22a96ebfacc74b0968a811"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#f27d106e6513eda10b28e96c37a764e332a969cf"
 
 [[package]]
 name = "switchy_tcp"
@@ -13000,7 +13000,7 @@ dependencies = [
 [[package]]
 name = "switchy_thread"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e4dfef512eb895517b22a96ebfacc74b0968a811"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#f27d106e6513eda10b28e96c37a764e332a969cf"
 dependencies = [
  "switchy_simulation",
  "switchy_time 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
@@ -13021,7 +13021,7 @@ dependencies = [
 [[package]]
 name = "switchy_time"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e4dfef512eb895517b22a96ebfacc74b0968a811"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#f27d106e6513eda10b28e96c37a764e332a969cf"
 dependencies = [
  "switchy_random 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "switchy_simulation",
@@ -13281,7 +13281,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.5",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -15106,7 +15106,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

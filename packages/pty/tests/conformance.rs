@@ -612,3 +612,40 @@ fn a_control_handle_works_from_another_thread_than_the_reader() {
         assert_eq!(control.exit_status(), Some(exit));
     });
 }
+
+#[test]
+fn typed_lines_are_edited_before_programs_read_them() {
+    scenario(|| {
+        let mut process = program("exec cat", "cat", &[])
+            .spawn(PtySize::new(80, 24))
+            .unwrap();
+        let writer = process.writer().unwrap();
+        // Erase, kill and word erase edit the line being typed; end of file sends a partial
+        // line, then ends the input.
+        writer
+            .write(&b"abc\x7f\x7fd\rxyz\x15hi\rone two\x17three\rpart\x04\x04"[..])
+            .unwrap();
+        let deadline = now() + Duration::from_secs(10);
+        let mut output = Vec::new();
+        let exit = loop {
+            let left = deadline.saturating_duration_since(now());
+            match process
+                .next_event_timeout(left)
+                .expect("cat exits at end of input")
+            {
+                PtyEvent::Output(bytes) => output.extend(bytes),
+                PtyEvent::Stdout(_) => {}
+                PtyEvent::Exited(exit) => break exit,
+            }
+        };
+        assert_eq!(exit.code(), Some(0));
+        let output = text(&output);
+        // The echo erases characters; cat copies only the edited lines, a line at a time.
+        assert!(output.contains("\x08 \x08"), "{output:?}");
+        assert!(output.contains("ad\r\n"), "{output:?}");
+        assert_eq!(output.matches("hi\r\n").count(), 2, "{output:?}");
+        assert!(output.contains("one three\r\n"), "{output:?}");
+        assert_eq!(output.matches("part").count(), 2, "{output:?}");
+        assert!(!output.contains("part\r\n"), "{output:?}");
+    });
+}

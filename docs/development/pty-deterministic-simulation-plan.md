@@ -257,7 +257,8 @@ target as today.
 
 **Terminal fidelity** (decided: the core subset): the subset above. Canonical-mode
 line editing (ICANON with erase and kill, VMIN/VTIME) comes later, only if a test
-needs it.
+needs it. (Done later for ICANON: see the implementation notes. VMIN/VTIME are
+still not modelled; raw mode behaves as `VMIN=1, VTIME=0`.)
 
 **Snapshot API for the TUI** (used by workstream C): `switchy_pty` exposes a
 read-only `KernelSnapshot` built from the oracle. It contains:
@@ -707,6 +708,14 @@ The TUI (phases 10–14), as built:
   the scheduling generator, and `SIMULATOR_SHRINK` shrinks a failure's by delta
   debugging to a schedule where dropping any choice makes the run pass (a racy
   example in simvar shrank from 136 choices to 1).
+- **Canonical input:** simulated terminals now edit typed lines like a real
+  one in canonical mode: erase, word erase and kill with `\b \b` echo, reads of
+  at most one line, and the end-of-file character sending a partial line or
+  ending the input. A conformance scenario checks it against Linux and macOS.
+- **A real macOS bug the conformance suite exposed:** under concurrent opens,
+  `openpty` can fail with -6, XNU's internal `EREDRIVEOPEN`, which leaked out
+  of the kernel (about one open in a thousand when the tests ran in parallel).
+  `switchy_pty` retries the open.
 
 Weak memory (phase 9), as built: `SIMULATOR_WEAK_MEMORY=1` gives every
 simulated thread a vector clock and every atomic a 32-store history; a load
