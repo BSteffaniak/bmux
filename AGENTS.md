@@ -146,6 +146,16 @@ If `bmux plugin rebuild --all-workspace-plugins` is unavailable in the current
 environment, run direct cargo builds for plugin crates (for example, `cargo
 build -p <plugin-crate> ...`).
 
+## Simulations (REQUIRED)
+
+Simulations live in `simulation/`, a separate Cargo workspace (never add it to
+the main one: its simulator features would reach real builds). If a change
+touches `simulation/**`, `packages/pty/**` or the switchy crates it uses, run:
+
+- `cargo clippy --manifest-path simulation/Cargo.toml --all-targets -- -D warnings`
+- `cargo sim pty --regression`
+- `SIMULATOR_RUNS=500 SIMULATOR_VERIFY_DETERMINISM=1 cargo sim pty`
+
 ## Minimum Required Commands (CLI/runtime work)
 
 For changes in `packages/cli/**` (runtime, input, pane/layout, protocol,
@@ -205,5 +215,6 @@ Agents should report test execution in final response using this format:
 - `./scripts/smoke-pty-runtime.sh` - PASS/FAIL
 - `./scripts/compat-matrix.sh` - PASS/FAIL (if required)
 - `bmux plugin rebuild --all-workspace-plugins` - PASS/FAIL (if required)
+- `cargo sim pty --regression` - PASS/FAIL (if required)
 
 If any required command is skipped, explain why.

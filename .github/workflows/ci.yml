@@ -431,13 +431,20 @@ jobs:
           cargo test -p bmux_pty --no-default-features --features simulator \
             --test conformance --test simulation
 
+      - name: Lint the simulations
+        shell: bash
+        run: cargo clippy --manifest-path simulation/Cargo.toml --all-targets -- -D warnings
+
       - name: Regression seeds (each replayed to verify determinism)
         shell: bash
-        run: scripts/sim-pty.sh --regression
+        run: cargo sim pty --regression
 
       - name: Random runs, determinism verified
         shell: bash
-        run: scripts/sim-pty.sh --runs 500 --verify-determinism
+        env:
+          SIMULATOR_RUNS: "500"
+          SIMULATOR_VERIFY_DETERMINISM: "1"
+        run: cargo sim pty
 
   sandbox-bundle-regression:
     name: Sandbox Bundle Regression

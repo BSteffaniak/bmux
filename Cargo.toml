@@ -1,6 +1,7 @@
 [workspace]
-# Its own workspace, so its simulator features never reach this one.
-exclude = ["packages/pty/simulator"]
+# Simulations are a workspace of their own (`cargo sim`), so their simulator
+# features never reach this one.
+exclude = ["simulation"]
 members = [
     "xtask",
     "examples/counter-plugin",

@@ -1,0 +1,23 @@
+[package]
+description = "Deterministic simulation testing for bmux_pty"
+edition     = { workspace = true }
+license     = { workspace = true }
+name        = "pty"
+publish     = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_pty           = { workspace = true, features = ["simulator"] }
+bmux_simvar_tui    = { workspace = true }
+bmux_tui           = { workspace = true }
+simvar             = { workspace = true, features = ["random", "thread", "time"] }
+switchy_pty        = { workspace = true, features = ["simulator"] }
+switchy_simulation = { workspace = true }
+switchy_thread     = { workspace = true, features = ["simulator"] }
+switchy_time       = { workspace = true, features = ["simulator"] }
+
+[features]
+default = []
+
+fail-on-warnings = []

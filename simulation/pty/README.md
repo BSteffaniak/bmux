@@ -1,9 +1,9 @@
-# bmux_pty simulator
+# pty: the bmux_pty simulation
 
 Deterministic simulation testing for `bmux_pty`, on
 [simvar](https://github.com/MoosicBox/MoosicBox/tree/master/packages/simvar) and
-switchy's simulated terminals, processes, threads and time. It is its own Cargo
-workspace so its `simulator` features never reach bmux's main workspace.
+switchy's simulated terminals, processes, threads and time. Run it with
+`cargo sim pty`; see [the simulation README](../README.md).
 
 Each run starts one to three driver threads. Each driver runs a random program
 from switchy_pty's simulated program library on a `PtyCommand`, then does random
@@ -27,14 +27,15 @@ the modelled OS (Linux or macOS), so a failure replays exactly on the same
 build.
 
 ```bash
-scripts/sim-pty.sh                       # 100 random runs
-scripts/sim-pty.sh --runs 2000           # more
-scripts/sim-pty.sh --replay SEED         # replay one run, with logs
-scripts/sim-pty.sh --regression          # the seeds in regression-seeds
-scripts/sim-pty.sh --verify-determinism  # replay every run and compare traces
-scripts/sim-pty.sh --replay SEED --tui   # watch one run; space pauses, n/N step
-SIMULATOR_PTY_PID_REUSE=1 scripts/sim-pty.sh   # reuse every freed process id
-SIMULATOR_PTY_FAULTS=0.1 scripts/sim-pty.sh    # more injected faults
+cargo sim pty                                      # SIMULATOR_RUNS random runs
+SIMULATOR_RUNS=2000 cargo sim pty                  # more
+SIMULATOR_SEED=42 SIMULATOR_RUNS=1 cargo sim pty   # replay one run
+SIMULATOR_SEED=42 SIMULATOR_RUNS=1 cargo sim pty --tui   # watch it; space pauses, n/N step
+SIMULATOR_VERIFY_DETERMINISM=1 cargo sim pty       # replay every run and compare traces
+cargo sim pty --regression                         # the seeds in regression-seeds
+SIMULATOR_PTY_PID_REUSE=1 cargo sim pty            # reuse every freed process id
+SIMULATOR_PTY_FAULTS=0.1 cargo sim pty             # more injected faults
+SIMULATOR_WEAK_MEMORY=1 cargo sim pty              # weak memory for atomics
 ```
 
 Bugs found so far: a kill or interrupt after the process was reaped could reach

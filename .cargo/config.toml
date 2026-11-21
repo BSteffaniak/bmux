@@ -1,2 +1,4 @@
 [alias]
 xtask = "run --package xtask --"
+# Deterministic simulations (simulation/): `cargo sim pty`, `cargo sim pty -- --tui`.
+sim = "xtask sim"

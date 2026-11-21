@@ -53,7 +53,7 @@ simulation context) for simulating the pane runtime, IPC and the server later.
 ```
             bmux (this repo)                         MoosicBox
  ┌────────────────────────────────────┐
- │ packages/pty/simulator  (bin)      │──uses──▶ simvar (harness: seeds, runs,
+ │ simulation/pty  (bin)              │──uses──▶ simvar (harness: seeds, runs,
  │   workload + invariants + oracle   │           reproduction, trace hash)
  └──────────────┬─────────────────────┘
                 │
@@ -383,13 +383,13 @@ Lint: in `bmux_pty`, add `clippy.toml` `disallowed_methods` and
 - A difference is either a simulator bug or a documented personality
   difference, marked per test. This is what keeps the simulator honest.
 
-### B3. `packages/pty/simulator`: the simvar binary
+### B3. `simulation/pty`: the simvar binary
 
 **Workspace placement:** this crate must **not** be a member of the main
 workspace. Cargo would merge its `simulator` features into the real `bmux_pty`
 during `cargo nextest run`. Make it its own workspace, excluded from the root
-one, run through `cargo run --manifest-path packages/pty/simulator/Cargo.toml`
-and a `scripts/sim-pty.sh` wrapper.
+one (`simulation/`, which will hold every bmux simulation), run with
+`cargo sim pty`.
 `scripts/check-workspace-dependencies.sh` needs to know about it.
 
 **Setup:** one simvar host runs a driver simulated thread, plus extra driver
@@ -475,7 +475,7 @@ bugs:
 
 ### B4. CI and developer workflow
 
-- `scripts/sim-pty.sh`:
+- `cargo sim pty` (configured through `SIMULATOR_*`, plus `--tui` and `--regression`):
   - `SIMULATOR_RUNS=N`, with a seed or a random one
   - `--verify-determinism`
   - `--replay <seed>` (one process, logs on)
@@ -507,7 +507,7 @@ rule doesn't apply to it.
   - the generic panels (C1, C2, C4)
   - the `BmuxSimObserver` implementation of `SimObserver`
   - a `SimPanel` extension trait for panels specific to one simulator
-- **The PTY-specific panels (C3)** live in `packages/pty/simulator` (outside the
+- **The PTY-specific panels (C3)** live in `simulation/pty` (outside the
   main workspace, see B3) and register through `SimPanel`. Later simulators for
   the pane runtime, IPC or the server reuse the crate and add their own panels.
 
@@ -701,3 +701,10 @@ sequences. `SeqCst`, fences and every non-atomic switch point are full fences,
 so the model never invents behaviour. Litmus tests (message passing, store
 buffering) behave as the model requires. bmux_pty passes about 3000 weak-memory
 runs; the nightly workflow runs it.
+
+Running simulations, as built: every bmux simulation is a member of the
+`simulation/` workspace (excluded from the main one, as `cargo-fuzz` keeps
+`fuzz/` apart, so its simulator features never reach real builds). `cargo sim
+NAME` (an alias for `cargo xtask sim`, so it works from anywhere in the repo)
+runs one, configured through simvar's `SIMULATOR_*` variables; the pty
+simulation adds `--tui` and `--regression`.

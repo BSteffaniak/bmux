@@ -1,5 +1,5 @@
-# Seeds scripts/sim-pty.sh --regression runs on every change to packages/pty (each replayed to
-# verify determinism). A seed reproduces a run only on the build it was found with, so these
+# Seeds `cargo sim pty --regression` runs on every change to packages/pty (each in its own
+# process, replayed to verify determinism). A seed reproduces a run only on the build it was found with, so these
 # are a fixed sample of schedules rather than exact reproductions; add a seed here when its
 # failure led to a fix, with a note.
 1

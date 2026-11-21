@@ -1,0 +1,23 @@
+# bmux's deterministic simulations: one member per simulated subsystem, run with
+# `cargo sim <name>`. A workspace of its own (excluded from the main one) so the
+# `simulator` features its members enable never reach bmux's real builds.
+[workspace]
+members  = ["pty"]
+resolver = "3"
+
+[workspace.package]
+edition    = "2024"
+license    = "MPL-2.0"
+publish    = false
+repository = "https://github.com/BSteffaniak/bmux"
+version    = "0.0.0"
+
+[workspace.dependencies]
+bmux_pty           = { path = "../packages/pty", default-features = false }
+bmux_simvar_tui    = { path = "../packages/simvar-tui", default-features = false }
+bmux_tui           = { path = "../packages/tui", default-features = false }
+simvar             = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
+switchy_pty        = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
+switchy_simulation = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
+switchy_thread     = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
+switchy_time       = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }

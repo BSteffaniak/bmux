@@ -27,9 +27,12 @@ fn invocation_args(executable: Option<&str>, mut args: Vec<String>) -> Vec<Strin
 }
 
 fn run(args: Vec<String>) -> Result<()> {
+    if args.first().is_some_and(|command| command == "sim") {
+        return simulate(&args[1..]);
+    }
     let Some(command) = args.first() else {
         return Err(error(
-            "usage: cargo xtask build [--target TARGET] [--profile PROFILE] [--features FEATURES] [--all-features] [--no-default-features] | stage --target TARGET --artifact-dir DIR --destination DIR | nfpm --target TARGET --config FILE --destination FILE | bterm {build,run} [--profile PROFILE] | bterm {stage,verify} --target TARGET | install SOURCE DESTINATION [--binary-name NAME | --activate-version VERSION]",
+            "usage: cargo xtask sim NAME [ARGS] | build [--target TARGET] [--profile PROFILE] [--features FEATURES] [--all-features] [--no-default-features] | stage --target TARGET --artifact-dir DIR --destination DIR | nfpm --target TARGET --config FILE --destination FILE | bterm {build,run} [--profile PROFILE] | bterm {stage,verify} --target TARGET | install SOURCE DESTINATION [--binary-name NAME | --activate-version VERSION]",
         ));
     };
     let mut positional = Vec::new();
@@ -226,3 +229,28 @@ fn run(args: Vec<String>) -> Result<()> {
 
 #[cfg(test)]
 mod tests;
+
+/// `cargo sim NAME [ARGS]`: run simulation NAME from the `simulation` workspace (its own
+/// workspace, so its simulator features never reach this one), passing ARGS to it.
+/// Configuration is simvar's `SIMULATOR_*` environment, which passes through.
+fn simulate(args: &[String]) -> Result<()> {
+    let Some(name) = args.first() else {
+        return Err(error("usage: cargo sim NAME [ARGS]; see simulation/README.md"));
+    };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .ok_or_else(|| error("xtask has no parent directory"))?;
+    let status = std::process::Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+        .args(["run", "--release", "--manifest-path"])
+        .arg(root.join("simulation").join("Cargo.toml"))
+        .args(["--package", name, "--"])
+        // `cargo sim pty -- --tui` and `cargo sim pty --tui` mean the same.
+        .args(args[1..].iter().skip_while(|arg| *arg == "--"))
+        .status()
+        .map_err(|e| error(format!("cannot run cargo: {e}")))?;
+    if status.success() {
+        Ok(())
+    } else {
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}

@@ -1,0 +1,43 @@
+# Simulations
+
+bmux's deterministic simulations, on
+[simvar](https://github.com/MoosicBox/MoosicBox/tree/master/packages/simvar)
+and switchy's simulated threads, time, terminals and processes. One seed
+decides everything in a run (interleavings, faults, timing), so any failure
+replays exactly on the same build.
+
+| Simulation | Tests |
+| --- | --- |
+| [`pty`](pty/README.md) | `bmux_pty` against a simulated kernel |
+
+This is a Cargo workspace of its own, excluded from bmux's main one, so the
+`simulator` features its members enable never reach bmux's real builds.
+
+## Running
+
+```bash
+cargo sim pty                                      # works from anywhere in the repo
+SIMULATOR_SEED=42 SIMULATOR_RUNS=1 cargo sim pty   # replay one run
+SIMULATOR_SEED=42 SIMULATOR_RUNS=1 cargo sim pty --tui   # watch it
+cargo sim pty --regression                         # its pinned seeds
+```
+
+`cargo sim NAME [ARGS]` (an alias for `cargo xtask sim`) builds and runs member
+`NAME` in release mode. Runs are configured through simvar's environment:
+
+| Variable | Meaning |
+| --- | --- |
+| `SIMULATOR_RUNS` | Runs (default 1) |
+| `SIMULATOR_MAX_PARALLEL` | Runs at once (default: CPUs) |
+| `SIMULATOR_SEED` | The first run's seed (default random) |
+| `SIMULATOR_VERIFY_DETERMINISM` | `1`: replay every run, fail if it differs |
+| `SIMULATOR_SCHEDULE_STRATEGY` | `random`, `pct` or `alternate` (default) |
+| `SIMULATOR_WEAK_MEMORY` | `1`: model weak memory for atomics |
+
+Each simulation documents its own variables and flags.
+
+## Linting
+
+```bash
+cargo clippy --manifest-path simulation/Cargo.toml --all-targets -- -D warnings
+```
