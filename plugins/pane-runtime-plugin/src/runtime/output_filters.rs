@@ -21,7 +21,8 @@ const MAX_REPLACEMENT_BYTES: usize = 4096;
 /// Set `caller`'s rules for every pane in `filters` (an empty list removes them), after checking
 /// each.
 pub(crate) fn set_rules(
-    filters: &switchy_thread::sync::RwLock<SequenceFilters>,
+    // In core's state registry, so behind std's lock.
+    filters: &std::sync::RwLock<SequenceFilters>,
     caller: &str,
     rules: Vec<OutputRule>,
 ) -> Result<(), OutputFilterError> {

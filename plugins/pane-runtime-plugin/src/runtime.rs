@@ -435,11 +435,11 @@ impl PaneRuntimeHost {
             .wrapping_add(1)
     }
 
-    /// The host's communal presentation fact service.
+    /// The host's communal presentation fact service (in core's state registry, so behind
+    /// std's lock).
     pub(crate) fn fact_service(
         &self,
-    ) -> Arc<switchy_thread::sync::RwLock<bmux_presentation_state::PresentationFactHostService>>
-    {
+    ) -> Arc<std::sync::RwLock<bmux_presentation_state::PresentationFactHostService>> {
         self.states
             .get_or_insert_with(bmux_presentation_state::PresentationFactHostService::new)
     }
@@ -2574,13 +2574,14 @@ impl ReaderImages for FollowImages<'_, '_> {
     }
 }
 
-type SharedFilters = Arc<switchy_thread::sync::RwLock<bmux_terminal_grid::SequenceFilters>>;
+/// Output filters shared through core's state registry, behind std's lock.
+type SharedFilters = Arc<std::sync::RwLock<bmux_terminal_grid::SequenceFilters>>;
 
 /// The registered filters, read for one chunk (a poisoned lock reads as none: filters shape what
 /// panes show, they gate no access).
 fn read_filters(
     shared: Option<&SharedFilters>,
-) -> Option<switchy_thread::sync::RwLockReadGuard<'_, bmux_terminal_grid::SequenceFilters>> {
+) -> Option<std::sync::RwLockReadGuard<'_, bmux_terminal_grid::SequenceFilters>> {
     shared.and_then(|filters| filters.read().ok())
 }
 
@@ -11116,7 +11117,8 @@ impl ServerSessionRuntimeAdapter {
         bmux_pane_runtime_state::RemovedRuntimeInfo {
             session_id,
             attached_clients: attached,
-            shutdown_token: Arc::new(Mutex::new(Some(boxed))),
+            // Core's server type holds the token behind std's lock.
+            shutdown_token: Arc::new(std::sync::Mutex::new(Some(boxed))),
         }
     }
 
@@ -14186,23 +14188,22 @@ pub(crate) fn activate_pane_runtime(
     let adapter = ServerSessionRuntimeAdapter::new(Arc::clone(&manager));
     let pane_index = Arc::clone(&adapter.pane_input_index);
     let runtime_handle = bmux_pane_runtime_state::SessionRuntimeManagerHandle::new(adapter);
+    // Core's state registry holds its entries behind std's locks.
     host.states()
         .register::<bmux_pane_runtime_state::SessionRuntimeManagerHandle>(&Arc::new(
-            switchy_thread::sync::RwLock::new(runtime_handle),
+            std::sync::RwLock::new(runtime_handle),
         ));
     host.states()
-        .register::<PanePaddingRuntimeHandle>(&Arc::new(switchy_thread::sync::RwLock::new(
+        .register::<PanePaddingRuntimeHandle>(&Arc::new(std::sync::RwLock::new(
             PanePaddingRuntimeHandle(Arc::clone(&manager)),
         )));
 
     host.states()
-        .register::<SpawnRuntimeHandle>(&Arc::new(switchy_thread::sync::RwLock::new(
-            SpawnRuntimeHandle(
-                Arc::clone(&manager),
-                switchy_async::runtime::Handle::current(),
-                pane_index,
-            ),
-        )));
+        .register::<SpawnRuntimeHandle>(&Arc::new(std::sync::RwLock::new(SpawnRuntimeHandle(
+            Arc::clone(&manager),
+            switchy_async::runtime::Handle::current(),
+            pane_index,
+        ))));
     let expiry_manager = Arc::clone(&manager);
     switchy_async::task::spawn(async move {
         let mut interval = switchy_async::time::interval(PANE_PADDING_PREVIEW_SWEEP_INTERVAL);
