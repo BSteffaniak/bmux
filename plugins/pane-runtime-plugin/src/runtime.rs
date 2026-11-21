@@ -7099,7 +7099,7 @@ fn process_start_identity_for_pid(pid: u32) -> Option<ProcessStartIdentity> {
     }
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(all(target_os = "linux", not(feature = "simulator")), test))]
 fn parse_linux_process_start(stat: &str) -> Option<ProcessStartIdentity> {
     // comm is parenthesized and may itself contain spaces and parentheses.
     // The suffix begins at field 3; starttime is field 22.
