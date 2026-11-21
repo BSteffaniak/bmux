@@ -794,6 +794,23 @@ where
     }
 }
 
+impl<C>
+    bmux_cluster_plugin_api::cluster_bounded_control_command::ClusterBoundedControlCommandService
+    for ControlServiceHandle<C>
+where
+    C: ServiceCaller + Send + Sync + 'static,
+{
+    fn mutate<'a>(
+        &'a self,
+        request: bmux_cluster_plugin_api::cluster_types::ControlCommand,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<ControlResponse, ControlServiceError>> + Send + 'a>,
+    > {
+        // Return leader guidance: forwarding through v1 would lose the contract.
+        Box::pin(async move { self.active()?.mutate_bounded(request).await })
+    }
+}
+
 fn control_read_service_error(
     error: crate::consensus_runtime::ConsensusReadError,
 ) -> ControlServiceError {

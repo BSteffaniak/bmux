@@ -515,6 +515,41 @@ impl ConsensusNode {
         Self::decode_write_response(&command_id, self.write_locked(encoded).await)
     }
 
+    /// Applies explicitly negotiated aggregate admission before encoding.
+    ///
+    /// # Errors
+    /// Returns leader/quorum errors, missing activation, invalid fields or an
+    /// oversized command without proposing it.
+    pub async fn mutate_bounded(
+        &self,
+        command: bmux_cluster_plugin_api::cluster_types::ControlCommand,
+    ) -> Result<ControlResponse, ControlServiceError> {
+        let state = self
+            .linearizable_control_state()
+            .await
+            .map_err(control_read_error)?;
+        if !state
+            .activated_features
+            .contains("bounded-control-command-v1")
+        {
+            return Err(ControlServiceError::Rejected {
+                error:
+                    bmux_cluster_plugin_api::cluster_types::ControlCommandError::InvalidTransition {
+                        reason: "bounded-control-command-v1 is not activated".into(),
+                    },
+            });
+        }
+        crate::control_codec::control_command_encoded_len(&command, 1_048_576).map_err(
+            |error| ControlServiceError::Rejected {
+                error:
+                    bmux_cluster_plugin_api::cluster_types::ControlCommandError::InvalidTransition {
+                        reason: format!("bounded canonical command rejected: {error}"),
+                    },
+            },
+        )?;
+        self.mutate(command).await
+    }
+
     /// Activates one durable schema feature after membership eligibility checks.
     ///
     /// # Errors
@@ -1048,6 +1083,31 @@ pub(crate) mod tests {
                 RemoteError::new_with_node(self.target, self.expected.clone(), error).into()
             })
         }
+    }
+
+    #[tokio::test]
+    async fn bounded_submission_requires_activation_and_preserves_legacy_path() {
+        let root = TempDir::new().unwrap();
+        let node = ConsensusNode::start(
+            root.path(),
+            "bounded-test",
+            NodeId::from(93),
+            InMemoryNetworkFactory::default(),
+        )
+        .await
+        .unwrap();
+        node.initialize_single(NodeId::from(93), "memory://bounded")
+            .await
+            .unwrap();
+        wait_for_leader(&[&node]).await;
+        assert!(matches!(
+            node.mutate_bounded(command(1, 0)).await,
+            Err(ControlServiceError::Rejected { .. })
+        ));
+        assert_eq!(node.persisted_control_state().unwrap().revision, 0);
+        // The old path does not implicitly opt into the new feature.
+        node.mutate(command(1, 0)).await.unwrap();
+        node.shutdown().await.unwrap();
     }
 
     #[tokio::test]

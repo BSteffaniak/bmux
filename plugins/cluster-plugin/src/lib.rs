@@ -625,6 +625,15 @@ impl ClusterPlugin {
                 + Send
                 + Sync,
         > = control.clone();
+        let bounded_commands: Arc<
+            dyn bmux_cluster_plugin_api::cluster_bounded_control_command::ClusterBoundedControlCommandService
+                + Send
+                + Sync,
+        > = control.clone();
+        let _ = bmux_cluster_plugin_api::cluster_bounded_control_command::register_provider(
+            registry,
+            bounded_commands,
+        );
         let control_commands_v2: Arc<
             dyn bmux_cluster_plugin_api::cluster_control_command_v2::ClusterControlCommandService
                 + Send

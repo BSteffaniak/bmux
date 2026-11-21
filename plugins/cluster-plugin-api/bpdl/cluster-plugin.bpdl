@@ -760,6 +760,15 @@ interface cluster-control-command {
     command mutate(request: cluster-types.control-command) -> result<cluster-types.control-response, cluster-types.control-service-error>;
 }
 
+// Explicit bounded admission; never fall back to legacy mutation interfaces.
+// Requires committed bounded-control-command-v1 activation. Canonical command
+// bytes (including all fields) must not exceed 1,048,576 bytes.
+@capability(CLUSTER_WRITE)
+@interface-version(1)
+interface cluster-bounded-control-command {
+    command mutate(request: cluster-types.control-command) -> result<cluster-types.control-response, cluster-types.control-service-error>;
+}
+
 @capability(CLUSTER_WRITE)
 @interface-version(2)
 interface cluster-control-command {
@@ -902,6 +911,7 @@ world cluster {
     provide cluster-control-state@1;
     provide cluster-control-state@2;
     provide cluster-raft-rpc@1;
+    provide cluster-bounded-control-command;
     require capability bmux.attach_runtime.read;
     require capability bmux.attach_runtime.write;
     require capability bmux.clients.read;

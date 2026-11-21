@@ -533,13 +533,14 @@ fn interface_ids_and_operations_match_schema() {
 fn generated_contract_declares_all_services() {
     let services = bmux_cluster_plugin_api::service_declarations()
         .expect("cluster service declarations should be valid");
-    assert_eq!(services.len(), 21);
+    assert_eq!(services.len(), 22);
     let service_ids = services
         .iter()
         .map(|service| service.interface_id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
     for interface_id in [
         "cluster-peer-read/v1",
+        "cluster-bounded-control-command/v1",
         "cluster-raft-rpc/v2",
         "cluster-raft-decoder/v1",
         "cluster-capability-publication/v1",
@@ -566,6 +567,7 @@ fn generated_contract_declares_all_services() {
         "provide cluster-control-watch;",
         "provide cluster-control-command@2;",
         "provide cluster-control-state@2;",
+        "provide cluster-bounded-control-command;",
     ] {
         assert!(package.contains(provided), "world must {provided}");
     }

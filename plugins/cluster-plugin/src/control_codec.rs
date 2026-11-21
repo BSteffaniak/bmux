@@ -219,13 +219,46 @@ pub fn is_feature_activation(bytes: &[u8]) -> bool {
 pub fn encode_control_command(command: &ControlCommand) -> Vec<u8> {
     validate_command(command).expect("typed control command must satisfy canonical limits");
     let mut writer = Writer::default();
+    write_control_command(&mut writer, command);
+    writer.bytes
+}
+
+/// Measures a canonical command without allocating its encoded buffer.
+///
+/// This does not change legacy admission semantics. Negotiated submission paths
+/// must supply their explicitly selected aggregate limit.
+///
+/// # Errors
+///
+/// Returns field-validation errors or an aggregate limit error, including when
+/// the encoded length cannot be represented on this platform.
+pub fn control_command_encoded_len(
+    command: &ControlCommand,
+    limit: usize,
+) -> Result<usize, CodecError> {
+    validate_command(command)?;
+    let mut writer = Writer {
+        measured_len: Measurement::Counting(Some(0)),
+        ..Writer::default()
+    };
+    write_control_command(&mut writer, command);
+    let Measurement::Counting(length) = writer.measured_len else {
+        unreachable!("measurement writer must remain in counting mode");
+    };
+    let length = length.ok_or(CodecError::LimitExceeded("encoded command bytes"))?;
+    if length > limit {
+        return Err(CodecError::LimitExceeded("encoded command bytes"));
+    }
+    Ok(length)
+}
+
+fn write_control_command(writer: &mut Writer, command: &ControlCommand) {
     writer.raw(CODEC_MAGIC);
     writer.u16(command.schema_version);
     writer.string(&command.principal_id);
     writer.uuid(command.command_id.value);
     writer.u64(command.issued_at_unix_ms);
-    encode_request(&mut writer, &command.request);
-    writer.bytes
+    encode_request(writer, &command.request);
 }
 
 /// Decodes one complete canonical control command.
@@ -1158,8 +1191,16 @@ fn decode_resource_kind(reader: &mut Reader<'_>) -> Result<ControlResourceKind, 
 }
 
 #[derive(Default)]
+enum Measurement {
+    #[default]
+    Disabled,
+    Counting(Option<usize>),
+}
+
+#[derive(Default)]
 pub(crate) struct Writer {
     bytes: Vec<u8>,
+    measured_len: Measurement,
 }
 
 impl Writer {
@@ -1186,11 +1227,15 @@ impl Writer {
     }
 
     pub(crate) fn raw(&mut self, bytes: &[u8]) {
-        self.bytes.extend_from_slice(bytes);
+        if let Measurement::Counting(length) = &mut self.measured_len {
+            *length = length.and_then(|length| length.checked_add(bytes.len()));
+        } else {
+            self.bytes.extend_from_slice(bytes);
+        }
     }
 
     pub(crate) fn bool(&mut self, value: bool) {
-        self.bytes.push(u8::from(value));
+        self.raw(&[u8::from(value)]);
     }
 
     pub(crate) fn u16(&mut self, value: u16) {
@@ -1609,6 +1654,32 @@ mod tests {
             validate_command(&oversized),
             Err(CodecError::LimitExceeded("string"))
         );
+    }
+
+    #[test]
+    fn aggregate_measurement_uses_encoding_and_checks_exact_boundary() {
+        let value = command(ControlCommandRequest::CreateWorkspace {
+            workspace_id: WorkspaceId { value: id(2) },
+            name: Some("workspace 🦀".to_string()),
+        });
+        let encoded = encode_control_command(&value);
+        assert_eq!(
+            control_command_encoded_len(&value, encoded.len()),
+            Ok(encoded.len())
+        );
+        assert_eq!(
+            control_command_encoded_len(&value, encoded.len() - 1),
+            Err(CodecError::LimitExceeded("encoded command bytes"))
+        );
+        let mut writer = Writer {
+            measured_len: Measurement::Counting(Some(0)),
+            ..Writer::default()
+        };
+        write_control_command(&mut writer, &value);
+        assert!(writer.bytes.is_empty());
+        writer.measured_len = Measurement::Counting(Some(usize::MAX));
+        writer.bool(true);
+        assert!(matches!(writer.measured_len, Measurement::Counting(None)));
     }
 
     #[test]
