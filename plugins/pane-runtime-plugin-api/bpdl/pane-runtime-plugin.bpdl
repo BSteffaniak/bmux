@@ -32,6 +32,7 @@ capability PANE_RUNTIME_ENVIRONMENT_V1 = bmux.pane_runtime.environment.v1;
 capability PANE_RUNTIME_LIVE_PRESENTATION_V1 = bmux.pane_runtime.live.presentation.v1;
 capability PANE_RUNTIME_POINTER_GRID_V1 = bmux.pane_runtime.pointer_grid.v1;
 capability PANE_RUNTIME_HUMAN_INPUT_V1 = bmux.pane_runtime.human.input.v1;
+capability PANE_RUNTIME_OUTPUT_FILTERS_V1 = bmux.pane_runtime.output_filters.v1;
 
 @capability(PANE_RUNTIME_ENVIRONMENT_V1)
 interface pane-runtime-environment-v1 {
@@ -1607,6 +1608,36 @@ interface pane-runtime-focus {
     @state events session-focus-state-map;
 }
 
+// What every pane's grid applies of its program's output, as callers set it.
+// Rules act on complete sequences as the grid parses them, in the same pass;
+// the raw output stream (raw readers, recording, the playbook) stays as the
+// program wrote it. Each caller (a plugin, or the host and its clients
+// together) has one rule list. Lists are consulted in the order they were
+// first set and their rules in order; the first rule matching a sequence
+// decides it.
+@capability(PANE_RUNTIME_OUTPUT_FILTERS_V1)
+interface pane-runtime-output-filters-v1 {
+    variant output-match {
+        // CSI sequences by final byte and intermediates (a private marker
+        // such as `?` first), and, when given, exactly these parameters.
+        csi { final_byte: u8, intermediates: bytes, params: list<u16>? },
+        // OSC strings by number.
+        osc { number: u32 },
+        // ESC sequences by final byte and intermediates.
+        esc { final_byte: u8, intermediates: bytes },
+    }
+    // A replacement is parsed on its own with no rule consulted: complete
+    // sequences and text (anything left incomplete is discarded).
+    variant output-action { keep, drop, replace { bytes: bytes } }
+    record output-rule { sequence: output-match, action: output-action }
+    variant output-filter-error {
+        invalid-rule { index: u32, reason: string },
+        too-many-rules { max: u32 },
+    }
+    // Replace the caller's rules; an empty list removes them.
+    command set-rules(rules: list<output-rule>) -> result<unit, output-filter-error>;
+}
+
 /// What `bmux.pane_runtime` provides to and requires from the host and other plugins.
 ///
 /// Native terminal-session operations are implemented. Durable
@@ -1630,6 +1661,7 @@ world pane-runtime {
     provide pane-runtime-terminal-events capability bmux.pane_runtime.read;
     provide pane-runtime-environment-v1;
     provide pane-runtime-spawn-v1;
+    provide pane-runtime-output-filters-v1;
     require capability bmux.clients.read;
     require capability bmux.clients.write;
     require capability bmux.contexts.read;

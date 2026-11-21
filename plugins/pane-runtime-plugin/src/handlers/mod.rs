@@ -138,6 +138,10 @@ fn route_authorized(
         "pane-runtime-presentation-wait-v1", "wait-present" => |req: bmux_pane_runtime_plugin_api::pane_runtime_presentation_wait_v1::client::WaitPresentRequest, ctx| {
             pointer_grid::legacy(crate::runtime::execution::wait_present(host, &req.execution, req.after.as_deref(), req.timeout_ms, req.max_bytes, || execution::authorize(ctx, &req.execution, "read")))
         },
+        "pane-runtime-output-filters-v1", "set-rules" => |req: bmux_pane_runtime_plugin_api::pane_runtime_output_filters_v1::client::SetRulesRequest, ctx| {
+            let filters = crate::runtime::pane_output_filters(host.states());
+            Ok::<_, ServiceResponse>(crate::runtime::output_filters::set_rules(&filters, &ctx.request.caller_plugin_id, req.rules))
+        },
         "pane-runtime-view-size-v1", "resize-alternate" => |req: bmux_pane_runtime_plugin_api::pane_runtime_view_size_v1::client::ResizeAlternateRequest, ctx| {
             Ok::<_, ServiceResponse>(crate::runtime::execution::resize_alternate(host, &req.execution, req.expected_grid_revision, req.cols, req.rows, || execution::authorize(ctx, &req.execution, "pane.resize")))
         },

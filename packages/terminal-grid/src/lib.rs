@@ -12,7 +12,7 @@
 mod charset;
 pub use charset::CharacterState;
 mod filter;
-pub use filter::{FilterInterest, SequenceFilter, SequenceFilters};
+pub use filter::{FilterInterest, FilterVerdict, SequenceFilter, SequenceFilters};
 mod frozen;
 pub use frozen::FrozenContentRows;
 mod model;

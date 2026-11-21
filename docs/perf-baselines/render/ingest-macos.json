@@ -8,7 +8,7 @@
           "allocations_per_frame": 0.0,
           "max_allocations": 0,
           "allocated_bytes_per_frame": 0,
-          "instructions_per_frame": 387865
+          "instructions_per_frame": 382267
         }
       },
       "output_bytes_per_frame": 0,
@@ -22,7 +22,7 @@
           "allocations_per_frame": 0.0,
           "max_allocations": 0,
           "allocated_bytes_per_frame": 0,
-          "instructions_per_frame": 389284
+          "instructions_per_frame": 383596
         }
       },
       "output_bytes_per_frame": 0,
@@ -36,7 +36,7 @@
           "allocations_per_frame": 2.76,
           "max_allocations": 15,
           "allocated_bytes_per_frame": 29881,
-          "instructions_per_frame": 11601961
+          "instructions_per_frame": 11452030
         }
       },
       "output_bytes_per_frame": 0,
@@ -50,7 +50,7 @@
           "allocations_per_frame": 6.06,
           "max_allocations": 15,
           "allocated_bytes_per_frame": 4465,
-          "instructions_per_frame": 587973
+          "instructions_per_frame": 582895
         }
       },
       "output_bytes_per_frame": 0,
@@ -64,7 +64,7 @@
           "allocations_per_frame": 6.02,
           "max_allocations": 12,
           "allocated_bytes_per_frame": 4337,
-          "instructions_per_frame": 587143
+          "instructions_per_frame": 581904
         }
       },
       "output_bytes_per_frame": 0,
@@ -78,7 +78,7 @@
           "allocations_per_frame": 28.81,
           "max_allocations": 75,
           "allocated_bytes_per_frame": 141781,
-          "instructions_per_frame": 711240
+          "instructions_per_frame": 706515
         }
       },
       "output_bytes_per_frame": 0,
@@ -92,11 +92,25 @@
           "allocations_per_frame": 6.08,
           "max_allocations": 16,
           "allocated_bytes_per_frame": 26040,
-          "instructions_per_frame": 677477
+          "instructions_per_frame": 670240
         }
       },
       "output_bytes_per_frame": 0,
       "live_growth_bytes": 4026664
+    },
+    {
+      "name": "plain-stream/rewritten",
+      "frames": 271,
+      "phases": {
+        "read": {
+          "allocations_per_frame": 6.06,
+          "max_allocations": 15,
+          "allocated_bytes_per_frame": 2311,
+          "instructions_per_frame": 707007
+        }
+      },
+      "output_bytes_per_frame": 0,
+      "live_growth_bytes": 527328
     }
   ]
 }

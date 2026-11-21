@@ -81,6 +81,7 @@ plugins/pane-runtime-plugin-api/bpdl/pane-runtime-plugin.bpdl attach-runtime-sta
 plugins/pane-runtime-plugin-api/bpdl/pane-runtime-plugin.bpdl pane-runtime-events 8e1c94e1d616a65368d8ca08da724692aec2c37dad080f818f82ac8ef3a506bd
 plugins/pane-runtime-plugin-api/bpdl/pane-runtime-plugin.bpdl pane-runtime-terminal-events e7d1f3fdd1693768806ec28e5a7952e1cd6c80ddbb0d8eb464f85923c7823a16
 plugins/pane-runtime-plugin-api/bpdl/pane-runtime-plugin.bpdl pane-runtime-focus 4726b830d0102d890c1ad1db4c4cfb16dbe747278f53324f5957a4ff46f3364e
+plugins/pane-runtime-plugin-api/bpdl/pane-runtime-plugin.bpdl pane-runtime-output-filters-v1 9f52c612dcdc52d2184da19410730e30aff9e1d33020ebbdb1a6d7f7aa95469b
 plugins/performance-plugin-api/bpdl/performance-plugin.bpdl performance-types c798ffec13cb056961c1cedae7fb1565cf5afefd8e6407a5b38d8bfb400fbcef
 plugins/performance-plugin-api/bpdl/performance-plugin.bpdl performance-state 1bd3ef495649a1b629a89d55348993afd399dcce89c24a65a710cf2da3f661e7
 plugins/performance-plugin-api/bpdl/performance-plugin.bpdl performance-commands eb82a9f7a9ce6f6e96f451eac0da025751d82acc6fe592a0b1f9cbdd309ff6f1

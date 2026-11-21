@@ -12,6 +12,7 @@ pub(crate) mod live_presentation;
 pub(crate) mod managed_idle;
 mod managed_scope;
 mod native_process;
+pub(crate) mod output_filters;
 pub(crate) mod pty;
 pub(crate) mod reservations;
 mod shell_callback;
@@ -52,8 +53,8 @@ use bmux_session_models::{ClientId, SessionId};
 use bmux_session_state::SessionManagerHandle;
 use bmux_snapshot_runtime::{SnapshotDirtyFlag, SnapshotDirtyFlagHandle};
 use bmux_terminal_grid::{
-    ChunkMark, GridLimits, ProtocolState, SequenceHeader, SequenceObserver, StreamedString,
-    TerminalGrid, TerminalGridStream,
+    ChunkMark, FilterVerdict, GridLimits, ProtocolState, SequenceHeader, SequenceObserver,
+    StreamedString, TerminalGrid, TerminalGridStream,
 };
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
 use pty::Slave as _;
@@ -2337,7 +2338,7 @@ const fn attach_input_modes(modes: ProtocolState) -> AttachInputModeState {
 /// The output filters native plugins register for every pane (see
 /// [`bmux_terminal_grid::SequenceFilters`]), shared plugin state created by whichever side asks
 /// first.
-fn pane_output_filters(states: &bmux_plugin::PluginStateRegistry) -> SharedFilters {
+pub(crate) fn pane_output_filters(states: &bmux_plugin::PluginStateRegistry) -> SharedFilters {
     states.get_or_insert_with(bmux_terminal_grid::SequenceFilters::default)
 }
 
@@ -2655,9 +2656,15 @@ impl<F: ReaderFilters, I: ReaderImages> ReaderObserver<'_, F, I> {
 /// The output filters a pane reader consults, statically: [`NoFilters`] keeps everything and
 /// compiles to nothing.
 trait ReaderFilters {
-    fn keep_csi(&self, sequence: &SequenceHeader<'_>) -> bool;
-    fn keep_osc(&self, params: &[&[u8]]) -> bool;
-    fn keep_esc(&self, intermediates: &[u8], byte: u8) -> bool;
+    fn filter_csi(&self, sequence: &SequenceHeader<'_>, replacement: &mut Vec<u8>)
+    -> FilterVerdict;
+    fn filter_osc(&self, params: &[&[u8]], replacement: &mut Vec<u8>) -> FilterVerdict;
+    fn filter_esc(
+        &self,
+        intermediates: &[u8],
+        byte: u8,
+        replacement: &mut Vec<u8>,
+    ) -> FilterVerdict;
 }
 
 /// No output filter is registered.
@@ -2665,28 +2672,37 @@ struct NoFilters;
 
 impl ReaderFilters for NoFilters {
     #[inline]
-    fn keep_csi(&self, _sequence: &SequenceHeader<'_>) -> bool {
-        true
+    fn filter_csi(&self, _sequence: &SequenceHeader<'_>, _: &mut Vec<u8>) -> FilterVerdict {
+        FilterVerdict::Keep
     }
     #[inline]
-    fn keep_osc(&self, _params: &[&[u8]]) -> bool {
-        true
+    fn filter_osc(&self, _params: &[&[u8]], _: &mut Vec<u8>) -> FilterVerdict {
+        FilterVerdict::Keep
     }
     #[inline]
-    fn keep_esc(&self, _intermediates: &[u8], _byte: u8) -> bool {
-        true
+    fn filter_esc(&self, _intermediates: &[u8], _byte: u8, _: &mut Vec<u8>) -> FilterVerdict {
+        FilterVerdict::Keep
     }
 }
 
 impl ReaderFilters for &bmux_terminal_grid::SequenceFilters {
-    fn keep_csi(&self, sequence: &SequenceHeader<'_>) -> bool {
-        bmux_terminal_grid::SequenceFilters::keep_csi(self, sequence)
+    fn filter_csi(
+        &self,
+        sequence: &SequenceHeader<'_>,
+        replacement: &mut Vec<u8>,
+    ) -> FilterVerdict {
+        bmux_terminal_grid::SequenceFilters::filter_csi(self, sequence, replacement)
     }
-    fn keep_osc(&self, params: &[&[u8]]) -> bool {
-        bmux_terminal_grid::SequenceFilters::keep_osc(self, params)
+    fn filter_osc(&self, params: &[&[u8]], replacement: &mut Vec<u8>) -> FilterVerdict {
+        bmux_terminal_grid::SequenceFilters::filter_osc(self, params, replacement)
     }
-    fn keep_esc(&self, intermediates: &[u8], byte: u8) -> bool {
-        bmux_terminal_grid::SequenceFilters::keep_esc(self, intermediates, byte)
+    fn filter_esc(
+        &self,
+        intermediates: &[u8],
+        byte: u8,
+        replacement: &mut Vec<u8>,
+    ) -> FilterVerdict {
+        bmux_terminal_grid::SequenceFilters::filter_esc(self, intermediates, byte, replacement)
     }
 }
 
@@ -2857,16 +2873,25 @@ impl<F: ReaderFilters, I: ReaderImages> SequenceObserver for ReaderObserver<'_, 
         self.holding = true;
     }
 
-    fn keep_csi(&mut self, sequence: &SequenceHeader<'_>) -> bool {
-        self.filters.keep_csi(sequence)
+    fn filter_csi(
+        &mut self,
+        sequence: &SequenceHeader<'_>,
+        replacement: &mut Vec<u8>,
+    ) -> FilterVerdict {
+        self.filters.filter_csi(sequence, replacement)
     }
 
-    fn keep_osc(&mut self, params: &[&[u8]]) -> bool {
-        self.filters.keep_osc(params)
+    fn filter_osc(&mut self, params: &[&[u8]], replacement: &mut Vec<u8>) -> FilterVerdict {
+        self.filters.filter_osc(params, replacement)
     }
 
-    fn keep_esc(&mut self, intermediates: &[u8], byte: u8) -> bool {
-        self.filters.keep_esc(intermediates, byte)
+    fn filter_esc(
+        &mut self,
+        intermediates: &[u8],
+        byte: u8,
+        replacement: &mut Vec<u8>,
+    ) -> FilterVerdict {
+        self.filters.filter_esc(intermediates, byte, replacement)
     }
 
     fn csi(&mut self, grid: &TerminalGrid, sequence: &SequenceHeader<'_>) {
@@ -19241,8 +19266,8 @@ exit 7"#
             fn interest(&self) -> FilterInterest {
                 FilterInterest::none().csi(b'n').csi(b'J')
             }
-            fn keep_csi(&self, _sequence: &SequenceHeader<'_>) -> bool {
-                false
+            fn filter_csi(&self, _sequence: &SequenceHeader<'_>, _: &mut Vec<u8>) -> FilterVerdict {
+                FilterVerdict::Drop
             }
         }
         let states = bmux_plugin::PluginStateRegistry::new();
@@ -19296,6 +19321,189 @@ exit 7"#
             "ab",
             "the filtered clear did not apply"
         );
+    }
+
+    /// Calls `pane-runtime-output-filters-v1` as the plugin `caller` (a local invocation), through
+    /// the pane runtime's own service routing.
+    struct OutputFilterCaller(PaneRuntimeHost, &'static str);
+    impl bmux_plugin_sdk::TypedDispatchClient for OutputFilterCaller {
+        fn invoke_service_raw(
+            &mut self,
+            capability: &str,
+            kind: bmux_ipc::InvokeServiceKind,
+            interface_id: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> impl std::future::Future<Output = bmux_plugin_sdk::TypedDispatchClientResult<Vec<u8>>>
+        {
+            use bmux_plugin_sdk::{
+                ApiVersion, HostConnectionInfo, HostMetadata, HostScope, NativeServiceContext,
+                ProviderId, RegisteredService, ServiceKind, ServiceRequest,
+            };
+            assert_eq!(kind, bmux_ipc::InvokeServiceKind::Command);
+            let response = crate::handlers::route(
+                &self.0,
+                &NativeServiceContext {
+                    host_service_port: Some(history_fixture_origin()),
+                    plugin_id: "bmux.pane_runtime".into(),
+                    request: ServiceRequest {
+                        caller_plugin_id: self.1.into(),
+                        service: RegisteredService {
+                            capability: HostScope::new(capability).unwrap(),
+                            kind: ServiceKind::Command,
+                            interface_id: interface_id.into(),
+                            provider: ProviderId::Plugin("bmux.pane_runtime".into()),
+                        },
+                        operation: operation.into(),
+                        payload,
+                    },
+                    required_capabilities: vec![],
+                    provided_capabilities: vec![],
+                    services: vec![],
+                    available_capabilities: vec![],
+                    enabled_plugins: vec![],
+                    plugin_search_roots: vec![],
+                    host: HostMetadata {
+                        product_name: "bmux".into(),
+                        product_version: env!("CARGO_PKG_VERSION").into(),
+                        plugin_api_version: ApiVersion::new(1, 0),
+                        plugin_abi_version: ApiVersion::new(1, 0),
+                    },
+                    connection: HostConnectionInfo {
+                        config_dir: String::new(),
+                        config_dir_candidates: vec![],
+                        runtime_dir: String::new(),
+                        data_dir: String::new(),
+                        state_dir: String::new(),
+                    },
+                    settings: None,
+                    plugin_settings_map: std::collections::BTreeMap::new(),
+                    caller_client_id: None,
+                    cancellation: bmux_plugin_sdk::CancellationToken::default(),
+                    host_kernel_bridge: None,
+                },
+            );
+            assert_eq!(response.error, None);
+            std::future::ready(Ok(response.payload))
+        }
+    }
+
+    /// Follow `output` through a reader with `host`'s output filters, and apply the grid's frame
+    /// to a client replica: the replica's first row and the style of its third cell, with the raw
+    /// output the reader publishes and the signals it saw.
+    fn follow_as_a_replica(
+        host: &PaneRuntimeHost,
+        output: &[u8],
+    ) -> (String, bmux_terminal_grid::Style, Vec<u8>, Vec<PaneSignal>) {
+        use bmux_terminal_grid::ReplicaCursor;
+        let mut reader = PaneReader::new(ProtocolProfile::Bmux, None)
+            .with_filters(pane_output_filters(host.states()));
+        let mut grid = TerminalGridStream::new(10, 2, GridLimits::default()).unwrap();
+        let shared = reader.filters.clone();
+        let guard = read_filters(shared.as_ref());
+        reader.feed(
+            &mut grid,
+            &mut TerminalProtocolEngine::new(ProtocolProfile::Bmux),
+            output,
+            &mut Vec::new(),
+            active_filters(guard.as_deref()),
+            &mut NoImages,
+        );
+        drop(guard);
+        let mut frame = Vec::new();
+        grid.grid_mut()
+            .write_frame_since(ReplicaCursor::default(), 0, &mut frame);
+        let mut replica = TerminalGrid::new(10, 2, GridLimits::default()).unwrap();
+        replica
+            .apply_frame(&frame, &mut ReplicaCursor::default())
+            .unwrap();
+        let text = bmux_terminal_grid::visible_text(&replica, 0, 1)
+            .trim_end()
+            .to_owned();
+        let style = replica.viewport_row_ref(0).unwrap().cells()[2].style();
+        (
+            text,
+            replica.palette().get(style),
+            reader.visible,
+            reader.signals,
+        )
+    }
+
+    /// A plugin's output rules, set through `pane-runtime-output-filters-v1`, rewrite what a
+    /// pane's frames show (a title replaced, colours turned to bold, a full clear dropped) while
+    /// the raw output the reader publishes stays as the program wrote it; another plugin's rules
+    /// are its own, invalid rules are refused, and clearing the rules restores the output.
+    #[tokio::test]
+    async fn output_filter_rules_rewrite_what_pane_frames_show() {
+        use bmux_pane_runtime_plugin_api::pane_runtime_output_filters_v1::{
+            OutputAction, OutputFilterError, OutputMatch, OutputRule, client,
+        };
+        let host = PaneRuntimeHost::detached();
+        let mut plugin = OutputFilterCaller(host.clone(), "example.rewrites");
+        let rules = vec![
+            OutputRule {
+                sequence: OutputMatch::Csi {
+                    final_byte: b'm',
+                    intermediates: Vec::new(),
+                    params: None,
+                },
+                action: OutputAction::Replace {
+                    bytes: b"\x1b[1m".to_vec(),
+                },
+            },
+            OutputRule {
+                sequence: OutputMatch::Csi {
+                    final_byte: b'J',
+                    intermediates: Vec::new(),
+                    params: Some(vec![2]),
+                },
+                action: OutputAction::Drop,
+            },
+            OutputRule {
+                sequence: OutputMatch::Osc { number: 2 },
+                action: OutputAction::Replace {
+                    bytes: b"\x1b]2;[pane]\x07".to_vec(),
+                },
+            },
+        ];
+        client::set_rules(&mut plugin, rules)
+            .await
+            .unwrap()
+            .unwrap();
+        let invalid = OutputRule {
+            sequence: OutputMatch::Csi {
+                final_byte: b'!',
+                intermediates: Vec::new(),
+                params: None,
+            },
+            action: OutputAction::Drop,
+        };
+        assert!(matches!(
+            client::set_rules(
+                &mut OutputFilterCaller(host.clone(), "example.other"),
+                vec![invalid]
+            )
+            .await
+            .unwrap(),
+            Err(OutputFilterError::InvalidRule { index: 0, .. })
+        ));
+        let output = b"ab\x1b[2J\x1b]2;secret\x07\x1b[31mred";
+        let (text, style, raw, signals) = follow_as_a_replica(&host, output);
+        assert_eq!(text, "abred", "the full clear was dropped");
+        assert!(
+            style.bold && style.fg.is_none(),
+            "the colour became bold: {style:?}"
+        );
+        assert_eq!(signals, [PaneSignal::Title("[pane]".into())]);
+        assert_eq!(raw, output, "raw output is as the program wrote it");
+        client::set_rules(&mut plugin, Vec::new())
+            .await
+            .unwrap()
+            .unwrap();
+        let (text, style, _, signals) = follow_as_a_replica(&host, output);
+        assert_eq!(text, "  red", "the clear applied, the cursor where it was");
+        assert!(!style.bold && style.fg.is_some());
+        assert_eq!(signals, [PaneSignal::Title("secret".into())]);
     }
 
     /// OSC 52 writes are recognized (selection kept, text decoded); queries and malformed or

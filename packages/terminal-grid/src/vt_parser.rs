@@ -274,6 +274,11 @@ impl Parser {
     pub(crate) fn new() -> Self {
         Self::new_with_size()
     }
+
+    /// Whether the bytes so far end between sequences, with no partial character.
+    pub(crate) fn between_sequences(&self) -> bool {
+        self.state == State::Text && self.utf8_len == 0
+    }
 }
 
 impl<const N: usize> Parser<N> {

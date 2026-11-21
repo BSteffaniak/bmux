@@ -1,10 +1,10 @@
-//! Output filters: code that drops escape sequences from a pane's output before its grid
-//! applies them, in the same pass that parses them.
+//! Output filters: code that keeps, drops or rewrites escape sequences from a pane's output before
+//! its grid applies them, in the same pass that parses them.
 //!
 //! A filter declares which sequences it wants to see ([`FilterInterest`]); [`SequenceFilters`]
 //! asks only the filters interested in a sequence, so a pane with no interested filter pays one
 //! bit test per sequence. Filters change what panes display (grids, and the frames clients
-//! receive); the raw output stream (recording) stays as the program wrote it.
+//! receive); the raw output stream (raw readers, recording) stays as the program wrote it.
 
 use std::sync::Arc;
 
@@ -93,38 +93,65 @@ impl FilterInterest {
     }
 }
 
-/// Decides whether sequences a pane's program wrote reach its grid. Each method answers only for
-/// the sequences [`Self::interest`] names; `false` drops the sequence (the grid does not apply
-/// it, and nothing replies to it).
+/// What a filter does with a sequence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FilterVerdict {
+    /// The grid applies it as written.
+    #[default]
+    Keep,
+    /// The grid does not apply it, and nothing replies to it.
+    Drop,
+    /// The grid applies, instead, the bytes the filter wrote to its replacement buffer: parsed on
+    /// their own (complete sequences and text; anything left incomplete is discarded), with no
+    /// filter consulted and no image recognised.
+    Replace,
+}
+
+/// Decides what of the sequences a pane's program wrote reaches its grid. Each method answers only
+/// for the sequences [`Self::interest`] names, and writes to `replacement` (empty when asked) only
+/// to answer [`FilterVerdict::Replace`].
 pub trait SequenceFilter: Send + Sync {
     /// The sequences this filter decides on. Read when the filter is registered.
     fn interest(&self) -> FilterInterest;
 
-    /// Whether to keep a CSI sequence.
-    fn keep_csi(&self, _sequence: &SequenceHeader<'_>) -> bool {
-        true
+    /// What to do with a CSI sequence.
+    fn filter_csi(
+        &self,
+        _sequence: &SequenceHeader<'_>,
+        _replacement: &mut Vec<u8>,
+    ) -> FilterVerdict {
+        FilterVerdict::Keep
     }
 
-    /// Whether to keep an OSC string (split at `;`, at most 16 parameters; the first is its
+    /// What to do with an OSC string (split at `;`, at most 16 parameters; the first is its
     /// number).
-    fn keep_osc(&self, _params: &[&[u8]]) -> bool {
-        true
+    fn filter_osc(&self, _params: &[&[u8]], _replacement: &mut Vec<u8>) -> FilterVerdict {
+        FilterVerdict::Keep
     }
 
-    /// Whether to keep an ESC sequence.
-    fn keep_esc(&self, _intermediates: &[u8], _byte: u8) -> bool {
-        true
+    /// What to do with an ESC sequence.
+    fn filter_esc(
+        &self,
+        _intermediates: &[u8],
+        _byte: u8,
+        _replacement: &mut Vec<u8>,
+    ) -> FilterVerdict {
+        FilterVerdict::Keep
     }
 }
+
+/// One registered filter: its owner's key (if it registered under one), interest, and the filter.
+type Registered = (Option<String>, FilterInterest, Arc<dyn SequenceFilter>);
 
 /// The registered output filters, and the union of their interests.
 ///
 /// Panes share one set through plugin state, keyed by this type: a native plugin registers a
 /// filter with `states.get_or_insert_with(SequenceFilters::default).write()?.register(filter)`,
-/// and every pane consults it from its next chunk of output.
+/// and every pane consults it from its next chunk of output. Interested filters are asked in
+/// registration order; the first that drops or replaces a sequence decides it.
 #[derive(Default, Clone)]
 pub struct SequenceFilters {
-    filters: Vec<(FilterInterest, Arc<dyn SequenceFilter>)>,
+    filters: Vec<Registered>,
     interest: FilterInterest,
 }
 
@@ -133,7 +160,35 @@ impl SequenceFilters {
     pub fn register(&mut self, filter: Arc<dyn SequenceFilter>) {
         let interest = filter.interest();
         self.interest = self.interest.union(interest);
-        self.filters.push((interest, filter));
+        self.filters.push((None, interest, filter));
+    }
+
+    /// Set the filter registered under `key` (replacing the one there, in its place), or with
+    /// `None` remove it.
+    pub fn set(&mut self, key: &str, filter: Option<Arc<dyn SequenceFilter>>) {
+        let at = self
+            .filters
+            .iter()
+            .position(|(owner, ..)| owner.as_deref() == Some(key));
+        match (at, filter) {
+            (Some(at), Some(filter)) => {
+                self.filters[at] = (Some(key.to_owned()), filter.interest(), filter);
+            }
+            (Some(at), None) => {
+                self.filters.remove(at);
+            }
+            (None, Some(filter)) => {
+                self.filters
+                    .push((Some(key.to_owned()), filter.interest(), filter));
+            }
+            (None, None) => {}
+        }
+        self.interest = self
+            .filters
+            .iter()
+            .fold(FilterInterest::none(), |all, (_, interest, _)| {
+                all.union(*interest)
+            });
     }
 
     /// Whether no filter is registered.
@@ -142,39 +197,72 @@ impl SequenceFilters {
         self.filters.is_empty()
     }
 
-    /// Whether every interested filter keeps this CSI sequence.
-    #[must_use]
-    pub fn keep_csi(&self, sequence: &SequenceHeader<'_>) -> bool {
+    /// The first verdict other than keep among the filters `wants` selects, in order.
+    fn decide(
+        &self,
+        replacement: &mut Vec<u8>,
+        wants: impl Fn(&FilterInterest) -> bool,
+        ask: impl Fn(&dyn SequenceFilter, &mut Vec<u8>) -> FilterVerdict,
+    ) -> FilterVerdict {
+        for (_, interest, filter) in &self.filters {
+            if !wants(interest) {
+                continue;
+            }
+            replacement.clear();
+            let verdict = ask(filter.as_ref(), replacement);
+            if verdict != FilterVerdict::Keep {
+                return verdict;
+            }
+        }
+        replacement.clear();
+        FilterVerdict::Keep
+    }
+
+    /// What the interested filters do with this CSI sequence.
+    pub fn filter_csi(
+        &self,
+        sequence: &SequenceHeader<'_>,
+        replacement: &mut Vec<u8>,
+    ) -> FilterVerdict {
         let action = sequence.action();
-        !self.interest.wants_csi(action)
-            || self
-                .filters
-                .iter()
-                .filter(|(interest, _)| interest.wants_csi(action))
-                .all(|(_, filter)| filter.keep_csi(sequence))
+        if !self.interest.wants_csi(action) {
+            return FilterVerdict::Keep;
+        }
+        self.decide(
+            replacement,
+            |interest| interest.wants_csi(action),
+            |filter, replacement| filter.filter_csi(sequence, replacement),
+        )
     }
 
-    /// Whether every interested filter keeps this OSC string.
-    #[must_use]
-    pub fn keep_osc(&self, params: &[&[u8]]) -> bool {
+    /// What the interested filters do with this OSC string.
+    pub fn filter_osc(&self, params: &[&[u8]], replacement: &mut Vec<u8>) -> FilterVerdict {
         let number = params.first().and_then(|first| osc_number(first));
-        !self.interest.wants_osc(number)
-            || self
-                .filters
-                .iter()
-                .filter(|(interest, _)| interest.wants_osc(number))
-                .all(|(_, filter)| filter.keep_osc(params))
+        if !self.interest.wants_osc(number) {
+            return FilterVerdict::Keep;
+        }
+        self.decide(
+            replacement,
+            |interest| interest.wants_osc(number),
+            |filter, replacement| filter.filter_osc(params, replacement),
+        )
     }
 
-    /// Whether every interested filter keeps this ESC sequence.
-    #[must_use]
-    pub fn keep_esc(&self, intermediates: &[u8], byte: u8) -> bool {
-        !self.interest.wants_esc(byte)
-            || self
-                .filters
-                .iter()
-                .filter(|(interest, _)| interest.wants_esc(byte))
-                .all(|(_, filter)| filter.keep_esc(intermediates, byte))
+    /// What the interested filters do with this ESC sequence.
+    pub fn filter_esc(
+        &self,
+        intermediates: &[u8],
+        byte: u8,
+        replacement: &mut Vec<u8>,
+    ) -> FilterVerdict {
+        if !self.interest.wants_esc(byte) {
+            return FilterVerdict::Keep;
+        }
+        self.decide(
+            replacement,
+            |interest| interest.wants_esc(byte),
+            |filter, replacement| filter.filter_esc(intermediates, byte, replacement),
+        )
     }
 }
 

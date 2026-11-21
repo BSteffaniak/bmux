@@ -1,3 +1,4 @@
+use crate::FilterVerdict;
 use crate::model::{
     GridLimits, GridMode, MouseProtocolEncoding, MouseProtocolMode, ProtocolState, TerminalGrid,
     TerminalGridError,
@@ -26,6 +27,11 @@ pub struct TerminalGridStream {
     /// A sequence's parameter values, rewritten for each sequence rather than built anew (boxed:
     /// a stream is held across awaits, and this is half a kilobyte).
     param_values: Box<ParamValues>,
+    /// The bytes an output filter replaces a sequence with, reused.
+    replacement: Vec<u8>,
+    /// The parser replacements are applied with, made at the first and reused while each ends
+    /// between sequences.
+    replayer: Option<Box<Parser>>,
 }
 
 impl TerminalGridStream {
@@ -49,6 +55,8 @@ impl TerminalGridStream {
             observed_dcs: ObservedDcs::default(),
             observed_osc: ObservedOsc::default(),
             param_values: Box::new(ParamValues::new()),
+            replacement: Vec::new(),
+            replayer: None,
         }
     }
 
@@ -131,6 +139,9 @@ impl TerminalGridStream {
             dcs: &mut self.observed_dcs,
             osc: &mut self.observed_osc,
             values: &mut self.param_values,
+            replacement: &mut self.replacement,
+            replayer: Some(&mut self.replayer),
+            replaying: false,
         };
         self.parser.advance(&mut performer, bytes);
         // Written into the storage of the prefix before last: normal text writes nothing.
@@ -296,6 +307,9 @@ pub(crate) fn process(grid: &mut TerminalGrid, bytes: &[u8]) {
         dcs: &mut ObservedDcs::default(),
         osc: &mut ObservedOsc::default(),
         values: &mut ParamValues::new(),
+        replacement: &mut Vec::new(),
+        replayer: None,
+        replaying: false,
     };
     parser.advance(&mut performer, bytes);
 }
@@ -313,21 +327,31 @@ pub const MAX_OBSERVED_OSC_BYTES: usize = 1024 * 1024;
 /// defaults to nothing, so a stream that observes nothing ([`TerminalGridStream::process`])
 /// costs what it did without them.
 pub trait SequenceObserver {
-    /// Whether the grid applies a complete CSI sequence; `false` drops it before the grid or
-    /// [`Self::csi`] sees it (an output filter).
-    fn keep_csi(&mut self, _sequence: &SequenceHeader<'_>) -> bool {
-        true
+    /// What the grid does with a complete CSI sequence (an output filter): apply it, drop it
+    /// before the grid or [`Self::csi`] sees it, or apply the bytes written to `replacement`
+    /// instead (see [`FilterVerdict::Replace`]).
+    fn filter_csi(
+        &mut self,
+        _sequence: &SequenceHeader<'_>,
+        _replacement: &mut Vec<u8>,
+    ) -> FilterVerdict {
+        FilterVerdict::Keep
     }
 
-    /// Whether the grid applies a complete OSC string; `false` drops it before the grid,
-    /// [`Self::osc`] or [`Self::osc_payload`] sees it.
-    fn keep_osc(&mut self, _params: &[&[u8]]) -> bool {
-        true
+    /// What the grid does with a complete OSC string, before the grid, [`Self::osc`] or
+    /// [`Self::osc_payload`] sees it.
+    fn filter_osc(&mut self, _params: &[&[u8]], _replacement: &mut Vec<u8>) -> FilterVerdict {
+        FilterVerdict::Keep
     }
 
-    /// Whether the grid applies a complete ESC sequence; `false` drops it.
-    fn keep_esc(&mut self, _intermediates: &[u8], _byte: u8) -> bool {
-        true
+    /// What the grid does with a complete ESC sequence.
+    fn filter_esc(
+        &mut self,
+        _intermediates: &[u8],
+        _byte: u8,
+        _replacement: &mut Vec<u8>,
+    ) -> FilterVerdict {
+        FilterVerdict::Keep
     }
 
     /// A complete CSI sequence the parser did not ignore.
@@ -626,6 +650,13 @@ struct GridPerformer<'a, O: SequenceObserver> {
     osc: &'a mut ObservedOsc,
     /// Scratch for a sequence's parameter values.
     values: &'a mut ParamValues,
+    /// What an output filter replaces a sequence with.
+    replacement: &'a mut Vec<u8>,
+    /// Where the parser replacements are applied with is kept (a fresh one each time without).
+    replayer: Option<&'a mut Option<Box<Parser>>>,
+    /// Whether a replacement is being applied: no filter is consulted, nothing is streamed, and
+    /// no span of the chunk is reported.
+    replaying: bool,
 }
 
 impl<O: SequenceObserver> Perform for GridPerformer<'_, O> {
@@ -640,31 +671,43 @@ impl<O: SequenceObserver> Perform for GridPerformer<'_, O> {
         _ignore: bool,
         action: char,
     ) -> bool {
-        self.observer.stream_dcs(&SequenceHeader {
-            params,
-            intermediates,
-            action,
-        })
+        !self.replaying
+            && self.observer.stream_dcs(&SequenceHeader {
+                params,
+                intermediates,
+                action,
+            })
     }
 
+    // A replacement's own strings (an APC or image OSC) are discarded, not streamed.
     fn string_start(&mut self, kind: StreamedString) {
-        self.observer.string_start(kind);
+        if !self.replaying {
+            self.observer.string_start(kind);
+        }
     }
 
     fn string_data(&mut self, data: &[u8]) {
-        self.observer.string_data(data);
+        if !self.replaying {
+            self.observer.string_data(data);
+        }
     }
 
     fn string_end(&mut self, completed: bool) {
-        self.observer.string_end(self.grid, completed);
+        if !self.replaying {
+            self.observer.string_end(self.grid, completed);
+        }
     }
 
     fn cut(&mut self, from: ChunkMark, to: usize) {
-        self.observer.cut(from, to);
+        if !self.replaying {
+            self.observer.cut(from, to);
+        }
     }
 
     fn hold(&mut self, from: ChunkMark) {
-        self.observer.hold(from);
+        if !self.replaying {
+            self.observer.hold(from);
+        }
     }
 
     fn print(&mut self, c: char) {
@@ -782,8 +825,12 @@ impl<O: SequenceObserver> Perform for GridPerformer<'_, O> {
 
     fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
         let collected = std::mem::take(&mut self.osc.phase) == OscPhase::Collecting;
-        if !self.observer.keep_osc(params) {
-            return;
+        if !self.replaying {
+            match self.observer.filter_osc(params, self.replacement) {
+                FilterVerdict::Keep => {}
+                FilterVerdict::Drop => return,
+                FilterVerdict::Replace => return self.replay(),
+            }
         }
         self.apply_osc(params);
         self.observer.osc(self.grid, params, bell_terminated);
@@ -800,8 +847,12 @@ impl<O: SequenceObserver> Perform for GridPerformer<'_, O> {
             intermediates,
             action,
         };
-        if !ignore && !self.observer.keep_csi(&header) {
-            return;
+        if !ignore && !self.replaying {
+            match self.observer.filter_csi(&header, self.replacement) {
+                FilterVerdict::Keep => {}
+                FilterVerdict::Drop => return,
+                FilterVerdict::Replace => return self.replay(),
+            }
         }
         self.apply_csi(params, intermediates, ignore, action);
         if !ignore {
@@ -811,8 +862,15 @@ impl<O: SequenceObserver> Perform for GridPerformer<'_, O> {
     }
 
     fn esc_dispatch(&mut self, intermediates: &[u8], ignore: bool, byte: u8) {
-        if !ignore && !self.observer.keep_esc(intermediates, byte) {
-            return;
+        if !ignore && !self.replaying {
+            match self
+                .observer
+                .filter_esc(intermediates, byte, self.replacement)
+            {
+                FilterVerdict::Keep => {}
+                FilterVerdict::Drop => return,
+                FilterVerdict::Replace => return self.replay(),
+            }
         }
         self.apply_esc(intermediates, ignore, byte);
         self.observer.operation(self.grid);
@@ -820,6 +878,28 @@ impl<O: SequenceObserver> Perform for GridPerformer<'_, O> {
 }
 
 impl<O: SequenceObserver> GridPerformer<'_, O> {
+    /// Apply the replacement an output filter wrote, in place of the sequence it declined: parsed
+    /// on its own, by a parser of its own (reset when a replacement leaves it inside a sequence, so
+    /// whatever one leaves incomplete is discarded), and the stream's own parse is unaffected.
+    fn replay(&mut self) {
+        let bytes = std::mem::take(self.replacement);
+        self.replaying = true;
+        match self.replayer.take() {
+            Some(kept) => {
+                let mut replayer = kept.take().unwrap_or_else(|| Box::new(Parser::new()));
+                replayer.advance(self, &bytes);
+                if replayer.between_sequences() {
+                    *kept = Some(replayer);
+                }
+                self.replayer = Some(kept);
+            }
+            None => Parser::new().advance(self, &bytes),
+        }
+        self.replaying = false;
+        *self.replacement = bytes;
+        self.replacement.clear();
+    }
+
     fn apply_osc(&mut self, params: &[&[u8]]) {
         if let [selector, payload] = params
             && *selector == b"22"
@@ -1223,6 +1303,9 @@ mod tests {
             dcs: &mut stream.observed_dcs,
             osc: &mut stream.observed_osc,
             values: &mut stream.param_values,
+            replacement: &mut stream.replacement,
+            replayer: Some(&mut stream.replayer),
+            replaying: false,
         };
         stream
             .parser
@@ -2165,22 +2248,34 @@ mod tests {
     /// is interested in apply as usual, and dropped ones are not observed.
     #[test]
     fn filters_drop_declined_sequences_before_the_grid() {
-        use crate::{FilterInterest, SequenceFilter, SequenceFilters, SequenceHeader};
+        use crate::{
+            FilterInterest, FilterVerdict, SequenceFilter, SequenceFilters, SequenceHeader,
+        };
         struct NoClearing;
         impl SequenceFilter for NoClearing {
             fn interest(&self) -> FilterInterest {
                 FilterInterest::none().csi(b'J').esc(b'c').osc(52)
             }
-            fn keep_csi(&self, sequence: &SequenceHeader<'_>) -> bool {
-                sequence
+            fn filter_csi(&self, sequence: &SequenceHeader<'_>, _: &mut Vec<u8>) -> FilterVerdict {
+                if sequence
                     .values()
                     .is_none_or(|values| values.first() != Some(&2))
+                {
+                    FilterVerdict::Keep
+                } else {
+                    FilterVerdict::Drop
+                }
             }
-            fn keep_esc(&self, _intermediates: &[u8], _byte: u8) -> bool {
-                false
+            fn filter_esc(
+                &self,
+                _intermediates: &[u8],
+                _byte: u8,
+                _: &mut Vec<u8>,
+            ) -> FilterVerdict {
+                FilterVerdict::Drop
             }
-            fn keep_osc(&self, _params: &[&[u8]]) -> bool {
-                false
+            fn filter_osc(&self, _params: &[&[u8]], _: &mut Vec<u8>) -> FilterVerdict {
+                FilterVerdict::Drop
             }
         }
         struct Filtered {
@@ -2189,14 +2284,23 @@ mod tests {
             payloads: usize,
         }
         impl super::SequenceObserver for Filtered {
-            fn keep_csi(&mut self, sequence: &SequenceHeader<'_>) -> bool {
-                self.filters.keep_csi(sequence)
+            fn filter_csi(
+                &mut self,
+                sequence: &SequenceHeader<'_>,
+                out: &mut Vec<u8>,
+            ) -> FilterVerdict {
+                self.filters.filter_csi(sequence, out)
             }
-            fn keep_osc(&mut self, params: &[&[u8]]) -> bool {
-                self.filters.keep_osc(params)
+            fn filter_osc(&mut self, params: &[&[u8]], out: &mut Vec<u8>) -> FilterVerdict {
+                self.filters.filter_osc(params, out)
             }
-            fn keep_esc(&mut self, intermediates: &[u8], byte: u8) -> bool {
-                self.filters.keep_esc(intermediates, byte)
+            fn filter_esc(
+                &mut self,
+                intermediates: &[u8],
+                byte: u8,
+                out: &mut Vec<u8>,
+            ) -> FilterVerdict {
+                self.filters.filter_esc(intermediates, byte, out)
             }
             fn csi(&mut self, _grid: &TerminalGrid, sequence: &SequenceHeader<'_>) {
                 self.seen.push(sequence.action());
@@ -2229,6 +2333,81 @@ mod tests {
         );
         assert_eq!(observer.seen, ['H', 'J'], "the dropped CSI is not observed");
         assert_eq!(observer.payloads, 1, "only the kept OSC 2 payload");
+    }
+
+    /// A filter replacing a sequence has the grid apply its replacement instead, parsed on its own
+    /// with no filter consulted (so a replacement of the same kind is applied, not filtered
+    /// again), and a replacement left incomplete does not disturb the stream's own parse.
+    #[test]
+    fn filters_replace_sequences_with_what_the_grid_applies() {
+        use crate::{
+            FilterInterest, FilterVerdict, SequenceFilter, SequenceFilters, SequenceHeader,
+        };
+        struct Rewrite;
+        impl SequenceFilter for Rewrite {
+            fn interest(&self) -> FilterInterest {
+                FilterInterest::none().csi(b'J').csi(b'm').osc(2)
+            }
+            fn filter_csi(
+                &self,
+                sequence: &SequenceHeader<'_>,
+                replacement: &mut Vec<u8>,
+            ) -> FilterVerdict {
+                match sequence.action() {
+                    // A full clear becomes a clear below the second row.
+                    'J' => replacement.extend_from_slice(b"\x1b[2;1H\x1b[J"),
+                    // Every SGR becomes bold, and an incomplete sequence (discarded).
+                    _ => replacement.extend_from_slice(b"\x1b[1m\x1b["),
+                }
+                FilterVerdict::Replace
+            }
+            fn filter_osc(&self, _params: &[&[u8]], replacement: &mut Vec<u8>) -> FilterVerdict {
+                replacement.extend_from_slice(b"\x1b]2;[pane]\x07");
+                FilterVerdict::Replace
+            }
+        }
+        #[derive(Default)]
+        struct Titles {
+            filters: SequenceFilters,
+            titles: Vec<Vec<u8>>,
+        }
+        impl super::SequenceObserver for Titles {
+            fn filter_csi(
+                &mut self,
+                sequence: &SequenceHeader<'_>,
+                out: &mut Vec<u8>,
+            ) -> FilterVerdict {
+                self.filters.filter_csi(sequence, out)
+            }
+            fn filter_osc(&mut self, params: &[&[u8]], out: &mut Vec<u8>) -> FilterVerdict {
+                self.filters.filter_osc(params, out)
+            }
+            fn osc(&mut self, _grid: &TerminalGrid, params: &[&[u8]], _bell: bool) {
+                self.titles
+                    .push(params.get(1).copied().unwrap_or_default().to_vec());
+            }
+        }
+        let mut observer = Titles::default();
+        observer.filters.register(std::sync::Arc::new(Rewrite));
+        let mut stream = TerminalGridStream::new(10, 3, GridLimits::default()).unwrap();
+        stream.process_observed(
+            b"one\r\ntwo\r\nthree\x1b[2J\x1b]2;secret\x07\x1b[31mred",
+            &mut observer,
+        );
+        let text = crate::visible_text(stream.grid(), 0, 3);
+        let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
+        assert_eq!(
+            lines,
+            ["one", "red", ""],
+            "the clear became a clear below row two"
+        );
+        assert_eq!(observer.titles, [b"[pane]".to_vec()]);
+        let style = stream.grid().current_style();
+        assert!(style.bold && style.fg.is_none(), "the SGR became bold");
+        assert!(
+            stream.between_sequences(),
+            "the incomplete replacement left no state"
+        );
     }
 
     /// An observer wanting an OSC number gets its whole payload, however long and however split

@@ -29,7 +29,8 @@ passthrough, with an observer, and across two panes; scattered edits; four panes
 decoration renderer (borders and titles, its intent sampled before every frame as the attach
 client samples it), one streaming (`plain-stream/decorated`) or none (`idle/decorated`); Kitty and
 sixel images beside streaming output and moving each frame; and, for the reader, text with a Kitty
-image every 30 frames. Each scenario runs 300 frames and measures the 270 after a 30-frame warm-up.
+image every 30 frames, and text with output rules rewriting every colour and title
+(`plain-stream/rewritten`: about 21% more than the same text unfiltered, every SGR replaced). Each scenario runs 300 frames and measures the 270 after a 30-frame warm-up.
 
 `pipeline_soak` and `ingest_soak` replay workloads ten times over and fail when live bytes keep
 growing through the second half: history, caches, retained images and the image registry must be

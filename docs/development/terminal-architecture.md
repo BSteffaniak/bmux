@@ -227,11 +227,20 @@ Done (each a measured commit; see [render-performance.md](render-performance.md)
   - OSC 52 clipboard writes travel only in the frames of clients viewing the pane, which apply
     `clipboard.osc52` (`ask` per pane while attached, the default; `allow`; `deny`). Queries stay
     unanswered. The grid collects whole payloads an observer asks for (`wants_osc`).
-  - Output filters: native plugins register a `SequenceFilter` in the shared
-    `SequenceFilters` (plugin state) with a declared `FilterInterest` (CSI and ESC final bytes, OSC
-    numbers). The reader asks only interested filters, on the grid's own parse, before the grid
-    applies the sequence; a dropped sequence is neither applied nor answered. With no filter
+  - Output filters: a `SequenceFilter` in the shared `SequenceFilters` (plugin state) declares a
+    `FilterInterest` (CSI and ESC final bytes, OSC numbers) and answers keep, drop or replace for
+    each sequence it is interested in. The reader asks only interested filters, on the grid's own
+    parse, before the grid applies the sequence; a dropped sequence is neither applied nor
+    answered, and a replacement is parsed in its place by a parser of its own with no filter
+    consulted, so it cannot recurse and whatever it leaves incomplete is discarded. With no filter
     registered the observer type has no filter check at all.
+  - Plugins (and the host's clients) set filters declaratively through
+    `pane-runtime-output-filters-v1` (capability `bmux.pane_runtime.output_filters.v1`):
+    `set-rules` replaces the caller's rule list, kept under its plugin id, each rule matching CSI
+    sequences (final byte, intermediates, optional exact parameters), OSC numbers or ESC sequences
+    and keeping, dropping or replacing them with given bytes. Rules run in-process in the parse;
+    no plugin is called per sequence. Native plugins can still register a `SequenceFilter` of
+    their own.
 - Images on the grid's parse: the parser recognises Sixel DCS strings, Kitty graphics APC strings
   (`ESC _ G`, an APC dispatch it did not have) and iTerm2 `OSC 1337;File=` strings itself and
   streams their payload, unbounded, to the observer (`SequenceObserver::string_*`), which hands it
@@ -258,8 +267,8 @@ client's largest cost.
 
 Output filters change what panes display (grids, and so frames), not the raw output stream:
 recording records what the program wrote, and the playbook, which still reads raw bytes for its
-display track and `pane_output` events, sees what was written. Filters keep or drop whole
-sequences; rewriting sequences and filtering text runs come later, with the same interest model.
+display track and `pane_output` events, sees what was written. Filters keep, drop or replace whole
+sequences; text runs are not filtered (see below).
 
 The playbook stays on raw bytes: its display track and `pane_output` events are defined as what
 the program wrote, and with the buffer retaining only for readers, it costs nothing unless a
@@ -274,10 +283,8 @@ server) is gone; status-line segments go through the tab bar's `status-items` se
 
 Deferred, each until something needs it (measured, not assumed):
 
-- Rewriting filters and text filters. No plugin uses even the keep/drop filters yet; a text-run
-  hook would sit in the hottest path (`print_ascii`). Should a consumer appear, the first step is
-  `Replace` for CSI and OSC, re-parsed with filters skipped; text redaction belongs at the replica
-  or render, not the PTY parse.
+- Text filters. A text-run hook would sit in the hottest path (`print_ascii`); text redaction
+  belongs at the replica or render, not the PTY parse.
 - Shell metadata on the grid's parse: its scan is now about 0.6% of the reader.
 - Delta relays for decoration scenes (only animated decorations would gain), and merging the
   scene protocol's paint commands with `RenderOp`.

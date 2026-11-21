@@ -7,8 +7,8 @@
 //!
 //! Each corpus frame is read in 8 KiB pieces, as the pane's PTY reader does, and each piece goes
 //! through what the reader runs for it ([`super::follow_chunk`], then mode tracking and the push
-//! into the output buffer): images intercepted, shell metadata filtered, protocol queries
-//! answered and the pane's grid parsed in one pass. Generated corpora run at `BMUX_BENCH_SIZE`
+//! into the output buffer): shell metadata filtered, then the pane's grid parsed in one pass that
+//! answers protocol queries, finds images and applies output filters. Generated corpora run at `BMUX_BENCH_SIZE`
 //! (`420x90` by default); captured ones are listed in `BMUX_BENCH_CORPUS`.
 
 use super::{
@@ -43,27 +43,37 @@ struct Pane {
     raw_reader: bool,
 }
 
+/// How a pane's output is followed, beyond the grid.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reading {
+    /// Clients take frames: no one reads raw output.
+    Frames,
+    /// A reader follows the pane's raw output (as the playbook does).
+    Raw,
+    /// Clients take frames, and output rules rewrite every SGR sequence and OSC 2 title, as a
+    /// plugin restyling panes would set (`pane-runtime-output-filters-v1`).
+    Rewritten,
+}
+
 impl Pane {
     /// A pane no one reads raw output from (attach clients take frames): its output buffer only
     /// advances.
     fn new(size: (u16, u16)) -> Self {
-        let pane = Self::with_reader(size, false);
-        pane.output.last_read.set(
-            Instant::now()
-                .checked_sub(super::RAW_READ_LEASE * 2)
-                .expect("clock past the lease"),
-        );
-        pane
+        Self::reading(size, Reading::Frames)
     }
 
-    fn with_reader((cols, rows): (u16, u16), raw_reader: bool) -> Self {
-        Self {
+    fn reading((cols, rows): (u16, u16), reading: Reading) -> Self {
+        let mut reader = PaneReader::new(
+            ProtocolProfile::Bmux,
+            Some(PaneShellMetadataParser::default()),
+        );
+        if reading == Reading::Rewritten {
+            reader = reader.with_filters(rewrite_rules());
+        }
+        let pane = Self {
             grid: TerminalGridStream::new(cols, rows, GridLimits::default()).expect("grid"),
             output: OutputFanoutBuffer::new(1 << 20),
-            reader: PaneReader::new(
-                ProtocolProfile::Bmux,
-                Some(PaneShellMetadataParser::default()),
-            ),
+            reader,
             modes: Default::default(),
             engine: TerminalProtocolEngine::new(ProtocolProfile::Bmux),
             #[cfg(feature = "image-registry")]
@@ -71,8 +81,16 @@ impl Pane {
             #[cfg(feature = "image-registry")]
             collector: bmux_image::ImageCollector::with_max_encoded_bytes(16 * 1024 * 1024),
             replies: Vec::new(),
-            raw_reader,
+            raw_reader: reading == Reading::Raw,
+        };
+        if !pane.raw_reader {
+            pane.output.last_read.set(
+                Instant::now()
+                    .checked_sub(super::RAW_READ_LEASE * 2)
+                    .expect("clock past the lease"),
+            );
         }
+        pane
     }
 
     /// One PTY read, as the pane reader handles it: followed through the grid, modes tracked, the
@@ -113,6 +131,38 @@ impl Pane {
             .push_parsed(&self.reader.visible, super::ChunkBoundary::of(&self.grid));
         self.replies.extend_from_slice(&self.reader.pointer_replies);
     }
+}
+
+/// Output rules rewriting every SGR sequence (to bold) and OSC 2 title, set as a plugin sets them.
+fn rewrite_rules() -> super::SharedFilters {
+    use bmux_pane_runtime_plugin_api::pane_runtime_output_filters_v1::{
+        OutputAction, OutputMatch, OutputRule,
+    };
+    let filters = super::SharedFilters::default();
+    super::output_filters::set_rules(
+        &filters,
+        "bench.restyle",
+        vec![
+            OutputRule {
+                sequence: OutputMatch::Csi {
+                    final_byte: b'm',
+                    intermediates: Vec::new(),
+                    params: None,
+                },
+                action: OutputAction::Replace {
+                    bytes: b"\x1b[1m".to_vec(),
+                },
+            },
+            OutputRule {
+                sequence: OutputMatch::Osc { number: 2 },
+                action: OutputAction::Replace {
+                    bytes: b"\x1b]2;pane\x07".to_vec(),
+                },
+            },
+        ],
+    )
+    .expect("valid rules");
+    filters
 }
 
 // Allocations are counted in this test binary: `ingest_metrics` reports them per frame.
@@ -192,14 +242,10 @@ const WARMUP: usize = 30;
 fn ingest_once(
     size: (u16, u16),
     frames: &[Frame],
-    raw_reader: bool,
+    reading: Reading,
 ) -> (BTreeMap<String, PhaseRecorder>, u64, i64) {
     let probe = Probe::new();
-    let mut reader = if raw_reader {
-        Pane::with_reader(size, true)
-    } else {
-        Pane::new(size)
-    };
+    let mut reader = Pane::reading(size, reading);
     let mut read = PhaseRecorder::default();
     let mut live_after_warmup = 0;
     let mut measured = 0_u64;
@@ -230,21 +276,21 @@ fn ingest_once(
 /// fresh reader [`bmux_bench::metrics::repeats`] times, which must allocate identically, each
 /// frame keeping its fewest instructions.
 fn ingest(name: &str, size: (u16, u16), frames: &[Frame]) -> Option<Scenario> {
-    ingest_with(name, size, frames, false)
+    ingest_with(name, size, frames, Reading::Frames)
 }
 
 fn ingest_with(
     name: &str,
     size: (u16, u16),
     frames: &[Frame],
-    raw_reader: bool,
+    reading: Reading,
 ) -> Option<Scenario> {
     if !bmux_bench::metrics::selected(name) {
         return None;
     }
-    let (mut stages, measured, live_growth) = ingest_once(size, frames, raw_reader);
+    let (mut stages, measured, live_growth) = ingest_once(size, frames, reading);
     for _ in 1..bmux_bench::metrics::repeats() {
-        let (repeat, _, _) = ingest_once(size, frames, raw_reader);
+        let (repeat, _, _) = ingest_once(size, frames, reading);
         for (stage, recorder) in &mut stages {
             let other = repeat
                 .get(stage)
@@ -336,7 +382,14 @@ fn ingest_metrics() {
         "plain-stream/raw-reader",
         size,
         &corpus::plain_stream(size, 300),
-        true,
+        Reading::Raw,
+    ));
+    // Output rules rewriting every colour and title, as a restyling plugin sets them.
+    report.scenarios.extend(ingest_with(
+        "plain-stream/rewritten",
+        size,
+        &corpus::plain_stream(size, 300),
+        Reading::Rewritten,
     ));
     for scenario in &report.scenarios {
         let stages: Vec<String> = scenario
