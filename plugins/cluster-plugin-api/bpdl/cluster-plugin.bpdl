@@ -953,6 +953,62 @@ interface cluster-consensus-transfer {
     command abort(request: cluster-consensus-transfer-types.transfer-request) -> result<cluster-consensus-transfer-types.abort-outcome, cluster-consensus-transfer-types.transfer-error>;
 }
 
+// Reserved owned-engine contract; not advertised until its provider and
+// authenticated negotiation are implemented. Existing Raft RPC meanings stay unchanged.
+interface cluster-consensus-rpc-types {
+    record sealed-entry-reference {
+        sender-incarnation: uuid,
+        sequence: u64,
+        identity: cluster-consensus-transfer-types.log-identity,
+        total-bytes: u64,
+        checksum: bytes,
+    }
+    variant append-entry {
+        inline { canonical: bytes },
+        staged { reference: sealed-entry-reference },
+    }
+    // The signature binds every field except itself, including operation and
+    // request identity. Sender must equal the authenticated leader.
+    record append-request {
+        cluster-id: string,
+        sender: bytes,
+        recipient: bytes,
+        request-id: uuid,
+        term: u64,
+        previous: cluster-consensus-transfer-types.log-identity?,
+        entries: list<append-entry>,
+        leader-commit: cluster-consensus-transfer-types.log-identity?,
+        proof: cluster-consensus-transfer-types.transfer-proof,
+    }
+    variant append-outcome {
+        durable { matched: cluster-consensus-transfer-types.log-identity? },
+        conflict { next-index: u64 },
+        missing-transfer { reference: sealed-entry-reference },
+    }
+    record append-response {
+        request-id: uuid,
+        source: bytes,
+        term: u64,
+        outcome: append-outcome,
+    }
+    enum rpc-error {
+        unauthorized,
+        incompatible,
+        stale-term,
+        invalid-request,
+        capacity-unavailable,
+        storage-failure,
+        stopped,
+    }
+}
+
+@capability(CLUSTER_AUTH)
+@interface-version(1)
+interface cluster-consensus-rpc {
+    // Durable means the log transaction committed, not application or quorum commit.
+    command append(request: cluster-consensus-rpc-types.append-request) -> result<cluster-consensus-rpc-types.append-response, cluster-consensus-rpc-types.rpc-error>;
+}
+
 @capability(CLUSTER_AUTH)
 @interface-version(1)
 interface cluster-peer-auth {

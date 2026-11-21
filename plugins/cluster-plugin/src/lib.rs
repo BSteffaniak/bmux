@@ -2407,6 +2407,170 @@ mod tests {
         );
     }
 
+    // Keep the signed request lifecycle and durable authority setup together.
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn owned_transfer_finishes_authenticated_canonical_entry_and_rejects_replay() {
+        use crate::consensus_model::{
+            Entry, EntryPayload, LogIdentity, LogIndex, Membership, Term,
+        };
+        use bmux_cluster_plugin_api::cluster_consensus_transfer_types::{
+            ChunkRequest, EntryPurpose, TransferHeader, TransferProof, TransferPurpose,
+        };
+        use sha2::{Digest, Sha256};
+        let caller = std::sync::Arc::new(FakeRuntime::default());
+        let identity = load_or_create_node_identity(caller.as_ref()).unwrap();
+        initialize_cluster(caller.as_ref()).unwrap();
+        configure_local_consensus_endpoint(caller.as_ref(), Some("tls://localhost:7443")).unwrap();
+        let member = membership::local_members(caller.as_ref())
+            .unwrap()
+            .members
+            .remove(0);
+        let node = *identity.node_id();
+        let parent = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let root = tempfile::tempdir_in(parent).unwrap();
+        let store = owned_vote_store::OwnedVoteStore::bootstrap(
+            &root.path().join("authority.redb"),
+            &member.cluster_id,
+            node,
+            Membership::new(vec![vec![node]], vec![(node, String::new())]).unwrap(),
+        )
+        .unwrap();
+        let executor =
+            owned_vote_store::VoteExecutor::new(owned_vote_store::DurableVoteGate::new(1, store));
+        let position = LogIdentity {
+            term: Term(0),
+            leader: node,
+            index: LogIndex(1),
+        };
+        let command = bmux_cluster_plugin_api::cluster_types::ControlCommand {
+            schema_version: 1,
+            principal_id: node.to_string(),
+            command_id: bmux_cluster_plugin_api::cluster_types::CommandId {
+                value: uuid::Uuid::new_v4(),
+            },
+            issued_at_unix_ms: now_unix_ms(),
+            request: bmux_cluster_plugin_api::cluster_types::ControlCommandRequest::UpsertMember {
+                member: member.clone(),
+            },
+        };
+        executor
+            .append(
+                crate::consensus_model::AppendRequest {
+                    term: Term(0),
+                    leader: node,
+                    previous: Some(LogIdentity {
+                        index: LogIndex(0),
+                        ..position
+                    }),
+                    entries: vec![Entry {
+                        identity: position,
+                        payload: EntryPayload::Application(
+                            crate::control_codec::encode_control_command(&command),
+                        ),
+                    }],
+                    leader_commit: Some(position),
+                },
+                (16, 1024 * 1024),
+            )
+            .await
+            .unwrap();
+        executor.apply_committed().await.unwrap();
+        std::fs::create_dir(root.path().join("staging")).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                root.path().join("staging"),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        }
+        executor
+            .configure_staging(root.path().join("staging"), 4096, 4096)
+            .await
+            .unwrap();
+        let bytes = crate::consensus_storage::encode_owned_entry(&Entry {
+            identity: position,
+            payload: EntryPayload::NoOp,
+        })
+        .unwrap();
+        let header = TransferHeader {
+            cluster_id: member.cluster_id,
+            sender: node.as_bytes().to_vec(),
+            recipient: node.as_bytes().to_vec(),
+            leader_term: 0,
+            sender_incarnation: uuid::Uuid::new_v4(),
+            sequence: 1,
+            purpose: TransferPurpose::Entry {
+                value: EntryPurpose {
+                    identity:
+                        bmux_cluster_plugin_api::cluster_consensus_transfer_types::LogIdentity {
+                            term: 0,
+                            leader: node.as_bytes().to_vec(),
+                            index: 1,
+                        },
+                    previous: Some(
+                        bmux_cluster_plugin_api::cluster_consensus_transfer_types::LogIdentity {
+                            term: 0,
+                            leader: node.as_bytes().to_vec(),
+                            index: 0,
+                        },
+                    ),
+                },
+            },
+            total_bytes: bytes.len() as u64,
+            checksum: Sha256::digest(&bytes).to_vec(),
+        };
+        for operation in ["begin", "chunk", "finish"] {
+            let challenge = create_peer_auth_challenge(
+                caller.as_ref(),
+                &ClusterPeerChallengeRequest {
+                    claimant_node_id: node.to_string(),
+                },
+            )
+            .unwrap();
+            let proof = create_peer_auth_proof(caller.as_ref(), challenge).unwrap();
+            let mut request = ChunkRequest {
+                header: header.clone(),
+                offset: 0,
+                data: if operation == "chunk" {
+                    bytes.clone()
+                } else {
+                    Vec::new()
+                },
+                proof: TransferProof {
+                    credential_serial: member.credential_serial.clone(),
+                    signature: vec![0; 64],
+                    peer: proof,
+                },
+            };
+            request.proof.signature = identity
+                .sign(&consensus_network::transfer_signing_payload(operation, &request).unwrap());
+            let offset = executor
+                .transfer(caller.clone(), node, operation.into(), request.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                offset,
+                if operation == "begin" {
+                    0
+                } else {
+                    header.total_bytes
+                }
+            );
+            if operation == "finish" {
+                assert!(
+                    executor
+                        .transfer(caller.clone(), node, operation.into(), request)
+                        .await
+                        .unwrap_err()
+                        .contains("already consumed")
+                );
+            }
+        }
+        executor.shutdown().await.unwrap();
+    }
+
     #[test]
     fn peer_read_proof_binds_query_target_operation_and_is_single_use() {
         let verifier = FakeRuntime::default();
@@ -2535,6 +2699,25 @@ mod tests {
             claimant_identity.node_id().to_string()
         );
         assert_eq!(authenticated.cluster_id, challenge.cluster_id);
+        let members = membership::local_members(&verifier).unwrap().members;
+        let continuation = ClusterPeerAuthenticateRequest {
+            proof: proof.clone(),
+        };
+        assert_eq!(
+            membership::revalidate_peer_for_members(&verifier, &continuation, &members)
+                .unwrap()
+                .node_id,
+            authenticated.node_id
+        );
+        let mut revoked = members;
+        revoked
+            .iter_mut()
+            .find(|member| member.node_id == authenticated.node_id)
+            .unwrap()
+            .state = ClusterMemberState::Revoked;
+        assert!(
+            membership::revalidate_peer_for_members(&verifier, &continuation, &revoked).is_err()
+        );
         assert!(
             authenticate_peer(&verifier, &ClusterPeerAuthenticateRequest { proof })
                 .unwrap_err()

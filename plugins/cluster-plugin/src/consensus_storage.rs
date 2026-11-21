@@ -1094,18 +1094,46 @@ fn decode_snapshot_envelope(bytes: &[u8]) -> Result<SnapshotEnvelope, ConsensusS
 pub(crate) fn decode_owned_snapshot(
     bytes: &[u8],
 ) -> Result<(crate::consensus_model::SnapshotDescriptor, Vec<u8>), ConsensusStorageError> {
-    if bytes.len() > MAX_SNAPSHOT_FILE_BYTES {
+    decode_owned_snapshot_reader(std::io::Cursor::new(bytes), bytes.len())
+}
+
+pub(crate) fn decode_owned_snapshot_reader(
+    mut input: impl std::io::Read + std::io::Seek,
+    length: usize,
+) -> Result<(crate::consensus_model::SnapshotDescriptor, Vec<u8>), ConsensusStorageError> {
+    if length > MAX_SNAPSHOT_FILE_BYTES {
         return Err(ConsensusStorageError::CorruptRecord("snapshot size"));
     }
-    let payload_len = bytes
-        .len()
+    let payload_len = length
         .checked_sub(32)
         .ok_or(ConsensusStorageError::CorruptRecord("snapshot checksum"))?;
-    let (payload, checksum) = bytes.split_at(payload_len);
-    if snapshot_checksum(payload).as_slice() != checksum {
+    let invalid = |_| ConsensusStorageError::CorruptRecord("snapshot input");
+    input.rewind().map_err(invalid)?;
+    let mut hash = Sha256::new();
+    let mut remaining = payload_len;
+    let mut chunk = [0; 8192];
+    while remaining != 0 {
+        let size = remaining.min(chunk.len());
+        input.read_exact(&mut chunk[..size]).map_err(invalid)?;
+        hash.update(&chunk[..size]);
+        remaining -= size;
+    }
+    let mut checksum = [0; 32];
+    input.read_exact(&mut checksum).map_err(invalid)?;
+    if <[u8; 32]>::from(hash.finalize()) != checksum
+        || input.read(&mut chunk[..1]).map_err(invalid)? != 0
+    {
         return Err(ConsensusStorageError::CorruptRecord("snapshot checksum"));
     }
-    let mut reader = DurableReader::new(payload, *b"BMSNP001", "snapshot envelope")?;
+    input.rewind().map_err(invalid)?;
+    let payload_length = u64::try_from(payload_len)
+        .map_err(|_| ConsensusStorageError::CorruptRecord("snapshot size"))?;
+    let mut reader = DurableReader::from_reader(
+        input.take(payload_length),
+        payload_len,
+        *b"BMSNP001",
+        "snapshot envelope",
+    )?;
     let version = reader.u16()?;
     if version != SNAPSHOT_FORMAT_VERSION {
         return Err(ConsensusStorageError::UnsupportedFormat(version));
@@ -1127,11 +1155,9 @@ pub(crate) fn decode_owned_snapshot(
         snapshot_id,
         last_included,
         membership,
-        total_bytes: u64::try_from(bytes.len())
+        total_bytes: u64::try_from(length)
             .map_err(|_| ConsensusStorageError::CorruptRecord("snapshot size"))?,
-        checksum: checksum
-            .try_into()
-            .map_err(|_| ConsensusStorageError::CorruptRecord("snapshot checksum"))?,
+        checksum,
     };
     descriptor
         .validate_positions()

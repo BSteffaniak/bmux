@@ -31,6 +31,32 @@ struct Incoming {
     progress: Instant,
     sealed: bool,
     failed: bool,
+    validation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Owns validation I/O while staging retains the byte/count reservation.
+/// Dropping a ticket leaves the transfer failed, eligible for explicit cleanup.
+pub(crate) struct ValidationTicket {
+    file: File,
+    total: u64,
+    identity: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A ticket whose canonical validator returned success. This does not grant
+/// consensus authority; the executor must revalidate authority before sealing.
+pub(crate) struct ValidatedTicket(ValidationTicket);
+
+impl ValidationTicket {
+    pub(crate) fn validate(
+        mut self,
+        validate: impl FnOnce(&mut File, u64) -> io::Result<()>,
+    ) -> io::Result<ValidatedTicket> {
+        validate(&mut self.file, self.total)?;
+        // Retry eligibility is not sealing authority. A retry must validate again.
+        self.identity
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(ValidatedTicket(self))
+    }
 }
 
 /// Owns at most eight temporary files and two per peer. Explicit cleanup retains
@@ -285,6 +311,7 @@ impl TransferStaging {
                 progress: now,
                 sealed: false,
                 failed: false,
+                validation: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
         Ok(0)
@@ -342,22 +369,54 @@ impl TransferStaging {
         key: TransferKey,
         validate: impl FnOnce(&mut File, u64) -> io::Result<()>,
     ) -> io::Result<()> {
+        let ticket = self.prepare_validation(key)?.validate(validate)?;
+        self.complete_validation(key, ticket)
+    }
+
+    pub(crate) fn prepare_validation(&mut self, key: TransferKey) -> io::Result<ValidationTicket> {
         let transfer = self
             .transfers
             .get_mut(&key)
             .ok_or_else(|| io::Error::other("unknown transfer"))?;
-        if transfer.failed
+        if std::sync::Arc::strong_count(&transfer.validation) != 1
+            || (transfer.failed
+                && !transfer
+                    .validation
+                    .load(std::sync::atomic::Ordering::SeqCst))
             || transfer.offset != transfer.total
             || <[u8; 32]>::from(transfer.hash.clone().finalize()) != transfer.digest
         {
             return Err(io::Error::other("incomplete or corrupt transfer"));
         }
         transfer.failed = true;
+        transfer
+            .validation
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         transfer.file.flush()?;
         transfer.file.seek(SeekFrom::Start(0))?;
-        validate(&mut transfer.file, transfer.total)?;
+        Ok(ValidationTicket {
+            file: transfer.file.try_clone()?,
+            total: transfer.total,
+            identity: std::sync::Arc::clone(&transfer.validation),
+        })
+    }
+
+    // Callers must revalidate authority before consuming a successfully validated ticket.
+    pub(crate) fn complete_validation(
+        &mut self,
+        key: TransferKey,
+        ticket: ValidatedTicket,
+    ) -> io::Result<()> {
+        let transfer = self
+            .transfers
+            .get_mut(&key)
+            .ok_or_else(|| io::Error::other("unknown transfer"))?;
+        if !std::sync::Arc::ptr_eq(&ticket.0.identity, &transfer.validation) {
+            return Err(io::Error::other("stale validation ticket"));
+        }
         transfer.sealed = true;
         transfer.failed = false;
+        drop(ticket);
         Ok(())
     }
 
@@ -384,6 +443,12 @@ impl TransferStaging {
     /// Failed deletion keeps the object and its reservation for a later retry.
     pub fn abort(&mut self, key: TransferKey) -> io::Result<()> {
         if let Some(transfer) = self.transfers.get(&key) {
+            if std::sync::Arc::strong_count(&transfer.validation) != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "validation still owns the transfer reservation",
+                ));
+            }
             rustix::fs::unlinkat(
                 &transfer.directory,
                 transfer.name.as_str(),
@@ -402,7 +467,8 @@ impl TransferStaging {
             .transfers
             .iter()
             .filter(|(_, transfer)| {
-                now.saturating_duration_since(transfer.progress) >= Duration::from_secs(30)
+                std::sync::Arc::strong_count(&transfer.validation) == 1
+                    && now.saturating_duration_since(transfer.progress) >= Duration::from_secs(30)
             })
             .map(|(key, _)| *key)
             .collect::<Vec<_>>();
@@ -461,6 +527,93 @@ mod tests {
             std::fs::read(root.path().join(OWNER_FILE)).unwrap(),
             b"corrupt"
         );
+    }
+
+    #[test]
+    fn validation_ticket_retains_reservation_until_dropped() {
+        let root = private_root();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = recover_directory(root.path()).unwrap();
+        let mut staging = TransferStaging::new(4, 4).unwrap();
+        let key = TransferKey {
+            peer: [1; 32],
+            incarnation: Uuid::nil(),
+            sequence: 1,
+        };
+        let now = Instant::now();
+        staging
+            .begin(
+                &directory,
+                key,
+                [0; 32],
+                4,
+                Sha256::digest(b"data").into(),
+                now,
+            )
+            .unwrap();
+        staging.chunk(key, 0, b"data", now).unwrap();
+        let ticket = staging.prepare_validation(key).unwrap();
+        assert_eq!(
+            staging.abort(key).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(staging.clear().is_err());
+        staging.expire(now + Duration::from_secs(31)).unwrap();
+        assert!(staging.transfers.contains_key(&key));
+        let other = TransferKey { sequence: 2, ..key };
+        assert!(
+            staging
+                .begin(&directory, other, [0; 32], 4, [0; 32], now)
+                .is_err()
+        );
+        assert!(staging.chunk(key, 0, b"data", now).is_err());
+        drop(ticket);
+        staging.abort(key).unwrap();
+        staging
+            .begin(&directory, other, [0; 32], 4, [0; 32], now)
+            .unwrap();
+    }
+
+    #[test]
+    fn successful_validation_can_retry_after_unpublished_ticket_is_dropped() {
+        let root = private_root();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = recover_directory(root.path()).unwrap();
+        let mut staging = TransferStaging::new(4, 4).unwrap();
+        let key = TransferKey {
+            peer: [1; 32],
+            incarnation: Uuid::nil(),
+            sequence: 1,
+        };
+        let now = Instant::now();
+        staging
+            .begin(
+                &directory,
+                key,
+                [0; 32],
+                4,
+                Sha256::digest(b"data").into(),
+                now,
+            )
+            .unwrap();
+        staging.chunk(key, 0, b"data", now).unwrap();
+        let ticket = staging
+            .prepare_validation(key)
+            .unwrap()
+            .validate(|_, _| Ok(()))
+            .unwrap();
+        assert!(staging.prepare_validation(key).is_err());
+        drop(ticket); // Final authority admission timed out without sealing.
+        assert!(staging.read(key, 0, &mut [0; 4]).is_err());
+        assert!(staging.chunk(key, 0, b"data", now).is_err());
+        let retry = staging.prepare_validation(key).unwrap();
+        assert!(
+            retry
+                .validate(|_, _| Err(io::Error::other("invalid")))
+                .is_err()
+        );
+        assert!(staging.prepare_validation(key).is_err());
+        staging.abort(key).unwrap();
     }
 
     #[test]

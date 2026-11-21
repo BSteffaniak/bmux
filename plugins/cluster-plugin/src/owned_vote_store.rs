@@ -610,7 +610,9 @@ impl DurableVoteGate {
 #[derive(Debug)]
 pub struct VoteExecutor {
     gate: std::sync::Arc<tokio::sync::Mutex<Option<DurableVoteGate>>>,
-    closing: std::sync::atomic::AtomicBool,
+    closing: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    validation: std::sync::Arc<tokio::sync::Semaphore>,
+    status: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
 
 /// Append admission errors are distinct from uncertain durable completion.
@@ -683,8 +685,10 @@ impl VoteExecutor {
     #[must_use]
     pub fn new(gate: DurableVoteGate) -> Self {
         Self {
+            status: gate.store.status.clone(),
             gate: std::sync::Arc::new(tokio::sync::Mutex::new(Some(gate))),
-            closing: std::sync::atomic::AtomicBool::new(false),
+            closing: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            validation: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -760,8 +764,9 @@ impl VoteExecutor {
         .map_err(|error| format!("staging configuration failed: {error:?}"))?
     }
 
-    /// Authenticate and mutate disposable staging under the same single-flight
-    /// authority as votes and appends. Offsets acknowledge staging, not replication.
+    /// Authenticate staging mutations under single-flight authority. Canonical
+    /// validation runs outside authority; sealing repeats authoritative admission.
+    /// Offsets acknowledge staging, not replication.
     /// # Errors
     /// Rejects busy/stopped authority, wrong clusters, stale terms and non-voters.
     // Keep durable authority read, authentication and staging in one visible
@@ -774,9 +779,80 @@ impl VoteExecutor {
         operation: String,
         request: bmux_cluster_plugin_api::cluster_consensus_transfer_types::ChunkRequest,
     ) -> Result<u64, String> {
+        if operation != "finish" {
+            return self
+                .transfer_phase(caller, local, operation, request, None)
+                .await
+                .map(|(offset, _)| offset);
+        }
+        crate::consensus_network::transfer_signing_payload(&operation, &request)?;
+        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("owned validation stopped".into());
+        }
+        let permit = self
+            .validation
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "owned validation busy".to_string())?;
+        let executor = Self {
+            gate: self.gate.clone(),
+            closing: self.closing.clone(),
+            validation: self.validation.clone(),
+            status: self.status.clone(),
+        };
+        // The task, not the request future, owns admission until all I/O and
+        // publication attempts terminate. Shutdown waits on this same permit.
+        tokio::spawn(async move {
+            let (_, ticket) = executor
+                .transfer_phase(
+                    caller.clone(),
+                    local,
+                    operation.clone(),
+                    request.clone(),
+                    None,
+                )
+                .await?;
+            let ticket = ticket.ok_or("missing prepared validation")?;
+            let header = request.header.clone();
+            let closing = executor.closing.clone();
+            let status = executor.status.clone();
+            let (validated, permit) = tokio::task::spawn_blocking(move || {
+                // Carry admission through worker completion even if its async
+                // supervisor is dropped. Return it with the validation outcome.
+                let result = ticket.validate(|file, total| {
+                    crate::consensus_network::validate_staged_object(
+                        file, total, &header, &status, &closing,
+                    )
+                });
+                (result, permit)
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+            let validated = validated.map_err(|error| error.to_string())?;
+            let result = executor
+                .transfer_phase(caller, local, operation, request, Some(validated))
+                .await
+                .map(|(offset, _)| offset);
+            drop(permit);
+            result
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep authentication and authoritative admission together.
+    async fn transfer_phase<C: crate::ClusterRuntimeOps + Send + Sync + 'static>(
+        &self,
+        caller: std::sync::Arc<C>,
+        local: NodeId,
+        operation: String,
+        request: bmux_cluster_plugin_api::cluster_consensus_transfer_types::ChunkRequest,
+        validated: Option<crate::transfer_staging::ValidatedTicket>,
+    ) -> Result<(u64, Option<crate::transfer_staging::ValidationTicket>), String> {
         // Charge and validate before moving attacker-controlled data into a task.
         crate::consensus_network::transfer_signing_payload(&operation, &request)?;
-        self.run(move |gate| {
+        let finishing = validated.is_some();
+        self.run_admitted(finishing, move |gate| {
             let store = &mut gate.store;
             if store.failed || store.status.load(std::sync::atomic::Ordering::SeqCst) != 0 {
                 return Err(VoteGateError::Stopped);
@@ -836,14 +912,26 @@ impl VoteExecutor {
                 ));
             }
             let members = state.members.into_values().collect::<Vec<_>>();
-            Ok((|| -> Result<u64, String> {
-                let source = crate::consensus_network::authenticate_transfer_request(
-                    caller.as_ref(),
-                    &operation,
-                    local,
-                    &members,
-                    &request,
-                )?;
+            Ok((|| -> Result<_, String> {
+                let source = if finishing {
+                    crate::membership::revalidate_peer_for_members(
+                        caller.as_ref(),
+                        &crate::ClusterPeerAuthenticateRequest {
+                            proof: request.proof.peer.clone(),
+                        },
+                        &members,
+                    )?
+                    .node_id
+                    .parse::<NodeId>()?
+                } else {
+                    crate::consensus_network::authenticate_transfer_request(
+                        caller.as_ref(),
+                        &operation,
+                        local,
+                        &members,
+                        &request,
+                    )?
+                };
                 let (directory, staging) =
                     gate.staging.as_mut().ok_or("staging is not configured")?;
                 let now = std::time::Instant::now();
@@ -878,19 +966,24 @@ impl VoteExecutor {
                         now,
                     ),
                     "chunk" => staging.chunk(key, request.offset, &request.data, now),
-                    "finish" => staging
-                        .finish_validated(key, |file, total| {
-                            crate::consensus_network::validate_staged_object(
-                                file,
-                                total,
-                                &request.header,
-                            )
-                        })
-                        .map(|()| request.header.total_bytes),
+                    "finish" => {
+                        if let Some(ticket) = validated {
+                            staging
+                                .complete_validation(key, ticket)
+                                .map(|()| request.header.total_bytes)
+                        } else {
+                            return staging
+                                .prepare_validation(key)
+                                .map(|ticket| (request.header.total_bytes, Some(ticket)))
+                                .map_err(|error| error.to_string());
+                        }
+                    }
                     "abort" => staging.abort(key).map(|()| 0),
                     _ => return Err("unknown transfer operation".into()),
                 };
-                result.map_err(|error| error.to_string())
+                result
+                    .map(|offset| (offset, None))
+                    .map_err(|error| error.to_string())
             })())
         })
         .await
@@ -960,14 +1053,32 @@ impl VoteExecutor {
         &self,
         operation: impl FnOnce(&mut DurableVoteGate) -> Result<T, VoteGateError> + Send + 'static,
     ) -> Result<T, VoteGateError> {
+        self.run_admitted(false, operation).await
+    }
+
+    // Only a finish workflow already holding the single validation permit may
+    // wait. Ordinary requests retain immediate Busy admission with no queue.
+    async fn run_admitted<T: Send + 'static>(
+        &self,
+        finishing: bool,
+        operation: impl FnOnce(&mut DurableVoteGate) -> Result<T, VoteGateError> + Send + 'static,
+    ) -> Result<T, VoteGateError> {
         if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(VoteGateError::Stopped);
         }
-        let mut guard = self
-            .gate
-            .clone()
-            .try_lock_owned()
-            .map_err(|_| VoteGateError::Busy)?;
+        let mut guard = if finishing {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                self.gate.clone().lock_owned(),
+            )
+            .await
+            .map_err(|_| VoteGateError::Busy)?
+        } else {
+            self.gate
+                .clone()
+                .try_lock_owned()
+                .map_err(|_| VoteGateError::Busy)?
+        };
         if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(VoteGateError::Stopped);
         }
@@ -1003,6 +1114,11 @@ impl VoteExecutor {
     pub async fn shutdown(&self) -> Result<(), VoteGateError> {
         self.closing
             .store(true, std::sync::atomic::Ordering::SeqCst);
+        let _validation = self
+            .validation
+            .acquire()
+            .await
+            .map_err(|_| VoteGateError::Stopped)?;
         let mut guard = self.gate.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || {
             if let Some(gate) = guard.as_mut()
@@ -1851,6 +1967,151 @@ mod tests {
             assert_eq!(response.control_revision, 1);
             assert_eq!(state.revision, 1);
         }
+    }
+
+    #[tokio::test]
+    async fn timed_out_sealing_retains_bytes_for_revalidated_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority.redb");
+        let node = NodeId::from(1);
+        let store = OwnedVoteStore::bootstrap(
+            &path,
+            "cluster",
+            node,
+            Membership::new(vec![vec![node]], vec![(node, String::new())]).unwrap(),
+        )
+        .unwrap();
+        let executor = VoteExecutor::new(DurableVoteGate::new(1, store));
+        // Use the same disposable staging owner, with a private test directory.
+        let directory = std::fs::File::open(root.path()).unwrap();
+        let key = crate::transfer_staging::TransferKey {
+            peer: *node.as_bytes(),
+            incarnation: uuid::Uuid::nil(),
+            sequence: 1,
+        };
+        let ticket = executor
+            .run(move |gate| {
+                let mut staging = crate::transfer_staging::TransferStaging::new(4, 4).unwrap();
+                let now = std::time::Instant::now();
+                staging
+                    .begin(
+                        &directory,
+                        key,
+                        [0; 32],
+                        4,
+                        Sha256::digest(b"data").into(),
+                        now,
+                    )
+                    .unwrap();
+                staging.chunk(key, 0, b"data", now).unwrap();
+                let ticket = staging
+                    .prepare_validation(key)
+                    .unwrap()
+                    .validate(|_, _| Ok(()))
+                    .unwrap();
+                gate.staging = Some((directory, staging));
+                Ok(ticket)
+            })
+            .await
+            .unwrap();
+        let permit = executor.validation.clone().try_acquire_owned().unwrap();
+        let guard = executor.gate.clone().lock_owned().await;
+        let result = executor
+            .run_admitted(true, move |gate| {
+                gate.staging
+                    .as_mut()
+                    .unwrap()
+                    .1
+                    .complete_validation(key, ticket)
+                    .unwrap();
+                Ok(())
+            })
+            .await;
+        assert!(matches!(result, Err(VoteGateError::Busy)));
+        drop(guard);
+        executor
+            .run_admitted(true, move |gate| {
+                let staging = &mut gate.staging.as_mut().unwrap().1;
+                assert!(staging.read(key, 0, &mut [0; 4]).is_err());
+                let ticket = staging
+                    .prepare_validation(key)
+                    .unwrap()
+                    .validate(|file, total| {
+                        use std::io::Read;
+                        assert_eq!(total, 4);
+                        let mut bytes = [0; 4];
+                        file.read_exact(&mut bytes)?;
+                        assert_eq!(&bytes, b"data");
+                        Ok(())
+                    })
+                    .unwrap();
+                staging.complete_validation(key, ticket).unwrap();
+                let mut bytes = [0; 4];
+                assert_eq!(staging.read(key, 0, &mut bytes).unwrap(), 4);
+                assert_eq!(&bytes, b"data");
+                Ok(())
+            })
+            .await
+            .unwrap();
+        drop(permit);
+        executor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_signals_admitted_worker_before_waiting_for_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority.redb");
+        let node = NodeId::from(1);
+        let store = OwnedVoteStore::bootstrap(
+            &path,
+            "cluster",
+            node,
+            Membership::new(vec![vec![node]], vec![(node, String::new())]).unwrap(),
+        )
+        .unwrap();
+        let executor = VoteExecutor::new(DurableVoteGate::new(1, store));
+        let closing = std::sync::Arc::clone(&executor.closing);
+        let (entered, admitted) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let work = executor.run(move |gate| {
+            entered.send(()).unwrap();
+            // Bound the fixture so a regression cannot strand a blocking worker.
+            released
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+            assert!(closing.load(std::sync::atomic::Ordering::SeqCst));
+            assert_eq!(
+                gate.store.status.load(std::sync::atomic::Ordering::SeqCst),
+                0
+            );
+            Ok(())
+        });
+        let shutdown = async {
+            admitted.await.unwrap();
+            let shutdown = executor.shutdown();
+            tokio::pin!(shutdown);
+            // Poll shutdown while the admitted worker still owns authority.
+            tokio::select! {
+                biased;
+                result = &mut shutdown => panic!("shutdown released live authority: {result:?}"),
+                () = std::future::ready(()) => {}
+            }
+            assert!(executor.closing.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(matches!(
+                executor.run(|_| Ok(())).await,
+                Err(VoteGateError::Stopped)
+            ));
+            release.send(()).unwrap();
+            shutdown.await.unwrap();
+        };
+        let (result, ()) = tokio::join!(work, shutdown);
+        result.unwrap();
+        assert!(executor.gate.lock().await.is_none());
+        // Successful shutdown released the durable owner, not only admission.
+        OwnedVoteStore::open(&path, "cluster")
+            .unwrap()
+            .close()
+            .unwrap();
     }
 
     #[tokio::test]

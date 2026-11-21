@@ -915,6 +915,38 @@ pub fn authenticate_peer_for_members(
     request: &ClusterPeerAuthenticateRequest,
     members: &[ClusterMember],
 ) -> Result<AuthenticatedPeer, String> {
+    let peer = revalidate_peer_for_members(caller, request, members)?;
+    let proof = &request.proof;
+    let now = now_unix_ms();
+    let _guard = identity_init_guard(caller)?;
+    let mut auth_state = load_peer_auth_state(caller)?;
+    prune_peer_auth_state(&mut auth_state, now);
+    if auth_state.consumed.contains_key(&proof.challenge.nonce) {
+        return Err("peer authentication challenge was already consumed".to_string());
+    }
+    let stored = auth_state
+        .challenges
+        .remove(&proof.challenge.nonce)
+        .ok_or_else(|| "peer authentication challenge is unknown or expired".to_string())?;
+    if stored.challenge != proof.challenge || stored.claimant_node_id != proof.claimant_node_id {
+        return Err("peer authentication challenge does not match issued state".to_string());
+    }
+    auth_state.consumed.insert(
+        proof.challenge.nonce.clone(),
+        proof.challenge.expires_at_unix_ms,
+    );
+    enforce_peer_auth_state_bound(&mut auth_state);
+    store_peer_auth_state(caller, &auth_state)?;
+    Ok(peer)
+}
+
+// Only for continuation of an already authenticated, internally owned workflow.
+// This verifies current credentials and expiry but does not admit a new request.
+pub fn revalidate_peer_for_members(
+    caller: &impl ClusterRuntimeOps,
+    request: &ClusterPeerAuthenticateRequest,
+    members: &[ClusterMember],
+) -> Result<AuthenticatedPeer, String> {
     let proof = &request.proof;
     let now = now_unix_ms();
     let cluster_id = load_cluster_id(caller)?
@@ -950,25 +982,6 @@ pub fn authenticate_peer_for_members(
         .verify(&canonical_peer_proof(proof)?, &claimant_signature)
         .map_err(|_| "peer authentication proof signature verification failed".to_string())?;
 
-    let _guard = identity_init_guard(caller)?;
-    let mut auth_state = load_peer_auth_state(caller)?;
-    prune_peer_auth_state(&mut auth_state, now);
-    if auth_state.consumed.contains_key(&proof.challenge.nonce) {
-        return Err("peer authentication challenge was already consumed".to_string());
-    }
-    let stored = auth_state
-        .challenges
-        .remove(&proof.challenge.nonce)
-        .ok_or_else(|| "peer authentication challenge is unknown or expired".to_string())?;
-    if stored.challenge != proof.challenge || stored.claimant_node_id != proof.claimant_node_id {
-        return Err("peer authentication challenge does not match issued state".to_string());
-    }
-    auth_state.consumed.insert(
-        proof.challenge.nonce.clone(),
-        proof.challenge.expires_at_unix_ms,
-    );
-    enforce_peer_auth_state_bound(&mut auth_state);
-    store_peer_auth_state(caller, &auth_state)?;
     Ok(AuthenticatedPeer {
         cluster_id: cluster_id.to_string(),
         node_id: claimant.node_id.clone(),

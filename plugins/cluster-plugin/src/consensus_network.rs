@@ -103,6 +103,102 @@ pub fn transfer_signing_payload(
     Ok(signed)
 }
 
+/// Authenticate unpublished owned append against membership supplied by its owner.
+///
+/// The owner must serialize membership/term checks and durable mutation; this
+/// helper does not authorize against a cached or legacy membership projection.
+/// # Errors
+/// Rejects malformed, oversized, misdirected or unauthenticated requests.
+pub fn authenticate_owned_append(
+    caller: &impl crate::ClusterRuntimeOps,
+    local: NodeId,
+    members: &[bmux_cluster_plugin_api::cluster_types::ClusterMember],
+    request: &bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
+) -> Result<NodeId, String> {
+    let signed = owned_append_signing_payload(request)?;
+    let source = request.proof.peer.claimant_node_id.parse::<NodeId>()?;
+    if request.recipient.as_slice() != local.as_bytes()
+        || request.sender.as_slice() != source.as_bytes()
+        || request.cluster_id != request.proof.peer.challenge.cluster_id
+        || request.proof.credential_serial != request.proof.peer.claimant_credential_serial
+        || request.proof.signature.len() != 64
+    {
+        return Err("invalid append identity or proof binding".into());
+    }
+    verify_node_signature(&source.to_string(), &signed, &request.proof.signature)?;
+    crate::membership::authenticate_peer_for_members(
+        caller,
+        &crate::ClusterPeerAuthenticateRequest {
+            proof: request.proof.peer.clone(),
+        },
+        members,
+    )?;
+    Ok(source)
+}
+
+/// Bounded, domain-separated signing input for owned append, not legacy Raft.
+/// # Errors
+/// Rejects malformed identities and requests exceeding the unpublished v1 budget.
+pub fn owned_append_signing_payload(
+    request: &bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
+) -> Result<Vec<u8>, String> {
+    use bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendEntry;
+    let mut remaining = 512 * 1024usize;
+    let mut charge = |len: usize| -> Result<(), String> {
+        remaining = remaining
+            .checked_sub(len.checked_add(128).ok_or("append size overflow")?)
+            .ok_or("append allocation budget exceeded")?;
+        Ok(())
+    };
+    let p = &request.proof;
+    let c = &p.peer.challenge;
+    for field in [
+        &request.cluster_id,
+        &p.credential_serial,
+        &p.peer.claimant_node_id,
+        &p.peer.claimant_credential_serial,
+        &p.peer.claimant_signature,
+        &c.cluster_id,
+        &c.verifier_node_id,
+        &c.verifier_credential_serial,
+        &c.audience_node_id,
+        &c.nonce,
+        &c.signature,
+    ] {
+        charge(field.len())?;
+    }
+    charge(p.signature.len())?;
+    transfer_node(&request.sender)?;
+    transfer_node(&request.recipient)?;
+    for identity in request.previous.iter().chain(request.leader_commit.iter()) {
+        transfer_node(&identity.leader)?;
+    }
+    if request.entries.len() > 64 {
+        return Err("append entry count exceeded".into());
+    }
+    for entry in &request.entries {
+        match entry {
+            AppendEntry::Inline { canonical } => charge(canonical.len())?,
+            AppendEntry::Staged { reference } => {
+                charge(128)?;
+                transfer_node(&reference.identity.leader)?;
+                if reference.checksum.len() != 32 || reference.total_bytes == 0 {
+                    return Err("invalid staged append reference".into());
+                }
+            }
+        }
+    }
+    let mut unsigned = request.clone();
+    unsigned.proof.signature.clear();
+    let encoded = encode_service_message(&unsigned).map_err(|error| error.to_string())?;
+    if encoded.len() > 1024 * 1024 - 1024 {
+        return Err("append envelope exceeds limit".into());
+    }
+    let mut signed = b"bmux.cluster.consensus-rpc.v1\0append\0".to_vec();
+    signed.extend(encoded);
+    Ok(signed)
+}
+
 fn transfer_node(bytes: &[u8]) -> Result<NodeId, String> {
     let node = NodeId::from_bytes(
         bytes
@@ -123,20 +219,81 @@ fn transfer_position(
     })
 }
 
+#[test]
+fn staged_reader_stops_after_cancellation() {
+    use std::io::{Read, Seek, Write};
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(&[1; 16384]).unwrap();
+    file.rewind().unwrap();
+    let status = std::sync::atomic::AtomicU8::new(0);
+    let closing = std::sync::atomic::AtomicBool::new(false);
+    let mut reader = CancellableTransferReader {
+        file: &mut file,
+        status: &status,
+        closing: &closing,
+    };
+    let mut bytes = [0; 16384];
+    assert_eq!(reader.read(&mut bytes).unwrap(), 8192);
+    closing.store(true, std::sync::atomic::Ordering::SeqCst);
+    assert!(reader.read_exact(&mut bytes[..1]).is_err());
+    assert!(reader.rewind().is_err());
+}
+
+struct CancellableTransferReader<'a> {
+    file: &'a mut std::fs::File,
+    status: &'a std::sync::atomic::AtomicU8,
+    closing: &'a std::sync::atomic::AtomicBool,
+}
+
+impl CancellableTransferReader<'_> {
+    fn check(&self) -> std::io::Result<()> {
+        if self.status.load(std::sync::atomic::Ordering::SeqCst) != 0
+            || self.closing.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // Interrupted is retried by read_exact; cancellation must terminate it.
+            return Err(std::io::Error::other("staged validation cancelled"));
+        }
+        Ok(())
+    }
+}
+
+impl std::io::Read for CancellableTransferReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.check()?;
+        let length = bytes.len().min(8192);
+        std::io::Read::read(self.file, &mut bytes[..length])
+    }
+}
+
+impl std::io::Seek for CancellableTransferReader<'_> {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.check()?;
+        std::io::Seek::seek(self.file, position)
+    }
+}
+
 pub(crate) fn validate_staged_object(
     file: &mut std::fs::File,
     total: u64,
     header: &bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferHeader,
+    status: &std::sync::atomic::AtomicU8,
+    closing: &std::sync::atomic::AtomicBool,
 ) -> std::io::Result<()> {
     use bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferPurpose;
-    use std::io::{Error, Read};
+    use std::io::Error;
     let length = usize::try_from(total).map_err(Error::other)?;
+    let mut file = CancellableTransferReader {
+        file,
+        status,
+        closing,
+    };
+    file.check()?;
     match &header.purpose {
         TransferPurpose::Entry { value } => {
             if total > 64 * 1024 * 1024 {
                 return Err(Error::other("entry exceeds owned storage bound"));
             }
-            let entry = crate::consensus_storage::decode_owned_entry_reader(file, length)
+            let entry = crate::consensus_storage::decode_owned_entry_reader(&mut file, length)
                 .map_err(Error::other)?;
             if entry.identity != transfer_position(&value.identity).map_err(Error::other)? {
                 return Err(Error::other("staged entry identity mismatch"));
@@ -146,13 +303,9 @@ pub(crate) fn validate_staged_object(
             if total > 300 * 1024 * 1024 {
                 return Err(Error::other("snapshot exceeds owned storage bound"));
             }
-            // The existing snapshot codec validates control state as well as the
-            // envelope. Retain its finite storage bound until streaming control
-            // decoding replaces this complete decoded-object allocation.
-            let mut bytes = Vec::new();
-            file.take(total + 1).read_to_end(&mut bytes)?;
             let (descriptor, _) =
-                crate::consensus_storage::decode_owned_snapshot(&bytes).map_err(Error::other)?;
+                crate::consensus_storage::decode_owned_snapshot_reader(&mut file, length)
+                    .map_err(Error::other)?;
             let membership = value
                 .membership
                 .as_ref()
@@ -199,7 +352,7 @@ pub(crate) fn validate_staged_object(
             }
         }
     }
-    Ok(())
+    file.check()
 }
 
 fn validate_transfer_descriptor(
@@ -1775,6 +1928,30 @@ mod tests {
                 },
             },
         };
+        let mut append = bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest {
+            cluster_id: request.header.cluster_id.clone(),
+            sender: request.header.sender.clone(),
+            recipient: request.header.recipient.clone(),
+            request_id: uuid::Uuid::from_u128(2),
+            term: 1,
+            previous: None,
+            entries: Vec::new(),
+            leader_commit: None,
+            proof: request.proof.clone(),
+        };
+        let append_signed = owned_append_signing_payload(&append).unwrap();
+        append.proof.signature.fill(1);
+        assert_eq!(
+            append_signed,
+            owned_append_signing_payload(&append).unwrap()
+        );
+        append.term = 2;
+        assert_ne!(
+            append_signed,
+            owned_append_signing_payload(&append).unwrap()
+        );
+        append.proof.peer.claimant_node_id = "x".repeat(512 * 1024);
+        assert!(owned_append_signing_payload(&append).is_err());
         let signed = transfer_signing_payload("chunk", &request).unwrap();
         request.proof.signature.fill(1);
         assert_eq!(signed, transfer_signing_payload("chunk", &request).unwrap());

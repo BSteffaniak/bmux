@@ -567,13 +567,14 @@ fn transfer_contract_preserves_full_node_keys() {
 fn generated_contract_declares_all_services() {
     let services = bmux_cluster_plugin_api::service_declarations()
         .expect("cluster service declarations should be valid");
-    assert_eq!(services.len(), 23);
+    assert_eq!(services.len(), 24);
     let service_ids = services
         .iter()
         .map(|service| service.interface_id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
     for interface_id in [
         "cluster-peer-read/v1",
+        "cluster-consensus-rpc/v1",
         "cluster-consensus-transfer/v1",
         "cluster-bounded-control-command/v1",
         "cluster-raft-rpc/v2",
@@ -607,7 +608,7 @@ fn generated_contract_declares_all_services() {
         assert!(package.contains(provided), "world must {provided}");
     }
     // Owned-consensus contracts are modeled but not served until ADR-0015 cutover.
-    for unprovided in ["cluster-consensus-transfer"] {
+    for unprovided in ["cluster-consensus-transfer", "cluster-consensus-rpc"] {
         assert!(
             !package.contains(&format!("provide {unprovided}")),
             "world must not provide {unprovided}"
