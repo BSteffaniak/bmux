@@ -270,6 +270,7 @@ impl PtyCommand {
         command
     }
 
+    // native-only: begin.
     #[cfg(not(unix))]
     fn std_command(&self) -> std::process::Command {
         let mut command = std::process::Command::new(&self.program);
@@ -288,6 +289,7 @@ impl PtyCommand {
         }
         command
     }
+    // native-only: end.
 }
 
 /// A process running on a pseudo-terminal.
@@ -850,6 +852,9 @@ mod platform {
     }
 }
 
+// native-only: begin. Windows and other non-Unix hosts are not simulated, so this code may use
+// std threads and channels directly.
+
 /// Plain pipes standing in for a terminal: output is streamed, nothing more.
 #[cfg(not(unix))]
 mod pipes {
@@ -1074,6 +1079,8 @@ mod platform {
         pipes::spawn(spec, size)
     }
 }
+
+// native-only: end.
 
 /// How the threads of one process learn that it ended.
 struct Exit {

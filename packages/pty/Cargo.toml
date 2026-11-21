@@ -43,3 +43,9 @@ fail-on-warnings = [
 
 # Real pseudo-terminals, threads and time.
 native = ["switchy_pty/native", "switchy_thread/std", "switchy_time/std"]
+# Simulated terminals, processes, threads and time, for deterministic simulation (Unix hosts).
+simulator = [
+    "switchy_pty/simulator",
+    "switchy_thread/simulator",
+    "switchy_time/simulator",
+]
