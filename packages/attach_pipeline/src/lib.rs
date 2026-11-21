@@ -14,10 +14,11 @@ pub mod pointer_shape;
 pub mod projection;
 pub mod projection_images;
 pub mod reconcile;
-pub mod retained_extensions;
 pub mod render;
+pub mod retained_extensions;
 pub mod scene_pipeline;
 pub mod terminal;
+pub mod text_redaction;
 pub mod types;
 
 use bmux_attach_layout_protocol::{

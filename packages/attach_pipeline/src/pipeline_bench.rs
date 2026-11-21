@@ -446,6 +446,24 @@ impl Replay {
         replay
     }
 
+    /// This replay with the configured redaction of `patterns`, as the attach client installs it.
+    fn redacting(mut self, patterns: &[&str]) -> Self {
+        let patterns = patterns
+            .iter()
+            .map(|&pattern| pattern.to_owned())
+            .collect::<Vec<_>>();
+        let redaction = crate::text_redaction::PaneTextRedaction::from_patterns(&patterns)
+            .expect("patterns compile")
+            .expect("patterns given");
+        self.extensions = Some(Extensions {
+            bus: bmux_plugin::EventBus::new(),
+            sources: vec![std::sync::Arc::new(redaction)],
+            retained: crate::retained_extensions::RetainedExtensions::default(),
+            prepared: std::sync::Arc::from(Vec::new()),
+        });
+        self
+    }
+
     /// [`Self::decorated`] panes, none fed, the first one's title a clock that changes every
     /// frame; the changes are relayed as deltas or, without `deltas`, as whole scenes.
     fn animated(size: (u16, u16), panes: u16, chunk_size: usize, deltas: bool) -> Self {
@@ -1036,6 +1054,57 @@ fn animated_decoration_deltas_write_what_whole_scenes_write() {
     }
 }
 
+/// The redaction pattern the `/redacted` scenarios and the redaction test use: AWS access key ids.
+const AWS_ACCESS_KEY_ID: &str = "AKIA[0-9A-Z]{16}";
+
+/// Configured redaction masks every secret in the pane's output as it is rendered: the host
+/// terminal shows `*` where each was, and no frame written to it ever holds a secret, through
+/// full repaints, new lines and scrolling.
+#[test]
+fn redacted_secrets_never_reach_the_host() {
+    let size = (60, 10);
+    let mut replay = Replay::new(size, true, 97).redacting(&[AWS_ACCESS_KEY_ID]);
+    let mut host = bmux_terminal_grid::TerminalGridStream::new(
+        size.0,
+        size.1,
+        bmux_terminal_grid::GridLimits::default(),
+    )
+    .expect("host terminal");
+    let secret = "AKIAABCDEFGHIJKLMNOP";
+    let mut output = Vec::new();
+    for index in 0..24 {
+        let line = if index % 3 == 0 {
+            format!("{index:02} export AWS_ACCESS_KEY_ID={secret} ok\r\n")
+        } else {
+            format!("{index:02} nothing to hide here\r\n")
+        };
+        output.clear();
+        replay.frame(line.as_bytes(), &mut output);
+        assert!(
+            !output.windows(4).any(|window| window == b"AKIA"),
+            "frame {index}: a secret was written to the host"
+        );
+        host.process(&output);
+    }
+    let rows = (0..usize::from(size.1))
+        .map(|row| {
+            (0..usize::from(size.0))
+                .map(|col| shown(host.grid(), row, col).0)
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    let masked = format!("AWS_ACCESS_KEY_ID={} ok", "*".repeat(secret.len()));
+    let exports = rows.iter().filter(|row| row.contains("export")).count();
+    assert!(exports >= 3, "the secrets' lines are on screen: {rows:#?}");
+    for row in rows.iter().filter(|row| row.contains("export")) {
+        assert!(row.contains(&masked), "the secret is masked: {row:?}");
+    }
+    assert!(
+        rows.iter().any(|row| row.contains("nothing to hide here")),
+        "other text shows as it is: {rows:#?}"
+    );
+}
+
 /// An observer paints the frames the host terminal presents into its own published frames: after
 /// every frame both hold the same cells, whether or not the observer still holds earlier frames.
 #[test]
@@ -1442,6 +1511,37 @@ fn image_replay(size: (u16, u16), kitty: bool, motion: u16) -> Replay {
     replay
 }
 
+/// A busy corpus without scroll passthrough, with redaction configured, and with an observer.
+fn busiest_variants(size: (u16, u16), corpus: &corpus::Generated) -> Vec<Scenario> {
+    let observed = move || {
+        let mut replay = Replay::new(size, true, delivery());
+        replay.observer = Some(bmux_tui::presentation::PresentationState::new(
+            bmux_tui::geometry::Rect::new(0, 0, size.0, size.1),
+        ));
+        replay
+    };
+    [
+        measure(
+            &format!("{}/no-passthrough", corpus.name),
+            || Replay::new(size, false, delivery()),
+            &corpus.frames,
+        ),
+        measure(
+            &format!("{}/redacted", corpus.name),
+            || Replay::new(size, true, delivery()).redacting(&[AWS_ACCESS_KEY_ID]),
+            &corpus.frames,
+        ),
+        measure(
+            &format!("{}/observed", corpus.name),
+            observed,
+            &corpus.frames,
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
 /// The scenarios the metrics cover: every generated corpus on one pane; the busiest ones with
 /// an observer, without scroll passthrough, and across two panes; scattered edits; and (with
 /// image features) an image beside streaming output and a moving image, on Kitty and sixel.
@@ -1450,32 +1550,15 @@ fn metrics_report() -> Report {
     let frames = 300;
     let mut report = Report::default();
     let busiest = |name: &str| matches!(name, "plain-stream" | "full-repaint");
-    let observed = move || {
-        let mut replay = Replay::new(size, true, delivery());
-        replay.observer = Some(bmux_tui::presentation::PresentationState::new(
-            bmux_tui::geometry::Rect::new(0, 0, size.0, size.1),
-        ));
-        replay
-    };
     for corpus in corpus::generated(size, frames) {
         report.scenarios.extend(measure(
             corpus.name,
             || Replay::new(size, true, delivery()),
             &corpus.frames,
         ));
-        if !busiest(corpus.name) {
-            continue;
+        if busiest(corpus.name) {
+            report.scenarios.extend(busiest_variants(size, &corpus));
         }
-        report.scenarios.extend(measure(
-            &format!("{}/no-passthrough", corpus.name),
-            || Replay::new(size, false, delivery()),
-            &corpus.frames,
-        ));
-        report.scenarios.extend(measure(
-            &format!("{}/observed", corpus.name),
-            observed,
-            &corpus.frames,
-        ));
     }
     let pane = (split_pane_width(size.0, 2), size.1);
     for corpus in corpus::generated(pane, frames) {

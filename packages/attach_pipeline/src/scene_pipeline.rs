@@ -129,6 +129,7 @@ impl UndecoratedGridPresenter {
             pending_buffer
                 .drawn_appearance
                 .clone_from(&previous.drawn_appearance);
+            pending_buffer.drawn_text_rules = previous.drawn_text_rules;
         }
         let mut pending_buffers = BTreeMap::from([(surface_id, pending_buffer)]);
         let mut pending_graphics = self.terminal_graphics_cache.clone();

@@ -2344,6 +2344,13 @@ pub struct BehaviorConfig {
     /// IPC compression settings (image payloads and remote connections).
     #[config_doc(nested)]
     pub compression: CompressionConfig,
+    /// Pane text the attach client never shows: regular expressions whose
+    /// matches are painted as `*` in every pane, one row at a time, so the
+    /// text is never written to your terminal. A match must lie within one
+    /// row, and text still arriving shows until the whole pattern matches.
+    /// Example: `["AKIA[0-9A-Z]{16}"]` hides AWS access key ids. Empty (the
+    /// default) changes nothing.
+    pub redact_patterns: Vec<String>,
 }
 
 impl Default for BehaviorConfig {
@@ -2372,6 +2379,7 @@ impl Default for BehaviorConfig {
             event_coalescing: EventCoalescingBehaviorConfig::default(),
             images: ImageBehaviorConfig::default(),
             compression: CompressionConfig::default(),
+            redact_patterns: Vec::new(),
         }
     }
 }
@@ -4633,6 +4641,20 @@ server_timeout = 1234
         let disabled: BmuxConfig = toml::from_str("[behavior]\nbracketed_paste = false\n")
             .expect("disabled bracketed paste should parse");
         assert!(!disabled.behavior.bracketed_paste);
+    }
+
+    #[test]
+    fn redact_patterns_default_empty_and_parse_as_a_list() {
+        let omitted: BmuxConfig = toml::from_str("").expect("default config should parse");
+        assert_eq!(omitted.behavior.redact_patterns, Vec::<String>::new());
+
+        let set: BmuxConfig =
+            toml::from_str("[behavior]\nredact_patterns = ['AKIA[0-9A-Z]{16}', 'token=\\S+']\n")
+                .expect("redact patterns should parse");
+        assert_eq!(
+            set.behavior.redact_patterns,
+            vec!["AKIA[0-9A-Z]{16}".to_string(), "token=\\S+".to_string()]
+        );
     }
 
     #[test]

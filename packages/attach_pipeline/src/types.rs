@@ -237,6 +237,11 @@ pub struct PaneRenderBuffer {
     /// The appearance the drawn rows were resolved with: rows the grid did not change may be
     /// skipped only while it is the same.
     pub drawn_appearance: Option<bmux_appearance::RuntimeAppearance>,
+    /// The pane text rules the drawn rows were painted with (their set's key, 0 for none): rows
+    /// the grid did not change may be skipped only while it is the same.
+    pub drawn_text_rules: u64,
+    /// Buffers pane text rules match this pane's rows with, kept from frame to frame.
+    pub text_scratch: crate::render::RowTextScratch,
     /// The pane's application is inside a synchronized update (DEC mode 2026) at the end of the
     /// output applied so far: it began a frame and has not finished it.
     pub sync_update_in_progress: bool,
@@ -702,6 +707,8 @@ impl Default for PaneRenderBuffer {
             protocol_tracker: TerminalProtocolTracker::new(),
             rows_drawn: false,
             drawn_appearance: None,
+            drawn_text_rules: 0,
+            text_scratch: crate::render::RowTextScratch::default(),
             sync_update_in_progress: false,
             sync_update_hold: SyncUpdateHold::Untimed,
             expected_stream_start: None,

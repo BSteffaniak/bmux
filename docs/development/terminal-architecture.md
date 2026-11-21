@@ -312,3 +312,18 @@ the first of a new view lifetime, is the whole scene; reading the scene does not
 client applies deltas to a replica whose surfaces are shared pointers, so the renderer re-derives
 only the surfaces a delta carried. A delta that does not apply (the revisions held and sent are
 tracked on both ends, so this would be a defect) makes the client read the whole scene again.
+
+Pane text rules redact or restyle pane text where the attach client paints it. A render extension
+answers `AttachRenderExtension::pane_text_rules` with compiled rules (literal or regular
+expression; a one-column mask and/or a style), sampled with the rest of its intent. The row
+painter applies them to each row it paints from the client's replica: a row is matched only when
+it is painted (rows the frame skips cost nothing, and with no rules nothing is matched at all),
+and matched columns are painted over in the same frame, before the frame is compared with the
+host's, so masked text is never written to the host terminal. That is why this lives in the
+row painter rather than in a render layer (a layer over the content would write the text first,
+then cover it) or in the PTY reader (the server's grid, recordings and other clients keep the
+real text; redaction is a property of one client's view). Matching is per row: a match cannot
+span rows, and text still arriving shows until the whole pattern matches. A new rule set redraws
+every pane. The rules are not gated by a capability: render extensions are compiled into the
+attach client and run with its authority, so what the client loads may transform what it shows.
+The in-repo consumer is configured redaction (`behavior.redact_patterns`, painted as `*`).

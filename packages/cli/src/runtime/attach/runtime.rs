@@ -4205,6 +4205,23 @@ async fn maybe_emit_attach_frame_perf(
     Ok(())
 }
 
+/// Redact the configured patterns in every pane this attachment renders. A pattern that does
+/// not compile is reported, and nothing is redacted (no partial set that would show what the
+/// user meant to hide).
+fn install_redaction(view_state: &mut AttachViewState, patterns: &[String]) {
+    match bmux_attach_pipeline::text_redaction::PaneTextRedaction::from_patterns(patterns) {
+        Ok(Some(redaction)) => view_state
+            .presentation_extensions
+            .register(std::sync::Arc::new(redaction)),
+        Ok(None) => {}
+        Err(error) => {
+            let warning = format!("redaction disabled: {error}");
+            eprintln!("bmux: warning: {warning}");
+            view_state.set_transient_status(warning, Instant::now(), Duration::from_secs(30));
+        }
+    }
+}
+
 /// Construct bundled render extensions for this attach's selected bus.
 fn install_bundled_render_extensions(view_state: &mut AttachViewState) {
     let registry = std::sync::Arc::new(bmux_plugin::RenderExtensionRegistry::new());
@@ -5393,6 +5410,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     }
     view_state.presentation_events = presentation_events;
     install_bundled_render_extensions(&mut view_state);
+    install_redaction(&mut view_state, &attach_config.behavior.redact_patterns);
     terminal.set_attached_session_id(view_state.attached_id);
     view_state.self_client_id = Some(self_client_id);
     // Select the command runtime once, on the entry thread: an explicit

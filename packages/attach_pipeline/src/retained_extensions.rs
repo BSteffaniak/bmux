@@ -62,6 +62,8 @@ const fn layer_index(layer: RenderExtensionLayer) -> usize {
 struct RetainedExtension {
     name: String,
     surfaces: Vec<Arc<Surface>>,
+    /// The pane text rules the extension answered with.
+    text_rules: Option<Arc<bmux_plugin::PaneTextRules>>,
 }
 impl RetainedExtension {
     fn surface(&self, id: Uuid, rect: ExtensionRect) -> Option<&Surface> {
@@ -98,6 +100,9 @@ impl AttachRenderExtension for RetainedExtension {
     ) -> RenderSurfaceChrome {
         self.surface(id, *rect)
             .map_or(RenderSurfaceChrome::Fallback, |surface| surface.chrome)
+    }
+    fn pane_text_rules(&self) -> Option<Arc<bmux_plugin::PaneTextRules>> {
+        self.text_rules.clone()
     }
     fn content_rect_override(&self, id: Uuid) -> Option<ExtensionRect> {
         self.surfaces
@@ -231,7 +236,14 @@ fn sample_source(
     entries: &mut usize,
 ) -> anyhow::Result<Arc<RetainedExtension>> {
     scratch.clear();
-    let mut unchanged = previous.is_some_and(|previous| previous.surfaces.len() == surfaces.len());
+    let text_rules = source.pane_text_rules();
+    let mut unchanged = previous.is_some_and(|previous| {
+        previous.surfaces.len() == surfaces.len()
+            && match (&previous.text_rules, &text_rules) {
+                (Some(held), Some(rules)) => Arc::ptr_eq(held, rules),
+                (held, rules) => held.is_none() && rules.is_none(),
+            }
+    });
     for (index, (id, rect, context)) in surfaces.iter().enumerate() {
         let last = previous.and_then(|previous| {
             previous.surfaces.iter().find(|surface| {
@@ -251,6 +263,7 @@ fn sample_source(
     Ok(Arc::new(RetainedExtension {
         name: source.name().to_owned(),
         surfaces: scratch.clone(),
+        text_rules,
     }))
 }
 

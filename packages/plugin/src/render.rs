@@ -1595,6 +1595,14 @@ pub trait AttachRenderExtension: Send + Sync {
         None
     }
 
+    /// Rules that redact or restyle the text of every pane this client renders: the renderer
+    /// applies them to each row it paints from its replica, so masked text never reaches the
+    /// host terminal. Return the same `Arc` while the rules are unchanged (a new set makes the
+    /// renderer draw panes again). The default, `None`, transforms nothing and costs nothing.
+    fn pane_text_rules(&self) -> Option<Arc<crate::PaneTextRules>> {
+        None
+    }
+
     /// Return retained declarative visual intent for one layer.
     ///
     /// This is how an extension paints: the scene is everything it shows on

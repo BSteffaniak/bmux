@@ -48,6 +48,7 @@ pub mod stream_admission;
 #[cfg(feature = "tui")]
 pub mod surface;
 pub mod test_support;
+mod text_transform;
 mod typed_dispatch_bridge;
 mod typed_service_caller;
 
@@ -130,6 +131,9 @@ pub use service_location::{
     global_service_locations,
 };
 pub use startup_gate::{StartupReadyGate, StartupReadyGateRegistry};
+pub use text_transform::{
+    PaneTextAction, PaneTextMatch, PaneTextPattern, PaneTextRule, PaneTextRules,
+};
 pub use typed_dispatch_bridge::{
     ASYNC_SERVICE_ROUTE_V1, AsyncCommandRouteGuard, AsyncServiceClient, AsyncServiceRequest,
     ServiceCallerDispatchClient, block_on_typed_dispatch, capture_async_command_route,

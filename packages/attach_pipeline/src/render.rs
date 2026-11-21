@@ -35,6 +35,9 @@ mod extension_plans;
 pub(crate) mod extension_retained;
 #[path = "render/terminal_graphics.rs"]
 mod terminal_graphics;
+#[path = "render/text_transform.rs"]
+mod text_transform;
+pub use text_transform::RowTextScratch;
 #[path = "render/visible_segments.rs"]
 mod visible_segments;
 
@@ -2417,6 +2420,8 @@ struct GridRowRenderContext<'a> {
     runtime_appearance: &'a RuntimeAppearance,
     palette: &'a bmux_terminal_grid::StylePalette,
     before_content_cells: &'a BTreeMap<u16, RenderUnderCell>,
+    /// Stretches of the row pane text rules transform, painted over the row.
+    text_spans: &'a [text_transform::RowTextSpan],
 }
 
 /// Paint columns `0..width` of `context`'s row, as the pane shows them, from column `x` of row
@@ -2525,6 +2530,57 @@ fn paint_pane_row(
             let (cell, advance) = sized_pane_cell(context, &mut memo, &style_of, col, width);
             canvas.cells(x.saturating_add(col), y, std::iter::once(cell));
             col = col.saturating_add(advance);
+        }
+    }
+    if !context.text_spans.is_empty() {
+        paint_text_spans(canvas, context, x, y, width, &style_of);
+    }
+}
+
+/// Paint the stretches pane text rules transform over the row just painted: in the same frame,
+/// before it is compared with the host's, so what a rule masks is never written to the host.
+fn paint_text_spans(
+    canvas: &mut Canvas<'_, '_, '_>,
+    context: &GridRowRenderContext<'_>,
+    x: u16,
+    y: u16,
+    width: u16,
+    style_of: &impl Fn(Option<&bmux_terminal_grid::Cell>, bool) -> bmux_tui::style::Style,
+) {
+    for span in context.text_spans {
+        let mut col = span.start;
+        while col < span.end.min(width) {
+            let cell = context.row.cells().get(usize::from(col));
+            let selected =
+                cell_selected(context.selection, context.selection_line, usize::from(col));
+            let style = span.action.style.map_or_else(
+                || style_of(cell, selected),
+                |style| {
+                    let mut style = render_style_to_cell_style(style);
+                    if selected {
+                        style = selected_style(style);
+                    }
+                    cell_style_to_tui(apply_content_effects(style, context.runtime_appearance))
+                },
+            );
+            if let Some(mask) = span.action.mask {
+                // Every column the match covers shows the mask, the halves of a wide glyph too.
+                canvas.cells(
+                    x.saturating_add(col),
+                    y,
+                    std::iter::once(bmux_tui::paint::SizedCell {
+                        symbol: mask.encode_utf8(&mut [0; 4]),
+                        width: 1,
+                        style,
+                    }),
+                );
+                col = col.saturating_add(1);
+            } else {
+                let (mut cell, advance) = sized_pane_cell(context, &mut None, style_of, col, width);
+                cell.style = style;
+                canvas.cells(x.saturating_add(col), y, std::iter::once(cell));
+                col = col.saturating_add(advance);
+            }
         }
     }
 }
@@ -3722,6 +3778,8 @@ struct PaneContentRenderStage<'a> {
     before_content_cells: &'a BeforeContentCells,
     content_damage: &'a PaneContentDamagePlan,
     host_scroll: HostScroll,
+    /// The pane text rules its rows are painted with.
+    text: &'a text_transform::PaneTextTransform,
 }
 
 /// How a pane's rows may be moved on the host terminal this frame when its application scrolled.
@@ -3740,6 +3798,8 @@ struct RenderFrameOutputPlan<'a> {
     terminal_size: (u16, u16),
     viewport_insets: (u16, u16),
     surfaces: Vec<SurfaceOutputPlan<'a>>,
+    /// The pane text rules applied as pane rows are painted.
+    text: text_transform::PaneTextTransform,
 }
 
 struct SurfaceOutputPlan<'a> {
@@ -3891,6 +3951,7 @@ fn build_render_frame_output_plan<'a>(
         terminal_size,
         viewport_insets,
         surfaces,
+        text: text_transform::PaneTextTransform::from_extensions(render_extensions),
     }
 }
 
@@ -4180,6 +4241,7 @@ fn execute_render_frame_output_plan(
         if let Some(content_cursor_state) = execute_surface_output_plan(
             canvas,
             surface,
+            &plan.text,
             pane_buffers,
             terminal_graphics_cache,
             terminal_graphics,
@@ -4222,6 +4284,7 @@ fn commit_before_content_surface_output_plan(
 fn execute_surface_output_plan(
     canvas: &mut Canvas<'_, '_, '_>,
     plan: &SurfaceOutputPlan<'_>,
+    text: &text_transform::PaneTextTransform,
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
     terminal_graphics_cache: &mut TerminalGraphicsCache,
     terminal_graphics: &mut TerminalGraphicsFrameResources,
@@ -4300,6 +4363,7 @@ fn execute_surface_output_plan(
                         before_content_cells: &before_content_cells,
                         content_damage: &plan.surface_plan.content_damage,
                         host_scroll: plan.host_scroll,
+                        text,
                     },
                     render_stats,
                     render_trace,
@@ -4458,7 +4522,8 @@ fn queue_pane_content_for_surface(
                     stats.pane_rows_scrolled = stats.pane_rows_scrolled.saturating_add(scrolled);
                 }
             }
-            let same_appearance = entry.drawn_appearance.as_ref() == Some(stage.runtime_appearance);
+            let same_appearance = entry.drawn_appearance.as_ref() == Some(stage.runtime_appearance)
+                && entry.drawn_text_rules == stage.text.key;
             if live && rows_follow && same_appearance {
                 let mut unchanged: Vec<bool> =
                     changes.into_iter().map(|changed| !changed).collect();
@@ -4472,6 +4537,7 @@ fn queue_pane_content_for_surface(
             }
             if !same_appearance {
                 entry.drawn_appearance = Some(stage.runtime_appearance.clone());
+                entry.drawn_text_rules = stage.text.key;
             }
         }
         // Per-pane scrollback: a pane renders frozen history if and only if it
@@ -4542,6 +4608,7 @@ fn queue_pane_content_for_surface(
                 .keys()
                 .map(|(_, row)| *row)
                 .collect();
+            let mut text_scratch = std::mem::take(&mut entry.text_scratch);
             for row in 0..inner_h {
                 if let Some(stats) = render_stats.as_deref_mut() {
                     stats.pane_rows_examined = stats.pane_rows_examined.saturating_add(1);
@@ -4568,6 +4635,7 @@ fn queue_pane_content_for_surface(
                 }
                 {
                     let before_cells = before_content_row_cells(stage.before_content_cells, y);
+                    text_scratch.match_row(stage.text, grid_row, inner_width);
                     paint_pane_row(
                         canvas,
                         &GridRowRenderContext {
@@ -4577,6 +4645,7 @@ fn queue_pane_content_for_surface(
                             runtime_appearance: stage.runtime_appearance,
                             palette: entry.scrollback_palette(scrollback.as_ref()),
                             before_content_cells: &before_cells,
+                            text_spans: &text_scratch.spans,
                         },
                         stage.content.x,
                         y,
@@ -4591,6 +4660,7 @@ fn queue_pane_content_for_surface(
                     render_trace,
                 );
             }
+            entry.text_scratch = text_scratch;
             entry.rows_drawn = true;
         }
     } else if stage.content_damage.requires_redraw() {
@@ -4607,6 +4677,7 @@ fn queue_pane_content_for_surface(
                 runtime_appearance: stage.runtime_appearance,
                 palette: &palette,
                 before_content_cells: &before_cells,
+                text_spans: &[],
             };
             paint_pane_row(canvas, &context, stage.content.x, y, inner_width);
             note_pane_row_captured(
@@ -5078,6 +5149,7 @@ mod tests {
                     runtime_appearance: appearance,
                     palette: grid.palette(),
                     before_content_cells: &before_content_cells,
+                    text_spans: &[],
                 },
                 0,
                 0,
@@ -8273,6 +8345,7 @@ mod tests {
             before_content_cells: &before_content_cells,
             content_damage: &damage,
             host_scroll: HostScroll::Margins,
+            text: &super::text_transform::PaneTextTransform::default(),
         };
         // Scroll over a 40x10 frame whose row `y` shows the digit `y` in every column; returns
         // what scrolling returned and the frame's rows after.
@@ -8395,6 +8468,7 @@ mod tests {
             before_content_cells: &before_content_cells,
             content_damage: &damage,
             host_scroll: super::HostScroll::Off,
+            text: &super::text_transform::PaneTextTransform::default(),
         };
         marked(8, 5, |canvas| {
             queue_pane_content_for_surface(canvas, &mut buffers, &stage, &mut None, &mut None)
@@ -8657,6 +8731,7 @@ mod tests {
                         runtime_appearance: &appearance,
                         palette: grid.palette(),
                         before_content_cells: &under,
+                        text_spans: &[],
                     },
                     0,
                     u16::try_from(index).unwrap(),
@@ -10571,6 +10646,7 @@ mod tests {
                     runtime_appearance: &appearance,
                     palette: stream.grid().palette(),
                     before_content_cells: &under,
+                    text_spans: &[],
                 },
                 0,
                 0,
