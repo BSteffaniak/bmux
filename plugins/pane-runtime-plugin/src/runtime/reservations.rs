@@ -274,7 +274,7 @@ fn verify_or_create_marker(marker: &Path, expected: &str) -> Result<(), Recovery
             if serde_json::from_slice::<String>(&identity).ok().as_deref() == Some(expected) => {}
         Ok(_) => return Err(failed("managed execution target identity mismatch")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if std::fs::read_dir(root)
+            if crate::dir_order::read_dir_sorted(root)
                 .map_err(failed)?
                 .any(|entry| entry.map_or(true, |entry| entry.file_name() != "owner.lock"))
             {
@@ -299,7 +299,7 @@ pub(crate) fn retained_authority(host: &crate::runtime::PaneRuntimeHost) -> Vec<
     };
     let domain = PathBuf::from(readiness.state_dir).join("pane-executions-v4");
     let mut retained = Vec::new();
-    match std::fs::read_dir(&domain) {
+    match crate::dir_order::read_dir_sorted(&domain) {
         Ok(entries) => {
             if entries
                 .filter_map(Result::ok)
@@ -313,7 +313,7 @@ pub(crate) fn retained_authority(host: &crate::runtime::PaneRuntimeHost) -> Vec<
         }
         Err(error) => retained.push(format!("legacy execution inventory unavailable: {error}")),
     }
-    match std::fs::read_dir(domain.join("targets")) {
+    match crate::dir_order::read_dir_sorted(domain.join("targets")) {
         Ok(entries) => {
             let mut count = 0;
             for entry in entries {
@@ -366,7 +366,7 @@ pub(crate) fn check_authority(host: &crate::runtime::PaneRuntimeHost) -> anyhow:
 
 pub(crate) fn idle_blocker(host: &crate::runtime::PaneRuntimeHost) -> Option<String> {
     with_store(host, |store| {
-        for entry in std::fs::read_dir(&store.root).map_err(failed)? {
+        for entry in crate::dir_order::read_dir_sorted(&store.root).map_err(failed)? {
             let entry = entry.map_err(failed)?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
@@ -423,7 +423,7 @@ impl ReservationStore {
     fn retire_orphans(&self) -> Result<usize, RecoveryError> {
         use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalInputPhase;
         let mut retired = 0;
-        for entry in std::fs::read_dir(&self.root).map_err(failed)? {
+        for entry in crate::dir_order::read_dir_sorted(&self.root).map_err(failed)? {
             let entry = entry.map_err(failed)?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
@@ -442,7 +442,7 @@ impl ReservationStore {
                 continue;
             }
             let token = stored.receipt.reservation.execution.execution_token;
-            for input in std::fs::read_dir(&self.root).map_err(failed)? {
+            for input in crate::dir_order::read_dir_sorted(&self.root).map_err(failed)? {
                 let input = input.map_err(failed)?;
                 if !input
                     .file_name()
@@ -545,7 +545,7 @@ impl ReservationStore {
             }
             return Ok(stored.receipt.reservation);
         }
-        if std::fs::read_dir(&self.root)
+        if crate::dir_order::read_dir_sorted(&self.root)
             .map_err(failed)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(failed)?
@@ -856,7 +856,7 @@ fn find(
     store: &ReservationStore,
     reference: &ExecutionRef,
 ) -> Result<StoredReservation, RecoveryError> {
-    for entry in std::fs::read_dir(&store.root).map_err(failed)? {
+    for entry in crate::dir_order::read_dir_sorted(&store.root).map_err(failed)? {
         let entry = entry.map_err(failed)?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -1186,7 +1186,7 @@ pub(crate) fn send_admitted(
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 validate_fresh_input(host, store, reference)?;
-                let count = std::fs::read_dir(&store.root)
+                let count = crate::dir_order::read_dir_sorted(&store.root)
                     .map_err(failed)?
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(failed)?
@@ -1313,7 +1313,7 @@ pub(crate) fn retire(
                     .into(),
             });
         }
-        for entry in std::fs::read_dir(&store.root).map_err(failed)? {
+        for entry in crate::dir_order::read_dir_sorted(&store.root).map_err(failed)? {
             let entry = entry.map_err(failed)?;
             if !entry
                 .file_name()

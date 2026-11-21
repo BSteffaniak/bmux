@@ -127,7 +127,7 @@ fn check_deadline(deadline: Instant) -> io::Result<()> {
 fn members(sid: i32, deadline: Instant) -> io::Result<BTreeSet<Member>> {
     use std::io::Read;
     let mut result = BTreeSet::new();
-    for entry in std::fs::read_dir("/proc")? {
+    for entry in crate::dir_order::read_dir_sorted("/proc")? {
         check_deadline(deadline)?;
         let entry = entry?;
         let Some(pid) = entry

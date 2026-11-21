@@ -169,7 +169,7 @@ fn blocker(host: &crate::runtime::PaneRuntimeHost, state: &RuntimeReadiness) -> 
             }
             Err(error) => return Some(format!("cannot inspect execution authority: {error}")),
         }
-        let entries = match std::fs::read_dir(&directory) {
+        let entries = match crate::dir_order::read_dir_sorted(&directory) {
             Ok(entries) => entries,
             Err(error) => {
                 return Some(format!(
@@ -185,7 +185,7 @@ fn blocker(host: &crate::runtime::PaneRuntimeHost, state: &RuntimeReadiness) -> 
             };
             // Live pane sessions leave crash records under pane-sessions/.
             let live_sessions = entry.file_name() == "pane-sessions"
-                && std::fs::read_dir(entry.path())
+                && crate::dir_order::read_dir_sorted(entry.path())
                     .map_or(true, |mut records| records.next().is_some());
             if directory.ends_with("pane-executions-v4") || live_sessions {
                 return Some("retained execution authority prevents automatic restart".into());

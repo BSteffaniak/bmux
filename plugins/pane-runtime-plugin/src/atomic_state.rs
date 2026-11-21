@@ -42,7 +42,12 @@ mod tests {
         super::commit(&path, &vec![1, 2]).unwrap();
         super::commit(&path, &vec![3, 4]).unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"[3,4]");
-        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        assert_eq!(
+            crate::dir_order::read_dir_sorted(directory.path())
+                .unwrap()
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -31,6 +31,7 @@ mod application_resurrection;
 mod atomic_state;
 mod capture_handshake;
 mod commands;
+mod dir_order;
 mod handlers;
 mod ids;
 pub mod observation;

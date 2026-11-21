@@ -122,7 +122,7 @@ pub(crate) fn activate(
 
 /// Sweep every session recorded by a predecessor, then delete its record.
 pub(crate) fn recover(records: &Path) {
-    let Ok(entries) = std::fs::read_dir(records) else {
+    let Ok(entries) = crate::dir_order::read_dir_sorted(records) else {
         return;
     };
     for entry in entries.flatten() {
@@ -152,7 +152,7 @@ pub(crate) fn recover(records: &Path) {
 /// same runtime means the old server, and with it every guardian bound to its
 /// lifetime, is gone, so this state is inert and safe to delete.
 fn remove_legacy_supervisor_state(runtime_dir: &Path, state_dir: &Path) {
-    if let Ok(entries) = std::fs::read_dir(runtime_dir) {
+    if let Ok(entries) = crate::dir_order::read_dir_sorted(runtime_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
