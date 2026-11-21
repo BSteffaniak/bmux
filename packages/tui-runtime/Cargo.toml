@@ -23,8 +23,13 @@ name              = "image_iterm2"
 required-features = ["image-iterm2"]
 
 [[example]]
-name              = "image_protocols"
-required-features = ["image-kitty", "image-sixel", "image-iterm2", "terminal-io"]
+name = "image_protocols"
+required-features = [
+    "image-kitty",
+    "image-sixel",
+    "image-iterm2",
+    "terminal-io",
+]
 
 [[example]]
 name              = "pointer_controls"

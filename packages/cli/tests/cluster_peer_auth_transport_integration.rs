@@ -382,6 +382,27 @@ fn join_voter(
     assert!(combined_output(&retry).contains("joined cluster:"));
 }
 
+/// Read replicated membership, waiting out a leadership change.
+///
+/// Killing or restarting a voter can leave the survivors (or the restarted
+/// node) without a reachable leader until an election completes or the
+/// restarted node discovers the leader: reads then fail as `NotLeader` or as a
+/// `RuntimeUnavailable` forwarding/transport error to the departed leader.
+/// Those states are expected to clear within a few election timeouts; any other
+/// failure, or one that persists past the deadline, is returned unchanged.
+fn read_members_through_leader_change(node: &ServerEnv) -> std::process::Output {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let output = node.run(&["cluster", "members"]);
+        let text = combined_output(&output);
+        let transient = text.contains("NotLeader {") || text.contains("RuntimeUnavailable {");
+        if output.status.success() || !transient || std::time::Instant::now() >= deadline {
+            return output;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
 fn admitted_cluster_config(port: u16) -> String {
     format!(
         "[general]\nserver_timeout = 30000\n\n[plugins.settings.\"bmux.connections\".remote]\nallow_full_runtime_ingress = true\nauto_start = true\nbind_addr = \"127.0.0.1:{port}\"\n\n[plugins.settings.\"bmux.connections\".remote.relay]\nmode = \"disabled\"\n"
@@ -463,8 +484,12 @@ fn three_admitted_voters_form_membership_and_survive_one_node_restart() {
 
     harness.node_mut(2).kill();
     for index in 0..2 {
-        let members = harness.node(index).run(&["cluster", "members"]);
-        assert_success(&members, "read membership with one voter down");
+        let members = read_members_through_leader_change(harness.node(index));
+        assert_success_with_server_logs(
+            &members,
+            "read membership with one voter down",
+            &[harness.node(0), harness.node(1)],
+        );
         assert_eq!(
             combined_output(&members)
                 .matches(" state=Active role=Voter ")
@@ -488,20 +513,8 @@ fn three_admitted_voters_form_membership_and_survive_one_node_restart() {
         &mut restarted_connection,
         &owner_status.endpoint_targets,
     ));
-    // IPC readiness precedes Raft leader discovery after restart. Wait for that
-    // specific transient state, while failing immediately on other read errors.
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let recovered = loop {
-        let output = harness.node(2).run(&["cluster", "members"]);
-        if output.status.success()
-            || !combined_output(&output)
-                .contains("NotLeader { leader_node_id: None, leader_endpoint: None }")
-            || std::time::Instant::now() >= deadline
-        {
-            break output;
-        }
-        thread::sleep(Duration::from_millis(100));
-    };
+    // IPC readiness precedes Raft leader discovery after restart.
+    let recovered = read_members_through_leader_change(harness.node(2));
     assert_success_with_server_logs(
         &recovered,
         "read membership after voter restart",

@@ -483,6 +483,7 @@ mod tests {
         assert_eq!(client.calls, ["register", "start-profile"]);
     }
 
+    #[cfg(unix)] // Used by the Unix-only lifecycle tests.
     struct RecordingClient {
         calls: Vec<String>,
         refresh: u64,
@@ -492,6 +493,7 @@ mod tests {
         prepared: bool,
     }
 
+    #[cfg(unix)]
     impl bmux_plugin_sdk::TypedDispatchClient for RecordingClient {
         async fn invoke_service_raw(
             &mut self,

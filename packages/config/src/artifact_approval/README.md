@@ -29,8 +29,9 @@ the approval file retain no-follow behavior. No whole-path canonicalization or
 candidate fallback occurs. Root/current-user ownership is required. Other-user
 write permission is rejected; sticky ancestor directories are allowed, but the
 final configuration directory cannot rely on that exception. The document must
-be a regular non-other-writable file. Other platforms reject protected loading
-until their security contract is implemented. Only genuine NotFound is absence;
+be a regular non-other-writable file. Other platforms treat a missing document
+as absence and reject a present one until their security contract is
+implemented. Only genuine NotFound is absence;
 malformed/unreadable/insecure authoritative state is not an empty store.
 
 A configuration match is policy **intent**, not execution authority. A selected

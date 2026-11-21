@@ -252,7 +252,7 @@ pub(super) fn copy_text(text: &str) -> Result<(), ClipboardError> {
 
 fn decode_text(bytes: &[u8]) -> Result<String, ClipboardError> {
     let mut units = Vec::new();
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let unit = u16::from_le_bytes([pair[0], pair[1]]);
         if unit == 0 {
             return String::from_utf16(&units).map_err(|error| failed(error.to_string()));
@@ -318,7 +318,7 @@ fn encode_dib(image: &NativeImage, v5: bool) -> Result<Vec<u8>, ClipboardError> 
     }
     bytes.reserve(image.bytes.len());
     for row in image.bytes.chunks_exact(image.width * 4).rev() {
-        for pixel in row.chunks_exact(4) {
+        for pixel in row.as_chunks::<4>().0 {
             bytes.extend_from_slice(&[pixel[2], pixel[1], pixel[0], if v5 { pixel[3] } else { 0 }]);
         }
     }
@@ -485,7 +485,7 @@ mod tests {
             let decoded = decode_dib(dib).unwrap();
             let mut expected = image.bytes.clone();
             if !v5 {
-                for pixel in expected.chunks_exact_mut(4) {
+                for pixel in expected.as_chunks_mut::<4>().0 {
                     pixel[3] = 255;
                 }
             }
@@ -504,7 +504,7 @@ mod tests {
         }
         let decoded = decode_dib(dib).unwrap();
         let mut expected = self::pixels().bytes;
-        for pixel in expected.chunks_exact_mut(4) {
+        for pixel in expected.as_chunks_mut::<4>().0 {
             pixel[3] = 255;
         }
         assert_eq!(decoded.bytes, expected);

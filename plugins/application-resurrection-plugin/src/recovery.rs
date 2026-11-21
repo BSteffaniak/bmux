@@ -50,6 +50,7 @@ pub(super) fn validate(
     Ok(())
 }
 
+#[cfg(any(unix, test))] // Only the Unix host resolves nested invocations.
 pub(super) fn find(checkpoint: &Checkpoint, invocation: Uuid) -> Option<&Checkpoint> {
     if checkpoint.invocation == invocation {
         return Some(checkpoint);
@@ -60,6 +61,7 @@ pub(super) fn find(checkpoint: &Checkpoint, invocation: Uuid) -> Option<&Checkpo
         .and_then(|command| find(&command.checkpoint, invocation))
 }
 
+#[cfg(any(unix, test))] // Only the Unix host resolves nested invocations.
 pub(super) fn find_mut(checkpoint: &mut Checkpoint, invocation: Uuid) -> Option<&mut Checkpoint> {
     if checkpoint.invocation == invocation {
         return Some(checkpoint);

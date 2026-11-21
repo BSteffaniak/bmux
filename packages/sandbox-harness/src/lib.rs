@@ -278,12 +278,15 @@ fn create_temp_paths() -> (ConfigPaths, PathBuf) {
 }
 
 fn ensure_sandbox_dirs(paths: &ConfigPaths, root_dir: &Path) -> Result<()> {
-    let mut private_dir = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let private_dir = {
         use std::os::unix::fs::DirBuilderExt as _;
-        private_dir.mode(0o700);
-    }
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+    };
+    #[cfg(not(unix))]
+    let private_dir = std::fs::DirBuilder::new();
     // Claim a fresh sandbox root, never adopt or chmod a pre-existing path.
     private_dir
         .create(root_dir)
@@ -337,21 +340,18 @@ fn harness_process_alive(root_dir: &Path) -> bool {
         .is_some_and(is_pid_alive)
 }
 
+#[cfg(unix)]
 fn harness_socket_alive(root_dir: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        let socket_path = root_dir.join("r").join("server.sock");
-        if !socket_path.exists() {
-            return false;
-        }
-        std::os::unix::net::UnixStream::connect(socket_path).is_ok()
+    let socket_path = root_dir.join("r").join("server.sock");
+    if !socket_path.exists() {
+        return false;
     }
+    std::os::unix::net::UnixStream::connect(socket_path).is_ok()
+}
 
-    #[cfg(not(unix))]
-    {
-        let _ = root_dir;
-        false
-    }
+#[cfg(not(unix))]
+const fn harness_socket_alive(_root_dir: &Path) -> bool {
+    false
 }
 
 fn is_pid_alive(pid: u32) -> bool {

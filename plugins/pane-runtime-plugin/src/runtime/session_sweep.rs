@@ -295,7 +295,7 @@ fn kill(sid: i32, batch: &BTreeSet<Member>) -> io::Result<()> {
         };
         if sent < 0 {
             let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
+            if !gone_or_unsignalable(&error) {
                 return Err(error);
             }
         }
@@ -329,10 +329,18 @@ fn kill_group_checked(sid: i32, member: Member) -> io::Result<()> {
         return Ok(());
     }
     let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
+    if gone_or_unsignalable(&error) {
         return Ok(());
     }
     Err(error)
+}
+
+/// `ESRCH`: the target is already gone. `EPERM`: nothing in it may be signalled,
+/// such as a group left with only an exiting or privileged process. Neither is a
+/// sweep failure by itself: the rescan reports anything that is really still
+/// alive.
+fn gone_or_unsignalable(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(libc::ESRCH | libc::EPERM))
 }
 
 #[cfg(test)]
@@ -382,6 +390,16 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("members remain"));
+    }
+
+    #[test]
+    fn missing_and_unsignalable_targets_are_left_to_the_rescan() {
+        for code in [libc::ESRCH, libc::EPERM] {
+            assert!(gone_or_unsignalable(&io::Error::from_raw_os_error(code)));
+        }
+        assert!(!gone_or_unsignalable(&io::Error::from_raw_os_error(
+            libc::EINVAL
+        )));
     }
 
     #[test]

@@ -3963,6 +3963,11 @@ fn shell_kind_for_path(shell: &str) -> ShellKind {
         .unwrap_or(shell)
         .trim_start_matches('-')
         .to_ascii_lowercase();
+    // Windows shells are executables such as `nu.exe`.
+    #[cfg(windows)]
+    let basename = basename
+        .strip_suffix(".exe")
+        .map_or_else(|| basename.clone(), str::to_owned);
     match basename.as_str() {
         "bash" => ShellKind::Bash,
         "zsh" => ShellKind::Zsh,
@@ -4341,10 +4346,14 @@ fn pane_xdg_data_dirs(
     share: std::path::PathBuf,
     inherited: Option<std::ffi::OsString>,
 ) -> Vec<std::path::PathBuf> {
-    let inherited =
-        inherited.unwrap_or_else(|| std::ffi::OsString::from("/usr/local/share:/usr/share"));
     let mut dirs = vec![share];
-    dirs.extend(std::env::split_paths(&inherited).filter(|dir| !is_bmux_nested_share(dir)));
+    match inherited {
+        Some(inherited) => {
+            dirs.extend(std::env::split_paths(&inherited).filter(|dir| !is_bmux_nested_share(dir)));
+        }
+        // The XDG default, spelled out: the list separator differs per platform.
+        None => dirs.extend(["/usr/local/share", "/usr/share"].map(std::path::PathBuf::from)),
+    }
     dirs
 }
 
@@ -8902,6 +8911,23 @@ impl SessionRuntimeManager {
                 }
             }
 
+            // A forced stop ends the job at once, but the owner retires only
+            // after the child waiter reaps the leader. Wait for that before
+            // deciding about the console below: ConPTY output ends only at
+            // ClosePseudoConsole, so keeping the console here would leave the
+            // reader, and the supervision join after it, waiting forever.
+            #[cfg(windows)]
+            while execution_for_task.group_kill_issued.load(Ordering::SeqCst)
+                && !execution_for_task
+                    .terminal_owner_retired
+                    .load(Ordering::SeqCst)
+                && !execution_for_task.cleanup_failed.load(Ordering::SeqCst)
+                && !reader_thread_done.load(Ordering::SeqCst)
+            {
+                if execution_changes.changed().await.is_err() {
+                    break;
+                }
+            }
             // ConPTY owns its output pipe until ClosePseudoConsole, even after
             // every hosted process has exited. Once the authenticated terminal
             // owner has retired, close the console concurrently with the live
@@ -14531,6 +14557,8 @@ mod tests {
         assert!(String::from_utf8_lossy(&output).contains("conpty-program-tail"));
     }
 
+    // Needs coreutils printf; Windows has windows_program_startup_answers_conpty_query_then_captures_and_drains.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn program_first_pane_captures_fast_literal_argv_and_drains() {
         let host = crate::runtime::PaneRuntimeHost::detached();
@@ -14656,6 +14684,8 @@ mod tests {
         );
     }
 
+    // Runs /bin/sh and dd.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn conventional_session_drains_startup_backpressure_and_retires_owner() {
         let session_id = SessionId(Uuid::new_v4());
@@ -14732,6 +14762,8 @@ mod tests {
         assert!(!execution.group_kill_issued.load(Ordering::SeqCst));
     }
 
+    // Runs /bin/sh and dd.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn supervised_fast_exit_drains_startup_backpressure_before_retirement() {
         let session_id = SessionId(Uuid::new_v4());
@@ -17998,6 +18030,8 @@ exit 7"#
         assert_eq!(query.await.unwrap(), Some(ProcessStartIdentity(42, 0)));
     }
 
+    // Process start identities are only read on Unix.
+    #[cfg(unix)]
     #[test]
     fn native_directory_observation_rejects_wrong_process_start_identity() {
         let pid = std::process::id();
@@ -21665,6 +21699,8 @@ exit 7"#
         assert_eq!(inspection.cwd.as_deref(), Some("/work/project"));
     }
 
+    // Runs fish and sh from PATH.
+    #[cfg(unix)]
     #[test]
     fn fish_integration_restores_config_home_for_config_and_children() {
         let directory = tempfile::tempdir().unwrap();
@@ -21700,6 +21736,8 @@ exit 7"#
         }
     }
 
+    // Runs fish from PATH.
+    #[cfg(unix)]
     #[test]
     fn fish_shell_metadata_preserves_long_commands_and_directories() {
         let directory = tempfile::Builder::new()
@@ -21905,6 +21943,8 @@ exit 7"#
         assert_eq!(state.active_command_source, None);
     }
 
+    // Runs a Unix bash from PATH.
+    #[cfg(unix)]
     #[test]
     fn bash_prompt_work_does_not_consume_user_command_boundary() {
         let script = shell_integration_bash_rcfile()

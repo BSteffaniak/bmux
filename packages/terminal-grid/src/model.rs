@@ -401,8 +401,11 @@ enum CellText {
         bytes: [u8; INLINE_CELL_TEXT],
     },
     /// Text too long to hold inline (long grapheme clusters, rare): boxed so the variant is one
-    /// pointer.
-    Heap(Box<Box<str>>),
+    /// pointer. A `String`, not a `Box<str>`, so appending to a long cluster (a stream of
+    /// combining marks) grows amortized instead of copying the whole cluster per mark.
+    // The box is deliberate: an unboxed `String` (three words) would widen every cell.
+    #[allow(clippy::box_collection)]
+    Heap(Box<String>),
 }
 
 impl CellText {
@@ -427,7 +430,7 @@ impl CellText {
         }
         let mut stored = Self::empty();
         if !stored.push_str(text) {
-            stored = Self::Heap(Box::new(text.into()));
+            stored = Self::Heap(Box::new(text.to_owned()));
         }
         stored
     }
@@ -450,7 +453,7 @@ impl CellText {
         if stored.push_str(&text) {
             stored
         } else {
-            Self::Heap(Box::new(text.into_boxed_str()))
+            Self::Heap(Box::new(text))
         }
     }
 
@@ -465,7 +468,7 @@ impl CellText {
                 let mut copy = String::new();
                 copy.try_reserve_exact(text.len()).ok()?;
                 copy.push_str(text);
-                Some(Self::Heap(Box::new(copy.into_boxed_str())))
+                Some(Self::Heap(Box::new(copy)))
             }
         }
     }
@@ -491,7 +494,7 @@ impl CellText {
     fn capacity(&self) -> usize {
         match self {
             Self::Inline { .. } => 0,
-            Self::Heap(text) => std::mem::size_of::<Box<str>>() + text.len(),
+            Self::Heap(text) => std::mem::size_of::<String>() + text.capacity(),
         }
     }
 
@@ -509,10 +512,7 @@ impl CellText {
                 true
             }
             Self::Heap(stored) => {
-                let mut grown = String::with_capacity(stored.len() + text.len());
-                grown.push_str(stored);
-                grown.push_str(text);
-                **stored = grown.into_boxed_str();
+                stored.push_str(text);
                 true
             }
         }
@@ -525,14 +525,14 @@ impl CellText {
             let mut heap = String::with_capacity(self.len() + text.len());
             heap.push_str(self.as_str());
             heap.push_str(text);
-            *self = Self::Heap(Box::new(heap.into_boxed_str()));
+            *self = Self::Heap(Box::new(heap));
         }
     }
 
     /// Hold the text on the heap, however short.
     #[cfg(test)]
     fn move_to_heap(&mut self) {
-        *self = Self::Heap(Box::new(self.as_str().into()));
+        *self = Self::Heap(Box::new(self.as_str().to_owned()));
     }
 }
 

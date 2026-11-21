@@ -80,9 +80,9 @@ fn junction_ancestor_is_rejected_without_symlink_privileges() {
 
 #[test]
 fn source_setup_rejects_ambient_toolchain_but_asset_access_remains_available() {
-    let error = source_command(Path::new(r"C:\source"), &["cargo", "build"])
-        .err()
-        .expect("native source driver is not implemented");
+    let Err(error) = source_command(Path::new(r"C:\source"), &["cargo", "build"]) else {
+        panic!("native source driver is not implemented");
+    };
     assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     assert!(error.to_string().contains("verified release bundle"));
 }

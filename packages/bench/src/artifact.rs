@@ -84,12 +84,15 @@ fn stage(parent: &Path) -> BenchResult<PathBuf> {
         let serial = NEXT_STAGE.fetch_add(1, Ordering::Relaxed);
         let path = parent.join(format!(".bmux-bench-stage-{}-{serial}", std::process::id()));
         let result = {
-            let mut builder = fs::DirBuilder::new();
             #[cfg(unix)]
-            {
+            let builder = {
                 use std::os::unix::fs::DirBuilderExt;
+                let mut builder = fs::DirBuilder::new();
                 builder.mode(0o700);
-            }
+                builder
+            };
+            #[cfg(not(unix))]
+            let builder = fs::DirBuilder::new();
             builder.create(&path)
         };
         match result {

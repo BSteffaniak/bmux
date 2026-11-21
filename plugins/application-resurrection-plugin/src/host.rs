@@ -19,6 +19,12 @@ mod tests;
 
 const PROTOCOL: &str = "application-resurrection/1";
 const LIMIT: u64 = 16_384;
+/// How long a handshake or shell callback waits for launch metadata that is
+/// delivered on another path (pane output OSC hooks, other callbacks). Those
+/// arrive out of order and, on a loaded host, seconds late; a tight bound
+/// turns a late boundary into a spurious ownership rejection. Waiting grants
+/// no authority: ownership is re-verified after every wait.
+const ORDERING_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Clone, Copy)]
 pub enum IdentityCheck<'a> {
@@ -493,24 +499,45 @@ fn receive_hello(reader: &mut BufReader<UnixStream>, peer: u32) -> Result<Hello,
     Ok(hello)
 }
 
-fn wait_for_command_boundary(entry: &Entry) -> Result<(), String> {
+/// Wait on `entry.changed` until `probe` yields a value, the launch stops, or
+/// `deadline` passes (`Ok(None)`). Wakes are event-driven; a short bounded
+/// slice also rechecks conditions that change without a notification (process
+/// liveness inside `probe`).
+fn wait_until<T>(
+    entry: &Entry,
+    deadline: std::time::Instant,
+    mut probe: impl FnMut(&State) -> Result<Option<T>, Rejection>,
+) -> Result<Option<T>, Rejection> {
+    let mut state = entry
+        .state
+        .lock()
+        .map_err(|_| Rejection("launch_unavailable"))?;
+    loop {
+        if entry.stopped.load(Ordering::SeqCst) {
+            return Err(Rejection("launch_unavailable"));
+        }
+        if let Some(value) = probe(&state)? {
+            return Ok(Some(value));
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        (state, _) = entry
+            .changed
+            .wait_timeout(state, remaining.min(std::time::Duration::from_millis(50)))
+            .map_err(|_| Rejection("launch_unavailable"))?;
+    }
+}
+
+fn wait_for_command_boundary(entry: &Entry, deadline: std::time::Instant) -> Result<(), Rejection> {
     // Bind and shell metadata arrive independently of the application socket.
     // Acknowledge no application state until the shell's command boundary has
     // established its invocation; otherwise a delayed boundary erases that state.
-    for _ in 0..100 {
-        let ready = {
-            let state = entry.state.lock().map_err(|e| e.to_string())?;
-            state.registration_ready()
-        };
-        if ready {
-            return Ok(());
-        }
-        if entry.stopped.load(Ordering::SeqCst) {
-            return Err("launch stopped before command boundary".into());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    Err("command boundary was not established before the deadline".into())
+    wait_until(entry, deadline, |state| {
+        Ok(state.registration_ready().then_some(()))
+    })?
+    .ok_or(Rejection("launch_unavailable"))
 }
 
 struct Rejection(&'static str);
@@ -550,11 +577,13 @@ fn accept_hello(
     {
         return Err(Rejection("invalid_handshake"));
     }
-    wait_for_command_boundary(entry).map_err(|_| Rejection("launch_unavailable"))?;
+    // One deadline covers every ordering wait of this handshake.
+    let deadline = std::time::Instant::now() + ORDERING_DEADLINE;
+    wait_for_command_boundary(entry, deadline)?;
     let peer_identity = crate::process::inspect(peer)
         .map_err(|_| Rejection("ownership_verification_unavailable"))?
         .identity;
-    let (invocation, root, shell, observed_epoch) = registration_target(entry, peer)?;
+    let (invocation, root, shell, observed_epoch) = registration_target(entry, peer, deadline)?;
     // Native inspection must not prevent a command boundary or final snapshot from
     // fencing this invocation. Revalidate the epoch after the probe completes.
     if !inspect(peer, root, shell).map_err(|_| Rejection("ownership_verification_unavailable"))? {
@@ -603,27 +632,18 @@ fn accept_hello(
 fn registration_target(
     entry: &Entry,
     peer: u32,
+    deadline: std::time::Instant,
 ) -> Result<(uuid::Uuid, crate::process::Identity, bool, u64), Rejection> {
-    // Some shells start a command while its pre-exec callback is still finishing.
-    // Wait for the authoritative boundary instead of assigning the outer command.
-    for _ in 0..100 {
-        {
-            let state = entry
-                .state
-                .lock()
-                .map_err(|_| Rejection("launch_unavailable"))?;
-            if entry.stopped.load(Ordering::SeqCst) {
-                return Err(Rejection("launch_unavailable"));
-            }
-            if state.command_phase == CommandPhase::Active
-                && let Ok((invocation, root)) = scopes::target(&state, peer)
-            {
-                return Ok((invocation, root, state.shell, state.epoch));
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    Err(Rejection("ownership_rejected"))
+    // Some shells start a command while its pre-exec callback is still finishing,
+    // and nested-shell boundaries arrive on other sockets. Wait for the
+    // authoritative boundary instead of assigning the outer command.
+    wait_until(entry, deadline, |state| {
+        Ok((state.command_phase == CommandPhase::Active)
+            .then(|| scopes::target(state, peer).ok())
+            .flatten()
+            .map(|(invocation, root)| (invocation, root, state.shell, state.epoch)))
+    })?
+    .ok_or(Rejection("ownership_rejected"))
 }
 
 fn serve(entry: &Entry, stream: UnixStream) -> Result<(), String> {

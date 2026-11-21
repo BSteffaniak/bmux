@@ -463,6 +463,12 @@ mod harness {
         Ok(())
     }
 
+    #[cfg(not(unix))]
+    fn monotonic_ns() -> Result<u128> {
+        anyhow::bail!("CLOCK_MONOTONIC timestamps are only available on Unix")
+    }
+
+    #[cfg(unix)]
     fn monotonic_ns() -> Result<u128> {
         let mut time = libc::timespec {
             tv_sec: 0,

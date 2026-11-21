@@ -48,7 +48,7 @@ pub(super) fn handle(
     boundary: Boundary,
 ) -> Result<Option<String>, super::readiness::Rejection> {
     use super::readiness::{self, Rejection};
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let deadline = std::time::Instant::now() + super::ORDERING_DEADLINE;
     if boundary.protocol != PROTOCOL
         || !matches!(boundary.operation.as_str(), "prompt" | "start" | "location")
     {
@@ -70,7 +70,11 @@ pub(super) fn handle(
     }
     // Waiting grants no authority: redo executable, ancestry and foreground
     // verification against live processes after readiness is established.
-    handle_ready(entry, peer, shell.identity, boundary).map_err(|error| {
+    let result = handle_ready(entry, peer, shell.identity, boundary);
+    // A nested boundary can complete an application handshake waiting in
+    // `registration_target`; wake it instead of leaving it to its poll slice.
+    entry.changed.notify_all();
+    result.map_err(|error| {
         let code = match error.as_str() {
             "invalid shell lifecycle operation" => "invalid_operation",
             "shell executable identity mismatch" => "shell_executable_mismatch",

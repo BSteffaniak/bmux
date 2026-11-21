@@ -929,6 +929,18 @@ impl AttachViewState {
     /// Whether the last frame presented left any image showing (on the host, and for
     /// observers).
     #[must_use]
+    #[cfg_attr(
+        not(all(
+            test,
+            feature = "bundled-plugin-playbook",
+            any(
+                feature = "image-sixel",
+                feature = "image-kitty",
+                feature = "image-iterm2"
+            )
+        )),
+        allow(dead_code, reason = "observed only by playbook image test assertions")
+    )]
     pub fn shows_images(&self) -> bool {
         self.terminal_presenter.shows_images()
     }
@@ -936,6 +948,18 @@ impl AttachViewState {
     /// Whether graphics are, or were last frame, on the host terminal: pane rows must then not
     /// be moved there, since moving them would move or orphan the graphics.
     #[must_use]
+    #[cfg_attr(
+        not(any(
+            feature = "image-sixel",
+            feature = "image-kitty",
+            feature = "image-iterm2"
+        )),
+        expect(
+            clippy::unused_self,
+            clippy::missing_const_for_fn,
+            reason = "graphics exist only with an image protocol"
+        )
+    )]
     pub fn graphics_on_host(&self) -> bool {
         #[cfg(any(
             feature = "image-sixel",

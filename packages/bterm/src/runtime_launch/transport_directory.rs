@@ -2,7 +2,9 @@
 
 use std::path::Path;
 
-use anyhow::{Context as _, Result, ensure};
+#[cfg(unix)]
+use anyhow::ensure;
+use anyhow::{Context as _, Result};
 
 pub(super) fn ensure_transport_directory(runtime: &Path) -> Result<()> {
     #[cfg(unix)]

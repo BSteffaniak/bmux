@@ -19,6 +19,17 @@ pub(super) struct ScrollbackCache {
     bytes: usize,
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    )),
+    expect(
+        clippy::missing_const_for_fn,
+        reason = "trivial without an image protocol"
+    )
+)]
 pub fn project_images(
     images: &[bmux_attach_image_protocol::AttachPaneImage],
     start: usize,

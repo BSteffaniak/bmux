@@ -60,6 +60,17 @@ pub async fn run_cli() -> anyhow::Result<u8> {
 /// and daemon startup. Every public entrypoint dispatches them identically:
 /// nested-shell lifecycle callbacks re-execute this binary and fail closed if
 /// ordinary CLI parsing receives their private arguments.
+#[cfg_attr(
+    not(any(
+        feature = "bench",
+        all(unix, feature = "bundled-plugin-application-resurrection")
+    )),
+    expect(
+        clippy::unnecessary_wraps,
+        clippy::missing_const_for_fn,
+        reason = "every private mode is feature-gated"
+    )
+)]
 fn run_pre_runtime_mode() -> anyhow::Result<Option<u8>> {
     #[cfg(feature = "bench")]
     if let Some(arguments) = benchmark_arguments(std::env::args_os()) {

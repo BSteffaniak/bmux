@@ -58,6 +58,8 @@ impl Plugin for ApplicationResurrectionPlugin {
 }
 
 impl ApplicationResurrectionPlugin {
+    // The resurrection host is Unix-only; elsewhere these keep the shared signature.
+    #[cfg_attr(not(unix), allow(clippy::unused_self, clippy::unnecessary_wraps))]
     fn activate_host(&self, context: &NativeLifecycleContext) -> Result<(), PluginCommandError> {
         #[cfg(unix)]
         {
@@ -83,6 +85,8 @@ impl ApplicationResurrectionPlugin {
         Ok(())
     }
 
+    // The resurrection host is Unix-only; elsewhere these keep the shared signature.
+    #[cfg_attr(not(unix), allow(clippy::unused_self, clippy::unnecessary_wraps))]
     fn deactivate_host(&self) -> Result<(), PluginCommandError> {
         #[cfg(unix)]
         {
@@ -98,6 +102,8 @@ impl ApplicationResurrectionPlugin {
         Ok(())
     }
 
+    // The resurrection host is Unix-only; elsewhere this keeps the shared signature.
+    #[cfg_attr(not(unix), allow(clippy::unused_self))]
     fn service(&self, context: &NativeServiceContext) -> ServiceResponse {
         #[cfg(unix)]
         {

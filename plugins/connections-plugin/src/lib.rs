@@ -1902,6 +1902,7 @@ mod tests {
         task.await.expect("server task join").expect("server run");
     }
 
+    #[cfg(unix)] // Used by the Unix-only end-to-end test.
     async fn cached_test_client(
         identity: &str,
         deadline: tokio::time::Instant,

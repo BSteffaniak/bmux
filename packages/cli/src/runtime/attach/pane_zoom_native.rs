@@ -834,6 +834,18 @@ fn history_fragments(view: &AttachViewState) -> anyhow::Result<Vec<PreparedGridF
         .collect()
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    )),
+    expect(
+        clippy::missing_const_for_fn,
+        clippy::unnecessary_wraps,
+        reason = "without an image protocol the fragment passes through unchanged"
+    )
+)]
 fn history_images(
     fragment: PreparedGridFragment,
     projection: &PaneZoomHistoryProjection,

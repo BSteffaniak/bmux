@@ -76,15 +76,21 @@ pub(super) fn ancestor(peer: u32, ancestor: u32) -> Result<Process, String> {
     Err("shell callback ancestry unavailable or exceeds limit".into())
 }
 
+/// Bound on waiting for a shell's job-control (tcsetpgrp) handoff to a child.
+const FOREGROUND_HANDOFF_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub(super) fn foreground_child(peer: u32, root: Identity, shell: bool) -> Result<bool, String> {
     let mut process = inspect(peer)?;
     let owner = inspect(root.pid)?;
     if shell {
         // Shells can spawn the child before tcsetpgrp completes. Wait only for
         // that job-control handoff, retaining the exact process incarnation.
+        // The handoff is the parent shell's next step, but a loaded host can
+        // delay its scheduling well past a few milliseconds.
         let identity = process.identity;
-        for _ in 0..50 {
-            if process.group == process.foreground {
+        let deadline = std::time::Instant::now() + FOREGROUND_HANDOFF_DEADLINE;
+        while process.group != process.foreground {
+            if std::time::Instant::now() >= deadline {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(2));

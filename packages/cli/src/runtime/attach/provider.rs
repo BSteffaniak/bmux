@@ -16,6 +16,10 @@ pub(in crate::runtime) fn host_registry() -> Arc<AttachProviderRegistry> {
 
 /// Keep a plugin-supplied provider registered for this process's lifetime.
 /// A provider whose identity is already registered keeps the first one.
+#[cfg_attr(
+    not(feature = "bundled-plugins"),
+    allow(dead_code, reason = "only bundled plugins supply attach providers")
+)]
 pub(in crate::runtime) fn register_plugin_provider(provider: Arc<dyn AttachProvider>) {
     static KEPT: OnceLock<Mutex<Vec<AttachProviderRegistration>>> = OnceLock::new();
     match host_registry().register(provider) {

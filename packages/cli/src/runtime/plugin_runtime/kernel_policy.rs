@@ -195,6 +195,10 @@ pub(super) struct TrustedKernelPolicy {
 }
 
 impl TrustedKernelPolicy {
+    #[cfg_attr(
+        not(feature = "bundled-plugins"),
+        allow(dead_code, reason = "used once per compiled-in bundled plugin")
+    )]
     pub(super) fn bundled(
         metadata: &PluginMetadata,
         authorize: KernelRequestAuthorizer,

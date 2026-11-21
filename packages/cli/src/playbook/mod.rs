@@ -28,7 +28,13 @@ pub use bmux_playbook::parser::{parse_file, parse_stdin};
 ///
 /// Returns an error if the playbook execution fails.
 pub async fn run(playbook: Playbook, target_server: bool) -> Result<PlaybookResult> {
-    run_with_options(playbook, target_server, RunOptions::default()).await
+    // The run future is large (notably on Windows); keep it off the caller's stack.
+    Box::pin(run_with_options(
+        playbook,
+        target_server,
+        RunOptions::default(),
+    ))
+    .await
 }
 
 /// Run a playbook with explicit execution options.

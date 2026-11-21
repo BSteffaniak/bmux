@@ -244,6 +244,33 @@ fn slot_mut<T>(
         .map_err(|_| bmux_plugin_sdk::PluginCommandError::failed("plugin state lock poisoned"))
 }
 
+/// Read the local voter record once the activation that spawned this
+/// bootstrap has settled.
+///
+/// The bootstrap runs on the host runtime as soon as `activate` spawns it, so
+/// its first host call races the loader settling the activation: a call that
+/// is admitted on the activation's setup invocation just before the loader
+/// closes it is rejected when the host dispatch re-admits it ("scope is closed
+/// or no longer retained"). Any later call waits for the activation to become
+/// active and gets a fresh invocation. This read has no effects, so retrying it
+/// until the deadline is safe; every step after it then runs on a settled
+/// activation.
+async fn settled_local_consensus_member(
+    caller: &bmux_plugin::TypedServiceCaller,
+) -> Result<Option<(ClusterId, NodeIdentity, ClusterMember, bool)>, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match local_consensus_member(caller) {
+            Ok(member) => return Ok(member),
+            Err(error) if std::time::Instant::now() < deadline => {
+                tracing::debug!(%error, "retrying local consensus member read");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 async fn ensure_persistent_consensus_runtime(
     caller: Arc<bmux_plugin::TypedServiceCaller>,
     state_dir: PathBuf,
@@ -252,7 +279,7 @@ async fn ensure_persistent_consensus_runtime(
 ) -> Result<(), String> {
     let _start_guard = bootstrap.lock().await;
     let Some((cluster_id, identity, member, single_member)) =
-        local_consensus_member(caller.as_ref())?
+        settled_local_consensus_member(caller.as_ref()).await?
     else {
         return Ok(());
     };

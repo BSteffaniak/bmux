@@ -64,7 +64,29 @@ pub(super) struct PaneZoomHistoryProjection {
     pub pin: bmux_attach_pipeline::ScrollbackPin,
     pub content: bmux_terminal_grid::FrozenContentRows,
     pub palette: StylePalette,
+    #[cfg_attr(
+        not(any(
+            feature = "image-sixel",
+            feature = "image-kitty",
+            feature = "image-iterm2"
+        )),
+        allow(
+            dead_code,
+            reason = "history images are drawn only with an image protocol"
+        )
+    )]
     pub images: Vec<bmux_attach_image_protocol::AttachPaneImage>,
+    #[cfg_attr(
+        not(any(
+            feature = "image-sixel",
+            feature = "image-kitty",
+            feature = "image-iterm2"
+        )),
+        allow(
+            dead_code,
+            reason = "history images are drawn only with an image protocol"
+        )
+    )]
     top: bmux_attach_pipeline::CapturedHistoryAnchor,
     retained_bytes: usize,
 }
@@ -331,6 +353,17 @@ impl PaneZoomHistoryProjection {
     /// Top logical origin to preserve when changing width. Feed it to
     /// `PaneZoomHistoryOrigin::Top(...).query()` for the existing bottom-anchor
     /// history service. Near the tail that service may backfill above it.
+    #[cfg_attr(
+        not(any(
+            feature = "image-sixel",
+            feature = "image-kitty",
+            feature = "image-iterm2"
+        )),
+        allow(
+            dead_code,
+            reason = "history images are drawn only with an image protocol"
+        )
+    )]
     pub const fn top_anchor(&self) -> bmux_attach_pipeline::CapturedHistoryAnchor {
         self.top
     }

@@ -97,6 +97,7 @@ impl Execution {
         })
     }
 
+    #[cfg(unix)] // Only the Unix host restores executions.
     pub(crate) fn restoring(&self) -> bool {
         self.restoration
     }

@@ -5435,7 +5435,7 @@ timeout_profile = "missing"
         std::fs::write(&env_path, "[general]\nserver_timeout = 150\n").expect("write env");
         std::fs::write(&cli_path, "[general]\nserver_timeout = 175\n").expect("write cli");
 
-        let _cwd_guard = CwdGuard::set(&dir);
+        let cwd_guard = CwdGuard::set(&dir);
         let _config_dir_guard = EnvVarGuard::set("BMUX_CONFIG_DIR", ".");
         let _override_guard = push_process_config_overrides(ConfigLoadOverrides {
             base_config_path: None,
@@ -5447,6 +5447,8 @@ timeout_profile = "missing"
         let config = BmuxConfig::load().expect("load merged config");
         assert_eq!(config.general.server_timeout, 175);
 
+        // Windows cannot remove the current directory.
+        drop(cwd_guard);
         std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
     }
 

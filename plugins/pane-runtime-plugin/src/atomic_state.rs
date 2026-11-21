@@ -44,4 +44,17 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"[3,4]");
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
+
+    #[test]
+    fn publication_replaces_state_that_readers_hold_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("receipt.json");
+        super::commit(&path, &vec![1]).unwrap();
+        let reader = std::fs::File::open(&path).unwrap();
+        super::commit(&path, &vec![2]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"[2]");
+        drop(reader);
+        super::commit(&path, &vec![3]).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"[3]");
+    }
 }

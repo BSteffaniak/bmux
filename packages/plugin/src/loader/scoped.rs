@@ -3756,6 +3756,7 @@ fn read_bounded(mut read: impl FnMut(&mut [u8], &mut usize) -> i32) -> Result<Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)] // Only the Unix tests wait.
     use std::time::Duration;
 
     #[test]
@@ -5129,11 +5130,13 @@ mod tests {
         .expect("selected activation polling failed")
     }
 
+    #[cfg(unix)]
     thread_local! {
         static OBSERVER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
     /// Synchronous author code runs on the host runtime's blocking pool,
     /// never on the observing async thread.
+    #[cfg(unix)] // Used by the Unix-only factory lifecycle test.
     fn assert_blocking_pool() {
         assert!(!OBSERVER.with(std::cell::Cell::get));
         assert!(tokio::runtime::Handle::try_current().is_ok());

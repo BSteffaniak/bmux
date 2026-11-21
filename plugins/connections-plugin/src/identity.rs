@@ -191,6 +191,7 @@ mod tests {
         (state, runtime)
     }
 
+    #[cfg(unix)] // Used by the Unix-only permission checks.
     fn record_path(state: &Path) -> std::path::PathBuf {
         std::fs::read_dir(state)
             .unwrap()

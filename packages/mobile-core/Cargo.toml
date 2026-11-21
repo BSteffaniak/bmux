@@ -30,7 +30,6 @@ rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-ssh2 = { workspace = true, features = ["vendored-openssl"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = [
     "io-util",
@@ -41,6 +40,14 @@ tokio = { workspace = true, features = [
 tokio-rustls = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true, features = ["serde", "v4"] }
+
+# libssh2 needs OpenSSL on Unix and mobile targets; Windows uses its native WinCNG
+# backend, so vendoring OpenSSL there would only add a Perl build dependency.
+[target.'cfg(not(windows))'.dependencies]
+ssh2 = { workspace = true, features = ["vendored-openssl"] }
+
+[target.'cfg(windows)'.dependencies]
+ssh2 = { workspace = true }
 
 [features]
 default = []

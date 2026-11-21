@@ -67,7 +67,7 @@ fn executable_identity(path: &Path) -> Result<(File, String), String> {
     }
     #[cfg(windows)]
     {
-        let current = open_windows_regular(&path)?;
+        let current = open_windows_regular(path)?;
         if windows_file_identity(&current)? != identity
             || path.canonicalize().map_err(|error| error.to_string())? != path
         {

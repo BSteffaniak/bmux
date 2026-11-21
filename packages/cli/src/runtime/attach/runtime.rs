@@ -1758,10 +1758,13 @@ impl AttachTerminal for HeadlessAttachTerminal {
     }
 }
 
-#[cfg(any(
-    feature = "image-sixel",
-    feature = "image-kitty",
-    feature = "image-iterm2"
+#[cfg(all(
+    any(test, feature = "bundled-plugin-playbook"),
+    any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    )
 ))]
 fn headless_image_capabilities_from_env() -> bmux_image::host_caps::HostImageCapabilities {
     let mut caps = bmux_image::host_caps::HostImageCapabilities {

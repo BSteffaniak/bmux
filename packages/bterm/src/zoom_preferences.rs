@@ -9,7 +9,7 @@
 //! edits therefore neither lose preferences nor change companion identity.
 
 use std::collections::BTreeSet;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
@@ -265,9 +265,7 @@ impl PreferenceStore {
             file.write_all(&bytes).context("write zoom preferences")?;
             file.sync_all().context("sync zoom preferences")?;
             std::fs::rename(&temporary, &self.path).context("publish zoom preferences")?;
-            File::open(parent)?
-                .sync_all()
-                .context("sync zoom preference directory")?;
+            sync_directory(parent).context("sync zoom preference directory")?;
             Ok(())
         })();
         if result.is_err() {
@@ -372,27 +370,40 @@ fn create_directory_durably(path: &Path) -> Result<()> {
         }
     }
     for directory in missing.into_iter().rev() {
-        let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt as _;
+            let mut builder = std::fs::DirBuilder::new();
             builder.mode(0o700);
-        }
+            builder
+        };
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
         match builder.create(directory) {
             Ok(()) => {}
             Err(error)
                 if error.kind() == std::io::ErrorKind::AlreadyExists && directory.is_dir() => {}
             Err(error) => return Err(error).context("create zoom preference directory"),
         }
-        File::open(directory)?
-            .sync_all()
-            .context("sync new zoom preference directory")?;
+        sync_directory(directory).context("sync new zoom preference directory")?;
         if let Some(parent) = directory.parent() {
-            File::open(parent)?
-                .sync_all()
-                .context("sync zoom preference ancestor")?;
+            sync_directory(parent).context("sync zoom preference ancestor")?;
         }
     }
+    Ok(())
+}
+
+/// Make a directory's entries durable.
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+/// Windows cannot open a directory as a plain file ("Access is denied"), and
+/// NTFS journals directory entries itself, so there is nothing to sync.
+#[cfg(not(unix))]
+#[allow(clippy::unnecessary_wraps)] // Matches the Unix signature.
+const fn sync_directory(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 

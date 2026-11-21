@@ -294,10 +294,19 @@ fn open_config_component(
 }
 
 #[cfg(not(unix))]
-fn open_protected(_root: &Path) -> Result<File, ArtifactApprovalError> {
-    Err(invalid(
-        "protected artifact approvals are unsupported on this platform",
-    ))
+fn open_protected(root: &Path) -> Result<File, ArtifactApprovalError> {
+    // Absence approves nothing, so it needs no protected-storage contract and
+    // must not stop the host from starting. A present document still fails
+    // closed until this platform's ownership/permission checks exist.
+    if !root.is_absolute() {
+        return Err(invalid("host configuration directory must be absolute"));
+    }
+    match std::fs::symlink_metadata(root.join(APPROVAL_FILE)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => Err(invalid(
+            "protected artifact approvals are unsupported on this platform",
+        )),
+    }
 }
 
 #[cfg(test)]

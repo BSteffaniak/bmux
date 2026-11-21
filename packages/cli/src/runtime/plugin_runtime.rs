@@ -176,6 +176,10 @@ macro_rules! declare_bundled_plugins {
     };
 }
 
+#[cfg_attr(
+    not(feature = "bundled-plugins"),
+    allow(dead_code, reason = "used once per compiled-in bundled plugin")
+)]
 fn register_bundled_definition(
     plugin_id: &str,
     definition: bmux_plugin_sdk::definition::PluginDefinition,
@@ -3203,6 +3207,13 @@ fn connections_definition(
     expect(
         clippy::unnecessary_wraps,
         reason = "only the cluster definition is fallible; every entry is feature-gated"
+    )
+)]
+#[cfg_attr(
+    not(feature = "bundled-plugins"),
+    allow(
+        clippy::missing_const_for_fn,
+        reason = "with no provider compiled in, the body is empty"
     )
 )]
 fn standalone_provider_definitions(

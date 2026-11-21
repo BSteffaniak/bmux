@@ -291,8 +291,11 @@ fn run_terminal(
             cancelled.store(true, Ordering::Relaxed);
         }
     });
-    let restored = backend.restore();
-    drop(backend);
+    // Restore and release the terminal before reporting.
+    let restored = {
+        let mut backend = backend;
+        backend.restore()
+    };
     let result = match (result, restored) {
         (Ok(record), Ok(())) => Ok(record),
         (Err(error), Ok(())) => Err(error),

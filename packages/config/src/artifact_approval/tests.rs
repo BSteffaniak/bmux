@@ -1,4 +1,13 @@
 use super::*;
+/// An absolute runtime directory on this platform.
+fn runtime(name: &str) -> std::path::PathBuf {
+    let root = if cfg!(windows) {
+        r"C:\runtime"
+    } else {
+        "/runtime"
+    };
+    Path::new(root).join(name)
+}
 fn document(runtime: &Path) -> String {
     format!(
         "schema_version=1\nruntime_dir={:?}\n[[approvals]]\nplugin_id='example.provider'\nrole='backend'\nartifact_sha256='{}'\nrequest_policy='example-policy-v1'\n",
@@ -8,11 +17,8 @@ fn document(runtime: &Path) -> String {
 }
 #[test]
 fn exact_matching_rejects_wrong_digest_role_identity() {
-    let store = ArtifactApprovalStore::parse_for_runtime(
-        &document(Path::new("/runtime/a")),
-        Path::new("/runtime/a"),
-    )
-    .unwrap();
+    let store =
+        ArtifactApprovalStore::parse_for_runtime(&document(&runtime("a")), &runtime("a")).unwrap();
     assert!(
         store
             .find("example.provider", "backend", &"a".repeat(64))
@@ -36,8 +42,8 @@ fn exact_matching_rejects_wrong_digest_role_identity() {
 }
 #[test]
 fn closed_schema_and_runtime_isolation() {
-    let runtime = Path::new("/runtime/a");
-    let text = document(runtime);
+    let selected = runtime("a");
+    let text = document(&selected);
     for invalid in [
         text.replace("schema_version=1", "schema_version=2"),
         text.replace("role='backend'", "role='all'"),
@@ -48,9 +54,9 @@ fn closed_schema_and_runtime_isolation() {
             "b".repeat(64)
         ),
     ] {
-        assert!(ArtifactApprovalStore::parse_for_runtime(&invalid, runtime).is_err());
+        assert!(ArtifactApprovalStore::parse_for_runtime(&invalid, &selected).is_err());
     }
-    assert!(ArtifactApprovalStore::parse_for_runtime(&text, Path::new("/runtime/b")).is_err());
+    assert!(ArtifactApprovalStore::parse_for_runtime(&text, &runtime("b")).is_err());
 }
 #[cfg(unix)]
 #[test]

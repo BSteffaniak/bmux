@@ -10,6 +10,11 @@ pub(super) struct CommittedSource {
 
 impl CommittedSource {
     #[cfg(not(feature = "bundled-plugin-broadcast"))]
+    #[allow(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "same signature as the broadcast-backed registration"
+    )]
     pub(super) async fn register(
         _client: &mut StreamingBmuxClient,
         _runtime_dir: &std::path::Path,
