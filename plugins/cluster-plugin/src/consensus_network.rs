@@ -171,6 +171,92 @@ pub fn owned_vote_response_signing_payload(
     Ok(signed)
 }
 
+/// Bind an owned append response to its signed request and intended responder.
+/// # Errors
+/// Rejects mismatched identities and oversized response fields before encoding.
+pub fn owned_append_response_signing_payload(
+    request: &bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
+    response: &bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendResponse,
+) -> Result<Vec<u8>, String> {
+    use bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendOutcome;
+    let request_bytes = owned_append_signing_payload(request)?;
+    if response.source != request.recipient {
+        return Err("append responder mismatch".into());
+    }
+    if response.request_id != request.request_id || response.signature.len() > 64 {
+        return Err("append response binding mismatch".into());
+    }
+    match &response.outcome {
+        AppendOutcome::Durable { matched: Some(position) } => {
+            transfer_node(&position.leader)?;
+        }
+        AppendOutcome::MissingTransfer { reference }
+            if !request.entries.iter().any(|entry| matches!(entry,
+                bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendEntry::Staged { reference: candidate }
+                    if candidate == reference)) => {
+                return Err("unknown missing transfer".into());
+        }
+        _ => {}
+    }
+    let mut unsigned = response.clone();
+    unsigned.signature.clear();
+    let mut signed = b"bmux.cluster.consensus-append.v1\0response\0".to_vec();
+    signed.extend(
+        encode_service_message(&(request_bytes, &request.proof.signature, unsigned))
+            .map_err(|error| error.to_string())?,
+    );
+    Ok(signed)
+}
+
+/// Verify an append response against the exact locally retained signed request.
+/// This proves its origin and binding, not current leadership or quorum commit.
+/// # Errors
+/// Invalid signatures and request/responder mismatches reject the response.
+pub fn verify_owned_append_response(
+    request: &bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
+    response: &bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendResponse,
+) -> Result<(), String> {
+    if response.signature.len() != 64 {
+        return Err("invalid append response signature length".into());
+    }
+    let payload = owned_append_response_signing_payload(request, response)?;
+    let peer = transfer_node(&request.recipient)?;
+    verify_node_signature(&peer.to_string(), &payload, &response.signature)
+}
+
+/// Whether a durable member has negotiated both halves of the owned protocol.
+/// Capability advertisement alone is not admission to this engine.
+pub(crate) fn supports_owned_consensus(
+    member: &bmux_cluster_plugin_api::cluster_types::ClusterMember,
+) -> bool {
+    [
+        bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID,
+        bmux_cluster_plugin_api::cluster_consensus_transfer::INTERFACE_ID,
+    ]
+    .iter()
+    .all(|interface| {
+        member
+            .negotiated_protocol
+            .features
+            .iter()
+            .any(|feature| feature == interface.as_str())
+    })
+}
+
+fn require_owned_consensus(
+    members: &[bmux_cluster_plugin_api::cluster_types::ClusterMember],
+    source: NodeId,
+) -> Result<(), String> {
+    if members
+        .iter()
+        .any(|member| member.node_id == source.to_string() && supports_owned_consensus(member))
+    {
+        Ok(())
+    } else {
+        Err("peer has not negotiated the owned consensus protocol".into())
+    }
+}
+
 /// Authenticate a vote against the durable members supplied by its executor.
 /// # Errors
 /// Rejects invalid signatures, identity bindings, and revoked or replayed proofs.
@@ -182,6 +268,7 @@ pub fn authenticate_owned_vote(
 ) -> Result<NodeId, String> {
     let signed = owned_vote_signing_payload(request)?;
     let source = request.proof.peer.claimant_node_id.parse::<NodeId>()?;
+    require_owned_consensus(members, source)?;
     if request.recipient.as_slice() != local.as_bytes()
         || request.sender.as_slice() != source.as_bytes()
         || request.cluster_id != request.proof.peer.challenge.cluster_id
@@ -215,6 +302,7 @@ pub fn authenticate_owned_append(
 ) -> Result<NodeId, String> {
     let signed = owned_append_signing_payload(request)?;
     let source = request.proof.peer.claimant_node_id.parse::<NodeId>()?;
+    require_owned_consensus(members, source)?;
     if request.recipient.as_slice() != local.as_bytes()
         || request.sender.as_slice() != source.as_bytes()
         || request.cluster_id != request.proof.peer.challenge.cluster_id
@@ -2013,6 +2101,19 @@ impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static>
             use bmux_cluster_plugin_api::cluster_consensus_rpc_types::{
                 AppendOutcome, AppendResponse, RpcError,
             };
+            owned_append_signing_payload(&request).map_err(|_| RpcError::InvalidRequest)?;
+            let identity = crate::load_or_create_node_identity(self.caller.as_ref())
+                .map_err(|_| RpcError::Unauthorized)?;
+            if *identity.node_id() != self.local {
+                return Err(RpcError::Unauthorized);
+            }
+            let sign = |mut response: AppendResponse| -> Result<AppendResponse, RpcError> {
+                response.signature = identity.sign(
+                    &owned_append_response_signing_payload(&request, &response)
+                        .map_err(|_| RpcError::InvalidRequest)?,
+                );
+                Ok(response)
+            };
             let request_id = request.request_id;
             let next_index = request
                 .previous
@@ -2020,14 +2121,15 @@ impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static>
                 .map_or(0, |position| position.index);
             let result = self
                 .executor
-                .append_authenticated(self.caller.clone(), self.local, request)
+                .append_authenticated(self.caller.clone(), self.local, request.clone())
                 .await;
             let result = match result {
                 Err(crate::owned_vote_store::AuthenticatedAppendError::MissingTransfer {
                     reference,
                     term,
                 }) => {
-                    return Ok(AppendResponse {
+                    return sign(AppendResponse {
+                        signature: Vec::new(),
                         request_id,
                         source: self.local.as_bytes().to_vec(),
                         term: term.0,
@@ -2077,7 +2179,8 @@ impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static>
                 },
                 Err(_) => return Err(RpcError::ExecutionFailed),
             };
-            Ok(AppendResponse {
+            sign(AppendResponse {
+                signature: Vec::new(),
                 request_id,
                 source: self.local.as_bytes().to_vec(),
                 term: decision.term.0,

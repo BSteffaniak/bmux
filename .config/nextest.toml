@@ -7,6 +7,9 @@ experimental = ["setup-scripts"]
 # slow under concurrent load, but a hung test must fail on its own instead of
 # stalling every test queued behind it.
 slow-timeout = { period = "60s", terminate-after = 15, grace-period = "10s" }
+# Leaked output handles are blocking validation failures, not passing tests.
+# Keep nextest's default detection window; do not hide leaks with a longer timeout.
+leak-timeout = { period = "100ms", result = "fail" }
 
 # Recorded-process tests launch isolated servers and rasterize animated evidence.
 # Bound their aggregate host load without relaxing per-command deadlines.

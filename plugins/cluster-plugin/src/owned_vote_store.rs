@@ -57,18 +57,7 @@ fn owned_vote_endpoint(
     if member.cluster_id != cluster || member.state != ClusterMemberState::Active {
         return Err(RpcError::Unauthorized);
     }
-    if ![
-        bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID,
-        bmux_cluster_plugin_api::cluster_consensus_transfer::INTERFACE_ID,
-    ]
-    .iter()
-    .all(|interface| {
-        member
-            .negotiated_protocol
-            .features
-            .iter()
-            .any(|feature| feature == interface.as_str())
-    }) {
+    if !crate::consensus_network::supports_owned_consensus(member) {
         return Err(RpcError::Incompatible);
     }
     member
@@ -623,7 +612,8 @@ pub struct DurableVoteGate {
     #[cfg(test)]
     gate: VoteGate,
     store: OwnedVoteStore,
-    campaign: Option<(RequestVote, Membership, std::collections::BTreeSet<NodeId>)>,
+    campaign: Option<crate::consensus_model::Campaign>,
+    leader: Option<crate::consensus_model::LeaderProgress>,
     staging: Option<(std::fs::File, crate::transfer_staging::TransferStaging)>,
 }
 
@@ -637,6 +627,7 @@ impl DurableVoteGate {
             gate: VoteGate::new(incarnation, store.state()),
             store,
             campaign: None,
+            leader: None,
             staging: None,
         }
     }
@@ -1160,6 +1151,7 @@ impl VoteExecutor {
                         .map_err(AuthenticatedAppendError::Storage)?;
                 }
                 gate.campaign = None;
+                gate.leader = None;
                 let mut previous = request.previous.clone();
                 let mut entries = Vec::with_capacity(request.entries.len());
                 let mut remaining = 32 * 1024 * 1024usize;
@@ -1317,6 +1309,7 @@ impl VoteExecutor {
             let result = gate.store.append(&request, limits);
             if result.as_ref().is_ok_and(|decision| decision.step_down) {
                 gate.campaign = None;
+                gate.leader = None;
             }
             Ok(result)
         })
@@ -1394,7 +1387,7 @@ impl VoteExecutor {
                 if gate
                     .campaign
                     .as_ref()
-                    .is_some_and(|(campaign, _, _)| campaign.term != response.term)
+                    .is_some_and(|campaign| campaign.request.term != response.term)
                 {
                     gate.campaign = None;
                 }
@@ -1413,15 +1406,12 @@ impl VoteExecutor {
     pub async fn campaign(&self, local: NodeId) -> Result<Option<RequestVote>, VoteGateError> {
         self.run(move |gate| {
             gate.campaign = None;
+            gate.leader = None;
             let request = gate.store.campaign(local)?;
             if let Some(request) = request {
                 let (_, membership) = gate.store.election_context()?;
                 let membership = membership.ok_or(VoteGateError::Stopped)?;
-                gate.campaign = Some((
-                    request,
-                    membership,
-                    std::collections::BTreeSet::from([local]),
-                ));
+                gate.campaign = Some(crate::consensus_model::Campaign::new(request, membership));
             }
             Ok(request)
         })
@@ -1472,18 +1462,15 @@ impl VoteExecutor {
         let term = Term(request.term);
         let endpoint = self
             .run(move |gate| {
-                if !gate
-                    .campaign
-                    .as_ref()
-                    .is_some_and(|(campaign, membership, _)| {
-                        campaign.term == term
-                            && campaign.candidate == local
-                            && membership
-                                .configurations()
-                                .iter()
-                                .any(|voters| voters.contains(&recipient))
-                    })
-                {
+                if !gate.campaign.as_ref().is_some_and(|campaign| {
+                    campaign.request.term == term
+                        && campaign.request.candidate == local
+                        && campaign
+                            .membership
+                            .configurations()
+                            .iter()
+                            .any(|voters| voters.contains(&recipient))
+                }) {
                     return Ok(Err(RpcError::Unauthorized));
                 }
                 gate.store.failed = true;
@@ -1572,44 +1559,61 @@ impl VoteExecutor {
     ) -> Result<bool, VoteGateError> {
         self.run(move |gate| {
             let (_, membership) = gate.store.election_context()?;
-            // Term discovery outlives the campaign that sent the request. Only
-            // currently eligible peers may advance authority through this path.
-            if !membership.as_ref().is_some_and(|membership| {
-                membership
-                    .configurations()
-                    .iter()
-                    .any(|set| set.contains(&peer))
-            }) {
-                return Ok(false);
-            }
-            if response.term > gate.store.state.term {
-                gate.campaign = None;
+            let decision = crate::consensus_model::Campaign::observe(
+                &mut gate.campaign,
+                gate.store.state,
+                membership.as_ref(),
+                campaign_term,
+                peer,
+                response,
+            );
+            if let Some(hard_state) = decision.persist {
                 gate.store
-                    .persist(HardState {
-                        term: response.term,
-                        voted_for: None,
-                    })
+                    .persist(hard_state)
                     .map_err(|_| VoteGateError::StorageFailure)?;
-                return Ok(false);
             }
-            let Some((request, voters, granted)) = &mut gate.campaign else {
-                return Ok(false);
+            Ok(decision.quorum)
+        })
+        .await
+    }
+
+    /// Persist the elected leader's initial no-op before exposing it for replication.
+    /// Consumes the campaign only after durable append; does not advance commit.
+    /// # Errors
+    /// Busy/stopped storage, exhausted indexes, or failed persistence suppress output.
+    pub async fn initialize_leader(&self) -> Result<Option<AppendRequest>, VoteGateError> {
+        self.run(|gate| {
+            let (last_log, membership) = gate.store.election_context()?;
+            let (Some(campaign), Some(membership)) = (&gate.campaign, membership) else {
+                return Ok(None);
             };
-            if request.term != campaign_term {
-                return Ok(false);
-            }
-            if gate.store.state.term != campaign_term
-                || gate.store.state.voted_for != Some(request.candidate)
-                || membership.as_ref() != Some(voters)
-            {
+            let Some(request) = campaign
+                .leader_initialization(gate.store.state, &membership, last_log)
+                .map_err(|_| VoteGateError::EffectExhausted)?
+            else {
+                return Ok(None);
+            };
+            let decision = gate
+                .store
+                .append(&request, (1, 1024))
+                .map_err(|_| VoteGateError::StorageFailure)?;
+            if !matches!(
+                decision.outcome,
+                Ok(AppendOutcome::Reconciled(
+                    AppendReconciliation::Matched { .. }
+                ))
+            ) {
                 gate.campaign = None;
-                return Ok(false);
+                return Err(VoteGateError::Stopped);
             }
-            if response.term != campaign_term || !response.granted {
-                return Ok(false);
-            }
-            granted.insert(peer);
-            Ok(voters.has_quorum(granted))
+            gate.leader = Some(
+                crate::consensus_model::LeaderProgress::after_durable_initialization(
+                    membership,
+                    request.entries[0].identity,
+                ),
+            );
+            gate.campaign = None;
+            Ok(Some(request))
         })
         .await
     }
@@ -1679,7 +1683,21 @@ impl VoteExecutor {
         }
         tokio::task::spawn_blocking(move || {
             let mut gate = guard.take().ok_or(VoteGateError::Stopped)?;
-            let response = operation(&mut gate);
+            let mut response = operation(&mut gate);
+            if gate.leader.is_some() {
+                match gate.store.election_context() {
+                    Ok((_, membership))
+                        if gate.leader.as_ref().is_some_and(|leader| {
+                            leader.term == gate.store.state.term
+                                && membership.as_ref() == Some(&leader.membership)
+                        }) => {}
+                    Ok(_) => gate.leader = None,
+                    Err(error) => {
+                        gate.leader = None;
+                        response = Err(error);
+                    }
+                }
+            }
             *guard = Some(gate);
             drop(guard);
             response
@@ -3221,6 +3239,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn leader_authority_read_failure_suppresses_success() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority.redb");
+        let local = NodeId::from(1);
+        OwnedVoteStore::bootstrap(
+            &path,
+            "cluster",
+            local,
+            Membership::new(vec![vec![local]], vec![(local, String::new())]).unwrap(),
+        )
+        .unwrap()
+        .close()
+        .unwrap();
+        let executor = VoteExecutor::recover(path, "cluster".into(), 1)
+            .await
+            .unwrap();
+        executor.campaign(local).await.unwrap().unwrap();
+        executor.initialize_leader().await.unwrap().unwrap();
+        let result = executor
+            .run(|gate| {
+                let tx = gate.store.database.begin_write().unwrap();
+                tx.open_table(TABLE).unwrap().remove("membership").unwrap();
+                tx.commit().unwrap();
+                Ok(true)
+            })
+            .await;
+        assert_eq!(result, Err(VoteGateError::StorageFailure));
+        {
+            let gate = executor.gate.lock().await;
+            assert!(gate.as_ref().unwrap().leader.is_none());
+            assert!(gate.as_ref().unwrap().store.failed);
+            drop(gate);
+        }
+        assert!(matches!(
+            executor.campaign(local).await,
+            Err(VoteGateError::Stopped)
+        ));
+        assert!(matches!(
+            executor.shutdown().await,
+            Err(VoteGateError::StorageFailure)
+        ));
+    }
+
+    #[tokio::test]
     async fn campaign_persists_self_vote_and_uses_recovered_log() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("authority.redb");
@@ -3238,13 +3300,38 @@ mod tests {
         assert_eq!(request.term, Term(1));
         assert_eq!(request.candidate, local);
         assert_eq!(request.last_log.unwrap().index.0, 0);
+        let initial = executor.initialize_leader().await.unwrap().unwrap();
+        assert_eq!(initial.entries[0].identity.term, Term(1));
+        assert_eq!(initial.entries[0].identity.index.0, 1);
+        assert!(matches!(initial.entries[0].payload, EntryPayload::NoOp));
+        assert!(initial.leader_commit.is_none());
+        executor
+            .run(move |gate| {
+                let leader = gate.leader.as_ref().unwrap();
+                assert_eq!(leader.term, Term(1));
+                assert_eq!(leader.matched.get(&local).unwrap().unwrap().index.0, 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(executor.initialize_leader().await.unwrap().is_none());
         executor.shutdown().await.unwrap();
         assert!(matches!(
             executor.campaign(local).await,
             Err(VoteGateError::Stopped)
         ));
         drop(executor);
-        let recovered = OwnedVoteStore::open(&path, "cluster").unwrap();
+        let mut recovered = OwnedVoteStore::open(&path, "cluster").unwrap();
+        assert_eq!(
+            recovered.election_context().unwrap().0,
+            Some(initial.entries[0].identity)
+        );
+        let tx = recovered.database.begin_read().unwrap();
+        let meta = tx.open_table(TABLE).unwrap();
+        let committed = decode_position(meta.get("commit").unwrap().unwrap().value()).unwrap();
+        assert_eq!(committed.unwrap().index.0, 0);
+        drop(meta);
+        drop(tx);
         assert_eq!(
             recovered.state(),
             HardState {

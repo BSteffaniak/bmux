@@ -990,6 +990,8 @@ interface cluster-consensus-rpc-types {
         source: bytes,
         term: u64,
         outcome: append-outcome,
+        // Binds the complete signed request and response to the responder.
+        signature: bytes,
     }
     enum rpc-error {
         unauthorized,

@@ -554,6 +554,148 @@ pub struct VoteResponse {
     pub granted: bool,
 }
 
+/// Execution-local leader progress, never recovered as leadership after restart.
+/// Remote matches start unknown: election votes are not replication evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LeaderProgress {
+    pub term: Term,
+    pub membership: Membership,
+    pub matched: BTreeMap<NodeId, Option<LogIdentity>>,
+}
+
+impl LeaderProgress {
+    pub fn after_durable_initialization(membership: Membership, entry: LogIdentity) -> Self {
+        let matched = membership
+            .nodes()
+            .keys()
+            .map(|peer| (*peer, (*peer == entry.leader).then_some(entry)))
+            .collect();
+        Self {
+            term: entry.term,
+            membership,
+            matched,
+        }
+    }
+}
+
+/// Caller-owned election state, created only after the self-vote is durable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Campaign {
+    pub(crate) request: RequestVote,
+    pub(crate) membership: Membership,
+    granted: BTreeSet<NodeId>,
+}
+
+/// A response transition. Higher-term persistence must complete before any
+/// dependent effect; `quorum` is not permission to acknowledge application work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CampaignDecision {
+    pub persist: Option<HardState>,
+    pub quorum: bool,
+}
+
+impl Campaign {
+    /// Plan the first leader entry against current durable authority. This is
+    /// not a commit decision: replication must still establish a current quorum.
+    /// # Errors
+    /// Log-index exhaustion requires explicit recovery rather than wraparound.
+    pub fn leader_initialization(
+        &self,
+        hard_state: HardState,
+        membership: &Membership,
+        last_log: Option<LogIdentity>,
+    ) -> Result<Option<AppendRequest>, IdentityExhaustion> {
+        if hard_state.term != self.request.term
+            || hard_state.voted_for != Some(self.request.candidate)
+            || membership != &self.membership
+            || !membership.has_quorum(&self.granted)
+            || last_log.is_some_and(|last| last.term > hard_state.term)
+        {
+            return Ok(None);
+        }
+        let index = last_log.map_or(Ok(LogIndex(0)), |last| last.index.successor())?;
+        Ok(Some(AppendRequest {
+            term: hard_state.term,
+            leader: self.request.candidate,
+            previous: last_log,
+            entries: vec![Entry {
+                identity: LogIdentity {
+                    term: hard_state.term,
+                    leader: self.request.candidate,
+                    index,
+                },
+                payload: EntryPayload::NoOp,
+            }],
+            leader_commit: None,
+        }))
+    }
+
+    #[must_use]
+    pub fn new(request: RequestVote, membership: Membership) -> Self {
+        Self {
+            request,
+            membership,
+            granted: BTreeSet::from([request.candidate]),
+        }
+    }
+
+    /// Evaluate an authenticated, request-bound response using current durable
+    /// authority. No clocks, storage, or network operations occur here.
+    /// Higher terms from eligible peers invalidate even an absent/old campaign.
+    pub fn observe(
+        campaign: &mut Option<Self>,
+        hard_state: HardState,
+        membership: Option<&Membership>,
+        campaign_term: Term,
+        peer: NodeId,
+        response: VoteResponse,
+    ) -> CampaignDecision {
+        let ignored = CampaignDecision {
+            persist: None,
+            quorum: false,
+        };
+        let Some(membership) = membership.filter(|membership| {
+            membership
+                .configurations()
+                .iter()
+                .any(|voters| voters.contains(&peer))
+        }) else {
+            return ignored;
+        };
+        if response.term > hard_state.term {
+            *campaign = None;
+            return CampaignDecision {
+                persist: Some(HardState {
+                    term: response.term,
+                    voted_for: None,
+                }),
+                quorum: false,
+            };
+        }
+        let Some(active) = campaign else {
+            return ignored;
+        };
+        if active.request.term != campaign_term {
+            return ignored;
+        }
+        if hard_state.term != campaign_term
+            || hard_state.voted_for != Some(active.request.candidate)
+            || membership != &active.membership
+        {
+            *campaign = None;
+            return ignored;
+        }
+        if response.term != campaign_term || !response.granted {
+            return ignored;
+        }
+        active.granted.insert(peer);
+        CampaignDecision {
+            persist: None,
+            quorum: active.membership.has_quorum(&active.granted),
+        }
+    }
+}
+
 /// A proposed transition, not permission to send a reply. If persistence is
 /// present, its durable completion must precede publication of the response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1331,6 +1473,96 @@ mod tests {
             ),
             Err(MembershipError::DuplicateNode)
         );
+    }
+
+    #[test]
+    fn campaign_transition_requires_joint_quorum_and_durable_authority() {
+        let ids: Vec<_> = (1..=5).map(NodeId::from).collect();
+        let membership = Membership::new(
+            vec![ids[..3].to_vec(), ids[2..].to_vec()],
+            ids.iter().map(|id| (*id, String::new())).collect(),
+        )
+        .unwrap();
+        let request = RequestVote {
+            term: Term(2),
+            candidate: ids[0],
+            last_log: None,
+        };
+        let hard = HardState {
+            term: request.term,
+            voted_for: Some(ids[0]),
+        };
+        let mut campaign = Some(Campaign::new(request, membership.clone()));
+        for (peer, quorum) in [(ids[1], false), (ids[2], false), (ids[3], true)] {
+            let decision = Campaign::observe(
+                &mut campaign,
+                hard,
+                Some(&membership),
+                Term(2),
+                peer,
+                VoteResponse {
+                    term: Term(2),
+                    granted: true,
+                },
+            );
+            assert_eq!(
+                decision,
+                CampaignDecision {
+                    persist: None,
+                    quorum
+                }
+            );
+        }
+        let stale = Campaign::observe(
+            &mut campaign,
+            hard,
+            Some(&membership),
+            Term(1),
+            ids[4],
+            VoteResponse {
+                term: Term(1),
+                granted: true,
+            },
+        );
+        assert!(!stale.quorum);
+        let higher = Campaign::observe(
+            &mut campaign,
+            hard,
+            Some(&membership),
+            Term(1),
+            ids[4],
+            VoteResponse {
+                term: Term(3),
+                granted: false,
+            },
+        );
+        assert_eq!(
+            higher.persist,
+            Some(HardState {
+                term: Term(3),
+                voted_for: None
+            })
+        );
+        assert!(campaign.is_none());
+        campaign = Some(Campaign::new(request, membership.clone()));
+        let replacement = Membership::new(
+            vec![ids.clone()],
+            ids.iter().map(|id| (*id, String::new())).collect(),
+        )
+        .unwrap();
+        let changed = Campaign::observe(
+            &mut campaign,
+            hard,
+            Some(&replacement),
+            Term(2),
+            ids[1],
+            VoteResponse {
+                term: Term(2),
+                granted: true,
+            },
+        );
+        assert!(!changed.quorum);
+        assert!(campaign.is_none());
     }
 
     #[test]

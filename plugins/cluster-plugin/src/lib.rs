@@ -2422,10 +2422,33 @@ mod tests {
         let identity = load_or_create_node_identity(caller.as_ref()).unwrap();
         initialize_cluster(caller.as_ref()).unwrap();
         configure_local_consensus_endpoint(caller.as_ref(), Some("tls://localhost:7443")).unwrap();
-        let member = membership::local_members(caller.as_ref())
+        let mut member = membership::local_members(caller.as_ref())
             .unwrap()
             .members
             .remove(0);
+        member.negotiated_protocol.features.extend([
+            bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID.to_string(),
+            bmux_cluster_plugin_api::cluster_consensus_transfer::INTERFACE_ID.to_string(),
+        ]);
+        let endpoint = member.endpoint.clone();
+        member = membership::issue_membership_credential(
+            &identity,
+            member.cluster_id.parse().unwrap(),
+            member.node_id,
+            member.public_key,
+            member.capabilities,
+            member.negotiated_protocol,
+            now_unix_ms(),
+        )
+        .unwrap();
+        member.endpoint = endpoint;
+        let mut local_membership = membership::load_membership_state(caller.as_ref())
+            .unwrap()
+            .unwrap();
+        local_membership
+            .members
+            .insert(member.node_id.clone(), member.clone());
+        membership::store_membership_state(caller.as_ref(), &local_membership).unwrap();
         let node = *identity.node_id();
         let parent = std::fs::canonicalize(std::env::temp_dir()).unwrap();
         let root = tempfile::tempdir_in(parent).unwrap();
@@ -2499,7 +2522,7 @@ mod tests {
         })
         .unwrap();
         let header = TransferHeader {
-            cluster_id: member.cluster_id,
+            cluster_id: member.cluster_id.clone(),
             sender: node.as_bytes().to_vec(),
             recipient: node.as_bytes().to_vec(),
             leader_term: 0,
@@ -2652,10 +2675,32 @@ mod tests {
             };
             let response =
                 bmux_cluster_plugin_api::cluster_consensus_rpc::ClusterConsensusRpcService::append(
-                    &provider, append,
+                    &provider,
+                    append.clone(),
                 )
                 .await
                 .unwrap();
+            consensus_network::verify_owned_append_response(&append, &response).unwrap();
+            let mut altered = response.clone();
+            altered.term += 1;
+            assert!(consensus_network::verify_owned_append_response(&append, &altered).is_err());
+            altered = response.clone();
+            altered.signature[0] ^= 1;
+            assert!(consensus_network::verify_owned_append_response(&append, &altered).is_err());
+            altered = response.clone();
+            altered.source = NodeId::from(42).as_bytes().to_vec();
+            assert!(consensus_network::verify_owned_append_response(&append, &altered).is_err());
+            altered = response.clone();
+            altered.outcome =
+                bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendOutcome::Conflict {
+                    next_index: 0,
+                };
+            assert!(consensus_network::verify_owned_append_response(&append, &altered).is_err());
+            let mut other_request = append;
+            other_request.request_id = uuid::Uuid::new_v4();
+            assert!(
+                consensus_network::verify_owned_append_response(&other_request, &response).is_err()
+            );
             assert_eq!(response.request_id, request_id);
             assert_eq!(response.source, node.as_bytes());
             assert_eq!(response.term, attempt);
@@ -2699,6 +2744,30 @@ mod tests {
         };
         vote.proof.signature =
             identity.sign(&consensus_network::owned_vote_signing_payload(&vote).unwrap());
+        let mut incompatible = member.clone();
+        incompatible.negotiated_protocol.features.clear();
+        assert!(
+            consensus_network::authenticate_owned_vote(
+                caller.as_ref(),
+                node,
+                &[incompatible.clone()],
+                &vote,
+            )
+            .is_err()
+        );
+        incompatible
+            .negotiated_protocol
+            .features
+            .push(bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID.to_string());
+        assert!(
+            consensus_network::authenticate_owned_vote(
+                caller.as_ref(),
+                node,
+                &[incompatible],
+                &vote,
+            )
+            .is_err()
+        );
         let provider = consensus_network::OwnedAppendService {
             caller: caller.clone(),
             local: node,
