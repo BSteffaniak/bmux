@@ -1,29 +1,23 @@
 //! Client-side render extension for the bmux decoration plugin.
 //!
-//! The decoration plugin runs in the bmux server process. Every time
-//! its internal state changes it publishes a
-//! [`bmux_scene_protocol::scene_protocol::DecorationScene`] on the
-//! typed plugin event bus; the server relays the event to streaming
-//! clients as a `ServerEvent::PluginBusEvent` over the attach IPC
-//! stream.
+//! The decoration plugin runs in the bmux server process, one view per attach connection. A view
+//! pushes its connection the changes to its scene as
+//! [`bmux_scene_protocol::scene_delta::DecorationSceneDelta`]s (`bmux.scene/scene-delta`, the
+//! whole scene first); the attach client reads the whole scene once when it starts.
 //!
-//! This crate consumes those relayed scenes on the client side:
+//! This crate consumes those on the client side:
 //!
-//! 1. [`renderer_for_bus`] creates an
-//!    [`bmux_plugin::AttachRenderExtension`] subscribed to the retained
-//!    `bmux.scene/scene-protocol` state on the attach runtime's own
-//!    presentation bus (there is no process-wide bus).
-//! 2. The retained scene state seeds the extension's cache immediately, and
-//!    every subsequent scene replacement is drained by
-//!    [`AttachRenderExtension::refresh_state`] before the next frame renders
-//!    (revision-guarded so stale wire events can't downgrade).
-//! 3. Each surface's layers are published as retained scenes, with a revision
-//!    hashed from the scene's inputs, for the attach renderer to diff and emit.
+//! 1. [`relay_scene_delta_on`] and [`publish_relayed_scene_on`] keep a [`SceneReplica`] (the
+//!    scene with shared surfaces) current on the attach runtime's own presentation bus.
+//! 2. [`renderer_for_bus`] creates an [`bmux_plugin::AttachRenderExtension`] subscribed to it;
+//!    [`AttachRenderExtension::refresh_state`] takes the latest replica before the next frame
+//!    renders (revision-guarded so stale scenes can't downgrade), re-deriving only surfaces whose
+//!    pointer changed.
+//! 3. Each surface's layers are published as retained scenes, with a revision hashed from the
+//!    scene's inputs, for the attach renderer to diff and emit.
 //!
-//! The CLI's streaming loop is responsible for decoding the IPC
-//! `PluginBusEvent` payloads and re-emitting them onto the local
-//! event bus; this crate subscribes locally and has no direct IPC
-//! awareness.
+//! The CLI's streaming loop decodes the pushed deltas and relays them; this crate has no direct
+//! IPC awareness.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic)]
@@ -44,15 +38,20 @@ use bmux_plugin::{
 };
 use bmux_scene_protocol::glyphs::border_glyphs_corners_or_custom;
 use bmux_scene_protocol::scene_protocol::{
-    BorderGlyphs as SceneBorderGlyphs, Cell as SceneCell, Color as SceneColor, DecorationScene,
-    GradientAxis, NamedColor, PaintCommand, Rect as SceneRect, STATE_KIND as SCENE_STATE_KIND,
-    Style as SceneStyle, SurfaceDecoration, VisualAdapterRequest,
+    BorderGlyphs as SceneBorderGlyphs, Cell as SceneCell, Color as SceneColor, GradientAxis,
+    NamedColor, PaintCommand, Rect as SceneRect, Style as SceneStyle, SurfaceDecoration,
+    VisualAdapterRequest,
 };
 use bmux_scene_protocol_render::capabilities::{SceneRenderCapabilities, capability_query_matches};
 use bmux_scene_protocol_render::paint::interpolate_style;
 use uuid::Uuid;
 
 mod raster_border;
+mod replica;
+
+pub use replica::{
+    REPLICA_STATE_KIND, SceneGap, SceneReplica, publish_relayed_scene_on, relay_scene_delta_on,
+};
 
 const VISUAL_REQUEST_BUDGET: Duration = Duration::from_millis(4);
 const SLOW_VISUAL_PROJECTION: Duration = Duration::from_millis(2);
@@ -64,11 +63,11 @@ const VISUAL_STATS_LOG_INTERVAL: Duration = Duration::from_secs(30);
 #[derive(Default)]
 struct DecorationRendererCache {
     revision: u64,
-    surfaces: BTreeMap<Uuid, SurfaceDecoration>,
+    surfaces: BTreeMap<Uuid, Arc<SurfaceDecoration>>,
     /// Each surface's layer revisions ([`surface_layer_revision`], before-content then
     /// after-content), hashed once per scene rather than at every frame's revision query.
     layer_revisions: BTreeMap<Uuid, [u64; 2]>,
-    scene_rx: Option<tokio::sync::watch::Receiver<Arc<DecorationScene>>>,
+    scene_rx: Option<tokio::sync::watch::Receiver<Arc<SceneReplica>>>,
     visual_last_at: BTreeMap<String, Instant>,
     visual_last_revision: BTreeMap<String, u64>,
     visual_last_payload_hash: BTreeMap<String, u64>,
@@ -113,25 +112,38 @@ struct VisualProjectionContext<'a> {
 }
 
 impl DecorationRendererCache {
-    fn replace_if_newer(&mut self, scene: DecorationScene) -> bool {
+    /// Hold `scene` unless it is older than the one held. A surface whose pointer is unchanged
+    /// keeps its layer revisions; only new or changed surfaces are hashed again.
+    fn replace_if_newer(&mut self, scene: &SceneReplica) -> bool {
         if scene.revision < self.revision {
             return false;
         }
         self.revision = scene.revision;
-        self.surfaces = scene.surfaces;
-        self.layer_revisions = self
+        let previous = std::mem::take(&mut self.surfaces);
+        let mut revisions = std::mem::take(&mut self.layer_revisions);
+        self.layer_revisions = scene
             .surfaces
             .iter()
             .map(|(id, surface)| {
-                (
-                    *id,
-                    [
-                        surface_layer_revision(surface, RenderExtensionLayer::BeforePaneContent),
-                        surface_layer_revision(surface, RenderExtensionLayer::AfterPaneContent),
-                    ],
-                )
+                let unchanged = previous
+                    .get(id)
+                    .is_some_and(|held| Arc::ptr_eq(held, surface));
+                let layers = revisions
+                    .remove(id)
+                    .filter(|_| unchanged)
+                    .unwrap_or_else(|| {
+                        [
+                            surface_layer_revision(
+                                surface,
+                                RenderExtensionLayer::BeforePaneContent,
+                            ),
+                            surface_layer_revision(surface, RenderExtensionLayer::AfterPaneContent),
+                        ]
+                    });
+                (*id, layers)
             })
             .collect();
+        self.surfaces = scene.surfaces.clone();
         true
     }
 
@@ -149,7 +161,7 @@ impl DecorationRendererCache {
         ))
     }
 
-    fn set_scene_receiver(&mut self, rx: tokio::sync::watch::Receiver<Arc<DecorationScene>>) {
+    fn set_scene_receiver(&mut self, rx: tokio::sync::watch::Receiver<Arc<SceneReplica>>) {
         self.scene_rx = Some(rx);
     }
 
@@ -158,13 +170,13 @@ impl DecorationRendererCache {
             return;
         };
         if let Ok(true) = rx.has_changed() {
-            let scene = rx.borrow_and_update().as_ref().clone();
-            self.replace_if_newer(scene);
+            let scene = rx.borrow_and_update().clone();
+            self.replace_if_newer(&scene);
         }
     }
 
     fn surface(&self, surface_id: &Uuid) -> Option<&SurfaceDecoration> {
-        self.surfaces.get(surface_id)
+        self.surfaces.get(surface_id).map(AsRef::as_ref)
     }
 
     fn forget_surface(&mut self, surface_id: &Uuid) {
@@ -1718,24 +1730,15 @@ fn create_renderer(
     // Register only when absent: registration replaces an existing retained
     // value, which would erase the latest scene on renderer restart.
     if bus
-        .subscribe_state::<DecorationScene>(&SCENE_STATE_KIND)
+        .subscribe_state::<SceneReplica>(&REPLICA_STATE_KIND)
         .is_err()
     {
-        let _ = bus.register_state_channel::<DecorationScene>(
-            SCENE_STATE_KIND,
-            DecorationScene {
-                revision: 0,
-                surfaces: BTreeMap::new(),
-                animation: None,
-                input_hooks: Vec::new(),
-                visual_adapters: Vec::new(),
-            },
-        );
+        let _ = bus.register_state_channel(REPLICA_STATE_KIND, SceneReplica::default());
     }
-    match bus.subscribe_state::<DecorationScene>(&SCENE_STATE_KIND) {
+    match bus.subscribe_state::<SceneReplica>(&REPLICA_STATE_KIND) {
         Ok((initial, rx)) => {
             let mut guard = cache.lock().expect("new decoration cache is not poisoned");
-            guard.replace_if_newer(initial.as_ref().clone());
+            guard.replace_if_newer(&initial);
             guard.set_scene_receiver(rx);
         }
         Err(error) => tracing::warn!(%error, "decoration scene subscription failed"),
@@ -1756,24 +1759,6 @@ pub fn renderer_for_bus(
     visual_adapters: Arc<bmux_plugin::VisualAdapterRegistry>,
 ) -> Arc<dyn AttachRenderExtension> {
     Arc::new(create_renderer(bus, visual_adapters))
-}
-
-/// Relay a scene only to the selected renderer bus.
-pub fn publish_relayed_scene_on(bus: &bmux_plugin::EventBus, scene: DecorationScene) {
-    if bus.publish_state(&SCENE_STATE_KIND, scene.clone()).is_ok() {
-        return;
-    }
-    let _ = bus.register_state_channel::<DecorationScene>(
-        SCENE_STATE_KIND,
-        DecorationScene {
-            revision: 0,
-            surfaces: BTreeMap::new(),
-            animation: None,
-            input_hooks: Vec::new(),
-            visual_adapters: Vec::new(),
-        },
-    );
-    let _ = bus.publish_state(&SCENE_STATE_KIND, scene);
 }
 
 #[cfg(test)]
@@ -1802,7 +1787,9 @@ mod tests {
     }
 
     use super::*;
-    use bmux_scene_protocol::scene_protocol::{TerminalCapability, TerminalCapabilityQuery};
+    use bmux_scene_protocol::scene_protocol::{
+        DecorationScene, TerminalCapability, TerminalCapabilityQuery,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static TEST_VISUAL_ADAPTER_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -1923,7 +1910,7 @@ mod tests {
             input_hooks: Vec::new(),
             visual_adapters: vec![visual_request()],
         };
-        let (_tx, rx) = tokio::sync::watch::channel(Arc::new(scene));
+        let (_tx, rx) = tokio::sync::watch::channel(Arc::new(SceneReplica::from_scene(scene)));
         let cache = Arc::new(Mutex::new(DecorationRendererCache {
             visual_adapters: test_visual_adapters(),
             ..DecorationRendererCache::default()
@@ -1963,7 +1950,7 @@ mod tests {
             .lock()
             .expect("cache lock")
             .surfaces
-            .insert(id, surface(id, Vec::new()));
+            .insert(id, Arc::new(surface(id, Vec::new())));
         for layer in [
             RenderExtensionLayer::BeforePaneContent,
             RenderExtensionLayer::AfterPaneContent,
@@ -2062,7 +2049,7 @@ mod tests {
         };
         let cache = Arc::new(Mutex::new(DecorationRendererCache {
             revision: 1,
-            surfaces: BTreeMap::from([(surface_id, decoration)]),
+            surfaces: BTreeMap::from([(surface_id, Arc::new(decoration))]),
             layer_revisions: BTreeMap::new(),
             scene_rx: None,
             visual_last_at: BTreeMap::new(),
@@ -2135,7 +2122,7 @@ mod tests {
     ) {
         let cache = Arc::new(Mutex::new(DecorationRendererCache {
             revision: 7,
-            surfaces: BTreeMap::from([(surface_id, surface(surface_id, paint_commands))]),
+            surfaces: BTreeMap::from([(surface_id, Arc::new(surface(surface_id, paint_commands)))]),
             layer_revisions: BTreeMap::new(),
             scene_rx: None,
             visual_last_at: BTreeMap::new(),
@@ -2190,6 +2177,7 @@ mod tests {
             .expect("cache lock")
             .surfaces
             .get_mut(&surface_id)
+            .map(Arc::make_mut)
             .expect("surface")
             .before_content_paint_commands = vec![PaintCommand::Text {
             col: 1,
@@ -2432,10 +2420,10 @@ mod tests {
             visual_adapters: Vec::new(),
         };
         first_bus
-            .publish_state(&SCENE_STATE_KIND, scene(7))
+            .publish_state(&REPLICA_STATE_KIND, SceneReplica::from_scene(scene(7)))
             .unwrap();
         second_bus
-            .publish_state(&SCENE_STATE_KIND, scene(2))
+            .publish_state(&REPLICA_STATE_KIND, SceneReplica::from_scene(scene(2)))
             .unwrap();
         first.refresh_state();
         second.refresh_state();
@@ -2445,7 +2433,7 @@ mod tests {
         drop(first);
         assert!(released.upgrade().is_none());
         second_bus
-            .publish_state(&SCENE_STATE_KIND, scene(3))
+            .publish_state(&REPLICA_STATE_KIND, SceneReplica::from_scene(scene(3)))
             .unwrap();
         second.refresh_state();
         assert_eq!(second.cache.lock().unwrap().revision, 3);
@@ -2482,7 +2470,7 @@ mod tests {
             input_hooks: Vec::new(),
             visual_adapters: Vec::new(),
         };
-        let (tx, rx) = tokio::sync::watch::channel(Arc::new(initial));
+        let (tx, rx) = tokio::sync::watch::channel(Arc::new(SceneReplica::from_scene(initial)));
         let cache = Arc::new(Mutex::new(DecorationRendererCache::default()));
         {
             let mut guard = cache.lock().expect("cache lock");
@@ -2493,7 +2481,7 @@ mod tests {
             cache: cache.clone(),
         };
 
-        tx.send(Arc::new(updated))
+        tx.send(Arc::new(SceneReplica::from_scene(updated)))
             .expect("watch receiver remains live");
         extension.refresh_state();
 
@@ -2803,7 +2791,7 @@ mod tests {
         }];
         let cache = Arc::new(Mutex::new(DecorationRendererCache {
             revision: 7,
-            surfaces: BTreeMap::from([(surface_id, decoration)]),
+            surfaces: BTreeMap::from([(surface_id, Arc::new(decoration))]),
             layer_revisions: BTreeMap::new(),
             scene_rx: None,
             visual_last_at: BTreeMap::new(),
@@ -2852,7 +2840,7 @@ mod tests {
         }];
         let cache = Arc::new(Mutex::new(DecorationRendererCache {
             revision: 7,
-            surfaces: BTreeMap::from([(surface_id, decoration)]),
+            surfaces: BTreeMap::from([(surface_id, Arc::new(decoration))]),
             layer_revisions: BTreeMap::new(),
             scene_rx: None,
             visual_last_at: BTreeMap::new(),

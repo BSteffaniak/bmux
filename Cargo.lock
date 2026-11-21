@@ -1592,6 +1592,7 @@ dependencies = [
  "bmux_terminal_protocol",
  "bmux_tui",
  "futures-util",
+ "serde_json",
  "tokio",
  "tracing",
  "uuid",

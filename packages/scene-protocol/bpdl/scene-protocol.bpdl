@@ -368,3 +368,21 @@ interface scene-protocol {
 
     @state events decoration-scene;
 }
+
+// What a decoration view pushes to its attach client: the changes between the scene the
+// connection was last sent and the current one, instead of the whole scene each time.
+interface scene-delta {
+    // With `reset`, the whole scene (`surfaces` holds every surface); otherwise it applies on
+    // the scene at `base-revision`: `surfaces` replaces or adds those surfaces, `removed` drops
+    // surfaces, and the scene-wide fields replace the scene's.
+    record decoration-scene-delta {
+        base-revision: u64,
+        revision: u64,
+        reset: bool,
+        surfaces: map<uuid, scene-protocol.surface-decoration>,
+        removed: list<uuid>,
+        animation: scene-protocol.animation-hint?,
+        input-hooks: list<scene-protocol.input-hook>,
+        visual-adapters: list<scene-protocol.visual-adapter-request>,
+    }
+}

@@ -114,18 +114,3 @@ async fn scoped_layouts_have_private_buses_focus_and_monotonic_revisions() {
     assert_eq!(requests[1].focused_pane_id, Some(b));
     assert_eq!(requests[2].focused_pane_id, Some(b));
 }
-
-#[test]
-fn scene_baseline_fences_old_lifetimes_and_reconnect_has_fresh_state() {
-    let mut baseline = 0;
-    assert!(accept_scene_revision(&mut baseline, 40));
-    assert!(!accept_scene_revision(&mut baseline, 39));
-    assert!(!accept_scene_revision(&mut baseline, 40));
-    // Close's empty barrier is newer; queued old-target output cannot revive it.
-    assert!(accept_scene_revision(&mut baseline, 41));
-    assert!(!accept_scene_revision(&mut baseline, 40));
-    assert!(accept_scene_revision(&mut baseline, 42));
-    let mut reconnected_baseline = 0;
-    assert!(accept_scene_revision(&mut reconnected_baseline, 1));
-    assert_eq!(baseline, 42);
-}

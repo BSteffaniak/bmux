@@ -14,7 +14,10 @@ use bmux_appearance::{RUNTIME_APPEARANCE_STATE_KIND, RuntimeAppearance};
 use bmux_attach_layout_protocol::attach_layout_protocol::AttachSurfaceSummary;
 use bmux_client::{BmuxClient, ServerEvent, StreamingBmuxClient};
 use bmux_decoration_plugin_api::decoration_view_v1::client as view;
-use bmux_scene_protocol::scene_protocol::{DecorationScene, Rect, STATE_KIND};
+use bmux_scene_protocol::DELTA_KIND;
+use bmux_scene_protocol::delta::apply_scene_delta;
+use bmux_scene_protocol::scene_delta::DecorationSceneDelta;
+use bmux_scene_protocol::scene_protocol::{DecorationScene, Rect};
 use bmux_theme_plugin::{theme_control_v1 as theme, theme_state};
 use uuid::Uuid;
 
@@ -91,17 +94,23 @@ struct PresentationEvents {
 }
 
 // An absolute deadline prevents unrelated public events from extending a negative assertion.
-async fn events(client: &mut StreamingBmuxClient) -> PresentationEvents {
+/// The scenes pushed are rebuilt from the deltas the view pushes, on `held` (the last scene this
+/// connection was pushed).
+async fn events(
+    client: &mut StreamingBmuxClient,
+    held: &mut Option<DecorationScene>,
+) -> PresentationEvents {
     let deadline = tokio::time::Instant::now() + EVENT_WINDOW;
     let mut result = PresentationEvents::default();
     loop {
         match tokio::time::timeout_at(deadline, client.event_receiver().recv()).await {
-            Ok(Some(ServerEvent::PluginBusEvent { kind, payload }))
-                if kind == STATE_KIND.as_str() =>
-            {
-                result
-                    .scenes
-                    .push(serde_json::from_slice(&payload).expect("complete scene payload"));
+            Ok(Some(ServerEvent::PluginBusEvent { kind, payload })) if kind == DELTA_KIND => {
+                let delta: DecorationSceneDelta =
+                    serde_json::from_slice(&payload).expect("complete scene delta payload");
+                let scene = apply_scene_delta(held.as_ref(), delta)
+                    .expect("each pushed delta applies on the scene pushed before it");
+                *held = Some(scene.clone());
+                result.scenes.push(scene);
             }
             Ok(Some(ServerEvent::PluginBusEvent { kind, payload }))
                 if kind == RUNTIME_APPEARANCE_STATE_KIND.as_str() =>
@@ -266,6 +275,7 @@ async fn real_connections_keep_layout_theme_and_retained_lifetimes_private() {
     server.start();
     let mut a = connect(&server).await;
     let mut b = connect(&server).await;
+    let (mut held_a, mut held_b) = (None, None);
     let pane = Uuid::new_v4();
     let life_a = Uuid::new_v4();
     let life_b = Uuid::new_v4();
@@ -293,16 +303,16 @@ async fn real_connections_keep_layout_theme_and_retained_lifetimes_private() {
     // Publish BEFORE event push: hydration must come from the real recipient retention table.
     a.enable_event_push().await.expect("enable A push");
     b.enable_event_push().await.expect("enable B push");
-    hydrated(&events(&mut a).await, &a_scene, &a_appearance);
-    hydrated(&events(&mut b).await, &b_scene, &b_appearance);
+    hydrated(&events(&mut a, &mut held_a).await, &a_scene, &a_appearance);
+    hydrated(&events(&mut b, &mut held_b).await, &b_scene, &b_appearance);
 
     // Read/no-op operations must not repaint either connection.
     assert_eq!(current(&mut a).await, a_selected);
     assert_eq!(appearance(&mut a).await, a_appearance);
     assert_eq!(view::scene(&mut a).await.expect("query scene"), a_scene);
     layout(&mut a, life_a, pane, 20, 2).await;
-    quiet(&events(&mut a).await);
-    quiet(&events(&mut b).await);
+    quiet(&events(&mut a, &mut held_a).await);
+    quiet(&events(&mut b, &mut held_b).await);
 
     // Another owner cannot cancel A's preview token, even though it knows its value.
     let token = theme::client::begin_preview(&mut a, a_selected.revision)
@@ -325,7 +335,7 @@ async fn real_connections_keep_layout_theme_and_retained_lifetimes_private() {
     .await
     .expect("preview dispatch")
     .expect("preview preset");
-    let preview_events = events(&mut a).await;
+    let preview_events = events(&mut a, &mut held_a).await;
     assert_eq!(preview_events.appearances.last(), Some(&b_appearance));
     let preview_scene = view::scene(&mut a).await.expect("preview owner scene");
     assert_eq!(preview_events.scenes.last(), Some(&preview_scene));
@@ -334,12 +344,12 @@ async fn real_connections_keep_layout_theme_and_retained_lifetimes_private() {
         preview_scene.surfaces[&pane].paint_commands, a_scene.surfaces[&pane].paint_commands,
         "theme preview must reach real decoration output, not appearance alone"
     );
-    quiet(&events(&mut b).await);
+    quiet(&events(&mut b, &mut held_b).await);
     theme::client::cancel_preview(&mut a, token)
         .await
         .expect("cancel dispatch")
         .expect("cancel owner preview");
-    let restored = events(&mut a).await;
+    let restored = events(&mut a, &mut held_a).await;
     assert_eq!(restored.appearances.last(), Some(&a_appearance));
     let restored_scene = view::scene(&mut a).await.expect("restored owner scene");
     assert_eq!(restored.scenes.last(), Some(&restored_scene));
@@ -347,7 +357,7 @@ async fn real_connections_keep_layout_theme_and_retained_lifetimes_private() {
         restored_scene.surfaces[&pane].paint_commands, a_scene.surfaces[&pane].paint_commands,
         "cancel must restore real decoration output"
     );
-    quiet(&events(&mut b).await);
+    quiet(&events(&mut b, &mut held_b).await);
     assert_eq!(
         view::scene(&mut b).await.expect("unchanged B scene"),
         b_scene
@@ -359,8 +369,11 @@ async fn real_connections_keep_layout_theme_and_retained_lifetimes_private() {
     let changed = view::scene(&mut a).await.expect("changed A scene");
     assert!(changed.revision > a_scene.revision);
     assert_eq!(changed.surfaces[&pane].rect.w, 24);
-    assert_eq!(events(&mut a).await.scenes.last(), Some(&changed));
-    quiet(&events(&mut b).await);
+    assert_eq!(
+        events(&mut a, &mut held_a).await.scenes.last(),
+        Some(&changed)
+    );
+    quiet(&events(&mut b, &mut held_b).await);
     assert!(
         view::update_layout(&mut a, life_a, 2, surfaces(pane, 99), None)
             .await
@@ -382,8 +395,8 @@ async fn real_connections_keep_layout_theme_and_retained_lifetimes_private() {
         .await
         .expect("close dispatch")
         .expect("close A lifetime");
-    let _ = events(&mut a).await; // A may receive the retirement tombstone before clear.
-    quiet(&events(&mut b).await);
+    let _ = events(&mut a, &mut held_a).await; // A may receive the retirement tombstone before clear.
+    quiet(&events(&mut b, &mut held_b).await);
     assert!(
         view::update_layout(&mut a, life_a, 4, surfaces(pane, 99), None)
             .await
@@ -399,12 +412,13 @@ async fn real_connections_keep_layout_theme_and_retained_lifetimes_private() {
             .revision
             > changed.revision
     );
-    let _ = events(&mut a).await;
-    quiet(&events(&mut b).await);
+    let _ = events(&mut a, &mut held_a).await;
+    quiet(&events(&mut b, &mut held_b).await);
     drop(a);
 
     // A fresh transport identity must never inherit the previous owner's live preset/preview.
     let mut c = connect(&server).await;
+    let mut held_c = None;
     assert_eq!(current(&mut c).await.selection, baseline.selection);
     assert_eq!(appearance(&mut c).await, baseline_appearance);
     layout(&mut c, Uuid::new_v4(), pane, 32, 1).await;
@@ -412,8 +426,12 @@ async fn real_connections_keep_layout_theme_and_retained_lifetimes_private() {
     c.enable_event_push()
         .await
         .expect("enable fresh owner push");
-    hydrated(&events(&mut c).await, &c_scene, &baseline_appearance);
-    quiet(&events(&mut b).await);
+    hydrated(
+        &events(&mut c, &mut held_c).await,
+        &c_scene,
+        &baseline_appearance,
+    );
+    quiet(&events(&mut b, &mut held_b).await);
     assert_eq!(
         view::scene(&mut b).await.expect("B survives A disconnect"),
         b_scene

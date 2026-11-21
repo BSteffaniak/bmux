@@ -228,7 +228,18 @@ struct Replay {
     scrollback: PaneScrollbackViews,
     /// Render extensions sampled every frame as the attach client samples them.
     extensions: Option<Extensions>,
+    /// A decoration that changes every frame, relayed to the renderer before it renders.
+    animation: Option<Animation>,
     probe: Probe,
+}
+
+/// A decoration that changes every frame (a clock in the first pane's title), sent from the
+/// decoration view to the attach client's renderer as they exchange it.
+struct Animation {
+    /// Whether the view pushes the changes (as it does) or the whole scene (what that avoids).
+    deltas: bool,
+    /// The scene the view last sent.
+    sent: Option<bmux_scene_protocol::scene_protocol::DecorationScene>,
 }
 
 /// Render extensions a replay samples before each frame, as the attach client does: the
@@ -336,6 +347,7 @@ impl Replay {
             graphics: crate::TerminalGraphicsCache::new(),
             scrollback: PaneScrollbackViews::new(),
             extensions: None,
+            animation: None,
             probe: Probe::new(),
         }
     }
@@ -432,6 +444,48 @@ impl Replay {
             prepared: std::sync::Arc::from(Vec::new()),
         });
         replay
+    }
+
+    /// [`Self::decorated`] panes, none fed, the first one's title a clock that changes every
+    /// frame; the changes are relayed as deltas or, without `deltas`, as whole scenes.
+    fn animated(size: (u16, u16), panes: u16, chunk_size: usize, deltas: bool) -> Self {
+        let mut replay = Self::decorated(size, panes, chunk_size);
+        replay.fed.clear();
+        replay.animation = Some(Animation { deltas, sent: None });
+        replay
+    }
+
+    /// Send this frame's animated scene from the view to the renderer, when animated: what that
+    /// costs, from encoding on the server to relaying on the client (building the scene, the
+    /// decoration's own work either way, is not counted).
+    fn relay_animation(&mut self) -> Option<Cost> {
+        use bmux_scene_protocol::scene_protocol::DecorationScene;
+        let animation = self.animation.as_mut()?;
+        let extensions = self.extensions.as_ref()?;
+        let tick = self.frames;
+        let scene = decoration_scene(&self.scene, tick as u64 + 2, |pane| {
+            if pane == 0 {
+                format!(" {pane}: {:02}:{:02} ", tick / 60 % 60, tick % 60)
+            } else {
+                format!(" {pane}: shell ")
+            }
+        });
+        let mark = self.probe.mark();
+        if animation.deltas {
+            let delta = bmux_scene_protocol::delta::scene_delta(animation.sent.as_ref(), &scene)
+                .expect("every frame's scene is new");
+            let payload = serde_json::to_vec(&delta).expect("encode delta");
+            let delta = serde_json::from_slice(&payload).expect("decode delta");
+            bmux_decoration_plugin_renderer::relay_scene_delta_on(&extensions.bus, delta)
+                .expect("each delta applies on the scene sent before it");
+        } else {
+            let payload = serde_json::to_vec(&scene).expect("encode scene");
+            let scene: DecorationScene = serde_json::from_slice(&payload).expect("decode scene");
+            bmux_decoration_plugin_renderer::publish_relayed_scene_on(&extensions.bus, scene);
+        }
+        let cost = self.probe.since(mark);
+        animation.sent = Some(scene);
+        Some(cost)
     }
 
     /// Apply `frame` and render, writing what the host terminal receives to `output`.
@@ -943,6 +997,45 @@ fn decorated_panes_keep_their_borders_and_titles() {
     }
 }
 
+/// An animated decoration relayed as deltas shows each frame's clock on the host, writing what
+/// relaying whole scenes writes, frame after frame.
+#[test]
+fn animated_decoration_deltas_write_what_whole_scenes_write() {
+    let size = (60, 16);
+    let mut deltas = Replay::animated(size, DECORATED_PANES, 97, true);
+    let mut whole = Replay::animated(size, DECORATED_PANES, 97, false);
+    let mut host = bmux_terminal_grid::TerminalGridStream::new(
+        size.0,
+        size.1,
+        bmux_terminal_grid::GridLimits::default(),
+    )
+    .expect("host terminal");
+    let first = deltas.scene.surfaces[0].rect;
+    let (mut by_delta, mut by_scene) = (Vec::new(), Vec::new());
+    for tick in 0..12_usize {
+        by_delta.clear();
+        by_scene.clear();
+        deltas.relay_animation();
+        deltas.frame(&[], &mut by_delta);
+        whole.relay_animation();
+        whole.frame(&[], &mut by_scene);
+        assert_eq!(by_delta, by_scene, "frame {tick}: the bytes written differ");
+        host.process(&by_delta);
+        let clock = format!(" 0: {:02}:{:02} ", tick / 60 % 60, tick % 60);
+        let shown_clock = (0..clock.chars().count())
+            .map(|offset| {
+                shown(
+                    host.grid(),
+                    usize::from(first.y),
+                    usize::from(first.x) + 2 + offset,
+                )
+                .0
+            })
+            .collect::<String>();
+        assert_eq!(shown_clock, clock, "frame {tick}: the first pane's clock");
+    }
+}
+
 /// An observer paints the frames the host terminal presents into its own published frames: after
 /// every frame both hold the same cells, whether or not the observer still holds earlier frames.
 #[test]
@@ -1187,6 +1280,7 @@ struct Run {
     apply: PhaseRecorder,
     render: PhaseRecorder,
     observe: Option<PhaseRecorder>,
+    relay: Option<PhaseRecorder>,
     bytes_out: usize,
     measured: u64,
     live_growth: i64,
@@ -1195,10 +1289,11 @@ struct Run {
 /// Replay `frames` and measure every frame after warm-up: what applying, rendering and
 /// presenting (and observing, with an observer) allocate and execute, and the bytes written.
 fn run_once(mut replay: Replay, frames: &[Frame]) -> Run {
-    let (mut frame_phase, mut apply, mut render, mut observe) = (
+    let (mut frame_phase, mut apply, mut render, mut observe, mut relayed) = (
         PhaseRecorder::default(),
         PhaseRecorder::default(),
         PhaseRecorder::default(),
+        None::<PhaseRecorder>,
         None::<PhaseRecorder>,
     );
     let mut output = Vec::new();
@@ -1209,6 +1304,7 @@ fn run_once(mut replay: Replay, frames: &[Frame]) -> Run {
             live_after_warmup = bmux_bench::allocations::live_bytes();
         }
         output.clear();
+        let relay_cost = replay.relay_animation();
         let rendered = replay.frame(frame, &mut output);
         if index < WARMUP {
             continue;
@@ -1223,6 +1319,11 @@ fn run_once(mut replay: Replay, frames: &[Frame]) -> Run {
                 .get_or_insert_with(PhaseRecorder::default)
                 .record(cost);
         }
+        if let Some(cost) = relay_cost {
+            relayed
+                .get_or_insert_with(PhaseRecorder::default)
+                .record(cost);
+        }
     }
     let live_growth = i64::try_from(bmux_bench::allocations::live_bytes()).unwrap_or(i64::MAX)
         - i64::try_from(live_after_warmup).unwrap_or(i64::MAX);
@@ -1231,6 +1332,7 @@ fn run_once(mut replay: Replay, frames: &[Frame]) -> Run {
         apply,
         render,
         observe,
+        relay: relayed,
         bytes_out,
         measured,
         live_growth,
@@ -1262,6 +1364,9 @@ fn measure(name: &str, replay: impl Fn() -> Replay, frames: &[Frame]) -> Option<
         if let (Some(observe), Some(other)) = (&mut run.observe, &repeat.observe) {
             fold(observe, other, "observe");
         }
+        if let (Some(relay), Some(other)) = (&mut run.relay, &repeat.relay) {
+            fold(relay, other, "relay");
+        }
     }
     let mut phases = BTreeMap::from([
         ("frame".to_owned(), run.frame.finish()),
@@ -1270,6 +1375,9 @@ fn measure(name: &str, replay: impl Fn() -> Replay, frames: &[Frame]) -> Option<
     ]);
     if let Some(observe) = &run.observe {
         phases.insert("observe".to_owned(), observe.finish());
+    }
+    if let Some(relay) = &run.relay {
+        phases.insert("relay".to_owned(), relay.finish());
     }
     Some(Scenario {
         name: name.to_owned(),
@@ -1401,6 +1509,18 @@ fn metrics_report() -> Report {
         },
         &decorated_stream,
     ));
+    // The same panes, none streaming, one title a clock changing every frame: the change sent
+    // from the decoration view as it is (deltas), and as whole scenes for comparison.
+    report.scenarios.extend(measure(
+        &format!("animated{DECORATED}"),
+        || Replay::animated(size, DECORATED_PANES, delivery(), true),
+        &decorated_stream,
+    ));
+    report.scenarios.extend(measure(
+        &format!("animated{DECORATED}/whole-scenes"),
+        || Replay::animated(size, DECORATED_PANES, delivery(), false),
+        &decorated_stream,
+    ));
     report.scenarios.extend(measure(
         "scattered-edits",
         || Replay::new(size, true, delivery()),
@@ -1442,9 +1562,10 @@ fn print_scenario(scenario: &Scenario) {
         })
     };
     println!(
-        "{} ({} frames){}{}{} | out {} B | live growth {} B",
+        "{} ({} frames){}{}{}{} | out {} B | live growth {} B",
         scenario.name,
         scenario.frames,
+        phase("relay"),
         phase("apply"),
         phase("render"),
         phase("observe"),

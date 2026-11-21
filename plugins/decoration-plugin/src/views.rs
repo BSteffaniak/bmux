@@ -10,6 +10,7 @@ use bmux_decoration_plugin_api::{
     decoration_commands::client as commands, decoration_view_v1::client as view,
 };
 use bmux_plugin_sdk::{NativeServiceContext, ServiceResponse, WireEventSinkHandle};
+use bmux_scene_protocol::scene_protocol::DecorationScene;
 use uuid::Uuid;
 
 use crate::{
@@ -142,43 +143,108 @@ impl Drop for ViewRegistry {
     }
 }
 
-pub(super) fn publish_scene(
-    states: Option<&bmux_plugin::PluginStateRegistry>,
-    recipient: Uuid,
-    scene: &bmux_scene_protocol::scene_protocol::DecorationScene,
-) {
-    let result = serde_json::to_vec(scene)
-        .map_err(|error| error.to_string())
-        .and_then(|payload| {
-            let sink = states
-                .and_then(bmux_plugin::PluginStateRegistry::get::<WireEventSinkHandle>)
-                .ok_or_else(|| "targeted scene delivery unavailable".to_string())?;
-            let sink = sink.read().map_err(|_| "scene sink poisoned".to_string())?;
-            sink.0
-                .publish_retained_to(
-                    recipient,
-                    bmux_scene_protocol::scene_protocol::STATE_KIND
-                        .as_str()
-                        .to_string(),
-                    payload,
-                )
-                .map_err(|error| format!("{error:?}"))
-        });
-    if let Err(error) = result {
-        tracing::warn!(%recipient, %error, "private decoration scene delivery failed; retained state remains queryable");
+/// The scene each connection was last sent and the latest one it is to be sent. A decoration view
+/// pushes its connection the delta between the two when the host can send to it (pull
+/// delivery), so a connection slow to read is sent the changes up to the latest scene once, not
+/// every scene in between. Nothing sent yet (a new connection, or a new view lifetime) means the
+/// next push is the whole scene.
+#[derive(Default)]
+pub(super) struct SceneOutbox {
+    slots: Mutex<BTreeMap<Uuid, SceneSlot>>,
+    /// Whether the pull source is registered with the host (false when it cannot pull).
+    registered: std::sync::OnceLock<bool>,
+}
+
+#[derive(Default)]
+struct SceneSlot {
+    latest: Option<Arc<DecorationScene>>,
+    sent: Option<Arc<DecorationScene>>,
+}
+
+impl SceneOutbox {
+    fn slots(&self) -> std::sync::MutexGuard<'_, BTreeMap<Uuid, SceneSlot>> {
+        self.slots
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// What the host can send `recipient` now: the delta from what it was sent to the latest
+    /// scene, if there is one.
+    fn pull(&self, recipient: Uuid) -> Option<Vec<u8>> {
+        let mut slots = self.slots();
+        let slot = slots.get_mut(&recipient)?;
+        let latest = slot.latest.clone()?;
+        let delta = bmux_scene_protocol::delta::scene_delta(slot.sent.as_deref(), &latest)?;
+        let payload = serde_json::to_vec(&delta).ok()?;
+        slot.sent = Some(latest);
+        Some(payload)
     }
 }
 
+/// The instance's scene outbox, its pull source registered with the host (once), and the host's
+/// sink; an error when the host cannot deliver to connections by pull.
+fn outbox(
+    states: Option<&bmux_plugin::PluginStateRegistry>,
+) -> Result<(Arc<std::sync::RwLock<SceneOutbox>>, WireEventSinkHandle), String> {
+    let states = states.ok_or_else(|| "targeted scene delivery unavailable".to_string())?;
+    let sink = states
+        .get::<WireEventSinkHandle>()
+        .ok_or_else(|| "targeted scene delivery unavailable".to_string())?;
+    let sink = sink
+        .read()
+        .map_err(|_| "scene sink poisoned".to_string())?
+        .clone();
+    let outbox = states.get_or_insert_with(SceneOutbox::default);
+    let registered = *outbox
+        .read()
+        .map_err(|_| "scene outbox poisoned".to_string())?
+        .registered
+        .get_or_init(|| {
+            let source = Arc::downgrade(&outbox);
+            sink.0
+                .register_pull_source(
+                    bmux_scene_protocol::DELTA_KIND.to_string(),
+                    Arc::new(move |recipient| {
+                        source
+                            .upgrade()
+                            .and_then(|outbox| outbox.read().ok()?.pull(recipient))
+                    }),
+                )
+                .is_ok()
+        });
+    if !registered {
+        return Err("the host cannot deliver scenes by pull".to_string());
+    }
+    Ok((outbox, sink))
+}
+
+/// Make `scene` the latest scene for `recipient`, and ask the host to push it the changes.
+pub(super) fn publish_scene(
+    states: Option<&bmux_plugin::PluginStateRegistry>,
+    recipient: Uuid,
+    scene: &DecorationScene,
+) {
+    let result = outbox(states).and_then(|(outbox, sink)| {
+        outbox
+            .read()
+            .map_err(|_| "scene outbox poisoned".to_string())?
+            .slots()
+            .entry(recipient)
+            .or_default()
+            .latest = Some(Arc::new(scene.clone()));
+        sink.0.wake(recipient).map_err(|error| format!("{error:?}"))
+    });
+    if let Err(error) = result {
+        tracing::warn!(%recipient, %error, "private decoration scene delivery failed; the scene remains queryable");
+    }
+}
+
+/// `recipient`'s view stopped: it is sent nothing more, and a later one starts from a whole scene.
 fn clear_scene(states: Option<&bmux_plugin::PluginStateRegistry>, recipient: Uuid) {
-    if let Some(sink) =
-        states.and_then(bmux_plugin::PluginStateRegistry::get::<WireEventSinkHandle>)
-        && let Ok(sink) = sink.read()
-        && let Err(error) = sink.0.clear_retained_to(
-            recipient,
-            bmux_scene_protocol::scene_protocol::STATE_KIND.as_str(),
-        )
+    if let Some(outbox) = states.and_then(bmux_plugin::PluginStateRegistry::get::<SceneOutbox>)
+        && let Ok(outbox) = outbox.read()
     {
-        tracing::warn!(%recipient, ?error, "private decoration scene cleanup failed");
+        outbox.slots().remove(&recipient);
     }
 }
 

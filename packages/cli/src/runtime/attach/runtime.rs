@@ -2887,7 +2887,6 @@ enum AttachWakeSource {
     Prompt,
     ActionDispatch,
     Appearance,
-    Scene,
     TabList,
 }
 
@@ -3032,7 +3031,6 @@ struct AttachPerfWindow {
     wake_prompt_events: u64,
     wake_action_dispatch_events: u64,
     wake_appearance_events: u64,
-    wake_scene_events: u64,
     wake_window_list_events: u64,
     dirty_status_frames: u64,
     dirty_full_pane_frames: u64,
@@ -3114,7 +3112,6 @@ impl AttachPerfWindow {
             wake_prompt_events: 0,
             wake_action_dispatch_events: 0,
             wake_appearance_events: 0,
-            wake_scene_events: 0,
             wake_window_list_events: 0,
             dirty_status_frames: 0,
             dirty_full_pane_frames: 0,
@@ -3354,9 +3351,6 @@ impl AttachPerfWindow {
             }
             AttachWakeSource::Appearance => {
                 self.wake_appearance_events = self.wake_appearance_events.saturating_add(1);
-            }
-            AttachWakeSource::Scene => {
-                self.wake_scene_events = self.wake_scene_events.saturating_add(1);
             }
             AttachWakeSource::TabList => {
                 self.wake_window_list_events = self.wake_window_list_events.saturating_add(1);
@@ -3908,10 +3902,6 @@ fn insert_attach_perf_detailed_payload(
         window.wake_appearance_events.into(),
     );
     object.insert(
-        "wake_scene_events".to_string(),
-        window.wake_scene_events.into(),
-    );
-    object.insert(
         "wake_window_list_events".to_string(),
         window.wake_window_list_events.into(),
     );
@@ -4050,7 +4040,6 @@ async fn maybe_emit_attach_perf_window(
         wake_prompt_events = window.wake_prompt_events,
         wake_action_dispatch_events = window.wake_action_dispatch_events,
         wake_appearance_events = window.wake_appearance_events,
-        wake_scene_events = window.wake_scene_events,
         wake_window_list_events = window.wake_window_list_events,
         dirty_status_frames = window.dirty_status_frames,
         dirty_full_pane_frames = window.dirty_full_pane_frames,
@@ -5604,25 +5593,12 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     ))]
     let mut image_fetch_pending = view_state.presentation_only || view_state.observer.is_some();
 
-    // Subscribe to the generic retained scene-protocol state so the attach
-    // runtime can mark the frame dirty whenever a new scene arrives. Render
-    // extensions subscribe to the same channel independently. When no plugin
-    // has registered the channel the subscription returns `Err` and we run
-    // without scene updates — extensions that aren't loaded simply have nothing to draw.
+    // Seed the renderers with the view's whole scene. Reading it also restarts what the view
+    // pushes (deltas, relayed as they arrive, each marking the frame dirty) from a whole scene.
     #[cfg(feature = "bundled-plugin-decoration")]
     if let Ok(scene) = bmux_decoration_plugin_api::decoration_view_v1::client::scene(&mut client).await {
         bmux_decoration_plugin_renderer::publish_relayed_scene_on(&view_state.presentation_events, scene);
     }
-
-    let (mut last_scene_revision, mut scene_event_rx) =
-        match view_state
-            .presentation_events
-            .subscribe_state::<bmux_scene_protocol::scene_protocol::DecorationScene>(
-                &bmux_scene_protocol::scene_protocol::STATE_KIND,
-            ) {
-            Ok((initial, rx)) => (initial.revision, Some(rx)),
-            Err(_) => (0, None),
-        };
 
     // Subscribe to the tabs-plugin `tabs-list` state channel so
     // the attach tab bar can render the authoritative plugin-owned
@@ -5778,7 +5754,6 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                     &attach_config,
                     &mut perf_emitter,
                     &mut pane_output_pending,
-                    &mut last_scene_revision,
                 )
                 .await?;
                 if handling.image_fetch_requested {
@@ -6146,31 +6121,6 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 }
             },
 
-            // Scene state pushed on the local event bus. The PluginBusEvent handler
-            // above publishes incoming scenes onto the same retained channel; render
-            // extensions drain that retained state at the frame boundary. Core
-            // observes changes only to mark the frame dirty so the renderer consults
-            // extensions on the next pass.
-            scene_result = async {
-                match &mut scene_event_rx {
-                    Some(rx) => rx.changed().await.ok().map(|()| rx.borrow().clone()),
-                    None => std::future::pending().await,
-                }
-            } => {
-                if let Some(scene) = scene_result {
-                    perf_window.record_wake(AttachWakeSource::Scene);
-                    if scene.revision > last_scene_revision {
-                        last_scene_revision = scene.revision;
-                        view_state
-                            .dirty
-                            .mark_extension_dirty(AttachDirtySource::SceneChanged);
-                    }
-                } else {
-                    // Broadcast lagged/closed — drop subscription.
-                    scene_event_rx = None;
-                }
-            }
-
             surface_revision_result = surface_revision_rx.changed() => {
                 if surface_revision_result.is_err() {
                     tracing::warn!("plugin surface revision channel closed");
@@ -6252,7 +6202,6 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 &attach_config,
                 &mut perf_emitter,
                 &mut pane_output_pending,
-                &mut last_scene_revision,
             )
             .await?;
             if handling.image_fetch_requested {
@@ -7005,12 +6954,51 @@ struct AttachServerEventHandling {
 }
 
 /// Connection-scoped scene baseline: never reset on target/lifetime replacement.
-const fn accept_scene_revision(baseline: &mut u64, incoming: u64) -> bool {
-    if incoming <= *baseline {
-        return false;
+/// Relay a decoration scene delta pushed by the decoration view to this client's renderers. A
+/// delta that does not apply on the scene held means reading the whole scene again, which also
+/// restarts what the view pushes from a whole scene.
+#[cfg(feature = "bundled-plugin-decoration")]
+async fn relay_scene_delta(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    payload: &[u8],
+) {
+    let delta = match serde_json::from_slice::<bmux_scene_protocol::scene_delta::DecorationSceneDelta>(
+        payload,
+    ) {
+        Ok(delta) => delta,
+        Err(error) => {
+            tracing::warn!(%error, "decoding a pushed decoration scene delta");
+            return;
+        }
+    };
+    let changed = match bmux_decoration_plugin_renderer::relay_scene_delta_on(
+        &view_state.presentation_events,
+        delta,
+    ) {
+        Ok(changed) => changed,
+        Err(gap) => {
+            tracing::debug!(%gap, "reading the whole decoration scene again");
+            match bmux_decoration_plugin_api::decoration_view_v1::client::scene(client).await {
+                Ok(scene) => {
+                    bmux_decoration_plugin_renderer::publish_relayed_scene_on(
+                        &view_state.presentation_events,
+                        scene,
+                    );
+                    true
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "reading the decoration scene after a gap");
+                    false
+                }
+            }
+        }
+    };
+    if changed {
+        view_state
+            .dirty
+            .mark_extension_dirty(AttachDirtySource::SceneChanged);
     }
-    *baseline = incoming;
-    true
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -7028,7 +7016,6 @@ async fn handle_attach_stream_server_event(
     attach_config: &BmuxConfig,
     perf_emitter: &mut perf_telemetry::PerfEventEmitter,
     pane_output_pending: &mut bool,
-    last_scene_revision: &mut u64,
 ) -> Result<AttachServerEventHandling> {
     let mut image_fetch_requested = false;
 
@@ -7283,37 +7270,9 @@ async fn handle_attach_stream_server_event(
                     );
                 }
             }
-        } else if kind.as_str() == bmux_scene_protocol::scene_protocol::STATE_KIND.as_str() {
-            match serde_json::from_slice::<bmux_scene_protocol::scene_protocol::DecorationScene>(
-                payload,
-            ) {
-                Ok(scene) => {
-                    let scene_revision = scene.revision;
-                    if !accept_scene_revision(last_scene_revision, scene_revision) {
-                        return Ok(AttachServerEventHandling {
-                            control: AttachLoopControl::Continue,
-                            image_fetch_requested: false,
-                        });
-                    }
-                    #[cfg(feature = "bundled-plugin-decoration")]
-                    bmux_decoration_plugin_renderer::publish_relayed_scene_on(
-                        &view_state.presentation_events,
-                        scene,
-                    );
-                    #[cfg(not(feature = "bundled-plugin-decoration"))]
-                    let _ = scene;
-                    view_state
-                        .dirty
-                        .mark_extension_dirty(AttachDirtySource::SceneChanged);
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        kind = %kind,
-                        error = %error,
-                        "decoding forwarded scene-protocol payload",
-                    );
-                }
-            }
+        } else if kind.as_str() == bmux_scene_protocol::DELTA_KIND {
+            #[cfg(feature = "bundled-plugin-decoration")]
+            relay_scene_delta(client, view_state, payload).await;
         } else if kind.as_str() == bmux_contexts_plugin_api::contexts_events::EVENT_KIND.as_str() {
             match serde_json::from_slice::<bmux_contexts_plugin_api::contexts_events::ContextEvent>(
                 payload,

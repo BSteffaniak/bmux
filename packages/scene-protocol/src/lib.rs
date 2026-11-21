@@ -14,6 +14,11 @@
 #![warn(clippy::all, clippy::pedantic)]
 #![allow(clippy::module_name_repetitions)]
 
+pub mod delta;
+
+/// The kind of the [`scene_delta::DecorationSceneDelta`] a decoration view pushes to its
+/// connection (JSON).
+pub const DELTA_KIND: &str = "bmux.scene/scene-delta";
 pub mod glyphs;
 
 bmux_plugin_schema_macros::schema! {

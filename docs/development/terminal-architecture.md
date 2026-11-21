@@ -286,7 +286,6 @@ Deferred, each until something needs it (measured, not assumed):
 - Text filters. A text-run hook would sit in the hottest path (`print_ascii`); text redaction
   belongs at the replica or render, not the PTY parse.
 - Shell metadata on the grid's parse: its scan is now about 0.6% of the reader.
-- Delta relays for decoration scenes (only animated decorations would gain).
 
 Retained layers cost nothing when unchanged: the attach client samples a layer again only when
 its extension's revision, the surface rect or the render context changed, and the renderer skips
@@ -304,3 +303,12 @@ fingerprints hash the item itself. Scene-protocol paint commands stay as what th
 authoring contract themes and scripts write (`bmux.scene`): gradients, capability-gated semantic
 borders and occlusion are lowered once, per attached terminal's capabilities, by the decoration
 renderer into those items. The unused terminal-ANSI executor for paint commands is gone.
+
+Decoration scenes travel as deltas. A decoration view keeps, per connection, the scene it last
+sent and the latest one, and pushes the difference (changed and removed surfaces, scene-wide
+fields) through the host's pull delivery when it can send: nothing is queued, and a slow
+connection is sent the changes up to the latest scene once. The first push to a connection, and
+the first of a new view lifetime, is the whole scene; reading the scene does not push. The attach
+client applies deltas to a replica whose surfaces are shared pointers, so the renderer re-derives
+only the surfaces a delta carried. A delta that does not apply (the revisions held and sent are
+tracked on both ends, so this would be a defect) makes the client read the whole scene again.

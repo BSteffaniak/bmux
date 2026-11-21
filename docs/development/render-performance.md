@@ -21,13 +21,15 @@ instrumentation live in the benchmarks, `bmux_bench` and `scripts/perf-render.py
 
 | Benchmark | Where | Phases per frame |
 | --- | --- | --- |
-| Client pipeline | `pipeline_bench::pipeline_metrics` (`packages/attach_pipeline`) | `apply` (pane output into the client's grids), `render` (painting and presenting), `observe` (preparing and publishing for an observer) |
+| Client pipeline | `pipeline_bench::pipeline_metrics` (`packages/attach_pipeline`) | `apply` (pane output into the client's grids), `render` (painting and presenting), `observe` (preparing and publishing for an observer), `relay` (an animated decoration's change, from encoding on the server to relaying on the client) |
 | Pane reader | `runtime::ingest_bench::ingest_metrics` (`plugins/pane-runtime-plugin`) | `read`: one PTY read as the reader handles it (`follow_chunk`: shell metadata filtered, then the pane's grid parsed in one pass that also answers queries and finds images; then mode tracking and the output push) |
 
 Scenarios: every generated corpus (`bmux_bench::corpus`) at 420×90; the busiest without scroll
 passthrough, with an observer, and across two panes; scattered edits; four panes decorated by the
 decoration renderer (borders and titles, its intent sampled before every frame as the attach
-client samples it), one streaming (`plain-stream/decorated`) or none (`idle/decorated`); Kitty and
+client samples it), one streaming (`plain-stream/decorated`) or none (`idle/decorated`), or none
+with the first title a clock changing every frame, relayed as the decoration view pushes it
+(`animated/decorated`, deltas) and as whole scenes (`animated/decorated/whole-scenes`); Kitty and
 sixel images beside streaming output and moving each frame; and, for the reader, text with a Kitty
 image every 30 frames, and text with output rules rewriting every colour and title
 (`plain-stream/rewritten`: about 21% more than the same text unfiltered, every SGR replaced). Each scenario runs 300 frames and measures the 270 after a 30-frame warm-up.
@@ -101,6 +103,8 @@ client now keeps its panes current with frames (see
 | Streaming text | server frame build | — → 3 | — → 0.13M | |
 | Streaming text | client render | — | 1.35M → 1.01M (−25%) | |
 | Four decorated panes, one streaming | client render | 15,158 → 1,413 | 18.6M → 4.3M (−77%) | 30,929 → 30,929 |
+| Four decorated panes, a clock title (whole scenes → deltas) | relay | 24 → 14 | 0.149M → 0.056M (−62%) | |
+| Four decorated panes, a clock title (whole scenes → deltas) | client render | 1,505 → 1,481 | 1.69M → 1.64M | 43 → 43 |
 | Moving sixel image | client apply + render | 7,270 → 52 | 23.6M → 5.0M (−79%) | 104,180 → 85,639 |
 | Full repaint | pane reader | 101,285 → 2.8 | 136.9M → 14.4M (−89%) | |
 | Streaming text | pane reader | 3,380 → 6 | 4.75M → 0.70M (−85%) | |
@@ -146,4 +150,7 @@ What changed, each its own commit with its numbers:
   where a read holds an OSC), and the raw output fan-out for the readers that remain (playbook,
   recording).
 - **The render rebuilds a compositor plan every frame** (about 15 small allocations).
+- **A changed decoration layer is planned from scratch**: one clock title changing costs the
+  render about 1.6M instructions and 1,500 allocations (the layer sampled, lowered from paint
+  commands and diffed again), against about 0.1M when nothing changed.
 - **Cluster replication** still moves pane output between nodes as bytes.

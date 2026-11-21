@@ -1,26 +1,20 @@
 # bmux_decoration_plugin_renderer
 
-Client-side render extension for the [bmux decorationplugin](../decoration-plugin).
+Client-side render extension for the [bmux decoration plugin](../decoration-plugin).
 
-The decoration plugin runs in the bmux server process. Every time its internal
-state changes, it publishes a retained `DecorationScene` on the typed plugin
-event bus. The server relays the current state and live replacements to
-streaming clients as `ServerEvent::PluginBusEvent` values over the attach IPC
-stream.
+The decoration plugin runs in the bmux server process, with one view per attach
+connection. A view pushes its connection the changes to its scene as
+`DecorationSceneDelta`s (`bmux.scene/scene-delta`, the whole scene first) when the
+server can send to it; the attach client reads the whole scene once when it starts.
 
-This crate provides the **client-side** consumer of those relayed
-scenes:
+This crate provides the **client-side** consumer of those scenes:
 
-- Registers an [`AttachRenderExtension`][ext] so every render pass
-  consults the decoration scene for each visible surface.
-- Subscribes to the client-side retained `bmux.scene/scene-protocol` state
-  channel and caches the latest `DecorationScene`.
-- Publishes each surface's paint commands as retained scene layers
-  (before and after pane content), each with a revision hashed from its
-  inputs, for the attach renderer to diff and paint.
-
-Call \[`install`\] once during CLI bootstrap to register the extension
-and set up the subscriber. The function is idempotent; repeat
-invocations leave the existing extension in place.
+- `relay_scene_delta_on` and `publish_relayed_scene_on` keep a `SceneReplica` (the
+  scene with shared surfaces) current on the attach runtime's presentation bus.
+- `renderer_for_bus` registers an [`AttachRenderExtension`][ext] that takes the
+  latest replica before each frame, re-deriving only the surfaces a delta changed.
+- Each surface's paint commands are lowered into retained scene layers (before and
+  after pane content), each with a revision hashed from its inputs, for the attach
+  renderer to diff and paint.
 
 [ext]: bmux_plugin::AttachRenderExtension
