@@ -377,11 +377,100 @@ only after the required durable commit. Concurrent initializers cannot create
 competing authorities. Fresh clusters use new cluster identities and
 authenticated enrollment, never adopt old workers or resources implicitly.
 
+The owned vote-store prototype uses an immutable 4,096-byte identification
+header followed by a redb payload in the same inode. Header version `BMOWNDB1`
+contains the exact bounded cluster identifier (8-byte little-endian length, at
+most 1,024 UTF-8 bytes), zero padding, and a SHA-256 checksum over the first
+4,064 bytes. Header validation compares the complete canonical representation;
+unsupported versions, wrong clusters, corrupt headers, and missing payloads fail
+before writable redb recovery. The checksum detects corruption, not
+authentication. The file is exclusively locked before reading the header, and
+that same lock remains held through database recovery and operation. The
+payload's metadata format is `BMOWNV03`; earlier unactivated prototype files are
+unsupported and are not rewritten or imported.
+
+A private redb storage backend translates payload offsets by 4,096 bytes using
+checked arithmetic and never exposes the immutable header to redb writes or
+truncation. Initialization commits header and initial payload in a
+same-directory temporary inode, then publishes without replacing an existing
+canonical path and synchronizes the directory before acknowledging success. The
+published file is the only authority; temporary files are never selected as
+fallback authority. Process-exit recovery, publication interruption, corrupt
+payloads, orphan-file handling and storage-failure behavior still require their
+qualification gates; the header does not establish engine readiness.
+
+Before recovering the canonical payload, the vote-store prototype copies at most
+64 MiB of payload into an anonymous disposable file while retaining exclusive
+ownership of the original inode. redb recovery and format/cluster/vote
+validation first run on this copy. Failure rejects the original without writable
+recovery; success permits recovery and repeated validation on the original. The
+copy is never published, selected as authority, or used as a fallback. The size
+bound is specific to this vote-only prototype, not the future consensus log;
+scratch storage failure is an explicit startup error.
+
 No import or rollback workflow is required for this replacement. Normal
 owned-format restart, snapshots, unfinished workflows, logical identities,
 fencing and lease recovery remain required. Existing workers and stores are
 not destroyed by a failed startup; worker unreachability remains distinct from
 death. Future migration support would require a separate architectural decision.
+
+### Owned append transaction contract
+
+The private fresh-store bootstrap path accepts one founding voter, never a joint
+or multi-voter initial configuration. Provisioning owns authorization and
+cluster identity. Before canonical publication, one immediate transaction
+records the term-zero/index-zero membership entry, its membership index,
+effective membership and commit position. Applied position remains absent until
+deterministic application is integrated. Ordinary empty-store creation remains
+nonvoting; neither bootstrap nor creation overwrites an existing canonical
+store. Process-exit tests cover both sides of publication and recovery of the
+founding voting authority. This does not activate a production provisioning
+endpoint or replace authenticated membership transitions.
+
+The vote-store prototype is not a second authority alongside a log store. Before
+owned append handling is enabled, hard state, retained log, snapshot boundary,
+commit watermark, and membership recovery metadata must belong to one
+exclusively owned database and one serialized mutation lifecycle. Application
+state and its applied watermark remain distinct from replication commitment.
+
+An admitted append executes against one authoritative transaction view. That
+view supplies the current term/vote, snapshot boundary, committed identity,
+requested log entries, and effective membership. Caller-provided cached
+positions cannot substitute for those reads. Read or decode failure stops the
+affected authority; it is never interpreted as an absent entry or a peer
+mismatch. Authentication, protocol negotiation, and sender eligibility precede
+admission, outside deterministic application.
+
+The transaction follows these rules:
+
+1. Reject stale terms without changing the log. A higher authenticated term clears the prior vote and requires durable hard-state persistence before any dependent response. Candidate step-down and input admission must not leave the old authority usable while that persistence is pending.
+2. Validate the request and reconcile against the transaction view. A healthy previous-log mismatch may commit only the higher-term hard-state change before returning mismatch. Storage corruption or I/O failure does not permit a best-effort term-only write on uncertain storage; stop without replying as healthy.
+3. On a match, preserve identical entries and any extra local tail unless an actual conflict requires suffix replacement. Never replace a committed entry. Apply suffix deletion and insertion together with the required hard-state update and proposed commit watermark in one immediate durable transaction. The commit watermark cannot exceed the matched request prefix or regress; it does not advance the applied watermark.
+4. Update effective membership recovery metadata in that same transaction. Replacement may remove an uncommitted membership entry, so recovery must resolve the latest surviving configuration from the retained log and snapshot membership. The implementation must support bounded predecessor lookup rather than scanning an unbounded log on the interactive path. No cached configuration or stale removed entry may remain voting authority.
+5. Publish the resulting in-memory authority and allow an append acknowledgement only after commit succeeds. Transaction failure poisons the owner and suppresses dependent replies. Cancellation after admission leaves transaction completion and cleanup with the serialized owner; retry resolves against durable state rather than launching a competing mutation.
+
+Recovery validates the relationship among snapshot, applied, committed,
+retained-log, and membership positions before opening admission. Unsupported or
+inconsistent metadata is an explicit recovery error, not an empty installation.
+An interrupted transaction recovers either the prior complete state or the new
+complete state, never a suffix paired with old membership or a commit watermark
+beyond durable coverage. Snapshot installation and application transactions must
+use the same owner and preserve their existing atomicity requirements.
+
+These rules specify the integration acceptance contract. The private store now
+has an uncompacted append transaction and a membership predecessor index, but is
+not a production append authority. Its `BMOWNV04` payload explicitly initializes
+commit, applied, snapshot and effective-membership metadata alongside log and
+membership tables; older prototype payload versions are rejected. Retention is
+capped at 4,096 entries and the existing 64 MiB payload limit; admission returns
+explicit backpressure when compaction is needed. Nonempty snapshot metadata is
+rejected until snapshot installation is integrated. Complete
+snapshot/application transactions, recovery qualification and runtime
+integration remain required before activation. The private single-flight
+executor now serializes append and vote operations; voting reads retained-log
+freshness and effective membership from its owned store. Uninitialized
+membership denies votes while still durably observing higher terms. Test-only
+injected-context helpers are not production voting APIs.
 
 ## Qualification gates
 

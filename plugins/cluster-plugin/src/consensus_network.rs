@@ -25,6 +25,239 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 pub(crate) const PEER_READ_OPERATION: &str = "cluster-peer-read/v1/read_linearizable";
+
+/// Authenticate an owned transfer before reserving staging resources.
+///
+/// The caller supplies members read from committed owned control state and must
+/// serialize that read, current-term/eligibility validation and staging admission.
+/// This function deliberately does not load legacy membership projections and
+/// does not authorize snapshot installation.
+/// # Errors
+/// Rejects malformed, misdirected, oversized or unauthenticated requests.
+pub fn authenticate_transfer_request(
+    caller: &impl crate::ClusterRuntimeOps,
+    operation: &str,
+    local: NodeId,
+    members: &[bmux_cluster_plugin_api::cluster_types::ClusterMember],
+    request: &bmux_cluster_plugin_api::cluster_consensus_transfer_types::ChunkRequest,
+) -> Result<NodeId, String> {
+    validate_transfer_allocation(request)?;
+    let header = &request.header;
+    if header.sender.len() != 32
+        || header.recipient.as_slice() != local.as_bytes()
+        || header.checksum.len() != 32
+        || request.proof.signature.len() != 64
+        || header.cluster_id != request.proof.peer.challenge.cluster_id
+        || request.proof.credential_serial != request.proof.peer.claimant_credential_serial
+    {
+        return Err("invalid transfer identity or proof binding".into());
+    }
+    let source = request.proof.peer.claimant_node_id.parse::<NodeId>()?;
+    if source.as_bytes() != header.sender.as_slice() {
+        return Err("transfer sender differs from authenticated claimant".into());
+    }
+    let signed = transfer_signing_payload(operation, request)?;
+    verify_node_signature(&source.to_string(), &signed, &request.proof.signature)?;
+    crate::membership::authenticate_peer_for_members(
+        caller,
+        &crate::ClusterPeerAuthenticateRequest {
+            proof: request.proof.peer.clone(),
+        },
+        members,
+    )?;
+    Ok(source)
+}
+
+/// Canonical domain-separated signature input for the unpublished transfer v1.
+///
+/// Non-chunk operations use offset zero and empty data. The signature field is
+/// excluded; all other proof/header fields use generated typed-stable encoding.
+/// # Errors
+/// Rejects unknown operations, invalid chunk ranges and oversized envelopes.
+pub fn transfer_signing_payload(
+    operation: &str,
+    request: &bmux_cluster_plugin_api::cluster_consensus_transfer_types::ChunkRequest,
+) -> Result<Vec<u8>, String> {
+    if !matches!(operation, "begin" | "chunk" | "finish" | "abort")
+        || request.data.len() > 64 * 1024
+        || (operation != "chunk" && (request.offset != 0 || !request.data.is_empty()))
+        || request
+            .offset
+            .checked_add(u64::try_from(request.data.len()).map_err(|_| "transfer size overflow")?)
+            .is_none_or(|end| end > request.header.total_bytes)
+    {
+        return Err("invalid transfer operation or range".into());
+    }
+    validate_transfer_allocation(request)?;
+    validate_transfer_descriptor(&request.header)?;
+    let mut unsigned = request.clone();
+    unsigned.proof.signature.clear();
+    let encoded = encode_service_message(&unsigned).map_err(|error| error.to_string())?;
+    if encoded.len() > 1024 * 1024 - 1024 {
+        return Err("transfer envelope exceeds limit".into());
+    }
+    let mut signed = b"bmux.cluster.consensus-transfer.v1\0".to_vec();
+    signed.extend_from_slice(operation.as_bytes());
+    signed.push(0);
+    signed.extend(encoded);
+    Ok(signed)
+}
+
+fn transfer_node(bytes: &[u8]) -> Result<NodeId, String> {
+    let node = NodeId::from_bytes(
+        bytes
+            .try_into()
+            .map_err(|_| "invalid transfer node length")?,
+    );
+    node.public_key()?;
+    Ok(node)
+}
+
+fn transfer_position(
+    value: &bmux_cluster_plugin_api::cluster_consensus_transfer_types::LogIdentity,
+) -> Result<crate::consensus_model::LogIdentity, String> {
+    Ok(crate::consensus_model::LogIdentity {
+        term: crate::consensus_model::Term(value.term),
+        leader: transfer_node(&value.leader)?,
+        index: crate::consensus_model::LogIndex(value.index),
+    })
+}
+
+fn validate_transfer_descriptor(
+    header: &bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferHeader,
+) -> Result<(), String> {
+    use bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferPurpose;
+    transfer_node(&header.sender)?;
+    transfer_node(&header.recipient)?;
+    if header.cluster_id.is_empty() || header.total_bytes == 0 || header.checksum.len() != 32 {
+        return Err("invalid transfer header".into());
+    }
+    match &header.purpose {
+        TransferPurpose::Entry { value } => {
+            let identity = transfer_position(&value.identity)?;
+            let previous = value.previous.as_ref().map(transfer_position).transpose()?;
+            if identity.term.0 > header.leader_term
+                || previous.map_or(Some(0), |p| p.index.0.checked_add(1)) != Some(identity.index.0)
+            {
+                return Err("invalid transferred entry position".into());
+            }
+            crate::consensus_model::validate_position_prefix(previous, Some(identity))
+                .map_err(|_| "invalid transferred entry prefix")?;
+        }
+        TransferPurpose::Snapshot { value } => {
+            let boundary = value
+                .last_included
+                .as_ref()
+                .map(transfer_position)
+                .transpose()?;
+            if value.format_version != 1
+                || value.cluster_id != header.cluster_id
+                || value.total_bytes != header.total_bytes
+                || value.checksum.len() != 32
+                || value.snapshot_id.is_empty()
+                || boundary.is_some_and(|b| b.term.0 > header.leader_term)
+            {
+                return Err("invalid transferred snapshot descriptor".into());
+            }
+            if let Some(membership) = &value.membership {
+                let introduced = transfer_position(&membership.introduced_at)?;
+                crate::consensus_model::validate_position_prefix(Some(introduced), boundary)
+                    .map_err(|_| "snapshot membership exceeds boundary")?;
+                let configurations = membership
+                    .configurations
+                    .iter()
+                    .map(|c| {
+                        c.voters
+                            .iter()
+                            .map(|v| transfer_node(v))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let nodes = membership
+                    .nodes
+                    .iter()
+                    .map(|n| Ok((transfer_node(&n.node)?, n.endpoint.clone())))
+                    .collect::<Result<Vec<_>, String>>()?;
+                crate::consensus_model::Membership::new(configurations, nodes)
+                    .map_err(|_| "invalid transferred membership")?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_transfer_allocation(
+    request: &bmux_cluster_plugin_api::cluster_consensus_transfer_types::ChunkRequest,
+) -> Result<(), String> {
+    use bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferPurpose;
+    // Charge per-field overhead as well as bytes, before any clone/encoding.
+    // This bounds work for this helper, not allocations in the wire decoder.
+    let mut remaining = 512 * 1024usize;
+    let mut charge = |bytes: usize| -> Result<(), String> {
+        remaining = remaining
+            .checked_sub(bytes.checked_add(128).ok_or("transfer size overflow")?)
+            .ok_or("transfer metadata exceeds allocation budget")?;
+        Ok(())
+    };
+    let h = &request.header;
+    let p = &request.proof;
+    let c = &p.peer.challenge;
+    for field in [
+        &h.cluster_id,
+        &p.credential_serial,
+        &p.peer.claimant_node_id,
+        &p.peer.claimant_credential_serial,
+        &p.peer.claimant_signature,
+        &c.cluster_id,
+        &c.verifier_node_id,
+        &c.verifier_credential_serial,
+        &c.audience_node_id,
+        &c.nonce,
+        &c.signature,
+    ] {
+        charge(field.len())?;
+    }
+    for bytes in [
+        &h.sender,
+        &h.recipient,
+        &h.checksum,
+        &p.signature,
+        &request.data,
+    ] {
+        charge(bytes.len())?;
+    }
+    match &h.purpose {
+        TransferPurpose::Entry { value } => {
+            charge(value.identity.leader.len())?;
+            if let Some(previous) = &value.previous {
+                charge(previous.leader.len())?;
+            }
+        }
+        TransferPurpose::Snapshot { value } => {
+            charge(value.cluster_id.len())?;
+            charge(value.snapshot_id.len())?;
+            charge(value.checksum.len())?;
+            if let Some(position) = &value.last_included {
+                charge(position.leader.len())?;
+            }
+            if let Some(membership) = &value.membership {
+                charge(membership.introduced_at.leader.len())?;
+                for configuration in &membership.configurations {
+                    charge(0)?;
+                    for voter in &configuration.voters {
+                        charge(voter.len())?;
+                    }
+                }
+                for node in &membership.nodes {
+                    charge(node.node.len())?;
+                    charge(node.endpoint.len())?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 const RAFT_RPC_DOMAIN: &[u8] = b"bmux.cluster.raft-rpc.v1\0";
 const DECODER_PROBE_OPERATION: &str = "capability-publication-decoder-v1";
 
@@ -1412,6 +1645,74 @@ mod tests {
         ClusterConsensusRole, ClusterNodeCapabilities, ControlCommandError, PeerAuthChallenge,
         PeerAuthProof,
     };
+
+    #[test]
+    fn transfer_signing_rejects_oversized_proof_and_invalid_descriptor() {
+        use bmux_cluster_plugin_api::cluster_consensus_transfer_types::{
+            ChunkRequest, EntryPurpose, LogIdentity, TransferHeader, TransferProof, TransferPurpose,
+        };
+        let node = NodeIdentity::new_for_test(1);
+        let mut request = ChunkRequest {
+            header: TransferHeader {
+                cluster_id: "cluster".into(),
+                sender: node.node_id().as_bytes().to_vec(),
+                recipient: node.node_id().as_bytes().to_vec(),
+                leader_term: 1,
+                sender_incarnation: uuid::Uuid::from_u128(1),
+                sequence: 1,
+                purpose: TransferPurpose::Entry {
+                    value: EntryPurpose {
+                        identity: LogIdentity {
+                            term: 1,
+                            leader: node.node_id().as_bytes().to_vec(),
+                            index: 0,
+                        },
+                        previous: None,
+                    },
+                },
+                total_bytes: 1,
+                checksum: vec![0; 32],
+            },
+            offset: 0,
+            data: vec![1],
+            proof: TransferProof {
+                credential_serial: "serial".into(),
+                signature: vec![0; 64],
+                peer: PeerAuthProof {
+                    challenge: PeerAuthChallenge {
+                        protocol_version: 1,
+                        cluster_id: "cluster".into(),
+                        verifier_node_id: node.node_id().to_string(),
+                        verifier_credential_serial: "serial".into(),
+                        audience_node_id: node.node_id().to_string(),
+                        nonce: "nonce".into(),
+                        issued_at_unix_ms: 0,
+                        expires_at_unix_ms: 1,
+                        signature: String::new(),
+                    },
+                    claimant_node_id: node.node_id().to_string(),
+                    claimant_credential_serial: "serial".into(),
+                    claimant_signature: String::new(),
+                },
+            },
+        };
+        let signed = transfer_signing_payload("chunk", &request).unwrap();
+        request.proof.signature.fill(1);
+        assert_eq!(signed, transfer_signing_payload("chunk", &request).unwrap());
+        request.data[0] = 2;
+        assert_ne!(signed, transfer_signing_payload("chunk", &request).unwrap());
+        request.proof.peer.claimant_node_id = "x".repeat(512 * 1024);
+        assert_eq!(
+            transfer_signing_payload("chunk", &request).unwrap_err(),
+            "transfer metadata exceeds allocation budget"
+        );
+        request.proof.peer.claimant_node_id = node.node_id().to_string();
+        request.header.sender.pop();
+        assert_eq!(
+            transfer_signing_payload("chunk", &request).unwrap_err(),
+            "invalid transfer node length"
+        );
+    }
 
     fn activation_member(
         issuer: &NodeIdentity,

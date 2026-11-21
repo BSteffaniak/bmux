@@ -171,6 +171,27 @@ impl ControlState {
         command: &crate::capability_publication::PublicationCommand,
         membership: &openraft::StoredMembership<crate::membership::NodeId, openraft::BasicNode>,
     ) -> Result<u64, String> {
+        self.apply_publication_with_membership(command, || {
+            crate::capability_publication::owned_publication_membership(membership)
+        })
+    }
+
+    /// Apply publication using owned committed membership and existing deduplication.
+    /// # Errors
+    /// Rejects stale revisions, conflicting identities, invalid authority and exhaustion.
+    pub fn apply_owned_publication(
+        &mut self,
+        command: &crate::capability_publication::PublicationCommand,
+        membership: &crate::consensus_model::StoredMembership,
+    ) -> Result<u64, String> {
+        self.apply_publication_with_membership(command, || Ok(membership.clone()))
+    }
+
+    fn apply_publication_with_membership(
+        &mut self,
+        command: &crate::capability_publication::PublicationCommand,
+        membership: impl FnOnce() -> Result<crate::consensus_model::StoredMembership, String>,
+    ) -> Result<u64, String> {
         command.encode()?;
         for (previous, revision) in &self.publication_history {
             if previous.reports == command.reports {
@@ -188,10 +209,10 @@ impl ControlState {
         if self.publication_history.len() >= 64 {
             return Err("publication history capacity exhausted".into());
         }
-        crate::capability_publication::verify_bridge(
+        crate::capability_publication::verify_owned_bridge(
             &command.reports,
             &self.members,
-            membership,
+            &membership()?,
             &self.cluster_id,
             command.verified_at_unix_ms,
         )?;
@@ -233,16 +254,44 @@ impl ControlState {
         command: &crate::principal_bootstrap::BootstrapCommand,
         membership: &openraft::StoredMembership<crate::membership::NodeId, openraft::BasicNode>,
     ) -> ControlResponse {
+        self.apply_verified_bootstrap(command, |state| {
+            crate::principal_bootstrap::verify_proof(
+                &command.proof,
+                &state.cluster_id,
+                membership,
+                &state.members,
+                command.verified_at_unix_ms,
+            )
+        })
+    }
+
+    /// Apply bootstrap using owned committed membership. Completed retries retain
+    /// their original result even after membership changes.
+    pub fn apply_owned_bootstrap_command(
+        &mut self,
+        command: &crate::principal_bootstrap::BootstrapCommand,
+        membership: &crate::consensus_model::StoredMembership,
+    ) -> ControlResponse {
+        self.apply_verified_bootstrap(command, |state| {
+            crate::principal_bootstrap::verify_owned_proof(
+                &command.proof,
+                &state.cluster_id,
+                membership,
+                &state.members,
+                command.verified_at_unix_ms,
+            )
+        })
+    }
+
+    fn apply_verified_bootstrap(
+        &mut self,
+        command: &crate::principal_bootstrap::BootstrapCommand,
+        verify: impl FnOnce(&Self) -> Result<(), String>,
+    ) -> ControlResponse {
         let outcome = (|| {
             // A committed successful retry remains valid after membership changes.
             if self.principal_bootstrap.is_none() {
-                crate::principal_bootstrap::verify_proof(
-                    &command.proof,
-                    &self.cluster_id,
-                    membership,
-                    &self.members,
-                    command.verified_at_unix_ms,
-                )?;
+                verify(self)?;
             }
             self.apply_principal_bootstrap(
                 &command.proof.statement,
@@ -627,6 +676,29 @@ impl ControlState {
             &openraft::StoredMembership<crate::membership::NodeId, openraft::BasicNode>,
         >,
     ) -> ControlResponse {
+        self.apply_feature_activation_resolved(command, || {
+            membership
+                .map(crate::capability_publication::owned_publication_membership)
+                .transpose()
+        })
+    }
+
+    /// Apply activation with owned committed membership.
+    /// # Panics
+    /// Panics on unrecoverable control revision overflow.
+    pub fn apply_owned_feature_activation(
+        &mut self,
+        command: &FeatureActivationCommand,
+        membership: Option<&crate::consensus_model::StoredMembership>,
+    ) -> ControlResponse {
+        self.apply_feature_activation_resolved(command, || Ok(membership.cloned()))
+    }
+
+    fn apply_feature_activation_resolved(
+        &mut self,
+        command: &FeatureActivationCommand,
+        resolve: impl FnOnce() -> Result<Option<crate::consensus_model::StoredMembership>, String>,
+    ) -> ControlResponse {
         let key = DedupKey {
             principal_id: command.principal_id.clone(),
             command_id: command.command_id.value,
@@ -640,8 +712,12 @@ impl ControlState {
                 self.feature_error_response(command, ControlCommandError::CommandIdConflict)
             };
         }
-        let result = self
-            .validate_feature_activation(command, membership)
+        let resolved = resolve();
+        let membership = resolved.as_ref().ok().and_then(Option::as_ref);
+        let result = resolved
+            .as_ref()
+            .map_err(|reason| invalid_transition(reason))
+            .and_then(|_| self.validate_feature_activation(command, membership))
             .and_then(|()| {
                 if !matches!(
                     command.feature.as_str(),
@@ -653,9 +729,10 @@ impl ControlState {
                     invalid_transition("bootstrap activation requires committed membership")
                 })?;
                 let committed = membership
-                    .membership()
+                    .membership
                     .nodes()
-                    .map(|(id, _)| id.to_string())
+                    .keys()
+                    .map(ToString::to_string)
                     .collect::<BTreeSet<_>>();
                 let active = self
                     .members
@@ -663,10 +740,7 @@ impl ControlState {
                     .filter(|member| member.state == ClusterMemberState::Active)
                     .map(|member| member.node_id.clone())
                     .collect::<BTreeSet<_>>();
-                if membership.log_id().is_none()
-                    || membership.membership().voter_ids().next().is_none()
-                    || committed != active
-                {
+                if membership.introduced_at.is_none() || committed != active {
                     return Err(invalid_transition(
                         "bootstrap activation member records do not match committed membership",
                     ));
@@ -712,9 +786,7 @@ impl ControlState {
     fn validate_feature_activation(
         &self,
         command: &FeatureActivationCommand,
-        membership: Option<
-            &openraft::StoredMembership<crate::membership::NodeId, openraft::BasicNode>,
-        >,
+        membership: Option<&crate::consensus_model::StoredMembership>,
     ) -> Result<(), ControlCommandError> {
         require_revision(command.expected_control_revision, self.revision)?;
         if command.feature.trim().is_empty()
@@ -731,10 +803,7 @@ impl ControlState {
             let membership = membership.ok_or_else(|| {
                 invalid_transition("bounded admission requires consensus membership")
             })?;
-            if membership.membership().voter_ids().next().is_none() {
-                return Err(invalid_transition("bounded admission requires voters"));
-            }
-            for (node_id, _) in membership.membership().nodes() {
+            for node_id in membership.membership.nodes().keys() {
                 let compatible = self
                     .members
                     .get(&node_id.to_string())
@@ -800,9 +869,7 @@ impl ControlState {
         &self,
         member: &ClusterMember,
         command: &FeatureActivationCommand,
-        membership: Option<
-            &openraft::StoredMembership<crate::membership::NodeId, openraft::BasicNode>,
-        >,
+        membership: Option<&crate::consensus_model::StoredMembership>,
     ) -> bool {
         if command.feature != "protocol-refresh-v1" {
             return false;
@@ -826,7 +893,7 @@ impl ControlState {
         report.schema_min <= u32::from(command.read_schema_floor)
             && report.schema_max >= u32::from(command.write_schema_floor)
             && report.features.contains(&command.feature)
-            && crate::capability_publication::verify_report(
+            && crate::capability_publication::verify_owned_report(
                 report,
                 member,
                 membership,

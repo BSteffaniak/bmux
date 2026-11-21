@@ -181,15 +181,53 @@ pub fn verify_proof(
     members: &BTreeMap<String, ClusterMember>,
     now_unix_ms: u64,
 ) -> Result<(), String> {
-    let statement = &proof.statement;
     let log = membership
         .log_id()
         .as_ref()
         .ok_or("bootstrap requires committed membership")?;
+    let owned = crate::consensus_model::StoredMembership {
+        introduced_at: Some(crate::consensus_model::LogIdentity {
+            term: crate::consensus_model::Term(log.leader_id.term),
+            leader: log.leader_id.node_id,
+            index: crate::consensus_model::LogIndex(log.index),
+        }),
+        membership: crate::consensus_model::Membership::new(
+            membership
+                .membership()
+                .get_joint_config()
+                .iter()
+                .map(|voters| voters.iter().copied().collect())
+                .collect(),
+            membership
+                .membership()
+                .nodes()
+                .map(|(id, node)| (*id, node.addr.clone()))
+                .collect(),
+        )
+        .map_err(|error| format!("invalid bootstrap membership: {error:?}"))?,
+    };
+    verify_owned_proof(proof, cluster_id, &owned, members, now_unix_ms)
+}
+
+/// Verify bootstrap against owned committed authority and explicit verification time.
+/// # Errors
+/// Rejects invalid identity, signatures, credentials or insufficient joint quorum.
+pub fn verify_owned_proof(
+    proof: &BootstrapProof,
+    cluster_id: &str,
+    membership: &crate::consensus_model::StoredMembership,
+    members: &BTreeMap<String, ClusterMember>,
+    now_unix_ms: u64,
+) -> Result<(), String> {
+    let statement = &proof.statement;
+    let log = membership
+        .introduced_at
+        .as_ref()
+        .ok_or("bootstrap requires committed membership")?;
     if statement.cluster_id != cluster_id
-        || statement.membership_term != log.leader_id.term
-        || statement.membership_leader_id != log.leader_id.node_id.to_string()
-        || statement.membership_log_index != log.index
+        || statement.membership_term != log.term.0
+        || statement.membership_leader_id != log.leader.to_string()
+        || statement.membership_log_index != log.index.0
     {
         return Err("bootstrap membership or cluster mismatch".into());
     }
@@ -210,7 +248,7 @@ pub fn verify_proof(
     principal
         .verify(&payload, &signature)
         .map_err(|_| "principal proof failed")?;
-    let configs = membership.membership().get_joint_config();
+    let configs = membership.membership.configurations();
     if configs.is_empty()
         || configs.len() > 2
         || configs

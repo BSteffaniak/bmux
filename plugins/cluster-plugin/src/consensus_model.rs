@@ -22,6 +22,21 @@ pub enum MembershipError {
 }
 
 impl Membership {
+    // Fixed-width identities and count/length words are charged explicitly;
+    // endpoint lengths are UTF-8 byte lengths, not character counts.
+    fn admission_bytes(&self) -> Option<usize> {
+        let mut bytes = 16usize;
+        for configuration in &self.voters {
+            bytes = bytes
+                .checked_add(8)?
+                .checked_add(configuration.len().checked_mul(32)?)?;
+        }
+        for endpoint in self.nodes.values() {
+            bytes = bytes.checked_add(40)?.checked_add(endpoint.len())?;
+        }
+        Some(bytes)
+    }
+
     /// Validate before canonicalizing so duplicate wire identities cannot vanish.
     /// # Errors
     /// Rejects malformed uniform/joint configurations or missing node records.
@@ -153,6 +168,217 @@ pub struct Entry {
     pub payload: EntryPayload,
 }
 
+/// A decoded append batch, admitted before persistence or engine mutation.
+/// Authentication and negotiated transport limits remain adapter responsibilities.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppendRequest {
+    pub term: Term,
+    pub leader: NodeId,
+    pub previous: Option<LogIdentity>,
+    pub entries: Vec<Entry>,
+    pub leader_commit: Option<LogIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppendError {
+    TooManyEntries,
+    ApplicationBytesExceeded,
+    InvalidPreviousTerm,
+    NonContiguousIndex,
+    InvalidEntryTerm,
+    ConflictingLeader,
+    InvalidCommit,
+}
+
+impl AppendRequest {
+    /// Validate the log chain without reading storage or changing authority.
+    /// A leader commit may be beyond this batch; it is not permission to apply
+    /// beyond the prefix actually matched and durably stored by the receiver.
+    /// # Errors
+    /// Rejects oversized batches, index gaps/overflow, and inconsistent identities.
+    pub fn validate(
+        &self,
+        max_entries: usize,
+        max_application_bytes: usize,
+    ) -> Result<(), AppendError> {
+        if self.entries.len() > max_entries {
+            return Err(AppendError::TooManyEntries);
+        }
+        if self
+            .previous
+            .is_some_and(|previous| previous.term > self.term)
+        {
+            return Err(AppendError::InvalidPreviousTerm);
+        }
+        if self
+            .previous
+            .is_some_and(|previous| previous.term == self.term && previous.leader != self.leader)
+        {
+            return Err(AppendError::ConflictingLeader);
+        }
+        let mut previous = self.previous;
+        let mut bytes = 0usize;
+        for entry in &self.entries {
+            let expected = match previous {
+                Some(previous) => previous
+                    .index
+                    .successor()
+                    .map_err(|_| AppendError::NonContiguousIndex)?,
+                None => LogIndex(0),
+            };
+            if entry.identity.index != expected {
+                return Err(AppendError::NonContiguousIndex);
+            }
+            if entry.identity.term > self.term
+                || previous.is_some_and(|previous| previous.term > entry.identity.term)
+            {
+                return Err(AppendError::InvalidEntryTerm);
+            }
+            if (entry.identity.term == self.term && entry.identity.leader != self.leader)
+                || previous.is_some_and(|previous| {
+                    previous.term == entry.identity.term && previous.leader != entry.identity.leader
+                })
+            {
+                return Err(AppendError::ConflictingLeader);
+            }
+            // Charge membership data as well as application bytes. This is a
+            // decoded-model budget, not a claim about transport envelope size.
+            let payload_bytes = match &entry.payload {
+                EntryPayload::NoOp => 0,
+                EntryPayload::Application(payload) => payload.len(),
+                EntryPayload::Membership(membership) => membership
+                    .admission_bytes()
+                    .ok_or(AppendError::ApplicationBytesExceeded)?,
+            };
+            bytes = bytes
+                .checked_add(payload_bytes)
+                .filter(|bytes| *bytes <= max_application_bytes)
+                .ok_or(AppendError::ApplicationBytesExceeded)?;
+            previous = Some(entry.identity);
+        }
+        if let Some(commit) = self.leader_commit {
+            if commit.term > self.term {
+                return Err(AppendError::InvalidCommit);
+            }
+            for identity in self
+                .previous
+                .iter()
+                .chain(self.entries.iter().map(|entry| &entry.identity))
+            {
+                let (prefix, boundary) = if commit.index <= identity.index {
+                    (commit, *identity)
+                } else {
+                    (*identity, commit)
+                };
+                validate_position_prefix(Some(prefix), Some(boundary))
+                    .map_err(|_| AppendError::InvalidCommit)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A reconciliation result, not a durable acknowledgement. The caller must
+/// serialize its authoritative reads with application of the replacement suffix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppendReconciliation {
+    PreviousMismatch,
+    /// Entries through this identity matched or are proposed for persistence.
+    /// `replace_from` is an offset in the request, never a durable log index.
+    Matched {
+        through: Option<LogIdentity>,
+        replace_from: Option<usize>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileError {
+    InvalidRequest(AppendError),
+    CommittedConflict,
+    ConflictingPayload,
+    MissingCommittedEntry,
+    InvalidRecoveryPositions,
+    CompactedPrefix,
+    StorageReadFailure,
+}
+
+impl AppendRequest {
+    /// Compare a bounded request against one serialized authoritative log view.
+    /// The snapshot boundary and committed position come from the same recovered
+    /// authority as lookup. Compacted entries are never reconstructed or guessed.
+    /// # Errors
+    /// Rejects malformed requests and changes to committed entries. Read failure
+    /// stops reconciliation rather than being interpreted as a missing log entry.
+    /// The adapter must stop serving authority after a storage failure.
+    pub fn reconcile<'a>(
+        &self,
+        committed: Option<LogIdentity>,
+        snapshot: Option<LogIdentity>,
+        mut lookup: impl FnMut(LogIndex) -> Result<Option<&'a Entry>, ReconcileError>,
+        max_entries: usize,
+        max_application_bytes: usize,
+    ) -> Result<AppendReconciliation, ReconcileError> {
+        self.validate(max_entries, max_application_bytes)
+            .map_err(ReconcileError::InvalidRequest)?;
+        validate_position_prefix(snapshot, committed)
+            .map_err(|_| ReconcileError::InvalidRecoveryPositions)?;
+        if let Some(commit) = committed {
+            let recovered = match snapshot {
+                Some(boundary) if boundary.index == commit.index => Some(boundary),
+                _ => lookup(commit.index)?.map(|entry| entry.identity),
+            };
+            match recovered {
+                None => return Err(ReconcileError::MissingCommittedEntry),
+                Some(identity) if identity != commit => {
+                    return Err(ReconcileError::InvalidRecoveryPositions);
+                }
+                Some(_) => {}
+            }
+        }
+        if let Some(boundary) = snapshot
+            && self
+                .previous
+                .is_none_or(|previous| previous.index < boundary.index)
+        {
+            return Err(ReconcileError::CompactedPrefix);
+        }
+        if let Some(previous) = self.previous {
+            let local = match snapshot {
+                Some(boundary) if boundary.index == previous.index => Some(boundary),
+                _ => lookup(previous.index)?.map(|entry| entry.identity),
+            };
+            if local != Some(previous) {
+                return Ok(AppendReconciliation::PreviousMismatch);
+            }
+        }
+        let mut replace_from = None;
+        for (offset, proposed) in self.entries.iter().enumerate() {
+            let existing = lookup(proposed.identity.index)?;
+            let protected = committed.is_some_and(|commit| proposed.identity.index <= commit.index);
+            match existing {
+                Some(existing) if existing.identity == proposed.identity => {
+                    if existing.payload != proposed.payload {
+                        return Err(ReconcileError::ConflictingPayload);
+                    }
+                }
+                Some(_) if protected => return Err(ReconcileError::CommittedConflict),
+                None if protected => return Err(ReconcileError::MissingCommittedEntry),
+                _ => {
+                    replace_from.get_or_insert(offset);
+                }
+            }
+        }
+        Ok(AppendReconciliation::Matched {
+            through: self
+                .entries
+                .last()
+                .map(|entry| entry.identity)
+                .or(self.previous),
+            replace_from,
+        })
+    }
+}
+
 /// Application bytes keep their own schema and deduplication semantics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntryPayload {
@@ -202,6 +428,97 @@ impl LogIndex {
 pub struct HardState {
     pub term: Term,
     pub voted_for: Option<NodeId>,
+}
+
+/// Combined append authority decision.
+///
+/// Neither outcome authorizes a reply until
+/// required hard-state and suffix writes complete. Errors require stopping the
+/// affected operation; storage errors additionally stop the authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppendDecision {
+    pub persist: Option<HardState>,
+    pub term: Term,
+    pub step_down: bool,
+    /// Proposed commit watermark, published only after required persistence.
+    /// This does not advance the separately tracked durable applied position.
+    pub commit: Option<LogIdentity>,
+    pub outcome: Result<AppendOutcome, ReconcileError>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppendOutcome {
+    StaleTerm,
+    Reconciled(AppendReconciliation),
+}
+
+impl HardState {
+    /// Evaluate an authenticated append against a serialized recovered log view.
+    /// Higher-term authority must be persisted even on a log mismatch. `step_down`
+    /// also directs candidates to follow a same-term authenticated leader.
+    #[must_use]
+    pub fn evaluate_append<'a>(
+        self,
+        request: &AppendRequest,
+        positions: (Option<LogIdentity>, Option<LogIdentity>),
+        mut lookup: impl FnMut(LogIndex) -> Result<Option<&'a Entry>, ReconcileError>,
+        limits: (usize, usize),
+    ) -> AppendDecision {
+        if request.term < self.term {
+            return AppendDecision {
+                persist: None,
+                term: self.term,
+                step_down: false,
+                commit: positions.0,
+                outcome: Ok(AppendOutcome::StaleTerm),
+            };
+        }
+        let persist = (request.term > self.term).then_some(Self {
+            term: request.term,
+            voted_for: None,
+        });
+        let mut outcome = request
+            .reconcile(positions.0, positions.1, &mut lookup, limits.0, limits.1)
+            .map(AppendOutcome::Reconciled);
+        let mut commit = positions.0;
+        if let Ok(AppendOutcome::Reconciled(AppendReconciliation::Matched {
+            through: Some(matched),
+            ..
+        })) = outcome
+            && let Some(advertised) = request.leader_commit
+        {
+            let candidate = if advertised.index <= matched.index {
+                advertised
+            } else {
+                matched
+            };
+            if commit.is_none_or(|current| candidate.index > current.index) {
+                let identity = if candidate == matched {
+                    Ok(Some(matched))
+                } else if let Some(entry) = request
+                    .entries
+                    .iter()
+                    .find(|entry| entry.identity.index == candidate.index)
+                {
+                    Ok(Some(entry.identity))
+                } else {
+                    lookup(candidate.index).map(|entry| entry.map(|entry| entry.identity))
+                };
+                match identity {
+                    Ok(Some(identity)) if identity == candidate => commit = Some(candidate),
+                    Ok(_) => outcome = Err(ReconcileError::InvalidRecoveryPositions),
+                    Err(error) => outcome = Err(error),
+                }
+            }
+        }
+        AppendDecision {
+            persist,
+            term: request.term,
+            step_down: true,
+            commit,
+            outcome,
+        }
+    }
 }
 
 /// Full identity is used for matching; deliberately has no total ordering.
@@ -411,6 +728,406 @@ impl VoteGate {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn append_budget_charges_membership_and_application_together() {
+        let leader = NodeId::from(1);
+        let membership = Membership::new(vec![vec![leader]], vec![(leader, "é".into())]).unwrap();
+        let cost = 16 + 8 + 32 + 40 + 2;
+        assert_eq!(membership.admission_bytes(), Some(cost));
+        let identity = LogIdentity {
+            term: Term(1),
+            leader,
+            index: LogIndex(0),
+        };
+        let mut request = AppendRequest {
+            term: Term(1),
+            leader,
+            previous: None,
+            entries: vec![Entry {
+                identity,
+                payload: EntryPayload::Membership(membership),
+            }],
+            leader_commit: None,
+        };
+        assert_eq!(request.validate(2, cost), Ok(()));
+        assert_eq!(
+            request.validate(2, cost - 1),
+            Err(AppendError::ApplicationBytesExceeded)
+        );
+        request.entries.push(Entry {
+            identity: LogIdentity {
+                index: LogIndex(1),
+                ..identity
+            },
+            payload: EntryPayload::Application(vec![0]),
+        });
+        assert_eq!(
+            request.validate(2, cost),
+            Err(AppendError::ApplicationBytesExceeded)
+        );
+        assert_eq!(request.validate(2, cost + 1), Ok(()));
+    }
+    #[test]
+    fn follower_commit_is_capped_by_matched_request_not_local_tail() {
+        let leader = NodeId::from(1);
+        let first = LogIdentity {
+            term: Term(1),
+            leader,
+            index: LogIndex(0),
+        };
+        let second = LogIdentity {
+            index: LogIndex(1),
+            ..first
+        };
+        let tail = LogIdentity {
+            index: LogIndex(10),
+            ..first
+        };
+        let entry = Entry {
+            identity: first,
+            payload: EntryPayload::NoOp,
+        };
+        let state = HardState {
+            term: Term(2),
+            voted_for: None,
+        };
+        let mut request = AppendRequest {
+            term: Term(2),
+            leader,
+            previous: Some(first),
+            entries: vec![Entry {
+                identity: second,
+                payload: EntryPayload::NoOp,
+            }],
+            leader_commit: Some(tail),
+        };
+        let decision = state.evaluate_append(
+            &request,
+            (Some(first), None),
+            |index| Ok((index == first.index).then_some(&entry)),
+            (1, 0),
+        );
+        assert_eq!(decision.commit, Some(second));
+        request.entries.clear();
+        let heartbeat =
+            state.evaluate_append(&request, (Some(first), None), |_| Ok(Some(&entry)), (1, 0));
+        assert_eq!(heartbeat.commit, Some(first));
+        request.leader_commit = None;
+        let unchanged =
+            state.evaluate_append(&request, (Some(first), None), |_| Ok(Some(&entry)), (1, 0));
+        assert_eq!(unchanged.commit, Some(first));
+    }
+    #[test]
+    fn heartbeat_rejects_missing_or_conflicting_committed_authority() {
+        let leader = NodeId::from(1);
+        let commit = LogIdentity {
+            term: Term(2),
+            leader,
+            index: LogIndex(0),
+        };
+        let request = AppendRequest {
+            term: Term(3),
+            leader,
+            previous: None,
+            entries: vec![],
+            leader_commit: None,
+        };
+        assert_eq!(
+            request.reconcile(Some(commit), None, |_| Ok(None), 0, 0),
+            Err(ReconcileError::MissingCommittedEntry)
+        );
+        let corrupt = Entry {
+            identity: LogIdentity {
+                term: Term(1),
+                ..commit
+            },
+            payload: EntryPayload::NoOp,
+        };
+        assert_eq!(
+            request.reconcile(Some(commit), None, |_| Ok(Some(&corrupt)), 0, 0),
+            Err(ReconcileError::InvalidRecoveryPositions)
+        );
+        assert_eq!(
+            request.reconcile(
+                Some(commit),
+                None,
+                |_| Err(ReconcileError::StorageReadFailure),
+                0,
+                0
+            ),
+            Err(ReconcileError::StorageReadFailure)
+        );
+    }
+    #[test]
+    fn append_term_transition_survives_mismatch_and_stale_requests_do_not_read() {
+        let leader = NodeId::from(1);
+        let state = HardState {
+            term: Term(3),
+            voted_for: Some(leader),
+        };
+        let mut request = AppendRequest {
+            term: Term(2),
+            leader,
+            previous: None,
+            entries: vec![],
+            leader_commit: None,
+        };
+        let rejected = state.evaluate_append(
+            &request,
+            (None, None),
+            |_| panic!("stale append read storage"),
+            (1, 0),
+        );
+        assert_eq!(rejected.outcome, Ok(AppendOutcome::StaleTerm));
+        assert_eq!(rejected.persist, None);
+        assert!(!rejected.step_down);
+        request.term = Term(4);
+        request.previous = Some(LogIdentity {
+            term: Term(2),
+            leader,
+            index: LogIndex(0),
+        });
+        let decision = state.evaluate_append(&request, (None, None), |_| Ok(None), (1, 0));
+        assert_eq!(
+            decision.persist,
+            Some(HardState {
+                term: Term(4),
+                voted_for: None
+            })
+        );
+        assert_eq!(
+            decision.outcome,
+            Ok(AppendOutcome::Reconciled(
+                AppendReconciliation::PreviousMismatch
+            ))
+        );
+        assert!(decision.step_down);
+        let failed = state.evaluate_append(
+            &request,
+            (None, None),
+            |_| Err(ReconcileError::StorageReadFailure),
+            (1, 0),
+        );
+        assert_eq!(failed.persist, decision.persist);
+        assert_eq!(failed.outcome, Err(ReconcileError::StorageReadFailure));
+        request.term = Term(3);
+        let same = state.evaluate_append(&request, (None, None), |_| Ok(None), (1, 0));
+        assert_eq!(same.persist, None);
+        assert!(same.step_down);
+        assert_eq!(state.voted_for, Some(leader));
+    }
+    #[test]
+    fn failed_lookup_never_becomes_mismatch_or_suffix_replacement() {
+        let leader = NodeId::from(1);
+        let identity = LogIdentity {
+            term: Term(1),
+            leader,
+            index: LogIndex(0),
+        };
+        let mut request = AppendRequest {
+            term: Term(1),
+            leader,
+            previous: Some(identity),
+            entries: vec![],
+            leader_commit: None,
+        };
+        assert_eq!(
+            request.reconcile(
+                None,
+                None,
+                |_| Err(ReconcileError::StorageReadFailure),
+                1,
+                0
+            ),
+            Err(ReconcileError::StorageReadFailure)
+        );
+        request.previous = None;
+        request.entries.push(Entry {
+            identity,
+            payload: EntryPayload::NoOp,
+        });
+        assert_eq!(
+            request.reconcile(
+                None,
+                None,
+                |_| Err(ReconcileError::StorageReadFailure),
+                1,
+                0
+            ),
+            Err(ReconcileError::StorageReadFailure)
+        );
+    }
+    #[test]
+    fn reconciliation_uses_snapshot_identity_without_reading_deleted_entries() {
+        let leader = NodeId::from(1);
+        let boundary = LogIdentity {
+            term: Term(2),
+            leader,
+            index: LogIndex(10),
+        };
+        let mut request = AppendRequest {
+            term: Term(2),
+            leader,
+            previous: Some(boundary),
+            entries: vec![],
+            leader_commit: Some(boundary),
+        };
+        let no_read = |_| -> Result<Option<&Entry>, ReconcileError> {
+            panic!("compacted history must not be read")
+        };
+        assert_eq!(
+            request.reconcile(Some(boundary), Some(boundary), no_read, 1, 0),
+            Ok(AppendReconciliation::Matched {
+                through: Some(boundary),
+                replace_from: None
+            })
+        );
+        assert_eq!(
+            request.reconcile(None, Some(boundary), no_read, 1, 0),
+            Err(ReconcileError::InvalidRecoveryPositions)
+        );
+        request.previous = None;
+        assert_eq!(
+            request.reconcile(Some(boundary), Some(boundary), no_read, 1, 0),
+            Err(ReconcileError::CompactedPrefix)
+        );
+        request.previous = Some(LogIdentity {
+            index: LogIndex(9),
+            ..boundary
+        });
+        assert_eq!(
+            request.reconcile(Some(boundary), Some(boundary), no_read, 1, 0),
+            Err(ReconcileError::CompactedPrefix)
+        );
+        request.previous = Some(boundary);
+        let next = LogIdentity {
+            index: LogIndex(11),
+            ..boundary
+        };
+        request.entries.push(Entry {
+            identity: next,
+            payload: EntryPayload::NoOp,
+        });
+        assert_eq!(
+            request.reconcile(Some(boundary), Some(boundary), |_| Ok(None), 1, 0),
+            Ok(AppendReconciliation::Matched {
+                through: Some(next),
+                replace_from: Some(0)
+            })
+        );
+    }
+    #[test]
+    fn append_reconciliation_protects_committed_prefix_and_preserves_extra_tail() {
+        let leader = NodeId::from(1);
+        let first = Entry {
+            identity: LogIdentity {
+                term: Term(1),
+                leader,
+                index: LogIndex(0),
+            },
+            payload: EntryPayload::NoOp,
+        };
+        let old = Entry {
+            identity: LogIdentity {
+                index: LogIndex(1),
+                ..first.identity
+            },
+            payload: EntryPayload::NoOp,
+        };
+        let replacement = Entry {
+            identity: LogIdentity {
+                term: Term(2),
+                ..old.identity
+            },
+            payload: EntryPayload::NoOp,
+        };
+        let mut request = AppendRequest {
+            term: Term(2),
+            leader,
+            previous: Some(first.identity),
+            entries: vec![replacement.clone()],
+            leader_commit: Some(first.identity),
+        };
+        let log = [&first, &old];
+        let lookup = |index: LogIndex| {
+            Ok(log
+                .iter()
+                .copied()
+                .find(|entry| entry.identity.index == index))
+        };
+        assert_eq!(
+            request.reconcile(Some(first.identity), None, lookup, 1, 0),
+            Ok(AppendReconciliation::Matched {
+                through: Some(replacement.identity),
+                replace_from: Some(0)
+            })
+        );
+        assert_eq!(
+            request.reconcile(Some(old.identity), None, lookup, 1, 0),
+            Err(ReconcileError::CommittedConflict)
+        );
+        request.entries.clear();
+        assert_eq!(
+            request.reconcile(Some(first.identity), None, lookup, 1, 0),
+            Ok(AppendReconciliation::Matched {
+                through: Some(first.identity),
+                replace_from: None
+            })
+        );
+        request.previous = Some(replacement.identity);
+        assert_eq!(
+            request.reconcile(Some(first.identity), None, lookup, 1, 0),
+            Ok(AppendReconciliation::PreviousMismatch)
+        );
+    }
+
+    #[test]
+    fn append_admission_checks_chain_and_budget_before_effects() {
+        let leader = NodeId::from(1);
+        let first = LogIdentity {
+            term: Term(2),
+            leader,
+            index: LogIndex(0),
+        };
+        let mut request = AppendRequest {
+            term: Term(2),
+            leader,
+            previous: None,
+            entries: vec![Entry {
+                identity: first,
+                payload: EntryPayload::Application(vec![1, 2]),
+            }],
+            leader_commit: Some(first),
+        };
+        assert_eq!(request.validate(1, 2), Ok(()));
+        assert_eq!(request.validate(0, 2), Err(AppendError::TooManyEntries));
+        assert_eq!(
+            request.validate(1, 1),
+            Err(AppendError::ApplicationBytesExceeded)
+        );
+        request.entries[0].identity.index = LogIndex(1);
+        assert_eq!(request.validate(1, 2), Err(AppendError::NonContiguousIndex));
+        request.entries[0].identity = first;
+        request.entries[0].identity.leader = NodeId::from(2);
+        assert_eq!(request.validate(1, 2), Err(AppendError::ConflictingLeader));
+        request.entries[0].identity = first;
+        request.leader_commit = Some(LogIdentity {
+            term: Term(1),
+            ..first
+        });
+        assert_eq!(request.validate(1, 2), Err(AppendError::InvalidCommit));
+        request.leader_commit = Some(LogIdentity {
+            index: LogIndex(10),
+            ..first
+        });
+        assert_eq!(request.validate(1, 2), Ok(()));
+        request.previous = Some(LogIdentity {
+            index: LogIndex(u64::MAX),
+            ..first
+        });
+        assert_eq!(request.validate(1, 2), Err(AppendError::NonContiguousIndex));
+    }
+
     use super::*;
 
     #[test]

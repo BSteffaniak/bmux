@@ -688,56 +688,95 @@ impl ConsensusStateMachine {
         &mut self,
         request: &ControlRequest,
     ) -> Result<ControlReply, StorageError<NodeId>> {
-        let response = if crate::principal_bootstrap::is_bootstrap_command(&request.0) {
-            let command = crate::principal_bootstrap::BootstrapCommand::decode(&request.0)
-                .map_err(|error| storage_write_error(std::io::Error::other(error)))?;
-            self.control_state
-                .apply_bootstrap_command(&command, &self.last_membership)
-        } else if request.0.starts_with(b"BMCAP001") {
-            use bmux_cluster_plugin_api::cluster_types::{
-                ControlCommandError, ControlCommandResult, ControlResponse, ControlWorkflowStatus,
-            };
-            let command = crate::capability_publication::PublicationCommand::decode(&request.0)
-                .map_err(|error| storage_write_error(std::io::Error::other(error)))?;
-            let outcome = self
-                .control_state
-                .apply_publication(&command, &self.last_membership);
-            let (control_revision, result) = match outcome {
-                Ok(revision) => (
-                    revision,
-                    ControlCommandResult::Accepted {
-                        payload: Vec::new(),
-                    },
-                ),
-                Err(reason) => (
-                    self.control_state.revision,
-                    ControlCommandResult::Rejected {
-                        error: ControlCommandError::InvalidTransition { reason },
-                    },
-                ),
-            };
-            ControlResponse {
-                schema_version: 1,
-                command_id: command.reports[0].command_id.clone(),
-                control_revision,
-                workflow_status: ControlWorkflowStatus::Complete,
-                result,
-            }
-        } else if crate::control_codec::is_protocol_refresh(&request.0) {
-            let command = crate::control_codec::ProtocolRefreshCommand::decode(&request.0)
-                .map_err(storage_write_error)?;
-            self.control_state.apply_refresh_command(&command)
-        } else if crate::control_codec::is_feature_activation(&request.0) {
-            let command = crate::control_codec::decode_feature_activation(&request.0)
-                .map_err(storage_write_error)?;
-            self.control_state
-                .apply_feature_activation_with_membership(&command, Some(&self.last_membership))
-        } else {
-            let command = decode_control_command(&request.0).map_err(storage_write_error)?;
-            self.control_state.apply(&command)
-        };
-        Ok(ControlReply(encode_control_response(&response)))
+        apply_control_command(
+            &mut self.control_state,
+            ApplicationMembership::Legacy(&self.last_membership),
+            &request.0,
+        )
+        .map(ControlReply)
+        .map_err(storage_write_error)
     }
+}
+
+// One deterministic dispatcher for every command family. Storage adapters own
+// candidate isolation, durable commit and reply release, never this function.
+#[derive(Clone, Copy)]
+pub(crate) enum ApplicationMembership<'a> {
+    Legacy(&'a StoredMembership<NodeId, BasicNode>),
+    Owned(&'a crate::consensus_model::StoredMembership),
+}
+
+pub(crate) fn apply_control_command(
+    control_state: &mut ControlState,
+    membership: ApplicationMembership<'_>,
+    bytes: &[u8],
+) -> Result<Vec<u8>, std::io::Error> {
+    let response = if crate::principal_bootstrap::is_bootstrap_command(bytes) {
+        let command = crate::principal_bootstrap::BootstrapCommand::decode(bytes)
+            .map_err(std::io::Error::other)?;
+        match membership {
+            ApplicationMembership::Legacy(membership) => {
+                control_state.apply_bootstrap_command(&command, membership)
+            }
+            ApplicationMembership::Owned(membership) => {
+                control_state.apply_owned_bootstrap_command(&command, membership)
+            }
+        }
+    } else if bytes.starts_with(b"BMCAP001") {
+        use bmux_cluster_plugin_api::cluster_types::{
+            ControlCommandError, ControlCommandResult, ControlResponse, ControlWorkflowStatus,
+        };
+        let command = crate::capability_publication::PublicationCommand::decode(bytes)
+            .map_err(std::io::Error::other)?;
+        let outcome = match membership {
+            ApplicationMembership::Legacy(membership) => {
+                control_state.apply_publication(&command, membership)
+            }
+            ApplicationMembership::Owned(membership) => {
+                control_state.apply_owned_publication(&command, membership)
+            }
+        };
+        let (control_revision, result) = match outcome {
+            Ok(revision) => (
+                revision,
+                ControlCommandResult::Accepted {
+                    payload: Vec::new(),
+                },
+            ),
+            Err(reason) => (
+                control_state.revision,
+                ControlCommandResult::Rejected {
+                    error: ControlCommandError::InvalidTransition { reason },
+                },
+            ),
+        };
+        ControlResponse {
+            schema_version: 1,
+            command_id: command.reports[0].command_id.clone(),
+            control_revision,
+            workflow_status: ControlWorkflowStatus::Complete,
+            result,
+        }
+    } else if crate::control_codec::is_protocol_refresh(bytes) {
+        let command = crate::control_codec::ProtocolRefreshCommand::decode(bytes)
+            .map_err(std::io::Error::other)?;
+        control_state.apply_refresh_command(&command)
+    } else if crate::control_codec::is_feature_activation(bytes) {
+        let command = crate::control_codec::decode_feature_activation(bytes)
+            .map_err(std::io::Error::other)?;
+        match membership {
+            ApplicationMembership::Legacy(membership) => {
+                control_state.apply_feature_activation_with_membership(&command, Some(membership))
+            }
+            ApplicationMembership::Owned(membership) => {
+                control_state.apply_owned_feature_activation(&command, Some(membership))
+            }
+        }
+    } else {
+        let command = decode_control_command(bytes).map_err(std::io::Error::other)?;
+        control_state.apply(&command)
+    };
+    Ok(encode_control_response(&response))
 }
 
 impl RaftStateMachine<ControlRaftConfig> for ConsensusStateMachine {
@@ -955,6 +994,53 @@ fn snapshot_checksum(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
+pub(crate) fn encode_owned_snapshot(
+    cluster: &str,
+    snapshot_id: &str,
+    position: crate::consensus_model::LogIdentity,
+    membership: &crate::consensus_model::StoredMembership,
+    control: &[u8],
+) -> Result<Vec<u8>, ConsensusStorageError> {
+    let mut stored = DurableWriter::new(*b"BMMEM001");
+    stored.boolean(membership.introduced_at.is_some());
+    if let Some(identity) = membership.introduced_at {
+        encode_owned_log_identity(&mut stored, identity);
+    }
+    encode_owned_membership_fields(&mut stored, &membership.membership)?;
+    let mut writer = DurableWriter::new(*b"BMSNP001");
+    writer.u16(SNAPSHOT_FORMAT_VERSION);
+    writer.bytes(cluster.as_bytes())?;
+    writer.bytes(snapshot_id.as_bytes())?;
+    writer.boolean(true);
+    encode_owned_log_identity(&mut writer, position);
+    writer.bytes(&stored.finish())?;
+    writer.bytes(control)?;
+    let mut bytes = writer.finish();
+    let checksum = snapshot_checksum(&bytes);
+    bytes.extend_from_slice(&checksum);
+    decode_owned_snapshot(&bytes)?;
+    Ok(bytes)
+}
+
+fn encode_owned_membership_fields(
+    writer: &mut DurableWriter,
+    membership: &crate::consensus_model::Membership,
+) -> Result<(), ConsensusStorageError> {
+    writer.count(membership.configurations().len())?;
+    for configuration in membership.configurations() {
+        writer.count(configuration.len())?;
+        for id in configuration {
+            writer.raw(id.as_bytes());
+        }
+    }
+    writer.count(membership.nodes().len())?;
+    for (id, endpoint) in membership.nodes() {
+        writer.raw(id.as_bytes());
+        writer.bytes(endpoint.as_bytes())?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn encode_snapshot_envelope(
     cluster_id: &str,
@@ -1001,6 +1087,13 @@ pub(super) fn snapshot_requires_publication_decoder(
 }
 
 fn decode_snapshot_envelope(bytes: &[u8]) -> Result<SnapshotEnvelope, ConsensusStorageError> {
+    let (descriptor, control_bytes) = decode_owned_snapshot(bytes)?;
+    Ok(legacy_snapshot_envelope(descriptor, control_bytes))
+}
+
+pub(crate) fn decode_owned_snapshot(
+    bytes: &[u8],
+) -> Result<(crate::consensus_model::SnapshotDescriptor, Vec<u8>), ConsensusStorageError> {
     if bytes.len() > MAX_SNAPSHOT_FILE_BYTES {
         return Err(ConsensusStorageError::CorruptRecord("snapshot size"));
     }
@@ -1052,6 +1145,13 @@ fn decode_snapshot_envelope(bytes: &[u8]) -> Result<SnapshotEnvelope, ConsensusS
             "snapshot cluster mismatch",
         ));
     }
+    Ok((descriptor, control_bytes))
+}
+
+fn legacy_snapshot_envelope(
+    descriptor: crate::consensus_model::SnapshotDescriptor,
+    control_bytes: Vec<u8>,
+) -> SnapshotEnvelope {
     let legacy_position = |identity: crate::consensus_model::LogIdentity| {
         LogId::new(
             CommittedLeaderId::new(identity.term.0, identity.leader),
@@ -1067,13 +1167,13 @@ fn decode_snapshot_envelope(bytes: &[u8]) -> Result<SnapshotEnvelope, ConsensusS
                     legacy_membership(&membership.membership),
                 )
             });
-    Ok(SnapshotEnvelope {
+    SnapshotEnvelope {
         cluster_id: descriptor.cluster_id,
         snapshot_id: descriptor.snapshot_id,
         last_log_id: descriptor.last_included.map(legacy_position),
         last_membership,
         control_bytes,
-    })
+    }
 }
 
 fn encode_snapshot_install_manifest(
@@ -1583,18 +1683,69 @@ fn legacy_membership(owned: &crate::consensus_model::Membership) -> Membership<N
     )
 }
 
+#[derive(Clone, Copy)]
+enum EntryPayloadRef<'a> {
+    NoOp,
+    Application(&'a [u8]),
+    OwnedMembership(&'a crate::consensus_model::Membership),
+    LegacyMembership(&'a Membership<NodeId, BasicNode>),
+}
+
 fn encode_entry(entry: &Entry<ControlRaftConfig>) -> Result<Vec<u8>, ConsensusStorageError> {
-    let mut writer = DurableWriter::new(*b"BMENT001");
-    encode_log_id_fields(&mut writer, &entry.log_id);
-    match &entry.payload {
-        EntryPayload::Blank => writer.u8(0),
-        EntryPayload::Normal(request) => {
-            writer.u8(1);
-            writer.bytes(&request.0)?;
+    let identity = crate::consensus_model::LogIdentity {
+        term: crate::consensus_model::Term(entry.log_id.leader_id.term),
+        leader: entry.log_id.leader_id.node_id,
+        index: crate::consensus_model::LogIndex(entry.log_id.index),
+    };
+    let payload = match &entry.payload {
+        EntryPayload::Blank => EntryPayloadRef::NoOp,
+        EntryPayload::Normal(request) => EntryPayloadRef::Application(&request.0),
+        // Preserve legacy encoding of uninitialized/malformed configurations;
+        // decoding remains responsible for rejecting those representations.
+        EntryPayload::Membership(membership) => EntryPayloadRef::LegacyMembership(membership),
+    };
+    encode_entry_fields(identity, payload)
+}
+
+/// Encode an owned entry using the existing durable entry representation.
+/// # Errors
+/// Returns an error when a count or payload exceeds the format's size limits.
+pub fn encode_owned_entry(
+    entry: &crate::consensus_model::Entry,
+) -> Result<Vec<u8>, ConsensusStorageError> {
+    let payload = match &entry.payload {
+        crate::consensus_model::EntryPayload::NoOp => EntryPayloadRef::NoOp,
+        crate::consensus_model::EntryPayload::Application(bytes) => {
+            EntryPayloadRef::Application(bytes)
         }
-        EntryPayload::Membership(membership) => {
+        crate::consensus_model::EntryPayload::Membership(membership) => {
+            EntryPayloadRef::OwnedMembership(membership)
+        }
+    };
+    encode_entry_fields(entry.identity, payload)
+}
+
+fn encode_entry_fields(
+    identity: crate::consensus_model::LogIdentity,
+    payload: EntryPayloadRef<'_>,
+) -> Result<Vec<u8>, ConsensusStorageError> {
+    let mut writer = DurableWriter::new(*b"BMENT001");
+    writer.u64(identity.term.0);
+    writer.raw(identity.leader.as_bytes());
+    writer.u64(identity.index.0);
+    match payload {
+        EntryPayloadRef::NoOp => writer.u8(0),
+        EntryPayloadRef::Application(bytes) => {
+            writer.u8(1);
+            writer.bytes(bytes)?;
+        }
+        EntryPayloadRef::LegacyMembership(membership) => {
             writer.u8(2);
             encode_membership_fields(&mut writer, membership)?;
+        }
+        EntryPayloadRef::OwnedMembership(membership) => {
+            writer.u8(2);
+            encode_owned_membership_fields(&mut writer, membership)?;
         }
     }
     Ok(writer.finish())
@@ -1618,7 +1769,7 @@ fn decode_entry(bytes: &[u8]) -> Result<Entry<ControlRaftConfig>, ConsensusStora
     Ok(Entry { log_id, payload })
 }
 
-fn decode_owned_entry(
+pub(crate) fn decode_owned_entry(
     bytes: &[u8],
 ) -> Result<crate::consensus_model::Entry, ConsensusStorageError> {
     use crate::consensus_model::{Entry, EntryPayload};
@@ -1845,6 +1996,41 @@ fn storage_write_error(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn owned_entry_encoder_preserves_legacy_wire_bytes() {
+        let node = NodeId::from(1);
+        let membership = Membership::new(
+            vec![std::collections::BTreeSet::from([node])],
+            std::collections::BTreeMap::from([(node, BasicNode::new("endpoint"))]),
+        );
+        for payload in [
+            EntryPayload::Blank,
+            EntryPayload::Normal(ControlRequest(vec![1, 2, 3])),
+            EntryPayload::Membership(membership),
+        ] {
+            let entry: Entry<ControlRaftConfig> = Entry {
+                log_id: LogId::new(CommittedLeaderId::new(3, node), 4),
+                payload,
+            };
+            let mut reference = DurableWriter::new(*b"BMENT001");
+            encode_log_id_fields(&mut reference, &entry.log_id);
+            match &entry.payload {
+                EntryPayload::Blank => reference.u8(0),
+                EntryPayload::Normal(request) => {
+                    reference.u8(1);
+                    reference.bytes(&request.0).unwrap();
+                }
+                EntryPayload::Membership(membership) => {
+                    reference.u8(2);
+                    encode_membership_fields(&mut reference, membership).unwrap();
+                }
+            }
+            let expected = reference.finish();
+            let owned = decode_owned_entry(&expected).unwrap();
+            assert_eq!(encode_owned_entry(&owned).unwrap(), expected);
+            assert_eq!(encode_entry(&entry).unwrap(), expected);
+        }
+    }
     use super::*;
     use openraft::storage::RaftLogStorageExt;
     use openraft::{CommittedLeaderId, EntryPayload};

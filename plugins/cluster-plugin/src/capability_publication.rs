@@ -62,9 +62,54 @@ pub fn verify_report(
     cluster_id: &str,
     verified_at_unix_ms: u64,
 ) -> Result<(), String> {
-    let payload = signing_payload(report)?;
+    let owned = owned_publication_membership(membership)?;
+    verify_owned_report(report, member, &owned, cluster_id, verified_at_unix_ms)
+}
+
+pub(crate) fn owned_publication_membership(
+    membership: &StoredMembership<NodeId, BasicNode>,
+) -> Result<crate::consensus_model::StoredMembership, String> {
     let position = membership
         .log_id()
+        .as_ref()
+        .ok_or("missing committed membership")?;
+    Ok(crate::consensus_model::StoredMembership {
+        introduced_at: Some(crate::consensus_model::LogIdentity {
+            term: crate::consensus_model::Term(position.leader_id.term),
+            leader: position.leader_id.node_id,
+            index: crate::consensus_model::LogIndex(position.index),
+        }),
+        membership: crate::consensus_model::Membership::new(
+            membership
+                .membership()
+                .get_joint_config()
+                .iter()
+                .map(|voters| voters.iter().copied().collect())
+                .collect(),
+            membership
+                .membership()
+                .nodes()
+                .map(|(id, node)| (*id, node.addr.clone()))
+                .collect(),
+        )
+        .map_err(|error| format!("invalid committed membership: {error:?}"))?,
+    })
+}
+
+/// Verify report authority against owned committed membership without consulting
+/// a consensus runtime or clock. Verification time is explicit replicated input.
+/// # Errors
+/// Rejects missing membership, stale credentials, mismatched identity or signature.
+pub fn verify_owned_report(
+    report: &CapabilityReport,
+    member: &ClusterMember,
+    membership: &crate::consensus_model::StoredMembership,
+    cluster_id: &str,
+    verified_at_unix_ms: u64,
+) -> Result<(), String> {
+    let payload = signing_payload(report)?;
+    let position = membership
+        .introduced_at
         .as_ref()
         .ok_or("missing committed membership")?;
     let node: NodeId = report
@@ -77,10 +122,10 @@ pub fn verify_report(
         || report.node_id != member.node_id
         || report.credential_serial != member.credential_serial
         || member.state != ClusterMemberState::Active
-        || membership.membership().get_node(&node).is_none()
-        || report.membership_term != position.leader_id.term
-        || report.membership_leader_id != position.leader_id.node_id.to_string()
-        || report.membership_log_index != position.index
+        || !membership.membership.nodes().contains_key(&node)
+        || report.membership_term != position.term.0
+        || report.membership_leader_id != position.leader.to_string()
+        || report.membership_log_index != position.index.0
     {
         return Err("capability report authority mismatch".into());
     }
@@ -106,13 +151,26 @@ pub fn verify_bridge(
     cluster_id: &str,
     verified_at_unix_ms: u64,
 ) -> Result<(), String> {
+    let owned = owned_publication_membership(membership)?;
+    verify_owned_bridge(reports, members, &owned, cluster_id, verified_at_unix_ms)
+}
+
+/// Verify complete publication evidence against owned committed membership.
+/// # Errors
+/// Rejects incomplete coverage, duplicates, invalid authority and incompatible peers.
+pub fn verify_owned_bridge(
+    reports: &[CapabilityReport],
+    members: &std::collections::BTreeMap<String, ClusterMember>,
+    membership: &crate::consensus_model::StoredMembership,
+    cluster_id: &str,
+    verified_at_unix_ms: u64,
+) -> Result<(), String> {
     const MAX_RECIPIENTS: usize = 128;
     if reports.is_empty() || reports.len() > MAX_RECIPIENTS {
         return Err("invalid bridge recipient count".into());
     }
-    let committed = membership.membership();
-    if committed.voter_ids().next().is_none()
-        || committed.nodes().take(MAX_RECIPIENTS + 1).count() != reports.len()
+    let committed = &membership.membership;
+    if committed.nodes().len() != reports.len()
         || members
             .values()
             .filter(|member| member.state == ClusterMemberState::Active)
@@ -130,7 +188,7 @@ pub fn verify_bridge(
         let member = members
             .get(&report.node_id)
             .ok_or("bridge member missing")?;
-        verify_report(report, member, membership, cluster_id, verified_at_unix_ms)?;
+        verify_owned_report(report, member, membership, cluster_id, verified_at_unix_ms)?;
         // The bridge's publication encoding is separately versioned from the
         // eventual feature floor; advertising refresh support is insufficient.
         if !report

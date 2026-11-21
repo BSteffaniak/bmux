@@ -855,6 +855,104 @@ interface cluster-worker-stream {
     query observe(authorities: list<cluster-types.worker-authority>, max_history_lines: u32) -> result<list<cluster-types.observed-execution>, cluster-types.worker-service-error>;
 }
 
+// Owned-engine staging contract. Not advertised until authenticated bounded
+// staging and owned RPC negotiation are implemented together (ADR-0015).
+interface cluster-consensus-transfer-types {
+    // Canonical NodeId bytes are the full 32-byte signing public key, not UUIDs.
+    record log-identity {
+        term: u64,
+        leader: bytes,
+        index: u64,
+    }
+    record node-address {
+        node: bytes,
+        endpoint: string,
+    }
+    record voter-configuration {
+        voters: list<bytes>,
+    }
+    record stored-membership {
+        introduced-at: log-identity,
+        configurations: list<voter-configuration>,
+        nodes: list<node-address>,
+    }
+    record snapshot-descriptor {
+        format-version: u16,
+        cluster-id: string,
+        snapshot-id: string,
+        last-included: log-identity?,
+        membership: stored-membership?,
+        total-bytes: u64,
+        checksum: bytes,
+    }
+    record entry-purpose {
+        identity: log-identity,
+        previous: log-identity?,
+    }
+    variant transfer-purpose {
+        entry { value: entry-purpose },
+        snapshot { value: snapshot-descriptor },
+    }
+    record transfer-header {
+        cluster-id: string,
+        sender: bytes,
+        recipient: bytes,
+        leader-term: u64,
+        sender-incarnation: uuid,
+        sequence: u64,
+        purpose: transfer-purpose,
+        total-bytes: u64,
+        checksum: bytes,
+    }
+    // Signatures bind the operation, complete header, offset and chunk bytes.
+    // Hash/signature lengths and encoded-envelope limits require validation.
+    record transfer-proof {
+        peer: cluster-types.peer-auth-proof,
+        credential-serial: string,
+        signature: bytes,
+    }
+    record transfer-request {
+        header: transfer-header,
+        proof: transfer-proof,
+    }
+    record chunk-request {
+        header: transfer-header,
+        offset: u64,
+        data: bytes,
+        proof: transfer-proof,
+    }
+    enum transfer-error {
+        unauthorized,
+        incompatible,
+        stale-term,
+        invalid-object,
+        conflicting-identity,
+        capacity-unavailable,
+        unknown-transfer,
+        cleanup-incomplete,
+        storage-failure,
+    }
+    enum finish-outcome {
+        sealed,
+    }
+    enum abort-outcome {
+        no-staging-remains,
+    }
+    variant chunk-outcome {
+        accepted { offset: u64 },
+        expected-offset { offset: u64 },
+    }
+}
+
+@capability(CLUSTER_AUTH)
+@interface-version(1)
+interface cluster-consensus-transfer {
+    command begin(request: cluster-consensus-transfer-types.transfer-request) -> result<u64, cluster-consensus-transfer-types.transfer-error>;
+    command chunk(request: cluster-consensus-transfer-types.chunk-request) -> result<cluster-consensus-transfer-types.chunk-outcome, cluster-consensus-transfer-types.transfer-error>;
+    command finish(request: cluster-consensus-transfer-types.transfer-request) -> result<cluster-consensus-transfer-types.finish-outcome, cluster-consensus-transfer-types.transfer-error>;
+    command abort(request: cluster-consensus-transfer-types.transfer-request) -> result<cluster-consensus-transfer-types.abort-outcome, cluster-consensus-transfer-types.transfer-error>;
+}
+
 @capability(CLUSTER_AUTH)
 @interface-version(1)
 interface cluster-peer-auth {

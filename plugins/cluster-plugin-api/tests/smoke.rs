@@ -530,16 +530,51 @@ fn interface_ids_and_operations_match_schema() {
 }
 
 #[test]
+fn transfer_contract_preserves_full_node_keys() {
+    use bmux_cluster_plugin_api::cluster_consensus_transfer_types::{
+        EntryPurpose, LogIdentity, TransferHeader, TransferPurpose,
+    };
+    let sender = (0u8..32).collect::<Vec<_>>();
+    let recipient = (32u8..64).collect::<Vec<_>>();
+    let header = TransferHeader {
+        cluster_id: "cluster".into(),
+        sender: sender.clone(),
+        recipient,
+        leader_term: 7,
+        sender_incarnation: uuid::Uuid::from_u128(1),
+        sequence: 2,
+        purpose: TransferPurpose::Entry {
+            value: EntryPurpose {
+                identity: LogIdentity {
+                    term: 7,
+                    leader: sender,
+                    index: 3,
+                },
+                previous: None,
+            },
+        },
+        total_bytes: 12,
+        checksum: vec![1; 32],
+    };
+    let bytes = bmux_plugin_sdk::encode_service_message(&header).unwrap();
+    assert_eq!(
+        bmux_plugin_sdk::decode_service_message::<TransferHeader>(&bytes).unwrap(),
+        header
+    );
+}
+
+#[test]
 fn generated_contract_declares_all_services() {
     let services = bmux_cluster_plugin_api::service_declarations()
         .expect("cluster service declarations should be valid");
-    assert_eq!(services.len(), 22);
+    assert_eq!(services.len(), 23);
     let service_ids = services
         .iter()
         .map(|service| service.interface_id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
     for interface_id in [
         "cluster-peer-read/v1",
+        "cluster-consensus-transfer/v1",
         "cluster-bounded-control-command/v1",
         "cluster-raft-rpc/v2",
         "cluster-raft-decoder/v1",
@@ -570,6 +605,13 @@ fn generated_contract_declares_all_services() {
         "provide cluster-bounded-control-command;",
     ] {
         assert!(package.contains(provided), "world must {provided}");
+    }
+    // Owned-consensus contracts are modeled but not served until ADR-0015 cutover.
+    for unprovided in ["cluster-consensus-transfer"] {
+        assert!(
+            !package.contains(&format!("provide {unprovided}")),
+            "world must not provide {unprovided}"
+        );
     }
 }
 
