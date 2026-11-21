@@ -58,7 +58,7 @@ inherited.
 
 Native plugins are trusted unsandboxed code. Main-library digests do not
 authenticate
-all transitive libraries or auxiliary executables. Whole-package trust requires
+all transitive libraries or other package files. Whole-package trust requires
 a
 separate explicit package closure contract.
 

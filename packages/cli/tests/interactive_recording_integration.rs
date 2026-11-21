@@ -106,8 +106,7 @@ impl Fixture {
                 assert!(
                     artifacts
                         .iter()
-                        .any(|artifact| artifact["relative_path"]
-                            == "bmux-pane-execution-supervisor")
+                        .any(|artifact| artifact["relative_path"] == "bmux")
                 );
                 for artifact in artifacts {
                     let relative =

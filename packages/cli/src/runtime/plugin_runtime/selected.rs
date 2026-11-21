@@ -753,8 +753,8 @@ impl ProductionPlugin {
                 context.host_kernel_bridge = None;
                 let id = execution.begin_activation(context, self.registered.manifest.concurrency)
                     .map_err(|error| failure(format!(
-                        "selected lifecycle activation admission failed: plugin={} declared_auxiliaries={} error={error}",
-                        self.registered.manifest.id, self.registered.manifest.auxiliary_executables.len(),
+                        "selected lifecycle activation admission failed: plugin={} error={error}",
+                        self.registered.manifest.id,
                     )))?;
                 match Self::observe(execution, id).await? {
                     NativeOutcome::Unit => {

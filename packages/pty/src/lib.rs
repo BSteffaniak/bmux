@@ -928,6 +928,9 @@ mod platform {
             libc::SIGQUIT,
             libc::SIGTERM,
             libc::SIGALRM,
+            libc::SIGTSTP,
+            libc::SIGTTIN,
+            libc::SIGTTOU,
         ] {
             // SAFETY: restoring a valid signal's default disposition.
             unsafe { libc::signal(signal, libc::SIG_DFL) };

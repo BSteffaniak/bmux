@@ -90,7 +90,7 @@ jobs:
 
       - name: Stage distribution
         shell: bash
-        run: cargo xtask auxiliary stage --target '${{ matrix.target }}' --artifact-dir 'target/${{ matrix.target }}/release' --destination dist
+        run: cargo xtask stage --target '${{ matrix.target }}' --artifact-dir 'target/${{ matrix.target }}/release' --destination dist
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4

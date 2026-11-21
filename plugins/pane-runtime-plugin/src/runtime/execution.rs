@@ -18,8 +18,9 @@ use super::native_process::{self, StopAction};
 type SpawnAuthorization = Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>;
 
 pub(super) struct ExecutionCapture {
-    pub(super) supervisor: Mutex<Option<Arc<super::supervisor::SupervisorControl>>>,
-    pub(super) lifecycle_interrupter: Mutex<Option<super::supervisor::LifecycleInterrupter>>,
+    /// The pane's terminal session, once its leader has been spawned. Its lock is
+    /// the control fence: leader exit, stops and retirement serialize on it.
+    pub(super) session: Mutex<Option<Arc<super::session_control::SessionControl>>>,
     pub(super) spawn_authorization: Mutex<Option<SpawnAuthorization>>,
     pub(super) exact_environment: Mutex<
         Option<Vec<bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry>>,
@@ -34,8 +35,6 @@ pub(super) struct ExecutionCapture {
     pub(super) terminal_session_ended: AtomicBool,
     pub(super) terminal_owner_retired: AtomicBool,
     #[cfg(test)]
-    pub(super) inject_missing_supervisor: AtomicBool,
-    #[cfg(test)]
     pub(super) inject_reader_failure: AtomicBool,
     pub(super) capture_order: Mutex<()>,
     projection_progress: Mutex<u64>,
@@ -47,7 +46,6 @@ pub(super) struct ExecutionCapture {
     pub(super) geometry_revision: AtomicU64,
     pub(super) output_watermark: AtomicU64,
     pub(super) outcome: Mutex<(Option<u32>, Option<String>, Option<String>)>,
-    pub(super) lifecycle_done: tokio::sync::watch::Sender<bool>,
     changes: tokio::sync::watch::Sender<()>,
     admission: Arc<Semaphore>,
 }
@@ -55,8 +53,7 @@ pub(super) struct ExecutionCapture {
 impl Default for ExecutionCapture {
     fn default() -> Self {
         Self {
-            supervisor: Mutex::new(None),
-            lifecycle_interrupter: Mutex::new(None),
+            session: Mutex::new(None),
             spawn_authorization: Mutex::new(None),
             exact_environment: Mutex::new(None),
             group_kill_issued: AtomicBool::new(false),
@@ -66,8 +63,6 @@ impl Default for ExecutionCapture {
             managed_program: AtomicBool::new(false),
             terminal_session_ended: AtomicBool::new(false),
             terminal_owner_retired: AtomicBool::new(false),
-            #[cfg(test)]
-            inject_missing_supervisor: AtomicBool::new(false),
             #[cfg(test)]
             inject_reader_failure: AtomicBool::new(false),
             capture_order: Mutex::new(()),
@@ -80,7 +75,6 @@ impl Default for ExecutionCapture {
             geometry_revision: AtomicU64::new(0),
             output_watermark: AtomicU64::new(0),
             outcome: Mutex::new((None, None, None)),
-            lifecycle_done: tokio::sync::watch::channel(true).0,
             changes: tokio::sync::watch::channel(()).0,
             admission: Arc::new(Semaphore::new(64)),
         }
@@ -194,23 +188,6 @@ impl ExecutionCapture {
         Ok(())
     }
 
-    pub(super) fn interrupt_lifecycle(&self) {
-        if let Ok(interrupter) = self.lifecycle_interrupter.lock()
-            && let Some(interrupter) = interrupter.as_ref()
-        {
-            let _ = interrupter.interrupt();
-        }
-    }
-
-    pub(super) async fn join_lifecycle(&self) -> anyhow::Result<()> {
-        let mut done = self.lifecycle_done.subscribe();
-        self.interrupt_lifecycle();
-        while !*done.borrow_and_update() {
-            done.changed().await?;
-        }
-        Ok(())
-    }
-
     pub(super) fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
         self.changes.subscribe()
     }
@@ -238,11 +215,8 @@ impl ExecutionCapture {
             && !self.cleanup_failed.load(Ordering::SeqCst)
     }
 
-    // Keep admission, exact supervisor receipts and direct PTY authority under
-    // one control fence; splitting these transitions would obscure signal safety.
-    #[allow(clippy::too_many_lines)]
-    /// Release the helper's inherited output handles only after acknowledged scope
-    /// retirement. Output capture remains pending until the reader observes EOF.
+    /// Release the session's native authority only after the session ended.
+    /// Output capture remains pending until the reader observes EOF.
     pub(super) fn finish_owner_retirement(
         &self,
         end_lifetime: impl FnOnce() -> anyhow::Result<()>,
@@ -256,100 +230,161 @@ impl ExecutionCapture {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)] // Keep the authority lock, effect authorization, and retirement fences in one auditable flow.
+    /// Record that the session leader has exited. Must run before the leader is
+    /// reaped: from then on its pid is never signalled.
+    pub(super) fn mark_leader_exited(&self) {
+        if let Ok(session) = self.session.lock()
+            && let Some(control) = session.as_ref()
+        {
+            control.mark_leader_exited();
+        }
+    }
+
+    /// Settle the session after its leader was reaped: sweep what is left when
+    /// `sweep` is set, then end and retire it. Without `sweep`, a session that
+    /// still has members is left running and retired later by
+    /// [`Self::retire_released_session`] or swept by a forced stop.
+    pub(super) fn settle_after_leader_exit(&self, sweep: bool) {
+        let Ok(session) = self.session.lock() else {
+            self.record_cleanup_error("terminal session lock poisoned".into());
+            return;
+        };
+        let Some(control) = session.as_ref() else {
+            return;
+        };
+        if self.terminal_owner_retired.load(Ordering::SeqCst) {
+            return;
+        }
+        if sweep {
+            if let Err(error) = control.force_stop() {
+                self.record_cleanup_error(format!("terminal session cleanup failed: {error}"));
+            }
+        } else {
+            match control.occupied() {
+                Ok(false) => {
+                    tracing::debug!("terminal session empty after leader exit; retiring");
+                }
+                Ok(true) => {
+                    tracing::debug!("terminal session members left running after leader exit");
+                    control.release_survivors();
+                    return;
+                }
+                Err(error) => {
+                    self.record_cleanup_error(format!(
+                        "terminal session inspection failed: {error}"
+                    ));
+                }
+            }
+        }
+        self.terminal_session_ended.store(true, Ordering::SeqCst);
+        if let Err(error) = self.finish_owner_retirement(|| control.end_lifetime()) {
+            self.record_cleanup_error(format!("terminal session release failed: {error}"));
+        }
+        self.notify();
+    }
+
+    /// Retire a session whose leader exited while members were deliberately
+    /// left running (`sweep_on_exit = false`), once the pane no longer needs it.
+    pub(super) fn retire_released_session(&self) {
+        let Ok(session) = self.session.lock() else {
+            self.record_cleanup_error("terminal session lock poisoned".into());
+            return;
+        };
+        let Some(control) = session.as_ref() else {
+            return;
+        };
+        if self.terminal_owner_retired.load(Ordering::SeqCst) || !control.leader_exited() {
+            return;
+        }
+        tracing::debug!("terminal released by left-running members; retiring session");
+        self.terminal_session_ended.store(true, Ordering::SeqCst);
+        if let Err(error) = self.finish_owner_retirement(|| control.end_lifetime()) {
+            self.record_cleanup_error(format!("terminal session release failed: {error}"));
+        }
+        self.notify();
+    }
+
+    /// End the pane's lifetime: kill whatever still runs in its session unless
+    /// the session already ended or was already swept, then release it.
+    pub(super) fn release_session(&self) -> anyhow::Result<()> {
+        let session = self
+            .session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("terminal session lock poisoned"))?;
+        let Some(control) = session.as_ref() else {
+            return Ok(());
+        };
+        if !self.terminal_session_ended.load(Ordering::SeqCst)
+            && !self.terminal_owner_retired.load(Ordering::SeqCst)
+            && !self.group_kill_issued.load(Ordering::SeqCst)
+        {
+            control.force_stop()?;
+            self.group_kill_issued.store(true, Ordering::SeqCst);
+            self.target_stop_issued.store(true, Ordering::SeqCst);
+            if control.leader_exited() {
+                self.terminal_session_ended.store(true, Ordering::SeqCst);
+                return self.finish_owner_retirement(|| control.end_lifetime());
+            }
+        }
+        control.end_lifetime()
+    }
+
+    /// Stop the pane's program. A forced stop kills the whole session and
+    /// verifies it is empty; a cooperative one asks the leader to exit.
     pub(super) fn signal_owned_group(
         &self,
         host: &crate::runtime::PaneRuntimeHost,
         action: StopAction,
     ) -> anyhow::Result<bool> {
-        // Serialize controls through their acknowledged consumption fence, so
-        // concurrent cleanup callers cannot send Sweep after helper retirement.
-        let supervisor_guard = self
-            .supervisor
+        // The session lock is the control fence shared with leader exit and
+        // retirement: a retired session is never signalled again.
+        let session = self
+            .session
             .lock()
-            .map_err(|_| anyhow::anyhow!("supervisor control lock poisoned"))?;
-        // Natural session end revokes signal authority before the separate
-        // owner-retirement acknowledgement. A retained owner is not a license
-        // to sweep descendants after that terminal session has ended.
+            .map_err(|_| anyhow::anyhow!("terminal session lock poisoned"))?;
         if self.terminal_session_ended.load(Ordering::SeqCst)
             || self.terminal_owner_retired.load(Ordering::SeqCst)
         {
             return Ok(false);
         }
-        if let Some(supervisor) = supervisor_guard.as_ref() {
-            if self.group_kill_issued.load(Ordering::SeqCst)
-                || self.target_stop_issued.load(Ordering::SeqCst)
-            {
-                return Ok(false);
-            }
-            let operation = match action {
-                StopAction::Force => crate::supervisor_protocol::Operation::RequestStop {
-                    mutation_id: "00000000-0000-4000-8000-000000000002".into(),
-                },
+        if let Some(control) = session.as_ref() {
+            return match action {
                 StopAction::Cooperative => {
-                    if !native_process::supports_cooperative_stop() {
-                        // Unsupported soft termination is not a cleanup failure.
-                        // Retain authority and let the bounded caller escalate.
+                    if self.group_kill_issued.load(Ordering::SeqCst)
+                        || !native_process::supports_cooperative_stop()
+                    {
+                        // Unsupported soft termination is not a cleanup failure;
+                        // the bounded caller escalates to a forced stop.
                         return Ok(false);
                     }
-                    crate::supervisor_protocol::Operation::Term {
-                        mutation_id: "00000000-0000-4000-8000-000000000001".into(),
+                    let signalled = control.terminate_leader()?;
+                    if signalled {
+                        self.target_stop_issued.store(true, Ordering::SeqCst);
                     }
+                    Ok(signalled)
+                }
+                StopAction::Force => {
+                    if self.group_kill_issued.load(Ordering::SeqCst) {
+                        return Ok(false);
+                    }
+                    control.force_stop()?;
+                    self.group_kill_issued.store(true, Ordering::SeqCst);
+                    self.target_stop_issued.store(true, Ordering::SeqCst);
+                    if let Err(error) = host.shutdown_progress().advance("terminal session swept") {
+                        tracing::warn!(%error, "shutdown progress publication failed");
+                    }
+                    if control.leader_exited() {
+                        // The leader was already reaped; the sweep just ended
+                        // the members it had left running.
+                        self.terminal_session_ended.store(true, Ordering::SeqCst);
+                        self.finish_owner_retirement(|| control.end_lifetime())?;
+                    }
+                    self.notify();
+                    Ok(true)
                 }
             };
-            let response = match operation {
-                crate::supervisor_protocol::Operation::RequestStop { mutation_id } => {
-                    match supervisor.stop_and_wait(host, &mutation_id) {
-                        Ok(response) => response,
-                        Err(error) if super::supervisor::transport_uncertain(&error) => {
-                            // Revoke the owned lease, never signal a saved PID.
-                            // The child/reaper and retained evidence still own
-                            // settlement; transport loss is not cleanup failure.
-                            tracing::warn!(%error, "stop observation unavailable; using retained lifetime cleanup");
-                            supervisor.end_lifetime()?;
-                            return Ok(false);
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-                other => supervisor.request(other)?,
-            };
-            if action == StopAction::Force {
-                anyhow::ensure!(
-                    response.group_consumed || response.target_terminated,
-                    "owned target termination not acknowledged"
-                );
-                // Fence only an acknowledged sweep. Failed/uncertain requests
-                // retain their mutation identity and remain retryable.
-                // Preserve the authoritative target outcome even if sweep wins
-                // the race with the waiter polling its natural exit.
-                if let Ok(mut outcome) = self.outcome.lock() {
-                    outcome.0 = response.exit_code.and_then(|code| u32::try_from(code).ok());
-                    outcome.1 = response.exit_signal.map(|signal| signal.to_string());
-                }
-                if response.target_terminated && response.terminal_session_ended == Some(true) {
-                    self.terminal_session_ended.store(true, Ordering::SeqCst);
-                    let retired =
-                        supervisor.request(crate::supervisor_protocol::Operation::RetireOwner {
-                            mutation_id: "00000000-0000-4000-8000-000000000003".into(),
-                        })?;
-                    anyhow::ensure!(
-                        retired.error.is_none(),
-                        "terminal owner retirement rejected"
-                    );
-                    self.finish_owner_retirement(|| supervisor.end_lifetime())?;
-                    self.interrupt_lifecycle();
-                }
-                // Publish stop fences only after the retirement receipt; waiter
-                // consumes these without the control lock to reap the guardian.
-                self.target_stop_issued
-                    .store(response.target_terminated, Ordering::SeqCst);
-                self.group_kill_issued
-                    .store(response.group_consumed, Ordering::SeqCst);
-            }
-            self.notify();
-            return Ok(true);
         }
+        drop(session);
         if action == StopAction::Force && self.group_kill_issued.load(Ordering::SeqCst) {
             return Ok(false);
         }
@@ -365,8 +400,8 @@ impl ExecutionCapture {
             }
             return Ok(false);
         };
-        // Keep the retained PTY locked through the backend side effect. A saved
-        // PID or PGID is never authority to signal a potentially recycled group.
+        // Before the session is adopted, only the live PTY supplies authority.
+        // A saved PID or PGID is never authority to signal a recycled group.
         let Some(signaled) = native_process::stop_foreground_group(master, action)? else {
             if self.output_drained.load(Ordering::SeqCst)
                 && !self.managed_program.load(Ordering::SeqCst)
@@ -388,7 +423,11 @@ impl ExecutionCapture {
             match result {
                 Ok(status) => {
                     outcome.0 = Some(status.exit_code());
-                    outcome.1 = status.signal().map(ToString::to_string);
+                    // Report signals by number, as the execution API always has.
+                    outcome.1 = status.signal_number().map_or_else(
+                        || status.signal().map(ToString::to_string),
+                        |number| Some(number.to_string()),
+                    );
                 }
                 Err(error) => outcome.2 = Some(format!("process wait failed: {error}")),
             }
@@ -1871,7 +1910,7 @@ mod tests {
         let capture = std::sync::Arc::new(super::ExecutionCapture::default());
         // A missing PTY would be a recovery error if signaling fell through.
         capture.managed_program.store(true, super::Ordering::SeqCst);
-        let fence = capture.supervisor.lock().unwrap();
+        let fence = capture.session.lock().unwrap();
         let first = std::sync::Arc::clone(&capture);
         let second = std::sync::Arc::clone(&capture);
         let (first_host, second_host) = (host.clone(), host.clone());
@@ -1899,7 +1938,7 @@ mod tests {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
         let capture = std::sync::Arc::new(super::ExecutionCapture::default());
-        let fence = capture.supervisor.lock().unwrap();
+        let fence = capture.session.lock().unwrap();
         let first = std::sync::Arc::clone(&capture);
         let second = std::sync::Arc::clone(&capture);
         let (first_host, second_host) = (host.clone(), host.clone());

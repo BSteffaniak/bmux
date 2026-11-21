@@ -106,8 +106,6 @@ fn lifecycle_context() -> NativeLifecycleContext {
         connection: service.connection,
         settings: None,
         plugin_settings_map: BTreeMap::new(),
-        auxiliary_executables: BTreeMap::new(),
-        auxiliary_executable_errors: BTreeMap::new(),
         host_service_port: None,
         capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
         host_kernel_bridge: None,

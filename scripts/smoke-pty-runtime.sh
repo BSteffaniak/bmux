@@ -96,28 +96,23 @@ run_case() {
 }
 
 cd "$ROOT_DIR"
-# Static plugins resolve declared auxiliary executables beside the host binary.
-# A CLI-only build can appear to work locally while failing on a clean runner.
+# bmux is a single binary; build it explicitly so a clean runner never picks up
+# whichever bmux happens to be on PATH.
 if [[ -z "$BMUX_SMOKE_BINARY" ]]; then
-  cargo build -q --locked -p bmux_cli -p bmux_pane_runtime_plugin --bins
+  cargo build -q --locked -p bmux_cli --bin bmux
   BMUX_SMOKE_BINARY="${CARGO_TARGET_DIR:-$ROOT_DIR/target}/debug/bmux"
 fi
-if [[ ! -x "$(dirname "$BMUX_SMOKE_BINARY")/bmux-pane-execution-supervisor" ]]; then
-  echo "error: selected bmux requires its adjacent bmux-pane-execution-supervisor" >&2
-  exit 1
-fi
-# Record the actual selected pair, not whichever bmux happens to be on PATH.
+# Record the actual selected binary, not whichever bmux happens to be on PATH.
 python3 - "$BMUX_SMOKE_BINARY" <<'PY'
 import hashlib
 import pathlib
 import sys
-binary = pathlib.Path(sys.argv[1])
-for path in (binary, binary.with_name('bmux-pane-execution-supervisor')):
-    digest = hashlib.sha256()
-    with path.open('rb') as artifact:
-        for chunk in iter(lambda: artifact.read(1024 * 1024), b''):
-            digest.update(chunk)
-    print(f"artifact: {path} sha256={digest.hexdigest()}")
+path = pathlib.Path(sys.argv[1])
+digest = hashlib.sha256()
+with path.open('rb') as artifact:
+    for chunk in iter(lambda: artifact.read(1024 * 1024), b''):
+        digest.update(chunk)
+print(f"artifact: {path} sha256={digest.hexdigest()}")
 PY
 
 run_case /bin/sh

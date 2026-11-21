@@ -130,7 +130,7 @@ jobs:
         shell: bash
         run: |
           VERSION="${{ needs.release-metadata.outputs.version }}"
-          cargo xtask auxiliary stage --target '${{ matrix.target }}' --artifact-dir 'target/${{ matrix.target }}/release' --destination dist
+          cargo xtask stage --target '${{ matrix.target }}' --artifact-dir 'target/${{ matrix.target }}/release' --destination dist
           tar -czf "bmux-${VERSION}-${{ matrix.target }}.tar.gz" -C dist .
 
       - name: Upload release archives
@@ -184,7 +184,7 @@ jobs:
 
       - name: Stage distribution
         shell: bash
-        run: cargo xtask auxiliary stage --target '${{ matrix.target }}' --artifact-dir 'target/${{ matrix.target }}/release' --destination 'dist/${{ matrix.target }}'
+        run: cargo xtask stage --target '${{ matrix.target }}' --artifact-dir 'target/${{ matrix.target }}/release' --destination 'dist/${{ matrix.target }}'
 
       - name: Build deb package
         shell: bash
@@ -193,7 +193,7 @@ jobs:
           export TARGET="${{ matrix.target }}"
           export ARCH="${{ matrix.arch }}"
           CFG="packaging/nfpm/${{ needs.release-metadata.outputs.channel }}.yaml"
-          cargo xtask auxiliary nfpm --target "$TARGET" --config "$CFG" --destination /tmp/bmux-deb.yaml
+          cargo xtask nfpm --target "$TARGET" --config "$CFG" --destination /tmp/bmux-deb.yaml
           nfpm package --packager deb --target "out/${{ needs.release-metadata.outputs.channel }}/artifacts" --config /tmp/bmux-deb.yaml
 
       - name: Build rpm package
@@ -203,7 +203,7 @@ jobs:
           export TARGET="${{ matrix.target }}"
           export ARCH="${{ matrix.rpm_arch }}"
           CFG="packaging/nfpm/${{ needs.release-metadata.outputs.channel }}.yaml"
-          cargo xtask auxiliary nfpm --target "$TARGET" --config "$CFG" --destination /tmp/bmux-rpm.yaml
+          cargo xtask nfpm --target "$TARGET" --config "$CFG" --destination /tmp/bmux-rpm.yaml
           nfpm package --packager rpm --target "out/${{ needs.release-metadata.outputs.channel }}/artifacts" --config /tmp/bmux-rpm.yaml
 
       - name: Upload Linux packages

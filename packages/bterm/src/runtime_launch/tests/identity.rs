@@ -42,8 +42,8 @@ fn readiness(
         "config_dir": roots.config_dir,
         "data_dir": roots.data_dir,
         "state_dir": roots.state_dir,
-        "helper_ready": true,
-        "helper_error": null,
+        "execution_ready": true,
+        "execution_error": null,
         "restart_blocker": null,
         "fenced": false,
     })).unwrap()

@@ -20,7 +20,6 @@ bmux_config = { workspace = true }
 bmux_connections_plugin_api = { workspace = true }
 bmux_ipc = { workspace = true }
 bmux_pane_runtime_plugin_api = { workspace = true }
-bmux_pane_runtime_state = { workspace = true }
 bmux_plugin = { workspace = true }
 bmux_plugin_schema_macros = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
@@ -58,7 +57,6 @@ fail-on-warnings = [
     "bmux_clients_plugin_api/fail-on-warnings",
     "bmux_codec/fail-on-warnings",
     "bmux_pane_runtime_plugin_api/fail-on-warnings",
-    "bmux_pane_runtime_state/fail-on-warnings",
     "bmux_sessions_plugin_api/fail-on-warnings",
 ]
 

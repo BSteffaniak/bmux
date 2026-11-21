@@ -40,12 +40,6 @@ mod readiness;
 mod runtime;
 mod snapshot;
 mod snapshot_v1_migration;
-mod supervisor_protocol;
-
-/// Control protocol version the execution supervisor auxiliary executable
-/// must declare (`protocol_version` in `plugin.toml`). Hosts and fixtures
-/// that resolve the supervisor themselves declare this rather than a copy.
-pub const EXECUTION_SUPERVISOR_PROTOCOL_VERSION: u32 = supervisor_protocol::VERSION;
 #[cfg(windows)]
 mod windows_environment;
 
@@ -186,22 +180,6 @@ mod contract_tests {
         assert!(manifest.services.iter().any(|service| service.interface_id
             == "pane-runtime-pointer-grid-v2"
             && service.kind == bmux_plugin_sdk::ServiceKind::Command));
-    }
-
-    #[test]
-    fn manifest_declares_the_supervisor_protocol_the_code_speaks() {
-        let manifest =
-            bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
-                .unwrap();
-        let supervisor = manifest
-            .auxiliary_executables
-            .iter()
-            .find(|executable| executable.id == "execution-supervisor")
-            .unwrap();
-        assert_eq!(
-            supervisor.protocol_version,
-            super::EXECUTION_SUPERVISOR_PROTOCOL_VERSION
-        );
     }
 
     #[test]
@@ -413,7 +391,10 @@ impl PaneRuntimePlugin {
         runtime::activate_managed_scope(host);
         application_resurrection::activate(host, context);
         readiness::activate(host, context);
-        runtime::supervisor::activate(host, context);
+        let execution_settings =
+            runtime::session_control::ExecutionSettings::parse(context.settings.as_ref())
+                .map_err(PluginCommandError::invalid_arguments)?;
+        runtime::session_control::activate(host, context, execution_settings);
         runtime::reservations::activate(host, context);
         // Register the focus-state channel so subscribers (e.g.
         // the decoration plugin) can observe the focused pane per

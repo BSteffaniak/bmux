@@ -917,154 +917,6 @@ fn relocated_installed_payload_exports_and_remains_offline() {
     assert_eq!(parse_json(&offline)["recording_id"], status["recording_id"]);
 }
 
-fn assert_installed_launch_rejected(env: &RecordingEnv) {
-    let marker = env.root.join("must-not-launch");
-    let script = env.script("rejected-program.sh", "printf launched > must-not-launch\n");
-    let output = env.run(&[
-        "recording",
-        "process",
-        "start",
-        "--json",
-        "--cwd",
-        env.root.to_str().expect("owned cwd"),
-        "--",
-        "/bin/sh",
-        script.to_str().expect("owned script"),
-    ]);
-    assert!(
-        !output.status.success(),
-        "invalid installed helper was admitted"
-    );
-    let diagnostics = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        diagnostics.contains("auxiliary")
-            || diagnostics.contains("supervisor")
-            || diagnostics.contains("inventory"),
-        "failure was not attributed to installed helper authority: {diagnostics}"
-    );
-    assert!(
-        !marker.exists(),
-        "program launched before installed helper rejection"
-    );
-    assert!(
-        !diagnostics.contains("dedicated runtime cleanup failed"),
-        "owned failed launch did not clean up: {diagnostics}"
-    );
-}
-
-#[test]
-#[ignore = "requires coordinator-built real installed payload and explicit binary/root selection"]
-#[serial]
-fn installed_missing_and_same_length_tampered_helpers_reject_before_launch() {
-    for tampered in [false, true] {
-        let env = RecordingEnv::relocated_installation();
-        let directory = env.binary.parent().expect("relocated root");
-        let inventory = fs::read(directory.join("artifacts.json")).expect("retained inventory");
-        let helper = directory.join("bmux-pane-execution-supervisor");
-        if tampered {
-            let mut bytes = fs::read(&helper).expect("installed real supervisor");
-            assert!(!bytes.is_empty());
-            // Preserve length, path, permissions and inventory. Hash must detect
-            // replacement before a tampered Mach-O/ELF reaches execution.
-            let last = bytes.last_mut().expect("helper byte");
-            *last ^= 1;
-            fs::write(helper, bytes).expect("tamper only owned copied helper");
-        } else {
-            fs::rename(helper, env.root.join("withheld-supervisor"))
-                .expect("withhold owned helper");
-        }
-        assert_installed_launch_rejected(&env);
-        assert_eq!(
-            fs::read(directory.join("artifacts.json")).expect("inventory after rejection"),
-            inventory
-        );
-    }
-}
-
-#[test]
-#[ignore = "requires explicit installed payload and real different-slot BMUX_RECORDING_TEST_FOREIGN_SUPERVISOR"]
-#[serial]
-fn installed_different_slot_helper_rejects_against_untouched_inventory() {
-    let foreign = PathBuf::from(
-        std::env::var_os("BMUX_RECORDING_TEST_FOREIGN_SUPERVISOR")
-            .expect("explicit coordinator-supplied different-slot supervisor"),
-    );
-    assert!(foreign.is_absolute());
-    assert!(
-        fs::symlink_metadata(&foreign)
-            .expect("foreign helper metadata")
-            .file_type()
-            .is_file()
-    );
-    let foreign = foreign.canonicalize().expect("foreign helper path");
-    let env = RecordingEnv::relocated_installation();
-    let directory = env.binary.parent().expect("relocated root");
-    assert!(
-        !foreign.starts_with(directory),
-        "foreign helper must originate outside selected installation"
-    );
-    let inventory = fs::read(directory.join("artifacts.json")).expect("retained inventory");
-    let helper = directory.join("bmux-pane-execution-supervisor");
-    assert_ne!(
-        fs::read(&foreign).expect("real foreign helper"),
-        fs::read(&helper).expect("selected helper"),
-        "byte-identical helper cannot demonstrate wrong-artifact rejection"
-    );
-    fs::copy(foreign, helper).expect("replace only owned helper with real foreign artifact");
-    assert_installed_launch_rejected(&env);
-    assert_eq!(
-        fs::read(directory.join("artifacts.json")).expect("inventory after rejection"),
-        inventory
-    );
-}
-
-#[test]
-#[ignore = "requires coordinator-built real installed payload and explicit binary/root selection"]
-#[serial]
-fn installed_wrong_owner_unsupported_or_corrupt_inventory_rejects_before_launch() {
-    for case in ["wrong-owner", "unsupported-schema", "corrupt"] {
-        let env = RecordingEnv::relocated_installation();
-        let path = env
-            .binary
-            .parent()
-            .expect("relocated root")
-            .join("artifacts.json");
-        let original = fs::read(&path).expect("real installed inventory");
-        let mut inventory: Value = serde_json::from_slice(&original).expect("inventory JSON");
-        match case {
-            "wrong-owner" => {
-                let artifact = inventory["artifacts"]
-                    .as_array_mut()
-                    .expect("artifacts")
-                    .iter_mut()
-                    .find(|artifact| artifact["relative_path"] == "bmux-pane-execution-supervisor")
-                    .expect("committed supervisor");
-                artifact["declaration"]["owner"] = Value::String("foreign.owner".into());
-                fs::write(
-                    &path,
-                    serde_json::to_vec(&inventory).expect("mutated inventory JSON"),
-                )
-                .expect("mutate owned owner");
-            }
-            "unsupported-schema" => {
-                inventory["schema_version"] = Value::from(99);
-                fs::write(
-                    &path,
-                    serde_json::to_vec(&inventory).expect("mutated inventory JSON"),
-                )
-                .expect("mutate owned schema");
-            }
-            "corrupt" => fs::write(&path, b"{invalid").expect("corrupt owned inventory"),
-            _ => unreachable!(),
-        }
-        assert_installed_launch_rejected(&env);
-    }
-}
-
 #[test]
 #[serial]
 fn terminal_profiles_complete_capture_without_lifecycle_selectors() {
@@ -2237,7 +2089,7 @@ fn server_sigkill_does_not_resurrect_recorded_execution_or_invent_completion() {
     }
     let leaked = target_running();
     if leaked {
-        // Failure containment for the old independent-guardian implementation.
+        // Failure containment: never leak the target if cleanup regressed.
         let _ = Command::new("kill")
             .args(["-KILL", &target_pid.to_string()])
             .status();
@@ -2256,7 +2108,20 @@ fn server_sigkill_does_not_resurrect_recorded_execution_or_invent_completion() {
             assert_eq!(value["run_id"], first["run_id"]);
             assert_eq!(value["execution"], first["execution"]);
             assert_eq!(value["recording_id"], first["recording_id"]);
-            assert_eq!(value["recovery_required"], true);
+            // Either still awaiting recovery, or retired by the restarted
+            // server as a failure whose exit status was lost.
+            let retired_failure = value["phase"] == "failed"
+                && value["errors"].as_array().is_some_and(|errors| {
+                    errors.iter().any(|error| {
+                        error
+                            .as_str()
+                            .is_some_and(|e| e.contains("exit status lost"))
+                    })
+                });
+            assert!(
+                value["recovery_required"] == true || retired_failure,
+                "server loss must not look recoverable-free success: {value}"
+            );
             assert_eq!(value["capture_finalized"], false);
             assert_eq!(value["output_drained"], false);
             assert!(value["exit_code"].is_null());
@@ -2295,7 +2160,12 @@ fn server_sigkill_does_not_resurrect_recorded_execution_or_invent_completion() {
     assert_eq!(retained["output_drained"], false);
     assert_eq!(retained["capture_eof"], false);
     assert_eq!(retained["target_exited"], false);
-    assert_eq!(retained["cleanup_complete"], false);
+    // Cleanup is only claimed once the restarted server swept the lost
+    // execution's session and retired it as a failure.
+    assert!(
+        retained["cleanup_complete"] == false || retained["phase"] == "failed",
+        "cleanup claimed without crash retirement: {retained}"
+    );
     assert!(retained["exit_code"].is_null());
     let stopped = env.run_at_runtime(&["server", "stop"], None, Some(&owner.root));
     assert_success(&stopped);

@@ -98,7 +98,7 @@ fn invalid_feature_options_fail_before_building() {
         vec!["build", "--features", "--all-features"],
         vec!["build", "--all-features=true"],
         vec!["build", "--no-default-features=false"],
-        vec!["auxiliary", "build", "--features", "bmux_cli/bench"],
+        vec!["stage", "--features", "bmux_cli/bench"],
         vec!["bterm", "build", "--all-features"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_xtask"))

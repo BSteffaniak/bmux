@@ -74,51 +74,6 @@ pub struct PluginManifestExtension {
     pub payload: Vec<u8>,
 }
 
-/// One owner-scoped executable distributed with a plugin. Resolution never
-/// searches PATH, the working directory, or plugin discovery roots.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AuxiliaryExecutableDeclaration {
-    pub id: String,
-    pub cargo_package: String,
-    pub cargo_binary: String,
-    pub relative_path: String,
-    pub protocol_version: u32,
-    /// Explicit platform families. Omission preserves the legacy Unix-only contract.
-    #[serde(
-        default = "default_auxiliary_platforms",
-        skip_serializing_if = "is_default_auxiliary_platforms"
-    )]
-    pub supported_platforms: Vec<String>,
-}
-
-fn default_auxiliary_platforms() -> Vec<String> {
-    vec!["unix".into()]
-}
-
-fn is_default_auxiliary_platforms(platforms: &[String]) -> bool {
-    platforms == ["unix"]
-}
-
-impl AuxiliaryExecutableDeclaration {
-    pub(crate) fn supports_platform(&self, platform: &str) -> bool {
-        self.supported_platforms
-            .iter()
-            .any(|value| value == platform)
-    }
-
-    pub(crate) fn platform_filename(&self, platform: &str) -> Option<String> {
-        if !self.supports_platform(platform) {
-            return None;
-        }
-        match platform {
-            "unix" => Some(self.relative_path.clone()),
-            "windows" => Some(format!("{}.exe", self.relative_path)),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PluginCliHelp {
@@ -131,9 +86,6 @@ pub struct PluginCliHelp {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginManifest {
-    /// Requires explicit native ABI 1.1 opt-in. IDs are local to this owner.
-    #[serde(default)]
-    pub auxiliary_executables: Vec<AuxiliaryExecutableDeclaration>,
     pub id: String,
     pub name: String,
     pub version: String,
@@ -276,7 +228,6 @@ impl PluginManifest {
     pub fn from_toml_str(value: &str) -> Result<Self> {
         let manifest: Self = toml::from_str(value)?;
         manifest.validate_component_identity()?;
-        manifest.validate_auxiliary_executables()?;
         Ok(manifest)
     }
 
@@ -373,55 +324,7 @@ impl PluginManifest {
         }
     }
 
-    pub(crate) fn validate_auxiliary_executables(&self) -> Result<()> {
-        let mut ids = BTreeSet::new();
-        for executable in &self.auxiliary_executables {
-            let platforms: BTreeSet<_> = executable.supported_platforms.iter().collect();
-            if !safe_auxiliary_name(&executable.id)
-                || !safe_auxiliary_name(&executable.relative_path)
-                || !safe_auxiliary_name(&executable.cargo_package)
-                || !safe_auxiliary_name(&executable.cargo_binary)
-                || executable.protocol_version == 0
-                || platforms.is_empty()
-                || platforms.len() != executable.supported_platforms.len()
-                || platforms
-                    .iter()
-                    .any(|value| !matches!(value.as_str(), "unix" | "windows"))
-                || (executable.supports_platform("windows")
-                    && (executable
-                        .relative_path
-                        .to_ascii_lowercase()
-                        .ends_with(".exe")
-                        || executable
-                            .cargo_binary
-                            .to_ascii_lowercase()
-                            .ends_with(".exe")))
-                || !ids.insert(&executable.id)
-            {
-                return Err(PluginError::ServiceProtocol {
-                    details: format!(
-                        "plugin '{}' has invalid or duplicate auxiliary executable '{}'",
-                        self.id, executable.id
-                    ),
-                });
-            }
-        }
-        if !self.auxiliary_executables.is_empty() {
-            let range = self
-                .native_abi
-                .to_version_range()
-                .map_err(|details| PluginError::ServiceProtocol { details })?;
-            if range.minimum.major != 1 || range.minimum < ApiVersion::new(1, 1) {
-                return Err(PluginError::ServiceProtocol {
-                    details: "auxiliary executables require explicit native_abi minimum 1.1".into(),
-                });
-            }
-        }
-        Ok(())
-    }
-
     fn validate_extensions(&self) -> Result<()> {
-        self.validate_auxiliary_executables()?;
         for extension in &self.extensions {
             if !extension_point_id_is_valid(&extension.extension_point) {
                 return Err(PluginError::ServiceProtocol {
@@ -433,120 +336,6 @@ impl PluginManifest {
             }
         }
         Ok(())
-    }
-}
-
-pub fn safe_auxiliary_name(value: &str) -> bool {
-    !value.is_empty()
-        && value != "."
-        && value != ".."
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-}
-
-#[cfg(test)]
-mod auxiliary_manifest_tests {
-    use super::*;
-
-    fn source(owner: &str, minimum: &str, id: &str, path: &str) -> String {
-        format!(
-            r#"id = "{owner}"
-name = "Test"
-version = "1.0.0"
-[native_abi]
-minimum = "{minimum}"
-[[auxiliary_executables]]
-id = "{id}"
-cargo_package = "example"
-cargo_binary = "worker"
-relative_path = "{path}"
-protocol_version = 1
-"#
-        )
-    }
-
-    #[test]
-    fn helper_platforms_default_to_unix_and_windows_opt_in_is_explicit() {
-        let source = source("example.first", "1.1", "worker", "worker");
-        let legacy = PluginManifest::from_toml_str(&source).unwrap();
-        let declaration = &legacy.auxiliary_executables[0];
-        assert_eq!(declaration.supported_platforms, ["unix"]);
-        assert!(
-            serde_json::to_value(declaration)
-                .unwrap()
-                .get("supported_platforms")
-                .is_none()
-        );
-        assert_eq!(
-            declaration.platform_filename("unix").as_deref(),
-            Some("worker")
-        );
-        assert_eq!(declaration.platform_filename("windows"), None);
-        let manifest = PluginManifest::from_toml_str(&format!(
-            "{source}\nsupported_platforms = [\"unix\", \"windows\"]\n"
-        ))
-        .unwrap();
-        assert_eq!(
-            manifest.auxiliary_executables[0]
-                .platform_filename("windows")
-                .as_deref(),
-            Some("worker.exe")
-        );
-        for platforms in ["[]", "[\"win32\"]", "[\"unix\", \"unix\"]"] {
-            assert!(
-                PluginManifest::from_toml_str(&format!(
-                    "{source}\nsupported_platforms = {platforms}\n"
-                ))
-                .is_err()
-            );
-        }
-        let suffixed = source.replace(
-            "relative_path = \"worker\"",
-            "relative_path = \"worker.exe\"",
-        );
-        assert!(
-            PluginManifest::from_toml_str(&format!(
-                "{suffixed}\nsupported_platforms = [\"windows\"]\n"
-            ))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn auxiliary_declarations_are_versioned_and_owner_scoped() {
-        let first =
-            PluginManifest::from_toml_str(&source("example.first", "1.1", "worker", "worker"))
-                .unwrap();
-        let second =
-            PluginManifest::from_toml_str(&source("example.second", "1.1", "worker", "worker"))
-                .unwrap();
-        assert_eq!(first.auxiliary_executables, second.auxiliary_executables);
-        assert!(
-            PluginManifest::from_toml_str(&source("example.first", "1.0", "worker", "worker"))
-                .is_err()
-        );
-        for path in [
-            "../worker",
-            "/worker",
-            "nested/worker",
-            "..",
-            "worker\\\\escape",
-        ] {
-            assert!(
-                PluginManifest::from_toml_str(&source("example.first", "1.1", "worker", path))
-                    .is_err()
-            );
-        }
-        let duplicate = format!(
-            "{}\n[[auxiliary_executables]]\nid = \"worker\"\ncargo_package = \"example\"\ncargo_binary = \"other\"\nrelative_path = \"other\"\nprotocol_version = 1\n",
-            source("example.first", "1.1", "worker", "worker")
-        );
-        assert!(PluginManifest::from_toml_str(&duplicate).is_err());
-        assert!(
-            PluginManifest::from_toml_str(&source("example.first", "1.1", "../worker", "worker"))
-                .is_err()
-        );
     }
 }
 

@@ -209,7 +209,8 @@ M2: BMUX `packages/plugin-runtime/**`, including its module root/manifests
 (non-root manifests allowed only this lane).
 M3: BMUX plugin `loader.rs` (process-plugin adapter and host service
 dispatch), `loader/scoped.rs`+submodules (the scoped definition loader),
-`auxiliary.rs`+submodules, `static_definition_registry.rs` (inert bundled
+`executable_identity.rs`+submodules, `static_definition_registry.rs` (inert
+bundled
 definitions; formerly `static_vtable_registry.rs`), `stream_admission.rs`;
 excludes other plugin modules and plugin lib root.
 M4: BMUX `packages/plugin-schema/**`, `packages/plugin-schema-macros/**`, SDK

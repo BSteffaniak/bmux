@@ -16,21 +16,18 @@ fn write_executable(path: &Path, bytes: &[u8]) {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 }
-fn fixture(root: &Path) -> (PathBuf, Vec<Value>) {
-    let plugin = root.join("plugins/fixture");
-    fs::create_dir_all(&plugin).unwrap();
-    fs::write(plugin.join("plugin.toml"), "id = 'fixture.owner'\nname = 'Fixture'\nversion = '1.0.0'\n[native_abi]\nminimum = '1.1'\nmaximum = '1.1'\n[[auxiliary_executables]]\nid = 'helper'\ncargo_package = 'fixture_package'\ncargo_binary = 'fixture-helper'\nrelative_path = 'fixture-helper'\nprotocol_version = 1\n").unwrap();
+fn fixture(root: &Path) -> PathBuf {
     let build = root.join("build");
     fs::create_dir(&build).unwrap();
-    for name in ["bmux", "bmux.exe", "xtask", "xtask.exe", "fixture-helper"] {
+    for name in ["bmux", "bmux.exe", "xtask", "xtask.exe"] {
         write_executable(&build.join(name), format!("fixture:{name}").as_bytes());
     }
-    (build, artifacts::declarations(root).unwrap())
+    build
 }
 fn staged(root: &Path) -> PathBuf {
-    let (build, declarations) = fixture(root);
+    let build = fixture(root);
     let stage = root.join("stage");
-    artifacts::stage(&build, &stage, "x86_64-unknown-linux-gnu", &declarations).unwrap();
+    artifacts::stage(&build, &stage, "x86_64-unknown-linux-gnu").unwrap();
     stage
 }
 fn inventory(source: &Path) -> Value {
@@ -49,33 +46,39 @@ fn change_inventory(source: &Path, mutation: impl FnOnce(&mut Value)) {
 #[test]
 fn stage_install_slots_and_platform_policy() {
     let root = root();
-    let (build, declarations) = fixture(root.path());
+    let build = fixture(root.path());
     let stage = root.path().join("stage");
-    artifacts::stage(&build, &stage, "x86_64-unknown-linux-gnu", &declarations).unwrap();
+    artifacts::stage(&build, &stage, "x86_64-unknown-linux-gnu").unwrap();
     let value = inventory(&stage);
-    assert_eq!(value["artifacts"].as_array().unwrap().len(), 3);
-    assert_eq!(value["artifacts"][2]["declaration"]["protocol_version"], 1);
+    let listed: Vec<_> = value["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["relative_path"].as_str().unwrap())
+        .collect();
+    assert_eq!(listed, ["bmux", "bmux-install"]);
+    assert!(value.get("unavailable_auxiliary_executables").is_none());
+    assert!(
+        value["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item.get("declaration").is_none())
+    );
     assert!(stage.join("bmux-install").is_file());
     assert!(!stage.join("install-artifacts.py").exists());
     let slot = root.path().join("slot");
     artifacts::install(&stage, &slot, Some("bmux-test")).unwrap();
     assert!(slot.join("bmux-test").is_file());
-    assert!(slot.join("fixture-helper").is_file());
     assert_eq!(inventory(&slot), value);
     let installed: Value =
         serde_json::from_slice(&fs::read(slot.join("installation.json")).unwrap()).unwrap();
     assert_eq!(installed["binary_name"], "bmux-test");
     assert!(artifacts::install(&stage, &slot, Some("bmux-test")).is_err());
     let windows = root.path().join("windows");
-    artifacts::stage(&build, &windows, "x86_64-pc-windows-msvc", &declarations).unwrap();
-    assert!(!windows.join("fixture-helper").exists());
-    assert_eq!(
-        inventory(&windows)["unavailable_auxiliary_executables"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
-    );
+    artifacts::stage(&build, &windows, "x86_64-pc-windows-msvc").unwrap();
+    assert!(windows.join("bmux.exe").is_file());
+    assert!(windows.join("bmux-install.exe").is_file());
     artifacts::install(
         &windows,
         &root.path().join("windows-slot"),
@@ -91,87 +94,47 @@ fn stage_install_slots_and_platform_policy() {
     )
     .unwrap();
     let generated = root.path().join("generated.yaml");
-    artifacts::nfpm(&config, &generated, &declarations).unwrap();
+    artifacts::nfpm(&config, &generated).unwrap();
     let text = fs::read_to_string(generated).unwrap();
-    assert!(text.contains("dst: /usr/bin/fixture-helper"));
-    assert!(text.contains("mode: 0755"));
+    assert!(text.starts_with("contents:\n  - src: bmux\n    dst: /usr/bin/bmux\n"));
+    assert!(text.contains("dst: /usr/share/bmux/artifacts.json"));
+    assert_eq!(text.matches("dst: /usr/bin/").count(), 1);
 }
 
 #[test]
-fn declaration_rejects_unsafe_duplicate_reserved_unknown_and_zero_protocol() {
+fn legacy_inventory_with_helper_metadata_still_verifies_and_installs() {
     let root = root();
-    fixture(root.path());
-    let path = root.path().join("plugins/fixture/plugin.toml");
-    let original = fs::read_to_string(&path).unwrap();
-    for replacement in [
-        "../escape",
-        "/absolute",
-        "bmux",
-        "BMUX",
-        "BMUX-INSTALL",
-        "ARTIFACTS.JSON",
-        "INSTALLATION.JSON",
-        "INSTALL-ARTIFACTS.PY",
-        "artifacts.json",
-        "install-artifacts.py",
-    ] {
-        fs::write(
-            &path,
-            original.replace(
-                "relative_path = 'fixture-helper'",
-                &format!("relative_path = '{replacement}'"),
-            ),
-        )
-        .unwrap();
-        assert!(
-            artifacts::declarations(root.path()).is_err(),
-            "{replacement}"
-        );
-    }
-    for replacement in [
-        original.replace("protocol_version = 1", "protocol_version = 0"),
-        original.replace("protocol_version = 1", "protocol_version = -1"),
-        format!("{original}unknown = true\n"),
-        original.replace("minimum = '1.1'", "minimum = '1.0'"),
-    ] {
-        fs::write(&path, replacement).unwrap();
-        assert!(artifacts::declarations(root.path()).is_err());
-    }
-    fs::write(&path, &original).unwrap();
-    let other = root.path().join("plugins/other");
-    fs::create_dir(&other).unwrap();
-    fs::write(
-        other.join("plugin.toml"),
-        original.replace("fixture.owner", "fixture.other"),
-    )
-    .unwrap();
-    assert!(artifacts::declarations(root.path()).is_err());
-    fs::write(
-        other.join("plugin.toml"),
-        original.replace("fixture.owner", "fixture.other").replace(
-            "relative_path = 'fixture-helper'",
-            "relative_path = 'FIXTURE-HELPER'",
-        ),
-    )
-    .unwrap();
-    assert!(artifacts::declarations(root.path()).is_err());
+    let stage = staged(root.path());
+    write_executable(&stage.join("legacy-helper"), b"legacy helper");
+    let digest = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(b"legacy helper")
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    change_inventory(&stage, |value| {
+        value["unavailable_auxiliary_executables"] = json!([{"id": "windows-only"}]);
+        value["artifacts"].as_array_mut().unwrap().push(json!({
+            "relative_path": "legacy-helper",
+            "sha256": digest,
+            "bytes": 13,
+            "declaration": {"id": "legacy", "owner": "legacy.owner"},
+        }));
+    });
+    artifacts::verify(&stage).unwrap();
+    let destination = root.path().join("installed");
+    artifacts::install(&stage, &destination, None).unwrap();
+    assert_eq!(inventory(&destination), inventory(&stage));
 }
 
 #[test]
-fn missing_declared_helper_prevents_product_stage_publication() {
+fn missing_installer_prevents_product_stage_publication() {
     let root = root();
-    let (build, declarations) = fixture(root.path());
-    fs::remove_file(build.join("fixture-helper")).unwrap();
+    let build = fixture(root.path());
+    fs::remove_file(build.join("xtask")).unwrap();
     let destination = root.path().join("incomplete");
-    assert!(
-        artifacts::stage(
-            &build,
-            &destination,
-            "x86_64-unknown-linux-gnu",
-            &declarations
-        )
-        .is_err()
-    );
+    assert!(artifacts::stage(&build, &destination, "x86_64-unknown-linux-gnu").is_err());
     assert!(!destination.exists());
 }
 
@@ -180,27 +143,19 @@ fn corrupt_and_missing_artifacts_never_publish_partial_installations() {
     let root = root();
     let stage = staged(root.path());
     let destination = root.path().join("bad");
-    fs::write(stage.join("fixture-helper"), "corrupt").unwrap();
+    fs::write(stage.join("bmux-install"), "corrupt").unwrap();
     assert!(artifacts::install(&stage, &destination, None).is_err());
     assert!(!destination.exists());
-    fs::remove_file(stage.join("fixture-helper")).unwrap();
+    fs::remove_file(stage.join("bmux-install")).unwrap();
     assert!(artifacts::install(&stage, &destination, None).is_err());
     assert!(!destination.exists());
-    let (build, declarations) = {
+    let build = {
         let another = root.path().join("another");
         fs::create_dir(&another).unwrap();
         fixture(&another)
     };
-    fs::remove_file(build.join("fixture-helper")).unwrap();
-    assert!(
-        artifacts::stage(
-            &build,
-            &destination,
-            "x86_64-unknown-linux-gnu",
-            &declarations
-        )
-        .is_err()
-    );
+    fs::remove_file(build.join("bmux")).unwrap();
+    assert!(artifacts::stage(&build, &destination, "x86_64-unknown-linux-gnu").is_err());
     assert!(!destination.exists());
 }
 
@@ -250,7 +205,7 @@ fn symlink_files_inventory_and_parent_directories_are_refused() {
     let root = root();
     let stage = staged(root.path());
     let destination = root.path().join("bad");
-    let helper = stage.join("fixture-helper");
+    let helper = stage.join("bmux-install");
     fs::rename(&helper, stage.join("real-helper")).unwrap();
     symlink("real-helper", &helper).unwrap();
     assert!(artifacts::install(&stage, &destination, None).is_err());
@@ -283,8 +238,8 @@ fn immutable_activation_preserves_old_versions_and_failed_input_preserves_pointe
     let link = prefix.join("bin/bmux");
     let original = fs::read_link(&link).unwrap();
     assert_eq!(
-        fs::read(original.with_file_name("fixture-helper")).unwrap(),
-        b"fixture:fixture-helper"
+        fs::read(original.with_file_name("bmux-install")).unwrap(),
+        b"fixture:xtask"
     );
     assert!(artifacts::activate(&stage, &prefix, "test-version").is_err());
     assert_eq!(fs::read_link(&link).unwrap(), original);
@@ -292,7 +247,7 @@ fn immutable_activation_preserves_old_versions_and_failed_input_preserves_pointe
     let second = fs::read_link(&link).unwrap();
     assert_ne!(second, original);
     assert_eq!(fs::read(&original).unwrap(), b"fixture:bmux");
-    fs::write(stage.join("fixture-helper"), "corrupt").unwrap();
+    fs::write(stage.join("bmux-install"), "corrupt").unwrap();
     assert!(artifacts::activate(&stage, &prefix, "bad-version").is_err());
     assert_eq!(fs::read_link(&link).unwrap(), second);
     assert!(!prefix.join("lib/bmux/versions/bad-version").exists());
@@ -343,9 +298,21 @@ fn cli_rejects_unknown_duplicate_conflicting_and_missing_flags() {
             "--binary-name",
             "bmux-slot",
         ],
-        vec!["auxiliary", "stage"],
-        vec!["auxiliary", "stage", "--target", "bad", "--target", "bad"],
-        vec!["auxiliary", "stage", "--unknown", "value"],
+        vec!["stage"],
+        vec!["stage", "--target", "bad", "--target", "bad"],
+        vec!["stage", "--unknown", "value"],
+        vec!["stage", "extra", "--target", "x86_64-unknown-linux-gnu"],
+        vec!["stage", "--workspace", "."],
+        vec![
+            "nfpm",
+            "--target",
+            "x86_64-pc-windows-msvc",
+            "--config",
+            "c",
+            "--destination",
+            "d",
+        ],
+        vec!["auxiliary", "stage", "--target", "x86_64-unknown-linux-gnu"],
     ] {
         assert!(run(args.into_iter().map(str::to_string).collect()).is_err());
     }
@@ -401,13 +368,9 @@ fn unlisted_members_and_empty_existing_destination() {
 fn non_executable_build_artifact_is_not_published() {
     use std::os::unix::fs::PermissionsExt;
     let root = root();
-    let (build, declarations) = fixture(root.path());
-    fs::set_permissions(
-        build.join("fixture-helper"),
-        fs::Permissions::from_mode(0o644),
-    )
-    .unwrap();
+    let build = fixture(root.path());
+    fs::set_permissions(build.join("xtask"), fs::Permissions::from_mode(0o644)).unwrap();
     let stage = root.path().join("stage");
-    assert!(artifacts::stage(&build, &stage, "x86_64-unknown-linux-gnu", &declarations).is_err());
+    assert!(artifacts::stage(&build, &stage, "x86_64-unknown-linux-gnu").is_err());
     assert!(!stage.exists());
 }

@@ -233,6 +233,10 @@ impl PanePaddingRule {
 #[serde(default, deny_unknown_fields)]
 struct PaneRuntimeSettings {
     padding: PaddingDefaults,
+    /// Parsed by `runtime::session_control::ExecutionSettings`; accepted here so
+    /// the strict padding parse does not reject the plugin's other table.
+    #[serde(rename = "execution")]
+    _execution: Option<toml::Value>,
 }
 
 #[derive(Debug, Clone)]

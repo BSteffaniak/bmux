@@ -9,7 +9,6 @@ use std::sync::{Mutex, OnceLock};
 /// activation's host handles (never process-wide).
 pub(crate) struct Readiness {
     state: Mutex<RuntimeReadiness>,
-    helper: Option<(std::path::PathBuf, String)>,
     // Retained so the executable handle captured at activation stays pinned.
     _executable: ExecutableIdentity,
 }
@@ -71,46 +70,6 @@ impl ExecutableIdentity {
     }
 }
 
-fn helper_error(context: &NativeLifecycleContext) -> Option<String> {
-    resolution_error(
-        context
-            .auxiliary_executables
-            .get("execution-supervisor")
-            .map(|artifact| artifact.protocol_version),
-        context
-            .auxiliary_executable_errors
-            .get("execution-supervisor")
-            .map(String::as_str),
-    )
-}
-
-fn resolution_error(version: Option<u32>, error: Option<&str>) -> Option<String> {
-    match version {
-        Some(version) if version == crate::supervisor_protocol::VERSION => None,
-        Some(version) => Some(format!(
-            "execution supervisor protocol mismatch: expected {}, got {version}",
-            crate::supervisor_protocol::VERSION
-        )),
-        None => Some(
-            error
-                .unwrap_or("execution supervisor was not resolved at plugin activation")
-                .to_owned(),
-        ),
-    }
-    .map(|cause| {
-        format!(
-            "{cause}; install/rebuild the matching pane-runtime plugin package with its \
-             bmux-pane-execution-supervisor auxiliary artifact in the selected runtime's \
-             authoritative package location, then explicitly restart that runtime when safe; \
-             PATH helpers and direct-PTY fallback are not supported"
-        )
-    })
-}
-
-fn sha256(path: &std::path::Path) -> std::io::Result<String> {
-    sha256_reader(std::fs::File::open(path)?)
-}
-
 fn sha256_reader(mut input: impl std::io::Read) -> std::io::Result<String> {
     let mut hash = Sha256::new();
     // Debug hosts can exceed a gigabyte. Keep memory independent of artifact
@@ -152,16 +111,7 @@ pub(crate) fn running_executable_sha256() -> Option<String> {
 }
 
 pub(crate) fn activate(host: &crate::runtime::PaneRuntimeHost, context: &NativeLifecycleContext) {
-    let mut error = helper_error(context);
-    let helper = context
-        .auxiliary_executables
-        .get("execution-supervisor")
-        .map(|artifact| {
-            (
-                std::path::PathBuf::from(&artifact.path),
-                artifact.artifact_sha256.clone(),
-            )
-        });
+    let mut error = None;
     let identity = ExecutableIdentity::capture();
     let verified = identity.get();
     let executable_sha256 = verified.as_ref().ok().cloned();
@@ -182,21 +132,20 @@ pub(crate) fn activate(host: &crate::runtime::PaneRuntimeHost, context: &NativeL
         config_dir: context.connection.config_dir.clone(),
         data_dir: context.connection.data_dir.clone(),
         state_dir: context.connection.state_dir.clone(),
-        helper_ready: error.is_none(),
-        helper_error: error,
+        execution_ready: error.is_none(),
+        execution_error: error,
         restart_blocker: None,
         fenced: false,
     });
     let _ = host.readiness().set(Readiness {
         state,
-        helper,
         _executable: identity,
     });
 }
 
 fn blocker(host: &crate::runtime::PaneRuntimeHost, state: &RuntimeReadiness) -> Option<String> {
     // Only an activation that could never spawn may be recovered automatically.
-    if state.helper_ready {
+    if state.execution_ready {
         return Some("healthy activation cannot be fenced for automatic restart".into());
     }
     let Some(handle) = host.registered_session_runtime() else {
@@ -233,12 +182,11 @@ fn blocker(host: &crate::runtime::PaneRuntimeHost, state: &RuntimeReadiness) -> 
                 Ok(entry) => entry,
                 Err(error) => return Some(error.to_string()),
             };
-            if directory.ends_with("pane-executions-v4")
-                || entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with("supervisor-")
-            {
+            // Live pane sessions leave crash records under pane-sessions/.
+            let live_sessions = entry.file_name() == "pane-sessions"
+                && std::fs::read_dir(entry.path())
+                    .map_or(true, |mut records| records.next().is_some());
+            if directory.ends_with("pane-executions-v4") || live_sessions {
                 return Some("retained execution authority prevents automatic restart".into());
             }
         }
@@ -258,12 +206,11 @@ pub(crate) fn snapshot(host: &crate::runtime::PaneRuntimeHost) -> Result<Runtime
         .clone();
     state.fenced |= crate::runtime::managed_idle::is_fenced(host)?;
     state.restart_blocker = blocker(host, &state);
-    if state.helper_ready
-        && let Err(error) =
-            crate::runtime::reservations::check_authority(host).and_then(|()| verify_helper(host))
+    if state.execution_ready
+        && let Err(error) = crate::runtime::reservations::check_authority(host)
     {
-        state.helper_ready = false;
-        state.helper_error = Some(error.to_string());
+        state.execution_ready = false;
+        state.execution_error = Some(error.to_string());
     }
     Ok(state)
 }
@@ -294,40 +241,13 @@ fn apply_fence(
     if state.instance != instance {
         return Err("runtime instance changed".into());
     }
-    if state.helper_ready {
+    if state.execution_ready {
         return Err("healthy activation cannot be fenced for automatic restart".into());
     }
     if let Some(reason) = blocker {
         return Err(reason);
     }
     state.fenced = true;
-    Ok(())
-}
-
-fn verify_helper(host: &crate::runtime::PaneRuntimeHost) -> anyhow::Result<()> {
-    let (path, expected) = host
-        .readiness()
-        .get()
-        .and_then(|readiness| readiness.helper.as_ref())
-        .ok_or_else(|| anyhow::anyhow!("activation helper identity is unavailable"))?;
-    let metadata = std::fs::symlink_metadata(path)?;
-    anyhow::ensure!(
-        metadata.file_type().is_file(),
-        "execution supervisor is no longer a regular file"
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        anyhow::ensure!(
-            metadata.permissions().mode() & 0o111 != 0,
-            "execution supervisor is no longer executable"
-        );
-    }
-    let hash = sha256(path)?;
-    anyhow::ensure!(
-        &hash == expected,
-        "execution supervisor checksum no longer matches activation identity"
-    );
     Ok(())
 }
 
@@ -338,8 +258,8 @@ pub(crate) fn check_admission(host: &crate::runtime::PaneRuntimeHost) -> anyhow:
             .lock()
             .map_err(|_| anyhow::anyhow!("readiness lock poisoned"))?;
         anyhow::ensure!(!state.fenced, "runtime fenced for graceful recovery");
-        if let Some(reason) = &state.helper_error {
-            anyhow::bail!("execution supervisor unavailable: {reason}");
+        if let Some(reason) = &state.execution_error {
+            anyhow::bail!("terminal execution unavailable: {reason}");
         }
     }
     Ok(())
@@ -457,8 +377,8 @@ mod tests {
             config_dir: "/config".into(),
             data_dir: "/data".into(),
             state_dir: "/state".into(),
-            helper_ready: false,
-            helper_error: Some("hash mismatch".into()),
+            execution_ready: false,
+            execution_error: Some("hash mismatch".into()),
             restart_blocker: None,
             fenced: false,
         };
@@ -467,39 +387,11 @@ mod tests {
         assert!(!state.fenced);
         assert!(apply_fence(&mut state, instance, Some("retained execution".into())).is_err());
         assert!(!state.fenced);
-        state.helper_ready = true;
+        state.execution_ready = true;
         assert!(apply_fence(&mut state, instance, None).is_err());
-        state.helper_ready = false;
+        state.execution_ready = false;
         apply_fence(&mut state, instance, None).unwrap();
         apply_fence(&mut state, instance, None).unwrap();
         assert!(state.fenced);
-    }
-    #[test]
-    fn resolution_errors_retain_actual_cause_and_protocol_identity() {
-        for error in [
-            "missing artifact",
-            "checksum mismatch",
-            "permission denied",
-            "inventory mismatch",
-        ] {
-            let diagnostic = resolution_error(None, Some(error)).unwrap();
-            assert!(diagnostic.starts_with(error));
-            assert!(diagnostic.contains("bmux-pane-execution-supervisor"));
-            assert!(diagnostic.contains("selected runtime"));
-            assert!(diagnostic.contains("explicitly restart that runtime when safe"));
-            assert!(diagnostic.contains("PATH helpers and direct-PTY fallback are not supported"));
-        }
-        let missing = resolution_error(None, None).unwrap();
-        assert!(missing.contains("not resolved at plugin activation"));
-        assert!(missing.contains("matching pane-runtime plugin package"));
-        assert!(
-            resolution_error(Some(0), None)
-                .unwrap()
-                .contains("protocol mismatch")
-        );
-        assert_eq!(
-            resolution_error(Some(crate::supervisor_protocol::VERSION), None),
-            None
-        );
     }
 }

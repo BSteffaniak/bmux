@@ -13,7 +13,9 @@ use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{self, Read as _, Write as _};
 use std::os::windows::ffi::{OsStrExt as _, OsStringExt as _};
-use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle, RawHandle};
+use std::os::windows::io::{
+    AsRawHandle as _, BorrowedHandle, FromRawHandle as _, OwnedHandle, RawHandle,
+};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -22,6 +24,7 @@ use windows_sys::Win32::Foundation::{
     ERROR_BROKEN_PIPE, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, HANDLE, INVALID_HANDLE_VALUE, S_OK,
     WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
+use windows_sys::Win32::Globalization::CompareStringOrdinal;
 use windows_sys::Win32::System::Console::{
     COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
 };
@@ -36,8 +39,9 @@ use windows_sys::Win32::System::Registry::{
 use windows_sys::Win32::System::Threading::{
     CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
-    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-    TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject,
 };
 use windows_sys::core::HRESULT;
 
@@ -284,13 +288,18 @@ pub struct Slave {
 
 impl Slave {
     pub fn spawn(&self, spec: &SpawnCommand) -> io::Result<Child> {
+        self.start_in(spec, None)
+    }
+
+    pub fn spawn_in_job(&self, spec: &SpawnCommand, job: BorrowedHandle<'_>) -> io::Result<Child> {
+        self.start_in(spec, Some(job))
+    }
+
+    fn start_in(&self, spec: &SpawnCommand, job: Option<BorrowedHandle<'_>>) -> io::Result<Child> {
         let argv = spec.argv();
         let program = argv
             .first()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no program to run"))?;
-        let resolved = search_path(program, spec.get_env("PATH"), spec.get_env("PATHEXT"));
-        let mut line = Vec::new();
-        quote(resolved.as_deref().unwrap_or(program), &mut line);
         for arg in &argv[1..] {
             if arg.encode_wide().any(|unit| unit == 0) {
                 return Err(io::Error::new(
@@ -298,13 +307,26 @@ impl Slave {
                     format!("argument {} contains a nul character", arg.display()),
                 ));
             }
-            line.push(u16::from(b' '));
-            quote(arg, &mut line);
+        }
+        let resolved = search_path(program, spec.get_env("PATH"), spec.get_env("PATHEXT"));
+        let mut line = Vec::new();
+        quote(resolved.as_deref().unwrap_or(program), &mut line);
+        if job.is_some() && is_cmd(program) {
+            cmd_arguments(&argv[1..], &mut line)?;
+        } else {
+            for arg in &argv[1..] {
+                line.push(u16::from(b' '));
+                quote(arg, &mut line);
+            }
         }
         line.push(0);
         // Without a resolved path, CreateProcessW looks the program up itself.
         let application = resolved.as_deref().map(wide);
-        let environment = environment_block(spec);
+        let environment = if spec.is_exact_environment() {
+            exact_environment_block(spec)?
+        } else {
+            environment_block(spec)
+        };
         let cwd = working_directory(spec).map(|dir| wide(dir.as_os_str()));
         start(
             &mut line,
@@ -312,6 +334,7 @@ impl Slave {
             &environment,
             cwd.as_deref(),
             self.shared.console.0,
+            job,
         )
         .map_err(|error| {
             io::Error::new(
@@ -327,6 +350,152 @@ impl Slave {
             )
         })
     }
+}
+
+/// Whether `program` names the Windows command interpreter.
+fn is_cmd(program: &OsStr) -> bool {
+    Path::new(program)
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("cmd") || name.eq_ignore_ascii_case("cmd.exe")
+        })
+}
+
+/// `cmd`'s arguments: options as given, then the script after `/C` or `/K` verbatim, wrapped in
+/// `/S` quotes. `cmd` parses that remainder as shell source, not as C runtime arguments, so
+/// escaping it would change it. Without `/C` or `/K`, every argument is quoted as usual.
+fn cmd_arguments(args: &[OsString], line: &mut Vec<u16>) -> io::Result<()> {
+    let invalid = |message: &str| io::Error::new(io::ErrorKind::InvalidInput, message.to_owned());
+    let script = args.iter().position(|arg| {
+        arg.to_str()
+            .is_some_and(|arg| arg.eq_ignore_ascii_case("/c") || arg.eq_ignore_ascii_case("/k"))
+    });
+    let Some(index) = script else {
+        for arg in args {
+            line.push(u16::from(b' '));
+            quote(arg, line);
+        }
+        return Ok(());
+    };
+    if index + 2 != args.len() {
+        return Err(invalid(
+            "cmd /C or /K takes exactly one script argument, last",
+        ));
+    }
+    for option in &args[..index] {
+        let units: Vec<u16> = option.encode_wide().collect();
+        if units.first() != Some(&u16::from(b'/'))
+            || units
+                .iter()
+                .any(|unit| matches!(*unit, 0x20 | 0x09 | 0x0a | 0x0b | 0x22))
+        {
+            return Err(invalid("only cmd options may precede /C or /K"));
+        }
+        line.push(u16::from(b' '));
+        line.extend(units);
+    }
+    line.extend(" /S ".encode_utf16());
+    line.extend(args[index].encode_wide());
+    line.extend(" \"".encode_utf16());
+    line.extend(args[index + 1].encode_wide());
+    line.push(u16::from(b'"'));
+    Ok(())
+}
+
+/// Whether `name` can be an environment block entry's name: not empty, without `=` after an
+/// optional leading one (`cmd` keeps names such as `=C:` and `=ExitCode`), and without nul.
+fn valid_name(name: &[u16]) -> bool {
+    let name = name.strip_prefix(&[u16::from(b'=')]).unwrap_or(name);
+    !name.is_empty() && !name.contains(&0) && !name.contains(&u16::from(b'='))
+}
+
+/// How Windows orders and compares environment names: ordinally, ignoring case.
+fn compare_names(left: &[u16], right: &[u16]) -> io::Result<std::cmp::Ordering> {
+    let length = |units: &[u16]| {
+        i32::try_from(units.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "environment name too long"))
+    };
+    // SAFETY: both slices are valid for the lengths passed.
+    let result = unsafe {
+        CompareStringOrdinal(
+            left.as_ptr(),
+            length(left)?,
+            right.as_ptr(),
+            length(right)?,
+            1,
+        )
+    };
+    match result {
+        1 => Ok(std::cmp::Ordering::Less),
+        2 => Ok(std::cmp::Ordering::Equal),
+        3 => Ok(std::cmp::Ordering::Greater),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+/// Exactly the command's variables, checked and ordered as Windows requires.
+fn exact_environment_block(spec: &SpawnCommand) -> io::Result<Vec<u16>> {
+    let invalid = |message: String| io::Error::new(io::ErrorKind::InvalidInput, message);
+    let mut variables = Vec::new();
+    for (name, value) in spec.environment() {
+        let name: Vec<u16> = name.encode_wide().collect();
+        let value: Vec<u16> = value.encode_wide().collect();
+        if !valid_name(&name) {
+            return Err(invalid(format!(
+                "invalid environment variable name {:?}",
+                String::from_utf16_lossy(&name)
+            )));
+        }
+        if value.contains(&0) {
+            return Err(invalid(format!(
+                "environment variable {} contains a nul character",
+                String::from_utf16_lossy(&name)
+            )));
+        }
+        variables.push((name, value));
+    }
+    sorted_block(variables)
+}
+
+/// `variables` ordered by name as Windows orders them, as a terminated block. Names Windows
+/// considers equal are an error.
+fn sorted_block(mut variables: Vec<(Vec<u16>, Vec<u16>)>) -> io::Result<Vec<u16>> {
+    let mut failure = None;
+    variables.sort_by(|(left, _), (right, _)| {
+        compare_names(left, right).unwrap_or_else(|error| {
+            failure.get_or_insert(error);
+            std::cmp::Ordering::Equal
+        })
+    });
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    for pair in variables.windows(2) {
+        if compare_names(&pair[0].0, &pair[1].0)? == std::cmp::Ordering::Equal {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "environment variables {} and {} differ only in case",
+                    String::from_utf16_lossy(&pair[0].0),
+                    String::from_utf16_lossy(&pair[1].0)
+                ),
+            ));
+        }
+    }
+    let mut block = Vec::new();
+    for (name, value) in &variables {
+        block.extend(name);
+        block.push(u16::from(b'='));
+        block.extend(value);
+        block.push(0);
+    }
+    // An empty block still needs both terminators.
+    if block.is_empty() {
+        block.push(0);
+    }
+    block.push(0);
+    Ok(block)
 }
 
 /// `program` found on `path`, as given or with each `PATHEXT` extension, when it is a file.
@@ -396,16 +565,19 @@ fn start(
     environment: &[u16],
     cwd: Option<&[u16]>,
     console: HPCON,
+    job: Option<BorrowedHandle<'_>>,
 ) -> io::Result<Child> {
+    let count = if job.is_some() { 2 } else { 1 };
     let mut size = 0;
     // SAFETY: a size query with no list.
-    unsafe { InitializeProcThreadAttributeList(null_mut(), 1, 0, &raw mut size) };
+    unsafe { InitializeProcThreadAttributeList(null_mut(), count, 0, &raw mut size) };
     let mut storage = vec![0usize; size.div_ceil(size_of::<usize>())];
     let attributes = storage.as_mut_ptr().cast();
     // SAFETY: storage of the queried size.
-    if unsafe { InitializeProcThreadAttributeList(attributes, 1, 0, &raw mut size) } == 0 {
+    if unsafe { InitializeProcThreadAttributeList(attributes, count, 0, &raw mut size) } == 0 {
         return Err(io::Error::last_os_error());
     }
+    let jobs = job.map(|job| [job.as_raw_handle()]);
     let started = (|| {
         // SAFETY: the console outlives CreateProcessW below.
         if unsafe {
@@ -419,6 +591,23 @@ fn start(
                 null(),
             )
         } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // Assigned to the job as it is created, before it can run or start anything.
+        // SAFETY: the job list outlives CreateProcessW below.
+        if let Some(jobs) = &jobs
+            && unsafe {
+                UpdateProcThreadAttribute(
+                    attributes,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+                    jobs.as_ptr().cast(),
+                    size_of_val(jobs),
+                    null_mut(),
+                    null(),
+                )
+            } == 0
         {
             return Err(io::Error::last_os_error());
         }
@@ -710,4 +899,219 @@ pub fn base_environment() -> Vec<(OsString, OsString)> {
         set(&mut environment, name, value);
     }
     environment
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::windows::io::AsHandle as _;
+    use windows_sys::Win32::System::JobObjects::{
+        CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+
+    fn text(units: &[u16]) -> String {
+        String::from_utf16(units).unwrap()
+    }
+
+    fn cmd_line(args: &[&str]) -> io::Result<String> {
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let mut line = Vec::new();
+        cmd_arguments(&args, &mut line)?;
+        Ok(text(&line))
+    }
+
+    fn block(variables: &[(&str, &str)]) -> io::Result<Vec<u16>> {
+        let mut command = SpawnCommand::new("program");
+        command.env_clear().exact_environment();
+        for (name, value) in variables {
+            command.env(name, value);
+        }
+        exact_environment_block(&command)
+    }
+
+    #[test]
+    fn quoting_escapes_backslashes_only_before_quotes() {
+        let quoted = |arg: &str| {
+            let mut line = Vec::new();
+            quote(OsStr::new(arg), &mut line);
+            text(&line)
+        };
+        assert_eq!(quoted("a\\"), "a\\");
+        assert_eq!(quoted("a\"b"), "\"a\\\"b\"");
+        assert_eq!(quoted("a b\\"), "\"a b\\\\\"");
+        assert_eq!(quoted("/D"), "/D");
+        assert_eq!(quoted(""), "\"\"");
+    }
+
+    #[test]
+    fn cmd_scripts_are_passed_verbatim() {
+        assert_eq!(
+            cmd_line(&["/D", "/C", "echo \"a b\" & exit /b 37"]).unwrap(),
+            " /D /S /C \"echo \"a b\" & exit /b 37\""
+        );
+        assert_eq!(cmd_line(&["/k", "dir"]).unwrap(), " /S /k \"dir\"");
+        // Without a script, cmd's arguments are ordinary ones.
+        assert_eq!(cmd_line(&["/Q", "a b"]).unwrap(), " /Q \"a b\"");
+        assert!(cmd_line(&["/C", "echo", "ambiguous"]).is_err());
+        assert!(cmd_line(&["/C"]).is_err());
+        assert!(cmd_line(&["not-an-option", "/C", "echo"]).is_err());
+        assert!(cmd_line(&["/D x", "/C", "echo"]).is_err());
+        assert!(is_cmd(OsStr::new(r"C:\Windows\System32\CMD.EXE")));
+        assert!(is_cmd(OsStr::new("cmd")));
+        assert!(!is_cmd(OsStr::new("cmdx.exe")));
+    }
+
+    #[test]
+    fn exact_environment_is_ordered_as_windows_orders_names() {
+        let expected: Vec<u16> = "=C:=C:\\work\0a=1\0Path=C:\\Windows\0zz=2\0\0"
+            .encode_utf16()
+            .collect();
+        assert_eq!(
+            block(&[
+                ("zz", "2"),
+                ("Path", "C:\\Windows"),
+                ("a", "1"),
+                ("=C:", "C:\\work"),
+            ])
+            .unwrap(),
+            expected
+        );
+        assert_eq!(block(&[]).unwrap(), vec![0, 0]);
+    }
+
+    #[test]
+    fn exact_environment_keeps_cmd_pseudo_variables() {
+        let block = block(&[
+            ("=ExitCode", "00000000"),
+            ("=ExitCodeAscii", "\u{20ac}"),
+            ("=C:", "C:\\work"),
+        ])
+        .unwrap();
+        let block = text(&block);
+        assert!(block.contains("=ExitCode=00000000\0"));
+        assert!(block.contains("=ExitCodeAscii=\u{20ac}\0"));
+    }
+
+    #[test]
+    fn exact_environment_rejects_invalid_names() {
+        for name in ["=", "==", "=C:=", "A=B", "=ExitCode=Value"] {
+            assert!(block(&[(name, "value")]).is_err(), "accepted {name:?}");
+        }
+        assert!(valid_name(&[u16::from(b'='), 0xd800]));
+        assert!(!valid_name(&[]));
+        assert!(!valid_name(&[u16::from(b'A'), 0]));
+    }
+
+    #[test]
+    fn exact_environment_rejects_names_equal_but_for_case() {
+        // SpawnCommand already folds ASCII case; the block is checked as Windows compares.
+        let variables = vec![
+            ("\u{e9}".encode_utf16().collect(), vec![]),
+            ("\u{c9}".encode_utf16().collect(), vec![]),
+        ];
+        assert!(sorted_block(variables).is_err());
+        let surrogate = vec![(vec![u16::from(b'A')], vec![0xd800])];
+        assert_eq!(sorted_block(surrogate).unwrap(), vec![65, 61, 0xd800, 0, 0]);
+    }
+
+    fn kill_on_close_job() -> OwnedHandle {
+        // SAFETY: an unnamed job with default security.
+        let job = unsafe { CreateJobObjectW(null(), null()) };
+        assert!(!job.is_null());
+        // SAFETY: a new handle nothing else owns.
+        let job = unsafe { OwnedHandle::from_raw_handle(job) };
+        // SAFETY: zeroed is a valid empty limit structure.
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: the structure outlives the call and its size is passed.
+        let set = unsafe {
+            SetInformationJobObject(
+                job.as_raw_handle(),
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                u32::try_from(size_of_val(&limits)).unwrap(),
+            )
+        };
+        assert_ne!(set, 0, "{}", io::Error::last_os_error());
+        job
+    }
+
+    /// A console whose cursor queries are answered, with its output collected.
+    fn console() -> (Master, Slave, std::sync::mpsc::Receiver<Vec<u8>>) {
+        let (master, slave) = open(PtySize::new(80, 24)).unwrap();
+        let mut reader = master.try_clone_reader().unwrap();
+        let mut input = master.take_writer().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buffer = [0; 4096];
+            loop {
+                let read = match reader.read(&mut buffer) {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => read,
+                };
+                if buffer[..read].windows(4).any(|window| window == b"\x1b[6n") {
+                    let _ = input.write(b"\x1b[1;1R");
+                    let _ = input.flush();
+                }
+                if sender.send(buffer[..read].to_vec()).is_err() {
+                    return;
+                }
+            }
+        });
+        (master, slave, receiver)
+    }
+
+    fn comspec() -> OsString {
+        std::env::var_os("COMSPEC").unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".into())
+    }
+
+    #[test]
+    fn processes_start_inside_the_job_with_exactly_their_environment() {
+        let (master, slave, output) = console();
+        let job = kill_on_close_job();
+        let mut command = SpawnCommand::new(comspec());
+        command
+            .env_clear()
+            .exact_environment()
+            .env("SystemRoot", std::env::var_os("SystemRoot").unwrap())
+            .env("BMUX_PTY_EXACT", "only")
+            .args(["/D", "/C", "echo [%BMUX_PTY_EXACT%][%USERNAME%]& exit /b 7"]);
+        let mut child = slave.spawn_in_job(&command, job.as_handle()).unwrap();
+        let mut in_job = 0;
+        // SAFETY: a live process handle and an owned job handle.
+        let checked =
+            unsafe { IsProcessInJob(child.as_raw_handle(), job.as_raw_handle(), &raw mut in_job) };
+        assert_ne!(checked, 0, "{}", io::Error::last_os_error());
+        assert_ne!(in_job, 0, "the process must start inside the job");
+        assert_eq!(child.wait().unwrap().exit_code(), 7);
+        drop(slave);
+        drop(master);
+        let text: Vec<u8> = output.iter().flatten().collect();
+        let text = String::from_utf8_lossy(&text);
+        assert!(text.contains("[only][%USERNAME%]"), "{text:?}");
+    }
+
+    #[test]
+    fn closing_a_kill_on_close_job_ends_its_processes() {
+        let (master, slave, _output) = console();
+        let job = kill_on_close_job();
+        let mut command = SpawnCommand::new(comspec());
+        command.args(["/D", "/C", "ping -n 60 127.0.0.1 >nul"]);
+        let mut child = slave.spawn_in_job(&command, job.as_handle()).unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+        // The job's only handle.
+        drop(job);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the job did not end its process"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        drop(slave);
+        drop(master);
+    }
 }

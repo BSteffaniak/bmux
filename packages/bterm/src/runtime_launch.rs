@@ -56,7 +56,7 @@ pub async fn prepare_native_configured(
         .context("native attachment identity timed out")??;
     authenticate_managed_readiness(selection, &current)?;
     anyhow::ensure!(
-        current.instance == readiness.instance && current.helper_ready && !current.fenced,
+        current.instance == readiness.instance && current.execution_ready && !current.fenced,
         "native attachment target changed after preparation; no attachment attempted"
     );
     Ok((attachment, Some(preparation)))
@@ -163,10 +163,10 @@ async fn connect_selection_inner(
             .await
             .context("external runtime readiness timed out")??;
             anyhow::ensure!(
-                readiness.helper_ready && !readiness.fenced,
+                readiness.execution_ready && !readiness.fenced,
                 "external runtime is not ready: {}; attach-only selection never repairs a runtime",
                 readiness
-                    .helper_error
+                    .execution_error
                     .as_deref()
                     .unwrap_or("runtime is fenced")
             );
@@ -393,7 +393,7 @@ async fn connect_selection_inner(
             .context("runtime identity timed out")??;
         let observation = if readiness.fenced {
             crate::reconciliation::Observation::Draining
-        } else if readiness.helper_ready {
+        } else if readiness.execution_ready {
             crate::reconciliation::Observation::Ready
         } else {
             crate::reconciliation::Observation::Unhealthy {
@@ -428,7 +428,7 @@ async fn connect_selection_inner(
                     bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::client::fence_unhealthy(&mut client, readiness.instance)
                 ).await.context("runtime fencing timed out")??.map_err(anyhow::Error::msg)?;
                 anyhow::ensure!(
-                    fence.instance == readiness.instance && fence.fenced && !fence.helper_ready,
+                    fence.instance == readiness.instance && fence.fenced && !fence.execution_ready,
                     "runtime did not acknowledge exact-instance recovery fence"
                 );
                 // Recheck the same connection's authoritative incarnation immediately before shutdown.
@@ -473,7 +473,7 @@ async fn connect_selection_inner(
             action => bail!(
                 "runtime is not ready: {}; reconciliation: {action:?}; runtime preserved",
                 readiness
-                    .helper_error
+                    .execution_error
                     .as_deref()
                     .unwrap_or("execution readiness unavailable")
             ),

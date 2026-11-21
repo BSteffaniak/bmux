@@ -2,13 +2,9 @@ use super::StopAction;
 use std::io;
 
 pub(in super::super) fn supports_cooperative_stop() -> bool {
-    // Managed Windows executions are owned by the supervisor's Job Object.
-    // Its Term operation is explicitly unsupported: proceed to bounded Sweep.
+    // Windows panes run in a Job Object, which can only be terminated as a
+    // whole: callers escalate straight to a forced sweep of the job.
     false
-}
-
-pub(in super::super) fn foreground_group(_master: &bmux_pty::PtyMaster) -> Option<i32> {
-    None
 }
 
 pub(in super::super) fn stop_foreground_group(
@@ -17,7 +13,7 @@ pub(in super::super) fn stop_foreground_group(
 ) -> io::Result<Option<bool>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "owned PTY process-group signaling unavailable; managed execution requires a supervisor",
+        "PTY process-group signaling is unavailable on this platform; panes are stopped through their job",
     ))
 }
 

@@ -19,7 +19,7 @@ pub(super) enum StopAction {
     Force,
 }
 
-pub(super) use backend::{foreground_group, stop_foreground_group, supports_cooperative_stop};
+pub(super) use backend::{stop_foreground_group, supports_cooperative_stop};
 
 #[cfg(not(unix))]
 pub(super) use non_unix::send_process_signal;

@@ -64,37 +64,6 @@ fn diagnostic(owner: uuid::Uuid, stage: &'static str, total: u64, bytes: &[u8]) 
     eprintln!("ConPTY bootstrap owner={owner} stage={stage} total={total} classes={classes}");
 }
 
-/// Observe only the native spawn boundary, without logging command arguments,
-/// bootstrap paths, authentication, or environment. This distinguishes a stuck
-/// `CreateProcess` from subsequent supervisor pipe/lifetime negotiation.
-#[cfg(windows)]
-pub(in super::super) struct ObservedSlave<'a> {
-    pub(in super::super) slave: &'a dyn crate::runtime::pty::Slave,
-    pub(in super::super) owner: uuid::Uuid,
-}
-
-#[cfg(windows)]
-impl crate::runtime::pty::Slave for ObservedSlave<'_> {
-    fn spawn_command(
-        &self,
-        command: bmux_pty::SpawnCommand,
-    ) -> io::Result<Box<dyn crate::runtime::pty::Child + Send + Sync>> {
-        diagnostic(self.owner, "native-spawn-enter", 0, &[]);
-        let result = self.slave.spawn_command(command);
-        diagnostic(
-            self.owner,
-            if result.is_ok() {
-                "native-spawn-ok"
-            } else {
-                "native-spawn-error"
-            },
-            0,
-            &[],
-        );
-        result
-    }
-}
-
 pub(in super::super) struct BootstrapReader {
     owner: uuid::Uuid,
     raw: Box<dyn Read + Send>,

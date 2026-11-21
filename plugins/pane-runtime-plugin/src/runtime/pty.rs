@@ -1,12 +1,14 @@
 //! Process handles for pane terminals.
 //!
-//! Startup wraps the process spawned on a terminal (to tie it to supervision, or to observe the
-//! native spawn), and the wrappers must stand in for the process itself; these traits are what
-//! every such handle provides. `bmux_pty` supplies the terminals and the processes.
+//! Startup wraps the process spawned on a terminal (to tie its cleanup to startup), and the
+//! wrappers must stand in for the process itself; these traits are what every such handle
+//! provides. `bmux_pty` supplies the terminals and the processes.
 
 use std::io;
 
-use bmux_pty::{ChildExit, PtyChild, PtyChildKiller, PtySlave, SpawnCommand};
+use bmux_pty::{ChildExit, PtyChild, PtyChildKiller};
+#[cfg(unix)]
+use bmux_pty::{PtySlave, SpawnCommand};
 
 /// Ends a process from wherever the handle was cloned to.
 pub(crate) trait ChildKiller: std::fmt::Debug + Send {
@@ -20,8 +22,8 @@ pub(crate) trait ChildKiller: std::fmt::Debug + Send {
 /// A process started on a pane terminal.
 pub(crate) trait Child: ChildKiller {
     /// How the process ended, if it has, without waiting.
-    // Only Windows startup polls its helper; Unix startup negotiates over a socket instead.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    // Startup waits for its process instead; tests poll.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn try_wait(&mut self) -> io::Result<Option<ChildExit>>;
 
     /// Wait for the process to end.
@@ -31,12 +33,13 @@ pub(crate) trait Child: ChildKiller {
     fn process_id(&self) -> Option<u32>;
 }
 
-/// Where a process can be started on a terminal: the terminal's slave, or a wrapper observing
-/// the spawn.
+/// Where a process can be started on a terminal. Windows spawns into the pane's job instead.
+#[cfg(unix)]
 pub(crate) trait Slave {
     fn spawn_command(&self, command: SpawnCommand) -> io::Result<Box<dyn Child + Send + Sync>>;
 }
 
+#[cfg(unix)]
 impl Slave for PtySlave {
     fn spawn_command(&self, command: SpawnCommand) -> io::Result<Box<dyn Child + Send + Sync>> {
         Ok(Box::new(self.spawn(&command)?))

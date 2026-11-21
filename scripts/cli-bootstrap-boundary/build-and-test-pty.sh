@@ -25,6 +25,5 @@ if found != set(sys.argv[2:]):
 }
 "${build_cli[@]}" --message-format=json | collect "$out/bare" bmux
 "${build_cli[@]}" --features bundled-plugin-windows,bundled-plugin-pane-runtime,bundled-plugin-sessions,bundled-plugin-contexts,bundled-plugin-clients --message-format=json | collect "$out/local-splits" bmux
-cargo build --locked --offline -p bmux_pane_runtime_plugin --bin bmux-pane-execution-supervisor --message-format=json | collect "$out/local-splits" bmux-pane-execution-supervisor
 "${build_cli[@]}" --features bundled-plugin-performance --message-format=json | collect "$out/diagnostics" bmux
 python3 scripts/cli-bootstrap-boundary/pty-input.py --diagnostics "$out/diagnostics/bmux" "$out/bare/bmux" "$out/local-splits/bmux"

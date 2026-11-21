@@ -11,28 +11,27 @@ cargo xtask build --features bmux_cli/bench --features bmux_cli/fail-on-warnings
 `build` forwards repeatable `--features FEATURES` (also `--features=FEATURES`),
 `--all-features`, and `--no-default-features` to the product Cargo build.
 Feature lists retain Cargo's comma/space-separated and package-qualified syntax.
-Prefer `package/feature` because the product build selects the CLI, installer,
-and platform-supported helper packages together. Cargo validates feature names;
+Prefer `package/feature` because the product build selects the CLI and
+installer packages together. Cargo validates feature names;
 xtask does not add packages or silently map features to the CLI.
 `--all-features` and `--no-default-features` apply to the selected packages,
 using Cargo's normal semantics. Without these options, existing defaults are
-unchanged. These options are scoped to `xtask build`, not auxiliary or Bterm
+unchanged. These options are scoped to `xtask build`, not the staging or Bterm
 packaging commands.
 
-These are explicit repository tasks, not Cargo build-script hooks. The task uses
-`bmux_plugin::PluginManifest` for the same declaration/ABI validation as the
-host;
-it does not initialize a plugin runtime or contact a daemon.
+These are explicit repository tasks, not Cargo build-script hooks. They do not
+initialize a plugin runtime or contact a daemon.
 
 ```
-cargo xtask auxiliary build --target TARGET
-cargo xtask auxiliary stage --target TARGET --artifact-dir DIR --destination DIR
-cargo xtask auxiliary nfpm --target TARGET --config FILE --destination FILE
+cargo xtask stage --target TARGET --artifact-dir DIR --destination DIR
+cargo xtask nfpm --target TARGET --config FILE --destination FILE
 cargo xtask install SOURCE DESTINATION [--binary-name bmux-SLOT]
 cargo xtask install SOURCE --prefix PREFIX --version VERSION
 ```
 
-Auxiliary operations accept `--workspace ROOT` (default: this repository).
+bmux ships as a single binary: the release payload is `bmux`, the Rust
+installer `bmux-install`, and `artifacts.json`. `nfpm` appends the inventory to
+an nFPM configuration whose own `contents` list the binaries.
 `--activate-version VERSION` is an alias for `--version`. Version activation and
 slot renaming are mutually exclusive. Install destinations must be absent or
 empty dedicated directories. Unix activation retains immutable version
@@ -41,20 +40,21 @@ and atomically replaces only `PREFIX/bin/bmux`, under an exclusive publication
 lock. A failed activation may retain a fully published but inactive version;
 retrying that immutable version is explicitly refused, never overwritten.
 
-Build selects `xtask` and each declared Cargo package/binary explicitly, using
-`--locked --release --target`. Stage renames the target `xtask` binary to
+`cargo xtask build` selects the `bmux` and `xtask` binaries explicitly, using
+`--locked --target --profile`. Stage renames the target `xtask` binary to
 `bmux-install` (`.exe` on Windows); invocation under that basename defaults to
 the
 install task, without an `install` subcommand. The host task can install
 cross-target
-inventories without executing their binaries. Windows inventories include only
-`bmux.exe` and `bmux-install.exe`, with unavailable helper declarations
-recorded;
-symlink activation is Unix-only. Supported targets are x86_64/aarch64 Darwin and
+inventories without executing their binaries. Windows inventories include
+`bmux.exe` and `bmux-install.exe`; symlink activation is Unix-only. Supported
+targets are x86_64/aarch64 Darwin and
 Linux GNU/musl, and x86_64 Windows MSVC.
 
-The inventory is schema 1 and includes SHA-256, length, target, and
-declarations.
+The inventory is schema 1 and records the target plus each member's SHA-256 and
+length. Inventories written by older releases may also carry plugin helper
+members, their `declaration`s and `unavailable_auxiliary_executables`; these
+are still read, verified and preserved, but never produced.
 Install verifies every member, rejects unlisted payload members,
 unsafe/duplicate
 names and symlinked files or path ancestors, then copies into a private staging
@@ -95,7 +95,7 @@ at
 Linux).
 `bterm-run/<host>/latest.json` is an atomically updated informational reference.
 Older generations (including pre-generation legacy bundles) are retained so live
-daemons and supervisors never lose their artifact paths. Corrupt generations
+daemons never lose their artifact paths. Corrupt generations
 are rejected, never overwritten. Concurrent builds/runs serialize publication;
 publication locks are released before launching a window. Persistent
 state lives separately under `${XDG_STATE_HOME:-$HOME/.local/state}/bterm-dev/`,
@@ -112,10 +112,9 @@ cargo xtask bterm stage --target TARGET --artifact-dir DIR --destination ABSENT_
 cargo xtask bterm verify --target TARGET --root EXECUTABLE_DIRECTORY
 ```
 
-Staging copies the actual `bterm` frontend plus the manifest-driven BMUX product
-payload: companion, installer, declared platform-supported helper executables
-(including the execution supervisor), and `artifacts.json`. That inventory and
-all helper bytes are covered by the Bterm bundle manifest. It also includes four
+Staging copies the actual `bterm` frontend plus the BMUX product payload:
+companion, installer and `artifacts.json`. That inventory and the installer
+bytes are covered by the Bterm bundle manifest. It also includes four
 bundled JetBrains Mono Nerd Font faces and font/project notices. Static plugins
 remain part of
 the BMUX companion. Both processes retain independent lifetimes; packaging never

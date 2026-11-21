@@ -1,9 +1,9 @@
 #[path = "loader/scoped.rs"]
 pub mod scoped;
 
-#[path = "auxiliary.rs"]
-mod auxiliary;
-pub use auxiliary::{executable_sha256, retain_executable};
+#[path = "executable_identity.rs"]
+mod executable_identity;
+pub use executable_identity::{executable_sha256, retain_executable};
 
 use crate::{
     CapabilityProvider, PluginDeclaration, PluginEntrypoint, PluginRegistry, RegisteredPlugin,
@@ -1399,65 +1399,7 @@ pub struct LoadedPlugin {
     concurrency_gate: ConcurrencyGate,
 }
 
-// Resolve only declared auxiliary artifacts against an authoritative selected
-// base. Missing artifacts remain explicit diagnostics, never PATH fallbacks.
-fn resolve_lifecycle_auxiliaries(
-    registered: &RegisteredPlugin,
-    base: &std::result::Result<PathBuf, String>,
-    mut context: NativeLifecycleContext,
-) -> Result<NativeLifecycleContext> {
-    context.auxiliary_executables.clear();
-    context.auxiliary_executable_errors.clear();
-    let manifest = &registered.manifest;
-    manifest.validate_auxiliary_executables()?;
-    if manifest.auxiliary_executables.is_empty() {
-        return Ok(context);
-    }
-    let required = bmux_plugin_sdk::ApiVersion::new(1, 1);
-    if context.host.plugin_abi_version.major != 1 || context.host.plugin_abi_version < required {
-        return Err(PluginError::ServiceProtocol {
-            details: "auxiliary lifecycle metadata requires negotiated host native ABI 1.1".into(),
-        });
-    }
-    for declaration in &manifest.auxiliary_executables {
-        let resolved = base.as_ref().map_err(Clone::clone).and_then(|base| {
-            auxiliary::resolve_retained(base, declaration, &manifest.id, &context.connection)
-        });
-        match resolved {
-            Ok(value) => {
-                context
-                    .auxiliary_executables
-                    .insert(declaration.id.clone(), value);
-            }
-            Err(error) => {
-                context.auxiliary_executable_errors.insert(
-                    declaration.id.clone(),
-                    format!(
-                        "selected plugin {} auxiliary {} resolution failed: {error}",
-                        manifest.id, declaration.id
-                    ),
-                );
-            }
-        }
-    }
-    Ok(context)
-}
-
 impl LoadedPlugin {
-    fn resolved_lifecycle_context(
-        &self,
-        context: &NativeLifecycleContext,
-    ) -> Result<NativeLifecycleContext> {
-        let base = self
-            .registered
-            .manifest_path
-            .parent()
-            .filter(|path| path.is_absolute())
-            .map(PathBuf::from)
-            .ok_or_else(|| "auxiliary package manifest has no absolute authoritative root".into());
-        resolve_lifecycle_auxiliaries(&self.registered, &base, context.clone())
-    }
-
     #[must_use]
     pub const fn effective_concurrency_policy(&self) -> EffectiveConcurrencyPolicy {
         EffectiveConcurrencyPolicy::new(self.declaration.concurrency)
@@ -1761,15 +1703,14 @@ impl LoadedPlugin {
     fn run_lifecycle(&self, hook: &str, context: &NativeLifecycleContext) -> Result<i32> {
         let total_started = Instant::now();
         let encode_started = Instant::now();
-        let context = self.resolved_lifecycle_context(context)?;
-        let legacy = self.declaration.native_abi.minimum < bmux_plugin_sdk::ApiVersion::new(1, 1);
-        let payload_result = if legacy {
-            encode_service_message(&context.legacy_wire_snapshot())
-        } else {
-            encode_service_message(&context)
-        };
-        let payload = payload_result.map_err(|_| PluginError::InvalidNativeLifecycleInput {
-            plugin_id: self.declaration.id.as_str().to_string(),
+        let context = context.clone();
+        // The lifecycle context serializes exactly the frozen native ABI 1.0
+        // fields, so one encoding serves both ABI 1.0 and 1.1 plugins (see
+        // `lifecycle_context_serializes_settings_and_host`).
+        let payload = encode_service_message(&context).map_err(|_| {
+            PluginError::InvalidNativeLifecycleInput {
+                plugin_id: self.declaration.id.as_str().to_string(),
+            }
         })?;
         let encode_us = encode_started.elapsed().as_micros();
 
@@ -2811,10 +2752,8 @@ minimum = "1.0"
     #[test]
     fn lifecycle_context_serializes_settings_and_host() {
         let context = NativeLifecycleContext {
-            auxiliary_executables: BTreeMap::new(),
             host_service_port: None,
             capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
-            auxiliary_executable_errors: BTreeMap::new(),
             plugin_id: "test.plugin".to_string(),
             required_capabilities: Vec::new(),
             provided_capabilities: Vec::new(),
@@ -2851,41 +2790,29 @@ minimum = "1.0"
             decode_service_message(&payload).expect("frozen legacy consumer should decode");
         assert_eq!(legacy, frozen);
         // The frozen adapter also preserves positional encoding used by legacy
-        // fixtures; it never inserts the new maps before existing fields.
+        // fixtures.
         let positional =
             bmux_ipc::encode(&frozen).expect("legacy positional snapshot should encode");
         let positional_legacy: bmux_plugin_sdk::NativeLifecycleContextV1 =
             bmux_ipc::decode(&positional).expect("legacy positional snapshot should decode");
         assert_eq!(positional_legacy, frozen);
         let modern: NativeLifecycleContext = decode_service_message(&payload)
-            .expect("modern consumer should accept legacy typed fields with empty maps");
+            .expect("modern consumer should accept legacy typed fields");
         assert_eq!(modern, context);
+        // Lifecycle dispatch sends one encoding to every plugin ABI, so the
+        // current context must stay byte-identical to the frozen ABI 1.0 wire.
         let mut modern = modern;
-        modern.auxiliary_executables.insert(
-            "worker".into(),
-            bmux_plugin_sdk::ResolvedAuxiliaryExecutable {
-                path: "/owned/package/worker".into(),
-                protocol_version: 1,
-                artifact_sha256: "a".repeat(64),
-            },
-        );
-        modern
-            .auxiliary_executable_errors
-            .insert("optional-worker".into(), "unavailable".into());
         assert_eq!(
+            encode_service_message(&modern).expect("context should encode"),
+            payload,
+            "ABI 1.0 payload must be byte-identical to the current lifecycle context"
+        );
+        modern.host.plugin_abi_version = ApiVersion::new(1, 1);
+        assert_eq!(
+            encode_service_message(&modern).expect("ABI 1.1 should encode"),
             encode_service_message(&modern.legacy_wire_snapshot())
                 .expect("legacy snapshot should encode"),
-            payload,
-            "ABI 1.0 payload must be byte-identical despite new lifecycle metadata"
-        );
-        // New metadata is only dispatched after selecting ABI 1.1; legacy
-        // snapshot equality above is checked with identical host metadata.
-        modern.host.plugin_abi_version = ApiVersion::new(1, 1);
-        let modern_payload = encode_service_message(&modern).expect("ABI 1.1 should encode");
-        assert_eq!(
-            decode_service_message::<NativeLifecycleContext>(&modern_payload)
-                .expect("ABI 1.1 should roundtrip"),
-            modern
+            "ABI 1.1 lifecycle payload must match the frozen ABI 1.0 wire"
         );
     }
 

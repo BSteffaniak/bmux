@@ -1582,7 +1582,6 @@ dependencies = [
  "bmux_client",
  "bmux_decoration_plugin_renderer",
  "bmux_image",
- "bmux_ipc",
  "bmux_plugin",
  "bmux_raster",
  "bmux_scene_protocol",
@@ -1950,7 +1949,6 @@ dependencies = [
  "bmux_connections_plugin_api",
  "bmux_ipc",
  "bmux_pane_runtime_plugin_api",
- "bmux_pane_runtime_state",
  "bmux_plugin",
  "bmux_plugin_schema_macros",
  "bmux_plugin_sdk",
@@ -2776,7 +2774,6 @@ dependencies = [
  "bmux_pane_runtime_plugin_api",
  "bmux_performance_plugin_api",
  "bmux_performance_state",
- "bmux_plugin",
  "bmux_plugin_sdk",
  "bmux_recording_plugin_api",
  "bmux_recording_protocol",
@@ -15672,7 +15669,6 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 name = "xtask"
 version = "0.0.1-alpha.4"
 dependencies = [
- "bmux_plugin",
  "libc",
  "serde",
  "serde_json",

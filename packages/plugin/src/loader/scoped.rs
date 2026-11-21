@@ -136,7 +136,6 @@ struct BundledExecutableArtifact {
     )]
     snapshot: std::fs::File,
     identity: String,
-    executable_parent: std::path::PathBuf,
 }
 impl BundledExecutableCache {
     fn observe(&self) -> Result<Arc<BundledExecutableArtifact>> {
@@ -164,11 +163,6 @@ impl BundledExecutableArtifact {
     fn capture(path: &Path) -> Result<Self> {
         use sha2::{Digest, Sha256};
         use std::io::{Read, Write};
-        let executable_parent = path
-            .canonicalize()?
-            .parent()
-            .map(std::path::PathBuf::from)
-            .ok_or_else(|| failure("canonical host executable has no parent"))?;
         let mut input = std::fs::File::open(path)?;
         let before = input.metadata()?;
         if !before.is_file() {
@@ -177,7 +171,7 @@ impl BundledExecutableArtifact {
         // Hash the retained inode on clone-capable volumes. If cloning fails
         // (e.g. TMPDIR is on another volume), copy and hash in a single pass.
         #[cfg(target_os = "macos")]
-        let cloned = super::auxiliary::try_clone_snapshot(&input).ok();
+        let cloned = super::executable_identity::try_clone_snapshot(&input).ok();
         #[cfg(not(target_os = "macos"))]
         let cloned: Option<std::fs::File> = None;
         let copying = cloned.is_none();
@@ -211,7 +205,6 @@ impl BundledExecutableArtifact {
         Ok(Self {
             snapshot,
             identity: hex_digest(&hash.finalize()),
-            executable_parent,
         })
     }
 }
@@ -219,7 +212,7 @@ impl BundledExecutableArtifact {
 /// Loader-issued provenance for one created native instance, not policy approval.
 ///
 /// The digest covers only the retained private main-library copy, not its
-/// dependencies, auxiliary executables, or a whole package. No wire/payload
+/// dependencies, sibling executables, or a whole package. No wire/payload
 /// representation can construct this receipt.
 #[derive(Debug)]
 pub struct VerifiedArtifact {
@@ -269,12 +262,7 @@ pub struct DefinitionArtifact {
     metadata: PluginMetadata,
     backend: ArtifactBackend,
     bundled_executable: Option<Arc<BundledExecutableArtifact>>,
-    lifecycle_selection: Option<Arc<LifecycleSelection>>,
     verified_selection: Option<(String, ComponentRole)>,
-}
-struct LifecycleSelection {
-    registered: crate::RegisteredPlugin,
-    base: std::result::Result<std::path::PathBuf, String>,
 }
 #[derive(Clone)]
 enum ArtifactBackend {
@@ -307,7 +295,6 @@ impl DefinitionArtifact {
             metadata: definition.metadata.clone(),
             backend: ArtifactBackend::Static(definition),
             bundled_executable: None,
-            lifecycle_selection: None,
             verified_selection: None,
         }
     }
@@ -446,7 +433,6 @@ impl DefinitionArtifact {
                 service_contracts,
             })),
             bundled_executable: None,
-            lifecycle_selection: None,
             verified_selection: None,
         })
     }
@@ -552,23 +538,6 @@ impl DefinitionArtifact {
         {
             artifact.verified_selection = Some((observed_identity, selected.role()));
         }
-        let base = artifact.bundled_executable.as_ref().map_or_else(
-            || {
-                plugin
-                    .manifest_path
-                    .parent()
-                    .filter(|path| path.is_absolute())
-                    .map(std::path::PathBuf::from)
-                    .ok_or_else(|| {
-                        "auxiliary package manifest has no absolute authoritative root".into()
-                    })
-            },
-            |executable| Ok(executable.executable_parent.clone()),
-        );
-        artifact.lifecycle_selection = Some(Arc::new(LifecycleSelection {
-            registered: plugin.clone(),
-            base,
-        }));
         Ok(artifact)
     }
 
@@ -679,7 +648,6 @@ impl DefinitionArtifact {
             context,
             backend,
             _bundled_executable: self.bundled_executable.clone(),
-            lifecycle_selection: self.lifecycle_selection.clone(),
             control: AtomicBool::new(false),
             operation_admissions: AtomicUsize::new(0),
             kernel_dispatch: Mutex::new(None),
@@ -787,7 +755,6 @@ pub struct LoadedExecution {
     context: PluginCreateContext,
     backend: ExecutionBackend,
     _bundled_executable: Option<Arc<BundledExecutableArtifact>>,
-    lifecycle_selection: Option<Arc<LifecycleSelection>>,
     control: AtomicBool,
     operation_admissions: AtomicUsize,
     kernel_dispatch: Mutex<Option<Arc<dyn crate::InvocationKernelDispatch>>>,
@@ -1274,25 +1241,6 @@ impl LoadedExecution {
         }
     }
 
-    fn resolved_lifecycle_context(
-        &self,
-        context: NativeLifecycleContext,
-    ) -> Result<NativeLifecycleContext> {
-        if let Some(selection) = &self.lifecycle_selection {
-            return super::resolve_lifecycle_auxiliaries(
-                &selection.registered,
-                &selection.base,
-                context,
-            );
-        }
-        // Raw test/embedded definitions have no verified package root. Do not
-        // accept caller-supplied executable handles as selected artifact metadata.
-        let mut context = context;
-        context.auxiliary_executables.clear();
-        context.auxiliary_executable_errors.clear();
-        Ok(context)
-    }
-
     /// Standalone command activation uses this exact implementation and owner.
     /// Observe/acknowledge this operation before begin(Command) on the same self.
     ///
@@ -1319,8 +1267,6 @@ impl LoadedExecution {
                 settings: command.settings.clone(),
                 plugin_settings_map: command.plugin_settings_map.clone(),
                 host_kernel_bridge: None,
-                auxiliary_executables: BTreeMap::new(),
-                auxiliary_executable_errors: BTreeMap::new(),
                 host_service_port: None,
                 capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
             },
@@ -1643,7 +1589,6 @@ impl LoadedExecution {
         policy: PluginConcurrencyConfig,
     ) -> Result<u64> {
         reject_executable_context(native.host_kernel_bridge.is_some())?;
-        let native = self.resolved_lifecycle_context(native)?;
         let _control = self.control()?;
         self.ensure_capacity()?;
         self.ensure_activation_port_negotiated()?;
@@ -1750,10 +1695,9 @@ impl LoadedExecution {
     /// Ordinary work has not drained or cleanup startup fails.
     pub async fn begin_deactivation(&self, native: NativeLifecycleContext) -> Result<u64> {
         // Failed admission has no cleanup root. Preserve its primary diagnostic
-        // before auxiliary resolution or later cleanup preconditions can mask it.
+        // before later cleanup preconditions can mask it.
         self.activation()?;
         reject_executable_context(native.host_kernel_bridge.is_some())?;
-        let native = self.resolved_lifecycle_context(native)?;
         let _control = self.control()?;
         self.ensure_previous_lifecycle_settled()?;
         if let Some(port) = self.registration_port()? {
@@ -4103,7 +4047,7 @@ mod tests {
             callback_execution: Some(callback.clone()),
             scope: execution.context.clone(),
             activation: ActivationId::from_uuid(activation.id().as_uuid()),
-            native: auxiliary_lifecycle_fixture(),
+            native: lifecycle_fixture(),
             capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
         };
         let outcome = static_operation_with_tasks(
@@ -4627,11 +4571,6 @@ mod tests {
         let repeated = owner
             .observe_with(|| panic!("must observe only once per owner"))
             .unwrap();
-        assert_eq!(
-            first.executable_parent,
-            directory.path().canonicalize().unwrap()
-        );
-        assert_eq!(repeated.executable_parent, first.executable_parent);
         assert!(Arc::ptr_eq(&first, &repeated));
         let mut retained = first.snapshot.try_clone().unwrap();
         retained.rewind().unwrap();
@@ -5077,7 +5016,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn auxiliary_lifecycle_fixture() -> NativeLifecycleContext {
+    fn lifecycle_fixture() -> NativeLifecycleContext {
         let service = super::super::tests::native_test_service_context(vec![]);
         NativeLifecycleContext {
             plugin_id: "test.safety".into(),
@@ -5095,8 +5034,6 @@ mod tests {
             connection: service.connection,
             settings: None,
             plugin_settings_map: BTreeMap::new(),
-            auxiliary_executables: BTreeMap::new(),
-            auxiliary_executable_errors: BTreeMap::new(),
             host_service_port: None,
             capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
             host_kernel_bridge: None,
@@ -5121,10 +5058,7 @@ mod tests {
             }))
             .unwrap();
         let id = execution
-            .begin_activation(
-                auxiliary_lifecycle_fixture(),
-                PluginConcurrencyConfig::Concurrent,
-            )
+            .begin_activation(lifecycle_fixture(), PluginConcurrencyConfig::Concurrent)
             .unwrap();
         let actual = observed.lock().unwrap().clone().unwrap();
         assert_eq!(
@@ -5159,7 +5093,7 @@ mod tests {
             panic!("pre-scope rejection must not execute bridge")
         }
         let execution = fixture_unactivated();
-        let mut context = auxiliary_lifecycle_fixture();
+        let mut context = lifecycle_fixture();
         // Rejection is before scope creation and before any author effects.
         context.host_kernel_bridge =
             Some(bmux_plugin_sdk::HostKernelBridge::from_fn(forbidden_bridge));
@@ -5169,7 +5103,7 @@ mod tests {
             .to_string();
         assert!(execution.state.lock().unwrap().activation.is_none());
         let cleanup = execution
-            .begin_deactivation(auxiliary_lifecycle_fixture())
+            .begin_deactivation(lifecycle_fixture())
             .await
             .unwrap_err()
             .to_string();
@@ -5180,39 +5114,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn private_auxiliary_lifecycle_fixture(root: &Path) -> NativeLifecycleContext {
-        use std::os::unix::fs::DirBuilderExt as _;
-
-        // The host initializes these private roots before plugin activation;
-        // retention creates only its own auxiliary-images subtree.
-        for directory in ["state", "runtime"] {
-            std::fs::DirBuilder::new()
-                .mode(0o700)
-                .create(root.join(directory))
-                .unwrap();
-        }
-        let mut context = auxiliary_lifecycle_fixture();
-        context.connection.state_dir = root.join("state").to_string_lossy().into_owned();
-        context.connection.runtime_dir = root.join("runtime").to_string_lossy().into_owned();
-        context
-    }
-
-    #[cfg(unix)]
-    struct AuxiliaryActivationObserver(Arc<Mutex<Option<NativeLifecycleContext>>>);
-
-    #[cfg(unix)]
-    impl PluginInstance for AuxiliaryActivationObserver {
-        fn activate(
-            &self,
-            context: PluginLifecycleContext,
-        ) -> PluginFuture<'_, bmux_plugin_sdk::definition::PluginResult<()>> {
-            *self.0.lock().unwrap() = Some(context.native);
-            Box::pin(async { Ok(()) })
-        }
-    }
-
-    #[cfg(unix)]
-    async fn observe_auxiliary_activation(execution: &LoadedExecution, id: u64) -> NativeOutcome {
+    async fn observe_activation(execution: &LoadedExecution, id: u64) -> NativeOutcome {
         // Bound only the observer wait; timeout does not unload retained work.
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
@@ -5291,12 +5193,9 @@ mod tests {
                 execution.scope().id().as_uuid()
             );
             let id = execution
-                .begin_activation(
-                    auxiliary_lifecycle_fixture(),
-                    PluginConcurrencyConfig::Concurrent,
-                )
+                .begin_activation(lifecycle_fixture(), PluginConcurrencyConfig::Concurrent)
                 .unwrap();
-            let outcome = observe_auxiliary_activation(&execution, id).await;
+            let outcome = observe_activation(&execution, id).await;
             if !bound {
                 assert!(matches!(outcome, NativeOutcome::Error { code: 70, message }
                     if message == "callback instance binding missing"));
@@ -5306,11 +5205,11 @@ mod tests {
                 assert!(execution.acknowledge(id).await.is_err());
                 assert!(execution.call(id).is_ok());
                 let cleanup = execution
-                    .begin_deactivation(auxiliary_lifecycle_fixture())
+                    .begin_deactivation(lifecycle_fixture())
                     .await
                     .unwrap();
                 assert!(matches!(
-                    observe_auxiliary_activation(&execution, cleanup).await,
+                    observe_activation(&execution, cleanup).await,
                     NativeOutcome::Error { code: 70, message }
                         if message == "callback instance binding missing"
                 ));
@@ -5322,118 +5221,17 @@ mod tests {
             assert_eq!(effects.load(Ordering::Acquire), 1);
             execution.acknowledge(id).await.unwrap();
             let cleanup = execution
-                .begin_deactivation(auxiliary_lifecycle_fixture())
+                .begin_deactivation(lifecycle_fixture())
                 .await
                 .unwrap();
             assert!(matches!(
-                observe_auxiliary_activation(&execution, cleanup).await,
+                observe_activation(&execution, cleanup).await,
                 NativeOutcome::Unit
             ));
             assert_eq!(effects.load(Ordering::Acquire), 2);
             execution.acknowledge(cleanup).await.unwrap();
             execution.destroy().await.unwrap();
         }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn scoped_lifecycle_resolves_selected_auxiliary_and_reports_missing_without_fallback() {
-        use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
-        let base = root.path().join("package");
-        std::fs::create_dir(&base).unwrap();
-        let worker = base.join("worker");
-        std::fs::write(&worker, b"#!/bin/sh\nexit 0\n").unwrap();
-        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let manifest = crate::PluginManifest::from_toml_str(
-            r#"
-            id = "test.safety"
-            name = "Test"
-            version = "1.0.0"
-            [native_abi]
-            minimum = "1.1"
-            [[auxiliary_executables]]
-            id = "worker"
-            cargo_package = "example"
-            cargo_binary = "worker"
-            relative_path = "worker"
-            protocol_version = 1
-        "#,
-        )
-        .unwrap();
-        let registered = crate::RegisteredPlugin {
-            search_root: base.clone(),
-            manifest_path: base.join("plugin.toml"),
-            declaration: manifest.to_declaration().unwrap(),
-            manifest,
-            bundled_static: false,
-        };
-        let observed = Arc::new(Mutex::new(None));
-        let mut artifact = fixture_artifact();
-        let captured = observed.clone();
-        artifact = DefinitionArtifact::from_definition(PluginDefinition::new(
-            artifact.metadata.clone(),
-            move |_| {
-                Ok(Arc::new(AuxiliaryActivationObserver(captured.clone()))
-                    as Arc<dyn PluginInstance>)
-            },
-        ));
-        artifact.lifecycle_selection = Some(Arc::new(LifecycleSelection {
-            registered,
-            base: Ok(base),
-        }));
-        let execution = artifact
-            .create(
-                PluginRuntimeScopeId::from_uuid(uuid::Uuid::from_u128(25)),
-                ComponentRole::Backend,
-                &[],
-            )
-            .unwrap();
-        execution
-            .bind_callback_runtime(tokio::runtime::Handle::current())
-            .unwrap();
-        let mut context = private_auxiliary_lifecycle_fixture(root.path());
-        let resolved = execution
-            .resolved_lifecycle_context(context.clone())
-            .unwrap();
-        assert!(
-            resolved.auxiliary_executable_errors.is_empty(),
-            "{:?}",
-            resolved.auxiliary_executable_errors,
-        );
-        let retained = &resolved.auxiliary_executables["worker"];
-        assert_eq!(
-            std::fs::read(&retained.path).unwrap(),
-            b"#!/bin/sh\nexit 0\n"
-        );
-        assert_ne!(std::path::Path::new(&retained.path), worker);
-        let activation = execution
-            .begin_activation(context.clone(), PluginConcurrencyConfig::Concurrent)
-            .unwrap();
-        let outcome = observe_auxiliary_activation(&execution, activation).await;
-        assert!(matches!(outcome, NativeOutcome::Unit), "{outcome:?}");
-        let observed = observed.lock().unwrap();
-        let author = observed
-            .as_ref()
-            .expect("selected activation hook must run");
-        assert_eq!(author.auxiliary_executables, resolved.auxiliary_executables);
-        assert!(
-            author.auxiliary_executable_errors.is_empty(),
-            "{:?}",
-            author.auxiliary_executable_errors,
-        );
-        drop(observed);
-        std::fs::rename(&worker, root.path().join("unselected-worker")).unwrap();
-        let missing = execution
-            .resolved_lifecycle_context(resolved.clone())
-            .unwrap();
-        assert!(missing.auxiliary_executables.is_empty());
-        assert_ne!(missing.auxiliary_executable_errors["worker"], "");
-        // Prior retained identity remains usable; it does not become a fallback
-        // for a new failed resolution of the declared selected source.
-        assert!(std::path::Path::new(&retained.path).is_file());
-        context.host.plugin_abi_version = bmux_plugin_sdk::ApiVersion::new(1, 0);
-        assert!(execution.resolved_lifecycle_context(context).is_err());
     }
 
     #[cfg(unix)]
@@ -5503,11 +5301,11 @@ mod tests {
             invocation.drain().await.unwrap();
             invocation.finish().unwrap();
             let cleanup = execution
-                .begin_deactivation(auxiliary_lifecycle_fixture())
+                .begin_deactivation(lifecycle_fixture())
                 .await
                 .unwrap();
             assert!(matches!(
-                observe_auxiliary_activation(&execution, cleanup).await,
+                observe_activation(&execution, cleanup).await,
                 NativeOutcome::Unit
             ));
             execution.acknowledge(cleanup).await.unwrap();

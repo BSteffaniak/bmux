@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Local hosted product acceptance. Pass the absolute bundled bmux binary.
 
-Requires Python 3.11+, an adjacent pane supervisor, and zbarimg or macOS Vision.
+Requires Python 3.11+ and zbarimg or macOS Vision.
 The clipboard provider is disabled before any invocation; use only fixture auth.
 """
 import http.server

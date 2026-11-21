@@ -316,9 +316,9 @@ telemetry and must report that limitation.
 Execution authority, terminal lifetime, capture, and finalization are separate
 plugin-owned responsibilities:
 
-- A control guardian retains authenticated execution identity, mutation receipts,
-  reconnect authority, and its precisely fenced signal scope outside the
-  controlling-terminal session.
+- The server process (there is no separate guardian process) retains
+  authenticated execution identity, mutation receipts, reconnect authority, and
+  its precisely fenced signal scope outside the controlling-terminal session.
 - A designated terminal owner defines that session's lifetime. Its retirement is
   independent of raw capture EOF and does not wait for every descendant to exit
   or close its slave descriptor. Conventional OS session-end effects apply, but

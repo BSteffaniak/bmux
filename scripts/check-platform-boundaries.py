@@ -13,8 +13,8 @@ import re
 import sys
 
 SHARED_FILES = (
-    "plugins/pane-runtime-plugin/src/runtime/supervisor.rs",
     "plugins/pane-runtime-plugin/src/runtime/environment.rs",
+    "plugins/pane-runtime-plugin/src/runtime/session_control.rs",
     "plugins/recording-plugin/src/interactive_command.rs",
     "plugins/recording-plugin/src/interactive_terminal.rs",
 )

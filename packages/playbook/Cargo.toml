@@ -57,10 +57,8 @@ tracing = { workspace = true }
 uuid    = { workspace = true, features = ["serde", "std", "v4"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
-# The render-cache regression constructs types owned by the plugin render contract.
-bmux_plugin = { workspace = true }
-tempfile    = { workspace = true }
+tempfile = { workspace = true }
+tokio    = { workspace = true, features = ["test-util"] }
 
 [features]
 default = []

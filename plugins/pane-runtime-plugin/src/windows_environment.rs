@@ -1,4 +1,4 @@
-//! Windows environment-block key syntax, shared by admission and the supervisor.
+//! Windows environment-block key syntax, checked when an exact environment is admitted.
 //!
 //! CMD inherits hidden names such as `=C:`, `=ExitCode`, and `=ExitCodeAscii`.
 //! These are not ordinary `SetEnvironmentVariable` names: an environment block

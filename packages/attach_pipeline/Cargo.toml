@@ -36,7 +36,6 @@ uuid               = { workspace = true, features = ["std"] }
 [dev-dependencies]
 bmux_bench                      = { workspace = true }
 bmux_decoration_plugin_renderer = { workspace = true }
-bmux_ipc                        = { workspace = true }
 bmux_scene_protocol             = { workspace = true }
 serde_json                      = { workspace = true }
 

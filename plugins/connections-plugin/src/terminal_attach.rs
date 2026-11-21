@@ -386,6 +386,48 @@ fn same_execution(a: &TerminalExecutionRef, b: &TerminalExecutionRef) -> bool {
     a.session_id == b.session_id && a.pane_id == b.pane_id && a.execution_token == b.execution_token
 }
 
+/// The saved execution to resume, or `None` (and the record forgotten) when the
+/// remote program ended or its server restarted and retired it: reopening the
+/// name then starts a fresh terminal.
+async fn resume_saved(
+    client: &mut BmuxClient,
+    paths: &ConfigPaths,
+    key: &str,
+    value: &str,
+) -> Result<Option<TerminalExecutionRef>> {
+    let reference: TerminalExecutionRef = serde_json::from_str(value)?;
+    if !remote_execution_finished(client, &reference).await? {
+        return Ok(Some(reference));
+    }
+    crate::remote_preferences::client_update(&paths.state_dir, "default", |p| {
+        if p.terminals.get(key).map(String::as_str) == Some(value) {
+            p.terminals.remove(key);
+        }
+        Ok(())
+    })?;
+    Ok(None)
+}
+
+/// Whether a saved remote execution has ended for good, so reopening its name
+/// should start a new one rather than refuse input.
+async fn remote_execution_finished(
+    client: &mut BmuxClient,
+    reference: &TerminalExecutionRef,
+) -> Result<bool> {
+    use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalLaunchPhase;
+    let state = operation(execution::reconcile(client, reference.clone()).await?)?;
+    anyhow::ensure!(
+        same_execution(reference, &state.launch.reservation.execution),
+        "remote control execution identity mismatch"
+    );
+    Ok(!state.recovery_required
+        && state.terminal_session_ended
+        && matches!(
+            state.launch.phase,
+            TerminalLaunchPhase::Exited | TerminalLaunchPhase::Retired
+        ))
+}
+
 async fn validate_control(client: &mut BmuxClient, reference: &TerminalExecutionRef) -> Result<()> {
     use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::{
         TerminalLaunchPhase, TerminalSessionEnd,
@@ -508,8 +550,12 @@ impl RemoteTerminal {
             }
             Ok(p.terminals.get(&key).cloned())
         })?;
-        let execution = if let Some(value) = saved {
-            serde_json::from_str(&value)?
+        let saved = match saved {
+            Some(value) => resume_saved(&mut client, &paths, &key, &value).await?,
+            None => None,
+        };
+        let execution = if let Some(reference) = saved {
+            reference
         } else {
             // Persist the reservation BEFORE the non-idempotent launch. Reopening
             // reconciles this exact execution; it must never silently launch another.

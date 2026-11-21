@@ -1,7 +1,7 @@
-//! Content-addressed auxiliary images survive replacement of their source package.
+//! Content-addressed executable images survive replacement of their source package.
 //! There is deliberately no automatic pruning: activation lifetime does not prove
-//! that an auxiliary process (or its recovery work) has finished.
-use super::open_auxiliary_artifact;
+//! that a process launched from an image (or its recovery work) has finished.
+use super::open_verified_executable;
 
 #[cfg(all(test, unix))]
 #[path = "retained/tests.rs"]
@@ -23,7 +23,7 @@ pub fn retain(source: &Path, root: &Path, owner: &str, expected: &str) -> Result
             return Err("invalid executable SHA-256 identity".into());
         }
         if !root.is_absolute() {
-            return Err("auxiliary image root must be absolute".into());
+            return Err("executable image root must be absolute".into());
         }
         // Hash owner names rather than interpreting arbitrary plugin IDs as paths.
         let directory = root.join(hex(&Sha256::digest(owner.as_bytes())));
@@ -34,7 +34,7 @@ pub fn retain(source: &Path, root: &Path, owner: &str, expected: &str) -> Result
             .map_err(|error| error.to_string())?;
         let filename = source
             .file_name()
-            .ok_or("auxiliary image has no filename")?;
+            .ok_or("executable image has no filename")?;
         let directory = directory.join(expected);
         private_directory(&directory)?;
         let destination = directory.join(filename);
@@ -46,7 +46,7 @@ pub fn retain(source: &Path, root: &Path, owner: &str, expected: &str) -> Result
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.to_string()),
         }
-        let (mut input, _) = open_auxiliary_artifact(source)?;
+        let (mut input, _) = open_verified_executable(source)?;
         let mut staging = stage(&mut input, &directory)?;
         verify_file(staging.as_file_mut(), expected)?;
         #[cfg(unix)]
@@ -82,7 +82,7 @@ pub fn retain(source: &Path, root: &Path, owner: &str, expected: &str) -> Result
     })();
     result.map_err(|error: String| {
         format!(
-            "retain auxiliary executable {} in {}: {error}",
+            "retain executable {} in {}: {error}",
             source.display(),
             root.display()
         )
@@ -171,10 +171,10 @@ fn private_directory(path: &Path) -> Result<(), String> {
 }
 
 fn verify(path: &Path, expected: &str) -> Result<(), String> {
-    let (mut file, _) = open_auxiliary_artifact(path)?;
+    let (mut file, _) = open_verified_executable(path)?;
     verify_file(&mut file, expected).map_err(|error| {
         format!(
-            "invalid retained auxiliary image {}: {error}",
+            "invalid retained executable image {}: {error}",
             path.display()
         )
     })
@@ -201,7 +201,7 @@ fn verify_file(file: &mut File, expected: &str) -> Result<(), String> {
         digest.update(&buffer[..count]);
     }
     if hex(&digest.finalize()) != expected {
-        return Err("auxiliary image checksum mismatch".into());
+        return Err("executable image checksum mismatch".into());
     }
     Ok(())
 }

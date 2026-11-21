@@ -1,5 +1,5 @@
 //! Shell-owned selection and lifetime policy; publication uses the host's generic
-//! executable-retention primitive, shared with declared auxiliary executables.
+//! executable-retention primitive.
 use anyhow::{Context as _, Result};
 use std::path::{Path, PathBuf};
 

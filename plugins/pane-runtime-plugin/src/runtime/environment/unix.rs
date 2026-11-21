@@ -5,6 +5,13 @@ pub(super) const ENCODING: &str = "unix-bytes";
 pub(super) fn encode(value: &std::ffi::OsStr) -> Vec<u8> {
     value.as_bytes().to_vec()
 }
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "UTF-16 decoding on Windows can fail"
+)]
+pub(super) fn decode(bytes: &[u8]) -> Option<std::ffi::OsString> {
+    Some(std::ffi::OsStr::from_bytes(bytes).to_owned())
+}
 pub(super) fn keys_equal(left: &[u8], right: &[u8]) -> bool {
     left == right
 }

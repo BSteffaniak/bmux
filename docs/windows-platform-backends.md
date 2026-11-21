@@ -11,44 +11,30 @@ durability
 mechanisms live in platform modules. No new domain convenience methods belong in
 `HostRuntimeApi` or the generic plugin host.
 
-## Managed execution
+## Pane execution
 
-`plugins/pane-runtime-plugin/src/runtime/supervisor.rs` owns helper installation
-hash verification, admission, authenticated requests, startup authorization, and
-lifecycle snapshot validation. `supervisor/unix.rs` and `supervisor/windows.rs`
-implement the native transport/spawn/lifetime mechanisms. The shared entry point
-is `spawn_terminal(master, slave, command)`; lifecycle readers expose a
-backend-neutral `LifecycleInterrupter::interrupt()`.
+The server spawns each pane's program directly on its ConPTY. There is no
+helper process. `runtime/session_control.rs` is the platform-neutral owner;
+`session_control/windows.rs` is the Windows backend:
 
-- Unix resolves the PTY slave through `master.tty_name()` and launches the
-  guardian. Inherited readiness IPC and its unreaped startup-child guard remain
-  Unix-owned. Failed negotiation kills/reaps the startup child. Lifetime
-  installation and sticky revocation share one lock.
-- Windows attaches the helper to ConPTY using `slave.spawn_command(command)`.
-  Its invocation is `--guardian-windows-session-v1 BOOTSTRAP_PATH PIPE_NAME`.
-  The random `\\.\pipe\bmux-exec-UUID` endpoint uses authenticated bounded
-  framing, not a TCP fallback. Bootstrap creation uses current-user private ACLs.
-  The client uses overlapped named-pipe handles for deadlines/cancellation.
-- Private protocol version 8 adds `BindLifetime`. Windows establishes a dedicated
-  connection, accepts an authenticated successful response, and retains that
-  lease. EOF ends the helper's owned lifetime. Failed binding retains startup
-  child cleanup ownership; revocation cannot be undone by a late install.
-- `Subscribe` streams snapshots on both systems. Capability, protocol version,
-  execution token, and increasing revision must match; EOF/interruption is not a
-  successful terminal-end receipt. Requests and lifecycle receipts remain
-  distinct from capture completion.
+- `prepare` creates an unnamed, non-inheritable Job Object with
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and no breakaway limits.
+- `bmux_pty::PtySlave::spawn_in_job` creates the program with both
+  `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` and `PROC_THREAD_ATTRIBUTE_JOB_LIST`, so
+  it is in the job from its first instruction and nothing it starts can escape.
+  Exact environments (`SpawnCommand::exact_environment`) are validated and
+  ordinal-sorted; `cmd /C` scripts are passed verbatim with `/S`.
+- A forced stop is `TerminateJobObject` followed by a bounded wait until the
+  job's active-process count is zero; processes that remain are a cleanup
+  error. Cooperative stop is unsupported and escalates to a forced stop.
+- The server holds the job handle for the pane's lifetime. If the server dies,
+  even when killed outright, the kernel closes the handle and kill-on-close ends
+  every process in the job. No crash records are needed on Windows.
+- With `sweep_on_exit = false`, kill-on-close is cleared once the shell exits
+  while jobs remain, so releasing the handle leaves them running.
 
-The Windows helper creates a suspended target, assigns it to its owned
-kill-on-close Job Object, then resumes it. Job termination/active-process
-accounting supplies the Windows cleanup boundary. This is not a POSIX process
-group/session emulation, and numeric PID signaling is not a substitute for owned
-handles. Unix session/process-group inspection and signaling stay in Unix helper
-and native-process modules.
-
-Windows cooperative/graceful `Term` is explicitly unsupported. Managed teardown
-uses the bounded owned-job `Sweep` path; direct pane process signaling is also
-unsupported there. Console Ctrl-C/close notifications received by an interactive
-frontend do **not** grant authority to terminate the managed execution.
+The early ConPTY cursor reply (`native_process/conpty_startup.rs`) is unchanged.
+The console host is not in the job; the retired console is closed explicitly.
 
 ## Environment and interactive frontend
 
@@ -59,7 +45,8 @@ validation. Native codecs are selected as whole modules:
 - Windows requires `windows-utf16le`, preserves native UTF-16 code units, and uses
   Windows case-insensitive key identity (including native drive-directory keys).
 
-`Start.native_env_encoding` identifies the native representation. Incompatible,
+The `windows-utf16le` / `unix-bytes` encoding tag identifies the native
+representation. Incompatible,
 malformed, duplicate, or oversized input is rejected rather than lossily
 decoded.
 
@@ -108,7 +95,7 @@ python3 scripts/check-platform-boundaries.py
 python3 scripts/test-platform-boundaries.py
 ```
 
-The guard scans the four named shared supervisor, environment, and interactive
+The guard scans the named shared session-control, environment, and interactive
 frontend files on every host. It rejects raw OS namespaces/crates/handles,
 native signal calls, ABI declarations, and platform cfg on implementations.
 Whole out-of-line module selectors and explicit positive `cfg(test)` items are

@@ -254,17 +254,8 @@ interface pane-runtime-execution-v4 {
         acknowledged_bytes: u64,
         error: string?,
     }
-    record terminal-supervisor-locator {
-        execution: terminal-execution-ref,
-        protocol_version: u32,
-        artifact_sha256: string,
-        endpoint: string,
-        // Not a credential; reconnect independently authenticates runtime owner.
-        generation: u64,
-    }
     record terminal-reconciliation {
         launch: terminal-launch-receipt,
-        supervisor: terminal-supervisor-locator?,
         // True only when the canonical raw stream has reached EOF without a gap.
         capture_complete: bool,
         oldest_cursor: terminal-capture-cursor,
@@ -506,8 +497,8 @@ interface pane-runtime-readiness-v1 {
         config_dir: string,
         data_dir: string,
         state_dir: string,
-        helper_ready: bool,
-        helper_error: string?,
+        execution_ready: bool,
+        execution_error: string?,
         restart_blocker: string?,
         fenced: bool,
     }

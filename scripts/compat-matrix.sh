@@ -90,10 +90,10 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 1
 fi
 
-# Build the host and its static plugins' auxiliary executables together.
-# An explicit --bmux-bin remains caller-owned; never rebuild or substitute it.
-if [[ "$EXPLICIT_BINARY" == "0" ]] && ! cargo build -q --locked -p bmux_cli -p bmux_pane_runtime_plugin --bins; then
-  echo "error: failed to build bmux_cli and execution supervisor before matrix run" >&2
+# Build the single bmux binary. An explicit --bmux-bin remains caller-owned;
+# never rebuild or substitute it.
+if [[ "$EXPLICIT_BINARY" == "0" ]] && ! cargo build -q --locked -p bmux_cli --bin bmux; then
+  echo "error: failed to build bmux_cli before matrix run" >&2
   exit 1
 fi
 

@@ -31,18 +31,10 @@ fn profile_directory(profile: &str) -> &str {
     if profile == "dev" { "debug" } else { profile }
 }
 
-fn build_arguments(
-    target: &str,
-    profile: &str,
-    declarations: &[serde_json::Value],
-) -> Result<Vec<String>> {
+fn build_arguments(target: &str, profile: &str) -> Result<Vec<String>> {
     let profile = self::profile(Some(profile))?;
-    let mut arguments = crate::build::arguments(
-        target,
-        profile,
-        declarations,
-        &crate::build::Features::default(),
-    )?;
+    let mut arguments =
+        crate::build::arguments(target, profile, &crate::build::Features::default())?;
     arguments.extend(["-p".into(), "bterm".into(), "--bin".into(), "bterm".into()]);
     Ok(arguments)
 }
@@ -79,7 +71,7 @@ fn sync_tree(path: &Path) -> Result<()> {
 }
 
 /// Stage and verify before publishing a content-addressed immutable bundle.
-/// Existing generations stay in place for live daemons and their helper paths.
+/// Existing generations stay in place for live daemons.
 fn refresh(workspace: &Path, source: &Path, bundle: &Path, target: &str) -> Result<PathBuf> {
     use sha2::{Digest as _, Sha256};
     let parent = bundle
@@ -234,11 +226,7 @@ pub(crate) fn build(workspace: &Path, profile: &str) -> Result<BuiltBundle> {
         .open(owned.join("run.lock"))?;
     lock.try_lock()
         .map_err(|err| error(format!("another bterm build/run may be active: {err}")))?;
-    let arguments = build_arguments(
-        &target,
-        profile,
-        &crate::artifacts::declarations(workspace)?,
-    )?;
+    let arguments = build_arguments(&target, profile)?;
     let status = cargo().args(arguments).current_dir(workspace).status()?;
     if !status.success() {
         return Err(error(format!("bterm build failed: {status}")));
@@ -318,12 +306,8 @@ mod tests {
 
     #[test]
     fn every_product_artifact_uses_the_exact_selected_profile() {
-        let declarations = vec![serde_json::json!({
-            "cargo_package": "worker_plugin", "cargo_binary": "worker"
-        })];
         for profile in ["dev", "release", "profiling", "custom-fast_2"] {
-            let arguments =
-                build_arguments("aarch64-apple-darwin", profile, &declarations).unwrap();
+            let arguments = build_arguments("aarch64-apple-darwin", profile).unwrap();
             assert_eq!(
                 arguments.iter().filter(|arg| *arg == "--profile").count(),
                 1
@@ -333,7 +317,7 @@ mod tests {
                     .windows(2)
                     .any(|pair| pair == ["--profile", profile])
             );
-            for binary in ["bmux", "xtask", "worker", "bterm"] {
+            for binary in ["bmux", "xtask", "bterm"] {
                 assert!(arguments.windows(2).any(|pair| pair == ["--bin", binary]));
             }
             assert!(!arguments.iter().any(|arg| arg == "--release"));
@@ -378,7 +362,7 @@ mod tests {
         let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let source = temp.path().join("source");
         fs::create_dir(&source).unwrap();
-        for name in ["bterm", "bmux", "xtask", "bmux-pane-execution-supervisor"] {
+        for name in ["bterm", "bmux", "xtask"] {
             fs::write(source.join(name), "version one").unwrap();
             #[cfg(unix)]
             {

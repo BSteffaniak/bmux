@@ -24,8 +24,8 @@ them runs under `cargo test`:
 - `python3 packages/cli/tests/recording_snapshot_roundtrip.py --binary /path/to/bmux`:
   Unix PTY attach, recording and snapshot save/restore round trip.
 - `python3 plugins/connections-plugin/src/hosted/acceptance.py /path/to/bmux`:
-  hosted share/join/setup flows against a local fixture control plane (needs an
-  adjacent pane supervisor and `zbarimg` or macOS Vision for QR decoding).
+  hosted share/join/setup flows against a local fixture control plane (needs
+  `zbarimg` or macOS Vision for QR decoding).
 
 ## Migration decisions
 

@@ -511,9 +511,9 @@ async fn exercise_attached(
         "stage=helper-readiness runtime mismatch"
     );
     ensure!(
-        readiness.helper_ready,
+        readiness.execution_ready,
         "stage=helper-readiness unavailable: {:?}",
-        readiness.helper_error
+        readiness.execution_error
     );
     let session = panes::new_session_with_runtime(&mut client, Some("native-echo".into()))
         .await

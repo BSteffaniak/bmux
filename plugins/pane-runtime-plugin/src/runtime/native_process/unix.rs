@@ -5,7 +5,7 @@ pub(in super::super) fn supports_cooperative_stop() -> bool {
     true
 }
 
-pub(in super::super) fn foreground_group(master: &bmux_pty::PtyMaster) -> Option<i32> {
+fn foreground_group(master: &bmux_pty::PtyMaster) -> Option<i32> {
     master.foreground_process_group().filter(|group| *group > 0)
 }
 

@@ -19,6 +19,10 @@ fn units(bytes: &[u8]) -> Option<Vec<u16>> {
             .collect(),
     )
 }
+pub(super) fn decode(bytes: &[u8]) -> Option<std::ffi::OsString> {
+    use std::os::windows::ffi::OsStringExt as _;
+    units(bytes).map(|units| std::ffi::OsString::from_wide(&units))
+}
 pub(super) fn keys_equal(left: &[u8], right: &[u8]) -> bool {
     let (Some(left), Some(right)) = (units(left), units(right)) else {
         return false;

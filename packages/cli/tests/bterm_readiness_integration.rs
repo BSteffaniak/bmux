@@ -74,7 +74,7 @@ async fn managed_companion_idle_watch_does_not_block_handshake_or_lose_host_orig
     // An ordinary cargo test binary may have no packaged supervisor. The
     // watcher must reach policy verification, then fail closed (not time out
     // on a self-Hello or reject the host origin).
-    if !ready.helper_ready {
+    if !ready.execution_ready {
         loop {
             let output = server_output();
             if output.contains("managed idle policy requires ready, unfenced execution service") {
@@ -160,7 +160,7 @@ async fn fresh_companion_exposes_authoritative_readiness() {
         assert_eq!(digest.len(), 64);
         assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
     }
-    assert!(readiness.helper_ready || readiness.helper_error.is_some());
+    assert!(readiness.execution_ready || readiness.execution_error.is_some());
     // Repeated readiness requests retain the same activation identity.
     let mut warm_client = bmux_client::BmuxClient::connect(
         &endpoint,

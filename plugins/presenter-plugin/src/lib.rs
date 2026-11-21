@@ -126,7 +126,6 @@ mod tests {
         let manifest =
             bmux_plugin::PluginManifest::from_toml_str(crate::declaration::PLUGIN_MANIFEST)
                 .unwrap();
-        assert!(manifest.auxiliary_executables.is_empty());
         assert_eq!(manifest.commands.len(), 4);
         assert!(
             manifest

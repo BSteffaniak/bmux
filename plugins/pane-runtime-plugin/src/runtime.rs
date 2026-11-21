@@ -1,6 +1,8 @@
 //! Concrete pane runtime implementation owned by the pane-runtime plugin.
 
 mod capture_writer;
+#[cfg(unix)]
+mod crash_guard;
 mod durable_capture;
 mod environment;
 pub(crate) mod execution;
@@ -15,9 +17,11 @@ mod native_process;
 pub(crate) mod output_filters;
 pub(crate) mod pty;
 pub(crate) mod reservations;
+pub(crate) mod session_control;
+#[cfg(unix)]
+mod session_sweep;
 mod shell_callback;
 mod startup_capture;
-pub(crate) mod supervisor;
 
 use native_process::send_process_signal;
 #[cfg(all(unix, test))]
@@ -57,6 +61,7 @@ use bmux_terminal_grid::{
     StreamedString, TerminalGrid, TerminalGridStream,
 };
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
+#[cfg(all(test, unix))]
 use pty::Slave as _;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
@@ -183,8 +188,8 @@ pub(crate) struct PaneRuntimeHost {
     managed_scope: Arc<managed_scope::ManagedScope>,
     /// This activation's managed idle/retirement admission authority.
     idle: managed_idle::IdleAuthority,
-    /// This activation's execution supervisor installation and settlements.
-    supervisor: Arc<supervisor::SupervisorAuthority>,
+    /// This activation's terminal-session settings and crash-record root.
+    sessions: Arc<session_control::SessionAuthority>,
     /// This activation's durable execution reservation store.
     reservations: Arc<reservations::ReservationAuthority>,
     /// This activation's ephemeral HUMAN input epochs.
@@ -227,7 +232,7 @@ impl PaneRuntimeHost {
             observers: Arc::default(),
             managed_scope: Arc::default(),
             idle: managed_idle::IdleAuthority::default(),
-            supervisor: Arc::default(),
+            sessions: Arc::default(),
             reservations: Arc::default(),
             human_input: Arc::default(),
             input_scopes: Arc::default(),
@@ -244,8 +249,8 @@ impl PaneRuntimeHost {
         &self.idle
     }
 
-    pub(crate) fn supervisor(&self) -> &Arc<supervisor::SupervisorAuthority> {
-        &self.supervisor
+    pub(crate) fn sessions(&self) -> &session_control::SessionAuthority {
+        &self.sessions
     }
 
     pub(crate) fn reservations(&self) -> &reservations::ReservationAuthority {
@@ -836,7 +841,7 @@ async fn shutdown_panes_owned(
         // Freeze and revoke each lease before waiting on its task. In
         // particular, a failed Sweep must not leave its slave holder alive
         // while the cleanup task waits forever for reader EOF.
-        // Startup still owns its guardian/child until readiness is published.
+        // Startup still owns its child until readiness is published.
         // Do not race Start with Sweep or revoke its lease underneath startup's
         // acknowledged child cleanup. The stop above cancels startup, whose
         // task retains the child/reaper until cleanup actually settles.
@@ -920,14 +925,6 @@ async fn shutdown_panes_owned(
     settlement
         .await
         .map_err(|error| format!("pane cleanup owner failed: {error}"))?
-}
-
-struct LifecycleCompletion<'a>(&'a tokio::sync::watch::Sender<bool>);
-
-impl Drop for LifecycleCompletion<'_> {
-    fn drop(&mut self) {
-        self.0.send_replace(true);
-    }
 }
 
 struct SupervisionCompletion {
@@ -1366,60 +1363,53 @@ fn mark_pane_startup_failed(
     host.mark_snapshot_dirty();
 }
 
-// Retains the actual child and its authenticated target authority together.
-// Killing only the receipt guardian during startup leaves its terminal owner
-// holding the slave and makes capture EOF/cleanup impossible.
-struct GuardianStartupChild {
-    child: Box<dyn crate::runtime::pty::Child + Send + Sync>,
-    execution: Arc<execution::ExecutionCapture>,
-    launch_attempted: Arc<AtomicBool>,
-    host: PaneRuntimeHost,
-}
-
-impl std::fmt::Debug for GuardianStartupChild {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("GuardianStartupChild")
-            .field("child", &self.child)
-            .field("launch_attempted", &self.launch_attempted)
-            .finish_non_exhaustive()
+/// Hang up on the pane's leader unless it has already exited: its pid is
+/// fenced before it is reaped, so a reused pid is never signalled.
+fn kill_unreaped_leader(
+    execution: &execution::ExecutionCapture,
+    killer: &mut Box<dyn crate::runtime::pty::ChildKiller + Send + Sync>,
+) {
+    let Ok(session) = execution.session.lock() else {
+        return;
+    };
+    if session
+        .as_ref()
+        .is_some_and(|control| control.leader_exited())
+    {
+        return;
     }
+    let _ = killer.kill();
 }
 
-impl crate::runtime::pty::ChildKiller for GuardianStartupChild {
-    fn kill(&mut self) -> std::io::Result<()> {
-        let host = &self.host;
-        if self.launch_attempted.load(Ordering::SeqCst) {
-            self.execution
-                .signal_owned_group(host, native_process::StopAction::Force)
-                .map_err(std::io::Error::other)?;
-            if !self.execution.terminal_owner_retired.load(Ordering::SeqCst) {
-                return Err(std::io::Error::other(
-                    "startup terminal owner retirement not acknowledged",
-                ));
-            }
+/// Block until `pid` (our child) has exited, without reaping it.
+#[cfg(unix)]
+fn wait_for_exit_without_reaping(pid: u32) {
+    let pid = libc::id_t::from(pid);
+    loop {
+        // SAFETY: zeroed siginfo is valid output storage.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: waiting on our own child; WNOWAIT leaves it to child.wait().
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                &raw mut info,
+                libc::WEXITED | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            return;
         }
-        self.child.kill()
-    }
-
-    fn clone_killer(&self) -> Box<dyn crate::runtime::pty::ChildKiller + Send + Sync> {
-        // Published supervision performs its own authority handshake before
-        // using this exact owned child killer.
-        self.child.clone_killer()
+        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            // ECHILD and friends: the caller's own wait reports the outcome.
+            return;
+        }
     }
 }
 
-impl crate::runtime::pty::Child for GuardianStartupChild {
-    fn try_wait(&mut self) -> std::io::Result<Option<bmux_pty::ChildExit>> {
-        self.child.try_wait()
-    }
-    fn wait(&mut self) -> std::io::Result<bmux_pty::ChildExit> {
-        self.child.wait()
-    }
-    fn process_id(&self) -> Option<u32> {
-        self.child.process_id()
-    }
-}
+/// Windows process handles stay valid after exit, so there is no pid to fence.
+#[cfg(not(unix))]
+const fn wait_for_exit_without_reaping(_pid: u32) {}
 
 struct StartupChild {
     child: Option<Box<dyn crate::runtime::pty::Child + Send + Sync>>,
@@ -1748,7 +1738,6 @@ impl Drop for PreparedSplit {
 }
 
 enum ExecutionExitNotice {
-    TargetExited,
     OwnerExited,
 }
 
@@ -2214,17 +2203,7 @@ impl PaneLifetime {
             ));
             warn!(%error, "failed freezing resurrection before pane lifetime end");
         }
-        let revoked = self
-            .execution
-            .supervisor
-            .lock()
-            .map_err(|_| anyhow::anyhow!("supervisor lock poisoned"))
-            .and_then(|control| {
-                control
-                    .as_ref()
-                    .map_or(Ok(()), |control| control.end_lifetime())
-            });
-        if let Err(error) = revoked {
+        if let Err(error) = self.execution.release_session() {
             self.execution
                 .record_cleanup_error(format!("failed revoking pane execution lifetime: {error}"));
             warn!(%error, "failed revoking pane execution lifetime");
@@ -7796,7 +7775,7 @@ impl SessionRuntimeManager {
                 fail_startup!(reason);
                 return;
             }
-            let mut pty_pair = match bmux_pty::PtyPair::open(PtySize {
+            let pty_pair = match bmux_pty::PtyPair::open(PtySize {
                 rows: initial_rows,
                 cols: initial_cols,
             }) {
@@ -7812,40 +7791,14 @@ impl SessionRuntimeManager {
                 .lock()
                 .expect("execution identity lock")
                 .observation_execution;
-            // Select the backend before either backend can launch a product.
-            // A failed/uncertain guardian launch must never retry a direct shell.
-            #[cfg(test)]
-            let preparation = if execution_for_task
-                .inject_missing_supervisor
-                .load(Ordering::SeqCst)
-            {
-                Err(anyhow::anyhow!(
-                    "execution supervisor helper artifact is unavailable"
-                ))
-            } else {
-                supervisor::SupervisorControl::prepare(&host, token)
+            let session_preparation = match session_control::SessionControl::prepare() {
+                Ok(preparation) => preparation,
+                Err(error) => {
+                    fail_startup!(format!("terminal session preparation failed: {error:#}"));
+                    return;
+                }
             };
-            #[cfg(not(test))]
-            let preparation = supervisor::SupervisorControl::prepare(&host, token);
-            let (supervisor_control, guardian_command) =
-                match supervisor::select_backend(preparation, managed_program || program_execution)
-                {
-                    Ok(Some((control, command))) => (Some(Arc::new(control)), Some(command)),
-                    Ok(None) => (None, None),
-                    Err(error) => {
-                        fail_startup!(format!("durable supervision unavailable: {error:#}"));
-                        return;
-                    }
-                };
-            if supervisor_control.is_none() {
-                let mut state = resurrection_state_for_reader
-                    .lock()
-                    .expect("execution identity lock");
-                state.close_launch();
-                state.execution_token = None;
-            }
-            let application_resume = if supervisor_control.is_none()
-                || managed_program
+            let application_resume = if managed_program
                 || (launch.is_none()
                     && !matches!(
                         shell_kind_for_path(&shell),
@@ -8004,7 +7957,13 @@ impl SessionRuntimeManager {
                 .ok()
                 .and_then(|env| env.clone())
                 .map(|env| environment::terminal_environment(env, &command));
-            let guardian_launch = PaneLaunchSpec {
+            if let Some(entries) = &exact_environment
+                && let Err(error) = environment::apply_exact(&mut command, entries)
+            {
+                fail_startup!(format!("prepared execution environment invalid: {error}"));
+                return;
+            }
+            let launch_spec = PaneLaunchSpec {
                 program: argv[0].clone(),
                 args: argv[1..].to_vec(),
                 cwd: command
@@ -8016,7 +7975,7 @@ impl SessionRuntimeManager {
                     .map(|(key, value)| (key.to_owned(), value.to_owned()))
                     .collect(),
             };
-            if let Err(error) = validate_explicit_launch(&guardian_launch) {
+            if let Err(error) = validate_explicit_launch(&launch_spec) {
                 fail_startup!(format!("prepared execution command invalid: {error}"));
                 return;
             }
@@ -8050,9 +8009,9 @@ impl SessionRuntimeManager {
                     return;
                 }
             };
-            // ConPTY asks for its inherited cursor before CreateProcess/helper
-            // readiness can complete. Own this PTY's writer before starting the
-            // raw drain, not after waiting for guardian startup/publication.
+            // ConPTY asks for its inherited cursor before the program it hosts
+            // can run. Own this PTY's writer before starting the raw drain so
+            // the bootstrap reader can answer before the spawn below.
             #[cfg(windows)]
             let early_writer = match pty_pair.master.take_writer() {
                 Ok(writer) => Arc::new(std::sync::Mutex::new(
@@ -8176,97 +8135,12 @@ impl SessionRuntimeManager {
                 }};
             }
             let (startup_cleanup_tx, _) = watch::channel(None);
-            let launch_attempted = Arc::new(AtomicBool::new(false));
-            execution_for_task
-                .supervisor
-                .lock()
-                .expect("supervisor control lock")
-                .clone_from(&supervisor_control);
-            let spawned = if let Some(control) = &supervisor_control {
-                let control = Arc::clone(control);
-                let runtime = tokio::runtime::Handle::current();
-                let execution = Arc::clone(&execution_for_task);
-                let launch_attempted = Arc::clone(&launch_attempted);
-                // Own the pair while blocking: Unix guardian readiness and
-                // Windows pipe negotiation both happen behind this boundary.
-                #[cfg(all(windows, test))]
-                eprintln!("ConPTY startup pane={pane_id} stage=guardian-spawn-enter");
-                let (returned_pair, spawned) = match tokio::task::spawn_blocking({
-                    let host = host.clone();
-                    move || {
-                        #[cfg(windows)]
-                        let observed_slave = native_process::conpty_startup::ObservedSlave {
-                            slave: &pty_pair.slave,
-                            owner: pane_id,
-                        };
-                        #[cfg(windows)]
-                        let spawn_slave: &dyn crate::runtime::pty::Slave = &observed_slave;
-                        #[cfg(not(windows))]
-                        let spawn_slave = &pty_pair.slave;
-                        let spawned = control
-                            .spawn_terminal(
-                                &pty_pair.master,
-                                spawn_slave,
-                                guardian_command
-                                    .expect("supervisor preparation retains guardian command"),
-                            )
-                            .map(|child| StartupChild {
-                                child: Some(Box::new(GuardianStartupChild {
-                                    child,
-                                    execution,
-                                    launch_attempted,
-                                    host: host.clone(),
-                                })),
-                                runtime,
-                                host: host.clone(),
-                            });
-                        #[cfg(all(windows, test))]
-                        eprintln!(
-                            "ConPTY startup pane={pane_id} stage=guardian-spawn-return ok={}",
-                            spawned.is_ok()
-                        );
-                        (pty_pair, spawned)
-                    }
-                })
-                .await
-                {
-                    Ok(result) => result,
-                    Err(error) => {
-                        // The blocking task owned the pair and its child cleanup.
-                        // Without its receipt, never report cleanup success.
-                        if let Some(writer) = &capture_writer {
-                            writer.fail("terminal spawn task failed before capture drain");
-                        }
-                        drop(reader);
-                        let reason = startup_capture::acknowledge_cleanup(
-                            &host,
-                            capture_owner.take(),
-                            &cleanup_tx,
-                            Some(Err(
-                                "terminal spawn task failed without cleanup acknowledgement".into(),
-                            )),
-                            format!("terminal spawn task failed: {error}"),
-                        )
-                        .await;
-                        child_spawned = true;
-                        fail_startup!(reason);
-                        return;
-                    }
-                };
-                pty_pair = returned_pair;
-                spawned
-            } else {
-                match execution_for_task.authorize_spawn() {
-                    Ok(()) => {
-                        launch_attempted.store(true, Ordering::SeqCst);
-                        pty_pair
-                            .slave
-                            .spawn_command(command)
-                            .map(|child| StartupChild::new(&host, child))
-                            .map_err(anyhow::Error::from)
-                    }
-                    Err(error) => Err(error),
-                }
+            let spawned = match execution_for_task.authorize_spawn() {
+                Ok(()) => session_preparation
+                    .spawn(&pty_pair.slave, command)
+                    .map(|child| StartupChild::new(&host, child))
+                    .map_err(anyhow::Error::from),
+                Err(error) => Err(error),
             };
             let mut child = match spawned {
                 Ok(child) => child,
@@ -8285,77 +8159,50 @@ impl SessionRuntimeManager {
             {
                 child_spawned = true;
             }
-            let mut target_pid = if supervisor_control.is_none() {
-                child.process_id()
-            } else {
-                None
-            };
-            if let Some(control) = &supervisor_control {
-                let startup_control = Arc::clone(control);
-                let authorization = Arc::clone(&execution_for_task);
-                let launch = guardian_launch;
-                let launch_attempted = Arc::clone(&launch_attempted);
-                // Transfer the RAII child into the blocking launch owner. If
-                // this async waiter is cancelled, the completed task result
-                // still drops through supervised cleanup, never a raw Child.
-                let started = tokio::task::spawn_blocking(move || {
-                    #[cfg(all(windows, test))]
-                    eprintln!("ConPTY startup pane={pane_id} stage=guardian-start-enter");
-                    let result = startup_control.start(&launch, exact_environment, || {
-                        authorization.authorize_spawn()?;
-                        launch_attempted.store(true, Ordering::SeqCst);
-                        Ok(())
-                    });
-                    #[cfg(all(windows, test))]
-                    eprintln!(
-                        "ConPTY startup pane={pane_id} stage=guardian-start-return ok={}",
-                        result.is_ok()
-                    );
-                    (child, result)
-                })
-                .await;
-                let (returned_child, started) = match started {
-                    Ok(result) => result,
-                    Err(error) => {
-                        fail_captured_startup!(
-                            format!("supervisor startup task failed: {error}"),
-                            Some(Err(
-                                "startup child cleanup transferred after task failure".into()
-                            ))
-                        );
-                        return;
-                    }
-                };
-                child = returned_child;
-                target_pid = match started {
-                    Ok(pid) => pid,
-                    Err(error) => {
-                        // Cleanup replies acknowledge authority retirement, not
-                        // successful launch. Retain the original launch errno
-                        // independently before consuming those replies.
-                        execution_for_task
-                            .record_error(format!("supervisor target startup failed: {error}"));
-                        let reason = cleanup_failed_startup_child_acknowledged(
-                            &host,
-                            child.take(),
-                            format!("supervisor target startup failed: {error}"),
-                            &startup_cleanup_tx,
-                        )
-                        .await;
-                        fail_captured_startup!(reason, startup_cleanup_tx.borrow().clone());
-                        return;
-                    }
-                };
-                *execution_for_task
-                    .supervisor
-                    .lock()
-                    .expect("supervisor control lock") = Some(Arc::clone(control));
+            let target_pid = child.process_id();
+            // Adopt the session before anything else can observe the pane, so
+            // every later stop goes through the session, never a bare pid.
+            let adopted = target_pid
+                .ok_or_else(|| anyhow::anyhow!("terminal target has no process id"))
+                .and_then(|pid| {
+                    session_control::SessionControl::adopt(
+                        &host,
+                        session_preparation,
+                        token,
+                        pid,
+                        &pty_pair.master,
+                    )
+                });
+            match adopted {
+                Ok(control) => {
+                    *execution_for_task
+                        .session
+                        .lock()
+                        .expect("terminal session lock") = Some(Arc::new(control));
+                }
+                Err(error) => {
+                    let reason = cleanup_failed_startup_child_acknowledged(
+                        &host,
+                        child.take(),
+                        format!("terminal session adoption failed: {error:#}"),
+                        &startup_cleanup_tx,
+                    )
+                    .await;
+                    fail_captured_startup!(reason, startup_cleanup_tx.borrow().clone());
+                    return;
+                }
             }
             if let Some(resume) = &application_resume {
                 let result = target_pid
                     .ok_or_else(|| "terminal target has no acknowledged PID".to_owned())
                     .and_then(|pid| resume.bind(pid));
                 if let Err(error) = result {
+                    // Kill the adopted session as a whole, not just its leader.
+                    if let Err(cleanup) = execution_for_task.release_session() {
+                        execution_for_task.record_cleanup_error(format!(
+                            "startup session cleanup failed: {cleanup:#}"
+                        ));
+                    }
                     let reason = cleanup_failed_startup_child_acknowledged(
                         &host,
                         child.take(),
@@ -8379,6 +8226,12 @@ impl SessionRuntimeManager {
             )
             .await;
             let Ok(start_identity) = start_identity else {
+                // Kill the adopted session as a whole, not just its leader.
+                if let Err(cleanup) = execution_for_task.release_session() {
+                    execution_for_task.record_cleanup_error(format!(
+                        "startup session cleanup failed: {cleanup:#}"
+                    ));
+                }
                 let reason = cleanup_failed_startup_child_acknowledged(
                     &host,
                     child.take(),
@@ -8399,15 +8252,8 @@ impl SessionRuntimeManager {
                 *pid = target_pid;
             }
             if let Ok(mut pgid) = process_group_id_for_task.lock() {
-                *pgid = if supervisor_control.is_some() {
-                    // The helper's session-leader PID is not the owned target
-                    // group. Startup acknowledged tcsetpgrp before this lookup.
-                    native_process::foreground_group(&pty_pair.master)
-                } else {
-                    child
-                        .process_id()
-                        .and_then(resolve_process_group_id_for_pid)
-                };
+                // The leader leads its own session and therefore its own group.
+                *pgid = target_pid.and_then(|pid| i32::try_from(pid).ok());
             }
             let mut child_killer = child.clone_killer();
             drop(pty_pair.slave);
@@ -8418,6 +8264,12 @@ impl SessionRuntimeManager {
             let writer = match master.take_writer() {
                 Ok(writer) => Box::new(writer) as Box<dyn std::io::Write + Send>,
                 Err(error) => {
+                    // Kill the adopted session as a whole, not just its leader.
+                    if let Err(cleanup) = execution_for_task.release_session() {
+                        execution_for_task.record_cleanup_error(format!(
+                            "startup session cleanup failed: {cleanup:#}"
+                        ));
+                    }
                     let reason = cleanup_failed_startup_child_acknowledged(
                         &host,
                         child.take(),
@@ -8484,87 +8336,13 @@ impl SessionRuntimeManager {
                 .spawn({ let host = host.clone(); move || {
                     let _thread_guard = PaneBlockingThreadGuard::new(pane_id, "waiter");
                     let _completion = SupervisionCompletion { done: Arc::clone(&child_waiter_done_for_thread), execution: Arc::clone(&execution_for_waiter) };
-                    let wait_result = if let Some(control) = &supervisor_control {
-                        let subscription = {
-                            let _fence = execution_for_waiter.supervisor.lock();
-                            if execution_for_waiter.terminal_owner_retired.load(Ordering::SeqCst) {
-                                None
-                            } else {
-                                let result = control.subscribe().and_then(|watcher| {
-                                    *execution_for_waiter.lifecycle_interrupter.lock()
-                                        .map_err(|error| anyhow::anyhow!(error.to_string()))? = Some(watcher.interrupter()?);
-                                    execution_for_waiter.lifecycle_done.send_replace(false);
-                                    Ok(watcher)
-                                });
-                                Some(result)
-                            }
-                        };
-                        match subscription {
-                            None => child.wait(),
-                            Some(Ok(mut watcher)) => {
-                                std::thread::scope(|scope| {
-                                    scope.spawn(|| {
-                                        let _lifecycle_done = LifecycleCompletion(&execution_for_waiter.lifecycle_done);
-                        let observed = (|| -> anyhow::Result<()> {
-                            let mut snapshot = watcher.initial().clone();
-                            let mut exit_announced = false;
-                            loop {
-                                let status = snapshot.status;
-                                if let Some(error) = status.capture_error {
-                                    // Incomplete capture is retained, but does not
-                                    // invalidate target termination or retirement.
-                                    execution_for_waiter.record_error(error);
-                                }
-                                if let Some(error) = status.error.or(status.cleanup_error) {
-                                    anyhow::bail!(error);
-                                }
-                                if status.exit_code.is_some() || status.exit_signal.is_some() {
-                                    if let Ok(mut outcome) = execution_for_waiter.outcome.lock() {
-                                        outcome.0 = status.exit_code.and_then(|code| u32::try_from(code).ok());
-                                        outcome.1 = status.exit_signal.map(|signal| signal.to_string());
-                                    }
-                                    if !exit_announced {
-                                        exited_for_waiter.store(true, Ordering::SeqCst);
-                                        let _ = child_exit_tx.send(ExecutionExitNotice::TargetExited);
-                                        exit_announced = true;
-                                    }
-                                }
-                                if status.terminal_session_ended == Some(true) {
-                                    // Share the control fence with signal admission. Owner
-                                    // exit revokes signal authority, independently of EOF.
-                                    let _control_fence = execution_for_waiter.supervisor.lock().expect("supervisor control fence");
-                                    execution_for_waiter.terminal_session_ended.store(true, Ordering::SeqCst);
-                                }
-                                execution_for_waiter.notify();
-                                if execution_for_waiter.terminal_session_ended.load(Ordering::SeqCst) {
-                                    break;
-                                }
-                                snapshot = watcher.next()?;
-                            }
-                            Ok(())
-                        })();
-                        if let Err(error) = observed {
-                            let _fence = execution_for_waiter.supervisor.lock();
-                            if !execution_for_waiter.terminal_owner_retired.load(Ordering::SeqCst) {
-                                execution_for_waiter.record_error(format!("supervisor outcome unavailable: {error}"));
-                            }
-                        }
-                                    });
-                                    // Always block on the actual child concurrently;
-                                    // owner death wakes a subscription blocked on next.
-                                    let result = child.wait();
-                                    execution_for_waiter.interrupt_lifecycle();
-                                    result
-                                })
-                            }
-                            Some(Err(error)) => {
-                                execution_for_waiter.record_error(format!("supervisor subscription unavailable: {error}"));
-                                child.wait()
-                            }
-                        }
-                    } else {
-                        child.wait()
-                    };
+                    // Observe the exit without reaping, fence the leader's pid,
+                    // then reap: from here on nothing signals that pid again.
+                    if let Some(pid) = child.process_id() {
+                        wait_for_exit_without_reaping(pid);
+                    }
+                    execution_for_waiter.mark_leader_exited();
+                    let wait_result = child.wait();
                     if wait_result.is_ok() {
                         drop(child.take());
                     }
@@ -8575,9 +8353,10 @@ impl SessionRuntimeManager {
                             resurrection.active_command_source = None;
                         }
                     }
-                    if supervisor_control.is_none() {
-                        execution_for_waiter.record_exit(&wait_result);
-                    }
+                    execution_for_waiter.record_exit(&wait_result);
+                    execution_for_waiter.settle_after_leader_exit(
+                        program_execution || host.sessions().sweep_on_exit(),
+                    );
                     exited_for_waiter.store(true, Ordering::SeqCst);
                     if let Ok(mut reason) = exit_reason_for_waiter.lock()
                         && reason.is_none()
@@ -8979,15 +8758,10 @@ impl SessionRuntimeManager {
                         "startup-thread group cleanup failed: {error}"
                     ));
                 }
-                if !execution_for_task
-                    .terminal_owner_retired
-                    .load(Ordering::SeqCst)
-                {
-                    let _ = child_killer.kill();
-                }
+                kill_unreaped_leader(&execution_for_task, &mut child_killer);
             }
 
-            let mut natural_retirement_failed = false;
+            let mut owner_exited = false;
             let mut execution_changes = execution_for_task.subscribe();
             execution_for_task.notify();
             loop {
@@ -9003,36 +8777,10 @@ impl SessionRuntimeManager {
                         if execution_for_task.terminal_owner_retired.load(Ordering::SeqCst) {
                             break;
                         }
-                        if execution_for_task.terminal_session_ended.load(Ordering::SeqCst)
-                            && !natural_retirement_failed {
-                            let execution = Arc::clone(&execution_for_task);
-                            let retired = tokio::task::spawn_blocking(move || {
-                                let guard = execution.supervisor.lock()
-                                    .map_err(|_| anyhow::anyhow!("supervisor lock poisoned"))?;
-                                if execution.terminal_owner_retired.load(Ordering::SeqCst) {
-                                    return Ok(());
-                                }
-                                let control = guard.as_ref().ok_or_else(|| anyhow::anyhow!("terminal-owner control unavailable"))?;
-                                let response = control.request(crate::supervisor_protocol::Operation::RetireOwner {
-                                    mutation_id: "00000000-0000-4000-8000-000000000003".into()
-                                })?;
-                                anyhow::ensure!(response.error.is_none(), "terminal-owner retirement rejected: {:?}", response.error);
-                                execution.finish_owner_retirement(|| control.end_lifetime())
-                            }).await;
-                            let retirement_error = match retired {
-                                Ok(Ok(())) => None,
-                                Ok(Err(error)) => Some(error.to_string()),
-                                Err(error) => Some(error.to_string()),
-                            };
-                            if let Some(error) = retirement_error {
-                                execution_for_task.record_cleanup_error(format!("terminal-owner retirement failed: {error}"));
-                                natural_retirement_failed = true;
-                                // Preserve the pinned guardian for explicit recovery.
-                                continue;
-                            }
-                            execution_for_task.terminal_owner_retired.store(true, Ordering::SeqCst);
-                            execution_for_task.interrupt_lifecycle();
-                            execution_for_task.notify();
+                        if owner_exited && reader_thread_done.load(Ordering::SeqCst) {
+                            // Members deliberately left running after the
+                            // leader exited no longer hold the terminal.
+                            execution_for_task.retire_released_session();
                             break;
                         }
                         if execution_for_task.capture_failure().is_some()
@@ -9050,7 +8798,7 @@ impl SessionRuntimeManager {
                             if let Err(error) = cleanup {
                                 execution_for_task.record_cleanup_error(format!("reader cleanup worker failed: {error}"));
                             }
-                            if !execution_for_task.terminal_owner_retired.load(Ordering::SeqCst) { let _ = child_killer.kill(); }
+                            kill_unreaped_leader(&execution_for_task, &mut child_killer);
                             break;
                         }
                     }
@@ -9076,16 +8824,20 @@ impl SessionRuntimeManager {
                         if let Err(error) = stopped {
                             execution_for_task.record_cleanup_error(format!("pane stop worker failed: {error}"));
                         }
-                        if !execution_for_task.terminal_owner_retired.load(Ordering::SeqCst) { let _ = child_killer.kill(); }
+                        kill_unreaped_leader(&execution_for_task, &mut child_killer);
                         break;
                     }
                     child_exit = child_exit_rx.recv() => {
                         match child_exit {
-                            Some(ExecutionExitNotice::TargetExited) => {
-                                // Capture can drain independently while the execution
-                                // authority and its reaper remain alive for explicit sweep.
+                            Some(ExecutionExitNotice::OwnerExited) => {
+                                if execution_for_task.terminal_owner_retired.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                // Members were left running; keep serving the
+                                // terminal until they release it or the pane stops.
+                                owner_exited = true;
                             }
-                            Some(ExecutionExitNotice::OwnerExited) | None => break,
+                            None => break,
                         }
                     }
                     input = input_rx.recv() => {
@@ -9125,13 +8877,13 @@ impl SessionRuntimeManager {
                                     let _ = writer.flush();
                                 } else {
                                     execution_for_task.record_error("PTY input write failed".into());
-                                    // Sweep while the live PTY/supervisor still
+                                    // Sweep while the live PTY/session still
                                     // supplies group authority; killing its leader
                                     // first can strand descendants on direct paths.
                                     if let Err(error) = execution_for_task.signal_owned_group(&host, native_process::StopAction::Force) {
                                         execution_for_task.record_cleanup_error(format!("input-failure group cleanup failed: {error}"));
                                     }
-                                    let _ = child_killer.kill();
+                                    kill_unreaped_leader(&execution_for_task, &mut child_killer);
                                     break;
                                 }
                             }
@@ -9148,19 +8900,6 @@ impl SessionRuntimeManager {
                         }
                     }
                 }
-            }
-
-            // Interrupt and acknowledge the lifecycle observer before stopping
-            // its receipt guardian. A closed socket is never an exit outcome.
-            if execution_for_task
-                .terminal_owner_retired
-                .load(Ordering::SeqCst)
-            {
-                if let Err(error) = execution_for_task.join_lifecycle().await {
-                    execution_for_task
-                        .record_cleanup_error(format!("lifecycle observer join failed: {error}"));
-                }
-                let _ = child_killer.kill();
             }
 
             // ConPTY owns its output pipe until ClosePseudoConsole, even after
@@ -9202,7 +8941,7 @@ impl SessionRuntimeManager {
                                 "failed-reader group cleanup failed: {error}"
                             ));
                         }
-                        let _ = child_killer.kill();
+                        kill_unreaped_leader(&execution_for_task, &mut child_killer);
                     }
                     if !reader_thread_done.load(Ordering::SeqCst) {
                         let _ = execution_changes.changed().await;
@@ -9216,7 +8955,7 @@ impl SessionRuntimeManager {
                             "reader-failure group cleanup failed: {error}"
                         ));
                     }
-                    let _ = child_killer.kill();
+                    kill_unreaped_leader(&execution_for_task, &mut child_killer);
                 }
             }
             drop(writer);
@@ -14041,31 +13780,6 @@ fn inspect_process_group_command_and_cwd(
     None
 }
 
-#[cfg(unix)]
-fn resolve_process_group_id_for_pid(pid: u32) -> Option<i32> {
-    let bytes = bounded_probe_output(
-        std::process::Command::new("ps").args(["-o", "pgid=", "-p", &pid.to_string()]),
-        Duration::from_millis(100),
-    )
-    .ok()?;
-    let value = String::from_utf8_lossy(&bytes).trim().to_string();
-    let parsed = value.parse::<i32>().ok()?;
-    (parsed > 0).then_some(parsed)
-}
-
-/// On Windows there are no POSIX process groups. Return the PID itself so
-/// that `terminate_process_group` can use it as the `taskkill /T` target for
-/// process-tree termination.
-#[cfg(windows)]
-fn resolve_process_group_id_for_pid(pid: u32) -> Option<i32> {
-    i32::try_from(pid).ok().filter(|&id| id > 0)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn resolve_process_group_id_for_pid(_pid: u32) -> Option<i32> {
-    None
-}
-
 fn with_padding_manager<R>(
     manager: &Mutex<SessionRuntimeManager>,
     operation: impl FnOnce(&mut SessionRuntimeManager) -> Result<R, SessionRuntimeError>,
@@ -14675,92 +14389,6 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn missing_helper_rejects_an_ordinary_shell_before_spawn() {
-        let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
-        let manager = SessionRuntimeManager::new(
-            PaneRuntimeHost::detached(),
-            "/bin/sh".into(),
-            "xterm-256color".into(),
-            protocol_profile_for_term("xterm-256color"),
-            true,
-            None,
-            PanePaddingConfig::default(),
-            exit_tx,
-        );
-        let mut prepared = manager
-            .prepare_fresh_program_runtime(SessionId(Uuid::new_v4()), None, None, (17, 73))
-            .unwrap();
-        let pane = prepared
-            .runtime
-            .as_ref()
-            .unwrap()
-            .panes
-            .values()
-            .next()
-            .unwrap();
-        pane.execution
-            .inject_missing_supervisor
-            .store(true, Ordering::SeqCst);
-        let process_id = Arc::clone(&pane.process_id);
-        let error = prepared.wait_until_ready().await.unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("durable supervision unavailable"),
-            "{error}"
-        );
-        assert!(process_id.lock().unwrap().is_none());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn missing_helper_rejects_managed_program_before_spawn() {
-        let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
-        let manager = SessionRuntimeManager::new(
-            PaneRuntimeHost::detached(),
-            "/bin/sh".into(),
-            "xterm-256color".into(),
-            protocol_profile_for_term("xterm-256color"),
-            true,
-            None,
-            PanePaddingConfig::default(),
-            exit_tx,
-        );
-        let mut durable_request = manager
-            .prepare_fresh_program_runtime(
-                SessionId(Uuid::new_v4()),
-                None,
-                Some(PaneLaunchSpec {
-                    program: "/bin/sh".into(),
-                    args: vec![],
-                    cwd: None,
-                    env: BTreeMap::default(),
-                }),
-                (24, 80),
-            )
-            .unwrap();
-        let pane = durable_request
-            .runtime
-            .as_ref()
-            .unwrap()
-            .panes
-            .values()
-            .next()
-            .unwrap();
-        pane.execution
-            .inject_missing_supervisor
-            .store(true, Ordering::SeqCst);
-        let error = durable_request.wait_until_ready().await.unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("durable supervision unavailable"),
-            "{error}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn owned_terminal_accepts_input_resize_and_explicit_shutdown() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
@@ -14808,7 +14436,7 @@ mod tests {
             })
             .await
             .unwrap();
-            assert!(execution.supervisor.lock().unwrap().is_some());
+            assert!(execution.session.lock().unwrap().is_some());
             assert!(!pane.exited.load(Ordering::SeqCst));
             let removed = manager.remove_runtime(session_id).unwrap();
             tokio::time::timeout(
@@ -14826,8 +14454,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn windows_program_startup_answers_conpty_query_then_captures_and_drains() {
         let host = crate::runtime::PaneRuntimeHost::detached();
-        supervisor::install_test_artifact(&host)
-            .expect("explicit coordinator-built supervisor artifact");
         let session_id = SessionId(Uuid::new_v4());
         let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
         let program = std::env::var("COMSPEC").expect("Windows command interpreter");
@@ -14908,8 +14534,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn program_first_pane_captures_fast_literal_argv_and_drains() {
         let host = crate::runtime::PaneRuntimeHost::detached();
-        supervisor::install_test_artifact(&host)
-            .expect("explicit coordinator-built supervisor artifact");
         let session_id = SessionId(Uuid::new_v4());
         let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager::new(
@@ -14966,7 +14590,6 @@ mod tests {
     async fn initial_shell_uses_conventional_owner_preserves_cwd_and_natural_tail() {
         use std::os::unix::fs::PermissionsExt;
         let host = crate::runtime::PaneRuntimeHost::detached();
-        supervisor::install_test_artifact(&host).unwrap();
         let root = tempfile::tempdir().unwrap();
         let shell = root.path().join("owned-shell");
         std::fs::write(&shell, "#!/bin/sh\npwd > witness\nprintf TAIL\n").unwrap();
@@ -15035,9 +14658,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn conventional_session_drains_startup_backpressure_and_retires_owner() {
-        let host = crate::runtime::PaneRuntimeHost::detached();
-        supervisor::install_test_artifact(&host)
-            .expect("explicit coordinator-built supervisor artifact");
         let session_id = SessionId(Uuid::new_v4());
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[Uuid::new_v4()]));
         manager.runtimes.clear();
@@ -15077,7 +14697,7 @@ mod tests {
             .commit_fresh_runtime(session_id, &mut prepared, || Ok(()))
             .unwrap();
         let pane = manager.runtimes[&session_id].panes.values().next().unwrap();
-        assert!(execution.supervisor.lock().unwrap().is_some());
+        assert!(execution.session.lock().unwrap().is_some());
         let drained = tokio::time::timeout(Duration::from_secs(5), async {
             while !execution.output_drained.load(Ordering::SeqCst)
                 || !pane.exited.load(Ordering::SeqCst)
@@ -15114,9 +14734,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn supervised_fast_exit_drains_startup_backpressure_before_retirement() {
-        let host = crate::runtime::PaneRuntimeHost::detached();
-        supervisor::install_test_artifact(&host)
-            .expect("explicit coordinator-built supervisor artifact");
         let session_id = SessionId(Uuid::new_v4());
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[Uuid::new_v4()]));
         manager.runtimes.clear();
@@ -15155,7 +14772,7 @@ mod tests {
             .commit_fresh_runtime(session_id, &mut prepared, || Ok(()))
             .unwrap();
         let pane = manager.runtimes[&session_id].panes.values().next().unwrap();
-        assert!(execution.supervisor.lock().unwrap().is_some());
+        assert!(execution.session.lock().unwrap().is_some());
         let drained = tokio::time::timeout(Duration::from_secs(5), async {
             while execution.output_watermark.load(Ordering::SeqCst) != 40 * 8192 + 4
                 || !pane.exited.load(Ordering::SeqCst)
@@ -15303,8 +14920,6 @@ exit 7"#
     async fn ended_terminal_preserves_escaped_descendant_without_late_signal_authority() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        supervisor::install_test_artifact(host)
-            .expect("explicit coordinator-built supervisor artifact");
         let session_id = SessionId(Uuid::new_v4());
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[Uuid::new_v4()]));
         manager.runtimes.clear();
@@ -15457,9 +15072,6 @@ exit 7"#
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn injected_reader_failure_cleans_live_process_and_acknowledges_threads() {
-        let host = crate::runtime::PaneRuntimeHost::detached();
-        supervisor::install_test_artifact(&host)
-            .expect("explicit coordinator-built supervisor artifact");
         let session_id = SessionId(Uuid::new_v4());
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[Uuid::new_v4()]));
         manager.runtimes.clear();
@@ -15529,8 +15141,8 @@ exit 7"#
         assert!(pane.execution.target_stop_issued.load(Ordering::SeqCst));
         assert!(pane.execution.terminal_owner_retired.load(Ordering::SeqCst));
         assert!(
-            !pane.execution.group_kill_issued.load(Ordering::SeqCst),
-            "target termination must not claim descendant cleanup"
+            pane.execution.group_kill_issued.load(Ordering::SeqCst),
+            "a forced stop sweeps and verifies the whole terminal session"
         );
         assert!(!pane.execution.output_drained.load(Ordering::SeqCst));
         assert!(
@@ -17636,11 +17248,7 @@ exit 7"#
         let host = &host;
         let mut pane = dummy_pane(Uuid::new_v4());
         pane.startup = watch::channel(None).1;
-        // An external Sweep without a ready guardian would fail. Startup alone
-        // must own this cleanup, not concurrent Release lease revocation.
-        pane.execution
-            .inject_missing_supervisor
-            .store(true, Ordering::SeqCst);
+        // Startup alone owns this cleanup: no session was adopted yet.
         let execution = Arc::clone(&pane.execution);
         let state = Arc::clone(&pane.resurrection_state);
         let (stop, stopped) = oneshot::channel();
@@ -17792,112 +17400,6 @@ exit 7"#
         tokio::time::timeout(Duration::from_secs(2), shutdown_panes(host, panes))
             .await
             .expect("serial shutdown deadlocks at the pane barrier");
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn failed_sweep_revokes_open_slave_even_when_shutdown_waiter_is_cancelled() {
-        let host = crate::runtime::PaneRuntimeHost::detached();
-        let host = &host;
-        supervisor::install_test_artifact(host).unwrap();
-        let (control, child, pty, endpoint) = tokio::task::spawn_blocking(|| {
-            let pty = bmux_pty::PtyPair::open(PtySize { rows: 24, cols: 80 }).unwrap();
-            let (control, command) = supervisor::SupervisorControl::prepare(
-                &crate::runtime::PaneRuntimeHost::detached(),
-                Uuid::new_v4(),
-            )
-            .unwrap();
-            let endpoint = std::path::PathBuf::from(&command.argv()[3]);
-            let child = control
-                .spawn_guardian(pty.master.tty_name().unwrap())
-                .unwrap();
-            control
-                .start(
-                    &PaneLaunchSpec {
-                        program: "/bin/sh".into(),
-                        args: vec![
-                            "-c".into(),
-                            "trap '' HUP TERM; while :; do sleep 1; done".into(),
-                        ],
-                        cwd: None,
-                        env: BTreeMap::new(),
-                    },
-                    None,
-                    || Ok(()),
-                )
-                .unwrap();
-            (Arc::new(control), child, pty, endpoint)
-        })
-        .await
-        .unwrap();
-        // Removing only this test's control socket forces a genuine Sweep
-        // failure while the product still owns the slave. Lease EOF must work.
-        std::fs::remove_file(endpoint).unwrap();
-        drop(pty.slave);
-        let mut pane = dummy_pane(Uuid::new_v4());
-        *pane.execution.supervisor.lock().unwrap() = Some(control);
-        let execution = Arc::clone(&pane.execution);
-        let mut execution_changes = execution.subscribe();
-        let state = Arc::clone(&pane.resurrection_state);
-        let observed_state = Arc::clone(&state);
-        let (done, mut completion) = watch::channel(false);
-        let (ack, cleanup) = watch::channel(None);
-        pane.cleanup = cleanup;
-        let (stop, stopped) = oneshot::channel();
-        let (started, start) = oneshot::channel();
-        pane.stop_tx = Some(stop);
-        let task = tokio::spawn(async move {
-            stopped.await.unwrap();
-            let _ = started.send(());
-            tokio::task::spawn_blocking(move || {
-                let mut child = child;
-                child.wait().unwrap();
-                assert!(observed_state.lock().unwrap().frozen);
-            })
-            .await
-            .unwrap();
-            ack.send_replace(Some(Err("Sweep failed; lease fallback used".into())));
-            done.send_replace(true);
-        });
-        let old = std::mem::replace(&mut pane.task, task);
-        old.abort();
-        let _ = old.await;
-        let waiter_host = host.clone();
-        let waiter = tokio::spawn(async move { shutdown_pane_handle(&waiter_host, pane).await });
-        start.await.unwrap();
-        waiter.abort();
-        let _ = waiter.await;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while !*completion.borrow_and_update() {
-                completion.changed().await.unwrap();
-            }
-        })
-        .await
-        .expect("failed Sweep retained a live slave holder");
-        assert!(state.lock().unwrap().frozen);
-        // The cancelled waiter's cleanup owner still records the fixture's
-        // explicit failed receipt; wait for that recording rather than racing
-        // it. Losing the control endpoint is observation uncertainty, not a
-        // cleanup failure: anything revocation recorded would precede the
-        // receipt (it happens before the lease EOF that lets the child exit),
-        // so the first retained cleanup error must be the receipt itself.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while execution.cleanup_error().is_none() {
-                execution_changes.changed().await.unwrap();
-            }
-        })
-        .await
-        .expect("cleanup owner never recorded the failed receipt");
-        assert_eq!(
-            execution.cleanup_error().as_deref(),
-            Some("Sweep failed; lease fallback used"),
-            "lost control endpoint must not be recorded as a cleanup failure"
-        );
-        assert!(
-            !execution.cleanup_complete(true),
-            "fallback must not fabricate cleanup success"
-        );
-        drop(pty.master);
     }
 
     #[tokio::test]
@@ -18066,12 +17568,12 @@ exit 7"#
         let summary = pane_cleanup_failure_summary((0..64).map(|_| {
             (
                 Uuid::new_v4(),
-                "group stop failed: supervisor disconnected".into(),
+                "group stop failed: session sweep failed".into(),
             )
         }))
         .unwrap();
         assert!(summary.contains("cleanup failed for 64 pane(s)"));
-        assert_eq!(summary.matches("supervisor disconnected").count(), 1);
+        assert_eq!(summary.matches("session sweep failed").count(), 1);
         assert_eq!(summary.matches(',').count(), 2);
         assert!(summary.len() < 300);
 
@@ -18090,13 +17592,13 @@ exit 7"#
         let pane = dummy_pane(id);
         pane.execution.record_error("earlier reader failure".into());
         pane.execution
-            .record_cleanup_error("group stop failed: supervisor disconnected".into());
+            .record_cleanup_error("group stop failed: session sweep failed".into());
         let error = shutdown_panes_owned(host, vec![pane], true)
             .await
             .unwrap_err();
         assert!(error.contains(&id.to_string()));
         assert!(error.contains("cleanup failed for 1 pane(s)"));
-        assert_eq!(error.matches("supervisor disconnected").count(), 1);
+        assert_eq!(error.matches("session sweep failed").count(), 1);
         assert!(!error.contains("earlier reader failure"));
     }
 
@@ -23097,88 +22599,6 @@ exit 7"#
         fn process_id(&self) -> Option<u32> {
             None
         }
-    }
-
-    #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn preowner_launch_failure_retires_owned_guardian_without_inventing_exit() {
-        let host = crate::runtime::PaneRuntimeHost::detached();
-        let host = &host;
-        supervisor::install_test_artifact(host)
-            .expect("explicit coordinator-built supervisor artifact");
-        let execution = Arc::new(execution::ExecutionCapture::default());
-        let runtime = tokio::runtime::Handle::current();
-        let setup_execution = Arc::clone(&execution);
-        let (child, launch_error) = tokio::task::spawn_blocking(move || {
-            let (control, _) = supervisor::SupervisorControl::prepare(
-                &crate::runtime::PaneRuntimeHost::detached(),
-                Uuid::new_v4(),
-            )
-            .unwrap();
-            let control = Arc::new(control);
-            *setup_execution.supervisor.lock().unwrap() = Some(Arc::clone(&control));
-            // The guardian now opens the slave before readiness. Remove only a
-            // test-owned alias after readiness to fail the later owner spawn.
-            let pty = bmux_pty::PtyPair::open(PtySize { rows: 24, cols: 80 }).unwrap();
-            let root = tempfile::tempdir().unwrap();
-            let alias = root.path().join("slave");
-            std::os::unix::fs::symlink(pty.master.tty_name().unwrap(), &alias).unwrap();
-            let child = control.spawn_guardian(&alias).unwrap();
-            std::fs::remove_file(&alias).unwrap();
-            let child = StartupChild {
-                child: Some(Box::new(GuardianStartupChild {
-                    child,
-                    execution: Arc::clone(&setup_execution),
-                    launch_attempted: Arc::new(AtomicBool::new(true)),
-                    host: PaneRuntimeHost::detached(),
-                })),
-                runtime,
-                host: PaneRuntimeHost::detached(),
-            };
-            let error = control
-                .start(
-                    &PaneLaunchSpec {
-                        program: "/bin/sh".into(),
-                        args: Vec::new(),
-                        cwd: None,
-                        env: BTreeMap::new(),
-                    },
-                    None,
-                    || Ok(()),
-                )
-                .unwrap_err()
-                .to_string();
-            setup_execution.record_error(error.clone());
-            (child, error)
-        })
-        .await
-        .unwrap();
-        assert!(
-            launch_error.contains("No such file") || launch_error.contains("os error 2"),
-            "{launch_error}"
-        );
-        let (ack, mut acknowledged) = watch::channel(None);
-        let mut child = child;
-        let cleanup = cleanup_failed_startup_child_on(
-            host,
-            &tokio::runtime::Handle::current(),
-            child.take(),
-            launch_error.clone(),
-            Some(ack),
-        );
-        let (reason, result) = tokio::time::timeout(Duration::from_secs(5), cleanup)
-            .await
-            .expect("failed launch must reap its actual guardian");
-        assert!(result.is_ok(), "{reason}");
-        acknowledged.changed().await.unwrap();
-        assert!(acknowledged.borrow().as_ref().unwrap().is_ok());
-        assert!(reason.contains(&launch_error));
-        assert!(execution.terminal_owner_retired.load(Ordering::SeqCst));
-        assert!(!execution.group_kill_issued.load(Ordering::SeqCst));
-        let outcome = execution.outcome.lock().unwrap();
-        assert!(outcome.0.is_none());
-        assert!(outcome.1.is_none());
-        assert_eq!(outcome.2.as_deref(), Some(launch_error.as_str()));
     }
 
     #[tokio::test]

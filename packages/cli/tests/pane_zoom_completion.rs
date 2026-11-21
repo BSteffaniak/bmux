@@ -613,9 +613,9 @@ async fn exercise() -> Result<()> {
         )
         .await?;
     ensure!(
-        readiness.helper_ready,
+        readiness.execution_ready,
         "isolated helper unavailable: {:?}",
-        readiness.helper_error
+        readiness.execution_error
     );
     ensure!(
         readiness.runtime_dir == paths.runtime_dir.to_string_lossy(),

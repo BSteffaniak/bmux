@@ -62,7 +62,7 @@ pub(crate) fn preparation(
     if readiness.instance != instance {
         return Err("runtime instance changed; preparation has no effect authority".into());
     }
-    if !readiness.helper_ready || readiness.fenced {
+    if !readiness.execution_ready || readiness.fenced {
         return Err(
             "managed runtime unavailable or draining; preparation refused before effects".into(),
         );
@@ -176,7 +176,7 @@ pub(crate) fn configure(
     if readiness.instance != instance {
         return Err("runtime instance changed".into());
     }
-    if readiness.fenced || !readiness.helper_ready {
+    if readiness.fenced || !readiness.execution_ready {
         return Err("managed idle policy requires a ready, unfenced execution authority".into());
     }
     if readiness
@@ -225,8 +225,7 @@ pub(crate) fn inspect(
     // Durable checks happen before manager locking: existing recovery diagnostics
     // may read manager state while holding the store. A concurrent mutation is
     // covered by its admission owner and resets grace even if it finishes here.
-    let retained_blocker =
-        reservations::idle_blocker(host).or_else(|| super::supervisor::idle_blocker(host));
+    let retained_blocker = reservations::idle_blocker(host);
     let retained_authority = reservations::retained_authority(host);
     let manager = handle
         .0

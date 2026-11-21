@@ -183,11 +183,13 @@ impl Slave {
             .args(&argv[1..])
             .current_dir(&dir)
             .env_clear()
-            .env("SHELL", shell(spec))
             .envs(spec.environment())
             .stdin(Stdio::from(self.fd.try_clone()?))
             .stdout(Stdio::from(self.fd.try_clone()?))
             .stderr(Stdio::from(self.fd.try_clone()?));
+        if !spec.is_exact_environment() && spec.get_env("SHELL").is_none() {
+            command.env("SHELL", shell(spec));
+        }
         // SAFETY: `prepare_child` makes only async-signal-safe calls. Standard input is this
         // terminal by then.
         unsafe {

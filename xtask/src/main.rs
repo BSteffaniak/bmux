@@ -29,7 +29,7 @@ fn invocation_args(executable: Option<&str>, mut args: Vec<String>) -> Vec<Strin
 fn run(args: Vec<String>) -> Result<()> {
     let Some(command) = args.first() else {
         return Err(error(
-            "usage: cargo xtask build [--target TARGET] [--profile PROFILE] [--features FEATURES] [--all-features] [--no-default-features] | auxiliary {build,stage,nfpm} --target TARGET | bterm {build,run} [--profile PROFILE] | bterm {stage,verify} --target TARGET | install SOURCE DESTINATION [--binary-name NAME | --activate-version VERSION]",
+            "usage: cargo xtask build [--target TARGET] [--profile PROFILE] [--features FEATURES] [--all-features] [--no-default-features] | stage --target TARGET --artifact-dir DIR --destination DIR | nfpm --target TARGET --config FILE --destination FILE | bterm {build,run} [--profile PROFILE] | bterm {stage,verify} --target TARGET | install SOURCE DESTINATION [--binary-name NAME | --activate-version VERSION]",
         ));
     };
     let mut positional = Vec::new();
@@ -93,13 +93,8 @@ fn run(args: Vec<String>) -> Result<()> {
             "--root",
         ],
         "build" => &["--workspace", "--target", "--profile"],
-        "auxiliary" => &[
-            "--workspace",
-            "--target",
-            "--artifact-dir",
-            "--destination",
-            "--config",
-        ],
+        "stage" => &["--target", "--artifact-dir", "--destination"],
+        "nfpm" => &["--target", "--config", "--destination"],
         "install" => &[
             "--binary-name",
             "--activate-version",
@@ -172,13 +167,7 @@ fn run(args: Vec<String>) -> Result<()> {
             .cloned()
             .map_or_else(|| build::host_target(&workspace), Ok)?;
         let profile = options.get("--profile").map_or("dev", String::as_str);
-        return build::run(
-            &workspace,
-            &target,
-            profile,
-            &artifacts::declarations(&workspace)?,
-            &features,
-        );
+        return build::run(&workspace, &target, profile, &features);
     }
     if command == "install" {
         let source = positional
@@ -207,49 +196,30 @@ fn run(args: Vec<String>) -> Result<()> {
             artifacts::install(source.as_ref(), &destination, binary)
         }
     } else {
-        if positional.len() != 1 {
-            return Err(error("auxiliary requires one operation"));
+        if !positional.is_empty() {
+            return Err(error(format!("{command} takes no positional arguments")));
         }
-        let workspace = options
-            .get("--workspace")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".."));
         let target = options
             .get("--target")
             .ok_or_else(|| error("--target is required"))?;
         let unix = artifacts::unix_target(target)?;
-        let declarations = artifacts::declarations(&workspace)?;
         let required = |name: &str| {
             options
                 .get(name)
                 .map(PathBuf::from)
                 .ok_or_else(|| error(format!("{name} is required")))
         };
-        match positional[0].as_str() {
-            "build" => build::run(
-                &workspace,
-                target,
-                "release",
-                &declarations,
-                &build::Features::default(),
-            ),
-            "stage" => artifacts::stage(
+        if command == "stage" {
+            artifacts::stage(
                 &required("--artifact-dir")?,
                 &required("--destination")?,
                 target,
-                &declarations,
-            ),
-            "nfpm" => {
-                if !unix {
-                    return Err(error("nfpm requires a Unix target"));
-                }
-                artifacts::nfpm(
-                    &required("--config")?,
-                    &required("--destination")?,
-                    &declarations,
-                )
+            )
+        } else {
+            if !unix {
+                return Err(error("nfpm requires a Unix target"));
             }
-            _ => Err(error("unknown auxiliary operation")),
+            artifacts::nfpm(&required("--config")?, &required("--destination")?)
         }
     }
 }

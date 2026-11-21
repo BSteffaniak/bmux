@@ -598,24 +598,6 @@ mod tests {
         server: &bmux_server::BmuxServer,
         paths: &bmux_config::ConfigPaths,
     ) -> Arc<bmux_pane_runtime_plugin::PaneRuntimePlugin> {
-        use sha2::Digest;
-        use std::fmt::Write as _;
-        let helper = std::env::current_exe()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("bmux-pane-execution-supervisor");
-        let bytes = std::fs::read(&helper)
-            .expect("build bmux-pane-execution-supervisor before this integration test");
-        let hash = sha2::Sha256::digest(bytes).iter().fold(
-            String::with_capacity(64),
-            |mut output, byte| {
-                write!(&mut output, "{byte:02x}").unwrap();
-                output
-            },
-        );
         let context = bmux_plugin_sdk::NativeLifecycleContext {
             plugin_id: "bmux.pane_runtime".into(),
             required_capabilities: vec![],
@@ -641,18 +623,8 @@ mod tests {
             settings: None,
             plugin_settings_map: std::collections::BTreeMap::new(),
             host_kernel_bridge: None,
-            auxiliary_executables: std::collections::BTreeMap::from([(
-                "execution-supervisor".into(),
-                bmux_plugin_sdk::ResolvedAuxiliaryExecutable {
-                    path: helper.to_string_lossy().into(),
-                    protocol_version:
-                        bmux_pane_runtime_plugin::EXECUTION_SUPERVISOR_PROTOCOL_VERSION,
-                    artifact_sha256: hash,
-                },
-            )]),
             host_service_port: None,
             capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
-            auxiliary_executable_errors: std::collections::BTreeMap::new(),
         };
         let host_values = || {
             let capabilities = bmux_plugin_sdk::definition::ActivationCapabilities::default();

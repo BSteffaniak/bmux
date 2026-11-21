@@ -92,14 +92,8 @@ pub fn stage(workspace: &Path, source: &Path, destination: &Path, target: &str) 
     } else {
         payload.clone()
     };
-    // Use the same manifest-driven companion payload as the normal BMUX product.
-    // Helpers must remain beside the companion for owner-local plugin discovery.
-    crate::artifacts::stage(
-        source,
-        &root,
-        target,
-        &crate::artifacts::declarations(workspace)?,
-    )?;
+    // Use the same companion payload as the normal BMUX product.
+    crate::artifacts::stage(source, &root, target)?;
     let inventory = crate::artifacts::verify(&root)?;
     let mut artifacts = Vec::new();
     for entry in fs::read_dir(&root)? {
@@ -276,8 +270,6 @@ mod tests {
             "bterm.exe",
             "xtask",
             "xtask.exe",
-            "bmux-pane-execution-supervisor",
-            "bmux-pane-execution-supervisor.exe",
         ] {
             fs::write(source.join(name), name).unwrap();
             #[cfg(unix)]
@@ -300,22 +292,22 @@ mod tests {
             };
             verify(&root, target).unwrap();
             {
-                let helper = root.join(if target.contains("windows") {
-                    "bmux-pane-execution-supervisor.exe"
+                let installer = root.join(if target.contains("windows") {
+                    "bmux-install.exe"
                 } else {
-                    "bmux-pane-execution-supervisor"
+                    "bmux-install"
                 });
-                assert!(helper.is_file());
-                let bytes = fs::read(&helper).unwrap();
-                fs::write(&helper, "corrupt").unwrap();
+                assert!(installer.is_file());
+                let bytes = fs::read(&installer).unwrap();
+                fs::write(&installer, "corrupt").unwrap();
                 assert!(verify(&root, target).is_err());
-                fs::remove_file(&helper).unwrap();
+                fs::remove_file(&installer).unwrap();
                 assert!(verify(&root, target).is_err());
-                fs::write(&helper, bytes).unwrap();
+                fs::write(&installer, bytes).unwrap();
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt as _;
-                    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+                    fs::set_permissions(&installer, fs::Permissions::from_mode(0o755)).unwrap();
                 }
                 verify(&root, target).unwrap();
             }

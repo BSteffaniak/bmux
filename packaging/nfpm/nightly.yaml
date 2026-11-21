@@ -1,6 +1,6 @@
 name: bmux-nightly
-# Auxiliary entries and artifact hashes are appended by the manifest-driven
-# cargo xtask auxiliary nfpm step; do not enumerate helpers here.
+# The artifacts.json inventory entry is appended by `cargo xtask nfpm`.
+# bmux ships as a single binary; list only the binaries staged by `cargo xtask stage`.
 arch: ${ARCH}
 platform: linux
 version: ${VERSION}

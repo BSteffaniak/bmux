@@ -98,8 +98,8 @@ selected target's startup fence before spawn using identity `durable_roots` and
 
 Pane execution receipts require owning-target routing under the stable state
 root. New independent targets must not claim old reservations or interpret old
-launch intent as permission to launch again. Existing receipt locations and
-supervisor recovery evidence remain available to their original owners; scope
+launch intent as permission to launch again. Existing receipt locations
+remain available to their original owners; scope
 routing is not migration, cleanup, or proof that detached work finished.
 
 These locks coordinate **participating writer implementations only**. A new

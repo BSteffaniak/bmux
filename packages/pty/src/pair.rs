@@ -145,6 +145,35 @@ impl PtySlave {
     pub fn spawn(&self, command: &SpawnCommand) -> io::Result<PtyChild> {
         self.0.spawn(command).map(PtyChild)
     }
+
+    /// Start `command` as [`Self::spawn`] does, inside the caller's Job Object `job`.
+    ///
+    /// The process is assigned to the job as it is created, so it cannot run, or start anything,
+    /// outside the job. The job's limits are the caller's: a kill-on-close job ends the process
+    /// when the caller's last handle to it closes. Nested jobs are allowed.
+    ///
+    /// The command line differs from [`Self::spawn`] in one case: when the program is `cmd`,
+    /// the argument after `/C` or `/K` is the script and is passed verbatim, wrapped as
+    /// `/S /C "script"`, because `cmd` parses it as shell source rather than as C runtime
+    /// arguments. Only options may precede `/C` or `/K`, and the script must be the last
+    /// argument.
+    ///
+    /// With [`SpawnCommand::exact_environment`], the environment block holds exactly the
+    /// command's variables. Their names are checked (one leading `=` is allowed, as in `cmd`'s
+    /// `=C:`), and two names that Windows considers equal are an error. The block is ordered as
+    /// Windows orders names.
+    ///
+    /// # Errors
+    /// As [`Self::spawn`], and [`io::ErrorKind::InvalidInput`] for a malformed `cmd` script
+    /// invocation or an invalid exact environment.
+    #[cfg(windows)]
+    pub fn spawn_in_job(
+        &self,
+        command: &SpawnCommand,
+        job: std::os::windows::io::BorrowedHandle<'_>,
+    ) -> io::Result<PtyChild> {
+        self.0.spawn_in_job(command, job).map(PtyChild)
+    }
 }
 
 /// Reads output from a pseudo-terminal; see [`PtyMaster::try_clone_reader`].
@@ -253,13 +282,18 @@ impl PtyChildKiller {
 pub struct ChildExit {
     code: u32,
     signal: Option<String>,
+    signal_number: Option<i32>,
 }
 
 impl ChildExit {
     /// An exit with `code`.
     #[must_use]
     pub const fn with_exit_code(code: u32) -> Self {
-        Self { code, signal: None }
+        Self {
+            code,
+            signal: None,
+            signal_number: None,
+        }
     }
 
     /// An exit by the signal named `signal`; the exit code is then 1.
@@ -268,6 +302,7 @@ impl ChildExit {
         Self {
             code: 1,
             signal: Some(signal.to_owned()),
+            signal_number: None,
         }
     }
 
@@ -288,6 +323,12 @@ impl ChildExit {
     pub fn signal(&self) -> Option<&str> {
         self.signal.as_deref()
     }
+
+    /// The number of the signal that ended the process, when it is known (Unix).
+    #[must_use]
+    pub const fn signal_number(&self) -> Option<i32> {
+        self.signal_number
+    }
 }
 
 impl fmt::Display for ChildExit {
@@ -304,7 +345,10 @@ impl From<std::process::ExitStatus> for ChildExit {
     fn from(status: std::process::ExitStatus) -> Self {
         #[cfg(unix)]
         if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&status) {
-            return Self::with_signal(&native::signal_name(signal));
+            return Self {
+                signal_number: Some(signal),
+                ..Self::with_signal(&native::signal_name(signal))
+            };
         }
         let code = status.code().map_or_else(
             || u32::from(!status.success()),
@@ -334,6 +378,7 @@ pub struct SpawnCommand {
     argv: Vec<OsString>,
     env: BTreeMap<OsString, Variable>,
     cwd: Option<OsString>,
+    exact: bool,
 }
 
 impl SpawnCommand {
@@ -348,6 +393,7 @@ impl SpawnCommand {
             argv: vec![program.as_ref().to_owned()],
             env,
             cwd: None,
+            exact: false,
         }
     }
 
@@ -391,6 +437,19 @@ impl SpawnCommand {
     pub fn env_clear(&mut self) -> &mut Self {
         self.env.clear();
         self
+    }
+
+    /// Give the process exactly the environment set on this command: nothing is added to it
+    /// (on Unix, `SHELL` is otherwise added when unset).
+    pub fn exact_environment(&mut self) -> &mut Self {
+        self.exact = true;
+        self
+    }
+
+    /// Whether [`Self::exact_environment`] was requested.
+    #[must_use]
+    pub const fn is_exact_environment(&self) -> bool {
+        self.exact
     }
 
     /// Run in `dir`. A directory that does not exist when the process starts is replaced by the

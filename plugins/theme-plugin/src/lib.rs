@@ -5992,10 +5992,8 @@ mod tests {
 
     fn lifecycle_context(settings: Option<toml::Value>) -> NativeLifecycleContext {
         NativeLifecycleContext {
-            auxiliary_executables: BTreeMap::new(),
             host_service_port: None,
             capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
-            auxiliary_executable_errors: BTreeMap::new(),
             plugin_id: "bmux.theme".to_string(),
             required_capabilities: vec![
                 "bmux.storage".to_string(),

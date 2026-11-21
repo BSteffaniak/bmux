@@ -7,7 +7,7 @@ unset DISPLAY WAYLAND_DISPLAY WAYLAND_SOCKET XAUTHORITY DBUS_SESSION_BUS_ADDRESS
 rev=$(python3 -c 'import json; n=json.load(open("flake.lock"))["nodes"]; print(n[n["root"]["inputs"]["nixpkgs"]]["locked"]["rev"])')
 sha256sum flake.lock Cargo.lock "$lane"/product.{sh,py}
 nix develop --no-write-lock-file --command bash -eu -o pipefail -c '
-  cargo build --locked -p bmux_cli -p bterm -p bmux_pane_runtime_plugin --bins
+  cargo build --locked -p bmux_cli -p bterm --bins
   pkgs=github:NixOS/nixpkgs/$2
   mesa=$(nix build --no-link --print-out-paths "$pkgs#mesa.drivers")
   shopt -s nullglob; drivers=("$mesa"/share/vulkan/icd.d/lvp*.json)

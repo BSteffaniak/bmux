@@ -75,7 +75,7 @@ pub async fn run(
         "managed-connect executable identity mismatch"
     );
     ensure!(
-        readiness.helper_ready && !readiness.fenced,
+        readiness.execution_ready && !readiness.fenced,
         "managed-connect runtime is not ready"
     );
     let roots = selection.roots();

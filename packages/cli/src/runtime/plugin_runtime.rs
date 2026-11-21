@@ -1548,10 +1548,8 @@ fn plugin_lifecycle_context(
     } = availability;
     let host = plugin_host_for_declaration(declaration, paths, config, available_services.clone());
     NativeLifecycleContext {
-        auxiliary_executables: BTreeMap::default(),
         host_service_port: None,
         capabilities: bmux_plugin_sdk::definition::ActivationCapabilities::default(),
-        auxiliary_executable_errors: BTreeMap::default(),
         plugin_id: declaration.id.as_str().to_string(),
         required_capabilities: declaration
             .required_capabilities

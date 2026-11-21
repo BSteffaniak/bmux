@@ -32,12 +32,26 @@ pub(crate) fn activate(
         &PathBuf::from(&context.connection.state_dir).join("pane-executions-v4"),
     )
     .map_err(|error| format!("{error:?}"));
+    if let Ok(store) = &opened
+        && let Err(error) = store.retire_orphans()
+    {
+        tracing::warn!(
+            ?error,
+            "could not retire executions orphaned by a previous server"
+        );
+    }
     let authority = host.reservations();
     let _ = authority
         .health
         .set(opened.as_ref().map(|_| ()).map_err(Clone::clone));
     let _ = authority.store.set(Mutex::new(opened));
 }
+
+/// Recorded on executions a previous server left unfinished. Their sessions
+/// were swept by `session_control::activate` before this store opened.
+pub(crate) const ORPHANED_EXECUTION: &str =
+    "server stopped before the execution ended; exit status lost; session swept on recovery";
+
 fn with_store<T>(
     host: &crate::runtime::PaneRuntimeHost,
     action: impl FnOnce(&ReservationStore) -> Result<T, RecoveryError>,
@@ -400,6 +414,69 @@ impl ReservationStore {
             owner_lock: None,
         })
     }
+    /// Retire every launch a previous server left in flight. No live pane can
+    /// own it in this activation: the process that ran it is gone and its
+    /// session was swept, so its exit status is lost. Unfinished input
+    /// receipts are rejected and the launch is retired so it never blocks
+    /// managed idle. Capture evidence is kept as-is (incomplete).
+    fn retire_orphans(&self) -> Result<usize, RecoveryError> {
+        use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalInputPhase;
+        let mut retired = 0;
+        for entry in std::fs::read_dir(&self.root).map_err(failed)? {
+            let entry = entry.map_err(failed)?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(mutation) = name
+                .strip_prefix("launch-")
+                .and_then(|rest| rest.strip_suffix(".json"))
+                .and_then(|id| id.parse::<uuid::Uuid>().ok())
+            else {
+                continue;
+            };
+            let mut stored = self.read(mutation)?;
+            if !matches!(
+                stored.receipt.phase,
+                LaunchPhase::Launching | LaunchPhase::Running | LaunchPhase::Uncertain
+            ) {
+                continue;
+            }
+            let token = stored.receipt.reservation.execution.execution_token;
+            for input in std::fs::read_dir(&self.root).map_err(failed)? {
+                let input = input.map_err(failed)?;
+                if !input
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("input-{token}-"))
+                {
+                    continue;
+                }
+                let mut receipt: StoredInput =
+                    serde_json::from_slice(&std::fs::read(input.path()).map_err(failed)?)
+                        .map_err(failed)?;
+                if matches!(
+                    receipt.receipt.phase,
+                    TerminalInputPhase::Accepted
+                        | TerminalInputPhase::Writing
+                        | TerminalInputPhase::Uncertain
+                ) {
+                    receipt.receipt.phase = TerminalInputPhase::Rejected;
+                    receipt.receipt.revision += 1;
+                    receipt.receipt.error = Some(ORPHANED_EXECUTION.into());
+                    crate::atomic_state::commit(&input.path(), &receipt).map_err(failed)?;
+                }
+            }
+            stored.receipt.phase = LaunchPhase::Retired;
+            stored.receipt.revision += 1;
+            stored.receipt.exit_code = None;
+            stored.receipt.exit_signal = None;
+            stored.receipt.cleanup_complete = true;
+            stored.receipt.error = Some(ORPHANED_EXECUTION.into());
+            self.commit(&stored)?;
+            retired += 1;
+        }
+        Ok(retired)
+    }
+
     fn read(&self, mutation: uuid::Uuid) -> Result<StoredReservation, RecoveryError> {
         let bytes =
             std::fs::read(self.root.join(format!("launch-{mutation}.json"))).map_err(failed)?;
@@ -861,6 +938,9 @@ pub(crate) fn reconcile(
         let complete = boundary
             .as_ref()
             .is_some_and(|boundary| boundary.eof && boundary.error.is_none());
+        // A launch retired after its server died never reaches capture EOF.
+        let orphaned = matches!(stored.receipt.phase, LaunchPhase::Retired)
+            && stored.receipt.error.as_deref() == Some(ORPHANED_EXECUTION);
         recovery |= boundary
             .as_ref()
             .is_some_and(|boundary| boundary.error.is_some());
@@ -869,7 +949,6 @@ pub(crate) fn reconcile(
         continuation.offset = boundary.as_ref().map_or(0, |boundary| boundary.bytes);
         Ok(TerminalReconciliation {
             launch: stored.receipt,
-            supervisor: None,
             capture_complete: complete,
             oldest_cursor: oldest,
             continuation_cursor: continuation,
@@ -884,7 +963,7 @@ pub(crate) fn reconcile(
             terminal_session_ended: ended,
             capture_integrity: if complete {
                 TerminalCaptureIntegrity::Complete
-            } else if recovery {
+            } else if recovery || orphaned {
                 TerminalCaptureIntegrity::Incomplete
             } else {
                 TerminalCaptureIntegrity::Capturing

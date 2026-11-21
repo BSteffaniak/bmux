@@ -29,6 +29,27 @@ pub(super) fn validate(entries: &[EnvironmentEntry]) -> Result<(), String> {
     Ok(())
 }
 
+/// Replace the command's environment with exactly `entries` (already validated
+/// at admission). Nothing is added at spawn, not even `SHELL`.
+pub(super) fn apply_exact(
+    command: &mut bmux_pty::SpawnCommand,
+    entries: &[EnvironmentEntry],
+) -> Result<(), String> {
+    command.env_clear();
+    for entry in entries {
+        if !native::valid(entry) {
+            return Err("invalid native environment entry".into());
+        }
+        let (Some(key), Some(value)) = (native::decode(&entry.key), native::decode(&entry.value))
+        else {
+            return Err("undecodable native environment entry".into());
+        };
+        command.env(key, value);
+    }
+    command.exact_environment();
+    Ok(())
+}
+
 /// Only emulated-terminal identity changes; no bootstrap directory or hooks.
 pub(super) fn terminal_environment(
     mut entries: Vec<EnvironmentEntry>,

@@ -1,6 +1,5 @@
-//! Manifest-driven product build: the CLI, installer and declared helpers are one unit.
+//! Product build: the CLI and its installer are one unit.
 use crate::artifacts::{self, Result, error};
-use serde_json::Value;
 use std::{path::Path, process::Command};
 
 #[derive(Debug, Default)]
@@ -24,12 +23,7 @@ impl Features {
     }
 }
 
-pub(crate) fn arguments(
-    target: &str,
-    profile: &str,
-    declarations: &[Value],
-    features: &Features,
-) -> Result<Vec<String>> {
+pub(crate) fn arguments(target: &str, profile: &str, features: &Features) -> Result<Vec<String>> {
     artifacts::unix_target(target)?;
     let mut args: Vec<String> = [
         "build",
@@ -50,16 +44,6 @@ pub(crate) fn arguments(
     .into_iter()
     .map(str::to_owned)
     .collect();
-    for item in declarations {
-        if artifacts::supports_target(item, target)? {
-            args.extend([
-                "-p".into(),
-                artifacts::field(item, "cargo_package")?.into(),
-                "--bin".into(),
-                artifacts::field(item, "cargo_binary")?.into(),
-            ]);
-        }
-    }
     features.append_arguments(&mut args);
     Ok(args)
 }
@@ -82,17 +66,14 @@ pub(crate) fn run(
     workspace: &Path,
     target: &str,
     profile: &str,
-    declarations: &[Value],
     features: &Features,
 ) -> Result<()> {
     let status = Command::new("cargo")
-        .args(arguments(target, profile, declarations, features)?)
+        .args(arguments(target, profile, features)?)
         .current_dir(workspace)
         .status()?;
     if !status.success() {
-        return Err(error(
-            "product build failed (CLI, installer and declared helpers)",
-        ));
+        return Err(error("product build failed (CLI and installer)"));
     }
     Ok(())
 }
@@ -102,74 +83,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn product_build_selects_cli_installer_and_every_helper_with_one_target_profile() {
-        let declarations =
-            vec![serde_json::json!({"cargo_package": "worker_plugin", "cargo_binary": "worker"})];
-        let args = arguments(
-            "x86_64-unknown-linux-gnu",
-            "dev",
-            &declarations,
-            &Features::default(),
-        )
-        .unwrap();
-        for name in ["bmux_cli", "bmux", "xtask", "worker_plugin", "worker"] {
-            assert!(args.iter().any(|arg| arg == name));
+    fn product_build_selects_cli_and_installer_with_one_target_profile() {
+        for target in ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"] {
+            let args = arguments(target, "dev", &Features::default()).unwrap();
+            for pair in [
+                ["-p", "bmux_cli"],
+                ["--bin", "bmux"],
+                ["-p", "xtask"],
+                ["--bin", "xtask"],
+            ] {
+                assert!(args.windows(2).any(|window| window == pair), "{pair:?}");
+            }
+            assert_eq!(args.iter().filter(|arg| *arg == "--bin").count(), 2);
+            assert_eq!(args.iter().filter(|arg| *arg == "--target").count(), 1);
+            assert_eq!(args.iter().filter(|arg| *arg == "--profile").count(), 1);
+            assert!(args.windows(2).any(|pair| pair == ["--profile", "dev"]));
         }
-        assert_eq!(args.iter().filter(|arg| *arg == "--target").count(), 1);
-        assert_eq!(args.iter().filter(|arg| *arg == "--profile").count(), 1);
-        assert!(args.windows(2).any(|pair| pair == ["--profile", "dev"]));
         assert!(
-            arguments(
-                "x86_64-unknown-linux-gnu",
-                "release",
-                &declarations,
-                &Features::default()
-            )
-            .unwrap()
-            .windows(2)
-            .any(|pair| pair == ["--profile", "release"])
+            arguments("x86_64-unknown-linux-gnu", "release", &Features::default())
+                .unwrap()
+                .windows(2)
+                .any(|pair| pair == ["--profile", "release"])
         );
-    }
-
-    #[test]
-    fn windows_build_includes_opted_in_helpers_but_not_legacy_unix_helpers() {
-        let declarations = vec![
-            serde_json::json!({"cargo_package": "fixture_helper", "cargo_binary": "fixture-helper", "supported_platforms": ["unix", "windows"]}),
-            serde_json::json!({"cargo_package": "unix_plugin", "cargo_binary": "unix-helper"}),
-        ];
-        let args = arguments(
-            "x86_64-pc-windows-msvc",
-            "release",
-            &declarations,
-            &Features::default(),
-        )
-        .unwrap();
-        assert!(args.iter().any(|arg| arg == "fixture-helper"));
-        assert!(args.iter().any(|arg| arg == "fixture_helper"));
-        assert!(!args.iter().any(|arg| arg == "unix-helper"));
-        let unix = arguments(
-            "x86_64-apple-darwin",
-            "release",
-            &declarations,
-            &Features::default(),
-        )
-        .unwrap();
-        assert!(unix.iter().any(|arg| arg == "unix-helper"));
-        assert!(unix.iter().any(|arg| arg == "fixture-helper"));
-    }
-
-    #[test]
-    fn unsupported_helpers_are_not_built_on_windows() {
-        let declarations =
-            vec![serde_json::json!({"cargo_package": "worker_plugin", "cargo_binary": "worker"})];
-        let args = arguments(
-            "x86_64-pc-windows-msvc",
-            "release",
-            &declarations,
-            &Features::default(),
-        )
-        .unwrap();
-        assert!(!args.iter().any(|arg| arg == "worker"));
-        assert!(args.iter().any(|arg| arg == "bmux"));
+        assert!(arguments("unknown-target", "dev", &Features::default()).is_err());
     }
 }

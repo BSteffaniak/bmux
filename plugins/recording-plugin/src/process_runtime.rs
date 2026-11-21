@@ -1242,7 +1242,7 @@ pub(crate) async fn refresh_finalized_cleanup(
         status.execution == reference,
         "cleanup execution identity mismatch"
     );
-    let _guard = mutation
+    let guard = mutation
         .lock()
         .map_err(|_| anyhow::anyhow!("process authority lock poisoned"))?;
     // Reload after the await so a concurrent refresh cannot overwrite a newer
@@ -1257,8 +1257,36 @@ pub(crate) async fn refresh_finalized_cleanup(
         current.cleanup_complete = status.cleanup_complete;
         store.replace(current.revision, &mut current)?;
     }
+    drop(guard);
+    if current.cleanup_complete {
+        retire_finished_launch(client, &reference).await;
+    }
     Ok(current)
 }
+
+/// Release the pane runtime's durable launch authority once the recording is
+/// finalized and the execution cleaned up; until then it blocks managed idle.
+/// Best effort: a retired, unavailable or not-yet-retirable launch is left as is.
+async fn retire_finished_launch(
+    client: &mut impl bmux_plugin_sdk::TypedDispatchClient,
+    reference: &pane::TerminalExecutionRef,
+) {
+    let Ok(Ok(state)) = pane::client::reconcile(client, reference.clone()).await else {
+        return;
+    };
+    if state.recovery_required || !matches!(state.launch.phase, pane::TerminalLaunchPhase::Exited) {
+        return;
+    }
+    // A stable mutation id makes a retried retirement an idempotent replay.
+    let mutation = Uuid::from_u128(reference.execution_token.as_u128() ^ RETIREMENT_MUTATION_SALT);
+    match pane::client::retire(client, reference.clone(), mutation, state.launch.revision).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => tracing::debug!(?error, "finished launch not retired"),
+        Err(error) => tracing::debug!(%error, "finished launch retirement unavailable"),
+    }
+}
+
+const RETIREMENT_MUTATION_SALT: u128 = 0x7265_7469_7265_2d72_6563_6f72_6469_6e67;
 
 fn execution(value: &process::RunStatus) -> Result<pane::TerminalExecutionRef> {
     let reference = value.execution.as_ref().context("run has no execution")?;
@@ -1779,6 +1807,22 @@ fn retain_incomplete_launch(
     ) {
         return false;
     }
+    if matches!(receipt.phase, pane::TerminalLaunchPhase::Retired)
+        && let Some(reason) = receipt.error.as_deref()
+    {
+        // The pane runtime retired a launch that a previous server left
+        // unfinished: its session was swept and its exit status is lost. That
+        // is a terminal failure, not something a later recovery can resolve.
+        value.phase = process::RunPhase::Failed;
+        value.recovery_required = false;
+        value.terminal_session_ended = true;
+        value.cleanup_complete = receipt.cleanup_complete;
+        let error = format!("native launch retired: {reason}");
+        if !value.errors.contains(&error) {
+            value.errors.push(error);
+        }
+        return true;
+    }
     value.phase = process::RunPhase::RecoveryRequired;
     value.recovery_required = true;
     let error = format!(
@@ -1932,7 +1976,6 @@ mod lifecycle_consumer_tests {
             pane::TerminalLaunchPhase::Reserved,
             pane::TerminalLaunchPhase::Launching,
             pane::TerminalLaunchPhase::Failed,
-            pane::TerminalLaunchPhase::Retired,
         ] {
             let mut receipt = receipt.clone();
             receipt.phase = phase;
@@ -1957,6 +2000,48 @@ mod lifecycle_consumer_tests {
             receipt.phase = phase;
             assert!(!retain_incomplete_launch(&mut value, &receipt));
         }
+    }
+
+    #[test]
+    fn launch_retired_after_a_server_crash_is_a_terminal_failure() {
+        let mut value = ProcessService::initial_status(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "/owned/runtime".into(),
+        );
+        let reason = "server stopped before the execution ended; exit status lost";
+        let receipt: pane::TerminalLaunchReceipt = serde_json::from_value(serde_json::json!({
+            "reservation": {
+                "execution": {"session_id": Uuid::new_v4(), "pane_id": Uuid::new_v4(), "execution_token": Uuid::new_v4()},
+                "launch_mutation_id": value.launch_mutation_id, "revision": 1,
+                "options": {"program": "/bin/sh", "args": [], "cwd": null, "env": {}, "cols": 80, "rows": 24},
+                "initial_cursor": {"execution": {"session_id": Uuid::new_v4(), "pane_id": Uuid::new_v4(), "execution_token": Uuid::new_v4()}, "spool_generation": Uuid::new_v4(), "offset": 0}
+            },
+            "phase": "retired", "revision": 4, "exit_code": null, "exit_signal": null,
+            "cleanup_complete": true, "error": reason
+        })).unwrap();
+        assert!(retain_incomplete_launch(&mut value, &receipt));
+        assert!(matches!(value.phase, process::RunPhase::Failed));
+        assert!(!value.recovery_required);
+        assert!(value.terminal_session_ended && value.cleanup_complete);
+        assert!(value.exit_code.is_none() && !value.capture_finalized);
+        assert!(value.errors[0].contains(reason));
+        // Retirement without an error is never produced by crash recovery and
+        // still needs explicit recovery.
+        let mut clean = receipt;
+        clean.error = None;
+        let mut observed = ProcessService::initial_status(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "/owned/runtime".into(),
+        );
+        assert!(retain_incomplete_launch(&mut observed, &clean));
+        assert!(matches!(
+            observed.phase,
+            process::RunPhase::RecoveryRequired
+        ));
     }
 
     fn execution_status(phase: pane::TerminalExecutionPhase) -> pane::TerminalExecutionStatus {
@@ -2016,6 +2101,15 @@ mod lifecycle_consumer_tests {
             std::future::poll_fn(move |_| {
                 let payload = payload.take().expect("transport polled after completion");
                 std::task::Poll::Ready((|| {
+                    if operation == "reconcile" {
+                        // Read-only launch inspection before best-effort
+                        // retirement; an absent endpoint skips retirement.
+                        return Err(bmux_plugin_sdk::TypedDispatchClientError::transport(
+                            "pane-runtime-execution-v4",
+                            operation,
+                            "owned endpoint absent",
+                        ));
+                    }
                     assert_eq!(operation, "status", "must not reopen capture or launch");
                     let request = bmux_plugin_sdk::decode_service_message::<
                         pane::client::StatusRequest,

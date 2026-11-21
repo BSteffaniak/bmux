@@ -303,7 +303,7 @@ async fn complete(
     // finalized owned runtime. Preserve export's original failure if both fail.
     let cleaned = crate::process_bootstrap::cleanup(context, status.run_id).await;
     // ServerStopping plus the durable bootstrap marker acknowledges this
-    // owned server's stop request, not process-group guardian retirement.
+    // owned server's stop request, not terminal-session retirement.
     // Never rewrite status.cleanup_complete to stand in for server cleanup.
     *owned_server_cleanup_acknowledged = Some(cleaned.is_ok());
     match (exported, cleaned) {

@@ -97,7 +97,7 @@ impl ManagedIdlePolicy {
             "managed idle service is not owned by this process"
         );
         ensure!(
-            readiness.helper_ready && !readiness.fenced,
+            readiness.execution_ready && !readiness.fenced,
             "managed idle policy requires ready, unfenced execution service"
         );
         Ok(())
@@ -319,8 +319,8 @@ mod tests {
             config_dir: String::new(),
             data_dir: String::new(),
             state_dir: String::new(),
-            helper_ready: true,
-            helper_error: None,
+            execution_ready: true,
+            execution_error: None,
             restart_blocker: None,
             fenced: false,
         };
@@ -331,9 +331,9 @@ mod tests {
         readiness.process_id = 0;
         assert!(selected.verify_readiness(&readiness).is_err());
         readiness.process_id = std::process::id();
-        readiness.helper_ready = false;
+        readiness.execution_ready = false;
         assert!(selected.verify_readiness(&readiness).is_err());
-        readiness.helper_ready = true;
+        readiness.execution_ready = true;
         readiness.fenced = true;
         assert!(selected.verify_readiness(&readiness).is_err());
         readiness.fenced = false;
