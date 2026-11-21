@@ -13,10 +13,13 @@ use std::path::{Path, PathBuf};
 use switchy_thread::sync::Mutex;
 use switchy_thread::sync::atomic::{AtomicBool, Ordering};
 
-#[cfg(unix)]
+#[cfg(feature = "simulator")]
+#[path = "session_control/simulated.rs"]
+mod backend;
+#[cfg(all(unix, not(feature = "simulator")))]
 #[path = "session_control/unix.rs"]
 mod backend;
-#[cfg(windows)]
+#[cfg(all(windows, not(feature = "simulator")))]
 #[path = "session_control/windows.rs"]
 mod backend;
 

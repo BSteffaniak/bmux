@@ -1,7 +1,7 @@
 //! Concrete pane runtime implementation owned by the pane-runtime plugin.
 
 mod capture_writer;
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "simulator")))]
 mod crash_guard;
 mod durable_capture;
 mod environment;
@@ -18,7 +18,7 @@ pub(crate) mod output_filters;
 pub(crate) mod pty;
 pub(crate) mod reservations;
 pub(crate) mod session_control;
-#[cfg(unix)]
+#[cfg(all(unix, not(feature = "simulator")))]
 mod session_sweep;
 mod shell_callback;
 mod startup_capture;
@@ -1382,7 +1382,21 @@ fn kill_unreaped_leader(
 }
 
 /// Block until `pid` (our child) has exited, without reaping it.
-#[cfg(unix)]
+#[cfg(feature = "simulator")]
+fn wait_for_exit_without_reaping(pid: u32) {
+    use switchy_pty::simulator::ProcessState;
+    // Polled on the run's clock: the simulated kernel has no waitid.
+    while switchy_pty::simulator::snapshot()
+        .processes
+        .iter()
+        .any(|process| process.pid == pid && process.state == ProcessState::Running)
+    {
+        switchy_thread::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Block until `pid` (our child) has exited, without reaping it.
+#[cfg(all(unix, not(feature = "simulator")))]
 fn wait_for_exit_without_reaping(pid: u32) {
     let pid = libc::id_t::from(pid);
     loop {
@@ -1408,7 +1422,7 @@ fn wait_for_exit_without_reaping(pid: u32) {
 }
 
 /// Windows process handles stay valid after exit, so there is no pid to fence.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, feature = "simulator")))]
 const fn wait_for_exit_without_reaping(_pid: u32) {}
 
 struct StartupChild {
@@ -7024,7 +7038,12 @@ async fn bounded_start_identity_probe(
 }
 
 fn process_start_identity_for_pid(pid: u32) -> Option<ProcessStartIdentity> {
-    #[cfg(target_os = "macos")]
+    // A simulated process's serial is unique for the whole run, as a start time is.
+    #[cfg(feature = "simulator")]
+    {
+        switchy_pty::simulator::serial_of(pid).map(|serial| ProcessStartIdentity(serial, 0))
+    }
+    #[cfg(all(target_os = "macos", not(feature = "simulator")))]
     {
         let pid = i32::try_from(pid).ok()?;
         let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
@@ -7049,7 +7068,7 @@ fn process_start_identity_for_pid(pid: u32) -> Option<ProcessStartIdentity> {
             info.pbi_start_tvusec,
         ))
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(feature = "simulator")))]
     {
         use std::io::Read;
         let mut stat = String::new();
@@ -7060,7 +7079,7 @@ fn process_start_identity_for_pid(pid: u32) -> Option<ProcessStartIdentity> {
             .ok()?;
         parse_linux_process_start(&stat)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", feature = "simulator")))]
     {
         let _ = pid;
         None
@@ -7088,7 +7107,15 @@ fn observe_process_directory_for_identity(
 }
 
 fn observe_process_directory(pid: u32) -> Option<String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(feature = "simulator")]
+    {
+        switchy_pty::simulator::snapshot()
+            .processes
+            .into_iter()
+            .find(|process| process.pid == pid)
+            .map(|process| process.cwd.to_string_lossy().into_owned())
+    }
+    #[cfg(all(target_os = "macos", not(feature = "simulator")))]
     {
         let pid = i32::try_from(pid).ok()?;
         let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
@@ -7121,13 +7148,13 @@ fn observe_process_directory(pid: u32) -> Option<String> {
             .ok()
             .filter(|path| Path::new(path).is_absolute())
     }
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(feature = "simulator")))]
     {
         std::fs::read_link(format!("/proc/{pid}/cwd"))
             .ok()
             .and_then(|path| path.into_os_string().into_string().ok())
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", feature = "simulator")))]
     {
         let _ = pid;
         None

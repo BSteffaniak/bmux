@@ -52,6 +52,7 @@ switchy_async = { workspace = true, features = [
     "time",
     "tokio",
 ] }
+switchy_pty = { workspace = true, optional = true }
 switchy_simulation = { workspace = true, optional = true }
 switchy_thread = { workspace = true, features = ["std"] }
 switchy_time = { workspace = true, features = ["std"] }
@@ -111,7 +112,9 @@ image-registry = [
 ]
 simulator = [
     "bmux_pty/simulator",
+    "dep:switchy_pty",
     "dep:switchy_simulation",
+    "switchy_pty/simulator",
     "switchy_async/thread-simulator",
     "switchy_thread/simulator",
     "switchy_time/simulator",

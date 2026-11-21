@@ -1,9 +1,10 @@
 //! Unix process observation and legacy user-directed signaling.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(feature = "simulator")))]
 use super::super::bounded_probe_output;
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(feature = "simulator")))]
 use std::time::Duration;
 
+#[cfg(not(feature = "simulator"))]
 pub(in super::super) fn send_process_signal_command(
     program: &str,
     process: &bmux_pane_runtime_state::PaneProcessIdentity,
@@ -35,6 +36,7 @@ pub(in super::super) fn send_process_signal_command(
     }
 }
 
+#[cfg(not(feature = "simulator"))]
 pub(in super::super) fn send_process_signal(
     process: &bmux_pane_runtime_state::PaneProcessIdentity,
     signal: bmux_pane_runtime_state::PaneProcessSignal,
@@ -74,7 +76,7 @@ pub(in super::super) fn process_command_looks_like_shell(command: &str, shell_pa
         )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "simulator")))]
 pub(in super::super) fn resolve_process_working_directory(pid: u32) -> Option<String> {
     let pid = i32::try_from(pid).ok()?;
     // SAFETY: integer-only C storage is initialized and the kernel receives its
@@ -105,7 +107,7 @@ pub(in super::super) fn resolve_process_working_directory(pid: u32) -> Option<St
     std::path::Path::new(&path).is_absolute().then_some(path)
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(all(unix, not(target_os = "macos"), not(feature = "simulator")))]
 pub(in super::super) fn resolve_process_working_directory(pid: u32) -> Option<String> {
     let proc_cwd = std::path::PathBuf::from(format!("/proc/{pid}/cwd"));
     if let Ok(path) = std::fs::read_link(&proc_cwd)
