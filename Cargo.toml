@@ -205,7 +205,7 @@ bmux_frontend_runtime = { version = "0.0.1-alpha.4", default-features = false, p
 bterm_native_platform = { version = "0.0.1-alpha.4", default-features = false, path = "packages/bterm-native-platform" }
 bterm_native_renderer = { version = "0.0.1-alpha.4", default-features = false, path = "packages/bterm-native-renderer" }
 bytemuck = { version = "1.25", default-features = false }
-cranelift-codegen = { version = "0.137.0", default-features = false, features = [
+cranelift-codegen = { version = "0.137.3", default-features = false, features = [
     "all-native-arch",
 ] }
 pollster = { version = "1.0", default-features = false }
@@ -217,13 +217,13 @@ swash = { version = "0.2", default-features = false, features = [
     "render",
     "std",
 ] }
-wasmtime = { version = "50.0.0", default-features = false, features = [
+wasmtime = { version = "50.0.3", default-features = false, features = [
     "cranelift",
     "runtime",
     "std",
 ] }
 wat = "1"
-wgpu = { version = "30.0.1", default-features = false, features = [
+wgpu = { version = "30.0.2", default-features = false, features = [
     "std",
     "wgsl",
     "vulkan",
@@ -391,9 +391,9 @@ hyperchad_markdown = { version = "0.5.0", default-features = false, features = [
     "xss-protection",
 ] }
 insta = { version = "1.49.0", default-features = false }
-pulldown-cmark = { version = "0.13.5", default-features = false }
+pulldown-cmark = { version = "0.13.6", default-features = false }
 serde_yaml = { package = "yaml_serde", version = "0.10.7", default-features = false }
-smallvec = { version = "1.16.4", default-features = false, features = [
+smallvec = { version = "1.16.6", default-features = false, features = [
     "union",
 ] }
 syntect = { version = "5.3.0", default-features = false, features = [
@@ -402,7 +402,7 @@ syntect = { version = "5.3.0", default-features = false, features = [
     "parsing",
 ] }
 two-face = { version = "0.5.2", default-features = false }
-url = { version = "2.5.8", default-features = false }
+url = { version = "2.5.9", default-features = false }
 
 switchy = { version = "0.5.0", package = "switchy", default-features = false }
 
@@ -423,7 +423,7 @@ ab_glyph = { version = "0.2.32" }
 anyhow = { version = "1.0.104", default-features = false }
 axum = { version = "0.8.9", default-features = false }
 chrono = { version = "0.4.45", default-features = false }
-clap = { version = "4.6.7", default-features = false }
+clap = { version = "4.6.9", default-features = false }
 flate2 = { version = "1", default-features = false, features = [
     "rust_backend",
 ] }
@@ -434,11 +434,11 @@ futures-core = { version = "0.3.34", default-features = false }
 futures-util = { version = "0.3.34", default-features = false }
 getrandom = "0.4.3"
 gif = { version = "0.14.2" }
-iroh = { version = "1.4.1", default-features = true }
-js-sys = { version = "0.3.106" }
+iroh = { version = "1.5.0", default-features = true }
+js-sys = { version = "0.3.107" }
 libc = { version = "0.2" }
-libloading = { version = "0.9.0", default-features = false, features = ["std"] }
-log = { version = "0.4.34", default-features = false }
+libloading = { version = "0.9.1", default-features = false, features = ["std"] }
+log = { version = "0.4.35", default-features = false }
 lz4_flex = { version = "0.14", default-features = false }
 memchr = { version = "2.8.3", default-features = false, features = ["std"] }
 png = { version = "0.18.1", default-features = false }
@@ -450,7 +450,7 @@ rcgen = { version = "0.14.10", default-features = false, features = [
     "pem",
     "ring",
 ] }
-regex = { version = "1.13.1", default-features = false, features = ["std"] }
+regex = { version = "1.13.2", default-features = false, features = ["std"] }
 reqwest = { version = "0.13.5", default-features = false, features = [
     "json",
     "rustls-no-provider",
@@ -473,9 +473,9 @@ serde_json = { version = "1.0.154", default-features = false, features = [
 sha2 = { version = "0.11.1", default-features = false }
 sha2_010 = { package = "sha2", version = "0.11.1", default-features = false }
 signal-hook = { version = "0.3.18", default-features = false }
-ssh2 = { version = "0.9.6" }
+ssh2 = { version = "0.9.7" }
 sshenv_vault = { version = "0.0.1-alpha.6", features = ["macos-keychain"] }
-syn = { version = "3.0.9", default-features = false }
+syn = { version = "3.0.10", default-features = false }
 sysinfo = { version = "0.39.6" }
 tempfile = { version = "3.27.0", default-features = false }
 thiserror = { version = "2.0.21", default-features = false }
@@ -483,11 +483,11 @@ time = { version = "0.3.55", default-features = false }
 tokio = { version = "1.54.1", default-features = false }
 tokio-rustls = { version = "0.26.6", default-features = false }
 tokio-tungstenite = { version = "0.30.0", default-features = false }
-toml = { version = "1.1.8", default-features = false, features = [
+toml = { version = "1.2.2", default-features = false, features = [
     "display",
     "serde",
 ] }
-toml_edit = { version = "0.25.17", default-features = false, features = [
+toml_edit = { version = "0.25.20", default-features = false, features = [
     "parse",
     "display",
 ] }
@@ -495,16 +495,16 @@ tracing = { version = "0.1.44", default-features = false }
 tracing-appender = { version = "0.2.5", default-features = false }
 tracing-log = { version = "0.2.0", default-features = false }
 tracing-subscriber = { version = "0.3.23", default-features = false }
-trybuild = { version = "1.0.122" }
+trybuild = { version = "1.0.125" }
 ttf-parser = { version = "0.25.1", default-features = true }
 uniffi = { version = "0.32.2" }
-uuid = { version = "1.29.0", default-features = false }
-wasm-bindgen = { version = "0.2.129" }
-wasm-bindgen-futures = { version = "0.4.79" }
+uuid = { version = "1.29.3", default-features = false }
+wasm-bindgen = { version = "0.2.130" }
+wasm-bindgen-futures = { version = "0.4.80" }
 wayland-client = { version = "0.31.15", default-features = false }
 wayland-protocols = { version = "0.32.13", default-features = false }
 wayland-protocols-wlr = { version = "0.3.12", default-features = false }
-web-sys = { version = "0.3.106" }
+web-sys = { version = "0.3.107" }
 web-time = { version = "1.1.0", default-features = false }
 windows-sys = { version = "0.61.2" }
 zune-core = { version = "0.5.3", default-features = false }
@@ -512,7 +512,7 @@ zune-jpeg = { version = "0.5.15" }
 # Dev-only: validates BPDL-to-WIT lowering against the reference WIT parser.
 wit-parser = { version = "0.263.0", default-features = false }
 x11rb      = { version = "0.14.0", default-features = false }
-zeroize    = { version = "1.9.1", default-features = false, features = ["std"] }
+zeroize    = { version = "1.9.2", default-features = false, features = ["std"] }
 zstd       = { version = "0.14", default-features = false }
 
 # File-system watcher for config / theme / decoration-script hot-reload.

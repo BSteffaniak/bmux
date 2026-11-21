@@ -605,7 +605,9 @@ impl X {
         let offered = match self.fetch(self.atom("TARGETS"))? {
             Some((32, bytes)) if bytes.len().is_multiple_of(4) => Some(
                 bytes
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|bytes| word(bytes, 0))
                     .collect::<Vec<_>>(),
             ),
@@ -1127,7 +1129,9 @@ mod tests {
         assert_eq!(
             receive
                 .bytes
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|bytes| word(bytes, 0))
                 .collect::<Vec<_>>(),
             vec![100, 101]
