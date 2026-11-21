@@ -2261,9 +2261,14 @@ mod tests {
         network: Arc<TestEndpointNetwork>,
         storage: std::sync::Mutex<BTreeMap<String, Vec<u8>>>,
         executor: std::sync::Mutex<Option<Arc<VoteExecutor>>>,
+        scope: crate::durable_storage::TestScope,
     }
 
     impl bmux_plugin::ServiceCaller for TestEndpointCaller {
+        fn host_connection(&self) -> Option<&bmux_plugin_sdk::HostConnectionInfo> {
+            Some(&self.scope.connection)
+        }
+
         fn execute_kernel_request(
             &self,
             _request: bmux_ipc::Request,
@@ -2519,6 +2524,7 @@ mod tests {
                     network: network.clone(),
                     storage: std::sync::Mutex::new(BTreeMap::new()),
                     executor: std::sync::Mutex::new(None),
+                    scope: crate::durable_storage::TestScope::default(),
                 })
             })
             .collect::<Vec<_>>();

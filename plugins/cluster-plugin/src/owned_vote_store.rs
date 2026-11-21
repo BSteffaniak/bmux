@@ -6121,8 +6121,15 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct InstallCaller(std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>);
+    struct InstallCaller(
+        std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+        crate::durable_storage::TestScope,
+    );
     impl bmux_plugin::ServiceCaller for InstallCaller {
+        fn host_connection(&self) -> Option<&bmux_plugin_sdk::HostConnectionInfo> {
+            Some(&self.1.connection)
+        }
+
         fn call_service_raw(
             &self,
             _: &str,
@@ -6177,6 +6184,10 @@ mod tests {
     }
 
     impl bmux_plugin::ServiceCaller for AppendV2Endpoint {
+        fn host_connection(&self) -> Option<&bmux_plugin_sdk::HostConnectionInfo> {
+            bmux_plugin::ServiceCaller::host_connection(self.source.as_ref())
+        }
+
         fn execute_kernel_request(
             &self,
             request: bmux_ipc::Request,

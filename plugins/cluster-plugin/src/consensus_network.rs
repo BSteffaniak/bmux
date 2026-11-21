@@ -2915,9 +2915,14 @@ mod tests {
     #[derive(Default)]
     struct SnapshotAuthCaller {
         storage: std::sync::Mutex<std::collections::BTreeMap<String, Vec<u8>>>,
+        scope: crate::durable_storage::TestScope,
     }
 
     impl bmux_plugin::ServiceCaller for SnapshotAuthCaller {
+        fn host_connection(&self) -> Option<&bmux_plugin_sdk::HostConnectionInfo> {
+            Some(&self.scope.connection)
+        }
+
         fn call_service_raw(
             &self,
             _capability: &str,

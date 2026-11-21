@@ -170,6 +170,32 @@ fn acquire(root: &Path, timeout: Duration) -> Result<File, String> {
     Ok(file)
 }
 
+/// A private durable scope for one test caller, so fixtures that run several
+/// nodes in one process do not share (and serialize on) a store lock.
+#[cfg(test)]
+pub struct TestScope {
+    _root: tempfile::TempDir,
+    pub connection: bmux_plugin_sdk::HostConnectionInfo,
+}
+
+#[cfg(test)]
+impl Default for TestScope {
+    fn default() -> Self {
+        let root = tempfile::tempdir().expect("test durable scope");
+        let data_dir = root.path().to_string_lossy().into_owned();
+        Self {
+            _root: root,
+            connection: bmux_plugin_sdk::HostConnectionInfo {
+                config_dir: data_dir.clone(),
+                config_dir_candidates: Vec::new(),
+                runtime_dir: data_dir.clone(),
+                state_dir: data_dir.clone(),
+                data_dir,
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

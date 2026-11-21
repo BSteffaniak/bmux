@@ -26,6 +26,7 @@ plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-protocol-refresh/v1 
 plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-principal-bootstrap/v1 ca0c65896c108d7040f8a26d0e0bd43c476ebf9fb5316282a7a1708917a1cf5e
 plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-capability-publication/v1 aba9b932d009526f249a586a9c70dbbe5a3d2189502b57e91c32f7f827ae8726
 plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-control-command/v1 fdcf5aca8b5711e7b5c40acf78597fdea750627fb9adfd028f13c7911acbf203
+plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-bounded-control-command/v1 44ca5cd3933631b7d3346d5984255ba33a4d32ab097de0ee94bd27796b9238e5
 plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-control-command/v2 3c65c742c3be52b227757a2d6a3882f94b6cc3510a3a6d06b06440390de301c6
 plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-control-state/v1 b4e21b87857507ba4fdd644265a48192a209006ca8c9eb212af0d9a1b677718e
 plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-control-state/v2 82f0b8e98795247ba96fc8ca76f0af312248226dd4a999d50aa6fdb17488d0c5
@@ -35,6 +36,15 @@ plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-worker-command/v2 cf
 plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-worker-state/v2 1343dc8621be5e807f8a344606c239b8af83c87ed78bdf004d8b94438dde5f51
 plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-control-watch/v1 1b3de06c65a494a6e2d02fbf53e62568bb4faf40671eaf512c88a0cf14ddf87d
 plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-worker-stream/v1 ce2e5050ba187ac6d0dd4907d267cb25aac1eb5e36d0fd5cb8ab8b088b9f0b81
+plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-consensus-transfer-types f050e2136a6abfea9b3617a582b53953074f0b1cda305021a95c21b40c8c92be
+plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-consensus-transfer/v1 6dc096a9b1248050a0b2882d80d1c2e097afa5d3d50e0e0665308c223c3e1520
+plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-consensus-rpc-types 8350bc23975a0de087f323731728b9550499b0bc215582e274efb4e24954138c
+plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-consensus-rpc/v1 60f11749e8320233483e0c9a40e9c38489f6487146ea287f21694fda40148ebd
+plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-consensus-rpc-v2-types c7efdf08449f7271107f65092af7f9dae8c30319592f0333b7454edafd0f6d91
+plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-consensus-rpc/v2 6867506be92330711f7988d1aad6cb92b7106c2c101acab07caa22f0f6aaf710
+plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-consensus-snapshot-types 4bff9bca97513e612b5b67fa8c20491003565a22cf23ff8958fecc09232c5cb5
+plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-consensus-snapshot/v1 4ad35066e5e2fa950cc1a8d4224d86523c50308e5c9c2270ad470b376899b1a4
+plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-consensus-vote-types 201bdb585ab4800a646bbdff3ae7f89812a044e47e03cdb89c532bdfc1b9946e
 plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-peer-auth/v1 e0b80fcdc33ae2a42fc133a865ed2a6595a1518d7e189c29e687b588bb6a0e6b
 plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-peer-read/v1 21fb6f7c419daec4ebb74442bbff0fbb31b57f929237b473fa4cd39e913f546b
 plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-raft-rpc/v1 33bbfe6ea2f472100132d799e1dfc9bacfc2b6fc41e647fac8c6883252f2f210
