@@ -440,6 +440,7 @@ pub fn spawn(spec: &PtyCommand, size: PtySize) -> io::Result<PtyProcess> {
                 complete: true,
             })
         },
+        || {},
     );
     Ok(PtyProcess {
         events: receiver,

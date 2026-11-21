@@ -638,6 +638,9 @@ mod platform {
         /// Set once the exit is reported; the reader and writer threads then stop.
         closed: Arc<AtomicBool>,
         writer: Mutex<Option<PtyWriter>>,
+        /// Held until the last control handle is gone; the exited process is reaped only
+        /// then, so its process group id cannot be reused while it may still be signalled.
+        _reap_guard: mpsc::Sender<()>,
     }
 
     impl Control {
@@ -689,8 +692,9 @@ mod platform {
 
         /// Signal the process group the process leads (it started its own session).
         fn signal(&self, signal: Signal) -> io::Result<()> {
-            // Once the process is reaped its id may be reused, but not while its group still
-            // has members: something holding the terminal open is taken as one.
+            // The process is not reaped while this handle exists (see `_reap_guard`), so its
+            // id, which names the group, cannot belong to another process yet. After the exit
+            // with nothing holding the terminal there is nothing left to signal.
             if self.exited.load(Ordering::Acquire) && !self.master.has_peer() {
                 return Ok(());
             }
@@ -817,6 +821,7 @@ mod platform {
         }
         let closed = Arc::clone(&events.closed);
         let pid = child.id();
+        let (reap_guard, reap_when_released) = mpsc::channel::<()>();
         let control = PtyControl::new(
             Control {
                 master: Arc::new(master),
@@ -824,9 +829,14 @@ mod platform {
                 exited: Arc::clone(&exited),
                 closed,
                 writer: Mutex::new(None),
+                _reap_guard: reap_guard,
             },
             size,
         );
+        // Reported as soon as it exits, but reaped only once no control handle could still
+        // signal its group: until then the zombie keeps its id (and the group's) from reuse.
+        let waiting = Arc::new(Mutex::new(Some(child)));
+        let reaping = Arc::clone(&waiting);
         super::report_exit(
             events,
             Exit {
@@ -837,11 +847,24 @@ mod platform {
                 status: Arc::clone(&control.status),
             },
             move || {
-                let mut child = child;
-                child
-                    .wait()
-                    .ok()
-                    .map(|exit| PtyExit::from_child_exit(&exit))
+                let mut child = waiting
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take()?;
+                let exit = child.wait_unreaped().or_else(|_| child.wait());
+                *waiting.lock().unwrap_or_else(PoisonError::into_inner) = Some(child);
+                exit.ok().map(|exit| PtyExit::from_child_exit(&exit))
+            },
+            move || {
+                // Every sender is the control handle's: this returns once they are all gone.
+                let _ = reap_when_released.recv();
+                let child = reaping
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .take();
+                if let Some(mut child) = child {
+                    let _ = child.wait();
+                }
             },
         );
         Ok(PtyProcess {
@@ -971,8 +994,10 @@ mod pipes {
             grace: spec.drain_grace,
             status: Arc::clone(&control.status),
         };
-        super::report_exit(events, exit, move || {
-            loop {
+        super::report_exit(
+            events,
+            exit,
+            move || loop {
                 // Polled so `kill` can take the lock between checks.
                 match waited
                     .lock()
@@ -984,8 +1009,9 @@ mod pipes {
                     Err(_) => return None,
                 }
                 std::thread::sleep(Duration::from_millis(20));
-            }
-        });
+            },
+            || {},
+        );
         Ok(PtyProcess {
             events: receiver,
             control,
@@ -1096,10 +1122,12 @@ struct Exit {
 /// Wait for the process with `wait`, give its readers `exit.grace` to deliver the last output,
 /// and report the exit. Output arriving later is dropped (the exit says so): the exit is the
 /// last event.
+/// Then run `after` on the same thread.
 fn report_exit(
     events: Events,
     exit: Exit,
     wait: impl FnOnce() -> Option<PtyExit> + Send + 'static,
+    after: impl FnOnce() + Send + 'static,
 ) {
     spawn_named("bmux-pty-exit", move || {
         let mut status = wait().unwrap_or(PtyExit {
@@ -1127,6 +1155,8 @@ fn report_exit(
         events.closed.store(true, Ordering::Release);
         *exit.status.lock().unwrap_or_else(PoisonError::into_inner) = Some(status);
         let _ = events.sender.send(PtyEvent::Exited(status));
+        drop(events);
+        after();
     });
 }
 
