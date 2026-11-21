@@ -14276,7 +14276,7 @@ mod tests {
     /// state (capture barriers, observers, revisions) lives in that
     /// activation's host handles, even when two activations share one host
     /// registry root.
-    #[tokio::test]
+    #[switchy_async::test]
     async fn two_instances_keep_separate_runtime_and_activation_state() {
         let first = PaneRuntimeHost::detached();
         let second = PaneRuntimeHost::detached();
@@ -14359,7 +14359,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn activated_exit_consumer_survives_initialization_and_publishes_exit() {
         let bus = Arc::new(bmux_plugin::EventBus::new());
         let host = PaneRuntimeHost::new(
@@ -14432,7 +14432,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[switchy_async::test(flavor = "multi_thread", worker_threads = 2)]
     async fn owned_terminal_accepts_input_resize_and_explicit_shutdown() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
@@ -14495,7 +14495,7 @@ mod tests {
     }
 
     #[cfg(windows)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[switchy_async::test(flavor = "multi_thread", worker_threads = 2)]
     async fn windows_program_startup_answers_conpty_query_then_captures_and_drains() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let session_id = SessionId(crate::ids::new_uuid());
@@ -14577,7 +14577,7 @@ mod tests {
 
     // Needs coreutils printf; Windows has windows_program_startup_answers_conpty_query_then_captures_and_drains.
     #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[switchy_async::test(flavor = "multi_thread", worker_threads = 2)]
     async fn program_first_pane_captures_fast_literal_argv_and_drains() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let session_id = SessionId(crate::ids::new_uuid());
@@ -14632,7 +14632,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[switchy_async::test(flavor = "multi_thread", worker_threads = 2)]
     async fn initial_shell_uses_conventional_owner_preserves_cwd_and_natural_tail() {
         use std::os::unix::fs::PermissionsExt;
         let host = crate::runtime::PaneRuntimeHost::detached();
@@ -14704,7 +14704,7 @@ mod tests {
 
     // Runs /bin/sh and dd.
     #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[switchy_async::test(flavor = "multi_thread", worker_threads = 2)]
     async fn conventional_session_drains_startup_backpressure_and_retires_owner() {
         let session_id = SessionId(crate::ids::new_uuid());
         let mut manager =
@@ -14783,7 +14783,7 @@ mod tests {
 
     // Runs /bin/sh and dd.
     #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[switchy_async::test(flavor = "multi_thread", worker_threads = 2)]
     async fn supervised_fast_exit_drains_startup_backpressure_before_retirement() {
         let session_id = SessionId(crate::ids::new_uuid());
         let mut manager =
@@ -14965,7 +14965,7 @@ exit 7"#
     }
 
     #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[switchy_async::test(flavor = "multi_thread", worker_threads = 2)]
     // Keep the real owner/descendant/capture ordering visible in one acceptance
     // fixture; splitting it obscures which boundary each assertion observes.
     #[allow(clippy::too_many_lines)]
@@ -15123,7 +15123,7 @@ exit 7"#
     }
 
     #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[switchy_async::test(flavor = "multi_thread", worker_threads = 2)]
     async fn injected_reader_failure_cleans_live_process_and_acknowledges_threads() {
         let session_id = SessionId(crate::ids::new_uuid());
         let mut manager =
@@ -15227,7 +15227,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn supervision_join_reports_live_thread_deadline_without_blocking_executor() {
         let (release, blocked) = switchy_thread::sync::mpsc::channel();
         let (done, finished) = tokio::sync::oneshot::channel();
@@ -15251,7 +15251,7 @@ exit 7"#
         assert!(threads.iter().all(Option::is_none));
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn supervision_join_acknowledges_completion_and_reports_panics() {
         let thread = switchy_thread::thread::spawn(|| {});
         super::join_supervision_threads(
@@ -15339,7 +15339,7 @@ exit 7"#
         PaneLayoutNode::Leaf { pane_id: id }
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn zoom_transition_reselects_padding_rule_and_restores_split_size() {
         let session_id = SessionId(crate::ids::new_uuid());
         let first = crate::ids::new_uuid();
@@ -15376,7 +15376,7 @@ exit 7"#
         assert_eq!(*last_requested_size.lock().unwrap(), (38, 58));
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn floating_resize_reselects_padding_rule_and_resizes_pty() {
         let session_id = SessionId(crate::ids::new_uuid());
         let tiled = crate::ids::new_uuid();
@@ -15410,7 +15410,7 @@ exit 7"#
         assert_eq!(state.effective_content_rect.w, 10);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn padding_geometry_is_shared_across_attached_clients() {
         let session_id = SessionId(crate::ids::new_uuid());
         let pane_id = crate::ids::new_uuid();
@@ -15448,7 +15448,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn begin_attach_registers_input_producer_before_accepting_input() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
@@ -15494,7 +15494,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn begin_attach_rejects_unregistered_producer_during_private_input() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -15537,7 +15537,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn failed_retarget_preserves_previous_attach_registration() {
         let previous_session_id = SessionId(crate::ids::new_uuid());
         let missing_session_id = SessionId(crate::ids::new_uuid());
@@ -15571,7 +15571,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn over_reserved_viewport_normalizes_once_for_scene_and_response() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -15602,7 +15602,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn horizontal_viewport_insets_drive_scene_geometry_and_pty_size() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -15638,7 +15638,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn observer_open_preserves_focus_and_pty_size_and_cannot_escalate() {
         use crate::handlers::attach_commands::{mark_test_observer, observer_operation_allowed};
         let session = SessionId(crate::ids::new_uuid());
@@ -15729,7 +15729,7 @@ exit 7"#
             .unwrap();
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn interactive_attach_registers_producers_without_bypassing_private_barriers() {
         let session = SessionId(crate::ids::new_uuid());
         let client = ClientId(crate::ids::new_uuid());
@@ -15772,7 +15772,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn observation_preserves_sizing_authority_and_last_detached_geometry() {
         let session = SessionId(crate::ids::new_uuid());
         let owner = ClientId(crate::ids::new_uuid());
@@ -15817,7 +15817,7 @@ exit 7"#
         ));
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn viewport_height_resize_reselects_padding_rule_and_resizes_pty() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -15851,7 +15851,7 @@ exit 7"#
         assert_eq!(state.effective_content_rect.y, 15);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn viewport_resize_reselects_padding_rule_and_resizes_pty() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -15883,7 +15883,7 @@ exit 7"#
         assert_eq!(*last_requested_size.lock().unwrap(), (28, 40));
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn floating_geometry_remains_host_viewport_relative_with_reserved_content_edges() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -15939,7 +15939,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn attach_scene_uses_authoritative_padding_for_tiled_zoomed_and_floating_panes() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -16057,7 +16057,7 @@ exit 7"#
         assert!(root.y < 4);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn attach_scene_reselects_geometry_rules_across_viewport_boundary() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -16099,7 +16099,7 @@ exit 7"#
         assert_eq!(wide_scene.surfaces[0].content_rect.x, 40);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn metadata_reconciliation_ignores_intervening_viewport_change_without_padding() {
         let session_id = SessionId(crate::ids::new_uuid());
         let pane_id = crate::ids::new_uuid();
@@ -16129,7 +16129,7 @@ exit 7"#
         assert!(manager.pending_layout_revisions.is_empty());
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn padding_mutation_captures_one_revision_and_drains_after_unlock() {
         let session_id = SessionId(crate::ids::new_uuid());
         let pane_id = crate::ids::new_uuid();
@@ -16161,7 +16161,7 @@ exit 7"#
         assert!(manager.pending_layout_revisions.is_empty());
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn command_and_prompt_metadata_transitions_reselect_padding_rule() {
         let session_id = SessionId(crate::ids::new_uuid());
         let pane_id = crate::ids::new_uuid();
@@ -16217,7 +16217,7 @@ exit 7"#
         assert_eq!(changed.effective_content_rect.w, 118);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn equivalent_metadata_rule_results_avoid_resize_and_revision_churn() {
         let session_id = SessionId(crate::ids::new_uuid());
         let pane_id = crate::ids::new_uuid();
@@ -16263,7 +16263,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn padding_override_updates_state_resizes_and_clears() {
         let session_id = SessionId(crate::ids::new_uuid());
         let pane_id = crate::ids::new_uuid();
@@ -16293,7 +16293,7 @@ exit 7"#
         assert_eq!(*last_requested_size.lock().unwrap(), (38, 118));
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn replacement_padding_config_applies_to_panes_created_later() {
         let session_id = SessionId(crate::ids::new_uuid());
         let first_pane_id = crate::ids::new_uuid();
@@ -16326,7 +16326,7 @@ exit 7"#
         assert_eq!(future.runtime_override, None);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn expired_padding_preview_restores_underlying_geometry() {
         let session_id = SessionId(crate::ids::new_uuid());
         let pane_id = crate::ids::new_uuid();
@@ -16355,7 +16355,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn updating_padding_preview_renews_its_lease() {
         let session_id = SessionId(crate::ids::new_uuid());
         let pane_id = crate::ids::new_uuid();
@@ -16386,7 +16386,7 @@ exit 7"#
         assert!(manager.padding_previews.contains_key(&token));
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn cancelled_preview_restores_geometry() {
         let session_id = SessionId(crate::ids::new_uuid());
         let pane_id = crate::ids::new_uuid();
@@ -16413,7 +16413,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn replacing_padding_defaults_applies_live_and_rejects_zero_limits() {
         let session_id = SessionId(crate::ids::new_uuid());
         let pane_id = crate::ids::new_uuid();
@@ -16443,7 +16443,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn failed_preview_commit_keeps_transaction_and_durable_state_unchanged() {
         let session_id = SessionId(crate::ids::new_uuid());
         let pane_id = crate::ids::new_uuid();
@@ -16479,7 +16479,7 @@ exit 7"#
         assert!(manager.padding_overrides_for_snapshot().is_empty());
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn clear_padding_overrides_is_atomic_across_targets() {
         let session_id = SessionId(crate::ids::new_uuid());
         let first = crate::ids::new_uuid();
@@ -16529,7 +16529,7 @@ exit 7"#
         assert!(cleared.iter().all(|state| state.runtime_override.is_none()));
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn owner_detach_cancels_owned_preview_and_restores_geometry() {
         let session_id = SessionId(crate::ids::new_uuid());
         let pane_id = crate::ids::new_uuid();
@@ -16561,7 +16561,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn cancelling_all_previews_restores_every_target() {
         let session_id = SessionId(crate::ids::new_uuid());
         let first = crate::ids::new_uuid();
@@ -16618,7 +16618,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn preview_geometry_updates_only_resize_pty_when_dimensions_change() {
         let session_id = SessionId(crate::ids::new_uuid());
         let pane_id = crate::ids::new_uuid();
@@ -16680,7 +16680,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn cancelling_preview_restores_runtime_override_and_persistence() {
         let session_id = SessionId(crate::ids::new_uuid());
         let pane_id = crate::ids::new_uuid();
@@ -16724,7 +16724,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn closing_preview_target_retains_remaining_targets() {
         let session_id = SessionId(crate::ids::new_uuid());
         let first_pane = crate::ids::new_uuid();
@@ -16769,7 +16769,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn removing_session_drops_only_its_preview_targets() {
         let first_session = SessionId(crate::ids::new_uuid());
         let second_session = SessionId(crate::ids::new_uuid());
@@ -16810,7 +16810,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn invalid_padding_preview_update_preserves_previous_preview() {
         let session_id = SessionId(crate::ids::new_uuid());
         let pane_id = crate::ids::new_uuid();
@@ -16845,7 +16845,7 @@ exit 7"#
         assert_eq!(state.effective, previous);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn non_overlapping_cross_client_padding_previews_coexist() {
         let session_id = SessionId(crate::ids::new_uuid());
         let first_pane = crate::ids::new_uuid();
@@ -16901,7 +16901,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn same_client_new_padding_preview_replaces_previous_preview() {
         let session_id = SessionId(crate::ids::new_uuid());
         let first_pane = crate::ids::new_uuid();
@@ -16957,7 +16957,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn overlapping_cross_client_padding_preview_is_rejected() {
         let session_id = SessionId(crate::ids::new_uuid());
         let pane_id = crate::ids::new_uuid();
@@ -16979,7 +16979,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn padding_preview_updates_cancels_and_commits_without_snapshot_leakage() {
         let session_id = SessionId(crate::ids::new_uuid());
         let pane_id = crate::ids::new_uuid();
@@ -17027,7 +17027,7 @@ exit 7"#
         assert!(manager.padding_overrides_for_snapshot().is_empty());
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn invalid_padding_mutation_is_atomic() {
         let session_id = SessionId(crate::ids::new_uuid());
         let pane_id = crate::ids::new_uuid();
@@ -17054,7 +17054,7 @@ exit 7"#
         assert!(manager.padding_overrides_for_snapshot().is_empty());
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn clearing_override_omits_it_and_restores_declarative_geometry() {
         let session_id = SessionId(crate::ids::new_uuid());
         let pane_id = crate::ids::new_uuid();
@@ -17090,7 +17090,7 @@ exit 7"#
         assert!(manager.padding_overrides_for_snapshot().is_empty());
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn restart_preserves_padding_override_and_reapplies_its_size() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
@@ -17117,7 +17117,7 @@ exit 7"#
         shutdown_runtime_handle(host, removed).await;
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn session_removal_omits_all_owned_padding_overrides() {
         let session_id = SessionId(crate::ids::new_uuid());
         let pane_id = crate::ids::new_uuid();
@@ -17139,7 +17139,7 @@ exit 7"#
         assert!(manager.padding_overrides_for_snapshot().is_empty());
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn padding_overrides_follow_pane_close_and_persistence_policy() {
         let session_id = SessionId(crate::ids::new_uuid());
         let first = crate::ids::new_uuid();
@@ -17183,7 +17183,7 @@ exit 7"#
         assert!(manager.padding_overrides_for_snapshot().is_empty());
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn alignment_only_override_moves_content_without_resizing_pty() {
         let session_id = SessionId(crate::ids::new_uuid());
         let pane_id = crate::ids::new_uuid();
@@ -17296,7 +17296,7 @@ exit 7"#
         state.freeze_with(|_| panic!("close retried")).unwrap();
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn pane_shutdown_pending_startup_keeps_cleanup_authority_with_startup_owner() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
@@ -17318,7 +17318,7 @@ exit 7"#
         assert!(state.lock().unwrap().frozen);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn pane_shutdown_starts_every_runtime_before_waiting() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
@@ -17352,7 +17352,7 @@ exit 7"#
         .unwrap();
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn pane_shutdown_error_receipt_retains_owner_until_reaper_settles() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
@@ -17390,7 +17390,7 @@ exit 7"#
         .expect("cleanup owner not released after settlement");
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn pane_shutdown_release_waits_for_failed_cleanup_owner() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
@@ -17431,7 +17431,7 @@ exit 7"#
         assert!(release.await.unwrap().unwrap_err().contains("late reaper"));
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn pane_shutdown_starts_every_pane_before_waiting() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
@@ -17456,7 +17456,7 @@ exit 7"#
             .expect("serial shutdown deadlocks at the pane barrier");
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn cancelled_shutdown_waiter_retains_cleanup_and_freezes_before_release() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
@@ -17641,7 +17641,7 @@ exit 7"#
         assert!(summary.contains("12 additional causes; see server logs"));
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn shutdown_reports_original_cleanup_cause_once_per_pane() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
@@ -17756,7 +17756,7 @@ exit 7"#
         }
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn rejected_split_preserves_focus_zoom_and_execution_count() {
         let session_id = SessionId(crate::ids::new_uuid());
         let pane_id = crate::ids::new_uuid();
@@ -17788,7 +17788,7 @@ exit 7"#
         }
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn source_capture_reads_published_identity_while_manager_and_metadata_are_busy() {
         let session = SessionId(crate::ids::new_uuid());
         let pane = crate::ids::new_uuid();
@@ -17815,7 +17815,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn spawn_source_capture_is_explicit_live_and_incarnation_scoped() {
         use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
         let session_id = SessionId(crate::ids::new_uuid());
@@ -17895,7 +17895,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn startup_stop_wins_over_ready_or_pending_identity() {
         let (send, mut stop) = oneshot::channel();
         send.send(()).unwrap();
@@ -17916,7 +17916,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn failed_startup_cleanup_reports_wait_error_and_timeout() {
         let wait = poll_failed_startup_child(
             || Err(std::io::Error::other("injected wait failure")),
@@ -17943,7 +17943,7 @@ exit 7"#
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[switchy_async::test]
     async fn failed_startup_cleanup_reaps_spawned_child() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
@@ -17959,7 +17959,7 @@ exit 7"#
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[switchy_async::test]
     async fn failed_startup_cleanup_survives_dropped_waiter() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
@@ -17992,7 +17992,7 @@ exit 7"#
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[switchy_async::test]
     async fn aborting_startup_owner_reaps_child() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
@@ -18023,7 +18023,7 @@ exit 7"#
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[switchy_async::test]
     async fn startup_child_drop_on_plain_thread_uses_owning_runtime() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
@@ -18047,7 +18047,7 @@ exit 7"#
         }
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[switchy_async::test(flavor = "current_thread")]
     async fn process_identity_probe_does_not_block_async_runtime() {
         let (release, blocked) = switchy_thread::sync::mpsc::channel();
         let (started, ready) = oneshot::channel();
@@ -18132,7 +18132,7 @@ exit 7"#
         assert_eq!(ACTIVE.load(Ordering::SeqCst), MAX_DIRECTORY_PROBES);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn native_directory_probe_releases_locks_and_rejects_replacement() {
         use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
         let session_id = SessionId(crate::ids::new_uuid());
@@ -18266,7 +18266,7 @@ exit 7"#
         }
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn pane_direct_input_resolves_visible_cross_session_owner() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
@@ -18344,7 +18344,7 @@ exit 7"#
         }
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn attach_snapshot_watermark_matches_concurrent_output() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -18423,7 +18423,7 @@ exit 7"#
         writer.join().unwrap();
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn attach_grid_snapshot_budget_rejection_preserves_replay_cursors() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -18473,7 +18473,7 @@ exit 7"#
         assert_eq!(cursor_count(1), pane_ids.len() - returned);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn oversized_screen_cell_snapshot_rejection_preserves_state() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -18525,7 +18525,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn oversized_pin_capture_preserves_previous_pin() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -18606,7 +18606,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn sparse_wide_attach_snapshot_does_not_charge_unused_columns() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -18631,7 +18631,7 @@ exit 7"#
         assert_eq!(snapshot.rows[0].runs[0].text, "sparse");
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn adapters_share_pin_reservations_and_shrink_releases_only_unused_capacity() {
         let runtime = runtime_with_panes(&[crate::ids::new_uuid()]);
         let manager = Arc::new(Mutex::new(manager_with_runtime(
@@ -18675,7 +18675,7 @@ exit 7"#
         assert_eq!(used.load(Ordering::Acquire), 0);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn retained_pin_admission_counts_other_sessions_and_releases_removed_pins() {
         let session = SessionId(crate::ids::new_uuid());
         let other_session = SessionId(crate::ids::new_uuid());
@@ -18726,7 +18726,7 @@ exit 7"#
         assert!(admit_retained_pin(&manager, session, client, pane, &grid.grid).is_ok());
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn attach_grid_windows_reject_aggregate_overflow_and_allow_retry() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -19001,7 +19001,7 @@ exit 7"#
     /// pane's frames show (a title replaced, colours turned to bold, a full clear dropped) while
     /// the raw output the reader publishes stays as the program wrote it; another plugin's rules
     /// are its own, invalid rules are refused, and clearing the rules restores the output.
-    #[tokio::test]
+    #[switchy_async::test]
     async fn output_filter_rules_rewrite_what_pane_frames_show() {
         use bmux_pane_runtime_plugin_api::pane_runtime_output_filters_v1::{
             OutputAction, OutputFilterError, OutputMatch, OutputRule, client,
@@ -19093,7 +19093,7 @@ exit 7"#
 
     /// A clipboard write queued for a client reaches it in a frame, even when the grid did not
     /// otherwise change, and only once.
-    #[tokio::test]
+    #[switchy_async::test]
     async fn queued_clipboard_writes_reach_the_client_in_its_next_frame() {
         use bmux_pane_runtime_state::SessionRuntimeManagerApi as Api;
         let session_id = SessionId(crate::ids::new_uuid());
@@ -19169,7 +19169,7 @@ exit 7"#
     /// An observer, not attached to the pane's session, gets frames that keep its replica level
     /// with the grid as an attached client does; a reset starts it over, and a target that does
     /// not exist is skipped.
-    #[tokio::test]
+    #[switchy_async::test]
     async fn observed_pane_frames_keep_an_unattached_replica_level_with_the_grid() {
         use bmux_pane_runtime_state::SessionRuntimeManagerApi as Api;
         let session_id = SessionId(crate::ids::new_uuid());
@@ -19209,7 +19209,7 @@ exit 7"#
         assert_eq!(follow(&adapter), (1, true), "a reset replica starts over");
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn attach_pane_frames_keep_a_client_replica_level_with_the_pane_grid() {
         use bmux_pane_runtime_state::SessionRuntimeManagerApi as Api;
         let session_id = SessionId(crate::ids::new_uuid());
@@ -19275,7 +19275,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn attach_grid_snapshot_state_reports_retained_scrollback_without_encoding_it() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -19322,7 +19322,7 @@ exit 7"#
         assert!(snapshot.scrollback_rows > 0);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn attach_grid_snapshot_state_omits_panes_beyond_reply_budget() {
         fn fill(pane: &PaneRuntimeHandle) {
             set_pane_grid(pane, 200, 60);
@@ -19390,7 +19390,7 @@ exit 7"#
         const { assert!(REPLY_WIRE_BUDGET < bmux_plugin_sdk::abi::MAX_BUFFER_BYTES) };
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn attach_grid_window_state_returns_bounded_scrollback_window() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -19443,7 +19443,7 @@ exit 7"#
         assert!(!retained.iter().any(|row| row == "line3"));
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn attach_grid_window_state_anchors_offset_when_output_appends() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -19542,7 +19542,7 @@ exit 7"#
         assert_ne!(live.snapshot(1, 2), frozen_before);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn frozen_scrollback_pin_serves_immutable_windows_while_live_grid_advances() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -19632,12 +19632,12 @@ exit 7"#
         assert_eq!(exhausted.0, usize::MAX);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn removed_pane_cannot_store_an_in_flight_scrollback_capture() {
         assert_retired_pane_capture_rejected(false);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn replaced_pane_cannot_store_an_in_flight_scrollback_capture() {
         assert_retired_pane_capture_rejected(true);
     }
@@ -19686,7 +19686,7 @@ exit 7"#
         assert!(manager.runtimes[&session_id].scrollback_pins.is_empty());
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn grid_builders_share_capture_admission_and_release_working_capacity() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -19850,7 +19850,7 @@ exit 7"#
     }
 
     #[cfg(feature = "image-registry")]
-    #[tokio::test]
+    #[switchy_async::test]
     async fn generated_history_images_survive_live_reset_and_reject_stale_capture() {
         use bmux_pane_runtime_plugin_api::attach_runtime_state::client;
 
@@ -20087,7 +20087,7 @@ exit 7"#
         }
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     #[allow(
         clippy::too_many_lines,
         reason = "capture, fetch, replacement and stale-identity assertions share one registered runtime lifecycle"
@@ -20218,7 +20218,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn history_fetch_uses_frozen_pin_and_rejects_released_token() {
         use bmux_pane_runtime_state::SessionRuntimeManagerApi;
         let session = SessionId(crate::ids::new_uuid());
@@ -20292,7 +20292,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn failed_pin_publication_releases_capture_and_allows_retry() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -20325,7 +20325,7 @@ exit 7"#
         assert_eq!(adapter.retained_pin_bytes.load(Ordering::Acquire), 0);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn unpinned_capture_lives_only_until_last_window_reader_drops() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -20364,7 +20364,7 @@ exit 7"#
         assert_eq!(adapter.retained_pin_bytes.load(Ordering::Acquire), 0);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn frozen_scrollback_pin_releases_explicitly_and_on_detach() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -20406,7 +20406,7 @@ exit 7"#
         assert!(second.pin_id > first.pin_id);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn exhausted_scrollback_pin_ids_preserve_existing_capture() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -20439,7 +20439,7 @@ exit 7"#
         assert!(ack.released);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn replacing_scrollback_pin_rejects_stale_and_cross_client_release() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -20481,7 +20481,7 @@ exit 7"#
         assert!(ack.released);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn frozen_scrollback_pins_are_removed_with_panes_and_sessions() {
         let session_id = SessionId(crate::ids::new_uuid());
         let client_id = ClientId(crate::ids::new_uuid());
@@ -20532,7 +20532,7 @@ exit 7"#
         assert!(!manager.runtimes.contains_key(&session_id));
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn alternate_resize_guard_is_atomic_and_preserves_last_writer_policy() {
         let pane = dummy_pane(crate::ids::new_uuid());
         let pty = bmux_pty::PtyPair::open(PtySize { rows: 1, cols: 1 }).unwrap();
@@ -20567,7 +20567,7 @@ exit 7"#
         assert_eq!(*pane.last_requested_size.lock().unwrap(), (4, 9));
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn uncaptured_alternate_resize_acknowledges_master_without_queueing() {
         let mut pane = dummy_pane(crate::ids::new_uuid());
         let (input, mut queued) = mpsc::unbounded_channel();
@@ -20620,7 +20620,7 @@ exit 7"#
         assert_eq!((actual.rows, actual.cols), (7, 19));
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn uncaptured_alternate_resize_never_acknowledges_missing_master() {
         let pane = dummy_pane(crate::ids::new_uuid());
         pane.terminal_grid.lock().unwrap().process(b"\x1b[?1049h");
@@ -20639,7 +20639,7 @@ exit 7"#
         }
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn alternate_resize_commits_geometry_in_ordered_capture() {
         let pane = dummy_pane(crate::ids::new_uuid());
         let pty = bmux_pty::PtyPair::open(PtySize { rows: 1, cols: 1 }).unwrap();
@@ -20689,7 +20689,7 @@ exit 7"#
         owner.take().join().unwrap();
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn rejected_alternate_resize_does_not_publish_reserved_capture_event() {
         let pane = dummy_pane(crate::ids::new_uuid());
         let root = tempfile::tempdir().unwrap();
@@ -20712,7 +20712,7 @@ exit 7"#
         owner.take().join().unwrap();
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn resize_waits_for_output_geometry_guard() {
         let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
@@ -20745,7 +20745,7 @@ exit 7"#
     }
 
     #[cfg(feature = "image-registry")]
-    #[tokio::test]
+    #[switchy_async::test]
     async fn resize_waits_for_image_capture_guard() {
         let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
@@ -20774,7 +20774,7 @@ exit 7"#
         assert_eq!(*pane.last_requested_size.lock().unwrap(), (4, 20));
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn resize_preserves_partial_cursor_escape_state() {
         for prefix in [
             b"\x1b".as_slice(),
@@ -20797,7 +20797,7 @@ exit 7"#
     }
 
     #[cfg(feature = "image-registry")]
-    #[tokio::test]
+    #[switchy_async::test]
     async fn height_growth_preserves_retained_image_anchor() {
         let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
@@ -20828,7 +20828,7 @@ exit 7"#
     }
 
     #[cfg(feature = "image-registry")]
-    #[tokio::test]
+    #[switchy_async::test]
     async fn failed_image_height_growth_preserves_both_grids() {
         let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
@@ -20863,7 +20863,7 @@ exit 7"#
     }
 
     #[cfg(feature = "image-registry")]
-    #[tokio::test]
+    #[switchy_async::test]
     async fn height_shrink_moves_image_into_history() {
         let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
@@ -20888,7 +20888,7 @@ exit 7"#
     }
 
     #[cfg(feature = "image-registry")]
-    #[tokio::test]
+    #[switchy_async::test]
     async fn height_shrink_evicts_images_with_text_history() {
         let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
@@ -20928,7 +20928,7 @@ exit 7"#
     }
 
     #[cfg(feature = "image-registry")]
-    #[tokio::test]
+    #[switchy_async::test]
     async fn width_resize_restores_image_from_pending_wrapped_line() {
         let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
@@ -20962,7 +20962,7 @@ exit 7"#
     }
 
     #[cfg(feature = "image-registry")]
-    #[tokio::test]
+    #[switchy_async::test]
     async fn width_resize_remaps_hidden_history_without_exposing_images() {
         let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
@@ -21000,7 +21000,7 @@ exit 7"#
     }
 
     #[cfg(feature = "image-registry")]
-    #[tokio::test]
+    #[switchy_async::test]
     async fn height_resize_restores_image_from_pending_wrapped_line() {
         let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
@@ -21034,7 +21034,7 @@ exit 7"#
     }
 
     #[cfg(feature = "image-registry")]
-    #[tokio::test]
+    #[switchy_async::test]
     async fn text_only_resize_does_not_require_image_capture_budget() {
         let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
@@ -21056,7 +21056,7 @@ exit 7"#
     }
 
     #[cfg(feature = "image-registry")]
-    #[tokio::test]
+    #[switchy_async::test]
     async fn height_resize_remaps_hidden_main_images_only() {
         let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
@@ -21100,7 +21100,7 @@ exit 7"#
     }
 
     #[cfg(feature = "image-registry")]
-    #[tokio::test]
+    #[switchy_async::test]
     async fn alternate_only_images_reproject_on_height_resize() {
         let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
@@ -21127,7 +21127,7 @@ exit 7"#
     }
 
     #[cfg(feature = "image-registry")]
-    #[tokio::test]
+    #[switchy_async::test]
     async fn blank_cell_width_resize_tracks_cursor_without_creating_text() {
         let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
@@ -21156,7 +21156,7 @@ exit 7"#
         assert_eq!(usize::from(images.images()[0].position.col), cursor.col);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn rejected_resize_preserves_published_geometry() {
         let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
@@ -21174,7 +21174,7 @@ exit 7"#
         }
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn attach_scene_projects_client_and_server_global_floating_panes() {
         let attach_session_id = SessionId(crate::ids::new_uuid());
         let other_session_id = SessionId(crate::ids::new_uuid());
@@ -21239,7 +21239,7 @@ exit 7"#
         assert!(!visible_panes.contains(&other_client_pane_id));
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn per_window_and_per_pane_scopes_stay_in_owner_session() {
         let attach_session_id = SessionId(crate::ids::new_uuid());
         let other_session_id = SessionId(crate::ids::new_uuid());
@@ -21290,7 +21290,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn closing_last_tiled_pane_leaves_unanchored_floating_pane_visible() {
         let session_id = SessionId(crate::ids::new_uuid());
         let tiled_pane_id = crate::ids::new_uuid();
@@ -21335,7 +21335,7 @@ exit 7"#
         assert_eq!(runtime.floating_surfaces.len(), 1);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn exiting_focused_floating_pane_restores_live_focus() {
         let session_id = SessionId(crate::ids::new_uuid());
         let tiled_pane_id = crate::ids::new_uuid();
@@ -21387,7 +21387,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn closing_final_floating_pane_requires_explicit_session_action() {
         let session_id = SessionId(crate::ids::new_uuid());
         let floating_pane_id = crate::ids::new_uuid();
@@ -22368,7 +22368,7 @@ exit 7"#
         ));
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn unpublished_cleanup_waits_for_task_and_reports_panics() {
         let mut pane = dummy_pane(crate::ids::new_uuid());
         stop_unpublished_pane(&mut pane).await.unwrap();
@@ -22382,7 +22382,7 @@ exit 7"#
         assert!(error.to_string().contains("task cleanup failed"));
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn split_commit_rejects_replaced_target_before_publication() {
         let session_id = SessionId(crate::ids::new_uuid());
         let target = crate::ids::new_uuid();
@@ -22412,7 +22412,7 @@ exit 7"#
         assert!(manager.pane_input_index.read().unwrap().is_empty());
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn split_commit_rejects_exited_target_without_publishing_new_pane() {
         let session_id = SessionId(crate::ids::new_uuid());
         let target = crate::ids::new_uuid();
@@ -22455,7 +22455,7 @@ exit 7"#
         let contender = Arc::clone(manager);
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let competing = Arc::clone(&barrier);
-        let runtime = tokio::runtime::Handle::current();
+        let runtime = switchy_async::runtime::Handle::current();
         let thread = {
             let guard = manager.lock().unwrap();
             let thread = switchy_thread::thread::spawn(move || {
@@ -22477,7 +22477,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[switchy_async::test(flavor = "multi_thread", worker_threads = 2)]
     async fn managed_idle_fence_serializes_real_prepare_attach_and_restore() {
         const CHILD: &str = "BMUX_TEST_MANAGED_IDLE_AUTHORITY_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -22591,7 +22591,7 @@ exit 7"#
         assert!(publication.wait());
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn failed_startup_watch_prevents_readiness() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let pane_id = crate::ids::new_uuid();
@@ -22610,7 +22610,7 @@ exit 7"#
         drop(prepared);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn readiness_wait_retains_ownership_until_commit() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
@@ -22686,7 +22686,7 @@ exit 7"#
         }
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn failed_child_cleanup_retains_owner_until_observed_exit() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
@@ -22738,7 +22738,7 @@ exit 7"#
         assert!(startup_stop_requested(&mut receiver));
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn prepared_cleanup_reservation_bounds_admission_and_releases_on_drop() {
         let host = PaneRuntimeHost::detached();
         let slots = Arc::new(tokio::sync::Semaphore::new(1));
@@ -22752,7 +22752,7 @@ exit 7"#
         assert!(PreparedCleanup::reserve_from(&host, slots).is_ok());
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn dropped_prepared_runtime_retains_cleanup_acknowledgement() {
         let existing = SessionId(crate::ids::new_uuid());
         let manager = manager_with_runtime(existing, runtime_with_panes(&[crate::ids::new_uuid()]));
@@ -22783,7 +22783,7 @@ exit 7"#
         .expect("cleanup must complete after request owner is dropped");
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn commit_rejects_unready_runtime_without_publication() {
         let existing = SessionId(crate::ids::new_uuid());
         let pane_id = crate::ids::new_uuid();
@@ -22811,7 +22811,7 @@ exit 7"#
         assert!(manager.pane_input_index.read().unwrap().is_empty());
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn prepared_runtime_rejects_lost_launch_receiver() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let pane_id = crate::ids::new_uuid();
@@ -22837,7 +22837,7 @@ exit 7"#
         .unwrap();
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn abandoned_prepared_runtime_stops_all_owned_tasks() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let first = crate::ids::new_uuid();
@@ -22863,7 +22863,7 @@ exit 7"#
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[switchy_async::test]
     async fn abandoning_preparation_never_launches_shell() {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
@@ -22902,7 +22902,7 @@ exit 7"#
         );
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn preparing_fresh_runtime_does_not_register_input_or_manager_state() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
@@ -22931,7 +22931,7 @@ exit 7"#
         .await;
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn invalid_initial_directory_does_not_mutate_runtime() {
         use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions;
         let session_id = SessionId(crate::ids::new_uuid());
@@ -22980,7 +22980,7 @@ exit 7"#
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[switchy_async::test]
     async fn fresh_shell_options_reach_pty_without_resurrection_metadata() {
         use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions;
         let host = crate::runtime::PaneRuntimeHost::detached();
@@ -23043,7 +23043,7 @@ exit 7"#
     }
 
     #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[switchy_async::test(flavor = "multi_thread", worker_threads = 2)]
     async fn fresh_split_workflow_checks_authority_again_and_starts_in_requested_directory() {
         use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::{
             InitialShellOptions, SpawnError,
@@ -23116,7 +23116,7 @@ exit 7"#
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[switchy_async::test]
     async fn fresh_session_roster_failure_never_publishes_runtime() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -23184,7 +23184,7 @@ exit 7"#
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[switchy_async::test]
     async fn fresh_session_options_reach_shell_and_recheck_authority() {
         use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions;
         let host = crate::runtime::PaneRuntimeHost::detached();
@@ -23260,7 +23260,7 @@ exit 7"#
         Ok(std::path::PathBuf::from(result.trim()))
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn restored_shell_metadata_is_healed_before_padding_rule_initial_size() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
@@ -23318,7 +23318,7 @@ exit 7"#
         shutdown_runtime_handle(host, removed).await;
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn restored_override_sets_initial_pty_size_before_runtime_is_available() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
@@ -23373,7 +23373,7 @@ exit 7"#
         shutdown_runtime_handle(host, removed).await;
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn multi_session_restore_heals_stale_shells_in_persistence_snapshot() {
         let configured_shell = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
         let stale_shell = if cfg!(windows) {

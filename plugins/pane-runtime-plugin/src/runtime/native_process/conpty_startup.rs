@@ -217,7 +217,7 @@ mod tests {
         assert_eq!(projected, b"program-started\r\n\x1b[6n");
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[switchy_async::test(flavor = "current_thread")]
     async fn retired_console_closes_while_independent_output_reader_drains() {
         struct Console {
             close_started: mpsc::SyncSender<()>,

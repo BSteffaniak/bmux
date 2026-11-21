@@ -1670,7 +1670,7 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn execution_keeps_live_drain_and_committed_capture_distinct() {
         let root = tempfile::tempdir().unwrap();
         let capture = super::super::durable_capture::DurableCapture::create(root.path()).unwrap();
@@ -1699,7 +1699,7 @@ mod tests {
         owner.take().join().unwrap();
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn execution_capture_failure_never_acknowledges_clean_completion() {
         let root = tempfile::tempdir().unwrap();
         let capture = super::super::durable_capture::DurableCapture::create(root.path()).unwrap();
@@ -1813,7 +1813,7 @@ mod tests {
         assert!(super::validate_presentation_wait(None, 1000, 4 * 1024 * 1024 + 1).is_err());
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn canceled_wait_does_not_consume_token_or_notification() {
         let capture = super::ExecutionCapture::default();
         let mut changes = capture.subscribe();
@@ -1966,7 +1966,7 @@ mod tests {
         assert!(!b.join().unwrap().unwrap());
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn retained_event_before_subscription_is_visible_without_pending_wake() {
         let capture = super::ExecutionCapture::default();
         capture.record_error("retained failure".into());
@@ -1979,7 +1979,7 @@ mod tests {
         // Initial inspection, not a synthetic event, establishes readiness.
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn simultaneous_waiters_observe_event_before_first_wait() {
         let capture = super::ExecutionCapture::default();
         let mut first = capture.subscribe();
@@ -1992,7 +1992,7 @@ mod tests {
         assert!(!second.has_changed().unwrap());
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn idle_capture_has_only_one_deadline_and_no_lifecycle_wake() {
         let capture = super::ExecutionCapture::default();
         let mut changes = capture.subscribe();
@@ -2007,7 +2007,7 @@ mod tests {
         assert!(capture.outcome.lock().unwrap().0.is_none());
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn errors_eof_and_cleanup_are_independent_acknowledgements() {
         let capture = super::ExecutionCapture::default();
         let mut changes = capture.subscribe();
@@ -2031,23 +2031,24 @@ mod tests {
         );
     }
 
-    /// The switchy handle of a tokio runtime.
-    fn owner_handle(owner: &tokio::runtime::Runtime) -> switchy_async::runtime::Handle {
-        owner.block_on(async { switchy_async::runtime::Handle::current() })
+    /// A multi-thread runtime, as the server's, and a current-thread one, as a caller's.
+    fn runtimes() -> (
+        switchy_async::runtime::Runtime,
+        switchy_async::runtime::Runtime,
+    ) {
+        let mut owner = switchy_async::runtime::Builder::new();
+        owner
+            .flavor(switchy_async::RuntimeFlavor::MultiThread)
+            .worker_threads(2);
+        let owner = owner.build().unwrap();
+        let caller = switchy_async::runtime::Builder::new().build().unwrap();
+        (owner, caller)
     }
 
     #[test]
     fn current_thread_control_preserves_cancellation_error() {
-        let owner = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let caller = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let handle = owner_handle(&owner);
+        let (owner, caller) = runtimes();
+        let handle = owner.handle();
         let cancelled = switchy_thread::sync::atomic::AtomicBool::new(true);
         let authorize = || {
             assert!(cancelled.load(super::Ordering::SeqCst));
@@ -2064,16 +2065,8 @@ mod tests {
 
     #[test]
     fn current_thread_caller_keeps_tasks_on_persistent_owner() {
-        let owner = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let caller = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let handle = owner_handle(&owner);
+        let (owner, caller) = runtimes();
+        let handle = owner.handle();
         let (sender, receiver) = tokio::sync::oneshot::channel();
         caller.block_on(async {
             super::drive_startup(&handle, async {

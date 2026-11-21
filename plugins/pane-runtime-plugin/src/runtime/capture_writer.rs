@@ -512,7 +512,7 @@ mod writer_tests {
         (root, writer, owner)
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn live_admission_precedes_storage_and_timestamps_are_not_writer_time() {
         let root = tempfile::tempdir().unwrap();
         let (release, blocked) = switchy_thread::sync::mpsc::channel();
@@ -552,7 +552,7 @@ mod writer_tests {
         assert_eq!(event.mono_ns, admitted_time);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn output_resize_end_are_ordered_and_eof_requires_commit() {
         let (root, writer, mut owner) = fresh();
         let first = writer
@@ -584,7 +584,7 @@ mod writer_tests {
         owner.take().join().unwrap();
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn reservations_bound_payload_and_controls_and_failure_wakes_waiter() {
         let (_root, writer, mut owner) = fresh();
         let outputs: Vec<_> = (0..OUTPUT_SLOTS)
@@ -609,7 +609,7 @@ mod writer_tests {
         owner.take().join().unwrap();
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn persistence_failure_retains_last_acknowledged_boundary() {
         let (root, writer, mut owner) = fresh();
         let first = writer
@@ -640,7 +640,7 @@ mod writer_tests {
         assert!(!DurableCapture::validate_recovery(root.path()).unwrap().eof);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn ordered_error_end_never_claims_clean_eof() {
         let (root, writer, mut owner) = fresh();
         let ticket = writer
@@ -661,7 +661,7 @@ mod writer_tests {
         owner.take().join().unwrap();
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn abandoned_owner_stops_admission_without_eof() {
         let (root, writer, owner) = fresh();
         let ticket = writer

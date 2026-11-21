@@ -56,17 +56,13 @@ switchy_simulation = { workspace = true, optional = true }
 switchy_thread = { workspace = true, features = ["std"] }
 switchy_time = { workspace = true, features = ["std"] }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = [
-    "macros",
-    "rt",
-    "rt-multi-thread",
-    "sync",
-    "time",
-] }
-toml = { workspace = true }
+# Only its runtime-free sync primitives, which run deterministically under either executor;
+# tasks, timers and tests go through switchy_async.
+tokio     = { workspace = true, features = ["sync"] }
+toml      = { workspace = true }
 toml_edit = { workspace = true }
-tracing = { workspace = true, features = ["std"] }
-uuid = { workspace = true, features = ["serde", "std"] }
+tracing   = { workspace = true, features = ["std"] }
+uuid      = { workspace = true, features = ["serde", "std"] }
 
 [dev-dependencies]
 

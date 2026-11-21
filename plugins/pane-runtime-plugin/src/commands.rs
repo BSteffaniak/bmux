@@ -1419,7 +1419,7 @@ mod tests {
         )
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn dropped_preview_guard_cancels_through_the_captured_route() {
         let (route, mut requests) = test_route();
         let token = crate::ids::new_uuid();
@@ -1436,7 +1436,7 @@ mod tests {
         assert_eq!(args.token, token);
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn disarmed_preview_guard_sends_nothing() {
         let (route, mut requests) = test_route();
         let mut guard = PreviewCancelGuard::new(route, crate::ids::new_uuid());
@@ -1446,7 +1446,7 @@ mod tests {
         assert!(requests.try_recv().is_err());
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn numeric_preview_deadline_waits_for_the_settle_window() {
         let start = switchy_async::time::Instant::now();
         let deadline = numeric_preview_deadline(start);
@@ -1528,7 +1528,7 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"second\n");
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn global_padding_install_restores_file_when_live_install_fails() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("bmux.toml");

@@ -365,7 +365,7 @@ mod tests {
         assert_eq!(reader.publication_ticket(), Some(ticket));
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn ordered_reader_publishes_exact_tail_and_durable_end_separately() {
         let root = tempfile::tempdir().unwrap();
         let capture = super::super::durable_capture::DurableCapture::create(root.path()).unwrap();
@@ -387,7 +387,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
+    #[switchy_async::test]
     async fn ordered_pty_eio_is_one_real_terminal_boundary() {
         struct ClosedPty;
         impl Read for ClosedPty {
@@ -413,7 +413,7 @@ mod tests {
         owner.take().join().unwrap();
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn cancelled_capture_owner_retains_blocked_thread_until_release() {
         let (release, blocked) = switchy_thread::sync::mpsc::channel();
         let (done, finished) = tokio::sync::oneshot::channel();
@@ -431,7 +431,7 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
+    #[switchy_async::test]
     async fn capture_cleanup_preserves_prior_failure_after_real_join() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
