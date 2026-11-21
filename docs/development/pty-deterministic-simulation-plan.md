@@ -1,8 +1,8 @@
 # Plan: deterministic simulation testing for `bmux_pty`
 
-Status: phases 0–8 and 10–14 implemented (2026-11-21); phase 9 (weak-memory
-mode) and 15 open. See "Implementation notes" for what changed from this
-design and what the simulation found.
+Status: phases 0–14 implemented (2026-11-21); phase 15 (the pane runtime and
+beyond) is a separate plan. See "Implementation notes" for what changed from
+this design and what the simulation found.
 Spans two repositories:
 
 - MoosicBox (`../MoosicBox`): new and changed `switchy_*` crates, and `simvar`
@@ -692,3 +692,12 @@ The TUI (phases 10–14), as built:
   terminal's state and recent output (escape sequences dropped). Rendering the
   screens through `bmux_terminal_grid` and `terminal_view`, and seeking
   backwards by rerunning a seed up to a decision, are not built yet.
+
+Weak memory (phase 9), as built: `SIMULATOR_WEAK_MEMORY=1` gives every
+simulated thread a vector clock and every atomic a 32-store history; a load
+returns a seeded choice among the stores the C++20 model allows, acquire loads
+of release stores join clocks, and read-modify-writes continue release
+sequences. `SeqCst`, fences and every non-atomic switch point are full fences,
+so the model never invents behaviour. Litmus tests (message passing, store
+buffering) behave as the model requires. bmux_pty passes about 3000 weak-memory
+runs; the nightly workflow runs it.

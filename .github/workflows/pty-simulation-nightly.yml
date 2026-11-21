@@ -30,6 +30,8 @@ jobs:
             env: "SIMULATOR_PTY_FAULTS=0.1"
           - name: PCT scheduling
             env: "SIMULATOR_SCHEDULE_STRATEGY=pct"
+          - name: Weak memory
+            env: "SIMULATOR_WEAK_MEMORY=1"
 
     steps:
       - uses: actions/checkout@v4
