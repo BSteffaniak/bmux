@@ -1,6 +1,8 @@
 # Plan: deterministic simulation testing for `bmux_pty`
 
-Status: proposed (2026-11-21). The decisions are settled (see "Decisions").
+Status: phases 0–8 implemented (2026-11-21); phases 9–15 open. See
+"Implementation notes" for what changed from this design and what the
+simulation found.
 Spans two repositories:
 
 - MoosicBox (`../MoosicBox`): new and changed `switchy_*` crates, and `simvar`
@@ -630,3 +632,43 @@ Settled on 2026-11-21:
    (10–14).
 7. **The generic TUI crate is `packages/simvar-tui` (`bmux_simvar_tui`)** in
    bmux's main workspace. The PTY-specific panels live in the PTY simulator.
+
+## Implementation notes
+
+What was built differs from the design above in these ways:
+
+- **`switchy_simulation`** is a new std-only crate that holds the per-run
+  context (A1), the seed and a portable PRNG (xoshiro256**) with named streams.
+  `switchy_random` keeps its `rand` API and its SmallRng seed sequence, with its
+  state in the context. `switchy_time` draws from a `switchy_simulation` stream
+  unless its new `random` feature asks for `switchy_random`; every existing
+  MoosicBox user enables `random`, and fixed-seed simvar runs are unchanged.
+- **`rand` pin:** MoosicBox accepts any `rand` 0.8.5–0.8.8, so bmux can mix the
+  published 0.5.0 switchy crates (pinned to 0.8.5) with git ones.
+- **Banning std primitives** with clippy's `disallowed_methods` does not work:
+  in native builds `switchy_thread` re-exports std, so the ban also flags the
+  correct calls. `packages/pty/tests/primitives.rs` scans the source instead,
+  exempting code marked `// native-only`.
+- **`switchy_time::Instant`** belongs to a run's context, not an OS thread, and
+  `switchy_time::simulator::set_step_multiplier` lets a simulation use 1 ms steps.
+  Without that, 10 ms polls advance the clock a whole coarse step.
+- **Oracle APIs** added to the simulated kernel while writing the invariants:
+  process serials, a run-long signal log, per-thread `last_spawned` (looking a
+  process up by id races with id reuse), and pipe histories kept after reaping.
+
+What the simulation found:
+
+- **`bmux_pty` (fixed):** `PtyControl::kill` and `interrupt` signal the process
+  group by the leader's id. The exit thread reaped the leader before marking it
+  exited, and after the exit with something still holding the terminal the
+  group was signalled anyway. Either way, a newer process that reused the id
+  could be killed. Fix: the exited leader is reported at once but reaped only
+  when the last control handle is gone (`PtyChild::wait_unreaped`), so its id
+  cannot be reused while it may be signalled. A mutation check (reintroducing
+  the bug) fails 3 of 25 simulation batches with aggressive id reuse, and
+  `packages/pty/tests/simulation.rs` reproduces it on every seed.
+- **`switchy_pty` simulator (fixed):** a simulated process killed by a signal
+  could still start children until its next kernel call, so a group kill could
+  miss them; natively fork fails once a fatal signal is pending.
+- **`switchy_thread` (fixed during phase 1):** a state initializer running under
+  the context's lock deadlocked when it read other state.
