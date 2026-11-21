@@ -23,6 +23,8 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
+pub mod telemetry;
+
 use std::{collections::BTreeSet, fmt::Write as _, io, time::Duration};
 
 use bmux_pty::{PtyCommand, PtyEvent, PtyExit, PtySize};
@@ -137,6 +139,7 @@ struct Shared {
 pub fn run_workload() -> Result<(), Vec<String>> {
     // Fine-grained time, so 10 ms polls and grace periods mean what they say.
     switchy_time::simulator::set_step_multiplier(1);
+    telemetry::watch_run();
     let config = kernel_config();
     simulator::configure(config);
     simulator::install_default_programs();
@@ -168,6 +171,7 @@ pub fn run_workload() -> Result<(), Vec<String>> {
             break;
         }
     }
+    telemetry::emit_now();
     // Signals the drivers' processes received, before the end-of-run cleanup kills the rest.
     let signal_log = simulator::signal_log();
     simulator::kill_all();

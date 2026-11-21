@@ -81,6 +81,7 @@ members = [
     "packages/sandbox-harness",
     "packages/scene-protocol",
     "packages/scene-protocol-render",
+    "packages/simvar-tui",
     "packages/slots",
     "packages/bmux-env",
     "packages/terminal_protocol",
@@ -309,6 +310,7 @@ bmux_scene_protocol_render = { version = "0.0.1-alpha.4", default-features = fal
 bmux_server = { version = "0.0.1-alpha.4", default-features = false, path = "packages/server" }
 bmux_session_models = { version = "0.0.1-alpha.4", default-features = false, path = "packages/session/models" }
 bmux_session_state = { version = "0.0.1-alpha.4", default-features = false, path = "packages/session-state" }
+bmux_simvar_tui = { version = "0.0.1-alpha.4", default-features = false, path = "packages/simvar-tui" }
 bmux_slots = { version = "0.0.1-alpha.4", default-features = false, path = "packages/slots" }
 bmux_snapshot_protocol = { version = "0.0.1-alpha.4", default-features = false, path = "packages/snapshot-protocol" }
 bmux_snapshot_runtime = { version = "0.0.1-alpha.4", default-features = false, path = "packages/snapshot-runtime" }
@@ -405,6 +407,7 @@ switchy = { version = "0.5.0", package = "switchy", default-features = false }
 
 moosicbox_log_runtime = { version = "0.5.0", package = "moosicbox_log_runtime", default-features = false }
 moosicbox_log_watch   = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
+simvar_observer       = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
 switchy_pty           = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
 switchy_simulation    = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
 switchy_thread        = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }

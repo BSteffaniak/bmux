@@ -7,7 +7,9 @@
 #   scripts/sim-pty.sh --replay 42           replay exactly one run, single-threaded, with logs
 #   scripts/sim-pty.sh --regression          every seed in packages/pty/simulator/regression-seeds
 #   scripts/sim-pty.sh --verify-determinism  replay every run and fail if it differs
-#   scripts/sim-pty.sh --tui                 show simvar's progress display
+#   scripts/sim-pty.sh --tui                 watch runs in a dashboard (bmux_simvar_tui):
+#                                            runs, scheduler, processes and terminals;
+#                                            space pauses at a decision, n/N step
 #
 # Other SIMULATOR_* variables (SIMULATOR_SCHEDULE_STRATEGY, SIMULATOR_PTY_PERSONALITY,
 # SIMULATOR_PTY_FAULTS, SIMULATOR_PTY_PID_REUSE, ...) pass through.
@@ -19,6 +21,7 @@ simulator="$root/packages/pty/simulator"
 export SIMULATOR_RUNS="${SIMULATOR_RUNS:-100}"
 export NO_TUI="${NO_TUI:-1}"
 regression=0
+tui=
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -31,7 +34,7 @@ while [ $# -gt 0 ]; do
         ;;
     --verify-determinism) export SIMULATOR_VERIFY_DETERMINISM=1; shift ;;
     --regression) regression=1; shift ;;
-    --tui) unset NO_TUI; shift ;;
+    --tui) tui=--tui; shift ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
 done
@@ -54,4 +57,4 @@ if [ "$regression" = 1 ]; then
     exit "$failed"
 fi
 
-exec "$binary"
+exec "$binary" $tui

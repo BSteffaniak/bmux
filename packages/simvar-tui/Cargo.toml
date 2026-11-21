@@ -1,0 +1,28 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools::testing", "simulation"]
+description = "A terminal interface for watching and replaying simvar simulations, on bmux's TUI stack"
+edition     = { workspace = true }
+keywords    = ["bmux", "deterministic", "simulation", "tui"]
+license     = { workspace = true }
+name        = "bmux_simvar_tui"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_keyboard    = { workspace = true }
+bmux_tui         = { workspace = true, features = ["terminal-io"] }
+bmux_tui_runtime = { workspace = true }
+futures-util     = { workspace = true }
+simvar_observer  = { workspace = true }
+
+[features]
+default = []
+
+fail-on-warnings = [
+    "bmux_keyboard/fail-on-warnings",
+    "bmux_tui/fail-on-warnings",
+    "bmux_tui_runtime/fail-on-warnings",
+    "simvar_observer/fail-on-warnings",
+]

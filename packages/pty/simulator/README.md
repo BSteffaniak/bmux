@@ -32,6 +32,7 @@ scripts/sim-pty.sh --runs 2000           # more
 scripts/sim-pty.sh --replay SEED         # replay one run, with logs
 scripts/sim-pty.sh --regression          # the seeds in regression-seeds
 scripts/sim-pty.sh --verify-determinism  # replay every run and compare traces
+scripts/sim-pty.sh --replay SEED --tui   # watch one run; space pauses, n/N step
 SIMULATOR_PTY_PID_REUSE=1 scripts/sim-pty.sh   # reuse every freed process id
 SIMULATOR_PTY_FAULTS=0.1 scripts/sim-pty.sh    # more injected faults
 ```

@@ -1,8 +1,8 @@
 # Plan: deterministic simulation testing for `bmux_pty`
 
-Status: phases 0–8 implemented (2026-11-21); phases 9–15 open. See
-"Implementation notes" for what changed from this design and what the
-simulation found.
+Status: phases 0–8 and 10–14 implemented (2026-11-21); phase 9 (weak-memory
+mode) and 15 open. See "Implementation notes" for what changed from this
+design and what the simulation found.
 Spans two repositories:
 
 - MoosicBox (`../MoosicBox`): new and changed `switchy_*` crates, and `simvar`
@@ -672,3 +672,23 @@ What the simulation found:
   miss them; natively fork fails once a fatal signal is pending.
 - **`switchy_thread` (fixed during phase 1):** a state initializer running under
   the context's lock deadlocked when it read other state.
+
+The TUI (phases 10–14), as built:
+
+- **`simvar_observer`** (std-only) carries run events, typed telemetry, neutral
+  scheduler views and a `ReplayControl`; simvar sends events to observers from
+  `add_observer`, `simvar::emit` sends telemetry from any thread of a run, and
+  `simvar::set_quiet` keeps run reports off stdout. simvar's ratatui display
+  keeps its internal path rather than becoming an observer.
+- **`switchy_thread` decision hook:** called at each decision with a lazy
+  scheduler snapshot while the scheduler is locked, so a paused observer
+  freezes the run in real time only. A test checks an observed run matches an
+  unobserved one.
+- **`bmux_simvar_tui`** (main workspace, no simvar or switchy dependency): Runs
+  (seeds, progress, results, failure reports with replay commands), Scheduler
+  (threads, states, recent decisions, trace hash) and simulation panels; space
+  pauses and resumes at decisions, `n`/`N` step one or a hundred.
+- **The bmux_pty simulator's panel** shows the kernel's processes and each
+  terminal's state and recent output (escape sequences dropped). Rendering the
+  screens through `bmux_terminal_grid` and `terminal_view`, and seeking
+  backwards by rerunning a seed up to a decision, are not built yet.
