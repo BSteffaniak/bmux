@@ -224,6 +224,145 @@ pub fn verify_owned_append_response(
     verify_node_signature(&peer.to_string(), &payload, &response.signature)
 }
 
+/// Canonical append-only V2 request signature input. V1 signatures are not reusable.
+/// # Errors
+/// Rejects the same malformed or oversized request fields as V1.
+pub fn owned_append_v2_signing_payload(
+    request: &bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
+) -> Result<Vec<u8>, String> {
+    // Reuse representation validation, never the V1 signature domain.
+    if request.proof.signature.len() > 64 {
+        return Err("invalid append V2 request signature length".into());
+    }
+    let _ = owned_append_signing_payload(request)?;
+    let mut unsigned = request.clone();
+    unsigned.proof.signature.clear();
+    let mut signed = b"bmux.cluster.consensus-append.v2\0request\0".to_vec();
+    signed.extend(encode_service_message(&unsigned).map_err(|error| error.to_string())?);
+    Ok(signed)
+}
+
+/// Bind the receiver's current durable term and outcome to the exact signed V2 request.
+///
+/// The executor must authenticate/admit the request and supply durable state before
+/// signing; this helper neither reads state nor authorizes a response.
+/// # Errors
+/// Rejects mismatched bindings and impossible stale-term/progress combinations.
+pub fn owned_append_v2_response_signing_payload(
+    request: &bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
+    response: &bmux_cluster_plugin_api::cluster_consensus_rpc_v2_types::AppendResponse,
+) -> Result<Vec<u8>, String> {
+    use bmux_cluster_plugin_api::cluster_consensus_rpc_v2_types::AppendOutcome;
+    let request_bytes = owned_append_v2_signing_payload(request)?;
+    // Bind the reply origin and correlation identity to the issued request.
+    if (&response.source, response.request_id) != (&request.recipient, request.request_id)
+        || response.signature.len() > 64
+        || request.proof.signature.len() != 64
+    {
+        return Err("append V2 response binding mismatch".into());
+    }
+    match &response.outcome {
+        AppendOutcome::StaleTerm if response.term <= request.term => {
+            return Err("append V2 stale rejection requires a higher term".into());
+        }
+        AppendOutcome::Accepted { value } => {
+            if response.term != request.term {
+                return Err("append V2 progress requires the request term".into());
+            }
+            // Apply existing outcome/reference validation without signing V1 bytes.
+            let _ = owned_append_response_signing_payload(
+                request,
+                &bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendResponse {
+                    request_id: response.request_id,
+                    source: response.source.clone(),
+                    term: response.term,
+                    outcome: value.clone(),
+                    signature: Vec::new(),
+                },
+            )?;
+        }
+        AppendOutcome::StaleTerm => {}
+    }
+    let mut unsigned = response.clone();
+    unsigned.signature.clear();
+    let mut signed = b"bmux.cluster.consensus-append.v2\0response\0".to_vec();
+    signed.extend(
+        encode_service_message(&(request_bytes, &request.proof.signature, unsigned))
+            .map_err(|error| error.to_string())?,
+    );
+    Ok(signed)
+}
+
+/// Verify against the exact locally retained issued V2 request before observing term.
+///
+/// This proves request-bound origin only, not current peer eligibility, leadership,
+/// durable local term settlement, or quorum progress. Those belong to the executor.
+/// Bare RPC errors are deliberately not accepted as term evidence.
+/// # Errors
+/// Rejects untrusted, malformed, cross-version or incorrectly bound responses.
+pub fn verify_owned_append_v2_response(
+    request: &bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
+    response: &bmux_cluster_plugin_api::cluster_consensus_rpc_v2_types::AppendResponse,
+) -> Result<(), String> {
+    if response.signature.len() != 64 || request.proof.signature.len() != 64 {
+        return Err("invalid append V2 signature length".into());
+    }
+    let payload = owned_append_v2_response_signing_payload(request, response)?;
+    let peer = transfer_node(&request.recipient)?;
+    verify_node_signature(&peer.to_string(), &payload, &response.signature)
+}
+
+/// Explicit append V2 selection in addition to the unchanged owned V1 bundle.
+///
+/// Call only with an authoritatively authenticated negotiated member record.
+/// False means incompatible for V2, never permission to retry the request as V1.
+#[must_use]
+pub fn supports_owned_append_v2(
+    member: &bmux_cluster_plugin_api::cluster_types::ClusterMember,
+) -> bool {
+    supports_owned_consensus(member)
+        && member.negotiated_protocol.features.iter().any(|feature| {
+            feature == bmux_cluster_plugin_api::cluster_consensus_rpc_v2::INTERFACE_ID.as_str()
+        })
+}
+
+/// Authenticate V2 append using members supplied by the serialized lifecycle owner.
+/// Eligibility, term decisions and durable mutation still belong to that owner.
+/// # Errors
+/// Rejects missing explicit V2 selection, invalid signatures and revoked/replayed proofs.
+pub fn authenticate_owned_append_v2(
+    caller: &impl crate::ClusterRuntimeOps,
+    local: NodeId,
+    members: &[bmux_cluster_plugin_api::cluster_types::ClusterMember],
+    request: &bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
+) -> Result<NodeId, String> {
+    let signed = owned_append_v2_signing_payload(request)?;
+    let source = request.proof.peer.claimant_node_id.parse::<NodeId>()?;
+    if !members
+        .iter()
+        .any(|member| member.node_id == source.to_string() && supports_owned_append_v2(member))
+    {
+        return Err("peer has not negotiated owned append V2".into());
+    }
+    if request.recipient.as_slice() != local.as_bytes()
+        || request.sender.as_slice() != source.as_bytes()
+        || request.cluster_id != request.proof.peer.challenge.cluster_id
+        || request.proof.credential_serial != request.proof.peer.claimant_credential_serial
+        || request.proof.signature.len() != 64
+    {
+        return Err("invalid append V2 identity or proof binding".into());
+    }
+    verify_node_signature(&source.to_string(), &signed, &request.proof.signature)?;
+    crate::membership::authenticate_peer_for_members(
+        caller,
+        &crate::ClusterPeerAuthenticateRequest {
+            proof: request.proof.peer.clone(),
+        },
+        members,
+    )?;
+    Ok(source)
+}
+
 /// Whether a durable member has negotiated both halves of the owned protocol.
 /// Capability advertisement alone is not admission to this engine.
 pub(crate) fn supports_owned_consensus(
@@ -2222,6 +2361,29 @@ impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static> OwnedAppendService<C> 
         .map_err(Box::new)
     }
 
+    /// Register append V2 separately against the lifecycle-owned executor.
+    ///
+    /// This neither changes V1 registration nor advertises negotiation support.
+    /// The executor owns authentication, durable decisions and response signing.
+    /// # Errors
+    /// Returns generated descriptor registration failures.
+    pub fn register_append_v2(
+        registry: &mut bmux_plugin_sdk::TypedServiceRegistry,
+        caller: Arc<C>,
+        local: NodeId,
+        executor: Arc<crate::owned_vote_store::VoteExecutor>,
+    ) -> Result<(), Box<bmux_plugin_sdk::PluginError>> {
+        bmux_cluster_plugin_api::cluster_consensus_rpc_v2::register_provider(
+            registry,
+            Arc::new(Self {
+                caller,
+                local,
+                executor,
+            }),
+        )
+        .map_err(Box::new)
+    }
+
     /// Register generated dispatch against an executor supplied by its lifecycle owner.
     ///
     /// This neither opens storage nor advertises negotiation support. The owner
@@ -2243,6 +2405,48 @@ impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static> OwnedAppendService<C> 
             }),
         )
         .map_err(Box::new)
+    }
+}
+
+impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static>
+    bmux_cluster_plugin_api::cluster_consensus_rpc_v2::ClusterConsensusRpcService
+    for OwnedAppendService<C>
+{
+    fn append<'a>(
+        &'a self,
+        request: bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
+    ) -> std::pin::Pin<
+        Box<
+            dyn Future<
+                    Output = Result<
+                        bmux_cluster_plugin_api::cluster_consensus_rpc_v2_types::AppendResponse,
+                        bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError,
+                    >,
+                > + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async move {
+            use crate::owned_vote_store::AuthenticatedAppendError;
+            use bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError;
+            // The same serialized owner authenticates, settles durable term/log
+            // state and signs every successful response, including stale rejection.
+            // Never synthesize term evidence from an error in this adapter.
+            self.executor
+                .append_v2_authenticated(self.caller.clone(), self.local, request)
+                .await
+                .map_err(|error| match error {
+                    AuthenticatedAppendError::Unauthorized => RpcError::Unauthorized,
+                    AuthenticatedAppendError::Invalid(_) => RpcError::InvalidRequest,
+                    AuthenticatedAppendError::Storage(_) => RpcError::StorageFailure,
+                    AuthenticatedAppendError::Executor(
+                        crate::consensus_model::VoteGateError::Stopped,
+                    ) => RpcError::Stopped,
+                    AuthenticatedAppendError::TermMismatch => RpcError::StaleTerm,
+                    AuthenticatedAppendError::MissingTransfer { .. }
+                    | AuthenticatedAppendError::Executor(_) => RpcError::ExecutionFailed,
+                })
+        })
     }
 }
 

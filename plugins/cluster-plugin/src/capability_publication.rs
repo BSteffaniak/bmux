@@ -69,31 +69,7 @@ pub fn verify_report(
 pub(crate) fn owned_publication_membership(
     membership: &StoredMembership<NodeId, BasicNode>,
 ) -> Result<crate::consensus_model::StoredMembership, String> {
-    let position = membership
-        .log_id()
-        .as_ref()
-        .ok_or("missing committed membership")?;
-    Ok(crate::consensus_model::StoredMembership {
-        introduced_at: Some(crate::consensus_model::LogIdentity {
-            term: crate::consensus_model::Term(position.leader_id.term),
-            leader: position.leader_id.node_id,
-            index: crate::consensus_model::LogIndex(position.index),
-        }),
-        membership: crate::consensus_model::Membership::new(
-            membership
-                .membership()
-                .get_joint_config()
-                .iter()
-                .map(|voters| voters.iter().copied().collect())
-                .collect(),
-            membership
-                .membership()
-                .nodes()
-                .map(|(id, node)| (*id, node.addr.clone()))
-                .collect(),
-        )
-        .map_err(|error| format!("invalid committed membership: {error:?}"))?,
-    })
+    crate::consensus_membership::owned_committed_membership(membership)
 }
 
 /// Verify report authority against owned committed membership without consulting

@@ -61,6 +61,95 @@ pub fn request_fingerprint(command: &ControlCommand) -> [u8; 32] {
     Sha256::digest(writer.bytes).into()
 }
 
+/// Private inventory of canonical application payloads understood by owned apply.
+/// Protocol membership entries and leader no-ops are deliberately not commands.
+/// Decoding is representation validation, never caller authorization or proof of
+/// peer decoder support. Keep each family's existing durable encoding intact.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OwnedApplicationCommand {
+    Control(Box<ControlCommand>),
+    FeatureActivation(FeatureActivationCommand),
+    Bootstrap(Box<crate::principal_bootstrap::BootstrapCommand>),
+    ProtocolRefresh(Box<ProtocolRefreshCommand>),
+    Publication(crate::capability_publication::PublicationCommand),
+}
+
+impl OwnedApplicationCommand {
+    /// The caller selects a negotiated aggregate limit for new admission.
+    /// Replay uses no new aggregate policy: historical per-family bounds remain.
+    pub(crate) fn decode(bytes: &[u8], limit: usize) -> Result<Self, String> {
+        if bytes.len() > limit {
+            return Err("application command exceeds selected aggregate limit".into());
+        }
+        let command = if bytes.starts_with(CODEC_MAGIC) {
+            Self::Control(Box::new(
+                decode_control_command(bytes).map_err(|error| error.to_string())?,
+            ))
+        } else if is_feature_activation(bytes) {
+            Self::FeatureActivation(
+                decode_feature_activation(bytes).map_err(|error| error.to_string())?,
+            )
+        } else if crate::principal_bootstrap::is_bootstrap_command(bytes) {
+            Self::Bootstrap(Box::new(
+                crate::principal_bootstrap::BootstrapCommand::decode(bytes)?,
+            ))
+        } else if is_protocol_refresh(bytes) {
+            Self::ProtocolRefresh(Box::new(
+                ProtocolRefreshCommand::decode(bytes).map_err(|error| error.to_string())?,
+            ))
+        } else if bytes.starts_with(b"BMCAP001") {
+            Self::Publication(crate::capability_publication::PublicationCommand::decode(
+                bytes,
+            )?)
+        } else {
+            return Err("unknown owned application command representation".into());
+        };
+        if command.encode(limit)? != bytes {
+            return Err("noncanonical owned application command".into());
+        }
+        Ok(command)
+    }
+
+    pub(crate) fn encode(&self, limit: usize) -> Result<Vec<u8>, String> {
+        let bytes = match self {
+            Self::Control(command) => {
+                if command.schema_version != CONTROL_SCHEMA_VERSION {
+                    return Err(CodecError::UnsupportedSchema(command.schema_version).to_string());
+                }
+                control_command_encoded_len(command, limit).map_err(|error| error.to_string())?;
+                encode_control_command(command)
+            }
+            Self::FeatureActivation(command) => {
+                // Validate before invoking the infallible legacy encoder.
+                validate_string(&command.principal_id).map_err(|error| error.to_string())?;
+                validate_string(&command.feature).map_err(|error| error.to_string())?;
+                encode_feature_activation(command)
+            }
+            Self::Bootstrap(command) => {
+                let bytes = command.encode()?;
+                if bytes.len() > 32_768 {
+                    return Err("bootstrap command exceeds limit".into());
+                }
+                bytes
+            }
+            Self::ProtocolRefresh(command) => {
+                command.encode().map_err(|error| error.to_string())?
+            }
+            Self::Publication(command) => {
+                let bytes = command.encode()?;
+                if bytes.len() > 3 * 1024 * 1024 {
+                    return Err("publication command exceeds limit".into());
+                }
+                bytes
+            }
+        };
+        if bytes.len() > limit {
+            return Err("application command exceeds selected aggregate limit".into());
+        }
+        Ok(bytes)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtocolRefreshCommand {
     pub command_id: uuid::Uuid,
@@ -1435,6 +1524,246 @@ mod tests {
         }
     }
 
+    fn application_commands() -> Vec<OwnedApplicationCommand> {
+        use crate::capability_publication::PublicationCommand;
+        use crate::principal_bootstrap::BootstrapCommand;
+        use bmux_cluster_plugin_api::cluster_capability_types::CapabilityReport;
+        use bmux_cluster_plugin_api::cluster_principal_bootstrap_types::{
+            BootstrapProof, BootstrapStatement,
+        };
+        let identity = crate::membership::NodeIdentity::new_for_test(93);
+        let node = identity.node_id().to_string();
+        let cluster = "cluster:00000000-0000-0000-0000-000000000093";
+        let member = crate::membership::issue_test_member(
+            &identity,
+            cluster.parse().unwrap(),
+            &identity,
+            "tls://127.0.0.1:49993",
+            crate::membership::initializer_capabilities(),
+            42,
+        );
+        vec![
+            OwnedApplicationCommand::Control(Box::new(command(
+                ControlCommandRequest::CreateWorkspace {
+                    workspace_id: WorkspaceId { value: id(2) },
+                    name: Some("owned".into()),
+                },
+            ))),
+            OwnedApplicationCommand::FeatureActivation(FeatureActivationCommand {
+                principal_id: "principal:test".into(),
+                command_id: CommandId { value: id(3) },
+                issued_at_unix_ms: 42,
+                expected_control_revision: 0,
+                read_schema_floor: 3,
+                write_schema_floor: 3,
+                feature: "principal-bootstrap-v1".into(),
+            }),
+            OwnedApplicationCommand::Bootstrap(Box::new(BootstrapCommand {
+                proof: BootstrapProof {
+                    statement: BootstrapStatement {
+                        schema_version: 1,
+                        cluster_id: cluster.into(),
+                        membership_term: 1,
+                        membership_leader_id: node.clone(),
+                        membership_log_index: 2,
+                        principal_id: id(4),
+                        principal_public_key: identity.public_key().to_string(),
+                        command_id: CommandId { value: id(5) },
+                    },
+                    principal_signature: vec![0; 64],
+                    voter_approvals: Vec::new(),
+                },
+                expected_control_revision: 0,
+                verified_at_unix_ms: 42,
+            })),
+            OwnedApplicationCommand::ProtocolRefresh(Box::new(ProtocolRefreshCommand {
+                command_id: id(6),
+                expected_serial: member.credential_serial.clone(),
+                expected_revision: 0,
+                replacement: member,
+                node_signature: vec![0; 64],
+                verified_at_unix_ms: 42,
+            })),
+            OwnedApplicationCommand::Publication(PublicationCommand {
+                reports: vec![CapabilityReport {
+                    report_version: 1,
+                    cluster_id: cluster.into(),
+                    node_id: node.clone(),
+                    credential_serial: "serial".into(),
+                    membership_term: 1,
+                    membership_leader_id: node,
+                    membership_log_index: 2,
+                    expected_report_revision: 0,
+                    command_id: CommandId { value: id(7) },
+                    schema_min: 1,
+                    schema_max: 4,
+                    features: vec!["capability-publication-v1".into()],
+                    signature: vec![0; 64],
+                }],
+                verified_at_unix_ms: 42,
+            }),
+        ]
+    }
+
+    #[test]
+    fn owned_inventory_preserves_every_existing_canonical_family() {
+        for command in application_commands() {
+            let legacy_bytes = match &command {
+                OwnedApplicationCommand::Control(command) => encode_control_command(command),
+                OwnedApplicationCommand::FeatureActivation(command) => {
+                    encode_feature_activation(command)
+                }
+                OwnedApplicationCommand::Bootstrap(command) => command.encode().unwrap(),
+                OwnedApplicationCommand::ProtocolRefresh(command) => command.encode().unwrap(),
+                OwnedApplicationCommand::Publication(command) => command.encode().unwrap(),
+            };
+            assert_eq!(command.encode(legacy_bytes.len()).unwrap(), legacy_bytes);
+            assert_eq!(
+                OwnedApplicationCommand::decode(&legacy_bytes, legacy_bytes.len()).unwrap(),
+                command
+            );
+            assert!(command.encode(legacy_bytes.len() - 1).is_err());
+            assert!(
+                OwnedApplicationCommand::decode(&legacy_bytes, legacy_bytes.len() - 1).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn owned_inventory_rejects_truncated_trailing_and_future_representations() {
+        for command in application_commands() {
+            let bytes = command.encode(usize::MAX).unwrap();
+            assert!(
+                OwnedApplicationCommand::decode(&bytes[..bytes.len() - 1], usize::MAX).is_err()
+            );
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            assert!(OwnedApplicationCommand::decode(&trailing, usize::MAX).is_err());
+            let mut future = bytes;
+            future[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
+            assert!(OwnedApplicationCommand::decode(&future, usize::MAX).is_err());
+        }
+        assert!(OwnedApplicationCommand::decode(b"UNKNOWN1", usize::MAX).is_err());
+    }
+
+    #[test]
+    fn owned_typed_admission_checks_schema_and_bounds_before_encoding() {
+        let mut invalid = command(ControlCommandRequest::CreateWorkspace {
+            workspace_id: WorkspaceId { value: id(2) },
+            name: None,
+        });
+        invalid.schema_version = 99;
+        assert!(
+            OwnedApplicationCommand::Control(Box::new(invalid))
+                .encode(usize::MAX)
+                .is_err()
+        );
+        let activation = FeatureActivationCommand {
+            principal_id: "p".repeat(MAX_STRING_BYTES + 1),
+            command_id: CommandId { value: id(3) },
+            issued_at_unix_ms: 42,
+            expected_control_revision: 0,
+            read_schema_floor: 3,
+            write_schema_floor: 3,
+            feature: "principal-bootstrap-v1".into(),
+        };
+        assert!(
+            OwnedApplicationCommand::FeatureActivation(activation)
+                .encode(usize::MAX)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn owned_dispatch_matches_family_apply_and_preflight_never_mutates() {
+        use crate::consensus_model::{LogIdentity, LogIndex, Membership, StoredMembership, Term};
+        use crate::control_state::ControlState;
+        let node = *crate::membership::NodeIdentity::new_for_test(93).node_id();
+        let membership = StoredMembership {
+            introduced_at: Some(LogIdentity {
+                term: Term(1),
+                leader: node,
+                index: LogIndex(2),
+            }),
+            membership: Membership::new(
+                vec![vec![node]],
+                vec![(node, "tls://127.0.0.1:49993".into())],
+            )
+            .unwrap(),
+        };
+        for command in application_commands() {
+            let state = ControlState::new("cluster:00000000-0000-0000-0000-000000000093");
+            let original = state.clone();
+            let bytes = command.encode(usize::MAX).unwrap();
+            let preflight = state
+                .preflight_owned_application_command(&bytes, bytes.len(), &membership)
+                .unwrap();
+            assert_eq!(state, original);
+            assert!(
+                state
+                    .preflight_owned_application_command(&bytes, bytes.len() - 1, &membership)
+                    .is_err()
+            );
+            let mut actual = state.clone();
+            let response = actual
+                .apply_owned_application_command(&bytes, &membership)
+                .unwrap();
+            assert_eq!(preflight, response);
+            match &command {
+                OwnedApplicationCommand::Control(_) => {
+                    assert!(matches!(
+                        &response.result,
+                        ControlCommandResult::Accepted { .. }
+                    ));
+                }
+                _ => assert!(matches!(
+                    &response.result,
+                    ControlCommandResult::Rejected { .. }
+                )),
+            }
+            let mut expected = state;
+            match command {
+                OwnedApplicationCommand::Control(command) => {
+                    assert_eq!(response, expected.apply(&command));
+                }
+                OwnedApplicationCommand::FeatureActivation(command) => {
+                    assert_eq!(
+                        response,
+                        expected.apply_owned_feature_activation(&command, Some(&membership))
+                    );
+                }
+                OwnedApplicationCommand::Bootstrap(command) => {
+                    assert_eq!(
+                        response,
+                        expected.apply_owned_bootstrap_command(&command, &membership)
+                    );
+                }
+                OwnedApplicationCommand::ProtocolRefresh(command) => {
+                    assert_eq!(response, expected.apply_refresh_command(&command));
+                }
+                OwnedApplicationCommand::Publication(command) => {
+                    assert!(
+                        expected
+                            .apply_owned_publication(&command, &membership)
+                            .is_err()
+                    );
+                    assert!(matches!(
+                        &response.result,
+                        ControlCommandResult::Rejected { .. }
+                    ));
+                }
+            }
+            assert_eq!(actual, expected);
+            let before = actual.clone();
+            assert!(
+                actual
+                    .apply_owned_application_command(b"UNKNOWN1", &membership)
+                    .is_err()
+            );
+            assert_eq!(actual, before);
+        }
+    }
+
     fn assignment() -> ExecutionAssignment {
         ExecutionAssignment {
             node_id: "node:worker".to_string(),
@@ -1676,7 +2005,7 @@ mod tests {
             ..Writer::default()
         };
         write_control_command(&mut writer, &value);
-        assert!(writer.bytes.is_empty());
+        assert_eq!(writer.bytes, Vec::<u8>::new());
         writer.measured_len = Measurement::Counting(Some(usize::MAX));
         writer.bool(true);
         assert!(matches!(writer.measured_len, Measurement::Counting(None)));

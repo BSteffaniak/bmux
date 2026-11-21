@@ -14,6 +14,38 @@ use std::collections::BTreeMap;
 const VOTER_CHANGE_DOMAIN: &[u8] = b"bmux.cluster.voter-change.v2\0";
 const AUTHORIZATION_LIFETIME_MS: u64 = 300_000;
 
+/// Legacy adapter only. Owned application validation accepts the resulting owned
+/// model directly and never reconstructs `OpenRaft` membership to validate it.
+pub(crate) fn owned_committed_membership(
+    membership: &openraft::StoredMembership<NodeId, BasicNode>,
+) -> Result<crate::consensus_model::StoredMembership, String> {
+    let position = membership
+        .log_id()
+        .as_ref()
+        .ok_or("missing committed membership")?;
+    Ok(crate::consensus_model::StoredMembership {
+        introduced_at: Some(crate::consensus_model::LogIdentity {
+            term: crate::consensus_model::Term(position.leader_id.term),
+            leader: position.leader_id.node_id,
+            index: crate::consensus_model::LogIndex(position.index),
+        }),
+        membership: crate::consensus_model::Membership::new(
+            membership
+                .membership()
+                .get_joint_config()
+                .iter()
+                .map(|voters| voters.iter().copied().collect())
+                .collect(),
+            membership
+                .membership()
+                .nodes()
+                .map(|(id, node)| (*id, node.addr.clone()))
+                .collect(),
+        )
+        .map_err(|error| format!("invalid committed membership: {error:?}"))?,
+    })
+}
+
 fn authorization_payload(auth: &ConsensusVoterChangeAuthorization) -> Result<Vec<u8>, String> {
     if auth.protocol_version != 2 {
         return Err(
@@ -487,6 +519,45 @@ mod tests {
         member.state = state;
         member.endpoint = Some(format!("tls://node-{}:7443", id.as_bytes()[31]));
         member
+    }
+
+    #[test]
+    fn legacy_adapter_preserves_joint_sets_learners_endpoints_and_log_identity() {
+        use std::collections::BTreeSet;
+        let first = NodeId::from(1);
+        let second = NodeId::from(2);
+        let learner = NodeId::from(3);
+        let legacy = openraft::StoredMembership::new(
+            Some(openraft::LogId::new(
+                openraft::CommittedLeaderId::new(7, first),
+                19,
+            )),
+            openraft::Membership::new(
+                vec![BTreeSet::from([first]), BTreeSet::from([second])],
+                BTreeMap::from([
+                    (first, BasicNode::new("tls://first:7443")),
+                    (second, BasicNode::new("tls://second:7443")),
+                    (learner, BasicNode::new("tls://learner:7443")),
+                ]),
+            ),
+        );
+        let owned = owned_committed_membership(&legacy).unwrap();
+        assert_eq!(
+            owned.introduced_at,
+            Some(crate::consensus_model::LogIdentity {
+                term: crate::consensus_model::Term(7),
+                leader: first,
+                index: crate::consensus_model::LogIndex(19),
+            })
+        );
+        assert_eq!(
+            owned.membership.configurations(),
+            &[BTreeSet::from([first]), BTreeSet::from([second])]
+        );
+        assert_eq!(owned.membership.nodes().len(), 3);
+        assert_eq!(owned.membership.nodes()[&learner], "tls://learner:7443");
+        let absent = openraft::StoredMembership::new(None, legacy.membership().clone());
+        assert!(owned_committed_membership(&absent).is_err());
     }
 
     #[test]

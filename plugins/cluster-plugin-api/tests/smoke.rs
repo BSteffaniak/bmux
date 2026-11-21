@@ -53,6 +53,44 @@ fn owned_vote_contract_is_distinct_from_legacy_raft() {
 }
 
 #[test]
+fn owned_append_v2_contract_is_explicit_and_round_trips() {
+    use bmux_cluster_plugin_api::{
+        cluster_consensus_rpc_types::AppendOutcome as V1Outcome,
+        cluster_consensus_rpc_v2,
+        cluster_consensus_rpc_v2_types::{AppendOutcome, AppendResponse},
+    };
+    assert_eq!(
+        cluster_consensus_rpc_v2::INTERFACE_ID,
+        "cluster-consensus-rpc/v2"
+    );
+    assert_eq!(cluster_consensus_rpc_v2::OP_APPEND, "append");
+    let response = AppendResponse {
+        request_id: uuid::Uuid::from_u128(19),
+        source: vec![1; 32],
+        term: 10,
+        outcome: AppendOutcome::StaleTerm,
+        signature: vec![2; 64],
+    };
+    let bytes = bmux_plugin_sdk::encode_service_message(&response).unwrap();
+    let decoded: AppendResponse = bmux_plugin_sdk::decode_service_message(&bytes).unwrap();
+    assert_eq!(decoded, response);
+    for value in [
+        V1Outcome::Durable { matched: None },
+        V1Outcome::Conflict { next_index: 3 },
+    ] {
+        let accepted = AppendResponse {
+            outcome: AppendOutcome::Accepted { value },
+            ..response.clone()
+        };
+        let decoded: AppendResponse = bmux_plugin_sdk::decode_service_message(
+            &bmux_plugin_sdk::encode_service_message(&accepted).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded, accepted);
+    }
+}
+
+#[test]
 fn generated_control_services_expose_consistency_and_structured_errors() {
     let view = ControlStateView {
         membership_epoch: None,
@@ -655,7 +693,7 @@ fn owned_snapshot_install_contract_is_separate_and_round_trips() {
 fn generated_contract_declares_all_services() {
     let services = bmux_cluster_plugin_api::service_declarations()
         .expect("cluster service declarations should be valid");
-    assert_eq!(services.len(), 25);
+    assert_eq!(services.len(), 26);
     let service_ids = services
         .iter()
         .map(|service| service.interface_id.as_str())
@@ -663,6 +701,7 @@ fn generated_contract_declares_all_services() {
     for interface_id in [
         "cluster-peer-read/v1",
         "cluster-consensus-rpc/v1",
+        "cluster-consensus-rpc/v2",
         "cluster-consensus-transfer/v1",
         "cluster-consensus-snapshot/v1",
         "cluster-bounded-control-command/v1",

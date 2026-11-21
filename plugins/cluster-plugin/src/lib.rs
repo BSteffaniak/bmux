@@ -309,7 +309,7 @@ async fn ensure_persistent_consensus_runtime(
         return Err(error.clone());
     }
     if single_member {
-        match node.raft().is_initialized().await {
+        match node.is_initialized().await {
             Ok(true) => {}
             Ok(false) => {
                 if let Err(error) = node.initialize_single(node_id, endpoint.clone()).await {

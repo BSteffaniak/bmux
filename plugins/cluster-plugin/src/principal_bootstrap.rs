@@ -181,31 +181,11 @@ pub fn verify_proof(
     members: &BTreeMap<String, ClusterMember>,
     now_unix_ms: u64,
 ) -> Result<(), String> {
-    let log = membership
+    membership
         .log_id()
         .as_ref()
         .ok_or("bootstrap requires committed membership")?;
-    let owned = crate::consensus_model::StoredMembership {
-        introduced_at: Some(crate::consensus_model::LogIdentity {
-            term: crate::consensus_model::Term(log.leader_id.term),
-            leader: log.leader_id.node_id,
-            index: crate::consensus_model::LogIndex(log.index),
-        }),
-        membership: crate::consensus_model::Membership::new(
-            membership
-                .membership()
-                .get_joint_config()
-                .iter()
-                .map(|voters| voters.iter().copied().collect())
-                .collect(),
-            membership
-                .membership()
-                .nodes()
-                .map(|(id, node)| (*id, node.addr.clone()))
-                .collect(),
-        )
-        .map_err(|error| format!("invalid bootstrap membership: {error:?}"))?,
-    };
+    let owned = crate::consensus_membership::owned_committed_membership(membership)?;
     verify_owned_proof(proof, cluster_id, &owned, members, now_unix_ms)
 }
 

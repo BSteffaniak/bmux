@@ -1,4 +1,11 @@
 use super::*;
+use bmux_cluster_plugin_api::cluster_consensus_rpc_types::{
+    AppendOutcome as AppendOutcomeV1, AppendRequest,
+};
+use bmux_cluster_plugin_api::cluster_consensus_rpc_v2_types::{
+    AppendOutcome as AppendOutcomeV2, AppendResponse as AppendResponseV2,
+};
+use bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferProof;
 use bmux_cluster_plugin_api::cluster_control_command::ClusterControlCommandService;
 use bmux_cluster_plugin_api::cluster_control_state::ClusterControlStateService;
 use bmux_cluster_plugin_api::cluster_types::{
@@ -8,6 +15,243 @@ use bmux_connections_plugin_api::{connection_types::ConnectionError, connections
 use bmux_plugin_sdk::{PluginError, Result as PluginResult, ServiceKind};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
+
+fn signed_append_v2_fixture() -> (NodeIdentity, AppendRequest, AppendResponseV2) {
+    let sender = NodeIdentity::new_for_test(41);
+    let receiver = NodeIdentity::new_for_test(42);
+    let mut request = AppendRequest {
+        cluster_id: "cluster:v2-test".into(),
+        sender: sender.node_id().as_bytes().to_vec(),
+        recipient: receiver.node_id().as_bytes().to_vec(),
+        request_id: uuid::Uuid::from_u128(123),
+        term: 7,
+        previous: None,
+        entries: Vec::new(),
+        leader_commit: None,
+        proof: TransferProof {
+            credential_serial: "serial".into(),
+            signature: Vec::new(),
+            peer: bmux_cluster_plugin_api::cluster_types::PeerAuthProof {
+                challenge: bmux_cluster_plugin_api::cluster_types::PeerAuthChallenge {
+                    protocol_version: 1,
+                    cluster_id: "cluster:v2-test".into(),
+                    verifier_node_id: receiver.node_id().to_string(),
+                    verifier_credential_serial: "receiver-serial".into(),
+                    audience_node_id: sender.node_id().to_string(),
+                    nonce: "nonce".into(),
+                    issued_at_unix_ms: 1,
+                    expires_at_unix_ms: 2,
+                    signature: "fixture".into(),
+                },
+                claimant_node_id: sender.node_id().to_string(),
+                claimant_credential_serial: "serial".into(),
+                claimant_signature: "fixture".into(),
+            },
+        },
+    };
+    request.proof.signature = sender.sign(&owned_append_v2_signing_payload(&request).unwrap());
+    let mut response = AppendResponseV2 {
+        request_id: request.request_id,
+        source: receiver.node_id().as_bytes().to_vec(),
+        term: 8,
+        outcome: AppendOutcomeV2::StaleTerm,
+        signature: Vec::new(),
+    };
+    response.signature =
+        receiver.sign(&owned_append_v2_response_signing_payload(&request, &response).unwrap());
+    (receiver, request, response)
+}
+
+#[test]
+fn append_v2_stale_reply_is_signed_and_request_bound() {
+    let (_, request, response) = signed_append_v2_fixture();
+    verify_owned_append_v2_response(&request, &response).unwrap();
+    let mut changed = response.clone();
+    changed.term += 1;
+    assert!(verify_owned_append_v2_response(&request, &changed).is_err());
+    changed = response.clone();
+    changed.request_id = uuid::Uuid::from_u128(999);
+    assert!(verify_owned_append_v2_response(&request, &changed).is_err());
+    changed = response.clone();
+    changed.source = NodeIdentity::new_for_test(43).node_id().as_bytes().to_vec();
+    assert!(verify_owned_append_v2_response(&request, &changed).is_err());
+    changed = response.clone();
+    changed.signature.clear();
+    assert!(verify_owned_append_v2_response(&request, &changed).is_err());
+    let mut other_request = request.clone();
+    other_request.proof.signature[0] ^= 1;
+    assert!(verify_owned_append_v2_response(&other_request, &response).is_err());
+    other_request = request.clone();
+    other_request.cluster_id.push('x');
+    assert!(verify_owned_append_v2_response(&other_request, &response).is_err());
+    other_request = request.clone();
+    other_request.term -= 1;
+    assert!(verify_owned_append_v2_response(&other_request, &response).is_err());
+    other_request = request.clone();
+    other_request.sender = NodeIdentity::new_for_test(44).node_id().as_bytes().to_vec();
+    assert!(verify_owned_append_v2_response(&other_request, &response).is_err());
+    other_request = request.clone();
+    other_request.proof.credential_serial.push('x');
+    assert!(verify_owned_append_v2_response(&other_request, &response).is_err());
+    changed = response.clone();
+    changed.signature = NodeIdentity::new_for_test(45)
+        .sign(&owned_append_v2_response_signing_payload(&request, &response).unwrap());
+    assert!(verify_owned_append_v2_response(&request, &changed).is_err());
+}
+
+#[test]
+fn append_v2_rejection_cannot_claim_progress_or_reuse_v1_signatures() {
+    let (receiver, request, mut response) = signed_append_v2_fixture();
+    response.term = request.term;
+    assert!(owned_append_v2_response_signing_payload(&request, &response).is_err());
+    response.term = request.term - 1;
+    assert!(owned_append_v2_response_signing_payload(&request, &response).is_err());
+    response.term = request.term + 1;
+    response.outcome = AppendOutcomeV2::Accepted {
+        value: AppendOutcomeV1::Durable { matched: None },
+    };
+    assert!(owned_append_v2_response_signing_payload(&request, &response).is_err());
+    response.term = request.term;
+    let legacy = bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendResponse {
+        request_id: response.request_id,
+        source: response.source.clone(),
+        term: response.term,
+        outcome: AppendOutcomeV1::Durable { matched: None },
+        signature: Vec::new(),
+    };
+    response.signature =
+        receiver.sign(&owned_append_response_signing_payload(&request, &legacy).unwrap());
+    assert!(verify_owned_append_v2_response(&request, &response).is_err());
+    response.signature =
+        receiver.sign(&owned_append_v2_response_signing_payload(&request, &response).unwrap());
+    verify_owned_append_v2_response(&request, &response).unwrap();
+    assert_ne!(
+        owned_append_signing_payload(&request).unwrap(),
+        owned_append_v2_signing_payload(&request).unwrap()
+    );
+}
+
+#[test]
+fn append_v2_requires_explicit_complete_negotiated_bundle() {
+    let (_, _, enrollment) = enrolled_forwarding_callers();
+    let mut member = enrollment.members[0].clone();
+    member.negotiated_protocol.features = vec![
+        bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID.to_string(),
+        bmux_cluster_plugin_api::cluster_consensus_transfer::INTERFACE_ID.to_string(),
+    ];
+    assert!(!supports_owned_append_v2(&member));
+    member
+        .negotiated_protocol
+        .features
+        .push(bmux_cluster_plugin_api::cluster_consensus_rpc_v2::INTERFACE_ID.to_string());
+    assert!(supports_owned_append_v2(&member));
+    for missing in [
+        bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID,
+        bmux_cluster_plugin_api::cluster_consensus_transfer::INTERFACE_ID,
+        bmux_cluster_plugin_api::cluster_consensus_rpc_v2::INTERFACE_ID,
+    ] {
+        let mut incomplete = member.clone();
+        incomplete
+            .negotiated_protocol
+            .features
+            .retain(|feature| feature != missing.as_str());
+        assert!(!supports_owned_append_v2(&incomplete));
+    }
+}
+
+#[test]
+fn append_v2_authentication_requires_v2_request_signature() {
+    let caller = ForwardingCaller::default();
+    let identity = crate::membership::load_or_create_node_identity(&caller).unwrap();
+    crate::membership::initialize_cluster(&caller).unwrap();
+    let mut members = crate::membership::list_members(&caller).unwrap().members;
+    let member = &mut members[0];
+    member.negotiated_protocol.features = vec![
+        bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID.to_string(),
+        bmux_cluster_plugin_api::cluster_consensus_transfer::INTERFACE_ID.to_string(),
+        bmux_cluster_plugin_api::cluster_consensus_rpc_v2::INTERFACE_ID.to_string(),
+    ];
+    *member = crate::membership::issue_membership_credential(
+        &identity,
+        member.cluster_id.parse().unwrap(),
+        member.node_id.clone(),
+        member.public_key.clone(),
+        member.capabilities.clone(),
+        member.negotiated_protocol.clone(),
+        crate::now_unix_ms(),
+    )
+    .unwrap();
+    let local = *identity.node_id();
+    let (_, mut request, _) = signed_append_v2_fixture();
+    request.cluster_id.clone_from(&members[0].cluster_id);
+    request.sender = local.as_bytes().to_vec();
+    request.recipient = local.as_bytes().to_vec();
+    request.proof.peer.challenge = crate::membership::create_peer_auth_challenge_for_members(
+        &caller,
+        &crate::ClusterPeerChallengeRequest {
+            claimant_node_id: local.to_string(),
+        },
+        &members,
+    )
+    .unwrap();
+    request.proof.peer.claimant_node_id = local.to_string();
+    request
+        .proof
+        .peer
+        .claimant_credential_serial
+        .clone_from(&members[0].credential_serial);
+    request
+        .proof
+        .credential_serial
+        .clone_from(&members[0].credential_serial);
+    request.proof.peer.claimant_signature = crate::membership::encode_hex(
+        &identity.sign(&crate::membership::canonical_peer_proof(&request.proof.peer).unwrap()),
+    );
+    request.proof.signature = identity.sign(&owned_append_signing_payload(&request).unwrap());
+    assert!(authenticate_owned_append_v2(&caller, local, &members, &request).is_err());
+    request.proof.signature = identity.sign(&owned_append_v2_signing_payload(&request).unwrap());
+    assert_eq!(
+        authenticate_owned_append_v2(&caller, local, &members, &request).unwrap(),
+        local
+    );
+    assert!(authenticate_owned_append_v2(&caller, local, &members, &request).is_err());
+}
+
+#[tokio::test]
+async fn append_v2_generated_registry_dispatch_preserves_executor_rejection() {
+    use crate::owned_vote_store::{DurableVoteGate, OwnedVoteStore, VoteExecutor};
+    use bmux_cluster_plugin_api::{
+        cluster_consensus_rpc_types::RpcError,
+        cluster_consensus_rpc_v2::{ClusterConsensusRpcClient, ClusterConsensusRpcService},
+    };
+    let root = tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let (_, request, _) = signed_append_v2_fixture();
+    let store =
+        OwnedVoteStore::create(&root.path().join("authority.redb"), &request.cluster_id).unwrap();
+    let executor = Arc::new(VoteExecutor::new(DurableVoteGate::new(1, store)));
+    let caller = Arc::new(ForwardingCaller::default());
+    let local = transfer_node(&request.recipient).unwrap();
+    let direct = OwnedAppendService {
+        caller: caller.clone(),
+        local,
+        executor: executor.clone(),
+    };
+    let mut registry = bmux_plugin_sdk::TypedServiceRegistry::new();
+    OwnedAppendService::register_append_v2(&mut registry, caller, local, executor.clone()).unwrap();
+    assert_eq!(registry.len(), 1);
+    let (_, handle) = registry.iter().next().unwrap();
+    assert_eq!(handle.interface_id().as_str(), "cluster-consensus-rpc/v2");
+    let provider = handle
+        .provider_as_trait::<dyn ClusterConsensusRpcService + Send + Sync>()
+        .unwrap();
+    let client = ClusterConsensusRpcClient::new(provider);
+    // Cryptographic fixture is not an enrolled peer in this empty authority.
+    // Generated dispatch must preserve rejection, never synthesize signed progress.
+    let expected = ClusterConsensusRpcService::append(&direct, request.clone()).await;
+    assert_eq!(expected, Err(RpcError::Unauthorized));
+    assert_eq!(client.append(request).await, expected);
+    executor.shutdown().await.unwrap();
+}
 
 struct ForwardingCaller {
     // Retain the selected durable scope for the whole forwarding fixture.

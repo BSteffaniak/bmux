@@ -1,7 +1,7 @@
 //! Qualification-only owned lifecycle over the real owned authority.
 //!
-//! Fixed 3/5-voter operation uses explicit campaigns until authenticated leader
-//! activity is observable by the lifecycle; it does not approximate that signal.
+//! Fixed 3/5-voter qualification supports explicit campaigns and an automatic
+//! lifecycle driven only by executor-authenticated election activity.
 //! No production registry, endpoint provider, or capability is installed here.
 //! The executor is exclusively transferred to this task. Durable application
 //! results are correlated by full log identity, never response-vector position.
@@ -29,6 +29,76 @@ const COMPACTION_INTERVAL: u64 = 128;
 // Large entries can exhaust byte capacity long before the entry-count cadence.
 const LARGE_COMMAND_BYTES: usize = 256 * 1024;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+// Four remote voters in the currently supported five-voter configuration.
+// This stays below the executor's existing sixteen outbound admissions.
+const PEER_TASK_CAPACITY: usize = 4;
+// Measurement candidates, not ADR-0008 performance qualification.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(75);
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(25);
+const ELECTION_MIN_MILLIS: u64 = 450;
+const ELECTION_JITTER_MILLIS: u64 = 450;
+
+struct AutomaticElection {
+    deadline: tokio::time::Instant,
+    activity_sequence: Option<u64>,
+    history: std::collections::VecDeque<String>,
+    jitter_state: [u8; 32],
+}
+
+impl AutomaticElection {
+    fn timeout(&mut self) -> Duration {
+        use sha2::Digest as _;
+        // A per-instance entropy seed with a deterministic hash stream makes
+        // timing reproducible without sharing startup/retry jitter across nodes.
+        self.jitter_state = sha2::Sha256::digest(self.jitter_state).into();
+        let random = u64::from_le_bytes(self.jitter_state[..8].try_into().expect("eight bytes"));
+        Duration::from_millis(ELECTION_MIN_MILLIS + random % ELECTION_JITTER_MILLIS)
+    }
+
+    fn seeded(now: tokio::time::Instant, seed: [u8; 32]) -> Self {
+        let mut election = Self {
+            deadline: now,
+            activity_sequence: None,
+            history: std::collections::VecDeque::new(),
+            jitter_state: seed,
+        };
+        election.reset(now);
+        election
+    }
+
+    fn reset(&mut self, base: tokio::time::Instant) {
+        self.deadline = base + self.timeout();
+    }
+
+    fn record(&mut self, event: String) {
+        if self.history.len() == 16 {
+            self.history.pop_front();
+        }
+        self.history.push_back(event);
+    }
+
+    fn observe_activity(&mut self, activity: crate::owned_vote_store::ElectionActivity) -> bool {
+        if self.activity_sequence == Some(activity.sequence) {
+            return false;
+        }
+        if activity.kind == crate::owned_vote_store::ElectionActivityKind::GrantedVote {
+            self.record(format!(
+                "granted term={:?} peer={} seq={}",
+                activity.term, activity.peer, activity.sequence
+            ));
+        }
+        self.activity_sequence = Some(activity.sequence);
+        self.reset(tokio::time::Instant::from_std(activity.observed_at));
+        true
+    }
+
+    fn new() -> Self {
+        let mut seed = [0; 32];
+        seed[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        seed[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        Self::seeded(tokio::time::Instant::now(), seed)
+    }
+}
 
 type Authorize = Box<dyn FnOnce(&ControlState, &ControlCommand) -> Result<(), String> + Send>;
 
@@ -132,10 +202,20 @@ where
     fn replicate(&self, executor: Arc<VoteExecutor>, peer: NodeId) -> PeerWork {
         let caller = self.caller.clone();
         Box::pin(async move {
-            executor
-                .replicate_turn(caller.as_ref(), peer)
-                .await
-                .map(|_| ())
+            // One bounded probe per scheduling turn: an eight-probe catch-up
+            // loop must not monopolize preparation/settlement while other
+            // voters need their heartbeat. Only explicit capacity rejection is
+            // retried here; transport/authority outcomes leave this turn.
+            for attempt in 0..4 {
+                match executor.replicate_next(caller.as_ref(), peer).await {
+                    Err(RpcError::CapacityUnavailable) if attempt < 3 => {
+                        let millis = u64::from(uuid::Uuid::new_v4().as_bytes()[0] % 4) + 1;
+                        tokio::time::sleep(Duration::from_millis(millis)).await;
+                    }
+                    result => return result,
+                }
+            }
+            unreachable!("bounded probe admission always returns")
         })
     }
 }
@@ -172,6 +252,9 @@ struct PendingRead {
 }
 
 struct FixedPeers {
+    automatic: Option<AutomaticElection>,
+    next_heartbeat: tokio::time::Instant,
+    read_turn: bool,
     cursor: usize,
     recent: std::collections::VecDeque<String>,
     ticks: u64,
@@ -186,13 +269,42 @@ struct FixedPeers {
 }
 
 impl FixedPeers {
+    fn preparing(&self) -> bool {
+        !self.tasks.is_empty()
+            && (self.automatic.is_none() || tokio::time::Instant::now() < self.next_heartbeat)
+    }
+
+    fn expire_waiters(&mut self, now: tokio::time::Instant) {
+        let expired = self
+            .pending
+            .iter()
+            .filter_map(|(key, pending)| {
+                (pending.deadline <= now || pending.response.is_closed()).then_some(*key)
+            })
+            .collect::<Vec<_>>();
+        for key in expired {
+            if let Some(pending) = self.pending.remove(&key) {
+                // Cancellation removes waiting only, never durable intent.
+                let _ = pending.response.send(Err(RuntimeError::Indeterminate));
+            }
+        }
+        if self
+            .read
+            .as_ref()
+            .is_some_and(|read| read.deadline <= now || read.response.is_closed())
+            && let Some(read) = self.read.take()
+        {
+            let _ = read.response.send(Err(RuntimeError::QuorumUnavailable));
+        }
+    }
+
     fn completed(&mut self, peer: NodeId, result: Result<(), RpcError>) {
         if self.recent.len() == 16 {
             self.recent.pop_front();
         }
         self.recent.push_back(format!("{peer}: {result:?}"));
         self.in_flight.remove(&peer);
-        if matches!(result, Err(RpcError::CapacityUnavailable))
+        if result.is_err()
             && let Some(read) = self.read.as_mut()
         {
             read.attempted.remove(&peer);
@@ -230,6 +342,14 @@ enum Request {
 struct Task {
     handle: Option<JoinHandle<Result<(), RuntimeError>>>,
     result: Option<Result<(), RuntimeError>>,
+}
+
+struct FixedRecovery {
+    path: PathBuf,
+    cluster: String,
+    local: NodeId,
+    incarnation: u128,
+    automatic: bool,
 }
 
 struct OwnedRuntime {
@@ -299,10 +419,70 @@ impl OwnedRuntime {
         G: Send + 'static,
         F: FnOnce(Arc<VoteExecutor>) -> Result<G, RuntimeError>,
     {
+        Self::recover_peers(
+            FixedRecovery {
+                path,
+                cluster,
+                local,
+                incarnation,
+                automatic: false,
+            },
+            caller,
+            register,
+        )
+        .await
+    }
+
+    /// Automatic elections and heartbeats over the same authenticated authority
+    /// as fixed qualification. Dynamic/joint membership is deliberately rejected.
+    async fn recover_automatic<C, G, F>(
+        path: PathBuf,
+        cluster: String,
+        local: NodeId,
+        incarnation: u128,
+        caller: Arc<C>,
+        register: F,
+    ) -> Result<Self, RuntimeError>
+    where
+        C: crate::ClusterRuntimeOps + bmux_plugin::ServiceCaller + Send + Sync + 'static,
+        G: Send + 'static,
+        F: FnOnce(Arc<VoteExecutor>) -> Result<G, RuntimeError>,
+    {
+        Self::recover_peers(
+            FixedRecovery {
+                path,
+                cluster,
+                local,
+                incarnation,
+                automatic: true,
+            },
+            caller,
+            register,
+        )
+        .await
+    }
+
+    async fn recover_peers<C, G, F>(
+        recovery: FixedRecovery,
+        caller: Arc<C>,
+        register: F,
+    ) -> Result<Self, RuntimeError>
+    where
+        C: crate::ClusterRuntimeOps + bmux_plugin::ServiceCaller + Send + Sync + 'static,
+        G: Send + 'static,
+        F: FnOnce(Arc<VoteExecutor>) -> Result<G, RuntimeError>,
+    {
+        let FixedRecovery {
+            path,
+            cluster,
+            local,
+            incarnation,
+            automatic,
+        } = recovery;
         let executor = Arc::new(
             VoteExecutor::recover(path, cluster, incarnation)
                 .await
-                .map_err(authority)?,
+                .map_err(recovery_error)?,
         );
         let mut recovering = RecoveringExecutor(Some(executor.clone()));
         let observation = match executor.observe(local).await {
@@ -338,6 +518,9 @@ impl OwnedRuntime {
             }
         };
         let fixed = FixedPeers {
+            automatic: automatic.then(AutomaticElection::new),
+            next_heartbeat: tokio::time::Instant::now(),
+            read_turn: false,
             cursor: 0,
             recent: std::collections::VecDeque::new(),
             ticks: 0,
@@ -481,6 +664,17 @@ impl Drop for OwnedRuntime {
         // Dropping requests does not authorize dropping an admitted storage
         // operation. The task finishes it and closes the store itself.
         self.stop.send_replace(true);
+    }
+}
+
+fn recovery_error(error: std::io::Error) -> RuntimeError {
+    // The executor reports WouldBlock only for definitive pre-admission
+    // capacity/ownership rejection, before returning an executor or registering
+    // services. Do not classify uncertain recovery/storage failures as retryable.
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        RuntimeError::Capacity
+    } else {
+        authority(error)
     }
 }
 
@@ -718,26 +912,139 @@ fn fixed_gate_error(error: crate::consensus_model::VoteGateError) -> RuntimeErro
     }
 }
 
+async fn automatic_campaign(
+    executor: &VoteExecutor,
+    local: NodeId,
+    fixed: &mut FixedPeers,
+    observation: &OwnedObservation,
+) -> Result<(), RuntimeError> {
+    let Some(election) = fixed.automatic.as_mut() else {
+        return Ok(());
+    };
+    let activity = observation.election_activity.as_ref();
+    let sequence = activity.map(|activity| activity.sequence);
+    if let Some(activity) = activity
+        && activity.term < observation.hard_state.term
+    {
+        // A newer local campaign or verified term supersedes old vote/leader
+        // evidence. Mark it consumed without shortening the new deadline.
+        election.activity_sequence = sequence;
+    }
+    if let Some(activity) = activity
+        && election.observe_activity(*activity)
+    {
+        // Both a persisted granted vote and accepted same-term leader activity
+        // reset the timer. Evidence older than our campaign cannot cancel it.
+        if fixed
+            .campaign
+            .is_some_and(|campaign| activity.term >= campaign.term)
+        {
+            fixed.campaign = None;
+        }
+    }
+    if observation.local_leader || tokio::time::Instant::now() < election.deadline {
+        return Ok(());
+    }
+    let Some(membership) = observation.effective_membership.clone() else {
+        return Err(RuntimeError::UnsupportedMembership);
+    };
+    let campaign = executor
+        .campaign_if_unchanged(local, observation.hard_state, membership, sequence)
+        .await
+        .map_err(fixed_gate_error)?;
+    // Busy or a failed guard must not buy another complete election timeout.
+    // Keep the expired deadline until fresh activity or an admitted campaign;
+    // the bounded progress tick supplies retry backoff, not a tight loop.
+    if let Some(campaign) = campaign {
+        election.record(format!(
+            "campaign term={:?} activity={sequence:?} age={:?}",
+            campaign.term,
+            activity.map(|activity| activity.observed_at.elapsed())
+        ));
+        election.reset(tokio::time::Instant::now());
+        fixed.campaign = Some(campaign);
+        fixed.next_heartbeat = tokio::time::Instant::now();
+    }
+    Ok(())
+}
+
+fn validate_fixed_membership(
+    observation: &OwnedObservation,
+    membership: &Membership,
+) -> Result<(), RuntimeError> {
+    if observation
+        .effective_membership
+        .as_ref()
+        .is_none_or(|m| &m.membership != membership)
+        || observation
+            .committed_membership
+            .as_ref()
+            .is_none_or(|m| &m.membership != membership)
+    {
+        return Err(RuntimeError::UnsupportedMembership);
+    }
+    Ok(())
+}
+
+async fn progress_follower(
+    executor: &VoteExecutor,
+    fixed: &mut FixedPeers,
+    observation: &OwnedObservation,
+) -> Result<(), RuntimeError> {
+    expire_pending_proposals(fixed, observation);
+    if let Some(read) = fixed.read.take() {
+        let _ = read.response.send(Err(RuntimeError::QuorumUnavailable));
+    }
+    if observation.applied != observation.committed {
+        executor
+            .apply_committed_batch()
+            .await
+            .map_err(|error| match error {
+                crate::owned_vote_store::AppendExecutionError::Executor(
+                    crate::consensus_model::VoteGateError::Busy,
+                ) => RuntimeError::Capacity,
+                other => authority(other),
+            })?;
+    }
+    Ok(())
+}
+
+fn idle_leader(fixed: &FixedPeers, observation: &OwnedObservation) -> bool {
+    fixed.automatic.is_some()
+        && observation.local_leader
+        && observation.last_log == observation.committed
+        && observation.applied == observation.committed
+        && fixed.pending.is_empty()
+        && fixed.read.is_none()
+}
+
 async fn fixed_progress(
     executor: &Arc<VoteExecutor>,
     local: NodeId,
     fixed: &mut FixedPeers,
 ) -> Result<(), RuntimeError> {
-    if !fixed.tasks.is_empty() || !fixed.in_flight.is_empty() {
+    if fixed.preparing() {
         return Ok(());
     }
     let observation = executor.observe(local).await.map_err(fixed_gate_error)?;
-    if observation
-        .effective_membership
-        .as_ref()
-        .is_none_or(|m| m.membership != fixed.membership)
-        || observation
-            .committed_membership
-            .as_ref()
-            .is_none_or(|m| m.membership != fixed.membership)
-    {
-        return Err(RuntimeError::UnsupportedMembership);
+    validate_fixed_membership(&observation, &fixed.membership)?;
+    if idle_leader(fixed, &observation) {
+        // No local durability work exists. In particular do not begin an idle
+        // commit transaction and four more reads before a heartbeat turn.
+        schedule_peers(executor, local, fixed, &observation);
+        return Ok(());
     }
+    automatic_campaign(executor, local, fixed, &observation).await?;
+    // An idle follower needs one coherent observation, not repeated reads of
+    // the same authority on every 25ms tick. Those extra blocking admissions
+    // contend with the authenticated heartbeat that keeps this node following.
+    if fixed.automatic.is_some() && !observation.local_leader && fixed.campaign.is_none() {
+        progress_follower(executor, fixed, &observation).await?;
+        return Ok(());
+    }
+    // A successful guarded campaign has durably advanced the term. Do not
+    // compare its request against the pre-campaign observation below.
+    let observation = executor.observe(local).await.map_err(fixed_gate_error)?;
     if !observation.local_leader {
         // No inferred stepdown: the executor has already persisted any higher
         // authenticated term before publishing this observation.
@@ -801,8 +1108,15 @@ async fn fixed_progress(
             let _ = pending.response.send(result);
         }
     }
-    let now = tokio::time::Instant::now();
     let observation = executor.observe(local).await.map_err(fixed_gate_error)?;
+    expire_pending_proposals(fixed, &observation);
+    progress_read(executor, local, fixed, &observation).await?;
+    schedule_peers(executor, local, fixed, &observation);
+    Ok(())
+}
+
+fn expire_pending_proposals(fixed: &mut FixedPeers, observation: &OwnedObservation) {
+    let now = tokio::time::Instant::now();
     let expired = fixed
         .pending
         .iter()
@@ -818,9 +1132,6 @@ async fn fixed_progress(
             let _ = pending.response.send(Err(RuntimeError::Indeterminate));
         }
     }
-    progress_read(executor, local, fixed, &observation).await?;
-    schedule_peers(executor, local, fixed, &observation);
-    Ok(())
 }
 
 async fn progress_read(
@@ -863,9 +1174,12 @@ fn schedule_peers(
     fixed: &mut FixedPeers,
     observation: &OwnedObservation,
 ) {
-    // The executor has one shared outbound admission permit. Do not let a
-    // second peer race an admitted turn and repeatedly lose that permit.
-    // Join completion is consumed before the rotating cursor admits another.
+    if fixed.automatic.is_some() {
+        schedule_automatic_peers(executor, local, fixed, observation);
+        return;
+    }
+    // Fixed qualification serializes preparation; automatic operation instead
+    // bounds each peer independently so a slow RPC cannot stop local progress.
     if !fixed.tasks.is_empty() || !fixed.in_flight.is_empty() {
         return;
     }
@@ -910,6 +1224,79 @@ fn schedule_peers(
     }
 }
 
+fn schedule_automatic_peers(
+    executor: &Arc<VoteExecutor>,
+    local: NodeId,
+    fixed: &mut FixedPeers,
+    observation: &OwnedObservation,
+) {
+    let now = tokio::time::Instant::now();
+    if now < fixed.next_heartbeat || fixed.tasks.len() >= PEER_TASK_CAPACITY {
+        return;
+    }
+    let peers = fixed.membership.configurations()[0]
+        .iter()
+        .copied()
+        .filter(|peer| *peer != local)
+        .collect::<Vec<_>>();
+    if peers.is_empty() {
+        return;
+    }
+    // Stagger preparation instead of racing four immediate gate admissions.
+    // Network futures remain concurrent: an unavailable peer occupies only its
+    // own slot. Four peers receive a turn within 100ms at the 25ms tick.
+    fixed.next_heartbeat = now
+        + HEARTBEAT_INTERVAL
+            / u32::try_from(peers.len()).expect("fixed configuration has at most four peers");
+    // Alternate read and replication sweeps. A continuous stream of reads must
+    // not prevent catch-up or commit-watermark delivery. Each staggered turn
+    // admits at most one operation, bounded by the executor's read permit.
+    if fixed.cursor == 0 {
+        fixed.read_turn = !fixed.read_turn;
+    }
+    let confirm_available = fixed.read_turn;
+    let start = fixed.cursor;
+    for offset in 0..peers.len() {
+        if fixed.tasks.len() >= PEER_TASK_CAPACITY {
+            break;
+        }
+        let index = (start + offset) % peers.len();
+        let peer = peers[index];
+        if fixed.in_flight.contains(&peer) {
+            continue;
+        }
+        let read = fixed.read.as_mut().filter(|read| {
+            observation.local_leader && confirm_available && !read.attempted.contains(&peer)
+        });
+        let operation = if let Some(read) = read {
+            read.attempted.insert(peer);
+            fixed
+                .transport
+                .confirm(executor.clone(), read.context, peer)
+        } else if observation.local_leader {
+            fixed.transport.replicate(executor.clone(), peer)
+        } else if let Some(campaign) = fixed.campaign {
+            fixed.transport.vote(executor.clone(), campaign, peer)
+        } else {
+            continue;
+        };
+        fixed.in_flight.insert(peer);
+        fixed.tasks.spawn(async move {
+            // Bound waiting without aborting executor-owned admitted persistence.
+            // Its handoff/settlement and shutdown retain durable ownership.
+            let result = tokio::time::timeout(Duration::from_secs(50), operation)
+                .await
+                .unwrap_or(Err(RpcError::ExecutionFailed));
+            (peer, result)
+        });
+        fixed.cursor = (index + 1) % peers.len();
+        return;
+    }
+    // Rotate even when every peer was busy; slow peers keep only their own slot
+    // and cannot hold healthy peers behind a shared serial network turn.
+    fixed.cursor = (start + 1) % peers.len();
+}
+
 async fn drain_peer_tasks(
     tasks: &mut JoinSet<(NodeId, Result<(), RpcError>)>,
 ) -> Result<(), RuntimeError> {
@@ -950,9 +1337,21 @@ async fn run(
     if ready.send(initialized.clone()).is_err() || !started {
         return initialized;
     }
-    // Single-voter progress timer only: no invented remote election or heartbeat
-    // success. The real campaign/no-op above supplies all leadership evidence.
-    let mut timer = tokio::time::interval(Duration::from_millis(100));
+    // Explicit timer events drive bounded local progress and automatic election
+    // deadlines. Heartbeat success still comes only from authenticated RPCs.
+    // The legacy explicit-campaign qualification scheduler serializes complete
+    // peer turns and rejects requests during preparation. Preserve its original
+    // 100ms cadence rather than applying the automatic actor's 25ms polling to
+    // that serialized admission policy and starving pre-proposal requests.
+    let progress_interval = if fixed
+        .as_ref()
+        .is_some_and(|peers| peers.automatic.is_some())
+    {
+        PROGRESS_INTERVAL
+    } else {
+        Duration::from_millis(100)
+    };
+    let mut timer = tokio::time::interval(progress_interval);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut result = loop {
         if *stop.borrow() {
@@ -964,10 +1363,10 @@ async fn run(
                 let Some(request) = request else { break Ok(()); };
                 // A spawned peer turn owns its gate-admission opportunity until
                 // completion. Polling clients must not starve that preparation.
-                if fixed.as_ref().is_some_and(|fixed| !fixed.tasks.is_empty()) {
+                if fixed.as_ref().is_some_and(FixedPeers::preparing) {
                     match request {
                         Request::Diagnostics(response) => {
-                            let _ = response.send(format!("peer preparation active: {:?}", fixed.as_ref().map(|fixed| (&fixed.in_flight, &fixed.recent))));
+                            let _ = response.send(format!("peer preparation active: {:?}", fixed.as_ref().map(|fixed| (&fixed.in_flight, &fixed.recent, fixed.automatic.as_ref().map(|election| &election.history)))));
                         }
                         Request::ReadLinearizable(response) => { let _ = response.send(Err(RuntimeError::Capacity)); }
                         Request::Campaign(response) => { let _ = response.send(Err(RuntimeError::Capacity)); }
@@ -980,9 +1379,10 @@ async fn run(
                 match request {
                     Request::Diagnostics(response) => {
                         let diagnostic = fixed.as_ref().map_or_else(|| "single-voter".into(), |fixed| format!(
-                            "ticks={} busy_ticks={} campaign={:?} in_flight={:?} tasks={} pending={:?} read={:?} recent={:?}",
+                            "ticks={} busy_ticks={} campaign={:?} in_flight={:?} tasks={} pending={:?} read={:?} recent={:?} election={:?}",
                             fixed.ticks, fixed.busy_ticks, fixed.campaign, fixed.in_flight, fixed.tasks.len(), fixed.pending.keys().collect::<Vec<_>>(),
                             fixed.read.as_ref().map(|read| (read.context, &read.attempted, read.deadline.saturating_duration_since(tokio::time::Instant::now()))), fixed.recent,
+                            fixed.automatic.as_ref().map(|election| (&election.history, election.activity_sequence, election.deadline.saturating_duration_since(tokio::time::Instant::now()))),
                         ));
                         let _ = response.send(diagnostic);
                     }
@@ -1022,6 +1422,14 @@ async fn run(
                             };
                             match executor.propose_authorized(local, observation.hard_state, principal.clone(), (*command).clone(), authorize).await {
                                 Ok(identity) => {
+                                    fixed.next_heartbeat = tokio::time::Instant::now();
+                                    // Proposal admission is already durable. Wake
+                                    // replication now rather than waiting for an
+                                    // idle heartbeat; executor fencing rechecks
+                                    // the observation before any actual send.
+                                    if fixed.automatic.is_some() {
+                                        schedule_peers(executor, local, fixed, &observation);
+                                    }
                                     fixed.pending.insert(proposal_key(identity), PendingProposal { identity, principal, command, response, deadline: tokio::time::Instant::now() + REQUEST_TIMEOUT });
                                 }
                                 Err(error) => { let _ = response.send(Err(proposal_error(error))); }
@@ -1098,6 +1506,7 @@ async fn run(
             }
             _ = timer.tick() => {
                 if let Some(fixed) = fixed.as_mut() {
+                    fixed.expire_waiters(tokio::time::Instant::now());
                     fixed.ticks = fixed.ticks.saturating_add(1);
                     match fixed_progress(executor, local, fixed).await {
                         Ok(()) => {}
@@ -1833,6 +2242,7 @@ mod tests {
     struct TestEndpointNetwork {
         nodes: std::sync::Mutex<BTreeMap<String, Arc<TestEndpointCaller>>>,
         blocked: std::sync::Mutex<BTreeSet<(String, String)>>,
+        delays: std::sync::Mutex<BTreeMap<String, Duration>>,
         trace: std::sync::Mutex<std::collections::VecDeque<String>>,
     }
 
@@ -1926,6 +2336,18 @@ mod tests {
             {
                 return Err(unsupported());
             }
+            let delay = self
+                .network
+                .delays
+                .lock()
+                .unwrap()
+                .get(&invocation.target)
+                .copied();
+            if let Some(delay) = delay {
+                // Simulate a slow authenticated endpoint transport without
+                // blocking an async runtime worker or holding a network lock.
+                tokio::task::block_in_place(|| std::thread::sleep(delay));
+            }
             let remote = self
                 .network
                 .nodes
@@ -1947,6 +2369,21 @@ mod tests {
                     .node_id(),
                 executor: executor.clone(),
             };
+            let mut registry = bmux_plugin_sdk::TypedServiceRegistry::new();
+            crate::consensus_network::OwnedAppendService::register(
+                &mut registry,
+                remote.clone(),
+                provider.local,
+                executor.clone(),
+            )
+            .map_err(|_| unsupported())?;
+            crate::consensus_network::OwnedAppendService::register_append_v2(
+                &mut registry,
+                remote.clone(),
+                provider.local,
+                executor.clone(),
+            )
+            .map_err(|_| unsupported())?;
             let runtime = tokio::runtime::Handle::current();
             let result = match (
                 invocation.interface_id.as_str(),
@@ -1955,9 +2392,32 @@ mod tests {
                 ("cluster-peer-auth/v1", "challenge") => {
                     let request: bmux_cluster_plugin_api::cluster_peer_auth::client::ChallengeRequest = decode_service_message(&invocation.payload)?;
                     let state = tokio::task::block_in_place(|| {
-                        runtime.block_on(executor.read_control_state())
+                        runtime.block_on(async {
+                            // A canonical read rejected before admission is
+                            // retryable. Do not turn transient gate contention
+                            // into a false peer-authentication failure.
+                            for attempt in 0..4 {
+                                match executor.read_control_state().await {
+                                    Err(
+                                        crate::owned_vote_store::AppendExecutionError::Executor(
+                                            crate::consensus_model::VoteGateError::Busy,
+                                        ),
+                                    ) if attempt < 3 => {
+                                        tokio::time::sleep(Duration::from_millis(1)).await;
+                                    }
+                                    result => return result,
+                                }
+                            }
+                            unreachable!("bounded challenge read always returns")
+                        })
                     })
-                    .map_err(|_| unsupported())?;
+                    .map_err(|error| {
+                        self.network.record(format!(
+                            "auth {} -> {} canonical read failed: {error:?}",
+                            self.endpoint, remote.endpoint
+                        ));
+                        unsupported()
+                    })?;
                     let challenge = crate::membership::create_peer_auth_challenge_for_members(
                         remote.as_ref(),
                         &request,
@@ -1972,6 +2432,33 @@ mod tests {
                     let result = tokio::task::block_in_place(|| {
                         runtime.block_on(provider.vote(request.request))
                     });
+                    encode_service_message(&result)?
+                }
+                ("cluster-consensus-rpc/v2", "append") => {
+                    use bmux_cluster_plugin_api::cluster_consensus_rpc_v2::ClusterConsensusRpcService;
+                    let request: bmux_cluster_plugin_api::cluster_consensus_rpc_v2::client::AppendRequest = decode_service_message(&invocation.payload)?;
+                    let (_, handle) = registry
+                        .iter()
+                        .find(|(_, handle)| {
+                            handle.interface_id().as_str() == "cluster-consensus-rpc/v2"
+                        })
+                        .ok_or_else(unsupported)?;
+                    let service = handle
+                        .provider_as_trait::<dyn ClusterConsensusRpcService + Send + Sync>()
+                        .map_err(|_| unsupported())?;
+                    let probe = format!(
+                        "v2 {} -> {} term={} prev={:?} entries={} commit={:?}",
+                        self.endpoint,
+                        remote.endpoint,
+                        request.request.term,
+                        request.request.previous,
+                        request.request.entries.len(),
+                        request.request.leader_commit
+                    );
+                    let result = tokio::task::block_in_place(|| {
+                        runtime.block_on(service.append(request.request))
+                    });
+                    self.network.record(format!("{probe} result={result:?}"));
                     encode_service_message(&result)?
                 }
                 ("cluster-consensus-rpc/v1", "append") => {
@@ -2062,6 +2549,8 @@ mod tests {
                         peer_revision: 1,
                         schema_version: 1,
                         features: vec![
+                            bmux_cluster_plugin_api::cluster_consensus_rpc_v2::INTERFACE_ID
+                                .to_string(),
                             bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID
                                 .to_string(),
                             bmux_cluster_plugin_api::cluster_consensus_transfer::INTERFACE_ID
@@ -2174,6 +2663,205 @@ mod tests {
         .unwrap()
     }
 
+    async fn start_automatic(
+        caller: Arc<TestEndpointCaller>,
+        path: PathBuf,
+        cluster: String,
+        local: NodeId,
+        incarnation: u128,
+    ) -> OwnedRuntime {
+        retry_capacity(|| {
+            let registration_caller = caller.clone();
+            OwnedRuntime::recover_automatic(
+                path.clone(),
+                cluster.clone(),
+                local,
+                incarnation,
+                caller.clone(),
+                move |executor| {
+                    *registration_caller.executor.lock().unwrap() = Some(executor);
+                    Ok(Registration(registration_caller))
+                },
+            )
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn automatic_leader(
+        nodes: &[OwnedRuntime],
+        callers: &[Arc<TestEndpointCaller>],
+        eligible: &[usize],
+    ) -> usize {
+        let result = tokio::time::timeout(Duration::from_secs(25), async {
+            loop {
+                for &index in eligible {
+                    if nodes[index].observe().await.is_ok_and(|observation| {
+                        observation.local_leader
+                            && observation.applied == observation.committed
+                            && observation.committed.is_some_and(|position| {
+                                position.term == observation.hard_state.term
+                            })
+                    }) {
+                        return index;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        match result {
+            Ok(index) => index,
+            Err(error) => panic!(
+                "automatic election failed: {error:?}; {}",
+                topology_diagnostics(nodes, callers).await
+            ),
+        }
+    }
+
+    async fn automatic_proposal(
+        nodes: &[OwnedRuntime],
+        callers: &[Arc<TestEndpointCaller>],
+        leader: usize,
+        command_id: u128,
+    ) -> ControlResponse {
+        match retry_capacity(|| {
+            nodes[leader].submit("principal:test".into(), command(command_id), |_, _| Ok(()))
+        })
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => panic!(
+                "automatic proposal {command_id} on node {leader} failed: {error:?}; {}",
+                topology_diagnostics(nodes, callers).await
+            ),
+        }
+    }
+
+    async fn automatic_observation(
+        nodes: &[OwnedRuntime],
+        callers: &[Arc<TestEndpointCaller>],
+        index: usize,
+    ) -> OwnedObservation {
+        match retry_capacity(|| nodes[index].observe()).await {
+            Ok(observation) => observation,
+            Err(error) => panic!(
+                "automatic observation node {index} failed: {error:?}; {}",
+                topology_diagnostics(nodes, callers).await
+            ),
+        }
+    }
+
+    async fn automatic_generated_transport_scenario(count: usize) {
+        let root = tempfile::tempdir().unwrap();
+        let (callers, paths, ids, cluster) = fixed_test_cluster(root.path(), count);
+        let mut nodes = Vec::new();
+        for index in 0..count {
+            nodes.push(
+                start_automatic(
+                    callers[index].clone(),
+                    paths[index].clone(),
+                    cluster.clone(),
+                    ids[index],
+                    1,
+                )
+                .await,
+            );
+        }
+        let eligible = (0..count).collect::<Vec<_>>();
+        let leader = automatic_leader(&nodes, &callers, &eligible).await;
+        let term = automatic_observation(&nodes, &callers, leader)
+            .await
+            .hard_state
+            .term;
+        let first = automatic_proposal(&nodes, &callers, leader, 1).await;
+        // More than the maximum randomized election timeout, with no explicit
+        // campaign or client traffic needed to retain the elected term.
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        for node in &nodes {
+            assert_eq!(
+                retry_capacity(|| node.observe())
+                    .await
+                    .unwrap()
+                    .hard_state
+                    .term,
+                term,
+                "stable term changed: {}",
+                topology_diagnostics(&nodes, &callers).await
+            );
+        }
+        assert_eq!(
+            automatic_leader(&nodes, &callers, &eligible).await,
+            leader,
+            "stable leader changed: {}",
+            topology_diagnostics(&nodes, &callers).await
+        );
+        let authorized = checked_quorum_read(leader, &nodes, &callers).await;
+        assert!(authorized.state.revision >= first.control_revision);
+
+        // Complete joined shutdown, then require an automatic replacement.
+        // The old node remains registered in the test routing map but its
+        // authority registration is gone: reachability cannot confer a vote.
+        nodes[leader].shutdown().await.unwrap();
+        callers[0]
+            .network
+            .delays
+            .lock()
+            .unwrap()
+            .insert(callers[leader].endpoint.clone(), Duration::from_secs(8));
+        let surviving = eligible
+            .into_iter()
+            .filter(|index| *index != leader)
+            .collect::<Vec<_>>();
+        let replacement = automatic_leader(&nodes, &callers, &surviving).await;
+        assert!(
+            automatic_observation(&nodes, &callers, replacement)
+                .await
+                .hard_state
+                .term
+                > term,
+            "replacement term did not advance: {}",
+            topology_diagnostics(&nodes, &callers).await
+        );
+        automatic_proposal(&nodes, &callers, replacement, 2).await;
+        let replacement_term = automatic_observation(&nodes, &callers, replacement)
+            .await
+            .hard_state
+            .term;
+        // The unavailable peer occupies a transport turn longer than the
+        // election timeout. Healthy-majority heartbeats and local application
+        // must continue independently of that slot.
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        for &index in &surviving {
+            assert_eq!(
+                automatic_observation(&nodes, &callers, index)
+                    .await
+                    .hard_state
+                    .term,
+                replacement_term,
+                "replacement stable term changed: {}",
+                topology_diagnostics(&nodes, &callers).await
+            );
+        }
+        callers[0].network.delays.lock().unwrap().clear();
+        for node in &nodes {
+            node.shutdown().await.unwrap();
+        }
+        callers[0].network.nodes.lock().unwrap().clear();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn automatic_three_voter_generated_transport_heartbeat_and_failover() {
+        let _scenario = RECOVERY_SCENARIO.lock().await;
+        automatic_generated_transport_scenario(3).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+    async fn automatic_five_voter_generated_transport_heartbeat_and_failover() {
+        let _scenario = RECOVERY_SCENARIO.lock().await;
+        automatic_generated_transport_scenario(5).await;
+    }
+
     /// Caller-side backpressure only. Capacity proves no proposal/read round
     /// was admitted; never retry an uncertain mutation or quorum failure.
     async fn retry_capacity<T, F, Fut>(mut attempt: F) -> Result<T, RuntimeError>
@@ -2181,18 +2869,21 @@ mod tests {
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, RuntimeError>>,
     {
-        tokio::time::timeout(REQUEST_TIMEOUT, async {
-            loop {
-                match attempt().await {
-                    Err(RuntimeError::Capacity) => {
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                    }
-                    result => return result,
+        let deadline = tokio::time::Instant::now() + REQUEST_TIMEOUT;
+        loop {
+            // Each attempt owns its runtime's bounded completion deadline.
+            // An outer timeout must not cancel admitted waiting and relabel an
+            // uncertain mutation as definitive pre-admission Capacity.
+            match attempt().await {
+                Err(RuntimeError::Capacity) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep_until(
+                        (tokio::time::Instant::now() + Duration::from_millis(20)).min(deadline),
+                    )
+                    .await;
                 }
+                result => return result,
             }
-        })
-        .await
-        .unwrap_or(Err(RuntimeError::Capacity))
+        }
     }
 
     async fn topology_diagnostics(
@@ -2431,7 +3122,12 @@ mod tests {
                 .unwrap()
         };
         let (minority, _) = tokio::join!(minority, majority);
-        assert_eq!(minority, Err(RuntimeError::Indeterminate));
+        assert_eq!(
+            minority,
+            Err(RuntimeError::Indeterminate),
+            "minority proposal outcome: {}",
+            topology_diagnostics(&nodes, &callers).await
+        );
         assert_eq!(
             retry_capacity(|| nodes[0].observe())
                 .await
@@ -2553,6 +3249,9 @@ mod tests {
         let (response, _receive) = oneshot::channel();
         let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut fixed = FixedPeers {
+            automatic: None,
+            next_heartbeat: tokio::time::Instant::now(),
+            read_turn: false,
             cursor: 0,
             recent: std::collections::VecDeque::new(),
             ticks: 0,
@@ -2601,7 +3300,68 @@ mod tests {
         }
         assert_eq!(calls.iter().filter(|peer| **peer == peers[0]).count(), 3);
         assert_eq!(calls.iter().filter(|peer| **peer == peers[1]).count(), 3);
+        exercise_automatic_fairness(&executor, local, &mut fixed, &observation, peers, context)
+            .await;
         executor.shutdown().await.unwrap();
+    }
+
+    async fn exercise_automatic_fairness(
+        executor: &Arc<VoteExecutor>,
+        local: NodeId,
+        fixed: &mut FixedPeers,
+        observation: &OwnedObservation,
+        peers: [NodeId; 2],
+        context: ReadContext,
+    ) {
+        fixed.automatic = Some(AutomaticElection::seeded(
+            tokio::time::Instant::now(),
+            [3; 32],
+        ));
+        let expired = tokio::time::Instant::now() - Duration::from_secs(1);
+        fixed.automatic.as_mut().unwrap().deadline = expired;
+        let mut stale = observation.clone();
+        stale.local_leader = false;
+        stale.hard_state.term = crate::consensus_model::Term(stale.hard_state.term.0 + 1);
+        automatic_campaign(executor, local, fixed, &stale)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixed.automatic.as_ref().unwrap().deadline,
+            expired,
+            "failed guarded campaign redrew its expired deadline"
+        );
+        assert!(fixed.campaign.is_none());
+        fixed.read = None;
+        let (release, held) = oneshot::channel();
+        fixed.in_flight.insert(peers[1]);
+        let slow = peers[1];
+        fixed.tasks.spawn(async move {
+            let _ = held.await;
+            (slow, Ok(()))
+        });
+        for _ in 0..4 {
+            fixed.next_heartbeat = tokio::time::Instant::now();
+            schedule_peers(executor, local, fixed, observation);
+            assert_eq!(fixed.tasks.len(), 2, "slow peer blocked healthy admission");
+            let (peer, result) = fixed.tasks.join_next().await.unwrap().unwrap();
+            assert_eq!(peer, peers[0]);
+            fixed.completed(peer, result);
+        }
+        // Cancelling a waiter must release only waiting state, without needing
+        // a storage admission or cancelling a peer task.
+        let (send, receive) = oneshot::channel();
+        drop(receive);
+        fixed.read = Some(PendingRead {
+            context,
+            response: send,
+            deadline: tokio::time::Instant::now() + REQUEST_TIMEOUT,
+            attempted: BTreeSet::new(),
+        });
+        fixed.expire_waiters(tokio::time::Instant::now());
+        assert!(fixed.read.is_none());
+        assert_eq!(fixed.tasks.len(), 1);
+        release.send(()).unwrap();
+        drain_peer_tasks(&mut fixed.tasks).await.unwrap();
     }
 
     #[tokio::test]
@@ -2626,6 +3386,71 @@ mod tests {
         ));
         assert!(completed.load(std::sync::atomic::Ordering::SeqCst));
         assert!(tasks.is_empty());
+    }
+
+    #[test]
+    fn recovery_capacity_classification_does_not_retry_storage_failures() {
+        assert_eq!(
+            recovery_error(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            RuntimeError::Capacity
+        );
+        for kind in [
+            std::io::ErrorKind::InvalidData,
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Other,
+        ] {
+            assert!(matches!(
+                recovery_error(std::io::Error::from(kind)),
+                RuntimeError::Authority(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn randomized_election_deadlines_stay_above_heartbeat_budget() {
+        let now = tokio::time::Instant::now();
+        let mut first = AutomaticElection::seeded(now, [7; 32]);
+        let mut replay = AutomaticElection::seeded(now, [7; 32]);
+        let initial = first.deadline;
+        let mut changed = false;
+        for _ in 0..128 {
+            let timeout = first.timeout();
+            assert_eq!(timeout, replay.timeout());
+            changed |= now + timeout != initial;
+            assert!(timeout >= Duration::from_millis(ELECTION_MIN_MILLIS));
+            assert!(timeout < Duration::from_millis(ELECTION_MIN_MILLIS + ELECTION_JITTER_MILLIS));
+            assert!(timeout > HEARTBEAT_INTERVAL * 4);
+        }
+        assert!(changed, "seeded retries must redraw jitter");
+    }
+
+    #[test]
+    fn activity_deadline_uses_receive_time_and_does_not_redraw_on_poll() {
+        use crate::owned_vote_store::{ElectionActivity, ElectionActivityKind};
+        let now = tokio::time::Instant::now();
+        let mut election = AutomaticElection::seeded(now, [9; 32]);
+        for (sequence, kind) in [
+            (1, ElectionActivityKind::GrantedVote),
+            (2, ElectionActivityKind::AuthenticatedLeader),
+        ] {
+            let activity = ElectionActivity {
+                sequence,
+                term: crate::consensus_model::Term(2),
+                peer: NodeId::from(2),
+                kind,
+                observed_at: (now + Duration::from_secs(sequence)).into_std(),
+            };
+            assert!(election.observe_activity(activity));
+            let deadline = election.deadline;
+            assert!(
+                deadline
+                    >= now
+                        + Duration::from_secs(sequence)
+                        + Duration::from_millis(ELECTION_MIN_MILLIS)
+            );
+            assert!(!election.observe_activity(activity));
+            assert_eq!(election.deadline, deadline);
+        }
     }
 
     #[tokio::test]

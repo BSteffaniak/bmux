@@ -279,6 +279,14 @@ impl ConsensusNode {
             .collect()
     }
 
+    /// Reports whether durable protocol membership has been initialized.
+    ///
+    /// # Errors
+    /// Returns the runtime failure rather than treating unavailable state as pristine.
+    pub async fn is_initialized(&self) -> Result<bool, ConsensusRuntimeError> {
+        self.raft.is_initialized().await.map_err(Into::into)
+    }
+
     #[must_use]
     pub const fn raft(&self) -> &openraft::Raft<ControlRaftConfig> {
         &self.raft
@@ -1105,9 +1113,11 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
+        assert!(!node.is_initialized().await.unwrap());
         node.initialize_single(*identity.node_id(), "memory://bounded")
             .await
             .unwrap();
+        assert!(node.is_initialized().await.unwrap());
         wait_for_leader(&[&node]).await;
         assert!(matches!(
             node.mutate_bounded(command(1, 0)).await,

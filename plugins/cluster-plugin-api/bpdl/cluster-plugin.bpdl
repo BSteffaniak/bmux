@@ -1016,6 +1016,34 @@ interface cluster-consensus-rpc {
 
 // Separate owned installation contract. Transfer v1 finish remains seal-only;
 // neither legacy Raft RPC nor owned append meanings change. Not advertised.
+// Append-only V2 extension. V1 vote/append/error meanings remain unchanged.
+// Selection requires authenticated negotiation of RPC V1, transfer V1 AND RPC V2.
+// Declaration does not advertise or activate a provider.
+interface cluster-consensus-rpc-v2-types {
+    variant append-outcome {
+        accepted { value: cluster-consensus-rpc-types.append-outcome },
+        // No replication progress. The signed response term exceeds request.term.
+        stale-term,
+    }
+    record append-response {
+        request-id: uuid,
+        source: bytes,
+        term: u64,
+        outcome: append-outcome,
+        // V2 domain; binds the complete signed V2 request and intended responder.
+        signature: bytes,
+    }
+}
+
+@capability(CLUSTER_AUTH)
+@interface-version(2)
+interface cluster-consensus-rpc {
+    // Request fields retain their modeled representation, but signatures use
+    // the V2 append domain. No fallback to V1 or interpretation of bare errors
+    // as authenticated term evidence is permitted.
+    command append(request: cluster-consensus-rpc-types.append-request) -> result<cluster-consensus-rpc-v2-types.append-response, cluster-consensus-rpc-types.rpc-error>;
+}
+
 interface cluster-consensus-snapshot-types {
     record install-request {
         request-id: uuid,

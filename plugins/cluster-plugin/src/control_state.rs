@@ -135,6 +135,86 @@ pub struct ControlState {
 }
 
 impl ControlState {
+    /// Applies one canonical owned application payload using committed membership
+    /// at this log position. This is deterministic replay, not proposal admission:
+    /// the executor must authenticate/authorize and negotiate recipient decoders
+    /// before replication. New aggregate admission limits do not rewrite history.
+    ///
+    /// # Errors
+    /// Rejects malformed, unsupported or noncanonical command bytes before mutation.
+    pub fn apply_owned_application_command(
+        &mut self,
+        bytes: &[u8],
+        membership: &crate::consensus_model::StoredMembership,
+    ) -> Result<ControlResponse, String> {
+        let command = crate::control_codec::OwnedApplicationCommand::decode(bytes, usize::MAX)?;
+        Ok(self.apply_owned_decoded_command(&command, membership))
+    }
+
+    /// Checks deterministic proposal preconditions against one authoritative
+    /// state/membership snapshot without mutating it. The executor supplies its
+    /// negotiated aggregate limit, then rechecks authority before appending.
+    /// This does not authenticate the caller or negotiate recipient decoders.
+    ///
+    /// # Errors
+    /// Rejects invalid representations and commands exceeding the selected limit.
+    /// Semantic rejection is returned as the unchanged canonical response.
+    pub fn preflight_owned_application_command(
+        &self,
+        bytes: &[u8],
+        limit: usize,
+        membership: &crate::consensus_model::StoredMembership,
+    ) -> Result<ControlResponse, String> {
+        let command = crate::control_codec::OwnedApplicationCommand::decode(bytes, limit)?;
+        Ok(self
+            .clone()
+            .apply_owned_decoded_command(&command, membership))
+    }
+
+    fn apply_owned_decoded_command(
+        &mut self,
+        command: &crate::control_codec::OwnedApplicationCommand,
+        membership: &crate::consensus_model::StoredMembership,
+    ) -> ControlResponse {
+        use crate::control_codec::OwnedApplicationCommand;
+        match command {
+            OwnedApplicationCommand::Control(command) => self.apply(command),
+            OwnedApplicationCommand::FeatureActivation(command) => {
+                self.apply_owned_feature_activation(command, Some(membership))
+            }
+            OwnedApplicationCommand::Bootstrap(command) => {
+                self.apply_owned_bootstrap_command(command, membership)
+            }
+            OwnedApplicationCommand::ProtocolRefresh(command) => {
+                self.apply_refresh_command(command)
+            }
+            OwnedApplicationCommand::Publication(command) => {
+                let result = self.apply_owned_publication(command, membership);
+                let (control_revision, result) = match result {
+                    Ok(revision) => (
+                        revision,
+                        ControlCommandResult::Accepted {
+                            payload: Vec::new(),
+                        },
+                    ),
+                    Err(reason) => (
+                        self.revision,
+                        ControlCommandResult::Rejected {
+                            error: ControlCommandError::InvalidTransition { reason },
+                        },
+                    ),
+                };
+                ControlResponse {
+                    schema_version: CONTROL_SCHEMA_VERSION,
+                    command_id: command.reports[0].command_id.clone(),
+                    control_revision,
+                    workflow_status: ControlWorkflowStatus::Complete,
+                    result,
+                }
+            }
+        }
+    }
+
     #[must_use]
     pub fn new(cluster_id: impl Into<String>) -> Self {
         Self {

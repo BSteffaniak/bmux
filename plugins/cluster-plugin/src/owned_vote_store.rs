@@ -56,6 +56,7 @@ pub enum ReplicationTurn {
 }
 
 struct OutboundAppendBatch {
+    v2: bool,
     endpoint: String,
     cluster: String,
     credential_serial: String,
@@ -508,13 +509,20 @@ fn validate_install_receipts(bytes: &[u8]) -> io::Result<()> {
     {
         return Err(invalid("invalid install receipt framing"));
     }
-    for (index, receipt) in bytes.chunks_exact(INSTALL_RECEIPT_BYTES).enumerate() {
+    for (index, receipt) in bytes
+        .as_chunks::<INSTALL_RECEIPT_BYTES>()
+        .0
+        .iter()
+        .enumerate()
+    {
         let boundary = decode_position(&receipt[104..152])?
             .ok_or_else(|| invalid("missing receipt boundary"))?;
         let term = u64::from_le_bytes(receipt[152..160].try_into().map_err(io::Error::other)?);
         if boundary.term.0 > term
             || bytes[..index * INSTALL_RECEIPT_BYTES]
-                .chunks_exact(INSTALL_RECEIPT_BYTES)
+                .as_chunks::<INSTALL_RECEIPT_BYTES>()
+                .0
+                .iter()
                 .any(|old| old[..48] == receipt[..48] || (old[16..72] == receipt[16..72]))
         {
             return Err(invalid("conflicting install receipt authority"));
@@ -529,7 +537,7 @@ fn validate_install_receipt_coverage(
     hard_state: HardState,
 ) -> io::Result<()> {
     validate_install_receipts(bytes)?;
-    for receipt in bytes.chunks_exact(INSTALL_RECEIPT_BYTES) {
+    for receipt in bytes.as_chunks::<INSTALL_RECEIPT_BYTES>().0 {
         let boundary = decode_position(&receipt[104..152])?
             .ok_or_else(|| invalid("missing receipt boundary"))?;
         let term = Term(u64::from_le_bytes(
@@ -897,12 +905,30 @@ pub struct OwnedVoteStore {
     failed: bool,
 }
 
-/// Coherent local durable positions and execution-local leadership. This is
-/// diagnostic state, not a quorum-confirmed read or an authority lease.
+/// Execution-local evidence for election deadline scheduling, never a lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElectionActivityKind {
+    AuthenticatedLeader,
+    GrantedVote,
+}
+
+/// Checked, incarnation-local activity; restart begins with no observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElectionActivity {
+    pub sequence: u64,
+    pub term: Term,
+    pub peer: NodeId,
+    pub kind: ElectionActivityKind,
+    pub observed_at: std::time::Instant,
+}
+
+/// Coherent local durable positions and execution-local leadership/activity.
+/// Diagnostic state, not a quorum-confirmed read or an authority lease.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedObservation {
     pub hard_state: HardState,
     pub local_leader: bool,
+    pub election_activity: Option<ElectionActivity>,
     pub effective_membership: Option<crate::consensus_model::StoredMembership>,
     pub committed_membership: Option<crate::consensus_model::StoredMembership>,
     pub last_log: Option<LogIdentity>,
@@ -963,10 +989,42 @@ pub struct DurableVoteGate {
     read_barrier: crate::consensus_model::ReadBarrier,
     read_context: Option<crate::consensus_model::ReadContext>,
     read_membership: Option<crate::consensus_model::StoredMembership>,
+    election_activity: Option<ElectionActivity>,
+    staging_expiry: Option<tokio::task::JoinHandle<()>>,
     staging: Option<(std::fs::File, crate::transfer_staging::TransferStaging)>,
 }
 
 impl DurableVoteGate {
+    fn record_election_activity(
+        &mut self,
+        peer: NodeId,
+        kind: ElectionActivityKind,
+    ) -> Result<(), VoteGateError> {
+        if self.election_activity.is_some_and(|activity| {
+            activity.term == self.store.state.term
+                && activity.kind == ElectionActivityKind::AuthenticatedLeader
+                && activity.peer != peer
+        }) {
+            // Conflicting same-term claims cannot keep postponing an election.
+            return Ok(());
+        }
+        let Some(sequence) = self
+            .election_activity
+            .map_or(Some(1), |activity| activity.sequence.checked_add(1))
+        else {
+            self.store.failed = true;
+            return Err(VoteGateError::EffectExhausted);
+        };
+        self.election_activity = Some(ElectionActivity {
+            sequence,
+            term: self.store.state.term,
+            peer,
+            kind,
+            observed_at: std::time::Instant::now(),
+        });
+        Ok(())
+    }
+
     fn observe_verified_term(&mut self, peer: NodeId, term: Term) -> Result<bool, VoteGateError> {
         let (_, membership) = self.store.election_context()?;
         let eligible = membership.as_ref().is_some_and(|membership| {
@@ -1044,6 +1102,8 @@ impl DurableVoteGate {
             read_barrier: crate::consensus_model::ReadBarrier::default(),
             read_context: None,
             read_membership: None,
+            election_activity: None,
+            staging_expiry: None,
             staging: None,
         }
     }
@@ -1225,7 +1285,7 @@ impl VoteExecutor {
             gate.staging = Some((directory, staging));
             // Install the timer inside admitted work: cancellation of configure
             // cannot leave successfully configured staging without idle cleanup.
-            tokio::spawn(async move {
+            gate.staging_expiry = Some(tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     let Some(owner) = owner.upgrade() else { break };
@@ -1251,7 +1311,7 @@ impl VoteExecutor {
                         break;
                     }
                 }
-            });
+            }));
             Ok(Ok(()))
         })
         .await
@@ -1493,14 +1553,108 @@ impl VoteExecutor {
     /// unpublished path does not yet resolve staged retries from the durable log.
     /// # Errors
     /// Rejects stale authority, invalid objects, missing staging and storage failure.
-    #[allow(clippy::too_many_lines)] // Keep authority observation and mutation in one serialized closure.
     pub async fn append_authenticated<C: crate::ClusterRuntimeOps + Send + Sync + 'static>(
         &self,
         caller: std::sync::Arc<C>,
         local: NodeId,
         request: bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
     ) -> Result<AppendDecision, AuthenticatedAppendError> {
-        crate::consensus_network::owned_append_signing_payload(&request)?;
+        self.append_authenticated_version(caller, local, request, false)
+            .await?
+            .0
+            .ok_or(AuthenticatedAppendError::TermMismatch)
+    }
+
+    /// V2 signs the exact request-bound durable outcome, including stale terms.
+    /// # Errors
+    /// Authentication or uncertain persistence never produces a signed outcome.
+    pub async fn append_v2_authenticated<C: crate::ClusterRuntimeOps + Send + Sync + 'static>(
+        &self,
+        caller: std::sync::Arc<C>,
+        local: NodeId,
+        request: bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
+    ) -> Result<
+        bmux_cluster_plugin_api::cluster_consensus_rpc_v2_types::AppendResponse,
+        AuthenticatedAppendError,
+    > {
+        use bmux_cluster_plugin_api::{
+            cluster_consensus_rpc_types::AppendOutcome as V1,
+            cluster_consensus_rpc_v2_types::{AppendOutcome as V2, AppendResponse},
+        };
+        let identity = crate::load_or_create_node_identity(caller.as_ref())
+            .map_err(|_| AuthenticatedAppendError::Unauthorized)?;
+        if *identity.node_id() != local {
+            return Err(AuthenticatedAppendError::Unauthorized);
+        }
+        let (outcome, term) = match self
+            .append_authenticated_version(caller, local, request.clone(), true)
+            .await
+        {
+            Ok((None, term)) => (V2::StaleTerm, term),
+            Ok((Some(decision), term)) => {
+                let value = match decision.outcome {
+                    Ok(AppendOutcome::Reconciled(AppendReconciliation::Matched {
+                        through,
+                        ..
+                    })) => V1::Durable {
+                        matched: through.map(wire_log_identity),
+                    },
+                    Ok(AppendOutcome::Reconciled(AppendReconciliation::PreviousMismatch)) => {
+                        V1::Conflict {
+                            next_index: request
+                                .previous
+                                .as_ref()
+                                .map_or(0, |previous| previous.index),
+                        }
+                    }
+                    _ => {
+                        return Err(AuthenticatedAppendError::Invalid(
+                            "append reconciliation rejected".into(),
+                        ));
+                    }
+                };
+                (V2::Accepted { value }, term)
+            }
+            Err(AuthenticatedAppendError::MissingTransfer { reference, term }) => (
+                V2::Accepted {
+                    value: V1::MissingTransfer {
+                        reference: *reference,
+                    },
+                },
+                term,
+            ),
+            Err(error) => return Err(error),
+        };
+        let mut response = AppendResponse {
+            request_id: request.request_id,
+            source: local.as_bytes().to_vec(),
+            term: term.0,
+            outcome,
+            signature: Vec::new(),
+        };
+        response.signature = identity.sign(
+            &crate::consensus_network::owned_append_v2_response_signing_payload(
+                &request, &response,
+            )?,
+        );
+        Ok(response)
+    }
+
+    // Keep authentication, authoritative eligibility, term persistence and append
+    // in one serialized admission; V1 and V2 differ only at explicit wire boundaries.
+    #[allow(clippy::too_many_lines)]
+    async fn append_authenticated_version<C: crate::ClusterRuntimeOps + Send + Sync + 'static>(
+        &self,
+        caller: std::sync::Arc<C>,
+        local: NodeId,
+        request: bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
+        v2: bool,
+    ) -> Result<(Option<AppendDecision>, Term), AuthenticatedAppendError> {
+        if v2 {
+            crate::consensus_network::owned_append_v2_signing_payload(&request)?;
+        } else {
+            crate::consensus_network::owned_append_signing_payload(&request)?;
+        }
         self.run(move |gate| {
             use bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendEntry;
             use bmux_cluster_plugin_api::cluster_consensus_transfer_types::{
@@ -1542,17 +1696,26 @@ impl VoteExecutor {
             })()
             .map_err(|_| VoteGateError::StorageFailure)?;
             store.failed = false;
-            Ok((|| -> Result<_, AuthenticatedAppendError> {
+            let outcome = (|| -> Result<_, AuthenticatedAppendError> {
                 if request.cluster_id.as_bytes() != authority.1 {
                     return Err(AuthenticatedAppendError::Unauthorized);
                 }
                 let members = authority.0.members.into_values().collect::<Vec<_>>();
-                let source = crate::consensus_network::authenticate_owned_append(
-                    caller.as_ref(),
-                    local,
-                    &members,
-                    &request,
-                )
+                let source = if v2 {
+                    crate::consensus_network::authenticate_owned_append_v2(
+                        caller.as_ref(),
+                        local,
+                        &members,
+                        &request,
+                    )
+                } else {
+                    crate::consensus_network::authenticate_owned_append(
+                        caller.as_ref(),
+                        local,
+                        &members,
+                        &request,
+                    )
+                }
                 .map_err(|_| AuthenticatedAppendError::Unauthorized)?;
                 if !authority.2.as_ref().is_some_and(|membership| {
                     membership.nodes().contains_key(&local)
@@ -1564,7 +1727,7 @@ impl VoteExecutor {
                     return Err(AuthenticatedAppendError::Unauthorized);
                 }
                 if request.term < store.state.term.0 {
-                    return Err(AuthenticatedAppendError::TermMismatch);
+                    return Ok((source, None, false, store.state.term));
                 }
                 if request.term > store.state.term.0 {
                     // Authentication and voter eligibility precede authority changes.
@@ -1707,10 +1870,36 @@ impl VoteExecutor {
                         .map(crate::consensus_network::transfer_position)
                         .transpose()?,
                 };
-                store
+                // Authentication/eligible higher-term persistence precedes this
+                // structural check. Malformed peer input is not storage failure.
+                decoded.validate(64, 32 * 1024 * 1024).map_err(|error| {
+                    AuthenticatedAppendError::Invalid(format!("invalid append request: {error:?}"))
+                })?;
+                let protocol_valid = store
+                    .append_activity_valid(&decoded)
+                    .map_err(AuthenticatedAppendError::Storage)?;
+                let decision = store
                     .append(&decoded, (64, 32 * 1024 * 1024))
-                    .map_err(AuthenticatedAppendError::Storage)
-            })())
+                    .map_err(AuthenticatedAppendError::Storage)?;
+                let leader_activity = protocol_valid
+                    && decision.term == store.state.term
+                    && matches!(decision.outcome, Ok(AppendOutcome::Reconciled(_)));
+                Ok((source, Some(decision), leader_activity, store.state.term))
+            })();
+            Ok(match outcome {
+                Ok((source, decision, leader_activity, term)) => {
+                    // A healthy prefix mismatch is normal during follower repair.
+                    // Invalid membership, equivocation and storage failure are not.
+                    if leader_activity {
+                        gate.record_election_activity(
+                            source,
+                            ElectionActivityKind::AuthenticatedLeader,
+                        )?;
+                    }
+                    Ok((decision, term))
+                }
+                Err(error) => Err(error),
+            })
         })
         .await
         .map_err(AuthenticatedAppendError::Executor)?
@@ -1783,7 +1972,7 @@ impl VoteExecutor {
             })()
             .map_err(|_| VoteGateError::StorageFailure)?;
             store.failed = false;
-            Ok((|| -> Result<_, RpcError> {
+            let outcome = (|| -> Result<_, RpcError> {
                 if request.cluster_id.as_bytes() != authority.1 {
                     return Err(RpcError::Unauthorized);
                 }
@@ -1810,18 +1999,75 @@ impl VoteExecutor {
                         },
                     )
                     .map_err(vote_rpc_error)?;
-                if gate
-                    .campaign
-                    .as_ref()
-                    .is_some_and(|campaign| campaign.request.term != response.term)
-                {
-                    gate.campaign = None;
+                Ok((source, response))
+            })();
+            Ok(match outcome {
+                Ok((source, response)) => {
+                    if response.granted {
+                        gate.record_election_activity(source, ElectionActivityKind::GrantedVote)?;
+                    }
+                    if gate
+                        .campaign
+                        .as_ref()
+                        .is_some_and(|campaign| campaign.request.term != response.term)
+                    {
+                        gate.campaign = None;
+                    }
+                    Ok(response)
                 }
-                Ok(response)
-            })())
+                Err(error) => Err(error),
+            })
         })
         .await
         .map_err(vote_rpc_error)?
+    }
+
+    /// Campaign only if the deadline's complete authority observation still holds.
+    /// Comparison, voter eligibility and durable self-vote share one admission;
+    /// a watch notification is not authority to campaign.
+    /// # Errors
+    /// Returns busy/stopped, exhausted identities or uncertain persistence errors.
+    pub async fn campaign_if_unchanged(
+        &self,
+        local: NodeId,
+        expected_hard_state: HardState,
+        expected_membership: crate::consensus_model::StoredMembership,
+        expected_activity_sequence: Option<u64>,
+    ) -> Result<Option<RequestVote>, VoteGateError> {
+        self.run(move |gate| {
+            let observation = gate.store.observe()?;
+            let eligible_leader = gate.leader.as_ref().is_some_and(|leader| {
+                leader.term == observation.hard_state.term
+                    && observation.hard_state.voted_for == Some(local)
+                    && leader.membership == expected_membership.membership
+                    && leader.matched.contains_key(&local)
+            });
+            if eligible_leader
+                || observation.hard_state != expected_hard_state
+                || observation.effective_membership.as_ref() != Some(&expected_membership)
+                || gate.election_activity.map(|activity| activity.sequence)
+                    != expected_activity_sequence
+                || !expected_membership
+                    .membership
+                    .configurations()
+                    .iter()
+                    .any(|voters| voters.contains(&local))
+            {
+                return Ok(None);
+            }
+            let request = gate.store.campaign(local)?;
+            if let Some(request) = request {
+                gate.cancel_read();
+                gate.leader = None;
+                gate.initialized_noop = None;
+                gate.campaign = Some(crate::consensus_model::Campaign::new(
+                    request,
+                    expected_membership.membership,
+                ));
+            }
+            Ok(request)
+        })
+        .await
     }
 
     /// Begin an eligible local campaign using authoritative log and membership.
@@ -2026,6 +2272,9 @@ impl VoteExecutor {
             .run(move |gate| gate.store.outbound_batch(gate.leader.as_ref(), local, peer))
             .await
             .map_err(vote_rpc_error)??;
+        if !batch.v2 {
+            return Err(RpcError::Incompatible);
+        }
         let proof = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             crate::endpoint::peer_authentication_proof(
@@ -2062,12 +2311,11 @@ impl VoteExecutor {
                 peer: proof,
             },
         };
-        request.proof.signature = identity.sign(
-            &crate::consensus_network::owned_append_signing_payload(&request)
-                .map_err(|_| RpcError::InvalidRequest)?,
-        );
+        let signed = crate::consensus_network::owned_append_v2_signing_payload(&request)
+            .map_err(|_| RpcError::InvalidRequest)?;
+        request.proof.signature = identity.sign(&signed);
         drop(preparation);
-        self.replicate_append(caller, local, request).await
+        self.replicate_append_v2(caller, local, request).await
     }
 
     /// Return the current retry position only while durable leader authority
@@ -2089,6 +2337,101 @@ impl VoteExecutor {
                 })
                 .and_then(|leader| leader.next.get(&peer).copied()))
         })
+        .await
+    }
+
+    /// Send explicitly negotiated V2; transport errors never trigger V1 fallback.
+    /// # Errors
+    /// Rejects missing selection, stale authority, invalid bindings or storage failure.
+    pub async fn replicate_append_v2<C: bmux_plugin::ServiceCaller + Send + Sync + 'static>(
+        &self,
+        caller: &C,
+        local: NodeId,
+        request: bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
+    ) -> Result<(), bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError> {
+        use bmux_cluster_plugin_api::{
+            cluster_consensus_rpc_types::{AppendResponse, RpcError},
+            cluster_consensus_rpc_v2_types::AppendOutcome as V2,
+        };
+        let outbound = self
+            .outbound_votes
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| RpcError::CapacityUnavailable)?;
+        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(RpcError::Stopped);
+        }
+        let signed = crate::consensus_network::owned_append_v2_signing_payload(&request)
+            .map_err(|_| RpcError::InvalidRequest)?;
+        if request.sender.as_slice() != local.as_bytes() || request.proof.signature.len() != 64 {
+            return Err(RpcError::Unauthorized);
+        }
+        crate::membership::verify_node_signature(
+            &local.to_string(),
+            &signed,
+            &request.proof.signature,
+        )
+        .map_err(|_| RpcError::Unauthorized)?;
+        let admitted = request.clone();
+        let (endpoint, peer, expected, membership) = self
+            .run(move |gate| {
+                let admission =
+                    gate.store
+                        .admit_replication(gate.leader.as_ref(), local, &admitted)?;
+                if let Ok((_, peer, _, _)) = &admission
+                    && !gate.store.peer_supports_append_v2(*peer)?
+                {
+                    return Ok(Err(RpcError::Incompatible));
+                }
+                Ok(admission)
+            })
+            .await
+            .map_err(vote_rpc_error)??;
+        let mut remote = crate::endpoint::EndpointDispatchClient::new(caller, endpoint.clone());
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bmux_cluster_plugin_api::cluster_consensus_rpc_v2::client::append(
+                &mut remote,
+                request.clone(),
+            ),
+        )
+        .await
+        .map_err(|_| RpcError::ExecutionFailed)?
+        .map_err(|_| RpcError::ExecutionFailed)??;
+        crate::consensus_network::verify_owned_append_v2_response(&request, &response)
+            .map_err(|_| RpcError::Unauthorized)?;
+        let outcome = match response.outcome {
+            V2::Accepted { value } => value,
+            V2::StaleTerm => {
+                return self
+                    .settle_response(outbound, move |gate| {
+                        if !gate.store.peer_supports_append_v2(peer)? {
+                            return Ok(Err(RpcError::Unauthorized));
+                        }
+                        gate.observe_verified_term(peer, Term(response.term))?;
+                        Ok(Err(RpcError::StaleTerm))
+                    })
+                    .await
+                    .map_err(vote_rpc_error)?;
+            }
+        };
+        self.replicate_response_admitted(
+            local,
+            request,
+            AppendResponse {
+                request_id: response.request_id,
+                source: response.source,
+                term: response.term,
+                outcome,
+                signature: response.signature,
+            },
+            endpoint,
+            peer,
+            expected,
+            membership,
+            outbound,
+            true,
+        )
         .await
     }
 
@@ -2135,7 +2478,7 @@ impl VoteExecutor {
         crate::consensus_network::verify_owned_append_response(&request, &response)
             .map_err(|_| RpcError::Unauthorized)?;
         self.replicate_response_admitted(
-            local, request, response, endpoint, peer, expected, membership, outbound,
+            local, request, response, endpoint, peer, expected, membership, outbound, false,
         )
         .await
     }
@@ -2153,11 +2496,15 @@ impl VoteExecutor {
         expected: Option<LogIdentity>,
         membership: Membership,
         outbound: tokio::sync::OwnedSemaphorePermit,
+        v2: bool,
     ) -> Result<(), bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError> {
         use bmux_cluster_plugin_api::cluster_consensus_rpc_types::{
             AppendOutcome as WireOutcome, RpcError,
         };
         self.settle_response(outbound, move |gate| {
+            if v2 && !gate.store.peer_supports_append_v2(peer)? {
+                return Ok(Err(RpcError::Unauthorized));
+            }
             if gate.observe_verified_term(peer, Term(response.term))? {
                 return Ok(Err(RpcError::StaleTerm));
             }
@@ -2580,6 +2927,7 @@ impl VoteExecutor {
     pub async fn observe(&self, local: NodeId) -> Result<OwnedObservation, VoteGateError> {
         self.run(move |gate| {
             let mut observation = gate.store.observe()?;
+            observation.election_activity = gate.election_activity;
             observation.local_leader = gate.leader.as_ref().is_some_and(|leader| {
                 leader.term == observation.hard_state.term
                     && observation.hard_state.voted_for == Some(local)
@@ -2996,6 +3344,14 @@ impl VoteExecutor {
                                     if let Some((_, staging)) = gate.staging.as_mut() {
                                         let _ = staging.abort(key);
                                     }
+                                    if gate.store.state.term == Term(request.reference.leader_term)
+                                    {
+                                        gate.record_election_activity(
+                                            source,
+                                            ElectionActivityKind::AuthenticatedLeader,
+                                        )
+                                        .map_err(|_| InstallError::ExecutionFailed)?;
+                                    }
                                     InstallOutcome::Installed {
                                         boundary: boundary.clone(),
                                     }
@@ -3249,6 +3605,9 @@ impl VoteExecutor {
     /// must retry shutdown to wait for release; Drop alone does not report it.
     /// # Errors
     /// Reports blocking-task failure rather than claiming successful shutdown.
+    // The guard must span expiry joining and move into the blocking close task;
+    // dropping it earlier permits cleanup to race canonical-store retirement.
+    #[allow(clippy::significant_drop_tightening)]
     pub async fn shutdown(&self) -> Result<(), VoteGateError> {
         self.closing
             .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -3263,6 +3622,15 @@ impl VoteExecutor {
             .await
             .map_err(|_| VoteGateError::Stopped)?;
         let mut guard = self.gate.clone().lock_owned().await;
+        // Taking the gate drains any already admitted expiry worker before abort.
+        if let Some(task) = guard.as_mut().and_then(|gate| gate.staging_expiry.take()) {
+            task.abort();
+            if let Err(error) = task.await
+                && !error.is_cancelled()
+            {
+                return Err(VoteGateError::Stopped);
+            }
+        }
         tokio::task::spawn_blocking(move || {
             if let Some(gate) = guard.as_mut()
                 && let Some((_, staging)) = gate.staging.as_mut()
@@ -3493,9 +3861,11 @@ impl OwnedVoteStore {
         validate_read_install_receipts(&meta)?;
         let result = receipts
             .value()
-            .chunks_exact(INSTALL_RECEIPT_BYTES)
+            .as_chunks::<INSTALL_RECEIPT_BYTES>()
+            .0
+            .iter()
             .find(|old| old[..48] == candidate[..48] || old[16..72] == candidate[16..72])
-            .map(|old| old == candidate);
+            .map(|old| old.as_slice() == candidate);
         self.failed = false;
         Ok(result)
     }
@@ -4179,6 +4549,7 @@ impl OwnedVoteStore {
                     .value(),
             )?;
             Ok(Ok(OutboundAppendBatch {
+                v2: crate::consensus_network::supports_owned_append_v2(member),
                 endpoint,
                 cluster,
                 credential_serial: member.credential_serial.clone(),
@@ -4194,6 +4565,20 @@ impl OwnedVoteStore {
         .map_err(|_| VoteGateError::StorageFailure)?;
         self.failed = false;
         Ok(result)
+    }
+
+    fn peer_supports_append_v2(&mut self, peer: NodeId) -> Result<bool, VoteGateError> {
+        let state = self
+            .read_control_state()
+            .map_err(|_| VoteGateError::StorageFailure)?;
+        let Some(member) = state.members.get(&peer.to_string()) else {
+            return Ok(false);
+        };
+        Ok(member.cluster_id == state.cluster_id
+            && member.state == bmux_cluster_plugin_api::cluster_types::ClusterMemberState::Active
+            && crate::membership::verify_membership_credential(member, crate::now_unix_ms())
+                .is_ok()
+            && crate::consensus_network::supports_owned_append_v2(member))
     }
 
     fn admit_replication(
@@ -4498,6 +4883,7 @@ impl OwnedVoteStore {
             Ok(OwnedObservation {
                 hard_state: self.state,
                 local_leader: false,
+                election_activity: None,
                 effective_membership,
                 committed_membership,
                 last_log,
@@ -4650,6 +5036,216 @@ impl OwnedVoteStore {
             self.failed = false;
         }
         result
+    }
+
+    fn activity_membership_valid(
+        tx: &redb::ReadTransaction,
+        request: &AppendRequest,
+        committed: Option<LogIdentity>,
+    ) -> io::Result<bool> {
+        if !request
+            .entries
+            .iter()
+            .any(|entry| matches!(entry.payload, EntryPayload::Membership(_)))
+        {
+            return Ok(true);
+        }
+        let meta = tx.open_table(TABLE).map_err(io::Error::other)?;
+        let memberships = tx.open_table(MEMBERSHIPS).map_err(io::Error::other)?;
+        let seed_bytes = meta
+            .get("applied_membership")
+            .map_err(io::Error::other)?
+            .ok_or_else(|| invalid("missing activity membership"))?;
+        let seed = (!seed_bytes.value().is_empty())
+            .then(|| stored_membership(seed_bytes.value()))
+            .transpose()?;
+        let first = request
+            .entries
+            .first()
+            .ok_or_else(|| invalid("missing proposed suffix"))?
+            .identity
+            .index
+            .0;
+        let mut chain = Vec::new();
+        for record in memberships.range(..first).map_err(io::Error::other)? {
+            let (_, bytes) = record.map_err(io::Error::other)?;
+            let membership = stored_membership(bytes.value())?;
+            if seed.as_ref().is_none_or(|seed| {
+                membership
+                    .introduced_at
+                    .zip(seed.introduced_at)
+                    .is_some_and(|(entry, seed)| entry.index > seed.index)
+            }) {
+                chain.push(membership);
+            }
+        }
+        for entry in &request.entries {
+            if let EntryPayload::Membership(membership) = &entry.payload {
+                if seed.as_ref().is_some_and(|seed| {
+                    seed.introduced_at
+                        .is_some_and(|position| entry.identity.index <= position.index)
+                }) {
+                    continue;
+                }
+                chain.push(crate::consensus_model::StoredMembership {
+                    introduced_at: Some(entry.identity),
+                    membership: membership.clone(),
+                });
+            }
+        }
+        Ok(validate_owned_membership_chain(seed.as_ref(), &chain, committed).is_ok())
+    }
+
+    // Authentication and eligibility are checked by the executor first. Inspect
+    // the pre-append view: PreviousMismatch alone does not inspect the proposed
+    // suffix for committed conflicts, payload equivocation or membership errors.
+    // These checks gate deadline evidence, not Raft's ordinary repair response.
+    fn activity_commit_valid(
+        log: &redb::ReadOnlyTable<u64, &[u8]>,
+        request: &AppendRequest,
+        snapshot: Option<LogIdentity>,
+        committed: Option<LogIdentity>,
+    ) -> io::Result<bool> {
+        let Some(advertised) = request.leader_commit else {
+            return Ok(true);
+        };
+        if advertised.term == request.term && advertised.leader != request.leader {
+            return Ok(false);
+        }
+        let existing = log
+            .get(advertised.index.0)
+            .map_err(io::Error::other)?
+            .map(|bytes| {
+                crate::consensus_storage::decode_owned_entry(bytes.value())
+                    .map(|entry| entry.identity)
+                    .map_err(io::Error::other)
+            })
+            .transpose()?
+            .or_else(|| snapshot.filter(|boundary| boundary.index == advertised.index));
+        // A known committed identity is immutable, regardless of term ordering.
+        // Snapshot boundaries are committed anchors even without a retained log.
+        if committed.is_some_and(|commit| advertised.index <= commit.index)
+            && existing.is_some_and(|identity| identity != advertised)
+            || snapshot.is_some_and(|boundary| {
+                boundary.index == advertised.index && boundary != advertised
+            })
+        {
+            return Ok(false);
+        }
+        let last = log
+            .last()
+            .map_err(io::Error::other)?
+            .map(|(_, bytes)| {
+                crate::consensus_storage::decode_owned_entry(bytes.value())
+                    .map(|entry| entry.identity)
+                    .map_err(io::Error::other)
+            })
+            .transpose()?;
+        // Different-term suffixes can legitimately be repaired. Same-term
+        // leader disagreement at any visible anchor cannot be ordinary repair.
+        Ok(existing
+            .into_iter()
+            .chain(snapshot)
+            .chain(last)
+            .chain(request.previous)
+            .chain(request.entries.iter().map(|entry| entry.identity))
+            .all(|identity| {
+                identity.term != advertised.term || identity.leader == advertised.leader
+            }))
+    }
+
+    fn append_activity_valid(&mut self, request: &AppendRequest) -> io::Result<bool> {
+        if request.term != self.state.term || request.validate(64, 32 * 1024 * 1024).is_err() {
+            return Ok(false);
+        }
+        self.failed = true;
+        let valid = (|| -> io::Result<bool> {
+            let tx = self.database.begin_read().map_err(io::Error::other)?;
+            let meta = tx.open_table(TABLE).map_err(io::Error::other)?;
+            let log = tx.open_table(LOG).map_err(io::Error::other)?;
+            let position = |key| -> io::Result<Option<LogIdentity>> {
+                decode_position(
+                    meta.get(key)
+                        .map_err(io::Error::other)?
+                        .ok_or_else(|| invalid("missing activity authority"))?
+                        .value(),
+                )
+            };
+            let committed = position("commit")?;
+            let snapshot = position("snapshot")?;
+            if !Self::activity_commit_valid(&log, request, snapshot, committed)? {
+                return Ok(false);
+            }
+            let last = log
+                .last()
+                .map_err(io::Error::other)?
+                .map(|(_, bytes)| {
+                    crate::consensus_storage::decode_owned_entry(bytes.value())
+                        .map(|entry| entry.identity)
+                        .map_err(io::Error::other)
+                })
+                .transpose()?
+                .or(snapshot);
+            if last.is_some_and(|last| last.term == request.term && last.leader != request.leader) {
+                return Ok(false);
+            }
+            for proposed in request
+                .previous
+                .iter()
+                .chain(request.entries.iter().map(|entry| &entry.identity))
+            {
+                let existing = log
+                    .get(proposed.index.0)
+                    .map_err(io::Error::other)?
+                    .map(|bytes| {
+                        crate::consensus_storage::decode_owned_entry(bytes.value())
+                            .map_err(io::Error::other)
+                    })
+                    .transpose()?;
+                let identity = existing
+                    .as_ref()
+                    .map(|entry| entry.identity)
+                    .or_else(|| snapshot.filter(|boundary| boundary.index == proposed.index));
+                if identity.is_some_and(|identity| {
+                    identity.term == proposed.term && identity.leader != proposed.leader
+                }) || (committed.is_some_and(|commit| proposed.index <= commit.index)
+                    && identity != Some(*proposed))
+                {
+                    return Ok(false);
+                }
+                if let Some(existing) = existing
+                    && let Some(entry) = request
+                        .entries
+                        .iter()
+                        .find(|entry| entry.identity == *proposed)
+                    && existing.identity == entry.identity
+                    && existing.payload != entry.payload
+                {
+                    return Ok(false);
+                }
+            }
+            // Matched suffixes receive full candidate-membership validation in
+            // append (including its reconciled commit watermark). Only the
+            // mismatch fast path needs this extra admission check.
+            if let Some(previous) = request.previous {
+                let local = log
+                    .get(previous.index.0)
+                    .map_err(io::Error::other)?
+                    .map(|bytes| {
+                        crate::consensus_storage::decode_owned_entry(bytes.value())
+                            .map(|entry| entry.identity)
+                            .map_err(io::Error::other)
+                    })
+                    .transpose()?
+                    .or_else(|| snapshot.filter(|boundary| boundary.index == previous.index));
+                if local != Some(previous) {
+                    return Self::activity_membership_valid(&tx, request, committed);
+                }
+            }
+            Ok(true)
+        })()?;
+        self.failed = false;
+        Ok(valid)
     }
 
     /// Persist an authenticated append under the same owner as votes. The caller
@@ -4841,6 +5437,249 @@ fn application_crash(point: &str) {
 
 #[cfg(test)]
 mod tests {
+    fn election_executor(path: &Path) -> (VoteExecutor, NodeId) {
+        let local = NodeId::from(1);
+        let membership = Membership::new(vec![vec![local]], vec![(local, String::new())]).unwrap();
+        let store = OwnedVoteStore::bootstrap(path, "cluster", local, membership).unwrap();
+        (VoteExecutor::new(DurableVoteGate::new(1, store)), local)
+    }
+
+    #[tokio::test]
+    async fn election_deadline_checks_activity_membership_and_term_under_admission() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let (executor, local) = election_executor(&path);
+        let observed = executor.observe(local).await.unwrap();
+        let membership = observed.effective_membership.unwrap();
+        assert!(observed.election_activity.is_none());
+        // Model a completed authenticated admission, not a watch notification.
+        executor
+            .run(move |gate| {
+                gate.record_election_activity(local, ElectionActivityKind::GrantedVote)
+            })
+            .await
+            .unwrap();
+        assert!(
+            executor
+                .campaign_if_unchanged(local, observed.hard_state, membership.clone(), None)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let activity = executor
+            .observe(local)
+            .await
+            .unwrap()
+            .election_activity
+            .unwrap();
+        let mut wrong_membership = membership.clone();
+        wrong_membership.introduced_at = None;
+        assert!(
+            executor
+                .campaign_if_unchanged(
+                    local,
+                    observed.hard_state,
+                    wrong_membership,
+                    Some(activity.sequence),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            executor
+                .campaign_if_unchanged(
+                    NodeId::from(2),
+                    observed.hard_state,
+                    membership.clone(),
+                    Some(activity.sequence),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let request = executor
+            .campaign_if_unchanged(
+                local,
+                observed.hard_state,
+                membership.clone(),
+                Some(activity.sequence),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.term, Term(1));
+        assert!(
+            executor
+                .campaign_if_unchanged(
+                    local,
+                    observed.hard_state,
+                    membership,
+                    Some(activity.sequence),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        executor.shutdown().await.unwrap();
+        let store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        assert_eq!(
+            store.state(),
+            HardState {
+                term: Term(1),
+                voted_for: Some(local)
+            }
+        );
+        let restarted = VoteExecutor::new(DurableVoteGate::new(2, store));
+        assert!(
+            restarted
+                .observe(local)
+                .await
+                .unwrap()
+                .election_activity
+                .is_none()
+        );
+        restarted.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn initialized_leader_rejects_deadline_from_same_term_campaign() {
+        let root = tempfile::tempdir().unwrap();
+        let (executor, local) = election_executor(&root.path().join("authority"));
+        executor.campaign(local).await.unwrap().unwrap();
+        let timeout = executor.observe(local).await.unwrap();
+        assert!(!timeout.local_leader);
+        executor.initialize_leader().await.unwrap().unwrap();
+        let leader = executor.observe(local).await.unwrap();
+        assert!(leader.local_leader);
+        assert_eq!(leader.hard_state, timeout.hard_state);
+        assert_eq!(leader.effective_membership, timeout.effective_membership);
+        assert_eq!(leader.election_activity, timeout.election_activity);
+        assert!(
+            executor
+                .campaign_if_unchanged(
+                    local,
+                    timeout.hard_state,
+                    timeout.effective_membership.unwrap(),
+                    timeout.election_activity.map(|activity| activity.sequence),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(executor.observe(local).await.unwrap(), leader);
+        executor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn competing_deadlines_cannot_both_increment_term() {
+        let root = tempfile::tempdir().unwrap();
+        let (executor, local) = election_executor(&root.path().join("authority"));
+        let observed = executor.observe(local).await.unwrap();
+        let membership = observed.effective_membership.unwrap();
+        let results: [_; 2] = tokio::join!(
+            executor.campaign_if_unchanged(local, observed.hard_state, membership.clone(), None),
+            executor.campaign_if_unchanged(local, observed.hard_state, membership, None),
+        )
+        .into();
+        let mut campaigns = 0;
+        for result in results {
+            match result {
+                Ok(Some(_)) => campaigns += 1,
+                Ok(None) | Err(VoteGateError::Busy) => {}
+                other => panic!("unexpected deadline result: {other:?}"),
+            }
+        }
+        assert_eq!(campaigns, 1);
+        assert_eq!(
+            executor.observe(local).await.unwrap().hard_state.term,
+            Term(1)
+        );
+        executor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_activity_caller_cannot_lose_admitted_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let (executor, local) = election_executor(&root.path().join("authority"));
+        let executor = std::sync::Arc::new(executor);
+        let owner = executor.clone();
+        let (started, receive) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let caller = tokio::spawn(async move {
+            owner
+                .run(move |gate| {
+                    started.send(()).unwrap();
+                    wait.recv().unwrap();
+                    gate.record_election_activity(local, ElectionActivityKind::GrantedVote)
+                })
+                .await
+        });
+        receive.await.unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match executor.observe(local).await {
+                    Ok(observed) => {
+                        assert_eq!(observed.election_activity.unwrap().sequence, 1);
+                        break;
+                    }
+                    Err(VoteGateError::Busy) => tokio::task::yield_now().await,
+                    other => panic!("unexpected observation: {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        executor.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn election_activity_sequence_is_checked_and_conflicting_leaders_do_not_reset() {
+        let root = tempfile::tempdir().unwrap();
+        let store = OwnedVoteStore::create(&root.path().join("authority"), "cluster").unwrap();
+        let mut gate = DurableVoteGate::new(1, store);
+        let peer = NodeId::from(1);
+        gate.record_election_activity(peer, ElectionActivityKind::AuthenticatedLeader)
+            .unwrap();
+        let first = gate.election_activity.unwrap();
+        gate.record_election_activity(NodeId::from(2), ElectionActivityKind::AuthenticatedLeader)
+            .unwrap();
+        assert_eq!(gate.election_activity, Some(first));
+        gate.record_election_activity(peer, ElectionActivityKind::AuthenticatedLeader)
+            .unwrap();
+        assert_eq!(gate.election_activity.unwrap().sequence, 2);
+        gate.election_activity.as_mut().unwrap().sequence = u64::MAX;
+        assert!(matches!(
+            gate.record_election_activity(peer, ElectionActivityKind::GrantedVote),
+            Err(VoteGateError::EffectExhausted)
+        ));
+        assert!(gate.store.failed);
+    }
+
+    #[tokio::test]
+    async fn staging_shutdown_joins_expiry_owner() {
+        let parent = std::env::temp_dir().canonicalize().unwrap();
+        let root = tempfile::tempdir_in(parent).unwrap();
+        let directory = root.path().join("staging");
+        std::fs::create_dir(&directory).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let (executor, _) = election_executor(&root.path().join("authority"));
+        executor.configure_staging(directory, 16, 32).await.unwrap();
+        let expiry = executor
+            .run(|gate| Ok(gate.staging_expiry.as_ref().unwrap().abort_handle()))
+            .await
+            .unwrap();
+        executor.shutdown().await.unwrap();
+        assert!(expiry.is_finished());
+    }
+
     #[tokio::test]
     async fn outbound_vote_preparation_waits_fairly_without_queueing_inbound() {
         let root = tempfile::tempdir().unwrap();
@@ -5323,6 +6162,1090 @@ mod tests {
                 operation: "install test kernel",
             })
         }
+    }
+
+    type HeldAuthority = tokio::sync::OwnedMutexGuard<Option<DurableVoteGate>>;
+
+    struct AppendV2Endpoint {
+        source: std::sync::Arc<InstallCaller>,
+        target: std::sync::Arc<InstallCaller>,
+        receiver: std::sync::Arc<VoteExecutor>,
+        target_id: NodeId,
+        calls: std::sync::atomic::AtomicUsize,
+        hold_sender: std::sync::Mutex<Option<std::sync::Arc<VoteExecutor>>>,
+        held_guard: std::sync::Mutex<Option<HeldAuthority>>,
+    }
+
+    impl bmux_plugin::ServiceCaller for AppendV2Endpoint {
+        fn execute_kernel_request(
+            &self,
+            request: bmux_ipc::Request,
+        ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
+            bmux_plugin::ServiceCaller::execute_kernel_request(self.source.as_ref(), request)
+        }
+
+        fn call_service_raw(
+            &self,
+            capability: &str,
+            kind: bmux_plugin_sdk::ServiceKind,
+            interface: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> bmux_plugin_sdk::Result<Vec<u8>> {
+            use bmux_connections_plugin_api::{
+                connection_types::ConnectionError, connections_commands,
+            };
+            use bmux_plugin_sdk::{decode_service_message, encode_service_message};
+            if interface != connections_commands::INTERFACE_ID.as_str() {
+                return bmux_plugin::ServiceCaller::call_service_raw(
+                    self.source.as_ref(),
+                    capability,
+                    kind,
+                    interface,
+                    operation,
+                    payload,
+                );
+            }
+            assert_eq!(operation, connections_commands::OP_INVOKE_SERVICE.as_str());
+            let request: connections_commands::client::InvokeServiceRequest =
+                decode_service_message(bmux_plugin_sdk::service_contract::decode_for(
+                    interface,
+                    connections_commands::SERVICE_CONTRACT,
+                    &payload,
+                )?)?;
+            let invocation = request.invocation;
+            let provider = crate::consensus_network::OwnedAppendService {
+                caller: self.target.clone(),
+                local: self.target_id,
+                executor: self.receiver.clone(),
+            };
+            let result = if invocation.interface_id
+                == bmux_cluster_plugin_api::cluster_consensus_rpc_v2::INTERFACE_ID.as_str()
+            {
+                use bmux_cluster_plugin_api::cluster_consensus_rpc_v2::ClusterConsensusRpcService;
+                assert_eq!(invocation.operation, "append");
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let request: bmux_cluster_plugin_api::cluster_consensus_rpc_v2::client::AppendRequest = decode_service_message(&invocation.payload)?;
+                let result = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(provider.append(request.request))
+                });
+                let held_sender = self.hold_sender.lock().unwrap().take();
+                if let Some(sender) = held_sender {
+                    let guard = tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(sender.gate.clone().lock_owned())
+                    });
+                    *self.held_guard.lock().unwrap() = Some(guard);
+                }
+                encode_service_message(&result)?
+            } else if invocation.interface_id
+                == bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID.as_str()
+            {
+                use bmux_cluster_plugin_api::cluster_consensus_rpc::ClusterConsensusRpcService;
+                // V1 vote remains its existing contract; append fallback is forbidden.
+                assert_eq!(invocation.operation, "vote");
+                let request: bmux_cluster_plugin_api::cluster_consensus_rpc::client::VoteRequest =
+                    decode_service_message(&invocation.payload)?;
+                let result = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(provider.vote(request.request))
+                });
+                encode_service_message(&result)?
+            } else {
+                assert_eq!(invocation.interface_id, "cluster-peer-auth/v1");
+                assert_eq!(invocation.operation, "challenge");
+                let request: bmux_cluster_plugin_api::cluster_peer_auth::client::ChallengeRequest =
+                    decode_service_message(&invocation.payload)?;
+                let state = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(self.receiver.read_control_state())
+                })
+                .unwrap();
+                let challenge = crate::membership::create_peer_auth_challenge_for_members(
+                    self.target.as_ref(),
+                    &request,
+                    &state.members.into_values().collect::<Vec<_>>(),
+                )
+                .unwrap();
+                encode_service_message(&challenge)?
+            };
+            let response = encode_service_message(&Result::<Vec<u8>, ConnectionError>::Ok(result))?;
+            Ok(bmux_plugin_sdk::service_contract::encode_response(
+                &response,
+            ))
+        }
+    }
+
+    fn append_v2_store(
+        path: &Path,
+        members: &[bmux_cluster_plugin_api::cluster_types::ClusterMember],
+        local: NodeId,
+        peer: NodeId,
+        membership: &Membership,
+    ) -> std::sync::Arc<VoteExecutor> {
+        let mut store =
+            OwnedVoteStore::bootstrap(path, &members[0].cluster_id, local, membership.clone())
+                .unwrap();
+        store.apply_committed().unwrap();
+        // Commit legal joint/uniform transitions, not fabricated voter maps.
+        let nodes = || {
+            membership
+                .nodes()
+                .iter()
+                .map(|(node, endpoint)| (*node, endpoint.clone()))
+                .collect()
+        };
+        let joint = Membership::new(vec![vec![local], vec![local, peer]], nodes()).unwrap();
+        let uniform = Membership::new(vec![vec![local, peer]], nodes()).unwrap();
+        for (index, configuration) in [(1, joint), (2, uniform)] {
+            let previous = store.observe().unwrap().last_log;
+            let identity = LogIdentity {
+                term: Term(0),
+                leader: local,
+                index: crate::consensus_model::LogIndex(index),
+            };
+            store
+                .append(
+                    &AppendRequest {
+                        term: Term(0),
+                        leader: local,
+                        previous,
+                        entries: vec![Entry {
+                            identity,
+                            payload: EntryPayload::Membership(configuration),
+                        }],
+                        leader_commit: Some(identity),
+                    },
+                    (1, 4096),
+                )
+                .unwrap();
+            store.apply_committed().unwrap();
+        }
+        let mut state = store.read_control_state().unwrap();
+        state.members = members
+            .iter()
+            .cloned()
+            .map(|member| (member.node_id.clone(), member))
+            .collect();
+        let tx = store.database.begin_write().unwrap();
+        tx.open_table(TABLE)
+            .unwrap()
+            .insert("control", state.encode_snapshot().unwrap().as_slice())
+            .unwrap();
+        tx.commit().unwrap();
+        std::sync::Arc::new(VoteExecutor::new(DurableVoteGate::new(1, store)))
+    }
+
+    fn provision_append_members(
+        caller: &InstallCaller,
+        target: &InstallCaller,
+        members: &[bmux_cluster_plugin_api::cluster_types::ClusterMember],
+    ) {
+        let mut provisioned: serde_json::Value = serde_json::from_slice(
+            caller
+                .0
+                .lock()
+                .unwrap()
+                .get(crate::membership::MEMBERSHIP_STATE_STORAGE_KEY)
+                .unwrap(),
+        )
+        .unwrap();
+        provisioned["members"] = serde_json::to_value(
+            members
+                .iter()
+                .cloned()
+                .map(|member| (member.node_id.clone(), member))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        )
+        .unwrap();
+        let provisioned = serde_json::to_vec(&provisioned).unwrap();
+        caller.0.lock().unwrap().insert(
+            crate::membership::MEMBERSHIP_STATE_STORAGE_KEY.into(),
+            provisioned.clone(),
+        );
+        target.0.lock().unwrap().insert(
+            crate::membership::MEMBERSHIP_STATE_STORAGE_KEY.into(),
+            provisioned,
+        );
+    }
+
+    fn append_v2_pair(root: &Path) -> (std::sync::Arc<VoteExecutor>, AppendV2Endpoint, NodeId) {
+        let ElectionFixture {
+            _root,
+            executor,
+            caller,
+            identity,
+            mut members,
+            ..
+        } = authenticated_election_fixture();
+        // The fixture executor is replaced by two explicitly provisioned stores;
+        // use its genuine issued credential and identity, not synthetic auth maps.
+        drop(executor);
+        let target = std::sync::Arc::new(InstallCaller::default());
+        let target_identity =
+            crate::membership::load_or_create_node_identity(target.as_ref()).unwrap();
+        target.0.lock().unwrap().insert(
+            crate::membership::CLUSTER_ID_STORAGE_KEY.into(),
+            caller
+                .0
+                .lock()
+                .unwrap()
+                .get(crate::membership::CLUSTER_ID_STORAGE_KEY)
+                .unwrap()
+                .clone(),
+        );
+        let local = *identity.node_id();
+        let peer = *target_identity.node_id();
+        let member = &mut members[0];
+        member
+            .negotiated_protocol
+            .features
+            .push(bmux_cluster_plugin_api::cluster_consensus_rpc_v2::INTERFACE_ID.to_string());
+        *member = crate::membership::issue_membership_credential(
+            &identity,
+            member.cluster_id.parse().unwrap(),
+            member.node_id.clone(),
+            member.public_key.clone(),
+            member.capabilities.clone(),
+            member.negotiated_protocol.clone(),
+            crate::now_unix_ms(),
+        )
+        .unwrap();
+        member.endpoint = Some("tls://source:7443".into());
+        let mut learner = crate::membership::issue_membership_credential(
+            &identity,
+            member.cluster_id.parse().unwrap(),
+            peer.to_string(),
+            target_identity.public_key().to_string(),
+            member.capabilities.clone(),
+            member.negotiated_protocol.clone(),
+            crate::now_unix_ms(),
+        )
+        .unwrap();
+        learner.endpoint = Some("tls://target:7443".into());
+        members.push(learner);
+        provision_append_members(caller.as_ref(), target.as_ref(), &members);
+        let membership = Membership::new(
+            vec![vec![local]],
+            vec![
+                (local, "tls://source:7443".into()),
+                (peer, "tls://target:7443".into()),
+            ],
+        )
+        .unwrap();
+        let open = |name| append_v2_store(&root.join(name), &members, local, peer, &membership);
+        let sender = open("sender");
+        let receiver = open("receiver");
+        (
+            sender,
+            AppendV2Endpoint {
+                source: caller,
+                target,
+                receiver,
+                target_id: peer,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                hold_sender: std::sync::Mutex::new(None),
+                held_guard: std::sync::Mutex::new(None),
+            },
+            local,
+        )
+    }
+
+    async fn elect_append_v2_sender(
+        sender: &VoteExecutor,
+        endpoint: &AppendV2Endpoint,
+        local: NodeId,
+    ) {
+        let campaign = sender.campaign(local).await.unwrap().unwrap();
+        let identity = crate::load_or_create_node_identity(endpoint.source.as_ref()).unwrap();
+        let state = sender.read_control_state().await.unwrap();
+        let member = state.members.get(&local.to_string()).unwrap();
+        let proof = crate::endpoint::peer_authentication_proof(
+            endpoint,
+            "tls://target:7443",
+            &local.to_string(),
+            &endpoint.target_id.to_string(),
+        )
+        .await
+        .unwrap();
+        let mut request = bmux_cluster_plugin_api::cluster_consensus_vote_types::VoteRequest {
+            cluster_id: state.cluster_id,
+            sender: local.as_bytes().to_vec(),
+            recipient: endpoint.target_id.as_bytes().to_vec(),
+            request_id: uuid::Uuid::new_v4(),
+            term: campaign.term.0,
+            last_log: campaign.last_log.map(wire_log_identity),
+            proof: bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferProof {
+                credential_serial: member.credential_serial.clone(),
+                peer: proof,
+                signature: Vec::new(),
+            },
+        };
+        request.proof.signature =
+            identity.sign(&crate::consensus_network::owned_vote_signing_payload(&request).unwrap());
+        assert!(
+            sender
+                .request_campaign_vote(endpoint, local, request)
+                .await
+                .unwrap()
+        );
+        sender.initialize_leader().await.unwrap().unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn append_v2_sender_provider_durable_and_signed_stale_term() {
+        let root = tempfile::tempdir().unwrap();
+        let (sender, endpoint, local) = append_v2_pair(root.path());
+        elect_append_v2_sender(sender.as_ref(), &endpoint, local).await;
+        sender
+            .replicate_next(&endpoint, endpoint.target_id)
+            .await
+            .unwrap();
+        let sent = sender.observe(local).await.unwrap();
+        assert_eq!(
+            endpoint
+                .receiver
+                .observe(endpoint.target_id)
+                .await
+                .unwrap()
+                .last_log,
+            sent.last_log
+        );
+        // Receiver is ahead in term; actual provider returns a signed stale-term
+        // response, and the sender durably steps down instead of counting progress.
+        endpoint
+            .receiver
+            .run(|gate| {
+                gate.store
+                    .persist(HardState {
+                        term: Term(9),
+                        voted_for: None,
+                    })
+                    .map_err(|_| VoteGateError::StorageFailure)
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            sender.replicate_next(&endpoint, endpoint.target_id).await,
+            Err(bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError::StaleTerm)
+        ));
+        let after = sender.observe(local).await.unwrap();
+        assert_eq!(after.hard_state.term, Term(9));
+        assert!(!after.local_leader);
+        assert_eq!(after.last_log, sent.last_log);
+        assert_eq!(endpoint.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        sender.shutdown().await.unwrap();
+        endpoint.receiver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn append_v2_signed_higher_term_settles_despite_busy_and_cancellation() {
+        let root = tempfile::tempdir().unwrap();
+        let (sender, endpoint, local) = append_v2_pair(root.path());
+        elect_append_v2_sender(sender.as_ref(), &endpoint, local).await;
+        endpoint
+            .receiver
+            .run(|gate| {
+                gate.store
+                    .persist(HardState {
+                        term: Term(12),
+                        voted_for: None,
+                    })
+                    .map_err(|_| VoteGateError::StorageFailure)
+            })
+            .await
+            .unwrap();
+        *endpoint.hold_sender.lock().unwrap() = Some(sender.clone());
+        let endpoint = std::sync::Arc::new(endpoint);
+        let owner = sender.clone();
+        let remote = endpoint.clone();
+        let call = tokio::spawn(async move {
+            owner
+                .replicate_next(remote.as_ref(), remote.target_id)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while sender
+                .response_pending
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            sender.observe(local).await,
+            Err(VoteGateError::Busy)
+        ));
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        endpoint.held_guard.lock().unwrap().take();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while sender
+                .response_pending
+                .load(std::sync::atomic::Ordering::SeqCst)
+                != 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let after = sender.observe(local).await.unwrap();
+        assert_eq!(after.hard_state.term, Term(12));
+        assert!(!after.local_leader);
+        sender.shutdown().await.unwrap();
+        endpoint.receiver.shutdown().await.unwrap();
+        drop(endpoint);
+    }
+
+    #[tokio::test]
+    async fn append_v2_requires_selection_and_rejects_cross_version_signatures() {
+        let ElectionFixture {
+            _root,
+            executor,
+            caller,
+            identity,
+            members,
+            mut request,
+        } = authenticated_election_fixture();
+        let local = *identity.node_id();
+        request.proof.signature = identity
+            .sign(&crate::consensus_network::owned_append_v2_signing_payload(&request).unwrap());
+        assert!(matches!(
+            executor
+                .append_v2_authenticated(caller.clone(), local, request.clone())
+                .await,
+            Err(AuthenticatedAppendError::Unauthorized)
+        ));
+        assert!(matches!(
+            executor
+                .append_authenticated(caller.clone(), local, request.clone())
+                .await,
+            Err(AuthenticatedAppendError::Unauthorized)
+        ));
+        request.proof = fresh_election_proof(caller.as_ref(), &members, &identity);
+        request.proof.signature = identity
+            .sign(&crate::consensus_network::owned_append_signing_payload(&request).unwrap());
+        assert!(matches!(
+            executor
+                .append_v2_authenticated(caller, local, request)
+                .await,
+            Err(AuthenticatedAppendError::Unauthorized)
+        ));
+        assert!(
+            executor
+                .observe(local)
+                .await
+                .unwrap()
+                .election_activity
+                .is_none()
+        );
+        executor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn append_v2_unselected_peer_is_incompatible_without_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let (sender, endpoint, local) = append_v2_pair(root.path());
+        elect_append_v2_sender(sender.as_ref(), &endpoint, local).await;
+        let peer = endpoint.target_id;
+        sender
+            .run(move |gate| {
+                let mut state = gate.store.read_control_state().unwrap();
+                state
+                    .members
+                    .get_mut(&peer.to_string())
+                    .unwrap()
+                    .negotiated_protocol
+                    .features
+                    .retain(|feature| {
+                        feature
+                            != bmux_cluster_plugin_api::cluster_consensus_rpc_v2::INTERFACE_ID
+                                .as_str()
+                    });
+                let tx = gate.store.database.begin_write().unwrap();
+                tx.open_table(TABLE)
+                    .unwrap()
+                    .insert("control", state.encode_snapshot().unwrap().as_slice())
+                    .unwrap();
+                tx.commit().unwrap();
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            sender.replicate_next(&endpoint, peer).await,
+            Err(bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError::Incompatible)
+        ));
+        assert_eq!(endpoint.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        sender.shutdown().await.unwrap();
+        endpoint.receiver.shutdown().await.unwrap();
+    }
+
+    fn fresh_election_proof(
+        caller: &InstallCaller,
+        members: &[bmux_cluster_plugin_api::cluster_types::ClusterMember],
+        identity: &crate::membership::NodeIdentity,
+    ) -> bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferProof {
+        let challenge = crate::membership::create_peer_auth_challenge_for_members(
+            caller,
+            &crate::ClusterPeerChallengeRequest {
+                claimant_node_id: identity.node_id().to_string(),
+            },
+            members,
+        )
+        .unwrap();
+        let mut peer = bmux_cluster_plugin_api::cluster_types::PeerAuthProof {
+            challenge,
+            claimant_node_id: identity.node_id().to_string(),
+            claimant_credential_serial: members[0].credential_serial.clone(),
+            claimant_signature: String::new(),
+        };
+        peer.claimant_signature = crate::membership::encode_hex(
+            &identity.sign(&crate::membership::canonical_peer_proof(&peer).unwrap()),
+        );
+        bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferProof {
+            credential_serial: members[0].credential_serial.clone(),
+            signature: Vec::new(),
+            peer,
+        }
+    }
+
+    struct ElectionFixture {
+        _root: tempfile::TempDir,
+        executor: VoteExecutor,
+        caller: std::sync::Arc<InstallCaller>,
+        identity: crate::membership::NodeIdentity,
+        members: Vec<bmux_cluster_plugin_api::cluster_types::ClusterMember>,
+        request: bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
+    }
+
+    // Real credentials, challenge consumption, signatures and canonical product
+    // membership exercise the remote boundary, not a synthetic auth shortcut.
+    fn authenticated_election_fixture() -> ElectionFixture {
+        use bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest as WireAppend;
+        let caller = std::sync::Arc::new(InstallCaller::default());
+        let identity = crate::membership::load_or_create_node_identity(caller.as_ref()).unwrap();
+        crate::membership::initialize_cluster(caller.as_ref()).unwrap();
+        let local = *identity.node_id();
+        let mut members = crate::membership::list_members(caller.as_ref())
+            .unwrap()
+            .members;
+        let member = &mut members[0];
+        member.negotiated_protocol.features = vec![
+            bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID.to_string(),
+            bmux_cluster_plugin_api::cluster_consensus_transfer::INTERFACE_ID.to_string(),
+        ];
+        *member = crate::membership::issue_membership_credential(
+            &identity,
+            member.cluster_id.parse().unwrap(),
+            member.node_id.clone(),
+            member.public_key.clone(),
+            member.capabilities.clone(),
+            member.negotiated_protocol.clone(),
+            crate::now_unix_ms(),
+        )
+        .unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let mut store = OwnedVoteStore::bootstrap(
+            &root.path().join("authority"),
+            &members[0].cluster_id,
+            local,
+            Membership::new(vec![vec![local]], vec![(local, String::new())]).unwrap(),
+        )
+        .unwrap();
+        store.apply_committed().unwrap();
+        let boundary = store.observe().unwrap().last_log.unwrap();
+        let mut state = store.read_control_state().unwrap();
+        state.members = members
+            .iter()
+            .cloned()
+            .map(|member| (member.node_id.clone(), member))
+            .collect();
+        {
+            let tx = store.database.begin_write().unwrap();
+            tx.open_table(TABLE)
+                .unwrap()
+                .insert("control", state.encode_snapshot().unwrap().as_slice())
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        let executor = VoteExecutor::new(DurableVoteGate::new(1, store));
+        let mut request = WireAppend {
+            cluster_id: members[0].cluster_id.clone(),
+            sender: local.as_bytes().to_vec(),
+            recipient: local.as_bytes().to_vec(),
+            request_id: uuid::Uuid::new_v4(),
+            term: boundary.term.0,
+            previous: Some(wire_log_identity(boundary)),
+            entries: Vec::new(),
+            leader_commit: Some(wire_log_identity(boundary)),
+            proof: fresh_election_proof(caller.as_ref(), &members, &identity),
+        };
+        request.proof.signature = identity
+            .sign(&crate::consensus_network::owned_append_signing_payload(&request).unwrap());
+        ElectionFixture {
+            _root: root,
+            executor,
+            caller,
+            identity,
+            members,
+            request,
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_append_activity_rejects_spoof_replay_and_mismatch() {
+        let ElectionFixture {
+            _root,
+            executor,
+            caller,
+            identity,
+            members,
+            mut request,
+        } = authenticated_election_fixture();
+        let local = *identity.node_id();
+        let mut spoof = request.clone();
+        spoof.proof.signature[0] ^= 1;
+        assert!(
+            executor
+                .append_authenticated(caller.clone(), local, spoof)
+                .await
+                .is_err()
+        );
+        assert!(
+            executor
+                .observe(local)
+                .await
+                .unwrap()
+                .election_activity
+                .is_none()
+        );
+        let decision = executor
+            .append_authenticated(caller.clone(), local, request.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            decision.outcome,
+            Ok(AppendOutcome::Reconciled(
+                AppendReconciliation::Matched { .. }
+            ))
+        ));
+        let first = executor
+            .observe(local)
+            .await
+            .unwrap()
+            .election_activity
+            .unwrap();
+        assert_eq!(first.kind, ElectionActivityKind::AuthenticatedLeader);
+        assert_eq!(first.peer, local);
+        assert!(
+            executor
+                .append_authenticated(caller.clone(), local, request.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            executor.observe(local).await.unwrap().election_activity,
+            Some(first)
+        );
+
+        // A valid leader can probe beyond this follower's divergent prefix.
+        // Its durable mismatch response is activity even though no log is added.
+        let deadline = executor.observe(local).await.unwrap();
+        request.proof = fresh_election_proof(caller.as_ref(), &members, &identity);
+        request.previous.as_mut().unwrap().index += 10;
+        request.proof.signature = identity
+            .sign(&crate::consensus_network::owned_append_signing_payload(&request).unwrap());
+        let decision = executor
+            .append_authenticated(caller.clone(), local, request.clone())
+            .await
+            .unwrap();
+        assert!(matches!(
+            decision.outcome,
+            Ok(AppendOutcome::Reconciled(
+                AppendReconciliation::PreviousMismatch
+            ))
+        ));
+        let repaired = executor.observe(local).await.unwrap();
+        let activity = repaired.election_activity.unwrap();
+        assert_eq!(activity.sequence, first.sequence + 1);
+        assert_eq!(repaired.hard_state, deadline.hard_state);
+        assert_eq!(repaired.last_log, deadline.last_log);
+        assert!(
+            executor
+                .campaign_if_unchanged(
+                    local,
+                    deadline.hard_state,
+                    deadline.effective_membership.unwrap(),
+                    Some(first.sequence),
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
+        executor.shutdown().await.unwrap();
+    }
+
+    async fn check_committed_activity_contradiction(
+        compacted: bool,
+        mismatch: bool,
+        advertised_term: u64,
+    ) {
+        let ElectionFixture {
+            _root,
+            executor,
+            caller,
+            identity,
+            members,
+            mut request,
+        } = authenticated_election_fixture();
+        let local = *identity.node_id();
+        let before = executor.observe(local).await.unwrap();
+        let boundary = LogIdentity {
+            term: Term(2),
+            leader: local,
+            index: crate::consensus_model::LogIndex(5),
+        };
+        executor
+            .append(
+                AppendRequest {
+                    term: Term(2),
+                    leader: local,
+                    previous: before.last_log,
+                    entries: (1..=5)
+                        .map(|index| Entry {
+                            identity: LogIdentity {
+                                index: crate::consensus_model::LogIndex(index),
+                                ..boundary
+                            },
+                            payload: EntryPayload::NoOp,
+                        })
+                        .collect(),
+                    leader_commit: Some(boundary),
+                },
+                (5, 1024),
+            )
+            .await
+            .unwrap();
+        executor.apply_committed().await.unwrap();
+        if compacted {
+            executor.publish_snapshot().await.unwrap();
+            executor.compact_snapshot().await.unwrap();
+        }
+        let advertised = LogIdentity {
+            term: Term(advertised_term),
+            leader: if advertised_term == 2 {
+                NodeId::from(2)
+            } else {
+                local
+            },
+            ..boundary
+        };
+        request.term = 4;
+        request.previous = Some(wire_log_identity(if mismatch {
+            LogIdentity {
+                term: Term(3),
+                index: crate::consensus_model::LogIndex(10),
+                ..boundary
+            }
+        } else {
+            boundary
+        }));
+        request.leader_commit = Some(wire_log_identity(advertised));
+        request.proof = fresh_election_proof(caller.as_ref(), &members, &identity);
+        request.proof.signature = identity
+            .sign(&crate::consensus_network::owned_append_signing_payload(&request).unwrap());
+        let result = executor.append_authenticated(caller, local, request).await;
+        if mismatch {
+            assert!(
+                matches!(
+                    result,
+                    Ok(AppendDecision {
+                        outcome: Ok(AppendOutcome::Reconciled(
+                            AppendReconciliation::PreviousMismatch
+                        )),
+                        ..
+                    })
+                ),
+                "compacted={compacted} mismatch={mismatch} advertised_term={advertised_term}: {result:?}"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(AuthenticatedAppendError::Invalid(_))),
+                "compacted={compacted} mismatch={mismatch} advertised_term={advertised_term}: {result:?}"
+            );
+        }
+        let after = executor.observe(local).await.unwrap();
+        assert_eq!(after.hard_state.term, Term(4));
+        assert_eq!(after.committed, Some(boundary));
+        assert_eq!(after.last_log, Some(boundary));
+        assert!(after.election_activity.is_none());
+        executor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn committed_and_snapshot_commit_identity_conflicts_never_refresh_activity() {
+        for compacted in [false, true] {
+            for mismatch in [false, true] {
+                for advertised_term in [1, 2, 3] {
+                    check_committed_activity_contradiction(compacted, mismatch, advertised_term)
+                        .await;
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn contradictory_advertised_commit_never_refreshes_activity() {
+        let ElectionFixture {
+            _root,
+            executor,
+            caller,
+            identity,
+            members,
+            mut request,
+        } = authenticated_election_fixture();
+        let local = *identity.node_id();
+        let boundary =
+            crate::consensus_network::transfer_position(request.previous.as_ref().unwrap())
+                .unwrap();
+        let other = NodeId::from(2);
+        // Cover both matching and missing predecessors; the advertised commit
+        // is beyond either request prefix, so reconciliation alone misses it.
+        for mismatch in [false, true] {
+            request.term = boundary.term.0 + 1;
+            request.previous = Some(wire_log_identity(LogIdentity {
+                index: crate::consensus_model::LogIndex(
+                    boundary.index.0 + if mismatch { 10 } else { 0 },
+                ),
+                ..boundary
+            }));
+            request.leader_commit = Some(wire_log_identity(LogIdentity {
+                term: Term(request.term),
+                leader: other,
+                index: crate::consensus_model::LogIndex(boundary.index.0 + 20),
+            }));
+            request.proof = fresh_election_proof(caller.as_ref(), &members, &identity);
+            request.proof.signature = identity
+                .sign(&crate::consensus_network::owned_append_signing_payload(&request).unwrap());
+            let decision = executor
+                .append_authenticated(caller.clone(), local, request.clone())
+                .await
+                .unwrap();
+            assert!(matches!(decision.outcome, Ok(AppendOutcome::Reconciled(_))));
+            let after = executor.observe(local).await.unwrap();
+            assert_eq!(after.hard_state.term, Term(request.term));
+            assert!(after.election_activity.is_none());
+        }
+        // An older-term commit cannot contradict an equal-term identity already
+        // retained locally, even when its predecessor is a healthy mismatch.
+        request.previous.as_mut().unwrap().term = request.term;
+        request.leader_commit = Some(wire_log_identity(LogIdentity {
+            leader: other,
+            ..boundary
+        }));
+        request.proof = fresh_election_proof(caller.as_ref(), &members, &identity);
+        request.proof.signature = identity
+            .sign(&crate::consensus_network::owned_append_signing_payload(&request).unwrap());
+        let decision = executor
+            .append_authenticated(caller, local, request)
+            .await
+            .unwrap();
+        assert!(matches!(
+            decision.outcome,
+            Ok(AppendOutcome::Reconciled(
+                AppendReconciliation::PreviousMismatch
+            ))
+        ));
+        assert!(
+            executor
+                .observe(local)
+                .await
+                .unwrap()
+                .election_activity
+                .is_none()
+        );
+        executor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_suffix_cannot_turn_prefix_mismatch_into_election_activity() {
+        use bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendEntry;
+        let ElectionFixture {
+            _root,
+            executor,
+            caller,
+            identity,
+            members,
+            mut request,
+        } = authenticated_election_fixture();
+        let local = *identity.node_id();
+        let boundary =
+            crate::consensus_network::transfer_position(request.previous.as_ref().unwrap())
+                .unwrap();
+        let before = executor.observe(local).await.unwrap();
+        // Reusing the committed identity with different payload is equivocation.
+        request.previous = None;
+        request.entries = vec![AppendEntry::Inline {
+            canonical: crate::consensus_storage::encode_owned_entry(&Entry {
+                identity: boundary,
+                payload: EntryPayload::Application(b"different payload".to_vec()),
+            })
+            .unwrap(),
+        }];
+        request.proof.signature = identity
+            .sign(&crate::consensus_network::owned_append_signing_payload(&request).unwrap());
+        let decision = executor
+            .append_authenticated(caller.clone(), local, request.clone())
+            .await
+            .unwrap();
+        assert!(decision.outcome.is_err());
+        assert_eq!(
+            executor.observe(local).await.unwrap().election_activity,
+            before.election_activity
+        );
+        // Even with a missing predecessor, a direct uniform voter-set change
+        // is invalid. A PreviousMismatch must not conceal this admission error.
+        let previous = LogIdentity {
+            index: crate::consensus_model::LogIndex(boundary.index.0 + 10),
+            ..boundary
+        };
+        request.previous = Some(wire_log_identity(previous));
+        let other = NodeId::from(2);
+        request.entries = vec![AppendEntry::Inline {
+            canonical: crate::consensus_storage::encode_owned_entry(&Entry {
+                identity: LogIdentity {
+                    index: crate::consensus_model::LogIndex(previous.index.0 + 1),
+                    ..boundary
+                },
+                payload: EntryPayload::Membership(
+                    Membership::new(
+                        vec![vec![local, other]],
+                        vec![(local, String::new()), (other, String::new())],
+                    )
+                    .unwrap(),
+                ),
+            })
+            .unwrap(),
+        }];
+        request.proof = fresh_election_proof(caller.as_ref(), &members, &identity);
+        request.proof.signature = identity
+            .sign(&crate::consensus_network::owned_append_signing_payload(&request).unwrap());
+        let decision = executor
+            .append_authenticated(caller, local, request)
+            .await
+            .unwrap();
+        assert!(matches!(
+            decision.outcome,
+            Ok(AppendOutcome::Reconciled(
+                AppendReconciliation::PreviousMismatch
+            ))
+        ));
+        let after = executor.observe(local).await.unwrap();
+        assert_eq!(after.election_activity, before.election_activity);
+        assert_eq!(after.hard_state, before.hard_state);
+        assert!(
+            executor
+                .campaign_if_unchanged(
+                    local,
+                    before.hard_state,
+                    before.effective_membership.unwrap(),
+                    None,
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        executor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_vote_activity_and_stale_malformed_append() {
+        let ElectionFixture {
+            _root,
+            executor,
+            caller,
+            identity,
+            members,
+            mut request,
+        } = authenticated_election_fixture();
+        let local = *identity.node_id();
+        let boundary =
+            crate::consensus_network::transfer_position(request.previous.as_ref().unwrap())
+                .unwrap();
+        let before_vote = std::time::Instant::now();
+        // A granted authenticated vote publishes only after durable term/vote.
+        let mut vote = bmux_cluster_plugin_api::cluster_consensus_vote_types::VoteRequest {
+            cluster_id: members[0].cluster_id.clone(),
+            sender: local.as_bytes().to_vec(),
+            recipient: local.as_bytes().to_vec(),
+            request_id: uuid::Uuid::new_v4(),
+            term: boundary.term.0 + 1,
+            last_log: Some(wire_log_identity(boundary)),
+            proof: fresh_election_proof(caller.as_ref(), &members, &identity),
+        };
+        vote.proof.signature =
+            identity.sign(&crate::consensus_network::owned_vote_signing_payload(&vote).unwrap());
+        assert!(
+            executor
+                .vote_authenticated(caller.clone(), local, vote)
+                .await
+                .unwrap()
+                .granted
+        );
+        let granted = executor.observe(local).await.unwrap();
+        let activity = granted.election_activity.unwrap();
+        assert_eq!(activity.kind, ElectionActivityKind::GrantedVote);
+        assert_eq!(activity.sequence, 1);
+        assert_eq!(granted.hard_state.voted_for, Some(local));
+        assert_eq!(granted.hard_state.term, activity.term);
+        assert!(activity.observed_at >= before_vote);
+
+        request.previous = Some(wire_log_identity(boundary));
+        request.proof = fresh_election_proof(caller.as_ref(), &members, &identity);
+        request.proof.signature = identity
+            .sign(&crate::consensus_network::owned_append_signing_payload(&request).unwrap());
+        assert!(
+            executor
+                .append_authenticated(caller.clone(), local, request.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            executor.observe(local).await.unwrap().election_activity,
+            Some(activity)
+        );
+        request.entries.push(
+            bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendEntry::Inline {
+                canonical: b"malformed".to_vec(),
+            },
+        );
+        request.term = activity.term.0;
+        request.proof = fresh_election_proof(caller.as_ref(), &members, &identity);
+        request.proof.signature = identity
+            .sign(&crate::consensus_network::owned_append_signing_payload(&request).unwrap());
+        assert!(
+            executor
+                .append_authenticated(caller, local, request)
+                .await
+                .is_err()
+        );
+        let after = executor.observe(local).await.unwrap();
+        assert_eq!(after.election_activity, Some(activity));
+        assert!(
+            executor
+                .campaign_if_unchanged(
+                    local,
+                    granted.hard_state,
+                    granted.effective_membership.unwrap(),
+                    Some(activity.sequence),
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        executor.shutdown().await.unwrap();
     }
 
     fn fresh_install_proof(
@@ -6237,6 +8160,7 @@ mod tests {
                             Membership::new(vec![vec![local]], vec![(local, String::new())])
                                 .unwrap(),
                             permit,
+                            false,
                         )
                         .await
                         .unwrap_err();
@@ -6557,7 +8481,10 @@ mod tests {
                 more: false
             }
         );
-        assert!(executor.apply_committed().await.unwrap().is_empty());
+        assert_eq!(
+            executor.apply_committed().await.unwrap(),
+            [] as [Vec<u8>; 0]
+        );
         assert_eq!(
             executor
                 .read_control_state()
@@ -6613,7 +8540,7 @@ mod tests {
         assert_eq!(second.applied, Some(identity(3)));
         assert!(!second.more);
         let empty = store.apply_committed_batch().unwrap();
-        assert!(empty.outcomes.is_empty());
+        assert_eq!(empty.outcomes, [] as [AppliedOutcome; 0]);
         assert_eq!(empty.applied, second.applied);
         assert!(!empty.more);
     }
@@ -7995,7 +9922,7 @@ mod tests {
                 assert_eq!(replies.len(), 2);
                 assert_eq!(replies[0], replies[1]);
             } else {
-                assert!(replies.is_empty());
+                assert_eq!(replies, [] as [Vec<u8>; 0]);
             }
             assert_snapshot(&mut store, identity(2));
             let tx = store.database.begin_read().unwrap();
@@ -8172,7 +10099,10 @@ mod tests {
             executor.apply_committed().await.unwrap(),
             vec![Vec::<u8>::new()]
         );
-        assert!(executor.apply_committed().await.unwrap().is_empty());
+        assert_eq!(
+            executor.apply_committed().await.unwrap(),
+            [] as [Vec<u8>; 0]
+        );
         let published = executor.publish_snapshot().await.unwrap();
         executor.compact_snapshot().await.unwrap();
         executor.shutdown().await.unwrap();
@@ -8191,13 +10121,9 @@ mod tests {
                 .0,
             0
         );
-        assert!(
-            !meta
-                .get("applied_membership")
-                .unwrap()
-                .unwrap()
-                .value()
-                .is_empty()
+        assert_ne!(
+            meta.get("applied_membership").unwrap().unwrap().value(),
+            b""
         );
     }
 
@@ -8292,7 +10218,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(batch.append.previous, Some(boundary));
-        assert!(batch.append.entries.is_empty());
+        assert_eq!(batch.append.entries, [] as [Entry; 0]);
         assert_eq!(batch.append.leader_commit, Some(boundary));
         leader.term = Term(2);
         assert!(matches!(
@@ -8471,12 +10397,9 @@ mod tests {
             decode_position(meta.get("applied").unwrap().unwrap().value()).unwrap(),
             None
         );
-        assert!(
-            meta.get("applied_membership")
-                .unwrap()
-                .unwrap()
-                .value()
-                .is_empty()
+        assert_eq!(
+            meta.get("applied_membership").unwrap().unwrap().value(),
+            b""
         );
     }
 
@@ -9190,7 +11113,7 @@ mod tests {
             decode_position(meta.get("commit").unwrap().unwrap().value()).unwrap(),
             Some(identity(2, 1))
         );
-        assert!(!meta.get("membership").unwrap().unwrap().value().is_empty());
+        assert_ne!(meta.get("membership").unwrap().unwrap().value(), b"");
     }
     #[test]
     fn retained_transfer_retry_survives_reopen_without_staging() {
