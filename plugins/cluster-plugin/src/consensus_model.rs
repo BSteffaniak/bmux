@@ -561,19 +561,88 @@ pub(crate) struct LeaderProgress {
     pub term: Term,
     pub membership: Membership,
     pub matched: BTreeMap<NodeId, Option<LogIdentity>>,
+    pub next: BTreeMap<NodeId, LogIndex>,
 }
 
 impl LeaderProgress {
+    /// A conflict is a retry hint, never evidence that a prefix is durable.
+    /// Ignore responses for probes superseded by a newer success or conflict.
+    pub fn reject_probe(&mut self, peer: NodeId, previous: Option<LogIndex>, hint: LogIndex) {
+        let Some(previous) = previous else { return };
+        let Some(sent_next) = previous.0.checked_add(1).map(LogIndex) else {
+            return;
+        };
+        let Some(next) = self.next.get_mut(&peer) else {
+            return;
+        };
+        if *next != sent_next {
+            return;
+        }
+        let floor = match self.matched.get(&peer).copied().flatten() {
+            Some(matched) => {
+                let Some(floor) = matched.index.0.checked_add(1).map(LogIndex) else {
+                    return;
+                };
+                floor
+            }
+            None => LogIndex(0),
+        };
+        *next = hint.min(previous).max(floor);
+    }
+
+    pub fn acknowledge_probe(&mut self, peer: NodeId, matched: Option<LogIdentity>) {
+        let Some(matched) = matched else { return };
+        let Some(current) = self.matched.get_mut(&peer) else {
+            return;
+        };
+        if current.is_none_or(|old| matched.index > old.index) {
+            *current = Some(matched);
+        }
+        if let Some(next) = matched.index.0.checked_add(1).map(LogIndex)
+            && let Some(current) = self.next.get_mut(&peer)
+        {
+            *current = (*current).max(next);
+        }
+    }
+    /// Highest index covered by each voter majority. This is only a candidate;
+    /// the storage owner must check the current-term rule and commit durably.
+    pub fn quorum_index(&self) -> Option<LogIndex> {
+        self.membership
+            .configurations()
+            .iter()
+            .map(|voters| {
+                let mut positions: Vec<_> = voters
+                    .iter()
+                    .filter_map(|peer| self.matched.get(peer).copied().flatten().map(|id| id.index))
+                    .collect();
+                let majority = voters.len() / 2 + 1;
+                if positions.len() < majority {
+                    return None;
+                }
+                positions.sort_unstable_by(|left, right| right.cmp(left));
+                Some(positions[majority - 1])
+            })
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .min()
+    }
+
     pub fn after_durable_initialization(membership: Membership, entry: LogIdentity) -> Self {
         let matched = membership
             .nodes()
             .keys()
             .map(|peer| (*peer, (*peer == entry.leader).then_some(entry)))
             .collect();
+        let next = membership
+            .nodes()
+            .keys()
+            .map(|peer| (*peer, entry.index))
+            .collect();
         Self {
             term: entry.term,
             membership,
             matched,
+            next,
         }
     }
 }
@@ -1563,6 +1632,71 @@ mod tests {
         );
         assert!(!changed.quorum);
         assert!(campaign.is_none());
+    }
+
+    #[test]
+    fn replication_conflicts_backtrack_without_erasing_durable_matches() {
+        let local = NodeId::from(1);
+        let peer = NodeId::from(2);
+        let identity = |index| LogIdentity {
+            term: Term(3),
+            leader: local,
+            index: LogIndex(index),
+        };
+        let membership = Membership::new(
+            vec![vec![local, peer]],
+            vec![(local, String::new()), (peer, String::new())],
+        )
+        .unwrap();
+        let mut leader = LeaderProgress::after_durable_initialization(membership, identity(10));
+        leader.reject_probe(peer, Some(LogIndex(9)), LogIndex(500));
+        assert_eq!(leader.next[&peer], LogIndex(9));
+        assert_eq!(leader.matched[&peer], None);
+        leader.reject_probe(peer, Some(LogIndex(9)), LogIndex(0));
+        assert_eq!(leader.next[&peer], LogIndex(9), "stale conflict ignored");
+        leader.reject_probe(peer, Some(LogIndex(8)), LogIndex(2));
+        assert_eq!(leader.next[&peer], LogIndex(2));
+        leader.acknowledge_probe(peer, Some(identity(7)));
+        assert_eq!(leader.next[&peer], LogIndex(8));
+        leader.reject_probe(peer, Some(LogIndex(7)), LogIndex(0));
+        assert_eq!(
+            leader.next[&peer],
+            LogIndex(8),
+            "never retry below durable match"
+        );
+        leader.acknowledge_probe(peer, Some(identity(3)));
+        assert_eq!(leader.matched[&peer], Some(identity(7)));
+        leader.reject_probe(peer, None, LogIndex(0));
+        assert_eq!(leader.next[&peer], LogIndex(8));
+    }
+
+    #[test]
+    fn replication_quorum_requires_each_majority_and_excludes_learners() {
+        let nodes: Vec<_> = (1..=6).map(NodeId::from).collect();
+        let membership = Membership::new(
+            vec![nodes[..3].to_vec(), nodes[2..5].to_vec()],
+            nodes.iter().map(|id| (*id, String::new())).collect(),
+        )
+        .unwrap();
+        let identity = LogIdentity {
+            term: Term(2),
+            leader: nodes[0],
+            index: LogIndex(8),
+        };
+        let mut progress = LeaderProgress::after_durable_initialization(membership, identity);
+        progress.matched.insert(nodes[1], Some(identity));
+        progress.matched.insert(nodes[5], Some(identity));
+        assert_eq!(progress.quorum_index(), None);
+        progress.matched.insert(nodes[2], Some(identity));
+        assert_eq!(progress.quorum_index(), None);
+        progress.matched.insert(
+            nodes[3],
+            Some(LogIdentity {
+                index: LogIndex(5),
+                ..identity
+            }),
+        );
+        assert_eq!(progress.quorum_index(), Some(LogIndex(5)));
     }
 
     #[test]

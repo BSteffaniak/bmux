@@ -88,6 +88,16 @@
             mainProgram = "tofu";
           };
         };
+        # Backport nextest#3553: macOS concurrent spawns could inherit sibling
+        # capture pipes and falsely report leaks. Keep the locked Rust toolchain.
+        cargoNextest = pkgs.cargo-nextest.overrideAttrs (old: {
+          patches = (old.patches or [ ]) ++ [
+            (pkgs.fetchurl {
+              url = "https://github.com/nextest-rs/nextest/pull/3553.diff";
+              sha256 = "0v9abic7x2n3bpiq751lixad9g3l4p07klp0gr7w6knnvfm8kr3v";
+            })
+          ];
+        });
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [
             "rustfmt"
@@ -120,7 +130,7 @@
             [
               rustToolchain
               cargo-deny
-              cargo-nextest
+              cargoNextest
               rust-analyzer
               cargo-ndk
               cargoMachete

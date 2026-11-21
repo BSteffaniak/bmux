@@ -16,6 +16,11 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+type ReplicationAdmission = Result<
+    (String, NodeId, Option<LogIdentity>, Membership),
+    bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError,
+>;
+
 /// Classified failures at the unpublished authenticated append boundary.
 #[derive(Debug)]
 pub enum AuthenticatedAppendError {
@@ -40,6 +45,30 @@ impl From<&str> for AuthenticatedAppendError {
     fn from(message: &str) -> Self {
         Self::Invalid(message.to_owned())
     }
+}
+
+fn verify_outbound_append(
+    local: NodeId,
+    request: &bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
+) -> Result<(), bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError> {
+    use bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError;
+    let signed = crate::consensus_network::owned_append_signing_payload(request)
+        .map_err(|_| RpcError::InvalidRequest)?;
+    if request.sender.as_slice() != local.as_bytes() || request.proof.signature.len() != 64 {
+        return Err(RpcError::Unauthorized);
+    }
+    crate::membership::verify_node_signature(&local.to_string(), &signed, &request.proof.signature)
+        .map_err(|_| RpcError::Unauthorized)
+}
+
+fn decode_replication_identity(
+    id: &bmux_cluster_plugin_api::cluster_consensus_transfer_types::LogIdentity,
+) -> Result<LogIdentity, std::array::TryFromSliceError> {
+    Ok(LogIdentity {
+        term: Term(id.term),
+        index: crate::consensus_model::LogIndex(id.index),
+        leader: NodeId::from_bytes(id.leader.as_slice().try_into()?),
+    })
 }
 
 fn owned_vote_endpoint(
@@ -711,10 +740,13 @@ impl VoteExecutor {
         let (send, receive) = tokio::sync::oneshot::channel();
         let (acknowledge, acknowledged) = tokio::sync::oneshot::channel();
         tokio::task::spawn_blocking(move || {
-            let _permit = permit;
+            let recovery_permit = permit;
             let store = match OwnedVoteStore::open(&path, &cluster) {
                 Ok(store) => store,
                 Err(error) => {
+                    // A completed failed attempt must release admission before
+                    // its caller can observe the error and retry recovery.
+                    drop(recovery_permit);
                     let _ = send.send(Err(error));
                     return;
                 }
@@ -723,6 +755,7 @@ impl VoteExecutor {
             if let Err(error) = executor.handoff(send, acknowledged) {
                 tracing::error!(%error, "cancelled owned recovery cleanup failed");
             }
+            drop(recovery_permit);
         });
         let executor = receive
             .await
@@ -1506,6 +1539,131 @@ impl VoteExecutor {
             .await
     }
 
+    /// Return the current retry position only while durable leader authority
+    /// still matches. The transport uses this to construct its next signed probe.
+    /// # Errors
+    /// Returns executor shutdown, admission, or authoritative storage errors.
+    pub async fn replication_next(
+        &self,
+        peer: NodeId,
+    ) -> Result<Option<crate::consensus_model::LogIndex>, VoteGateError> {
+        self.run(move |gate| {
+            let (_, membership) = gate.store.election_context()?;
+            Ok(gate
+                .leader
+                .as_ref()
+                .filter(|leader| {
+                    leader.term == gate.store.state.term
+                        && membership.as_ref() == Some(&leader.membership)
+                })
+                .and_then(|leader| leader.next.get(&peer).copied()))
+        })
+        .await
+    }
+
+    /// Dispatch a bounded signed append from current leader authority. The exact
+    /// request remains owned until its response is verified; cancellation drops
+    /// the call without counting replication. Success is progress, not commit.
+    /// # Errors
+    /// Rejects incompatible peers, stale authority, invalid log claims and replies.
+    pub async fn replicate_append<C: bmux_plugin::ServiceCaller + Send + Sync + 'static>(
+        &self,
+        caller: &C,
+        local: NodeId,
+        request: bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
+    ) -> Result<(), bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError> {
+        use bmux_cluster_plugin_api::cluster_consensus_rpc_types::{
+            AppendOutcome as WireOutcome, RpcError,
+        };
+        let _outbound = self
+            .outbound_votes
+            .try_acquire()
+            .map_err(|_| RpcError::CapacityUnavailable)?;
+        if self.closing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(RpcError::Stopped);
+        }
+        verify_outbound_append(local, &request)?;
+        let admitted = request.clone();
+        let (endpoint, peer, expected, membership) = self
+            .run(move |gate| {
+                gate.store
+                    .admit_replication(gate.leader.as_ref(), local, &admitted)
+            })
+            .await
+            .map_err(vote_rpc_error)??;
+        let mut remote = crate::endpoint::EndpointDispatchClient::new(caller, endpoint.clone());
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bmux_cluster_plugin_api::cluster_consensus_rpc::client::append(
+                &mut remote,
+                request.clone(),
+            ),
+        )
+        .await
+        .map_err(|_| RpcError::ExecutionFailed)?
+        .map_err(|_| RpcError::ExecutionFailed)??;
+        crate::consensus_network::verify_owned_append_response(&request, &response)
+            .map_err(|_| RpcError::Unauthorized)?;
+        self.run(move |gate| {
+            let admission = gate
+                .store
+                .admit_replication(gate.leader.as_ref(), local, &request)?;
+            let Ok((current_endpoint, _, _, current_membership)) = admission else {
+                return Ok(Err(RpcError::StaleTerm));
+            };
+            if current_endpoint != endpoint || current_membership != membership {
+                return Ok(Err(RpcError::Unauthorized));
+            }
+            if response.term > gate.store.state.term.0 {
+                gate.leader = None;
+                gate.campaign = None;
+                gate.store
+                    .persist(HardState {
+                        term: Term(response.term),
+                        voted_for: None,
+                    })
+                    .map_err(|_| VoteGateError::StorageFailure)?;
+                return Ok(Err(RpcError::StaleTerm));
+            }
+            if response.term != request.term {
+                return Ok(Err(RpcError::StaleTerm));
+            }
+            if let WireOutcome::Durable { matched } = response.outcome {
+                let Ok(matched) = matched
+                    .as_ref()
+                    .map(decode_replication_identity)
+                    .transpose()
+                else {
+                    return Ok(Err(RpcError::InvalidRequest));
+                };
+                if matched != expected {
+                    return Ok(Err(RpcError::InvalidRequest));
+                }
+                if let Some(leader) = gate.leader.as_mut() {
+                    leader.acknowledge_probe(peer, matched);
+                }
+                if let Some(leader) = gate.leader.as_ref() {
+                    gate.store.commit_replicated(leader)?;
+                }
+            } else if let WireOutcome::Conflict { next_index } = response.outcome {
+                let previous = request
+                    .previous
+                    .as_ref()
+                    .map(|id| crate::consensus_model::LogIndex(id.index));
+                if let Some(leader) = gate.leader.as_mut() {
+                    leader.reject_probe(
+                        peer,
+                        previous,
+                        crate::consensus_model::LogIndex(next_index),
+                    );
+                }
+            }
+            Ok(Ok(()))
+        })
+        .await
+        .map_err(vote_rpc_error)?
+    }
+
     /// Verify a response to a locally issued signed request before observing its
     /// term or counting its vote. The caller retains the exact issued request;
     /// remote callers must not choose the request used for this binding.
@@ -1614,6 +1772,20 @@ impl VoteExecutor {
             );
             gate.campaign = None;
             Ok(Some(request))
+        })
+        .await
+    }
+
+    /// Advance commit from current retained replication evidence without applying
+    /// commands. This also handles a single voter, which needs no remote reply.
+    /// # Errors
+    /// Uncertain storage stops the owner and suppresses commit success.
+    pub async fn commit_replicated(&self) -> Result<Option<LogIdentity>, VoteGateError> {
+        self.run(|gate| {
+            let Some(leader) = gate.leader.as_ref() else {
+                return Ok(None);
+            };
+            gate.store.commit_replicated(leader)
         })
         .await
     }
@@ -2137,6 +2309,166 @@ impl OwnedVoteStore {
         application_crash("after-commit");
         self.failed = false;
         Ok(replies)
+    }
+
+    fn admit_replication(
+        &mut self,
+        leader: Option<&crate::consensus_model::LeaderProgress>,
+        local: NodeId,
+        request: &bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
+    ) -> Result<ReplicationAdmission, VoteGateError> {
+        use bmux_cluster_plugin_api::cluster_consensus_rpc_types::{AppendEntry, RpcError};
+        if crate::consensus_network::owned_append_signing_payload(request).is_err() {
+            return Ok(Err(RpcError::InvalidRequest));
+        }
+        let mut decoded = Vec::with_capacity(request.entries.len());
+        for wire in &request.entries {
+            match wire {
+                AppendEntry::Inline { canonical } => {
+                    let Ok(entry) = crate::consensus_storage::decode_owned_entry(canonical) else {
+                        return Ok(Err(RpcError::InvalidRequest));
+                    };
+                    decoded.push(entry);
+                }
+                AppendEntry::Staged { .. } => return Ok(Err(RpcError::Incompatible)),
+            }
+        }
+        let (_, membership) = self.election_context()?;
+        let Some(leader) = leader.filter(|leader| {
+            leader.term.0 == request.term
+                && self.state.term == leader.term
+                && self.state.voted_for == Some(local)
+                && membership.as_ref() == Some(&leader.membership)
+        }) else {
+            return Ok(Err(RpcError::StaleTerm));
+        };
+        let peer = NodeId::from_bytes(
+            request
+                .recipient
+                .as_slice()
+                .try_into()
+                .map_err(|_| VoteGateError::Stopped)?,
+        );
+        if peer == local || !leader.matched.contains_key(&peer) {
+            return Ok(Err(RpcError::Unauthorized));
+        }
+        self.failed = true;
+        let result = (|| -> io::Result<_> {
+            let tx = self.database.begin_read().map_err(io::Error::other)?;
+            let meta = tx.open_table(TABLE).map_err(io::Error::other)?;
+            let log = tx.open_table(LOG).map_err(io::Error::other)?;
+            let control = meta.get("control").map_err(io::Error::other)?.ok_or_else(|| invalid("missing control"))?;
+            let state = crate::control_state::ControlState::decode_snapshot(control.value()).map_err(io::Error::other)?;
+            let endpoint = match owned_vote_endpoint(&state, &request.cluster_id, peer) {
+                Ok(endpoint) => endpoint, Err(error) => return Ok(Err(error)),
+            };
+            let convert = |id: &bmux_cluster_plugin_api::cluster_consensus_transfer_types::LogIdentity| -> io::Result<LogIdentity> {
+                Ok(LogIdentity { term: Term(id.term), index: crate::consensus_model::LogIndex(id.index),
+                    leader: NodeId::from_bytes(id.leader.as_slice().try_into().map_err(|_| invalid("invalid identity"))?) })
+            };
+            let mut through = request.previous.as_ref().map(convert).transpose()?;
+            let snapshot = decode_position(meta.get("snapshot").map_err(io::Error::other)?.ok_or_else(|| invalid("missing snapshot"))?.value())?;
+            for position in through.iter().chain(request.leader_commit.as_ref().map(convert).transpose()?.iter()) {
+                // The durable snapshot replaces its boundary entry, but never
+                // authorizes another identity at that index or a guessed prefix.
+                if snapshot == Some(*position) {
+                    continue;
+                }
+                let Some(bytes) = log.get(position.index.0).map_err(io::Error::other)? else { return Ok(Err(RpcError::InvalidRequest)); };
+                let entry = crate::consensus_storage::decode_owned_entry(bytes.value()).map_err(io::Error::other)?;
+                if entry.identity != *position { return Ok(Err(RpcError::InvalidRequest)); }
+            }
+            if let Some(claimed) = request.leader_commit.as_ref() {
+                let commit = decode_position(meta.get("commit").map_err(io::Error::other)?.ok_or_else(|| invalid("missing commit"))?.value())?;
+                if commit.is_none_or(|commit| claimed.index > commit.index.0) { return Ok(Err(RpcError::InvalidRequest)); }
+            }
+            for entry in decoded {
+                if through.is_some_and(|previous| previous.index.0.checked_add(1) != Some(entry.identity.index.0))
+                    || (through.is_none() && entry.identity.index.0 != 0) {
+                    return Ok(Err(RpcError::InvalidRequest));
+                }
+                let Some(bytes) = log.get(entry.identity.index.0).map_err(io::Error::other)? else { return Ok(Err(RpcError::InvalidRequest)); };
+                if crate::consensus_storage::decode_owned_entry(bytes.value()).map_err(io::Error::other)? != entry {
+                    return Ok(Err(RpcError::InvalidRequest));
+                }
+                through = Some(entry.identity);
+            }
+            Ok(Ok((endpoint, peer, through, leader.membership.clone())))
+        })().map_err(|_| VoteGateError::StorageFailure)?;
+        self.failed = false;
+        Ok(result)
+    }
+
+    fn commit_replicated(
+        &mut self,
+        leader: &crate::consensus_model::LeaderProgress,
+    ) -> Result<Option<LogIdentity>, VoteGateError> {
+        let (_, membership) = self.election_context()?;
+        if self.state.term != leader.term || membership.as_ref() != Some(&leader.membership) {
+            return Ok(None);
+        }
+        let Some(index) = leader.quorum_index() else {
+            return Ok(None);
+        };
+        self.failed = true;
+        let committed = (|| -> io::Result<_> {
+            let mut tx = self.database.begin_write().map_err(io::Error::other)?;
+            tx.set_durability(Durability::Immediate)
+                .map_err(io::Error::other)?;
+            let previous = {
+                let meta = tx.open_table(TABLE).map_err(io::Error::other)?;
+                write_position(&meta, "commit")?
+            };
+            // A quorum behind the durable commit cannot advance authority and
+            // may legitimately refer to entries removed by snapshot compaction.
+            if previous.is_some_and(|committed| index <= committed.index) {
+                return Ok(None);
+            }
+            let candidate = {
+                let log = tx.open_table(LOG).map_err(io::Error::other)?;
+                let bytes = log
+                    .get(index.0)
+                    .map_err(io::Error::other)?
+                    .ok_or_else(|| invalid("quorum position missing from log"))?;
+                let candidate = crate::consensus_storage::decode_owned_entry(bytes.value())
+                    .map_err(io::Error::other)?
+                    .identity;
+                // Evidence beyond commit must still name authoritative entries.
+                // Older matches cannot contribute to this advancing candidate.
+                for matched in leader.matched.values().flatten().filter(|matched| {
+                    previous.is_none_or(|committed| matched.index > committed.index)
+                }) {
+                    let bytes = log
+                        .get(matched.index.0)
+                        .map_err(io::Error::other)?
+                        .ok_or_else(|| invalid("replication match missing from log"))?;
+                    if crate::consensus_storage::decode_owned_entry(bytes.value())
+                        .map_err(io::Error::other)?
+                        .identity
+                        != *matched
+                    {
+                        return Err(invalid("replication match identity changed"));
+                    }
+                }
+                candidate
+            };
+            let advance = {
+                let mut meta = tx.open_table(TABLE).map_err(io::Error::other)?;
+                let previous = write_position(&meta, "commit")?;
+                let advance = candidate.term == self.state.term
+                    && previous.is_none_or(|old| candidate.index > old.index);
+                if advance {
+                    meta.insert("commit", encode_position(Some(candidate)).as_slice())
+                        .map_err(io::Error::other)?;
+                }
+                advance
+            };
+            tx.commit().map_err(io::Error::other)?;
+            Ok(advance.then_some(candidate))
+        })()
+        .map_err(|_| VoteGateError::StorageFailure)?;
+        self.failed = false;
+        Ok(committed)
     }
 
     fn election_context(
@@ -2863,6 +3195,149 @@ mod tests {
         );
     }
 
+    fn append_admission_request(
+        local: NodeId,
+        peer: NodeId,
+        cluster_id: String,
+    ) -> bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest {
+        use bmux_cluster_plugin_api::{
+            cluster_consensus_rpc_types as wire,
+            cluster_consensus_transfer_types::{LogIdentity as WireIdentity, TransferProof},
+            cluster_types::{PeerAuthChallenge, PeerAuthProof},
+        };
+        let position = WireIdentity {
+            term: 0,
+            index: 0,
+            leader: local.as_bytes().to_vec(),
+        };
+        wire::AppendRequest {
+            cluster_id: cluster_id.clone(),
+            sender: local.as_bytes().to_vec(),
+            recipient: peer.as_bytes().to_vec(),
+            request_id: uuid::Uuid::new_v4(),
+            term: 1,
+            previous: Some(position.clone()),
+            entries: Vec::new(),
+            leader_commit: Some(position),
+            proof: TransferProof {
+                credential_serial: "serial".into(),
+                signature: vec![0; 64],
+                peer: PeerAuthProof {
+                    challenge: PeerAuthChallenge {
+                        protocol_version: 1,
+                        cluster_id,
+                        verifier_node_id: peer.to_string(),
+                        verifier_credential_serial: "serial".into(),
+                        audience_node_id: local.to_string(),
+                        nonce: "nonce".into(),
+                        issued_at_unix_ms: 0,
+                        expires_at_unix_ms: 1,
+                        signature: String::new(),
+                    },
+                    claimant_node_id: local.to_string(),
+                    claimant_credential_serial: "serial".into(),
+                    claimant_signature: String::new(),
+                },
+            },
+        }
+    }
+
+    #[test]
+    fn outbound_append_accepts_only_exact_compacted_boundary() {
+        use bmux_cluster_plugin_api::{
+            cluster_consensus_rpc_types as wire,
+            cluster_types::{ClusterConsensusRole, ClusterNodeCapabilities},
+        };
+        let root = tempfile::tempdir().unwrap();
+        let local = NodeId::from(1);
+        let remote = crate::membership::NodeIdentity::new_for_test(2);
+        let peer = *remote.node_id();
+        let cluster = crate::membership::ClusterId::generate();
+        let mut member = crate::membership::issue_test_member(
+            &remote,
+            cluster,
+            &remote,
+            "memory://peer",
+            ClusterNodeCapabilities {
+                consensus_role: ClusterConsensusRole::Voter,
+                worker: false,
+                ingress: false,
+            },
+            crate::now_unix_ms(),
+        );
+        member.negotiated_protocol.features.extend([
+            bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID.to_string(),
+            bmux_cluster_plugin_api::cluster_consensus_transfer::INTERFACE_ID.to_string(),
+        ]);
+        let cluster_id = member.cluster_id.clone();
+        let membership = Membership::new(
+            vec![vec![local]],
+            vec![(local, String::new()), (peer, String::new())],
+        )
+        .unwrap();
+        let mut store = OwnedVoteStore::bootstrap(
+            &root.path().join("authority.redb"),
+            &cluster_id,
+            local,
+            membership.clone(),
+        )
+        .unwrap();
+        let boundary = LogIdentity {
+            term: Term(0),
+            index: crate::consensus_model::LogIndex(0),
+            leader: local,
+        };
+        store.apply_committed().unwrap();
+        store.publish_snapshot().unwrap();
+        store.compact_snapshot().unwrap();
+        store
+            .persist(HardState {
+                term: Term(1),
+                voted_for: Some(local),
+            })
+            .unwrap();
+        let tx = store.database.begin_write().unwrap();
+        {
+            let mut meta = tx.open_table(TABLE).unwrap();
+            let mut state = crate::control_state::ControlState::new(cluster_id.clone());
+            state.members.insert(peer.to_string(), member);
+            meta.insert("control", state.encode_snapshot().unwrap().as_slice())
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        let leader = crate::consensus_model::LeaderProgress {
+            term: Term(1),
+            membership,
+            matched: [(local, Some(boundary)), (peer, None)].into(),
+            next: [(local, boundary.index), (peer, boundary.index)].into(),
+        };
+        let mut request = append_admission_request(local, peer, cluster_id);
+        assert_eq!(
+            store
+                .admit_replication(Some(&leader), local, &request)
+                .unwrap()
+                .unwrap()
+                .2,
+            Some(boundary)
+        );
+        request.previous.as_mut().unwrap().leader = peer.as_bytes().to_vec();
+        assert!(matches!(
+            store
+                .admit_replication(Some(&leader), local, &request)
+                .unwrap(),
+            Err(wire::RpcError::InvalidRequest)
+        ));
+        request.previous.as_mut().unwrap().leader = local.as_bytes().to_vec();
+        request.leader_commit.as_mut().unwrap().term = 1;
+        assert!(matches!(
+            store
+                .admit_replication(Some(&leader), local, &request)
+                .unwrap(),
+            Err(wire::RpcError::InvalidRequest)
+        ));
+        assert!(!store.failed);
+    }
+
     #[test]
     fn outbound_vote_requires_both_negotiated_interfaces() {
         use bmux_cluster_plugin_api::cluster_types::{
@@ -3235,6 +3710,80 @@ mod tests {
                 voted_for: None
             }
         );
+        store.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn replicated_commit_survives_compacted_matches() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority.redb");
+        let local = NodeId::from(1);
+        OwnedVoteStore::bootstrap(
+            &path,
+            "cluster",
+            local,
+            Membership::new(vec![vec![local]], vec![(local, String::new())]).unwrap(),
+        )
+        .unwrap()
+        .close()
+        .unwrap();
+        let executor = VoteExecutor::recover(path, "cluster".into(), 1)
+            .await
+            .unwrap();
+        executor.campaign(local).await.unwrap().unwrap();
+        executor.initialize_leader().await.unwrap().unwrap();
+        assert!(executor.commit_replicated().await.unwrap().is_some());
+        executor.apply_committed().await.unwrap();
+        executor.publish_snapshot().await.unwrap();
+        executor.compact_snapshot().await.unwrap();
+        assert_eq!(executor.commit_replicated().await.unwrap(), None);
+        executor.campaign(local).await.unwrap().unwrap();
+        let next = executor.initialize_leader().await.unwrap().unwrap();
+        assert_eq!(
+            executor.commit_replicated().await.unwrap(),
+            Some(next.entries[0].identity)
+        );
+        executor.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replicated_commit_is_durable_without_application() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority.redb");
+        let local = NodeId::from(1);
+        OwnedVoteStore::bootstrap(
+            &path,
+            "cluster",
+            local,
+            Membership::new(vec![vec![local]], vec![(local, String::new())]).unwrap(),
+        )
+        .unwrap()
+        .close()
+        .unwrap();
+        let executor = VoteExecutor::recover(path.clone(), "cluster".into(), 1)
+            .await
+            .unwrap();
+        executor.campaign(local).await.unwrap().unwrap();
+        let initial = executor.initialize_leader().await.unwrap().unwrap();
+        assert_eq!(
+            executor.commit_replicated().await.unwrap(),
+            Some(initial.entries[0].identity)
+        );
+        assert_eq!(executor.commit_replicated().await.unwrap(), None);
+        executor.shutdown().await.unwrap();
+        let store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        let tx = store.database.begin_read().unwrap();
+        let meta = tx.open_table(TABLE).unwrap();
+        assert_eq!(
+            decode_position(meta.get("commit").unwrap().unwrap().value()).unwrap(),
+            Some(initial.entries[0].identity)
+        );
+        assert_eq!(
+            decode_position(meta.get("applied").unwrap().unwrap().value()).unwrap(),
+            None
+        );
+        drop(meta);
+        drop(tx);
         store.close().unwrap();
     }
 
