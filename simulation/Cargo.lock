@@ -97,6 +97,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
+name = "block-buffer"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
+dependencies = [
+ "hybrid-array",
+]
+
+[[package]]
 name = "block2"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -106,10 +115,101 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_application_resurrection_plugin_api"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_ipc",
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "serde",
+]
+
+[[package]]
+name = "bmux_attach_image_protocol"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_codec",
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_attach_layout_protocol"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_codec",
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "bmux_scene_protocol",
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_attach_token_state"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_session_models",
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_bench"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "libc",
+ "rustc-demangle",
+ "serde",
+ "serde_json",
+ "sha2",
+ "toml",
+]
+
+[[package]]
 name = "bmux_cell_geometry"
 version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_unicode_segmentation",
+]
+
+[[package]]
+name = "bmux_client"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_attach_image_protocol",
+ "bmux_attach_layout_protocol",
+ "bmux_codec",
+ "bmux_config",
+ "bmux_ipc",
+ "bmux_keyboard",
+ "bmux_perf_telemetry",
+ "bmux_plugin_sdk",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_client_state"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_session_models",
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_clients_plugin_api"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_ipc",
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "serde",
+ "uuid",
 ]
 
 [[package]]
@@ -124,8 +224,274 @@ name = "bmux_color"
 version = "0.0.1-alpha.4"
 
 [[package]]
+name = "bmux_config"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "anyhow",
+ "bmux_config_composition",
+ "bmux_config_doc",
+ "bmux_config_doc_derive",
+ "bmux_event_models",
+ "bmux_ipc",
+ "bmux_keybind",
+ "bmux_slots",
+ "libc",
+ "serde",
+ "switchy 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "thiserror",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "bmux_config_composition"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "libc",
+ "serde",
+ "toml",
+]
+
+[[package]]
+name = "bmux_config_doc"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "hyperchad_docs_config",
+]
+
+[[package]]
+name = "bmux_config_doc_derive"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
+]
+
+[[package]]
+name = "bmux_context_state"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_session_models",
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_event_models"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "bmux_ipc"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_attach_image_protocol",
+ "bmux_codec",
+ "libc",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_keybind"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "anyhow",
+]
+
+[[package]]
 name = "bmux_keyboard"
 version = "0.0.1-alpha.4"
+
+[[package]]
+name = "bmux_pane_runtime_plugin"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "anyhow",
+ "bmux_application_resurrection_plugin_api",
+ "bmux_attach_image_protocol",
+ "bmux_attach_layout_protocol",
+ "bmux_attach_token_state",
+ "bmux_bench",
+ "bmux_client",
+ "bmux_client_state",
+ "bmux_clients_plugin_api",
+ "bmux_config",
+ "bmux_context_state",
+ "bmux_ipc",
+ "bmux_pane_runtime_plugin_api",
+ "bmux_pane_runtime_state",
+ "bmux_permissions_plugin_api",
+ "bmux_plugin",
+ "bmux_plugin_runtime",
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "bmux_presentation_state",
+ "bmux_pty",
+ "bmux_recording_protocol",
+ "bmux_recording_runtime",
+ "bmux_session_models",
+ "bmux_session_state",
+ "bmux_sessions_plugin_api",
+ "bmux_snapshot_runtime",
+ "bmux_tabs_plugin_api",
+ "bmux_terminal_grid",
+ "bmux_terminal_protocol",
+ "libc",
+ "memchr",
+ "serde",
+ "serde_json",
+ "sha2",
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
+ "switchy_pty",
+ "switchy_simulation",
+ "switchy_thread",
+ "switchy_time",
+ "tempfile",
+ "tokio",
+ "toml",
+ "toml_edit",
+ "tracing",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "bmux_pane_runtime_plugin_api"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_codec",
+ "bmux_ipc",
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_pane_runtime_state"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "anyhow",
+ "bmux_attach_image_protocol",
+ "bmux_attach_layout_protocol",
+ "bmux_ipc",
+ "bmux_session_models",
+ "serde",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_perf_telemetry"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "bmux_permissions_plugin_api"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_ipc",
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_plugin"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_cell_geometry",
+ "bmux_codec",
+ "bmux_ipc",
+ "bmux_perf_telemetry",
+ "bmux_plugin_runtime",
+ "bmux_plugin_sdk",
+ "libc",
+ "libloading",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "uuid",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "bmux_plugin_runtime"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_plugin_schema"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "serde",
+ "sha2",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
+name = "bmux_plugin_schema_macros"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_plugin_schema",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.10",
+]
+
+[[package]]
+name = "bmux_plugin_sdk"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_codec",
+ "bmux_ipc",
+ "bmux_perf_telemetry",
+ "bmux_plugin_runtime",
+ "bmux_plugin_schema",
+ "serde",
+ "serde_json",
+ "switchy 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_presentation_state"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_codec",
+ "serde",
+ "tokio",
+]
 
 [[package]]
 name = "bmux_pty"
@@ -145,6 +511,64 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_recording_protocol"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_attach_image_protocol",
+ "bmux_codec",
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_recording_runtime"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_ipc",
+ "bmux_recording_protocol",
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_scene_protocol"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_session_models"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "serde",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_session_state"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "anyhow",
+ "bmux_session_models",
+ "serde",
+]
+
+[[package]]
+name = "bmux_sessions_plugin_api"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_ipc",
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "serde",
+ "uuid",
+]
+
+[[package]]
 name = "bmux_simvar_tui"
 version = "0.0.1-alpha.4"
 dependencies = [
@@ -154,6 +578,43 @@ dependencies = [
  "bmux_tui_runtime",
  "futures-util",
  "simvar_observer",
+]
+
+[[package]]
+name = "bmux_slots"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "serde",
+ "switchy 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "thiserror",
+ "toml",
+]
+
+[[package]]
+name = "bmux_snapshot_protocol"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "bmux_snapshot_runtime"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_plugin_sdk",
+ "bmux_snapshot_protocol",
+ "thiserror",
+]
+
+[[package]]
+name = "bmux_tabs_plugin_api"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_ipc",
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "serde",
+ "uuid",
 ]
 
 [[package]]
@@ -324,6 +785,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "cpufeatures"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -348,6 +818,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
 
 [[package]]
+name = "crypto-common"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
+dependencies = [
+ "hybrid-array",
+]
+
+[[package]]
 name = "ctrlc"
 version = "3.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -363,6 +842,16 @@ name = "deranged"
 version = "0.5.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e9de72ce2ad1f90dc62fa25f0f430ef85eb4b0d8fa0be4f30373bc40a21d28e"
+
+[[package]]
+name = "digest"
+version = "0.11.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
+dependencies = [
+ "block-buffer",
+ "crypto-common",
+]
 
 [[package]]
 name = "dispatch2"
@@ -398,6 +887,16 @@ name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
+
+[[package]]
+name = "errno"
+version = "0.3.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e35d6e78f4cebb90e51d543db8fe41528851d6deeef6ef21ebd4bfdc1e784776"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
 
 [[package]]
 name = "fallible-iterator"
@@ -725,6 +1224,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
+name = "hybrid-array"
+version = "0.4.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17"
+dependencies = [
+ "typenum",
+]
+
+[[package]]
 name = "hyper"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -781,6 +1289,12 @@ dependencies = [
  "tower-service",
  "tracing",
 ]
+
+[[package]]
+name = "hyperchad_docs_config"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80ee8dcabbadc4107bff1e8006241f9640d5cca4b0b2cadfe3daf434bc54b563"
 
 [[package]]
 name = "iana-time-zone"
@@ -1051,6 +1565,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
+name = "libloading"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1832accd5a4ca2795ace4d05d15c4039be15b62d3b950eff99746a990e3cc10"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libsqlite3-sys"
 version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1060,6 +1584,12 @@ dependencies = [
  "pkg-config",
  "vcpkg",
 ]
+
+[[package]]
+name = "linux-raw-sys"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "litemap"
@@ -1147,7 +1677,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_assert"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 dependencies = [
  "colored",
  "moosicbox_env_utils",
@@ -1156,14 +1686,14 @@ dependencies = [
 [[package]]
 name = "moosicbox_env_utils"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 
 [[package]]
 name = "moosicbox_log_runtime"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 dependencies = [
- "switchy_fs",
+ "switchy_fs 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "thiserror",
  "tracing-appender",
  "tracing-log",
@@ -1173,9 +1703,9 @@ dependencies = [
 [[package]]
 name = "moosicbox_profiles"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 dependencies = [
- "switchy_async",
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
 ]
 
 [[package]]
@@ -1311,6 +1841,19 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-stream",
+]
+
+[[package]]
+name = "pane-runtime"
+version = "0.0.0"
+dependencies = [
+ "bmux_pane_runtime_plugin",
+ "simvar",
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
+ "switchy_pty",
+ "switchy_simulation",
+ "switchy_thread",
+ "switchy_time",
 ]
 
 [[package]]
@@ -1494,9 +2037,9 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand"
-version = "0.8.8"
+version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e058c7de0b26af77780c769414d6257830bb240f3c38477dbc2c16e5f54d6d4c"
+checksum = "34af8d1a0e25924bc5b7c43c079c942339d8f0a8b57c39049bef581b46327404"
 dependencies = [
  "libc",
  "rand_chacha 0.3.1",
@@ -1661,6 +2204,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustc-demangle"
+version = "0.1.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b74b56ffa8bb2830709a538c2cbcae9aa062db0d2a42563bfb09bdaae44020eb"
+
+[[package]]
+name = "rustix"
+version = "1.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5e76742e5294153d4dde1207dbec5bdd81eef6fabdc0d2118babadabfd858aa"
+dependencies = [
+ "bitflags",
+ "errno",
+ "libc",
+ "linux-raw-sys",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "rustversion"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1732,6 +2294,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_spanned"
+version = "1.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c187e0a369471c550af028cba56d4f4fa2a489ad28151ae95a4d340a2a8b782"
+dependencies = [
+ "serde_core",
+]
+
+[[package]]
+name = "sha2"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1761,7 +2343,7 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 [[package]]
 name = "simvar"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 dependencies = [
  "simvar_harness",
 ]
@@ -1769,7 +2351,7 @@ dependencies = [
 [[package]]
 name = "simvar_harness"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 dependencies = [
  "btparse",
  "color-backtrace",
@@ -1779,21 +2361,21 @@ dependencies = [
  "shell-words",
  "simvar_observer",
  "simvar_utils",
- "switchy",
+ "switchy 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "thiserror",
 ]
 
 [[package]]
 name = "simvar_observer"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 
 [[package]]
 name = "simvar_utils"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 dependencies = [
- "switchy",
+ "switchy 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
 ]
 
 [[package]]
@@ -1880,16 +2462,27 @@ dependencies = [
 [[package]]
 name = "switchy"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55334b2f67eca743ddbe89ea73611523afef1e710a4eabe39f3cbf55d912b6e1"
 dependencies = [
- "switchy_async",
+ "switchy_async 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "switchy_fs 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "switchy_random 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+]
+
+[[package]]
+name = "switchy"
+version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
+dependencies = [
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "switchy_async_macros",
  "switchy_database",
  "switchy_database_connection",
- "switchy_fs",
+ "switchy_fs 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "switchy_http",
  "switchy_mdns",
- "switchy_random",
+ "switchy_random 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "switchy_simulation",
  "switchy_tcp",
  "switchy_telemetry",
@@ -1903,7 +2496,20 @@ dependencies = [
 [[package]]
 name = "switchy_async"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "207d054c34cf69f21e7b5469bf5dd38ffc8a193772e64bb00ae0f86e6fd421a6"
+dependencies = [
+ "log",
+ "pin-project-lite",
+ "scoped-tls",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "switchy_async"
+version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 dependencies = [
  "flume",
  "futures",
@@ -1911,7 +2517,8 @@ dependencies = [
  "pin-project-lite",
  "scoped-tls",
  "switchy_async_macros",
- "switchy_random",
+ "switchy_random 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
+ "switchy_thread",
  "switchy_time",
  "thiserror",
  "tokio",
@@ -1921,7 +2528,7 @@ dependencies = [
 [[package]]
 name = "switchy_async_macros"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 dependencies = [
  "log",
  "proc-macro-crate",
@@ -1933,7 +2540,7 @@ dependencies = [
 [[package]]
 name = "switchy_database"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1942,7 +2549,7 @@ dependencies = [
  "moosicbox_profiles",
  "regex",
  "rusqlite",
- "switchy_async",
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "switchy_time",
  "thiserror",
  "tokio",
@@ -1951,10 +2558,10 @@ dependencies = [
 [[package]]
 name = "switchy_database_connection"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 dependencies = [
  "log",
- "switchy_async",
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "switchy_database",
  "switchy_env",
  "thiserror",
@@ -1963,7 +2570,7 @@ dependencies = [
 [[package]]
 name = "switchy_env"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 dependencies = [
  "log",
  "thiserror",
@@ -1972,12 +2579,23 @@ dependencies = [
 [[package]]
 name = "switchy_fs"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8dcf16a0a6988f098d228570f63958843126179a0f92066f0d8207b118b89afa"
+dependencies = [
+ "libc",
+ "log",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "switchy_fs"
+version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 dependencies = [
  "bytes",
  "libc",
  "log",
- "switchy_async",
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "tokio",
  "windows-sys 0.61.2",
 ]
@@ -1985,7 +2603,7 @@ dependencies = [
 [[package]]
 name = "switchy_http"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2000,7 +2618,7 @@ dependencies = [
 [[package]]
 name = "switchy_http_models"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 dependencies = [
  "strum",
  "thiserror",
@@ -2009,7 +2627,7 @@ dependencies = [
 [[package]]
 name = "switchy_mdns"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 dependencies = [
  "async-trait",
  "hostname",
@@ -2021,31 +2639,43 @@ dependencies = [
 [[package]]
 name = "switchy_pty"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 dependencies = [
+ "libc",
  "switchy_simulation",
  "switchy_thread",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "switchy_random"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0bb656d3a75379c438a030a39292c7590c736468168406ec7d44764148f6178"
 dependencies = [
  "log",
- "rand 0.8.8",
+ "rand 0.8.5",
+]
+
+[[package]]
+name = "switchy_random"
+version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
+dependencies = [
+ "log",
+ "rand 0.8.5",
  "switchy_simulation",
 ]
 
 [[package]]
 name = "switchy_simulation"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 
 [[package]]
 name = "switchy_tcp"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2053,7 +2683,7 @@ dependencies = [
  "log",
  "paste",
  "scoped-tls",
- "switchy_async",
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "thiserror",
  "tokio",
 ]
@@ -2061,7 +2691,7 @@ dependencies = [
 [[package]]
 name = "switchy_telemetry"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 dependencies = [
  "log",
  "moosicbox_log_runtime",
@@ -2077,7 +2707,7 @@ dependencies = [
 [[package]]
 name = "switchy_thread"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 dependencies = [
  "switchy_simulation",
  "switchy_time",
@@ -2086,17 +2716,17 @@ dependencies = [
 [[package]]
 name = "switchy_time"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 dependencies = [
  "chrono",
- "switchy_random",
+ "switchy_random 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "switchy_simulation",
 ]
 
 [[package]]
 name = "switchy_upnp"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -2108,7 +2738,7 @@ dependencies = [
  "roxmltree 0.21.2",
  "rupnp",
  "serde",
- "switchy_async",
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "thiserror",
  "tokio",
  "xml",
@@ -2117,18 +2747,18 @@ dependencies = [
 [[package]]
 name = "switchy_uuid"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 dependencies = [
  "log",
  "switchy_env",
- "switchy_random",
+ "switchy_random 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "uuid",
 ]
 
 [[package]]
 name = "switchy_web_server"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -2137,7 +2767,7 @@ dependencies = [
  "paste",
  "serde",
  "serde-querystring",
- "switchy_fs",
+ "switchy_fs 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "switchy_http_models",
  "switchy_web_server_core",
  "thiserror",
@@ -2147,7 +2777,7 @@ dependencies = [
 [[package]]
 name = "switchy_web_server_core"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#c9ae5548a5641e98ae17e9052d12a93528163ba0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#b0332ff1f83b94602c8216f56c9ea3efefbdb880"
 
 [[package]]
 name = "symlink"
@@ -2195,6 +2825,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.10",
+]
+
+[[package]]
+name = "tempfile"
+version = "3.27.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
+dependencies = [
+ "fastrand",
+ "once_cell",
+ "rustix",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2328,6 +2970,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "toml"
+version = "1.2.2+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5426cb1b964690d913f6c5c1a1ae0b42f428ec506bb4d452876d7a209c9bca3b"
+dependencies = [
+ "serde_core",
+ "serde_spanned",
+ "toml_datetime",
+ "toml_parser",
+ "toml_writer",
+ "winnow",
+]
+
+[[package]]
 name = "toml_datetime"
 version = "1.1.3+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2345,6 +3001,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
@@ -2356,6 +3013,12 @@ checksum = "e6769c452d71ba30696c6b37770c439a9cc9110f47f7d5cdbeda79840ef5ea31"
 dependencies = [
  "winnow",
 ]
+
+[[package]]
+name = "toml_writer"
+version = "1.2.0+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "009dbb7700f11c55ef83aebbe4c0e9cf1f1ac0844bd8d6f00dc38f302026e13a"
 
 [[package]]
 name = "tonic"
@@ -2553,6 +3216,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
+name = "typenum"
+version = "1.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2599,6 +3268,7 @@ checksum = "3c14b15dffa2f4bd712103e857140aa04a4f2ff6e955c77d7eb8e53ee02a3b64"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

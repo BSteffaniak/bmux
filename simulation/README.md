@@ -9,6 +9,7 @@ replays exactly on the same build.
 | Simulation | Tests |
 | --- | --- |
 | [`pty`](pty/README.md) | `bmux_pty` against a simulated kernel |
+| [`pane-runtime`](pane-runtime/README.md) | the pane runtime plugin on simulated tasks, threads, time and processes |
 
 This is a Cargo workspace of its own, excluded from bmux's main one, so the
 `simulator` features its members enable never reach bmux's real builds.

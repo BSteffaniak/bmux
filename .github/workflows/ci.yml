@@ -446,6 +446,13 @@ jobs:
           SIMULATOR_VERIFY_DETERMINISM: "1"
         run: cargo sim pty
 
+      - name: Pane runtime runs, determinism verified
+        shell: bash
+        env:
+          SIMULATOR_RUNS: "300"
+          SIMULATOR_VERIFY_DETERMINISM: "1"
+        run: cargo sim pane-runtime
+
   sandbox-bundle-regression:
     name: Sandbox Bundle Regression
     runs-on: ubuntu-latest

@@ -150,11 +150,18 @@ build -p <plugin-crate> ...`).
 
 Simulations live in `simulation/`, a separate Cargo workspace (never add it to
 the main one: its simulator features would reach real builds). If a change
-touches `simulation/**`, `packages/pty/**` or the switchy crates it uses, run:
+touches `simulation/**`, `packages/pty/**`, `plugins/pane-runtime-plugin/**` or the
+switchy crates they use, run:
 
 - `cargo clippy --manifest-path simulation/Cargo.toml --all-targets -- -D warnings`
 - `cargo sim pty --regression`
 - `SIMULATOR_RUNS=500 SIMULATOR_VERIFY_DETERMINISM=1 cargo sim pty`
+- `SIMULATOR_RUNS=300 SIMULATOR_VERIFY_DETERMINISM=1 cargo sim pane-runtime`
+
+Code the pane runtime simulation runs must stay deterministic: tasks, timers and
+`select!` through `switchy_async`, threads and locks through `switchy_thread`, clocks
+through `switchy_time`, identifiers through the plugin's `ids` module, directory
+listings through `dir_order`, and process-wide bounds through `run_shared`.
 
 ## Minimum Required Commands (CLI/runtime work)
 
@@ -216,5 +223,6 @@ Agents should report test execution in final response using this format:
 - `./scripts/compat-matrix.sh` - PASS/FAIL (if required)
 - `bmux plugin rebuild --all-workspace-plugins` - PASS/FAIL (if required)
 - `cargo sim pty --regression` - PASS/FAIL (if required)
+- `cargo sim pane-runtime` (300 verified runs) - PASS/FAIL (if required)
 
 If any required command is skipped, explain why.

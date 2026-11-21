@@ -21,6 +21,8 @@ pub(crate) mod session_control;
 #[cfg(all(unix, not(feature = "simulator")))]
 mod session_sweep;
 mod shell_callback;
+#[cfg(feature = "simulator")]
+pub mod simulation;
 mod startup_capture;
 
 use native_process::send_process_signal;
@@ -85,7 +87,12 @@ pub(crate) fn activate_managed_scope(host: &PaneRuntimeHost) {
 
 // Process-wide diagnostic: counts OS threads blocked in pane I/O across every
 // activation in this process (a thread budget, not per-instance state).
-static PANE_BLOCKING_THREAD_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// Pane blocking threads alive (see [`crate::run_shared`]).
+enum PaneBlockingThreads {}
+
+fn pane_blocking_threads() -> Arc<AtomicUsize> {
+    crate::run_shared::run_shared::<PaneBlockingThreads, _>(|| AtomicUsize::new(0))
+}
 
 struct PaneBlockingThreadGuard {
     pane_id: Uuid,
@@ -94,7 +101,7 @@ struct PaneBlockingThreadGuard {
 
 impl PaneBlockingThreadGuard {
     fn new(pane_id: Uuid, role: &'static str) -> Self {
-        let active = PANE_BLOCKING_THREAD_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+        let active = pane_blocking_threads().fetch_add(1, Ordering::SeqCst) + 1;
         trace!(%pane_id, role, active, "pane blocking thread started");
         Self { pane_id, role }
     }
@@ -102,7 +109,7 @@ impl PaneBlockingThreadGuard {
 
 impl Drop for PaneBlockingThreadGuard {
     fn drop(&mut self) {
-        let active = PANE_BLOCKING_THREAD_COUNT.fetch_sub(1, Ordering::SeqCst) - 1;
+        let active = pane_blocking_threads().fetch_sub(1, Ordering::SeqCst) - 1;
         trace!(pane_id = %self.pane_id, role = self.role, active, "pane blocking thread exited");
     }
 }
@@ -1684,10 +1691,10 @@ impl PreparedCleanup {
     fn reserve(host: &PaneRuntimeHost) -> Result<Arc<Self>> {
         // Process-wide bound on concurrent cleanup tasks: they hold OS
         // resources (threads, PTYs) shared by every activation in this process.
-        static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+        enum CleanupSlots {}
         Self::reserve_from(
             host,
-            Arc::clone(SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(64)))),
+            crate::run_shared::run_shared::<CleanupSlots, _>(|| tokio::sync::Semaphore::new(64)),
         )
     }
 
@@ -6984,7 +6991,12 @@ struct ProcessStartIdentity(u64, u64);
 
 // Process-wide bound on in-flight OS process-identity probes: they occupy OS
 // threads shared by every activation in this process.
-static PROCESS_IDENTITY_PROBES: AtomicUsize = AtomicUsize::new(0);
+/// Process start identity probes running (see [`crate::run_shared`]).
+enum IdentityProbes {}
+
+fn identity_probes() -> Arc<AtomicUsize> {
+    crate::run_shared::run_shared::<IdentityProbes, _>(|| AtomicUsize::new(0))
+}
 
 fn startup_stop_requested(stop: &mut oneshot::Receiver<()>) -> bool {
     !matches!(stop.try_recv(), Err(oneshot::error::TryRecvError::Empty))
@@ -7008,18 +7020,19 @@ async fn bounded_process_start_identity(pid: u32) -> Option<ProcessStartIdentity
 async fn bounded_start_identity_probe(
     probe: impl FnOnce() -> Option<ProcessStartIdentity> + Send + 'static,
 ) -> Option<ProcessStartIdentity> {
-    struct Permit;
+    struct Permit(Arc<AtomicUsize>);
     impl Drop for Permit {
         fn drop(&mut self) {
-            PROCESS_IDENTITY_PROBES.fetch_sub(1, Ordering::SeqCst);
+            self.0.fetch_sub(1, Ordering::SeqCst);
         }
     }
-    PROCESS_IDENTITY_PROBES
+    let probes = identity_probes();
+    probes
         .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
             (count < 4).then_some(count + 1)
         })
         .ok()?;
-    let permit = Permit;
+    let permit = Permit(probes);
     let (sender, receiver) = oneshot::channel();
     switchy_thread::thread::Builder::new()
         .name("bmux-process-identity".into())
@@ -7378,7 +7391,8 @@ impl SessionRuntimeManager {
         }
 
         let cleanup = PreparedCleanup::reserve(&self.host)?;
-        let first_pane_id = reserved.map_or_else(Uuid::new_v4, |reference| reference.pane_id);
+        let first_pane_id =
+            reserved.map_or_else(crate::ids::new_uuid, |reference| reference.pane_id);
         let managed_program = launch.is_some();
         let pane_meta = PaneRuntimeMeta {
             id: first_pane_id,
@@ -12852,7 +12866,7 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                 }
                 let shell = pane.meta.shell.clone();
                 let expected_identity = pane.process_start_identity.lock().ok().and_then(|v| *v);
-                bounded_directory_probe(&DIRECTORY_PROBES, budget, move || {
+                bounded_directory_probe(directory_probes(), budget, move || {
                     let pid = process_id?;
                     let identity = process_start_identity_for_pid(pid)?;
                     if expected_identity
@@ -13445,7 +13459,7 @@ pub(crate) fn observe_spawn_directory(
         bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError::SourceUnavailable,
     )?;
     observe_spawn_directory_with(&handle.0, source, |pid, identity| {
-        bounded_directory_probe(&DIRECTORY_PROBES, Duration::from_millis(250), move || {
+        bounded_directory_probe(directory_probes(), Duration::from_millis(250), move || {
             observe_process_directory_for_identity(pid, identity)
         })
     })
@@ -13454,18 +13468,26 @@ pub(crate) fn observe_spawn_directory(
 // Timed-out OS calls retain their admission slot until they actually finish.
 // There is no queue: a stalled filesystem cannot accumulate detached workers.
 // Process-wide because the stalled OS threads it bounds are process-wide.
-static DIRECTORY_PROBES: AtomicUsize = AtomicUsize::new(0);
+/// Directory probes running (see [`crate::run_shared`]).
+enum DirectoryProbes {}
+
+fn directory_probes() -> Arc<AtomicUsize> {
+    crate::run_shared::run_shared::<DirectoryProbes, _>(|| AtomicUsize::new(0))
+}
 const MAX_DIRECTORY_PROBES: usize = 4;
 
-fn bounded_directory_probe<T: Send + 'static>(
-    active: &'static AtomicUsize,
+fn bounded_directory_probe<
+    T: Send + 'static,
+    A: std::ops::Deref<Target = AtomicUsize> + Send + 'static,
+>(
+    active: A,
     timeout: Duration,
     probe: impl FnOnce() -> Option<T> + Send + 'static,
 ) -> std::result::Result<Option<T>, bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError>
 {
     use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
-    struct Permit(&'static AtomicUsize);
-    impl Drop for Permit {
+    struct Permit<A: std::ops::Deref<Target = AtomicUsize>>(A);
+    impl<A: std::ops::Deref<Target = AtomicUsize>> Drop for Permit<A> {
         fn drop(&mut self) {
             self.0.fetch_sub(1, Ordering::SeqCst);
         }
@@ -18122,7 +18144,7 @@ exit 7"#
         static ACTIVE: AtomicUsize = AtomicUsize::new(0);
         let (release, blocked) = switchy_thread::sync::mpsc::channel();
         assert_eq!(
-            bounded_directory_probe::<String>(&ACTIVE, Duration::ZERO, move || {
+            bounded_directory_probe::<String, _>(&ACTIVE, Duration::ZERO, move || {
                 blocked.recv().unwrap();
                 Some("/late".into())
             }),
@@ -18139,7 +18161,7 @@ exit 7"#
             switchy_thread::thread::yield_now();
         }
         assert_eq!(
-            bounded_directory_probe::<String>(&ACTIVE, Duration::from_secs(2), || Some(
+            bounded_directory_probe::<String, _>(&ACTIVE, Duration::from_secs(2), || Some(
                 "/ready".into()
             )),
             Ok(Some("/ready".into()))
@@ -18151,7 +18173,7 @@ exit 7"#
         use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
         static ACTIVE: AtomicUsize = AtomicUsize::new(MAX_DIRECTORY_PROBES);
         assert_eq!(
-            bounded_directory_probe::<String>(&ACTIVE, Duration::from_secs(1), || panic!(
+            bounded_directory_probe::<String, _>(&ACTIVE, Duration::from_secs(1), || panic!(
                 "must not run"
             )),
             Err(SpawnError::Busy)

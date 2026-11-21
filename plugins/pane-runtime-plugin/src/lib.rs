@@ -39,7 +39,10 @@ mod padding;
 mod padding_api;
 mod private_input;
 mod readiness;
+mod run_shared;
 mod runtime;
+#[cfg(feature = "simulator")]
+pub use runtime::simulation;
 mod snapshot;
 mod snapshot_v1_migration;
 #[cfg(windows)]

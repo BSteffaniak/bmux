@@ -1,6 +1,5 @@
 //! Retained request authority for queued terminal input.
 use std::io::{self, Write};
-use std::sync::OnceLock;
 use std::time::Duration;
 use switchy_thread::sync::Arc;
 use switchy_time::Instant;
@@ -9,15 +8,16 @@ type WriteReceipt = switchy_thread::sync::mpsc::Receiver<Result<(), String>>;
 const MAX_PENDING_WRITES: usize = 64;
 const MAX_INPUT_BYTES: usize = 65_536;
 const WRITE_SETTLEMENT_TIMEOUT: Duration = Duration::from_secs(10);
-// Shared capacity only: caller authority is captured separately in each command.
-// Process-wide because it bounds OS PTY writer work across every activation.
-static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
 
 /// Process-wide PTY write queue capacity. It bounds OS writer threads and
 /// memory across every activation, so it is a true process resource bound,
 /// not per-instance state.
 fn write_slots() -> Arc<tokio::sync::Semaphore> {
-    Arc::clone(SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_WRITES))))
+    // Shared capacity only: caller authority is captured separately in each command.
+    enum WriteSlots {}
+    crate::run_shared::run_shared::<WriteSlots, _>(|| {
+        tokio::sync::Semaphore::new(MAX_PENDING_WRITES)
+    })
 }
 
 /// The input invocation one thread is synchronously executing for this
