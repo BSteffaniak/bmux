@@ -1,0 +1,23 @@
+[package]
+description = "Deterministic simulation testing for bmux's plugin-less local terminal"
+edition     = { workspace = true }
+license     = { workspace = true }
+name        = "local-terminal"
+publish     = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_local_terminal = { workspace = true, features = ["simulator"] }
+simvar              = { workspace = true, features = ["random", "thread", "time"] }
+switchy_async       = { workspace = true, features = ["thread-simulator", "time"] }
+switchy_pty         = { workspace = true, features = ["simulator"] }
+switchy_simulation  = { workspace = true }
+switchy_thread      = { workspace = true, features = ["simulator"] }
+switchy_time        = { workspace = true, features = ["simulator"] }
+tokio               = { workspace = true, features = ["io-util"] }
+
+[features]
+default = []
+
+fail-on-warnings = []

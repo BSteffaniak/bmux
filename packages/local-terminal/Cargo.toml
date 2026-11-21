@@ -1,0 +1,35 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-interface"]
+description = "The server side of bmux's plugin-less local terminal: a shell on a pseudo-terminal, over any stream"
+edition     = { workspace = true }
+keywords    = ["bmux", "pty", "terminal"]
+license     = { workspace = true }
+name        = "bmux_local_terminal"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+anyhow        = { workspace = true }
+bmux_pty      = { workspace = true }
+switchy_async = { workspace = true, features = ["macros", "time"] }
+tokio         = { workspace = true, features = ["io-util"] }
+
+[dev-dependencies]
+switchy_async = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "time",
+    "tokio",
+] }
+
+[features]
+default = ["native"]
+
+fail-on-warnings = ["bmux_pty/fail-on-warnings"]
+
+# Real pseudo-terminals and tokio.
+native = ["bmux_pty/native", "switchy_async/tokio"]
+# Simulated terminals, processes, threads and executor, for deterministic simulation.
+simulator = ["bmux_pty/simulator", "switchy_async/thread-simulator"]

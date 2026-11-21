@@ -57,6 +57,14 @@ jobs:
             SIMULATOR_VERIFY_DETERMINISM=1 \
             cargo sim pane-runtime | tee "$RUNNER_TEMP/pane-runtime-simulation.log"
 
+      - name: Simulate the local terminal
+        shell: bash
+        run: |
+          env ${{ matrix.env }} \
+            SIMULATOR_RUNS="${{ github.event.inputs.runs || '2000' }}" \
+            SIMULATOR_VERIFY_DETERMINISM=1 \
+            cargo sim local-terminal | tee "$RUNNER_TEMP/local-terminal-simulation.log"
+
       - name: Upload the log of a failure
         if: failure()
         uses: actions/upload-artifact@v4

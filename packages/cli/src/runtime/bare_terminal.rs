@@ -1,12 +1,11 @@
 //! Local single-terminal transport for a server with no activated backends.
 //! A disconnected reader leaves the PTY and its bounded output queue in the server.
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use bmux_config::ConfigPaths;
 use bmux_ipc::{
     IpcEndpoint,
     transport::{LocalIpcListener, LocalIpcStream},
 };
-use bmux_pty::{PtyCommand, PtyEvent, PtyProcess, PtySize};
 use bmux_terminal::terminal;
 use std::{
     fs::File,
@@ -17,8 +16,8 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const HELLO: &[u8; 8] = b"BMUXPTY1";
-const LIMIT: usize = 64 * 1024;
+use bmux_local_terminal::{HELLO, LIMIT, serve_attachment};
+
 fn address(paths: &ConfigPaths, pid: u32, started: u64) -> PathBuf {
     paths.runtime_dir.join(format!("t-{pid:x}-{started:x}"))
 }
@@ -60,83 +59,6 @@ impl Drop for Listener {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
-}
-async fn serve_attachment(
-    stream: &mut LocalIpcStream,
-    shell: &str,
-    slot: &mut Option<PtyProcess>,
-) -> Result<()> {
-    let mut hello = [0; 12];
-    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut hello)).await??;
-    ensure!(&hello[..8] == HELLO, "incompatible single terminal client");
-    let size = |b: &[u8]| {
-        PtySize::new(
-            u16::from_be_bytes([b[0], b[1]]),
-            u16::from_be_bytes([b[2], b[3]]),
-        )
-    };
-    let initial = size(&hello[8..]);
-    if slot.is_none() {
-        *slot = Some(PtyCommand::new(shell).spawn(initial)?);
-    }
-    let proc = slot.as_mut().context("missing terminal execution")?;
-    proc.resize(initial)?;
-    let writer = proc.writer()?;
-    stream.write_all(HELLO).await?;
-    let (mut read, mut write) = tokio::io::split(stream);
-    let control = proc.control();
-    let input = async {
-        loop {
-            match read.read_u8().await? {
-                0 => return Ok::<(), anyhow::Error>(()),
-                1 => {
-                    let len = usize::from(read.read_u16().await?);
-                    let mut buf = vec![0; len];
-                    read.read_exact(&mut buf).await?;
-                    writer.write(buf)?;
-                }
-                2 => {
-                    let mut buf = [0; 4];
-                    read.read_exact(&mut buf).await?;
-                    control.resize(size(&buf))?;
-                }
-                _ => anyhow::bail!("invalid terminal control"),
-            }
-        }
-    };
-    let output = async {
-        let mut tick = tokio::time::interval(Duration::from_millis(10));
-        loop {
-            tick.tick().await;
-            for event in proc.ready_events(16) {
-                match event {
-                    PtyEvent::Output(bytes) | PtyEvent::Stdout(bytes) => {
-                        for chunk in bytes.chunks(LIMIT) {
-                            write.write_u32(u32::try_from(chunk.len())?).await?;
-                            write.write_all(chunk).await?;
-                        }
-                    }
-                    PtyEvent::Exited(status) => {
-                        write.write_u32(0).await?;
-                        write
-                            .write_u8(
-                                status
-                                    .code()
-                                    .and_then(|c| u8::try_from(c).ok())
-                                    .unwrap_or(1),
-                            )
-                            .await?;
-                        return Ok::<(), anyhow::Error>(());
-                    }
-                }
-            }
-        }
-    };
-    let result = tokio::select! { result=input => result, result=output => result };
-    if proc.has_exited() {
-        *slot = None;
-    }
-    result
 }
 struct RawMode;
 impl Drop for RawMode {
