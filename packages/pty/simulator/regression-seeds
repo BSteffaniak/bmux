@@ -1,0 +1,14 @@
+# Seeds scripts/sim-pty.sh --regression runs on every change to packages/pty (each replayed to
+# verify determinism). A seed reproduces a run only on the build it was found with, so these
+# are a fixed sample of schedules rather than exact reproductions; add a seed here when its
+# failure led to a fix, with a note.
+1
+2
+3
+42
+1337
+3645178397112225762  workload: end-of-run cleanup counted as an unexpected signal
+12753484066174446883 simulator: a killed process could still fork (switchy_pty fix)
+2258571551243736516  bmux_pty: kill after reaping reached a process that reused the id
+2908671648205331351
+10903523760680128016

@@ -1,4 +1,6 @@
 [workspace]
+# Its own workspace, so its simulator features never reach this one.
+exclude = ["packages/pty/simulator"]
 members = [
     "xtask",
     "examples/counter-plugin",

@@ -1,0 +1,54 @@
+name: PTY Simulation (nightly)
+
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Random runs per configuration"
+        required: false
+        default: "5000"
+
+jobs:
+  rust-version:
+    uses: ./.github/workflows/rust-version.yml
+
+  simulate:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    needs: [rust-version]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Default
+            env: ""
+          - name: Aggressive process id reuse
+            env: "SIMULATOR_PTY_PID_REUSE=1"
+          - name: Faults
+            env: "SIMULATOR_PTY_FAULTS=0.1"
+          - name: PCT scheduling
+            env: "SIMULATOR_SCHEDULE_STRATEGY=pct"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.rust-version.outputs.version }}
+
+      - name: Simulate
+        shell: bash
+        run: |
+          env ${{ matrix.env }} scripts/sim-pty.sh \
+            --runs "${{ github.event.inputs.runs || '5000' }}" --verify-determinism \
+            | tee "$RUNNER_TEMP/simulation.log"
+
+      - name: Upload the log of a failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pty-simulation-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/simulation.log
