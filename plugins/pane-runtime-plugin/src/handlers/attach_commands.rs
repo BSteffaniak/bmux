@@ -80,7 +80,7 @@ impl ObserverIdentities {
 }
 
 fn epoch_ms() -> u64 {
-    std::time::SystemTime::now()
+    switchy_time::now()
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .and_then(|duration| u64::try_from(duration.as_millis()).ok())

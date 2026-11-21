@@ -9,8 +9,9 @@ use bmux_pane_runtime_plugin_api::pane_runtime_human_input_v1::{
     HumanInputAck, HumanInputCapabilities, HumanInputError, HumanInputStream,
 };
 use std::collections::{BTreeMap, VecDeque};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use switchy_thread::sync::{Arc, Mutex, TryLockError};
+use switchy_time::Instant;
 use uuid::Uuid;
 
 const MAX_PAYLOAD_BYTES: usize = 16 * 1024;

@@ -1,8 +1,9 @@
 //! Retained request authority for queued terminal input.
 use std::io::{self, Write};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use switchy_thread::sync::Arc;
+use switchy_time::Instant;
 
 type WriteReceipt = switchy_thread::sync::mpsc::Receiver<Result<(), String>>;
 const MAX_PENDING_WRITES: usize = 64;

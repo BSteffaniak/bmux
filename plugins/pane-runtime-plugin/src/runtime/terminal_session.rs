@@ -168,13 +168,13 @@ pub(crate) fn wait(
             reason: "wait timeout exceeds 30000ms".into(),
         });
     }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout));
+    let deadline = switchy_time::Instant::now() + std::time::Duration::from_millis(u64::from(timeout));
     loop {
         authorize()?;
         let current = status(reference)?;
         if current.output_drained
             || current.error.is_some()
-            || std::time::Instant::now() >= deadline
+            || switchy_time::Instant::now() >= deadline
         {
             return Ok(current);
         }

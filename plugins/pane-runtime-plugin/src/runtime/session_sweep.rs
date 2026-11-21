@@ -20,7 +20,8 @@
 //! Verification only trusts rescans: a signal delivered is not proof of exit.
 use std::collections::BTreeSet;
 use std::io;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use switchy_time::Instant;
 
 /// One live, non-zombie session member.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

@@ -17,7 +17,7 @@ pub(super) struct DurableCapture {
     root: PathBuf,
     file: std::fs::File,
     boundary: Boundary,
-    origin: std::time::Instant,
+    origin: switchy_time::Instant,
     failed: bool,
 }
 fn persistence_error(stage: &'static str, error: &std::io::Error) -> std::io::Error {
@@ -45,7 +45,7 @@ impl DurableCapture {
                 eof: false,
                 error: None,
             },
-            origin: std::time::Instant::now(),
+            origin: switchy_time::Instant::now(),
             failed: false,
         };
         capture.commit()?;

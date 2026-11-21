@@ -1012,7 +1012,7 @@ async fn rollback_prepared(
 fn queued_input_authority(
     pane: &super::PaneRuntimeHandle,
     authority: super::input_authority::InputAuthority,
-    deadline: Option<std::time::Instant>,
+    deadline: Option<switchy_time::Instant>,
 ) -> super::input_authority::InputAuthority {
     let execution = Arc::clone(&pane.execution);
     let exited = Arc::clone(&pane.exited);
@@ -1034,7 +1034,7 @@ fn queued_input_authority(
             || execution.terminal_session_ended.load(Ordering::SeqCst)
             || execution.terminal_owner_retired.load(Ordering::SeqCst)
             || execution.capture_failure().is_some()
-            || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            || deadline.is_some_and(|deadline| switchy_time::Instant::now() >= deadline)
         {
             return Err("queued input authority ended".into());
         }
@@ -1581,7 +1581,7 @@ pub(super) fn send_acknowledged(
         let authority = queued_input_authority(
             pane,
             authority,
-            Some(std::time::Instant::now() + Duration::from_secs(5)),
+            Some(switchy_time::Instant::now() + Duration::from_secs(5)),
         );
         pane.input_tx
             .send(PaneRuntimeCommand::AdmittedInput(

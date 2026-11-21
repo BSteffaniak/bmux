@@ -1,8 +1,9 @@
 //! Managed retirement and short-lived admission, serialized with the real manager.
 use super::{SessionRuntimeManager, reservations};
 use bmux_pane_runtime_plugin_api::pane_runtime_readiness_v1::ManagedIdleStatus;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use switchy_thread::sync::{Arc, Mutex};
+use switchy_time::Instant;
 
 #[derive(Default)]
 struct State {

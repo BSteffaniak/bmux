@@ -66,10 +66,11 @@ use pty::Slave as _;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use switchy_async::task::JoinHandle;
 use switchy_thread::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use switchy_thread::sync::{Arc, Mutex, RwLock};
+use switchy_time::Instant;
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{trace, warn};
 
@@ -1283,7 +1284,7 @@ fn note_replay_markers_read(bytes: &[u8]) -> Vec<(u64, u128)> {
     if markers.is_empty() {
         return markers;
     }
-    let read = std::time::SystemTime::now()
+    let read = switchy_time::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_nanos());
     let mut lines = Vec::new();
@@ -10825,7 +10826,7 @@ fn pane_state_reason_for_handle(pane: &PaneRuntimeHandle) -> Option<String> {
 
 struct ManagerLockHolder {
     operation: &'static str,
-    started: std::time::Instant,
+    started: switchy_time::Instant,
 }
 
 struct ServerSessionRuntimeAdapter {
@@ -11018,7 +11019,7 @@ impl ServerSessionRuntimeAdapter {
         if let Ok(mut holder) = self.current_holder.lock() {
             *holder = Some(ManagerLockHolder {
                 operation,
-                started: std::time::Instant::now(),
+                started: switchy_time::Instant::now(),
             });
         }
     }
@@ -11038,7 +11039,7 @@ impl ServerSessionRuntimeAdapter {
         operation: &'static str,
         f: impl FnOnce(&mut SessionRuntimeManager) -> R,
     ) -> Option<R> {
-        let wait_started = std::time::Instant::now();
+        let wait_started = switchy_time::Instant::now();
         let mut guard = self.inner.lock().ok()?;
         let wait = wait_started.elapsed();
         if wait > Duration::from_millis(10) {
@@ -11052,7 +11053,7 @@ impl ServerSessionRuntimeAdapter {
             );
         }
         self.mark_holder_start(operation);
-        let hold_started = std::time::Instant::now();
+        let hold_started = switchy_time::Instant::now();
         let result = f(&mut guard);
         let revisions = std::mem::take(&mut guard.pending_layout_revisions);
         let hold = hold_started.elapsed();
@@ -11078,7 +11079,7 @@ impl ServerSessionRuntimeAdapter {
         operation: &'static str,
         f: impl FnOnce(&SessionRuntimeManager) -> R,
     ) -> Option<R> {
-        let wait_started = std::time::Instant::now();
+        let wait_started = switchy_time::Instant::now();
         let guard = self.inner.lock().ok()?;
         let wait = wait_started.elapsed();
         if wait > Duration::from_millis(10) {
@@ -11092,7 +11093,7 @@ impl ServerSessionRuntimeAdapter {
             );
         }
         self.mark_holder_start(operation);
-        let hold_started = std::time::Instant::now();
+        let hold_started = switchy_time::Instant::now();
         let result = f(&guard);
         let hold = hold_started.elapsed();
         self.mark_holder_end();
@@ -11578,7 +11579,7 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         if crate::handlers::attach_commands::observer_identity(host, client_id) {
             return Err(SessionRuntimeError::NotAttached);
         }
-        let lookup_started = std::time::Instant::now();
+        let lookup_started = switchy_time::Instant::now();
         let owner_session_id = self
             .with_lock_read(|m| {
                 let scene = m
@@ -11609,7 +11610,7 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             return Err(SessionRuntimeError::Closed);
         }
         let bytes = data.len();
-        let send_started = std::time::Instant::now();
+        let send_started = switchy_time::Instant::now();
         let recording_data =
             crate::private_input::with_producer_admission(host, pane_id, client_id.0, || {
                 crate::private_input::with_capture_barrier(host, pane_id, |capture| {
@@ -18097,10 +18098,10 @@ exit 7"#
         );
         assert_eq!(ACTIVE.load(Ordering::SeqCst), 1);
         release.send(()).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let deadline = switchy_time::Instant::now() + Duration::from_secs(2);
         while ACTIVE.load(Ordering::SeqCst) != 0 {
             assert!(
-                std::time::Instant::now() < deadline,
+                switchy_time::Instant::now() < deadline,
                 "worker leaked admission"
             );
             switchy_thread::thread::yield_now();
@@ -23142,8 +23143,8 @@ exit 7"#
                     // validation; it must not re-enter the manager.
                     assert!(adapter.inner.try_lock().is_err());
                     assert!(adapter.pane_input_index.read().unwrap().is_empty());
-                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-                    while !ready.exists() && std::time::Instant::now() < deadline {
+                    let deadline = switchy_time::Instant::now() + Duration::from_secs(5);
+                    while !ready.exists() && switchy_time::Instant::now() < deadline {
                         switchy_thread::thread::sleep(Duration::from_millis(5));
                     }
                     assert!(ready.exists(), "shell must queue output before rollback");

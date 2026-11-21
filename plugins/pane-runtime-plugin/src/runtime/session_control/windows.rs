@@ -8,8 +8,9 @@ use std::io;
 use std::os::windows::io::{AsHandle as _, AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use switchy_thread::sync::Mutex;
+use switchy_time::Instant;
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,

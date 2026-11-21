@@ -56,7 +56,7 @@ impl CaptureHandshake {
                     let entering = phase == "enter-v2";
                     let generation =
                         super::private_input::begin_barrier(host, pane_id, nonce, entering);
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    let deadline = switchy_time::Instant::now() + std::time::Duration::from_secs(2);
                     let mut accepted = false;
                     if let Some(generation) = generation {
                         loop {
@@ -70,7 +70,7 @@ impl CaptureHandshake {
                                     );
                                 break;
                             }
-                            if std::time::Instant::now() >= deadline {
+                            if switchy_time::Instant::now() >= deadline {
                                 break;
                             }
                             switchy_thread::thread::sleep(std::time::Duration::from_millis(2));

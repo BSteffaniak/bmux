@@ -62,7 +62,7 @@ struct State {
 struct Shared {
     state: Mutex<State>,
     changed: Condvar,
-    origin: std::time::Instant,
+    origin: switchy_time::Instant,
     changes: tokio::sync::watch::Sender<()>,
 }
 
@@ -133,7 +133,7 @@ impl CaptureWriter {
                 },
             }),
             changed: Condvar::new(),
-            origin: std::time::Instant::now(),
+            origin: switchy_time::Instant::now(),
             changes: tokio::sync::watch::channel(()).0,
         }));
         let worker = writer.clone();

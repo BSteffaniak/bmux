@@ -20,7 +20,8 @@ use bmux_bench::corpus::{self, Frame};
 use bmux_bench::metrics::{PhaseRecorder, Probe, Report, Scenario};
 use bmux_terminal_grid::{GridLimits, TerminalGridStream};
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use switchy_time::Instant;
 
 /// Bytes one PTY read delivers at most (the reader's buffer).
 const READ: usize = 8192;
