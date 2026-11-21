@@ -276,15 +276,16 @@ playbook runs.
 
 Compact cells (phase 5), as far as measured gains justified: grid cells 24 bytes (from 32),
 compositor symbols 16 (from 24), both without `unsafe` or API changes. A 12-byte `Copy` cell with
-a per-grid grapheme table would move about 60 `text()` callers for a few more percent; not done.
+a per-grid grapheme table was measured: dropping the per-write drop check, its main saving, takes
+full-repaint apply 3.9% and read 1.5% lower, for about 285 `text()` call sites moved; not done.
 
 One status model: the host-declared `status-item` extension point (never declared by the
 server) is gone; status-line segments go through the tab bar's `status-items` service.
 
 Deferred, each until something needs it (measured, not assumed):
 
-- Text filters. A text-run hook would sit in the hottest path (`print_ascii`); text redaction
-  belongs at the replica or render, not the PTY parse.
+- Text filters in the PTY parse. A text-run hook would sit in the hottest path (`print_ascii`);
+  redaction and restyling are done where the attach client paints rows instead (pane text rules).
 - Shell metadata on the grid's parse: its scan is now about 0.6% of the reader.
 
 Retained layers cost nothing when unchanged: the attach client samples a layer again only when
