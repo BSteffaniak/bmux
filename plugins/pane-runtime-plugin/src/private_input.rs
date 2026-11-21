@@ -321,11 +321,11 @@ mod tests {
     fn multipane_admission_failure_does_not_register_other_panes() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let open = Uuid::new_v4();
-        let private = Uuid::new_v4();
-        let owner = Uuid::new_v4();
-        let newcomer = Uuid::new_v4();
-        let nonce = Uuid::new_v4();
+        let open = crate::ids::new_uuid();
+        let private = crate::ids::new_uuid();
+        let owner = crate::ids::new_uuid();
+        let newcomer = crate::ids::new_uuid();
+        let nonce = crate::ids::new_uuid();
         assert!(register_producer(host, private, owner));
         let generation = begin_barrier(host, private, nonce, true).unwrap();
         assert!(acknowledge_producer(
@@ -341,9 +341,9 @@ mod tests {
     fn detached_producer_invalidates_inflight_proof_without_releasing_suppression() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let pane = Uuid::new_v4();
-        let client = Uuid::new_v4();
-        let nonce = Uuid::new_v4();
+        let pane = crate::ids::new_uuid();
+        let client = crate::ids::new_uuid();
+        let nonce = crate::ids::new_uuid();
         assert!(register_producer(host, pane, client));
         let generation = begin_barrier(host, pane, nonce, true).unwrap();
         assert!(acknowledge_producer(
@@ -360,7 +360,7 @@ mod tests {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let (recorder_host, owner_host) = (host.clone(), host.clone());
         let host = &host;
-        let pane = Uuid::new_v4();
+        let pane = crate::ids::new_uuid();
         let (entered_tx, entered_rx) = switchy_thread::sync::mpsc::channel();
         let (release_tx, release_rx) = switchy_thread::sync::mpsc::channel();
         let recorder = switchy_thread::thread::spawn(move || {
@@ -393,7 +393,7 @@ mod tests {
     fn barrier_allows_private_delivery_without_creating_recording_copy() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let pane = Uuid::new_v4();
+        let pane = crate::ids::new_uuid();
         assert!(suppress(host, pane));
         let mut delivered = false;
         let mut copied = false;
@@ -415,10 +415,10 @@ mod tests {
     fn producers_require_exact_membership_identity_nonce_and_generation() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let pane = Uuid::new_v4();
-        let a = Uuid::new_v4();
-        let b = Uuid::new_v4();
-        let nonce = Uuid::new_v4();
+        let pane = crate::ids::new_uuid();
+        let a = crate::ids::new_uuid();
+        let b = crate::ids::new_uuid();
+        let nonce = crate::ids::new_uuid();
         assert!(register_producer(host, pane, a));
         assert!(register_producer(host, pane, b));
         let generation = begin_barrier(host, pane, nonce, true).unwrap();
@@ -428,7 +428,7 @@ mod tests {
             pane,
             nonce,
             generation,
-            Uuid::new_v4(),
+            crate::ids::new_uuid(),
             true
         ));
         assert!(!acknowledge_producer(
@@ -442,7 +442,7 @@ mod tests {
         assert!(!acknowledge_producer(
             host,
             pane,
-            Uuid::new_v4(),
+            crate::ids::new_uuid(),
             generation,
             a,
             true
@@ -457,7 +457,7 @@ mod tests {
             with_capture_barrier(host, pane, |capture| capture),
             Some(false)
         );
-        assert!(!register_producer(host, pane, Uuid::new_v4()));
+        assert!(!register_producer(host, pane, crate::ids::new_uuid()));
         assert!(!suppress(host, pane)); // legacy suppression cannot be restored by v2
         let exit = begin_barrier(host, pane, nonce, false).unwrap();
         assert!(!barrier_ready(host, pane, nonce, generation));
@@ -475,13 +475,13 @@ mod tests {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
         for changed in [false, true] {
-            let pane = Uuid::new_v4();
-            let client = Uuid::new_v4();
-            let nonce = Uuid::new_v4();
+            let pane = crate::ids::new_uuid();
+            let client = crate::ids::new_uuid();
+            let nonce = crate::ids::new_uuid();
             assert!(register_producer(host, pane, client));
             let generation = begin_barrier(host, pane, nonce, true).unwrap();
             if changed {
-                assert!(register_producer(host, pane, Uuid::new_v4()));
+                assert!(register_producer(host, pane, crate::ids::new_uuid()));
             }
             acknowledge_producer(host, pane, nonce, generation, client, changed);
             assert!(!finish_barrier(host, pane, nonce, generation));
@@ -497,7 +497,7 @@ mod tests {
     fn acknowledged_suppression_prevents_all_future_recording_copies() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let pane = Uuid::new_v4();
+        let pane = crate::ids::new_uuid();
         assert_eq!(while_capture_allowed(host, pane, || 1), Some(1));
         assert!(suppress(host, pane));
         assert_eq!(

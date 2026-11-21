@@ -1245,7 +1245,7 @@ mod creation_failure_tests {
 
     #[test]
     fn rollback_failure_preserves_both_errors_and_resource_identity() {
-        let session_id = SessionId(Uuid::new_v4());
+        let session_id = SessionId(crate::ids::new_uuid());
         let error = runtime_creation_failure(
             session_id,
             &anyhow::anyhow!("runtime unavailable"),
@@ -1262,7 +1262,7 @@ mod creation_failure_tests {
     #[test]
     fn successful_rollback_does_not_claim_cleanup_failed() {
         let error = runtime_creation_failure(
-            SessionId(Uuid::new_v4()),
+            SessionId(crate::ids::new_uuid()),
             &anyhow::anyhow!("runtime unavailable"),
             Ok::<(), String>(()),
         );

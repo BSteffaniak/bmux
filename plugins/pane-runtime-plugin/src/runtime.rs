@@ -820,7 +820,7 @@ async fn shutdown_panes_owned(
     mut panes: Vec<PaneRuntimeHandle>,
     wait_for_settlement: bool,
 ) -> std::result::Result<(), String> {
-    let id = Uuid::new_v4();
+    let id = crate::ids::new_uuid();
     let (begin, admission) = oneshot::channel();
     let (settled, settlement) = oneshot::channel();
     let task_host = host.clone();
@@ -2010,7 +2010,7 @@ impl PaneResurrectionRuntime {
             frozen: false,
             freeze_error: None,
             launch: None,
-            observation_execution: Uuid::new_v4(),
+            observation_execution: crate::ids::new_uuid(),
             metadata_revision: 0,
             observed_cwd: None,
             execution_token: snapshot.execution_token.clone(),
@@ -3215,10 +3215,10 @@ mod image_lifecycle_tests {
         };
         registry.reset();
         let mut request = crate::handlers::attach_state::HistoryImagesArgs {
-            session_id: Uuid::new_v4(),
-            pane_id: Uuid::new_v4(),
+            session_id: crate::ids::new_uuid(),
+            pane_id: crate::ids::new_uuid(),
             pin_id: 1,
-            capture_id: Uuid::new_v4(),
+            capture_id: crate::ids::new_uuid(),
             width: 80,
             scrollback_offset: 1,
             rows: 3,
@@ -3286,10 +3286,10 @@ mod image_lifecycle_tests {
         };
         for (width, scrollback_offset) in [(4, 0), (2, 1)] {
             let request = crate::handlers::attach_state::HistoryImagesArgs {
-                session_id: Uuid::new_v4(),
-                pane_id: Uuid::new_v4(),
+                session_id: crate::ids::new_uuid(),
+                pane_id: crate::ids::new_uuid(),
                 pin_id: 1,
-                capture_id: Uuid::new_v4(),
+                capture_id: crate::ids::new_uuid(),
                 width,
                 scrollback_offset,
                 rows: 1,
@@ -5162,7 +5162,7 @@ impl SessionRuntimeManager {
         for token in owned_tokens {
             self.cancel_padding_preview(owner_client_id, token)?;
         }
-        let token = Uuid::new_v4();
+        let token = crate::ids::new_uuid();
         self.padding_previews.insert(
             token,
             PanePaddingPreviewTransaction {
@@ -7669,7 +7669,7 @@ impl SessionRuntimeManager {
             .and_then(|options| options.cwd)
             .or_else(|| pane_meta.resurrection.last_known_cwd.clone());
         let pane_exit_tx = self.pane_exit_tx.clone();
-        let shell_marker_token = Uuid::new_v4().simple().to_string();
+        let shell_marker_token = crate::ids::new_uuid().simple().to_string();
         let shell_integration_root = self
             .shell_integration_root
             .as_ref()
@@ -9123,7 +9123,7 @@ impl SessionRuntimeManager {
         let pane = self.spawn_pane_runtime_gated(
             session_id,
             PaneRuntimeMeta {
-                id: Uuid::new_v4(),
+                id: crate::ids::new_uuid(),
                 name: Some(format!("{prefix}-pane-{}", session.panes.len() + 1)),
                 shell: source.meta.shell.clone(),
                 launch: None,
@@ -9270,7 +9270,7 @@ impl SessionRuntimeManager {
             )
         };
 
-        let pane_id = Uuid::new_v4();
+        let pane_id = crate::ids::new_uuid();
         // Prepare geometry before spawning so a stale target cannot create an
         // orphan execution or alter focus/zoom. The manager is exclusively held.
         let mut next_layout = self.runtimes[&session_id].layout_root.clone();
@@ -9668,7 +9668,7 @@ impl SessionRuntimeManager {
             )
         };
 
-        let pane_id = Uuid::new_v4();
+        let pane_id = crate::ids::new_uuid();
         let pane_meta = PaneRuntimeMeta {
             id: pane_id,
             name: next_pane_name,
@@ -9684,7 +9684,7 @@ impl SessionRuntimeManager {
         }
 
         let surface = FloatingSurfaceRuntime {
-            id: Uuid::new_v4(),
+            id: crate::ids::new_uuid(),
             pane_id,
             anchor_pane_id: matches!(scope, FloatingPaneScope::PerPane)
                 .then_some(anchor_pane_id.unwrap_or(target_pane_id)),
@@ -12517,7 +12517,7 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             if !Arc::ptr_eq(&current_pane.terminal_grid, &pane.terminal_grid) {
                 return Err(SessionRuntimeError::NotFound);
             }
-            let capture_id = Uuid::new_v4();
+            let capture_id = crate::ids::new_uuid();
             let pin_id = runtime.next_scrollback_pin_id;
             // Never reuse a token: a delayed unpin must not release a newer capture.
             runtime.next_scrollback_pin_id =
@@ -14293,7 +14293,7 @@ mod tests {
         let root = Arc::new(bmux_plugin::PluginStateRegistry::new());
         let left = PaneRuntimeHost::new(Arc::clone(&root), None);
         let right = PaneRuntimeHost::new(Arc::clone(&root), None);
-        let pane = Uuid::new_v4();
+        let pane = crate::ids::new_uuid();
         assert!(crate::private_input::suppress(&left, pane));
         assert_eq!(
             crate::private_input::with_capture_barrier(&left, pane, |capture| capture),
@@ -14308,7 +14308,7 @@ mod tests {
         assert_eq!(right.next_focus_revision(), 1);
         crate::handlers::attach_commands::mark_test_observer(
             &left,
-            ClientId(Uuid::new_v4()),
+            ClientId(crate::ids::new_uuid()),
             SessionId(pane),
         );
         assert!(right.observers().lock().unwrap().is_empty());
@@ -14324,9 +14324,9 @@ mod tests {
         );
         let execution =
             bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalExecutionRef {
-                session_id: Uuid::new_v4(),
+                session_id: crate::ids::new_uuid(),
                 pane_id: pane,
-                execution_token: Uuid::new_v4(),
+                execution_token: crate::ids::new_uuid(),
             };
         assert_eq!(
             human_input::open_unvalidated_for_test(&left, execution.clone()),
@@ -14381,8 +14381,8 @@ mod tests {
         )
         .expect("activate pane runtime");
         let manager = host.spawn_runtime_handle().expect("activated runtime").0;
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let reason = "activation exit regression";
         let mut runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get_mut(&pane_id).unwrap();
@@ -14448,7 +14448,7 @@ mod tests {
         );
         // Repeat to prove retiring a direct terminal does not poison later starts.
         for _ in 0..2 {
-            let session_id = SessionId(Uuid::new_v4());
+            let session_id = SessionId(crate::ids::new_uuid());
             let mut prepared = manager
                 .prepare_fresh_program_runtime(session_id, None, None, (24, 80))
                 .unwrap();
@@ -14497,7 +14497,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn windows_program_startup_answers_conpty_query_then_captures_and_drains() {
         let host = crate::runtime::PaneRuntimeHost::detached();
-        let session_id = SessionId(Uuid::new_v4());
+        let session_id = SessionId(crate::ids::new_uuid());
         let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
         let program = std::env::var("COMSPEC").expect("Windows command interpreter");
         let mut manager = SessionRuntimeManager::new(
@@ -14579,7 +14579,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn program_first_pane_captures_fast_literal_argv_and_drains() {
         let host = crate::runtime::PaneRuntimeHost::detached();
-        let session_id = SessionId(Uuid::new_v4());
+        let session_id = SessionId(crate::ids::new_uuid());
         let (exit_tx, _exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager::new(
             host.clone(),
@@ -14650,7 +14650,7 @@ mod tests {
             PanePaddingConfig::default(),
             exit_tx,
         );
-        let session_id = SessionId(Uuid::new_v4());
+        let session_id = SessionId(crate::ids::new_uuid());
         let mut prepared = manager
             .prepare_fresh_program_runtime(
                 session_id,
@@ -14705,8 +14705,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn conventional_session_drains_startup_backpressure_and_retires_owner() {
-        let session_id = SessionId(Uuid::new_v4());
-        let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[Uuid::new_v4()]));
+        let session_id = SessionId(crate::ids::new_uuid());
+        let mut manager =
+            manager_with_runtime(session_id, runtime_with_panes(&[crate::ids::new_uuid()]));
         manager.runtimes.clear();
         // More than the startup capture queue: publication must unblock capture
         // without mistaking leader exit for EOF or dropping the buffered tail.
@@ -14783,8 +14784,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn supervised_fast_exit_drains_startup_backpressure_before_retirement() {
-        let session_id = SessionId(Uuid::new_v4());
-        let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[Uuid::new_v4()]));
+        let session_id = SessionId(crate::ids::new_uuid());
+        let mut manager =
+            manager_with_runtime(session_id, runtime_with_panes(&[crate::ids::new_uuid()]));
         manager.runtimes.clear();
         // More than the startup capture queue: publication must unblock capture
         // without mistaking leader exit for EOF or dropping the buffered tail.
@@ -14969,8 +14971,9 @@ exit 7"#
     async fn ended_terminal_preserves_escaped_descendant_without_late_signal_authority() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let session_id = SessionId(Uuid::new_v4());
-        let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[Uuid::new_v4()]));
+        let session_id = SessionId(crate::ids::new_uuid());
+        let mut manager =
+            manager_with_runtime(session_id, runtime_with_panes(&[crate::ids::new_uuid()]));
         manager.runtimes.clear();
         let witness = tempfile::tempdir().unwrap();
         let mut prepared = prepare_escaped_terminal_witness(&manager, session_id, witness.path());
@@ -15121,8 +15124,9 @@ exit 7"#
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn injected_reader_failure_cleans_live_process_and_acknowledges_threads() {
-        let session_id = SessionId(Uuid::new_v4());
-        let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[Uuid::new_v4()]));
+        let session_id = SessionId(crate::ids::new_uuid());
+        let mut manager =
+            manager_with_runtime(session_id, runtime_with_panes(&[crate::ids::new_uuid()]));
         manager.runtimes.clear();
         let mut prepared = manager
             .prepare_fresh_program_runtime(
@@ -15336,9 +15340,9 @@ exit 7"#
 
     #[tokio::test]
     async fn zoom_transition_reselects_padding_rule_and_restores_split_size() {
-        let session_id = SessionId(Uuid::new_v4());
-        let first = Uuid::new_v4();
-        let second = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let first = crate::ids::new_uuid();
+        let second = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[first, second]);
         runtime.layout_root = Some(PaneLayoutNode::Split {
             direction: PaneSplitDirection::Vertical,
@@ -15373,9 +15377,9 @@ exit 7"#
 
     #[tokio::test]
     async fn floating_resize_reselects_padding_rule_and_resizes_pty() {
-        let session_id = SessionId(Uuid::new_v4());
-        let tiled = Uuid::new_v4();
-        let floating = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let tiled = crate::ids::new_uuid();
+        let floating = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[tiled, floating]);
         runtime.layout_root = Some(PaneLayoutNode::Leaf { pane_id: tiled });
         runtime.floating_surfaces = vec![floating_surface(floating, FloatingPaneScope::PerSession)];
@@ -15407,10 +15411,10 @@ exit 7"#
 
     #[tokio::test]
     async fn padding_geometry_is_shared_across_attached_clients() {
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
-        let first_client = ClientId(Uuid::new_v4());
-        let second_client = ClientId(Uuid::new_v4());
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
+        let first_client = ClientId(crate::ids::new_uuid());
+        let second_client = ClientId(crate::ids::new_uuid());
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime
             .attached_clients
@@ -15447,9 +15451,9 @@ exit 7"#
     async fn begin_attach_registers_input_producer_before_accepting_input() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         let (input_tx, mut input_rx) = mpsc::unbounded_channel();
         runtime.panes.get_mut(&pane_id).unwrap().input_tx = input_tx;
@@ -15491,11 +15495,11 @@ exit 7"#
 
     #[tokio::test]
     async fn begin_attach_rejects_unregistered_producer_during_private_input() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let existing_client = Uuid::new_v4();
-        let pane_id = Uuid::new_v4();
-        let nonce = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let existing_client = crate::ids::new_uuid();
+        let pane_id = crate::ids::new_uuid();
+        let nonce = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let mut manager = manager_with_runtime(session_id, runtime);
         // The manager owns the activation host the test observes through.
@@ -15534,10 +15538,10 @@ exit 7"#
 
     #[tokio::test]
     async fn failed_retarget_preserves_previous_attach_registration() {
-        let previous_session_id = SessionId(Uuid::new_v4());
-        let missing_session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let previous_session_id = SessionId(crate::ids::new_uuid());
+        let missing_session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(client_id);
         let manager = manager_with_runtime(previous_session_id, runtime);
@@ -15568,9 +15572,9 @@ exit 7"#
 
     #[tokio::test]
     async fn over_reserved_viewport_normalizes_once_for_scene_and_response() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(client_id);
         let mut manager = manager_with_runtime(session_id, runtime);
@@ -15599,9 +15603,9 @@ exit 7"#
 
     #[tokio::test]
     async fn horizontal_viewport_insets_drive_scene_geometry_and_pty_size() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(client_id);
         let mut manager = manager_with_runtime(session_id, runtime);
@@ -15636,10 +15640,10 @@ exit 7"#
     #[tokio::test]
     async fn observer_open_preserves_focus_and_pty_size_and_cannot_escalate() {
         use crate::handlers::attach_commands::{mark_test_observer, observer_operation_allowed};
-        let session = SessionId(Uuid::new_v4());
-        let owner = ClientId(Uuid::new_v4());
-        let observer = ClientId(Uuid::new_v4());
-        let pane = Uuid::new_v4();
+        let session = SessionId(crate::ids::new_uuid());
+        let owner = ClientId(crate::ids::new_uuid());
+        let observer = ClientId(crate::ids::new_uuid());
+        let pane = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane]);
         runtime.attached_clients.insert(owner);
         let mut manager = manager_with_runtime(session, runtime);
@@ -15726,10 +15730,10 @@ exit 7"#
 
     #[tokio::test]
     async fn interactive_attach_registers_producers_without_bypassing_private_barriers() {
-        let session = SessionId(Uuid::new_v4());
-        let client = ClientId(Uuid::new_v4());
-        let newcomer = ClientId(Uuid::new_v4());
-        let panes = [Uuid::new_v4(), Uuid::new_v4()];
+        let session = SessionId(crate::ids::new_uuid());
+        let client = ClientId(crate::ids::new_uuid());
+        let newcomer = ClientId(crate::ids::new_uuid());
+        let panes = [crate::ids::new_uuid(), crate::ids::new_uuid()];
         let mut manager = manager_with_runtime(session, runtime_with_panes(&panes));
         // The manager owns the activation host the test observes through.
         let host = manager.host.clone();
@@ -15741,7 +15745,7 @@ exit 7"#
                 Some(true)
             );
         }
-        let nonce = Uuid::new_v4();
+        let nonce = crate::ids::new_uuid();
         let generation = crate::private_input::begin_barrier(host, panes[0], nonce, true).unwrap();
         // Repeated admission/attachment does not clear the private transition.
         manager.begin_attach(session, client).unwrap();
@@ -15769,10 +15773,10 @@ exit 7"#
 
     #[tokio::test]
     async fn observation_preserves_sizing_authority_and_last_detached_geometry() {
-        let session = SessionId(Uuid::new_v4());
-        let owner = ClientId(Uuid::new_v4());
-        let observer = ClientId(Uuid::new_v4());
-        let pane = Uuid::new_v4();
+        let session = SessionId(crate::ids::new_uuid());
+        let owner = ClientId(crate::ids::new_uuid());
+        let observer = ClientId(crate::ids::new_uuid());
+        let pane = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane]);
         runtime.attached_clients.extend([owner, observer]);
         runtime.attach_viewport = None;
@@ -15807,16 +15811,16 @@ exit 7"#
             expected
         );
         assert!(matches!(
-            manager.observe_viewport(session, ClientId(Uuid::new_v4()), 80, 24),
+            manager.observe_viewport(session, ClientId(crate::ids::new_uuid()), 80, 24),
             Err(SessionRuntimeError::NotAttached)
         ));
     }
 
     #[tokio::test]
     async fn viewport_height_resize_reselects_padding_rule_and_resizes_pty() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(client_id);
         let mut manager = manager_with_runtime(session_id, runtime);
@@ -15848,9 +15852,9 @@ exit 7"#
 
     #[tokio::test]
     async fn viewport_resize_reselects_padding_rule_and_resizes_pty() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(client_id);
         let mut manager = manager_with_runtime(session_id, runtime);
@@ -15880,10 +15884,10 @@ exit 7"#
 
     #[tokio::test]
     async fn floating_geometry_remains_host_viewport_relative_with_reserved_content_edges() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let tiled = Uuid::new_v4();
-        let floating = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let tiled = crate::ids::new_uuid();
+        let floating = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[tiled, floating]);
         runtime.layout_root = Some(PaneLayoutNode::Leaf { pane_id: tiled });
         runtime.attach_viewport = Some(AttachViewport::normalized(100, 30, 2, 3, 4, 10));
@@ -15936,10 +15940,10 @@ exit 7"#
 
     #[tokio::test]
     async fn attach_scene_uses_authoritative_padding_for_tiled_zoomed_and_floating_panes() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let tiled = Uuid::new_v4();
-        let floating = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let tiled = crate::ids::new_uuid();
+        let floating = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[tiled, floating]);
         runtime.layout_root = Some(PaneLayoutNode::Leaf { pane_id: tiled });
         runtime.floating_surfaces = vec![floating_surface(floating, FloatingPaneScope::PerSession)];
@@ -16054,9 +16058,9 @@ exit 7"#
 
     #[tokio::test]
     async fn attach_scene_reselects_geometry_rules_across_viewport_boundary() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let config = PanePaddingConfig::parse(Some(
             &toml::toml! {
@@ -16096,8 +16100,8 @@ exit 7"#
 
     #[tokio::test]
     async fn metadata_reconciliation_ignores_intervening_viewport_change_without_padding() {
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[pane_id]));
         let before = manager.padding_state(session_id, Some(pane_id)).unwrap();
         // Deterministically interleave a navigation-driven viewport update
@@ -16126,8 +16130,8 @@ exit 7"#
 
     #[tokio::test]
     async fn padding_mutation_captures_one_revision_and_drains_after_unlock() {
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let manager = Mutex::new(manager_with_runtime(
             session_id,
             runtime_with_panes(&[pane_id]),
@@ -16158,8 +16162,8 @@ exit 7"#
 
     #[tokio::test]
     async fn command_and_prompt_metadata_transitions_reselect_padding_rule() {
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let mut manager = manager_with_runtime(session_id, runtime);
         manager.padding_config = PanePaddingConfig::parse(Some(
@@ -16214,8 +16218,8 @@ exit 7"#
 
     #[tokio::test]
     async fn equivalent_metadata_rule_results_avoid_resize_and_revision_churn() {
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let mut manager = manager_with_runtime(session_id, runtime);
         manager.padding_config = PanePaddingConfig::parse(Some(
@@ -16260,8 +16264,8 @@ exit 7"#
 
     #[tokio::test]
     async fn padding_override_updates_state_resizes_and_clears() {
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let mut manager = manager_with_runtime(session_id, runtime);
         let centered = PanePaddingSpec {
@@ -16290,8 +16294,8 @@ exit 7"#
 
     #[tokio::test]
     async fn replacement_padding_config_applies_to_panes_created_later() {
-        let session_id = SessionId(Uuid::new_v4());
-        let first_pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let first_pane_id = crate::ids::new_uuid();
         let manager = manager_with_runtime(session_id, runtime_with_panes(&[first_pane_id]));
         let handle = PanePaddingRuntimeHandle(Arc::new(Mutex::new(manager)));
         let settings = toml::Value::Table(toml::toml! {
@@ -16302,7 +16306,7 @@ exit 7"#
         let config = PanePaddingConfig::parse(Some(&settings)).unwrap();
         handle.replace_padding_config(config).unwrap();
 
-        let future_pane_id = Uuid::new_v4();
+        let future_pane_id = crate::ids::new_uuid();
         {
             let mut manager = handle.0.lock().unwrap();
             let runtime = manager.runtimes.get_mut(&session_id).unwrap();
@@ -16323,9 +16327,9 @@ exit 7"#
 
     #[tokio::test]
     async fn expired_padding_preview_restores_underlying_geometry() {
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
-        let owner = ClientId(Uuid::new_v4());
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
+        let owner = ClientId(crate::ids::new_uuid());
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[pane_id]));
         let baseline = manager.padding_state(session_id, Some(pane_id)).unwrap();
         manager
@@ -16352,9 +16356,9 @@ exit 7"#
 
     #[tokio::test]
     async fn updating_padding_preview_renews_its_lease() {
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
-        let owner = ClientId(Uuid::new_v4());
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
+        let owner = ClientId(crate::ids::new_uuid());
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[pane_id]));
         let (token, _) = manager
             .begin_padding_preview(owner, vec![pane_id], PanePaddingSpec::default())
@@ -16383,9 +16387,9 @@ exit 7"#
 
     #[tokio::test]
     async fn cancelled_preview_restores_geometry() {
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
-        let owner = ClientId(Uuid::new_v4());
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
+        let owner = ClientId(crate::ids::new_uuid());
         let manager = manager_with_runtime(session_id, runtime_with_panes(&[pane_id]));
         let handle = PanePaddingRuntimeHandle::from_manager_for_test(manager);
         let baseline = handle.state(session_id, Some(pane_id)).unwrap().effective;
@@ -16410,8 +16414,8 @@ exit 7"#
 
     #[tokio::test]
     async fn replacing_padding_defaults_applies_live_and_rejects_zero_limits() {
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let manager = manager_with_runtime(session_id, runtime_with_panes(&[pane_id]));
         let handle = PanePaddingRuntimeHandle::from_manager_for_test(manager);
         let defaults = PanePaddingSpec {
@@ -16440,10 +16444,10 @@ exit 7"#
 
     #[tokio::test]
     async fn failed_preview_commit_keeps_transaction_and_durable_state_unchanged() {
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
-        let missing = Uuid::new_v4();
-        let owner = ClientId(Uuid::new_v4());
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
+        let missing = crate::ids::new_uuid();
+        let owner = ClientId(crate::ids::new_uuid());
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[pane_id]));
         let preview_spec = PanePaddingSpec {
             left: 3,
@@ -16476,10 +16480,10 @@ exit 7"#
 
     #[tokio::test]
     async fn clear_padding_overrides_is_atomic_across_targets() {
-        let session_id = SessionId(Uuid::new_v4());
-        let first = Uuid::new_v4();
-        let second = Uuid::new_v4();
-        let missing = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let first = crate::ids::new_uuid();
+        let second = crate::ids::new_uuid();
+        let missing = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[first, second]);
         runtime.layout_root = Some(PaneLayoutNode::Split {
             direction: PaneSplitDirection::Vertical,
@@ -16526,9 +16530,9 @@ exit 7"#
 
     #[tokio::test]
     async fn owner_detach_cancels_owned_preview_and_restores_geometry() {
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
-        let owner = ClientId(Uuid::new_v4());
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
+        let owner = ClientId(crate::ids::new_uuid());
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(owner);
         let mut manager = manager_with_runtime(session_id, runtime);
@@ -16558,11 +16562,11 @@ exit 7"#
 
     #[tokio::test]
     async fn cancelling_all_previews_restores_every_target() {
-        let session_id = SessionId(Uuid::new_v4());
-        let first = Uuid::new_v4();
-        let second = Uuid::new_v4();
-        let first_owner = ClientId(Uuid::new_v4());
-        let second_owner = ClientId(Uuid::new_v4());
+        let session_id = SessionId(crate::ids::new_uuid());
+        let first = crate::ids::new_uuid();
+        let second = crate::ids::new_uuid();
+        let first_owner = ClientId(crate::ids::new_uuid());
+        let second_owner = ClientId(crate::ids::new_uuid());
         let mut runtime = runtime_with_panes(&[first, second]);
         runtime.layout_root = Some(PaneLayoutNode::Split {
             direction: PaneSplitDirection::Vertical,
@@ -16615,9 +16619,9 @@ exit 7"#
 
     #[tokio::test]
     async fn preview_geometry_updates_only_resize_pty_when_dimensions_change() {
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
-        let owner = ClientId(Uuid::new_v4());
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
+        let owner = ClientId(crate::ids::new_uuid());
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[pane_id]));
         let size = Arc::clone(&manager.runtimes[&session_id].panes[&pane_id].last_requested_size);
         manager.apply_stored_attach_viewport(session_id);
@@ -16677,9 +16681,9 @@ exit 7"#
 
     #[tokio::test]
     async fn cancelling_preview_restores_runtime_override_and_persistence() {
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
-        let owner = ClientId(Uuid::new_v4());
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
+        let owner = ClientId(crate::ids::new_uuid());
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[pane_id]));
         let underlying = PanePaddingSpec {
             left: 2,
@@ -16721,10 +16725,10 @@ exit 7"#
 
     #[tokio::test]
     async fn closing_preview_target_retains_remaining_targets() {
-        let session_id = SessionId(Uuid::new_v4());
-        let first_pane = Uuid::new_v4();
-        let second_pane = Uuid::new_v4();
-        let owner = ClientId(Uuid::new_v4());
+        let session_id = SessionId(crate::ids::new_uuid());
+        let first_pane = crate::ids::new_uuid();
+        let second_pane = crate::ids::new_uuid();
+        let owner = ClientId(crate::ids::new_uuid());
         let mut runtime = runtime_with_panes(&[first_pane, second_pane]);
         runtime.layout_root = Some(PaneLayoutNode::Split {
             direction: PaneSplitDirection::Vertical,
@@ -16766,11 +16770,11 @@ exit 7"#
 
     #[tokio::test]
     async fn removing_session_drops_only_its_preview_targets() {
-        let first_session = SessionId(Uuid::new_v4());
-        let second_session = SessionId(Uuid::new_v4());
-        let first_pane = Uuid::new_v4();
-        let second_pane = Uuid::new_v4();
-        let owner = ClientId(Uuid::new_v4());
+        let first_session = SessionId(crate::ids::new_uuid());
+        let second_session = SessionId(crate::ids::new_uuid());
+        let first_pane = crate::ids::new_uuid();
+        let second_pane = crate::ids::new_uuid();
+        let owner = ClientId(crate::ids::new_uuid());
         let mut manager = manager_with_runtime(first_session, runtime_with_panes(&[first_pane]));
         manager
             .runtimes
@@ -16807,9 +16811,9 @@ exit 7"#
 
     #[tokio::test]
     async fn invalid_padding_preview_update_preserves_previous_preview() {
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
-        let owner = ClientId(Uuid::new_v4());
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
+        let owner = ClientId(crate::ids::new_uuid());
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[pane_id]));
         let previous = PanePaddingSpec {
             left: 3,
@@ -16842,11 +16846,11 @@ exit 7"#
 
     #[tokio::test]
     async fn non_overlapping_cross_client_padding_previews_coexist() {
-        let session_id = SessionId(Uuid::new_v4());
-        let first_pane = Uuid::new_v4();
-        let second_pane = Uuid::new_v4();
-        let first_owner = ClientId(Uuid::new_v4());
-        let second_owner = ClientId(Uuid::new_v4());
+        let session_id = SessionId(crate::ids::new_uuid());
+        let first_pane = crate::ids::new_uuid();
+        let second_pane = crate::ids::new_uuid();
+        let first_owner = ClientId(crate::ids::new_uuid());
+        let second_owner = ClientId(crate::ids::new_uuid());
         let mut runtime = runtime_with_panes(&[first_pane, second_pane]);
         runtime.layout_root = Some(PaneLayoutNode::Split {
             direction: PaneSplitDirection::Vertical,
@@ -16898,10 +16902,10 @@ exit 7"#
 
     #[tokio::test]
     async fn same_client_new_padding_preview_replaces_previous_preview() {
-        let session_id = SessionId(Uuid::new_v4());
-        let first_pane = Uuid::new_v4();
-        let second_pane = Uuid::new_v4();
-        let owner = ClientId(Uuid::new_v4());
+        let session_id = SessionId(crate::ids::new_uuid());
+        let first_pane = crate::ids::new_uuid();
+        let second_pane = crate::ids::new_uuid();
+        let owner = ClientId(crate::ids::new_uuid());
         let mut runtime = runtime_with_panes(&[first_pane, second_pane]);
         runtime.layout_root = Some(PaneLayoutNode::Split {
             direction: PaneSplitDirection::Vertical,
@@ -16954,10 +16958,10 @@ exit 7"#
 
     #[tokio::test]
     async fn overlapping_cross_client_padding_preview_is_rejected() {
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
-        let first_owner = ClientId(Uuid::new_v4());
-        let second_owner = ClientId(Uuid::new_v4());
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
+        let first_owner = ClientId(crate::ids::new_uuid());
+        let second_owner = ClientId(crate::ids::new_uuid());
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[pane_id]));
         let spec = PanePaddingSpec {
             left: 2,
@@ -16976,9 +16980,9 @@ exit 7"#
 
     #[tokio::test]
     async fn padding_preview_updates_cancels_and_commits_without_snapshot_leakage() {
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
-        let owner = ClientId(Uuid::new_v4());
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
+        let owner = ClientId(crate::ids::new_uuid());
         let runtime = runtime_with_panes(&[pane_id]);
         let mut manager = manager_with_runtime(session_id, runtime);
         let initial = manager.padding_state(session_id, Some(pane_id)).unwrap();
@@ -17024,8 +17028,8 @@ exit 7"#
 
     #[tokio::test]
     async fn invalid_padding_mutation_is_atomic() {
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let mut manager = manager_with_runtime(session_id, runtime);
         let before = manager.padding_state(session_id, Some(pane_id)).unwrap();
@@ -17051,8 +17055,8 @@ exit 7"#
 
     #[tokio::test]
     async fn clearing_override_omits_it_and_restores_declarative_geometry() {
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let mut manager = manager_with_runtime(session_id, runtime);
         manager.padding_config = PanePaddingConfig::parse(Some(
@@ -17089,8 +17093,8 @@ exit 7"#
     async fn restart_preserves_padding_override_and_reapplies_its_size() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let mut manager = manager_with_runtime(session_id, runtime);
         let spec = PanePaddingSpec {
@@ -17114,8 +17118,8 @@ exit 7"#
 
     #[tokio::test]
     async fn session_removal_omits_all_owned_padding_overrides() {
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[pane_id]));
         manager
             .set_padding_override(
@@ -17136,9 +17140,9 @@ exit 7"#
 
     #[tokio::test]
     async fn padding_overrides_follow_pane_close_and_persistence_policy() {
-        let session_id = SessionId(Uuid::new_v4());
-        let first = Uuid::new_v4();
-        let second = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let first = crate::ids::new_uuid();
+        let second = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[first, second]);
         runtime.layout_root = Some(PaneLayoutNode::Split {
             direction: PaneSplitDirection::Vertical,
@@ -17180,8 +17184,8 @@ exit 7"#
 
     #[tokio::test]
     async fn alignment_only_override_moves_content_without_resizing_pty() {
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let mut manager = manager_with_runtime(session_id, runtime);
         let left = PanePaddingSpec {
@@ -17215,9 +17219,9 @@ exit 7"#
 
     #[test]
     fn close_focus_fallback_uses_nearest_layout_neighbor() {
-        let a = Uuid::new_v4();
-        let b = Uuid::new_v4();
-        let c = Uuid::new_v4();
+        let a = crate::ids::new_uuid();
+        let b = crate::ids::new_uuid();
+        let c = crate::ids::new_uuid();
         let root = PaneLayoutNode::Split {
             direction: PaneSplitDirection::Vertical,
             ratio: 0.5,
@@ -17244,8 +17248,8 @@ exit 7"#
 
     #[test]
     fn close_focus_keeps_existing_focus_when_closing_unfocused_pane() {
-        let focused = Uuid::new_v4();
-        let closed = Uuid::new_v4();
+        let focused = crate::ids::new_uuid();
+        let closed = crate::ids::new_uuid();
         let root = PaneLayoutNode::Split {
             direction: PaneSplitDirection::Horizontal,
             ratio: 0.5,
@@ -17295,7 +17299,7 @@ exit 7"#
     async fn pane_shutdown_pending_startup_keeps_cleanup_authority_with_startup_owner() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let mut pane = dummy_pane(Uuid::new_v4());
+        let mut pane = dummy_pane(crate::ids::new_uuid());
         pane.startup = watch::channel(None).1;
         // Startup alone owns this cleanup: no session was adopted yet.
         let execution = Arc::clone(&pane.execution);
@@ -17320,7 +17324,7 @@ exit 7"#
         let barrier = Arc::new(tokio::sync::Barrier::new(3));
         let mut removed = Vec::new();
         for _ in 0..3 {
-            let pane_id = Uuid::new_v4();
+            let pane_id = crate::ids::new_uuid();
             let mut runtime = runtime_with_panes(&[pane_id]);
             let pane = runtime.panes.get_mut(&pane_id).unwrap();
             let (stop, stopped) = oneshot::channel();
@@ -17334,7 +17338,7 @@ exit 7"#
             old.abort();
             let _ = old.await;
             removed.push(RemovedRuntime {
-                session_id: SessionId(Uuid::new_v4()),
+                session_id: SessionId(crate::ids::new_uuid()),
                 handle: runtime,
             });
         }
@@ -17351,7 +17355,7 @@ exit 7"#
     async fn pane_shutdown_error_receipt_retains_owner_until_reaper_settles() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let mut pane = dummy_pane(Uuid::new_v4());
+        let mut pane = dummy_pane(crate::ids::new_uuid());
         let execution = Arc::downgrade(&pane.execution);
         let (cleanup, receiver) = watch::channel(None);
         pane.cleanup = receiver;
@@ -17389,7 +17393,7 @@ exit 7"#
     async fn pane_shutdown_release_waits_for_failed_cleanup_owner() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let pane_id = Uuid::new_v4();
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get_mut(&pane_id).unwrap();
         let (cleanup, receiver) = watch::channel(None);
@@ -17409,7 +17413,7 @@ exit 7"#
             shutdown_removed_runtimes(
                 &release_host,
                 vec![RemovedRuntime {
-                    session_id: SessionId(Uuid::new_v4()),
+                    session_id: SessionId(crate::ids::new_uuid()),
                     handle: runtime,
                 }],
             )
@@ -17433,7 +17437,7 @@ exit 7"#
         let barrier = Arc::new(tokio::sync::Barrier::new(3));
         let mut panes = Vec::new();
         for _ in 0..3 {
-            let mut pane = dummy_pane(Uuid::new_v4());
+            let mut pane = dummy_pane(crate::ids::new_uuid());
             let (stop, stopped) = oneshot::channel();
             pane.stop_tx = Some(stop);
             let barrier = Arc::clone(&barrier);
@@ -17455,7 +17459,7 @@ exit 7"#
     async fn cancelled_shutdown_waiter_retains_cleanup_and_freezes_before_release() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let mut pane = dummy_pane(Uuid::new_v4());
+        let mut pane = dummy_pane(crate::ids::new_uuid());
         let state = Arc::clone(&pane.resurrection_state);
         let execution = Arc::downgrade(&pane.execution);
         let (stop, stopped) = oneshot::channel();
@@ -17619,7 +17623,7 @@ exit 7"#
         assert!(pane_cleanup_failure_summary([]).is_none());
         let summary = pane_cleanup_failure_summary((0..64).map(|_| {
             (
-                Uuid::new_v4(),
+                crate::ids::new_uuid(),
                 "group stop failed: session sweep failed".into(),
             )
         }))
@@ -17640,7 +17644,7 @@ exit 7"#
     async fn shutdown_reports_original_cleanup_cause_once_per_pane() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let id = Uuid::new_v4();
+        let id = crate::ids::new_uuid();
         let pane = dummy_pane(id);
         pane.execution.record_error("earlier reader failure".into());
         pane.execution
@@ -17753,17 +17757,17 @@ exit 7"#
 
     #[tokio::test]
     async fn rejected_split_preserves_focus_zoom_and_execution_count() {
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.zoomed_pane_id = Some(pane_id);
         let mut manager = manager_with_runtime(session_id, runtime);
-        for target in [Uuid::new_v4(), pane_id] {
+        for target in [crate::ids::new_uuid(), pane_id] {
             // The second case has a real pane but stale layout membership.
             if target == pane_id {
                 manager.runtimes.get_mut(&session_id).unwrap().layout_root =
                     Some(PaneLayoutNode::Leaf {
-                        pane_id: Uuid::new_v4(),
+                        pane_id: crate::ids::new_uuid(),
                     });
             }
             assert!(
@@ -17785,8 +17789,8 @@ exit 7"#
 
     #[tokio::test]
     async fn source_capture_reads_published_identity_while_manager_and_metadata_are_busy() {
-        let session = SessionId(Uuid::new_v4());
-        let pane = Uuid::new_v4();
+        let session = SessionId(crate::ids::new_uuid());
+        let pane = crate::ids::new_uuid();
         let manager = Arc::new(Mutex::new(manager_with_runtime(
             session,
             runtime_with_panes(&[pane]),
@@ -17813,9 +17817,9 @@ exit 7"#
     #[tokio::test]
     async fn spawn_source_capture_is_explicit_live_and_incarnation_scoped() {
         use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
-        let session_id = SessionId(Uuid::new_v4());
-        let first = Uuid::new_v4();
-        let second = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let first = crate::ids::new_uuid();
+        let second = crate::ids::new_uuid();
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[first, second]));
         manager.register_pane_input(session_id, &manager.runtimes[&session_id].panes[&second]);
         let index = Arc::clone(&manager.pane_input_index);
@@ -17861,11 +17865,11 @@ exit 7"#
         assert_eq!(observed, SpawnDirectoryProbe::Shell("/current".into()));
         assert_eq!(manager.runtimes[&session_id].focused_pane_id, first);
         assert_eq!(
-            indexed_spawn_source(&index, session_id, Uuid::new_v4()),
+            indexed_spawn_source(&index, session_id, crate::ids::new_uuid()),
             Err(SpawnError::SourceUnavailable)
         );
         assert_eq!(
-            indexed_spawn_source(&index, SessionId(Uuid::new_v4()), second),
+            indexed_spawn_source(&index, SessionId(crate::ids::new_uuid()), second),
             Err(SpawnError::SourceUnavailable)
         );
         manager
@@ -18130,8 +18134,8 @@ exit 7"#
     #[tokio::test]
     async fn native_directory_probe_releases_locks_and_rejects_replacement() {
         use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let manager = switchy_thread::sync::Mutex::new(manager_with_runtime(
             session_id,
             runtime_with_panes(&[pane_id]),
@@ -18240,7 +18244,7 @@ exit 7"#
 
     fn floating_surface(pane_id: Uuid, scope: FloatingPaneScope) -> FloatingSurfaceRuntime {
         FloatingSurfaceRuntime {
-            id: Uuid::new_v4(),
+            id: crate::ids::new_uuid(),
             pane_id,
             anchor_pane_id: None,
             context_id: None,
@@ -18265,11 +18269,11 @@ exit 7"#
     async fn pane_direct_input_resolves_visible_cross_session_owner() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let attach_session_id = SessionId(Uuid::new_v4());
-        let owner_session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let attach_pane_id = Uuid::new_v4();
-        let owner_pane_id = Uuid::new_v4();
+        let attach_session_id = SessionId(crate::ids::new_uuid());
+        let owner_session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let attach_pane_id = crate::ids::new_uuid();
+        let owner_pane_id = crate::ids::new_uuid();
 
         let mut attach_runtime = runtime_with_panes(&[attach_pane_id]);
         attach_runtime.attached_clients.insert(client_id);
@@ -18341,9 +18345,9 @@ exit 7"#
 
     #[tokio::test]
     async fn attach_snapshot_watermark_matches_concurrent_output() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(client_id);
         let pane = runtime.panes.get(&pane_id).unwrap();
@@ -18420,14 +18424,14 @@ exit 7"#
 
     #[tokio::test]
     async fn attach_grid_snapshot_budget_rejection_preserves_replay_cursors() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
         let mut grid = TerminalGridStream::new(1000, 100, GridLimits::default()).unwrap();
         grid.process(&vec![b'x'; 100_000]);
         let size = serde_json::to_vec(&grid.snapshot(0, 100)).unwrap().len();
         assert!(size < RESPONSE_OUTPUT_BUDGET);
         let pane_ids = (0..=RESPONSE_OUTPUT_BUDGET / size)
-            .map(|_| Uuid::new_v4())
+            .map(|_| crate::ids::new_uuid())
             .collect::<Vec<_>>();
         let mut runtime = runtime_with_panes(&pane_ids);
         runtime.attached_clients.insert(client_id);
@@ -18470,9 +18474,9 @@ exit 7"#
 
     #[tokio::test]
     async fn oversized_screen_cell_snapshot_rejection_preserves_state() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(client_id);
         let pane = runtime.panes.get(&pane_id).unwrap();
@@ -18522,9 +18526,9 @@ exit 7"#
 
     #[tokio::test]
     async fn oversized_pin_capture_preserves_previous_pin() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(client_id);
         let pane = runtime.panes.get(&pane_id).unwrap();
@@ -18603,9 +18607,9 @@ exit 7"#
 
     #[tokio::test]
     async fn sparse_wide_attach_snapshot_does_not_charge_unused_columns() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(client_id);
         let pane = runtime.panes.get(&pane_id).unwrap();
@@ -18628,9 +18632,9 @@ exit 7"#
 
     #[tokio::test]
     async fn adapters_share_pin_reservations_and_shrink_releases_only_unused_capacity() {
-        let runtime = runtime_with_panes(&[Uuid::new_v4()]);
+        let runtime = runtime_with_panes(&[crate::ids::new_uuid()]);
         let manager = Arc::new(Mutex::new(manager_with_runtime(
-            SessionId(Uuid::new_v4()),
+            SessionId(crate::ids::new_uuid()),
             runtime,
         )));
         let first = ServerSessionRuntimeAdapter::new(Arc::clone(&manager));
@@ -18672,10 +18676,10 @@ exit 7"#
 
     #[tokio::test]
     async fn retained_pin_admission_counts_other_sessions_and_releases_removed_pins() {
-        let session = SessionId(Uuid::new_v4());
-        let other_session = SessionId(Uuid::new_v4());
-        let client = ClientId(Uuid::new_v4());
-        let pane = Uuid::new_v4();
+        let session = SessionId(crate::ids::new_uuid());
+        let other_session = SessionId(crate::ids::new_uuid());
+        let client = ClientId(crate::ids::new_uuid());
+        let pane = crate::ids::new_uuid();
         let terminal_grid =
             bmux_terminal_grid::TerminalGrid::new(1, 1, GridLimits::default()).unwrap();
         let bytes = terminal_grid.retained_capacity_bytes().unwrap();
@@ -18692,7 +18696,7 @@ exit 7"#
             other.scrollback_pins.insert(
                 (client, Uuid::from_u128(id as u128)),
                 ScrollbackPin {
-                    capture_id: Uuid::new_v4(),
+                    capture_id: crate::ids::new_uuid(),
                     id: 1,
                     grid: Arc::clone(&grid),
                     total_scrolled_rows: 0,
@@ -18723,9 +18727,9 @@ exit 7"#
 
     #[tokio::test]
     async fn attach_grid_windows_reject_aggregate_overflow_and_allow_retry() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(client_id);
         let pane = runtime.panes.get(&pane_id).unwrap();
@@ -19091,9 +19095,9 @@ exit 7"#
     #[tokio::test]
     async fn queued_clipboard_writes_reach_the_client_in_its_next_frame() {
         use bmux_pane_runtime_state::SessionRuntimeManagerApi as Api;
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(client_id);
         let pane = runtime.panes.get(&pane_id).expect("pane should exist");
@@ -19167,16 +19171,16 @@ exit 7"#
     #[tokio::test]
     async fn observed_pane_frames_keep_an_unattached_replica_level_with_the_grid() {
         use bmux_pane_runtime_state::SessionRuntimeManagerApi as Api;
-        let session_id = SessionId(Uuid::new_v4());
-        let observer = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let observer = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).expect("pane should exist");
         set_pane_grid(pane, 20, 4);
         let grid = Arc::clone(&pane.terminal_grid);
         grid.lock().unwrap().process(b"one\r\ntwo\r\n");
         let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
-        let targets = [(session_id, pane_id), (session_id, Uuid::new_v4())];
+        let targets = [(session_id, pane_id), (session_id, crate::ids::new_uuid())];
         let mut replica = TerminalGrid::new(1, 1, GridLimits::default()).unwrap();
         let mut cursor = bmux_terminal_grid::ReplicaCursor::default();
         let mut follow = |adapter: &ServerSessionRuntimeAdapter| {
@@ -19207,9 +19211,9 @@ exit 7"#
     #[tokio::test]
     async fn attach_pane_frames_keep_a_client_replica_level_with_the_pane_grid() {
         use bmux_pane_runtime_state::SessionRuntimeManagerApi as Api;
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(client_id);
         let pane = runtime.panes.get(&pane_id).expect("pane should exist");
@@ -19263,7 +19267,7 @@ exit 7"#
             "a reset replica starts over"
         );
 
-        let other = ClientId(Uuid::new_v4());
+        let other = ClientId(crate::ids::new_uuid());
         assert_eq!(
             Api::attach_pane_frames(&adapter, session_id, other, &[pane_id], usize::MAX).err(),
             Some(SessionRuntimeError::NotAttached)
@@ -19272,9 +19276,9 @@ exit 7"#
 
     #[tokio::test]
     async fn attach_grid_snapshot_state_reports_retained_scrollback_without_encoding_it() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(client_id);
         let pane = runtime.panes.get(&pane_id).expect("pane should exist");
@@ -19335,11 +19339,11 @@ exit 7"#
                 .expect("grid lock should be available")
                 .process(&bytes);
         }
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
 
         // Measure one pane, then request enough identical panes to overflow.
-        let probe = Uuid::new_v4();
+        let probe = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[probe]);
         runtime.attached_clients.insert(client_id);
         fill(runtime.panes.get(&probe).expect("pane should exist"));
@@ -19356,7 +19360,9 @@ exit 7"#
         assert!(pane_bytes * 2 < REPLY_WIRE_BUDGET);
 
         let requested = REPLY_WIRE_BUDGET / pane_bytes + 2;
-        let pane_ids = (0..requested).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+        let pane_ids = (0..requested)
+            .map(|_| crate::ids::new_uuid())
+            .collect::<Vec<_>>();
         let mut runtime = runtime_with_panes(&pane_ids);
         runtime.attached_clients.insert(client_id);
         for pane_id in &pane_ids {
@@ -19385,9 +19391,9 @@ exit 7"#
 
     #[tokio::test]
     async fn attach_grid_window_state_returns_bounded_scrollback_window() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(client_id);
         let pane = runtime.panes.get(&pane_id).expect("pane should exist");
@@ -19438,9 +19444,9 @@ exit 7"#
 
     #[tokio::test]
     async fn attach_grid_window_state_anchors_offset_when_output_appends() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(client_id);
         let pane = runtime.panes.get(&pane_id).expect("pane should exist");
@@ -19537,9 +19543,9 @@ exit 7"#
 
     #[tokio::test]
     async fn frozen_scrollback_pin_serves_immutable_windows_while_live_grid_advances() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(client_id);
         let pane = runtime.panes.get(&pane_id).expect("pane should exist");
@@ -19636,9 +19642,9 @@ exit 7"#
     }
 
     fn assert_retired_pane_capture_rejected(replace: bool) {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(client_id);
         let grid = Arc::clone(&runtime.panes[&pane_id].terminal_grid);
@@ -19681,9 +19687,9 @@ exit 7"#
 
     #[tokio::test]
     async fn grid_builders_share_capture_admission_and_release_working_capacity() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(client_id);
         let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
@@ -19736,7 +19742,7 @@ exit 7"#
         assert!(
             bmux_pane_runtime_state::SessionRuntimeManagerApi::attach_grid_snapshot_state(
                 &other,
-                SessionId(Uuid::new_v4()),
+                SessionId(crate::ids::new_uuid()),
                 client_id,
                 &[pane_id],
                 1,
@@ -19847,9 +19853,9 @@ exit 7"#
     async fn generated_history_images_survive_live_reset_and_reject_stale_capture() {
         use bmux_pane_runtime_plugin_api::attach_runtime_state::client;
 
-        let session = SessionId(Uuid::new_v4());
-        let caller = ClientId(Uuid::new_v4());
-        let pane = Uuid::new_v4();
+        let session = SessionId(crate::ids::new_uuid());
+        let caller = ClientId(crate::ids::new_uuid());
+        let pane = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane]);
         runtime.attached_clients.insert(caller);
         let images = Arc::clone(&runtime.panes[&pane].image_registry);
@@ -19918,7 +19924,7 @@ exit 7"#
                 session.0,
                 pane,
                 capture.pin.pin_id,
-                Uuid::new_v4(),
+                crate::ids::new_uuid(),
                 80,
                 1,
                 3,
@@ -19974,7 +19980,7 @@ exit 7"#
                 session.0,
                 pane,
                 capture.pin.pin_id,
-                Uuid::new_v4(),
+                crate::ids::new_uuid(),
                 80,
                 0,
                 0,
@@ -20032,7 +20038,13 @@ exit 7"#
     ) {
         use bmux_pane_runtime_plugin_api::attach_runtime_state::{HistoryFetchError, client};
         for (identity, line, offset, columns, expected) in [
-            (Uuid::new_v4(), 0, 0, 2, HistoryFetchError::StaleCapture),
+            (
+                crate::ids::new_uuid(),
+                0,
+                0,
+                2,
+                HistoryFetchError::StaleCapture,
+            ),
             (
                 capture.capture_id,
                 u32::try_from(capture.history_line_count).unwrap(),
@@ -20084,9 +20096,9 @@ exit 7"#
             HistoryEnd, HistoryFetchError, client,
         };
 
-        let session = SessionId(Uuid::new_v4());
-        let caller = ClientId(Uuid::new_v4());
-        let pane = Uuid::new_v4();
+        let session = SessionId(crate::ids::new_uuid());
+        let caller = ClientId(crate::ids::new_uuid());
+        let pane = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane]);
         runtime.attached_clients.insert(caller);
         for _ in 0..100 {
@@ -20128,7 +20140,7 @@ exit 7"#
             session.0,
             pane,
             capture.pin.pin_id,
-            Uuid::new_v4(),
+            crate::ids::new_uuid(),
             0,
             0,
             4096,
@@ -20208,9 +20220,9 @@ exit 7"#
     #[tokio::test]
     async fn history_fetch_uses_frozen_pin_and_rejects_released_token() {
         use bmux_pane_runtime_state::SessionRuntimeManagerApi;
-        let session = SessionId(Uuid::new_v4());
-        let client = ClientId(Uuid::new_v4());
-        let pane = Uuid::new_v4();
+        let session = SessionId(crate::ids::new_uuid());
+        let client = ClientId(crate::ids::new_uuid());
+        let pane = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane]);
         runtime.attached_clients.insert(client);
         for _ in 0..100 {
@@ -20243,7 +20255,7 @@ exit 7"#
                     session,
                     client,
                     pane,
-                    (pin.pin_id, Uuid::new_v4()),
+                    (pin.pin_id, crate::ids::new_uuid()),
                     (0, 0),
                     (10, 100)
                 )
@@ -20281,9 +20293,9 @@ exit 7"#
 
     #[tokio::test]
     async fn failed_pin_publication_releases_capture_and_allows_retry() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(client_id);
         // Exhaust tokens to fail after capture and admission, before insertion.
@@ -20314,9 +20326,9 @@ exit 7"#
 
     #[tokio::test]
     async fn unpinned_capture_lives_only_until_last_window_reader_drops() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(client_id);
         let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
@@ -20353,9 +20365,9 @@ exit 7"#
 
     #[tokio::test]
     async fn frozen_scrollback_pin_releases_explicitly_and_on_detach() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(client_id);
         let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
@@ -20395,9 +20407,9 @@ exit 7"#
 
     #[tokio::test]
     async fn exhausted_scrollback_pin_ids_preserve_existing_capture() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(client_id);
         runtime.next_scrollback_pin_id = u64::MAX - 1;
@@ -20428,10 +20440,10 @@ exit 7"#
 
     #[tokio::test]
     async fn replacing_scrollback_pin_rejects_stale_and_cross_client_release() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let other_client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let other_client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.attached_clients.insert(client_id);
         runtime.attached_clients.insert(other_client_id);
@@ -20470,10 +20482,10 @@ exit 7"#
 
     #[tokio::test]
     async fn frozen_scrollback_pins_are_removed_with_panes_and_sessions() {
-        let session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
-        let other_pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
+        let other_pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id, other_pane_id]);
         runtime.attached_clients.insert(client_id);
         let adapter = adapter_for_manager(manager_with_runtime(session_id, runtime));
@@ -20521,7 +20533,7 @@ exit 7"#
 
     #[tokio::test]
     async fn alternate_resize_guard_is_atomic_and_preserves_last_writer_policy() {
-        let pane = dummy_pane(Uuid::new_v4());
+        let pane = dummy_pane(crate::ids::new_uuid());
         let pty = bmux_pty::PtyPair::open(PtySize { rows: 1, cols: 1 }).unwrap();
         *pane.execution.master.lock().unwrap() = Some(pty.master);
         let original = pane.terminal_grid.lock().unwrap().grid().revision();
@@ -20556,7 +20568,7 @@ exit 7"#
 
     #[tokio::test]
     async fn uncaptured_alternate_resize_acknowledges_master_without_queueing() {
-        let mut pane = dummy_pane(Uuid::new_v4());
+        let mut pane = dummy_pane(crate::ids::new_uuid());
         let (input, mut queued) = mpsc::unbounded_channel();
         pane.input_tx = input;
         let pty = bmux_pty::PtyPair::open(PtySize { rows: 1, cols: 1 }).unwrap();
@@ -20609,7 +20621,7 @@ exit 7"#
 
     #[tokio::test]
     async fn uncaptured_alternate_resize_never_acknowledges_missing_master() {
-        let pane = dummy_pane(Uuid::new_v4());
+        let pane = dummy_pane(crate::ids::new_uuid());
         pane.terminal_grid.lock().unwrap().process(b"\x1b[?1049h");
         let revision = pane.terminal_grid.lock().unwrap().grid().revision();
         let mut ticket = None;
@@ -20628,7 +20640,7 @@ exit 7"#
 
     #[tokio::test]
     async fn alternate_resize_commits_geometry_in_ordered_capture() {
-        let pane = dummy_pane(Uuid::new_v4());
+        let pane = dummy_pane(crate::ids::new_uuid());
         let pty = bmux_pty::PtyPair::open(PtySize { rows: 1, cols: 1 }).unwrap();
         *pane.execution.master.lock().unwrap() = Some(pty.master);
         let root = tempfile::tempdir().unwrap();
@@ -20678,7 +20690,7 @@ exit 7"#
 
     #[tokio::test]
     async fn rejected_alternate_resize_does_not_publish_reserved_capture_event() {
-        let pane = dummy_pane(Uuid::new_v4());
+        let pane = dummy_pane(crate::ids::new_uuid());
         let root = tempfile::tempdir().unwrap();
         let capture = durable_capture::DurableCapture::create(root.path()).unwrap();
         let (writer, mut owner) = capture_writer::CaptureWriter::start(capture).unwrap();
@@ -20701,7 +20713,7 @@ exit 7"#
 
     #[tokio::test]
     async fn resize_waits_for_output_geometry_guard() {
-        let pane_id = Uuid::new_v4();
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).expect("pane should exist");
         pane.resize_pty(2, 10);
@@ -20734,7 +20746,7 @@ exit 7"#
     #[cfg(feature = "image-registry")]
     #[tokio::test]
     async fn resize_waits_for_image_capture_guard() {
-        let pane_id = Uuid::new_v4();
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).expect("pane should exist");
         pane.resize_pty(2, 10);
@@ -20768,7 +20780,7 @@ exit 7"#
             b"\x1b[".as_slice(),
             b"\x1b[4;".as_slice(),
         ] {
-            let pane_id = Uuid::new_v4();
+            let pane_id = crate::ids::new_uuid();
             let runtime = runtime_with_panes(&[pane_id]);
             let pane = runtime.panes.get(&pane_id).expect("pane should exist");
             pane.resize_pty(2, 10);
@@ -20786,7 +20798,7 @@ exit 7"#
     #[cfg(feature = "image-registry")]
     #[tokio::test]
     async fn height_growth_preserves_retained_image_anchor() {
-        let pane_id = Uuid::new_v4();
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).unwrap();
         pane.resize_pty(3, 80);
@@ -20817,7 +20829,7 @@ exit 7"#
     #[cfg(feature = "image-registry")]
     #[tokio::test]
     async fn failed_image_height_growth_preserves_both_grids() {
-        let pane_id = Uuid::new_v4();
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).unwrap();
         pane.resize_pty(3, 80);
@@ -20852,7 +20864,7 @@ exit 7"#
     #[cfg(feature = "image-registry")]
     #[tokio::test]
     async fn height_shrink_moves_image_into_history() {
-        let pane_id = Uuid::new_v4();
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).unwrap();
         pane.resize_pty(5, 80);
@@ -20877,7 +20889,7 @@ exit 7"#
     #[cfg(feature = "image-registry")]
     #[tokio::test]
     async fn height_shrink_evicts_images_with_text_history() {
-        let pane_id = Uuid::new_v4();
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).unwrap();
         pane.resize_pty(5, 80);
@@ -20917,7 +20929,7 @@ exit 7"#
     #[cfg(feature = "image-registry")]
     #[tokio::test]
     async fn width_resize_restores_image_from_pending_wrapped_line() {
-        let pane_id = Uuid::new_v4();
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).unwrap();
         pane.resize_pty(2, 4);
@@ -20951,7 +20963,7 @@ exit 7"#
     #[cfg(feature = "image-registry")]
     #[tokio::test]
     async fn width_resize_remaps_hidden_history_without_exposing_images() {
-        let pane_id = Uuid::new_v4();
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).unwrap();
         pane.resize_pty(2, 4);
@@ -20989,7 +21001,7 @@ exit 7"#
     #[cfg(feature = "image-registry")]
     #[tokio::test]
     async fn height_resize_restores_image_from_pending_wrapped_line() {
-        let pane_id = Uuid::new_v4();
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).unwrap();
         pane.resize_pty(2, 5);
@@ -21023,7 +21035,7 @@ exit 7"#
     #[cfg(feature = "image-registry")]
     #[tokio::test]
     async fn text_only_resize_does_not_require_image_capture_budget() {
-        let pane_id = Uuid::new_v4();
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).unwrap();
         pane.resize_pty(3, 80);
@@ -21045,7 +21057,7 @@ exit 7"#
     #[cfg(feature = "image-registry")]
     #[tokio::test]
     async fn height_resize_remaps_hidden_main_images_only() {
-        let pane_id = Uuid::new_v4();
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).unwrap();
         pane.resize_pty(2, 5);
@@ -21089,7 +21101,7 @@ exit 7"#
     #[cfg(feature = "image-registry")]
     #[tokio::test]
     async fn alternate_only_images_reproject_on_height_resize() {
-        let pane_id = Uuid::new_v4();
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).unwrap();
         pane.resize_pty(5, 80);
@@ -21116,7 +21128,7 @@ exit 7"#
     #[cfg(feature = "image-registry")]
     #[tokio::test]
     async fn blank_cell_width_resize_tracks_cursor_without_creating_text() {
-        let pane_id = Uuid::new_v4();
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).unwrap();
         pane.resize_pty(2, 8);
@@ -21145,7 +21157,7 @@ exit 7"#
 
     #[tokio::test]
     async fn rejected_resize_preserves_published_geometry() {
-        let pane_id = Uuid::new_v4();
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let pane = runtime.panes.get(&pane_id).expect("pane should exist");
         pane.resize_pty(2, 10);
@@ -21163,13 +21175,13 @@ exit 7"#
 
     #[tokio::test]
     async fn attach_scene_projects_client_and_server_global_floating_panes() {
-        let attach_session_id = SessionId(Uuid::new_v4());
-        let other_session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let attach_pane_id = Uuid::new_v4();
-        let client_global_pane_id = Uuid::new_v4();
-        let server_global_pane_id = Uuid::new_v4();
-        let other_client_pane_id = Uuid::new_v4();
+        let attach_session_id = SessionId(crate::ids::new_uuid());
+        let other_session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let attach_pane_id = crate::ids::new_uuid();
+        let client_global_pane_id = crate::ids::new_uuid();
+        let server_global_pane_id = crate::ids::new_uuid();
+        let other_client_pane_id = crate::ids::new_uuid();
 
         let mut attach_runtime = runtime_with_panes(&[attach_pane_id]);
         attach_runtime.attached_clients.insert(client_id);
@@ -21185,7 +21197,7 @@ exit 7"#
             floating_surface(server_global_pane_id, FloatingPaneScope::ServerGlobal);
         let mut other_client =
             floating_surface(other_client_pane_id, FloatingPaneScope::ClientGlobal);
-        other_client.client_id = Some(ClientId(Uuid::new_v4()));
+        other_client.client_id = Some(ClientId(crate::ids::new_uuid()));
         other_runtime.floating_surfaces = vec![client_global, server_global, other_client];
 
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
@@ -21228,17 +21240,17 @@ exit 7"#
 
     #[tokio::test]
     async fn per_window_and_per_pane_scopes_stay_in_owner_session() {
-        let attach_session_id = SessionId(Uuid::new_v4());
-        let other_session_id = SessionId(Uuid::new_v4());
-        let client_id = ClientId(Uuid::new_v4());
-        let attach_pane_id = Uuid::new_v4();
-        let other_pane_id = Uuid::new_v4();
+        let attach_session_id = SessionId(crate::ids::new_uuid());
+        let other_session_id = SessionId(crate::ids::new_uuid());
+        let client_id = ClientId(crate::ids::new_uuid());
+        let attach_pane_id = crate::ids::new_uuid();
+        let other_pane_id = crate::ids::new_uuid();
 
         let mut attach_runtime = runtime_with_panes(&[attach_pane_id]);
         attach_runtime.attached_clients.insert(client_id);
         let mut other_runtime = runtime_with_panes(&[other_pane_id]);
         let mut per_window = floating_surface(other_pane_id, FloatingPaneScope::PerWindow);
-        per_window.context_id = Some(Uuid::new_v4());
+        per_window.context_id = Some(crate::ids::new_uuid());
         let mut per_pane = floating_surface(other_pane_id, FloatingPaneScope::PerPane);
         per_pane.anchor_pane_id = Some(other_pane_id);
         other_runtime.floating_surfaces = vec![per_window, per_pane];
@@ -21279,9 +21291,9 @@ exit 7"#
 
     #[tokio::test]
     async fn closing_last_tiled_pane_leaves_unanchored_floating_pane_visible() {
-        let session_id = SessionId(Uuid::new_v4());
-        let tiled_pane_id = Uuid::new_v4();
-        let floating_pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let tiled_pane_id = crate::ids::new_uuid();
+        let floating_pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[tiled_pane_id, floating_pane_id]);
         runtime.layout_root = Some(PaneLayoutNode::Leaf {
             pane_id: tiled_pane_id,
@@ -21324,9 +21336,9 @@ exit 7"#
 
     #[tokio::test]
     async fn exiting_focused_floating_pane_restores_live_focus() {
-        let session_id = SessionId(Uuid::new_v4());
-        let tiled_pane_id = Uuid::new_v4();
-        let floating_pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let tiled_pane_id = crate::ids::new_uuid();
+        let floating_pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[tiled_pane_id, floating_pane_id]);
         runtime.layout_root = Some(PaneLayoutNode::Leaf {
             pane_id: tiled_pane_id,
@@ -21376,8 +21388,8 @@ exit 7"#
 
     #[tokio::test]
     async fn closing_final_floating_pane_requires_explicit_session_action() {
-        let session_id = SessionId(Uuid::new_v4());
-        let floating_pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let floating_pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[floating_pane_id]);
         runtime.layout_root = None;
         runtime.floating_surfaces = vec![floating_surface(
@@ -22058,7 +22070,7 @@ exit 7"#
             std::fs::set_permissions(&configured_shell, permissions).unwrap();
         }
         let pane_meta = PaneRuntimeMeta {
-            id: Uuid::new_v4(),
+            id: crate::ids::new_uuid(),
             name: None,
             shell: "/nix/store/missing-nushell/bin/nu".to_string(),
             launch: None,
@@ -22094,7 +22106,7 @@ exit 7"#
             std::fs::set_permissions(&configured_shell, permissions).unwrap();
         }
         let pane_meta = PaneRuntimeMeta {
-            id: Uuid::new_v4(),
+            id: crate::ids::new_uuid(),
             name: None,
             shell: "/missing/zsh".to_string(),
             launch: None,
@@ -22118,7 +22130,7 @@ exit 7"#
     #[test]
     fn missing_resurrection_cwd_is_cleared() {
         let pane_meta = PaneRuntimeMeta {
-            id: Uuid::new_v4(),
+            id: crate::ids::new_uuid(),
             name: None,
             shell: "sh".to_string(),
             launch: None,
@@ -22128,7 +22140,7 @@ exit 7"#
                 active_command_source: None,
                 last_known_cwd: Some(
                     std::env::temp_dir()
-                        .join(Uuid::new_v4().to_string())
+                        .join(crate::ids::new_uuid().to_string())
                         .to_string_lossy()
                         .into_owned(),
                 ),
@@ -22170,7 +22182,7 @@ exit 7"#
     #[test]
     fn explicit_launch_does_not_replace_persisted_shell_metadata() {
         let pane_meta = PaneRuntimeMeta {
-            id: Uuid::new_v4(),
+            id: crate::ids::new_uuid(),
             name: None,
             shell: "/missing/original-shell".to_string(),
             launch: Some(PaneLaunchSpec {
@@ -22190,8 +22202,8 @@ exit 7"#
 
     #[test]
     fn runtime_notice_updates_grid_and_fanout() {
-        let pane_id = Uuid::new_v4();
-        let session_id = SessionId(Uuid::new_v4());
+        let pane_id = crate::ids::new_uuid();
+        let session_id = SessionId(crate::ids::new_uuid());
         let output = Arc::new(switchy_thread::sync::Mutex::new(OutputFanoutBuffer::new(
             4096,
         )));
@@ -22232,7 +22244,7 @@ exit 7"#
     #[test]
     fn resolved_launch_heals_pane_metadata() {
         let mut pane_meta = PaneRuntimeMeta {
-            id: Uuid::new_v4(),
+            id: crate::ids::new_uuid(),
             name: None,
             shell: "/missing/zsh".to_string(),
             launch: None,
@@ -22278,7 +22290,7 @@ exit 7"#
             args: Vec::new(),
             cwd: Some(
                 std::env::temp_dir()
-                    .join(Uuid::new_v4().to_string())
+                    .join(crate::ids::new_uuid().to_string())
                     .to_string_lossy()
                     .into_owned(),
             ),
@@ -22310,8 +22322,8 @@ exit 7"#
             pane_runtime_spawn_v1::{InitialShellOptions, SpawnError},
         };
         let request = SplitShellRequest {
-            session_id: Uuid::new_v4(),
-            target: Uuid::new_v4(),
+            session_id: crate::ids::new_uuid(),
+            target: crate::ids::new_uuid(),
             direction: "horizontal".into(),
             ratio_percent: 50,
             options: InitialShellOptions {
@@ -22357,12 +22369,12 @@ exit 7"#
 
     #[tokio::test]
     async fn unpublished_cleanup_waits_for_task_and_reports_panics() {
-        let mut pane = dummy_pane(Uuid::new_v4());
+        let mut pane = dummy_pane(crate::ids::new_uuid());
         stop_unpublished_pane(&mut pane).await.unwrap();
         assert!(pane.task.is_finished());
         assert!(!pane.publication.wait());
 
-        let mut pane = dummy_pane(Uuid::new_v4());
+        let mut pane = dummy_pane(crate::ids::new_uuid());
         pane.task.abort();
         pane.task = switchy_async::task::spawn(async { panic!("injected cleanup failure") });
         let error = stop_unpublished_pane(&mut pane).await.unwrap_err();
@@ -22371,8 +22383,8 @@ exit 7"#
 
     #[tokio::test]
     async fn split_commit_rejects_replaced_target_before_publication() {
-        let session_id = SessionId(Uuid::new_v4());
-        let target = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let target = crate::ids::new_uuid();
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[target]));
         let mut prepared = manager
             .prepare_split(session_id, None, PaneSplitDirection::Horizontal, None)
@@ -22381,7 +22393,7 @@ exit 7"#
             .resurrection_state
             .lock()
             .unwrap()
-            .observation_execution = Uuid::new_v4();
+            .observation_execution = crate::ids::new_uuid();
         let error = manager
             .commit_split(
                 session_id,
@@ -22401,8 +22413,8 @@ exit 7"#
 
     #[tokio::test]
     async fn split_commit_rejects_exited_target_without_publishing_new_pane() {
-        let session_id = SessionId(Uuid::new_v4());
-        let target = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let target = crate::ids::new_uuid();
         let mut manager = manager_with_runtime(session_id, runtime_with_panes(&[target]));
         let mut prepared = manager
             .prepare_split(session_id, None, PaneSplitDirection::Horizontal, None)
@@ -22484,9 +22496,9 @@ exit 7"#
             assert!(status.success());
             return;
         }
-        let session = SessionId(Uuid::new_v4());
-        let client = ClientId(Uuid::new_v4());
-        let pane = Uuid::new_v4();
+        let session = SessionId(crate::ids::new_uuid());
+        let client = ClientId(crate::ids::new_uuid());
+        let pane = crate::ids::new_uuid();
         let mut manager = manager_with_runtime(session, runtime_with_panes(&[pane]));
         // The idle authority under test is the manager's own activation's.
         let manager_host = manager.host.clone();
@@ -22507,7 +22519,7 @@ exit 7"#
             },
         )
         .await;
-        let prepared_connection = Uuid::new_v4();
+        let prepared_connection = crate::ids::new_uuid();
         let lease = managed_idle::preparation_for_test(host, prepared_connection, None, false);
         assert!(
             !managed_idle::fence_for_test(&manager),
@@ -22547,7 +22559,7 @@ exit 7"#
         assert!(
             manager
                 .restore_runtime(
-                    SessionId(Uuid::new_v4()),
+                    SessionId(crate::ids::new_uuid()),
                     &[],
                     RestoreRuntimeRequest::default()
                 )
@@ -22581,7 +22593,7 @@ exit 7"#
     #[tokio::test]
     async fn failed_startup_watch_prevents_readiness() {
         let host = crate::runtime::PaneRuntimeHost::detached();
-        let pane_id = Uuid::new_v4();
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         let (ready, receiver) = watch::channel(Some(Err("injected startup failure".into())));
         runtime.panes.get_mut(&pane_id).unwrap().startup = receiver;
@@ -22601,7 +22613,7 @@ exit 7"#
     async fn readiness_wait_retains_ownership_until_commit() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let pane_id = Uuid::new_v4();
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         let (ready, receiver) = watch::channel(None);
         runtime.panes.get_mut(&pane_id).unwrap().startup = receiver;
@@ -22622,7 +22634,7 @@ exit 7"#
         shutdown_runtime_handle(
             host,
             RemovedRuntime {
-                session_id: SessionId(Uuid::new_v4()),
+                session_id: SessionId(crate::ids::new_uuid()),
                 handle: prepared.take().unwrap(),
             },
         )
@@ -22741,10 +22753,10 @@ exit 7"#
 
     #[tokio::test]
     async fn dropped_prepared_runtime_retains_cleanup_acknowledgement() {
-        let existing = SessionId(Uuid::new_v4());
-        let manager = manager_with_runtime(existing, runtime_with_panes(&[Uuid::new_v4()]));
+        let existing = SessionId(crate::ids::new_uuid());
+        let manager = manager_with_runtime(existing, runtime_with_panes(&[crate::ids::new_uuid()]));
         let prepared = manager
-            .prepare_fresh_runtime(SessionId(Uuid::new_v4()), None)
+            .prepare_fresh_runtime(SessionId(crate::ids::new_uuid()), None)
             .unwrap();
         let mut cleanup = prepared
             .runtime
@@ -22772,10 +22784,10 @@ exit 7"#
 
     #[tokio::test]
     async fn commit_rejects_unready_runtime_without_publication() {
-        let existing = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let existing = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut manager = manager_with_runtime(existing, runtime_with_panes(&[pane_id]));
-        let created = SessionId(Uuid::new_v4());
+        let created = SessionId(crate::ids::new_uuid());
         let mut prepared = manager.prepare_fresh_runtime(created, None).unwrap();
         assert!(
             manager
@@ -22801,7 +22813,7 @@ exit 7"#
     #[tokio::test]
     async fn prepared_runtime_rejects_lost_launch_receiver() {
         let host = crate::runtime::PaneRuntimeHost::detached();
-        let pane_id = Uuid::new_v4();
+        let pane_id = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[pane_id]);
         let task = runtime.panes[&pane_id].task.abort_handle();
         let (launch, receiver) = oneshot::channel();
@@ -22827,8 +22839,8 @@ exit 7"#
     #[tokio::test]
     async fn abandoned_prepared_runtime_stops_all_owned_tasks() {
         let host = crate::runtime::PaneRuntimeHost::detached();
-        let first = Uuid::new_v4();
-        let second = Uuid::new_v4();
+        let first = crate::ids::new_uuid();
+        let second = crate::ids::new_uuid();
         let runtime = runtime_with_panes(&[first, second]);
         let finished = runtime
             .panes
@@ -22858,11 +22870,12 @@ exit 7"#
         let shell = directory.path().join("test-shell");
         std::fs::write(&shell, format!("#!/bin/sh\ntouch '{}'\n", marker.display())).unwrap();
         std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let existing = SessionId(Uuid::new_v4());
-        let mut manager = manager_with_runtime(existing, runtime_with_panes(&[Uuid::new_v4()]));
+        let existing = SessionId(crate::ids::new_uuid());
+        let mut manager =
+            manager_with_runtime(existing, runtime_with_panes(&[crate::ids::new_uuid()]));
         manager.shell = shell.to_string_lossy().into_owned();
         let prepared = manager
-            .prepare_fresh_runtime(SessionId(Uuid::new_v4()), None)
+            .prepare_fresh_runtime(SessionId(crate::ids::new_uuid()), None)
             .unwrap();
         let tasks = prepared
             .runtime
@@ -22892,10 +22905,10 @@ exit 7"#
     async fn preparing_fresh_runtime_does_not_register_input_or_manager_state() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let existing = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let existing = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let manager = manager_with_runtime(existing, runtime_with_panes(&[pane_id]));
-        let created = SessionId(Uuid::new_v4());
+        let created = SessionId(crate::ids::new_uuid());
         let prepared = manager.prepare_fresh_runtime(created, None).unwrap();
         switchy_async::task::yield_now().await;
         let pending = prepared.runtime.as_ref().unwrap();
@@ -22920,8 +22933,8 @@ exit 7"#
     #[tokio::test]
     async fn invalid_initial_directory_does_not_mutate_runtime() {
         use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions;
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let mut runtime = runtime_with_panes(&[pane_id]);
         runtime.zoomed_pane_id = Some(pane_id);
         let mut manager = manager_with_runtime(session_id, runtime);
@@ -22937,7 +22950,7 @@ exit 7"#
             assert!(
                 manager
                     .start_runtime_with_options(
-                        SessionId(Uuid::new_v4()),
+                        SessionId(crate::ids::new_uuid()),
                         Some(InitialShellOptions {
                             cwd: Some(cwd.clone())
                         }),
@@ -22972,7 +22985,7 @@ exit 7"#
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
         let directory = tempfile::tempdir().unwrap();
-        let session_id = SessionId(Uuid::new_v4());
+        let session_id = SessionId(crate::ids::new_uuid());
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager::new(
             PaneRuntimeHost::detached(),
@@ -23036,8 +23049,8 @@ exit 7"#
         };
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let session = SessionId(Uuid::new_v4());
-        let target = Uuid::new_v4();
+        let session = SessionId(crate::ids::new_uuid());
+        let target = crate::ids::new_uuid();
         let manager = manager_with_runtime(session, runtime_with_panes(&[target]));
         let adapter = ServerSessionRuntimeAdapter::new(Arc::new(Mutex::new(manager)));
         let directory = tempfile::tempdir().unwrap();
@@ -23121,12 +23134,12 @@ exit 7"#
         )
         .unwrap();
         std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let existing = SessionId(Uuid::new_v4());
-        let target = Uuid::new_v4();
+        let existing = SessionId(crate::ids::new_uuid());
+        let target = crate::ids::new_uuid();
         let mut manager = manager_with_runtime(existing, runtime_with_panes(&[target]));
         manager.shell = shell.to_string_lossy().into_owned();
         let adapter = ServerSessionRuntimeAdapter::new(Arc::new(Mutex::new(manager)));
-        let created = SessionId(Uuid::new_v4());
+        let created = SessionId(crate::ids::new_uuid());
         let checks = AtomicUsize::new(0);
         let published = AtomicBool::new(false);
         let result = adapter
@@ -23175,11 +23188,11 @@ exit 7"#
         use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions;
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let existing = SessionId(Uuid::new_v4());
-        let target = Uuid::new_v4();
+        let existing = SessionId(crate::ids::new_uuid());
+        let target = crate::ids::new_uuid();
         let manager = manager_with_runtime(existing, runtime_with_panes(&[target]));
         let adapter = ServerSessionRuntimeAdapter::new(Arc::new(Mutex::new(manager)));
-        let session = SessionId(Uuid::new_v4());
+        let session = SessionId(crate::ids::new_uuid());
         let directory = tempfile::tempdir().unwrap();
         let checks = AtomicUsize::new(0);
         adapter
@@ -23256,8 +23269,8 @@ exit 7"#
         } else {
             "/definitely/missing/sh"
         };
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let settings: toml::Value = toml::from_str(&format!(
             "[padding]\n[[padding.pane_rules]]\nmatch_shell = {configured_shell:?}\nmax_content_width = 40"
@@ -23309,8 +23322,8 @@ exit 7"#
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
         let configured_shell = if cfg!(windows) { "cmd.exe" } else { "/bin/sh" };
-        let session_id = SessionId(Uuid::new_v4());
-        let pane_id = Uuid::new_v4();
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
         let (pane_exit_tx, _pane_exit_rx) = mpsc::unbounded_channel();
         let mut manager = SessionRuntimeManager::new(
             PaneRuntimeHost::detached(),
@@ -23378,11 +23391,14 @@ exit 7"#
             PanePaddingConfig::default(),
             pane_exit_tx,
         );
-        let session_ids = [SessionId(Uuid::new_v4()), SessionId(Uuid::new_v4())];
+        let session_ids = [
+            SessionId(crate::ids::new_uuid()),
+            SessionId(crate::ids::new_uuid()),
+        ];
         let mut expected_pane_ids = BTreeMap::new();
 
         for session_id in session_ids {
-            let pane_ids = [Uuid::new_v4(), Uuid::new_v4()];
+            let pane_ids = [crate::ids::new_uuid(), crate::ids::new_uuid()];
             let panes = pane_ids.map(|id| PaneRuntimeMeta {
                 id,
                 name: None,
@@ -23437,7 +23453,7 @@ exit 7"#
         let handle = PaneInputHandle {
             execution_token: None,
             host: crate::runtime::PaneRuntimeHost::detached(),
-            session_id: SessionId(Uuid::new_v4()),
+            session_id: SessionId(crate::ids::new_uuid()),
             input_tx,
             exited: Arc::new(AtomicBool::new(true)),
         };
@@ -23450,7 +23466,7 @@ exit 7"#
 
     #[test]
     fn output_cursor_replays_bytes_withheld_while_frozen() {
-        let client_id = ClientId(Uuid::new_v4());
+        let client_id = ClientId(crate::ids::new_uuid());
         let mut output = OutputFanoutBuffer::new(4096);
         output.register_client_at_tail(client_id);
         output.push_chunk(b"before-freeze");
@@ -23467,7 +23483,7 @@ exit 7"#
 
     #[test]
     fn output_cursor_reports_gap_when_frozen_replay_exceeds_retention() {
-        let client_id = ClientId(Uuid::new_v4());
+        let client_id = ClientId(crate::ids::new_uuid());
         let mut output = OutputFanoutBuffer::new(8);
         output.register_client_at_tail(client_id);
         output.push_chunk(b"more-than-eight-bytes");
@@ -23480,7 +23496,7 @@ exit 7"#
 
     #[test]
     fn concurrent_snapshot_commits_preserve_newest_cursors() {
-        let client = ClientId(Uuid::new_v4());
+        let client = ClientId(crate::ids::new_uuid());
         let outputs = (0..3)
             .map(|_| {
                 let mut output = OutputFanoutBuffer::new(1024);
@@ -23523,7 +23539,7 @@ exit 7"#
 
     #[test]
     fn snapshot_cursor_commit_rejects_aliased_outputs_without_mutation() {
-        let client = ClientId(Uuid::new_v4());
+        let client = ClientId(crate::ids::new_uuid());
         let mut output = OutputFanoutBuffer::new(1024);
         output.register_client_at_tail(client);
         output.push_chunk(b"hello");
@@ -23543,7 +23559,7 @@ exit 7"#
 
     #[test]
     fn snapshot_cursor_commit_is_atomic_on_poisoned_output() {
-        let client = ClientId(Uuid::new_v4());
+        let client = ClientId(crate::ids::new_uuid());
         let mut updates = (0..2)
             .map(|_| {
                 let mut output = OutputFanoutBuffer::new(1024);
@@ -23571,7 +23587,7 @@ exit 7"#
 
     #[test]
     fn snapshot_acknowledgement_preserves_eviction_gap() {
-        let client_id = ClientId(Uuid::new_v4());
+        let client_id = ClientId(crate::ids::new_uuid());
         let mut output = OutputFanoutBuffer::new(8);
         output.register_client_at_tail(client_id);
         output.push_chunk(b"first");
@@ -23588,8 +23604,8 @@ exit 7"#
 
     #[test]
     fn snapshot_acknowledgement_preserves_other_clients_unread_output() {
-        let first = ClientId(Uuid::new_v4());
-        let second = ClientId(Uuid::new_v4());
+        let first = ClientId(crate::ids::new_uuid());
+        let second = ClientId(crate::ids::new_uuid());
         let mut output = OutputFanoutBuffer::new(1024);
         output.register_client_at_tail(first);
         output.register_client_at_tail(second);
@@ -23608,7 +23624,7 @@ exit 7"#
 
     #[test]
     fn snapshot_acknowledgement_does_not_recreate_detached_cursor() {
-        let client_id = ClientId(Uuid::new_v4());
+        let client_id = ClientId(crate::ids::new_uuid());
         let mut output = OutputFanoutBuffer::new(1024);
         output.register_client_at_tail(client_id);
         output.push_chunk(b"first");
@@ -23625,7 +23641,7 @@ exit 7"#
 
     #[test]
     fn snapshot_acknowledgement_does_not_rewind_concurrent_replay() {
-        let client_id = ClientId(Uuid::new_v4());
+        let client_id = ClientId(crate::ids::new_uuid());
         let mut output = OutputFanoutBuffer::new(1024);
         output.register_client_at_tail(client_id);
         output.push_chunk(b"first");
@@ -23719,7 +23735,7 @@ exit 7"#
     /// boundary between sequences, with the synchronized-update state the grid had there.
     #[test]
     fn output_is_retained_only_while_bytes_are_read() {
-        let client = ClientId(Uuid::new_v4());
+        let client = ClientId(crate::ids::new_uuid());
         let mut output = OutputFanoutBuffer::new(1024);
         output.register_client_at_tail(client);
         let between = |sync_update_open| ChunkBoundary {
@@ -23860,7 +23876,7 @@ exit 7"#
 
     #[test]
     fn delayed_snapshot_acknowledgement_recovers_after_split_escape() {
-        let client = ClientId(Uuid::new_v4());
+        let client = ClientId(crate::ids::new_uuid());
         let mut output = OutputFanoutBuffer::new(8);
         output.register_client_at_tail(client);
         output.push_chunk(b"old");
@@ -23883,7 +23899,7 @@ exit 7"#
     #[test]
     fn reads_report_synchronized_updates_at_their_own_end() {
         let mut buf = OutputFanoutBuffer::new(1 << 16);
-        let client = ClientId(Uuid::new_v4());
+        let client = ClientId(crate::ids::new_uuid());
         buf.register_client_at_tail(client);
         // Frame one complete, frame two begun, with its opening split across chunks.
         buf.push_chunk(b"\x1b[?2026hone\x1b[?2026l\x1b[?20");
@@ -23908,7 +23924,7 @@ exit 7"#
     #[test]
     fn read_for_client_gap_advances_to_ground_boundary() {
         let mut buf = OutputFanoutBuffer::new(64);
-        let client = ClientId(Uuid::new_v4());
+        let client = ClientId(crate::ids::new_uuid());
         buf.register_client_at_tail(client);
 
         buf.push_chunk(b"\x1b[31mhello");

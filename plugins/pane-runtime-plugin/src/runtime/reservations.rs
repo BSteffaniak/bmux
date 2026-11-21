@@ -565,15 +565,15 @@ impl ReservationStore {
             }
         })?;
         let execution = ExecutionRef {
-            session_id: uuid::Uuid::new_v4(),
-            pane_id: uuid::Uuid::new_v4(),
-            execution_token: uuid::Uuid::new_v4(),
+            session_id: crate::ids::new_uuid(),
+            pane_id: crate::ids::new_uuid(),
+            execution_token: crate::ids::new_uuid(),
         };
         authorize(execution.session_id)?;
         let reservation = LaunchReservation {
             initial_cursor: CaptureCursor {
                 execution: execution.clone(),
-                spool_generation: uuid::Uuid::new_v4(),
+                spool_generation: crate::ids::new_uuid(),
                 offset: 0,
             },
             execution,
@@ -672,7 +672,7 @@ mod tests {
             cols: 80,
             rows: 24,
         };
-        let mutation = uuid::Uuid::new_v4();
+        let mutation = crate::ids::new_uuid();
         let retained = legacy
             .reserve(mutation, options.clone(), |_| Ok(()))
             .unwrap();
@@ -708,7 +708,7 @@ mod tests {
     #[test]
     fn reopened_launch_admission_preserves_identity_phase_and_unknown_outcome() {
         let root = tempfile::tempdir().unwrap();
-        let mutation = uuid::Uuid::new_v4();
+        let mutation = crate::ids::new_uuid();
         let options = ProgramOptions {
             program: "/bin/sh".into(),
             args: vec![],
@@ -763,7 +763,7 @@ mod tests {
         let store = ReservationStore::open(root.path()).unwrap();
         let reservation = store
             .reserve(
-                uuid::Uuid::new_v4(),
+                crate::ids::new_uuid(),
                 ProgramOptions {
                     program: "/bin/echo".into(),
                     args: vec![],
@@ -787,7 +787,7 @@ mod tests {
         };
         assert!(validate_input_authority(&reference, &launch, &state, false).is_ok());
         assert!(validate_input_authority(&reference, &launch, &state, true).is_err());
-        state.execution.execution_token = uuid::Uuid::new_v4();
+        state.execution.execution_token = crate::ids::new_uuid();
         assert!(validate_input_authority(&reference, &launch, &state, false).is_err());
         state.execution = reference.clone();
         state.terminal_session_ended = true;
@@ -807,7 +807,7 @@ mod tests {
     fn keyed_admission_preserves_identity_rejects_conflict_and_corruption() {
         let root = tempfile::tempdir().unwrap();
         let store = ReservationStore::open(root.path()).unwrap();
-        let mutation = uuid::Uuid::new_v4();
+        let mutation = crate::ids::new_uuid();
         let options = ProgramOptions {
             program: "/bin/echo".into(),
             args: vec!["literal".into()],

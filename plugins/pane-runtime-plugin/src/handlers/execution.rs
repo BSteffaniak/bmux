@@ -186,7 +186,6 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use switchy_thread::sync::{Arc, Mutex};
-    use uuid::Uuid;
 
     thread_local! {
         static TEST_ORIGIN: std::cell::RefCell<Arc<Mutex<StreamProvenance>>> =
@@ -278,7 +277,7 @@ mod tests {
             },
             settings: None,
             plugin_settings_map: BTreeMap::new(),
-            caller_client_id: Some(Uuid::new_v4()),
+            caller_client_id: Some(crate::ids::new_uuid()),
             cancellation: bmux_plugin_sdk::CancellationToken::default(),
             host_kernel_bridge: None,
         }
@@ -325,8 +324,8 @@ mod tests {
             *origin.lock().unwrap() = StreamProvenance::Invalid;
             assert!(authorize_route(&ctx).is_err());
             *origin.lock().unwrap() = StreamProvenance::Admitted {
-                subject_id: Uuid::new_v4(),
-                lease_id: Uuid::new_v4(),
+                subject_id: crate::ids::new_uuid(),
+                lease_id: crate::ids::new_uuid(),
             };
             assert!(authorize_route(&ctx).is_err());
             *origin.lock().unwrap() = StreamProvenance::HostInternal;
@@ -341,7 +340,7 @@ mod tests {
             assert!(authorize_route(&ctx).is_err());
             ctx.request.caller_plugin_id = "bmux.cluster".into();
             assert!(authorize_route(&ctx).is_ok());
-            ctx.caller_client_id = Some(Uuid::new_v4());
+            ctx.caller_client_id = Some(crate::ids::new_uuid());
             assert!(authorize_route(&ctx).is_err());
             ctx.caller_client_id = None;
             *origin.lock().unwrap() = StreamProvenance::Invalid;
@@ -376,9 +375,9 @@ mod tests {
         );
         ctx.caller_client_id = None;
         let execution = ExecutionRef {
-            session_id: Uuid::new_v4(),
-            pane_id: Uuid::new_v4(),
-            execution_token: Uuid::new_v4(),
+            session_id: crate::ids::new_uuid(),
+            pane_id: crate::ids::new_uuid(),
+            execution_token: crate::ids::new_uuid(),
         };
         // No optional domain plugins: baseline local execution still works.
         let authority = input_authority(&ctx, &execution).unwrap();
@@ -397,8 +396,8 @@ mod tests {
         assert!(authority.write(&mut output, b"cancelled").is_err());
         assert_eq!(output, b"local");
         *origin.lock().unwrap() = StreamProvenance::Admitted {
-            subject_id: Uuid::new_v4(),
-            lease_id: Uuid::new_v4(),
+            subject_id: crate::ids::new_uuid(),
+            lease_id: crate::ids::new_uuid(),
         };
         let remote = context("pane-runtime-execution-v4", "send", Vec::new());
         assert!(input_authority(&remote, &execution).is_err());
@@ -419,7 +418,7 @@ mod tests {
             cancellation.clone(),
         );
         ctx.caller_client_id = None;
-        let session = bmux_session_models::SessionId(Uuid::new_v4());
+        let session = bmux_session_models::SessionId(crate::ids::new_uuid());
         let command = with_local(host, ctx.clone(), || {
             local_command(host, b"queued".to_vec(), session)
         });
@@ -448,7 +447,7 @@ mod tests {
         TEST_ORIGIN.with(|current| *current.borrow_mut() = origin);
         let mut ctx = context("attach-runtime-commands", "attach-input", Vec::new());
         ctx.caller_client_id = None;
-        let session = bmux_session_models::SessionId(Uuid::new_v4());
+        let session = bmux_session_models::SessionId(crate::ids::new_uuid());
         let manager = Arc::new(Mutex::new(()));
         let (sender, receiver) = switchy_thread::sync::mpsc::sync_channel(1);
         let writer_manager = manager.clone();
@@ -489,8 +488,8 @@ mod tests {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
         let origin = Arc::new(Mutex::new(StreamProvenance::Admitted {
-            subject_id: Uuid::new_v4(),
-            lease_id: Uuid::new_v4(),
+            subject_id: crate::ids::new_uuid(),
+            lease_id: crate::ids::new_uuid(),
         }));
         TEST_ORIGIN.with(|current| *current.borrow_mut() = Arc::clone(&origin));
         for (interface, operation) in [
@@ -504,9 +503,9 @@ mod tests {
             assert_eq!(response.error.unwrap().code, "authorization_denied");
         }
         let execution = ExecutionRef {
-            session_id: Uuid::new_v4(),
-            pane_id: Uuid::new_v4(),
-            execution_token: Uuid::new_v4(),
+            session_id: crate::ids::new_uuid(),
+            pane_id: crate::ids::new_uuid(),
+            execution_token: crate::ids::new_uuid(),
         };
         let ctx = context("pane-runtime-execution-v4", "send", Vec::new());
         for action in [
@@ -555,8 +554,12 @@ mod tests {
         // No clients, connections, permissions, or other domain services exist.
         assert!(ctx.enabled_plugins.is_empty() && ctx.services.is_empty());
         assert!(
-            super::super::spawn::authorize_session(&ctx, Uuid::new_v4(), "pane.direct_input")
-                .is_ok()
+            super::super::spawn::authorize_session(
+                &ctx,
+                crate::ids::new_uuid(),
+                "pane.direct_input"
+            )
+            .is_ok()
         );
         let response = super::super::route(
             host,

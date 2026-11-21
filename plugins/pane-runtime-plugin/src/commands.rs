@@ -794,9 +794,9 @@ fn atomic_replace(path: &Path, contents: &[u8]) -> Result<(), PluginCommandError
     #[cfg(test)]
     let temporary = TEST_ATOMIC_TEMP_PATH
         .with(|slot| slot.borrow_mut().take())
-        .unwrap_or_else(|| parent.join(format!(".bmux.toml.{}.tmp", Uuid::new_v4())));
+        .unwrap_or_else(|| parent.join(format!(".bmux.toml.{}.tmp", crate::ids::new_uuid())));
     #[cfg(not(test))]
-    let temporary = parent.join(format!(".bmux.toml.{}.tmp", Uuid::new_v4()));
+    let temporary = parent.join(format!(".bmux.toml.{}.tmp", crate::ids::new_uuid()));
     let result = (|| {
         let mut file = OpenOptions::new()
             .create_new(true)
@@ -1270,8 +1270,8 @@ mod tests {
     #[test]
     fn attach_outcome_records_status_without_cli_output_path() {
         let state = PanePaddingState {
-            session_id: Uuid::new_v4(),
-            pane_id: Uuid::new_v4(),
+            session_id: crate::ids::new_uuid(),
+            pane_id: crate::ids::new_uuid(),
             declarative: bmux_pane_runtime_plugin_api::pane_runtime_state::PanePaddingSpec {
                 left: 0,
                 right: 0,
@@ -1356,10 +1356,10 @@ mod tests {
 
     #[test]
     fn preview_feedback_reports_mixed_constraint_and_clamp_counts() {
-        let session_id = Uuid::new_v4();
+        let session_id = crate::ids::new_uuid();
         let first = crate::padding_api::RuntimePanePaddingState {
             session_id,
-            pane_id: Uuid::new_v4(),
+            pane_id: crate::ids::new_uuid(),
             declarative: PanePaddingSpec::default(),
             matched_rule_index: None,
             runtime_override: None,
@@ -1385,7 +1385,7 @@ mod tests {
             persist_runtime_overrides: true,
         };
         let second = crate::padding_api::RuntimePanePaddingState {
-            pane_id: Uuid::new_v4(),
+            pane_id: crate::ids::new_uuid(),
             effective: PanePaddingSpec {
                 left: 20,
                 ..PanePaddingSpec::default()
@@ -1422,7 +1422,7 @@ mod tests {
     #[tokio::test]
     async fn dropped_preview_guard_cancels_through_the_captured_route() {
         let (route, mut requests) = test_route();
-        let token = Uuid::new_v4();
+        let token = crate::ids::new_uuid();
 
         drop(PreviewCancelGuard::new(route, token));
 
@@ -1439,7 +1439,7 @@ mod tests {
     #[tokio::test]
     async fn disarmed_preview_guard_sends_nothing() {
         let (route, mut requests) = test_route();
-        let mut guard = PreviewCancelGuard::new(route, Uuid::new_v4());
+        let mut guard = PreviewCancelGuard::new(route, crate::ids::new_uuid());
         guard.disarm();
         drop(guard);
         switchy_async::task::yield_now().await;
@@ -1701,8 +1701,8 @@ enabled = true
     #[test]
     fn status_text_reports_effective_edges_limits_and_alignment() {
         let state = PanePaddingState {
-            session_id: Uuid::new_v4(),
-            pane_id: Uuid::new_v4(),
+            session_id: crate::ids::new_uuid(),
+            pane_id: crate::ids::new_uuid(),
             declarative: bmux_pane_runtime_plugin_api::pane_runtime_state::PanePaddingSpec {
                 left: 0,
                 right: 0,
@@ -1806,7 +1806,7 @@ enabled = true
 
     #[test]
     fn session_selector_normalizes_uuid_name_and_rejects_blank() {
-        let id = Uuid::new_v4();
+        let id = crate::ids::new_uuid();
         let by_id = session_selector(&[format!("--session={id}")])
             .unwrap()
             .expect("UUID selector");
@@ -1823,7 +1823,7 @@ enabled = true
 
     #[test]
     fn target_and_numeric_arguments_are_normalized_and_validated() {
-        let pane_id = Uuid::new_v4();
+        let pane_id = crate::ids::new_uuid();
         assert_eq!(
             target_pane(&[format!("--pane-id={pane_id}")]).unwrap(),
             Some(pane_id)

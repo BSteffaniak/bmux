@@ -32,6 +32,7 @@ mod atomic_state;
 mod capture_handshake;
 mod commands;
 mod handlers;
+mod ids;
 pub mod observation;
 mod padding;
 mod padding_api;

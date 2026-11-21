@@ -256,7 +256,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         assert!(
             session
-                .commit_record(root.path(), uuid::Uuid::new_v4())
+                .commit_record(root.path(), crate::ids::new_uuid())
                 .unwrap()
                 .is_none()
         );

@@ -127,7 +127,7 @@ fn preparation_on(
     if state.preparations.len() >= MAX_PREPARATIONS {
         return Err("managed preparation capacity exhausted before effects".into());
     }
-    let id = uuid::Uuid::new_v4();
+    let id = crate::ids::new_uuid();
     state.preparations.insert(
         id,
         Preparation {
@@ -375,8 +375,8 @@ mod tests {
     #[test]
     fn connection_preparation_blocks_shutdown_renewal_is_owner_scoped_and_expiry_resets_grace() {
         let now = Instant::now();
-        let instance = uuid::Uuid::new_v4();
-        let owner = uuid::Uuid::new_v4();
+        let instance = crate::ids::new_uuid();
+        let owner = crate::ids::new_uuid();
         let mut state = State {
             policy: Some(900),
             ..State::default()
@@ -389,7 +389,7 @@ mod tests {
             preparation_on(
                 &mut state,
                 instance,
-                uuid::Uuid::new_v4(),
+                crate::ids::new_uuid(),
                 Some(lease.lease_id),
                 false,
                 now
@@ -400,7 +400,7 @@ mod tests {
             preparation_on(
                 &mut state,
                 instance,
-                uuid::Uuid::new_v4(),
+                crate::ids::new_uuid(),
                 Some(lease.lease_id),
                 true,
                 now
@@ -454,8 +454,8 @@ mod tests {
     #[test]
     fn preparation_capacity_and_release_are_bounded_without_keeping_a_daemon_alive() {
         let now = Instant::now();
-        let instance = uuid::Uuid::new_v4();
-        let owner = uuid::Uuid::new_v4();
+        let instance = crate::ids::new_uuid();
+        let owner = crate::ids::new_uuid();
         let mut state = State::default();
         let mut leases = Vec::new();
         for _ in 0..MAX_PREPARATIONS {

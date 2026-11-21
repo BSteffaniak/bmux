@@ -594,7 +594,6 @@ mod tests {
     };
     use bmux_plugin_sdk::StatefulPluginSnapshot;
     use std::collections::BTreeMap;
-    use uuid::Uuid;
 
     #[test]
     fn managed_snapshot_restore_requires_exact_owner_not_legacy_or_foreign_work() {
@@ -607,8 +606,8 @@ mod tests {
 
     #[test]
     fn version_one_snapshot_migrates_to_generic_viewport_fields() {
-        let session_id = Uuid::new_v4();
-        let pane_id = Uuid::new_v4();
+        let session_id = crate::ids::new_uuid();
+        let pane_id = crate::ids::new_uuid();
         let legacy_viewport = serde_json::json!({
             "cols": 120,
             "rows": 40,
@@ -690,12 +689,12 @@ mod tests {
 
     #[test]
     fn schema_round_trips_through_json() {
-        let session_id = Uuid::new_v4();
-        let pane_id = Uuid::new_v4();
-        let surface_id = Uuid::new_v4();
-        let anchor_pane_id = Uuid::new_v4();
-        let context_id = Uuid::new_v4();
-        let client_id = Uuid::new_v4();
+        let session_id = crate::ids::new_uuid();
+        let pane_id = crate::ids::new_uuid();
+        let surface_id = crate::ids::new_uuid();
+        let anchor_pane_id = crate::ids::new_uuid();
+        let context_id = crate::ids::new_uuid();
+        let client_id = crate::ids::new_uuid();
         let snap = PaneRuntimeSnapshotV1 {
             managed_target_identity: None,
             sessions: vec![PaneRuntimeSessionSnapshotV1 {
@@ -767,8 +766,8 @@ mod tests {
     /// live in the sessions-plugin section).
     #[test]
     fn schema_round_trips_launch_command_fields() {
-        let session_id = Uuid::new_v4();
-        let pane_id = Uuid::new_v4();
+        let session_id = crate::ids::new_uuid();
+        let pane_id = crate::ids::new_uuid();
         let launch = PaneLaunchCommand {
             program: "ssh".to_string(),
             args: vec!["host-a".to_string(), "-p".to_string(), "2222".to_string()],
@@ -834,8 +833,8 @@ mod tests {
     /// = None` must round-trip cleanly through JSON without rejection.
     #[test]
     fn schema_permits_command_source_without_command() {
-        let session_id = Uuid::new_v4();
-        let pane_id = Uuid::new_v4();
+        let session_id = crate::ids::new_uuid();
+        let pane_id = crate::ids::new_uuid();
         let snap = PaneRuntimeSnapshotV1 {
             managed_target_identity: None,
             sessions: vec![PaneRuntimeSessionSnapshotV1 {
@@ -877,8 +876,8 @@ mod tests {
     /// whole pane-runtime section.
     #[test]
     fn schema_decodes_legacy_payload_without_zoomed_pane_id() {
-        let session_id = Uuid::new_v4();
-        let pane_id = Uuid::new_v4();
+        let session_id = crate::ids::new_uuid();
+        let pane_id = crate::ids::new_uuid();
         let legacy = serde_json::json!({
             "sessions": [{
                 "session_id": session_id,
@@ -905,9 +904,9 @@ mod tests {
     fn nonresumable_restore_rejects_before_any_argv_launch() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let pane_id = Uuid::new_v4();
+        let pane_id = crate::ids::new_uuid();
         let payload: super::PaneRuntimeSnapshotV1 = serde_json::from_value(serde_json::json!({
-            "sessions": [{ "session_id": Uuid::new_v4(), "panes": [{
+            "sessions": [{ "session_id": crate::ids::new_uuid(), "panes": [{
                 "id": pane_id, "shell": "/bin/sh", "resume_policy": "nonresumable",
                 "launch_command": { "program": "/usr/bin/touch", "args": ["must-not-replay"] }
             }]}]
@@ -921,7 +920,7 @@ mod tests {
 
     #[test]
     fn schema_omits_absent_padding_override_and_decodes_it_as_none() {
-        let pane_id = Uuid::new_v4();
+        let pane_id = crate::ids::new_uuid();
         let pane = PaneRuntimeSnapshotV1Pane {
             resume_policy: super::ExecutionResumePolicy::Resumable,
             execution_token: None,

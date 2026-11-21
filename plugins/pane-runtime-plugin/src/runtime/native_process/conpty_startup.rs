@@ -198,7 +198,7 @@ mod tests {
         let (sent, replies) = mpsc::sync_channel(1);
         let writer: Writer = Arc::new(Mutex::new(Box::new(ReplyWriter(sent))));
         let raw = Box::new(WaitingReader { phase: 0, replies });
-        let mut reader = BootstrapReader::new(raw, writer, uuid::Uuid::new_v4());
+        let mut reader = BootstrapReader::new(raw, writer, crate::ids::new_uuid());
         let mut captured = Vec::new();
         let mut buffer = [0; 8192];
         loop {

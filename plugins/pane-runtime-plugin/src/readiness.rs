@@ -125,7 +125,7 @@ pub(crate) fn activate(host: &crate::runtime::PaneRuntimeHost, context: &NativeL
         error.get_or_insert(reason);
     }
     let state = Mutex::new(RuntimeReadiness {
-        instance: uuid::Uuid::new_v4(),
+        instance: crate::ids::new_uuid(),
         process_id: std::process::id(),
         executable_sha256,
         managed_target_identity,
@@ -370,7 +370,7 @@ mod tests {
     #[test]
     fn exact_fence_is_repeatable_and_never_fences_healthy_or_unknown_authority() {
         let mut state = RuntimeReadiness {
-            instance: uuid::Uuid::new_v4(),
+            instance: crate::ids::new_uuid(),
             process_id: 42,
             executable_sha256: Some("a".repeat(64)),
             managed_target_identity: None,
@@ -384,7 +384,7 @@ mod tests {
             fenced: false,
         };
         let instance = state.instance;
-        assert!(apply_fence(&mut state, uuid::Uuid::new_v4(), None).is_err());
+        assert!(apply_fence(&mut state, crate::ids::new_uuid(), None).is_err());
         assert!(!state.fenced);
         assert!(apply_fence(&mut state, instance, Some("retained execution".into())).is_err());
         assert!(!state.fenced);

@@ -765,10 +765,10 @@ pub(crate) fn create(
 ) -> Result<ExecutionRef, ExecutionError> {
     let authorize = Arc::new(authorize);
     // Authorization precedes observing the durable store/runtime installation.
-    authorize(uuid::Uuid::new_v4()).map_err(|error| ExecutionError::Denied {
+    authorize(crate::ids::new_uuid()).map_err(|error| ExecutionError::Denied {
         reason: error.to_string(),
     })?;
-    let reservation = super::reservations::reserve(host, uuid::Uuid::new_v4(), options, |id| {
+    let reservation = super::reservations::reserve(host, crate::ids::new_uuid(), options, |id| {
         authorize(id).map_err(|error| {
             bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalRecoveryError::Denied {
                 reason: error.to_string(),
@@ -1656,9 +1656,9 @@ mod tests {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
         let execution = super::ExecutionRef {
-            session_id: uuid::Uuid::new_v4(),
-            pane_id: uuid::Uuid::new_v4(),
-            execution_token: uuid::Uuid::new_v4(),
+            session_id: crate::ids::new_uuid(),
+            pane_id: crate::ids::new_uuid(),
+            execution_token: crate::ids::new_uuid(),
         };
         assert!(matches!(
             super::resize_alternate(host, &execution, 0, 80, 24, || {
@@ -1757,9 +1757,9 @@ mod tests {
 
     fn presentation_state() -> (super::ExecutionScreen, super::ExecutionStatus) {
         let reference = super::ExecutionRef {
-            session_id: uuid::Uuid::new_v4(),
-            pane_id: uuid::Uuid::new_v4(),
-            execution_token: uuid::Uuid::new_v4(),
+            session_id: crate::ids::new_uuid(),
+            pane_id: crate::ids::new_uuid(),
+            execution_token: crate::ids::new_uuid(),
         };
         let screen = super::ExecutionScreen {
             execution: reference.clone(),
@@ -2114,13 +2114,13 @@ mod tests {
     #[test]
     fn replaced_execution_never_accepts_old_reference() {
         let reference = ExecutionRef {
-            session_id: uuid::Uuid::new_v4(),
-            pane_id: uuid::Uuid::new_v4(),
-            execution_token: uuid::Uuid::new_v4(),
+            session_id: crate::ids::new_uuid(),
+            pane_id: crate::ids::new_uuid(),
+            execution_token: crate::ids::new_uuid(),
         };
         assert!(validate_token(reference.execution_token, &reference).is_ok());
         assert_eq!(
-            validate_token(uuid::Uuid::new_v4(), &reference),
+            validate_token(crate::ids::new_uuid(), &reference),
             Err(ExecutionError::StaleExecution)
         );
     }

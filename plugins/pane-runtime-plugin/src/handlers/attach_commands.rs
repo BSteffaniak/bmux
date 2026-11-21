@@ -1250,9 +1250,9 @@ mod selection_tests {
 
     #[test]
     fn observer_cleanup_requires_disconnect_not_detach_and_missing_provider_retains_fence() {
-        let live_detached = ClientId(Uuid::new_v4());
-        let retired = ClientId(Uuid::new_v4());
-        let session = SessionId(Uuid::new_v4());
+        let live_detached = ClientId(crate::ids::new_uuid());
+        let retired = ClientId(crate::ids::new_uuid());
+        let session = SessionId(crate::ids::new_uuid());
         let mut identities = ObserverIdentities::default();
         identities
             .clients
@@ -1272,19 +1272,19 @@ mod selection_tests {
 
     #[test]
     fn observer_teardown_reclaims_capacity_and_expiry_only_removes_pending_grant() {
-        let live = ClientId(Uuid::new_v4());
-        let session = SessionId(Uuid::new_v4());
+        let live = ClientId(crate::ids::new_uuid());
+        let session = SessionId(crate::ids::new_uuid());
         let mut identities = ObserverIdentities::default();
-        let live_token = Uuid::new_v4();
+        let live_token = crate::ids::new_uuid();
         identities.clients.insert(live, (live_token, session));
         identities.pending_expiry.insert(live, 100);
         let follow = ConnectionFixture(live);
         // More than the admission cap over time must not exhaust the registry.
         for _ in 0..5000 {
-            let retired = ClientId(Uuid::new_v4());
+            let retired = ClientId(crate::ids::new_uuid());
             identities
                 .clients
-                .insert(retired, (Uuid::new_v4(), session));
+                .insert(retired, (crate::ids::new_uuid(), session));
             identities.pending_expiry.insert(retired, 100);
             identities.reclaim_disconnected(Some(&follow));
             assert_eq!(identities.clients.len(), 1);
@@ -1307,16 +1307,16 @@ mod selection_tests {
 
     #[test]
     fn observer_grant_preserves_owner_session_expiry_and_single_use() {
-        let owner = ClientId(Uuid::new_v4());
-        let other = ClientId(Uuid::new_v4());
-        let session = SessionId(Uuid::new_v4());
-        let token = Uuid::new_v4();
+        let owner = ClientId(crate::ids::new_uuid());
+        let other = ClientId(crate::ids::new_uuid());
+        let session = SessionId(crate::ids::new_uuid());
+        let token = crate::ids::new_uuid();
         let mut identities = ObserverIdentities::default();
         identities.clients.insert(owner, (token, session));
         for (client, request_token, request_session) in [
             (other, token, session),
-            (owner, Uuid::new_v4(), session),
-            (owner, token, SessionId(Uuid::new_v4())),
+            (owner, crate::ids::new_uuid(), session),
+            (owner, token, SessionId(crate::ids::new_uuid())),
         ] {
             assert!(matches!(
                 identities.consume_grant(client, request_token, request_session, || panic!(
@@ -1355,9 +1355,9 @@ mod selection_tests {
     fn observer_route_fence_is_absorbing_and_owner_specific() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let observer = ClientId(Uuid::new_v4());
-        let ordinary = ClientId(Uuid::new_v4());
-        mark_test_observer(host, observer, SessionId(Uuid::new_v4()));
+        let observer = ClientId(crate::ids::new_uuid());
+        let ordinary = ClientId(crate::ids::new_uuid());
+        mark_test_observer(host, observer, SessionId(crate::ids::new_uuid()));
         for (interface, operation) in [
             ("attach-runtime-commands", "attach-input"),
             ("attach-runtime-commands", "attach-set-viewport"),
@@ -1444,8 +1444,8 @@ mod selection_tests {
             cancellation: bmux_plugin_sdk::CancellationToken::default(),
             host_kernel_bridge: None,
         };
-        let session = SessionId(Uuid::new_v4());
-        let client = ClientId(Uuid::new_v4());
+        let session = SessionId(crate::ids::new_uuid());
+        let client = ClientId(crate::ids::new_uuid());
         assert!(session_write_allowed(host, &context, session, client).unwrap());
         context.enabled_plugins.push("bmux.permissions".into());
         assert!(session_write_allowed(host, &context, session, client).is_err());

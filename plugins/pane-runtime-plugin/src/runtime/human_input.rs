@@ -77,7 +77,7 @@ impl Registry {
             });
         }
         let stream_id = loop {
-            let candidate = Uuid::new_v4();
+            let candidate = crate::ids::new_uuid();
             if !streams.contains_key(&candidate) {
                 break candidate;
             }
@@ -314,9 +314,9 @@ mod tests {
 
     fn execution() -> TerminalExecutionRef {
         TerminalExecutionRef {
-            session_id: Uuid::new_v4(),
-            pane_id: Uuid::new_v4(),
-            execution_token: Uuid::new_v4(),
+            session_id: crate::ids::new_uuid(),
+            pane_id: crate::ids::new_uuid(),
+            execution_token: crate::ids::new_uuid(),
         }
     }
 
@@ -465,7 +465,7 @@ mod tests {
         let registry = Registry::default();
         let stream = registry.open(execution()).unwrap();
         let mut wrong = stream.clone();
-        wrong.execution.execution_token = Uuid::new_v4();
+        wrong.execution.execution_token = crate::ids::new_uuid();
         assert!(matches!(
             registry.push_with(&wrong, 1, vec![1], unexpected_write),
             Err(HumanInputError::Conflict { .. })

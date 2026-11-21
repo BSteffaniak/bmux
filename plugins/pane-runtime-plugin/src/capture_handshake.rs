@@ -119,8 +119,8 @@ mod tests {
     fn fragmented_owning_pty_request_returns_typed_nonce_ack_after_barrier() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let nonce = Uuid::new_v4();
-        let pane = Uuid::new_v4();
+        let nonce = crate::ids::new_uuid();
+        let pane = crate::ids::new_uuid();
         let request = format!("\x1b]633;bmux-input-capture-v1;{nonce}\x07");
         let mut parser = CaptureHandshake::default();
         let mut output = Vec::new();
@@ -149,7 +149,7 @@ mod tests {
     fn unknown_and_oversized_requests_preserve_output_without_suppression() {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
-        let pane = Uuid::new_v4();
+        let pane = crate::ids::new_uuid();
         for bytes in [
             b"ordinary\x1b[31mtext".to_vec(),
             format!("\x1b]633;bmux-input-capture-v1;{}\x07", "x".repeat(200)).into_bytes(),

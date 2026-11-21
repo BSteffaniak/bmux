@@ -157,7 +157,7 @@ mod tests {
             root.to_str().unwrap()
         );
         assert!(matches!(
-            validate_home_directory(Some(root.join(Uuid::new_v4().to_string()))),
+            validate_home_directory(Some(root.join(crate::ids::new_uuid().to_string()))),
             Err(SpawnError::InvalidDirectory { .. })
         ));
     }
@@ -192,11 +192,11 @@ mod tests {
     #[test]
     fn local_fallback_only_applies_to_missing_permissions() {
         use bmux_plugin::StreamOrigin as StreamProvenance;
-        let caller = Uuid::new_v4();
+        let caller = crate::ids::new_uuid();
         let local = StreamProvenance::Local;
         let remote = StreamProvenance::Admitted {
-            subject_id: Uuid::new_v4(),
-            lease_id: Uuid::new_v4(),
+            subject_id: crate::ids::new_uuid(),
+            lease_id: crate::ids::new_uuid(),
         };
         assert_eq!(check_read_identity(false, None, &local), Ok(None));
         assert_eq!(check_read_identity(false, Some(caller), &local), Ok(None));

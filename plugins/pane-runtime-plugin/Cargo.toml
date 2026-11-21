@@ -52,6 +52,7 @@ switchy_async = { workspace = true, features = [
     "time",
     "tokio",
 ] }
+switchy_simulation = { workspace = true, optional = true }
 switchy_thread = { workspace = true, features = ["std"] }
 switchy_time = { workspace = true, features = ["std"] }
 tempfile = { workspace = true }
@@ -72,9 +73,11 @@ uuid = { workspace = true, features = ["serde", "std"] }
 [features]
 # Package this crate as a dynamic library for one component. Only the
 # plugin packager enables these, together with `--cfg bmux_plugin_dylib`.
-default = []
-dynamic-backend = []
+default          = []
+dynamic-backend  = []
 dynamic-frontend = []
+# Run on simulated terminals, processes, threads, time and identifiers, for deterministic
+# simulation (never enabled in the main workspace; see simulation/).
 fail-on-warnings = [
     "bmux_attach_layout_protocol/fail-on-warnings",
     "bmux_clients_plugin_api/fail-on-warnings",
@@ -109,6 +112,13 @@ image-registry = [
     "bmux_image/sixel",
     "bmux_image/kitty",
     "bmux_image/iterm2",
+]
+simulator = [
+    "bmux_pty/simulator",
+    "dep:switchy_simulation",
+    "switchy_async/thread-simulator",
+    "switchy_thread/simulator",
+    "switchy_time/simulator",
 ]
 
 [target.'cfg(unix)'.dependencies]
