@@ -48,7 +48,7 @@ const CHUNK: usize = 16 * 1024;
 /// [`PtyCommand::drain_grace`] says otherwise.
 pub const DEFAULT_DRAIN_GRACE: Duration = Duration::from_millis(250);
 /// How often blocked reads and writes look up whether they should stop.
-#[cfg(unix)]
+#[cfg(any(unix, feature = "simulator"))]
 const POLL: Duration = Duration::from_millis(10);
 
 /// How a process ended.
@@ -87,7 +87,7 @@ impl PtyExit {
         self.complete
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, feature = "simulator"))]
     fn from_child_exit(exit: &ChildExit) -> Self {
         Self {
             code: if exit.signal_number().is_some() {
@@ -100,7 +100,7 @@ impl PtyExit {
         }
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, feature = "simulator")))]
     fn from_status(status: std::process::ExitStatus) -> Self {
         #[cfg(unix)]
         let signal = std::os::unix::process::ExitStatusExt::signal(&status);
@@ -251,7 +251,7 @@ impl PtyCommand {
 
     /// The process to start on a terminal: the caller's environment with this command's
     /// changes, and `TERM` unless set.
-    #[cfg(unix)]
+    #[cfg(any(unix, feature = "simulator"))]
     fn spawn_command(&self) -> SpawnCommand {
         let mut command = SpawnCommand::new(&self.program);
         command.args(&self.args);
@@ -271,7 +271,7 @@ impl PtyCommand {
     }
 
     // native-only: begin.
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, feature = "simulator")))]
     fn std_command(&self) -> std::process::Command {
         let mut command = std::process::Command::new(&self.program);
         command.args(&self.args);
@@ -546,7 +546,7 @@ impl PtyWriter {
 
 /// Write `input` to the child's standard input on its own thread (so a full pipe cannot
 /// block the caller), then close it.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, feature = "simulator")))]
 fn feed_input(child: &mut std::process::Child, input: Option<&Vec<u8>>) {
     if let (Some(input), Some(mut pipe)) = (input, child.stdin.take()) {
         let input = input.clone();
@@ -609,7 +609,7 @@ impl Events {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, feature = "simulator"))]
 mod platform {
     use std::io;
 
@@ -879,7 +879,7 @@ mod platform {
 // std threads and channels directly.
 
 /// Plain pipes standing in for a terminal: output is streamed, nothing more.
-#[cfg(not(unix))]
+#[cfg(not(any(unix, feature = "simulator")))]
 mod pipes {
     use std::io;
     use std::process::Stdio;
@@ -1020,13 +1020,13 @@ mod pipes {
     }
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(feature = "simulator")))]
 mod conpty;
 
 /// Where pseudo-terminals are not available, processes run on pipes; on Windows, on `ConPTY`
 /// unless standard output is captured or input is fed (a console cannot redirect only some of
 /// its streams).
-#[cfg(not(unix))]
+#[cfg(not(any(unix, feature = "simulator")))]
 mod platform {
     use std::io;
 
