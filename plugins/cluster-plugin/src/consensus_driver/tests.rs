@@ -301,3 +301,103 @@ async fn restarted_node_recovers_its_durable_state_and_rejoins() {
     }
     panic!("restarted follower did not catch up");
 }
+
+struct Unreachable;
+
+impl Transport for Unreachable {
+    fn call(&self, _: NodeId, _: Message) -> Reply {
+        Box::pin(async { None })
+    }
+
+    fn send_snapshot(&self, _: NodeId, _: Term, _: u64) -> Reply {
+        Box::pin(async { None })
+    }
+}
+
+fn start_owned(
+    path: &std::path::Path,
+    local: NodeId,
+) -> Driver<crate::control_state::ControlState> {
+    let mut store = crate::owned_vote_store::OwnedVoteStore::open(path, "owned-driver").unwrap();
+    let recovered = store.recovered().unwrap();
+    let (engine, effects) = Engine::recover(local, Config::default(), recovered).unwrap();
+    let storage = crate::owned_vote_store::OwnedStorage::new(
+        store,
+        Box::new(|_, _| Err(io::Error::other("no staged snapshots in this test"))),
+    );
+    Driver::start(
+        engine,
+        effects,
+        storage,
+        Arc::new(Unreachable),
+        Box::new(|min, _| min),
+        DriverConfig::default(),
+    )
+}
+
+async fn wait_leader<V: Send + Unpin + 'static>(driver: &Driver<V>, local: NodeId) {
+    for _ in 0..200 {
+        let status = driver.status();
+        if status.leader == Some(local) && status.commit.is_some_and(|c| c.term == status.term) {
+            return;
+        }
+        switchy_async::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("single voter did not become leader");
+}
+
+#[switchy_async::test]
+async fn owned_store_applies_reads_recovers_and_deduplicates() {
+    use bmux_cluster_plugin_api::cluster_types::{
+        CommandId, ControlCommand, ControlCommandRequest, WorkspaceId,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("owned.redb");
+    let local = node(1);
+    let membership = Membership::new(vec![vec![local]], vec![(local, String::new())]).unwrap();
+    crate::owned_vote_store::OwnedVoteStore::bootstrap(&path, "owned-driver", local, membership)
+        .unwrap()
+        .close()
+        .unwrap();
+    let workspace = uuid::Uuid::from_u128(7);
+    let command = crate::control_codec::encode_control_command(&ControlCommand {
+        schema_version: 1,
+        principal_id: "principal:test".into(),
+        command_id: CommandId {
+            value: uuid::Uuid::from_u128(9),
+        },
+        issued_at_unix_ms: 1,
+        request: ControlCommandRequest::CreateWorkspace {
+            workspace_id: WorkspaceId { value: workspace },
+            name: Some("driven".into()),
+        },
+    });
+
+    let driver = start_owned(&path, local);
+    wait_leader(&driver, local).await;
+    let first = driver.propose(command.clone()).await.unwrap();
+    assert!(
+        driver
+            .read()
+            .await
+            .unwrap()
+            .workspaces
+            .contains_key(&workspace)
+    );
+    driver.shutdown().await;
+
+    // Durable state survives restart, and retrying the same command id
+    // returns the original outcome instead of applying it twice.
+    let driver = start_owned(&path, local);
+    wait_leader(&driver, local).await;
+    assert!(
+        driver
+            .read()
+            .await
+            .unwrap()
+            .workspaces
+            .contains_key(&workspace)
+    );
+    assert_eq!(driver.propose(command).await.unwrap(), first);
+    driver.shutdown().await;
+}

@@ -26,9 +26,10 @@ mod tests;
 const INBOX_CAPACITY: usize = 256;
 
 /// Durable authority, driven in issue order by one worker. Implementations block.
-pub trait Storage: Send + 'static {
+/// It moves in and out of blocking work, which the simulator requires to be `Unpin`.
+pub trait Storage: Send + Unpin + 'static {
     /// The applied state a linearizable read observes.
-    type View: Send + 'static;
+    type View: Send + Unpin + 'static;
 
     /// # Errors
     /// Any failure stops the engine; durability is then uncertain.
@@ -153,7 +154,7 @@ impl Default for DriverConfig {
     }
 }
 
-impl<V: Send + 'static> Driver<V> {
+impl<V: Send + Unpin + 'static> Driver<V> {
     /// Start a node from its recovered engine and the effects recovery produced.
     pub fn start<S, T>(
         engine: Engine,

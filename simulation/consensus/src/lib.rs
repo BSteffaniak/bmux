@@ -31,6 +31,9 @@ pub struct Bounds {
     pub crashes: u8,
     pub drops: u8,
     pub duplicates: u8,
+    /// Heartbeats advance per-peer sequence numbers, so they need a budget for
+    /// the reachable state space to be finite.
+    pub heartbeats: u8,
     pub max_messages: usize,
     /// Promote every learner to a voter once (joint consensus).
     pub membership_change: bool,
@@ -49,7 +52,25 @@ impl Bounds {
             crashes: 1,
             drops: 1,
             duplicates: 0,
+            heartbeats: 2,
             max_messages: 4,
+            membership_change: false,
+        }
+    }
+
+    /// Fault-free elections and replication, small enough to finish quickly.
+    #[must_use]
+    pub const fn exhaustive_fault_free() -> Self {
+        Self {
+            voters: 3,
+            learners: 0,
+            max_term: 2,
+            proposals: 1,
+            crashes: 0,
+            drops: 0,
+            duplicates: 0,
+            heartbeats: 1,
+            max_messages: 3,
             membership_change: false,
         }
     }
@@ -65,6 +86,7 @@ impl Bounds {
             crashes: 3,
             drops: 6,
             duplicates: 3,
+            heartbeats: u8::MAX,
             max_messages: 12,
             membership_change: true,
         }
@@ -104,6 +126,7 @@ pub struct State {
     crashes: u8,
     drops: u8,
     duplicates: u8,
+    heartbeats: u8,
     changed: bool,
     /// Ghost history: every (term, leader) and committed entry ever observed.
     leaders: BTreeMap<Term, BTreeSet<usize>>,
@@ -417,6 +440,7 @@ impl Model for Raft {
             crashes: 0,
             drops: 0,
             duplicates: 0,
+            heartbeats: 0,
             changed: false,
             leaders: BTreeMap::new(),
             committed: BTreeMap::new(),
@@ -461,7 +485,9 @@ impl Model for Raft {
                 actions.push(Action::Persist(index));
             }
             if node.engine.is_leader() {
-                actions.push(Action::Heartbeat(index));
+                if state.heartbeats < self.bounds.heartbeats {
+                    actions.push(Action::Heartbeat(index));
+                }
                 if state.proposals < self.bounds.proposals {
                     actions.push(Action::Propose(index));
                 }
@@ -513,6 +539,7 @@ impl Model for Raft {
                 );
             }
             Action::Heartbeat(index) => {
+                next.heartbeats += 1;
                 let generation = next.nodes[index].heartbeat;
                 Self::step(
                     &mut next,

@@ -3657,6 +3657,94 @@ fn invalid(reason: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
 }
 
+/// Sealed snapshot bytes staged from a leader, found by sender and boundary.
+pub type StagedSnapshot = Box<dyn FnMut(NodeId, LogIdentity) -> io::Result<Vec<u8>> + Send>;
+
+/// The owned store as the consensus driver's durable authority.
+pub struct OwnedStorage {
+    store: OwnedVoteStore,
+    staged: StagedSnapshot,
+}
+
+impl OwnedStorage {
+    #[must_use]
+    pub fn new(store: OwnedVoteStore, staged: StagedSnapshot) -> Self {
+        Self { store, staged }
+    }
+}
+
+impl crate::consensus_driver::Storage for OwnedStorage {
+    type View = crate::control_state::ControlState;
+
+    fn write(&mut self, write: &crate::consensus_engine::Write) -> io::Result<()> {
+        self.store.write(write)
+    }
+
+    fn install_snapshot(
+        &mut self,
+        from: NodeId,
+        last_included: LogIdentity,
+        membership: &crate::consensus_model::StoredMembership,
+    ) -> io::Result<()> {
+        let bytes = (self.staged)(from, last_included)?;
+        let (descriptor, _) =
+            crate::consensus_storage::decode_owned_snapshot(&bytes).map_err(io::Error::other)?;
+        // The staged object must be exactly the snapshot the engine accepted.
+        if descriptor.last_included != Some(last_included)
+            || descriptor.membership.as_ref() != Some(membership)
+        {
+            return Err(invalid(
+                "staged snapshot does not match the accepted boundary",
+            ));
+        }
+        let expected = self.store.state;
+        self.store.install_snapshot(expected, &bytes)
+    }
+
+    fn apply(&mut self, through: LogIdentity) -> io::Result<Vec<(LogIdentity, Vec<u8>)>> {
+        let mut responses = Vec::new();
+        loop {
+            let batch = self.store.apply_committed_batch()?;
+            responses.extend(batch.outcomes.into_iter().filter_map(|outcome| {
+                outcome
+                    .response
+                    .map(|response| (outcome.identity, response))
+            }));
+            let reached = batch
+                .applied
+                .is_some_and(|applied| applied.index >= through.index);
+            if reached || !batch.more {
+                if !reached {
+                    return Err(invalid("application stopped before the durable commit"));
+                }
+                return Ok(responses);
+            }
+        }
+    }
+
+    fn compact(
+        &mut self,
+    ) -> io::Result<Option<(LogIdentity, crate::consensus_model::StoredMembership)>> {
+        let bytes = self.store.publish_snapshot()?;
+        let (descriptor, _) =
+            crate::consensus_storage::decode_owned_snapshot(&bytes).map_err(io::Error::other)?;
+        let (Some(boundary), Some(membership)) = (descriptor.last_included, descriptor.membership)
+        else {
+            return Ok(None);
+        };
+        self.store.compact_snapshot()?;
+        Ok(Some((boundary, membership)))
+    }
+
+    fn read(&mut self) -> io::Result<Self::View> {
+        self.store.read_control_state()
+    }
+
+    fn close(self) -> io::Result<()> {
+        self.store.close()
+    }
+}
+
 impl OwnedVoteStore {
     /// Explicit fresh initialization; an existing path is never truncated.
     /// # Errors

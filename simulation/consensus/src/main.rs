@@ -18,11 +18,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let mut failed = false;
     if flags.is_empty() {
-        let report = Checker::from_env().bfs_parallel(&Raft {
-            bounds: Bounds::exhaustive(),
-        });
-        println!("exhaustive search:\n{report}");
-        failed |= !report.is_success();
+        for (name, bounds) in [
+            ("fault-free", Bounds::exhaustive_fault_free()),
+            ("crash and loss", Bounds::exhaustive()),
+        ] {
+            let report = Checker::from_env().bfs_parallel(&Raft { bounds });
+            println!("exhaustive search ({name}):\n{report}");
+            failed |= !report.is_success();
+        }
     }
     let report = Checker::new()
         .walks(2_000)
