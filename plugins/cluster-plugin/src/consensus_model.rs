@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 /// Validated voting configuration. An uninitialized installation is represented
 /// outside this type, not as an empty configuration with a vacuous quorum.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Membership {
     voters: Vec<BTreeSet<NodeId>>,
     nodes: BTreeMap<NodeId, String>,
@@ -128,7 +128,7 @@ pub fn validate_position_prefix(
 ///
 /// Absence of the whole record denotes an uninitialized installation, not a voting configuration.
 /// A missing position is retained for legacy bootstrap representations.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StoredMembership {
     pub introduced_at: Option<LogIdentity>,
     pub membership: Membership,
@@ -313,7 +313,7 @@ pub fn plan_membership_successor(
 ///
 /// Format 1 checksums the envelope excluding its trailing checksum; `total_bytes`
 /// includes that checksum. These are storage semantics, not a peer protocol offer.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SnapshotDescriptor {
     pub format_version: u16,
     pub cluster_id: String,
@@ -337,7 +337,7 @@ impl SnapshotDescriptor {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Entry {
     pub identity: LogIdentity,
     pub payload: EntryPayload,
@@ -354,7 +354,7 @@ pub struct AppendRequest {
     pub leader_commit: Option<LogIdentity>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AppendError {
     TooManyEntries,
     ApplicationBytesExceeded,
@@ -466,7 +466,7 @@ pub enum AppendReconciliation {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReconcileError {
     InvalidRequest(AppendError),
     CommittedConflict,
@@ -555,21 +555,21 @@ impl AppendRequest {
 }
 
 /// Application bytes keep their own schema and deduplication semantics.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum EntryPayload {
     NoOp,
     Application(Vec<u8>),
     Membership(Membership),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Term(pub u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct LogIndex(pub u64);
 
 /// Exhaustion requires stopping the affected authority, never wrapping it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IdentityExhaustion {
     Term,
     LogIndex,
@@ -599,7 +599,7 @@ impl LogIndex {
 
 /// Persisted voting authority; the legacy committed-vote flag is not a
 /// commit position and remains solely in the storage adapter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HardState {
     pub term: Term,
     pub voted_for: Option<NodeId>,
@@ -697,7 +697,7 @@ impl HardState {
 }
 
 /// Full identity is used for matching; deliberately has no total ordering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct LogIdentity {
     pub term: Term,
     pub leader: NodeId,
