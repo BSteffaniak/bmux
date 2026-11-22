@@ -377,7 +377,7 @@ only after the required durable commit. Concurrent initializers cannot create
 competing authorities. Fresh clusters use new cluster identities and
 authenticated enrollment, never adopt old workers or resources implicitly.
 
-The owned vote-store prototype uses an immutable 4,096-byte identification
+The owned store uses an immutable 4,096-byte identification
 header followed by a redb payload in the same inode. Header version `BMOWNDB1`
 contains the exact bounded cluster identifier (8-byte little-endian length, at
 most 1,024 UTF-8 bytes), zero padding, and a SHA-256 checksum over the first
@@ -406,14 +406,15 @@ fallback authority. Process-exit recovery, publication interruption, corrupt
 payloads, orphan-file handling and storage-failure behavior still require their
 qualification gates; the header does not establish engine readiness.
 
-Before recovering the canonical payload, the vote-store prototype copies at most
+Before recovering the canonical payload, the owned store copies at most
 64 MiB of payload into an anonymous disposable file while retaining exclusive
 ownership of the original inode. redb recovery and format/cluster/vote
 validation first run on this copy. Failure rejects the original without writable
 recovery; success permits recovery and repeated validation on the original. The
-copy is never published, selected as authority, or used as a fallback. The size
-bound is specific to this vote-only prototype, not the future consensus log;
-scratch storage failure is an explicit startup error.
+copy is never published, selected as authority, or used as a fallback. The
+bound equals the store's payload limit; concurrent copies are bounded by an
+admission object each owner (plugin instance or simulated run) holds, never by
+process-wide state. Scratch storage failure is an explicit startup error.
 
 No import or rollback workflow is required for this replacement. Normal
 owned-format restart, snapshots, unfinished workflows, logical identities,
@@ -464,20 +465,35 @@ complete state, never a suffix paired with old membership or a commit watermark
 beyond durable coverage. Snapshot installation and application transactions must
 use the same owner and preserve their existing atomicity requirements.
 
-These rules specify the integration acceptance contract. The private store now
-has an uncompacted append transaction and a membership predecessor index, but is
-not a production append authority. Its `BMOWNV04` payload explicitly initializes
-commit, applied, snapshot and effective-membership metadata alongside log and
-membership tables; older prototype payload versions are rejected. Retention is
-capped at 4,096 entries and the existing 64 MiB payload limit; admission returns
-explicit backpressure when compaction is needed. Nonempty snapshot metadata is
-rejected until snapshot installation is integrated. Complete
-snapshot/application transactions, recovery qualification and runtime
-integration remain required before activation. The private single-flight
-executor now serializes append and vote operations; voting reads retained-log
-freshness and effective membership from its owned store. Uninitialized
-membership denies votes while still durably observing higher terms. Test-only
-injected-context helpers are not production voting APIs.
+These rules specify the integration acceptance contract. The owned store
+executes each engine write (hard state, suffix replacement, membership
+metadata, commit watermark) as one immediate transaction in issue order. Its
+`BMOWNV06` payload initializes commit, applied, snapshot and
+effective-membership metadata alongside the log and membership tables; older
+payload versions are rejected. Retention is capped at 4,096 entries within the
+64 MiB payload limit; the driver compacts behind application before the cap,
+and a write beyond it fails closed. Uninitialized membership denies votes while
+still durably observing higher terms.
+
+### Implementation architecture
+
+The replacement is layered so that every safety decision is deterministic and
+every effect is executed by an adapter:
+
+- **Engine** (`consensus_engine.rs`): a pure, sans-IO state machine. `handle(Input) -> Effects` consumes authenticated peer messages, one-shot timer events, proposals, membership changes, reads, and durable completions; it never performs I/O, reads a clock, or draws randomness. Replies that depend on durable state are released only after the covering persistence completes; a candidate counts its own vote, and a leader its own log, only once durable. Receiver-side append and vote safety reuse the model evaluators in `consensus_model.rs`. Heartbeats are never suppressed by a full replication window or slow persistence.
+- **Driver** (`consensus_driver.rs`): owns one engine on `switchy_async`. Durable effects run in issue order on a single storage worker (blocking work off the async thread); outbound requests are request/response calls whose replies re-enter as authenticated messages; inbound requests wait for the engine's matching reply. Proposals resolve by full log identity at application, so a superseded slot never reports success. Election jitter is supplied by the caller.
+- **Storage** (`OwnedStorage` over `OwnedVoteStore`): redb behind the `BMOWNDB1` header with all file I/O through `switchy_fs`, so the same store runs on the real filesystem and on the POSIX/crash-modelling simulator.
+- **Wire** (`consensus_wire.rs`): maps engine messages onto the generated `cluster-consensus-rpc` (vote v1, append v2), transfer and snapshot contracts with request signing, fresh single-use peer proofs, response binding, and authentication against durable member credentials. No V1-append or legacy-RPC fallback exists.
+- **Verification** (`simulation/`): `consensus` model checks real engines with `simvar::explore` (exhaustive search over small bounds and seeded random walks with crashes that keep only durable state, message loss and duplication, and joint-consensus promotion); `consensus-cluster` runs real drivers over the real store on per-host simulated filesystems under a nemesis (partitions, one-way partitions, isolation, lossy and slow links, power-loss crashes and restarts) and checks convergence, durability of acknowledged writes, and linearizable reads. Both replay exactly from a seed.
+
+### Qualification evidence
+
+This records evidence, not closure; each gate below remains binding.
+
+- Gate 1: engine types and transitions are reviewable in `consensus_engine.rs` with unit tests per transition class; persistence-before-effect ordering is enforced by the engine's durable-reply gating.
+- Gate 2: safety invariants (election safety, state machine safety, log matching, leader completeness, commit/apply bounds, election-deadline liveness) are model checked; a seeded mutation (vote freshness disabled) is caught. Simulation found and fixed a liveness defect: a deposed leader with the freshest log lost its one-shot election deadline and the cluster livelocked.
+- Gate 3: the simulated filesystem models durability per inode and directory entry, torn writes, and injected I/O faults; cluster simulations crash hosts with power-loss semantics. Simulation found that a store directory's own entry must be durable before the store counts as initialized.
+- Gates 4–8: tracked in the implementation work (process tests, production wiring, fresh-install boundary, performance, OpenRaft removal).
 
 ## Qualification gates
 
