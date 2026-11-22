@@ -5589,6 +5589,7 @@ dependencies = [
  "bmux_session_models",
  "bmux_session_state",
  "bmux_sessions_plugin_api",
+ "bmux_sim_primitives_check",
  "bmux_snapshot_runtime",
  "bmux_tabs_plugin_api",
  "bmux_terminal_grid",
@@ -6324,6 +6325,10 @@ dependencies = [
  "tracing",
  "uuid",
 ]
+
+[[package]]
+name = "bmux_sim_primitives_check"
+version = "0.0.1-alpha.4"
 
 [[package]]
 name = "bmux_simvar_tui"
