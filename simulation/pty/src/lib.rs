@@ -207,6 +207,7 @@ fn kernel_config() -> Config {
             interrupted: 0.05,
             short: 0.1,
             spawn: 0.02,
+            ..Faults::default()
         }
     } else {
         Faults::default()

@@ -879,6 +879,18 @@ impl Controller for FleetController {
     }
 }
 
+/// Vary scheduling per run: unless the environment fixes them, each run draws its scheduling
+/// strategy (random, or PCT with a drawn depth) and whether weak memory is modelled from its
+/// seed (`swarm`; see `switchy_thread`'s `Config::from_env`).
+fn scheduling_defaults() {
+    for name in ["SIMULATOR_SCHEDULE_STRATEGY", "SIMULATOR_WEAK_MEMORY"] {
+        if std::env::var_os(name).is_none() {
+            // SAFETY: called before the simulation (or anything else) starts any thread.
+            unsafe { std::env::set_var(name, "swarm") };
+        }
+    }
+}
+
 /// Run the simulation continuously (unless `SIMULATOR_RUNS` says otherwise), keeping going
 /// after failures (unless `SIMULATOR_ON_FAILURE` says otherwise).
 fn fleet_defaults() {
@@ -1035,6 +1047,7 @@ pub fn main<B: simvar::SimBootstrap + Send + 'static>(
         mut views,
         extra,
     } = simulation;
+    scheduling_defaults();
     let results = match args.first().map(String::as_str) {
         None => simvar::run_simulation(bootstrap)?,
         Some("--tui") => {

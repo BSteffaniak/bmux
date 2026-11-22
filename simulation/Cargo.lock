@@ -3102,6 +3102,7 @@ dependencies = [
  "switchy_thread",
  "switchy_time",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

@@ -20,6 +20,7 @@ switchy_simulation       = { workspace = true }
 switchy_thread           = { workspace = true, features = ["simulator"] }
 switchy_time             = { workspace = true, features = ["simulator"] }
 tempfile                 = { workspace = true }
+tokio                    = { workspace = true, features = ["sync"] }
 
 [features]
 default = []
