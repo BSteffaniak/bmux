@@ -72,6 +72,15 @@ impl Kind {
     }
 }
 
+/// Whether profiles turn thread spawn failures on (drawn, or by a guided mutation).
+///
+/// Off for now: `switchy_async`'s simulator expects the spawns of its own threads to succeed
+/// (`spawn_blocking`'s thread, and its executor workers), so a failing one panics the run there
+/// before the pane runtime's own failure paths matter. The draws stay, so turning it on shifts
+/// nothing. A profile with `threadspawn=` (or `SIMULATOR_THREAD_SPAWN_FAILURES`) still forces
+/// it.
+pub const THREAD_SPAWN_FAULTS: bool = false;
+
 /// Rates of the simulated kernel's faults (see `switchy_pty::simulator::Faults`), and how
 /// often process ids are reused.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -96,6 +105,11 @@ pub struct FaultRates {
     pub file: u64,
     /// New processes reusing an old id.
     pub pid_reuse: f64,
+    /// Simulated thread spawns failing (`switchy_thread`'s `set_spawn_failures`).
+    pub thread_spawn: f64,
+    /// The wall clock jumping, at each clock advance (`switchy_time`'s
+    /// `set_wall_clock_jumps`).
+    pub wall_clock: f64,
 }
 
 /// One run's profile.
@@ -173,6 +187,9 @@ impl Profile {
             } else {
                 0
             },
+            // Drawn last (below).
+            thread_spawn: 0.0,
+            wall_clock: 0.0,
         };
         let mut programs = [0; programs::Kind::ALL.len()];
         for (index, weight) in programs.iter_mut().enumerate() {
@@ -185,7 +202,7 @@ impl Profile {
                 0
             };
         }
-        Self {
+        let mut profile = Self {
             programs,
             // Kept on (the draw stays, so turning it back on shifts nothing): with it off, a
             // Windows pane whose shell left an attached job can fail to close (an open finding
@@ -200,7 +217,20 @@ impl Profile {
             clock: [1, 10, 100][usize::try_from(draw(3)).unwrap_or(0)],
             weights,
             faults,
+        };
+        // Drawn after everything else, so every other field draws as before they existed (and
+        // regression seeds without a profile keep theirs).
+        if draw(5) == 0 {
+            let rate = [0.005, 0.02][usize::try_from(draw(2)).unwrap_or(0)];
+            if THREAD_SPAWN_FAULTS {
+                profile.faults.thread_spawn = rate;
+            }
         }
+        if draw(4) == 0 {
+            profile.faults.wall_clock =
+                [0.0001, 0.001, 0.01][usize::try_from(draw(3)).unwrap_or(0)];
+        }
+        profile
     }
 
     /// `kind`'s weight.
@@ -266,7 +296,7 @@ impl Profile {
             .collect()
     }
 
-    const fn fault_list(&self) -> [(&'static str, f64); 9] {
+    const fn fault_list(&self) -> [(&'static str, f64); 11] {
         let f = &self.faults;
         [
             ("eintr", f.interrupted),
@@ -278,6 +308,8 @@ impl Profile {
             ("late", f.signal_delay),
             ("query", f.startup_query),
             ("reuse", f.pid_reuse),
+            ("threadspawn", f.thread_spawn),
+            ("clockjump", f.wall_clock),
         ]
     }
 }
@@ -344,6 +376,8 @@ impl std::str::FromStr for Profile {
                 "late" => faults.signal_delay = rate()?,
                 "query" => faults.startup_query = rate()?,
                 "reuse" => faults.pid_reuse = rate()?,
+                "threadspawn" => faults.thread_spawn = rate()?,
+                "clockjump" => faults.wall_clock = rate()?,
                 "fsfault" => faults.file = number()?,
                 "sweep" => profile.sweep = number()? != 0,
                 other if other.starts_with("p.") => {
@@ -379,6 +413,62 @@ mod tests {
         });
         let parsed: Profile = profile.to_string().parse().unwrap();
         assert_eq!(parsed, profile);
+    }
+
+    #[test]
+    fn profiles_with_the_new_faults_print_and_parse_back() {
+        // Enough seeds that some draw each new fault (thread spawn failures while profiles
+        // turn them on).
+        let (mut spawns, mut jumps) = (0, 0);
+        for seed in 0..200_u64 {
+            let mut state = seed;
+            let profile = Profile::draw(|bound| {
+                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                (state >> 33) % bound
+            });
+            spawns += usize::from(profile.faults.thread_spawn > 0.0);
+            jumps += usize::from(profile.faults.wall_clock > 0.0);
+            let parsed: Profile = profile.to_string().parse().unwrap();
+            assert_eq!(parsed, profile, "seed {seed}");
+        }
+        assert_eq!(spawns > 0, THREAD_SPAWN_FAULTS, "{spawns}");
+        assert!(jumps > 0);
+        let forced: Profile = "threadspawn=0.01 clockjump=0.001".parse().unwrap();
+        assert!(forced.faults.thread_spawn > 0.0 && forced.faults.wall_clock > 0.0);
+        assert_eq!(forced.to_string().parse::<Profile>().unwrap(), forced);
+    }
+
+    #[test]
+    fn the_new_faults_are_drawn_after_every_other_field() {
+        // So every other field draws as before they existed.
+        for seed in 0..50_u64 {
+            let mut state = seed;
+            let mut draws: Vec<(u64, u64)> = Vec::new();
+            let profile = Profile::draw(|bound| {
+                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                let value = (state >> 33) % bound;
+                draws.push((bound, value));
+                value
+            });
+            let mut at = draws.len();
+            // The wall clock: on (then a rate, of three) or not.
+            if profile.faults.wall_clock > 0.0 {
+                at -= 1;
+                assert_eq!(draws[at].0, 3, "seed {seed}: {draws:?}");
+            }
+            at -= 1;
+            assert_eq!(draws[at].0, 4, "seed {seed}: {draws:?}");
+            // Thread spawns: on (then a rate, of two) or not.
+            if draws[at - 1].0 == 2 && draws[at - 2] == (5, 0) {
+                at -= 2;
+            } else {
+                at -= 1;
+                assert_eq!(draws[at].0, 5, "seed {seed}: {draws:?}");
+                assert_ne!(draws[at].1, 0, "seed {seed}: {draws:?}");
+            }
+            // The clock's draw (one of three rates) comes just before.
+            assert_eq!(draws[at - 1].0, 3, "seed {seed}: {draws:?}");
+        }
     }
 
     #[test]

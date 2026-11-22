@@ -211,6 +211,15 @@ pub async fn run_workload() -> Result<(), Vec<String>> {
         eprintln!("profile {profile}");
     }
     switchy_time::simulator::set_step_multiplier(profile.clock);
+    // The faults of the runtime's own failure paths, before it starts anything. Set only when
+    // on, so `SIMULATOR_THREAD_SPAWN_FAILURES` and `SIMULATOR_WALL_CLOCK_JUMPS` still apply
+    // to runs whose profile has them off.
+    if profile.faults.thread_spawn > 0.0 {
+        switchy_thread::simulator::set_spawn_failures(profile.faults.thread_spawn);
+    }
+    if profile.faults.wall_clock > 0.0 {
+        switchy_time::simulator::set_wall_clock_jumps(profile.faults.wall_clock);
+    }
     trace_decisions();
     sim_support::watch_run();
     // The run's own environment, so nothing depends on the host it runs on.

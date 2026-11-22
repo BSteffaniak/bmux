@@ -529,6 +529,7 @@ impl Shared {
     fn opens_may_fail(&self) -> bool {
         let faults = &self.profile.faults;
         faults.spawn > 0.0
+            || faults.thread_spawn > 0.0
             || faults.kill > 0.0
             || faults.read_error > 0.0
             || faults.file > 0
