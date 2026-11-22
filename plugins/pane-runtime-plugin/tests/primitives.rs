@@ -1,7 +1,8 @@
 //! Everything the pane runtime does with tasks, threads, locks, time, randomness, the
-//! environment, processes and directory listings goes through what a simulation controls
-//! (`switchy_async`, `switchy_thread`, `switchy_time`, `switchy_env` and the plugin's `ids`,
-//! `dir_order` and `run_shared` modules), so a simulator build runs it deterministically.
+//! environment, processes, files and directory listings goes through what a simulation controls
+//! (`switchy_async`, `switchy_thread`, `switchy_time`, `switchy_env`, `switchy_fs` and the
+//! plugin's `ids`, `dir_order` and `run_shared` modules, and the platform layer's `files`), so a
+//! simulator build runs it deterministically.
 //!
 //! Native backends (the platform layer's files that talk to one operating system and never run
 //! in simulation) are exempt as a whole, as are the modules that implement the controlled
@@ -32,7 +33,26 @@ const FORBIDDEN: &[&str] = &[
     "env::var(",
     "env::var_os(",
     "env::vars(",
-    "std::fs::read_dir",
+    // Files go through `switchy_fs` (the run's file system in simulation), and this process's
+    // executable through the platform layer's `files`.
+    "std::fs",
+    "fs::",
+    "tempfile::",
+    "use tempfile",
+    "current_exe(",
+    "/proc/self",
+    "bmux_plugin::retain_executable",
+    "bmux_plugin::executable_sha256",
+    // `Path`'s own file system queries always ask the host (use `crate::files` or
+    // `switchy_fs`).
+    ").is_dir()",
+    ").is_file()",
+    ".exists()",
+    ".try_exists(",
+    ".canonicalize()",
+    ".read_dir()",
+    ".read_link()",
+    ".symlink_metadata()",
     "tokio::spawn",
     "tokio::time",
     "tokio::task",
@@ -54,6 +74,15 @@ fn process_wide(line: &str) -> bool {
         && ["OnceLock", "LazyLock", "Atomic", "Mutex", "RwLock"]
             .iter()
             .any(|kind| line.contains(kind))
+}
+
+/// Whether `line` imports `std::fs` in a group (`use std::{fs, io};`), which the forbidden
+/// patterns cannot see.
+fn imports_std_fs(line: &str) -> bool {
+    line.contains("std::{")
+        && line
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .any(|word| word == "fs")
 }
 
 /// Native backends: each talks to one operating system and never runs in simulation.
@@ -165,6 +194,9 @@ fn simulated_primitives_only() {
                 || (number >= 2 && raw[number - 2].contains("// simulation-safe:"))
             {
                 continue;
+            }
+            if imports_std_fs(line) {
+                violations.push(format!("{relative}:{number}: {}", line.trim()));
             }
             if process_wide(line) {
                 violations.push(format!(
