@@ -13,14 +13,16 @@
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
 use bmux_pane_runtime_plugin::simulation::{Pane, Panes, Restarted};
 use bmux_simvar_tui::Tone;
 use switchy_pty::simulator::{self, ProcessState};
-use tokio::sync::watch;
 
 use crate::{
     profile::{Kind, Profile},
@@ -129,8 +131,10 @@ pub struct Shared {
     profile: Profile,
     /// The runtime directory's session records, which outlive a crashed server.
     records: PathBuf,
-    /// Bumped when the server crashes; actions under way watch it.
-    generation: watch::Sender<u64>,
+    /// Bumped when the server crashes; actions under way watch it. (Not a `tokio` watch:
+    /// with several receivers, it wakes them in an order drawn from `tokio`'s own per-thread
+    /// generator, which no seed decides.)
+    generation: AtomicU64,
     /// One crash at a time.
     crash: tokio::sync::Mutex<()>,
     /// Simulated time per unit of [`SETTLE`]: the profile's clock.
@@ -247,7 +251,7 @@ struct Opening<'a>(&'a Shared, u64);
 impl Drop for Opening<'_> {
     fn drop(&mut self) {
         // A crash resets the count for the new server: only an open of the current one counts.
-        if *self.0.generation.borrow() == self.1 {
+        if self.0.generation.load(Ordering::SeqCst) == self.1 {
             let mut state = self.0.lock();
             state.opening = state.opening.saturating_sub(1);
         }
@@ -278,7 +282,7 @@ impl Shared {
             }),
             profile,
             records,
-            generation: watch::channel(0).0,
+            generation: AtomicU64::new(0),
             crash: tokio::sync::Mutex::new(()),
             settle,
         })
@@ -357,6 +361,15 @@ impl Shared {
             if std::env::var_os("PANE_RUNTIME_SIM_TRACE").is_some() {
                 eprintln!("driver {driver} chose {}", kind.name());
             }
+            // Debugging replays that part: a draw from the run's generator (taken, so the
+            // probed run differs from an unprobed one, but alike in every probed replay).
+            if std::env::var_os("PANE_RUNTIME_SIM_RNG_PROBE").is_some() {
+                eprintln!(
+                    "probe driver {driver} {} rng {}",
+                    kind.name(),
+                    simvar::switchy::random::simulator::rng().next_u64()
+                );
+            }
             if kind == Kind::Crash {
                 self.crash(driver).await;
             } else {
@@ -368,12 +381,16 @@ impl Shared {
 
     /// Run `kind`, cancelled if the server crashes meanwhile.
     async fn cancellable(&self, driver: u64, kind: Kind) {
-        let mut generation = self.generation.subscribe();
-        let current = *generation.borrow_and_update();
+        let current = self.generation.load(Ordering::SeqCst);
         self.lock().busy += 1;
+        let crashed = async {
+            while self.generation.load(Ordering::SeqCst) == current {
+                switchy_async::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
         let cancelled = switchy_async::select! {
             () = self.act(driver, kind) => false,
-            _ = generation.wait_for(|g| *g != current) => true,
+            () = crashed => true,
         };
         let mut state = self.lock();
         state.busy -= 1;
@@ -445,7 +462,7 @@ impl Shared {
                 return;
             }
             state.opening += 1;
-            (Arc::clone(&state.panes), *self.generation.borrow())
+            (Arc::clone(&state.panes), self.generation.load(Ordering::SeqCst))
         };
         let _opening = Opening(self, generation);
         let (rows, cols) = random_size();
@@ -735,7 +752,7 @@ impl Shared {
         };
         event("crash", format!("d{driver}: the server crashed"), Tone::Warn);
         // The drivers' work under way stops with the server.
-        self.generation.send_modify(|generation| *generation += 1);
+        self.generation.fetch_add(1, Ordering::SeqCst);
         while self.lock().busy > 0 {
             switchy_async::time::sleep(Duration::from_millis(1)).await;
         }
