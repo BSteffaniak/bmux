@@ -201,6 +201,55 @@ fleets and determinism-verified runs), regression seeds for what it finds, and n
 
 ## Implementation notes
 
+### 19.1 (workers)
+
+- **switchy_async.** With `thread-simulator`, each step of a simulator runtime (each `tick`,
+  each turn of `block_on` or `wait`) polls up to `n` ready tasks at once:
+  - the stepping thread polls one, and the runtime's workers poll the others;
+  - local (`spawn_local`) and blocking tasks stay on the stepping thread;
+  - a task's future is taken with `try_lock`, so a task woken while another worker polls it
+    is queued again, not polled twice;
+  - `n` is 1 for a current-thread runtime, `worker_threads` for a multi-thread one, else the
+    run's `SIMULATOR_ASYNC_WORKERS` (a number, or `swarm`: 1 in one run in four, otherwise 2
+    to 4).
+
+  Workers are `switchy_thread` daemon threads in the runtime's thread group. They are started
+  by the first step that needs them and fed through a queue: `shutdown_now` kills them, and so
+  does the run's end. A first design started helpers per step. Each finished simulated thread
+  keeps its OS thread until the run ends, so long runs reached the OS's thread limit, and a
+  refused spawn left a scheduled thread that never ran: the run hung.
+- **switchy_thread** gained what workers needed:
+  - daemon threads (`Builder::daemon`), killed at the run's end and not reported as leaked;
+  - group 0 means no group;
+  - `Scheduler::killed` and `try_me`.
+
+  A spawn the OS refuses now waits for other runs to free threads, and panics if none do. It
+  no longer returns an error that would make the run depend on the machine.
+- **bmux.** Simulations default `SIMULATOR_ASYNC_WORKERS` to `swarm`, and the run's shape
+  records `workers:N`. The workload's shared state uses `switchy_thread`'s `Mutex`: a std lock
+  held across a switch point blocks for real once drivers run on several workers.
+  `PluginStateRegistry::get_or_insert_with` runs its initializer unlocked for the same reason.
+  `PANE_RUNTIME_SIM_THREADS_AT=N` prints every thread's state at decision N.
+- **What workers exposed** (all in the simulators, none in bmux's own code so far):
+  - **A shut-down runtime kept running.** A worker of another runtime (the pump stepping the
+    server's runtime) can be mid-poll of one of the server's tasks when a crash shuts the
+    server down. Killing the group cannot stop a thread outside it, so a crashed server
+    spawned a process after the power failure had killed every process.
+    - `shutdown_now` now waits, asleep, for such polls to reach their next await.
+    - It records which thread polls each task, so it never waits on its own stack or on a
+      killed thread.
+  - **Processes died with the server's threads.** A program's thread inherited its spawner's
+    thread group. A simulated crash therefore killed the server's processes, so recovery was
+    never tested against survivors, and a program not started yet left a process running
+    forever with no program.
+    - Programs now belong to no group: processes outlive their server, as real ones do.
+    - A process whose program never starts ends as killed.
+  - **Harness noise.** With `SIMULATOR_ON_FAILURE=stop`, runs cut short by another run's
+    failure were reported as failed ("threads never finished"), burying the real failure. A
+    resumed panic printed only `Any { .. }`.
+- **Results.** 2000 fleet runs under `swarm` workers: 0 failures. The regression seeds pass,
+  as do 300 determinism-verified runs.
+
 ### 19.6 (scan beyond the plugin)
 
 - **The checker.** `packages/sim-primitives-check` (`bmux_sim_primitives_check`, dev-only)
