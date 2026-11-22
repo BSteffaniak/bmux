@@ -82,3 +82,42 @@ jobs:
           path: |
             ${{ runner.temp }}/*.log
             ${{ runner.temp }}/findings
+
+  # Every schedule of each pane runtime scenario within its full bound (two departures from the
+  # default schedule), under one and two executor workers, one scenario per job.
+  explore:
+    name: Explore ${{ matrix.scenario }}
+    runs-on: ubuntu-latest
+    needs: [rust-version]
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+          - restart-during-close
+          - crash-during-open
+          - resize-during-restart
+          - close-split-during-restart
+          - exit-during-restart
+          - interrupt-during-startup
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.rust-version.outputs.version }}
+
+      - name: Explore
+        shell: bash
+        run: |
+          cargo sim pane-runtime --explore "${{ matrix.scenario }}" \
+            | tee "$RUNNER_TEMP/explore.log"
+
+      - name: Upload the log of a failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: explore-${{ matrix.scenario }}
+          path: ${{ runner.temp }}/explore.log

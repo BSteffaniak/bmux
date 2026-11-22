@@ -46,6 +46,7 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
+pub mod explore;
 pub mod guide;
 pub mod profile;
 pub mod programs;
@@ -206,7 +207,21 @@ fn run_shape(profile: &Profile) -> Vec<String> {
 ///
 /// * If no temporary directory can be created for the session records
 pub async fn run_workload() -> Result<(), Vec<String>> {
-    let profile = run_profile();
+    run(run_profile(), None).await
+}
+
+/// A run of `profile`'s workload, or of an exploration scenario's script (on its personality,
+/// unless `SIMULATOR_PTY_PERSONALITY` says otherwise). Returns the violations found, if any.
+///
+/// # Errors
+///
+/// * Every invariant violated, one line each
+///
+/// # Panics
+///
+/// * If no temporary directory can be created for the session records
+#[allow(clippy::too_many_lines)]
+pub async fn run(profile: Profile, scenario: Option<&explore::Scenario>) -> Result<(), Vec<String>> {
     if std::env::var_os("PANE_RUNTIME_SIM_TRACE").is_some() {
         eprintln!("profile {profile}");
     }
@@ -229,8 +244,14 @@ pub async fn run_workload() -> Result<(), Vec<String>> {
             .map(|(name, value)| ((*name).to_string(), (*value).to_string())),
     );
     let faults = profile.faults;
+    let personality = match scenario {
+        Some(scenario) if std::env::var_os("SIMULATOR_PTY_PERSONALITY").is_none() => {
+            scenario.personality
+        }
+        _ => Config::from_env().personality,
+    };
     simulator::configure(Config {
-        personality: Config::from_env().personality,
+        personality,
         pid_reuse: faults.pid_reuse,
         faults: Faults {
             interrupted: faults.interrupted,
@@ -278,6 +299,11 @@ pub async fn run_workload() -> Result<(), Vec<String>> {
     let drivers = profile.drivers;
     let guided = guide::tracking().then(|| profile.clone());
     let shared = Shared::new(profile, records.path().to_path_buf());
+    if let Some(scenario) = scenario {
+        shared.setup(scenario.setup).await;
+        explore::open_window();
+        shared.script(scenario.drivers.iter().map(|steps| steps.to_vec()).collect());
+    }
     let handles: Vec<_> = (0..drivers)
         .map(|driver| switchy_async::task::spawn(Arc::clone(&shared).drive(driver, deadline)))
         .collect();

@@ -9,6 +9,10 @@
 //! A crash stops the old server mid-flight: every other driver's action under way is
 //! cancelled at its next await (dropped, as a dying server's tasks are), then the old runtime
 //! is torn down and a new one recovers from the same runtime directory.
+//!
+//! Drivers draw their actions from the profile, or follow scripts ([`Step`]s, for the
+//! exploration scenarios; see [`crate::explore`]): the same actions and checks, on panes named
+//! by the order they opened, so only the schedule varies between runs.
 
 use std::{
     collections::BTreeMap,
@@ -49,6 +53,49 @@ pub fn draw(bound: u64) -> u64 {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .below(bound.max(1))
+}
+
+/// One scripted action: what, on which pane (by the order panes opened, splits included), and
+/// for [`Kind::Type`], the line.
+///
+/// A script may act on a pane mid-restart, or on one closed meanwhile, which drawn actions never
+/// do: that is what the scenarios race. A line typed into a pane mid-restart is not expected
+/// back (which program reads it is undecided), and a restart of a pane closed meanwhile must
+/// leave nothing behind (invariant 9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Step {
+    /// The action.
+    pub kind: Kind,
+    /// Its pane, by the order panes opened.
+    pub pane: usize,
+    /// For [`Kind::Type`], the line typed (else a drawn one).
+    pub line: Option<&'static str>,
+}
+
+impl Step {
+    /// `kind` on the first pane opened.
+    #[must_use]
+    pub const fn new(kind: Kind) -> Self {
+        Self {
+            kind,
+            pane: 0,
+            line: None,
+        }
+    }
+
+    /// On the pane opened `pane`th (from 0).
+    #[must_use]
+    pub const fn on(mut self, pane: usize) -> Self {
+        self.pane = pane;
+        self
+    }
+
+    /// Typing `line`.
+    #[must_use]
+    pub const fn line(mut self, line: &'static str) -> Self {
+        self.line = Some(line);
+        self
+    }
 }
 
 fn random_size() -> (u16, u16) {
@@ -135,6 +182,12 @@ struct State {
     violations: Vec<String>,
     stats: Stats,
     witnesses: Vec<Witness>,
+    /// Panes in the order they opened (splits included), for scripts.
+    order: Vec<Pane>,
+    /// Each scripted driver's steps left; `None` when drivers draw their actions.
+    scripts: Option<Vec<std::collections::VecDeque<Step>>>,
+    /// The step each scripted driver is taking.
+    targets: BTreeMap<u64, Step>,
 }
 
 /// One run's workload, shared by its drivers.
@@ -343,6 +396,9 @@ impl Shared {
                 violations: Vec::new(),
                 stats: Stats::default(),
                 witnesses: Vec::new(),
+                order: Vec::new(),
+                scripts: None,
+                targets: BTreeMap::new(),
             }),
             profile,
             records,
@@ -409,18 +465,28 @@ impl Shared {
             }
             let kind = {
                 let mut state = self.lock();
-                if state.crashing {
+                let kind = if state.crashing {
                     None
+                } else if let Some(scripts) = &mut state.scripts {
+                    let Some(step) = usize::try_from(driver)
+                        .ok()
+                        .and_then(|index| scripts.get_mut(index))
+                        .and_then(std::collections::VecDeque::pop_front)
+                    else {
+                        return;
+                    };
+                    state.targets.insert(driver, step);
+                    Some(step.kind)
                 } else if state.steps_left == 0 {
                     return;
                 } else {
                     state.steps_left -= 1;
-                    let kind = self.profile.choose(draw);
-                    // Under way from now on, so a crash beginning after this waits for it (or
-                    // cancels it); counted later, a crash could pass it and tear the server
-                    // down under it.
-                    Some((kind, self.begin(&mut state, kind)))
-                }
+                    Some(self.profile.choose(draw))
+                };
+                // Under way from now on, so a crash beginning after this waits for it (or
+                // cancels it); counted later, a crash could pass it and tear the server down
+                // under it.
+                kind.map(|kind| (kind, self.begin(&mut state, kind)))
             };
             let Some((kind, generation)) = kind else {
                 switchy_async::time::sleep(Duration::from_millis(1)).await;
@@ -438,12 +504,7 @@ impl Shared {
                     simvar::switchy::random::simulator::rng().next_u64()
                 );
             }
-            if kind == Kind::Crash || kind == Kind::PowerLoss {
-                self.crash(driver, kind == Kind::PowerLoss).await;
-            } else {
-                self.cancellable(driver, kind, generation).await;
-            }
-            self.collect_exits();
+            self.take(driver, kind, generation).await;
         }
     }
 
@@ -454,6 +515,36 @@ impl Shared {
             state.busy += 1;
         }
         self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Take one action begun (see [`Self::begin`]) on server generation `generation`, as
+    /// driver `driver`.
+    async fn take(&self, driver: u64, kind: Kind, generation: u64) {
+        if kind == Kind::Crash || kind == Kind::PowerLoss {
+            self.crash(driver, kind == Kind::PowerLoss).await;
+        } else {
+            self.cancellable(driver, kind, generation).await;
+        }
+        self.collect_exits();
+    }
+
+    /// Follow scripts from now on: driver `n` takes `scripts[n]`'s steps, then stops.
+    pub fn script(&self, scripts: Vec<Vec<Step>>) {
+        self.lock().scripts = Some(scripts.into_iter().map(Into::into).collect());
+    }
+
+    /// Take `steps` one after another, as driver 0, before the drivers start (a scenario's
+    /// setup).
+    pub async fn setup(&self, steps: &[Step]) {
+        for step in steps {
+            let generation = {
+                let mut state = self.lock();
+                state.targets.insert(0, *step);
+                self.begin(&mut state, step.kind)
+            };
+            self.take(0, step.kind, generation).await;
+        }
+        self.lock().targets.remove(&0);
     }
 
     /// Run `kind` (begun on server generation `current`), cancelled if the server crashes
@@ -499,8 +590,12 @@ impl Shared {
         }
     }
 
-    /// A pane chosen at random among those open and not restarting.
-    fn pick(state: &State) -> Option<Pane> {
+    /// The pane `driver`'s script names (open or not), or else one chosen at random among
+    /// those open and not restarting.
+    fn pick(state: &State, driver: u64) -> Option<Pane> {
+        if let Some(step) = state.targets.get(&driver) {
+            return state.order.get(step.pane).copied();
+        }
         let candidates: Vec<Pane> = state
             .open
             .iter()
@@ -606,6 +701,7 @@ impl Shared {
         });
         let mut state = self.lock();
         state.stats.opened += 1;
+        state.order.push(pane);
         state.open.insert(
             pane,
             Opened {
@@ -625,19 +721,25 @@ impl Shared {
     /// recording the line.
     fn type_line(&self, driver: u64) {
         let mut state = self.lock();
-        let Some(pane) = Self::pick(&state) else {
+        let Some(pane) = Self::pick(&state, driver) else {
             return;
         };
-        let line: String = if draw(5) == 0 {
-            "bg".to_owned()
-        } else if draw(20) == 0 {
-            // The shell ends: the pane stays, its program exited.
-            "exit".to_owned()
-        } else {
-            (0..=draw(20))
-                .map(|_| char::from(b'a' + u8::try_from(draw(26)).unwrap_or(0)))
-                .collect()
-        };
+        let scripted = state.targets.get(&driver).and_then(|step| step.line);
+        let line: String = scripted.map_or_else(
+            || {
+                if draw(5) == 0 {
+                    "bg".to_owned()
+                } else if draw(20) == 0 {
+                    // The shell ends: the pane stays, its program exited.
+                    "exit".to_owned()
+                } else {
+                    (0..=draw(20))
+                        .map(|_| char::from(b'a' + u8::try_from(draw(26)).unwrap_or(0)))
+                        .collect()
+                }
+            },
+            str::to_owned,
+        );
         if !state.panes.input(pane, format!("{line}\r").as_bytes()) {
             return;
         }
@@ -650,6 +752,10 @@ impl Shared {
             format!("d{driver}: typed {line:?} into {}", opened.pid),
             Tone::Neutral,
         );
+        // Mid-restart (only scripts type then), the old program or the new one may read it.
+        if opened.restarting {
+            return;
+        }
         opened.typed.push(line);
         Board::typed(&format!("{pane:?}"));
     }
@@ -661,7 +767,7 @@ impl Shared {
             if state.open.len() + state.opening >= self.profile.panes {
                 return;
             }
-            let Some(pane) = Self::pick(&state) else {
+            let Some(pane) = Self::pick(&state, driver) else {
                 return;
             };
             state.opening += 1;
@@ -692,6 +798,7 @@ impl Shared {
         );
         let mut state = self.lock();
         state.stats.opened += 1;
+        state.order.push(new);
         state.open.insert(
             new,
             Opened {
@@ -709,7 +816,7 @@ impl Shared {
     /// Interrupt a pane's program (`ctrl+c`): its foreground program usually ends.
     fn interrupt(&self, driver: u64) {
         let mut state = self.lock();
-        let Some(pane) = Self::pick(&state) else {
+        let Some(pane) = Self::pick(&state, driver) else {
             return;
         };
         if state.panes.input(pane, b"\x03")
@@ -724,7 +831,7 @@ impl Shared {
     async fn resize(&self, driver: u64) {
         let (pane, rows, cols, epoch, panes) = {
             let mut state = self.lock();
-            let Some(pane) = Self::pick(&state) else {
+            let Some(pane) = Self::pick(&state, driver) else {
                 return;
             };
             let (rows, cols) = random_size();
@@ -781,7 +888,7 @@ impl Shared {
     async fn close_one(&self, driver: u64) {
         let (pane, opened, panes) = {
             let mut state = self.lock();
-            let Some(pane) = Self::pick(&state) else {
+            let Some(pane) = Self::pick(&state, driver) else {
                 return;
             };
             let Some(opened) = state.open.remove(&pane) else {
@@ -887,7 +994,9 @@ impl Shared {
     ) {
         // Only when attribution is exact: no other driver acts meanwhile, and the siblings run
         // shells that end only when told to (so any signal that ends one is the close's).
-        let siblings: Vec<_> = if self.profile.drivers == 1 {
+        // (Scripts also attribute exactly: what another driver does to a sibling touches it.)
+        let scripted = self.lock().scripts.is_some();
+        let siblings: Vec<_> = if self.profile.drivers == 1 || scripted {
             let state = self.lock();
             siblings
                 .into_iter()
@@ -942,14 +1051,14 @@ impl Shared {
 
     /// Restart a pane, checking invariant 7.
     async fn restart(&self, driver: u64) {
-        let (pane, old, old_session, panes) = {
+        let begun = 'begin: {
             let mut state = self.lock();
-            let Some(pane) = Self::pick(&state) else {
+            let Some(pane) = Self::pick(&state, driver) else {
                 return;
             };
             let panes = Arc::clone(&state.panes);
             let Some(opened) = state.open.get_mut(&pane) else {
-                return;
+                break 'begin Err((pane, panes));
             };
             let Some(old_session) = session_of(opened.serial) else {
                 return;
@@ -959,12 +1068,29 @@ impl Shared {
             opened.touched += 1;
             opened.programs += 1;
             opened.typed.clear();
-            (pane, opened.pid, old_session, panes)
+            Ok((pane, opened.pid, old_session, panes))
+        };
+        let (pane, old, old_session, panes) = match begun {
+            Ok(begun) => begun,
+            Err((pane, panes)) => {
+                // A scripted restart of a pane closed (or closing) meanwhile: the runtime may
+                // refuse it or restart it, but nothing it starts may outlive the pane
+                // (invariant 9, at the end).
+                let restarted = panes.restart(pane).await;
+                event(
+                    "restart",
+                    format!("d{driver}: restarting a closed pane: {restarted:?}"),
+                    Tone::Neutral,
+                );
+                return;
+            }
         };
         let restarted = panes.restart(pane).await;
         let pid = match restarted {
             Ok(Restarted::Running(pid)) => pid,
             Ok(Restarted::Gone) => return,
+            // A scripted close of the pane meanwhile ends the restart too.
+            Ok(Restarted::Failed) | Err(_) if !self.lock().open.contains_key(&pane) => return,
             Ok(Restarted::Failed) => {
                 if !self.opens_may_fail() {
                     self.violated(format!(

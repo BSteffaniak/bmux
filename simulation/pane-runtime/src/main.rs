@@ -5,15 +5,19 @@
 //! fleet, failures, and time travel through any run); `--fleet` runs it continuously and
 //! prints what it finds; `--regression` runs every seed in `regression-seeds`. `--guided`
 //! (with either of the first two) steers runs toward shapes not seen yet; see
-//! `pane_runtime::guide`.
+//! `pane_runtime::guide`. `--explore <scenario|all> [--preemptions N]` runs short scripted
+//! scenarios under every schedule within a preemption bound; see `pane_runtime::explore`.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
-use pane_runtime::{PaneRuntimeBootstrap, guide, telemetry};
+use pane_runtime::{PaneRuntimeBootstrap, explore, guide, telemetry};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--explore") {
+        return explore::main(&args[1..]);
+    }
     // Guided runs steer toward shapes not seen yet (see `pane_runtime::guide`).
     if let Some(at) = args.iter().position(|arg| arg == "--guided") {
         args.remove(at);

@@ -60,6 +60,31 @@ against its replay shows where they part when a seed does not replay;
 `PANE_RUNTIME_SIM_BACKTRACE_AT=N` adds where the stopping thread was at
 decision `N`.
 
+## Exploring scenarios
+
+`--explore` runs short scripted scenarios under every thread schedule within a
+bound, instead of seeded random ones. Each scenario opens a pane or two, then
+two drivers act at once (restart during close, crash during open, resize during
+restart, close of one split pane during the other's restart, exit during
+restart, interrupt during a restarted program's startup), then every pane
+closes, with every invariant checked in each run. The bound is on *delays*:
+choice points (from the drivers' start) where a run departs from the default
+schedule. Each scenario runs under one and two executor workers, each in a
+process of its own, several at once.
+
+```bash
+cargo sim pane-runtime --explore all --delays 1       # per-change CI
+cargo sim pane-runtime --explore all                  # each scenario's full bound (2): the nightly
+cargo sim pane-runtime --explore exit-during-restart --workers 2 --delays 1
+cargo sim pane-runtime --explore exit-during-restart --workers 2 --schedule 14=7  # replay one
+```
+
+A failing schedule is shrunk and printed with its replay command.
+`--max-runs N` stops each exploration after `N` runs, and
+`PANE_RUNTIME_SIM_EXPLORE_PROGRESS=1` reports progress. See
+`src/explore.rs` for why the bound counts every departure, not preemptions
+alone.
+
 Found so far: the simulator's `select!` chose among ready branches with a
 generator outside the simulation (fixed in `switchy_async`), and pane
 identifiers, directory listings and process-wide bounds that leaked between

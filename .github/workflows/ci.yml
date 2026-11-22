@@ -467,6 +467,12 @@ jobs:
           SIMULATOR_VERIFY_DETERMINISM: "1"
         run: cargo sim local-terminal
 
+      # Every schedule of each scenario that departs from the default once, under one and two
+      # executor workers (the nightly explores two departures).
+      - name: Pane runtime scenarios, explored
+        shell: bash
+        run: cargo sim pane-runtime --explore all --delays 1
+
   sandbox-bundle-regression:
     name: Sandbox Bundle Regression
     runs-on: ubuntu-latest
