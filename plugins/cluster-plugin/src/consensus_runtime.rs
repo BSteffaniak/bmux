@@ -352,12 +352,78 @@ fn seeded_jitter() -> Jitter {
 }
 
 /// Engine bounds for authenticated endpoint peers: each RPC carries a fresh
-/// peer proof and durable work, so leave headroom before suspecting a leader.
+/// peer proof and durable work, so leave headroom before suspecting a leader,
+/// and replicate one batch per peer at a time.
 fn endpoint_config() -> Config {
     Config {
         election_timeout: (Duration::from_millis(1_000), Duration::from_millis(2_000)),
         heartbeat_interval: Duration::from_millis(150),
+        max_inflight: 1,
         ..Config::default()
+    }
+}
+
+/// At most one outstanding call per peer. Every endpoint RPC holds shared host
+/// callback capacity for its whole round trip (peer proof, dispatch, reply),
+/// so unbounded fan-out under a slow peer would starve the host. A message to
+/// a busy peer is dropped as a lossy network would; the engine retries.
+struct PeerBoundedTransport<T> {
+    inner: Arc<T>,
+    busy: std::sync::Mutex<BTreeMap<NodeId, Arc<tokio::sync::Semaphore>>>,
+}
+
+impl<T: Transport> PeerBoundedTransport<T> {
+    const fn new(inner: Arc<T>) -> Self {
+        Self {
+            inner,
+            busy: std::sync::Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn admit(&self, to: NodeId) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.busy
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(to)
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(1)))
+            .clone()
+            .try_acquire_owned()
+            .ok()
+    }
+}
+
+impl<T: Transport> Transport for PeerBoundedTransport<T> {
+    fn call(
+        &self,
+        to: NodeId,
+        message: crate::consensus_engine::Message,
+    ) -> crate::consensus_driver::Reply {
+        let Some(permit) = self.admit(to) else {
+            return Box::pin(async { None });
+        };
+        let call = self.inner.call(to, message);
+        Box::pin(async move {
+            let reply = call.await;
+            drop(permit);
+            reply
+        })
+    }
+
+    fn send_snapshot(
+        &self,
+        to: NodeId,
+        term: crate::consensus_model::Term,
+        seq: u64,
+    ) -> crate::consensus_driver::Reply {
+        let Some(permit) = self.admit(to) else {
+            return Box::pin(async { None });
+        };
+        let call = self.inner.send_snapshot(to, term, seq);
+        Box::pin(async move {
+            let reply = call.await;
+            drop(permit);
+            reply
+        })
     }
 }
 
@@ -530,7 +596,14 @@ impl ConsensusNode {
             provisioning,
             admission,
             endpoint_config(),
-            |members| Arc::new(WireTransport::new(outbound, node_id, members, incarnation)),
+            |members| {
+                Arc::new(PeerBoundedTransport::new(Arc::new(WireTransport::new(
+                    outbound,
+                    node_id,
+                    members,
+                    incarnation,
+                ))))
+            },
         )
         .await?;
         node.refresh_members(caller.as_ref());
@@ -772,12 +845,24 @@ impl ConsensusNode {
         let driver = self
             .driver()
             .map_err(|error| ConsensusReadError::Fatal(error.to_string()))?;
-        match tokio::time::timeout(READ_TIMEOUT, driver.read()).await {
-            Err(_) => Err(ConsensusReadError::QuorumUnavailable(
-                "quorum did not confirm leadership before the deadline".into(),
-            )),
-            Ok(Ok(view)) => Ok(view),
-            Ok(Err(error)) => Err(self.read_error(error)),
+        let deadline = tokio::time::Instant::now() + READ_TIMEOUT;
+        loop {
+            match tokio::time::timeout_at(deadline, driver.read()).await {
+                Err(_) => {
+                    return Err(ConsensusReadError::QuorumUnavailable(
+                        "quorum did not confirm leadership before the deadline".into(),
+                    ));
+                }
+                Ok(Ok(view)) => return Ok(view),
+                // A new leader serves reads once its term's first entry commits,
+                // normally within one replication round.
+                Ok(Err(ClientError::Rejected(Rejection::LeaderNotReady)))
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Ok(Err(error)) => return Err(self.read_error(error)),
+            }
         }
     }
 

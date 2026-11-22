@@ -513,6 +513,24 @@ Neither a simulator-only implementation nor passing compilation establishes
 product closure. No architectural or recovery obligation may be deferred as
 cleanup to declare the replacement complete.
 
+### Production integration status
+
+The cluster plugin's `ConsensusNode` now runs the owned engine through its
+driver, the owned store and the authenticated `cluster-consensus-rpc` v1 (vote)
+and v2 (append) contracts, which the plugin world provides and protocol
+negotiation requires. OpenRaft, its adapters and the `cluster-raft-rpc` and
+`cluster-raft-decoder` contracts are removed. The owned store lives at
+`plugins/bmux.cluster/owned-consensus/<cluster>/authority.bmown` under the
+node's state directory; a retained `plugins/bmux.cluster/consensus` directory
+(the OpenRaft store) rejects startup without being read or modified. The sole
+member founds a fresh store; other voters create an empty store and are
+admitted by the leader as learners, then promoted through joint consensus.
+
+Still open: staged snapshot transfer and installation over the wire (until it
+lands, a follower that falls behind a compacted prefix cannot catch up),
+five-voter process tests, and the reliability/performance and independent
+review gates above.
+
 ## Consequences
 
 BMUX gains implementation ownership but assumes substantially more
