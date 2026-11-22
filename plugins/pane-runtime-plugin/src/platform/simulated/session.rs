@@ -242,6 +242,11 @@ impl Session {
         }
     }
 
+    /// The leader's serial: its start identity (Unix), or its job's (Windows).
+    pub(crate) fn leader_serial(&self) -> Option<u64> {
+        self.start.map(|start| start.0).or(self.job)
+    }
+
     pub(crate) fn sweep(&self) -> std::io::Result<()> {
         self.open()?;
         match self.job {
@@ -297,6 +302,16 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.release();
     }
+}
+
+/// End every member of the session `leader` started, which the server could not adopt (Unix;
+/// on Windows the job closed with the preparation, ending its members). Call it before
+/// reaping the leader.
+pub(crate) fn sweep_unadopted(leader: u32) -> std::io::Result<()> {
+    if super::windows() || leader <= 1 {
+        return Ok(());
+    }
+    sweep_session(leader)
 }
 
 pub(crate) fn recover_record(path: &Path) -> anyhow::Result<()> {

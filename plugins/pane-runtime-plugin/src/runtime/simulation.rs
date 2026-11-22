@@ -305,6 +305,22 @@ impl Panes {
             .flatten()
     }
 
+    /// The serial (in the simulated kernel) of `pane`'s program, once its session is adopted:
+    /// unlike its id, never another process's.
+    #[must_use]
+    pub fn program_serial(&self, pane: Pane) -> Option<u64> {
+        self.server
+            .with_pane(pane, |handle| {
+                handle
+                    .execution
+                    .session
+                    .lock()
+                    .ok()
+                    .and_then(|session| session.as_ref().and_then(|control| control.leader_serial()))
+            })
+            .flatten()
+    }
+
     /// Whether `pane`'s program exited.
     #[must_use]
     pub fn exited(&self, pane: Pane) -> bool {

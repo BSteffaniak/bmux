@@ -8041,6 +8041,16 @@ impl SessionRuntimeManager {
                         .expect("terminal session lock") = Some(Arc::new(control));
                 }
                 Err(error) => {
+                    // The leader exited before it could be adopted: what it left in its
+                    // session (a child holding the terminal, say) must not outlive the pane.
+                    // Before the leader is reaped, so the session's id cannot be reused yet.
+                    if let Some(pid) = target_pid
+                        && let Err(sweep) = session_control::sweep_unadopted(pid)
+                    {
+                        execution_for_task.record_cleanup_error(format!(
+                            "unadopted session sweep failed: {sweep}"
+                        ));
+                    }
                     let reason = cleanup_failed_startup_child_acknowledged(
                         &host,
                         child.take(),

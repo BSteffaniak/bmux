@@ -141,6 +141,15 @@ impl Session {
     }
 }
 
+/// End every member of the session `leader` started, which the server could not adopt (its
+/// leader had already exited, leaving members that would otherwise outlive the pane). Call it
+/// before reaping the leader: its zombie keeps the session's id from being reused.
+pub(crate) fn sweep_unadopted(leader: u32) -> std::io::Result<()> {
+    super::session_sweep::sweep(
+        i32::try_from(leader).map_err(|_| std::io::Error::other("pid out of range"))?,
+    )
+}
+
 /// Sweep the session one crash record describes, if it is still ours.
 pub(crate) fn recover_record(path: &Path) -> anyhow::Result<()> {
     let record: Record = serde_json::from_slice(&std::fs::read(path)?)?;

@@ -130,6 +130,12 @@ pub(crate) fn activate(
     }
 }
 
+/// End every member of the session `leader` started that could not be adopted (its leader
+/// exited first), before the leader is reaped; see the backends' `sweep_unadopted`.
+pub(crate) fn sweep_unadopted(leader: u32) -> std::io::Result<()> {
+    backend::sweep_unadopted(leader)
+}
+
 /// Sweep every session recorded by a predecessor, then delete its record.
 pub(crate) fn recover(records: &Path) {
     let Ok(entries) = crate::dir_order::read_dir_sorted(records) else {
@@ -229,6 +235,12 @@ impl SessionControl {
 
     fn abandoned(&self) -> bool {
         self.abandoned.load(Ordering::SeqCst)
+    }
+
+    /// The leader's serial in the simulated kernel (which no reused pid shares).
+    #[cfg(feature = "simulator")]
+    pub(crate) fn leader_serial(&self) -> Option<u64> {
+        self.backend.leader_serial()
     }
 
     pub(super) fn leader_exited(&self) -> bool {
