@@ -1023,6 +1023,60 @@ pub struct Simulation<B> {
     pub views: Vec<Box<dyn SimView>>,
     /// Its own telemetry.
     pub extra: Extra,
+    /// Its regression seeds file, for `--regression` (see [`regression`]).
+    pub regression_seeds: &'static str,
+}
+
+/// Run every seed in the regression seeds file at `path`, each alone in a fresh process of
+/// this executable, replayed to verify it is deterministic.
+///
+/// Each line not blank or a comment is `SEED [EPOCH] [NAME=VALUE ...] [# note]`: the run's
+/// seed, its clock's epoch offset, and environment variables it needs (a forced personality or
+/// profile, say).
+///
+/// # Errors
+///
+/// * If the file cannot be read, a line cannot be parsed, or any seed fails
+pub fn regression(name: &str, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use std::fmt::Write as _;
+    let seeds = std::fs::read_to_string(path)?;
+    let executable = std::env::current_exe()?;
+    let mut failed = Vec::new();
+    for line in seeds.lines() {
+        let line = line.split('#').next().unwrap_or_default().trim();
+        let mut words = line.split_whitespace();
+        let Some(seed) = words.next() else {
+            continue;
+        };
+        let mut command = std::process::Command::new(&executable);
+        command
+            .env("SIMULATOR_SEED", seed)
+            .env("SIMULATOR_RUNS", "1")
+            .env("SIMULATOR_MAX_PARALLEL", "1")
+            .env("SIMULATOR_VERIFY_DETERMINISM", "1")
+            .env_remove("SIMULATOR_EPOCH_OFFSET");
+        let mut replay = format!("SIMULATOR_SEED={seed}");
+        for word in words {
+            if let Some((variable, value)) = word.split_once('=') {
+                command.env(variable, value);
+                let _ = write!(replay, " {variable}={value}");
+            } else {
+                command.env("SIMULATOR_EPOCH_OFFSET", word);
+                let _ = write!(replay, " SIMULATOR_EPOCH_OFFSET={word}");
+            }
+        }
+        let status = command.stdout(std::process::Stdio::null()).status()?;
+        if !status.success() {
+            eprintln!("regression seed failed; replay with: {replay} cargo sim {name}");
+            failed.push(seed.to_owned());
+        }
+    }
+    if failed.is_empty() {
+        println!("all regression seeds passed");
+        Ok(())
+    } else {
+        Err(format!("{} regression seeds failed", failed.len()).into())
+    }
 }
 
 /// Run a simulation as `cargo sim NAME [FLAGS]` asks (`args` are the flags):
@@ -1046,7 +1100,11 @@ pub fn main<B: simvar::SimBootstrap + Send + 'static>(
         bootstrap,
         mut views,
         extra,
+        regression_seeds,
     } = simulation;
+    if args.first().map(String::as_str) == Some("--regression") {
+        return regression(name, regression_seeds);
+    }
     scheduling_defaults();
     let results = match args.first().map(String::as_str) {
         None => simvar::run_simulation(bootstrap)?,

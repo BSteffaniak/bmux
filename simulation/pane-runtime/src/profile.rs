@@ -285,10 +285,13 @@ impl fmt::Display for Profile {
 impl std::str::FromStr for Profile {
     type Err = String;
 
-    /// Parse `key=value` words; keys left out keep [`Profile::default`]'s values.
+    /// Parse `key=value` words (separated by spaces or commas); keys left out keep
+    /// [`Profile::default`]'s values.
     fn from_str(text: &str) -> Result<Self, Self::Err> {
         let mut profile = Self::default();
-        for word in text.split_whitespace() {
+        // Words are separated by spaces or commas (commas fit a profile in one environment
+        // variable on a regression seed's line).
+        for word in text.split(|c: char| c.is_whitespace() || c == ',').filter(|w| !w.is_empty()) {
             let (key, value) = word
                 .split_once('=')
                 .ok_or_else(|| format!("expected key=value, got '{word}'"))?;

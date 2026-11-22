@@ -22,7 +22,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: Default
+          - name: Default (swarm)
             env: ""
           - name: Aggressive process id reuse
             env: "SIMULATOR_PTY_PID_REUSE=1"
@@ -41,33 +41,42 @@ jobs:
         with:
           toolchain: ${{ needs.rust-version.outputs.version }}
 
-      - name: Simulate
+      - name: Regression seeds
         shell: bash
         run: |
+          cargo sim pty --regression
+          cargo sim pane-runtime --regression
+          cargo sim local-terminal --regression
+
+      # Every run draws its own scheduling strategy, weak memory, and (pane runtime) profile:
+      # actions, concurrent drivers, kernel and file faults, power loss, programs, clock rate.
+      # Failures do not stop a fleet; each distinct one is saved to the findings directory.
+      - name: Simulate
+        shell: bash
+        env:
+          SIMULATOR_FINDINGS: ${{ runner.temp }}/findings
+          SIMULATOR_ON_FAILURE: continue
+        run: |
+          status=0
           env ${{ matrix.env }} \
             SIMULATOR_RUNS="${{ github.event.inputs.runs || '5000' }}" \
             SIMULATOR_VERIFY_DETERMINISM=1 \
-            cargo sim pty | tee "$RUNNER_TEMP/simulation.log"
-
-      - name: Simulate the pane runtime
-        shell: bash
-        run: |
+            cargo sim pty | tee "$RUNNER_TEMP/simulation.log" || status=1
           env ${{ matrix.env }} \
             SIMULATOR_RUNS="${{ github.event.inputs.runs || '2000' }}" \
             SIMULATOR_VERIFY_DETERMINISM=1 \
-            cargo sim pane-runtime | tee "$RUNNER_TEMP/pane-runtime-simulation.log"
-
-      - name: Simulate the local terminal
-        shell: bash
-        run: |
+            cargo sim pane-runtime | tee "$RUNNER_TEMP/pane-runtime-simulation.log" || status=1
           env ${{ matrix.env }} \
             SIMULATOR_RUNS="${{ github.event.inputs.runs || '2000' }}" \
             SIMULATOR_VERIFY_DETERMINISM=1 \
-            cargo sim local-terminal | tee "$RUNNER_TEMP/local-terminal-simulation.log"
+            cargo sim local-terminal | tee "$RUNNER_TEMP/local-terminal-simulation.log" || status=1
+          exit "$status"
 
       - name: Upload the log of a failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: pty-simulation-${{ strategy.job-index }}
-          path: ${{ runner.temp }}/simulation.log
+          path: |
+            ${{ runner.temp }}/*.log
+            ${{ runner.temp }}/findings

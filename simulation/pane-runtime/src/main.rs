@@ -3,7 +3,7 @@
 //! `cargo sim pane-runtime` runs it, configured like any simvar simulation through
 //! `SIMULATOR_*` environment variables. `--tui` runs it continuously in the dashboard (the
 //! fleet, failures, and time travel through any run); `--fleet` runs it continuously and
-//! prints what it finds.
+//! prints what it finds; `--regression` runs every seed in `regression-seeds`.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
@@ -19,6 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             bootstrap: PaneRuntimeBootstrap,
             views: vec![Box::new(telemetry::PanesView::default())],
             extra: telemetry::extra,
+            regression_seeds: concat!(env!("CARGO_MANIFEST_DIR"), "/regression-seeds"),
         },
         &args,
     )

@@ -1,0 +1,8 @@
+# Seeds `cargo sim local-terminal --regression` runs (each in its own process, replayed to verify
+# determinism). Each line is `SEED [EPOCH] [NAME=VALUE ...] # note`. Add a seed when its failure
+# led to a fix.
+1
+2
+3
+42
+1337

@@ -441,7 +441,10 @@ jobs:
 
       - name: Regression seeds (each replayed to verify determinism)
         shell: bash
-        run: cargo sim pty --regression
+        run: |
+          cargo sim pty --regression
+          cargo sim pane-runtime --regression
+          cargo sim local-terminal --regression
 
       - name: Random runs, determinism verified
         shell: bash

@@ -1,0 +1,14 @@
+# Seeds `cargo sim pane-runtime --regression` runs (each in its own process, replayed to verify
+# determinism). Each line is `SEED [EPOCH] [NAME=VALUE ...] # note`; the variables pin what the
+# failure needed (a personality, a profile), so the run still exercises it on later builds,
+# though its schedule may differ. Add a seed when its failure led to a fix.
+1 1000 SIMULATOR_PTY_PERSONALITY=linux PANE_RUNTIME_SIM_PROFILE=drivers=1,steps=6,panes=1,open=1,type=0,resize=0,close=0,crash=0,restart=3,wait=1,reuse=0  # restarts: the replaced program's exit reported the running pane exited
+2 1000 SIMULATOR_PTY_PERSONALITY=macos PANE_RUNTIME_SIM_PROFILE=drivers=1,steps=6,panes=1,open=1,type=0,resize=0,close=0,crash=0,restart=3,wait=1,reuse=0  # the same on macOS
+1 1000 SIMULATOR_PTY_PERSONALITY=linux PANE_RUNTIME_SIM_PROFILE=drivers=1,steps=2,panes=1,open=1,type=0,resize=0,close=0,crash=0,restart=0,wait=0,p.shell=0,p.orphaner=1  # a program exiting before adoption left a child holding the terminal: opening hung
+1 1000 SIMULATOR_PTY_PERSONALITY=macos PANE_RUNTIME_SIM_PROFILE=drivers=1,steps=2,panes=1,open=1,type=0,resize=0,close=0,crash=0,restart=0,wait=0,p.shell=0,p.orphaner=1  # ... and on macOS the child outlived the pane
+1 1000 SIMULATOR_PTY_PERSONALITY=windows PANE_RUNTIME_SIM_PROFILE=drivers=1,steps=2,panes=1,open=1,type=0,resize=0,close=0,crash=0,restart=0,wait=0,p.shell=0,p.orphaner=1  # ... and on Windows the job ends it
+1 1000 SIMULATOR_PTY_PERSONALITY=windows PANE_RUNTIME_SIM_PROFILE=drivers=3,steps=49,panes=4,open=6,type=3,resize=5,close=2,restart=5,wait=2,query=0.3  # late startup cursor queries and typing before them held a console's output
+2 1000 SIMULATOR_PTY_PERSONALITY=linux PANE_RUNTIME_SIM_PROFILE=drivers=2,steps=12,panes=2,open=2,type=1,crash=1,wait=1  # crashes kill the server's tasks and threads, which release its terminals
+3 1000 SIMULATOR_PTY_PERSONALITY=windows PANE_RUNTIME_SIM_PROFILE=drivers=1,steps=20,panes=3,open=6,type=1,crash=2,restart=2,wait=1  # a crash during a restart's console close
+7017113770625937869  # crash cancellation woke drivers in an unseeded order (tokio's watch)
+5 1000 SIMULATOR_PTY_PERSONALITY=linux PANE_RUNTIME_SIM_PROFILE=drivers=1,steps=20,panes=3,open=6,type=1,power=2,wait=1,close=1  # power loss and recovery
