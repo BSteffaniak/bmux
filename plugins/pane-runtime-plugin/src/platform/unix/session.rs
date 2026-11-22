@@ -105,11 +105,27 @@ impl Session {
     }
 
     pub(crate) fn sweep(&self) -> std::io::Result<()> {
+        if self.reused() {
+            return Ok(());
+        }
         session_sweep::sweep(self.sid)
     }
 
     pub(crate) fn occupied(&self) -> std::io::Result<bool> {
+        if self.reused() {
+            return Ok(false);
+        }
         session_sweep::occupied(self.sid)
+    }
+
+    /// Whether the session ended and its id now names another: a process with the leader's
+    /// pid runs with another start. (While anything of the session lives, its id is never
+    /// handed out again; once it is empty, the id is free.)
+    fn reused(&self) -> bool {
+        let (Some(start), Ok(leader)) = (self.start, u32::try_from(self.sid)) else {
+            return false;
+        };
+        crate::platform::process_start_identity(leader).is_some_and(|current| current != start)
     }
 
     #[expect(

@@ -15,6 +15,17 @@ use super::{
     SessionRuntimeManager, protocol_profile_for_term, shutdown_runtime_handle,
 };
 
+/// Run the platform layer's conformance scenarios against the simulated target, in the current
+/// simulation run (whose kernel's personality decides what each expects): each scenario's
+/// name, and what went wrong.
+#[must_use]
+pub fn platform_conformance() -> Vec<(&'static str, Result<(), String>)> {
+    crate::platform::conformance::SCENARIOS
+        .iter()
+        .map(|(name, scenario)| (*name, scenario()))
+        .collect()
+}
+
 /// A pane runtime under simulation.
 pub struct Panes {
     manager: SessionRuntimeManager,
@@ -175,6 +186,28 @@ impl Panes {
             drained: execution.output_drained.load(Ordering::SeqCst),
             cleanup_error: execution.cleanup_error(),
         })
+    }
+
+    /// Restart `pane`: its program is shut down in the background and a fresh shell starts in
+    /// its place. Waits (in simulated time, at most ten seconds) for the new program to start.
+    ///
+    /// # Errors
+    ///
+    /// * If there is no such pane, or the new program never starts
+    pub async fn restart(&mut self, pane: Pane) -> anyhow::Result<()> {
+        // The new program may reuse the old one's id: tell them apart by pane.
+        let restarted = self.manager.restart_pane(pane.0, None)?;
+        let deadline = switchy_time::Instant::now() + std::time::Duration::from_secs(10);
+        while !self.pane(pane).is_some_and(|handle| {
+            handle.meta.id == restarted && handle.process_id.lock().is_ok_and(|pid| pid.is_some())
+        }) {
+            anyhow::ensure!(
+                switchy_time::Instant::now() < deadline,
+                "the restarted pane's program never started"
+            );
+            switchy_async::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        Ok(())
     }
 
     /// Die: from now on the runtime stops, inspects and cleans up none of its sessions (the

@@ -154,6 +154,7 @@ touches `simulation/**`, `packages/pty/**`, `packages/local-terminal/**`,
 `plugins/pane-runtime-plugin/**` or the switchy crates they use, run:
 
 - `cargo clippy --manifest-path simulation/Cargo.toml --all-targets -- -D warnings`
+- `cargo test --manifest-path simulation/Cargo.toml -p pane-runtime --test platform`
 - `cargo sim pty --regression`
 - `SIMULATOR_RUNS=500 SIMULATOR_VERIFY_DETERMINISM=1 cargo sim pty`
 - `SIMULATOR_RUNS=300 SIMULATOR_VERIFY_DETERMINISM=1 cargo sim pane-runtime`
@@ -161,8 +162,17 @@ touches `simulation/**`, `packages/pty/**`, `packages/local-terminal/**`,
 
 Code the pane runtime simulation runs must stay deterministic: tasks, timers and
 `select!` through `switchy_async`, threads and locks through `switchy_thread`, clocks
-through `switchy_time`, identifiers through the plugin's `ids` module, directory
-listings through `dir_order`, and process-wide bounds through `run_shared`.
+through `switchy_time`, environment reads through `switchy_env`, identifiers through
+the plugin's `ids` module, directory listings through `dir_order`, and process-wide
+state through `run_shared`. The plugin's `tests/primitives.rs` enforces this.
+
+The pane runtime plugin names an operating system only in `src/platform/` (native
+Unix, native Windows and simulated targets, plus the host's files). Core logic
+branches on `bmux_pty::behavior()` instead of `cfg(unix)`/`cfg(windows)`, so the
+simulation (Linux, macOS or Windows personality, on any host) runs every system's
+paths. A behaviour that differs between systems belongs in `switchy_pty`'s
+`Behavior` and personalities, checked by its `tests/conformance.rs` natively on each
+system, and in the platform layer's conformance scenarios.
 
 ## Minimum Required Commands (CLI/runtime work)
 

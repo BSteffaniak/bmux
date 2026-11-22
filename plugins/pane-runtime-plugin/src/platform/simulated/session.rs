@@ -53,8 +53,9 @@ impl Preparation {
 pub(crate) struct Session {
     sid: u32,
     start: Option<crate::platform::ProcessStartIdentity>,
-    /// The Windows job's semantics, rather than a Unix session's.
-    job: bool,
+    /// The Windows job's semantics, rather than a Unix session's: the job, by its session's
+    /// serial (a job is a handle, never reused, unlike a session id).
+    job: Option<u64>,
     /// Windows: releasing the job ends its processes.
     kill_on_close: AtomicBool,
     /// Windows: the job handle was released.
@@ -89,6 +90,18 @@ fn members(sid: u32) -> Vec<u32> {
         .collect()
 }
 
+/// The running members of the job whose session has serial `serial`.
+fn job_members(serial: u64) -> Vec<u32> {
+    simulator::snapshot()
+        .processes
+        .into_iter()
+        .filter(|process| {
+            process.session_serial == serial && process.state == ProcessState::Running
+        })
+        .map(|process| process.pid)
+        .collect()
+}
+
 /// Kill every member of `sid`, and wait (in simulated time) until none runs.
 fn sweep_session(sid: u32) -> std::io::Result<()> {
     if sid <= 1 {
@@ -115,6 +128,31 @@ fn sweep_session(sid: u32) -> std::io::Result<()> {
     }
 }
 
+/// Terminate every member of the job `serial`, and wait (in simulated time) until none runs.
+fn sweep_job(serial: u64) -> std::io::Result<()> {
+    let deadline = switchy_time::Instant::now() + SWEEP_BUDGET;
+    loop {
+        let survivors = job_members(serial);
+        if survivors.is_empty() {
+            return Ok(());
+        }
+        if switchy_time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "{} process(es) remain in the pane's job after termination",
+                    survivors.len()
+                ),
+            ));
+        }
+        for pid in survivors {
+            // A member that exited meanwhile is already gone.
+            let _ = simulator::signal_process(pid, Signal::Kill);
+        }
+        switchy_thread::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 impl Session {
     pub(crate) fn adopt(
         _preparation: Preparation,
@@ -129,7 +167,15 @@ impl Session {
         Ok(Self {
             sid: leader,
             start: crate::platform::process_start_identity(leader),
-            job: super::windows(),
+            job: super::windows()
+                .then(|| {
+                    simulator::snapshot()
+                        .processes
+                        .into_iter()
+                        .find(|process| process.pid == leader)
+                        .map(|process| process.session_serial)
+                })
+                .flatten(),
             kill_on_close: AtomicBool::new(true),
             released: AtomicBool::new(false),
         })
@@ -137,7 +183,7 @@ impl Session {
 
     /// Windows: operations on a released job fail, as on a closed handle.
     fn open(&self) -> std::io::Result<()> {
-        if self.job && self.released.load(Ordering::SeqCst) {
+        if self.job.is_some() && self.released.load(Ordering::SeqCst) {
             return Err(std::io::Error::other("pane job already released"));
         }
         Ok(())
@@ -149,7 +195,7 @@ impl Session {
         token: uuid::Uuid,
     ) -> anyhow::Result<Option<PathBuf>> {
         // The job's kill-on-close covers a crashed server on Windows; nothing to record.
-        if self.job {
+        if self.job.is_some() {
             return Ok(None);
         }
         std::fs::create_dir_all(root)?;
@@ -167,7 +213,7 @@ impl Session {
 
     pub(crate) fn terminate_leader(&self, leader: u32) -> std::io::Result<bool> {
         // Cooperative stop is unsupported on Windows; the caller escalates.
-        if self.job {
+        if self.job.is_some() {
             return Ok(false);
         }
         match simulator::signal_process(leader, Signal::Terminate) {
@@ -179,12 +225,29 @@ impl Session {
 
     pub(crate) fn sweep(&self) -> std::io::Result<()> {
         self.open()?;
-        sweep_session(self.sid)
+        match self.job {
+            Some(job) => sweep_job(job),
+            None if self.reused() => Ok(()),
+            None => sweep_session(self.sid),
+        }
     }
 
     pub(crate) fn occupied(&self) -> std::io::Result<bool> {
         self.open()?;
-        Ok(!members(self.sid).is_empty())
+        Ok(!match self.job {
+            Some(job) => job_members(job),
+            None if self.reused() => Vec::new(),
+            None => members(self.sid),
+        }
+        .is_empty())
+    }
+
+    /// Unix: whether the session ended and its id now names another (as the Unix backend).
+    fn reused(&self) -> bool {
+        self.start.is_some_and(|start| {
+            crate::platform::process_start_identity(self.sid)
+                .is_some_and(|current| current != start)
+        })
     }
 
     /// Windows: clear kill-on-close so releasing the job leaves its processes running.
@@ -195,11 +258,14 @@ impl Session {
     /// Windows: close the job, ending its processes unless released. Unix: nothing to release
     /// (there is no crash guard in simulation).
     pub(crate) fn release(&self) {
-        if !self.job || self.released.swap(true, Ordering::SeqCst) {
+        let Some(job) = self.job else {
+            return;
+        };
+        if self.released.swap(true, Ordering::SeqCst) {
             return;
         }
         if self.kill_on_close.load(Ordering::SeqCst) {
-            for pid in members(self.sid) {
+            for pid in job_members(job) {
                 let _ = simulator::signal_process(pid, Signal::Kill);
             }
         }

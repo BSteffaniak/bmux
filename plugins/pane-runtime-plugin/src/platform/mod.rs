@@ -26,6 +26,9 @@ mod target;
 #[cfg(not(feature = "simulator"))]
 mod native;
 
+#[cfg(any(test, feature = "simulator"))]
+pub(crate) mod conformance;
+
 #[cfg(unix)]
 #[path = "unix/host/mod.rs"]
 pub(crate) mod host;

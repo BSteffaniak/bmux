@@ -21,6 +21,8 @@
 //!    runs (Unix: the new server sweeps the recorded sessions, including jobs that ignore
 //!    hang-ups; Windows: closing the jobs ended them), and every process it never owned, ids
 //!    reused or not, still runs.
+//! 7. Restarting a pane ends everything in its old program's session and starts a new program
+//!    leading a session of its own.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
@@ -161,6 +163,7 @@ struct Stats {
     resized: u64,
     closed: u64,
     crashed: u64,
+    restarted: u64,
 }
 
 impl Stats {
@@ -171,6 +174,7 @@ impl Stats {
             self.resized,
             self.closed,
             self.crashed,
+            self.restarted,
         ] {
             simvar::record(value);
         }
@@ -357,6 +361,54 @@ impl Workload {
         }
     }
 
+    /// Restart a pane, checking invariant 7.
+    async fn restart(&mut self) {
+        let index = usize::try_from(draw(3)).unwrap_or(0) % self.open.len().max(1);
+        let Some((&pane, opened)) = self.open.iter_mut().nth(index) else {
+            return;
+        };
+        let old = opened.pid;
+        let Some(old_session) = simulator::snapshot()
+            .processes
+            .into_iter()
+            .find(|p| p.pid == old && p.state == ProcessState::Running)
+            .map(|p| p.session_serial)
+        else {
+            return;
+        };
+        if let Err(error) = self.panes.restart(pane).await {
+            violated(
+                &mut self.violations,
+                format!("7. restarting pane process {old} failed: {error:#}"),
+            );
+            return;
+        }
+        self.stats.restarted += 1;
+        // 7. The old session ends; the new program leads its own.
+        Board::checked(7);
+        let Some(pid) = self.panes.pid(pane) else {
+            return;
+        };
+        opened.pid = pid;
+        opened.typed.clear();
+        match running(pid) {
+            Some((session, _)) if session == pid => {}
+            other => violated(
+                &mut self.violations,
+                format!("7. restarted pane process {pid} does not lead its own session: {other:?}"),
+            ),
+        }
+        if !settle(|| running_in(&[old_session]).is_empty()).await {
+            violated(
+                &mut self.violations,
+                format!(
+                    "7. pane process {old}'s session still runs {:?} after a restart",
+                    running_in(&[old_session])
+                ),
+            );
+        }
+    }
+
     /// Crash the server, start processes it never owned, then start a new server on the same
     /// runtime directory, checking invariant 6.
     async fn crash(&mut self) {
@@ -514,6 +566,7 @@ pub async fn run_workload() -> Result<(), Vec<String>> {
             7 | 8 => workload.resize().await,
             9 | 10 => workload.close_one().await,
             11 if !workload.open.is_empty() => workload.crash().await,
+            12 if !workload.open.is_empty() => workload.restart().await,
             _ => switchy_async::time::sleep(Duration::from_millis(draw(50))).await,
         }
     }

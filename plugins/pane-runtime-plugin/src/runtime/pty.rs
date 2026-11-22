@@ -31,8 +31,8 @@ pub(crate) trait Child: ChildKiller {
     fn process_id(&self) -> Option<u32>;
 }
 
-/// Start `command` on `slave` (as the platform's session backends do), for tests.
-#[cfg(test)]
+/// Start `command` on `slave` (as the platform's session backends do), for the Unix tests.
+#[cfg(all(test, unix))]
 pub(crate) fn spawn(
     slave: &bmux_pty::PtySlave,
     command: &bmux_pty::SpawnCommand,

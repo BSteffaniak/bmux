@@ -115,3 +115,50 @@ cooperative stop.
 | 16.3 | Platform interface; no OS `cfg` in plugin core logic; scan enforces it | bmux | plugin suite passes natively on 3 OSes |
 | 16.4 | Pane runtime simulation on any host, personality by seed; restart and crash recovery in the workload | bmux | 300+ verified runs per personality on 3 OSes |
 | 16.5 | Conformance: `bmux_pty` suite per personality and natively; platform interface suite | bmux | passes on Linux, macOS, Windows |
+
+## Implementation notes
+
+Built on 2026-11-21:
+
+- **16.1:** the source scan (`plugins/pane-runtime-plugin/tests/primitives.rs`)
+  passes. The environment goes through `switchy_env`, and each simulated run
+  isolates a fixed one (`switchy_env::simulator::isolate`). The replay log and
+  shell callback image caches are per run (`run_shared`). Snapshot
+  acknowledgements lock outputs in pane order instead of address order. The
+  scan also rejects address ordering and new process-wide statics.
+- **16.2:** `switchy_pty::Behavior` and `Personality::Windows`, with simulator
+  tests per personality. Personalities left unset are drawn from all three.
+  The kernel also closes the named terminals' master sides as a dying holder
+  does (`close_masters`, used to simulate crashes), disassociates a terminal
+  from its session when the leader exits (as POSIX does), and reports whether a
+  program is registered.
+- **16.3:** `src/platform/` holds the target (`unix/`, `windows/`, `simulated/`,
+  plus `native.rs`, shared by the native targets) and the host part (`*/host/`).
+  Core code names no operating system; the scan enforces this. The simulated
+  target follows the personality: Windows job semantics keyed by the session's
+  serial (a job is a handle and is never reused), no cooperative stop, signals
+  or crash records.
+- **16.4:** the pane runtime simulation runs on any host with a personality
+  drawn from the seed. The workload gained `bg` jobs, restarts (invariant 7)
+  and crashes with recovery on a per-run runtime directory (invariant 6);
+  disabling recovery fails invariant 6. Verified on macOS, Linux and Windows
+  hosts.
+- **16.5:** `switchy_pty`'s `tests/conformance.rs` (startup query, output end,
+  kill reports, process groups and devices) passes natively on Linux, macOS and
+  Windows (real ConPTY), and in simulation under every personality. The
+  plugin's `platform/conformance.rs` scenarios (sweeps, releases, cooperative
+  stop, process identities) pass natively in the plugin's tests and, through
+  `simulation::platform_conformance`, under every personality in
+  `simulation/pane-runtime/tests/platform.rs`.
+- **Found:** the ordering bug in `release_session` (a released Windows job was
+  swept again when its leader exited; a released session now has nothing left
+  to stop or inspect); sweeping a session whose id was reused (the Unix
+  backends now check the leader's start identity first); host `ps` output
+  reaching simulated process inspection; and the kernel's stale
+  terminal-to-session link.
+- **Not yet:** `bmux_pty`'s own process API still has a separate Windows
+  implementation (`conpty.rs`) beside the Unix and simulated one, so
+  `cargo sim pty` draws only Unix personalities, and its conformance suite is
+  Unix only. Unifying it on `switchy_pty` and `behavior()` is the next step.
+  Files are still the host's (`switchy_fs` is a follow-up).
+
