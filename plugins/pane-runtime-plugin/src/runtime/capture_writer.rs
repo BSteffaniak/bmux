@@ -63,7 +63,7 @@ struct Shared {
     state: Mutex<State>,
     changed: Condvar,
     origin: switchy_time::Instant,
-    changes: tokio::sync::watch::Sender<()>,
+    changes: switchy_async::sync::watch::Sender<()>,
 }
 
 #[derive(Clone)]
@@ -134,7 +134,7 @@ impl CaptureWriter {
             }),
             changed: Condvar::new(),
             origin: switchy_time::Instant::now(),
-            changes: tokio::sync::watch::channel(()).0,
+            changes: switchy_async::sync::watch::channel(()).0,
         }));
         let worker = writer.clone();
         let thread = switchy_thread::thread::Builder::new()
@@ -224,7 +224,7 @@ impl CaptureWriter {
 
     /// Coalesced bounded wakeups for execution status/cleanup observers. Read
     /// progress after subscribing; notifications are not an event history.
-    pub(super) fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+    pub(super) fn subscribe(&self) -> switchy_async::sync::watch::Receiver<()> {
         self.0.changes.subscribe()
     }
 

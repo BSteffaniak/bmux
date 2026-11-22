@@ -59,6 +59,10 @@ const FORBIDDEN: &[&str] = &[
     "tokio::runtime",
     "tokio::select",
     "tokio::test",
+    // With several receivers, tokio's wakes them in an order no seed decides: use
+    // switchy_async's (tokio's natively, deterministic in simulation).
+    "tokio::sync::watch",
+    "sync::{mpsc, oneshot, watch}",
     "new_v4",
     "rand::",
     "HashMap",

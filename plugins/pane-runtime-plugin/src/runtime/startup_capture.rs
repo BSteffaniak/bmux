@@ -276,7 +276,7 @@ pub(super) fn start_ordered(
 pub(super) async fn acknowledge_cleanup(
     host: &crate::runtime::PaneRuntimeHost,
     threads: Vec<JoinHandle<()>>,
-    cleanup: &tokio::sync::watch::Sender<Option<Result<(), String>>>,
+    cleanup: &switchy_async::sync::watch::Sender<Option<Result<(), String>>>,
     previous: Option<Result<(), String>>,
     reason: String,
 ) -> String {
@@ -437,7 +437,7 @@ mod tests {
         let host = crate::runtime::PaneRuntimeHost::detached();
         let host = &host;
         let thread = switchy_thread::thread::spawn(|| {});
-        let (cleanup, mut acknowledged) = tokio::sync::watch::channel(None);
+        let (cleanup, mut acknowledged) = switchy_async::sync::watch::channel(None);
         let reason = super::acknowledge_cleanup(
             host,
             vec![thread],

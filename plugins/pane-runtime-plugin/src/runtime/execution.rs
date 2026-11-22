@@ -46,7 +46,7 @@ pub(super) struct ExecutionCapture {
     pub(super) geometry_revision: AtomicU64,
     pub(super) output_watermark: AtomicU64,
     pub(super) outcome: Mutex<(Option<u32>, Option<String>, Option<String>)>,
-    changes: tokio::sync::watch::Sender<()>,
+    changes: switchy_async::sync::watch::Sender<()>,
     admission: Arc<Semaphore>,
 }
 
@@ -75,7 +75,7 @@ impl Default for ExecutionCapture {
             geometry_revision: AtomicU64::new(0),
             output_watermark: AtomicU64::new(0),
             outcome: Mutex::new((None, None, None)),
-            changes: tokio::sync::watch::channel(()).0,
+            changes: switchy_async::sync::watch::channel(()).0,
             admission: Arc::new(Semaphore::new(64)),
         }
     }
@@ -188,7 +188,7 @@ impl ExecutionCapture {
         Ok(())
     }
 
-    pub(super) fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
+    pub(super) fn subscribe(&self) -> switchy_async::sync::watch::Receiver<()> {
         self.changes.subscribe()
     }
 
@@ -626,7 +626,7 @@ pub(crate) fn live_revision(
 pub(crate) fn subscribe(
     host: &crate::runtime::PaneRuntimeHost,
     reference: &ExecutionRef,
-) -> Result<tokio::sync::watch::Receiver<()>, ExecutionError> {
+) -> Result<switchy_async::sync::watch::Receiver<()>, ExecutionError> {
     with_pane(host, reference, |pane| Ok(pane.execution.subscribe()))
 }
 

@@ -66,7 +66,8 @@ use switchy_async::task::JoinHandle;
 use switchy_thread::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use switchy_thread::sync::{Arc, Mutex, RwLock};
 use switchy_time::Instant;
-use tokio::sync::{mpsc, oneshot, watch};
+use switchy_async::sync::watch;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{trace, warn};
 
 pub(crate) fn managed_target_identity(host: &PaneRuntimeHost) -> Result<Option<String>, String> {
