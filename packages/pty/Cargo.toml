@@ -32,6 +32,9 @@ windows-sys = { workspace = true, features = [
 [target.'cfg(unix)'.dev-dependencies]
 libc = { workspace = true }
 
+[dev-dependencies]
+bmux_sim_primitives_check = { workspace = true }
+
 [features]
 default = ["native"]
 

@@ -5116,6 +5116,7 @@ name = "bmux_context_state"
 version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_session_models",
+ "bmux_sim_primitives_check",
  "serde",
  "uuid",
 ]
@@ -5480,6 +5481,7 @@ version = "0.0.1-alpha.4"
 dependencies = [
  "anyhow",
  "bmux_pty",
+ "bmux_sim_primitives_check",
  "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "tokio",
 ]
@@ -5637,6 +5639,7 @@ dependencies = [
  "bmux_attach_layout_protocol",
  "bmux_ipc",
  "bmux_session_models",
+ "bmux_sim_primitives_check",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -5823,6 +5826,7 @@ dependencies = [
  "bmux_perf_telemetry",
  "bmux_plugin_runtime",
  "bmux_plugin_sdk",
+ "bmux_sim_primitives_check",
  "bmux_tui",
  "libc",
  "libloading 0.9.1",
@@ -5860,6 +5864,7 @@ dependencies = [
 name = "bmux_plugin_runtime"
 version = "0.0.1-alpha.4"
 dependencies = [
+ "bmux_sim_primitives_check",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -6082,6 +6087,7 @@ dependencies = [
 name = "bmux_pty"
 version = "0.0.1-alpha.4"
 dependencies = [
+ "bmux_sim_primitives_check",
  "libc",
  "switchy_pty",
  "switchy_thread",
@@ -6259,6 +6265,7 @@ dependencies = [
 name = "bmux_session_models"
 version = "0.0.1-alpha.4"
 dependencies = [
+ "bmux_sim_primitives_check",
  "serde",
  "uuid",
 ]
@@ -6269,6 +6276,7 @@ version = "0.0.1-alpha.4"
 dependencies = [
  "anyhow",
  "bmux_session_models",
+ "bmux_sim_primitives_check",
  "serde",
 ]
 
@@ -6405,7 +6413,10 @@ name = "bmux_snapshot_runtime"
 version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_plugin_sdk",
+ "bmux_sim_primitives_check",
  "bmux_snapshot_protocol",
+ "switchy_thread",
+ "switchy_time 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "thiserror 2.0.21",
  "tokio",
 ]
@@ -6517,6 +6528,7 @@ version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_cell_geometry",
  "bmux_codec",
+ "bmux_sim_primitives_check",
  "bmux_terminal_protocol",
  "bmux_tui",
  "bmux_unicode_segmentation",
@@ -6531,7 +6543,9 @@ dependencies = [
 name = "bmux_terminal_protocol"
 version = "0.0.1-alpha.4"
 dependencies = [
+ "bmux_sim_primitives_check",
  "serde",
+ "switchy_time 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
 ]
 
 [[package]]
