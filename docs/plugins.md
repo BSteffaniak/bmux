@@ -114,8 +114,12 @@ is a complete example.
   `AttachInputEvent` encoded as a service message; the service returns an
   `AttachInputResult`. Pointer moves are not forwarded (enter and leave are).
   The plugin answers by publishing a new presentation.
-- Process (`runtime = "process"`) plugins cannot publish events yet: their
-  protocol has no plugin-to-host channel.
+- Process (`runtime = "process"`) plugins publish by writing
+  `ProcessInvocationResponse::Publish { protocol_version, kind, state, payload }`
+  frames while answering any invocation (activation, an event, a service or
+  command call), before that invocation's response. Only kinds declared in the
+  manifest are accepted. `examples/process-plugin-python` publishes its
+  presentation this way when it is activated.
 
 See the executable split-surface example and stable update guidance in
 `packages/plugin/src/surface.rs`, and the deterministic layout contract in

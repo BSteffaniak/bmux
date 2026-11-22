@@ -10,3 +10,9 @@ minimum = "1.0"
 
 [native_abi]
 minimum = "1.0"
+
+# The presentation is retained state forwarded to every attach client.
+[[event_publications]]
+delivery                     = "state"
+forward_to_streaming_clients = true
+kind                         = "example.process.python/presentation"

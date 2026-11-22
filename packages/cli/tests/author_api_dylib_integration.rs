@@ -92,6 +92,79 @@ impl Sandbox {
         Self { env, server: None }
     }
 
+    /// A sandbox whose plugins are copied directories (a process plugin's
+    /// manifest and entry script) rather than packaged libraries.
+    fn with_plugin_dirs(plugins: &[(&str, &Path)]) -> Self {
+        let sandbox = Self::new(&[]);
+        for (id, source) in plugins {
+            let dir = sandbox.env.root().join("plugins").join(id);
+            std::fs::create_dir_all(&dir).expect("create plugin dir");
+            for entry in std::fs::read_dir(source).expect("read plugin source") {
+                let entry = entry.expect("plugin source entry");
+                if entry.file_type().expect("entry type").is_file() {
+                    std::fs::copy(entry.path(), dir.join(entry.file_name()))
+                        .expect("copy plugin file");
+                }
+            }
+        }
+        let enabled = plugins
+            .iter()
+            .map(|(id, _)| format!("{id:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        sandbox.env.write_config(&format!(
+            "[plugins]\nenabled = [{enabled}]\nsearch_paths = [{:?}]\n",
+            sandbox.env.root().join("plugins").display().to_string()
+        ));
+        sandbox
+    }
+
+    /// The first presentation `plugin_id` publishes, as a streaming client
+    /// receives it (replayed when it was published before the client connected).
+    fn published_presentation(
+        &self,
+        plugin_id: &str,
+    ) -> bmux_plugin::surface::PublishedPresentation {
+        let paths = bmux_config::ConfigPaths::new(
+            self.env.config_dir.clone(),
+            self.env.runtime_dir.clone(),
+            self.env.data_dir.clone(),
+            self.env.state_dir.clone(),
+        );
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let kind = bmux_plugin::surface::presentation_event_kind(plugin_id);
+        runtime.block_on(async {
+            let client = bmux_client::BmuxClient::connect_with_paths_and_timeout(
+                &paths,
+                "presentation-test",
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("connect");
+            let mut client =
+                bmux_client::StreamingBmuxClient::from_client(client).expect("streaming client");
+            client.enable_event_push().await.expect("enable event push");
+            loop {
+                let event =
+                    tokio::time::timeout(Duration::from_secs(10), client.event_receiver().recv())
+                        .await
+                        .expect("the retained presentation is replayed")
+                        .expect("event stream open");
+                if let bmux_client::ServerEvent::PluginBusEvent {
+                    kind: event_kind,
+                    payload,
+                } = event
+                    && event_kind == kind
+                {
+                    break serde_json::from_slice(&payload).expect("a published presentation");
+                }
+            }
+        })
+    }
+
     fn command(&self, args: &[&str]) -> Command {
         let env = &self.env;
         let mut command = env.command(args);
@@ -240,6 +313,29 @@ fn generated_clients_reach_a_generated_provider_across_dylibs() {
         sandbox.evidence()
     );
     sandbox.wait_for_log(&["watcher: observed 10"]);
+}
+
+/// A process plugin (a Python script speaking the stdio protocol) publishes its
+/// presentation while answering activation; the server forwards it to
+/// streaming clients like any plugin's.
+#[test]
+fn a_process_plugin_presentation_reaches_streaming_clients() {
+    let source = workspace_root().join("examples/process-plugin-python");
+    let mut sandbox = Sandbox::with_plugin_dirs(&[("example.process.python", &source)]);
+    sandbox.start();
+    let published = sandbox.published_presentation("example.process.python");
+    assert_eq!(published.layouts.len(), 1);
+    assert_eq!(published.surfaces.len(), 1);
+    let surfaces = bmux_plugin::surface::PluginSurfaceRegistry::new(8);
+    surfaces
+        .publish(
+            "example.process.python",
+            bmux_plugin::surface::PluginSurfaceSnapshot {
+                revision: published.revision,
+                surfaces: published.surfaces,
+            },
+        )
+        .expect("the plugin's own surfaces");
 }
 
 /// A dylib plugin draws attach UI by publishing its presentation as retained

@@ -175,7 +175,7 @@ pub use process_runtime::{
     PROCESS_RUNTIME_TRANSPORT_STDIO_V1, ProcessInvocationRequest, ProcessInvocationResponse,
     decode_process_invocation_response, decode_process_runtime_frame,
     encode_process_invocation_request, encode_process_invocation_response,
-    encode_process_runtime_frame,
+    encode_process_runtime_frame, split_process_runtime_frames,
 };
 pub use ready::{ReadySignalDecl, ReadyStatus, ReadyTracker};
 pub use service::{

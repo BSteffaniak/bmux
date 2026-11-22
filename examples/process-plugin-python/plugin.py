@@ -82,24 +82,78 @@ def encode_error_response(details: str, status_code: int) -> bytes:
     )
 
 
-def handle_request(payload: bytes) -> bytes:
+PRESENTATION_KIND = "example.process.python/presentation"
+
+# A one-row bar split off the bottom of the attach viewport, drawn by every
+# attach client. The JSON is bmux_plugin::surface::PublishedPresentation; only
+# the fields the bar uses are stated.
+PRESENTATION = (
+    '{"revision":1,'
+    '"layouts":[{"id":{"owner_plugin_id":"example.process.python","local_id":"bar"},'
+    '"order":0,"operation":{"Split":{"edge":"Bottom","extent":{"Cells":1}}}}],'
+    '"surfaces":[{"id":{"owner_plugin_id":"example.process.python","local_id":"bar",'
+    '"retained_id":"70726f63-6573-732e-7079-74686f6e0001"},"revision":1,'
+    '"target":{"Layout":{"owner_plugin_id":"example.process.python","local_id":"bar"}},'
+    '"opaque":true,"ops":[{"TextRun":{"x":0,"y":0,"text":" from a python process ",'
+    '"style":{"reverse":true}}}]}]}'
+)
+
+
+def encode_bytes(value: bytes) -> bytes:
+    return encode_u32_leb128(len(value)) + value
+
+
+def encode_publish(kind: str, state: bool, payload: bytes) -> bytes:
+    # ProcessInvocationResponse::Publish (variant 5) { protocol_version: 1,
+    #   kind, state, payload }, written before the invocation's response.
+    return (
+        encode_u32_leb128(5)
+        + encode_u32_leb128(1)
+        + encode_string(kind)
+        + bytes([1 if state else 0])
+        + encode_bytes(payload)
+    )
+
+
+def encode_lifecycle_success_response() -> bytes:
+    # ProcessInvocationResponse::Lifecycle { protocol_version: 1, status: 0 }.
+    return bytes([0x01, 0x01, 0x00])
+
+
+def request_variant_name(payload: bytes) -> str:
+    """The request's variant name: requests are encoded with a tag byte, then
+    the variant name as a length-prefixed string."""
+    if len(payload) < 2:
+        raise ValueError("truncated request")
+    length, start = decode_u32_leb128(payload, 1)
+    return payload[start : start + length].decode("utf-8")
+
+
+def handle_request(payload: bytes) -> list[bytes]:
+    """The frames answering one request: publications, then the response."""
     try:
-        request_variant, _ = decode_u32_leb128(payload, 0)
+        variant = request_variant_name(payload)
     except Exception:
-        return encode_error_response("invalid BMUX service-codec request payload", 2)
+        return [encode_error_response("invalid BMUX service-codec request payload", 2)]
 
-    if request_variant == 0:
-        return encode_command_success_response()
+    if variant == "Command":
+        return [encode_command_success_response()]
+    if variant == "Lifecycle":
+        # Lifecycle (activation): publish the presentation, then succeed.
+        return [
+            encode_publish(PRESENTATION_KIND, True, PRESENTATION.encode("utf-8")),
+            encode_lifecycle_success_response(),
+        ]
 
-    return encode_error_response("unsupported request kind in python example", 2)
+    return [encode_error_response("unsupported request kind in python example", 2)]
 
 
 def main() -> int:
     try:
         request_bytes = sys.stdin.buffer.read()
         payload = read_frame(request_bytes)
-        encoded = encode_frame(handle_request(payload))
-        sys.stdout.buffer.write(encoded)
+        for frame in handle_request(payload):
+            sys.stdout.buffer.write(encode_frame(frame))
         sys.stdout.buffer.flush()
         return 0
     except Exception as error:

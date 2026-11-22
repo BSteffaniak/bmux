@@ -59,6 +59,108 @@ struct ProcessPluginRuntime {
     persistent_worker: bool,
     persistent: Arc<Mutex<Option<PersistentProcessWorker>>>,
     metrics: Arc<ProcessRuntimeMetrics>,
+    publisher: Arc<ProcessPublisher>,
+}
+
+/// Where a process plugin's publications go: the host event bus it is bound
+/// to, limited to the kinds its manifest declares.
+#[derive(Default)]
+struct ProcessPublisher {
+    /// Declared kind to whether it is a retained state channel.
+    declared: BTreeMap<String, bool>,
+    bus: Mutex<Option<Arc<crate::EventBus>>>,
+    registered: Mutex<std::collections::BTreeSet<String>>,
+}
+
+impl std::fmt::Debug for ProcessPublisher {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProcessPublisher")
+            .field("declared", &self.declared)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ProcessPublisher {
+    fn for_declaration(declaration: &PluginDeclaration) -> Self {
+        Self {
+            declared: declaration
+                .event_publications
+                .iter()
+                .map(|publication| {
+                    (
+                        publication.kind.as_str().to_string(),
+                        publication.delivery == bmux_plugin_sdk::PluginEventDelivery::State,
+                    )
+                })
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Apply one publication. Undeclared kinds, a delivery other than the
+    /// declared one, or no bound bus drop it with a warning: a plugin cannot
+    /// publish on kinds it did not declare.
+    fn publish(&self, plugin_id: &str, kind: &str, state: bool, payload: &[u8]) {
+        if self.declared.get(kind) != Some(&state) {
+            warn!(
+                plugin_id,
+                kind, state, "process plugin published an undeclared event kind; dropped"
+            );
+            return;
+        }
+        let Some(bus) = self.bus.lock().ok().and_then(|bus| bus.clone()) else {
+            debug!(
+                plugin_id,
+                kind, "process plugin published without a bound event bus; dropped"
+            );
+            return;
+        };
+        let Ok(mut registered) = self.registered.lock() else {
+            return;
+        };
+        if !registered.contains(kind) {
+            let interface = bmux_plugin_sdk::PluginEventKind::from(kind.to_string());
+            let result = if state {
+                bus.register_json_state_channel(interface)
+            } else {
+                bus.register_json_channel(interface)
+            };
+            if let Err(error) = result {
+                warn!(plugin_id, kind, %error, "process plugin event channel refused");
+                return;
+            }
+            registered.insert(kind.to_string());
+        }
+        drop(registered);
+        match bus.emit_from_bytes(
+            &bmux_plugin_sdk::PluginEventKind::from(kind.to_string()),
+            payload,
+        ) {
+            Ok(true) => {}
+            Ok(false) => warn!(plugin_id, kind, "process plugin publication had no channel"),
+            Err(error) => warn!(plugin_id, kind, %error, "process plugin publication rejected"),
+        }
+    }
+
+    /// Apply `response` when it is a publication; otherwise hand it back.
+    fn take(
+        &self,
+        plugin_id: &str,
+        response: ProcessInvocationResponse,
+    ) -> Option<ProcessInvocationResponse> {
+        if let ProcessInvocationResponse::Publish {
+            kind,
+            state,
+            payload,
+            ..
+        } = &response
+        {
+            self.publish(plugin_id, kind, *state, payload);
+            return None;
+        }
+        Some(response)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -266,15 +368,28 @@ impl ProcessPluginRuntime {
             });
         }
 
-        let response = decode_process_invocation_response(&stdout).map_err(|error| {
-            PluginError::ServiceProtocol {
-                details: format!(
-                    "failed decoding process runtime stdout frame: {error}{}",
-                    summarize_stderr_suffix(&stderr)
-                ),
+        let decode_failed = |error: PluginError| PluginError::ServiceProtocol {
+            details: format!(
+                "failed decoding process runtime stdout frame: {error}{}",
+                summarize_stderr_suffix(&stderr)
+            ),
+        };
+        // Publications may precede the one final response.
+        let mut response = None;
+        for frame in
+            bmux_plugin_sdk::split_process_runtime_frames(&stdout).map_err(decode_failed)?
+        {
+            let decoded = decode_process_invocation_response(frame).map_err(decode_failed)?;
+            if let Some(decoded) = self.publisher.take(plugin_id, decoded) {
+                if response.is_some() {
+                    return Err(decode_failed(PluginError::ServiceProtocol {
+                        details: "more than one response frame".to_string(),
+                    }));
+                }
+                response = Some(decoded);
             }
-        })?;
-        Ok((Some(response), status))
+        }
+        Ok((response, status))
     }
 
     // Keep retry/respawn state machine inline so persistent-worker recovery paths stay auditable.
@@ -294,7 +409,7 @@ impl ProcessPluginRuntime {
             .map_err(|_| PluginError::ServiceProtocol {
                 details: "persistent worker mutex poisoned".to_string(),
             })?;
-        for attempt in 0..=1 {
+        'attempt: for attempt in 0..=1 {
             if guard.is_none() {
                 *guard = Some(self.spawn_persistent_worker(plugin_id)?);
             }
@@ -363,56 +478,64 @@ impl ProcessPluginRuntime {
                 });
             }
 
-            let response_bytes = match read_framed_payload_with_timeout(&mut worker.stdout, timeout)
-            {
-                Ok(frame_bytes) => frame_bytes,
-                Err(error) => {
-                    if attempt == 0 {
-                        self.metrics
-                            .persistent_retries
-                            .fetch_add(1, Ordering::Relaxed);
-                        if error.kind() == ErrorKind::TimedOut {
+            // Publications may precede the one final response.
+            let response = loop {
+                let response_bytes = match read_framed_payload_with_timeout(
+                    &mut worker.stdout,
+                    timeout,
+                ) {
+                    Ok(frame_bytes) => frame_bytes,
+                    Err(error) => {
+                        if attempt == 0 {
                             self.metrics
-                                .persistent_timeouts
+                                .persistent_retries
                                 .fetch_add(1, Ordering::Relaxed);
-                            warn!(
-                                plugin_id,
-                                command = self.command,
-                                error = %error,
-                                metrics = ?self.metrics.snapshot(),
-                                "[bmux-runtime-fault-json]{{\"kind\":\"persistent-timeout\"}} [bmux-runtime-fault:persistent-timeout] persistent process worker read timed out; recycling worker"
-                            );
-                        } else {
-                            warn!(
-                                plugin_id,
-                                command = self.command,
-                                error = %error,
-                                metrics = ?self.metrics.snapshot(),
-                                "[bmux-runtime-fault-json]{{\"kind\":\"persistent-retry\"}} [bmux-runtime-fault:persistent-retry] persistent process worker read failed; recycling worker"
-                            );
+                            if error.kind() == ErrorKind::TimedOut {
+                                self.metrics
+                                    .persistent_timeouts
+                                    .fetch_add(1, Ordering::Relaxed);
+                                warn!(
+                                    plugin_id,
+                                    command = self.command,
+                                    error = %error,
+                                    metrics = ?self.metrics.snapshot(),
+                                    "[bmux-runtime-fault-json]{{\"kind\":\"persistent-timeout\"}} [bmux-runtime-fault:persistent-timeout] persistent process worker read timed out; recycling worker"
+                                );
+                            } else {
+                                warn!(
+                                    plugin_id,
+                                    command = self.command,
+                                    error = %error,
+                                    metrics = ?self.metrics.snapshot(),
+                                    "[bmux-runtime-fault-json]{{\"kind\":\"persistent-retry\"}} [bmux-runtime-fault:persistent-retry] persistent process worker read failed; recycling worker"
+                                );
+                            }
+                            Self::reset_persistent_worker(&mut guard, true);
+                            recovered_once = true;
+                            continue 'attempt;
                         }
-                        Self::reset_persistent_worker(&mut guard, true);
-                        recovered_once = true;
-                        continue;
+                        return Err(PluginError::ServiceProtocol {
+                            details: format!(
+                                "failed reading persistent process response frame: {error}{}",
+                                summarize_stderr_suffix(&worker.stderr_snapshot())
+                            ),
+                        });
                     }
-                    return Err(PluginError::ServiceProtocol {
-                        details: format!(
-                            "failed reading persistent process response frame: {error}{}",
-                            summarize_stderr_suffix(&worker.stderr_snapshot())
-                        ),
-                    });
+                };
+
+                let decoded =
+                    decode_process_invocation_response(&response_bytes).map_err(|error| {
+                        PluginError::ServiceProtocol {
+                            details: format!(
+                                "failed decoding persistent process response frame: {error}{}",
+                                summarize_stderr_suffix(&worker.stderr_snapshot())
+                            ),
+                        }
+                    })?;
+                if let Some(decoded) = self.publisher.take(plugin_id, decoded) {
+                    break decoded;
                 }
             };
-
-            let response =
-                decode_process_invocation_response(&response_bytes).map_err(|error| {
-                    PluginError::ServiceProtocol {
-                        details: format!(
-                            "failed decoding persistent process response frame: {error}{}",
-                            summarize_stderr_suffix(&worker.stderr_snapshot())
-                        ),
-                    }
-                })?;
 
             let status = worker
                 .child
@@ -1400,6 +1523,14 @@ pub struct LoadedPlugin {
 }
 
 impl LoadedPlugin {
+    /// Deliver this process plugin's publications (on kinds its manifest
+    /// declares) to `bus`.
+    pub fn bind_event_bus(&self, bus: Arc<crate::EventBus>) {
+        if let Ok(mut bound) = self.runtime.publisher.bus.lock() {
+            *bound = Some(bus);
+        }
+    }
+
     #[must_use]
     pub const fn effective_concurrency_policy(&self) -> EffectiveConcurrencyPolicy {
         EffectiveConcurrencyPolicy::new(self.declaration.concurrency)
@@ -2016,6 +2147,9 @@ impl NativePluginLoader {
                     persistent_worker: *persistent_worker,
                     persistent: Arc::new(Mutex::new(None)),
                     metrics: Arc::new(ProcessRuntimeMetrics::default()),
+                    publisher: Arc::new(ProcessPublisher::for_declaration(
+                        &registered_plugin.declaration,
+                    )),
                 },
                 concurrency_gate: concurrency_gate_for(&registered_plugin.declaration),
             });
@@ -2249,6 +2383,7 @@ sleep 60
                 persistent_worker: false,
                 persistent: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 metrics: std::sync::Arc::new(super::ProcessRuntimeMetrics::default()),
+                publisher: std::sync::Arc::default(),
             },
             concurrency_gate: ConcurrencyGate::new(
                 bmux_plugin_runtime::PluginConcurrencyConfig::Concurrent,
@@ -2582,6 +2717,127 @@ minimum = "1.0"
             .run_command("hello", &args)
             .expect("process runtime command should run");
         assert_eq!(status, 0);
+    }
+
+    /// A process plugin that writes `stdout` (publications, then a command
+    /// response) for every invocation, declaring one state event kind.
+    #[cfg(unix)]
+    fn load_publishing_plugin(
+        root: &std::path::Path,
+        stdout: &[u8],
+        persistent: bool,
+    ) -> LoadedPlugin {
+        let output = root.join("out.bin");
+        std::fs::write(&output, stdout).expect("write plugin output");
+        let script = root.join("plugin.sh");
+        std::fs::write(
+            &script,
+            if persistent {
+                format!("#!/bin/sh\ncat '{}'\nsleep 60\n", output.display())
+            } else {
+                format!("#!/bin/sh\ncat > /dev/null\ncat '{}'\n", output.display())
+            },
+        )
+        .expect("write plugin script");
+        let manifest = PluginManifest::from_toml_str(&format!(
+            r#"
+id = "test.publisher"
+name = "Publisher"
+version = "0.1.0"
+runtime = "process"
+entry = "sh"
+entry_args = ["{}"]
+process_persistent_worker = {persistent}
+
+[[commands]]
+name = "hello"
+summary = "hello"
+execution = "provider_exec"
+
+[[event_publications]]
+kind = "test.publisher/presentation"
+delivery = "state"
+forward_to_streaming_clients = true
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
+"#,
+            script.display()
+        ))
+        .expect("manifest should parse");
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest(std::path::Path::new("plugin.toml"), manifest)
+            .expect("manifest should register");
+        let registered = registry.get("test.publisher").expect("registered").clone();
+        super::load_process_plugin(
+            &registered,
+            &HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            &BTreeMap::new(),
+        )
+        .expect("process plugin should load")
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_plugins_publish_declared_kinds_before_their_response() {
+        use bmux_plugin_sdk::{ProcessInvocationResponse, encode_process_invocation_response};
+        let mut stdout = Vec::new();
+        for (kind, payload) in [
+            ("test.publisher/presentation", r#"{"revision":1}"#),
+            ("test.publisher/undeclared", r#"{"revision":9}"#),
+        ] {
+            stdout.extend(
+                encode_process_invocation_response(&ProcessInvocationResponse::publish(
+                    kind,
+                    true,
+                    payload.as_bytes().to_vec(),
+                ))
+                .unwrap(),
+            );
+        }
+        // Command { protocol 1, status 0, no outcome } in the positional form
+        // hand-written plugins use.
+        stdout.extend_from_slice(b"BMUXPRC1\x00\x00\x00\x04\x00\x01\x00\x00");
+        for persistent in [false, true] {
+            let root = std::env::temp_dir().join(format!(
+                "bmux-process-publish-{}-{persistent}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            let loaded = load_publishing_plugin(&root, &stdout, persistent);
+            let bus = std::sync::Arc::new(crate::EventBus::new());
+            loaded.bind_event_bus(bus.clone());
+            let status = loaded.run_command("hello", &[]).expect("command runs");
+            assert_eq!(status, 0, "persistent={persistent}");
+            let (published, _) = bus
+                .subscribe_state::<serde_json::Value>(&bmux_plugin_sdk::PluginEventKind::from(
+                    "test.publisher/presentation".to_string(),
+                ))
+                .expect("the declared kind is registered");
+            assert_eq!(*published, serde_json::json!({ "revision": 1 }));
+            assert!(
+                bus.subscribe_state::<serde_json::Value>(&bmux_plugin_sdk::PluginEventKind::from(
+                    "test.publisher/undeclared".to_string(),
+                ))
+                .is_err(),
+                "undeclared kinds are dropped"
+            );
+            drop(loaded);
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[cfg(unix)]

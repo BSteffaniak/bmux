@@ -647,8 +647,8 @@ async fn run_server_start_inner(
         if !plugin.bind_host_handles(&plugin_events, &plugin_states)? {
             tracing::info!(
                 plugin_id = plugin.declaration.id.as_str(),
-                "process-packaged plugin activates without the host event bus \
-                 or state registry"
+                "process-packaged plugin activates without the host state registry; \
+                 its declared event publications reach the event bus"
             );
         }
     }

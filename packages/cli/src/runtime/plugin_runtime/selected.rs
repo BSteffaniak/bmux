@@ -632,9 +632,9 @@ impl ProductionPlugin {
 
     /// Offer this instance's activations views of the host event bus and
     /// plugin state registry, each scoped to the activation. Dynamic
-    /// artifacts receive only the event bus. Returns `false`, binding
-    /// nothing, for a process plugin: it then activates without them and
-    /// reports it, instead of reaching private process-wide copies.
+    /// artifacts receive only the event bus. A process plugin's declared
+    /// publications reach the event bus; it returns `false` because the state
+    /// registry stays in process.
     pub(in crate::runtime) fn bind_host_handles(
         &self,
         bus: &Arc<bmux_plugin::EventBus>,
@@ -654,7 +654,13 @@ impl ProductionPlugin {
                 }
                 Ok(true)
             }
-            Backend::Process(_) => Ok(false),
+            // A process plugin publishes its declared event kinds through its
+            // protocol (`ProcessInvocationResponse::Publish`) onto this bus;
+            // the in-process state registry cannot reach it.
+            Backend::Process(plugin) => {
+                plugin.bind_event_bus(Arc::clone(bus));
+                Ok(false)
+            }
         }
     }
 

@@ -73,6 +73,59 @@ pub enum ProcessInvocationResponse {
         details: String,
         status: Option<i32>,
     },
+    /// A publication on one of the plugin's declared event kinds (its manifest's
+    /// `event_publications`), written while answering any invocation, before
+    /// that invocation's final response. Any number may precede it. `state`
+    /// selects a retained state channel over a broadcast one; `payload` is JSON.
+    /// Appended last so earlier variants keep their encoding.
+    Publish {
+        protocol_version: u16,
+        kind: String,
+        state: bool,
+        payload: Vec<u8>,
+    },
+}
+
+impl ProcessInvocationResponse {
+    /// A publication on `kind` with a JSON `payload`.
+    #[must_use]
+    pub fn publish(kind: impl Into<String>, state: bool, payload: Vec<u8>) -> Self {
+        Self::Publish {
+            protocol_version: PROCESS_RUNTIME_PROTOCOL_V1,
+            kind: kind.into(),
+            state,
+            payload,
+        }
+    }
+}
+
+/// Split concatenated process-runtime frames (a one-shot plugin's whole
+/// stdout) into whole frames, each still carrying its header.
+///
+/// # Errors
+/// Returns an error when the bytes are not a sequence of complete frames.
+pub fn split_process_runtime_frames(mut bytes: &[u8]) -> Result<Vec<&[u8]>> {
+    let header_len = PROCESS_RUNTIME_MAGIC_V1.len() + 4;
+    let mut frames = Vec::new();
+    while !bytes.is_empty() {
+        if bytes.len() < header_len || !bytes.starts_with(PROCESS_RUNTIME_MAGIC_V1) {
+            return Err(PluginError::ServiceProtocol {
+                details: "process runtime output is not a sequence of BMUXPRC1 frames".to_string(),
+            });
+        }
+        let mut len_buf = [0_u8; 4];
+        len_buf.copy_from_slice(&bytes[PROCESS_RUNTIME_MAGIC_V1.len()..header_len]);
+        let end = usize::try_from(u32::from_be_bytes(len_buf))
+            .ok()
+            .and_then(|len| len.checked_add(header_len))
+            .filter(|end| *end <= bytes.len())
+            .ok_or_else(|| PluginError::ServiceProtocol {
+                details: "process runtime output truncated payload".to_string(),
+            })?;
+        frames.push(&bytes[..end]);
+        bytes = &bytes[end..];
+    }
+    Ok(frames)
 }
 
 /// # Errors
@@ -233,6 +286,50 @@ mod tests {
         ProcessInvocationRequest, ProcessInvocationResponse, decode_process_invocation_response,
         decode_process_runtime_frame, encode_process_runtime_frame,
     };
+
+    #[test]
+    fn publications_precede_the_response_and_split_into_frames() {
+        use super::{encode_process_invocation_response, split_process_runtime_frames};
+        let publish =
+            ProcessInvocationResponse::publish("example/presentation", true, b"{}".to_vec());
+        let response = ProcessInvocationResponse::Lifecycle {
+            protocol_version: 1,
+            invocation_id: crate::PluginInvocationId::new(),
+            status: 0,
+        };
+        let mut stdout = encode_process_invocation_response(&publish).unwrap();
+        stdout.extend(encode_process_invocation_response(&response).unwrap());
+        let frames = split_process_runtime_frames(&stdout).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert!(matches!(
+            decode_process_invocation_response(frames[0]).unwrap(),
+            ProcessInvocationResponse::Publish { kind, state: true, .. } if kind == "example/presentation"
+        ));
+        assert!(matches!(
+            decode_process_invocation_response(frames[1]).unwrap(),
+            ProcessInvocationResponse::Lifecycle { status: 0, .. }
+        ));
+        assert!(split_process_runtime_frames(&stdout[..stdout.len() - 1]).is_err());
+    }
+
+    /// Hand-written plugins encode a publication positionally: variant 5, the
+    /// protocol version, the kind, the state flag and the JSON payload.
+    #[test]
+    fn hand_encoded_publications_decode() {
+        let mut payload = vec![5, 1];
+        let kind = b"example/presentation";
+        payload.push(u8::try_from(kind.len()).unwrap());
+        payload.extend_from_slice(kind);
+        payload.push(1);
+        payload.push(2);
+        payload.extend_from_slice(b"{}");
+        let frame = encode_process_runtime_frame(&payload).unwrap();
+        assert!(matches!(
+            decode_process_invocation_response(&frame).unwrap(),
+            ProcessInvocationResponse::Publish { kind, state: true, payload, .. }
+                if kind == "example/presentation" && payload == b"{}"
+        ));
+    }
 
     #[test]
     fn process_frame_round_trips_payload() {

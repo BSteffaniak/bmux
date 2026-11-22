@@ -243,9 +243,10 @@ Each phase lands with the parity harness and the targeted tests green.
    regions becomes a service invocation of the region's endpoint carrying the
    event. `examples/presentation-plugin`, packaged as a dylib in a real server,
    proves the chain to a streaming client and into the registries. Process
-   plugins cannot publish events yet (no plugin-to-host channel in their
-   protocol); frontend portable presentations (path B) have no producers and are
-   deleted in phase 8.
+   plugins publish by writing `Publish` frames before an invocation's response
+   (declared kinds only); the Python process example proves it in a real server.
+   Frontend portable presentations (path B) had no producers and were removed in
+   phase 8.
 7. **Host overlays and components.** Prompts and help publish scenes; stock
    components (list, tab strip, menu, toast stack, text input) replace the
    sidebar's and tab bar's hand-written measuring, hover and scrolling.
