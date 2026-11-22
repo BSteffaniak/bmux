@@ -39,6 +39,7 @@ tempfile            = { version = "3.27.0", default-features = false }
 # MoosicBox master. Remove before merging.
 [patch."https://github.com/MoosicBox/MoosicBox"]
 simvar             = { path = "../../../wt-moosicbox/consensus-sim/packages/simvar" }
+simvar_observer    = { path = "../../../wt-moosicbox/consensus-sim/packages/simvar/observer" }
 switchy_async      = { path = "../../../wt-moosicbox/consensus-sim/packages/switchy/async" }
 switchy_fs         = { path = "../../../wt-moosicbox/consensus-sim/packages/switchy/fs" }
 switchy_pty        = { path = "../../../wt-moosicbox/consensus-sim/packages/switchy/pty" }

@@ -741,7 +741,7 @@ dependencies = [
  "bmux_tui_components",
  "serde",
  "serde_json",
- "simvar_observer 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
+ "simvar_observer",
 ]
 
 [[package]]
@@ -4034,7 +4034,7 @@ dependencies = [
  "log",
  "scoped-tls",
  "shell-words",
- "simvar_observer 0.5.0",
+ "simvar_observer",
  "simvar_utils",
  "switchy 0.5.0",
  "thiserror 2.0.21",
@@ -4043,11 +4043,6 @@ dependencies = [
 [[package]]
 name = "simvar_observer"
 version = "0.5.0"
-
-[[package]]
-name = "simvar_observer"
-version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#fd4de6943cdf3d48c6cb611de80791fcf4d730ce"
 
 [[package]]
 name = "simvar_utils"
