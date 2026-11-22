@@ -767,6 +767,8 @@ version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_plugin_sdk",
  "bmux_snapshot_protocol",
+ "switchy_thread",
+ "switchy_time",
  "thiserror 2.0.21",
 ]
 
@@ -810,6 +812,7 @@ name = "bmux_terminal_protocol"
 version = "0.0.1-alpha.4"
 dependencies = [
  "serde",
+ "switchy_time",
 ]
 
 [[package]]
