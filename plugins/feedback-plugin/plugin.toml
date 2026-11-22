@@ -1,0 +1,50 @@
+bundled_only      = "keeps a Bcode session bridge on Tokio tasks and opens prompts from Tokio tasks"
+component_roles   = ["backend", "frontend"]
+execution_class   = "native_fast"
+id                = "bmux.feedback"
+name              = "bmux Feedback"
+owns_namespaces   = ["feedback"]
+provided_features = ["bmux.feedback"]
+version           = "0.0.1-alpha.0"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = false
+name          = "give"
+path          = ["feedback", "give"]
+summary       = "Give feedback about what is on screen to Bcode"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = false
+name          = "submit"
+path          = ["feedback", "submit"]
+summary       = "Send a feedback draft to Bcode"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "draft"
+name       = "draft"
+value_name = "DRAFT"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "text"
+name       = "text"
+value_name = "TEXT"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = false
+name          = "discard"
+path          = ["feedback", "discard"]
+summary       = "Forget a feedback draft"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "draft"
+name       = "draft"
+value_name = "DRAFT"
+
+[keybindings.runtime]
+"shift+b" = "plugin:bmux.feedback:give"

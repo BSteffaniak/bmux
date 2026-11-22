@@ -1511,6 +1511,57 @@
       ],
       "frozen_help": true
     },
+    "feedback": {
+      "disposition": "non-cli",
+      "owner": "bmux.feedback",
+      "reason": "hidden",
+      "frozen_help": false
+    },
+    "feedback discard": {
+      "disposition": "non-cli",
+      "owner": "bmux.feedback",
+      "reason": "hidden",
+      "declarations": [
+        {
+          "owner": "bmux.feedback",
+          "command": "discard",
+          "manifest": "plugins/feedback-plugin/plugin.toml",
+          "canonical": "feedback discard",
+          "exposed": false
+        }
+      ],
+      "frozen_help": true
+    },
+    "feedback give": {
+      "disposition": "non-cli",
+      "owner": "bmux.feedback",
+      "reason": "hidden",
+      "declarations": [
+        {
+          "owner": "bmux.feedback",
+          "command": "give",
+          "manifest": "plugins/feedback-plugin/plugin.toml",
+          "canonical": "feedback give",
+          "exposed": false
+        }
+      ],
+      "frozen_help": true
+    },
+    "feedback submit": {
+      "disposition": "non-cli",
+      "owner": "bmux.feedback",
+      "reason": "hidden",
+      "declarations": [
+        {
+          "owner": "bmux.feedback",
+          "command": "submit",
+          "manifest": "plugins/feedback-plugin/plugin.toml",
+          "canonical": "feedback submit",
+          "exposed": false
+        }
+      ],
+      "frozen_help": true
+    },
     "finder": {
       "disposition": "composed-namespace",
       "owners": [

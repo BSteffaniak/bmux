@@ -1,0 +1,65 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Shipped feedback plugin for bmux: sends feedback, with the screen around it, to Bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "bmux", "feedback", "plugin"]
+license     = { workspace = true }
+name        = "bmux_feedback_plugin"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_bundled_plugins         = { workspace = true, optional = true }
+bcode_session_bridge          = { workspace = true }
+bcode_session_bridge_embedded = { workspace = true, optional = true }
+bcode_session_bridge_runtime  = { workspace = true }
+bmux_clients_plugin_api       = { workspace = true }
+bmux_contexts_plugin_api      = { workspace = true }
+bmux_ipc                      = { workspace = true }
+bmux_pane_runtime_plugin_api  = { workspace = true }
+bmux_plugin                   = { workspace = true }
+bmux_plugin_schema_macros     = { workspace = true }
+bmux_plugin_sdk               = { workspace = true }
+bmux_recording_plugin_api     = { workspace = true }
+bmux_tab_bar_plugin_api       = { workspace = true }
+serde                         = { workspace = true, features = ["derive", "std"] }
+serde_json                    = { workspace = true, features = ["std"] }
+tokio                         = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+toml                          = { workspace = true }
+tracing                       = { workspace = true }
+
+[package.metadata.cargo-machete]
+# The BPDL bindings of the imported interfaces name bmux_ipc types; the embedded
+# Bcode's plugins are chosen by enabling bcode_bundled_plugins' features.
+ignored = ["bcode_bundled_plugins", "bmux_ipc"]
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[features]
+# Package this crate as a dynamic library for one component. Only the
+# plugin packager enables these, together with `--cfg bmux_plugin_dylib`.
+dynamic-backend = []
+dynamic-frontend = []
+# Host Bcode inside the bmux server, so feedback works without an installed Bcode.
+embedded-bcode = [
+    "bcode_bundled_plugins/static-bundled-plugins",
+    "dep:bcode_session_bridge_embedded",
+]
+fail-on-warnings = [
+    "bcode_bundled_plugins?/fail-on-warnings",
+    "bcode_session_bridge/fail-on-warnings",
+    "bcode_session_bridge_embedded?/fail-on-warnings",
+    "bcode_session_bridge_runtime/fail-on-warnings",
+    "bmux_clients_plugin_api/fail-on-warnings",
+    "bmux_contexts_plugin_api/fail-on-warnings",
+    "bmux_ipc/fail-on-warnings",
+    "bmux_pane_runtime_plugin_api/fail-on-warnings",
+    "bmux_plugin/fail-on-warnings",
+    "bmux_plugin_schema_macros/fail-on-warnings",
+    "bmux_plugin_sdk/fail-on-warnings",
+    "bmux_recording_plugin_api/fail-on-warnings",
+    "bmux_tab_bar_plugin_api/fail-on-warnings",
+]

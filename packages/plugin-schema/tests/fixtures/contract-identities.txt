@@ -64,6 +64,7 @@ plugins/decoration-plugin-api/bpdl/decoration-plugin.bpdl decoration-state b3265
 plugins/decoration-plugin-api/bpdl/decoration-plugin.bpdl decoration-commands 94edc86f7cb9220ffb40ad4e35036b09f02a8d335c38f0a9c558b0868cf80931
 plugins/decoration-plugin-api/bpdl/decoration-plugin.bpdl decoration-events d3f0bf3648f0c3bdb77e4dc59b3840c49c0d735629dd8f8f37af695b08c051a9
 plugins/decoration-plugin-api/bpdl/decoration-plugin.bpdl decoration-input-hooks/v3 c368c9a1471ea947842dc45fadfd6fee4cce4ca2e719d31056c57e4b6947e2e2
+plugins/feedback-plugin/bpdl/feedback-plugin.bpdl feedback-commands/v1 dd7d57ee47a56366ce03387c1e4343b208c83f7f165b2bf0d567772f550ae511
 plugins/pane-runtime-plugin-api/bpdl/pane-runtime-plugin.bpdl pane-runtime-environment-v1 47fceabf07f7042e3fd7bb393a57fe293fa30b6929c1d41afbb4af7a46ded959
 plugins/pane-runtime-plugin-api/bpdl/pane-runtime-plugin.bpdl pane-runtime-pointer-grid-v2 90d51612718b9ba8e146ea20709cc531d8b071226a555760069e3746564430b8
 plugins/pane-runtime-plugin-api/bpdl/pane-runtime-plugin.bpdl pane-runtime-live-presentation-v1 8a848aa432552b7966713ce9528ee9a11caf9e4436f1e671d4a2c34f4c50f303

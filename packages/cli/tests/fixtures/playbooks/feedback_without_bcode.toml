@@ -1,0 +1,12 @@
+[plugins.settings."bmux.feedback"]
+bcode = "/nonexistent/bcode"
+
+[keybindings]
+initial_mode = "normal"
+
+[keybindings.global]
+"alt+g" = "plugin:bmux.feedback:give"
+
+[keybindings.modes.normal]
+label       = "NORMAL"
+passthrough = true

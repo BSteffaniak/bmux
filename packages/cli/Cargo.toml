@@ -101,6 +101,7 @@ bmux_decoration_plugin = { workspace = true, optional = true, features = [
 ] }
 bmux_decoration_plugin_api = { workspace = true }
 bmux_decoration_plugin_renderer = { workspace = true, optional = true }
+bmux_feedback_plugin = { workspace = true, optional = true }
 bmux_finder_plugin = { workspace = true, optional = true }
 bmux_pane_runtime_plugin = { workspace = true, optional = true }
 bmux_performance_plugin = { workspace = true, optional = true }
@@ -251,6 +252,7 @@ fail-on-warnings = [
     "bmux_playbook_plugin?/fail-on-warnings",
     "bmux_broadcast_plugin?/fail-on-warnings",
     "bmux_presenter_plugin?/fail-on-warnings",
+    "bmux_feedback_plugin?/fail-on-warnings",
     "bmux_finder_plugin?/fail-on-warnings",
     "bmux_application_resurrection_plugin?/fail-on-warnings",
     "bmux_attach_image_protocol/fail-on-warnings",
@@ -324,6 +326,8 @@ bundled-plugins = [
     "bundled-plugin-broadcast",
     "bundled-plugin-presenter",
     "bundled-plugin-finder",
+    "bundled-plugin-feedback",
+    "bundled-plugin-feedback-embedded-bcode",
     "bundled-visual-adapters",
 ]
 
@@ -351,6 +355,12 @@ bundled-plugin-control-catalog = ["dep:bmux_control_catalog_plugin"]
 bundled-plugin-decoration = [
     "dep:bmux_decoration_plugin",
     "dep:bmux_decoration_plugin_renderer",
+]
+bundled-plugin-feedback = ["dep:bmux_feedback_plugin"]
+# The feedback plugin hosts Bcode in the bmux server when no installed Bcode is named.
+bundled-plugin-feedback-embedded-bcode = [
+    "bmux_feedback_plugin?/embedded-bcode",
+    "bundled-plugin-feedback",
 ]
 bundled-plugin-finder = ["dep:bmux_finder_plugin"]
 bundled-plugin-pane-runtime = ["dep:bmux_pane_runtime_plugin"]

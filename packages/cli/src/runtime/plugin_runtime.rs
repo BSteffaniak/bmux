@@ -361,6 +361,10 @@ declare_bundled_plugins! {
     id = "bmux.finder",
     definition = bmux_finder_plugin::plugin_definition();
 
+    feature = "bundled-plugin-feedback",
+    id = "bmux.feedback",
+    definition = bmux_feedback_plugin::plugin_definition();
+
     feature = "bundled-plugin-pane-runtime",
     id = "bmux.pane_runtime",
     definition = bmux_pane_runtime_plugin::plugin_definition();
@@ -717,6 +721,8 @@ const fn static_bundled_workspace_plugin_dirs() -> &'static [&'static str] {
         "contexts-plugin",
         #[cfg(feature = "bundled-plugin-control-catalog")]
         "control-catalog-plugin",
+        #[cfg(feature = "bundled-plugin-feedback")]
+        "feedback-plugin",
         #[cfg(feature = "bundled-plugin-finder")]
         "finder-plugin",
         #[cfg(feature = "bundled-plugin-performance")]

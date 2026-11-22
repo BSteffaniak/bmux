@@ -322,6 +322,16 @@ fn playbook_real_attach_prompted_tab_rename_applies() {
 
 #[test]
 #[serial]
+fn playbook_real_attach_feedback_without_bcode_is_reported() {
+    let (json, pass) = run_playbook_fixture("feedback_without_bcode_real_attach.dsl");
+    assert!(
+        pass,
+        "feedback given without a usable Bcode should be reported: {json:#}"
+    );
+}
+
+#[test]
+#[serial]
 fn playbook_real_attach_finder_switches_sandbox_tabs() {
     let (json, pass) = run_playbook_fixture("tab_navigation_finder_real_attach.dsl");
     assert!(

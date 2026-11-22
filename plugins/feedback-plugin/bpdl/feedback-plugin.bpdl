@@ -1,0 +1,45 @@
+// Contract surface of the `bmux.feedback` plugin: the frontend opens a draft when the
+// person starts giving feedback and submits it once they have written it; the server sends
+// it to Bcode.
+plugin bmux.feedback version 1;
+
+import clients = bmux.clients;
+import contexts = bmux.contexts;
+import pane = bmux.pane_runtime;
+import recording = bmux.recording;
+import tabbar = bmux.tab_bar;
+
+capability FEEDBACK_WRITE = bmux.feedback.write;
+
+@capability(FEEDBACK_WRITE)
+@interface-version(1)
+interface feedback-commands {
+    // A fact about where the feedback was given, such as the focused pane's command.
+    // Sensitive values are kept from the model.
+    record facet {
+        key: string,
+        value: string,
+        sensitive: bool,
+    }
+
+    // Open a draft for feedback the person started giving at `opened_epoch_ms`, marking that
+    // moment in the rolling recording. Returns the draft's id.
+    command begin(opened_epoch_ms: u64, facets: list<facet>) -> u64;
+
+    // Send a draft's text to Bcode. Returns at once; the result arrives as a notification.
+    command submit(draft: u64, text: string) -> bool;
+
+    // Forget a draft the person abandoned.
+    command discard(draft: u64) -> bool;
+}
+
+/// What `bmux.feedback` provides to and requires from the host and other plugins.
+world feedback {
+    provide feedback-commands;
+    require clients.clients-state;
+    require contexts.contexts-state;
+    require pane.pane-runtime-state;
+    require recording.recording-state;
+    require recording.recording-commands;
+    require tabbar.notifications;
+}

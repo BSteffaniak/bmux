@@ -124,6 +124,7 @@ members = [
     "plugins/decoration-plugin",
     "plugins/decoration-plugin-api",
     "plugins/decoration-plugin-renderer",
+    "plugins/feedback-plugin",
     "plugins/finder-plugin",
     "plugins/pane-runtime-plugin",
     "plugins/pane-runtime-plugin-api",
@@ -352,6 +353,7 @@ bmux_control_catalog_plugin_api          = { version = "0.0.1-alpha.4", default-
 bmux_decoration_plugin                   = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/decoration-plugin" }
 bmux_decoration_plugin_api               = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/decoration-plugin-api" }
 bmux_decoration_plugin_renderer          = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/decoration-plugin-renderer" }
+bmux_feedback_plugin                     = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/feedback-plugin" }
 bmux_finder_plugin                       = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/finder-plugin" }
 bmux_pane_runtime_plugin                 = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/pane-runtime-plugin" }
 bmux_pane_runtime_plugin_api             = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/pane-runtime-plugin-api" }
@@ -417,6 +419,12 @@ switchy_pty           = { git = "https://github.com/MoosicBox/MoosicBox", branch
 switchy_simulation    = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
 switchy_thread        = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
 switchy_time          = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
+
+# Bcode's session bridge, for the feedback plugin, and the Bcode it embeds.
+bcode_bundled_plugins         = { git = "https://github.com/BSteffaniak/bcode", branch = "master", default-features = false }
+bcode_session_bridge          = { git = "https://github.com/BSteffaniak/bcode", branch = "master", default-features = false }
+bcode_session_bridge_embedded = { git = "https://github.com/BSteffaniak/bcode", branch = "master", default-features = false }
+bcode_session_bridge_runtime  = { git = "https://github.com/BSteffaniak/bcode", branch = "master", default-features = false }
 
 git_sshripped_recipient    = { version = "0.10.0", default-features = false }
 git_sshripped_ssh_agent    = { version = "0.10.0", default-features = false }
@@ -541,17 +549,34 @@ serial_test = { version = "4.0.1" }
 [profile.dev.package.sha2]
 opt-level = 3
 
-# moosicbox_log_watch follows MoosicBox master and names the bmux crates it
-# uses by their crates.io versions; resolve those to this workspace so one
-# copy of each is built.
+# moosicbox_log_watch and the embedded Bcode follow their masters and name the
+# bmux crates they use by their crates.io versions; resolve those to this
+# workspace so one copy of each is built. Bcode also needs sshenv_vault from
+# its master (Bcode's own patches do not apply here).
 [patch.crates-io]
-bmux_cell_geometry        = { path = "packages/cell-geometry" }
-bmux_keyboard             = { path = "packages/keyboard" }
-bmux_terminal             = { path = "packages/terminal" }
-bmux_text_edit            = { path = "packages/text-edit" }
-bmux_tui                  = { path = "packages/tui" }
-bmux_tui_components       = { path = "packages/tui-components" }
-bmux_unicode_segmentation = { path = "packages/unicode-segmentation" }
+bmux_attach_image_protocol = { path = "packages/attach-image-protocol" }
+bmux_cell_geometry         = { path = "packages/cell-geometry" }
+bmux_codec                 = { path = "packages/codec" }
+bmux_color                 = { path = "packages/color" }
+bmux_config_composition    = { path = "packages/config-composition" }
+bmux_ipc                   = { path = "packages/ipc" }
+bmux_keyboard              = { path = "packages/keyboard" }
+bmux_markdown              = { path = "packages/markdown" }
+bmux_perf_telemetry        = { path = "packages/perf-telemetry" }
+bmux_plugin                = { path = "packages/plugin" }
+bmux_plugin_runtime        = { path = "packages/plugin-runtime" }
+bmux_plugin_schema         = { path = "packages/plugin-schema" }
+bmux_plugin_sdk            = { path = "packages/plugin-sdk" }
+bmux_pty                   = { path = "packages/pty" }
+bmux_syntax_render         = { path = "packages/syntax-render" }
+bmux_terminal              = { path = "packages/terminal" }
+bmux_terminal_grid         = { path = "packages/terminal-grid" }
+bmux_text_edit             = { path = "packages/text-edit" }
+bmux_tui                   = { path = "packages/tui" }
+bmux_tui_components        = { path = "packages/tui-components" }
+bmux_tui_runtime           = { path = "packages/tui-runtime" }
+bmux_unicode_segmentation  = { path = "packages/unicode-segmentation" }
+sshenv_vault               = { git = "https://github.com/BSteffaniak/sshenv", branch = "master" }
 
 # To develop against a local MoosicBox checkout:
 # [patch."https://github.com/MoosicBox/MoosicBox"]
