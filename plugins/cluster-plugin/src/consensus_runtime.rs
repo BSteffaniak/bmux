@@ -12,16 +12,18 @@
 //! responses are the canonical control responses produced by application.
 
 use crate::consensus_driver::{
-    ClientError, Driver, DriverConfig, Jitter, Status, Storage, Transport,
+    ClientError, Driver, DriverConfig, Jitter, SnapshotObject, Status, Storage, Transport,
 };
 use crate::consensus_engine::{Config, Engine, Rejection, StopReason};
 use crate::consensus_model::{LogIdentity, Membership, StoredMembership};
-use crate::consensus_wire::{MemberView, WireService, WireTransport};
+use crate::consensus_wire::{MemberView, SnapshotStaging, WireService, WireTransport};
 use crate::control_state::ControlState;
 use crate::membership::NodeId;
 use crate::owned_vote_store::{OwnedStorage, OwnedVoteStore, PreflightAdmission};
 use bmux_cluster_plugin_api::cluster_consensus_rpc::ClusterConsensusRpcService as RpcV1;
 use bmux_cluster_plugin_api::cluster_consensus_rpc_v2::ClusterConsensusRpcService as RpcV2;
+use bmux_cluster_plugin_api::cluster_consensus_snapshot::ClusterConsensusSnapshotService as SnapshotV1;
+use bmux_cluster_plugin_api::cluster_consensus_transfer::ClusterConsensusTransferService as TransferV1;
 use bmux_cluster_plugin_api::cluster_types::{
     ControlReadConsistency, ControlResponse, ControlServiceError, ControlStateView,
 };
@@ -50,6 +52,19 @@ const MEMBER_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 /// directory identify the owned durable format; nothing else is selected.
 const OWNED_STORE_DIRECTORY: &str = "owned-consensus";
 const OWNED_STORE_FILE: &str = "authority.bmown";
+/// Disposable inbound snapshot staging, beside the owned store it feeds.
+const SNAPSHOT_STAGING_DIRECTORY: &str = "snapshot-staging";
+/// Staging quotas (ADR-0015: finite, local resource configuration). One peer
+/// may stage one complete snapshot of the largest size the owned store
+/// publishes; the node as a whole admits two, so a deposed leader's abandoned
+/// transfer cannot block the current leader's until it expires.
+const SNAPSHOT_STAGING_PER_PEER_BYTES: u64 =
+    crate::consensus_storage::MAX_SNAPSHOT_FILE_BYTES as u64;
+const SNAPSHOT_STAGING_TOTAL_BYTES: u64 = 2 * SNAPSHOT_STAGING_PER_PEER_BYTES;
+const _: () = assert!(
+    SNAPSHOT_STAGING_PER_PEER_BYTES > 0
+        && SNAPSHOT_STAGING_TOTAL_BYTES >= SNAPSHOT_STAGING_PER_PEER_BYTES
+);
 /// Where the retired `OpenRaft` runtime kept its stores. Its presence means
 /// this node holds legacy authority the owned runtime will not reinterpret.
 const LEGACY_STORE_DIRECTORY: &str = "consensus";
@@ -185,6 +200,15 @@ pub fn owned_store_path(state_dir: &Path, cluster_id: &str) -> PathBuf {
         .join(OWNED_STORE_FILE)
 }
 
+/// The node's private snapshot staging directory for `cluster_id`.
+#[must_use]
+pub fn snapshot_staging_path(state_dir: &Path, cluster_id: &str) -> PathBuf {
+    plugin_state_dir(state_dir)
+        .join(OWNED_STORE_DIRECTORY)
+        .join(cluster_id)
+        .join(SNAPSHOT_STAGING_DIRECTORY)
+}
+
 fn plugin_state_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("plugins").join("bmux.cluster")
 }
@@ -245,6 +269,30 @@ fn open_or_initialize(
         }
         Provisioning::Joiner => OwnedVoteStore::create(path, cluster_id),
     }
+}
+
+/// Create (owner-only) or reuse the staging directory and open it. Staging
+/// requires a trusted absolute path without symlinked components, so the
+/// configured state directory is resolved once here; the staging layer then
+/// re-walks it without following links and checks every ancestor's ownership.
+/// Leftovers from a previous run are discarded: staging is disposable.
+fn open_staging(path: &Path) -> io::Result<Arc<SnapshotStaging>> {
+    use std::os::unix::fs::DirBuilderExt;
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => {
+            if let Some(parent) = path.parent() {
+                switchy_fs::sync::sync_directory(parent)?;
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let resolved = std::fs::canonicalize(path)?;
+    SnapshotStaging::open(
+        &resolved,
+        SNAPSHOT_STAGING_PER_PEER_BYTES,
+        SNAPSHOT_STAGING_TOTAL_BYTES,
+    )
 }
 
 /// Cached applied view, refreshed after every durable application.
@@ -324,6 +372,10 @@ impl Storage for RuntimeStorage {
 
     fn compact(&mut self) -> io::Result<Option<(LogIdentity, StoredMembership)>> {
         self.inner.compact()
+    }
+
+    fn snapshot(&mut self) -> io::Result<Option<SnapshotObject>> {
+        self.inner.snapshot()
     }
 
     fn read(&mut self) -> io::Result<AppliedView> {
@@ -414,11 +466,12 @@ impl<T: Transport> Transport for PeerBoundedTransport<T> {
         to: NodeId,
         term: crate::consensus_model::Term,
         seq: u64,
+        snapshot: SnapshotObject,
     ) -> crate::consensus_driver::Reply {
         let Some(permit) = self.admit(to) else {
             return Box::pin(async { None });
         };
-        let call = self.inner.send_snapshot(to, term, seq);
+        let call = self.inner.send_snapshot(to, term, seq, snapshot);
         Box::pin(async move {
             let reply = call.await;
             drop(permit);
@@ -427,12 +480,22 @@ impl<T: Transport> Transport for PeerBoundedTransport<T> {
     }
 }
 
-/// A running node's inbound `cluster-consensus-rpc` v1 and v2 providers.
-pub type RpcProviders = (Arc<dyn RpcV1 + Send + Sync>, Arc<dyn RpcV2 + Send + Sync>);
+/// A running node's inbound consensus providers: `cluster-consensus-rpc` v1
+/// (vote) and v2 (append), staged `cluster-consensus-transfer` v1 and
+/// `cluster-consensus-snapshot` v1 installation.
+#[derive(Clone)]
+pub struct RpcProviders {
+    pub rpc_v1: Arc<dyn RpcV1 + Send + Sync>,
+    pub rpc_v2: Arc<dyn RpcV2 + Send + Sync>,
+    pub transfer: Arc<dyn TransferV1 + Send + Sync>,
+    pub snapshot: Arc<dyn SnapshotV1 + Send + Sync>,
+}
 
 struct Inner {
     driver: std::sync::Mutex<Option<Arc<Driver<AppliedView>>>>,
     rpc: std::sync::Mutex<Option<RpcProviders>>,
+    /// Inbound snapshot staging, closed during shutdown before the store.
+    staging: std::sync::Mutex<Option<Arc<SnapshotStaging>>>,
     status: tokio::sync::watch::Receiver<Status>,
     applied: Arc<AppliedCache>,
     members: MemberView,
@@ -490,7 +553,7 @@ impl ConsensusNode {
             node_id,
             provisioning,
             admission,
-            Config::default(),
+            (Config::default(), DriverConfig::default()),
             transport,
         )
         .await
@@ -502,7 +565,7 @@ impl ConsensusNode {
         node_id: NodeId,
         provisioning: Provisioning,
         admission: &PreflightAdmission,
-        config: Config,
+        (config, driver_config): (Config, DriverConfig),
         transport: impl FnOnce(MemberView) -> Arc<T>,
     ) -> Result<Self, ConsensusRuntimeError> {
         if cluster_id.is_empty()
@@ -516,9 +579,10 @@ impl ConsensusNode {
         }
         reject_legacy_store(state_dir)?;
         let path = owned_store_path(state_dir, cluster_id);
+        let staging_path = snapshot_staging_path(state_dir, cluster_id);
         let cluster = cluster_id.to_string();
         let admission = admission.clone();
-        let (store, recovered) = tokio::task::spawn_blocking(move || -> io::Result<_> {
+        let (store, recovered, staging) = tokio::task::spawn_blocking(move || -> io::Result<_> {
             let mut store = open_or_initialize(&path, &cluster, node_id, &provisioning, &admission)
                 .map_err(|error| {
                     io::Error::new(
@@ -526,19 +590,31 @@ impl ConsensusNode {
                         format!("owned consensus store {}: {error}", path.display()),
                     )
                 })?;
-            let recovered = store.recovered()?;
-            Ok((store, recovered))
+            // Staging is opened only by the store's single owner.
+            let opened = store.recovered().and_then(|recovered| {
+                open_staging(&staging_path)
+                    .map(|staging| (recovered, staging))
+                    .map_err(|error| {
+                        io::Error::new(
+                            error.kind(),
+                            format!("owned snapshot staging {}: {error}", staging_path.display()),
+                        )
+                    })
+            });
+            match opened {
+                Ok((recovered, staging)) => Ok((store, recovered, staging)),
+                Err(error) => {
+                    // Release durable ownership before reporting the failure.
+                    let _ = store.close();
+                    Err(error)
+                }
+            }
         })
         .await
         .map_err(|error| ConsensusRuntimeError::Fatal(error.to_string()))??;
         let (engine, effects) = Engine::recover(node_id, config, recovered)
             .map_err(|error| ConsensusRuntimeError::Storage(format!("{error:?}")))?;
-        let mut storage = OwnedStorage::new(
-            store,
-            // TODO(ADR-0015 snapshot transfer): staged snapshots arrive through
-            // the snapshot transfer service, which is wired separately.
-            Box::new(|_, _| Err(io::Error::other("snapshot transfer is not available"))),
-        );
+        let mut storage = OwnedStorage::new(store, staging.reader());
         let (state, membership) = storage.applied()?;
         let applied = Arc::new(AppliedCache::new(AppliedView { state, membership }));
         let members = MemberView::default();
@@ -552,13 +628,15 @@ impl ConsensusNode {
             },
             transport,
             seeded_jitter(),
-            DriverConfig::default(),
+            driver_config,
         );
+        staging.spawn_expiry();
         let status = driver.watch();
         Ok(Self {
             inner: Arc::new(Inner {
                 driver: std::sync::Mutex::new(Some(Arc::new(driver))),
                 rpc: std::sync::Mutex::new(None),
+                staging: std::sync::Mutex::new(Some(staging)),
                 status,
                 applied,
                 members,
@@ -586,6 +664,30 @@ impl ConsensusNode {
     where
         C: crate::ClusterRuntimeOps + bmux_plugin::ServiceCaller + Send + Sync + 'static,
     {
+        Self::start_endpoint_with(
+            state_dir,
+            cluster_id,
+            identity,
+            caller,
+            provisioning,
+            admission,
+            DriverConfig::default(),
+        )
+        .await
+    }
+
+    async fn start_endpoint_with<C>(
+        state_dir: &Path,
+        cluster_id: &str,
+        identity: &crate::membership::NodeIdentity,
+        caller: Arc<C>,
+        provisioning: Provisioning,
+        admission: &PreflightAdmission,
+        driver_config: DriverConfig,
+    ) -> Result<Self, ConsensusRuntimeError>
+    where
+        C: crate::ClusterRuntimeOps + bmux_plugin::ServiceCaller + Send + Sync + 'static,
+    {
         let node_id = *identity.node_id();
         let incarnation = uuid::Uuid::new_v4().as_u64_pair().0;
         let outbound = caller.clone();
@@ -595,7 +697,7 @@ impl ConsensusNode {
             node_id,
             provisioning,
             admission,
-            endpoint_config(),
+            (endpoint_config(), driver_config),
             |members| {
                 Arc::new(PeerBoundedTransport::new(Arc::new(WireTransport::new(
                     outbound,
@@ -610,17 +712,30 @@ impl ConsensusNode {
         let driver = node
             .driver()
             .map_err(|error| ConsensusRuntimeError::Fatal(error.to_string()))?;
+        let staging = node
+            .inner
+            .staging
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| ConsensusRuntimeError::Fatal("consensus node stopped".into()))?;
         let service = Arc::new(WireService::new(
             caller.clone(),
             node_id,
             node.inner.members.clone(),
             driver,
+            staging,
         ));
         *node
             .inner
             .rpc
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some((service.clone(), service));
+            .unwrap_or_else(PoisonError::into_inner) = Some(RpcProviders {
+            rpc_v1: service.clone(),
+            rpc_v2: service.clone(),
+            transfer: service.clone(),
+            snapshot: service,
+        });
         let refresher = node.clone();
         let task = tokio::spawn(async move {
             loop {
@@ -702,7 +817,7 @@ impl ConsensusNode {
     /// The engine's current status (term, leader, commit, applied, ...).
     #[must_use]
     pub fn status(&self) -> Status {
-        *self.inner.status.borrow()
+        self.inner.status.borrow().clone()
     }
 
     /// The engine status as it changes.
@@ -1448,6 +1563,21 @@ impl ConsensusNode {
                 }
             }
         };
+        // No wire service remains (each held the driver), so no transfer can
+        // be admitted: discard staged objects before the store closes.
+        let staging = self
+            .inner
+            .staging
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(staging) = staging {
+            let closed = tokio::task::spawn_blocking(move || staging.close()).await;
+            if let Ok(Err(error)) = closed {
+                // Staging is disposable: the next start discards leftovers.
+                tracing::warn!(%error, "owned snapshot staging cleanup was incomplete");
+            }
+        }
         driver.shutdown().await;
         Ok(())
     }

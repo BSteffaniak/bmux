@@ -1133,6 +1133,8 @@ world cluster {
     provide cluster-peer-read;
     provide cluster-consensus-rpc@1;
     provide cluster-consensus-rpc@2;
+    provide cluster-consensus-transfer;
+    provide cluster-consensus-snapshot;
     provide cluster-capability-publication;
     provide cluster-protocol-refresh;
     provide cluster-principal-bootstrap;

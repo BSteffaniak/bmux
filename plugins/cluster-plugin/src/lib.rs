@@ -694,16 +694,10 @@ impl ClusterPlugin {
                 + Send
                 + Sync,
         > = worker;
-        // TODO(ADR-0015 snapshot transfer): register the transfer and snapshot
-        // providers here once they are served.
-        let _ = bmux_cluster_plugin_api::cluster_consensus_rpc::register_provider(
-            registry,
-            consensus_rpc.clone(),
-        );
-        let _ = bmux_cluster_plugin_api::cluster_consensus_rpc_v2::register_provider(
-            registry,
-            consensus_rpc,
-        );
+        // Owned consensus: rpc v1/v2, staged transfer and snapshot install.
+        if let Err(error) = consensus_rpc.register(registry) {
+            tracing::error!(%error, "failed registering owned consensus providers");
+        }
         let _ = bmux_cluster_plugin_api::cluster_control_command::register_provider(
             registry,
             control_commands,
@@ -3206,7 +3200,7 @@ mod tests {
     #[test]
     fn admitted_route_contributions_are_exact_proof_protocols() {
         let routes = admission::routes();
-        assert_eq!(routes.len(), 10);
+        assert_eq!(routes.len(), 15);
         let declarations = plugin_definition().declarations().unwrap().services;
         for route in routes {
             assert_eq!(route.kind, ServiceKind::Command);

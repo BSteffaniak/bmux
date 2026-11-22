@@ -351,23 +351,66 @@ fn install_reply_requires_a_bound_response_signed_by_the_recipient() {
 
 // ----- in-memory endpoint network --------------------------------------------
 
-type Service = WireService<TestCaller, ControlState>;
+/// Registers the generated consensus providers an endpoint serves.
+pub type Registrar = Arc<
+    dyn Fn(
+            &mut bmux_plugin_sdk::TypedServiceRegistry,
+        ) -> Result<(), Box<bmux_plugin_sdk::PluginError>>
+        + Send
+        + Sync,
+>;
 
+/// Endpoints by address, with per-endpoint outages and a delivery trace.
 #[derive(Default)]
-struct Network {
-    callers: Mutex<BTreeMap<String, Arc<TestCaller>>>,
-    down: Mutex<BTreeSet<String>>,
+pub struct Network {
+    pub callers: Mutex<BTreeMap<String, Arc<TestCaller>>>,
+    pub down: Mutex<BTreeSet<String>>,
     /// `(target, interface, operation)` of every delivered invocation.
-    trace: Mutex<Vec<(String, String, String)>>,
+    pub trace: Mutex<Vec<(String, String, String)>>,
 }
 
-struct TestCaller {
-    endpoint: String,
+impl Network {
+    /// Delivered invocations of `interface`/`operation` to `endpoint`.
+    pub fn delivered(&self, endpoint: &str, interface: &str, operation: &str) -> usize {
+        self.trace
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(to, delivered, op)| {
+                to == endpoint && delivered == interface && op == operation
+            })
+            .count()
+    }
+}
+
+/// One endpoint's host: storage, a member view for peer challenges, and the
+/// providers that serve its inbound generated consensus calls.
+pub struct TestCaller {
+    pub endpoint: String,
     network: Arc<Network>,
-    storage: Mutex<BTreeMap<String, Vec<u8>>>,
+    pub storage: Mutex<BTreeMap<String, Vec<u8>>>,
     scope: crate::durable_storage::TestScope,
-    members: MemberView,
-    service: Mutex<Option<Arc<Service>>>,
+    pub members: MemberView,
+    pub service: Mutex<Option<Registrar>>,
+}
+
+impl TestCaller {
+    pub fn new(endpoint: String, network: &Arc<Network>) -> Arc<Self> {
+        let caller = Arc::new(Self {
+            endpoint: endpoint.clone(),
+            network: network.clone(),
+            storage: Mutex::new(BTreeMap::new()),
+            scope: crate::durable_storage::TestScope::default(),
+            members: MemberView::default(),
+            service: Mutex::new(None),
+        });
+        network
+            .callers
+            .lock()
+            .unwrap()
+            .insert(endpoint, caller.clone());
+        caller
+    }
 }
 
 impl bmux_plugin::ServiceCaller for TestCaller {
@@ -512,14 +555,14 @@ fn deliver(
             .map_err(|_| unsupported())?;
             encode_service_message(&challenge)?
         } else {
-            let service = remote
+            let register = remote
                 .service
                 .lock()
                 .unwrap()
                 .clone()
                 .ok_or_else(unsupported)?;
             let mut registry = bmux_plugin_sdk::TypedServiceRegistry::new();
-            service.register(&mut registry).map_err(|_| unsupported())?;
+            register(&mut registry).map_err(|_| unsupported())?;
             let provider = registry
                 .portable_providers()
                 .into_iter()
@@ -586,16 +629,7 @@ impl Harness {
         let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let network = Arc::new(Network::default());
         let callers = (0..count)
-            .map(|index| {
-                Arc::new(TestCaller {
-                    endpoint: format!("node-{index}"),
-                    network: network.clone(),
-                    storage: Mutex::new(BTreeMap::new()),
-                    scope: crate::durable_storage::TestScope::default(),
-                    members: MemberView::default(),
-                    service: Mutex::new(None),
-                })
-            })
+            .map(|index| TestCaller::new(format!("node-{index}"), &network))
             .collect::<Vec<_>>();
         let identities = callers
             .iter()
@@ -695,11 +729,6 @@ impl Harness {
                 }))
                 .unwrap();
             crate::membership::store_membership_state(caller.as_ref(), &state).unwrap();
-            network
-                .callers
-                .lock()
-                .unwrap()
-                .insert(caller.endpoint.clone(), caller.clone());
             let path = root.path().join(format!("node-{index}.redb"));
             let mut store = OwnedVoteStore::create(&path, &cluster.to_string()).unwrap();
             assert!(
@@ -774,13 +803,15 @@ impl Harness {
                 compaction_interval: 4,
             },
         ));
-        *caller.service.lock().unwrap() = Some(Arc::new(WireService::new(
+        let service = Arc::new(WireService::new(
             caller.clone(),
             local,
             caller.members.clone(),
             driver.clone(),
             staging.clone(),
-        )));
+        ));
+        *caller.service.lock().unwrap() =
+            Some(Arc::new(move |registry| service.register(registry)));
         self.network.down.lock().unwrap().remove(&caller.endpoint);
         self.nodes[index] = Some(Node { driver, staging });
     }
@@ -870,20 +901,11 @@ impl Harness {
     }
 
     fn installs_to(&self, index: usize) -> usize {
-        let target = &self.callers[index].endpoint;
-        self.network
-            .trace
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(to, interface, operation)| {
-                to == target
-                    && interface
-                        == bmux_cluster_plugin_api::cluster_consensus_snapshot::INTERFACE_ID
-                            .as_str()
-                    && operation == "install"
-            })
-            .count()
+        self.network.delivered(
+            &self.callers[index].endpoint,
+            bmux_cluster_plugin_api::cluster_consensus_snapshot::INTERFACE_ID.as_str(),
+            "install",
+        )
     }
 
     fn trace_tail(&self) -> Vec<(String, String, String)> {

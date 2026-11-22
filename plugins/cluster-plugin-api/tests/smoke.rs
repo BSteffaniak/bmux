@@ -729,17 +729,13 @@ fn generated_contract_declares_all_services() {
         "provide cluster-bounded-control-command;",
         "provide cluster-consensus-rpc@1;",
         "provide cluster-consensus-rpc@2;",
+        "provide cluster-consensus-transfer;",
+        "provide cluster-consensus-snapshot;",
     ] {
         assert!(package.contains(provided), "world must {provided}");
     }
-    // The retired OpenRaft contracts are gone; staged transfer and snapshot
-    // installation are served once their providers land.
-    for unprovided in [
-        "cluster-raft-rpc",
-        "cluster-raft-decoder",
-        "cluster-consensus-transfer",
-        "cluster-consensus-snapshot",
-    ] {
+    // The retired OpenRaft contracts are gone.
+    for unprovided in ["cluster-raft-rpc", "cluster-raft-decoder"] {
         assert!(
             !package.contains(&format!("provide {unprovided}")),
             "world must not provide {unprovided}"

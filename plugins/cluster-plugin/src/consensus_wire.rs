@@ -31,7 +31,7 @@ use std::time::Duration;
 
 mod snapshot;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use snapshot::SnapshotStaging;
 

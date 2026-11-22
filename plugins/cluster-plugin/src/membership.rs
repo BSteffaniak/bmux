@@ -34,12 +34,18 @@ pub const ATOMIC_LAYOUT_FEATURE: &str = "atomic-layout-mutation-v2";
 // owned engine is a clean break, so a peer without them cannot participate.
 const OWNED_CONSENSUS_VOTE_FEATURE: &str = "cluster-consensus-rpc/v1";
 const OWNED_CONSENSUS_APPEND_FEATURE: &str = "cluster-consensus-rpc/v2";
+// Snapshot catch-up: the owned runtime always compacts, so a peer that cannot
+// receive staged snapshots could never catch up once it falls behind.
+const OWNED_CONSENSUS_TRANSFER_FEATURE: &str = "cluster-consensus-transfer/v1";
+const OWNED_CONSENSUS_SNAPSHOT_FEATURE: &str = "cluster-consensus-snapshot/v1";
 const MANDATORY_CLUSTER_PROTOCOL_FEATURES: &[&str] = &[
     "membership-credential-v1",
     "node-possession-proof-v1",
     "single-use-enrollment-v1",
     OWNED_CONSENSUS_VOTE_FEATURE,
     OWNED_CONSENSUS_APPEND_FEATURE,
+    OWNED_CONSENSUS_TRANSFER_FEATURE,
+    OWNED_CONSENSUS_SNAPSHOT_FEATURE,
 ];
 const CLUSTER_PROTOCOL_FEATURES: &[&str] = &[
     "membership-credential-v1",
@@ -50,6 +56,8 @@ const CLUSTER_PROTOCOL_FEATURES: &[&str] = &[
     "principal-bootstrap-v1",
     OWNED_CONSENSUS_VOTE_FEATURE,
     OWNED_CONSENSUS_APPEND_FEATURE,
+    OWNED_CONSENSUS_TRANSFER_FEATURE,
+    OWNED_CONSENSUS_SNAPSHOT_FEATURE,
 ];
 
 pub const fn initializer_capabilities() -> ClusterNodeCapabilities {

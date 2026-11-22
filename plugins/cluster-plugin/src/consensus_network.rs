@@ -351,11 +351,11 @@ pub fn authenticate_owned_append_v2(
     Ok(source)
 }
 
-/// Whether a durable member negotiated the owned consensus contracts this
-/// runtime serves: `cluster-consensus-rpc` v1 (vote) and v2 (append).
-/// Capability advertisement alone is not admission to this engine.
-// TODO(ADR-0015 snapshot transfer): staged transfer and snapshot installation
-// are negotiated separately once their providers are served.
+/// Whether a durable member negotiated the owned consensus RPC contracts:
+/// `cluster-consensus-rpc` v1 (vote) and v2 (append). Staged transfer and
+/// snapshot installation are selected separately; see
+/// [`supports_owned_snapshot_install`]. Capability advertisement alone is not
+/// admission to this engine.
 pub(crate) fn supports_owned_consensus(
     member: &bmux_cluster_plugin_api::cluster_types::ClusterMember,
 ) -> bool {
@@ -1841,9 +1841,14 @@ where
     }
 }
 
-/// Registered `cluster-consensus-rpc` v1/v2 provider. Typed services register
-/// before the consensus node starts, so each call resolves the running local
-/// node and delegates to its authenticated wire service.
+/// Registered owned consensus providers.
+///
+/// Serves `cluster-consensus-rpc` v1/v2, `cluster-consensus-transfer` v1 and
+/// `cluster-consensus-snapshot` v1. Typed services register before the consensus node starts, so each call resolves
+/// the running local node and delegates to its authenticated wire service.
+/// Without a running node nothing is staged, installed or signed: RPCs and
+/// installs report `Stopped`, transfers (which have no stopped outcome) report
+/// `Unauthorized` because no member view exists to authenticate them.
 pub struct ConsensusRpcHandle {
     local_node_id: NodeId,
     nodes: ConsensusNodeRegistry,
@@ -1858,16 +1863,58 @@ impl ConsensusRpcHandle {
         }
     }
 
+    /// Register every owned consensus provider this handle serves.
+    /// # Errors
+    /// Reports registry rejection.
+    pub fn register(
+        self: &Arc<Self>,
+        registry: &mut bmux_plugin_sdk::TypedServiceRegistry,
+    ) -> Result<(), Box<bmux_plugin_sdk::PluginError>> {
+        bmux_cluster_plugin_api::cluster_consensus_rpc::register_provider(registry, self.clone())
+            .map_err(Box::new)?;
+        bmux_cluster_plugin_api::cluster_consensus_rpc_v2::register_provider(
+            registry,
+            self.clone(),
+        )
+        .map_err(Box::new)?;
+        bmux_cluster_plugin_api::cluster_consensus_transfer::register_provider(
+            registry,
+            self.clone(),
+        )
+        .map_err(Box::new)?;
+        bmux_cluster_plugin_api::cluster_consensus_snapshot::register_provider(
+            registry,
+            self.clone(),
+        )
+        .map_err(Box::new)
+    }
+
+    fn running(&self) -> Option<crate::consensus_runtime::RpcProviders> {
+        self.nodes
+            .get(self.local_node_id)
+            .and_then(|node| node.rpc())
+            .ok()
+    }
+
     fn providers(
         &self,
     ) -> Result<
         crate::consensus_runtime::RpcProviders,
         bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError,
     > {
-        self.nodes
-            .get(self.local_node_id)
-            .and_then(|node| node.rpc())
-            .map_err(|_| bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError::Stopped)
+        self.running()
+            .ok_or(bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError::Stopped)
+    }
+
+    fn transfer(
+        &self,
+    ) -> Result<
+        crate::consensus_runtime::RpcProviders,
+        bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferError,
+    > {
+        self.running().ok_or(
+            bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferError::Unauthorized,
+        )
     }
 }
 
@@ -1880,6 +1927,8 @@ type ConsensusRpc<'a, T> = std::pin::Pin<
     >,
 >;
 
+type ConsensusCall<'a, T, E> = std::pin::Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
+
 impl bmux_cluster_plugin_api::cluster_consensus_rpc::ClusterConsensusRpcService
     for ConsensusRpcHandle
 {
@@ -1887,10 +1936,7 @@ impl bmux_cluster_plugin_api::cluster_consensus_rpc::ClusterConsensusRpcService
         &self,
         request: bmux_cluster_plugin_api::cluster_consensus_vote_types::VoteRequest,
     ) -> ConsensusRpc<'_, bmux_cluster_plugin_api::cluster_consensus_vote_types::VoteResponse> {
-        Box::pin(async move {
-            let (v1, _) = self.providers()?;
-            v1.vote(request).await
-        })
+        Box::pin(async move { self.providers()?.rpc_v1.vote(request).await })
     }
 
     fn append(
@@ -1898,10 +1944,7 @@ impl bmux_cluster_plugin_api::cluster_consensus_rpc::ClusterConsensusRpcService
         request: bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
     ) -> ConsensusRpc<'_, bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendResponse>
     {
-        Box::pin(async move {
-            let (v1, _) = self.providers()?;
-            v1.append(request).await
-        })
+        Box::pin(async move { self.providers()?.rpc_v1.append(request).await })
     }
 }
 
@@ -1913,9 +1956,74 @@ impl bmux_cluster_plugin_api::cluster_consensus_rpc_v2::ClusterConsensusRpcServi
         request: bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
     ) -> ConsensusRpc<'_, bmux_cluster_plugin_api::cluster_consensus_rpc_v2_types::AppendResponse>
     {
+        Box::pin(async move { self.providers()?.rpc_v2.append(request).await })
+    }
+}
+
+impl bmux_cluster_plugin_api::cluster_consensus_transfer::ClusterConsensusTransferService
+    for ConsensusRpcHandle
+{
+    fn begin(
+        &self,
+        request: bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferRequest,
+    ) -> ConsensusCall<
+        '_,
+        u64,
+        bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferError,
+    > {
+        Box::pin(async move { self.transfer()?.transfer.begin(request).await })
+    }
+
+    fn chunk(
+        &self,
+        request: bmux_cluster_plugin_api::cluster_consensus_transfer_types::ChunkRequest,
+    ) -> ConsensusCall<
+        '_,
+        bmux_cluster_plugin_api::cluster_consensus_transfer_types::ChunkOutcome,
+        bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferError,
+    > {
+        Box::pin(async move { self.transfer()?.transfer.chunk(request).await })
+    }
+
+    fn finish(
+        &self,
+        request: bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferRequest,
+    ) -> ConsensusCall<
+        '_,
+        bmux_cluster_plugin_api::cluster_consensus_transfer_types::FinishOutcome,
+        bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferError,
+    > {
+        Box::pin(async move { self.transfer()?.transfer.finish(request).await })
+    }
+
+    fn abort(
+        &self,
+        request: bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferRequest,
+    ) -> ConsensusCall<
+        '_,
+        bmux_cluster_plugin_api::cluster_consensus_transfer_types::AbortOutcome,
+        bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferError,
+    > {
+        Box::pin(async move { self.transfer()?.transfer.abort(request).await })
+    }
+}
+
+impl bmux_cluster_plugin_api::cluster_consensus_snapshot::ClusterConsensusSnapshotService
+    for ConsensusRpcHandle
+{
+    fn install(
+        &self,
+        request: bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallRequest,
+    ) -> ConsensusCall<
+        '_,
+        bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallResponse,
+        bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallError,
+    > {
         Box::pin(async move {
-            let (_, v2) = self.providers()?;
-            v2.append(request).await
+            let running = self.running().ok_or(
+                bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallError::Stopped,
+            )?;
+            running.snapshot.install(request).await
         })
     }
 }

@@ -10,7 +10,7 @@ use crate::membership::NodeId;
 use sha2::{Digest, Sha256};
 
 const SNAPSHOT_FORMAT_VERSION: u16 = 1;
-const MAX_SNAPSHOT_FILE_BYTES: usize = 300 * 1024 * 1024;
+pub(crate) const MAX_SNAPSHOT_FILE_BYTES: usize = 300 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum ConsensusStorageError {

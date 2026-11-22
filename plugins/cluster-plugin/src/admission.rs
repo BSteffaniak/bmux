@@ -35,6 +35,16 @@ const REMOTE_PROTOCOLS: &[(&str, &str, &[&str])] = &[
         "cluster-consensus-rpc/v2",
         &["append"],
     ),
+    (
+        "bmux.server_clusters.auth",
+        "cluster-consensus-transfer/v1",
+        &["begin", "chunk", "finish", "abort"],
+    ),
+    (
+        "bmux.server_clusters.auth",
+        "cluster-consensus-snapshot/v1",
+        &["install"],
+    ),
 ];
 
 pub fn routes() -> Vec<bmux_plugin::stream_admission::StreamAdmittedRoute> {

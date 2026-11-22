@@ -70,7 +70,15 @@ impl Transport for MemoryTransport {
         })
     }
 
-    fn send_snapshot(&self, _: NodeId, _: crate::consensus_model::Term, _: u64) -> Reply {
+    fn send_snapshot(
+        &self,
+        _: NodeId,
+        _: crate::consensus_model::Term,
+        _: u64,
+        _: SnapshotObject,
+    ) -> Reply {
+        // Snapshot catch-up runs over the generated providers; see
+        // `follower_catches_up_through_a_snapshot_over_generated_providers`.
         Box::pin(async { None })
     }
 }
@@ -511,4 +519,229 @@ fn election_jitter_is_seeded_per_instance() {
     let b = (0..8).map(|_| second(min, max)).collect::<Vec<_>>();
     assert_ne!(a, b, "independent nodes must not share deadlines");
     assert!(a.iter().chain(&b).all(|draw| (min..=max).contains(draw)));
+}
+
+/// Three production endpoint nodes whose generated consensus providers are
+/// served through the registry-backed [`ConsensusRpcHandle`], as the plugin
+/// registers them, over an in-memory endpoint network.
+///
+/// [`ConsensusRpcHandle`]: crate::consensus_network::ConsensusRpcHandle
+struct EndpointCluster {
+    network: Arc<crate::consensus_wire::tests::Network>,
+    callers: Vec<Arc<crate::consensus_wire::tests::TestCaller>>,
+    identities: Vec<crate::membership::NodeIdentity>,
+    registries: Vec<crate::consensus_network::ConsensusNodeRegistry>,
+    roots: Vec<PathBuf>,
+    cluster: String,
+    nodes: Vec<Option<ConsensusNode>>,
+    _root: TempDir,
+}
+
+impl EndpointCluster {
+    /// Every node is enrolled with every member's credential and the
+    /// protocol this build negotiates, but only the first founds the store.
+    fn new(count: usize) -> Self {
+        use crate::consensus_network::{ConsensusNodeRegistry, ConsensusRpcHandle};
+        use crate::consensus_wire::tests::{Network, TestCaller};
+        use bmux_cluster_plugin_api::cluster_types::{
+            ClusterConsensusRole, ClusterNegotiatedProtocol, ClusterNodeCapabilities,
+        };
+        // Staging walks its path without following links (macOS temp is one).
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let network = Arc::new(Network::default());
+        let callers = (0..count)
+            .map(|index| TestCaller::new(format!("node-{index}"), &network))
+            .collect::<Vec<_>>();
+        let identities = callers
+            .iter()
+            .map(|caller| crate::load_or_create_node_identity(caller.as_ref()).unwrap())
+            .collect::<Vec<_>>();
+        let cluster = crate::membership::ClusterId::generate();
+        let offer = crate::membership::current_protocol_offer();
+        let members = identities
+            .iter()
+            .zip(&callers)
+            .map(|(identity, caller)| {
+                let mut member = crate::membership::issue_membership_credential(
+                    &identities[0],
+                    cluster,
+                    identity.node_id().to_string(),
+                    identity.public_key().to_string(),
+                    ClusterNodeCapabilities {
+                        ingress: true,
+                        worker: true,
+                        consensus_role: ClusterConsensusRole::Voter,
+                    },
+                    ClusterNegotiatedProtocol {
+                        wire_epoch: offer.wire_epoch,
+                        local_plugin_version: offer.plugin_version.clone(),
+                        remote_plugin_version: offer.plugin_version.clone(),
+                        peer_revision: 1,
+                        schema_version: 1,
+                        features: offer.features.clone(),
+                    },
+                    crate::now_unix_ms(),
+                )
+                .unwrap();
+                member.endpoint = Some(caller.endpoint.clone());
+                member
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            members
+                .iter()
+                .all(crate::consensus_network::supports_owned_snapshot_install),
+            "this build negotiates snapshot catch-up"
+        );
+        let mut registries = Vec::new();
+        let mut roots = Vec::new();
+        for (index, (caller, identity)) in callers.iter().zip(&identities).enumerate() {
+            caller.storage.lock().unwrap().insert(
+                crate::membership::CLUSTER_ID_STORAGE_KEY.into(),
+                serde_json::to_vec(
+                    &serde_json::json!({"version": 1, "cluster_id": cluster.to_string()}),
+                )
+                .unwrap(),
+            );
+            let state: crate::membership::MembershipState =
+                serde_json::from_value(serde_json::json!({
+                    "version": 1, "cluster_id": cluster.to_string(), "issuer_endpoint": null,
+                    "members": members
+                        .iter()
+                        .map(|member| (member.node_id.clone(), member.clone()))
+                        .collect::<BTreeMap<_, _>>(),
+                    "enrollment_tokens": {}, "accepted_rotations": {}
+                }))
+                .unwrap();
+            crate::membership::store_membership_state(caller.as_ref(), &state).unwrap();
+            // The host answers peer challenges from the enrolled credentials.
+            caller.members.update(cluster.to_string(), members.clone());
+            let registry = ConsensusNodeRegistry::default();
+            let handle = Arc::new(ConsensusRpcHandle::new(
+                *identity.node_id(),
+                registry.clone(),
+            ));
+            *caller.service.lock().unwrap() =
+                Some(Arc::new(move |registry| handle.register(registry)));
+            registries.push(registry);
+            roots.push(root.path().join(format!("state-{index}")));
+        }
+        Self {
+            network,
+            callers,
+            identities,
+            registries,
+            roots,
+            cluster: cluster.to_string(),
+            nodes: (0..count).map(|_| None).collect(),
+            _root: root,
+        }
+    }
+
+    fn id(&self, index: usize) -> NodeId {
+        *self.identities[index].node_id()
+    }
+
+    fn node(&self, index: usize) -> &ConsensusNode {
+        self.nodes[index].as_ref().unwrap()
+    }
+
+    async fn start(&mut self, index: usize) {
+        let provisioning = if index == 0 {
+            Provisioning::Founder {
+                endpoint: self.callers[0].endpoint.clone(),
+            }
+        } else {
+            Provisioning::Joiner
+        };
+        let node = ConsensusNode::start_endpoint_with(
+            &self.roots[index],
+            &self.cluster,
+            &self.identities[index],
+            self.callers[index].clone(),
+            provisioning,
+            &PreflightAdmission::default(),
+            // Compact often, so a stopped follower falls behind the log.
+            DriverConfig {
+                compaction_interval: 4,
+            },
+        )
+        .await
+        .unwrap();
+        self.registries[index]
+            .insert(self.id(index), node.clone())
+            .unwrap();
+        self.nodes[index] = Some(node);
+    }
+
+    async fn stop(&mut self, index: usize) {
+        let node = self.nodes[index].take().unwrap();
+        self.registries[index].remove(self.id(index)).unwrap();
+        node.shutdown().await.unwrap();
+    }
+
+    fn installs_to(&self, index: usize) -> usize {
+        self.network.delivered(
+            &self.callers[index].endpoint,
+            bmux_cluster_plugin_api::cluster_consensus_snapshot::INTERFACE_ID.as_str(),
+            "install",
+        )
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn follower_catches_up_through_a_snapshot_over_generated_providers() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut cluster = EndpointCluster::new(3);
+    for index in 0..3 {
+        cluster.start(index).await;
+    }
+    assert_eq!(wait_for_leader(&[cluster.node(0)]).await, cluster.id(0));
+    let voters = (0..3)
+        .map(|index| (cluster.id(index), cluster.callers[index].endpoint.clone()))
+        .collect::<BTreeMap<_, _>>();
+    cluster.node(0).change_voters(voters).await.unwrap();
+    cluster.node(0).mutate(command(1, 1)).await.unwrap();
+    let follower = 2;
+    wait_for_revision(cluster.node(follower), 1).await;
+    let staging = snapshot_staging_path(&cluster.roots[follower], &cluster.cluster);
+    assert_eq!(
+        std::fs::metadata(&staging).unwrap().permissions().mode() & 0o777,
+        0o700,
+        "staging is private beside the owned store"
+    );
+
+    cluster.stop(follower).await;
+    // Well past the compaction interval: the leader no longer holds the
+    // entries the stopped follower needs.
+    for id in 2..=16 {
+        cluster.node(0).mutate(command(id, id)).await.unwrap();
+    }
+    let revision = cluster.node(0).control_revision();
+    assert_eq!(cluster.installs_to(follower), 0);
+
+    cluster.start(follower).await;
+    wait_for_revision(cluster.node(follower), revision).await;
+    assert!(
+        cluster.installs_to(follower) >= 1,
+        "catch-up must use a snapshot install"
+    );
+    // Replication continues after the installed boundary.
+    cluster.node(0).mutate(command(100, 100)).await.unwrap();
+    wait_for_revision(cluster.node(follower), revision + 1).await;
+    assert_eq!(
+        cluster.node(follower).persisted_control_state(),
+        cluster.node(0).persisted_control_state()
+    );
+
+    for index in 0..3 {
+        cluster.stop(index).await;
+    }
+    // Shutdown discarded every staged object; only the ownership marker stays.
+    let leftovers = std::fs::read_dir(&staging)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name != "bmux-staging-v1")
+        .collect::<Vec<_>>();
+    assert!(leftovers.is_empty(), "{leftovers:?}");
 }
