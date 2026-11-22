@@ -226,6 +226,13 @@ impl PluginStateRegistry {
     where
         T: Any + Send + Sync,
     {
+        if let Some(existing) = self.get::<T>() {
+            return existing;
+        }
+        // Built with the registry unlocked: an initializer may reach a point where another
+        // thread runs (a simulated lock, say), and that thread must not block on this lock.
+        // If another caller registers first, its value is kept and this one dropped.
+        let initialized = initialize();
         let mut entries = self
             .core
             .entries
@@ -233,7 +240,7 @@ impl PluginStateRegistry {
             .expect("plugin state registry lock poisoned");
         let entry = entries
             .entry(TypeId::of::<Arc<RwLock<T>>>())
-            .or_insert_with(|| Arc::new(initialize()));
+            .or_insert_with(|| Arc::new(initialized));
         let handle = entry
             .downcast_ref::<Arc<RwLock<T>>>()
             .expect("registered state type")
@@ -242,10 +249,13 @@ impl PluginStateRegistry {
         handle
     }
 
-    /// Retrieve or atomically initialize shared neutral state.
+    /// Retrieve or initialize shared neutral state.
+    ///
+    /// The initializer runs with the registry unlocked (it may use the registry). When callers
+    /// race, every one gets the first registered value, and the others' values are dropped.
     ///
     /// # Panics
-    /// Panics if the registry lock is poisoned. The initializer must not reenter it.
+    /// Panics if the registry lock is poisoned.
     #[must_use]
     pub fn get_or_insert_with<T>(&self, initialize: impl FnOnce() -> T) -> Arc<RwLock<T>>
     where

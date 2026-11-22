@@ -164,7 +164,10 @@ Code the pane runtime simulation runs must stay deterministic: tasks, timers and
 `select!` through `switchy_async`, threads and locks through `switchy_thread`, clocks
 through `switchy_time`, environment reads through `switchy_env`, identifiers through
 the plugin's `ids` module, directory listings through `dir_order`, and process-wide
-state through `run_shared`. The plugin's `tests/primitives.rs` enforces this.
+state through `run_shared`. Each crate on the simulated path enforces this in its
+`tests/primitives.rs` (the shared `bmux_sim_primitives_check` scan), stating its exemptions;
+a crate the simulation starts running gets one too. A std lock must never be held across a
+switch point: simulations poll tasks on several workers.
 
 The pane runtime plugin names an operating system only in `src/platform/` (native
 Unix, native Windows and simulated targets, plus the host's files). Core logic

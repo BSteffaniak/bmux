@@ -251,10 +251,8 @@ fleets and determinism-verified runs), regression seeds for what it finds, and n
 
   Also marked safe: activation registrations and shutdown progress publication, which never
   run in a simulated pane runtime.
-- **Left open.** `PluginStateRegistry::get_or_insert_with` runs its initializer under the
-  registry's std write lock. An initializer that reaches a simulated switch point (a `switchy`
-  lock, atomic or channel) would let another simulated thread block on the std lock for real,
-  and the run would hang instead of reporting a deadlock. Today's initializers on the
-  simulated path have no switch points. Making the registry's own lock a `switchy_thread` lock
-  (its public `Arc<RwLock<T>>` entry type can stay std) would close this, but it adds a switch
-  point to every host-state lookup and so changes every seed's schedule.
+- **Closed after the scan.** `PluginStateRegistry::get_or_insert_with` ran its initializer
+  under the registry's std write lock. With several workers (19.1), an initializer that
+  reaches a simulated switch point would let another simulated thread block on that std lock
+  for real, hanging the run instead of reporting a deadlock. Initializers now run with the
+  registry unlocked; when callers race, all get the first value registered.
