@@ -32,6 +32,10 @@ pub struct Config {
     pub max_inflight: usize,
     /// A learner must be this close to the leader's log before promotion.
     pub learner_catchup_lag: u64,
+    /// A leader refuses proposals while this many entries are uncommitted, so a
+    /// leader without quorum pushes back instead of growing its log until the
+    /// store's retention limit stops the node.
+    pub max_uncommitted: u64,
 }
 
 impl Default for Config {
@@ -43,6 +47,7 @@ impl Default for Config {
             max_append_bytes: 1_048_576,
             max_inflight: 4,
             learner_catchup_lag: 64,
+            max_uncommitted: 1_024,
         }
     }
 }
@@ -236,7 +241,11 @@ pub enum Effect {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Rejection {
-    NotLeader { hint: Option<NodeId> },
+    NotLeader {
+        hint: Option<NodeId>,
+    },
+    /// Too many entries are uncommitted; retry once the quorum catches up.
+    Backpressure,
     MembershipChangeInProgress,
     InvalidMembership,
     LearnerNotCaughtUp(NodeId),
@@ -1661,6 +1670,18 @@ impl Engine {
                 reason: Rejection::NotLeader {
                     hint: self.leader_hint(),
                 },
+            });
+            return Ok(());
+        }
+        let uncommitted = self
+            .log
+            .last()
+            .map_or(0, |last| last.index.0)
+            .saturating_sub(self.commit.map_or(0, |commit| commit.index.0));
+        if uncommitted >= self.config.max_uncommitted {
+            effects.push(Effect::Rejected {
+                token,
+                reason: Rejection::Backpressure,
             });
             return Ok(());
         }

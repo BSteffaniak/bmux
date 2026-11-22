@@ -942,6 +942,11 @@ impl ConsensusNode {
             ClientError::Rejected(Rejection::Exhausted) => {
                 ConsensusWriteError::Fatal("consensus identity space is exhausted".into())
             }
+            ClientError::Rejected(Rejection::Backpressure) => {
+                ConsensusWriteError::QuorumUnavailable(
+                    "too many uncommitted entries; the quorum is not keeping up".into(),
+                )
+            }
             ClientError::Rejected(rejection) => ConsensusWriteError::Membership(format!(
                 "membership change rejected: {rejection:?}"
             )),

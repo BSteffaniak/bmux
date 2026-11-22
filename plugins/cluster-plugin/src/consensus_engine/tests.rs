@@ -671,3 +671,34 @@ fn deposed_leader_rearms_its_election_deadline() {
         "{effects:?}"
     );
 }
+
+#[test]
+fn leader_without_quorum_pushes_back_instead_of_growing_its_log() {
+    let mut cluster = Cluster::new(&[1, 2, 3], &[]);
+    cluster.elect(1);
+    let limit = Config::default().max_uncommitted;
+    // Isolated: nothing it appends can commit.
+    cluster.down.insert(node(2));
+    cluster.down.insert(node(3));
+    let mut backpressure = 0;
+    for token in 0..limit + 10 {
+        let effects = cluster.input(
+            1,
+            Input::Propose {
+                token,
+                payload: vec![1],
+            },
+        );
+        if effects.contains(&Effect::Rejected {
+            token,
+            reason: Rejection::Backpressure,
+        }) {
+            backpressure += 1;
+        }
+    }
+    cluster.settle();
+    let engine = cluster.engine(1);
+    let uncommitted = engine.last_log().unwrap().index.0 - engine.commit().unwrap().index.0;
+    assert_eq!(uncommitted, limit);
+    assert!(backpressure >= 10);
+}
