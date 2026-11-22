@@ -83,6 +83,8 @@ pub struct RecordingCutPlan {
     segment_mb: usize,
     session_filter: Option<Uuid>,
     capture_input: bool,
+    /// Leave out the bytes typed into panes.
+    without_input: bool,
     profile: RecordingProfile,
     event_kinds: Vec<RecordingEventKind>,
 }
@@ -561,6 +563,7 @@ impl RecordingRuntime {
         output_root: PathBuf,
         window: CutWindow,
         name: Option<String>,
+        without_input: bool,
     ) -> Result<RecordingCutPlan> {
         let active = self
             .active
@@ -590,12 +593,14 @@ impl RecordingRuntime {
             segment_mb: self.segment_mb,
             session_filter: active.session_filter,
             capture_input: active.capture_input,
+            without_input,
             profile: active.profile,
             event_kinds: active.event_kinds.clone(),
         })
     }
 
-    /// Cut a snapshot of the rolling recording for the given time window.
+    /// Cut a snapshot of the rolling recording for the given time window, leaving out the bytes
+    /// typed into panes when `without_input` is set.
     ///
     /// # Errors
     /// Returns an error if no recording is active, the window is invalid,
@@ -605,8 +610,9 @@ impl RecordingRuntime {
         output_root: &Path,
         window: CutWindow,
         name: Option<String>,
+        without_input: bool,
     ) -> Result<RecordingSummary> {
-        let plan = self.prepare_cut(output_root.to_path_buf(), window, name)?;
+        let plan = self.prepare_cut(output_root.to_path_buf(), window, name, without_input)?;
         execute_recording_cut(plan)
     }
 }
@@ -625,7 +631,10 @@ pub fn execute_recording_cut(plan: RecordingCutPlan) -> Result<RecordingSummary>
         events.append(&mut segment_events);
     }
 
-    events.retain(|event| (plan.window.start..=plan.window.end).contains(&event.wall_epoch_ms));
+    events.retain(|event| {
+        (plan.window.start..=plan.window.end).contains(&event.wall_epoch_ms)
+            && !(plan.without_input && event.kind == RecordingEventKind::PaneInputRaw)
+    });
     if events.is_empty() {
         anyhow::bail!("rolling recording has no events in the requested window")
     }
@@ -663,9 +672,13 @@ pub fn execute_recording_cut(plan: RecordingCutPlan) -> Result<RecordingSummary>
         name: plan.name,
         format_version: RECORDING_FORMAT_VERSION,
         session_id: plan.session_filter,
-        capture_input: plan.capture_input,
+        capture_input: plan.capture_input && !plan.without_input,
         profile: plan.profile,
-        event_kinds: plan.event_kinds,
+        event_kinds: plan
+            .event_kinds
+            .into_iter()
+            .filter(|kind| !(plan.without_input && *kind == RecordingEventKind::PaneInputRaw))
+            .collect(),
         started_epoch_ms: events
             .first()
             .map_or_else(epoch_millis_now, |event| event.wall_epoch_ms),
@@ -2494,7 +2507,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1200));
 
         let cut = runtime
-            .cut(&cut_root, super::CutWindow::LastSeconds(None), None)
+            .cut(&cut_root, super::CutWindow::LastSeconds(None), None, false)
             .expect("rolling cut should succeed");
         assert!(cut.ended_epoch_ms.is_some());
         assert!(cut.event_count >= 1);
@@ -2635,6 +2648,7 @@ mod tests {
                     end_epoch_ms: Some(end),
                 },
                 None,
+                false,
             )
             .expect("range cut should succeed");
         assert_eq!(
@@ -2683,9 +2697,79 @@ mod tests {
                 &cut_root,
                 super::CutWindow::LastSeconds(None),
                 Some("look-at-this-one".to_string()),
+                false,
             )
             .expect("rolling cut should succeed");
         assert_eq!(cut.name.as_deref(), Some("look-at-this-one"));
+
+        let _ = runtime.stop(None).expect("rolling recording should stop");
+    }
+
+    #[test]
+    fn rolling_cut_without_input_keeps_output_and_leaves_out_typed_bytes() {
+        let root = temp_dir();
+        let cut_root = root.join("cuts");
+        let mut runtime = RecordingRuntime::new_rolling(root.join(".rolling"), 64, 300);
+        runtime
+            .start(
+                None,
+                true,
+                None,
+                RecordingProfile::Functional,
+                vec![
+                    RecordingEventKind::PaneInputRaw,
+                    RecordingEventKind::PaneOutputRaw,
+                ],
+            )
+            .expect("rolling recording should start");
+        let meta = || RecordMeta {
+            session_id: None,
+            pane_id: None,
+            client_id: None,
+        };
+        for (kind, data) in [
+            (RecordingEventKind::PaneInputRaw, b"hunter2".to_vec()),
+            (RecordingEventKind::PaneOutputRaw, b"prompt$ ".to_vec()),
+        ] {
+            runtime
+                .record(kind, RecordingPayload::Bytes { data }, meta())
+                .expect("rolling event should be accepted");
+        }
+        std::thread::sleep(Duration::from_millis(1200));
+
+        let with_input = runtime
+            .cut(&cut_root, super::CutWindow::LastSeconds(None), None, false)
+            .expect("cut with input");
+        let without_input = runtime
+            .cut(&cut_root, super::CutWindow::LastSeconds(None), None, true)
+            .expect("cut without input");
+        let kinds = |summary: &RecordingSummary| -> Vec<RecordingEventKind> {
+            summary
+                .segments
+                .iter()
+                .flat_map(|segment| {
+                    super::read_recording_events(&Path::new(&summary.path).join(segment))
+                        .expect("cut segment should be readable")
+                })
+                .map(|event| event.kind)
+                .collect()
+        };
+        assert!(kinds(&with_input).contains(&RecordingEventKind::PaneInputRaw));
+        let kept = kinds(&without_input);
+        assert!(
+            kept.contains(&RecordingEventKind::PaneOutputRaw),
+            "{kept:?}"
+        );
+        assert!(
+            !kept.contains(&RecordingEventKind::PaneInputRaw),
+            "{kept:?}"
+        );
+        assert!(!without_input.capture_input);
+        assert!(
+            !without_input
+                .event_kinds
+                .contains(&RecordingEventKind::PaneInputRaw)
+        );
 
         let _ = runtime.stop(None).expect("rolling recording should stop");
     }
@@ -2716,7 +2800,7 @@ mod tests {
             .expect("active recording dir should be movable");
 
         let error = runtime
-            .cut(&cut_root, super::CutWindow::LastSeconds(None), None)
+            .cut(&cut_root, super::CutWindow::LastSeconds(None), None, false)
             .expect_err("cut should fail when active dir is missing");
         let missing_path = super::cut_missing_active_recording_dir(&error)
             .expect("error should classify as missing active recording dir");

@@ -2401,7 +2401,7 @@ fn bpdl_generated_service_declarations_expose_runtime_interfaces() {
                 ),
                 (
                     "bmux.recording.write",
-                    "recording-commands/v2",
+                    "recording-commands/v3",
                     bmux_plugin_sdk::ServiceKind::Command,
                 ),
             ][..],

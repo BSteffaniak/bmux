@@ -794,7 +794,9 @@ fn run_cut(context: &NativeCommandContext, args: &ArgCursor<'_>) -> Result<i32> 
     window.validate()?;
     let export_fps = args.u32_option("export-fps")?;
     let name = normalize_recording_name(args.option("name").as_deref())?;
-    let completed_job = queue_cut_generated_and_wait(context, window, name, export_fps)?;
+    let without_input = args.has_flag("without-input");
+    let completed_job =
+        queue_cut_generated_and_wait(context, window, name, export_fps, without_input)?;
     let recording_path = completed_job.recording_path.as_deref().unwrap_or("-");
     let export_path = completed_job.export_output_path.as_deref();
     match completed_job.status {
@@ -852,6 +854,7 @@ fn queue_cut_generated_and_wait(
     window: CutArgs,
     name: Option<String>,
     export_fps: Option<u32>,
+    without_input: bool,
 ) -> Result<recording_types::RecordingJob> {
     let mut client = bmux_plugin::ServiceCallerDispatchClient::new(context);
     let mut last_job = bmux_plugin::block_on_typed_dispatch(recording_commands::client::queue_cut(
@@ -861,6 +864,7 @@ fn queue_cut_generated_and_wait(
         export_fps,
         window.start_epoch_ms,
         window.end_epoch_ms,
+        Some(without_input),
     ))
     .map_err(|error| anyhow::anyhow!("recording queue-cut dispatch failed: {error}"))?;
     println!("recording cut queued: {}", last_job.id);

@@ -119,6 +119,8 @@ struct CutRequest {
     start_epoch_ms: Option<u64>,
     #[serde(default)]
     end_epoch_ms: Option<u64>,
+    #[serde(default)]
+    without_input: Option<bool>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -130,6 +132,8 @@ struct QueueCutRequest {
     start_epoch_ms: Option<u64>,
     #[serde(default)]
     end_epoch_ms: Option<u64>,
+    #[serde(default)]
+    without_input: Option<bool>,
 }
 
 /// Build the cut window from wire fields, rejecting a range combined with `last_seconds`.
@@ -923,53 +927,53 @@ impl RecordingOwner {
             "recording-state", "list-jobs" => |_req: (), _ctx| {
                 Ok::<Vec<recording_types::RecordingJob>, ServiceResponse>(self.recording_list_jobs_generated())
             },
-            "recording-commands/v2", "start" => |req: StartRequest, _ctx| {
+            "recording-commands/v3", "start" => |req: StartRequest, _ctx| {
                 Ok::<Result<recording_types::RecordingSummary, recording_types::RecordingError>, ServiceResponse>(
                     self.recording_start_generated(req),
                 )
             },
-            "recording-commands/v2", "stop" => |req: StopRequest, _ctx| {
+            "recording-commands/v3", "stop" => |req: StopRequest, _ctx| {
                 Ok::<Result<uuid::Uuid, recording_types::RecordingError>, ServiceResponse>(
                     self.recording_stop_generated(req.recording_id),
                 )
             },
-            "recording-commands/v2", "write-custom-event" => |req: WriteCustomEventRequest, _ctx| {
+            "recording-commands/v3", "write-custom-event" => |req: WriteCustomEventRequest, _ctx| {
                 Ok::<Result<(), recording_types::RecordingError>, ServiceResponse>(
                     self.recording_write_custom_event_generated(req),
                 )
             },
-            "recording-commands/v2", "delete" => |req: DeleteRequest, _ctx| {
+            "recording-commands/v3", "delete" => |req: DeleteRequest, _ctx| {
                 Ok::<Result<uuid::Uuid, recording_types::RecordingError>, ServiceResponse>(
                     self.recording_delete_generated(req.recording_id),
                 )
             },
-            "recording-commands/v2", "delete-all" => |_req: (), _ctx| {
+            "recording-commands/v3", "delete-all" => |_req: (), _ctx| {
                 Ok::<u64, ServiceResponse>(self.recording_delete_all_generated())
             },
-            "recording-commands/v2", "cut" => |req: CutRequest, _ctx| {
+            "recording-commands/v3", "cut" => |req: CutRequest, _ctx| {
                 Ok::<Result<recording_types::RecordingSummary, recording_types::RecordingError>, ServiceResponse>(
                     self.recording_cut_generated(req),
                 )
             },
-            "recording-commands/v2", "queue-cut" => |req: QueueCutRequest, _ctx| {
+            "recording-commands/v3", "queue-cut" => |req: QueueCutRequest, _ctx| {
                 self.recording_queue_cut_generated(req).map_err(|error| recording_error_response(&error))
             },
-            "recording-commands/v2", "rolling-start" => |req: RollingStartRequest, _ctx| {
+            "recording-commands/v3", "rolling-start" => |req: RollingStartRequest, _ctx| {
                 Ok::<Result<recording_types::RecordingSummary, recording_types::RecordingError>, ServiceResponse>(
                     self.recording_rolling_start_generated(req.options),
                 )
             },
-            "recording-commands/v2", "rolling-stop" => |_req: (), _ctx| {
+            "recording-commands/v3", "rolling-stop" => |_req: (), _ctx| {
                 Ok::<Result<uuid::Uuid, recording_types::RecordingError>, ServiceResponse>(
                     self.recording_rolling_stop_generated(),
                 )
             },
-            "recording-commands/v2", "rolling-clear" => |req: RollingClearRequest, _ctx| {
+            "recording-commands/v3", "rolling-clear" => |req: RollingClearRequest, _ctx| {
                 Ok::<recording_types::RecordingRollingClearReport, ServiceResponse>(
                     self.recording_rolling_clear_generated(req.restart_if_active),
                 )
             },
-            "recording-commands/v2", "prune" => |req: PruneRequest, _ctx| {
+            "recording-commands/v3", "prune" => |req: PruneRequest, _ctx| {
                 Ok::<u64, ServiceResponse>(self.recording_prune_generated(req.older_than_days))
             },
         })
@@ -1035,6 +1039,7 @@ impl RecordingOwner {
         name: Option<String>,
         start_epoch_ms: Option<u64>,
         end_epoch_ms: Option<u64>,
+        without_input: bool,
     ) -> anyhow::Result<RecordingSummary> {
         self.publish_recording_cut_started(
             last_seconds,
@@ -1042,13 +1047,18 @@ impl RecordingOwner {
             start_epoch_ms,
             end_epoch_ms,
         );
-        self.handle_cut(cut_window(last_seconds, start_epoch_ms, end_epoch_ms), name)
+        self.handle_cut(
+            cut_window(last_seconds, start_epoch_ms, end_epoch_ms),
+            name,
+            without_input,
+        )
     }
 
     fn handle_cut(
         &self,
         window: anyhow::Result<CutWindow>,
         name: Option<String>,
+        without_input: bool,
     ) -> anyhow::Result<RecordingSummary> {
         let window = window?;
         let config = self.config_handle();
@@ -1070,7 +1080,7 @@ impl RecordingOwner {
             let runtime = rolling.as_mut().ok_or_else(|| {
                 anyhow::anyhow!("recording cut requires rolling recording mode to be enabled")
             })?;
-            runtime.prepare_cut(output_root, window, name)?
+            runtime.prepare_cut(output_root, window, name, without_input)?
         };
 
         let _cut_guard = self
@@ -1518,6 +1528,7 @@ impl RecordingOwner {
             req.name,
             req.start_epoch_ms,
             req.end_epoch_ms,
+            req.without_input.unwrap_or(false),
         ) {
             Ok(summary) => {
                 self.publish_recording_cut_completed(&summary);
@@ -1766,6 +1777,7 @@ impl RecordingOwner {
             req.name,
             req.start_epoch_ms,
             req.end_epoch_ms,
+            req.without_input.unwrap_or(false),
         ) {
             Ok(summary) => summary,
             Err(error) => {
@@ -1884,6 +1896,7 @@ impl RecordingOwner {
                 export_fps,
                 start_epoch_ms,
                 end_epoch_ms,
+                without_input: Some(context.arguments.iter().any(|arg| arg == "--without-input")),
             })
             .map_err(|error| {
                 tracing::warn!(?error, "recording cut queue failed");
@@ -2586,7 +2599,7 @@ mod tests {
                 service: bmux_plugin_sdk::RegisteredService {
                     capability: bmux_plugin_sdk::HostScope::new("bmux.recording.write").unwrap(),
                     kind: bmux_plugin_sdk::ServiceKind::Command,
-                    interface_id: "recording-commands/v2".into(),
+                    interface_id: "recording-commands/v3".into(),
                     provider: bmux_plugin_sdk::ProviderId::Plugin(context.plugin_id.clone()),
                 },
                 operation: "queue-cut".into(),

@@ -282,7 +282,8 @@ interface recording-state {
 
 @capability(RECORDING_WRITE)
 // v2: `cut` and `queue-cut` take a wall-clock range.
-@interface-version(2)
+// v3: `cut` and `queue-cut` can leave out input.
+@interface-version(3)
 interface recording-commands {
     command start(
         session_id: uuid?,
@@ -310,8 +311,15 @@ interface recording-commands {
 
     // A cut keeps either the last `last_seconds` (the rolling window when absent) or the
     // wall-clock range from `start_epoch_ms` to `end_epoch_ms` (now when absent), inclusive.
-    // `last_seconds` and a range are mutually exclusive.
-    command cut(last_seconds: u64?, name: string?, start_epoch_ms: u64?, end_epoch_ms: u64?)
+    // `last_seconds` and a range are mutually exclusive. With `without_input`, the cut leaves
+    // out the bytes typed into panes (`pane-input-raw`), such as passwords that never echo.
+    command cut(
+        last_seconds: u64?,
+        name: string?,
+        start_epoch_ms: u64?,
+        end_epoch_ms: u64?,
+        without_input: bool?,
+    )
         -> result<recording-types.recording-summary, recording-types.recording-error>;
 
     command queue-cut(
@@ -320,6 +328,7 @@ interface recording-commands {
         export_fps: u32?,
         start_epoch_ms: u64?,
         end_epoch_ms: u64?,
+        without_input: bool?,
     )
         -> recording-types.recording-job;
 

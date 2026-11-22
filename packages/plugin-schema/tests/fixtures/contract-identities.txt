@@ -108,7 +108,7 @@ plugins/recording-plugin-api/bpdl/recording-plugin.bpdl recording-process-v4 bbf
 plugins/recording-plugin-api/bpdl/recording-plugin.bpdl recording-types 50bf7d720829cc5c953b3bad4769d5bd0016708ce240ad53f9f73ef3e7dfa791
 plugins/recording-plugin-api/bpdl/recording-plugin.bpdl recording-events/v2 9dc43bd03d0a8ba5229e0326a6d1eabd3c363224a6706c38ffea5ca01b514814
 plugins/recording-plugin-api/bpdl/recording-plugin.bpdl recording-state 9ed4d2efdf7eafc43658a56c7d777fdbf136088ae1e7a8c70b9b2fa489050dd0
-plugins/recording-plugin-api/bpdl/recording-plugin.bpdl recording-commands/v2 2ebbd00a7c774c49f7cb4bc4ef25b8f542f3f3e0a03a50081a61560604795744
+plugins/recording-plugin-api/bpdl/recording-plugin.bpdl recording-commands/v3 737c4aae34d453607280f11880fb2d0a1cccc16274830d6b19a90f88edf2168c
 plugins/sessions-plugin-api/bpdl/sessions-plugin.bpdl sessions-program-v1 e5cb267dfafc7e3934b393a03d7bf1f4d74916f5f00eee8de6878596f9554352
 plugins/sessions-plugin-api/bpdl/sessions-plugin.bpdl sessions-spawn-v1 efd7489c343a6e8e2cb0a2282be19d54eb700b251500c8e74b2c823948d512ea
 plugins/sessions-plugin-api/bpdl/sessions-plugin.bpdl sessions-state ba0d8d7c8bd2ce75a9932e9e62c7c3160d400b8985014ca35c0e0148b52e1975
