@@ -201,4 +201,60 @@ fleets and determinism-verified runs), regression seeds for what it finds, and n
 
 ## Implementation notes
 
-(Filled in as the work lands.)
+### 19.6 (scan beyond the plugin)
+
+- **The checker.** `packages/sim-primitives-check` (`bmux_sim_primitives_check`, dev-only)
+  holds the plugin's scan. Each crate calls `Scan::new(env!("CARGO_MANIFEST_DIR"))` from its
+  own `tests/primitives.rs`, stating its exemptions:
+  - `native` prefixes, skipped whole;
+  - `exempt` files;
+  - `os_named_in` (where `cfg(unix)` and the like may appear);
+  - extra `forbid` patterns;
+  - `only`, for crates a simulation runs only parts of.
+
+  `// native-only: begin/end` regions, `#[cfg(test)]` items, `tests.rs` and `*_tests.rs` are
+  skipped. Two holes are closed:
+  - `use` statements are expanded into the paths they import, so
+    `use std::sync::{Arc, Mutex};` and multi-line groups no longer hide a forbidden import;
+  - statics are caught whatever their visibility.
+- **Crates scanned.**
+  - The plugin itself.
+  - `bmux_pty` (its old scan, with its stricter patterns kept).
+  - `bmux_terminal_grid`.
+  - `bmux_terminal_protocol` (minus client-side `pointer_output.rs`).
+  - `bmux_session_models`.
+  - `bmux_session_state` and `bmux_context_state` (their no-op handles run).
+  - `bmux_pane_runtime_state`.
+  - `bmux_snapshot_runtime` (the dirty flag).
+  - `bmux_plugin`: only `plugin_state.rs`, since a simulated runtime's host is a bare state
+    registry.
+  - `bmux_plugin_runtime`: only `shutdown_progress.rs`.
+  - `bmux_local_terminal`.
+
+  Not scanned, because the simulation runs none of their code beyond plain data types and
+  constants:
+  - `bmux_presentation_state`, `bmux_recording_runtime`, `bmux_ipc` and `bmux_plugin_sdk`;
+  - the attach protocols and plugin API crates.
+- **Fixes.**
+  - `Session::new` drew random ids from inside the plugin's request handlers. The new
+    `Session::with_id` takes the plugin's seeded `ids` instead, and the plugin's scan forbids
+    the models' random constructors.
+  - `SnapshotDirtyFlag` (marked on every pane change) read the host clock and used std atomics;
+    it now uses `switchy_time` and `switchy_thread`'s atomics.
+  - The protocol engine's trace timestamps read `switchy_time`.
+- **Marked safe.** These are std locks held around one operation and never across a switch
+  point, or maps that are looked up but never iterated:
+  - the state registry's lock and `HashMap`;
+  - the style interner's `HashMap`;
+  - the grid's line memo;
+  - the trace buffer, the shutdown token and shutdown progress's lock.
+
+  Also marked safe: activation registrations and shutdown progress publication, which never
+  run in a simulated pane runtime.
+- **Left open.** `PluginStateRegistry::get_or_insert_with` runs its initializer under the
+  registry's std write lock. An initializer that reaches a simulated switch point (a `switchy`
+  lock, atomic or channel) would let another simulated thread block on the std lock for real,
+  and the run would hang instead of reporting a deadlock. Today's initializers on the
+  simulated path have no switch points. Making the registry's own lock a `switchy_thread` lock
+  (its public `Arc<RwLock<T>>` entry type can stay std) would close this, but it adds a switch
+  point to every host-state lookup and so changes every seed's schedule.
