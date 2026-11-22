@@ -30,7 +30,8 @@ build.
 cargo sim pty                                      # SIMULATOR_RUNS random runs
 SIMULATOR_RUNS=2000 cargo sim pty                  # more
 SIMULATOR_SEED=42 SIMULATOR_RUNS=1 cargo sim pty   # replay one run
-SIMULATOR_SEED=42 SIMULATOR_RUNS=1 cargo sim pty --tui   # watch it; space pauses, n/N step
+cargo sim pty --tui                                # the dashboard, running continuously
+cargo sim pty --tui 42                             # ... with the run of seed 42 open
 SIMULATOR_VERIFY_DETERMINISM=1 cargo sim pty       # replay every run and compare traces
 cargo sim pty --regression                         # the seeds in regression-seeds
 SIMULATOR_PTY_PID_REUSE=1 cargo sim pty            # reuse every freed process id
@@ -41,36 +42,18 @@ SIMULATOR_SHRINK=1 SIMULATOR_SEED=42 cargo sim pty # shrink a failure's thread s
 
 ## Watching and debugging a run
 
-`--tui` shows the runs in a dashboard on bmux's TUI stack:
-
-- **Runs**: seeds, progress, results, and each failure's report with its replay
-  command.
-- **Scheduler**: the simulated threads and recent decisions, the decision rate,
-  and each invariant above with how often it was checked and how it failed.
-- **Processes & terminals**: processes by session and process group, the signal
-  log, and each terminal's screen (through `bmux_terminal_grid`) as programs
-  wrote it next to what `bmux_pty` delivered, with how much output is buffered
-  over time.
-
-Space pauses and resumes at scheduling decisions, `n` and `N` step one and a
-hundred, and `b` and `B` go back one and a hundred. `:` opens a command line:
-
-| Command | Does |
-| --- | --- |
-| `goto N` | Run to decision N, or go back to it |
-| `back N` | Go back N decisions |
-| `break decision N`, `break step N` | Pause there |
-| `break block THREAD [ON]` | Pause when a thread blocks (on something) |
-| `break fail` | Pause whenever an invariant fails, where it fails |
-| `clear` | Remove the breakpoints |
-
-Going back reruns the run's seed from the start in a fresh process that pauses
-at the target decision (`SIMVAR_TUI_PAUSE_AT`); determinism makes it exact.
+`--tui` runs the simulation continuously in the
+[simulation dashboard](../../packages/simvar-tui/README.md): the fleet's
+throughput, outcomes and coverage; failures kept, reproduced, shrunk and
+saved; and time travel through any run (its timeline, threads, decisions and
+invariants, and the Kernel view: processes by session and process group, the
+signal log, and each terminal's screen as programs wrote it next to what
+`bmux_pty` delivered). `?` in the dashboard lists every key.
 
 `SIMULATOR_SHRINK=1` shrinks a failing run's thread schedule (the switches it
 made beyond the ones it had to) and prints the smallest failing schedule with
-its replay command, `SIMULATOR_SCHEDULE=… cargo sim pty`. Add `--tui` to watch
-the shrunk run.
+its replay command, `SIMULATOR_SCHEDULE=… cargo sim pty`; the dashboard does
+this on its own for every failure it finds.
 
 Bugs found so far: a kill or interrupt after the process was reaped could reach
 an unrelated newer process that reused its id (fixed in `bmux_pty`: the exited

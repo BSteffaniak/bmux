@@ -230,6 +230,22 @@ struct Shared {
     summary: u64,
 }
 
+/// Tag the run with what it exercises.
+fn tag_run(config: &Config, drivers: u64) {
+    telemetry::shape(vec![
+        format!(
+            "personality:{}",
+            format!("{:?}", config.personality).to_lowercase()
+        ),
+        format!("drivers:{drivers}"),
+        if config.faults == Faults::default() {
+            "faults:none".into()
+        } else {
+            "faults:on".into()
+        },
+    ]);
+}
+
 /// One run's workload. Returns the violations found, if any.
 ///
 /// # Errors
@@ -249,6 +265,7 @@ pub fn run_workload() -> Result<(), Vec<String>> {
 
     let shared = Arc::new(Mutex::new(Shared::default()));
     let drivers = 1 + draw(&rng(), 3);
+    tag_run(&config, drivers);
     let (finished, finishing) = mpsc::channel();
     let handles: Vec<_> = (0..drivers)
         .map(|index| {
@@ -279,7 +296,7 @@ pub fn run_workload() -> Result<(), Vec<String>> {
             break;
         }
     }
-    telemetry::emit_now();
+    telemetry::finish_run();
     // Signals the drivers' processes received, before the end-of-run cleanup kills the rest.
     let signal_log = simulator::signal_log();
     simulator::kill_all();

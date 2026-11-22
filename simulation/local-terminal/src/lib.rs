@@ -244,6 +244,28 @@ async fn drain_threads(violations: &mut Vec<String>) {
     }
 }
 
+/// Put attachment `attachment` on the run's timeline.
+fn attach_event(attachment: u64) {
+    sim_support::event(
+        "attach",
+        format!("attachment {attachment}"),
+        bmux_simvar_tui::Tone::Info,
+    );
+}
+
+/// Set up the run's kernel and telemetry.
+fn start_run() {
+    switchy_time::simulator::set_step_multiplier(1);
+    sim_support::watch_run();
+    simulator::configure(Config {
+        personality: Personality::Linux,
+        pid_reuse: 0.3,
+        faults: Faults::default(),
+    });
+    simulator::install_default_programs();
+    simulator::register_program("sh", shell);
+}
+
 /// One run's workload. Returns the violations found, if any.
 ///
 /// # Errors
@@ -254,14 +276,7 @@ async fn drain_threads(violations: &mut Vec<String>) {
 ///
 /// * If the server task panics
 pub async fn run_workload() -> Result<(), Vec<String>> {
-    switchy_time::simulator::set_step_multiplier(1);
-    simulator::configure(Config {
-        personality: Personality::Linux,
-        pid_reuse: 0.3,
-        faults: Faults::default(),
-    });
-    simulator::install_default_programs();
-    simulator::register_program("sh", shell);
+    start_run();
 
     let mut violations = Vec::new();
     let mut slot = None;
@@ -269,15 +284,25 @@ pub async fn run_workload() -> Result<(), Vec<String>> {
     let mut typed: Vec<String> = Vec::new();
     let mut terminal: Option<String> = None;
     let attachments = 1 + draw(4);
+    sim_support::shape(vec![
+        "personality:linux".into(),
+        format!("attachments:{attachments}"),
+    ]);
     let code = u8::try_from(draw(100)).unwrap_or(0);
     for attachment in 0..attachments {
         let last = attachment + 1 == attachments;
+        attach_event(attachment);
         let (mut client, mut server) = tokio::io::duplex(4096);
         let mut server_slot = slot.take();
         let server_task = switchy_async::task::spawn(async move {
             let result = serve_attachment(&mut server, "/bin/sh", &mut server_slot).await;
             (result, server_slot)
         });
+        sim_support::event(
+            "attach",
+            format!("attachment {attachment}"),
+            bmux_simvar_tui::Tone::Info,
+        );
         // 1. The handshake.
         let size = random_size();
         let mut hello = HELLO.to_vec();
@@ -340,6 +365,7 @@ pub async fn run_workload() -> Result<(), Vec<String>> {
     drop(slot);
     simulator::kill_all();
     drain_threads(&mut violations).await;
+    sim_support::finish_run();
     if violations.is_empty() {
         Ok(())
     } else {

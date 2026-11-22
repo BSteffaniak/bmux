@@ -327,3 +327,58 @@ domain, for example `simulation/pane-runtime`'s Panes.
 - **Terminal variety.** Mouse modes, truecolor and glyph widths differ.
   Capability detection already quantizes colors; glyph fallbacks (ASCII
   bars, no braille) are kept for 16-color and non-UTF-8 terminals.
+
+## Implementation notes
+
+Built on 2026-11-21:
+
+- **17.2 (MoosicBox):** `simvar::control()` steers a running simulation:
+  - pause and resume;
+  - `set_max_parallel` (workers grow and retire);
+  - `stop`;
+  - in-process `replay` jobs (seed, epoch offset and an optional
+    `ReplayControl`) and `shrink` jobs.
+
+  The rest:
+  - `SIMULATOR_RUNS=forever` and `SIMULATOR_ON_FAILURE=continue`.
+  - `current_run()` and `current_replay()`, so a run carries its own control
+    instead of sharing one.
+  - Richer events: `RunKind`, worker, epoch offset, real and simulated time, and
+    `Shrink` progress.
+  - Bugs found while testing it: a step-count underflow on early stops, a
+    worker-retirement race, and panics outside runs being swallowed.
+- **17.1, 17.3 to 17.8 (bmux):** `bmux_simvar_tui` was rewritten:
+  - `store` and `report`: the model and its headless view.
+  - `findings`: saved failures.
+  - `theme`: a dark and a light palette with meanings, and per-thread hues.
+  - `ui`: painting through bmux components (panes, sparklines, progress bars,
+    key hints) with hit regions.
+  - `timetravel`: keyframe replays.
+  - The application itself: actions shared by pointer, keys and the palette;
+    tabs, breadcrumb-like stacks, toasts and the palette.
+
+  `sim_support` gives every simulation:
+  - a per-run timeline index and heartbeat;
+  - full telemetry only for watched runs and replays;
+  - `event`, `shape` and `finish_run`;
+  - the Kernel `SimView`;
+  - `FleetController`;
+  - `main` (`--tui [SEED[:EPOCH]]`, `--fleet`).
+
+  The pane runtime simulation adds a Panes view, events and shapes.
+- **Seen working:** in a real terminal (driven headlessly), the fleet ran at
+  about 70 runs a second on 6 workers, opening a run and stepping back through
+  parked keyframes worked, and with crash recovery disabled the dashboard
+  grouped, reproduced, shrank (to "any schedule") and saved the failures,
+  only on Linux and macOS, as Windows' jobs end with the server.
+- **Differences from the plan:**
+  - The timeline's "dashed segment showing what a thread waits on" is the
+    thread's state in its lane label and in the Threads page.
+  - The nondeterminism diff shows `↺✗` (a replay that passed), not an aligned
+    trace diff.
+  - Predicates for breakpoints are event kinds (`break crash`), not arbitrary
+    state predicates.
+  - Dividers are dragged through the dashboard's own drag handles (the fleet's
+    columns, the run overview's rows), not `panel_group`, and are not saved
+    between sessions.
+  - The 8 ms performance budget is not yet a test.

@@ -32,6 +32,7 @@ pub mod telemetry;
 use std::{collections::BTreeMap, io, time::Duration};
 
 use bmux_pane_runtime_plugin::simulation::{Pane, Panes};
+use bmux_simvar_tui::Tone;
 use simvar::{Sim, SimBootstrap, SimConfig};
 use switchy_pty::simulator::{self, Config, Faults, Process, ProcessState};
 use telemetry::{Board, PaneView};
@@ -281,6 +282,11 @@ impl Workload {
                     ),
                 }
                 self.stats.opened += 1;
+                sim_support::event(
+                    "open",
+                    format!("pane {pid} opened at {rows}x{cols}"),
+                    Tone::Info,
+                );
                 Board::pane(PaneView {
                     pane: format!("{pane:?}"),
                     pid,
@@ -316,6 +322,11 @@ impl Workload {
             };
             if self.panes.input(pane, format!("{line}\r").as_bytes()) {
                 self.stats.typed += 1;
+                sim_support::event(
+                    "type",
+                    format!("typed {line:?} into {}", opened.pid),
+                    Tone::Neutral,
+                );
                 opened.typed.push(line);
                 Board::typed(&format!("{pane:?}"));
             }
@@ -333,6 +344,11 @@ impl Workload {
             return;
         }
         self.stats.resized += 1;
+        sim_support::event(
+            "resize",
+            format!("pane {pid} resized to {rows}x{cols}"),
+            Tone::Neutral,
+        );
         Board::resized(&format!("{pane:?}"), (rows, cols));
         // 3. The terminal ends up the requested size.
         Board::checked(3);
@@ -356,6 +372,11 @@ impl Workload {
     async fn close_one(&mut self) {
         if let Some((pane, opened)) = self.open.pop_first() {
             self.stats.closed += 1;
+            sim_support::event(
+                "close",
+                format!("pane {} closing", opened.pid),
+                Tone::Neutral,
+            );
             close(&mut self.panes, pane, &opened, &mut self.violations).await;
             Board::closed(&format!("{pane:?}"));
         }
@@ -384,6 +405,7 @@ impl Workload {
             return;
         }
         self.stats.restarted += 1;
+        sim_support::event("restart", format!("pane {old} restarted"), Tone::Info);
         // 7. The old session ends; the new program leads its own.
         Board::checked(7);
         let Some(pid) = self.panes.pid(pane) else {
@@ -424,6 +446,7 @@ impl Workload {
                     .map(|p| p.session_serial)
             })
             .collect();
+        sim_support::event("crash", "the server crashed", Tone::Warn);
         self.panes.crash().await;
         for (pane, _) in std::mem::take(&mut self.open) {
             Board::closed(&format!("{pane:?}"));
@@ -507,6 +530,21 @@ impl Workload {
                 format!("5. threads still running after every pane closed: {left:?}"),
             );
         }
+        let mut shape = vec![format!(
+            "personality:{}",
+            format!("{:?}", simulator::personality()).to_lowercase()
+        )];
+        if self.stats.crashed > 0 {
+            shape.push("crash".into());
+        }
+        if self.stats.restarted > 0 {
+            shape.push("restart".into());
+        }
+        if self.stats.opened >= 3 {
+            shape.push("3+ panes".into());
+        }
+        sim_support::shape(shape);
+        sim_support::finish_run();
         if self.violations.is_empty() {
             Ok(())
         } else {
@@ -541,6 +579,10 @@ pub async fn run_workload() -> Result<(), Vec<String>> {
     });
     simulator::install_default_programs();
     simulator::register_program("sh", shell);
+    sim_support::shape(vec![format!(
+        "personality:{}",
+        format!("{:?}", simulator::personality()).to_lowercase()
+    )]);
 
     let deadline = switchy_time::Instant::now() + BUDGET;
     let records = tempfile::tempdir().expect("a directory for session records");

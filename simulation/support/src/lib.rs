@@ -1,11 +1,12 @@
 //! What bmux's simulations show in `bmux_simvar_tui`, and how they pause for it.
 //!
-//! Telemetry is the scheduler's threads and decisions, the invariants' status, and the
-//! simulated kernel: its processes, terminals, signals, and what each terminal's programs
-//! wrote next to what `bmux_pty` delivered from it. It is taken from `switchy_thread`'s
-//! decision hook, throttled by real time, and only reads state, so watching a run never
-//! changes it. A [`ReplayControl`] holds the run at decisions, breakpoints and failures; the
-//! run sends its state before it waits, so the dashboard shows where it stopped.
+//! Every run records a timeline index (which simulated thread ran at each scheduling decision,
+//! and the simulation's [`event`]s) and sends a heartbeat ([`Pulse`]); those are cheap, so the
+//! fleet can run continuously. Runs the dashboard watches, and replays, also send the full
+//! picture: the scheduler, the invariants, and the simulated kernel (processes, terminals,
+//! signals, and what each terminal's programs wrote next to what `bmux_pty` delivered). All of
+//! it only reads state, so watching a run never changes it. A replay's own [`ReplayControl`]
+//! holds it at decisions, breakpoints and failures; the run sends its state before it waits.
 
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
@@ -17,30 +18,40 @@ use std::{
     time::{Duration, Instant},
 };
 
-use bmux_simvar_tui::{RunId, SimPanel, sparkline};
+use bmux_simvar_tui::{
+    Controller, Entity, FleetState, Interest, Pulse, RunId, RunIndex, Shape, SimView,
+    TimelineEvent, Tone,
+    findings::{Findings, default_dir},
+    report,
+    store::Store,
+    ui::{Size, Ui, columns, row},
+};
 use bmux_tui::{
+    geometry::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
 use bmux_tui_components::terminal_view::TerminalState;
-use simvar::observer::{DecisionView, ReplayControl, SchedulerView, ThreadView};
+use simvar::observer::{DecisionView, ReplayControl, ReplayMode, SchedulerView, ThreadView};
 use switchy_pty::simulator::{self, KernelSnapshot, ProcessSnapshot, ProcessState, SignalRecord};
 use switchy_thread::simulator::{Decision, SchedulerSnapshot};
 
-/// How often telemetry is sent, in real time.
+/// How often watched runs send their full state, in real time.
 const INTERVAL: Duration = Duration::from_millis(100);
+/// How often every run sends its heartbeat, in real time.
+const PULSE: Duration = Duration::from_millis(250);
 
-static ENABLED: OnceLock<Arc<ReplayControl>> = OnceLock::new();
+static INTEREST: OnceLock<Arc<Interest>> = OnceLock::new();
 
 /// A simulation's own telemetry, taken whenever the rest is (for example its invariants).
 pub type Extra = fn() -> Vec<Arc<dyn Any + Send + Sync>>;
 
 static EXTRA: OnceLock<Extra> = OnceLock::new();
 
-/// Turn telemetry on for every run from now on, with `replay` holding runs at decisions and
-/// `extra` adding the simulation's own telemetry.
-pub fn enable(replay: Arc<ReplayControl>, extra: Extra) {
-    let _ = ENABLED.set(replay);
+/// Turn telemetry on for every run from now on: `interest` says which runs the dashboard
+/// watches, and `extra` adds the simulation's own telemetry.
+pub fn enable(interest: Arc<Interest>, extra: Extra) {
+    let _ = INTEREST.set(interest);
     let _ = EXTRA.set(extra);
 }
 
@@ -64,7 +75,7 @@ struct Delivered(Mutex<BTreeMap<String, Vec<u8>>>);
 
 /// Note that `bmux_pty` delivered `bytes` from `terminal`, when telemetry is on.
 pub fn delivered(terminal: &str, bytes: &[u8]) {
-    if ENABLED.get().is_none() {
+    if INTEREST.get().is_none() {
         return;
     }
     let delivered = switchy_simulation::state::<Delivered>();
@@ -75,6 +86,41 @@ pub fn delivered(terminal: &str, bytes: &[u8]) {
         .entry(terminal.to_owned())
         .or_default()
         .extend_from_slice(bytes);
+}
+
+/// The current run's recording. Std locks, never switch points.
+#[derive(Default)]
+struct Recording {
+    index: Mutex<RunIndex>,
+    last_full: Mutex<Option<Instant>>,
+    last_pulse: Mutex<Option<Instant>>,
+}
+
+fn recording() -> Arc<Recording> {
+    switchy_simulation::state::<Recording>()
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Whether the current run sends its full state: the dashboard watches it, or it is a replay.
+fn detailed() -> bool {
+    simvar::current_replay().is_some()
+        || INTEREST
+            .get()
+            .zip(simvar::current_run())
+            .is_some_and(|(interest, run)| interest.watching(run))
+}
+
+fn due(last: &Mutex<Option<Instant>>, every: Duration) -> bool {
+    let mut last = lock(last);
+    let now = Instant::now();
+    if last.is_some_and(|at| now.duration_since(at) < every) {
+        return false;
+    }
+    *last = Some(now);
+    true
 }
 
 fn view(snapshot: &SchedulerSnapshot) -> SchedulerView {
@@ -90,7 +136,7 @@ fn view(snapshot: &SchedulerSnapshot) -> SchedulerView {
             .iter()
             .map(|t| ThreadView {
                 name: t.name.clone(),
-                state: format!("{:?}", t.state),
+                state: format!("{:?}", t.state).to_lowercase(),
                 op: format!("{:?}", t.op),
             })
             .collect(),
@@ -111,8 +157,19 @@ fn view(snapshot: &SchedulerSnapshot) -> SchedulerView {
     }
 }
 
-/// Send everything a dashboard shows: the scheduler, the invariants and the kernel.
+/// Send the run's timeline index as recorded so far.
+fn emit_index(trace_hash: u64) {
+    let recording = recording();
+    let mut index = lock(&recording.index);
+    index.trace_hash = trace_hash;
+    let copy = index.clone();
+    drop(index);
+    simvar::emit(Arc::new(copy));
+}
+
+/// Send everything a dashboard shows: the scheduler, the invariants, the kernel, the index.
 fn emit(scheduler: SchedulerView) {
+    let trace_hash = scheduler.trace_hash;
     simvar::emit(Arc::new(scheduler));
     for payload in EXTRA.get().map(|extra| extra()).unwrap_or_default() {
         simvar::emit(payload);
@@ -128,10 +185,7 @@ fn emit(scheduler: SchedulerView) {
             )
         })
         .collect();
-    let delivered = switchy_simulation::state::<Delivered>()
-        .0
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+    let delivered = lock(&switchy_simulation::state::<Delivered>().0)
         .iter()
         .map(|(name, bytes)| (name.clone(), bytes.clone()))
         .collect();
@@ -141,39 +195,93 @@ fn emit(scheduler: SchedulerView) {
         delivered,
         signals: simulator::signal_log(),
     }));
+    emit_index(trace_hash);
 }
 
-/// Watch the current run, when telemetry is on: hold it at decisions as the replay control
-/// says (sending its state first), and send telemetry every [`INTERVAL`] of real time.
+/// Record and watch the current run, when telemetry is on.
+///
+/// Every decision goes into its timeline index; a replay is held at decisions as its control says (sending its state
+/// first); watched runs send their state every [`INTERVAL`] of real time, every run its
+/// heartbeat every [`PULSE`].
 pub fn watch_run() {
-    let Some(replay) = ENABLED.get().cloned() else {
+    if INTEREST.get().is_none() {
         return;
-    };
-    let last = Mutex::new(None::<Instant>);
+    }
+    let replay = simvar::current_replay();
+    let recording = recording();
     switchy_thread::simulator::set_decision_hook(Some(Arc::new(
         move |decision: &Decision, snapshot: &dyn Fn() -> SchedulerSnapshot| {
-            if replay.arrive(decision.number, decision.step, &|| view(&snapshot())) {
+            lock(&recording.index).record(decision.number, decision.to, || {
+                snapshot()
+                    .threads
+                    .get(decision.to)
+                    .map_or_else(|| format!("#{}", decision.to), |t| t.name.clone())
+            });
+            if let Some(replay) = &replay {
+                if replay.arrive(decision.number, decision.step, &|| view(&snapshot())) {
+                    emit(view(&snapshot()));
+                    replay.wait();
+                    return;
+                }
+                if replay.status().0 != ReplayMode::Run {
+                    // Seeking: the state is sent where it stops.
+                    return;
+                }
+            }
+            if due(&recording.last_pulse, PULSE) {
+                simvar::emit(Arc::new(Pulse {
+                    decisions: decision.number + 1,
+                }));
+            }
+            if detailed() && due(&recording.last_full, INTERVAL) {
                 emit(view(&snapshot()));
-                replay.wait();
-                return;
             }
-            let stepping = replay.status().0 != simvar::observer::ReplayMode::Run;
-            let mut last = last.lock().unwrap_or_else(PoisonError::into_inner);
-            let due = last.is_none_or(|at| at.elapsed() >= INTERVAL);
-            if !stepping && !due {
-                return;
-            }
-            *last = Some(Instant::now());
-            drop(last);
-            emit(view(&snapshot()));
         },
     )));
 }
 
-/// A failure the run found (`what`): pause for it if the dashboard breaks on failures. Only
-/// reads state.
+/// Record that something happened in the run, at the current decision.
+///
+/// `kind` is for filters and breakpoints, `label` for people. A watched replay pauses at it when the dashboard
+/// breaks on its kind. Only reads state.
+pub fn event(kind: &str, label: impl Into<String>, tone: Tone) {
+    let Some(interest) = INTEREST.get() else {
+        return;
+    };
+    let recording = recording();
+    let mut index = lock(&recording.index);
+    let decision = index.decisions;
+    index.event(TimelineEvent {
+        decision,
+        kind: kind.to_owned(),
+        label: label.into(),
+        tone,
+        entity: None,
+    });
+    drop(index);
+    if interest.breaks_on(kind)
+        && let Some(replay) = simvar::current_replay()
+    {
+        replay.set(ReplayMode::Pause);
+    }
+}
+
+/// Describe what the run exercised (`personality:windows`, `crash`, …); the fleet counts runs
+/// by these and splits its outcomes by them.
+pub fn shape(tags: Vec<String>) {
+    if INTEREST.get().is_some() {
+        simvar::emit(Arc::new(Shape(tags)));
+    }
+}
+
+/// A failure the run found (`what`): recorded on its timeline, and a replay pauses for it if
+/// the dashboard breaks on failures. Only reads state.
 pub fn failure(what: &str) {
-    if let Some(replay) = ENABLED.get()
+    if INTEREST.get().is_none() {
+        return;
+    }
+    event("failure", what, Tone::Bad);
+    if let Some(replay) = simvar::current_replay()
         && replay.failure(what)
     {
         emit(view(&switchy_thread::simulator::scheduler().snapshot()));
@@ -181,11 +289,22 @@ pub fn failure(what: &str) {
     }
 }
 
-/// Send the run's state now, when telemetry is on (for example at the end of a run, which
-/// may come before the next decision would have sent it). Only reads state.
-pub fn emit_now() {
-    if ENABLED.get().is_some() {
-        emit(view(&switchy_thread::simulator::scheduler().snapshot()));
+/// The run is ending: send its finished index (every run), and its full state when watched.
+/// Only reads state.
+pub fn finish_run() {
+    if INTEREST.get().is_none() {
+        return;
+    }
+    let snapshot = switchy_thread::simulator::scheduler().snapshot();
+    lock(&recording().index).finished = true;
+    if detailed() {
+        emit(view(&snapshot));
+    } else {
+        // Every run's own telemetry (its invariants, for one) feeds the fleet's totals.
+        for payload in EXTRA.get().map(|extra| extra()).unwrap_or_default() {
+            simvar::emit(payload);
+        }
+        emit_index(snapshot.trace_hash);
     }
 }
 
@@ -222,6 +341,23 @@ impl Screen {
         }
         self.state.feed(&log[self.fed..]);
         self.fed = log.len();
+    }
+
+    /// Every row of the screen down to its last non-blank one, at most `columns` wide.
+    fn all_lines(&self, columns: usize) -> Vec<Line> {
+        let (cols, rows) = self.state.size();
+        let mut lines = self
+            .state
+            .screen_window(0..usize::from(cols).min(columns), 0..usize::from(rows))
+            .map(|window| window.lines)
+            .unwrap_or_default();
+        while lines
+            .last()
+            .is_some_and(|line| line.spans.iter().all(|s| s.content.trim().is_empty()))
+        {
+            lines.pop();
+        }
+        lines
     }
 
     /// The screen's last non-blank rows, at most `columns` wide.
@@ -375,27 +511,115 @@ fn comparison(written: &[u8], delivered: &[u8]) -> Span {
     }
 }
 
-/// `left` and `right` next to each other, `left` padded to `width` columns.
-fn side_by_side(left: Vec<Line>, right: Vec<Line>, width: usize) -> Vec<Line> {
-    let rows = left.len().max(right.len());
-    let mut left = left.into_iter();
-    let mut right = right.into_iter();
-    (0..rows)
-        .map(|_| {
-            let mut spans = vec![Span::raw("  ")];
-            let left = left.next().unwrap_or_default();
-            let pad = width.saturating_sub(left.width());
-            spans.extend(left.spans);
-            spans.push(Span::raw(format!("{} │ ", " ".repeat(pad))));
-            spans.extend(right.next().unwrap_or_default().spans);
-            Line::from_spans(spans)
-        })
+impl PtyPanel {
+    /// A view of the kernel of each run.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn process_card(process: &ProcessSnapshot) -> Vec<Line> {
+        let (state, color) = match &process.state {
+            ProcessState::Running => ("running".to_owned(), Color::Green),
+            ProcessState::Zombie(exit) => (format!("exited ({exit})"), Color::Yellow),
+        };
+        let field = |name: &str, value: String| {
+            Line::from_spans(vec![
+                Span::styled(format!(" {name:<10}"), Style::new().fg(Color::BrightBlack)),
+                Span::raw(value),
+            ])
+        };
+        let mut lines = vec![
+            Line::from_spans(vec![
+                Span::styled(format!(" {} ", process.program), bold()),
+                Span::styled(state, Style::new().fg(color)),
+            ]),
+            field("pid", process.pid.to_string()),
+            field("serial", process.serial.to_string()),
+            field(
+                "session",
+                format!("{} (serial {})", process.session, process.session_serial),
+            ),
+            field("group", process.group.to_string()),
+            field(
+                "parent",
+                process.parent.map_or_else(|| "-".into(), |p| p.to_string()),
+            ),
+            field(
+                "terminal",
+                process.terminal.clone().unwrap_or_else(|| "-".into()),
+            ),
+            field("cwd", process.cwd.display().to_string()),
+        ];
+        if !process.signals.is_empty() {
+            lines.push(field("signals", format!("{:?}", process.signals)));
+        }
+        lines
+    }
+
+    fn terminal_card(view: &RunView, name: &str, width: u16) -> Vec<Line> {
+        let telemetry = &view.telemetry;
+        let Some(terminal) = telemetry.kernel.terminals.iter().find(|t| t.name == name) else {
+            return vec![Line::raw(" gone")];
+        };
+        let tracked = telemetry.delivered.iter().any(|(n, _)| n == name);
+        let compared = if tracked {
+            comparison(
+                bytes_of(&telemetry.output, name),
+                bytes_of(&telemetry.delivered, name),
+            )
+        } else {
+            Span::raw(format!(
+                "written {} bytes",
+                bytes_of(&telemetry.output, name).len()
+            ))
+        };
+        let mut lines = vec![
+            Line::from_spans(vec![Span::styled(format!(" {name}"), bold())]),
+            Line::raw(format!(
+                " {}x{}  master handles {}  slave holders {}  {}",
+                terminal.size.cols,
+                terminal.size.rows,
+                terminal.master_handles,
+                terminal.slave_holders,
+                if terminal.hung_up { "hung up" } else { "open" },
+            )),
+            Line::from_spans(vec![Span::raw(" "), compared]),
+        ];
+        if let Some(screens) = view.terminals.get(name) {
+            lines.push(Line::from_spans(vec![
+                Span::raw(format!(" buffered {:>6} B ", terminal.output_buffered)),
+                Span::styled(
+                    bmux_simvar_tui_sparkline(&screens.buffered, width.saturating_sub(20)),
+                    Style::new().fg(Color::Cyan),
+                ),
+            ]));
+            lines.push(Line::raw(""));
+            lines.push(Line::from_spans(vec![Span::styled(
+                " screen (programs' output)",
+                Style::new().fg(Color::BrightBlack),
+            )]));
+            lines.extend(screens.written.lines(usize::from(width.saturating_sub(2))));
+        }
+        lines
+    }
+}
+
+/// `samples` as a sparkline at most `width` columns wide, newest last.
+fn bmux_simvar_tui_sparkline(samples: &[u64], width: u16) -> String {
+    const LEVELS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let start = samples.len().saturating_sub(usize::from(width));
+    let visible = &samples[start..];
+    let max = visible.iter().copied().max().unwrap_or(0).max(1);
+    visible
+        .iter()
+        .map(|v| LEVELS[usize::try_from(v * 7 / max).unwrap_or(7).min(7)])
         .collect()
 }
 
-impl SimPanel for PtyPanel {
+impl SimView for PtyPanel {
     fn title(&self) -> String {
-        "Processes & terminals".into()
+        "Kernel".into()
     }
 
     fn telemetry(&mut self, run: RunId, payload: &Arc<dyn Any + Send + Sync>) {
@@ -404,140 +628,444 @@ impl SimPanel for PtyPanel {
         }
     }
 
-    fn lines(&self, run: Option<RunId>, width: u16) -> Vec<Line> {
-        let Some(view) = run.and_then(|run| self.runs.get(&run)) else {
-            return vec![Line::raw("No kernel telemetry for this run yet.")];
+    fn entities(&self, run: RunId) -> Vec<Entity> {
+        let Some(view) = self.runs.get(&run) else {
+            return Vec::new();
         };
         let telemetry = &view.telemetry;
-        let width = usize::from(width);
+        let mut entities = Vec::new();
+        // Processes by session, then process group.
+        let mut sessions: BTreeMap<(u64, u32), BTreeMap<u32, Vec<&ProcessSnapshot>>> =
+            BTreeMap::new();
+        for process in &telemetry.kernel.processes {
+            sessions
+                .entry((process.session_serial, process.session))
+                .or_default()
+                .entry(process.group)
+                .or_default()
+                .push(process);
+        }
+        for ((serial, session), groups) in sessions {
+            let members: usize = groups.values().map(Vec::len).sum();
+            let running = groups
+                .values()
+                .flatten()
+                .filter(|p| p.state == ProcessState::Running)
+                .count();
+            entities.push(Entity {
+                id: format!("session.{serial}"),
+                kind: "session".into(),
+                label: session.to_string(),
+                status: format!("{running}/{members} running"),
+                tone: if running > 0 {
+                    Tone::Good
+                } else {
+                    Tone::Neutral
+                },
+                depth: 0,
+            });
+            for (group, members) in groups {
+                for process in members {
+                    let (status, tone) = match &process.state {
+                        ProcessState::Running => ("running".to_owned(), Tone::Good),
+                        ProcessState::Zombie(exit) => (format!("exited {exit}"), Tone::Warn),
+                    };
+                    entities.push(Entity {
+                        id: format!("process.{}", process.serial),
+                        kind: if process.pid == group {
+                            "group"
+                        } else {
+                            "process"
+                        }
+                        .into(),
+                        label: format!("{} {}", process.pid, process.program),
+                        status,
+                        tone,
+                        depth: 1,
+                    });
+                }
+            }
+        }
+        for terminal in &telemetry.kernel.terminals {
+            entities.push(Entity {
+                id: format!("terminal.{}", terminal.name),
+                kind: "terminal".into(),
+                label: terminal.name.clone(),
+                status: format!(
+                    "{}x{} {}",
+                    terminal.size.cols,
+                    terminal.size.rows,
+                    if terminal.hung_up { "hung up" } else { "open" }
+                ),
+                tone: if terminal.hung_up {
+                    Tone::Warn
+                } else {
+                    Tone::Info
+                },
+                depth: 0,
+            });
+        }
+        entities.push(Entity {
+            id: "signals".into(),
+            kind: "signals".into(),
+            label: format!("{} delivered", telemetry.signals.len()),
+            status: telemetry
+                .signals
+                .last()
+                .map_or_else(String::new, |s| format!("last {:?}", s.signal)),
+            tone: Tone::Neutral,
+            depth: 0,
+        });
+        entities
+    }
+
+    fn card(&self, run: RunId, entity: &str, width: u16) -> Vec<Line> {
+        let Some(view) = self.runs.get(&run) else {
+            return vec![Line::raw(" No kernel telemetry for this run yet.")];
+        };
+        let telemetry = &view.telemetry;
+        if let Some(serial) = entity.strip_prefix("process.") {
+            return telemetry
+                .kernel
+                .processes
+                .iter()
+                .find(|p| p.serial.to_string() == serial)
+                .map_or_else(|| vec![Line::raw(" gone")], Self::process_card);
+        }
+        if let Some(serial) = entity.strip_prefix("session.") {
+            let members: Vec<ProcessSnapshot> = telemetry
+                .kernel
+                .processes
+                .iter()
+                .filter(|p| p.session_serial.to_string() == serial)
+                .cloned()
+                .collect();
+            let mut lines = vec![Line::from_spans(vec![Span::styled(
+                format!(" session (leader serial {serial})"),
+                bold(),
+            )])];
+            lines.extend(process_tree(&members));
+            return lines;
+        }
+        if let Some(name) = entity.strip_prefix("terminal.") {
+            return Self::terminal_card(view, name, width);
+        }
         let mut lines = vec![Line::from_spans(vec![Span::styled(
             format!(
-                "Processes ({} kernel)",
-                telemetry.kernel.personality.to_lowercase()
-            ),
-            bold(),
-        )])];
-        lines.extend(process_tree(&telemetry.kernel.processes));
-
-        lines.push(Line::raw(""));
-        lines.push(Line::from_spans(vec![Span::styled(
-            format!(
-                "Signals ({} delivered, latest last)",
+                " signals ({} delivered, latest last)",
                 telemetry.signals.len()
             ),
             bold(),
-        )]));
-        for record in telemetry.signals.iter().rev().take(8).rev() {
+        )])];
+        for record in telemetry.signals.iter().rev().take(40).rev() {
             lines.push(Line::raw(format!(
-                "  {:?} -> {} (serial {}, session {})",
+                " {:?} → {} (serial {}, session {})",
                 record.signal, record.pid, record.serial, record.session_serial
             )));
         }
-
-        for t in &telemetry.kernel.terminals {
-            let Some(screens) = view.terminals.get(&t.name) else {
-                continue;
-            };
-            // What a terminal's reader received is known only where the simulation reports it
-            // (see `delivered`); elsewhere the panel shows what programs wrote alone.
-            let tracked = telemetry.delivered.iter().any(|(name, _)| *name == t.name);
-            let compared = if tracked {
-                comparison(
-                    bytes_of(&telemetry.output, &t.name),
-                    bytes_of(&telemetry.delivered, &t.name),
-                )
-            } else {
-                Span::raw(format!(
-                    "written {} bytes",
-                    bytes_of(&telemetry.output, &t.name).len()
-                ))
-            };
-            lines.push(Line::raw(""));
-            lines.push(Line::from_spans(vec![
-                Span::styled(format!("{} ", t.name), bold()),
-                Span::raw(format!(
-                    "{}x{}  master handles {}  slave holders {}  {}  in {}  ",
-                    t.size.cols,
-                    t.size.rows,
-                    t.master_handles,
-                    t.slave_holders,
-                    if t.hung_up { "hung up" } else { "open" },
-                    t.input_buffered,
-                )),
-                compared,
-            ]));
-            lines.push(Line::from_spans(vec![
-                Span::raw(format!("  buffered {:>6} B  ", t.output_buffered)),
-                Span::styled(
-                    sparkline(&screens.buffered, u16::try_from(width / 2).unwrap_or(40)),
-                    Style::new().fg(Color::Cyan),
-                ),
-            ]));
-            let column = width.saturating_sub(5) / 2;
-            if !tracked {
-                lines.extend(screens.written.lines(width.saturating_sub(2)));
-            } else if column >= 20 {
-                let mut heading = side_by_side(
-                    vec![Line::raw("written by programs")],
-                    vec![Line::raw("delivered by bmux_pty")],
-                    column,
-                );
-                for line in &mut heading {
-                    for span in &mut line.spans {
-                        span.style = bold();
-                    }
-                }
-                lines.extend(heading);
-                lines.extend(side_by_side(
-                    screens.written.lines(column),
-                    screens.delivered.lines(column),
-                    column,
-                ));
-            } else {
-                lines.push(Line::raw("  written by programs:"));
-                lines.extend(screens.written.lines(width.saturating_sub(2)));
-                lines.push(Line::raw("  delivered by bmux_pty:"));
-                lines.extend(screens.delivered.lines(width.saturating_sub(2)));
-            }
-        }
         lines
+    }
+
+    fn page(&self, run: RunId, entity: &str, ui: &mut Ui<'_, '_, '_>, area: Rect) {
+        let terminal = entity.strip_prefix("terminal.");
+        let (Some(name), Some(view)) = (terminal, self.runs.get(&run)) else {
+            let lines = self.card(run, entity, area.width);
+            ui.lines(area, &lines);
+            return;
+        };
+        // A terminal in full: what programs wrote beside what bmux_pty delivered.
+        let parts = columns(area, &[Size::Fill(1), Size::Fixed(1), Size::Fill(1)]);
+        let Some(screens) = view.terminals.get(name) else {
+            return;
+        };
+        let tracked = view.telemetry.delivered.iter().any(|(n, _)| n == name);
+        ui.line(
+            row(parts[0], 0),
+            &Line::from_spans(vec![Span::styled(" written by programs", bold())]),
+        );
+        ui.lines(
+            Rect::new(
+                parts[0].x,
+                parts[0].y + 1,
+                parts[0].width,
+                parts[0].height.saturating_sub(1),
+            ),
+            &screens.written.all_lines(usize::from(parts[0].width)),
+        );
+        for y in 0..area.height {
+            ui.cell(
+                parts[1].x,
+                area.y + y,
+                "│",
+                Style::new().fg(Color::BrightBlack),
+            );
+        }
+        ui.line(
+            row(parts[2], 0),
+            &Line::from_spans(vec![Span::styled(
+                if tracked {
+                    " delivered by bmux_pty"
+                } else {
+                    " (delivery not tracked)"
+                },
+                bold(),
+            )]),
+        );
+        if tracked {
+            ui.lines(
+                Rect::new(
+                    parts[2].x,
+                    parts[2].y + 1,
+                    parts[2].width,
+                    parts[2].height.saturating_sub(1),
+                ),
+                &screens.delivered.all_lines(usize::from(parts[2].width)),
+            );
+        }
+    }
+
+    fn forget(&mut self, run: RunId) {
+        self.runs.remove(&run);
     }
 }
 
-/// Run `bootstrap`'s simulation while a dashboard titled `title` shows it, then return its results.
+/// Steers simvar's fleet for the dashboard.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FleetController;
+
+impl Controller for FleetController {
+    fn status(&self) -> FleetState {
+        let status = simvar::control().status();
+        FleetState {
+            paused: status.paused,
+            max_parallel: status.max_parallel,
+            active: status.active,
+        }
+    }
+
+    fn pause(&self) {
+        simvar::control().pause();
+    }
+
+    fn resume(&self) {
+        simvar::control().resume();
+    }
+
+    fn set_max_parallel(&self, count: u64) {
+        simvar::control().set_max_parallel(count);
+    }
+
+    fn stop(&self) {
+        simvar::control().stop();
+    }
+
+    fn replay(
+        &self,
+        seed: u64,
+        epoch_offset: u64,
+        control: Option<Arc<ReplayControl>>,
+    ) -> Option<RunId> {
+        simvar::control()
+            .replay(simvar::ReplayRequest {
+                seed,
+                epoch_offset,
+                control,
+            })
+            .ok()
+    }
+
+    fn shrink(&self, seed: u64, epoch_offset: u64) -> Option<RunId> {
+        simvar::control().shrink(seed, epoch_offset).ok()
+    }
+}
+
+/// Run the simulation continuously (unless `SIMULATOR_RUNS` says otherwise), keeping going
+/// after failures (unless `SIMULATOR_ON_FAILURE` says otherwise).
+fn fleet_defaults() {
+    for (name, value) in [
+        ("SIMULATOR_RUNS", "forever"),
+        ("SIMULATOR_ON_FAILURE", "continue"),
+    ] {
+        if std::env::var_os(name).is_none() {
+            // SAFETY: called before the simulation (or anything else) starts any thread.
+            unsafe { std::env::set_var(name, value) };
+        }
+    }
+}
+
+/// Run `bootstrap`'s simulation while the dashboard shows it, until the user quits.
 ///
-/// The simulation runs on another thread; the dashboard shows `panels` after its own. Going back
-/// in a run replaces this process with a rerun of its seed (see `bmux_simvar_tui::seek`).
+/// Runs go on continuously and past failures (unless `SIMULATOR_RUNS` and
+/// `SIMULATOR_ON_FAILURE` say otherwise); failures are saved under the findings directory for
+/// `name`. The dashboard shows `views` in each run after its own pages, and opens the run of
+/// `open` (seed, epoch offset) at start when given.
 ///
 /// # Errors
 ///
 /// * If the dashboard cannot use the terminal, or the simulation fails to run
-///
-/// # Panics
-///
-/// * If the simulation's thread panics
-pub fn run_with_tui<B: simvar::SimBootstrap + Send + 'static>(
+pub fn run_dashboard<B: simvar::SimBootstrap + Send + 'static>(
     bootstrap: B,
+    name: &str,
     title: &str,
-    panels: Vec<Box<dyn SimPanel>>,
+    views: Vec<Box<dyn SimView>>,
     extra: Extra,
+    open: Option<(u64, u64)>,
 ) -> Result<Vec<simvar::SimResult>, Box<dyn std::error::Error>> {
-    let replay = bmux_simvar_tui::replay_control();
-    enable(Arc::clone(&replay), extra);
+    fleet_defaults();
+    let interest = Arc::new(Interest::default());
+    enable(Arc::clone(&interest), extra);
     let (observer, events) = bmux_simvar_tui::observer();
     simvar::add_observer(observer);
     simvar::set_quiet(true);
     let simulation =
         std::thread::spawn(move || simvar::run_simulation(bootstrap).map_err(|e| e.to_string()));
-    let exit = bmux_simvar_tui::Dashboard::new(title, events, panels, Some(replay)).run()?;
-    if let bmux_simvar_tui::Exit::Seek { seed, decision } = exit {
-        return Err(bmux_simvar_tui::seek(seed, decision).into());
-    }
-    // The user left: start no more runs, and let the current ones finish.
-    simvar::end_sim();
+    let dashboard = bmux_simvar_tui::Dashboard::new(
+        bmux_simvar_tui::Options {
+            title: title.into(),
+            views,
+            controller: Some(Box::new(FleetController)),
+            interest,
+            findings: Some(Findings::new(default_dir(name))),
+            open,
+        },
+        events,
+    );
+    let shown = dashboard.run();
+    // The user left: start no more runs, and end the ones in flight.
+    simvar::control().stop();
+    shown?;
     Ok(simulation
         .join()
         .map_err(|_| "the simulation thread panicked")??)
+}
+
+/// Run `bootstrap`'s simulation continuously without a dashboard.
+///
+/// It prints a summary line every few seconds and each kind of failure as it first appears, until interrupted (ctrl+c)
+/// or the runs `SIMULATOR_RUNS` asks for are done. Failures are saved like the dashboard's.
+///
+/// # Errors
+///
+/// * If the simulation fails to run
+pub fn run_report<B: simvar::SimBootstrap + Send + 'static>(
+    bootstrap: B,
+    name: &str,
+    extra: Extra,
+) -> Result<Vec<simvar::SimResult>, Box<dyn std::error::Error>> {
+    fleet_defaults();
+    enable(Arc::new(Interest::default()), extra);
+    let (observer, events) = bmux_simvar_tui::observer();
+    simvar::add_observer(observer);
+    simvar::set_quiet(true);
+    let simulation =
+        std::thread::spawn(move || simvar::run_simulation(bootstrap).map_err(|e| e.to_string()));
+    let findings = Findings::new(default_dir(name));
+    let build = bmux_simvar_tui::findings::build_identity();
+    let mut store = Store::new(Instant::now());
+    let mut last = Instant::now();
+    let mut reported = 0;
+    loop {
+        match events.recv_timeout(Duration::from_millis(200)) {
+            Ok(event) => {
+                let finished = matches!(event, simvar::observer::SimEvent::Finished);
+                store.apply(event, Instant::now());
+                if finished {
+                    break;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+        let now = Instant::now();
+        store.tick(now);
+        while reported < store.failures.len() {
+            for line in report::failure(&store.failures[reported]) {
+                println!("{line}");
+            }
+            let _ = findings.save(&bmux_simvar_tui::findings::Finding::of(
+                &store.failures[reported],
+                &build,
+            ));
+            reported += 1;
+        }
+        if now.duration_since(last) >= Duration::from_secs(5) {
+            println!("{}", report::summary(&store, now));
+            last = now;
+        }
+    }
+    println!("{}", report::summary(&store, Instant::now()));
+    Ok(simulation
+        .join()
+        .map_err(|_| "the simulation thread panicked")??)
+}
+
+/// A simulation, as [`main`] runs it.
+pub struct Simulation<B> {
+    /// Its name (`pane-runtime`), for its findings directory.
+    pub name: &'static str,
+    /// Its dashboard title.
+    pub title: &'static str,
+    /// Its bootstrap.
+    pub bootstrap: B,
+    /// Its views in the dashboard, after the kernel's.
+    pub views: Vec<Box<dyn SimView>>,
+    /// Its own telemetry.
+    pub extra: Extra,
+}
+
+/// Run a simulation as `cargo sim NAME [FLAGS]` asks (`args` are the flags):
+///
+/// * no flags: the runs `SIMULATOR_RUNS` asks for, then their results; failing exits 1.
+/// * `--tui [SEED[:EPOCH]]`: the dashboard, running continuously and keeping failures, with
+///   the run of `SEED` (and epoch offset `EPOCH`) open when given.
+/// * `--fleet`: continuously without the dashboard, printing a summary and each kind of
+///   failure as it appears; failing exits 1.
+///
+/// # Errors
+///
+/// * For an unknown flag, or when the simulation cannot run
+pub fn main<B: simvar::SimBootstrap + Send + 'static>(
+    simulation: Simulation<B>,
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Simulation {
+        name,
+        title,
+        bootstrap,
+        mut views,
+        extra,
+    } = simulation;
+    let results = match args.first().map(String::as_str) {
+        None => simvar::run_simulation(bootstrap)?,
+        Some("--tui") => {
+            let open = match args.get(1) {
+                Some(run) => {
+                    let (seed, epoch) = run.split_once(':').unwrap_or((run.as_str(), "0"));
+                    Some((seed.parse()?, epoch.parse()?))
+                }
+                None => None,
+            };
+            views.insert(0, Box::new(PtyPanel::new()));
+            run_dashboard(bootstrap, name, title, views, extra, open)?;
+            return Ok(());
+        }
+        Some("--fleet") => run_report(bootstrap, name, extra)?,
+        Some(other) => {
+            return Err(format!(
+                "unknown option {other}; expected --tui [SEED[:EPOCH]] or --fleet"
+            )
+            .into());
+        }
+    };
+    let failed: Vec<_> = results.iter().filter(|r| !r.is_success()).collect();
+    for result in &failed {
+        println!("{result}");
+    }
+    println!("{} runs, {} failed", results.len(), failed.len());
+    if !failed.is_empty() {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -571,15 +1099,5 @@ mod tests {
         assert_eq!(comparison(b"abc", b"ab").content, "delivered 2 of 3 bytes");
         assert!(comparison(b"abc", b"ax").content.contains("DIFFERS"));
         assert!(comparison(b"abc", b"ax").content.ends_with("byte 1"));
-    }
-
-    #[test]
-    fn screens_sit_side_by_side() {
-        let lines = side_by_side(
-            vec![Line::raw("ab"), Line::raw("c")],
-            vec![Line::raw("x")],
-            4,
-        );
-        assert_eq!(text(&lines), ["  ab   │ x", "  c    │ "]);
     }
 }

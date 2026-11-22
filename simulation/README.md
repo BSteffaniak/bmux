@@ -20,7 +20,9 @@ This is a Cargo workspace of its own, excluded from bmux's main one, so the
 ```bash
 cargo sim pty                                      # works from anywhere in the repo
 SIMULATOR_SEED=42 SIMULATOR_RUNS=1 cargo sim pty   # replay one run
-SIMULATOR_SEED=42 SIMULATOR_RUNS=1 cargo sim pty --tui   # watch it
+cargo sim pane-runtime --tui                       # the dashboard: run continuously
+cargo sim pane-runtime --tui 42                    # ... with the run of seed 42 open
+cargo sim pane-runtime --fleet                     # continuously, printing findings
 cargo sim pty --regression                         # its pinned seeds
 ```
 
@@ -29,7 +31,8 @@ cargo sim pty --regression                         # its pinned seeds
 
 | Variable | Meaning |
 | --- | --- |
-| `SIMULATOR_RUNS` | Runs (default 1) |
+| `SIMULATOR_RUNS` | Runs (default 1; `forever` until stopped, the default with `--tui` and `--fleet`) |
+| `SIMULATOR_ON_FAILURE` | `stop` or `continue` (the default with `--tui` and `--fleet`) |
 | `SIMULATOR_MAX_PARALLEL` | Runs at once (default: CPUs) |
 | `SIMULATOR_SEED` | The first run's seed (default random) |
 | `SIMULATOR_VERIFY_DETERMINISM` | `1`: replay every run, fail if it differs |
@@ -39,11 +42,13 @@ cargo sim pty --regression                         # its pinned seeds
 | `SIMULATOR_SCHEDULE` | Replay a thread schedule `SIMULATOR_SHRINK` printed |
 
 Each simulation documents its own variables and flags. `support` (crate
-`sim_support`) holds what they share: scheduler and kernel telemetry, pausing
-at decisions and failures, the processes-and-terminals panel, and
-`run_with_tui`. A simulation's `--tui`
-dashboard (`bmux_simvar_tui`) pauses, steps, runs to decisions, breaks on
-conditions and goes back; see the [pty simulation](pty/README.md).
+`sim_support`) holds what they share: each run's timeline index, events and
+shape; scheduler and kernel telemetry for the runs the dashboard watches;
+pausing replays at decisions and failures; the Kernel view; steering simvar's
+fleet; and `main`, which gives every simulation `--tui [SEED[:EPOCH]]` and
+`--fleet`. The dashboard (`bmux_simvar_tui`, see
+[its README](../packages/simvar-tui/README.md)) shows the fleet, keeps and
+shrinks failures, and travels through any run.
 
 ## Linting
 

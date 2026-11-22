@@ -3,8 +3,9 @@
 //! `cargo sim pty` runs it, configured like any simvar simulation through `SIMULATOR_*`
 //! environment variables. Its own flags:
 //!
-//! * `--tui`: watch the runs in a dashboard: pause and step with space, `n` and `N`, go back
-//!   with `b` and `B`, and run to decisions or set breakpoints from its `:` command line.
+//! * `--tui [SEED[:EPOCH]]`: run continuously in the dashboard (the fleet, failures, and time
+//!   travel through any run), with the run of `SEED` open when given.
+//! * `--fleet`: run continuously without the dashboard, printing what it finds.
 //! * `--regression`: run every seed in `regression-seeds`, each in a fresh process and
 //!   replayed to verify it is deterministic.
 
@@ -16,39 +17,19 @@ use std::{path::Path, process::Command};
 use pty::{PtyBootstrap, telemetry};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let flags: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(unknown) = flags
-        .iter()
-        .find(|f| !matches!(f.as_str(), "--tui" | "--regression"))
-    {
-        return Err(format!("unknown option {unknown}; expected --tui or --regression").into());
-    }
-    if flags.iter().any(|f| f == "--regression") {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--regression") {
         return regression();
     }
-    let results = if flags.iter().any(|f| f == "--tui") {
-        with_tui()?
-    } else {
-        simvar::run_simulation(PtyBootstrap)?
-    };
-    let failed: Vec<_> = results.iter().filter(|r| !r.is_success()).collect();
-    for result in &failed {
-        println!("{result}");
-    }
-    println!("{} runs, {} failed", results.len(), failed.len());
-    if !failed.is_empty() {
-        std::process::exit(1);
-    }
-    Ok(())
-}
-
-/// Run the simulation while a dashboard shows it, then return its results.
-fn with_tui() -> Result<Vec<simvar::SimResult>, Box<dyn std::error::Error>> {
-    sim_support::run_with_tui(
-        PtyBootstrap,
-        "bmux_pty simulation",
-        vec![Box::new(telemetry::PtyPanel::default())],
-        telemetry::extra,
+    sim_support::main(
+        sim_support::Simulation {
+            name: "pty",
+            title: "bmux_pty",
+            bootstrap: PtyBootstrap,
+            views: Vec::new(),
+            extra: telemetry::extra,
+        },
+        &args,
     )
 }
 

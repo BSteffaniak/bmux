@@ -10,19 +10,21 @@ use std::{
     sync::{Arc, Mutex, PoisonError},
 };
 
-use bmux_simvar_tui::{InvariantStatus, Invariants, RunId, SimPanel};
+use bmux_simvar_tui::{Entity, InvariantStatus, Invariants, RunId, SimView, Tone};
 use bmux_tui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
 
 /// The invariants, by number (see the crate documentation).
-const INVARIANTS: [&str; 5] = [
+const INVARIANTS: [&str; 7] = [
     "1. an opened pane leads its own session",
     "2. typed lines reach the program in order",
     "3. the terminal ends up the requested size",
     "4. closing drains, cleans up, leaves nothing running",
     "5. the workload finishes and its threads end",
+    "6. a crash's sessions end, and only they",
+    "7. restarting ends the old session",
 ];
 
 /// One pane as the dashboard shows it.
@@ -144,13 +146,13 @@ pub fn extra() -> Vec<Arc<dyn Any + Send + Sync>> {
     })
 }
 
-/// The dashboard tab listing the selected run's panes.
+/// The dashboard's Panes view: each pane of the run, with its process, size and typing.
 #[derive(Debug, Default)]
-pub struct PanesPanel {
+pub struct PanesView {
     latest: BTreeMap<RunId, PanesTelemetry>,
 }
 
-impl SimPanel for PanesPanel {
+impl SimView for PanesView {
     fn title(&self) -> String {
         "Panes".into()
     }
@@ -161,29 +163,77 @@ impl SimPanel for PanesPanel {
         }
     }
 
-    fn lines(&self, run: Option<RunId>, _width: u16) -> Vec<Line> {
-        let Some(telemetry) = run.and_then(|run| self.latest.get(&run)) else {
-            return vec![Line::raw("No panes for this run yet.")];
-        };
-        let open = telemetry.panes.iter().filter(|view| view.open).count();
-        let mut lines = vec![Line::from_spans(vec![Span::styled(
-            format!("Panes ({open} open, {} opened)", telemetry.panes.len()),
-            Style::new().add_modifier(Modifier::BOLD),
-        )])];
-        for view in &telemetry.panes {
-            let (state, color) = if view.open {
-                ("open", Color::Green)
-            } else {
-                ("closed", Color::Default)
-            };
-            lines.push(Line::from_spans(vec![
-                Span::raw(format!(
-                    "  {:<40} pid {:>5}  {:>3}x{:<4} typed {:>3}  ",
-                    view.pane, view.pid, view.size.1, view.size.0, view.typed
-                )),
-                Span::styled(state, Style::new().fg(color)),
-            ]));
-        }
-        lines
+    fn entities(&self, run: RunId) -> Vec<Entity> {
+        self.latest
+            .get(&run)
+            .map(|telemetry| {
+                telemetry
+                    .panes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, view)| Entity {
+                        id: format!("pane.{index}"),
+                        kind: "pane".into(),
+                        label: format!("pid {} {}", view.pid, short(&view.pane)),
+                        status: if view.open {
+                            format!("{}x{} · {} typed", view.size.1, view.size.0, view.typed)
+                        } else {
+                            "closed".into()
+                        },
+                        tone: if view.open { Tone::Good } else { Tone::Neutral },
+                        depth: 0,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
+
+    fn card(&self, run: RunId, entity: &str, _width: u16) -> Vec<Line> {
+        let view = entity
+            .strip_prefix("pane.")
+            .and_then(|index| index.parse::<usize>().ok())
+            .and_then(|index| self.latest.get(&run)?.panes.get(index));
+        let Some(view) = view else {
+            return vec![Line::raw(" No such pane in this run.")];
+        };
+        let field = |name: &str, value: String| {
+            Line::from_spans(vec![
+                Span::styled(format!(" {name:<9}"), Style::new().fg(Color::BrightBlack)),
+                Span::raw(value),
+            ])
+        };
+        let (state, color) = if view.open {
+            ("open", Color::Green)
+        } else {
+            ("closed", Color::BrightBlack)
+        };
+        vec![
+            Line::from_spans(vec![
+                Span::styled(" pane ", Style::new().add_modifier(Modifier::BOLD)),
+                Span::styled(state, Style::new().fg(color)),
+            ]),
+            field("session", view.pane.clone()),
+            field("program", format!("pid {} (see the Kernel view)", view.pid)),
+            field(
+                "size",
+                format!("{} rows × {} columns", view.size.1, view.size.0),
+            ),
+            field("typed", format!("{} lines", view.typed)),
+        ]
+    }
+
+    fn forget(&mut self, run: RunId) {
+        self.latest.remove(&run);
+    }
+}
+
+/// A pane's name, short.
+fn short(pane: &str) -> String {
+    pane.chars()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect()
 }
