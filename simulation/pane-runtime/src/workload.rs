@@ -1024,6 +1024,29 @@ impl Shared {
 }
 
 impl Stats {
+    /// What the run did, coarsely (each count bucketed by powers of two), for guided runs to
+    /// tell new behaviour from more of the same.
+    #[must_use]
+    pub fn outcome(&self) -> Vec<String> {
+        let bucket = |count: u64| match count {
+            0 => 0,
+            count => 1 + count.ilog2(),
+        };
+        [
+            ("opened", self.opened),
+            ("typed", self.typed),
+            ("resized", self.resized),
+            ("closed", self.closed),
+            ("crashed", self.crashed),
+            ("restarted", self.restarted),
+            ("cancelled", self.cancelled),
+            ("failed_opens", self.failed_opens),
+        ]
+        .into_iter()
+        .map(|(name, count)| format!("{name}:{}", bucket(count)))
+        .collect()
+    }
+
     /// Shape tags for what the run did.
     #[must_use]
     pub fn tags(&self) -> Vec<String> {

@@ -45,6 +45,7 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
+pub mod guide;
 pub mod profile;
 pub mod programs;
 pub mod telemetry;
@@ -75,6 +76,22 @@ const ENVIRONMENT: &[(&str, &str)] = &[
 pub struct PaneRuntimeBootstrap;
 
 impl SimBootstrap for PaneRuntimeBootstrap {
+    /// A guided run's profile is its input (see [`guide`]): reported as the run's
+    /// `PANE_RUNTIME_SIM_PROFILE`, so its replay command carries it.
+    fn props(&self) -> Vec<(String, String)> {
+        if std::env::var_os("PANE_RUNTIME_SIM_PROFILE").is_some() {
+            return Vec::new();
+        }
+        guide::profile_for(simvar::switchy::random::simulator::seed())
+            .map(|profile| {
+                vec![(
+                    "PANE_RUNTIME_SIM_PROFILE".to_owned(),
+                    profile.to_string().replace(' ', ","),
+                )]
+            })
+            .unwrap_or_default()
+    }
+
     fn build_sim(&self, mut config: SimConfig) -> SimConfig {
         config.duration = Duration::from_hours(24);
         config
@@ -120,7 +137,8 @@ fn trace_decisions() {
     )));
 }
 
-/// The run's profile: `PANE_RUNTIME_SIM_PROFILE` when set, else drawn from the seed.
+/// The run's profile: `PANE_RUNTIME_SIM_PROFILE` when set, else the guide's (see [`guide`]),
+/// else drawn from the seed.
 ///
 /// # Panics
 ///
@@ -131,6 +149,9 @@ pub fn run_profile() -> Profile {
         return text
             .parse()
             .unwrap_or_else(|error| panic!("PANE_RUNTIME_SIM_PROFILE: {error}"));
+    }
+    if let Some(profile) = guide::profile_for(simvar::switchy::random::simulator::seed()) {
+        return profile;
     }
     let stream = switchy_simulation::stream("pane_runtime_profile");
     Profile::draw(|bound| {
@@ -215,6 +236,9 @@ pub async fn run_workload() -> Result<(), Vec<String>> {
         format!("clock:{}", profile.clock),
     ];
     shape.extend(profile.tags());
+    if guide::enabled() {
+        shape.push("guided".into());
+    }
     sim_support::shape(shape.clone());
     sim_support::event("profile", profile.to_string(), bmux_simvar_tui::Tone::Neutral);
 
@@ -223,6 +247,7 @@ pub async fn run_workload() -> Result<(), Vec<String>> {
     // In the run's simulated file system, which outlives a crashed server like a disk.
     let records = switchy_fs::tempdir().expect("a directory for session records");
     let drivers = profile.drivers;
+    let guided = guide::tracking().then(|| profile.clone());
     let shared = Shared::new(profile, records.path().to_path_buf());
     let handles: Vec<_> = (0..drivers)
         .map(|driver| switchy_async::task::spawn(Arc::clone(&shared).drive(driver, deadline)))
@@ -235,6 +260,11 @@ pub async fn run_workload() -> Result<(), Vec<String>> {
     let (violations, stats) = shared.finish().await;
     drop(shared);
     shape.extend(stats.tags());
+    if let Some(profile) = &guided {
+        let mut outcome = stats.outcome();
+        outcome.push(format!("{:?}", simulator::personality()));
+        guide::observe(profile, &outcome);
+    }
     sim_support::shape(shape);
     sim_support::finish_run();
     if violations.is_empty() {

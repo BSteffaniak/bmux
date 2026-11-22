@@ -32,6 +32,8 @@ jobs:
             env: "SIMULATOR_SCHEDULE_STRATEGY=pct"
           - name: Weak memory
             env: "SIMULATOR_WEAK_MEMORY=1"
+          - name: Guided (pane runtime steers toward new outcomes)
+            env: "PANE_RUNTIME_SIM_GUIDED=1"
 
     steps:
       - uses: actions/checkout@v4
