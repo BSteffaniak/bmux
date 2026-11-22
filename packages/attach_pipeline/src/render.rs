@@ -2300,7 +2300,9 @@ const fn render_color_to_cell_color(color: Option<RenderColor>) -> CellColor {
     match color {
         Some(RenderColor::Indexed(index)) => CellColor::Indexed(index),
         Some(RenderColor::Rgb { r, g, b }) => CellColor::Rgb(r, g, b),
-        _ => CellColor::Default,
+        // Named colours are the 16 ANSI palette entries.
+        Some(RenderColor::Named(named)) => CellColor::Indexed(named as u8),
+        Some(RenderColor::Default) | None => CellColor::Default,
     }
 }
 

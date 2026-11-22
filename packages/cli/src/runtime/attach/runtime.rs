@@ -17963,6 +17963,10 @@ pub fn is_attach_not_attached_runtime_error(error: &ClientError) -> bool {
 mod native_input_tests;
 
 #[cfg(test)]
+#[path = "presentation_parity_tests.rs"]
+mod presentation_parity_tests;
+
+#[cfg(test)]
 #[path = "native_retry_tests.rs"]
 mod native_retry_tests;
 
