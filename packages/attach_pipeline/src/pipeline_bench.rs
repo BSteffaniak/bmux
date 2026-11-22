@@ -240,6 +240,216 @@ struct Animation {
     deltas: bool,
     /// The scene the view last sent.
     sent: Option<bmux_scene_protocol::scene_protocol::DecorationScene>,
+    /// When set, the decoration is drawn from published pane-attached surfaces
+    /// instead of being sampled from the renderer as a render extension.
+    published: Option<PublishedDecoration>,
+}
+
+/// A decoration renderer that publishes what it draws: each frame it builds every pane's
+/// under- and over-content scene and publishes them as pane-attached surfaces, which the
+/// attach pipeline samples through the published pane scene adapter.
+struct PublishedDecoration {
+    renderer: std::sync::Arc<dyn bmux_plugin::AttachRenderExtension>,
+    surfaces: std::sync::Arc<bmux_plugin::surface::PluginSurfaceRegistry>,
+    revision: u64,
+    /// Each pane layer's items, by the renderer's revision for it: a layer the
+    /// renderer reports unchanged is not rebuilt.
+    built: std::collections::BTreeMap<(Uuid, bool), (u64, Vec<bmux_plugin::RenderSceneItem>)>,
+}
+
+impl PublishedDecoration {
+    const OWNER: &'static str = "bench.decoration";
+
+    /// Publish every visible pane's decoration layers, in pane-local coordinates.
+    fn publish(
+        &mut self,
+        scene: &AttachScene,
+        capabilities: bmux_plugin::TerminalRenderCapabilities,
+    ) {
+        use bmux_plugin::{RenderExtensionLayer, RenderLayerItem};
+        use bmux_presentation_scene::scene::PaneDepth;
+        self.renderer.refresh_state();
+        self.revision += 1;
+        let context = bmux_plugin::RenderExtensionContext {
+            capabilities,
+            surface_role: bmux_plugin::RenderSurfaceRole::Content,
+            opaque_occluders: Vec::new(),
+        };
+        let mut surfaces = Vec::new();
+        for (index, pane) in scene
+            .surfaces
+            .iter()
+            .filter(|pane| pane.visible)
+            .enumerate()
+        {
+            let rect =
+                bmux_plugin::ExtensionRect::new(pane.rect.x, pane.rect.y, pane.rect.w, pane.rect.h);
+            for (layer, depth, name) in [
+                (
+                    RenderExtensionLayer::BeforePaneContent,
+                    PaneDepth::UnderContent,
+                    "under",
+                ),
+                (
+                    RenderExtensionLayer::AfterPaneContent,
+                    PaneDepth::OverContent,
+                    "over",
+                ),
+            ] {
+                let key = (pane.id, layer == RenderExtensionLayer::BeforePaneContent);
+                let revision = self.renderer.render_layer_revision(pane.id, layer);
+                if let Some((built, items)) = self.built.get(&key)
+                    && Some(*built) == revision
+                {
+                    surfaces.push(pane_surface(
+                        self.revision,
+                        index,
+                        name,
+                        pane.id,
+                        depth,
+                        items.clone(),
+                    ));
+                    continue;
+                }
+                let Some(layer_scene) = self
+                    .renderer
+                    .render_layer_scene_with_context(pane.id, &rect, layer, &context)
+                else {
+                    continue;
+                };
+                let items: Vec<_> = layer_scene
+                    .items
+                    .into_iter()
+                    .map(|mut item| {
+                        item.item = match item.item {
+                            RenderLayerItem::Op(op) => {
+                                RenderLayerItem::Op(local_op(op, rect.x, rect.y))
+                            }
+                            RenderLayerItem::Graphic(mut graphic) => {
+                                graphic.cell_rect.x -= rect.x;
+                                graphic.cell_rect.y -= rect.y;
+                                RenderLayerItem::Graphic(graphic)
+                            }
+                        };
+                        item
+                    })
+                    .collect();
+                if let Some(revision) = revision {
+                    self.built.insert(key, (revision, items.clone()));
+                }
+                surfaces.push(pane_surface(
+                    self.revision,
+                    index,
+                    name,
+                    pane.id,
+                    depth,
+                    items,
+                ));
+            }
+        }
+        self.surfaces
+            .publish_advancing(
+                Self::OWNER,
+                bmux_plugin::surface::PluginSurfaceSnapshot {
+                    revision: self.revision,
+                    surfaces,
+                },
+            )
+            .expect("decoration surfaces within limits");
+    }
+}
+
+/// One pane layer's published surface.
+fn pane_surface(
+    revision: u64,
+    index: usize,
+    name: &str,
+    pane: Uuid,
+    depth: bmux_presentation_scene::scene::PaneDepth,
+    items: Vec<bmux_plugin::RenderSceneItem>,
+) -> bmux_plugin::surface::PluginSurface {
+    bmux_plugin::surface::PluginSurface::pane(
+        bmux_plugin::surface::PluginSurfaceId::new(
+            PublishedDecoration::OWNER,
+            format!("pane-{index}-{name}"),
+            Uuid::from_u128(
+                (u128::try_from(index).unwrap_or(0) << 1) + 1 + u128::from(name == "over"),
+            ),
+        ),
+        revision,
+        pane,
+        depth,
+        items,
+    )
+}
+
+/// `op` moved by (-x, -y): from absolute into pane-local coordinates.
+fn local_op(op: bmux_plugin::RenderOp, x: u16, y: u16) -> bmux_plugin::RenderOp {
+    use bmux_plugin::RenderOp;
+    let rect = |rect: bmux_plugin::ExtensionRect| {
+        bmux_plugin::ExtensionRect::new(rect.x - x, rect.y - y, rect.w, rect.h)
+    };
+    match op {
+        RenderOp::TextRun {
+            x: ox,
+            y: oy,
+            text,
+            style,
+        } => RenderOp::TextRun {
+            x: ox - x,
+            y: oy - y,
+            text,
+            style,
+        },
+        RenderOp::StyledText {
+            x: ox,
+            y: oy,
+            spans,
+        } => RenderOp::StyledText {
+            x: ox - x,
+            y: oy - y,
+            spans,
+        },
+        RenderOp::ClearRect { rect: r, style } => RenderOp::ClearRect {
+            rect: rect(r),
+            style,
+        },
+        RenderOp::EraseRowSegment {
+            x: ox,
+            y: oy,
+            width,
+            style,
+        } => RenderOp::EraseRowSegment {
+            x: ox - x,
+            y: oy - y,
+            width,
+            style,
+        },
+        RenderOp::FillRect { rect: r, ch, style } => RenderOp::FillRect {
+            rect: rect(r),
+            ch,
+            style,
+        },
+        RenderOp::Border {
+            rect: r,
+            glyphs,
+            style,
+        } => RenderOp::Border {
+            rect: rect(r),
+            glyphs,
+            style,
+        },
+        RenderOp::CellGrid { x: ox, y: oy, rows } => RenderOp::CellGrid {
+            x: ox - x,
+            y: oy - y,
+            rows,
+        },
+        RenderOp::Cells(mut block) => {
+            block.x -= x;
+            block.y -= y;
+            RenderOp::Cells(block)
+        }
+    }
 }
 
 /// Render extensions a replay samples before each frame, as the attach client does: the
@@ -469,7 +679,35 @@ impl Replay {
     fn animated(size: (u16, u16), panes: u16, chunk_size: usize, deltas: bool) -> Self {
         let mut replay = Self::decorated(size, panes, chunk_size);
         replay.fed.clear();
-        replay.animation = Some(Animation { deltas, sent: None });
+        replay.animation = Some(Animation {
+            deltas,
+            sent: None,
+            published: None,
+        });
+        replay
+    }
+
+    /// [`Self::animated`] (deltas), with the decoration renderer publishing what it draws as
+    /// pane-attached surfaces instead of being sampled as a render extension.
+    fn animated_published(size: (u16, u16), panes: u16, chunk_size: usize) -> Self {
+        let mut replay = Self::animated(size, panes, chunk_size, true);
+        let extensions = replay.extensions.as_mut().expect("decorated");
+        let renderer = extensions.sources.remove(0);
+        let surfaces = std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(64));
+        extensions.sources = vec![std::sync::Arc::new(
+            crate::render::published_pane_scenes::PublishedPaneScenes::new(surfaces.clone()),
+        )];
+        let mut published = PublishedDecoration {
+            renderer,
+            surfaces,
+            revision: 0,
+            built: std::collections::BTreeMap::new(),
+        };
+        published.publish(
+            &replay.scene,
+            bmux_plugin::TerminalRenderCapabilities::default(),
+        );
+        replay.animation.as_mut().expect("animated").published = Some(published);
         replay
     }
 
@@ -500,6 +738,12 @@ impl Replay {
             let payload = serde_json::to_vec(&scene).expect("encode scene");
             let scene: DecorationScene = serde_json::from_slice(&payload).expect("decode scene");
             bmux_decoration_plugin_renderer::publish_relayed_scene_on(&extensions.bus, scene);
+        }
+        if let Some(published) = animation.published.as_mut() {
+            published.publish(
+                &self.scene,
+                bmux_plugin::TerminalRenderCapabilities::default(),
+            );
         }
         let cost = self.probe.since(mark);
         animation.sent = Some(scene);
@@ -1054,6 +1298,28 @@ fn animated_decoration_deltas_write_what_whole_scenes_write() {
     }
 }
 
+/// A decoration published as pane-attached surfaces writes exactly what the same decoration
+/// sampled as a render extension writes, frame after frame.
+#[test]
+fn published_decoration_writes_what_the_render_extension_writes() {
+    let size = (60, 16);
+    let mut sampled = Replay::animated(size, DECORATED_PANES, 97, true);
+    let mut published = Replay::animated_published(size, DECORATED_PANES, 97);
+    let (mut by_sample, mut by_publication) = (Vec::new(), Vec::new());
+    for tick in 0..12_usize {
+        by_sample.clear();
+        by_publication.clear();
+        sampled.relay_animation();
+        sampled.frame(&[], &mut by_sample);
+        published.relay_animation();
+        published.frame(&[], &mut by_publication);
+        assert_eq!(
+            by_sample, by_publication,
+            "frame {tick}: the bytes written differ"
+        );
+    }
+}
+
 /// The redaction pattern the `/redacted` scenarios and the redaction test use: AWS access key ids.
 const AWS_ACCESS_KEY_ID: &str = "AKIA[0-9A-Z]{16}";
 
@@ -1602,6 +1868,13 @@ fn metrics_report() -> Report {
     report.scenarios.extend(measure(
         &format!("animated{DECORATED}/whole-scenes"),
         || Replay::animated(size, DECORATED_PANES, delivery(), false),
+        &decorated_stream,
+    ));
+    // The same animation drawn from published pane-attached surfaces: the decoration builds
+    // and publishes its scenes (counted with the relay), the pipeline samples the registry.
+    report.scenarios.extend(measure(
+        &format!("animated{DECORATED}/published"),
+        || Replay::animated_published(size, DECORATED_PANES, delivery()),
         &decorated_stream,
     ));
     report.scenarios.extend(measure(

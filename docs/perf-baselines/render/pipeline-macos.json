@@ -467,6 +467,38 @@
       "live_growth_bytes": 32768
     },
     {
+      "name": "animated/decorated/published",
+      "frames": 271,
+      "phases": {
+        "apply": {
+          "allocations_per_frame": 0.0,
+          "max_allocations": 0,
+          "allocated_bytes_per_frame": 0,
+          "instructions_per_frame": 6633
+        },
+        "frame": {
+          "allocations_per_frame": 0.0,
+          "max_allocations": 0,
+          "allocated_bytes_per_frame": 0,
+          "instructions_per_frame": 6650
+        },
+        "relay": {
+          "allocations_per_frame": 2329.0,
+          "max_allocations": 2329,
+          "allocated_bytes_per_frame": 199042,
+          "instructions_per_frame": 2470636
+        },
+        "render": {
+          "allocations_per_frame": 3099.0,
+          "max_allocations": 3099,
+          "allocated_bytes_per_frame": 239178,
+          "instructions_per_frame": 2632765
+        }
+      },
+      "output_bytes_per_frame": 43,
+      "live_growth_bytes": 32768
+    },
+    {
       "name": "scattered-edits",
       "frames": 271,
       "phases": {

@@ -10,7 +10,6 @@
 //! without a per-frame callback.
 
 use std::collections::BTreeMap;
-use std::hash::{Hash, Hasher};
 use std::sync::{Arc, RwLock};
 
 use bmux_plugin::surface::{PluginSurface, PluginSurfaceRegistry, PluginSurfaceTarget};
@@ -36,15 +35,26 @@ struct PaneLayer {
 /// extension sampled by its identity.
 pub struct PublishedPaneScenes {
     registry: Arc<PluginSurfaceRegistry>,
-    layers: RwLock<BTreeMap<(Uuid, bool), PaneLayer>>,
+    /// The registry's change counter, read once per frame: nothing is rebuilt
+    /// while it stands still.
+    changes: std::sync::Mutex<tokio::sync::watch::Receiver<u64>>,
+    layers: RwLock<BTreeMap<(Uuid, bool), Arc<PaneLayer>>>,
+    /// Source of layer revisions: a layer keeps its revision while its content
+    /// is unchanged, so the pipeline reuses its sample.
+    next_revision: std::sync::atomic::AtomicU64,
 }
 
 impl PublishedPaneScenes {
     #[must_use]
-    pub const fn new(registry: Arc<PluginSurfaceRegistry>) -> Self {
+    pub fn new(registry: Arc<PluginSurfaceRegistry>) -> Self {
+        let mut changes = registry.subscribe();
+        // Rebuild on the first frame.
+        changes.mark_changed();
         Self {
             registry,
+            changes: std::sync::Mutex::new(changes),
             layers: RwLock::new(BTreeMap::new()),
+            next_revision: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -59,6 +69,18 @@ impl PublishedPaneScenes {
     }
 }
 
+/// Whether two stacks of surfaces draw the same thing (snapshot revisions aside).
+fn same_content(previous: &[Arc<PluginSurface>], next: &[Arc<PluginSurface>]) -> bool {
+    previous.len() == next.len()
+        && previous.iter().zip(next).all(|(left, right)| {
+            left.id == right.id
+                && left.layer == right.layer
+                && left.z == right.z
+                && left.ops == right.ops
+                && left.items == right.items
+        })
+}
+
 const fn depth_is_under(depth: PaneDepth) -> bool {
     matches!(depth, PaneDepth::UnderContent)
 }
@@ -69,7 +91,15 @@ impl AttachRenderExtension for PublishedPaneScenes {
     }
 
     fn refresh_state(&self) {
-        let mut layers: BTreeMap<(Uuid, bool), PaneLayer> = BTreeMap::new();
+        let changed = self.changes.lock().is_ok_and(|mut changes| {
+            let changed = changes.has_changed().unwrap_or(false);
+            changes.borrow_and_update();
+            changed
+        });
+        if !changed {
+            return;
+        }
+        let mut grouped: BTreeMap<(Uuid, bool), Vec<Arc<PluginSurface>>> = BTreeMap::new();
         for surface in self.registry.surfaces() {
             let PluginSurfaceTarget::Pane {
                 surface: pane,
@@ -81,14 +111,17 @@ impl AttachRenderExtension for PublishedPaneScenes {
             if !surface.visible {
                 continue;
             }
-            layers
+            grouped
                 .entry((pane, depth_is_under(depth)))
                 .or_default()
-                .surfaces
                 .push(Arc::new(surface));
         }
-        for layer in layers.values_mut() {
-            layer.surfaces.sort_by(|left, right| {
+        let Ok(mut current) = self.layers.write() else {
+            return;
+        };
+        let mut layers = BTreeMap::new();
+        for (key, mut surfaces) in grouped {
+            surfaces.sort_by(|left, right| {
                 (
                     left.layer,
                     left.z,
@@ -102,18 +135,20 @@ impl AttachRenderExtension for PublishedPaneScenes {
                         &right.id.local_id,
                     ))
             });
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            for surface in &layer.surfaces {
-                surface.id.owner_plugin_id.hash(&mut hasher);
-                surface.id.local_id.hash(&mut hasher);
-                surface.revision.hash(&mut hasher);
-            }
-            // Zero is reserved for "nothing published here".
-            layer.revision = hasher.finish().max(1);
+            // A layer whose surfaces only moved to a newer snapshot revision is
+            // unchanged: keep it (and its revision) so its sample is reused.
+            let layer = match current.get(&key) {
+                Some(previous) if same_content(&previous.surfaces, &surfaces) => previous.clone(),
+                _ => Arc::new(PaneLayer {
+                    revision: self
+                        .next_revision
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                    surfaces,
+                }),
+            };
+            layers.insert(key, layer);
         }
-        if let Ok(mut current) = self.layers.write() {
-            *current = layers;
-        }
+        *current = layers;
     }
 
     fn render_layer_revision(&self, surface_id: Uuid, layer: RenderExtensionLayer) -> Option<u64> {

@@ -231,11 +231,8 @@ Each phase lands with the parity harness and the targeted tests green.
    dropped). Publishing rejects duplicate item keys and graphics on surfaces not
    attached to a pane. The `pane_extension_layers` golden renders identically
    whether its scene comes from a render extension or from published surfaces.
-   Still on `AttachRenderExtension`: the decoration renderer (its scene depends on
-   per-frame pane geometry and it owns overlay chrome, the content inset, input
-   hooks and visual adapters) and pane text redaction. Moving them needs the
-   facets below published as data: content inset, text rules, chrome ownership
-   and frame observation.
+   The decoration renderer and pane text redaction stay on `AttachRenderExtension`
+   (pull), by measurement: see "Producer models" below.
 6. **Out-of-process transport.** A plugin publishes `PublishedPresentation` (its
    layout requests and surfaces, serde with optional fields defaulted) as retained
    JSON state on `<id>/presentation`. The server forwards any declared state kind
@@ -255,6 +252,40 @@ Each phase lands with the parity harness and the targeted tests green.
 8. **Remaining special cases.** Committed-frame subscription and attach context
    snapshot as generic primitives; broadcast and pane-runtime commands move onto
    presentation commands; the old paths and adapters are deleted.
+
+## Producer models: push and pull
+
+Two producer APIs feed one engine (the retained extension pipeline for pane
+depths, the surface compositor for root surfaces):
+
+- **Push (published surfaces).** Producers publish complete owner snapshots when
+  their state changes; in process or from another process (`PublishedPresentation`).
+  This is the model for event-driven UI: the sidebar, the tab bar, menus,
+  toasts, notifications, plugins outside the attach client.
+- **Pull (`AttachRenderExtension`).** An in-process producer is sampled per frame
+  and reports a per-layer revision, so the pipeline reuses its sample while
+  nothing changed and the producer copies nothing. This is the model for chrome
+  that tracks every pane and animates every frame: the decoration renderer
+  (theme borders, pulse borders) and pane text redaction.
+
+The decoration renderer stays on pull, by measurement. The gated scenario
+`animated/decorated/published` draws the `animated/decorated` scene (a clock in
+one of four decorated panes' titles, changing every frame) from published
+pane-attached surfaces instead; both write byte-identical output
+(`published_decoration_writes_what_the_render_extension_writes`). Per frame, on
+macOS:
+
+| Scenario | Relay instructions | Render instructions |
+| --- | --- | --- |
+| `animated/decorated` (pull) | 56k | 1.64M |
+| `animated/decorated/published` (push) | 2.47M | 2.63M |
+
+The published adapter already rebuilds only when the registry changes and keeps
+a pane layer (and its sample) while its content is unchanged; what remains is
+inherent to whole-snapshot publication (copying, validating and republishing
+every surface of the owner on every change). Moving the decoration renderer
+would need per-surface publication in the registry first; the scenario stays in
+the gate to measure that.
 
 ## Parity harness
 
