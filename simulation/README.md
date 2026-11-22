@@ -6,11 +6,12 @@ and switchy's simulated threads, time, terminals and processes. One seed
 decides everything in a run (interleavings, faults, timing), so any failure
 replays exactly on the same build.
 
-| Simulation | Tests |
-| --- | --- |
-| [`pty`](pty/README.md) | `bmux_pty` against a simulated kernel |
-| [`pane-runtime`](pane-runtime/README.md) | the pane runtime plugin on simulated tasks, threads, time and processes |
-| [`local-terminal`](local-terminal/README.md) | the plugin-less local terminal's server, over in-memory streams |
+| Simulation                                   | Tests                                                                                                                                       |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`consensus`](consensus/README.md)           | the owned consensus engine, model checked: exhaustive search plus seeded random walks with crashes, loss, duplication and membership change |
+| [`pty`](pty/README.md)                       | `bmux_pty` against a simulated kernel                                                                                                       |
+| [`pane-runtime`](pane-runtime/README.md)     | the pane runtime plugin on simulated tasks, threads, time and processes                                                                     |
+| [`local-terminal`](local-terminal/README.md) | the plugin-less local terminal's server, over in-memory streams                                                                             |
 
 This is a Cargo workspace of its own, excluded from bmux's main one, so the
 `simulator` features its members enable never reach bmux's real builds.

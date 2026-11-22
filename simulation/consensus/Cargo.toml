@@ -1,0 +1,17 @@
+[package]
+description = "Model checking and deterministic simulation of bmux's owned consensus engine"
+edition     = { workspace = true }
+license     = { workspace = true }
+name        = "consensus"
+publish     = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_cluster_plugin = { workspace = true }
+simvar              = { workspace = true, features = ["explore"] }
+
+[features]
+default = []
+
+fail-on-warnings = []

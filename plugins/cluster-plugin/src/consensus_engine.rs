@@ -13,7 +13,7 @@ use crate::consensus_model::{
     IdentityExhaustion, LogIdentity, LogIndex, Membership, ReconcileError, RequestVote,
     StoredMembership, Term,
 };
-use crate::membership::NodeId;
+pub use crate::membership::NodeId;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
@@ -576,6 +576,16 @@ impl Engine {
     #[must_use]
     pub fn entry(&self, index: LogIndex) -> Option<&Entry> {
         self.log.get(index)
+    }
+
+    /// Retained entries after the compacted boundary, in index order.
+    pub fn entries(&self) -> impl Iterator<Item = &Entry> {
+        self.log.entries.iter()
+    }
+
+    #[must_use]
+    pub const fn snapshot_boundary(&self) -> Option<LogIdentity> {
+        self.log.snapshot
     }
 
     #[must_use]

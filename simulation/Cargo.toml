@@ -2,7 +2,7 @@
 # `cargo sim <name>`. A workspace of its own (excluded from the main one) so the
 # `simulator` features its members enable never reach bmux's real builds.
 [workspace]
-members  = ["local-terminal", "pane-runtime", "pty", "support"]
+members  = ["consensus", "local-terminal", "pane-runtime", "pty", "support"]
 resolver = "3"
 
 [workspace.package]
@@ -14,6 +14,7 @@ version    = "0.0.0"
 
 [workspace.dependencies]
 sim_support = { path = "support" }
+bmux_cluster_plugin = { path = "../plugins/cluster-plugin", default-features = false }
 bmux_local_terminal = { path = "../packages/local-terminal", default-features = false }
 bmux_pane_runtime_plugin = { path = "../plugins/pane-runtime-plugin", default-features = false }
 bmux_pty            = { path = "../packages/pty", default-features = false }
@@ -29,3 +30,14 @@ switchy_simulation  = { git = "https://github.com/MoosicBox/MoosicBox", branch =
 switchy_thread      = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
 switchy_time        = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
 tempfile            = { version = "3.27.0", default-features = false }
+
+# Development override: build against the local MoosicBox integration branch
+# (simvar_explore, switchy_async JoinSet, run-seeded UUIDs) until it lands on
+# MoosicBox master. Remove before merging.
+[patch."https://github.com/MoosicBox/MoosicBox"]
+simvar             = { path = "../../../wt-moosicbox/consensus-sim/packages/simvar" }
+switchy_async      = { path = "../../../wt-moosicbox/consensus-sim/packages/switchy/async" }
+switchy_pty        = { path = "../../../wt-moosicbox/consensus-sim/packages/switchy/pty" }
+switchy_simulation = { path = "../../../wt-moosicbox/consensus-sim/packages/switchy/simulation" }
+switchy_thread     = { path = "../../../wt-moosicbox/consensus-sim/packages/switchy/thread" }
+switchy_time       = { path = "../../../wt-moosicbox/consensus-sim/packages/switchy/time" }

@@ -204,8 +204,9 @@ impl NodeId {
         Self(*secret_key.public().as_bytes())
     }
 
+    /// Raw identity bytes. Constructing one confers no authentication.
     #[must_use]
-    pub(crate) const fn from_bytes(bytes: [u8; 32]) -> Self {
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
 
