@@ -32,4 +32,3 @@ switchy_pty         = { git = "https://github.com/MoosicBox/MoosicBox", branch =
 switchy_simulation  = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
 switchy_thread      = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
 switchy_time        = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
-tempfile            = { version = "3.27.0", default-features = false }

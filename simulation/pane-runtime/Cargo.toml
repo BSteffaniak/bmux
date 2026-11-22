@@ -15,11 +15,11 @@ sim_support              = { workspace = true }
 simvar                   = { workspace = true, features = ["random", "thread", "time"] }
 switchy_async            = { workspace = true, features = ["thread-simulator", "time"] }
 switchy_env              = { workspace = true, features = ["simulator"] }
+switchy_fs               = { workspace = true, features = ["simulator", "sync"] }
 switchy_pty              = { workspace = true, features = ["simulator"] }
 switchy_simulation       = { workspace = true }
 switchy_thread           = { workspace = true, features = ["simulator"] }
 switchy_time             = { workspace = true, features = ["simulator"] }
-tempfile                 = { workspace = true }
 tokio                    = { workspace = true, features = ["sync"] }
 
 [features]

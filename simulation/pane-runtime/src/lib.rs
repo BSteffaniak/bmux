@@ -220,7 +220,8 @@ pub async fn run_workload() -> Result<(), Vec<String>> {
 
     let deadline =
         switchy_time::Instant::now() + BUDGET * u32::try_from(profile.clock).unwrap_or(1);
-    let records = tempfile::tempdir().expect("a directory for session records");
+    // In the run's simulated file system, which outlives a crashed server like a disk.
+    let records = switchy_fs::tempdir().expect("a directory for session records");
     let drivers = profile.drivers;
     let shared = Shared::new(profile, records.path().to_path_buf());
     let handles: Vec<_> = (0..drivers)
