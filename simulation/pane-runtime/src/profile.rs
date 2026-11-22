@@ -81,6 +81,16 @@ impl Kind {
 /// it.
 pub const THREAD_SPAWN_FAULTS: bool = false;
 
+/// Whether profiles turn wall clock jumps on (drawn, or by a guided mutation).
+///
+/// Off for now: simvar's harness measures each run's elapsed time on the simulated wall clock
+/// (`switchy::time::now()`, then `duration_since(..).unwrap()`) after the run, outside its
+/// panic catching, so a run whose clock ends behind where it started panics the fleet worker:
+/// the run disappears and the runs it cut short fail determinism checks. The draws stay, so
+/// turning it on shifts nothing. A profile with `clockjump=` (or `SIMULATOR_WALL_CLOCK_JUMPS`)
+/// still forces it.
+pub const WALL_CLOCK_JUMPS: bool = false;
+
 /// Rates of the simulated kernel's faults (see `switchy_pty::simulator::Faults`), and how
 /// often process ids are reused.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -227,8 +237,10 @@ impl Profile {
             }
         }
         if draw(4) == 0 {
-            profile.faults.wall_clock =
-                [0.0001, 0.001, 0.01][usize::try_from(draw(3)).unwrap_or(0)];
+            let rate = [0.0001, 0.001, 0.01][usize::try_from(draw(3)).unwrap_or(0)];
+            if WALL_CLOCK_JUMPS {
+                profile.faults.wall_clock = rate;
+            }
         }
         profile
     }
@@ -417,8 +429,7 @@ mod tests {
 
     #[test]
     fn profiles_with_the_new_faults_print_and_parse_back() {
-        // Enough seeds that some draw each new fault (thread spawn failures while profiles
-        // turn them on).
+        // Enough seeds that some draw each new fault (while profiles turn them on).
         let (mut spawns, mut jumps) = (0, 0);
         for seed in 0..200_u64 {
             let mut state = seed;
@@ -432,7 +443,7 @@ mod tests {
             assert_eq!(parsed, profile, "seed {seed}");
         }
         assert_eq!(spawns > 0, THREAD_SPAWN_FAULTS, "{spawns}");
-        assert!(jumps > 0);
+        assert_eq!(jumps > 0, WALL_CLOCK_JUMPS, "{jumps}");
         let forced: Profile = "threadspawn=0.01 clockjump=0.001".parse().unwrap();
         assert!(forced.faults.thread_spawn > 0.0 && forced.faults.wall_clock > 0.0);
         assert_eq!(forced.to_string().parse::<Profile>().unwrap(), forced);
@@ -444,7 +455,7 @@ mod tests {
         for seed in 0..50_u64 {
             let mut state = seed;
             let mut draws: Vec<(u64, u64)> = Vec::new();
-            let profile = Profile::draw(|bound| {
+            Profile::draw(|bound| {
                 state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
                 let value = (state >> 33) % bound;
                 draws.push((bound, value));
@@ -452,12 +463,13 @@ mod tests {
             });
             let mut at = draws.len();
             // The wall clock: on (then a rate, of three) or not.
-            if profile.faults.wall_clock > 0.0 {
+            if draws[at - 1].0 == 3 && draws[at - 2] == (4, 0) {
+                at -= 2;
+            } else {
                 at -= 1;
-                assert_eq!(draws[at].0, 3, "seed {seed}: {draws:?}");
+                assert_eq!(draws[at].0, 4, "seed {seed}: {draws:?}");
+                assert_ne!(draws[at].1, 0, "seed {seed}: {draws:?}");
             }
-            at -= 1;
-            assert_eq!(draws[at].0, 4, "seed {seed}: {draws:?}");
             // Thread spawns: on (then a rate, of two) or not.
             if draws[at - 1].0 == 2 && draws[at - 2] == (5, 0) {
                 at -= 2;
