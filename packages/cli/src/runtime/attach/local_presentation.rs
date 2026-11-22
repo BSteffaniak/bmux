@@ -24,6 +24,7 @@ pub fn publish_notification(
     let surfaces = message
         .filter(|message| !message.is_empty() && cols > 0 && rows > 0)
         .map(|message| PluginSurface {
+            items: Vec::new(),
             id: PluginSurfaceId::new(OWNER, SURFACE_ID, Uuid::nil()),
             revision,
             target: PluginSurfaceTarget::Overlay(OverlayPlacement::Anchored {

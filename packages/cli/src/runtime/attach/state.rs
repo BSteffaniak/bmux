@@ -286,6 +286,11 @@ pub struct AttachViewState {
     pub decoration_lifetime: Uuid,
     pub decoration_layout_revision: u64,
     pub presentation_extensions: std::sync::Arc<bmux_plugin::RenderExtensionRegistry>,
+    /// Paints pane-attached published surfaces through the retained extension
+    /// pipeline; rebuilt only when `presentation_surfaces` is replaced.
+    pub(super) pane_scenes: Option<
+        std::sync::Arc<bmux_attach_pipeline::render::published_pane_scenes::PublishedPaneScenes>,
+    >,
     pub presentation_layouts: std::sync::Arc<bmux_plugin::layout::PluginLayoutRegistry>,
     pub presentation_allocations: std::sync::Arc<bmux_plugin::layout::AllocationRegistry>,
     pub presentation_surfaces: std::sync::Arc<bmux_plugin::surface::PluginSurfaceRegistry>,
@@ -708,6 +713,7 @@ impl AttachViewState {
             presentation_extensions: std::sync::Arc::new(
                 bmux_plugin::RenderExtensionRegistry::new(),
             ),
+            pane_scenes: None,
             presentation_layouts: std::sync::Arc::new(
                 bmux_plugin::layout::PluginLayoutRegistry::new(PRESENTATION_OWNER_CONTRIBUTIONS),
             ),

@@ -280,6 +280,8 @@ pub fn resolve_plugin_surface_rects(
                 pending.push(index);
                 None
             }
+            // Pane-attached content is painted in the pane's own stages.
+            PluginSurfaceTarget::Pane { .. } => None,
         };
         if let Some(rect) = rect {
             resolved.insert(index, rect);
@@ -392,9 +394,21 @@ pub fn retained_surfaces_from_plugin_surfaces_within(
             } else {
                 Vec::new()
             };
+            // Plain ops first, then keyed op items in (z, key) order. Graphics
+            // items are rejected on publish for root surfaces.
+            let mut keyed = surface
+                .items
+                .iter()
+                .filter_map(|item| match &item.item {
+                    bmux_plugin::RenderLayerItem::Op(op) => Some((item.z, &item.key, op)),
+                    bmux_plugin::RenderLayerItem::Graphic(_) => None,
+                })
+                .collect::<Vec<_>>();
+            keyed.sort_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
             let render_ops = surface
                 .ops
                 .iter()
+                .chain(keyed.into_iter().map(|(_, _, op)| op))
                 .map(|op| translate_surface_render_op(op, rect.x, rect.y))
                 .collect();
             let mut builder = RetainedSurface::builder(surface.id.retained_id, rect)
@@ -2650,6 +2664,7 @@ mod tests {
         let allocations = BTreeMap::from([(layout_id.clone(), layout_rect)]);
         let surfaces = [
             PluginSurface {
+                items: Vec::new(),
                 id: PluginSurfaceId::new(owner, "layout", Uuid::from_u128(501)),
                 revision: 1,
                 target: PluginSurfaceTarget::Layout(layout_id),
@@ -2665,6 +2680,7 @@ mod tests {
                 ops: vec![RenderOp::text_run(0, 0, "layout", RenderStyle::new())],
             },
             PluginSurface {
+                items: Vec::new(),
                 id: PluginSurfaceId::new(owner, "overlay", Uuid::from_u128(502)),
                 revision: 1,
                 target: PluginSurfaceTarget::Explicit(ExtensionRect::new(30, 5, 10, 2)),
@@ -2809,6 +2825,7 @@ mod tests {
         let owner = "example.cursor";
         let mut compositor = RetainedCompositor::new();
         let surface = PluginSurface {
+            items: Vec::new(),
             id: PluginSurfaceId::new(owner, "surface", Uuid::from_u128(618)),
             revision: 1,
             target: PluginSurfaceTarget::Explicit(ExtensionRect::new(2, 2, 8, 4)),
@@ -2875,6 +2892,7 @@ mod tests {
         let owner = "example.queue";
         let mut compositor = RetainedCompositor::new();
         let surface = PluginSurface {
+            items: Vec::new(),
             id: PluginSurfaceId::new(owner, "surface", Uuid::from_u128(617)),
             revision: 1,
             target: PluginSurfaceTarget::Explicit(ExtensionRect::new(2, 2, 8, 4)),
@@ -2968,6 +2986,7 @@ mod tests {
         let owner = "example.focus";
         let mut compositor = RetainedCompositor::new();
         let surface = PluginSurface {
+            items: Vec::new(),
             id: PluginSurfaceId::new(owner, "surface", Uuid::from_u128(615)),
             revision: 1,
             target: PluginSurfaceTarget::Explicit(ExtensionRect::new(2, 2, 8, 4)),
@@ -3660,6 +3679,7 @@ mod tests {
     fn plugin_surface_lowering_clips_and_gates_local_input_regions() {
         let owner = "example.presentation";
         let surface = PluginSurface {
+            items: Vec::new(),
             id: PluginSurfaceId::new(owner, "interactive", Uuid::from_u128(506)),
             revision: 1,
             target: PluginSurfaceTarget::Explicit(ExtensionRect::new(10, 4, 8, 4)),
@@ -3732,6 +3752,7 @@ mod tests {
         let owner = "example.presentation";
         let surfaces = [
             PluginSurface {
+                items: Vec::new(),
                 id: PluginSurfaceId::new(owner, "hidden", Uuid::from_u128(503)),
                 revision: 1,
                 target: PluginSurfaceTarget::Explicit(ExtensionRect::new(1, 1, 4, 1)),
@@ -3747,6 +3768,7 @@ mod tests {
                 ops: Vec::new(),
             },
             PluginSurface {
+                items: Vec::new(),
                 id: PluginSurfaceId::new(owner, "missing", Uuid::from_u128(504)),
                 revision: 1,
                 target: PluginSurfaceTarget::Layout(bmux_plugin::layout::PluginLayoutId::new(
@@ -3764,6 +3786,7 @@ mod tests {
                 ops: Vec::new(),
             },
             PluginSurface {
+                items: Vec::new(),
                 id: PluginSurfaceId::new(owner, "empty", Uuid::from_u128(505)),
                 revision: 1,
                 target: PluginSurfaceTarget::Explicit(ExtensionRect::new(1, 1, 0, 1)),
@@ -3946,6 +3969,7 @@ mod tests {
             ),
         ];
         let surface = PluginSurface {
+            items: Vec::new(),
             id: surface_id,
             revision: 7,
             target: PluginSurfaceTarget::Explicit(ExtensionRect::new(5, 3, 10, 8)),

@@ -80,6 +80,13 @@ pub enum PluginSurfaceTarget {
     /// A host-resolved overlay: anchored in an area, or attached to a region of
     /// another of the owner's surfaces. Producers never compute its position.
     Overlay(bmux_presentation_scene::scene::OverlayPlacement),
+    /// Content attached to one pane surface of the attach scene, painted under
+    /// its content (showing only through transparent pane cells) or over it.
+    /// Coordinates are local to the pane surface.
+    Pane {
+        surface: Uuid,
+        depth: bmux_presentation_scene::scene::PaneDepth,
+    },
 }
 
 /// Stable namespaced identity for one input region.
@@ -160,6 +167,10 @@ pub struct PluginSurface {
     pub modal: bool,
     pub visible: bool,
     pub ops: Vec<RenderOp>,
+    /// Keyed, z-ordered items: ops and terminal graphics in one stream. The host
+    /// diffs them by key, so unchanged items are not repainted. Graphics are
+    /// drawn only by pane-attached surfaces.
+    pub items: Vec<crate::RenderSceneItem>,
     pub metadata: Option<PluginSurfaceMetadata>,
 }
 
@@ -184,7 +195,24 @@ impl PluginSurface {
             modal: false,
             visible: true,
             ops,
+            items: Vec::new(),
             metadata: None,
+        }
+    }
+
+    /// Keyed items attached to a pane surface at `depth`.
+    #[must_use]
+    pub fn pane(
+        id: PluginSurfaceId,
+        revision: u64,
+        surface: Uuid,
+        depth: bmux_presentation_scene::scene::PaneDepth,
+        items: Vec<crate::RenderSceneItem>,
+    ) -> Self {
+        Self {
+            target: PluginSurfaceTarget::Pane { surface, depth },
+            items,
+            ..Self::layout(id, revision, PluginLayoutId::new("", ""), Vec::new())
         }
     }
 
@@ -363,6 +391,15 @@ pub enum PluginSurfacePublishError {
         id: PluginSurfaceId,
         surface: String,
     },
+    /// Two items of one surface share a key.
+    DuplicateItemKey {
+        id: PluginSurfaceId,
+        key: String,
+    },
+    /// Terminal graphics on a surface that is not attached to a pane.
+    GraphicsNeedPaneTarget {
+        id: PluginSurfaceId,
+    },
 }
 
 impl std::fmt::Display for PluginSurfacePublishError {
@@ -447,6 +484,14 @@ impl std::fmt::Display for PluginSurfacePublishError {
             Self::UnknownAttachTarget { id, surface } => write!(
                 formatter,
                 "{} is attached to unknown surface {surface}",
+                id.local_id
+            ),
+            Self::DuplicateItemKey { id, key } => {
+                write!(formatter, "{} has two items keyed {key}", id.local_id)
+            }
+            Self::GraphicsNeedPaneTarget { id } => write!(
+                formatter,
+                "{} draws terminal graphics but is not attached to a pane",
                 id.local_id
             ),
             Self::ConflictingRevision => {
@@ -825,11 +870,17 @@ fn validate_snapshot(
                 .saturating_add(std::mem::size_of::<RenderOp>())
                 .saturating_add(text_bytes);
         }
-        snapshot_bytes = snapshot_bytes.saturating_add(validate_surface_metadata(
-            surface,
-            maximum_retained_items_per_surface,
-            maximum_text_bytes,
-        )?);
+        snapshot_bytes = snapshot_bytes
+            .saturating_add(validate_surface_metadata(
+                surface,
+                maximum_retained_items_per_surface,
+                maximum_text_bytes,
+            )?)
+            .saturating_add(validate_surface_items(
+                surface,
+                maximum_retained_items_per_surface,
+                maximum_text_bytes,
+            )?);
         if snapshot_bytes > maximum_snapshot_bytes {
             return Err(PluginSurfacePublishError::SnapshotTooLarge {
                 bytes: snapshot_bytes,
@@ -874,6 +925,59 @@ fn validate_snapshot(
         validate_surface_target(owner_plugin_id, snapshot, surface)?;
     }
     Ok(())
+}
+
+/// Keyed items: bounded with the ops, keys unique, graphics only on panes.
+/// Returns the retained bytes they account for.
+fn validate_surface_items(
+    surface: &PluginSurface,
+    maximum_items: usize,
+    maximum_text_bytes: usize,
+) -> Result<usize, PluginSurfacePublishError> {
+    let count = surface.ops.len().saturating_add(surface.items.len());
+    if count > maximum_items {
+        return Err(PluginSurfacePublishError::TooManyRetainedItems {
+            id: surface.id.clone(),
+            count,
+            maximum: maximum_items,
+        });
+    }
+    let pane = matches!(surface.target, PluginSurfaceTarget::Pane { .. });
+    let mut keys = BTreeSet::new();
+    let mut bytes = 0_usize;
+    for item in &surface.items {
+        if !keys.insert(&item.key) {
+            return Err(PluginSurfacePublishError::DuplicateItemKey {
+                id: surface.id.clone(),
+                key: item.key.0.clone(),
+            });
+        }
+        bytes = bytes
+            .saturating_add(std::mem::size_of::<crate::RenderSceneItem>())
+            .saturating_add(item.key.0.len());
+        match &item.item {
+            crate::RenderLayerItem::Op(op) => {
+                let text_bytes = render_op_text_bytes(op);
+                if text_bytes > maximum_text_bytes {
+                    return Err(PluginSurfacePublishError::TextTooLong {
+                        id: surface.id.clone(),
+                        bytes: text_bytes,
+                        maximum: maximum_text_bytes,
+                    });
+                }
+                bytes = bytes
+                    .saturating_add(text_bytes)
+                    .saturating_add(cell_block_bytes(surface, op)?);
+            }
+            crate::RenderLayerItem::Graphic(_) if !pane => {
+                return Err(PluginSurfacePublishError::GraphicsNeedPaneTarget {
+                    id: surface.id.clone(),
+                });
+            }
+            crate::RenderLayerItem::Graphic(_) => {}
+        }
+    }
+    Ok(bytes)
 }
 
 /// Layouts must be the owner's own; attachments must name a surface of the
@@ -1203,6 +1307,7 @@ mod tests {
 
     fn surface(owner: &str, local: &str, retained_id: Uuid) -> PluginSurface {
         PluginSurface {
+            items: Vec::new(),
             id: PluginSurfaceId::new(owner, local, retained_id),
             revision: 1,
             target: PluginSurfaceTarget::Explicit(ExtensionRect::new(1, 2, 3, 4)),

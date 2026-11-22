@@ -38,6 +38,7 @@ mod terminal_graphics;
 #[path = "render/text_transform.rs"]
 mod text_transform;
 pub use text_transform::RowTextScratch;
+pub mod published_pane_scenes;
 #[path = "render/visible_segments.rs"]
 mod visible_segments;
 

@@ -216,9 +216,23 @@ Each phase lands with the parity harness and the targeted tests green.
    symmetric codec. The sidebar, tab bar, tab menu and workspace rename no longer
    parse `owner:surface:region` hook strings; `hook_id` remains only as the
    coarse address of decoration hooks and remote codecs.
-5. **Pane targets and facets.** Under/over/chrome depths painted through the
-   existing pane stages; decoration renderer and redaction publish scenes and
-   facets instead of implementing `AttachRenderExtension`.
+5. **Pane targets.** `PluginSurfaceTarget::Pane { surface, depth }` and keyed
+   `items` (ops and terminal graphics in one z stream, diffed by key) let any
+   producer publish content under a pane's content (showing only through its
+   transparent cells, keeping its background) or over it, with no per-frame
+   callback. The host presents every pane-attached surface to the retained
+   extension pipeline through one long-lived adapter
+   (`render::published_pane_scenes`), so published content gets the same keyed
+   diffing, under-cell blending and graphics lifecycle; over-content items are
+   clipped to overlay occluders (cells become transparent; occluded graphics are
+   dropped). Publishing rejects duplicate item keys and graphics on surfaces not
+   attached to a pane. The `pane_extension_layers` golden renders identically
+   whether its scene comes from a render extension or from published surfaces.
+   Still on `AttachRenderExtension`: the decoration renderer (its scene depends on
+   per-frame pane geometry and it owns overlay chrome, the content inset, input
+   hooks and visual adapters) and pane text redaction. Moving them needs the
+   facets below published as data: content inset, text rules, chrome ownership
+   and frame observation.
 6. **Out-of-process transport.** Frontend presentations publish scenes; the
    native terminal renders them; input is routed back. A test plugin proves a
    split, an anchored overlay, an under-content layer and clicks.

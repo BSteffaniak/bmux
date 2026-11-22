@@ -1311,6 +1311,7 @@ fn publish_native_preedit(view: &mut AttachViewState, text: &str) -> Result<()> 
             PluginSurfaceSnapshot {
                 revision,
                 surfaces: vec![PluginSurface {
+                    items: Vec::new(),
                     id: PluginSurfaceId::new(NATIVE_PREEDIT_OWNER, "preedit", view.attached_id),
                     revision,
                     target: PluginSurfaceTarget::Explicit(rect),
@@ -10938,11 +10939,35 @@ fn refresh_retained_extensions(
             },
         ));
     }
-    view.prepared_extensions = Some(
-        view.retained_extensions
-            .refresh(&view.presentation_extensions.snapshot(), &surfaces)?,
-    );
+    let sources = extension_sources(view);
+    view.prepared_extensions = Some(view.retained_extensions.refresh(&sources, &surfaces)?);
     Ok(())
+}
+
+/// The producers sampled each frame: registered render extensions, then the
+/// adapter that paints pane-attached published surfaces through the same
+/// pipeline (so a published layer stacks above a theme's chrome of the same
+/// depth). The adapter is kept for the view's registry, since the pipeline
+/// reuses samples by producer identity.
+fn extension_sources(
+    view: &mut AttachViewState,
+) -> Vec<Arc<dyn bmux_plugin::AttachRenderExtension>> {
+    if !view
+        .pane_scenes
+        .as_ref()
+        .is_some_and(|scenes| scenes.reads(&view.presentation_surfaces))
+    {
+        view.pane_scenes = Some(Arc::new(
+            bmux_attach_pipeline::render::published_pane_scenes::PublishedPaneScenes::new(
+                view.presentation_surfaces.clone(),
+            ),
+        ));
+    }
+    let mut sources = view.presentation_extensions.snapshot();
+    if let Some(scenes) = &view.pane_scenes {
+        sources.push(scenes.clone());
+    }
+    sources
 }
 
 fn finish_presented_scroll_tracking(view: &mut AttachViewState) {
@@ -19413,6 +19438,7 @@ mod tests {
         let publisher = owner.publisher("test.chrome");
         let id = PluginSurfaceId::new("test.chrome", "status", Uuid::new_v4());
         let surface = PluginSurface {
+            items: Vec::new(),
             id: id.clone(),
             revision: 1,
             target: PluginSurfaceTarget::Explicit(ExtensionRect::new(0, 0, 8, 1)),
@@ -20790,6 +20816,7 @@ mod tests {
     fn plugin_surface_focus_requires_consumed_focusable_pointer_down() {
         let owner = "example.focus";
         let surface = bmux_plugin::surface::PluginSurface {
+            items: Vec::new(),
             id: bmux_plugin::surface::PluginSurfaceId::new(owner, "surface", Uuid::from_u128(50)),
             revision: 1,
             target: bmux_plugin::surface::PluginSurfaceTarget::Explicit(ExtensionRect::new(
@@ -22225,6 +22252,7 @@ mod tests {
                     PluginSurfaceSnapshot {
                         revision,
                         surfaces: vec![PluginSurface {
+                            items: Vec::new(),
                             id: PluginSurfaceId::new(OWNER, "strip", Uuid::nil()),
                             revision,
                             target: PluginSurfaceTarget::Explicit(ExtensionRect::new(0, 0, 100, 1)),

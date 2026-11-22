@@ -663,3 +663,65 @@ fn parity_host_placed_menu_and_toast() {
     harness.surfaces(OWNER, vec![strip, menu, toast]);
     assert_golden("host_placed_menu_toast", &harness.render());
 }
+
+#[test]
+#[serial]
+fn parity_published_pane_layers_match_render_extension_output() {
+    use bmux_presentation_scene::scene::PaneDepth;
+    const OWNER: &str = "parity.pane-published";
+    let mut harness = Harness::new(
+        full_pane(),
+        b"top row\r\nab\x1b[44m    \x1b[0m\r\n\r\n\r\nXYZXYZ",
+    );
+    let pane = Uuid::from_u128(0x5aff);
+    let under = PluginSurface::pane(
+        PluginSurfaceId::new(OWNER, "under", Uuid::from_u128(0xf1)),
+        1,
+        pane,
+        PaneDepth::UnderContent,
+        vec![scene_op(
+            "under",
+            0,
+            RenderOp::text_run(
+                0,
+                1,
+                "UNDERNEATH-UNDERNEATH",
+                RenderStyle::new().named_foreground(RenderNamedColor::Magenta),
+            ),
+        )],
+    );
+    let over = PluginSurface::pane(
+        PluginSurfaceId::new(OWNER, "over", Uuid::from_u128(0xf2)),
+        1,
+        pane,
+        PaneDepth::OverContent,
+        vec![
+            scene_op(
+                "sparse",
+                0,
+                RenderOp::cell_grid(
+                    2,
+                    4,
+                    vec![vec![
+                        RenderCell::new('#', RenderStyle::new().bold()),
+                        RenderCell::sparse(RenderStyle::new()),
+                        RenderCell::new('#', RenderStyle::new().bold()),
+                    ]],
+                ),
+            ),
+            scene_op(
+                "label",
+                1,
+                RenderOp::text_run(
+                    20,
+                    6,
+                    "over",
+                    styled(RenderNamedColor::Black, RenderNamedColor::Cyan),
+                ),
+            ),
+        ],
+    );
+    harness.surfaces(OWNER, vec![under, over]);
+    // The same scene the render extension paints, published instead.
+    assert_golden("pane_extension_layers", &harness.render());
+}
