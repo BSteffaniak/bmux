@@ -3830,6 +3830,27 @@ impl crate::consensus_driver::Storage for OwnedStorage {
         Ok(Some((boundary, membership)))
     }
 
+    fn snapshot(&mut self) -> io::Result<Option<crate::consensus_driver::SnapshotObject>> {
+        // Compaction and remote installs only ever use the published snapshot,
+        // so the latest one always covers every compacted entry.
+        let bytes = match self.store.published_snapshot()? {
+            Some(bytes) => bytes,
+            None => self.store.publish_snapshot()?,
+        };
+        let (descriptor, _) =
+            crate::consensus_storage::decode_owned_snapshot(&bytes).map_err(io::Error::other)?;
+        let (Some(last_included), Some(membership)) =
+            (descriptor.last_included, descriptor.membership)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(crate::consensus_driver::SnapshotObject {
+            bytes,
+            last_included,
+            membership,
+        }))
+    }
+
     fn read(&mut self) -> io::Result<Self::View> {
         self.store.read_control_state()
     }
@@ -4985,6 +5006,22 @@ impl OwnedVoteStore {
         .map_err(|_| VoteGateError::StorageFailure)?;
         self.failed = false;
         Ok(capacity)
+    }
+
+    /// The most recently published snapshot bytes, if any were published.
+    fn published_snapshot(&mut self) -> io::Result<Option<Vec<u8>>> {
+        if self.failed || self.status.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return Err(io::Error::other("owned authority stopped"));
+        }
+        self.failed = true;
+        let tx = self.database.begin_read().map_err(io::Error::other)?;
+        let meta = tx.open_table(TABLE).map_err(io::Error::other)?;
+        let bytes = meta
+            .get("published_snapshot")
+            .map_err(io::Error::other)?
+            .map(|bytes| bytes.value().to_vec());
+        self.failed = false;
+        Ok(bytes)
     }
 
     fn read_control_state(&mut self) -> io::Result<crate::control_state::ControlState> {

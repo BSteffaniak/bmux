@@ -25,6 +25,14 @@ mod tests;
 
 const INBOX_CAPACITY: usize = 256;
 
+/// A published snapshot and the boundary and membership its bytes carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotObject {
+    pub bytes: Vec<u8>,
+    pub last_included: LogIdentity,
+    pub membership: StoredMembership,
+}
+
 /// Durable authority, driven in issue order by one worker. Implementations block.
 /// It moves in and out of blocking work, which the simulator requires to be `Unpin`.
 pub trait Storage: Send + Unpin + 'static {
@@ -56,6 +64,13 @@ pub trait Storage: Send + Unpin + 'static {
     /// Any failure stops the engine.
     fn compact(&mut self) -> io::Result<Option<(LogIdentity, StoredMembership)>>;
 
+    /// The latest published snapshot, which covers every compacted entry,
+    /// publishing one first when none is current. `None` when there is nothing
+    /// to send yet.
+    /// # Errors
+    /// Any failure stops the engine.
+    fn snapshot(&mut self) -> io::Result<Option<SnapshotObject>>;
+
     /// # Errors
     /// Read failure is reported to the reader, not treated as empty state.
     fn read(&mut self) -> io::Result<Self::View>;
@@ -72,8 +87,9 @@ pub type Reply = Pin<Box<dyn Future<Output = Option<Message>> + Send>>;
 pub trait Transport: Send + Sync + 'static {
     /// Send a request and return the peer's reply, or `None` when unavailable.
     fn call(&self, to: NodeId, message: Message) -> Reply;
-    /// Stage and install the latest snapshot on `to`, returning its reply.
-    fn send_snapshot(&self, to: NodeId, term: Term, seq: u64) -> Reply;
+    /// Stage `snapshot` on `to` and install it there, returning the peer's
+    /// `SnapshotReply`, or `None` when the attempt failed and should be retried.
+    fn send_snapshot(&self, to: NodeId, term: Term, seq: u64, snapshot: SnapshotObject) -> Reply;
 }
 
 /// Draws an election deadline within `[min, max]`.
@@ -138,6 +154,11 @@ enum Command<V> {
     ReadLocal {
         respond: oneshot::Sender<Result<V, ClientError>>,
     },
+    /// A snapshot transfer ended without a usable reply; retry on a heartbeat.
+    SnapshotFailed {
+        peer: NodeId,
+        seq: u64,
+    },
     Shutdown,
 }
 
@@ -146,6 +167,7 @@ enum Operation {
     Install(u64, NodeId, LogIdentity, StoredMembership),
     Apply(LogIdentity),
     Compact,
+    Snapshot(NodeId, Term, u64),
     Read(u64),
 }
 
@@ -153,6 +175,7 @@ enum Completion<V> {
     Durable(u64),
     Applied(LogIdentity, Vec<(LogIdentity, Vec<u8>)>),
     Compacted(Option<(LogIdentity, StoredMembership)>),
+    Snapshot(NodeId, Term, u64, Option<SnapshotObject>),
     Read(u64, io::Result<V>),
     Failed,
 }
@@ -404,7 +427,12 @@ async fn run<S: Storage, T: Transport>(run: Run<S, T>) {
                     effects = engine.handle(Input::PersistFailed { id: u64::MAX });
                     continue;
                 };
-                effects = on_completion(&mut engine, &mut state, completion, &operations, config);
+                effects = if let Completion::Snapshot(to, term, seq, snapshot) = completion {
+                    // Publication is ordered on the storage worker; the transfer is not.
+                    send_snapshot(&mut engine, &transport, &loopback, to, term, seq, snapshot)
+                } else {
+                    on_completion(&mut engine, &mut state, completion, &operations, config)
+                };
             }
             command = inbox.recv() => {
                 match command {
@@ -490,6 +518,9 @@ fn on_command<V>(
             let _ = operations.send(Operation::Read(token));
             Vec::new()
         }
+        Command::SnapshotFailed { peer, seq } => {
+            engine.handle(Input::SnapshotSendFailed { peer, seq })
+        }
         Command::Shutdown => Vec::new(),
     }
 }
@@ -557,7 +588,42 @@ fn on_completion<V>(
             }
             Vec::new()
         }
+        // Routed to `send_snapshot` by the loop, which owns the transport.
+        Completion::Snapshot(..) => Vec::new(),
     }
+}
+
+/// Hand a published snapshot to the transport; its reply re-enters as a message.
+fn send_snapshot<V: Send + 'static, T: Transport>(
+    engine: &mut Engine,
+    transport: &Arc<T>,
+    loopback: &mpsc::WeakSender<Command<V>>,
+    to: NodeId,
+    term: Term,
+    seq: u64,
+    snapshot: Option<SnapshotObject>,
+) -> Vec<Effect> {
+    let Some(snapshot) = snapshot else {
+        return engine.handle(Input::SnapshotSendFailed { peer: to, seq });
+    };
+    let call = transport.send_snapshot(to, term, seq, snapshot);
+    let loopback = loopback.clone();
+    switchy_async::task::spawn(async move {
+        let reply = call.await;
+        if let Some(sender) = loopback.upgrade() {
+            // A failed attempt must not re-enter as a reply: the engine would
+            // resend at once. Clearing the attempt retries on the next heartbeat.
+            let command = reply.map_or(Command::SnapshotFailed { peer: to, seq }, |message| {
+                Command::Inbound {
+                    from: to,
+                    message,
+                    reply: None,
+                }
+            });
+            let _ = sender.send(command).await;
+        }
+    });
+    Vec::new()
 }
 
 /// Execute effects; returns whether the engine stopped.
@@ -600,30 +666,7 @@ fn apply_effects<V: Send + 'static, T: Transport>(
                     }
                 }
                 Effect::SendSnapshot { to, term, seq } => {
-                    let call = transport.send_snapshot(to, term, seq);
-                    let loopback = loopback.clone();
-                    switchy_async::task::spawn(async move {
-                        let reply = call.await;
-                        if let Some(sender) = loopback.upgrade() {
-                            let command = reply.map_or(
-                                Command::Inbound {
-                                    from: to,
-                                    message: Message::SnapshotReply {
-                                        term,
-                                        seq,
-                                        installed: None,
-                                    },
-                                    reply: None,
-                                },
-                                |message| Command::Inbound {
-                                    from: to,
-                                    message,
-                                    reply: None,
-                                },
-                            );
-                            let _ = sender.send(command).await;
-                        }
-                    });
+                    let _ = operations.send(Operation::Snapshot(to, term, seq));
                 }
                 Effect::SetTimer {
                     kind,
@@ -720,6 +763,9 @@ async fn storage_worker<S: Storage>(
                     .apply(through)
                     .map(|outcomes| Completion::Applied(through, outcomes)),
                 Operation::Compact => owned.compact().map(Completion::Compacted),
+                Operation::Snapshot(to, term, seq) => owned
+                    .snapshot()
+                    .map(|snapshot| Completion::Snapshot(to, term, seq, snapshot)),
                 Operation::Read(token) => Ok(Completion::Read(token, owned.read())),
             };
             (owned, completion)

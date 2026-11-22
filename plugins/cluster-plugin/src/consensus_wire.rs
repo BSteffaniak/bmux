@@ -7,7 +7,7 @@
 //! hands the decoded message to the driver, and signs the engine's reply. Request
 //! identities carry the sender's incarnation and the engine's sequence number.
 
-use crate::consensus_driver::{Driver, Reply, Transport};
+use crate::consensus_driver::{Driver, Reply, SnapshotObject, Transport};
 use crate::consensus_engine::{AppendReplyOutcome, Message, NodeId};
 use crate::consensus_model::{Entry, LogIdentity, LogIndex, Term};
 use bmux_cluster_plugin_api::cluster_consensus_rpc_types::{
@@ -175,7 +175,7 @@ where
         })
     }
 
-    fn send_snapshot(&self, _: NodeId, _: Term, _: u64) -> Reply {
+    fn send_snapshot(&self, _: NodeId, _: Term, _: u64, _: SnapshotObject) -> Reply {
         // Staged snapshot transfer is wired separately; the engine retries.
         Box::pin(async { None })
     }

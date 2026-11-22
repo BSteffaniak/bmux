@@ -68,6 +68,10 @@ impl Storage for MemoryStorage {
         Ok(None)
     }
 
+    fn snapshot(&mut self) -> io::Result<Option<SnapshotObject>> {
+        Ok(None)
+    }
+
     fn read(&mut self) -> io::Result<Self::View> {
         Ok(self.0.lock().unwrap().applied)
     }
@@ -98,7 +102,7 @@ impl Transport for MemoryTransport {
         })
     }
 
-    fn send_snapshot(&self, _: NodeId, _: Term, _: u64) -> Reply {
+    fn send_snapshot(&self, _: NodeId, _: Term, _: u64, _: SnapshotObject) -> Reply {
         Box::pin(async { None })
     }
 }
@@ -309,7 +313,7 @@ impl Transport for Unreachable {
         Box::pin(async { None })
     }
 
-    fn send_snapshot(&self, _: NodeId, _: Term, _: u64) -> Reply {
+    fn send_snapshot(&self, _: NodeId, _: Term, _: u64, _: SnapshotObject) -> Reply {
         Box::pin(async { None })
     }
 }
