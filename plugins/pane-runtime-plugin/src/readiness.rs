@@ -101,7 +101,7 @@ fn sha256_reader(mut input: impl std::io::Read) -> std::io::Result<String> {
 pub(crate) fn running_executable_sha256() -> Option<String> {
     // This is an explicit startup attestation, not a hash of current_exe(). The
     // application must verify its immutable bundle/manifest before activation.
-    std::env::var("BMUX_MANAGED_EXECUTABLE_SHA256")
+    switchy_env::var("BMUX_MANAGED_EXECUTABLE_SHA256")
         .ok()
         .filter(|digest| {
             digest.len() == 64
@@ -116,7 +116,7 @@ pub(crate) fn activate(host: &crate::runtime::PaneRuntimeHost, context: &NativeL
     let identity = ExecutableIdentity::capture();
     let verified = identity.get();
     let executable_sha256 = verified.as_ref().ok().cloned();
-    let managed_target_identity = std::env::var("BMUX_MANAGED_TARGET_IDENTITY").ok();
+    let managed_target_identity = switchy_env::var("BMUX_MANAGED_TARGET_IDENTITY").ok();
     // Ordinary non-Linux launches may lack mapped-image attestation. Never
     // substitute a mutable current_exe pathname hash for that proof.
     if (cfg!(target_os = "linux") || managed_target_identity.is_some())

@@ -492,7 +492,7 @@ fn path_is_usable_program(path: &Path) -> bool {
 }
 
 fn program_name_is_on_path(program: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
+    let Some(path) = switchy_env::var_os("PATH") else {
         return false;
     };
     for directory in std::env::split_paths(&path) {
@@ -503,7 +503,7 @@ fn program_name_is_on_path(program: &str) -> bool {
         #[cfg(windows)]
         if candidate.extension().is_none() {
             let path_ext =
-                std::env::var_os("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+                switchy_env::var_os("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
             for extension in path_ext.to_string_lossy().split(';') {
                 let extension = extension.trim().trim_start_matches('.');
                 if !extension.is_empty()
@@ -1277,7 +1277,7 @@ fn note_replay_markers_read(bytes: &[u8]) -> Vec<(u64, u128)> {
     static LOG: std::sync::OnceLock<Option<switchy_thread::sync::Mutex<std::fs::File>>> =
         std::sync::OnceLock::new();
     let Some(file) = LOG.get_or_init(|| {
-        let path = std::env::var_os("BMUX_REPLAY_LOG")?;
+        let path = switchy_env::var_os("BMUX_REPLAY_LOG")?;
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -4036,7 +4036,7 @@ fn clear_managed_launch_env(command: &mut SpawnCommand) {
 }
 
 fn configure_device_seal_broker_env(command: &mut SpawnCommand) {
-    if std::env::var("BMUX_DEVICE_SEAL_SCOPE").as_deref() == Ok("client") {
+    if switchy_env::var("BMUX_DEVICE_SEAL_SCOPE").is_ok_and(|scope| scope == "client") {
         if let Ok(exe) = std::env::current_exe() {
             command.env(
                 "SSHENV_DEVICE_SEAL_COMMAND",
@@ -4085,7 +4085,7 @@ fn configure_shell_integration_command(
                 ),
             )?;
             command.env("ZDOTDIR", zdotdir.as_os_str());
-            if let Ok(original_zdotdir) = std::env::var("ZDOTDIR")
+            if let Ok(original_zdotdir) = switchy_env::var("ZDOTDIR")
                 && !original_zdotdir.trim().is_empty()
             {
                 command.env("BMUX_ORIG_ZDOTDIR", original_zdotdir);
@@ -4102,7 +4102,7 @@ fn configure_shell_integration_command(
                 ),
             )?;
             command.env("XDG_CONFIG_HOME", xdg_config_home.as_os_str());
-            if let Ok(original_xdg_config_home) = std::env::var("XDG_CONFIG_HOME")
+            if let Ok(original_xdg_config_home) = switchy_env::var("XDG_CONFIG_HOME")
                 && !original_xdg_config_home.trim().is_empty()
             {
                 command.env("BMUX_ORIG_XDG_CONFIG_HOME", original_xdg_config_home);
@@ -7979,7 +7979,7 @@ impl SessionRuntimeManager {
                     }
                     None => unreachable!("shell integration requires a retained callback"),
                 }
-                let dirs = pane_xdg_data_dirs(share, std::env::var_os("XDG_DATA_DIRS"));
+                let dirs = pane_xdg_data_dirs(share, switchy_env::var_os("XDG_DATA_DIRS"));
                 if let Ok(value) = std::env::join_paths(dirs) {
                     command.env("XDG_DATA_DIRS", value);
                 }

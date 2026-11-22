@@ -434,7 +434,7 @@ impl PaneRuntimePlugin {
             .get::<bmux_pane_runtime_plugin_api::PaneRuntimePluginConfig>()
             .and_then(|handle| handle.read().ok().map(|guard| (*guard).clone()))
             .unwrap_or_else(|| bmux_pane_runtime_plugin_api::PaneRuntimePluginConfig {
-                shell: std::env::var("SHELL")
+                shell: switchy_env::var("SHELL")
                     .ok()
                     .filter(|shell| !shell.trim().is_empty())
                     .unwrap_or_else(|| {

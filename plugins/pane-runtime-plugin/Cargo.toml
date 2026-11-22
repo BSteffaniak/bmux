@@ -52,6 +52,7 @@ switchy_async = { workspace = true, features = [
     "time",
     "tokio",
 ] }
+switchy_env = { workspace = true, features = ["std"] }
 switchy_pty = { workspace = true, optional = true }
 switchy_simulation = { workspace = true, optional = true }
 switchy_thread = { workspace = true, features = ["std"] }
@@ -116,6 +117,7 @@ simulator = [
     "dep:switchy_simulation",
     "switchy_pty/simulator",
     "switchy_async/thread-simulator",
+    "switchy_env/simulator",
     "switchy_thread/simulator",
     "switchy_time/simulator",
 ]

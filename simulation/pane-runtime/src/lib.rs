@@ -33,6 +33,14 @@ const BUDGET: Duration = Duration::from_secs(300);
 /// How long a typed line or a resize has to reach the program, in simulated time.
 const SETTLE: Duration = Duration::from_secs(5);
 
+/// The environment every run sees, whatever the host's.
+const ENVIRONMENT: &[(&str, &str)] = &[
+    ("HOME", "/home/sim"),
+    ("PATH", "/usr/bin:/bin"),
+    ("SHELL", "/bin/sh"),
+    ("TERM", "xterm-256color"),
+];
+
 /// The simvar bootstrap: one client per run drives the workload.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PaneRuntimeBootstrap;
@@ -351,6 +359,10 @@ pub async fn run_workload() -> Result<(), Vec<String>> {
     switchy_time::simulator::set_step_multiplier(1);
     trace_decisions();
     sim_support::watch_run();
+    // The run's own environment, so nothing depends on the host it runs on.
+    switchy_env::simulator::isolate(ENVIRONMENT.iter().map(|(name, value)| {
+        ((*name).to_string(), (*value).to_string())
+    }));
     simulator::configure(Config {
         personality: Personality::Linux,
         pid_reuse: 0.3,

@@ -412,6 +412,7 @@ moosicbox_log_runtime = { version = "0.5.0", package = "moosicbox_log_runtime", 
 moosicbox_log_watch   = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
 simvar_observer       = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
 switchy_async         = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
+switchy_env           = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
 switchy_pty           = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
 switchy_simulation    = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
 switchy_thread        = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
@@ -554,6 +555,7 @@ bmux_unicode_segmentation = { path = "packages/unicode-segmentation" }
 
 # To develop against a local MoosicBox checkout:
 # [patch."https://github.com/MoosicBox/MoosicBox"]
+# switchy_env           = { path = "../MoosicBox/packages/switchy/env" }
 # switchy_pty           = { path = "../MoosicBox/packages/switchy/pty" }
 # switchy_simulation    = { path = "../MoosicBox/packages/switchy/simulation" }
 # switchy_thread        = { path = "../MoosicBox/packages/switchy/thread" }

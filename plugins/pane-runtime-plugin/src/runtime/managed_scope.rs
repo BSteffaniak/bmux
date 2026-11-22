@@ -13,11 +13,15 @@ pub(crate) struct Scope {
 }
 
 pub(crate) fn activate(host: &crate::runtime::PaneRuntimeHost) {
-    let identity = std::env::var("BMUX_MANAGED_TARGET_IDENTITY");
-    let target = std::env::var("BMUX_MANAGED_TARGET_ID");
+    // A variable that is present but not Unicode is set, so it is not treated as absent.
+    let read = |name| {
+        switchy_env::var_os(name).map(|value| value.into_string().map_err(|_| ()))
+    };
+    let identity = read("BMUX_MANAGED_TARGET_IDENTITY");
+    let target = read("BMUX_MANAGED_TARGET_ID");
     let result = match (identity, target) {
-        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => Ok(None),
-        (Ok(identity), Ok(target)) => {
+        (None, None) => Ok(None),
+        (Some(Ok(identity)), Some(Ok(target))) => {
             validate(&identity, &target).map(|()| Some(Scope { target, identity }))
         }
         _ => Err("managed launch requires both target identity and target ID".into()),

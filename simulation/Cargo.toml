@@ -23,6 +23,7 @@ bmux_tui_components = { path = "../packages/tui-components", default-features = 
 switchy_async       = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
 tokio               = { version = "1", default-features = false }
 simvar              = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
+switchy_env         = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
 switchy_pty         = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
 switchy_simulation  = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
 switchy_thread      = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", default-features = false }
