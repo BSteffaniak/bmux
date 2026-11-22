@@ -13,6 +13,7 @@
 
 mod action;
 mod component;
+mod cursor;
 mod focus;
 mod marks;
 mod motion;
@@ -48,6 +49,7 @@ pub use bmux_tui::measured_list::{
     MeasuredListError, MeasuredListIndex, MeasuredListItem, VisibleItemRange,
 };
 pub use component::{VirtualListChrome, VirtualListComponent};
+pub use cursor::{CursorInput, CursorOutcome, ItemCursor};
 pub use focus::{
     FocusTraversal, ItemFocusTarget, reveal_for_focus, reveal_top_offset, reveal_top_offset_below,
 };
@@ -2520,6 +2522,21 @@ where
 
 fn item_layout_id<K: ToString>(list_id: &str, key: &K) -> LayoutId {
     LayoutId::new(format!("{list_id}.item.{}", key.to_string()))
+}
+
+/// The item key a hit region of list `list_id` belongs to: the inverse of the
+/// ids list items are painted with, so callers routing committed hits never
+/// depend on the id format.
+#[must_use]
+pub fn item_key_from_hit<K: std::str::FromStr>(
+    list_id: &str,
+    hit: &bmux_tui::hit::HitId,
+) -> Option<K> {
+    hit.as_str()
+        .strip_prefix(list_id)?
+        .strip_prefix(".item.")?
+        .parse()
+        .ok()
 }
 
 fn translated_item_area(area: Rect, local_y: i64, item_height: u64) -> Rect {

@@ -873,12 +873,10 @@ impl AttachPromptState {
             let Some(hit) = active.hits.hit_test(Point::new(mouse.column, mouse.row)) else {
                 return PromptKeyDisposition::Consumed;
             };
-            let Some(source_index) = hit
-                .id()
-                .as_str()
-                .strip_prefix("command-list.item.")
-                .and_then(|value| value.parse::<usize>().ok())
-            else {
+            let Some(source_index) = bmux_tui_components::virtual_list::item_key_from_hit::<usize>(
+                "command-list",
+                hit.id(),
+            ) else {
                 return PromptKeyDisposition::Consumed;
             };
             let PromptField::SearchSelect {
@@ -934,10 +932,10 @@ impl AttachPromptState {
             .hits
             .hit_test(Point::new(mouse.column, mouse.row))
             .and_then(|hit| {
-                hit.id()
-                    .as_str()
-                    .strip_prefix("single-select-list.item.")
-                    .and_then(|index| index.parse::<usize>().ok())
+                bmux_tui_components::virtual_list::item_key_from_hit::<usize>(
+                    "single-select-list",
+                    hit.id(),
+                )
             })
         else {
             return PromptKeyDisposition::Consumed;

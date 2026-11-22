@@ -28,6 +28,7 @@ use bmux_presentation_state::visibility::{
 };
 use bmux_presentation_state::{PresentationEntityRef, PresentationFact, PresentationFactRole};
 use bmux_tabs_plugin_api::{tabs_commands, tabs_list};
+use bmux_tui_components::virtual_list::{CursorInput, CursorOutcome, ItemCursor};
 use std::sync::Mutex;
 use uuid::Uuid;
 
@@ -251,7 +252,8 @@ struct CompanionState {
     settings: Settings,
     revision: u64,
     snapshot: tabs_list::TabListSnapshot,
-    hovered_tab_id: Option<Uuid>,
+    /// The highlighted tab, moved by the pointer (hover) and the keyboard.
+    cursor: ItemCursor<Uuid>,
     scroll: bmux_tui_components::scroll_view::ScrollViewState,
     measured_items: std::cell::RefCell<std::collections::BTreeMap<Uuid, MeasuredSidebarItem>>,
     /// What each published revision's region keys mean.
@@ -305,7 +307,7 @@ impl CompanionState {
                 tabs: Vec::new(),
                 revision: 0,
             },
-            hovered_tab_id: None,
+            cursor: ItemCursor::new(),
             scroll: bmux_tui_components::scroll_view::ScrollViewState::new(),
             measured_items: std::cell::RefCell::new(std::collections::BTreeMap::new()),
         }
@@ -509,9 +511,15 @@ impl CompanionState {
         );
     }
 
+    fn tab_ids(&self) -> Vec<Uuid> {
+        self.snapshot.tabs.iter().map(|tab| tab.id).collect()
+    }
+
     fn replace_tabs(&mut self, snapshot: tabs_list::TabListSnapshot) {
         if self.snapshot != snapshot {
             self.snapshot = snapshot;
+            let keys = self.tab_ids();
+            self.cursor.retain(&keys);
             self.measured_items
                 .get_mut()
                 .retain(|id, _| self.snapshot.tabs.iter().any(|tab| tab.id == *id));
@@ -840,7 +848,7 @@ fn apply_visibility(
     };
     if changed {
         if !companion.visible() {
-            companion.hovered_tab_id = None;
+            companion.cursor.set_hovered(None);
         }
         companion.revision = companion.revision.saturating_add(1).max(1);
         companion.presentation_pending.set(true);
@@ -1281,7 +1289,7 @@ fn build_surface_with_hits(
             || {
                 sidebar_title_style(
                     tab.active,
-                    state.hovered_tab_id == Some(tab.id),
+                    state.cursor.hovered() == Some(&tab.id),
                     active,
                     inactive,
                 )
@@ -1363,14 +1371,13 @@ fn update_hover(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
     } else {
         hit_tab(companion, event)
     };
-    if companion.hovered_tab_id == hovered {
+    let previous = companion.cursor.clone();
+    if !companion.cursor.set_hovered(hovered) {
         return false;
     }
-    let previous = companion.hovered_tab_id;
-    companion.hovered_tab_id = hovered;
     companion.revision = companion.revision.saturating_add(1).max(1);
     if publish_companion(companion).is_err() {
-        companion.hovered_tab_id = previous;
+        companion.cursor = previous;
         return false;
     }
     true
@@ -1412,27 +1419,25 @@ fn update_keyboard(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<
     let mut guard = owner.lock().ok()?;
     let companion = guard.as_mut()?;
     let target = hit_tab(companion, event)?;
-    let index = companion
-        .snapshot
-        .tabs
-        .iter()
-        .position(|tab| tab.id == target)?;
-    let previous_scroll = companion.scroll;
-    let previous_hover = companion.hovered_tab_id;
-    match event.key.as_deref()? {
-        "up" => {
-            let next = index.saturating_sub(1);
-            companion.reveal(next);
-            companion.hovered_tab_id = companion.snapshot.tabs.get(next).map(|tab| tab.id);
-        }
-        "down" => {
-            let next = index
-                .saturating_add(1)
-                .min(companion.snapshot.tabs.len().saturating_sub(1));
-            companion.reveal(next);
-            companion.hovered_tab_id = companion.snapshot.tabs.get(next).map(|tab| tab.id);
-        }
+    let input = match event.key.as_deref()? {
+        "up" => CursorInput::Up,
+        "down" => CursorInput::Down,
+        "home" => CursorInput::Home,
+        "end" => CursorInput::End,
         _ => return None,
+    };
+    let previous_scroll = companion.scroll;
+    let previous_cursor = companion.cursor.clone();
+    // The keyboard moves from the focused tab; the highlight follows it.
+    let keys = companion.tab_ids();
+    companion.cursor.set_cursor(Some(target));
+    if let CursorOutcome::Moved(next) = companion.cursor.apply(&keys, input) {
+        if let Some(index) = keys.iter().position(|id| *id == next) {
+            companion.reveal(index);
+        }
+        companion.cursor.set_hovered(Some(next));
+    } else {
+        companion.cursor.set_hovered(Some(target));
     }
     let dirty = {
         companion.revision = companion.revision.saturating_add(1).max(1);
@@ -1440,7 +1445,7 @@ fn update_keyboard(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<
             true
         } else {
             companion.scroll = previous_scroll;
-            companion.hovered_tab_id = previous_hover;
+            companion.cursor = previous_cursor;
             false
         }
     };
@@ -2084,7 +2089,7 @@ mod tests {
             revision: 1,
         });
         let before = build_surface(&state, 1);
-        state.hovered_tab_id = Some(second);
+        state.cursor.set_hovered(Some(second));
         let after = build_surface(&state, 2);
         assert_eq!(before.ops[3], after.ops[3]);
         assert_ne!(before.ops[4], after.ops[4]);
@@ -2392,6 +2397,57 @@ mod tests {
     }
 
     #[test]
+    fn home_and_end_move_the_highlight_to_the_first_and_last_tab() {
+        let mut state = CompanionState::new(shown_settings(), None);
+        state.replace_tabs(tabs_list::TabListSnapshot {
+            tabs: (1..=4)
+                .map(|index| tabs_list::TabListEntry {
+                    id: Uuid::from_u128(index),
+                    name: format!("tab-{index}"),
+                    active: index == 2,
+                    workspace: "default".to_string(),
+                    workspace_id: Uuid::nil(),
+                })
+                .collect(),
+            revision: 1,
+        });
+        state.surfaces = Some(std::sync::Arc::new(
+            bmux_plugin::surface::PluginSurfaceRegistry::new(8),
+        ));
+        let target = test_target(&state, Uuid::from_u128(2));
+        let owner = std::sync::Arc::new(std::sync::Mutex::new(Some(state)));
+        let key = |name: &str| AttachInputEvent {
+            target: Some(target.clone()),
+            hook_id: String::new(),
+            event_kind: "key".to_string(),
+            phase: "press".to_string(),
+            button: None,
+            key: Some(name.to_string()),
+            col: None,
+            row: None,
+            wheel_delta: 0,
+            modifiers: bmux_plugin::render::AttachInputModifiers::default(),
+            focused_pane: None,
+            hovered_pane: None,
+        };
+        let hovered = |owner: &CompanionHandle| {
+            owner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .cursor
+                .hovered()
+                .copied()
+        };
+        assert!(update_keyboard(&owner, &key("end")).unwrap().consumed);
+        assert_eq!(hovered(&owner), Some(Uuid::from_u128(4)));
+        assert!(update_keyboard(&owner, &key("home")).unwrap().consumed);
+        assert_eq!(hovered(&owner), Some(Uuid::from_u128(1)));
+        assert!(update_keyboard(&owner, &key("x")).is_none());
+    }
+
+    #[test]
     fn rejected_interaction_publication_restores_scroll_and_hover() {
         let mut state = CompanionState::new(
             Settings {
@@ -2433,7 +2489,10 @@ mod tests {
             hovered_pane: None,
         };
         assert!(!update_hover(&owner, &event));
-        assert_eq!(owner.lock().unwrap().as_ref().unwrap().hovered_tab_id, None);
+        assert_eq!(
+            owner.lock().unwrap().as_ref().unwrap().cursor.hovered(),
+            None
+        );
         event.phase = "wheel".to_string();
         event.wheel_delta = -1;
         assert!(!update_scroll(&owner, &event));
@@ -2455,7 +2514,7 @@ mod tests {
             let mut guard = owner.lock().unwrap();
             let state = guard.as_mut().unwrap();
             assert_eq!(state.scroll.vertical_offset(), 0);
-            assert_eq!(state.hovered_tab_id, None);
+            assert_eq!(state.cursor.hovered(), None);
             state.surfaces = Some(std::sync::Arc::new(
                 bmux_plugin::surface::PluginSurfaceRegistry::new(1),
             ));
@@ -2465,7 +2524,7 @@ mod tests {
         assert!(update_keyboard(&owner, &event).unwrap().dirty);
         let guard = owner.lock().unwrap();
         let state = guard.as_ref().unwrap();
-        assert_eq!(state.hovered_tab_id, Some(Uuid::from_u128(2)));
+        assert_eq!(state.cursor.hovered(), Some(&Uuid::from_u128(2)));
         assert!(state.scroll.vertical_offset() > 0);
         drop(guard);
     }
