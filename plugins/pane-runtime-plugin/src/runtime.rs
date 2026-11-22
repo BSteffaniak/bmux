@@ -13166,7 +13166,10 @@ pub(crate) fn new_session_v1(
     authorize: impl Fn(Uuid) -> Result<()>,
 ) -> Result<Uuid> {
     use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::SpawnError;
-    let session = bmux_session_models::Session::new(request.name);
+    let session = bmux_session_models::Session::with_id(
+        bmux_session_models::SessionId(crate::ids::new_uuid()),
+        request.name,
+    );
     let id = session.id;
     authorize(id.0)?;
     validate_initial_shell_options(Some(&request.options)).map_err(|error| {

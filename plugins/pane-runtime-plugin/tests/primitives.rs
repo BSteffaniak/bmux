@@ -26,5 +26,13 @@ fn simulated_primitives_only() {
             "runtime/ingest_bench.rs",
         ])
         .os_named_in(&["platform/"])
+        // The session models' own random identifiers: name sessions and clients through `ids`.
+        .forbid(&[
+            "Session::new(",
+            "SessionId::new(",
+            "ClientId::new(",
+            "SessionId::default(",
+            "ClientId::default(",
+        ])
         .assert_clean();
 }

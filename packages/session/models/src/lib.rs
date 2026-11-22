@@ -16,8 +16,11 @@ use uuid::Uuid;
 pub struct SessionId(pub Uuid);
 
 impl SessionId {
+    /// A random identifier. Simulated code names sessions from its seed instead
+    /// ([`Session::with_id`]).
     #[must_use]
     pub fn new() -> Self {
+        // simulation-safe: never called by simulated code (which names sessions from its seed)
         Self(Uuid::new_v4())
     }
 }
@@ -39,8 +42,10 @@ impl std::fmt::Display for SessionId {
 pub struct ClientId(pub Uuid);
 
 impl ClientId {
+    /// A random identifier.
     #[must_use]
     pub fn new() -> Self {
+        // simulation-safe: never called by simulated code (no clients connect in a simulation)
         Self(Uuid::new_v4())
     }
 }
@@ -80,8 +85,15 @@ pub struct Session {
 impl Session {
     #[must_use]
     pub fn new(name: Option<String>) -> Self {
+        Self::with_id(SessionId::new(), name)
+    }
+
+    /// A session with the identifier `id` (for callers that choose their own, such as a
+    /// simulation whose identifiers come from its seed).
+    #[must_use]
+    pub const fn with_id(id: SessionId, name: Option<String>) -> Self {
         Self {
-            id: SessionId::new(),
+            id,
             name,
             clients: BTreeSet::new(),
         }

@@ -834,11 +834,11 @@ pub(super) fn create_reserved_environment(
     authorize: impl Fn(uuid::Uuid) -> anyhow::Result<()> + Send + Sync + 'static,
 ) -> Result<ExecutionRef, ExecutionError> {
     let authorize = Arc::new(authorize);
-    let mut session = bmux_session_models::Session::new(name);
-    if let Some(reference) = &reserved {
-        session.id = SessionId(reference.session_id);
-    }
-    let id = session.id;
+    let id = reserved.map_or_else(
+        || SessionId(crate::ids::new_uuid()),
+        |reference| SessionId(reference.session_id),
+    );
+    let session = bmux_session_models::Session::with_id(id, name);
     authorize(id.0).map_err(|error| ExecutionError::Denied {
         reason: error.to_string(),
     })?;
