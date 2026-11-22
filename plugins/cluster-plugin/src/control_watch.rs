@@ -51,7 +51,7 @@ impl ControlWatch {
         node: &crate::consensus_runtime::ConsensusNode,
         sink: Option<Arc<dyn WireEventSink>>,
     ) -> Result<u64, String> {
-        let revision = node.control_revision().map_err(|error| error.to_string())?;
+        let revision = node.control_revision();
         self.revision.fetch_max(revision, Ordering::SeqCst);
         if !enabled {
             self.subscribers().remove(&client);
@@ -83,8 +83,8 @@ impl ControlWatch {
         })
     }
 
-    /// Start following consensus, once: when the applied log advances, read the control
-    /// revision, and wake the watchers if it moved.
+    /// Start following consensus, once: when the applied control revision advances, wake
+    /// the watchers.
     fn follow(
         self: &Arc<Self>,
         node: &crate::consensus_runtime::ConsensusNode,
@@ -99,19 +99,12 @@ impl ControlWatch {
         let watch = Arc::downgrade(self);
         let node = node.clone();
         let task = runtime.spawn(async move {
-            let mut metrics = node.metrics_watch();
-            let mut applied = metrics.borrow().last_applied;
-            while metrics.changed().await.is_ok() {
-                let now = metrics.borrow().last_applied;
-                if now == applied {
-                    continue;
-                }
-                applied = now;
+            let mut revisions = node.revision_watch();
+            drop(node);
+            while revisions.changed().await.is_ok() {
+                let revision = *revisions.borrow_and_update();
                 let Some(watch) = watch.upgrade() else {
                     return;
-                };
-                let Ok(revision) = node.control_revision() else {
-                    continue;
                 };
                 if watch.revision.fetch_max(revision, Ordering::SeqCst) < revision {
                     watch.wake_all(sink.as_ref());

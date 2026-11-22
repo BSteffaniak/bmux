@@ -1,39 +1,64 @@
-//! `OpenRaft` control-plane runtime wiring.
+//! Control-plane consensus node: the BMUX-owned Raft engine (ADR-0015) behind
+//! the product API the cluster services use.
 //!
-//! This module owns node construction and lifecycle. Network implementations
-//! remain injectable so production authenticated endpoint RPC and deterministic
-//! in-memory tests exercise the same Raft/storage integration.
+//! A [`ConsensusNode`] runs one [`Driver`] over the node's owned durable store
+//! ([`OwnedStorage`]) and an injectable transport. Production nodes use the
+//! authenticated generated consensus contracts ([`WireTransport`] outbound,
+//! [`WireService`] inbound); deterministic tests substitute an in-process
+//! transport over the same engine, driver and store.
+//!
+//! Command encoding, authorization preconditions and response decoding are the
+//! product's: proposals carry the canonical control-command bytes and their
+//! responses are the canonical control responses produced by application.
 
-use crate::consensus_network::EndpointRaftNetworkFactory;
-use crate::consensus_storage::{
-    ConsensusLogStore, ConsensusStateMachine, ConsensusStorageError, ControlRaftConfig,
-    ControlRequest,
+use crate::consensus_driver::{
+    ClientError, Driver, DriverConfig, Jitter, Status, Storage, Transport,
 };
+use crate::consensus_engine::{Config, Engine, Rejection, StopReason};
+use crate::consensus_model::{LogIdentity, Membership, StoredMembership};
+use crate::consensus_wire::{MemberView, WireService, WireTransport};
 use crate::control_state::ControlState;
 use crate::membership::NodeId;
+use crate::owned_vote_store::{OwnedStorage, OwnedVoteStore, PreflightAdmission};
+use bmux_cluster_plugin_api::cluster_consensus_rpc::ClusterConsensusRpcService as RpcV1;
+use bmux_cluster_plugin_api::cluster_consensus_rpc_v2::ClusterConsensusRpcService as RpcV2;
 use bmux_cluster_plugin_api::cluster_types::{
     ControlReadConsistency, ControlResponse, ControlServiceError, ControlStateView,
 };
-use openraft::error::{CheckIsLeaderError, Fatal, ForwardToLeader, RaftError};
-use openraft::network::RaftNetworkFactory;
-use openraft::raft::ClientWriteResponse;
-use openraft::{BasicNode, Config, SnapshotPolicy};
-use std::collections::BTreeMap;
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, PoisonError};
+use std::time::Duration;
 
-// Qualification-only owned lifecycle. Production remains OpenRaft until the
-// multi-voter and product-integration gates in ADR-0015 are satisfied.
 #[cfg(test)]
-mod owned;
+pub(crate) mod tests;
 
-const SNAPSHOT_LOG_THRESHOLD: u64 = 1_024;
+/// A quorum confirmation that has not completed by now reports quorum loss.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
+/// A proposal that has not applied by now has an unknown outcome.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(15);
+/// One membership step (learner admission or promotion) must finish by now.
+const MEMBERSHIP_STEP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bounded wait for in-flight calls before durable ownership is released.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often the peer credential view is reconciled with local membership.
+const MEMBER_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The owned store file, under the node's state directory. Its name and
+/// directory identify the owned durable format; nothing else is selected.
+const OWNED_STORE_DIRECTORY: &str = "owned-consensus";
+const OWNED_STORE_FILE: &str = "authority.bmown";
+/// Where the retired `OpenRaft` runtime kept its stores. Its presence means
+/// this node holds legacy authority the owned runtime will not reinterpret.
+const LEGACY_STORE_DIRECTORY: &str = "consensus";
 
 #[derive(Debug)]
 pub enum ConsensusRuntimeError {
-    Storage(ConsensusStorageError),
+    Storage(String),
     Configuration(String),
-    Fatal(Box<Fatal<NodeId>>),
+    Fatal(String),
 }
 
 impl std::fmt::Display for ConsensusRuntimeError {
@@ -53,15 +78,9 @@ impl std::fmt::Display for ConsensusRuntimeError {
 
 impl std::error::Error for ConsensusRuntimeError {}
 
-impl From<ConsensusStorageError> for ConsensusRuntimeError {
-    fn from(error: ConsensusStorageError) -> Self {
-        Self::Storage(error)
-    }
-}
-
-impl From<Fatal<NodeId>> for ConsensusRuntimeError {
-    fn from(error: Fatal<NodeId>) -> Self {
-        Self::Fatal(Box::new(error))
+impl From<io::Error> for ConsensusRuntimeError {
+    fn from(error: io::Error) -> Self {
+        Self::Storage(error.to_string())
     }
 }
 
@@ -71,11 +90,14 @@ pub struct NotLeader {
     pub leader_endpoint: Option<String>,
 }
 
-impl From<&ForwardToLeader<NodeId, BasicNode>> for NotLeader {
-    fn from(forward: &ForwardToLeader<NodeId, BasicNode>) -> Self {
-        Self {
-            leader_id: forward.leader_id,
-            leader_endpoint: forward.leader_node.as_ref().map(|node| node.addr.clone()),
+impl std::fmt::Display for NotLeader {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.leader_id, &self.leader_endpoint) {
+            (Some(id), Some(endpoint)) => {
+                write!(formatter, "not leader; forward to {id} at {endpoint}")
+            }
+            (Some(id), None) => write!(formatter, "not leader; forward to {id}"),
+            (None, _) => formatter.write_str("not leader; current leader is unknown"),
         }
     }
 }
@@ -84,20 +106,14 @@ impl From<&ForwardToLeader<NodeId, BasicNode>> for NotLeader {
 pub enum ConsensusWriteError {
     NotLeader(NotLeader),
     QuorumUnavailable(String),
-    Fatal(Box<Fatal<NodeId>>),
+    Fatal(String),
     Membership(String),
 }
 
 impl std::fmt::Display for ConsensusWriteError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotLeader(forward) => match (forward.leader_id, &forward.leader_endpoint) {
-                (Some(id), Some(endpoint)) => {
-                    write!(formatter, "not leader; forward to {id} at {endpoint}")
-                }
-                (Some(id), None) => write!(formatter, "not leader; forward to {id}"),
-                (None, _) => formatter.write_str("not leader; current leader is unknown"),
-            },
+            Self::NotLeader(forward) => forward.fmt(formatter),
             Self::QuorumUnavailable(reason) => {
                 write!(formatter, "control-plane quorum is unavailable: {reason}")
             }
@@ -113,20 +129,14 @@ impl std::error::Error for ConsensusWriteError {}
 pub enum ConsensusReadError {
     NotLeader(NotLeader),
     QuorumUnavailable(String),
-    Fatal(Box<Fatal<NodeId>>),
-    Storage(ConsensusStorageError),
+    Fatal(String),
+    Storage(String),
 }
 
 impl std::fmt::Display for ConsensusReadError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotLeader(forward) => match (forward.leader_id, &forward.leader_endpoint) {
-                (Some(id), Some(endpoint)) => {
-                    write!(formatter, "not leader; forward to {id} at {endpoint}")
-                }
-                (Some(id), None) => write!(formatter, "not leader; forward to {id}"),
-                (None, _) => formatter.write_str("not leader; current leader is unknown"),
-            },
+            Self::NotLeader(forward) => forward.fmt(formatter),
             Self::QuorumUnavailable(error) => {
                 write!(formatter, "linearizable read unavailable: {error}")
             }
@@ -138,17 +148,241 @@ impl std::fmt::Display for ConsensusReadError {
 
 impl std::error::Error for ConsensusReadError {}
 
-/// One running `OpenRaft` node backed by cluster-owned durable storage.
-#[derive(Clone)]
-pub struct ConsensusNode {
-    raft: openraft::Raft<ControlRaftConfig>,
-    storage: ConsensusLogStore,
-    membership_submission: std::sync::Arc<tokio::sync::Mutex<()>>,
-    decoder_admission: Option<Arc<dyn crate::consensus_network::DecoderAdmission>>,
+impl From<ConsensusReadError> for ConsensusWriteError {
+    fn from(error: ConsensusReadError) -> Self {
+        match error {
+            ConsensusReadError::NotLeader(not_leader) => Self::NotLeader(not_leader),
+            ConsensusReadError::QuorumUnavailable(reason) => Self::QuorumUnavailable(reason),
+            ConsensusReadError::Fatal(reason) | ConsensusReadError::Storage(reason) => {
+                Self::Fatal(reason)
+            }
+        }
+    }
+}
+
+/// The applied control state and the committed membership it was applied under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppliedView {
+    pub state: ControlState,
+    pub membership: Option<StoredMembership>,
+}
+
+/// How a node with no store yet initializes one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Provisioning {
+    /// Found a single-voter cluster at this endpoint.
+    Founder { endpoint: String },
+    /// Start empty and wait for a leader to admit this node.
+    Joiner,
+}
+
+/// The node's owned store path for `cluster_id`.
+#[must_use]
+pub fn owned_store_path(state_dir: &Path, cluster_id: &str) -> PathBuf {
+    plugin_state_dir(state_dir)
+        .join(OWNED_STORE_DIRECTORY)
+        .join(cluster_id)
+        .join(OWNED_STORE_FILE)
+}
+
+fn plugin_state_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join("plugins").join("bmux.cluster")
+}
+
+/// Refuse to start beside retained `OpenRaft` authority (ADR-0015 clean break):
+/// it is neither imported nor modified, and no other directory is chosen.
+///
+/// # Errors
+/// Reports the legacy store location.
+pub fn reject_legacy_store(state_dir: &Path) -> Result<(), ConsensusRuntimeError> {
+    let legacy = plugin_state_dir(state_dir).join(LEGACY_STORE_DIRECTORY);
+    match std::fs::symlink_metadata(&legacy) {
+        Ok(_) => Err(ConsensusRuntimeError::Configuration(format!(
+            "legacy OpenRaft consensus state exists at {}; the owned consensus runtime is a \
+             fresh-install clean break and never imports, modifies or bypasses it. Retire \
+             that node's legacy cluster state explicitly (move the directory aside) and \
+             re-enroll it into a new cluster",
+            legacy.display()
+        ))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ConsensusRuntimeError::Storage(format!(
+            "cannot verify the absence of legacy consensus state at {}: {error}",
+            legacy.display()
+        ))),
+    }
+}
+
+/// Open the owned store, or initialize it exactly once. An existing path is
+/// always opened and validated (format, cluster binding, recovery) — never
+/// replaced; initialization publishes without replacing, so concurrent
+/// initializers cannot both win.
+fn open_or_initialize(
+    path: &Path,
+    cluster_id: &str,
+    node_id: NodeId,
+    provisioning: &Provisioning,
+    admission: &PreflightAdmission,
+) -> io::Result<OwnedVoteStore> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return OwnedVoteStore::open_with(path, cluster_id, admission),
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        Err(_) => {}
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("owned store path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    if let Some(grandparent) = parent.parent() {
+        switchy_fs::sync::sync_directory(grandparent)?;
+    }
+    match provisioning {
+        Provisioning::Founder { endpoint } => {
+            let membership =
+                Membership::new(vec![vec![node_id]], vec![(node_id, endpoint.clone())]).map_err(
+                    |error| io::Error::other(format!("invalid founding membership: {error:?}")),
+                )?;
+            OwnedVoteStore::bootstrap(path, cluster_id, node_id, membership)
+        }
+        Provisioning::Joiner => OwnedVoteStore::create(path, cluster_id),
+    }
+}
+
+/// Cached applied view, refreshed after every durable application.
+struct AppliedCache {
+    view: std::sync::RwLock<AppliedView>,
+    revision: tokio::sync::watch::Sender<u64>,
+    changed: tokio::sync::Notify,
+}
+
+impl AppliedCache {
+    fn new(view: AppliedView) -> Self {
+        let (revision, _) = tokio::sync::watch::channel(view.state.revision);
+        Self {
+            view: std::sync::RwLock::new(view),
+            revision,
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn get(&self) -> AppliedView {
+        self.view
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn publish(&self, view: AppliedView) {
+        let revision = view.state.revision;
+        *self.view.write().unwrap_or_else(PoisonError::into_inner) = view;
+        self.revision.send_if_modified(|current| {
+            let advanced = *current != revision;
+            *current = revision;
+            advanced
+        });
+        self.changed.notify_waiters();
+    }
+}
+
+/// The owned store as the driver's authority, publishing each applied view.
+struct RuntimeStorage {
+    inner: OwnedStorage,
+    applied: Arc<AppliedCache>,
+}
+
+impl RuntimeStorage {
+    fn refresh(&mut self) -> io::Result<AppliedView> {
+        let (state, membership) = self.inner.applied()?;
+        let view = AppliedView { state, membership };
+        self.applied.publish(view.clone());
+        Ok(view)
+    }
+}
+
+impl Storage for RuntimeStorage {
+    type View = AppliedView;
+
+    fn write(&mut self, write: &crate::consensus_engine::Write) -> io::Result<()> {
+        self.inner.write(write)
+    }
+
+    fn install_snapshot(
+        &mut self,
+        from: NodeId,
+        last_included: LogIdentity,
+        membership: &StoredMembership,
+    ) -> io::Result<()> {
+        self.inner
+            .install_snapshot(from, last_included, membership)?;
+        self.refresh().map(|_| ())
+    }
+
+    fn apply(&mut self, through: LogIdentity) -> io::Result<Vec<(LogIdentity, Vec<u8>)>> {
+        let responses = self.inner.apply(through)?;
+        self.refresh()?;
+        Ok(responses)
+    }
+
+    fn compact(&mut self) -> io::Result<Option<(LogIdentity, StoredMembership)>> {
+        self.inner.compact()
+    }
+
+    fn read(&mut self) -> io::Result<AppliedView> {
+        self.refresh()
+    }
+
+    fn close(self) -> io::Result<()> {
+        self.inner.close()
+    }
+}
+
+/// Election deadlines drawn from a generator seeded per node instance, so
+/// nodes never share deadlines.
+fn seeded_jitter() -> Jitter {
+    let (high, low) = uuid::Uuid::new_v4().as_u64_pair();
+    let mut state = (high ^ low) | 1;
+    Box::new(move |min, max| {
+        // xorshift64*
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let draw = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        let span = u64::try_from(max.saturating_sub(min).as_millis()).unwrap_or(u64::MAX);
+        min + Duration::from_millis(draw % span.saturating_add(1))
+    })
+}
+
+/// Engine bounds for authenticated endpoint peers: each RPC carries a fresh
+/// peer proof and durable work, so leave headroom before suspecting a leader.
+fn endpoint_config() -> Config {
+    Config {
+        election_timeout: (Duration::from_millis(1_000), Duration::from_millis(2_000)),
+        heartbeat_interval: Duration::from_millis(150),
+        ..Config::default()
+    }
+}
+
+/// A running node's inbound `cluster-consensus-rpc` v1 and v2 providers.
+pub type RpcProviders = (Arc<dyn RpcV1 + Send + Sync>, Arc<dyn RpcV2 + Send + Sync>);
+
+struct Inner {
+    driver: std::sync::Mutex<Option<Arc<Driver<AppliedView>>>>,
+    rpc: std::sync::Mutex<Option<RpcProviders>>,
+    status: tokio::sync::watch::Receiver<Status>,
+    applied: Arc<AppliedCache>,
+    members: MemberView,
+    background: std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Serializes membership transitions with the writes that depend on them.
+    membership_submission: tokio::sync::Mutex<()>,
     node_id: NodeId,
     cluster_id: String,
     /// The last worker lease sequence this node issued.
-    lease_sequence: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    lease_sequence: AtomicU64,
+}
+
+/// One running owned-consensus node.
+#[derive(Clone)]
+pub struct ConsensusNode {
+    inner: Arc<Inner>,
 }
 
 fn validate_admission_term(expected: u64, current: u64) -> Result<(), ConsensusWriteError> {
@@ -160,85 +394,259 @@ fn validate_admission_term(expected: u64, current: u64) -> Result<(), ConsensusW
     Ok(())
 }
 
+/// Format a membership epoch from its introducing log identity.
+#[must_use]
+pub fn membership_epoch(membership: &StoredMembership) -> Option<String> {
+    membership
+        .introduced_at
+        .map(|log| format!("{}:{}:{}", log.term.0, log.leader, log.index.0))
+}
+
 impl ConsensusNode {
-    /// Starts one Raft node over the durable storage for `cluster_id`.
+    /// Starts one node over its owned store with the supplied transport.
     ///
-    /// The supplied network factory determines transport only. All consensus,
-    /// snapshot, compaction, and persistence behavior is identical across the
-    /// production endpoint transport and deterministic test substitutions.
+    /// All consensus, application and persistence behavior is identical for
+    /// the production endpoint transport and deterministic substitutes.
+    ///
     /// # Errors
-    ///
-    /// Returns storage, configuration, or fatal Raft startup failures.
-    pub async fn start<N>(
+    /// Returns legacy-store, storage or recovery failures.
+    pub async fn start<T: Transport>(
         state_dir: &Path,
         cluster_id: &str,
         node_id: NodeId,
-        network: N,
-    ) -> Result<Self, ConsensusRuntimeError>
-    where
-        N: RaftNetworkFactory<ControlRaftConfig>,
-    {
-        let storage = ConsensusLogStore::open(state_dir, cluster_id)?;
-        let state_machine = storage.state_machine()?;
-        let raft = openraft::Raft::new(
+        provisioning: Provisioning,
+        admission: &PreflightAdmission,
+        transport: impl FnOnce(MemberView) -> Arc<T>,
+    ) -> Result<Self, ConsensusRuntimeError> {
+        Self::start_with(
+            state_dir,
+            cluster_id,
             node_id,
-            consensus_config(cluster_id)?,
-            network,
-            storage.clone(),
-            state_machine,
+            provisioning,
+            admission,
+            Config::default(),
+            transport,
         )
-        .await?;
+        .await
+    }
+
+    async fn start_with<T: Transport>(
+        state_dir: &Path,
+        cluster_id: &str,
+        node_id: NodeId,
+        provisioning: Provisioning,
+        admission: &PreflightAdmission,
+        config: Config,
+        transport: impl FnOnce(MemberView) -> Arc<T>,
+    ) -> Result<Self, ConsensusRuntimeError> {
+        if cluster_id.is_empty()
+            || cluster_id.len() > 128
+            || cluster_id.contains(['/', '\\'])
+            || cluster_id.starts_with('.')
+        {
+            return Err(ConsensusRuntimeError::Configuration(
+                "invalid cluster identity for the owned store".into(),
+            ));
+        }
+        reject_legacy_store(state_dir)?;
+        let path = owned_store_path(state_dir, cluster_id);
+        let cluster = cluster_id.to_string();
+        let admission = admission.clone();
+        let (store, recovered) = tokio::task::spawn_blocking(move || -> io::Result<_> {
+            let mut store = open_or_initialize(&path, &cluster, node_id, &provisioning, &admission)
+                .map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("owned consensus store {}: {error}", path.display()),
+                    )
+                })?;
+            let recovered = store.recovered()?;
+            Ok((store, recovered))
+        })
+        .await
+        .map_err(|error| ConsensusRuntimeError::Fatal(error.to_string()))??;
+        let (engine, effects) = Engine::recover(node_id, config, recovered)
+            .map_err(|error| ConsensusRuntimeError::Storage(format!("{error:?}")))?;
+        let mut storage = OwnedStorage::new(
+            store,
+            // TODO(ADR-0015 snapshot transfer): staged snapshots arrive through
+            // the snapshot transfer service, which is wired separately.
+            Box::new(|_, _| Err(io::Error::other("snapshot transfer is not available"))),
+        );
+        let (state, membership) = storage.applied()?;
+        let applied = Arc::new(AppliedCache::new(AppliedView { state, membership }));
+        let members = MemberView::default();
+        let transport = transport(members.clone());
+        let driver = Driver::start(
+            engine,
+            effects,
+            RuntimeStorage {
+                inner: storage,
+                applied: applied.clone(),
+            },
+            transport,
+            seeded_jitter(),
+            DriverConfig::default(),
+        );
+        let status = driver.watch();
         Ok(Self {
-            raft,
-            storage,
-            membership_submission: std::sync::Arc::new(tokio::sync::Mutex::new(())),
-            decoder_admission: None,
-            node_id,
-            cluster_id: cluster_id.to_string(),
-            lease_sequence: std::sync::Arc::default(),
+            inner: Arc::new(Inner {
+                driver: std::sync::Mutex::new(Some(Arc::new(driver))),
+                rpc: std::sync::Mutex::new(None),
+                status,
+                applied,
+                members,
+                background: std::sync::Mutex::new(Vec::new()),
+                membership_submission: tokio::sync::Mutex::new(()),
+                node_id,
+                cluster_id: cluster_id.to_string(),
+                lease_sequence: AtomicU64::new(0),
+            }),
         })
     }
 
-    /// Starts one production node using the authenticated connections-backed
-    /// peer transport.
+    /// Starts one production node over the authenticated generated contracts.
     ///
     /// # Errors
-    ///
-    /// Returns storage, configuration, or fatal Raft startup failures.
+    /// Returns legacy-store, storage or recovery failures.
     pub async fn start_endpoint<C>(
         state_dir: &Path,
         cluster_id: &str,
-        identity: crate::membership::NodeIdentity,
+        identity: &crate::membership::NodeIdentity,
         caller: Arc<C>,
+        provisioning: Provisioning,
+        admission: &PreflightAdmission,
     ) -> Result<Self, ConsensusRuntimeError>
     where
-        C: bmux_plugin::ServiceCaller + Send + Sync + 'static,
+        C: crate::ClusterRuntimeOps + bmux_plugin::ServiceCaller + Send + Sync + 'static,
     {
-        let network = EndpointRaftNetworkFactory::new(caller.clone(), identity.clone());
-        let mut node = Self::start(
+        let node_id = *identity.node_id();
+        let incarnation = uuid::Uuid::new_v4().as_u64_pair().0;
+        let outbound = caller.clone();
+        let node = Self::start_with(
             state_dir,
             cluster_id,
-            *identity.node_id(),
-            EndpointRaftNetworkFactory::new(caller, identity),
+            node_id,
+            provisioning,
+            admission,
+            endpoint_config(),
+            |members| Arc::new(WireTransport::new(outbound, node_id, members, incarnation)),
         )
         .await?;
-        node.decoder_admission = Some(Arc::new(network));
+        node.refresh_members(caller.as_ref());
+        let driver = node
+            .driver()
+            .map_err(|error| ConsensusRuntimeError::Fatal(error.to_string()))?;
+        let service = Arc::new(WireService::new(
+            caller.clone(),
+            node_id,
+            node.inner.members.clone(),
+            driver,
+        ));
+        *node
+            .inner
+            .rpc
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((service.clone(), service));
+        let refresher = node.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let changed = refresher.inner.applied.changed.notified();
+                tokio::select! {
+                    () = changed => {}
+                    () = tokio::time::sleep(MEMBER_REFRESH_INTERVAL) => {}
+                }
+                if refresher
+                    .inner
+                    .driver
+                    .lock()
+                    .map_or(true, |driver| driver.is_none())
+                {
+                    return;
+                }
+                refresher.refresh_members(caller.as_ref());
+            }
+        });
+        node.inner
+            .background
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(task);
         Ok(node)
     }
 
+    /// Peer credentials for the wire adapter: committed (applied) member records
+    /// win; locally enrolled records cover peers whose records have not been
+    /// replicated yet (a joining learner, or this node before it catches up).
+    fn refresh_members(&self, caller: &impl crate::ClusterRuntimeOps) {
+        let mut merged = crate::membership::local_members(caller)
+            .map(|list| {
+                list.members
+                    .into_iter()
+                    .map(|member| (member.node_id.clone(), member))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        merged.extend(self.inner.applied.get().state.members);
+        self.inner.members.update(
+            self.inner.cluster_id.clone(),
+            merged.into_values().collect(),
+        );
+    }
+
+    /// The node's inbound consensus RPC providers, while it runs.
+    ///
+    /// # Errors
+    /// Reports a node without a wire service (stopped, or test transport).
+    pub fn rpc(&self) -> Result<RpcProviders, String> {
+        self.inner
+            .rpc
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| "consensus node is not serving peer RPCs".to_string())
+    }
+
+    fn driver(&self) -> Result<Arc<Driver<AppliedView>>, ConsensusWriteError> {
+        self.inner
+            .driver
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| ConsensusWriteError::Fatal("consensus node stopped".into()))
+    }
+
     #[must_use]
-    pub const fn node_id(&self) -> NodeId {
-        self.node_id
+    pub fn node_id(&self) -> NodeId {
+        self.inner.node_id
     }
 
     #[must_use]
     pub fn cluster_id(&self) -> &str {
-        &self.cluster_id
+        &self.inner.cluster_id
+    }
+
+    /// The engine's current status (term, leader, commit, applied, ...).
+    #[must_use]
+    pub fn status(&self) -> Status {
+        *self.inner.status.borrow()
+    }
+
+    /// The engine status as it changes.
+    #[must_use]
+    pub fn status_watch(&self) -> tokio::sync::watch::Receiver<Status> {
+        self.inner.status.clone()
     }
 
     #[must_use]
     pub fn current_term(&self) -> u64 {
-        self.raft.metrics().borrow().current_term
+        self.status().term.0
+    }
+
+    /// Whether this node currently believes it leads.
+    #[must_use]
+    pub fn is_leader(&self) -> bool {
+        self.status().leader == Some(self.inner.node_id)
     }
 
     /// The control term and a lease sequence above every one this node issued
@@ -250,186 +658,289 @@ impl ConsensusNode {
     pub fn next_lease(&self) -> (u64, u64) {
         let term = self.current_term();
         let sequence = self
+            .inner
             .lease_sequence
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .fetch_add(1, Ordering::Relaxed)
             .saturating_add(1);
         (term, sequence)
     }
 
-    #[must_use]
-    pub fn committed_member_ids(&self) -> std::collections::BTreeSet<NodeId> {
-        self.raft
-            .metrics()
-            .borrow()
-            .membership_config
-            .membership()
-            .nodes()
-            .map(|(node_id, _)| *node_id)
-            .collect()
+    fn applied_membership(&self) -> Option<StoredMembership> {
+        self.inner.applied.get().membership
     }
 
+    /// Every node record (voters and learners) of the applied membership.
     #[must_use]
-    pub fn committed_voter_ids(&self) -> std::collections::BTreeSet<NodeId> {
-        self.raft
-            .metrics()
-            .borrow()
-            .membership_config
-            .membership()
-            .voter_ids()
-            .collect()
+    pub fn committed_member_ids(&self) -> BTreeSet<NodeId> {
+        self.applied_membership()
+            .map(|stored| stored.membership.nodes().keys().copied().collect())
+            .unwrap_or_default()
     }
 
-    /// Reports whether durable protocol membership has been initialized.
+    /// The voters of the applied membership (both sets while joint).
+    #[must_use]
+    pub fn committed_voter_ids(&self) -> BTreeSet<NodeId> {
+        self.applied_membership()
+            .map(|stored| {
+                stored
+                    .membership
+                    .configurations()
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether durable membership exists (founded, or replicated to a joiner).
+    #[must_use]
+    pub fn is_initialized(&self) -> bool {
+        self.applied_membership().is_some() || self.status().commit.is_some()
+    }
+
+    fn not_leader(&self, hint: Option<NodeId>) -> NotLeader {
+        let leader_endpoint = hint.and_then(|leader| {
+            self.applied_membership()
+                .and_then(|stored| stored.membership.nodes().get(&leader).cloned())
+                .or_else(|| {
+                    self.inner
+                        .applied
+                        .get()
+                        .state
+                        .members
+                        .get(&leader.to_string())
+                        .and_then(|member| member.endpoint.clone())
+                })
+                .filter(|endpoint| !endpoint.is_empty())
+        });
+        NotLeader {
+            leader_id: hint,
+            leader_endpoint,
+        }
+    }
+
+    fn read_error(&self, error: ClientError) -> ConsensusReadError {
+        match error {
+            ClientError::Rejected(Rejection::NotLeader { hint }) => {
+                ConsensusReadError::NotLeader(self.not_leader(hint))
+            }
+            ClientError::Rejected(Rejection::LeaderNotReady) => {
+                ConsensusReadError::QuorumUnavailable(
+                    "leader has not committed an entry in its term yet".into(),
+                )
+            }
+            ClientError::Rejected(rejection) => {
+                ConsensusReadError::QuorumUnavailable(format!("read rejected: {rejection:?}"))
+            }
+            ClientError::Superseded => {
+                ConsensusReadError::NotLeader(self.not_leader(self.status().leader))
+            }
+            ClientError::Stopped(reason) => ConsensusReadError::Fatal(stopped(reason)),
+            ClientError::Storage(reason) => ConsensusReadError::Storage(reason),
+        }
+    }
+
+    fn write_error(&self, error: ClientError) -> ConsensusWriteError {
+        match error {
+            ClientError::Rejected(Rejection::NotLeader { hint }) => {
+                ConsensusWriteError::NotLeader(self.not_leader(hint))
+            }
+            ClientError::Rejected(Rejection::LeaderNotReady) => {
+                ConsensusWriteError::QuorumUnavailable(
+                    "leader has not committed an entry in its term yet".into(),
+                )
+            }
+            ClientError::Rejected(Rejection::Exhausted) => {
+                ConsensusWriteError::Fatal("consensus identity space is exhausted".into())
+            }
+            ClientError::Rejected(rejection) => ConsensusWriteError::Membership(format!(
+                "membership change rejected: {rejection:?}"
+            )),
+            // The slot was taken by another leader's entry: it did not apply.
+            ClientError::Superseded => {
+                ConsensusWriteError::NotLeader(self.not_leader(self.status().leader))
+            }
+            ClientError::Stopped(reason) => ConsensusWriteError::Fatal(stopped(reason)),
+            ClientError::Storage(reason) => ConsensusWriteError::Fatal(reason),
+        }
+    }
+
+    /// Confirms leadership with a quorum, then returns the applied view at
+    /// least as new as the confirmed commit.
+    async fn confirmed_view(&self) -> Result<AppliedView, ConsensusReadError> {
+        let driver = self
+            .driver()
+            .map_err(|error| ConsensusReadError::Fatal(error.to_string()))?;
+        match tokio::time::timeout(READ_TIMEOUT, driver.read()).await {
+            Err(_) => Err(ConsensusReadError::QuorumUnavailable(
+                "quorum did not confirm leadership before the deadline".into(),
+            )),
+            Ok(Ok(view)) => Ok(view),
+            Ok(Err(error)) => Err(self.read_error(error)),
+        }
+    }
+
+    async fn propose(&self, bytes: Vec<u8>) -> Result<Vec<u8>, ConsensusWriteError> {
+        let driver = self.driver()?;
+        match tokio::time::timeout(WRITE_TIMEOUT, driver.propose(bytes)).await {
+            Err(_) => Err(ConsensusWriteError::QuorumUnavailable(
+                "the proposal did not apply before the deadline; its outcome is unknown, retry \
+                 the same CommandId"
+                    .into(),
+            )),
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(error)) => Err(self.write_error(error)),
+        }
+    }
+
+    /// Learner admission followed by joint-consensus promotion to exactly
+    /// `voters`. Every voter must have an authenticated endpoint address.
     ///
     /// # Errors
-    /// Returns the runtime failure rather than treating unavailable state as pristine.
-    pub async fn is_initialized(&self) -> Result<bool, ConsensusRuntimeError> {
-        self.raft.is_initialized().await.map_err(Into::into)
-    }
-
-    #[must_use]
-    pub const fn raft(&self) -> &openraft::Raft<ControlRaftConfig> {
-        &self.raft
-    }
-
-    /// Initializes a pristine node as a single-voter cluster.
-    ///
-    /// # Errors
-    ///
-    /// Returns a Raft initialization error when durable state is non-pristine
-    /// or the node cannot commit the initial membership.
-    // Preserve OpenRaft's public initialization error without an API-breaking box.
-    #[allow(clippy::result_large_err)]
-    pub async fn initialize_single(
-        &self,
-        node_id: NodeId,
-        endpoint: impl Into<String>,
-    ) -> Result<(), Box<RaftError<NodeId, openraft::error::InitializeError<NodeId, BasicNode>>>>
-    {
-        self.raft
-            .initialize(BTreeMap::from([(node_id, BasicNode::new(endpoint.into()))]))
-            .await
-            .map_err(Box::new)
-    }
-
-    /// Executes learner-first catch-up followed by `OpenRaft`'s joint and uniform
-    /// voter transition. Every requested voter must have an authenticated
-    /// endpoint address.
-    ///
-    /// The transition intentionally retains removed servers as learners so
-    /// leave/revoke can first commit the safe voter-set change and then commit
-    /// the replicated member-state update without making either step depend on
-    /// an already-removed voter.
-    ///
-    /// # Errors
-    ///
     /// Returns leader, quorum, membership, or fatal runtime failures.
     pub async fn change_voters(
         &self,
-        voters: std::collections::BTreeMap<NodeId, BasicNode>,
-    ) -> Result<ClientWriteResponse<ControlRaftConfig>, ConsensusWriteError> {
-        let submission_started = std::time::Instant::now();
-        let _submission = self.membership_submission.lock().await;
-        tracing::debug!(
-            node_id = %self.node_id,
-            wait_ms = submission_started.elapsed().as_millis(),
-            "consensus membership submission admitted"
-        );
+        voters: BTreeMap<NodeId, String>,
+    ) -> Result<(), ConsensusWriteError> {
+        let _submission = self.inner.membership_submission.lock().await;
         self.change_voters_locked(voters, None).await
     }
 
     async fn change_voters_locked(
         &self,
-        voters: std::collections::BTreeMap<NodeId, BasicNode>,
+        voters: BTreeMap<NodeId, String>,
         expected_term: Option<u64>,
-    ) -> Result<ClientWriteResponse<ControlRaftConfig>, ConsensusWriteError> {
-        let submission_started = std::time::Instant::now();
-        let authenticated = voters
-            .into_iter()
-            .map(|(node_id, node)| {
-                if node.addr.trim().is_empty() {
-                    Err(ConsensusWriteError::Membership(format!(
-                        "consensus voter {node_id} has no authenticated endpoint"
-                    )))
-                } else {
-                    Ok((node_id, node))
-                }
-            })
-            .collect::<Result<std::collections::BTreeMap<_, _>, _>>()?;
-        if authenticated.is_empty() {
+    ) -> Result<(), ConsensusWriteError> {
+        if let Some((node_id, _)) = voters
+            .iter()
+            .find(|(_, endpoint)| endpoint.trim().is_empty())
+        {
+            return Err(ConsensusWriteError::Membership(format!(
+                "consensus voter {node_id} has no authenticated endpoint"
+            )));
+        }
+        if voters.is_empty() {
             return Err(ConsensusWriteError::Membership(
                 "consensus voter set cannot be empty".to_string(),
             ));
         }
-        match self.raft.ensure_linearizable().await {
-            Ok(_) => {}
-            Err(RaftError::Fatal(error)) => {
-                return Err(ConsensusWriteError::Fatal(Box::new(error)));
-            }
-            Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward))) => {
-                return Err(ConsensusWriteError::NotLeader((&forward).into()));
-            }
-            Err(RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(error))) => {
-                return Err(ConsensusWriteError::QuorumUnavailable(error.to_string()));
-            }
-        }
+        let view = self.confirmed_view().await?;
         let admission_term = expected_term.unwrap_or_else(|| self.current_term());
         validate_admission_term(admission_term, self.current_term())?;
-        // Retained publication commands/snapshots require their decoder even
-        // before activation advances the schema floor. Endpoint authentication
-        // does not prove that a newly added learner can consume this history.
-        let state = self.persisted_control_state().map_err(|error| {
-            ConsensusWriteError::Membership(format!(
-                "cannot verify retained compatibility: {error}"
-            ))
-        })?;
-        if state.requires_publication_decoder() {
-            for (id, node) in &authenticated {
-                if *id == self.node_id {
-                    continue;
+        // Retained publication commands/snapshots require their decoder. Only
+        // peers that negotiated the owned consensus contracts run it; endpoint
+        // authentication alone does not prove a learner can consume history.
+        if view.state.requires_publication_decoder() {
+            let (_, members) = self.inner.members.snapshot();
+            for id in voters.keys().filter(|id| **id != self.inner.node_id) {
+                let negotiated = members.iter().any(|member| {
+                    member.node_id == id.to_string()
+                        && crate::consensus_network::supports_owned_append_v2(member)
+                });
+                if !negotiated {
+                    return Err(ConsensusWriteError::Membership(format!(
+                        "new recipient {id} has not negotiated the owned consensus protocol \
+                         required to decode retained capability publications"
+                    )));
                 }
-                // Probe every remote recipient, including endpoint replacements.
-                // A previous membership entry is not evidence of the current decoder.
-                let verifier = self.decoder_admission.as_ref().ok_or_else(|| {
-                    ConsensusWriteError::Membership(
-                        "new recipients require capability-publication decoder admission proof"
-                            .into(),
-                    )
-                })?;
-                verifier
-                    .verify(*id, &node.addr)
-                    .await
-                    .map_err(ConsensusWriteError::Membership)?;
             }
-            // Network waits may span a leadership transition. Never start admission
-            // on the authority of the earlier read alone.
-            self.raft.ensure_linearizable().await.map_err(|error| {
-                ConsensusWriteError::Membership(format!("admission authority changed: {error}"))
-            })?;
         }
-        let voter_ids = authenticated
-            .keys()
-            .copied()
-            .collect::<std::collections::BTreeSet<_>>();
-        for (node_id, node) in authenticated {
-            validate_admission_term(admission_term, self.current_term())?;
-            tracing::info!(node_id = %self.node_id, learner_id = %node_id, "consensus learner admission started");
-            let started = std::time::Instant::now();
-            self.raft
-                .add_learner(node_id, node, true)
-                .await
-                .map_err(client_write_error)?;
-            tracing::info!(node_id = %self.node_id, learner_id = %node_id, elapsed_ms = started.elapsed().as_millis(), "consensus learner admission completed");
+        let committed = view.membership.ok_or_else(|| {
+            ConsensusWriteError::Membership("committed membership is unavailable".into())
+        })?;
+        let [current] = committed.membership.configurations() else {
+            return Err(ConsensusWriteError::Membership(
+                "a membership transition is already in progress".into(),
+            ));
+        };
+        let current = current.clone();
+        // Learner admission: records for every target voter, voting unchanged.
+        let mut records = committed.membership.nodes().clone();
+        if voters
+            .iter()
+            .any(|(id, endpoint)| records.get(id) != Some(endpoint))
+        {
+            records.extend(voters.iter().map(|(id, endpoint)| (*id, endpoint.clone())));
+            let learners = Membership::new(
+                vec![current.iter().copied().collect()],
+                records.into_iter().collect(),
+            )
+            .map_err(|error| ConsensusWriteError::Membership(format!("{error:?}")))?;
+            tracing::info!(node_id = %self.inner.node_id, "consensus learner admission started");
+            self.membership_step(learners, admission_term).await?;
         }
-        validate_admission_term(admission_term, self.current_term())?;
-        tracing::info!(node_id = %self.node_id, voter_count = voter_ids.len(), "consensus voter-set commit started");
-        let result = self
-            .raft
-            .change_membership(voter_ids, false)
-            .await
-            .map_err(client_write_error);
-        tracing::info!(node_id = %self.node_id, succeeded = result.is_ok(), elapsed_ms = submission_started.elapsed().as_millis(), "consensus voter-set commit finished");
+        // Promotion: the engine commits the joint configuration, then the
+        // final one. Even an unchanged voter set commits a fresh position, so
+        // replayed authorizations cannot reuse its epoch.
+        let target = Membership::new(
+            vec![voters.keys().copied().collect()],
+            voters
+                .iter()
+                .map(|(id, endpoint)| (*id, endpoint.clone()))
+                .collect(),
+        )
+        .map_err(|error| ConsensusWriteError::Membership(format!("{error:?}")))?;
+        tracing::info!(node_id = %self.inner.node_id, voter_count = voters.len(), "consensus voter-set commit started");
+        let result = self.membership_step(target, admission_term).await;
+        tracing::info!(node_id = %self.inner.node_id, succeeded = result.is_ok(), "consensus voter-set commit finished");
         result
+    }
+
+    /// Propose one membership target (retrying while a learner catches up or
+    /// the previous change finishes) and wait until its final configuration
+    /// is applied here.
+    async fn membership_step(
+        &self,
+        target: Membership,
+        admission_term: u64,
+    ) -> Result<(), ConsensusWriteError> {
+        let deadline = tokio::time::Instant::now() + MEMBERSHIP_STEP_TIMEOUT;
+        let driver = self.driver()?;
+        let proposed = loop {
+            validate_admission_term(admission_term, self.current_term())?;
+            let attempt =
+                tokio::time::timeout_at(deadline, driver.change_membership(target.clone())).await;
+            match attempt {
+                Err(_) => {
+                    return Err(ConsensusWriteError::QuorumUnavailable(
+                        "membership change was not accepted before the deadline".into(),
+                    ));
+                }
+                Ok(Ok(identity)) => break identity,
+                Ok(Err(ClientError::Rejected(
+                    Rejection::LearnerNotCaughtUp(_) | Rejection::MembershipChangeInProgress,
+                ))) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Ok(Err(error)) => return Err(self.write_error(error)),
+            }
+        };
+        let wanted = target.configurations()[0].clone();
+        loop {
+            let notified = self.inner.applied.changed.notified();
+            if let Some(stored) = self.applied_membership()
+                && let Some(at) = stored.introduced_at
+                && at.index >= proposed.index
+                && stored.membership.configurations() == [wanted.clone()]
+            {
+                return Ok(());
+            }
+            validate_admission_term(admission_term, self.current_term())?;
+            if tokio::time::timeout_at(deadline, async {
+                tokio::select! {
+                    () = notified => {}
+                    () = tokio::time::sleep(Duration::from_millis(50)) => {}
+                }
+            })
+            .await
+            .is_err()
+            {
+                return Err(ConsensusWriteError::QuorumUnavailable(
+                    "membership change did not commit before the deadline".into(),
+                ));
+            }
+        }
     }
 
     /// Applies a signed exact transition under the membership submission lock.
@@ -440,61 +951,53 @@ impl ConsensusNode {
         authorization: &bmux_cluster_plugin_api::cluster_types::ConsensusVoterChangeAuthorization,
         proposed: Vec<bmux_cluster_plugin_api::cluster_types::ClusterMember>,
     ) -> Result<(), String> {
-        let _submission = self.membership_submission.lock().await;
-        self.linearizable_control_state()
+        let _submission = self.inner.membership_submission.lock().await;
+        let view = self
+            .confirmed_view()
             .await
             .map_err(|error| error.to_string())?;
         let expected_term = self.current_term();
-        let snapshot = self
-            .storage
-            .state_machine()
-            .map_err(|error| error.to_string())?;
-        let committed = snapshot.committed_membership();
-        let effective = self.raft.metrics().borrow().membership_config.clone();
-        if &*effective != committed
-            || !committed
-                .membership()
-                .voter_ids()
-                .any(|id| id.to_string() == authorization.actor_node_id)
+        let committed = view
+            .membership
+            .as_ref()
+            .ok_or("committed membership is unavailable")?;
+        let [voters] = committed.membership.configurations() else {
+            return Err("a membership transition is already in progress".into());
+        };
+        if !voters
+            .iter()
+            .any(|id| id.to_string() == authorization.actor_node_id)
         {
-            return Err("voter-change signer is not a current committed Raft voter".into());
+            return Err("voter-change signer is not a current committed voter".into());
         }
         let epoch =
             membership_epoch(committed).ok_or("committed membership epoch is unavailable")?;
-        let current = snapshot
-            .control_state()
-            .members
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        let current = view.state.members.values().cloned().collect::<Vec<_>>();
         crate::consensus_membership::verify_voter_change_authorization(
             authorization,
-            &self.cluster_id,
+            &self.inner.cluster_id,
             &epoch,
             &current,
             &proposed,
         )?;
         if authorization.current_members_digest == authorization.proposed_members_digest {
             // Successful join retry: quorum and signature were checked above.
-            // A metadata entry alone is insufficient evidence of Raft promotion.
-            if !committed
-                .membership()
-                .voter_ids()
+            // A metadata entry alone is insufficient evidence of promotion.
+            if !voters
+                .iter()
                 .any(|id| id.to_string() == authorization.target_node_id)
             {
-                return Err("acknowledged target is not a committed Raft voter".into());
+                return Err("acknowledged target is not a committed voter".into());
             }
             return Ok(());
         }
         let plan =
             crate::consensus_membership::validate_membership_transition(&current, &proposed)?;
         crate::consensus_membership::preflight_publication(
-            snapshot.control_state().clone(),
+            view.state.clone(),
             &authorization.actor_node_id,
             &proposed,
         )?;
-        // Even an identical voter set commits a fresh membership log position.
-        // Replays cannot reuse this epoch, including after removal/re-enrollment.
         self.change_voters_locked(plan.voters, Some(expected_term))
             .await
             .map_err(|error| error.to_string())?;
@@ -509,13 +1012,12 @@ impl ConsensusNode {
     /// Executes a generated control mutation and returns its typed response.
     ///
     /// # Errors
-    ///
     /// Returns structured leader, quorum, rejection, runtime, or internal errors.
     pub async fn mutate(
         &self,
         command: bmux_cluster_plugin_api::cluster_types::ControlCommand,
     ) -> Result<ControlResponse, ControlServiceError> {
-        let _submission = self.membership_submission.lock().await;
+        let _submission = self.inner.membership_submission.lock().await;
         self.mutate_locked(command).await
     }
 
@@ -566,7 +1068,6 @@ impl ConsensusNode {
     /// Activates one durable schema feature after membership eligibility checks.
     ///
     /// # Errors
-    ///
     /// Returns structured leader, quorum, rejection, runtime, or internal errors.
     pub async fn activate_feature(
         &self,
@@ -585,24 +1086,15 @@ impl ConsensusNode {
         &self,
         reports: Vec<bmux_cluster_plugin_api::cluster_capability_types::CapabilityReport>,
     ) -> Result<ControlResponse, ControlServiceError> {
-        let _submission = self.membership_submission.lock().await;
-        self.linearizable_control_state()
-            .await
-            .map_err(control_read_error)?;
-        let snapshot =
-            self.storage
-                .state_machine()
-                .map_err(|error| ControlServiceError::Internal {
-                    reason: error.to_string(),
-                })?;
-        let membership = snapshot.committed_membership();
-        let effective = self.raft.metrics().borrow().membership_config.clone();
-        if &*effective != membership
-            || membership.membership().nodes().count() != 1
-            || membership.membership().voter_ids().collect::<Vec<_>>() != vec![self.node_id]
-        {
+        let _submission = self.inner.membership_submission.lock().await;
+        let view = self.confirmed_view().await.map_err(control_read_error)?;
+        let isolated = view.membership.as_ref().filter(|stored| {
+            stored.membership.nodes().len() == 1
+                && stored.membership.configurations() == [BTreeSet::from([self.inner.node_id])]
+        });
+        let Some(membership) = isolated else {
             return Err(ControlServiceError::RuntimeUnavailable { reason: "publication requires an isolated single-member authority until peer decoder negotiation is available".into() });
-        }
+        };
         let command = crate::capability_publication::PublicationCommand {
             reports,
             verified_at_unix_ms: crate::now_unix_ms(),
@@ -610,9 +1102,9 @@ impl ConsensusNode {
         let bytes = command
             .encode()
             .map_err(|reason| ControlServiceError::RuntimeUnavailable { reason })?;
-        let mut state = snapshot.control_state().clone();
+        let mut state = view.state.clone();
         state
-            .apply_publication(&command, membership)
+            .apply_owned_publication(&command, membership)
             .map_err(|reason| ControlServiceError::Rejected {
                 error:
                     bmux_cluster_plugin_api::cluster_types::ControlCommandError::InvalidTransition {
@@ -621,11 +1113,7 @@ impl ConsensusNode {
             })?;
         // No remote recipient exists and membership changes share this lock.
         // Do not use the raw writer, which deliberately rejects publication.
-        let result = self
-            .raft
-            .client_write(ControlRequest(bytes))
-            .await
-            .map_err(client_write_error);
+        let result = self.propose(bytes).await;
         Self::decode_write_response(&command.reports[0].command_id, result)
     }
 
@@ -679,24 +1167,25 @@ impl ConsensusNode {
         proof: bmux_cluster_plugin_api::cluster_principal_bootstrap_types::BootstrapProof,
         expected_control_revision: u64,
     ) -> Result<ControlResponse, ControlServiceError> {
-        self.linearizable_control_state()
-            .await
-            .map_err(control_read_error)?;
-        let snapshot =
-            self.storage
-                .state_machine()
-                .map_err(|error| ControlServiceError::Internal {
-                    reason: error.to_string(),
-                })?;
+        let view = self.confirmed_view().await.map_err(control_read_error)?;
         let command = crate::principal_bootstrap::BootstrapCommand {
             proof,
             expected_control_revision,
             verified_at_unix_ms: crate::now_unix_ms(),
         };
-        // The preflight uses one persisted state/membership snapshot. Apply checks
+        // The preflight uses one confirmed state/membership view. Apply checks
         // again in log order, so intervening membership or revision changes reject.
-        let mut state = snapshot.control_state().clone();
-        let preflight = state.apply_bootstrap_command(&command, snapshot.committed_membership());
+        let membership = view
+            .membership
+            .as_ref()
+            .ok_or_else(|| ControlServiceError::Rejected {
+                error:
+                    bmux_cluster_plugin_api::cluster_types::ControlCommandError::InvalidTransition {
+                        reason: "bootstrap requires committed membership".into(),
+                    },
+            })?;
+        let mut state = view.state.clone();
+        let preflight = state.apply_owned_bootstrap_command(&command, membership);
         if let bmux_cluster_plugin_api::cluster_types::ControlCommandResult::Rejected { error } =
             preflight.result
         {
@@ -713,13 +1202,15 @@ impl ConsensusNode {
 
     fn decode_write_response(
         command_id: &bmux_cluster_plugin_api::cluster_types::CommandId,
-        result: Result<ClientWriteResponse<ControlRaftConfig>, ConsensusWriteError>,
+        result: Result<Vec<u8>, ConsensusWriteError>,
     ) -> Result<ControlResponse, ControlServiceError> {
         match result {
             Ok(response) => {
-                let response = crate::control_codec::decode_control_response(&response.data.0)
-                    .map_err(|error| ControlServiceError::Internal {
-                        reason: format!("committed control response is invalid: {error}"),
+                let response =
+                    crate::control_codec::decode_control_response(&response).map_err(|error| {
+                        ControlServiceError::Internal {
+                            reason: format!("committed control response is invalid: {error}"),
+                        }
                     })?;
                 match &response.result {
                     bmux_cluster_plugin_api::cluster_types::ControlCommandResult::Rejected {
@@ -756,57 +1247,37 @@ impl ConsensusNode {
     /// Returns a quorum-confirmed generated state view.
     ///
     /// # Errors
-    ///
     /// Returns structured leader, quorum, runtime, or storage errors.
     pub async fn read_linearizable_view(&self) -> Result<ControlStateView, ControlServiceError> {
-        self.linearizable_control_state()
-            .await
-            .map_err(control_read_error)?;
-        let snapshot =
-            self.storage
-                .state_machine()
-                .map_err(|error| ControlServiceError::Internal {
-                    reason: error.to_string(),
-                })?;
-        let mut view = snapshot
-            .control_state()
-            .to_view(ControlReadConsistency::Linearizable);
-        view.membership_epoch = membership_epoch(snapshot.committed_membership());
-        Ok(view)
+        let view = self.confirmed_view().await.map_err(control_read_error)?;
+        let mut state_view = view.state.to_view(ControlReadConsistency::Linearizable);
+        state_view.membership_epoch = view.membership.as_ref().and_then(membership_epoch);
+        Ok(state_view)
     }
 
     /// Returns an explicitly stale generated state view.
     ///
     /// # Errors
-    ///
-    /// Returns an internal error when durable state cannot be decoded.
+    /// Never fails today; kept fallible for callers that treat it as a read.
     pub fn read_stale_view(&self) -> Result<ControlStateView, ControlServiceError> {
-        self.persisted_control_state()
-            .map(|state| state.to_view(ControlReadConsistency::Stale))
-            .map_err(|error| ControlServiceError::Internal {
-                reason: error.to_string(),
-            })
+        Ok(self
+            .persisted_control_state()
+            .to_view(ControlReadConsistency::Stale))
     }
 
-    /// Submits one canonical control command to the current leader.
+    /// Submits one canonical control command to the current leader and returns
+    /// the canonical response bytes produced by its application.
     ///
     /// # Errors
-    ///
     /// Returns actionable leader guidance, quorum unavailability, membership
-    /// errors, or fatal Raft failures. A command is never replayed internally
+    /// errors, or fatal runtime failures. A command is never replayed internally
     /// after dispatch.
-    pub async fn write(
-        &self,
-        command: Vec<u8>,
-    ) -> Result<ClientWriteResponse<ControlRaftConfig>, ConsensusWriteError> {
-        let _submission = self.membership_submission.lock().await;
+    pub async fn write(&self, command: Vec<u8>) -> Result<Vec<u8>, ConsensusWriteError> {
+        let _submission = self.inner.membership_submission.lock().await;
         self.write_locked(command).await
     }
 
-    async fn write_locked(
-        &self,
-        command: Vec<u8>,
-    ) -> Result<ClientWriteResponse<ControlRaftConfig>, ConsensusWriteError> {
+    async fn write_locked(&self, command: Vec<u8>) -> Result<Vec<u8>, ConsensusWriteError> {
         // Publication has a decoder, but no membership-serialized proposal path
         // yet. Never let the generic raw writer bypass that compatibility boundary:
         // apply-time rejection cannot protect an older recipient's decoder.
@@ -815,100 +1286,92 @@ impl ConsensusNode {
                 "capability publication requires membership-safe negotiated submission".into(),
             ));
         }
-        match self.raft.ensure_linearizable().await {
-            Ok(_) => {}
-            Err(RaftError::Fatal(error)) => {
-                return Err(ConsensusWriteError::Fatal(Box::new(error)));
-            }
-            Err(RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward))) => {
-                return Err(ConsensusWriteError::NotLeader((&forward).into()));
-            }
-            Err(RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(error))) => {
-                return Err(ConsensusWriteError::QuorumUnavailable(error.to_string()));
-            }
-        }
-        match self.raft.client_write(ControlRequest(command)).await {
-            Ok(response) => Ok(response),
-            Err(error) => Err(client_write_error(error)),
-        }
+        // Loss of quorum never authorizes a mutation: confirm first.
+        self.confirmed_view().await?;
+        self.propose(command).await
     }
 
-    /// Confirms leadership and quorum before returning the durable state.
+    /// Confirms leadership and quorum before returning the applied state.
     ///
     /// # Errors
-    ///
-    /// Returns actionable leader guidance, quorum unavailability, fatal Raft
+    /// Returns actionable leader guidance, quorum unavailability, fatal
     /// failures, or durable state read failures.
     pub async fn linearizable_control_state(&self) -> Result<ControlState, ConsensusReadError> {
-        match self.raft.ensure_linearizable().await {
-            Ok(_) => self
-                .persisted_control_state()
-                .map_err(ConsensusReadError::Storage),
-            Err(error) => match error {
-                RaftError::Fatal(error) => Err(ConsensusReadError::Fatal(Box::new(error))),
-                RaftError::APIError(CheckIsLeaderError::ForwardToLeader(forward)) => {
-                    Err(ConsensusReadError::NotLeader((&forward).into()))
-                }
-                RaftError::APIError(CheckIsLeaderError::QuorumNotEnough(error)) => {
-                    Err(ConsensusReadError::QuorumUnavailable(error.to_string()))
-                }
-            },
-        }
+        self.confirmed_view().await.map(|view| view.state)
     }
 
-    /// Returns a durable state-machine view without a quorum confirmation.
+    /// The durably applied state without a quorum confirmation.
     ///
     /// Callers must explicitly label this result stale when presenting it.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the durable state machine cannot be decoded.
-    pub fn persisted_control_state(&self) -> Result<ControlState, ConsensusStorageError> {
-        self.storage
-            .state_machine()
-            .map(|state_machine: ConsensusStateMachine| state_machine.control_state().clone())
+    #[must_use]
+    pub fn persisted_control_state(&self) -> ControlState {
+        self.inner.applied.get().state
     }
 
     /// The control revision applied now.
-    ///
-    /// # Errors
-    ///
-    /// Returns a storage error when the state machine cannot be read.
-    pub fn control_revision(&self) -> Result<u64, ConsensusStorageError> {
-        self.storage
-            .state_machine()
-            .map(|state_machine: ConsensusStateMachine| state_machine.control_state().revision)
-    }
-
-    /// The node's Raft metrics as they change (the applied log among them).
     #[must_use]
-    pub fn metrics_watch(
-        &self,
-    ) -> tokio::sync::watch::Receiver<openraft::RaftMetrics<NodeId, openraft::BasicNode>> {
-        self.raft.metrics()
+    pub fn control_revision(&self) -> u64 {
+        *self.inner.applied.revision.borrow()
     }
 
-    /// Gracefully stops the node and waits for its Raft task to exit.
+    /// The applied control revision as it changes.
+    #[must_use]
+    pub fn revision_watch(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.inner.applied.revision.subscribe()
+    }
+
+    /// Stops admission, waits for in-flight calls, and releases durable
+    /// ownership of the store.
     ///
     /// # Errors
-    ///
-    /// Returns the host runtime join failure if the Raft task cannot be joined.
-    pub async fn shutdown(
-        &self,
-    ) -> Result<(), <openraft::TokioRuntime as openraft::AsyncRuntime>::JoinError> {
-        self.raft.shutdown().await
+    /// Reports in-flight calls that outlived the bounded wait (durable
+    /// ownership is then released when they finish).
+    pub async fn shutdown(&self) -> Result<(), String> {
+        let Some(mut driver) = self
+            .inner
+            .driver
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        else {
+            return Ok(());
+        };
+        self.inner
+            .rpc
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        for task in self
+            .inner
+            .background
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain(..)
+        {
+            task.abort();
+        }
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
+        let driver = loop {
+            match Arc::try_unwrap(driver) {
+                Ok(driver) => break driver,
+                Err(shared) if tokio::time::Instant::now() < deadline => {
+                    driver = shared;
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(_) => {
+                    return Err("in-flight consensus calls outlived the shutdown deadline".into());
+                }
+            }
+        };
+        driver.shutdown().await;
+        Ok(())
     }
 }
 
-fn client_write_error(
-    error: RaftError<NodeId, openraft::error::ClientWriteError<NodeId, BasicNode>>,
-) -> ConsensusWriteError {
-    error.forward_to_leader::<BasicNode>().cloned().map_or_else(
-        || match error {
-            RaftError::Fatal(error) => ConsensusWriteError::Fatal(Box::new(error)),
-            RaftError::APIError(error) => ConsensusWriteError::Membership(error.to_string()),
-        },
-        |forward| ConsensusWriteError::NotLeader((&forward).into()),
+fn stopped(reason: Option<StopReason>) -> String {
+    reason.map_or_else(
+        || "consensus engine stopped".to_string(),
+        |reason| format!("consensus engine stopped: {reason:?}"),
     )
 }
 
@@ -921,1609 +1384,8 @@ fn control_read_error(error: ConsensusReadError) -> ControlServiceError {
         ConsensusReadError::QuorumUnavailable(reason) => {
             ControlServiceError::QuorumUnavailable { reason }
         }
-        ConsensusReadError::Fatal(error) => ControlServiceError::Internal {
-            reason: error.to_string(),
-        },
-        ConsensusReadError::Storage(error) => ControlServiceError::Internal {
-            reason: error.to_string(),
-        },
-    }
-}
-
-fn consensus_config(cluster_id: &str) -> Result<Arc<Config>, ConsensusRuntimeError> {
-    let config = Config {
-        cluster_name: cluster_id.to_owned(),
-        // Authenticated peer RPCs include service dispatch and durable storage;
-        // allow those operations to finish before treating a healthy leader as lost.
-        heartbeat_interval: 100,
-        election_timeout_min: 750,
-        election_timeout_max: 1500,
-        snapshot_policy: SnapshotPolicy::LogsSinceLast(SNAPSHOT_LOG_THRESHOLD),
-        max_in_snapshot_log_to_keep: 0,
-        purge_batch_size: 64,
-        ..Config::default()
-    }
-    .validate()
-    .map_err(|error| ConsensusRuntimeError::Configuration(error.to_string()))?;
-    Ok(Arc::new(config))
-}
-
-fn membership_epoch(membership: &openraft::StoredMembership<NodeId, BasicNode>) -> Option<String> {
-    membership.log_id().map(|log| {
-        format!(
-            "{}:{}:{}",
-            log.leader_id.term, log.leader_id.node_id, log.index
-        )
-    })
-}
-
-#[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
-    use crate::control_codec::{
-        FeatureActivationCommand, decode_control_response, encode_control_command,
-    };
-    use crate::membership::{ClusterId, NodeIdentity};
-    use bmux_cluster_plugin_api::cluster_types::{
-        ClusterConsensusRole, ClusterNodeCapabilities, CommandId, ControlCommand,
-        ControlCommandRequest, WorkspaceId,
-    };
-    use openraft::error::{RPCError, RemoteError, Unreachable};
-    use openraft::network::{RPCOption, RaftNetwork};
-    use openraft::raft::{
-        AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
-        InstallSnapshotResponse, VoteRequest, VoteResponse,
-    };
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::io;
-    use std::sync::RwLock;
-    use std::time::Duration;
-    use tempfile::TempDir;
-
-    type RegisteredNode = (BasicNode, openraft::Raft<ControlRaftConfig>);
-
-    #[derive(Clone, Default)]
-    pub struct InMemoryNetworkFactory {
-        nodes: Arc<RwLock<BTreeMap<NodeId, RegisteredNode>>>,
-    }
-
-    impl InMemoryNetworkFactory {
-        pub fn unregister(&self, id: NodeId) {
-            self.nodes
-                .write()
-                .expect("network registry lock poisoned")
-                .remove(&id);
+        ConsensusReadError::Fatal(reason) | ConsensusReadError::Storage(reason) => {
+            ControlServiceError::Internal { reason }
         }
-
-        pub fn register(
-            &self,
-            id: NodeId,
-            node: BasicNode,
-            raft: openraft::Raft<ControlRaftConfig>,
-        ) {
-            self.nodes
-                .write()
-                .expect("network registry lock poisoned")
-                .insert(id, (node, raft));
-        }
-    }
-
-    pub struct InMemoryNetwork {
-        target: NodeId,
-        expected: BasicNode,
-        nodes: Arc<RwLock<BTreeMap<NodeId, RegisteredNode>>>,
-    }
-
-    #[allow(clippy::result_large_err)] // OpenRaft's transport error preserves typed remote context.
-    impl InMemoryNetwork {
-        fn remote<E: std::error::Error>(
-            &self,
-        ) -> Result<openraft::Raft<ControlRaftConfig>, RPCError<NodeId, BasicNode, E>> {
-            let Some((actual, raft)) = self
-                .nodes
-                .read()
-                .expect("network registry lock poisoned")
-                .get(&self.target)
-                .cloned()
-            else {
-                return Err(Unreachable::new(&io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "target node is not registered",
-                ))
-                .into());
-            };
-            if actual != self.expected {
-                return Err(Unreachable::new(&io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "target node identity does not match its registered endpoint",
-                ))
-                .into());
-            }
-            Ok(raft)
-        }
-    }
-
-    impl RaftNetworkFactory<ControlRaftConfig> for InMemoryNetworkFactory {
-        type Network = InMemoryNetwork;
-
-        fn new_client(
-            &mut self,
-            target: NodeId,
-            node: &BasicNode,
-        ) -> impl std::future::Future<Output = Self::Network> {
-            std::future::ready(InMemoryNetwork {
-                target,
-                expected: node.clone(),
-                nodes: self.nodes.clone(),
-            })
-        }
-    }
-
-    impl RaftNetwork<ControlRaftConfig> for InMemoryNetwork {
-        async fn append_entries(
-            &mut self,
-            rpc: AppendEntriesRequest<ControlRaftConfig>,
-            _option: RPCOption,
-        ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>>
-        {
-            let remote = self.remote()?;
-            remote.append_entries(rpc).await.map_err(|error| {
-                RemoteError::new_with_node(self.target, self.expected.clone(), error).into()
-            })
-        }
-
-        async fn install_snapshot(
-            &mut self,
-            rpc: InstallSnapshotRequest<ControlRaftConfig>,
-            _option: RPCOption,
-        ) -> Result<
-            InstallSnapshotResponse<NodeId>,
-            RPCError<NodeId, BasicNode, RaftError<NodeId, openraft::error::InstallSnapshotError>>,
-        > {
-            let remote = self.remote()?;
-            remote.install_snapshot(rpc).await.map_err(|error| {
-                RemoteError::new_with_node(self.target, self.expected.clone(), error).into()
-            })
-        }
-
-        async fn vote(
-            &mut self,
-            rpc: VoteRequest<NodeId>,
-            _option: RPCOption,
-        ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-            let remote = self.remote()?;
-            remote.vote(rpc).await.map_err(|error| {
-                RemoteError::new_with_node(self.target, self.expected.clone(), error).into()
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn bounded_submission_requires_activation_and_preserves_legacy_path() {
-        let root = TempDir::new().unwrap();
-        let identity = crate::membership::NodeIdentity::new_for_test(93);
-        let cluster: crate::membership::ClusterId = "cluster:00000000-0000-0000-0000-000000000093"
-            .parse()
-            .unwrap();
-        let node = ConsensusNode::start(
-            root.path(),
-            &cluster.to_string(),
-            *identity.node_id(),
-            InMemoryNetworkFactory::default(),
-        )
-        .await
-        .unwrap();
-        assert!(!node.is_initialized().await.unwrap());
-        node.initialize_single(*identity.node_id(), "memory://bounded")
-            .await
-            .unwrap();
-        assert!(node.is_initialized().await.unwrap());
-        wait_for_leader(&[&node]).await;
-        assert!(matches!(
-            node.mutate_bounded(command(1, 0)).await,
-            Err(ControlServiceError::Rejected { .. })
-        ));
-        assert_eq!(node.persisted_control_state().unwrap().revision, 0);
-        // The old path does not implicitly opt into the new feature.
-        node.mutate(command(1, 0)).await.unwrap();
-        assert!(matches!(
-            node.activate_feature(FeatureActivationCommand {
-                principal_id: "principal:test".into(),
-                command_id: CommandId {
-                    value: uuid::Uuid::from_u128(898)
-                },
-                issued_at_unix_ms: 0,
-                expected_control_revision: 1,
-                read_schema_floor: 2,
-                write_schema_floor: 2,
-                feature: "bounded-control-command-v1".into(),
-            })
-            .await,
-            Err(ControlServiceError::Rejected { .. })
-        ));
-        let member = crate::membership::issue_test_member(
-            &identity,
-            cluster,
-            &identity,
-            "tls://127.0.0.1:49993",
-            crate::membership::initializer_capabilities(),
-            42,
-        );
-        let mut publish = command(899, 0);
-        publish.request = ControlCommandRequest::UpsertMember { member };
-        node.mutate(publish).await.unwrap();
-        node.activate_feature(FeatureActivationCommand {
-            principal_id: "principal:test".into(),
-            command_id: CommandId {
-                value: uuid::Uuid::from_u128(900),
-            },
-            issued_at_unix_ms: 0,
-            expected_control_revision: 2,
-            read_schema_floor: 2,
-            write_schema_floor: 2,
-            feature: "bounded-control-command-v1".into(),
-        })
-        .await
-        .unwrap();
-        let accepted = node.mutate_bounded(command(2, 2)).await.unwrap();
-        let retried = node.mutate_bounded(command(2, 2)).await.unwrap();
-        assert_eq!(accepted, retried);
-        let revision = node.persisted_control_state().unwrap().revision;
-        let mut oversized = command(3, 3);
-        oversized.request = ControlCommandRequest::CompleteWorkflow {
-            original_command_id: CommandId {
-                value: uuid::Uuid::from_u128(99),
-            },
-            response: vec![0; 1_048_576],
-        };
-        assert!(matches!(
-            node.mutate_bounded(oversized).await,
-            Err(ControlServiceError::Rejected { .. })
-        ));
-        assert_eq!(node.persisted_control_state().unwrap().revision, revision);
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn bootstrap_submission_rejects_uninitialized_authority() {
-        use bmux_cluster_plugin_api::cluster_principal_bootstrap_types::{
-            BootstrapProof, BootstrapStatement,
-        };
-        let root = TempDir::new().unwrap();
-        let node = ConsensusNode::start(
-            root.path(),
-            "bootstrap-test",
-            NodeId::from(91),
-            InMemoryNetworkFactory::default(),
-        )
-        .await
-        .unwrap();
-        let result = node
-            .bootstrap_principal(
-                BootstrapProof {
-                    statement: BootstrapStatement {
-                        schema_version: 1,
-                        cluster_id: "bootstrap-test".into(),
-                        membership_term: 0,
-                        membership_leader_id: NodeId::from(91).to_string(),
-                        membership_log_index: 0,
-                        principal_id: uuid::Uuid::new_v4(),
-                        principal_public_key: String::new(),
-                        command_id: bmux_cluster_plugin_api::cluster_types::CommandId {
-                            value: uuid::Uuid::new_v4(),
-                        },
-                    },
-                    principal_signature: Vec::new(),
-                    voter_approvals: Vec::new(),
-                },
-                0,
-            )
-            .await;
-        assert!(matches!(result, Err(ControlServiceError::NotLeader { .. })));
-        assert!(
-            node.persisted_control_state()
-                .unwrap()
-                .principal_bootstrap
-                .is_none()
-        );
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn refresh_submission_requires_quorum_and_activation() {
-        use crate::membership::{
-            ClusterId, NodeIdentity, initializer_capabilities, issue_test_member,
-        };
-        let root = TempDir::new().unwrap();
-        let identity = NodeIdentity::new_for_test(92);
-        let cluster: ClusterId = "cluster:00000000-0000-0000-0000-000000000092"
-            .parse()
-            .unwrap();
-        let node = ConsensusNode::start(
-            root.path(),
-            &cluster.to_string(),
-            *identity.node_id(),
-            InMemoryNetworkFactory::default(),
-        )
-        .await
-        .unwrap();
-        let member = issue_test_member(
-            &identity,
-            cluster,
-            &identity,
-            "tls://127.0.0.1:49992",
-            initializer_capabilities(),
-            42,
-        );
-        let submit = || {
-            node.refresh_member_protocol(
-                CommandId {
-                    value: uuid::Uuid::new_v4(),
-                },
-                member.clone(),
-                member.credential_serial.clone(),
-                0,
-                vec![0; 64],
-            )
-        };
-        assert!(matches!(
-            submit().await,
-            Err(ControlServiceError::NotLeader { .. })
-        ));
-        node.initialize_single(*identity.node_id(), "node")
-            .await
-            .unwrap();
-        wait_for_leader(&[&node]).await;
-        assert!(matches!(
-            submit().await,
-            Err(ControlServiceError::Rejected { .. })
-        ));
-        assert_eq!(node.persisted_control_state().unwrap().revision, 0);
-        node.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn raw_publication_write_cannot_bypass_compatibility_gate() {
-        let root = TempDir::new().unwrap();
-        let node = ConsensusNode::start(
-            root.path(),
-            "publication-gate",
-            NodeId::from(95),
-            InMemoryNetworkFactory::default(),
-        )
-        .await
-        .unwrap();
-        node.initialize_single(NodeId::from(95), "node")
-            .await
-            .unwrap();
-        wait_for_leader(&[&node]).await;
-        assert!(matches!(
-            node.publish_capabilities(Vec::new()).await,
-            Err(ControlServiceError::RuntimeUnavailable { .. })
-        ));
-        let before = node.persisted_control_state().unwrap();
-        let result = node.write(b"BMCAP001".to_vec()).await;
-        assert!(
-            matches!(result, Err(ConsensusWriteError::Membership(reason)) if reason == "capability publication requires membership-safe negotiated submission")
-        );
-        assert_eq!(node.persisted_control_state().unwrap(), before);
-        node.shutdown().await.unwrap();
-    }
-
-    pub async fn wait_for_leader(nodes: &[&ConsensusNode]) -> NodeId {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                for node in nodes {
-                    // Election hints may precede a working quorum after links recover.
-                    if node.raft().current_leader().await == Some(node.node_id())
-                        && node.raft().ensure_linearizable().await.is_ok()
-                    {
-                        return node.node_id();
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("cluster should elect a leader")
-    }
-
-    pub async fn wait_for_leader_excluding(nodes: &[&ConsensusNode], excluded: NodeId) -> NodeId {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                for node in nodes {
-                    if node.node_id() != excluded
-                        && node.raft().current_leader().await == Some(node.node_id())
-                        && node.raft().ensure_linearizable().await.is_ok()
-                    {
-                        return node.node_id();
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("surviving quorum should elect a replacement leader")
-    }
-
-    fn command(id: u128, workspace: u128) -> ControlCommand {
-        ControlCommand {
-            schema_version: 1,
-            principal_id: "principal:test".to_string(),
-            command_id: CommandId {
-                value: uuid::Uuid::from_u128(id),
-            },
-            issued_at_unix_ms: u64::try_from(id).unwrap(),
-            request: ControlCommandRequest::CreateWorkspace {
-                workspace_id: WorkspaceId {
-                    value: uuid::Uuid::from_u128(workspace),
-                },
-                name: Some(format!("workspace-{workspace}")),
-            },
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[allow(clippy::too_many_lines)] // One scenario intentionally spans formation through failover.
-    async fn three_voters_replicate_dedup_and_resume_after_leader_shutdown() {
-        let network = InMemoryNetworkFactory::default();
-        let roots = [
-            TempDir::new().unwrap(),
-            TempDir::new().unwrap(),
-            TempDir::new().unwrap(),
-        ];
-        let ids = [NodeId::from(1), NodeId::from(2), NodeId::from(3)];
-        let endpoints = ["memory://one", "memory://two", "memory://three"];
-        let mut nodes = Vec::new();
-        for index in 0..3 {
-            let node = ConsensusNode::start(
-                roots[index].path(),
-                "cluster-runtime-test",
-                ids[index],
-                network.clone(),
-            )
-            .await
-            .unwrap();
-            network.register(
-                ids[index],
-                BasicNode::new(endpoints[index]),
-                node.raft().clone(),
-            );
-            nodes.push(node);
-        }
-
-        nodes[0]
-            .initialize_single(ids[0], endpoints[0])
-            .await
-            .unwrap();
-        assert_eq!(wait_for_leader(&[&nodes[0]]).await, ids[0]);
-        nodes[0]
-            .raft()
-            .add_learner(ids[1], BasicNode::new(endpoints[1]), true)
-            .await
-            .unwrap();
-        nodes[0]
-            .raft()
-            .add_learner(ids[2], BasicNode::new(endpoints[2]), true)
-            .await
-            .unwrap();
-        nodes[0]
-            .raft()
-            .change_membership(BTreeSet::from(ids), false)
-            .await
-            .unwrap();
-
-        let first = command(1, 10);
-        let encoded = encode_control_command(&first);
-        let response = nodes[0].write(encoded.clone()).await.unwrap();
-        let decoded = decode_control_response(&response.data.0).unwrap();
-        assert_eq!(decoded.command_id, first.command_id);
-        let replay = nodes[0].write(encoded).await.unwrap();
-        assert_eq!(replay.data, response.data);
-
-        let follower = &nodes[1];
-        assert!(matches!(
-            follower.write(encode_control_command(&command(99, 99))).await,
-            Err(ConsensusWriteError::NotLeader(NotLeader {
-                leader_id: Some(id),
-                leader_endpoint: Some(endpoint),
-            })) if id == ids[0] && endpoint == endpoints[0]
-        ));
-        let linear = nodes[0].read_linearizable_view().await.unwrap();
-        assert_eq!(linear.consistency, ControlReadConsistency::Linearizable);
-        assert!(
-            linear
-                .workspaces
-                .iter()
-                .any(|workspace| workspace.workspace_id.value == first_workspace())
-        );
-        let stale = follower.read_stale_view().unwrap();
-        assert_eq!(stale.consistency, ControlReadConsistency::Stale);
-        assert!(matches!(
-            follower.linearizable_control_state().await,
-            Err(ConsensusReadError::NotLeader(NotLeader {
-                leader_id: Some(id),
-                leader_endpoint: Some(endpoint),
-            })) if id == ids[0] && endpoint == endpoints[0]
-        ));
-
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if nodes.iter().all(|node| {
-                    node.persisted_control_state()
-                        .is_ok_and(|state| state.workspaces.contains_key(&first_workspace()))
-                }) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("all voters should apply the first command");
-
-        nodes[0].shutdown().await.unwrap();
-        let replacement = wait_for_leader_excluding(&[&nodes[1], &nodes[2]], ids[0]).await;
-        assert_ne!(replacement, ids[0]);
-        let leader = if replacement == ids[1] {
-            &nodes[1]
-        } else {
-            &nodes[2]
-        };
-        let second = command(2, 20);
-        leader.write(encode_control_command(&second)).await.unwrap();
-        let linear = leader.read_linearizable_view().await.unwrap();
-        assert!(
-            linear
-                .workspaces
-                .iter()
-                .any(|workspace| workspace.workspace_id.value == second_workspace())
-        );
-
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if nodes[1..].iter().all(|node| {
-                    node.persisted_control_state()
-                        .is_ok_and(|state| state.workspaces.contains_key(&second_workspace()))
-                }) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("surviving quorum should apply a command after leader loss");
-
-        nodes[1].shutdown().await.unwrap();
-        nodes[2].shutdown().await.unwrap();
-    }
-
-    #[allow(clippy::too_many_lines)] // Integration test keeps one three-voter lifecycle explicit.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn three_voters_activate_feature_floor_and_continue_v1_writes() {
-        let network = InMemoryNetworkFactory::default();
-        let roots = [
-            TempDir::new().unwrap(),
-            TempDir::new().unwrap(),
-            TempDir::new().unwrap(),
-        ];
-        let ids = [NodeId::from(31), NodeId::from(32), NodeId::from(33)];
-        let endpoints = ["memory://f1", "memory://f2", "memory://f3"];
-        let mut nodes = Vec::new();
-        for index in 0..3 {
-            let node = ConsensusNode::start(
-                roots[index].path(),
-                "cluster-feature-floor-test",
-                ids[index],
-                network.clone(),
-            )
-            .await
-            .unwrap();
-            network.register(
-                ids[index],
-                BasicNode::new(endpoints[index]),
-                node.raft().clone(),
-            );
-            nodes.push(node);
-        }
-        nodes[0]
-            .initialize_single(ids[0], endpoints[0])
-            .await
-            .unwrap();
-        // Initialization admits election; membership writes require a ready leader.
-        assert_eq!(wait_for_leader(&[&nodes[0]]).await, ids[0]);
-        nodes[0]
-            .change_voters(BTreeMap::from([
-                (ids[0], BasicNode::new(endpoints[0])),
-                (ids[1], BasicNode::new(endpoints[1])),
-                (ids[2], BasicNode::new(endpoints[2])),
-            ]))
-            .await
-            .unwrap();
-        let leader_id = wait_for_leader(&nodes.iter().collect::<Vec<_>>()).await;
-        let leader = nodes
-            .iter()
-            .find(|node| node.node_id() == leader_id)
-            .unwrap();
-
-        let issuer = NodeIdentity::new_for_test(70);
-        let cluster_id = ClusterId::generate();
-        let now = crate::now_unix_ms();
-        for (index, id) in ids.into_iter().enumerate() {
-            let identity = NodeIdentity::new_for_test(80 + u64::try_from(index).unwrap());
-            let mut member = crate::membership::issue_test_member(
-                &issuer,
-                cluster_id,
-                &identity,
-                endpoints[index],
-                ClusterNodeCapabilities {
-                    consensus_role: ClusterConsensusRole::Voter,
-                    worker: true,
-                    ingress: true,
-                },
-                now,
-            );
-            member.node_id = id.to_string();
-            member.public_key = identity.public_key().to_string();
-            member.credential_signature.clear();
-            member = crate::membership::issue_test_member_with_protocol(
-                &issuer,
-                cluster_id,
-                &identity,
-                endpoints[index],
-                member.capabilities,
-                member.negotiated_protocol,
-                now,
-            );
-            // Test NodeId values are not derived from the test identities, so
-            // re-key the signed record to the committed Raft id and skip the
-            // service eligibility layer here; the state-machine integration
-            // below proves replication and migration of the schema-2 envelope.
-            member.node_id = id.to_string();
-            let response = leader
-                .mutate(ControlCommand {
-                    schema_version: 1,
-                    principal_id: "principal:test".to_string(),
-                    command_id: CommandId {
-                        value: uuid::Uuid::from_u128(300 + u128::try_from(index).unwrap()),
-                    },
-                    issued_at_unix_ms: now,
-                    request: ControlCommandRequest::UpsertMember { member },
-                })
-                .await;
-            assert!(
-                response.is_err(),
-                "re-keyed unsigned fixture must fail closed"
-            );
-        }
-
-        let activation = FeatureActivationCommand {
-            principal_id: "principal:test".to_string(),
-            command_id: CommandId {
-                value: uuid::Uuid::from_u128(400),
-            },
-            issued_at_unix_ms: now,
-            expected_control_revision: 0,
-            read_schema_floor: 2,
-            write_schema_floor: 2,
-            feature: crate::membership::ATOMIC_LAYOUT_FEATURE.to_string(),
-        };
-        leader.activate_feature(activation).await.unwrap();
-        leader.mutate(command(401, 401)).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if nodes.iter().all(|node| {
-                    node.persisted_control_state().is_ok_and(|state| {
-                        state.read_schema_floor == 2
-                            && state.write_schema_floor == 2
-                            && state
-                                .activated_features
-                                .contains(crate::membership::ATOMIC_LAYOUT_FEATURE)
-                            && state.workspaces.contains_key(&uuid::Uuid::from_u128(401))
-                    })
-                }) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
-        for node in nodes {
-            node.shutdown().await.unwrap();
-        }
-    }
-
-    const fn first_workspace() -> uuid::Uuid {
-        uuid::Uuid::from_u128(10)
-    }
-
-    const fn second_workspace() -> uuid::Uuid {
-        uuid::Uuid::from_u128(20)
-    }
-
-    struct FailingCaller;
-
-    impl bmux_plugin::ServiceCaller for FailingCaller {
-        fn call_service_raw(
-            &self,
-            _capability: &str,
-            _kind: bmux_plugin_sdk::ServiceKind,
-            _interface_id: &str,
-            _operation: &str,
-            _payload: Vec<u8>,
-        ) -> bmux_plugin_sdk::Result<Vec<u8>> {
-            Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
-                operation: "call_service_raw",
-            })
-        }
-
-        fn execute_kernel_request(
-            &self,
-            _request: bmux_ipc::Request,
-        ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
-            Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
-                operation: "execute_kernel_request",
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn change_voters_catches_up_learners_and_removes_old_voters() {
-        let network = InMemoryNetworkFactory::default();
-        let roots = [
-            TempDir::new().unwrap(),
-            TempDir::new().unwrap(),
-            TempDir::new().unwrap(),
-        ];
-        let ids = [NodeId::from(81), NodeId::from(82), NodeId::from(83)];
-        let endpoints = ["memory://m1", "memory://m2", "memory://m3"];
-        let mut nodes = Vec::new();
-        for index in 0..3 {
-            let node = ConsensusNode::start(
-                roots[index].path(),
-                "cluster-voter-change-test",
-                ids[index],
-                network.clone(),
-            )
-            .await
-            .unwrap();
-            network.register(
-                ids[index],
-                BasicNode::new(endpoints[index]),
-                node.raft().clone(),
-            );
-            nodes.push(node);
-        }
-        nodes[0]
-            .initialize_single(ids[0], endpoints[0])
-            .await
-            .unwrap();
-        wait_for_leader(&[&nodes[0]]).await;
-        nodes[0]
-            .change_voters(BTreeMap::from([
-                (ids[0], BasicNode::new(endpoints[0])),
-                (ids[1], BasicNode::new(endpoints[1])),
-            ]))
-            .await
-            .unwrap();
-        assert_eq!(wait_for_leader(&[&nodes[0], &nodes[1]]).await, ids[0]);
-        let prospective = BTreeMap::from([
-            (ids[1], BasicNode::new(endpoints[1])),
-            (ids[2], BasicNode::new(endpoints[2])),
-        ]);
-        network.unregister(ids[1]);
-        network.unregister(ids[2]);
-        let failed = tokio::time::timeout(
-            Duration::from_secs(5),
-            nodes[0].change_voters(prospective.clone()),
-        )
-        .await
-        .expect("voter transition failure should be bounded")
-        .expect_err("minority must reject voter transition");
-        assert!(matches!(failed, ConsensusWriteError::QuorumUnavailable(_)));
-        assert_eq!(
-            nodes[0].committed_voter_ids(),
-            BTreeSet::from([ids[0], ids[1]])
-        );
-        for index in 1..3 {
-            network.register(
-                ids[index],
-                BasicNode::new(endpoints[index]),
-                nodes[index].raft().clone(),
-            );
-        }
-        let recovered_leader = wait_for_leader(&[&nodes[0], &nodes[1], &nodes[2]]).await;
-        let recovered_index = ids
-            .iter()
-            .position(|node_id| *node_id == recovered_leader)
-            .unwrap();
-        nodes[recovered_index]
-            .change_voters(prospective.clone())
-            .await
-            .unwrap();
-        nodes[0].shutdown().await.unwrap();
-        let replacement = wait_for_leader(&[&nodes[1], &nodes[2]]).await;
-        let replacement_index = if replacement == ids[1] { 1 } else { 2 };
-        nodes[replacement_index]
-            .change_voters(prospective)
-            .await
-            .unwrap();
-        assert!(replacement == ids[1] || replacement == ids[2]);
-        let leader = if replacement == ids[1] {
-            &nodes[1]
-        } else {
-            &nodes[2]
-        };
-        leader
-            .mutate(command(82, 820))
-            .await
-            .expect("new voter set should commit after old voter removal");
-        nodes[1].shutdown().await.unwrap();
-        nodes[2].shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn quorum_loss_rejects_writes_and_preserves_explicit_stale_reads() {
-        let network = InMemoryNetworkFactory::default();
-        let roots = [
-            TempDir::new().unwrap(),
-            TempDir::new().unwrap(),
-            TempDir::new().unwrap(),
-        ];
-        let ids = [NodeId::from(41), NodeId::from(42), NodeId::from(43)];
-        let endpoints = ["memory://q1", "memory://q2", "memory://q3"];
-        let mut nodes = Vec::new();
-        for index in 0..3 {
-            let node = ConsensusNode::start(
-                roots[index].path(),
-                "cluster-quorum-loss-test",
-                ids[index],
-                network.clone(),
-            )
-            .await
-            .unwrap();
-            network.register(
-                ids[index],
-                BasicNode::new(endpoints[index]),
-                node.raft().clone(),
-            );
-            nodes.push(node);
-        }
-
-        nodes[0]
-            .initialize_single(ids[0], endpoints[0])
-            .await
-            .unwrap();
-        wait_for_leader(&[&nodes[0]]).await;
-        for index in 1..3 {
-            nodes[0]
-                .raft()
-                .add_learner(ids[index], BasicNode::new(endpoints[index]), true)
-                .await
-                .unwrap();
-        }
-        nodes[0]
-            .raft()
-            .change_membership(BTreeSet::from(ids), false)
-            .await
-            .unwrap();
-        nodes[0]
-            .mutate(command(70, 700))
-            .await
-            .expect("quorum should commit baseline command");
-
-        nodes[1].shutdown().await.unwrap();
-        nodes[2].shutdown().await.unwrap();
-
-        let error = tokio::time::timeout(Duration::from_secs(5), nodes[0].mutate(command(71, 701)))
-            .await
-            .expect("quorum failure should be bounded")
-            .expect_err("minority leader must reject writes");
-        assert!(matches!(
-            error,
-            ControlServiceError::QuorumUnavailable { .. }
-        ));
-
-        let linear =
-            tokio::time::timeout(Duration::from_secs(5), nodes[0].read_linearizable_view())
-                .await
-                .expect("linearizable read failure should be bounded")
-                .expect_err("minority must reject linearizable reads");
-        assert!(matches!(
-            linear,
-            ControlServiceError::QuorumUnavailable { .. }
-        ));
-
-        let stale = nodes[0].read_stale_view().unwrap();
-        assert_eq!(stale.consistency, ControlReadConsistency::Stale);
-        assert!(
-            stale
-                .workspaces
-                .iter()
-                .any(|workspace| workspace.workspace_id.value == uuid::Uuid::from_u128(700))
-        );
-        assert!(
-            !stale
-                .workspaces
-                .iter()
-                .any(|workspace| workspace.workspace_id.value == uuid::Uuid::from_u128(701))
-        );
-
-        nodes[0].shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    #[allow(clippy::too_many_lines)]
-    async fn membership_publication_retries_after_quorum_restoration() {
-        let network = InMemoryNetworkFactory::default();
-        let roots = [
-            TempDir::new().unwrap(),
-            TempDir::new().unwrap(),
-            TempDir::new().unwrap(),
-        ];
-        let identities = [
-            NodeIdentity::new_for_test(51),
-            NodeIdentity::new_for_test(52),
-            NodeIdentity::new_for_test(53),
-        ];
-        let ids = identities.each_ref().map(|identity| *identity.node_id());
-        let endpoints = ["memory://p1", "memory://p2", "memory://p3"];
-        let cluster_id: ClusterId = "cluster:00000000-0000-0000-0000-000000000001"
-            .parse()
-            .unwrap();
-        let mut nodes = Vec::new();
-        for index in 0..3 {
-            let node = ConsensusNode::start(
-                roots[index].path(),
-                &cluster_id.to_string(),
-                ids[index],
-                network.clone(),
-            )
-            .await
-            .unwrap();
-            network.register(
-                ids[index],
-                BasicNode::new(endpoints[index]),
-                node.raft().clone(),
-            );
-            nodes.push(node);
-        }
-        nodes[0]
-            .initialize_single(ids[0], endpoints[0])
-            .await
-            .unwrap();
-        wait_for_leader(&[&nodes[0]]).await;
-        for index in 1..3 {
-            nodes[0]
-                .raft()
-                .add_learner(ids[index], BasicNode::new(endpoints[index]), true)
-                .await
-                .unwrap();
-        }
-        nodes[0]
-            .raft()
-            .change_membership(BTreeSet::from(ids), false)
-            .await
-            .unwrap();
-
-        let member = crate::membership::issue_test_member(
-            &identities[0],
-            cluster_id,
-            &identities[0],
-            "node-a",
-            ClusterNodeCapabilities {
-                consensus_role: ClusterConsensusRole::Voter,
-                worker: true,
-                ingress: true,
-            },
-            crate::now_unix_ms(),
-        );
-        network.unregister(ids[1]);
-        network.unregister(ids[2]);
-        let failed = tokio::time::timeout(
-            Duration::from_secs(5),
-            crate::consensus_membership::publish_members(
-                nodes[0].clone(),
-                &member.node_id,
-                [member.clone()],
-            ),
-        )
-        .await
-        .expect("publication failure should be bounded")
-        .expect_err("minority must reject membership publication");
-        assert!(failed.contains("QuorumUnavailable"));
-        assert_eq!(
-            nodes[0].read_stale_view().unwrap().members,
-            [] as [bmux_cluster_plugin_api::cluster_types::ClusterMember; 0]
-        );
-
-        for index in 1..3 {
-            network.register(
-                ids[index],
-                BasicNode::new(endpoints[index]),
-                nodes[index].raft().clone(),
-            );
-        }
-        // A successful quorum probe cannot prevent a subsequent leadership change.
-        // Retry the idempotent publication sequence, not arbitrary errors, while
-        // the restored cluster settles. The deadline keeps non-recovery fatal.
-        let view = tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                let leader_id = wait_for_leader(&nodes.iter().collect::<Vec<_>>()).await;
-                let leader = &nodes[ids.iter().position(|id| *id == leader_id).unwrap()];
-                let attempt = async {
-                    for _ in 0..2 {
-                        crate::consensus_membership::publish_members(
-                            leader.clone(),
-                            &member.node_id,
-                            [member.clone()],
-                        )
-                        .await?;
-                    }
-                    leader
-                        .read_linearizable_view()
-                        .await
-                        .map_err(|error| format!("{error:?}"))
-                }
-                .await;
-                match attempt {
-                    Ok(view) => break view,
-                    Err(error) if error.contains("NotLeader") => {
-                        tokio::time::sleep(Duration::from_millis(20)).await;
-                    }
-                    Err(error) => panic!("publication after quorum restoration failed: {error}"),
-                }
-            }
-        })
-        .await
-        .expect("restored quorum should accept membership publication");
-        assert_eq!(view.members, vec![member]);
-
-        for node in nodes {
-            node.shutdown().await.unwrap();
-        }
-    }
-
-    async fn assert_bootstrap_activation_service(node: &ConsensusNode, id: NodeId) {
-        use bmux_cluster_plugin_api::cluster_control_command_v2::ClusterControlCommandService;
-        let registry = crate::consensus_network::ConsensusNodeRegistry::default();
-        registry.insert(id, node.clone()).unwrap();
-        let service = crate::consensus_network::ControlServiceHandle::new(
-            Arc::new(FailingCaller),
-            id,
-            registry.clone(),
-        );
-        let revision = node.linearizable_control_state().await.unwrap().revision;
-        let command_id = bmux_cluster_plugin_api::cluster_types::CommandId {
-            value: uuid::Uuid::new_v4(),
-        };
-        let now = crate::now_unix_ms();
-        let first = service
-            .activate_feature(
-                command_id.clone(),
-                id.to_string(),
-                now,
-                revision,
-                3,
-                3,
-                "principal-bootstrap-v1".into(),
-            )
-            .await
-            .unwrap();
-        let retry = service
-            .activate_feature(
-                command_id.clone(),
-                id.to_string(),
-                now,
-                revision,
-                3,
-                3,
-                "principal-bootstrap-v1".into(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(first, retry);
-        let conflict = service
-            .activate_feature(
-                command_id,
-                id.to_string(),
-                now,
-                revision,
-                3,
-                3,
-                "different-feature".into(),
-            )
-            .await;
-        assert!(matches!(
-            conflict,
-            Err(ControlServiceError::Rejected {
-                error:
-                    bmux_cluster_plugin_api::cluster_types::ControlCommandError::CommandIdConflict
-            })
-        ));
-        registry.remove(id).unwrap();
-    }
-
-    #[tokio::test]
-    async fn bootstrap_commit_survives_restart_and_preserves_retry_revision() {
-        use crate::membership::{
-            ClusterId, NodeIdentity, initializer_capabilities, issue_test_member,
-        };
-        use bmux_cluster_plugin_api::cluster_principal_bootstrap_types::{
-            BootstrapProof, BootstrapStatement, VoterApproval,
-        };
-        let root = TempDir::new().unwrap();
-        let network = InMemoryNetworkFactory::default();
-        let identity = NodeIdentity::new_for_test(95);
-        let id = *identity.node_id();
-        let cluster: ClusterId = "cluster:00000000-0000-0000-0000-000000000095"
-            .parse()
-            .unwrap();
-        let node = ConsensusNode::start(root.path(), &cluster.to_string(), id, network.clone())
-            .await
-            .unwrap();
-        node.initialize_single(id, "tls://127.0.0.1:49995")
-            .await
-            .unwrap();
-        wait_for_leader(&[&node]).await;
-        let member = issue_test_member(
-            &identity,
-            cluster,
-            &identity,
-            "tls://127.0.0.1:49995",
-            initializer_capabilities(),
-            crate::now_unix_ms(),
-        );
-        crate::consensus_membership::publish_members(node.clone(), &id.to_string(), [member])
-            .await
-            .unwrap();
-        assert_bootstrap_activation_service(&node, id).await;
-        let snapshot = node.storage.state_machine().unwrap();
-        let membership = snapshot.committed_membership().log_id().unwrap();
-        let key = iroh::SecretKey::from_bytes(&[95; 32]);
-        let statement = BootstrapStatement {
-            schema_version: 1,
-            cluster_id: cluster.to_string(),
-            membership_term: membership.leader_id.term,
-            membership_leader_id: membership.leader_id.node_id.to_string(),
-            membership_log_index: membership.index,
-            principal_id: uuid::Uuid::new_v4(),
-            principal_public_key: key.public().to_string(),
-            command_id: bmux_cluster_plugin_api::cluster_types::CommandId {
-                value: uuid::Uuid::new_v4(),
-            },
-        };
-        let payload = crate::principal_bootstrap::signing_payload(&statement).unwrap();
-        let proof = BootstrapProof {
-            statement,
-            principal_signature: key.sign(&payload).to_bytes().to_vec(),
-            voter_approvals: vec![VoterApproval {
-                node_id: id.to_string(),
-                signature: identity.sign(&payload),
-            }],
-        };
-        let revision = snapshot.control_state().revision;
-        drop(snapshot);
-        let result = node
-            .bootstrap_principal(proof.clone(), revision)
-            .await
-            .unwrap();
-        assert_eq!(result.control_revision, revision + 1);
-        node.shutdown().await.unwrap();
-        drop(node);
-        let recovered = ConsensusNode::start(root.path(), &cluster.to_string(), id, network)
-            .await
-            .unwrap();
-        wait_for_leader(&[&recovered]).await;
-        assert_eq!(
-            recovered
-                .bootstrap_principal(proof.clone(), revision)
-                .await
-                .unwrap(),
-            result
-        );
-        let mut conflict = proof;
-        conflict.statement.principal_id = uuid::Uuid::new_v4();
-        assert!(
-            recovered
-                .bootstrap_principal(conflict, revision)
-                .await
-                .is_err()
-        );
-        recovered.shutdown().await.unwrap();
-    }
-
-    // Keep the complete add/remove/restart scenario together so epoch and
-    // authority assertions remain adjacent to the operations they protect.
-    #[allow(clippy::too_many_lines)]
-    #[tokio::test]
-    async fn signed_voter_transitions_commit_and_replay_fails_after_restart() {
-        use crate::consensus_membership::{authorize_voter_change, removal_plan};
-        use crate::membership::{
-            ClusterId, NodeIdentity, initializer_capabilities, issue_test_member,
-        };
-        use bmux_cluster_plugin_api::cluster_types::ConsensusVoterChangeAction;
-        let roots = [TempDir::new().unwrap(), TempDir::new().unwrap()];
-        let identities = [
-            NodeIdentity::new_for_test(91),
-            NodeIdentity::new_for_test(92),
-        ];
-        let ids = [*identities[0].node_id(), *identities[1].node_id()];
-        let endpoints = ["tls://127.0.0.1:49991", "tls://127.0.0.1:49992"];
-        let cluster: ClusterId = "cluster:00000000-0000-0000-0000-000000000091"
-            .parse()
-            .unwrap();
-        let network = InMemoryNetworkFactory::default();
-        let mut nodes = Vec::new();
-        for index in 0..2 {
-            let node = ConsensusNode::start(
-                roots[index].path(),
-                &cluster.to_string(),
-                ids[index],
-                network.clone(),
-            )
-            .await
-            .unwrap();
-            network.register(
-                ids[index],
-                BasicNode::new(endpoints[index]),
-                node.raft().clone(),
-            );
-            nodes.push(node);
-        }
-        nodes[0]
-            .initialize_single(ids[0], endpoints[0])
-            .await
-            .unwrap();
-        wait_for_leader(&[&nodes[0]]).await;
-        let current = vec![issue_test_member(
-            &identities[0],
-            cluster,
-            &identities[0],
-            endpoints[0],
-            initializer_capabilities(),
-            crate::now_unix_ms(),
-        )];
-        crate::consensus_membership::publish_members(
-            nodes[0].clone(),
-            &ids[0].to_string(),
-            current.clone(),
-        )
-        .await
-        .unwrap();
-        let target = issue_test_member(
-            &identities[0],
-            cluster,
-            &identities[1],
-            endpoints[1],
-            initializer_capabilities(),
-            crate::now_unix_ms(),
-        );
-        let proposed = vec![current[0].clone(), target];
-        let epoch = nodes[0]
-            .read_linearizable_view()
-            .await
-            .unwrap()
-            .membership_epoch
-            .unwrap();
-        let add = authorize_voter_change(
-            &cluster.to_string(),
-            ConsensusVoterChangeAction::Add,
-            &ids[1].to_string(),
-            &identities[0],
-            &epoch,
-            &current,
-            &proposed,
-        )
-        .unwrap();
-        let mut altered = proposed.clone();
-        altered[1].endpoint = Some("tls://127.0.0.1:49993".into());
-        assert!(
-            nodes[0]
-                .apply_voter_transition(&add, altered)
-                .await
-                .is_err()
-        );
-        assert_eq!(nodes[0].committed_voter_ids(), BTreeSet::from([ids[0]]));
-        let wire = bmux_plugin_sdk::encode_service_message(
-            &bmux_cluster_plugin_api::cluster_command::client::ConsensusReconcileMembersRequest {
-                members: proposed.clone(),
-                authorization: add.clone(),
-            },
-        )
-        .unwrap();
-        let request: bmux_cluster_plugin_api::cluster_command::client::ConsensusReconcileMembersRequest =
-            bmux_plugin_sdk::decode_service_message(&wire).unwrap();
-        nodes[0]
-            .apply_voter_transition(&request.authorization, request.members)
-            .await
-            .unwrap();
-        assert_eq!(nodes[0].committed_voter_ids(), BTreeSet::from(ids));
-        assert!(
-            nodes[0]
-                .apply_voter_transition(&add, proposed.clone())
-                .await
-                .is_err()
-        );
-        let promoted = nodes[0].read_linearizable_view().await.unwrap();
-        let acknowledgement = authorize_voter_change(
-            &cluster.to_string(),
-            ConsensusVoterChangeAction::Add,
-            &ids[1].to_string(),
-            &identities[0],
-            promoted.membership_epoch.as_deref().unwrap(),
-            &promoted.members,
-            &promoted.members,
-        )
-        .unwrap();
-        nodes[0]
-            .apply_voter_transition(&acknowledgement, promoted.members.clone())
-            .await
-            .unwrap();
-        let acknowledged = nodes[0].read_linearizable_view().await.unwrap();
-        assert_eq!(acknowledged.membership_epoch, promoted.membership_epoch);
-        assert_eq!(acknowledged.revision, promoted.revision);
-        let removed = removal_plan(&proposed, &ids[1].to_string()).unwrap();
-        let epoch = nodes[0]
-            .read_linearizable_view()
-            .await
-            .unwrap()
-            .membership_epoch
-            .unwrap();
-        let remove = authorize_voter_change(
-            &cluster.to_string(),
-            ConsensusVoterChangeAction::Remove,
-            &ids[1].to_string(),
-            &identities[0],
-            &epoch,
-            &proposed,
-            &removed,
-        )
-        .unwrap();
-        nodes[0]
-            .apply_voter_transition(&remove, removed.clone())
-            .await
-            .unwrap();
-        assert_eq!(nodes[0].committed_voter_ids(), BTreeSet::from([ids[0]]));
-        let committed = nodes[0].read_linearizable_view().await.unwrap();
-        let expected_digest = crate::control_codec::canonical_members_digest(&removed).unwrap();
-        assert_eq!(
-            crate::control_codec::canonical_members_digest(&committed.members).unwrap(),
-            expected_digest,
-        );
-        assert_ne!(
-            committed.membership_epoch.as_deref(),
-            Some(add.membership_epoch.as_str())
-        );
-        assert_ne!(
-            committed.membership_epoch.as_deref(),
-            Some(remove.membership_epoch.as_str())
-        );
-        for node in &nodes {
-            node.shutdown().await.unwrap();
-        }
-        for id in ids {
-            network.unregister(id);
-        }
-        drop(nodes);
-        let recovered = ConsensusNode::start(
-            roots[0].path(),
-            &cluster.to_string(),
-            ids[0],
-            network.clone(),
-        )
-        .await
-        .unwrap();
-        network.register(
-            ids[0],
-            BasicNode::new(endpoints[0]),
-            recovered.raft().clone(),
-        );
-        wait_for_leader(&[&recovered]).await;
-        let restored = recovered.read_linearizable_view().await.unwrap();
-        assert_eq!(restored.membership_epoch, committed.membership_epoch);
-        assert_eq!(restored.revision, committed.revision);
-        assert_eq!(recovered.committed_voter_ids(), BTreeSet::from([ids[0]]));
-        assert_eq!(
-            crate::control_codec::canonical_members_digest(&restored.members).unwrap(),
-            expected_digest,
-        );
-        for (authorization, plan) in [(&add, proposed), (&remove, removed)] {
-            let error = recovered
-                .apply_voter_transition(authorization, plan)
-                .await
-                .unwrap_err();
-            assert!(
-                error.contains("stale epoch"),
-                "unexpected replay rejection: {error}"
-            );
-        }
-        let unchanged = recovered.read_linearizable_view().await.unwrap();
-        assert_eq!(unchanged.membership_epoch, restored.membership_epoch);
-        assert_eq!(unchanged.revision, restored.revision);
-        assert_eq!(
-            crate::control_codec::canonical_members_digest(&unchanged.members).unwrap(),
-            expected_digest,
-        );
-        recovered.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn publication_commit_survives_restart_and_rejects_unqualified_admission() {
-        use crate::membership::{
-            ClusterId, NodeIdentity, initializer_capabilities, issue_test_member,
-        };
-        use bmux_cluster_plugin_api::cluster_capability_types::CapabilityReport;
-        let root = TempDir::new().unwrap();
-        let identity = NodeIdentity::new_for_test(96);
-        let id = *identity.node_id();
-        let cluster: ClusterId = "cluster:00000000-0000-0000-0000-000000000096"
-            .parse()
-            .unwrap();
-        let network = InMemoryNetworkFactory::default();
-        let node = ConsensusNode::start(root.path(), &cluster.to_string(), id, network.clone())
-            .await
-            .unwrap();
-        node.initialize_single(id, "node").await.unwrap();
-        wait_for_leader(&[&node]).await;
-        let member = issue_test_member(
-            &identity,
-            cluster,
-            &identity,
-            "tls://127.0.0.1:49996",
-            initializer_capabilities(),
-            crate::now_unix_ms(),
-        );
-        crate::consensus_membership::publish_members(
-            node.clone(),
-            &id.to_string(),
-            [member.clone()],
-        )
-        .await
-        .unwrap();
-        let snapshot = node.storage.state_machine().unwrap();
-        let position = snapshot.committed_membership().log_id().unwrap();
-        let mut report = CapabilityReport {
-            report_version: 1,
-            cluster_id: cluster.to_string(),
-            node_id: id.to_string(),
-            credential_serial: member.credential_serial.clone(),
-            membership_term: position.leader_id.term,
-            membership_leader_id: position.leader_id.node_id.to_string(),
-            membership_log_index: position.index,
-            expected_report_revision: 0,
-            command_id: CommandId {
-                value: uuid::Uuid::new_v4(),
-            },
-            schema_min: 1,
-            schema_max: 4,
-            features: vec![
-                "capability-publication-v1".into(),
-                "protocol-refresh-v1".into(),
-            ],
-            signature: Vec::new(),
-        };
-        report.signature =
-            identity.sign(&crate::capability_publication::signing_payload(&report).unwrap());
-        let revision = snapshot.control_state().revision;
-        drop(snapshot);
-        let result = node
-            .publish_capabilities(vec![report.clone()])
-            .await
-            .unwrap();
-        assert_eq!(result.control_revision, revision + 1);
-        assert!(
-            node.persisted_control_state()
-                .unwrap()
-                .requires_publication_decoder()
-        );
-        node.shutdown().await.unwrap();
-        drop(node);
-        let recovered = ConsensusNode::start(root.path(), &cluster.to_string(), id, network)
-            .await
-            .unwrap();
-        wait_for_leader(&[&recovered]).await;
-        assert_eq!(
-            recovered
-                .publish_capabilities(vec![report.clone()])
-                .await
-                .unwrap(),
-            result
-        );
-        assert_unqualified_admission_rejected(&recovered, id).await;
-        let mut conflict = report;
-        conflict.schema_max = 5;
-        conflict.signature =
-            identity.sign(&crate::capability_publication::signing_payload(&conflict).unwrap());
-        assert!(
-            recovered
-                .publish_capabilities(vec![conflict])
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            recovered.persisted_control_state().unwrap().revision,
-            result.control_revision
-        );
-        recovered.shutdown().await.unwrap();
-    }
-
-    #[test]
-    fn admission_evidence_does_not_survive_a_leadership_term_change() {
-        assert!(validate_admission_term(7, 7).is_ok());
-        assert!(
-            matches!(validate_admission_term(7, 8), Err(ConsensusWriteError::Membership(reason)) if reason.contains("retry compatibility checks"))
-        );
-    }
-
-    async fn assert_unqualified_admission_rejected(node: &ConsensusNode, id: NodeId) {
-        struct RejectDecoder;
-        impl crate::consensus_network::DecoderAdmission for RejectDecoder {
-            fn verify<'a>(
-                &'a self,
-                target: NodeId,
-                endpoint: &'a str,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>>
-            {
-                Box::pin(async move {
-                    assert_eq!(target, NodeId::from(97));
-                    assert_eq!(endpoint, "new-node");
-                    Err("unsupported remote decoder".into())
-                })
-            }
-        }
-        let admission = node
-            .change_voters(BTreeMap::from([
-                (id, BasicNode::new("node")),
-                (NodeId::from(97), BasicNode::new("new-node")),
-            ]))
-            .await;
-        assert!(
-            matches!(admission, Err(ConsensusWriteError::Membership(reason)) if reason.contains("decoder admission proof"))
-        );
-        let mut guarded = node.clone();
-        guarded.decoder_admission = Some(Arc::new(RejectDecoder));
-        let before = node.committed_member_ids();
-        let admission = guarded
-            .change_voters(BTreeMap::from([
-                (id, BasicNode::new("node")),
-                (NodeId::from(97), BasicNode::new("new-node")),
-            ]))
-            .await;
-        assert!(
-            matches!(admission, Err(ConsensusWriteError::Membership(reason)) if reason == "unsupported remote decoder")
-        );
-        assert_eq!(node.committed_member_ids(), before);
-    }
-
-    #[tokio::test]
-    async fn network_rejects_wrong_endpoint_for_expected_node() {
-        let network = InMemoryNetworkFactory::default();
-        let root = TempDir::new().unwrap();
-        let id = NodeId::from(9);
-        let node = ConsensusNode::start(
-            root.path(),
-            "cluster-runtime-identity-test",
-            id,
-            network.clone(),
-        )
-        .await
-        .unwrap();
-        network.register(id, BasicNode::new("memory://actual"), node.raft().clone());
-        let mut factory = network;
-        let client = factory
-            .new_client(id, &BasicNode::new("memory://forged"))
-            .await;
-        assert!(client.remote::<RaftError<NodeId>>().is_err());
-        let service = crate::consensus_network::ControlServiceHandle::new(
-            Arc::new(FailingCaller),
-            id,
-            crate::consensus_network::ConsensusNodeRegistry::default(),
-        );
-        assert!(matches!(
-            service.active(),
-            Err(ControlServiceError::RuntimeUnavailable { .. })
-        ));
-        node.shutdown().await.unwrap();
     }
 }

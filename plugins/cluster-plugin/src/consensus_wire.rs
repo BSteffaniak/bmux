@@ -46,7 +46,9 @@ impl MemberView {
         *self.0.write().unwrap_or_else(PoisonError::into_inner) = (cluster, members);
     }
 
-    fn snapshot(&self) -> (String, Vec<ClusterMember>) {
+    /// The cluster identity and member credentials as last refreshed.
+    #[must_use]
+    pub fn snapshot(&self) -> (String, Vec<ClusterMember>) {
         self.0
             .read()
             .unwrap_or_else(PoisonError::into_inner)

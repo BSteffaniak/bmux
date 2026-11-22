@@ -3749,6 +3749,18 @@ impl OwnedStorage {
         Ok(self)
     }
 
+    /// The applied control state with the membership it was applied under.
+    /// # Errors
+    /// Reports a stopped store or unreadable applied authority.
+    pub fn applied(
+        &mut self,
+    ) -> io::Result<(
+        crate::control_state::ControlState,
+        Option<crate::consensus_model::StoredMembership>,
+    )> {
+        self.store.read_applied()
+    }
+
     fn refresh_members(&mut self) -> io::Result<()> {
         let Some(view) = &self.members else {
             return Ok(());
@@ -5039,6 +5051,48 @@ impl OwnedVoteStore {
             .map_err(io::Error::other)?;
         self.failed = false;
         Ok(state)
+    }
+
+    /// The applied control state and the membership it was applied under, read
+    /// in one transaction.
+    fn read_applied(
+        &mut self,
+    ) -> io::Result<(
+        crate::control_state::ControlState,
+        Option<crate::consensus_model::StoredMembership>,
+    )> {
+        if self.failed || self.status.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return Err(io::Error::other("owned authority stopped"));
+        }
+        self.failed = true;
+        let tx = self.database.begin_read().map_err(io::Error::other)?;
+        let meta = tx.open_table(TABLE).map_err(io::Error::other)?;
+        let get = |key| -> io::Result<Vec<u8>> {
+            Ok(meta
+                .get(key)
+                .map_err(io::Error::other)?
+                .ok_or_else(|| invalid("missing applied authority"))?
+                .value()
+                .to_vec())
+        };
+        let state = crate::control_state::ControlState::decode_snapshot(&get("control")?)
+            .map_err(io::Error::other)?;
+        let membership_bytes = get("applied_membership")?;
+        let membership = if membership_bytes.is_empty() {
+            None
+        } else {
+            let entry = crate::consensus_storage::decode_owned_entry(&membership_bytes)
+                .map_err(io::Error::other)?;
+            let EntryPayload::Membership(membership) = entry.payload else {
+                return Err(invalid("invalid applied membership"));
+            };
+            Some(crate::consensus_model::StoredMembership {
+                introduced_at: Some(entry.identity),
+                membership,
+            })
+        };
+        self.failed = false;
+        Ok((state, membership))
     }
 
     fn observe(&mut self) -> Result<OwnedObservation, VoteGateError> {

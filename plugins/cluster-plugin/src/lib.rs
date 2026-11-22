@@ -110,8 +110,11 @@ pub struct ClusterPlugin {
     cluster_id: std::sync::RwLock<Option<ClusterId>>,
     nodes: consensus_network::ConsensusNodeRegistry,
     bootstrap: Arc<tokio::sync::Mutex<()>>,
+    /// This instance's bound on concurrent owned-store recovery copies; never
+    /// shared with other plugin instances through process-wide state.
+    preflight: owned_vote_store::PreflightAdmission,
     /// A one-command CLI instance never hosts the node's consensus runtime:
-    /// the server owns the retained Raft history and endpoint, and a second
+    /// the server owns the retained consensus history and endpoint, and a second
     /// node in the command process would contend for that exclusive store.
     command_scoped: bool,
     /// Host services of the current activation. They mint a fresh invocation
@@ -282,6 +285,7 @@ async fn ensure_persistent_consensus_runtime(
     state_dir: PathBuf,
     nodes: consensus_network::ConsensusNodeRegistry,
     bootstrap: Arc<tokio::sync::Mutex<()>>,
+    preflight: owned_vote_store::PreflightAdmission,
 ) -> Result<(), String> {
     let _start_guard = bootstrap.lock().await;
     let Some((cluster_id, identity, member, single_member)) =
@@ -299,11 +303,22 @@ async fn ensure_persistent_consensus_runtime(
     if nodes.contains(node_id)? {
         return Ok(());
     }
+    // A sole member founds the cluster in a fresh owned store; any other voter
+    // starts empty and is admitted by the leader. Existing stores are opened.
+    let provisioning = if single_member {
+        consensus_runtime::Provisioning::Founder {
+            endpoint: endpoint.clone(),
+        }
+    } else {
+        consensus_runtime::Provisioning::Joiner
+    };
     let node = consensus_runtime::ConsensusNode::start_endpoint(
         &state_dir,
         &cluster_id.to_string(),
-        identity.clone(),
+        &identity,
         caller.clone(),
+        provisioning,
+        &preflight,
     )
     .await
     .map_err(|error| format!("failed starting cluster consensus node: {error}"))?;
@@ -311,44 +326,22 @@ async fn ensure_persistent_consensus_runtime(
         let _ = node.shutdown().await;
         return Err(error.clone());
     }
-    if single_member {
-        match node.is_initialized().await {
-            Ok(true) => {}
-            Ok(false) => {
-                if let Err(error) = node.initialize_single(node_id, endpoint.clone()).await {
-                    node.shutdown()
-                        .await
-                        .map_err(|cleanup| format!("consensus cleanup required: {cleanup}"))?;
-                    let _ = nodes.remove(node_id);
-                    return Err(format!(
-                        "failed initializing single-voter consensus cluster: {error}"
-                    ));
-                }
-            }
-            Err(error) => {
-                node.shutdown()
-                    .await
-                    .map_err(|cleanup| format!("consensus cleanup required: {cleanup}"))?;
-                let _ = nodes.remove(node_id);
-                return Err(format!(
-                    "failed reading consensus initialization state: {error}"
-                ));
-            }
-        }
-    }
     let committed_members = node
         .read_stale_view()
         .map_err(|error| format!("failed reading committed membership at startup: {error:?}"))?
         .members;
     if single_member && committed_members.is_empty() {
-        // initialize() records membership before the asynchronous election finishes.
-        // Do not publish the first control mutation until this node can establish
-        // quorum authority; a stale local view is not evidence of leadership.
+        // The founding membership is durable before the first election
+        // finishes. Do not publish the first control mutation until this node
+        // can establish quorum authority; a stale local view is not leadership.
         let ready = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 match node.linearizable_control_state().await {
                     Ok(_) => return Ok(()),
-                    Err(consensus_runtime::ConsensusReadError::NotLeader(_)) => {
+                    Err(
+                        consensus_runtime::ConsensusReadError::NotLeader(_)
+                        | consensus_runtime::ConsensusReadError::QuorumUnavailable(_),
+                    ) => {
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
                     Err(error) => return Err(format!("initial quorum read failed: {error:?}")),
@@ -479,9 +472,11 @@ impl ClusterPlugin {
         let state_dir = PathBuf::from(&context.connection.state_dir);
         let nodes = self.nodes.clone();
         let bootstrap = Arc::clone(&self.bootstrap);
+        let preflight = self.preflight.clone();
         async_handle.spawn_with_name("bmux-cluster-consensus-bootstrap", async move {
             if let Err(error) =
-                ensure_persistent_consensus_runtime(caller, state_dir, nodes, bootstrap).await
+                ensure_persistent_consensus_runtime(caller, state_dir, nodes, bootstrap, preflight)
+                    .await
             {
                 tracing::error!(%error, "failed ensuring persistent cluster consensus runtime");
             }
@@ -600,8 +595,7 @@ impl ClusterPlugin {
             return;
         };
         let nodes = self.nodes.clone();
-        let raft_handle = Arc::new(consensus_network::RaftRpcServiceHandle::new(
-            caller.clone(),
+        let consensus_rpc = Arc::new(consensus_network::ConsensusRpcHandle::new(
             *identity.node_id(),
             nodes.clone(),
         ));
@@ -700,15 +694,16 @@ impl ClusterPlugin {
                 + Send
                 + Sync,
         > = worker;
-        let _ = bmux_cluster_plugin_api::cluster_raft_decoder::register_provider(
+        // TODO(ADR-0015 snapshot transfer): register the transfer and snapshot
+        // providers here once they are served.
+        let _ = bmux_cluster_plugin_api::cluster_consensus_rpc::register_provider(
             registry,
-            raft_handle.clone(),
+            consensus_rpc.clone(),
         );
-        let _ = bmux_cluster_plugin_api::cluster_raft_rpc_v2::register_provider(
+        let _ = bmux_cluster_plugin_api::cluster_consensus_rpc_v2::register_provider(
             registry,
-            raft_handle.clone(),
+            consensus_rpc,
         );
-        let _ = bmux_cluster_plugin_api::cluster_raft_rpc::register_provider(registry, raft_handle);
         let _ = bmux_cluster_plugin_api::cluster_control_command::register_provider(
             registry,
             control_commands,
@@ -835,6 +830,7 @@ impl ClusterPlugin {
                 context,
                 &self.nodes,
                 &self.bootstrap,
+                &self.preflight,
                 self.activation_caller().ok().as_ref(),
             );
         }
@@ -1069,6 +1065,7 @@ fn invoke_cluster_lifecycle_service(
     context: &NativeServiceContext,
     nodes: &consensus_network::ConsensusNodeRegistry,
     bootstrap: &Arc<tokio::sync::Mutex<()>>,
+    preflight: &owned_vote_store::PreflightAdmission,
     activation_caller: Option<&Arc<bmux_plugin::TypedServiceCaller>>,
 ) -> ServiceResponse {
     bmux_plugin_sdk::route_service!(context, {
@@ -1084,7 +1081,7 @@ fn invoke_cluster_lifecycle_service(
                 let handle = tokio::runtime::Handle::try_current()
                     .map_err(|error| ServiceResponse::error("join_failed", error.to_string()))?;
                 tokio::task::block_in_place(|| {
-                    handle.block_on(ensure_persistent_consensus_runtime(caller, state_dir, nodes.clone(), Arc::clone(bootstrap)))
+                    handle.block_on(ensure_persistent_consensus_runtime(caller, state_dir, nodes.clone(), Arc::clone(bootstrap), preflight.clone()))
                 })
                 .map_err(|error| ServiceResponse::error("join_failed", error))?;
             }
@@ -1294,7 +1291,7 @@ fn invoke_cluster_lifecycle_service(
                 let handle = tokio::runtime::Handle::try_current()
                     .map_err(|error| ServiceResponse::error("cluster_init_failed", error.to_string()))?;
                 tokio::task::block_in_place(|| {
-                    handle.block_on(ensure_persistent_consensus_runtime(caller, state_dir, nodes.clone(), Arc::clone(bootstrap)))
+                    handle.block_on(ensure_persistent_consensus_runtime(caller, state_dir, nodes.clone(), Arc::clone(bootstrap), preflight.clone()))
                 })
                 .map_err(|error| ServiceResponse::error("cluster_init_failed", error))?;
             }

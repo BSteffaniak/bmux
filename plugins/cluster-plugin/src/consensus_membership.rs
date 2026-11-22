@@ -125,7 +125,7 @@ pub fn removal_plan(current: &[ClusterMember], target: &str) -> Result<Vec<Clust
 }
 
 /// Verifies current committed authority, exact plan, freshness and issuer trust.
-/// The caller must serialize verification with the actual Raft membership change.
+/// The caller must serialize verification with the actual consensus membership change.
 /// # Errors
 /// Rejects stale/replayed authorizations, untrusted signers and modified plans.
 pub fn verify_voter_change_authorization(
@@ -223,7 +223,8 @@ pub fn verify_voter_change_authorization(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VoterSetPlan {
-    pub voters: BTreeMap<NodeId, BasicNode>,
+    /// Each active voter's authenticated advertised endpoint.
+    pub voters: BTreeMap<NodeId, String>,
 }
 
 /// Builds the exact active voter set from authenticated membership records.
@@ -253,13 +254,13 @@ pub fn plan_active_voters_ref<'a>(
         crate::membership::validate_advertised_endpoint(endpoint)?;
         if let Some((existing_id, _)) = voters
             .iter()
-            .find(|(_, existing): &(&NodeId, &BasicNode)| existing.addr == endpoint)
+            .find(|(_, existing): &(&NodeId, &String)| existing.as_str() == endpoint)
         {
             return Err(format!(
                 "active voters {existing_id} and {node_id} share advertised endpoint '{endpoint}'"
             ));
         }
-        if voters.insert(node_id, BasicNode::new(endpoint)).is_some() {
+        if voters.insert(node_id, endpoint.to_string()).is_some() {
             return Err(format!("duplicate active voter {node_id}"));
         }
     }
@@ -309,7 +310,7 @@ pub fn validate_membership_transition(
 
 /// Reconciles a provided membership snapshot through the active local node.
 ///
-/// This transaction primitive lets join, leave, and revoke transition Raft
+/// This transaction primitive lets join, leave, and revoke transition consensus
 /// around publication of plugin membership as required by each workflow.
 ///
 /// # Errors
@@ -334,7 +335,7 @@ pub async fn reconcile_members(
 ///
 /// The supplied node may already be absent from the voter set, making retries
 /// idempotent. The transition rejects removal of the final voter and validates
-/// all remaining voter credentials and endpoints before contacting `OpenRaft`.
+/// all remaining voter credentials and endpoints before proposing the change.
 ///
 /// # Errors
 ///
@@ -470,7 +471,6 @@ fn membership_command_id(member: &ClusterMember) -> Result<uuid::Uuid, String> {
 pub async fn change_voters(node: ConsensusNode, plan: VoterSetPlan) -> Result<(), String> {
     node.change_voters(plan.voters)
         .await
-        .map(|_| ())
         .map_err(|error| write_error(&error))
 }
 

@@ -14,9 +14,6 @@ pub fn invoke_native_consensus_service(
             invoke_control_read(context, true, nodes)
         }
         ("cluster-control-state/v1", "read_stale") => invoke_control_read(context, false, nodes),
-        ("cluster-raft-rpc/v1", operation @ ("append_entries" | "install_snapshot" | "vote")) => {
-            invoke_raft_rpc(context, operation, nodes)
-        }
         _ => return None,
     };
     Some(response)
@@ -134,62 +131,9 @@ fn invoke_control_read(
     typed_result(&result)
 }
 
-fn invoke_raft_rpc(
-    context: &NativeServiceContext,
-    operation: &str,
-    nodes: &consensus_network::ConsensusNodeRegistry,
-) -> ServiceResponse {
-    service_result((|| {
-        let request = match bmux_plugin_sdk::decode_service_message::<
-            bmux_cluster_plugin_api::cluster_raft_rpc::client::AppendEntriesRequest,
-        >(&context.request.payload)
-        {
-            Ok(request) => request.request,
-            Err(_) => bmux_plugin_sdk::decode_service_message::<
-                bmux_cluster_plugin_api::cluster_types::RaftRpcRequest,
-            >(&context.request.payload)
-            .map_err(|error| error.to_string())?,
-        };
-        let identity = load_or_create_node_identity(context)?;
-        let handle = consensus_network::RaftRpcServiceHandle::new(
-            Arc::new(context.clone()),
-            *identity.node_id(),
-            nodes.clone(),
-        );
-        let runtime = tokio::runtime::Handle::try_current().map_err(|error| error.to_string())?;
-        Ok(tokio::task::block_in_place(|| match operation {
-            "append_entries" => runtime.block_on(
-                bmux_cluster_plugin_api::cluster_raft_rpc::ClusterRaftRpcService::append_entries(
-                    &handle, request,
-                ),
-            ),
-            "install_snapshot" => runtime.block_on(
-                bmux_cluster_plugin_api::cluster_raft_rpc::ClusterRaftRpcService::install_snapshot(
-                    &handle, request,
-                ),
-            ),
-            "vote" => runtime.block_on(
-                bmux_cluster_plugin_api::cluster_raft_rpc::ClusterRaftRpcService::vote(
-                    &handle, request,
-                ),
-            ),
-            _ => unreachable!("closed raft RPC operation"),
-        }))
-    })())
-}
-
 fn typed_result<T: Serialize, E: Serialize>(result: &Result<T, E>) -> ServiceResponse {
     match bmux_plugin_sdk::encode_service_message(&result) {
         Ok(payload) => ServiceResponse::ok(payload),
         Err(error) => ServiceResponse::error("consensus_service_failed", error.to_string()),
-    }
-}
-
-fn service_result<T: Serialize>(result: Result<T, String>) -> ServiceResponse {
-    match result.and_then(|value| {
-        bmux_plugin_sdk::encode_service_message(&value).map_err(|error| error.to_string())
-    }) {
-        Ok(payload) => ServiceResponse::ok(payload),
-        Err(error) => ServiceResponse::error("consensus_service_failed", error),
     }
 }

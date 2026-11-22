@@ -1,27 +1,15 @@
-//! Authenticated typed peer transport for `OpenRaft`.
+//! Authenticated peer transport helpers, control services and the local
+//! consensus node registry.
 
 use crate::consensus_runtime::ConsensusNode;
-use crate::consensus_storage::ControlRaftConfig;
-use crate::endpoint::{EndpointDispatchClient, PeerAuthenticationFailure};
+use crate::endpoint::EndpointDispatchClient;
 use crate::membership::{NodeId, NodeIdentity, authenticate_peer_proof, verify_node_signature};
-use bmux_cluster_plugin_api::cluster_raft_rpc::ClusterRaftRpcService;
 use bmux_cluster_plugin_api::cluster_types::{
-    ControlResponse, ControlServiceError, ControlStateView, RaftRpcRequest, RaftRpcResponse,
+    ControlResponse, ControlServiceError, ControlStateView, RaftRpcRequest,
 };
 use bmux_plugin::ServiceCaller;
-use bmux_plugin_sdk::{decode_service_message, encode_service_message};
-use openraft::error::{
-    Fatal, NetworkError, RPCError, RaftError, RemoteError, ReplicationClosed, StreamingError,
-    Unreachable,
-};
-use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
-use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    SnapshotResponse, VoteRequest, VoteResponse,
-};
-use openraft::{BasicNode, Snapshot, Vote};
+use bmux_plugin_sdk::encode_service_message;
 use std::future::Future;
-use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 pub(crate) const PEER_READ_OPERATION: &str = "cluster-peer-read/v1/read_linearizable";
@@ -363,14 +351,17 @@ pub fn authenticate_owned_append_v2(
     Ok(source)
 }
 
-/// Whether a durable member has negotiated both halves of the owned protocol.
+/// Whether a durable member negotiated the owned consensus contracts this
+/// runtime serves: `cluster-consensus-rpc` v1 (vote) and v2 (append).
 /// Capability advertisement alone is not admission to this engine.
+// TODO(ADR-0015 snapshot transfer): staged transfer and snapshot installation
+// are negotiated separately once their providers are served.
 pub(crate) fn supports_owned_consensus(
     member: &bmux_cluster_plugin_api::cluster_types::ClusterMember,
 ) -> bool {
     [
         bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID,
-        bmux_cluster_plugin_api::cluster_consensus_transfer::INTERFACE_ID,
+        bmux_cluster_plugin_api::cluster_consensus_rpc_v2::INTERFACE_ID,
     ]
     .iter()
     .all(|interface| {
@@ -383,13 +374,22 @@ pub(crate) fn supports_owned_consensus(
 }
 
 /// Snapshot installation requires its own explicit selection, in addition to
-/// the unchanged owned RPC/transfer selection. No legacy fallback is permitted.
+/// the owned RPC selection and staged transfer. No legacy fallback is permitted.
 pub(crate) fn supports_owned_snapshot_install(
     member: &bmux_cluster_plugin_api::cluster_types::ClusterMember,
 ) -> bool {
     supports_owned_consensus(member)
-        && member.negotiated_protocol.features.iter().any(|feature| {
-            feature == bmux_cluster_plugin_api::cluster_consensus_snapshot::INTERFACE_ID.as_str()
+        && [
+            bmux_cluster_plugin_api::cluster_consensus_transfer::INTERFACE_ID,
+            bmux_cluster_plugin_api::cluster_consensus_snapshot::INTERFACE_ID,
+        ]
+        .iter()
+        .all(|interface| {
+            member
+                .negotiated_protocol
+                .features
+                .iter()
+                .any(|feature| feature == interface.as_str())
         })
 }
 
@@ -494,7 +494,7 @@ pub(crate) fn owned_snapshot_install_response_signing_payload(
     Ok(signed)
 }
 
-pub(crate) fn verify_owned_snapshot_install_response(
+pub fn verify_owned_snapshot_install_response(
     request: &bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallRequest,
     response: &bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallResponse,
 ) -> Result<(), String> {
@@ -518,10 +518,10 @@ pub(crate) async fn exchange_snapshot_install<C>(
     bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallError,
 >
 where
-    C: ServiceCaller + Sync,
+    C: bmux_plugin::ServiceCaller + Sync,
 {
     use bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallError;
-    let mut remote = EndpointDispatchClient::new(caller, endpoint);
+    let mut remote = crate::endpoint::EndpointDispatchClient::new(caller, endpoint);
     let response = switchy_async::time::timeout(
         std::time::Duration::from_secs(5),
         bmux_cluster_plugin_api::cluster_consensus_snapshot::client::install(
@@ -973,14 +973,6 @@ fn validate_transfer_metadata_allocation(
 }
 
 const RAFT_RPC_DOMAIN: &[u8] = b"bmux.cluster.raft-rpc.v1\0";
-const DECODER_PROBE_OPERATION: &str = "capability-publication-decoder-v1";
-
-fn decoder_proof_payload(request: &RaftRpcRequest) -> Result<Vec<u8>, String> {
-    let mut payload = b"bmux.cluster.raft-decoder-proof.v1\0".to_vec();
-    payload.extend(encode_service_message(request).map_err(|error| error.to_string())?);
-    Ok(payload)
-}
-
 fn signing_payload(
     operation: &str,
     target_node_id: &str,
@@ -1053,322 +1045,6 @@ pub fn authenticate_request(
     )?;
     verify_node_signature(&peer.node_id, &signed, &request.signature)?;
     Ok((source, request.payload))
-}
-
-#[derive(Clone)]
-pub struct EndpointRaftNetworkFactory<C> {
-    caller: Arc<C>,
-    identity: NodeIdentity,
-}
-
-impl<C> EndpointRaftNetworkFactory<C> {
-    #[must_use]
-    pub const fn new(caller: Arc<C>, identity: NodeIdentity) -> Self {
-        Self { caller, identity }
-    }
-}
-
-pub(super) trait DecoderAdmission: Send + Sync {
-    fn verify<'a>(
-        &'a self,
-        target: NodeId,
-        endpoint: &'a str,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
-}
-
-impl<C> DecoderAdmission for EndpointRaftNetworkFactory<C>
-where
-    C: ServiceCaller + Send + Sync + 'static,
-{
-    fn verify<'a>(
-        &'a self,
-        target: NodeId,
-        endpoint: &'a str,
-    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
-        Box::pin(async move {
-            EndpointRaftNetwork {
-                caller: self.caller.clone(),
-                identity: self.identity.clone(),
-                target,
-                endpoint: endpoint.to_string(),
-            }
-            .require_publication_decoder()
-            .await
-            .map_err(|error| format!("{error:?}"))
-        })
-    }
-}
-
-pub struct EndpointRaftNetwork<C> {
-    caller: Arc<C>,
-    identity: NodeIdentity,
-    target: NodeId,
-    endpoint: String,
-}
-
-impl<C> RaftNetworkFactory<ControlRaftConfig> for EndpointRaftNetworkFactory<C>
-where
-    C: ServiceCaller + Send + Sync + 'static,
-{
-    type Network = EndpointRaftNetwork<C>;
-
-    fn new_client(
-        &mut self,
-        target: NodeId,
-        node: &BasicNode,
-    ) -> impl std::future::Future<Output = Self::Network> {
-        std::future::ready(EndpointRaftNetwork {
-            caller: self.caller.clone(),
-            identity: self.identity.clone(),
-            target,
-            endpoint: node.addr.clone(),
-        })
-    }
-}
-
-impl<C> EndpointRaftNetwork<C>
-where
-    C: ServiceCaller + Send + Sync + 'static,
-{
-    async fn require_publication_decoder(&self) -> Result<(), PeerAuthenticationFailure> {
-        let proof = crate::endpoint::peer_authentication_proof(
-            self.caller.as_ref(),
-            &self.endpoint,
-            &self.identity.node_id().to_string(),
-            &self.target.to_string(),
-        )
-        .await?;
-        let request = authenticated_request(
-            DECODER_PROBE_OPERATION,
-            self.target,
-            &self.identity,
-            proof,
-            Vec::new(),
-        )
-        .map_err(PeerAuthenticationFailure::Local)?;
-        let signed = decoder_proof_payload(&request).map_err(PeerAuthenticationFailure::Local)?;
-        let mut remote = EndpointDispatchClient::new(self.caller.as_ref(), &self.endpoint);
-        let proof =
-            bmux_cluster_plugin_api::cluster_raft_decoder::client::probe(&mut remote, request)
-                .await
-                .map_err(|error| {
-                    PeerAuthenticationFailure::Unreachable(format!(
-                        "decoder negotiation failed: {error}"
-                    ))
-                })?
-                .map_err(PeerAuthenticationFailure::Untrusted)?;
-        verify_node_signature(&self.target.to_string(), &signed, &proof.signature)
-            .map_err(PeerAuthenticationFailure::Untrusted)
-    }
-
-    async fn invoke<Request, Response>(
-        &self,
-        operation: &str,
-        request: &Request,
-    ) -> Result<Response, PeerAuthenticationFailure>
-    where
-        Request: serde::Serialize + Sync,
-        Response: serde::de::DeserializeOwned,
-    {
-        let proof = crate::endpoint::peer_authentication_proof(
-            self.caller.as_ref(),
-            &self.endpoint,
-            &self.identity.node_id().to_string(),
-            &self.target.to_string(),
-        )
-        .await?;
-        let payload = encode_service_message(request).map_err(|error| {
-            PeerAuthenticationFailure::Local(format!("raft RPC encode failed: {error}"))
-        })?;
-        let envelope =
-            authenticated_request(operation, self.target, &self.identity, proof, payload)
-                .map_err(PeerAuthenticationFailure::Local)?;
-        let mut remote = EndpointDispatchClient::new(self.caller.as_ref(), &self.endpoint);
-        let response = match operation {
-            "append_entries_v2" => {
-                bmux_cluster_plugin_api::cluster_raft_rpc_v2::client::append_entries(
-                    &mut remote,
-                    envelope,
-                )
-                .await
-            }
-            "install_snapshot_v2" => {
-                bmux_cluster_plugin_api::cluster_raft_rpc_v2::client::install_snapshot(
-                    &mut remote,
-                    envelope,
-                )
-                .await
-            }
-            "append_entries" => {
-                bmux_cluster_plugin_api::cluster_raft_rpc::client::append_entries(
-                    &mut remote,
-                    envelope,
-                )
-                .await
-            }
-            "install_snapshot" => {
-                bmux_cluster_plugin_api::cluster_raft_rpc::client::install_snapshot(
-                    &mut remote,
-                    envelope,
-                )
-                .await
-            }
-            "vote" => {
-                bmux_cluster_plugin_api::cluster_raft_rpc::client::vote(&mut remote, envelope).await
-            }
-            _ => unreachable!("closed raft RPC operation"),
-        }
-        .map_err(|error| {
-            PeerAuthenticationFailure::Unreachable(format!("raft RPC failed: {error}"))
-        })?;
-        if response.source_node_id != self.target.to_string() {
-            return Err(PeerAuthenticationFailure::Untrusted(
-                "raft RPC response came from an unexpected node".to_string(),
-            ));
-        }
-        if let Some(error) = response.error {
-            return Err(PeerAuthenticationFailure::Untrusted(format!(
-                "remote raft RPC rejected request: {error}"
-            )));
-        }
-        decode_service_message(&response.payload).map_err(|error| {
-            PeerAuthenticationFailure::Untrusted(format!("raft RPC response is invalid: {error}"))
-        })
-    }
-
-    fn rpc_error<E: std::error::Error>(
-        error: PeerAuthenticationFailure,
-    ) -> RPCError<NodeId, BasicNode, E> {
-        match error {
-            PeerAuthenticationFailure::Unreachable(reason) => Unreachable::new(
-                &std::io::Error::new(std::io::ErrorKind::NotConnected, reason),
-            )
-            .into(),
-            PeerAuthenticationFailure::Untrusted(reason)
-            | PeerAuthenticationFailure::Local(reason) => NetworkError::new(&std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                reason,
-            ))
-            .into(),
-        }
-    }
-}
-
-impl<C> RaftNetwork<ControlRaftConfig> for EndpointRaftNetwork<C>
-where
-    C: ServiceCaller + Send + Sync + 'static,
-{
-    async fn append_entries(
-        &mut self,
-        rpc: AppendEntriesRequest<ControlRaftConfig>,
-        _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        if rpc.entries.iter().any(|entry| matches!(
-            &entry.payload, openraft::EntryPayload::Normal(request) if request.0.starts_with(b"BMCAP001")
-        )) {
-            self.require_publication_decoder().await.map_err(Self::rpc_error)?;
-            return self.invoke("append_entries_v2", &rpc).await.map_err(Self::rpc_error);
-        }
-        self.invoke("append_entries", &rpc)
-            .await
-            .map_err(Self::rpc_error)
-    }
-
-    async fn install_snapshot(
-        &mut self,
-        rpc: InstallSnapshotRequest<ControlRaftConfig>,
-        _option: RPCOption,
-    ) -> Result<
-        InstallSnapshotResponse<NodeId>,
-        RPCError<NodeId, BasicNode, RaftError<NodeId, openraft::error::InstallSnapshotError>>,
-    > {
-        // This transport sends complete envelopes. Do not guess decoder support
-        // from a partial chunk or scan arbitrary bytes for a format marker.
-        if rpc.offset != 0 || !rpc.done {
-            return Err(Self::rpc_error(PeerAuthenticationFailure::Local(
-                "partial snapshot negotiation is unsupported".into(),
-            )));
-        }
-        let advanced = crate::consensus_storage::snapshot_requires_publication_decoder(&rpc.data)
-            .map_err(|error| {
-            Self::rpc_error(PeerAuthenticationFailure::Local(error.to_string()))
-        })?;
-        if advanced {
-            self.require_publication_decoder()
-                .await
-                .map_err(Self::rpc_error)?;
-            return self
-                .invoke("install_snapshot_v2", &rpc)
-                .await
-                .map_err(Self::rpc_error);
-        }
-        self.invoke("install_snapshot", &rpc)
-            .await
-            .map_err(Self::rpc_error)
-    }
-
-    async fn vote(
-        &mut self,
-        rpc: VoteRequest<NodeId>,
-        _option: RPCOption,
-    ) -> Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>> {
-        self.invoke("vote", &rpc).await.map_err(Self::rpc_error)
-    }
-
-    async fn full_snapshot(
-        &mut self,
-        vote: Vote<NodeId>,
-        mut snapshot: Snapshot<ControlRaftConfig>,
-        cancel: impl Future<Output = ReplicationClosed> + Send + 'static,
-        _option: RPCOption,
-    ) -> Result<SnapshotResponse<NodeId>, StreamingError<ControlRaftConfig, Fatal<NodeId>>> {
-        tokio::pin!(cancel);
-        if std::future::poll_fn(|context| match cancel.as_mut().poll(context) {
-            std::task::Poll::Ready(closed) => std::task::Poll::Ready(Some(closed)),
-            std::task::Poll::Pending => std::task::Poll::Ready(None),
-        })
-        .await
-        .is_some()
-        {
-            return Err(ReplicationClosed::new("snapshot transfer cancelled").into());
-        }
-        snapshot
-            .snapshot
-            .seek(SeekFrom::Start(0))
-            .map_err(|error| StreamingError::Network(NetworkError::new(&error)))?;
-        let mut data = Vec::new();
-        snapshot
-            .snapshot
-            .read_to_end(&mut data)
-            .map_err(|error| StreamingError::Network(NetworkError::new(&error)))?;
-        let request = InstallSnapshotRequest {
-            vote,
-            meta: snapshot.meta,
-            offset: 0,
-            data,
-            done: true,
-        };
-        self.install_snapshot(request, RPCOption::new(std::time::Duration::from_secs(30)))
-            .await
-            .map(|response| SnapshotResponse::new(response.vote))
-            .map_err(|error| match error {
-                RPCError::Timeout(error) => error.into(),
-                RPCError::Unreachable(error) => error.into(),
-                RPCError::Network(error) => error.into(),
-                RPCError::RemoteError(error) => {
-                    StreamingError::RemoteError(RemoteError::new_with_node(
-                        error.target,
-                        error
-                            .target_node
-                            .unwrap_or_else(|| BasicNode::new(&self.endpoint)),
-                        error.source.into_fatal().unwrap_or(Fatal::Stopped),
-                    ))
-                }
-                RPCError::PayloadTooLarge(error) => {
-                    StreamingError::Network(NetworkError::new(&error))
-                }
-            })
-    }
 }
 
 #[derive(Clone, Default)]
@@ -2156,546 +1832,93 @@ where
     }
 }
 
-pub struct RaftRpcServiceHandle<C> {
-    caller: Arc<C>,
+/// Registered `cluster-consensus-rpc` v1/v2 provider. Typed services register
+/// before the consensus node starts, so each call resolves the running local
+/// node and delegates to its authenticated wire service.
+pub struct ConsensusRpcHandle {
     local_node_id: NodeId,
     nodes: ConsensusNodeRegistry,
 }
 
-impl<C> RaftRpcServiceHandle<C> {
+impl ConsensusRpcHandle {
     #[must_use]
-    pub const fn new(caller: Arc<C>, local_node_id: NodeId, nodes: ConsensusNodeRegistry) -> Self {
+    pub const fn new(local_node_id: NodeId, nodes: ConsensusNodeRegistry) -> Self {
         Self {
-            caller,
             local_node_id,
             nodes,
         }
     }
-}
 
-impl<C> RaftRpcServiceHandle<C>
-where
-    C: crate::ClusterRuntimeOps + Send + Sync + 'static,
-{
-    async fn dispatch<Request, Response>(
+    fn providers(
         &self,
-        operation: &'static str,
-        request: RaftRpcRequest,
-        invoke: impl FnOnce(
-            openraft::Raft<ControlRaftConfig>,
-            Request,
-        )
-            -> std::pin::Pin<Box<dyn Future<Output = Result<Response, String>> + Send>>,
-    ) -> RaftRpcResponse
-    where
-        Request: serde::de::DeserializeOwned,
-        Response: serde::Serialize,
-    {
-        let result = async {
-            let (_, payload) =
-                authenticate_request(self.caller.as_ref(), operation, self.local_node_id, request)?;
-            let request = decode_service_message(&payload)
-                .map_err(|error| format!("invalid {operation} payload: {error}"))?;
-            let raft = self.nodes.get(self.local_node_id)?.raft().clone();
-            let response = invoke(raft, request).await?;
-            encode_service_message(&response)
-                .map_err(|error| format!("failed encoding {operation} response: {error}"))
-        }
-        .await;
-        match result {
-            Ok(payload) => response(self.local_node_id, payload),
-            Err(error) => RaftRpcResponse {
-                source_node_id: self.local_node_id.to_string(),
-                payload: Vec::new(),
-                error: Some(error),
-            },
-        }
-    }
-}
-
-impl<C> bmux_cluster_plugin_api::cluster_raft_decoder::ClusterRaftDecoderService
-    for RaftRpcServiceHandle<C>
-where
-    C: crate::ClusterRuntimeOps + Send + Sync + 'static,
-{
-    fn probe<'a>(
-        &'a self,
-        request: RaftRpcRequest,
-    ) -> std::pin::Pin<
-        Box<
-            dyn Future<
-                    Output = Result<
-                        bmux_cluster_plugin_api::cluster_types::RaftDecoderProof,
-                        String,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async move {
-            // Authenticate before attesting; the request signature and fresh challenge
-            // bind this proof to one requester and target, not an endpoint cache.
-            let signed = decoder_proof_payload(&request)?;
-            let (_, payload) = authenticate_request(
-                self.caller.as_ref(),
-                DECODER_PROBE_OPERATION,
-                self.local_node_id,
-                request,
-            )?;
-            if !payload.is_empty() {
-                return Err("decoder probe payload must be empty".into());
-            }
-            let identity = crate::load_or_create_node_identity(self.caller.as_ref())?;
-            if *identity.node_id() != self.local_node_id {
-                return Err("decoder signer does not match service identity".into());
-            }
-            Ok(bmux_cluster_plugin_api::cluster_types::RaftDecoderProof {
-                signature: identity.sign(&signed),
-            })
-        })
-    }
-}
-
-impl<C> bmux_cluster_plugin_api::cluster_raft_rpc_v2::ClusterRaftRpcService
-    for RaftRpcServiceHandle<C>
-where
-    C: crate::ClusterRuntimeOps + Send + Sync + 'static,
-{
-    fn append_entries<'a>(
-        &'a self,
-        request: RaftRpcRequest,
-    ) -> std::pin::Pin<Box<dyn Future<Output = RaftRpcResponse> + Send + 'a>> {
-        Box::pin(
-            self.dispatch("append_entries_v2", request, |raft, request| {
-                Box::pin(async move {
-                    raft.append_entries(request)
-                        .await
-                        .map_err(|error| error.to_string())
-                })
-            }),
-        )
-    }
-    fn install_snapshot<'a>(
-        &'a self,
-        request: RaftRpcRequest,
-    ) -> std::pin::Pin<Box<dyn Future<Output = RaftRpcResponse> + Send + 'a>> {
-        Box::pin(
-            self.dispatch("install_snapshot_v2", request, |raft, request| {
-                Box::pin(async move {
-                    raft.install_snapshot(request)
-                        .await
-                        .map_err(|error| error.to_string())
-                })
-            }),
-        )
-    }
-    fn vote<'a>(
-        &'a self,
-        request: RaftRpcRequest,
-    ) -> std::pin::Pin<Box<dyn Future<Output = RaftRpcResponse> + Send + 'a>> {
-        Box::pin(self.dispatch("vote_v2", request, |raft, request| {
-            Box::pin(async move { raft.vote(request).await.map_err(|error| error.to_string()) })
-        }))
-    }
-}
-
-/// Unregistered owned append provider. Construction does not advertise capability
-/// or initialize another authority; the lifecycle owner supplies its executor.
-pub struct OwnedAppendService<C> {
-    pub caller: Arc<C>,
-    pub local: NodeId,
-    pub executor: Arc<crate::owned_vote_store::VoteExecutor>,
-}
-
-impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static> OwnedAppendService<C> {
-    /// Send an explicitly selected owned snapshot install using generated transport.
-    ///
-    /// The executor owner must admit the outbound request before calling and
-    /// revalidate authority before counting the returned boundary. This method
-    /// verifies transport evidence only; it never advances local progress.
-    /// # Errors
-    /// Rejects unsupported/revoked targets, bad local signatures, and unbound replies.
-    pub async fn send_snapshot_install(
-        &self,
-        member: &bmux_cluster_plugin_api::cluster_types::ClusterMember,
-        request: bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallRequest,
     ) -> Result<
-        bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallResponse,
-        bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallError,
-    >
-    where
-        C: bmux_plugin::ServiceCaller,
-    {
-        use bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallError;
-        if !supports_owned_snapshot_install(member) {
-            return Err(InstallError::Incompatible);
-        }
-        let peer = transfer_node(&request.reference.recipient)
-            .map_err(|_| InstallError::InvalidRequest)?;
-        if member.node_id != peer.to_string()
-            || request.reference.sender.as_slice() != self.local.as_bytes()
-            || request.reference.cluster_id != member.cluster_id
-        {
-            return Err(InstallError::Unauthorized);
-        }
-        crate::membership::verify_membership_credential(member, crate::now_unix_ms())
-            .map_err(|_| InstallError::Unauthorized)?;
-        if member.state != bmux_cluster_plugin_api::cluster_types::ClusterMemberState::Active {
-            return Err(InstallError::Unauthorized);
-        }
-        let payload = owned_snapshot_install_signing_payload(&request)
-            .map_err(|_| InstallError::InvalidRequest)?;
-        verify_node_signature(&self.local.to_string(), &payload, &request.proof.signature)
-            .map_err(|_| InstallError::Unauthorized)?;
-        let endpoint = member
-            .endpoint
-            .as_ref()
-            .filter(|endpoint| !endpoint.trim().is_empty())
-            .ok_or(InstallError::InvalidRequest)?;
-        exchange_snapshot_install(self.caller.as_ref(), endpoint, &request).await
-    }
-
-    /// Register snapshot v1 separately against the SAME lifecycle-owned executor.
-    ///
-    /// This does not register RPC v1, advertise compatibility, or open storage.
-    /// The owner must explicitly select this provider and stop its admission
-    /// before shutting down the supplied executor.
-    /// # Errors
-    /// Returns generated descriptor registration failures.
-    pub fn register_snapshot(
-        registry: &mut bmux_plugin_sdk::TypedServiceRegistry,
-        caller: Arc<C>,
-        local: NodeId,
-        executor: Arc<crate::owned_vote_store::VoteExecutor>,
-    ) -> Result<(), Box<bmux_plugin_sdk::PluginError>> {
-        bmux_cluster_plugin_api::cluster_consensus_snapshot::register_provider(
-            registry,
-            Arc::new(Self {
-                caller,
-                local,
-                executor,
-            }),
-        )
-        .map_err(Box::new)
-    }
-
-    /// Register append V2 separately against the lifecycle-owned executor.
-    ///
-    /// This neither changes V1 registration nor advertises negotiation support.
-    /// The executor owns authentication, durable decisions and response signing.
-    /// # Errors
-    /// Returns generated descriptor registration failures.
-    pub fn register_append_v2(
-        registry: &mut bmux_plugin_sdk::TypedServiceRegistry,
-        caller: Arc<C>,
-        local: NodeId,
-        executor: Arc<crate::owned_vote_store::VoteExecutor>,
-    ) -> Result<(), Box<bmux_plugin_sdk::PluginError>> {
-        bmux_cluster_plugin_api::cluster_consensus_rpc_v2::register_provider(
-            registry,
-            Arc::new(Self {
-                caller,
-                local,
-                executor,
-            }),
-        )
-        .map_err(Box::new)
-    }
-
-    /// Register generated dispatch against an executor supplied by its lifecycle owner.
-    ///
-    /// This neither opens storage nor advertises negotiation support. The owner
-    /// must stop admission and shut down the same executor when removing service.
-    /// # Errors
-    /// Returns generated descriptor registration failures.
-    pub fn register(
-        registry: &mut bmux_plugin_sdk::TypedServiceRegistry,
-        caller: Arc<C>,
-        local: NodeId,
-        executor: Arc<crate::owned_vote_store::VoteExecutor>,
-    ) -> Result<(), Box<bmux_plugin_sdk::PluginError>> {
-        bmux_cluster_plugin_api::cluster_consensus_rpc::register_provider(
-            registry,
-            Arc::new(Self {
-                caller,
-                local,
-                executor,
-            }),
-        )
-        .map_err(Box::new)
-    }
-}
-
-impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static>
-    bmux_cluster_plugin_api::cluster_consensus_rpc_v2::ClusterConsensusRpcService
-    for OwnedAppendService<C>
-{
-    fn append<'a>(
-        &'a self,
-        request: bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
-    ) -> std::pin::Pin<
-        Box<
-            dyn Future<
-                    Output = Result<
-                        bmux_cluster_plugin_api::cluster_consensus_rpc_v2_types::AppendResponse,
-                        bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError,
-                    >,
-                > + Send
-                + 'a,
-        >,
+        (
+            Arc<
+                dyn bmux_cluster_plugin_api::cluster_consensus_rpc::ClusterConsensusRpcService
+                    + Send
+                    + Sync,
+            >,
+            Arc<
+                dyn bmux_cluster_plugin_api::cluster_consensus_rpc_v2::ClusterConsensusRpcService
+                    + Send
+                    + Sync,
+            >,
+        ),
+        bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError,
     > {
-        Box::pin(async move {
-            use crate::owned_vote_store::AuthenticatedAppendError;
-            use bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError;
-            // The same serialized owner authenticates, settles durable term/log
-            // state and signs every successful response, including stale rejection.
-            // Never synthesize term evidence from an error in this adapter.
-            self.executor
-                .append_v2_authenticated(self.caller.clone(), self.local, request)
-                .await
-                .map_err(|error| match error {
-                    AuthenticatedAppendError::Unauthorized => RpcError::Unauthorized,
-                    AuthenticatedAppendError::Invalid(_) => RpcError::InvalidRequest,
-                    AuthenticatedAppendError::Storage(_) => RpcError::StorageFailure,
-                    AuthenticatedAppendError::Executor(
-                        crate::consensus_model::VoteGateError::Stopped,
-                    ) => RpcError::Stopped,
-                    AuthenticatedAppendError::TermMismatch => RpcError::StaleTerm,
-                    AuthenticatedAppendError::MissingTransfer { .. }
-                    | AuthenticatedAppendError::Executor(_) => RpcError::ExecutionFailed,
-                })
-        })
+        self.nodes
+            .get(self.local_node_id)
+            .and_then(|node| node.rpc())
+            .map_err(|_| bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError::Stopped)
     }
 }
 
-impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static>
-    bmux_cluster_plugin_api::cluster_consensus_snapshot::ClusterConsensusSnapshotService
-    for OwnedAppendService<C>
-{
-    fn install<'a>(
-        &'a self,
-        request: bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallRequest,
-    ) -> std::pin::Pin<
-        Box<
-            dyn Future<
-                    Output = Result<
-                        bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallResponse,
-                        bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
-        // Authentication, sealed-object ownership, fencing, durable replay and
-        // response signing all stay in the supplied executor's serialized scope.
-        Box::pin(self.executor.install_snapshot_authenticated(
-            self.caller.clone(),
-            self.local,
-            request,
-        ))
-    }
-}
+type ConsensusRpc<'a, T> = std::pin::Pin<
+    Box<
+        dyn Future<
+                Output = Result<T, bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError>,
+            > + Send
+            + 'a,
+    >,
+>;
 
-impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static>
-    bmux_cluster_plugin_api::cluster_consensus_rpc::ClusterConsensusRpcService
-    for OwnedAppendService<C>
+impl bmux_cluster_plugin_api::cluster_consensus_rpc::ClusterConsensusRpcService
+    for ConsensusRpcHandle
 {
-    fn vote<'a>(
-        &'a self,
+    fn vote(
+        &self,
         request: bmux_cluster_plugin_api::cluster_consensus_vote_types::VoteRequest,
-    ) -> std::pin::Pin<
-        Box<
-            dyn Future<
-                    Output = Result<
-                        bmux_cluster_plugin_api::cluster_consensus_vote_types::VoteResponse,
-                        bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
+    ) -> ConsensusRpc<'_, bmux_cluster_plugin_api::cluster_consensus_vote_types::VoteResponse> {
         Box::pin(async move {
-            use bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError;
-            owned_vote_signing_payload(&request).map_err(|_| RpcError::InvalidRequest)?;
-            let identity = crate::load_or_create_node_identity(self.caller.as_ref())
-                .map_err(|_| RpcError::Unauthorized)?;
-            if *identity.node_id() != self.local {
-                return Err(RpcError::Unauthorized);
-            }
-            let decision = self
-                .executor
-                .vote_authenticated(self.caller.clone(), self.local, request.clone())
-                .await?;
-            let mut response =
-                bmux_cluster_plugin_api::cluster_consensus_vote_types::VoteResponse {
-                    request_id: request.request_id,
-                    source: self.local.as_bytes().to_vec(),
-                    term: decision.term.0,
-                    granted: decision.granted,
-                    signature: Vec::new(),
-                };
-            response.signature = identity.sign(
-                &owned_vote_response_signing_payload(&request, &response)
-                    .map_err(|_| RpcError::InvalidRequest)?,
-            );
-            Ok(response)
+            let (v1, _) = self.providers()?;
+            v1.vote(request).await
         })
     }
 
-    fn append<'a>(
-        &'a self,
+    fn append(
+        &self,
         request: bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
-    ) -> std::pin::Pin<
-        Box<
-            dyn Future<
-                    Output = Result<
-                        bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendResponse,
-                        bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError,
-                    >,
-                > + Send
-                + 'a,
-        >,
-    > {
+    ) -> ConsensusRpc<'_, bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendResponse>
+    {
         Box::pin(async move {
-            use crate::consensus_model::{AppendOutcome as DecisionOutcome, AppendReconciliation};
-            use bmux_cluster_plugin_api::cluster_consensus_rpc_types::{
-                AppendOutcome, AppendResponse, RpcError,
-            };
-            owned_append_signing_payload(&request).map_err(|_| RpcError::InvalidRequest)?;
-            let identity = crate::load_or_create_node_identity(self.caller.as_ref())
-                .map_err(|_| RpcError::Unauthorized)?;
-            if *identity.node_id() != self.local {
-                return Err(RpcError::Unauthorized);
-            }
-            let sign = |mut response: AppendResponse| -> Result<AppendResponse, RpcError> {
-                response.signature = identity.sign(
-                    &owned_append_response_signing_payload(&request, &response)
-                        .map_err(|_| RpcError::InvalidRequest)?,
-                );
-                Ok(response)
-            };
-            let request_id = request.request_id;
-            let next_index = request
-                .previous
-                .as_ref()
-                .map_or(0, |position| position.index);
-            let result = self
-                .executor
-                .append_authenticated(self.caller.clone(), self.local, request.clone())
-                .await;
-            let result = match result {
-                Err(crate::owned_vote_store::AuthenticatedAppendError::MissingTransfer {
-                    reference,
-                    term,
-                }) => {
-                    return sign(AppendResponse {
-                        signature: Vec::new(),
-                        request_id,
-                        source: self.local.as_bytes().to_vec(),
-                        term: term.0,
-                        outcome: AppendOutcome::MissingTransfer {
-                            reference: *reference,
-                        },
-                    });
-                }
-                other => other,
-            };
-            let decision = result.map_err(|error| match error {
-                crate::owned_vote_store::AuthenticatedAppendError::Unauthorized => {
-                    RpcError::Unauthorized
-                }
-                crate::owned_vote_store::AuthenticatedAppendError::Invalid(_) => {
-                    RpcError::InvalidRequest
-                }
-                crate::owned_vote_store::AuthenticatedAppendError::Storage(_) => {
-                    RpcError::StorageFailure
-                }
-                crate::owned_vote_store::AuthenticatedAppendError::Executor(
-                    crate::consensus_model::VoteGateError::Stopped,
-                ) => RpcError::Stopped,
-                crate::owned_vote_store::AuthenticatedAppendError::TermMismatch => {
-                    RpcError::StaleTerm
-                }
-                crate::owned_vote_store::AuthenticatedAppendError::MissingTransfer { .. }
-                | crate::owned_vote_store::AuthenticatedAppendError::Executor(_) => {
-                    RpcError::ExecutionFailed
-                }
-            })?;
-            let outcome = match decision.outcome {
-                Ok(DecisionOutcome::StaleTerm) => return Err(RpcError::StaleTerm),
-                Ok(DecisionOutcome::Reconciled(AppendReconciliation::PreviousMismatch)) => {
-                    AppendOutcome::Conflict { next_index }
-                }
-                Ok(DecisionOutcome::Reconciled(AppendReconciliation::Matched {
-                    through, ..
-                })) => AppendOutcome::Durable {
-                    matched: through.map(|identity| {
-                        bmux_cluster_plugin_api::cluster_consensus_transfer_types::LogIdentity {
-                            term: identity.term.0,
-                            leader: identity.leader.as_bytes().to_vec(),
-                            index: identity.index.0,
-                        }
-                    }),
-                },
-                Err(_) => return Err(RpcError::ExecutionFailed),
-            };
-            sign(AppendResponse {
-                signature: Vec::new(),
-                request_id,
-                source: self.local.as_bytes().to_vec(),
-                term: decision.term.0,
-                outcome,
-            })
+            let (v1, _) = self.providers()?;
+            v1.append(request).await
         })
     }
 }
 
-impl<C> ClusterRaftRpcService for RaftRpcServiceHandle<C>
-where
-    C: crate::ClusterRuntimeOps + Send + Sync + 'static,
+impl bmux_cluster_plugin_api::cluster_consensus_rpc_v2::ClusterConsensusRpcService
+    for ConsensusRpcHandle
 {
-    fn append_entries<'a>(
-        &'a self,
-        request: RaftRpcRequest,
-    ) -> std::pin::Pin<Box<dyn Future<Output = RaftRpcResponse> + Send + 'a>> {
-        Box::pin(self.dispatch("append_entries", request, |raft, request| {
-            Box::pin(async move {
-                raft.append_entries(request)
-                    .await
-                    .map_err(|error| error.to_string())
-            })
-        }))
-    }
-
-    fn install_snapshot<'a>(
-        &'a self,
-        request: RaftRpcRequest,
-    ) -> std::pin::Pin<Box<dyn Future<Output = RaftRpcResponse> + Send + 'a>> {
-        Box::pin(self.dispatch("install_snapshot", request, |raft, request| {
-            Box::pin(async move {
-                raft.install_snapshot(request)
-                    .await
-                    .map_err(|error| error.to_string())
-            })
-        }))
-    }
-
-    fn vote<'a>(
-        &'a self,
-        request: RaftRpcRequest,
-    ) -> std::pin::Pin<Box<dyn Future<Output = RaftRpcResponse> + Send + 'a>> {
-        Box::pin(self.dispatch("vote", request, |raft, request| {
-            Box::pin(async move { raft.vote(request).await.map_err(|error| error.to_string()) })
-        }))
-    }
-}
-
-#[must_use]
-pub fn response(source_node_id: NodeId, payload: Vec<u8>) -> RaftRpcResponse {
-    RaftRpcResponse {
-        source_node_id: source_node_id.to_string(),
-        payload,
-        error: None,
+    fn append(
+        &self,
+        request: bmux_cluster_plugin_api::cluster_consensus_rpc_types::AppendRequest,
+    ) -> ConsensusRpc<'_, bmux_cluster_plugin_api::cluster_consensus_rpc_v2_types::AppendResponse>
+    {
+        Box::pin(async move {
+            let (_, v2) = self.providers()?;
+            v2.append(request).await
+        })
     }
 }
 
@@ -2710,225 +1933,6 @@ mod tests {
         ClusterConsensusRole, ClusterNodeCapabilities, ControlCommandError, PeerAuthChallenge,
         PeerAuthProof,
     };
-
-    struct SnapshotEndpointCaller {
-        mode: u8,
-        invocations: std::sync::Mutex<Vec<(String, String, String)>>,
-    }
-
-    impl bmux_plugin::ServiceCaller for SnapshotEndpointCaller {
-        fn call_service_raw(
-            &self,
-            _capability: &str,
-            _kind: bmux_plugin_sdk::ServiceKind,
-            interface: &str,
-            operation: &str,
-            payload: Vec<u8>,
-        ) -> bmux_plugin_sdk::Result<Vec<u8>> {
-            use bmux_cluster_plugin_api::cluster_consensus_snapshot_types::{
-                InstallError, InstallOutcome, InstallRequest, InstallResponse,
-            };
-            use bmux_connections_plugin_api::{
-                connection_types::ConnectionError, connections_commands,
-            };
-            assert_eq!(interface, connections_commands::INTERFACE_ID.as_str());
-            assert_eq!(operation, connections_commands::OP_INVOKE_SERVICE.as_str());
-            let request: connections_commands::client::InvokeServiceRequest =
-                decode_service_message(bmux_plugin_sdk::service_contract::decode_for(
-                    interface,
-                    connections_commands::SERVICE_CONTRACT,
-                    &payload,
-                )?)?;
-            let invocation = request.invocation;
-            assert_eq!(
-                invocation.interface_id,
-                bmux_cluster_plugin_api::cluster_consensus_snapshot::INTERFACE_ID.as_str()
-            );
-            assert_eq!(invocation.operation, "install");
-            self.invocations.lock().unwrap().push((
-                invocation.target,
-                invocation.interface_id,
-                invocation.operation,
-            ));
-            let request: bmux_cluster_plugin_api::cluster_consensus_snapshot::client::InstallRequest = decode_service_message(&invocation.payload)?;
-            let request: InstallRequest = request.request;
-            let bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferPurpose::Snapshot { value } = &request.reference.purpose else { unreachable!() };
-            let mut response = InstallResponse {
-                request_id: request.request_id,
-                source: request.reference.recipient.clone(),
-                term: request.reference.leader_term,
-                outcome: InstallOutcome::Installed {
-                    boundary: value.last_included.clone().unwrap(),
-                },
-                signature: Vec::new(),
-            };
-            response.signature = NodeIdentity::new_for_test(2).sign(
-                &owned_snapshot_install_response_signing_payload(&request, &response).unwrap(),
-            );
-            match self.mode {
-                1 => response.request_id = uuid::Uuid::from_u128(99),
-                2 => response.source = NodeIdentity::new_for_test(3).node_id().as_bytes().to_vec(),
-                3 => response.term += 1,
-                4 => {
-                    response.signature = NodeIdentity::new_for_test(3).sign(
-                        &owned_snapshot_install_response_signing_payload(&request, &response)
-                            .unwrap(),
-                    );
-                }
-                _ => {}
-            }
-            let encoded =
-                encode_service_message(&Result::<InstallResponse, InstallError>::Ok(response))?;
-            let result = encode_service_message(&Result::<Vec<u8>, ConnectionError>::Ok(encoded))?;
-            Ok(bmux_plugin_sdk::service_contract::encode_response(&result))
-        }
-
-        fn execute_kernel_request(
-            &self,
-            _request: bmux_ipc::Request,
-        ) -> bmux_plugin_sdk::Result<bmux_ipc::ResponsePayload> {
-            Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
-                operation: "snapshot sender test",
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn snapshot_install_generated_sender_verifies_endpoint_responses() {
-        use crate::owned_vote_store::{DurableVoteGate, OwnedVoteStore, VoteExecutor};
-        use bmux_cluster_plugin_api::cluster_consensus_snapshot_types::{
-            InstallError, InstallOutcome,
-        };
-        let source = NodeIdentity::new_for_test(1);
-        let target = NodeIdentity::new_for_test(2);
-        let cluster = crate::membership::ClusterId::generate();
-        let mut selected = activation_member(&source, cluster, &target, crate::now_unix_ms());
-        selected.negotiated_protocol.features = vec![
-            bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID.to_string(),
-            bmux_cluster_plugin_api::cluster_consensus_transfer::INTERFACE_ID.to_string(),
-            bmux_cluster_plugin_api::cluster_consensus_snapshot::INTERFACE_ID.to_string(),
-        ];
-        let mut member = crate::membership::issue_membership_credential(
-            &source,
-            cluster,
-            selected.node_id,
-            selected.public_key,
-            selected.capabilities,
-            selected.negotiated_protocol,
-            crate::now_unix_ms(),
-        )
-        .unwrap();
-        member.endpoint = Some("tls://snapshot-target:7443".into());
-        let mut request = snapshot_install_request();
-        request.reference.cluster_id = cluster.to_string();
-        request.proof.peer.challenge.cluster_id = cluster.to_string();
-        let bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferPurpose::Snapshot {
-            value,
-        } = &mut request.reference.purpose
-        else {
-            unreachable!()
-        };
-        value.cluster_id = cluster.to_string();
-        request.proof.signature =
-            source.sign(&owned_snapshot_install_signing_payload(&request).unwrap());
-        for mode in 0..5 {
-            let root = tempfile::tempdir().unwrap();
-            let store =
-                OwnedVoteStore::create(&root.path().join("sender"), &cluster.to_string()).unwrap();
-            let executor = Arc::new(VoteExecutor::new(DurableVoteGate::new(1, store)));
-            let caller = Arc::new(SnapshotEndpointCaller {
-                mode,
-                invocations: std::sync::Mutex::new(Vec::new()),
-            });
-            let service = OwnedAppendService {
-                caller: caller.clone(),
-                local: *source.node_id(),
-                executor: executor.clone(),
-            };
-            let result = service
-                .send_snapshot_install(&member, request.clone())
-                .await;
-            if mode == 0 {
-                let response = result.unwrap();
-                assert!(matches!(response.outcome, InstallOutcome::Installed { .. }));
-                verify_owned_snapshot_install_response(&request, &response).unwrap();
-            } else {
-                assert_eq!(
-                    result,
-                    Err(InstallError::Unauthorized),
-                    "invalid response mode {mode}"
-                );
-            }
-            assert_eq!(
-                *caller.invocations.lock().unwrap(),
-                vec![(
-                    "tls://snapshot-target:7443".into(),
-                    "cluster-consensus-snapshot/v1".into(),
-                    "install".into()
-                )]
-            );
-            let before = caller.invocations.lock().unwrap().len();
-            let mut unsupported = member.clone();
-            unsupported.negotiated_protocol.features.pop();
-            assert_eq!(
-                service
-                    .send_snapshot_install(&unsupported, request.clone())
-                    .await,
-                Err(InstallError::Incompatible)
-            );
-            assert_eq!(
-                caller.invocations.lock().unwrap().len(),
-                before,
-                "no fallback invocation"
-            );
-            executor.shutdown().await.unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn snapshot_install_provider_registration_is_explicit_and_uses_supplied_executor() {
-        use crate::owned_vote_store::{DurableVoteGate, OwnedVoteStore, VoteExecutor};
-        use bmux_cluster_plugin_api::cluster_consensus_snapshot::{
-            self, ClusterConsensusSnapshotService,
-        };
-        use bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallError;
-        let root = tempfile::tempdir().unwrap();
-        let store = OwnedVoteStore::create(&root.path().join("provider"), "cluster").unwrap();
-        let executor = Arc::new(VoteExecutor::new(DurableVoteGate::new(1, store)));
-        let caller = Arc::new(SnapshotAuthCaller::default());
-        let local = *NodeIdentity::new_for_test(2).node_id();
-        let mut registry = bmux_plugin_sdk::TypedServiceRegistry::new();
-        OwnedAppendService::register_snapshot(
-            &mut registry,
-            caller.clone(),
-            local,
-            executor.clone(),
-        )
-        .unwrap();
-        assert_eq!(registry.len(), 1);
-        assert_eq!(
-            registry.iter().next().unwrap().0.2.as_str(),
-            cluster_consensus_snapshot::INTERFACE_ID.as_str()
-        );
-        OwnedAppendService::register(&mut registry, caller.clone(), local, executor.clone())
-            .unwrap();
-        assert_eq!(
-            registry.len(),
-            2,
-            "RPC registration remains a separate owner decision"
-        );
-        executor.shutdown().await.unwrap();
-        let service = OwnedAppendService {
-            caller,
-            local,
-            executor,
-        };
-        assert_eq!(
-            ClusterConsensusSnapshotService::install(&service, snapshot_install_request()).await,
-            Err(InstallError::Stopped),
-            "provider must call the supplied stopped executor, not open another authority"
-        );
-    }
 
     #[derive(Default)]
     struct SnapshotAuthCaller {
@@ -3553,7 +2557,7 @@ mod tests {
     }
 
     #[test]
-    fn raft_rpc_signature_binds_operation_target_proof_and_payload() {
+    fn peer_rpc_signature_binds_operation_target_proof_and_payload() {
         let identity = NodeIdentity::new_for_test(7);
         let target = NodeId::from(8);
         let request = authenticated_request(
@@ -3572,23 +2576,20 @@ mod tests {
         )
         .unwrap();
         identity.verify(&signed, &request.signature).unwrap();
-        let decoder_signed = decoder_proof_payload(&request).unwrap();
-        let decoder_signature = identity.sign(&decoder_signed);
-        identity
-            .verify(&decoder_signed, &decoder_signature)
-            .unwrap();
         let mut replay = request.clone();
         replay.proof.challenge.nonce.push('x');
         assert!(
             identity
-                .verify(&decoder_proof_payload(&replay).unwrap(), &decoder_signature)
-                .is_err()
-        );
-        replay = request.clone();
-        replay.target_node_id = identity.node_id().to_string();
-        assert!(
-            identity
-                .verify(&decoder_proof_payload(&replay).unwrap(), &decoder_signature)
+                .verify(
+                    &signing_payload(
+                        "vote",
+                        &replay.target_node_id,
+                        &replay.proof,
+                        &replay.payload
+                    )
+                    .unwrap(),
+                    &request.signature,
+                )
                 .is_err()
         );
         assert!(
