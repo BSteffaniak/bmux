@@ -1312,6 +1312,7 @@ fn mark_pane_startup_failed(
     let _ = targets.pane_exit_tx.send(PaneExitEvent {
         session_id,
         pane_id,
+        exited: Arc::clone(targets.exited),
     });
     host.mark_snapshot_dirty();
 }
@@ -8248,6 +8249,7 @@ impl SessionRuntimeManager {
                     let _ = pane_exit_tx.send(PaneExitEvent {
                         session_id,
                         pane_id,
+                        exited: Arc::clone(&exited_for_waiter),
                     });
                     }
                     let _ = child_exit_tx.send(ExecutionExitNotice::OwnerExited);
@@ -12818,10 +12820,26 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// A pane's program ended (or never started). `exited` is that program's own flag: a restart
+/// keeps the pane's id but gives its new program a new flag, so a late notice from the program
+/// it replaced is recognisably stale ([`PaneExitEvent::is_current`]).
+#[derive(Debug, Clone)]
 struct PaneExitEvent {
     session_id: SessionId,
     pane_id: Uuid,
+    exited: Arc<AtomicBool>,
+}
+
+impl PaneExitEvent {
+    /// Whether the notice is about the program the pane runs now, or about a pane that is
+    /// gone (closed): not about one a restart replaced.
+    fn is_current(&self, manager: &SessionRuntimeManager) -> bool {
+        manager
+            .runtimes
+            .get(&self.session_id)
+            .and_then(|runtime| runtime.panes.get(&self.pane_id))
+            .is_none_or(|pane| Arc::ptr_eq(&pane.exited, &self.exited))
+    }
 }
 
 pub(crate) fn captured_image_window_anchored(
@@ -13451,6 +13469,11 @@ async fn process_pane_exit_events(
                 let Some(event) = maybe_event else {
                     break;
                 };
+                // A restart replaced the program that exited: the pane's id now names its
+                // successor, which is running.
+                if !manager.lock().is_ok_and(|manager| event.is_current(&manager)) {
+                    continue;
+                }
                 reap_exited_pane(&manager, event.session_id, event.pane_id);
             }
         }
@@ -14134,6 +14157,7 @@ mod tests {
         let pane = runtime.panes.get_mut(&pane_id).unwrap();
         pane.exited.store(true, Ordering::SeqCst);
         *pane.exit_reason.lock().unwrap() = Some(reason.to_owned());
+        let exited = Arc::clone(&pane.exited);
         let exit_tx = {
             let mut manager = manager.lock().unwrap();
             manager.runtimes.insert(session_id, runtime);
@@ -14150,6 +14174,7 @@ mod tests {
             .send(PaneExitEvent {
                 session_id,
                 pane_id,
+                exited,
             })
             .unwrap();
         let event = switchy_async::time::timeout(Duration::from_secs(1), async {
@@ -14166,6 +14191,69 @@ mod tests {
         .expect("activated consumer must publish the typed exit");
         assert!(
             matches!(&*event, PaneEvent::Exited { reason: Some(actual), .. } if actual == reason)
+        );
+        let mut removed = manager
+            .lock()
+            .unwrap()
+            .runtimes
+            .remove(&session_id)
+            .unwrap();
+        removed.panes.remove(&pane_id).unwrap().task.abort();
+    }
+
+    #[switchy_async::test]
+    async fn exit_of_a_program_a_restart_replaced_is_not_published() {
+        let bus = Arc::new(bmux_plugin::EventBus::new());
+        let host = PaneRuntimeHost::new(
+            Arc::new(bmux_plugin::PluginStateRegistry::new()),
+            Some(Arc::clone(&bus)),
+        );
+        bus.register_channel::<PaneEvent>(pane_runtime_events::EVENT_KIND);
+        let mut events = bus
+            .subscribe::<PaneEvent>(&pane_runtime_events::EVENT_KIND)
+            .unwrap();
+        activate_pane_runtime(
+            &host,
+            PaneRuntimePluginConfig {
+                shell: "/bin/sh".into(),
+                pane_term: "xterm-256color".into(),
+                bracketed_paste: true,
+                shell_integration_root: None,
+            },
+            PanePaddingConfig::default(),
+        )
+        .expect("activate pane runtime");
+        let manager = host.spawn_runtime_handle().expect("activated runtime").0;
+        let session_id = SessionId(crate::ids::new_uuid());
+        let pane_id = crate::ids::new_uuid();
+        // The pane runs its restarted program; the replaced one's flag is another.
+        let runtime = runtime_with_panes(&[pane_id]);
+        let replaced = Arc::new(AtomicBool::new(true));
+        let exit_tx = {
+            let mut manager = manager.lock().unwrap();
+            manager.runtimes.insert(session_id, runtime);
+            manager.pane_exit_tx.clone()
+        };
+        switchy_async::task::yield_now().await;
+        exit_tx
+            .send(PaneExitEvent {
+                session_id,
+                pane_id,
+                exited: replaced,
+            })
+            .unwrap();
+        let published = switchy_async::time::timeout(Duration::from_millis(200), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if matches!(&*event, PaneEvent::Exited { pane_id: pid, .. } if *pid == pane_id) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(
+            published.is_err(),
+            "a replaced program's exit must not report the running pane exited"
         );
         let mut removed = manager
             .lock()

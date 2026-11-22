@@ -89,7 +89,7 @@ struct Opened {
     serial: u64,
     /// Lines typed into its current program.
     typed: Vec<String>,
-    /// Programs it has run (one, plus one per restart).
+    /// Programs it has started (one, plus one per restart begun).
     programs: u64,
     /// Whether a restart is under way.
     restarting: bool,
@@ -116,7 +116,7 @@ struct State {
     busy: u64,
     /// A crash is under way: drivers start nothing until it is done.
     crashing: bool,
-    /// Exit notices the runtime sent, per pane.
+    /// Exits the runtime acted on, per pane.
     exits: BTreeMap<Pane, u64>,
     violations: Vec<String>,
     stats: Stats,
@@ -137,11 +137,23 @@ pub struct Shared {
     settle: Duration,
 }
 
+/// Record an event on the run's timeline (and print it with `PANE_RUNTIME_SIM_EVENTS`).
+fn event(kind: &str, label: impl Into<String>, tone: Tone) {
+    let label = label.into();
+    if std::env::var_os("PANE_RUNTIME_SIM_EVENTS").is_some() {
+        eprintln!("[{:?}] {kind}: {label}", switchy_time::Instant::now());
+    }
+    sim_support::event(kind, label, tone);
+}
+
 /// Record that an invariant failed with `message` (which starts with the invariant's number):
 /// as a violation of the run, in the dashboard's invariants, and to a dashboard breaking on
 /// failures (which may pause here).
 fn violated(violations: &mut Vec<String>, message: String) {
     Board::failed(&message);
+    if std::env::var_os("PANE_RUNTIME_SIM_EVENTS").is_some() {
+        eprintln!("[{:?}] VIOLATION: {message}", switchy_time::Instant::now());
+    }
     sim_support::failure(&message);
     violations.push(message);
 }
@@ -262,25 +274,27 @@ impl Shared {
         true
     }
 
-    /// Take the exit notices the runtime sent, checking that no program's exit is reported
-    /// twice (invariant 8).
+    /// Take the exits the runtime acted on, checking that it acts on each program's exit at
+    /// most once, and never on that of a program a restart replaced (invariant 8).
     fn collect_exits(&self) {
         let mut state = self.lock();
         let panes = Arc::clone(&state.panes);
         for pane in panes.take_exits() {
+            let Some(opened) = state.open.get(&pane) else {
+                // A closed pane's last word.
+                continue;
+            };
+            let (pid, programs) = (opened.pid, opened.programs);
+            event("exit", format!("pane {pid} exited"), Tone::Info);
+            Board::checked(8);
             let count = {
                 let count = state.exits.entry(pane).or_default();
                 *count += 1;
                 *count
             };
-            Board::checked(8);
-            if let Some(opened) = state.open.get(&pane)
-                && count > opened.programs
-            {
-                let message = format!(
-                    "8. pane process {} got {count} exit notices for {} programs",
-                    opened.pid, opened.programs
-                );
+            if count > programs {
+                let message =
+                    format!("8. pane process {pid} got {count} exits for {programs} programs");
                 violated(&mut state.violations, message);
             }
         }
@@ -407,7 +421,7 @@ impl Shared {
                 "1. pane process {pid} does not lead its own session: {other:?}"
             )),
         }
-        sim_support::event(
+        event(
             "open",
             format!("d{driver}: pane {pid} opened at {rows}x{cols}"),
             Tone::Info,
@@ -456,7 +470,7 @@ impl Shared {
         let Some(opened) = state.open.get_mut(&pane) else {
             return;
         };
-        sim_support::event(
+        event(
             "type",
             format!("d{driver}: typed {line:?} into {}", opened.pid),
             Tone::Neutral,
@@ -482,7 +496,7 @@ impl Shared {
                 return;
             };
             opened.resizes += 1;
-            sim_support::event(
+            event(
                 "resize",
                 format!("d{driver}: pane {} resized to {rows}x{cols}", opened.pid),
                 Tone::Neutral,
@@ -535,7 +549,7 @@ impl Shared {
             state.stats.closed += 1;
             (pane, opened, Arc::clone(&state.panes))
         };
-        sim_support::event(
+        event(
             "close",
             format!("d{driver}: pane {} closing", opened.pid),
             Tone::Neutral,
@@ -598,6 +612,7 @@ impl Shared {
             };
             // Lines typed from now on go to the new program.
             opened.restarting = true;
+            opened.programs += 1;
             opened.typed.clear();
             (pane, opened.pid, old_session, panes)
         };
@@ -626,10 +641,9 @@ impl Shared {
             };
             opened.pid = pid;
             opened.serial = serial;
-            opened.programs += 1;
             opened.restarting = false;
         }
-        sim_support::event(
+        event(
             "restart",
             format!("d{driver}: pane {old} restarted as {pid}"),
             Tone::Info,
@@ -663,7 +677,7 @@ impl Shared {
             state.crashing = true;
             Arc::clone(&state.panes)
         };
-        sim_support::event("crash", format!("d{driver}: the server crashed"), Tone::Warn);
+        event("crash", format!("d{driver}: the server crashed"), Tone::Warn);
         // Die: nothing the old server still does ends a session, and its work under way stops.
         panes.abandon();
         self.generation.send_modify(|generation| *generation += 1);

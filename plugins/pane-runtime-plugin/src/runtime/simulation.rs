@@ -282,13 +282,15 @@ impl Panes {
         }
     }
 
-    /// The panes whose programs exited on their own since last asked, one per exit notice
-    /// the runtime sent.
+    /// The panes whose exits the runtime acted on since last asked, one per notice (as its
+    /// exit processing does, it drops notices about a program a restart replaced).
     pub fn take_exits(&self) -> Vec<Pane> {
         let mut exits = lock(&self.exits);
         let mut panes = Vec::new();
         while let Ok(event) = exits.try_recv() {
-            panes.push(Pane(event.session_id));
+            if event.is_current(&lock(&self.manager)) {
+                panes.push(Pane(event.session_id));
+            }
         }
         panes
     }
