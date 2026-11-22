@@ -5358,6 +5358,130 @@ impl OwnedVoteStore {
         Ok(decision)
     }
 
+    /// Durable authority in the shape the pure engine recovers from.
+    /// # Errors
+    /// Read or decode failure is an explicit recovery error, never empty state.
+    pub fn recovered(&mut self) -> io::Result<crate::consensus_engine::Recovered> {
+        if self.failed || self.status.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return Err(io::Error::other("owned authority stopped"));
+        }
+        let tx = self.database.begin_read().map_err(io::Error::other)?;
+        let meta = tx.open_table(TABLE).map_err(io::Error::other)?;
+        let get = |key| -> io::Result<Vec<u8>> {
+            Ok(meta
+                .get(key)
+                .map_err(io::Error::other)?
+                .ok_or_else(|| invalid("missing recovery authority"))?
+                .value()
+                .to_vec())
+        };
+        let snapshot = match decode_position(&get("snapshot")?)? {
+            None => None,
+            Some(boundary) => {
+                let (descriptor, _) =
+                    crate::consensus_storage::decode_owned_snapshot(&get("compacted_snapshot")?)
+                        .map_err(io::Error::other)?;
+                let membership = descriptor
+                    .membership
+                    .ok_or_else(|| invalid("compacted snapshot lacks membership"))?;
+                Some((boundary, membership))
+            }
+        };
+        let log = tx.open_table(LOG).map_err(io::Error::other)?;
+        let mut entries = Vec::new();
+        for record in log.iter().map_err(io::Error::other)? {
+            let (_, bytes) = record.map_err(io::Error::other)?;
+            entries.push(
+                crate::consensus_storage::decode_owned_entry(bytes.value())
+                    .map_err(io::Error::other)?,
+            );
+        }
+        Ok(crate::consensus_engine::Recovered {
+            hard_state: self.state,
+            snapshot,
+            entries,
+            commit: decode_position(&get("commit")?)?,
+            applied: decode_position(&get("applied")?)?,
+        })
+    }
+
+    /// Execute one engine write (hard state, suffix replacement, commit
+    /// watermark) as a single immediate transaction, in the order issued.
+    /// # Errors
+    /// Any failure permanently stops the handle; the engine must stop too.
+    pub fn write(&mut self, write: &crate::consensus_engine::Write) -> io::Result<()> {
+        if self.failed || self.status.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return Err(io::Error::other("owned authority stopped"));
+        }
+        if let Some(state) = write.hard_state
+            && (state.term < self.state.term
+                || (state.term == self.state.term
+                    && self.state.voted_for.is_some()
+                    && state.voted_for != self.state.voted_for))
+        {
+            return Err(invalid("vote authority regression"));
+        }
+        self.failed = true;
+        let mut transaction = self.database.begin_write().map_err(io::Error::other)?;
+        transaction
+            .set_durability(Durability::Immediate)
+            .map_err(io::Error::other)?;
+        {
+            let mut meta = transaction.open_table(TABLE).map_err(io::Error::other)?;
+            if let Some(state) = write.hard_state {
+                meta.insert("vote", encode(state)?.as_slice())
+                    .map_err(io::Error::other)?;
+            }
+            if write.truncate_from.is_some() || !write.entries.is_empty() {
+                let mut log = transaction.open_table(LOG).map_err(io::Error::other)?;
+                let mut memberships = transaction
+                    .open_table(MEMBERSHIPS)
+                    .map_err(io::Error::other)?;
+                if let Some(first) = write.truncate_from {
+                    log.retain_in(first.0.., |_, _| false)
+                        .map_err(io::Error::other)?;
+                    memberships
+                        .retain_in(first.0.., |_, _| false)
+                        .map_err(io::Error::other)?;
+                }
+                for entry in &write.entries {
+                    let bytes = crate::consensus_storage::encode_owned_entry(entry)
+                        .map_err(io::Error::other)?;
+                    log.insert(entry.identity.index.0, bytes.as_slice())
+                        .map_err(io::Error::other)?;
+                    if matches!(entry.payload, EntryPayload::Membership(_)) {
+                        memberships
+                            .insert(entry.identity.index.0, bytes.as_slice())
+                            .map_err(io::Error::other)?;
+                    }
+                }
+                if log.len().map_err(io::Error::other)? > MAX_RETAINED_ENTRIES {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "owned log requires compaction",
+                    ));
+                }
+                let fallback = application_membership_bytes(&meta)?;
+                let latest = memberships
+                    .last()
+                    .map_err(io::Error::other)?
+                    .map_or(fallback, |(_, bytes)| bytes.value().to_vec());
+                meta.insert("membership", latest.as_slice())
+                    .map_err(io::Error::other)?;
+            }
+            if let Some(commit) = write.commit {
+                meta.insert("commit", encode_position(Some(commit)).as_slice())
+                    .map_err(io::Error::other)?;
+            }
+        }
+        transaction.commit().map_err(io::Error::other)?;
+        if let Some(state) = write.hard_state {
+            self.state = state;
+        }
+        self.failed = false;
+        Ok(())
+    }
+
     /// Atomically replace authority, acknowledging only an immediate commit.
     /// # Errors
     /// Rejects regression; transaction failures permanently stop the handle.

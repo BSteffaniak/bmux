@@ -18,6 +18,7 @@ mod admission;
 pub(crate) mod attach_state;
 pub mod capability_publication;
 pub(crate) mod commands;
+pub mod consensus_driver;
 pub mod consensus_engine;
 pub mod consensus_membership;
 pub mod consensus_model;
