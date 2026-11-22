@@ -9,7 +9,7 @@
 //!
 //! * uses a forbidden primitive ([`FORBIDDEN`]) other than through a `switchy_` crate of the same
 //!   name;
-//! * imports `std::fs` in a group (`use std::{fs, io};`);
+//! * imports one in a group (`use std::{fs, sync::{Arc, Mutex}};`);
 //! * declares process-wide mutable state (a `static` holding a lock, an atomic or a lazily
 //!   initialised value), which concurrent simulated runs would share;
 //! * chooses code by operating system outside the places the crate allows it, so the simulation
@@ -215,18 +215,39 @@ fn check_source(
     violations: &mut Vec<String>,
 ) {
     let raw: Vec<&str> = source.lines().collect();
+    // The `use` statement being read: its first line, its text so far, and whether it says why
+    // it is safe.
+    let mut statement: Option<(usize, String, bool)> = None;
     for (number, line) in production_lines(source) {
         if !os_allowed && names_an_operating_system(line) {
             violations.push(format!("{relative}:{number}: names an OS: {}", line.trim()));
         }
         // The reason may also stand on the line above.
-        if line.contains("// simulation-safe:")
-            || (number >= 2 && raw[number - 2].contains("// simulation-safe:"))
-        {
-            continue;
+        let safe = line.contains("// simulation-safe:")
+            || (number >= 2 && raw[number - 2].contains("// simulation-safe:"));
+        if statement.is_none() && starts_use(line) {
+            statement = Some((number, String::new(), false));
         }
-        if imports_std_fs(line) {
-            violations.push(format!("{relative}:{number}: {}", line.trim()));
+        if let Some((first, text, statement_safe)) = &mut statement {
+            *statement_safe |= safe;
+            text.push_str(line.split("//").next().unwrap_or_default());
+            text.push(' ');
+            if line.contains(';') {
+                if !*statement_safe {
+                    for path in imported_paths(text) {
+                        for pattern in forbidden {
+                            // What the statement's own text shows is reported line by line.
+                            if uses(&path, pattern) && !uses(text, pattern) {
+                                violations.push(format!("{relative}:{first}: imports {path}"));
+                            }
+                        }
+                    }
+                }
+                statement = None;
+            }
+        }
+        if safe {
+            continue;
         }
         if process_wide(line) {
             violations.push(format!(
@@ -239,6 +260,74 @@ fn check_source(
                 violations.push(format!("{relative}:{number}: {}", line.trim()));
             }
         }
+    }
+}
+
+/// Whether `line` starts a `use` statement.
+fn starts_use(line: &str) -> bool {
+    let item = line.trim_start();
+    let item = item
+        .strip_prefix("pub(crate) ")
+        .or_else(|| item.strip_prefix("pub(super) "))
+        .or_else(|| item.strip_prefix("pub "))
+        .unwrap_or(item);
+    item.starts_with("use ")
+}
+
+/// The full paths a `use` statement imports (`use std::{sync::{Arc, Mutex}, fs};` imports
+/// `std::sync::Arc`, `std::sync::Mutex` and `std::fs`), so grouped imports cannot hide a
+/// forbidden one.
+fn imported_paths(statement: &str) -> Vec<String> {
+    let tree = statement.trim().trim_end_matches(';').trim_end();
+    let tree = tree.split_once("use ").map_or(tree, |(_, tree)| tree);
+    // Aliases name nothing new: drop them (`a as b` imports `a`).
+    let mut words: Vec<&str> = Vec::new();
+    let mut tokens = tree.split_whitespace().peekable();
+    while let Some(token) = tokens.next() {
+        if token == "as" {
+            // The alias, and whatever punctuation it carries.
+            if let Some(alias) = tokens.next() {
+                let rest = alias.trim_start_matches(|c: char| c.is_alphanumeric() || c == '_');
+                words.push(rest);
+            }
+        } else {
+            words.push(token);
+        }
+    }
+    let tree: String = words.concat();
+    let mut paths = Vec::new();
+    expand("", &tree, &mut paths);
+    paths
+}
+
+/// Expand the use tree `tree` under `prefix` onto `paths`.
+fn expand(prefix: &str, tree: &str, paths: &mut Vec<String>) {
+    let Some(open) = tree.find('{') else {
+        let path = format!("{prefix}{tree}");
+        paths.push(path.strip_suffix("::self").unwrap_or(&path).to_string());
+        return;
+    };
+    let head = format!("{prefix}{}", &tree[..open]);
+    let inner = tree[open + 1..].strip_suffix('}').unwrap_or(&tree[open + 1..]);
+    let mut depth = 0;
+    let mut start = 0;
+    for (index, c) in inner.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            ',' if depth == 0 => {
+                expand_part(&head, &inner[start..index], paths);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    expand_part(&head, &inner[start..], paths);
+}
+
+fn expand_part(head: &str, part: &str, paths: &mut Vec<String>) {
+    if !part.is_empty() {
+        expand(head, part, paths);
     }
 }
 
@@ -255,15 +344,6 @@ fn process_wide(line: &str) -> bool {
         && ["OnceLock", "LazyLock", "OnceCell", "Lazy<", "Atomic", "Mutex", "RwLock"]
             .iter()
             .any(|kind| line.contains(kind))
-}
-
-/// Whether `line` imports `std::fs` in a group (`use std::{fs, io};`), which the forbidden
-/// patterns cannot see.
-fn imports_std_fs(line: &str) -> bool {
-    line.contains("std::{")
-        && line
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .any(|word| word == "fs")
 }
 
 /// Whether `line` chooses code by operating system.
@@ -383,6 +463,23 @@ mod tests {
     fn native_only_regions_are_skipped() {
         let source = "// native-only: begin\nuse std::sync::Mutex;\n#[cfg(windows)]\n// native-only: end\nuse std::sync::Mutex;";
         assert_eq!(check(source, false), ["x.rs:5: use std::sync::Mutex;"]);
+    }
+
+    #[test]
+    fn grouped_imports_are_expanded() {
+        assert_eq!(
+            check("use std::{\n    path::PathBuf,\n    sync::{Arc, Mutex},\n};", false),
+            ["x.rs:1: imports std::sync::Mutex"]
+        );
+        assert_eq!(
+            check("pub use std::sync::{Arc, RwLock as Lock};", false),
+            ["x.rs:1: imports std::sync::RwLock"]
+        );
+        assert!(check("use std::sync::{Arc, PoisonError};", false).is_empty());
+        assert!(check("use switchy_thread::sync::{Arc, Mutex};", false).is_empty());
+        // Reported once, by the line that shows it.
+        assert_eq!(check("use std::sync::Mutex;", false).len(), 1);
+        assert!(check("use std::{\n    sync::{Arc, Mutex}, // simulation-safe: x\n};", false).is_empty());
     }
 
     #[test]
