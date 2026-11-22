@@ -390,9 +390,15 @@ payload's metadata format is `BMOWNV06`; earlier unactivated prototype files are
 unsupported and are not rewritten or imported.
 
 Authenticated owned snapshot installation retains the last 64 successful install
-receipts in the same durable authority. Within that bounded receipt window,
-reusing a request identity with the same signed reference returns the retained
-outcome after reauthentication; conflicting reuse is rejected. Transfer sealing
+receipts in the receiving node's staging owner (in memory, not in the durable
+authority, so receipts never become a second authority). Within that bounded
+window and process lifetime, reusing a request identity with the same signed
+reference returns the retained outcome after reauthentication; conflicting reuse
+is rejected. After a restart a retried install finds no receipt or staged object
+and is answered `unknown-transfer`; the leader stages again under a new
+sequence, and the engine replies installed at once because its commit already
+covers the boundary. Correctness is unchanged; a lost reply that spans a restart
+costs one extra transfer. Transfer sealing
 alone does not acknowledge installation. Capability selection for the snapshot
 service is explicit and does not fall back to legacy snapshot RPCs.
 
@@ -493,7 +499,11 @@ This records evidence, not closure; each gate below remains binding.
 - Gate 1: engine types and transitions are reviewable in `consensus_engine.rs` with unit tests per transition class; persistence-before-effect ordering is enforced by the engine's durable-reply gating.
 - Gate 2: safety invariants (election safety, state machine safety, log matching, leader completeness, commit/apply bounds, election-deadline liveness) are model checked; a seeded mutation (vote freshness disabled) is caught. Simulation found and fixed a liveness defect: a deposed leader with the freshest log lost its one-shot election deadline and the cluster livelocked.
 - Gate 3: the simulated filesystem models durability per inode and directory entry, torn writes, and injected I/O faults; cluster simulations crash hosts with power-loss semantics. Simulation found that a store directory's own entry must be durable before the store counts as initialized.
-- Gates 4–8: tracked in the implementation work (process tests, production wiring, fresh-install boundary, performance, OpenRaft removal).
+- Gate 4: the cluster simulation runs three and five voters through partitions (symmetric and one-way), isolation, lossy and slow links, power-loss crashes and restarts, leader changes, voter removal and restoration through joint consensus, and snapshot catch-up; every run must reach a convergence verdict (identical applied state, every acknowledged write durable, nothing unproposed, linearizable reads observing earlier acknowledged writes). Multi-process tests (`cluster_peer_auth_transport_integration`) form three admitted voters and survive a restart; a production-runtime test catches a stopped follower up by snapshot over the generated providers. Five-voter multi-process tests remain open.
+- Gate 5: `ConsensusNode` runs the owned driver behind the existing control services, bootstrap, capability publication, authoritative reads and worker reconcilers (see the status section below).
+- Gate 6: legacy-store rejection without mutation, single store ownership, no-replace initialization publication and owned-format restart are tested; per-owner recovery admission replaces process-wide state.
+- Gate 8: OpenRaft and its adapters are removed (`cargo tree -i openraft` is empty).
+- Gate 7 (reliability/performance qualification against ADR-0008 and independent review) has not started.
 
 ## Qualification gates
 
@@ -526,10 +536,20 @@ node's state directory; a retained `plugins/bmux.cluster/consensus` directory
 member founds a fresh store; other voters create an empty store and are
 admitted by the leader as learners, then promoted through joint consensus.
 
-Still open: staged snapshot transfer and installation over the wire (until it
-lands, a follower that falls behind a compacted prefix cannot catch up),
-five-voter process tests, and the reliability/performance and independent
-review gates above.
+Staged snapshot transfer and installation are served
+(`cluster-consensus-transfer`
+v1 and `cluster-consensus-snapshot` v1 are provided and required by protocol
+negotiation, since a peer that cannot install snapshots could never catch up
+past
+compaction). Each node stages beside its store in an owner-only
+`snapshot-staging` directory with 300 MiB per-peer and 600 MiB aggregate quotas;
+staging is disposable after restart and closes before the store on shutdown.
+Transfer staging and the store's file I/O go through `switchy_fs`, and staging
+expiry uses the simulated-capable clock.
+
+Still open: five-voter multi-process tests, the reliability/performance and
+independent review gates, and landing the MoosicBox switchy/simvar changes this
+work depends on (bmux currently patches them to a local integration branch).
 
 ## Consequences
 
