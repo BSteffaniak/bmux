@@ -73,6 +73,8 @@ pub enum Restarted {
     Running(u32),
     /// The pane was closed (or the runtime crashed) before its new program started.
     Gone,
+    /// The new program failed to start (the pane says so, and stays).
+    Failed,
 }
 
 impl std::fmt::Debug for Panes {
@@ -149,22 +151,21 @@ impl Server {
     async fn restart(&self, pane: Pane) -> anyhow::Result<Restarted> {
         // The new program may reuse the old one's id: tell them apart by pane.
         let restarted = lock(&self.manager).restart_pane(pane.0, None)?;
-        let deadline = switchy_time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let state = self.with_pane(pane, |handle| {
-                (handle.meta.id == restarted)
-                    .then(|| handle.process_id.lock().ok().and_then(|pid| *pid))
-                    .flatten()
+                (handle.meta.id == restarted).then(|| {
+                    (
+                        handle.process_id.lock().ok().and_then(|pid| *pid),
+                        handle.exited.load(Ordering::SeqCst),
+                    )
+                })
             });
             match state {
-                None => return Ok(Restarted::Gone),
-                Some(Some(pid)) => return Ok(Restarted::Running(pid)),
-                Some(None) => {}
+                None | Some(None) => return Ok(Restarted::Gone),
+                Some(Some((Some(pid), _))) => return Ok(Restarted::Running(pid)),
+                Some(Some((None, true))) => return Ok(Restarted::Failed),
+                Some(Some((None, false))) => {}
             }
-            anyhow::ensure!(
-                switchy_time::Instant::now() < deadline,
-                "the restarted pane's program never started"
-            );
             switchy_async::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
@@ -334,12 +335,11 @@ impl Panes {
     }
 
     /// Restart `pane`: its program is shut down in the background and a fresh shell starts in
-    /// its place. Waits (in simulated time, at most ten seconds) for the new program to start,
-    /// or for the pane to go.
+    /// its place. Waits until the new program starts, fails to, or the pane goes.
     ///
     /// # Errors
     ///
-    /// * If there is no such pane, or the new program never starts
+    /// * If there is no such pane
     pub async fn restart(&self, pane: Pane) -> anyhow::Result<Restarted> {
         self.on_server(move |server| Box::pin(async move { server.restart(pane).await }))
             .await

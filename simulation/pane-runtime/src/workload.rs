@@ -167,6 +167,15 @@ fn alive(serial: u64) -> Option<(u32, u32, Option<String>)> {
         .map(|p| (p.pid, p.session, p.terminal))
 }
 
+/// The session of the process of `serial`, running or exited but not yet reaped.
+fn leader_of(serial: u64) -> Option<u32> {
+    simulator::snapshot()
+        .processes
+        .into_iter()
+        .find(|p| p.serial == serial)
+        .map(|p| p.session)
+}
+
 /// The session serial of the process of `serial`, while it runs.
 fn session_of(serial: u64) -> Option<u64> {
     simulator::snapshot()
@@ -191,6 +200,27 @@ fn running_in(serials: &[u64]) -> Vec<u32> {
         .filter(|p| p.state == ProcessState::Running && serials.contains(&p.session_serial))
         .map(|p| p.pid)
         .collect()
+}
+
+/// `pid`'s terminal as the kernel sees it, for a failure's message.
+fn terminal_state(pid: u32) -> String {
+    let Some(name) = simulator::process_io(pid).and_then(|io| io.terminal) else {
+        return "no terminal".into();
+    };
+    simulator::snapshot()
+        .terminals
+        .into_iter()
+        .find(|t| t.name == name)
+        .map_or_else(
+            || format!("terminal {name} gone"),
+            |t| {
+                format!(
+                    "terminal {name}: {} bytes unread by the pane, {} typed bytes unread by the \
+                     program, {} written, masters {}, hung up {}",
+                    t.output_buffered, t.input_buffered, t.written, t.master_handles, t.hung_up
+                )
+            },
+        )
 }
 
 /// Whether `pid`'s terminal shows each of `lines` answered, in order.
@@ -379,6 +409,28 @@ impl Shared {
         candidates.get(index).copied()
     }
 
+    /// What is wrong, if anything, with `pane`'s program (`pid`, `serial`) leading its own
+    /// session: it must, unless it already ended and the runtime knows (or the kill fault
+    /// killed it).
+    async fn leads_own_session(
+        &self,
+        panes: &Panes,
+        pane: Pane,
+        pid: u32,
+        serial: u64,
+    ) -> Option<String> {
+        match leader_of(serial) {
+            Some(session) if session == pid => None,
+            Some(session) => Some(format!("it is in session {session}")),
+            None if killed_by_fault(serial) => None,
+            // Reaped: the runtime notices a moment later.
+            None if self.settle(|| panes.exited(pane) || panes.pid(pane) != Some(pid)).await => {
+                None
+            }
+            None => Some("it is gone and the pane never noticed".into()),
+        }
+    }
+
     /// Whether a fault the profile has on may make opening a pane fail.
     fn opens_may_fail(&self) -> bool {
         let faults = &self.profile.faults;
@@ -412,14 +464,10 @@ impl Shared {
             return;
         };
         let serial = simulator::serial_of(pid).unwrap_or(0);
-        // 1. Its program runs and leads its own session.
+        // 1. Its program leads its own session (and if it already ended, the runtime knows).
         Board::checked(1);
-        match alive(serial) {
-            Some((_, session, _)) if session == pid => {}
-            None if killed_by_fault(serial) => {}
-            other => self.violated(format!(
-                "1. pane process {pid} does not lead its own session: {other:?}"
-            )),
+        if let Some(problem) = self.leads_own_session(&panes, pane, pid, serial).await {
+            self.violated(format!("1. pane process {pid} does not lead its own session: {problem}"));
         }
         event(
             "open",
@@ -568,8 +616,9 @@ impl Shared {
             .await;
         if !reached {
             self.violated(format!(
-                "2. pane process {pid} never answered all of {:?}",
-                opened.typed
+                "2. pane process {pid} never answered all of {:?} ({})",
+                opened.typed,
+                terminal_state(pid)
             ));
         }
         let session = session_of(opened.serial);
@@ -620,6 +669,17 @@ impl Shared {
         let pid = match restarted {
             Ok(Restarted::Running(pid)) => pid,
             Ok(Restarted::Gone) => return,
+            Ok(Restarted::Failed) => {
+                if !self.opens_may_fail() {
+                    self.violated(format!(
+                        "7. restarting pane process {old}: its new program failed to start"
+                    ));
+                }
+                if let Some(opened) = self.lock().open.get_mut(&pane) {
+                    opened.restarting = false;
+                }
+                return;
+            }
             Err(error) => {
                 if !self.opens_may_fail() {
                     self.violated(format!(
@@ -650,12 +710,8 @@ impl Shared {
         );
         // 7. The old session ends; the new program leads its own.
         Board::checked(7);
-        match alive(serial) {
-            Some((_, session, _)) if session == pid => {}
-            None if killed_by_fault(serial) => {}
-            other => self.violated(format!(
-                "7. restarted pane process {pid} does not lead its own session: {other:?}"
-            )),
+        if let Some(problem) = self.leads_own_session(&panes, pane, pid, serial).await {
+            self.violated(format!("7. restarted pane process {pid} does not lead its own session: {problem}"));
         }
         if !self.settle(|| running_in(&[old_session]).is_empty()).await {
             self.violated(format!(
