@@ -66,7 +66,8 @@ pub(crate) enum DecorationEngineCommand {
         reply: tokio::sync::oneshot::Sender<Result<(), NotifyError>>,
     },
     AttachInput {
-        event: AttachInputEvent,
+        // Boxed: input events are much larger than the other commands.
+        event: Box<AttachInputEvent>,
         enqueued_at: Instant,
         reply: std::sync::mpsc::Sender<AttachInputResult>,
     },
@@ -402,7 +403,7 @@ impl DecorationEngine {
                 event,
                 enqueued_at,
                 reply,
-            } => self.handle_attach_input_command(event, enqueued_at, &reply),
+            } => self.handle_attach_input_command(*event, enqueued_at, &reply),
             DecorationEngineCommand::PaneEvent(event) => self.notify_pane(&event),
             DecorationEngineCommand::FocusSnapshot(snapshot) => {
                 let changed = apply_focus_state_map(&mut self.state, &snapshot);
@@ -533,7 +534,7 @@ pub(crate) fn send_attach_input_soft(
     };
     let (reply, rx) = std::sync::mpsc::channel();
     let command = DecorationEngineCommand::AttachInput {
-        event,
+        event: Box::new(event),
         enqueued_at: Instant::now(),
         reply,
     };

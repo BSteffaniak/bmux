@@ -55,12 +55,11 @@ pub fn handle_pointer(
     owner: &CompanionHandle,
     event: &AttachInputEvent,
 ) -> Option<AttachInputResult> {
-    let id = event
-        .hook_id
-        .strip_prefix("bmux.tab_bar:strip:workspace:")
-        .and_then(|id| Uuid::parse_str(id).ok())?;
     let mut guard = owner.lock().ok()?;
     let companion = guard.as_mut()?;
+    let Some(super::TabBarHit::Workspace(id)) = super::hit(companion, event) else {
+        return None;
+    };
     if companion.workspace_id != Some(id) {
         return None;
     }

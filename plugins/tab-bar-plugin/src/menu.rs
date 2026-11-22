@@ -308,16 +308,10 @@ fn transition(
         if !down || event.button.as_deref() != Some("right") {
             return None;
         }
-        let (workspace, selector) =
-            if let Some(id) = event.hook_id.strip_prefix("bmux.tab_bar:strip:workspace:") {
-                (true, id)
-            } else {
-                (
-                    false,
-                    event.hook_id.strip_prefix("bmux.tab_bar:strip:tab:")?,
-                )
-            };
-        let target = Uuid::parse_str(selector).ok()?;
+        let (workspace, target) = match super::hit(companion, event)? {
+            super::TabBarHit::Workspace(id) => (true, id),
+            super::TabBarHit::Tab(id) => (false, id),
+        };
         if if workspace {
             companion.workspace_id != Some(target)
         } else {
@@ -587,6 +581,7 @@ mod tests {
             .strip_prefix("bmux.tab_bar:menu:item:")
             .and_then(|v| v.parse::<u16>().ok());
         AttachInputEvent {
+            target: crate::tests::hook_target(&hook),
             event_kind: kind.to_string(),
             phase: phase.to_string(),
             key: key.map(str::to_string),

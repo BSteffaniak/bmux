@@ -50,6 +50,7 @@ Four paths draw non-pane UI in the attach client today.
 - Tab-bar menus and toasts recompute absolute rects from the viewport themselves.
   Fixed in phase 3.
 - Every producer parses string hook ids (`strip_prefix("bmux.sidebar:sidebar:tab:")`).
+  Fixed in phase 4.
 - Under-content glyphs dropped named colours (`render_color_to_cell_color` mapped
   `RenderColor::Named` to the default colour). Fixed in phase 0; the parity golden
   `pane_extension_layers` records the corrected colour.
@@ -206,8 +207,15 @@ Each phase lands with the parity harness and the targeted tests green.
    bottom row) no longer compute positions. Allocation callbacks stay as they are:
    they fire only when retained surfaces are reconciled, and repeat delivery lets a
    producer retry a rejected publication.
-4. **Typed hits.** `HitKey` + `HitTable<K>`; sidebar, tab bar, menu move off
-   string parsing.
+4. **Typed hits.** Regions carry an optional `HitKey`; every input event the host
+   delivers carries `AttachInputTarget { surface, region, revision, key }`.
+   Producers keep a `HitTables<K>` per published (applied) revision and resolve
+   the key against the revision the event names, so input for a retired revision
+   resolves to nothing. Events without a key (stateless or out-of-process
+   callers) resolve the producer's own owner-local region id through one
+   symmetric codec. The sidebar, tab bar, tab menu and workspace rename no longer
+   parse `owner:surface:region` hook strings; `hook_id` remains only as the
+   coarse address of decoration hooks and remote codecs.
 5. **Pane targets and facets.** Under/over/chrome depths painted through the
    existing pane stages; decoration renderer and redaction publish scenes and
    facets instead of implementing `AttachRenderExtension`.

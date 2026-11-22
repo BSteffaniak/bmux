@@ -115,7 +115,7 @@ pub use render::{
     AttachInputCodec, AttachInputEndpoint, AttachInputEvent, AttachInputHook,
     AttachInputHookFilter, AttachInputKeyModes, AttachInputModifiers, AttachInputMouseModes,
     AttachInputMouseTracking, AttachInputPaneContext, AttachInputPaneModes, AttachInputResult,
-    AttachInputServiceInvocation, AttachRenderExtension, AttachVisualAdapter,
+    AttachInputServiceInvocation, AttachInputTarget, AttachRenderExtension, AttachVisualAdapter,
     AttachVisualAdapterOutput, AttachVisualAdapterRequest, AttachVisualCellRef,
     AttachVisualFrameView, AttachVisualProjectionResult, AttachVisualProjectionUpdate,
     AttachVisualSurfaceView, BorderGlyphs, ExtensionRect, RenderCell, RenderColor, RenderDamage,

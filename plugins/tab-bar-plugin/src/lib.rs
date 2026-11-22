@@ -42,6 +42,7 @@ use bmux_plugin::{
 };
 use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::{TypedServiceEndpoint, prelude::*};
+use bmux_presentation_scene::scene::{HitTable, HitTables};
 use bmux_presentation_state::visibility::{
     PresentationVisibility, VisibilityCommand, VisibilitySettings,
 };
@@ -272,6 +273,51 @@ impl Settings {
     }
 }
 
+/// The typed meaning of a strip region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TabBarHit {
+    Tab(Uuid),
+    Workspace(Uuid),
+}
+
+impl TabBarHit {
+    /// The owner-local region id this hit is published with.
+    pub(crate) fn region_id(self) -> String {
+        match self {
+            Self::Tab(id) => format!("tab:{id}"),
+            Self::Workspace(id) => format!("workspace:{id}"),
+        }
+    }
+
+    /// The inverse of [`Self::region_id`], for events without a typed key.
+    pub(crate) fn from_region_id(region: &str) -> Option<Self> {
+        let (kind, id) = region.split_once(':')?;
+        let id = Uuid::parse_str(id).ok()?;
+        match kind {
+            "tab" => Some(Self::Tab(id)),
+            "workspace" => Some(Self::Workspace(id)),
+            _ => None,
+        }
+    }
+}
+
+/// The strip region an event is addressed to: through the hit table of the
+/// revision it was published with when it carries a typed key (a retired
+/// revision resolves to nothing), otherwise through its owner-local region id.
+pub(crate) fn hit(companion: &CompanionState, event: &AttachInputEvent) -> Option<TabBarHit> {
+    let target = event.target.as_ref()?;
+    target.key.map_or_else(
+        || TabBarHit::from_region_id(&target.region),
+        |key| {
+            companion
+                .hits
+                .borrow()
+                .resolve(target.revision, key)
+                .copied()
+        },
+    )
+}
+
 #[derive(Clone)]
 struct CompanionState {
     surfaces: std::sync::Arc<bmux_plugin::surface::PluginSurfaceRegistry>,
@@ -283,6 +329,12 @@ struct CompanionState {
     scroll_anchor: Option<Uuid>,
     measurements: projection::ProjectionMeasurements,
     pending_projection: std::collections::VecDeque<(u64, projection::ProjectedBar)>,
+    /// What each published revision's region keys mean. Drags keep their
+    /// captured region across many republications, so many are retained.
+    hits: std::cell::RefCell<HitTables<TabBarHit>>,
+    /// The table of the most recent build, filed under the revision it is
+    /// published with.
+    staged_hits: std::cell::RefCell<HitTable<TabBarHit>>,
     committed_projection: Option<projection::ProjectedBar>,
     committed_projection_revision: u64,
     pointer_source: Option<Uuid>,
@@ -351,6 +403,8 @@ impl CompanionState {
             scroll_anchor: None,
             measurements: projection::ProjectionMeasurements::default(),
             pending_projection: std::collections::VecDeque::new(),
+            hits: std::cell::RefCell::new(HitTables::new(64)),
+            staged_hits: std::cell::RefCell::new(HitTable::new()),
             committed_projection: None,
             committed_projection_revision: 0,
             pointer_source: None,
@@ -1263,6 +1317,8 @@ fn publish_companion(companion: &mut CompanionState) -> Result<(), String> {
         external::now_unix_ms(),
     ));
     let revision = publish_surface(&companion.surfaces, revision, surfaces)?;
+    let staged = companion.staged_hits.take();
+    companion.hits.borrow_mut().publish(revision, staged);
     if companion.pending_projection.len() == 32 {
         companion.pending_projection.pop_front();
     }
@@ -1565,6 +1621,7 @@ fn build_surface_with_editor(
     projection::ProjectedBar,
 ) {
     let mut editor_viewport = None;
+    let mut hits = HitTable::new();
     let styles = BarStyles::resolve(&state.settings, &state.local_presentation);
     let mut interaction = projection_interaction(state);
     // The popup is a separate surface; retain the tabs and their focus identities.
@@ -1749,9 +1806,10 @@ fn build_surface_with_editor(
             && matches!(segment.kind, projection::SegmentKind::Workspace)
             && let Some(id) = state.workspace_id
         {
+            let hit = TabBarHit::Workspace(id);
             regions.push(
                 PluginSurfaceRegion::new(
-                    format!("workspace:{id}"),
+                    hit.region_id(),
                     ExtensionRect::new(
                         x,
                         row,
@@ -1764,15 +1822,17 @@ fn build_surface_with_editor(
                     ),
                 )
                 .endpoint(input_endpoint())
-                .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer),
+                .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer)
+                .key(hits.key(hit)),
             );
         }
         if let Some(tab_id) = segment.tab_id
             && segment.kind != projection::SegmentKind::EditingTab
         {
+            let hit = TabBarHit::Tab(tab_id);
             regions.push(
                 PluginSurfaceRegion::new(
-                    format!("tab:{tab_id}"),
+                    hit.region_id(),
                     ExtensionRect::new(
                         x,
                         row,
@@ -1785,24 +1845,22 @@ fn build_surface_with_editor(
                     ),
                 )
                 .endpoint(input_endpoint())
-                .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer),
+                .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer)
+                .key(hits.key(hit)),
             );
         }
     }
     if let Some(viewport) = &editor_viewport {
-        let id = state
+        let editing = state
             .editing_tab_id
-            .map(|id| format!("tab:{id}"))
-            .or_else(|| {
-                state
-                    .editing_workspace_id
-                    .map(|id| format!("workspace:{id}"))
-            });
-        if let Some(id) = id {
+            .map(TabBarHit::Tab)
+            .or_else(|| state.editing_workspace_id.map(TabBarHit::Workspace));
+        if let Some(editing) = editing {
+            let key = hits.key(editing);
             regions.extend(
-                rename_input::hit_regions(&state.edit_buffer, viewport, &id)
+                rename_input::hit_regions(&state.edit_buffer, viewport, &editing.region_id())
                     .into_iter()
-                    .map(|region| region.endpoint(input_endpoint())),
+                    .map(|region| region.endpoint(input_endpoint()).key(key)),
             );
         }
     }
@@ -1825,24 +1883,23 @@ fn build_surface_with_editor(
     for region in regions {
         surface = surface.interactive_region(region);
     }
+    state.staged_hits.replace(hits);
     (surface, editor_viewport, projected)
 }
 
 fn update_hover(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
-    let target = event
-        .hook_id
-        .strip_prefix("bmux.tab_bar:strip:tab:")
-        .and_then(|target| Uuid::parse_str(target).ok());
-    let hovered = match event.phase.as_str() {
-        "enter" | "move" => target,
-        "leave" => None,
-        _ => return false,
-    };
+    if !matches!(event.phase.as_str(), "enter" | "move" | "leave") {
+        return false;
+    }
     let Ok(mut guard) = owner.lock() else {
         return false;
     };
     let Some(companion) = guard.as_mut() else {
         return false;
+    };
+    let hovered = match (event.phase.as_str(), hit(companion, event)) {
+        ("enter" | "move", Some(TabBarHit::Tab(id))) => Some(id),
+        _ => None,
     };
     if companion.hovered_tab_id == hovered {
         return false;
@@ -1946,14 +2003,13 @@ fn update_drag_local(
     owner: &CompanionHandle,
     event: &AttachInputEvent,
 ) -> Option<AttachInputResult> {
-    let source = event
-        .hook_id
-        .strip_prefix("bmux.tab_bar:strip:tab:")
-        .and_then(|target| Uuid::parse_str(target).ok())?;
     let col = event.col.unwrap_or_default();
     let row = event.row.unwrap_or_default();
     let mut guard = owner.lock().ok()?;
     let companion = guard.as_mut()?;
+    let Some(TabBarHit::Tab(source)) = hit(companion, event) else {
+        return None;
+    };
     match event.phase.as_str() {
         "down" if event.button.as_deref() == Some("left") => {
             if event.modifiers.alt || event.modifiers.control {
@@ -2113,14 +2169,11 @@ fn begin_rename(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
     {
         return false;
     }
-    let Some(target) = event
-        .hook_id
-        .strip_prefix("bmux.tab_bar:strip:tab:")
-        .and_then(|target| Uuid::parse_str(target).ok())
-    else {
+    let Ok(mut guard) = owner.lock() else {
         return false;
     };
-    let Ok(mut guard) = owner.lock() else {
+    let Some(TabBarHit::Tab(target)) = guard.as_ref().and_then(|companion| hit(companion, event))
+    else {
         return false;
     };
     let Some(companion) = guard.as_mut() else {
@@ -2239,15 +2292,11 @@ fn handle_editor_pointer(
     }
     let mut guard = owner.lock().ok()?;
     let companion = guard.as_mut()?;
-    let target = companion
+    let editing = companion
         .editing_tab_id
-        .map(|id| format!("tab:{id}"))
-        .or_else(|| {
-            companion
-                .editing_workspace_id
-                .map(|id| format!("workspace:{id}"))
-        })?;
-    if event.hook_id != format!("bmux.tab_bar:strip:{target}") {
+        .map(TabBarHit::Tab)
+        .or_else(|| companion.editing_workspace_id.map(TabBarHit::Workspace))?;
+    if hit(companion, event) != Some(editing) {
         return None;
     }
     if event.phase == "down"
@@ -2400,6 +2449,19 @@ fn decode_action_payload<T: serde::de::DeserializeOwned>(
 
 #[cfg(test)]
 mod tests {
+    /// The target the host would address a hook string's region with, for
+    /// tests that build events by hand. Without a typed key, producers resolve
+    /// the owner-local region id.
+    pub fn hook_target(hook: &str) -> Option<bmux_plugin::AttachInputTarget> {
+        let rest = hook.strip_prefix("bmux.tab_bar:")?;
+        let (surface, region) = rest.split_once(':')?;
+        Some(bmux_plugin::AttachInputTarget {
+            surface: surface.to_string(),
+            region: region.to_string(),
+            revision: 0,
+            key: None,
+        })
+    }
 
     #[test]
     fn shared_definition_preserves_contract_and_capability_requirements() {
@@ -2769,6 +2831,62 @@ mod tests {
         drop(guard);
     }
 
+    #[tokio::test]
+    async fn published_region_keys_resolve_until_their_revision_is_retired() {
+        let resources = scoped_resources();
+        let presentation = TabBarPresentation::install(None, &resources).unwrap();
+        let id = Uuid::from_u128(7);
+        seed_input_owner(&presentation.owner, id);
+        let mut guard = presentation.owner.lock().unwrap();
+        let companion = guard.as_mut().unwrap();
+        publish_companion(companion).unwrap();
+        // Address the tab exactly as the host does: the published region's key
+        // and the revision it was published with.
+        let snapshot = companion.surfaces.owner_snapshot(OWNER).unwrap();
+        let strip = snapshot
+            .surfaces
+            .iter()
+            .find(|surface| surface.id.local_id == SURFACE_ID)
+            .unwrap();
+        let region = strip
+            .interactive_regions
+            .iter()
+            .find(|region| region.local_id == TabBarHit::Tab(id).region_id())
+            .unwrap();
+        let mut event = AttachInputEvent {
+            target: Some(bmux_plugin::AttachInputTarget {
+                surface: SURFACE_ID.to_string(),
+                region: region.local_id.clone(),
+                revision: snapshot.revision,
+                key: region.key,
+            }),
+            hook_id: String::new(),
+            event_kind: "pointer".to_string(),
+            phase: "enter".to_string(),
+            button: None,
+            key: None,
+            col: Some(1),
+            row: Some(0),
+            wheel_delta: 0,
+            modifiers: bmux_plugin::AttachInputModifiers::default(),
+            focused_pane: None,
+            hovered_pane: None,
+        };
+        assert!(region.key.is_some());
+        assert_eq!(hit(companion, &event), Some(TabBarHit::Tab(id)));
+        // Once enough newer revisions are published, the old key is rejected
+        // instead of being resolved against a different layout.
+        for _ in 0..80 {
+            companion.revision = companion.revision.saturating_add(1);
+            publish_companion(companion).unwrap();
+        }
+        assert_eq!(hit(companion, &event), None);
+        // Events without a typed key fall back to the owner-local region id.
+        event.target.as_mut().unwrap().key = None;
+        assert_eq!(hit(companion, &event), Some(TabBarHit::Tab(id)));
+        drop(guard);
+    }
+
     fn seed_rename_owner(presentation: &TabBarPresentation, id: Uuid) {
         let mut guard = presentation.owner.lock().unwrap();
         let companion = guard.as_mut().unwrap();
@@ -2789,6 +2907,7 @@ mod tests {
         let id = Uuid::from_u128(7);
         seed_input_owner(&presentation.owner, id);
         let mut event = AttachInputEvent {
+            target: crate::tests::hook_target(&format!("bmux.tab_bar:strip:tab:{id}")),
             hook_id: format!("bmux.tab_bar:strip:tab:{id}"),
             event_kind: "pointer".to_string(),
             phase: "up".to_string(),
@@ -2817,6 +2936,7 @@ mod tests {
             assert!(outcome.into_result().is_none(), "{phase}");
         }
         event.hook_id = "bmux.tab_bar:strip:padding".to_string();
+        event.target = crate::tests::hook_target(&event.hook_id);
         for phase in ["move", "down"] {
             event.phase = phase.to_string();
             let outcome = resources.input.dispatch(&input_endpoint(), &event);
@@ -2834,6 +2954,7 @@ mod tests {
             revision
         );
         event.hook_id = format!("bmux.tab_bar:strip:tab:{id}");
+        event.target = crate::tests::hook_target(&event.hook_id);
         event.phase = "down".to_string();
         event.button = Some("right".to_string());
         let outcome = resources.input.dispatch(&input_endpoint(), &event);
@@ -2854,6 +2975,7 @@ mod tests {
             seed_input_owner(owner, id);
         }
         let event = AttachInputEvent {
+            target: crate::tests::hook_target(&format!("bmux.tab_bar:strip:tab:{id}")),
             hook_id: format!("bmux.tab_bar:strip:tab:{id}"),
             event_kind: "pointer".to_string(),
             phase: "down".to_string(),
@@ -3056,6 +3178,7 @@ mod tests {
         let first = TabBarPresentation::install(None, &first_resources).unwrap();
         let second = TabBarPresentation::install(None, &second_resources).unwrap();
         let mut event = AttachInputEvent {
+            target: None,
             hook_id: String::new(),
             event_kind: "pointer".into(),
             phase: "wheel".into(),
@@ -3095,6 +3218,7 @@ mod tests {
             event.button = Some("right".into());
             event.wheel_delta = 0;
             event.hook_id = format!("bmux.tab_bar:strip:tab:{}", Uuid::from_u128(target));
+            event.target = crate::tests::hook_target(&event.hook_id);
             assert!(
                 resources
                     .input
@@ -3177,6 +3301,7 @@ mod tests {
         let first = TabBarPresentation::install(None, &first_resources).unwrap();
         let second = TabBarPresentation::install(None, &second_resources).unwrap();
         let mut event = AttachInputEvent {
+            target: crate::tests::hook_target(&format!("bmux.tab_bar:strip:tab:{target}")),
             hook_id: format!("bmux.tab_bar:strip:tab:{target}"),
             event_kind: "pointer".into(),
             phase: "down".into(),
@@ -3701,6 +3826,7 @@ width = 60
             })
             .unwrap();
         let mut event = AttachInputEvent {
+            target: crate::tests::hook_target(&format!("bmux.tab_bar:strip:tab:{id}")),
             hook_id: format!("bmux.tab_bar:strip:tab:{id}"),
             event_kind: "pointer".to_string(),
             phase: "down".to_string(),
@@ -3772,6 +3898,7 @@ width = 60
         event.row = Some(region.rect.y);
         event.button = Some("left".to_string());
         event.hook_id = "bmux.tab_bar:menu:item.1".to_string();
+        event.target = crate::tests::hook_target(&event.hook_id);
     }
 
     fn exercise_workspace_editor(fixture: &Fixture, mut event: AttachInputEvent) {
@@ -3779,6 +3906,7 @@ width = 60
         event.phase = "down".to_string();
         event.button = Some("left".to_string());
         event.hook_id = format!("bmux.tab_bar:strip:workspace:{}", Uuid::nil());
+        event.target = crate::tests::hook_target(&event.hook_id);
         fixture
             .handle
             .lock()
@@ -4249,6 +4377,7 @@ bar_bg = "#112233"
         });
         let owner = std::sync::Arc::new(Mutex::new(Some(state)));
         let mut event = AttachInputEvent {
+            target: None,
             hook_id: String::new(),
             event_kind: "pointer".to_string(),
             phase: "wheel".to_string(),

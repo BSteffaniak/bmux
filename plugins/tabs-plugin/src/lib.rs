@@ -6985,6 +6985,12 @@ mod tests {
             operation: "handle-input".into(),
         };
         let mut event = bmux_plugin::AttachInputEvent {
+            target: Some(bmux_plugin::AttachInputTarget {
+                surface: "strip".into(),
+                region: format!("tab:{target}"),
+                revision: 0,
+                key: None,
+            }),
             hook_id: format!("bmux.tab_bar:strip:tab:{target}"),
             event_kind: "pointer".into(),
             phase: "down".into(),

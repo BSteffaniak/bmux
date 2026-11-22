@@ -167,6 +167,7 @@ pub(super) fn event_to_wire(value: bmux_plugin::AttachInputEvent) -> wire::Input
 
 pub(super) fn event_from_wire(value: wire::InputEvent) -> bmux_plugin::AttachInputEvent {
     bmux_plugin::AttachInputEvent {
+        target: None,
         hook_id: value.hook_id,
         event_kind: value.event_kind,
         phase: value.phase,
@@ -257,6 +258,7 @@ mod tests {
 
     fn event() -> AttachInputEvent {
         AttachInputEvent {
+            target: None,
             hook_id: "test".into(),
             event_kind: "pointer".into(),
             phase: "wheel".into(),

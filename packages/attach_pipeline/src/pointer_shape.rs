@@ -109,6 +109,7 @@ mod tests {
             .revision(1)
             .build();
         surface.interactive_regions.push(RetainedInteractiveRegion {
+            key: None,
             id: Some(PluginSurfaceRegionId::new(&owner, "action")),
             rect: surface.rect,
             focusable: false,

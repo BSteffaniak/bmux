@@ -22,6 +22,7 @@ use bmux_plugin::{
 };
 use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::prelude::*;
+use bmux_presentation_scene::scene::{HitTable, HitTables};
 use bmux_presentation_state::visibility::{
     PresentationVisibility, VisibilityCommand, VisibilitySettings,
 };
@@ -253,6 +254,26 @@ struct CompanionState {
     hovered_tab_id: Option<Uuid>,
     scroll: bmux_tui_components::scroll_view::ScrollViewState,
     measured_items: std::cell::RefCell<std::collections::BTreeMap<Uuid, MeasuredSidebarItem>>,
+    /// What each published revision's region keys mean.
+    hits: std::cell::RefCell<HitTables<SidebarHit>>,
+}
+
+/// The typed meaning of a sidebar region.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarHit {
+    Tab(Uuid),
+}
+
+/// The owner-local region id of a tab row, and its inverse, for events without
+/// a typed key (the stateless service fallback has no hit table).
+fn tab_region_id(id: Uuid) -> String {
+    format!("tab:{id}")
+}
+
+fn region_tab_id(region: &str) -> Option<Uuid> {
+    region
+        .strip_prefix("tab:")
+        .and_then(|id| Uuid::parse_str(id).ok())
 }
 
 impl Drop for CompanionState {
@@ -277,6 +298,7 @@ impl CompanionState {
             allocation: None,
             allocation_publication_pending: false,
             presentation_pending: std::cell::Cell::new(false),
+            hits: std::cell::RefCell::new(HitTables::new(4)),
             settings,
             revision: 0,
             snapshot: tabs_list::TabListSnapshot {
@@ -910,12 +932,18 @@ fn publish_companion(companion: &CompanionState) -> Result<(), String> {
         return Ok(());
     };
     // A hidden sidebar keeps its identity and state but draws nothing.
-    let surfaces = if companion.visible() {
-        vec![build_surface(companion, revision)]
+    let (surfaces, hits) = if companion.visible() {
+        let (surface, hits) = build_surface_with_hits(companion, revision);
+        (vec![surface], hits)
     } else {
-        Vec::new()
+        (Vec::new(), HitTable::new())
     };
     publish_surfaces(registry, revision, surfaces)?;
+    // Publishing may rebase the revision; input arrives with the applied one.
+    let applied = registry
+        .owner_snapshot(OWNER)
+        .map_or(revision, |snapshot| snapshot.revision);
+    companion.hits.borrow_mut().publish(applied, hits);
     companion.presentation_pending.set(false);
     Ok(())
 }
@@ -1175,18 +1203,34 @@ const fn sidebar_title_style(
     }
 }
 
-fn sidebar_region(id: Uuid, width: u16, row: u16, height: u16) -> PluginSurfaceRegion {
+fn sidebar_region(
+    id: Uuid,
+    width: u16,
+    row: u16,
+    height: u16,
+    hits: &mut HitTable<SidebarHit>,
+) -> PluginSurfaceRegion {
     PluginSurfaceRegion::new(
-        format!("tab:{id}"),
+        tab_region_id(id),
         ExtensionRect::new(1, row, width.saturating_sub(2), height.max(1)),
     )
     .endpoint(input_endpoint())
     .focusable(bmux_plugin::surface::PluginSurfaceCursor::Pointer)
+    .key(hits.key(SidebarHit::Tab(id)))
+}
+
+#[cfg(test)]
+fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
+    build_surface_with_hits(state, revision).0
 }
 
 // Paint and logical descriptions share the same measured scroll projection.
 #[allow(clippy::too_many_lines)]
-fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
+fn build_surface_with_hits(
+    state: &CompanionState,
+    revision: u64,
+) -> (PluginSurface, HitTable<SidebarHit>) {
+    let mut hits = HitTable::new();
     let width = state.allocated_width();
     let background = RenderStyle::new()
         .named_foreground(RenderNamedColor::White)
@@ -1269,6 +1313,7 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
             width,
             start_row,
             row.saturating_sub(start_row),
+            &mut hits,
         ));
     }
     if state.settings.content_height {
@@ -1287,24 +1332,36 @@ fn build_surface(state: &CompanionState, revision: u64) -> PluginSurface {
     for region in regions {
         surface = surface.interactive_region(region);
     }
-    surface
+    (surface, hits)
+}
+
+/// The tab an event is addressed to: through the hit table of the revision it
+/// was published with when it carries a typed key (a retired revision resolves
+/// to nothing), otherwise through its owner-local region id.
+fn hit_tab(companion: &CompanionState, event: &AttachInputEvent) -> Option<Uuid> {
+    let target = event.target.as_ref()?;
+    match target.key {
+        Some(key) => match companion.hits.borrow().resolve(target.revision, key)? {
+            SidebarHit::Tab(id) => Some(*id),
+        },
+        None => region_tab_id(&target.region),
+    }
 }
 
 fn update_hover(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
-    let target = event
-        .hook_id
-        .strip_prefix("bmux.sidebar:sidebar:tab:")
-        .and_then(|target| Uuid::parse_str(target).ok());
-    let hovered = match event.phase.as_str() {
-        "enter" | "move" => target,
-        "leave" => None,
-        _ => return false,
-    };
+    if !matches!(event.phase.as_str(), "enter" | "move" | "leave") {
+        return false;
+    }
     let Ok(mut guard) = owner.lock() else {
         return false;
     };
     let Some(companion) = guard.as_mut() else {
         return false;
+    };
+    let hovered = if event.phase == "leave" {
+        None
+    } else {
+        hit_tab(companion, event)
     };
     if companion.hovered_tab_id == hovered {
         return false;
@@ -1352,12 +1409,9 @@ fn update_keyboard(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<
     if event.event_kind != "key" || !matches!(event.phase.as_str(), "press" | "repeat") {
         return None;
     }
-    let target = event
-        .hook_id
-        .strip_prefix("bmux.sidebar:sidebar:tab:")
-        .and_then(|target| Uuid::parse_str(target).ok())?;
     let mut guard = owner.lock().ok()?;
     let companion = guard.as_mut()?;
+    let target = hit_tab(companion, event)?;
     let index = companion
         .snapshot
         .tabs
@@ -1449,7 +1503,11 @@ fn handle_input(context: &NativeServiceContext, event: &AttachInputEvent) -> Att
     if !activate_key && !activate_pointer {
         return AttachInputResult::default();
     }
-    let Some(target) = event.hook_id.strip_prefix("bmux.sidebar:sidebar:tab:") else {
+    let Some(target) = event
+        .target
+        .as_ref()
+        .and_then(|target| region_tab_id(&target.region))
+    else {
         return AttachInputResult::default();
     };
     let mut client = ServiceCallerDispatchClient::new(context);
@@ -2214,6 +2272,7 @@ mod tests {
         };
         assert!(super::publish_for_installation(&owner, snapshot).is_err());
         let event = AttachInputEvent {
+            target: None,
             hook_id: format!("bmux.sidebar:sidebar:tab:{}", Uuid::from_u128(1)),
             event_kind: "key".to_string(),
             phase: "press".to_string(),
@@ -2279,6 +2338,59 @@ mod tests {
         );
     }
 
+    /// Address `tab` through a hit table recorded for a test revision, as the
+    /// host would after a successful publication.
+    fn test_target(state: &CompanionState, tab: Uuid) -> bmux_plugin::AttachInputTarget {
+        let mut table = HitTable::new();
+        let key = table.key(SidebarHit::Tab(tab));
+        state.hits.borrow_mut().publish(u64::MAX, table);
+        bmux_plugin::AttachInputTarget {
+            surface: SURFACE_ID.to_string(),
+            region: tab_region_id(tab),
+            revision: u64::MAX,
+            key: Some(key),
+        }
+    }
+
+    #[test]
+    fn retired_revisions_and_unknown_keys_resolve_to_no_tab() {
+        let state = CompanionState::new(shown_settings(), None);
+        let target = test_target(&state, Uuid::from_u128(5));
+        let event = |target| AttachInputEvent {
+            target,
+            hook_id: String::new(),
+            event_kind: "pointer".to_string(),
+            phase: "enter".to_string(),
+            button: None,
+            key: None,
+            col: None,
+            row: None,
+            wheel_delta: 0,
+            modifiers: bmux_plugin::render::AttachInputModifiers::default(),
+            focused_pane: None,
+            hovered_pane: None,
+        };
+        assert_eq!(
+            hit_tab(&state, &event(Some(target.clone()))),
+            Some(Uuid::from_u128(5))
+        );
+        let retired = bmux_plugin::AttachInputTarget {
+            revision: 3,
+            ..target.clone()
+        };
+        assert_eq!(hit_tab(&state, &event(Some(retired))), None);
+        let unknown = bmux_plugin::AttachInputTarget {
+            key: Some(bmux_presentation_scene::scene::HitKey(9)),
+            ..target
+        };
+        assert_eq!(hit_tab(&state, &event(Some(unknown))), None);
+        assert_eq!(hit_tab(&state, &event(None)), None);
+        assert_eq!(
+            region_tab_id(&tab_region_id(Uuid::from_u128(5))),
+            Some(Uuid::from_u128(5))
+        );
+    }
+
     #[test]
     fn rejected_interaction_publication_restores_scroll_and_hover() {
         let mut state = CompanionState::new(
@@ -2304,9 +2416,11 @@ mod tests {
         state.surfaces = Some(std::sync::Arc::new(
             bmux_plugin::surface::PluginSurfaceRegistry::new(0),
         ));
+        let target = test_target(&state, Uuid::from_u128(1));
         let owner = std::sync::Arc::new(std::sync::Mutex::new(Some(state)));
         let mut event = AttachInputEvent {
-            hook_id: format!("bmux.sidebar:sidebar:tab:{}", Uuid::from_u128(1)),
+            target: Some(target),
+            hook_id: String::new(),
             event_kind: "pointer".to_string(),
             phase: "enter".to_string(),
             button: None,

@@ -14846,6 +14846,11 @@ async fn invoke_plugin_surface_pointer_event(
         )
     });
     let input = AttachInputEvent {
+        target: event
+            .hit
+            .region_id
+            .as_ref()
+            .and_then(|id| view_state.retained_compositor.input_target(id)),
         hook_id,
         event_kind: "pointer".to_owned(),
         phase: phase.to_owned(),
@@ -15050,6 +15055,7 @@ fn dispatch_presentation_escape(view_state: &mut AttachViewState, key_name: &str
         && view_state.plugin_focus.focused().is_none()
     {
         let input = AttachInputEvent {
+            target: None,
             hook_id: String::new(),
             event_kind: "shortcut".into(),
             phase: "press".into(),
@@ -15100,6 +15106,7 @@ async fn try_handle_plugin_surface_key(
         return Ok(false);
     };
     let input = AttachInputEvent {
+        target: view_state.retained_compositor.input_target(&target),
         hook_id: format!(
             "{}:{}:{}",
             target.owner_plugin_id, target.surface_local_id, target.region_local_id
@@ -15586,6 +15593,7 @@ async fn try_handle_captured_attach_input_hook_mouse(
     }
 
     let event = AttachInputEvent {
+        target: None,
         hook_id: capture.hook.id.clone(),
         event_kind: "mouse".to_string(),
         phase: phase.to_string(),
@@ -15648,6 +15656,7 @@ async fn try_handle_uncaptured_attach_input_hook_mouse(
             continue;
         }
         let event = AttachInputEvent {
+            target: None,
             hook_id: hook.id.clone(),
             event_kind: "mouse".to_string(),
             phase: phase.to_string(),
@@ -15703,6 +15712,7 @@ async fn try_handle_attach_input_hook_key(
             continue;
         }
         let event = AttachInputEvent {
+            target: None,
             hook_id: hook.id.clone(),
             event_kind: "key".to_string(),
             phase: match key.kind {
@@ -18314,9 +18324,17 @@ mod tests {
                 .iter()
                 .find(|surface| surface.id.local_id == "menu")
                 .unwrap();
-            let bmux_plugin::surface::PluginSurfaceTarget::Explicit(rect) = popup.target else {
-                panic!("popup");
-            };
+            // The host resolves where the attached popup is shown.
+            let rect = super::retained_plugin_surfaces(state, viewport)
+                .into_iter()
+                .find(|surface| {
+                    surface
+                        .owner
+                        .as_ref()
+                        .is_some_and(|id| id.local_id == "menu")
+                })
+                .map(|surface| surface.rect)
+                .expect("the host places the popup");
             let hit = popup
                 .interactive_regions
                 .iter()
@@ -18516,6 +18534,7 @@ mod tests {
                 format!("tab:{}", Uuid::from_u128(42))
             };
             let mut event = bmux_plugin::AttachInputEvent {
+                target: None,
                 hook_id: format!("bmux.tab_bar:strip:{target}"),
                 event_kind: "pointer".into(),
                 phase: "down".into(),
@@ -22825,6 +22844,7 @@ mod tests {
         registry.register(Arc::new(LocalExtension));
         let mut client = disconnected_focus_test_client().await;
         let event = AttachInputEvent {
+            target: None,
             hook_id: "local".into(),
             event_kind: "key".into(),
             phase: "press".into(),
@@ -22852,6 +22872,7 @@ mod tests {
             operation: "handle".into(),
         };
         let event = AttachInputEvent {
+            target: None,
             hook_id: "unknown".into(),
             event_kind: "key".into(),
             phase: "press".into(),
@@ -24979,6 +25000,7 @@ mod tests {
                 .opaque()
                 .build();
         surface.interactive_regions.push(RetainedInteractiveRegion {
+            key: None,
             id: Some(bmux_plugin::surface::PluginSurfaceRegionId::new(
                 &owner, "drag",
             )),

@@ -355,6 +355,7 @@ mod tests {
 
     fn input_event() -> AttachInputEvent {
         AttachInputEvent {
+            target: None,
             hook_id: String::new(),
             event_kind: "pointer".to_string(),
             phase: "move".to_string(),
@@ -464,6 +465,7 @@ mod tests {
             }),
         );
         let event = AttachInputEvent {
+            target: None,
             hook_id: String::new(),
             event_kind: "pointer".to_string(),
             phase: "move".to_string(),

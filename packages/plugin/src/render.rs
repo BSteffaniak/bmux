@@ -218,6 +218,24 @@ pub struct AttachInputEvent {
     pub modifiers: AttachInputModifiers,
     pub focused_pane: Option<AttachInputPaneContext>,
     pub hovered_pane: Option<AttachInputPaneContext>,
+    /// The interactive region this event is addressed to, when it has one.
+    /// Producers resolve `key` against the hit table they published with
+    /// `revision`, instead of parsing `hook_id`.
+    #[serde(default)]
+    pub target: Option<AttachInputTarget>,
+}
+
+/// The surface region an input event is addressed to.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttachInputTarget {
+    /// Owner-local surface id.
+    pub surface: String,
+    /// Owner-local region id.
+    pub region: String,
+    /// The surface revision the region was published with.
+    pub revision: u64,
+    /// The region's typed key, when it was published with one.
+    pub key: Option<bmux_presentation_scene::scene::HitKey>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

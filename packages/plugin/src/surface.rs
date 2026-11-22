@@ -127,6 +127,8 @@ pub struct PluginSurfaceRegion {
     pub cursor: PluginSurfaceCursor,
     /// Typed generic service endpoint that owns input for this region.
     pub endpoint: Option<crate::AttachInputEndpoint>,
+    /// Typed identity for input routing, resolved by the producer's hit table.
+    pub key: Option<bmux_presentation_scene::scene::HitKey>,
 }
 
 /// Optional caller-owned scene descriptions in surface-local cell geometry.
@@ -246,6 +248,7 @@ impl PluginSurfaceRegion {
             focusable: region.focusable && region.enabled && region.visible,
             cursor,
             endpoint: None,
+            key: None,
         }
     }
 
@@ -257,6 +260,7 @@ impl PluginSurfaceRegion {
             focusable: false,
             cursor: PluginSurfaceCursor::Default,
             endpoint: None,
+            key: None,
         }
     }
 
@@ -270,6 +274,13 @@ impl PluginSurfaceRegion {
     pub const fn focusable(mut self, cursor: PluginSurfaceCursor) -> Self {
         self.focusable = true;
         self.cursor = cursor;
+        self
+    }
+
+    /// Give this region a typed key from the producer's hit table.
+    #[must_use]
+    pub const fn key(mut self, key: bmux_presentation_scene::scene::HitKey) -> Self {
+        self.key = Some(key);
         self
     }
 }
@@ -1467,6 +1478,7 @@ mod tests {
         duplicate.accepts_input = true;
         duplicate.interactive_regions = vec![
             PluginSurfaceRegion {
+                key: None,
                 local_id: "same".to_owned(),
                 rect: ExtensionRect::new(0, 0, 1, 1),
                 focusable: false,
@@ -1474,6 +1486,7 @@ mod tests {
                 endpoint: None,
             },
             PluginSurfaceRegion {
+                key: None,
                 local_id: "same".to_owned(),
                 rect: ExtensionRect::new(1, 0, 1, 1),
                 focusable: false,
@@ -1495,6 +1508,7 @@ mod tests {
 
         let mut disabled = surface("owner", "disabled", retained_id);
         disabled.interactive_regions = vec![PluginSurfaceRegion {
+            key: None,
             local_id: "region".to_owned(),
             rect: ExtensionRect::new(0, 0, 1, 1),
             focusable: false,

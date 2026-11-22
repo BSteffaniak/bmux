@@ -1115,6 +1115,7 @@ mod tests {
         );
         surface.clip_rect = Some(DamageRect::new(2, 0, 2, 2));
         surface.interactive_regions = vec![RetainedInteractiveRegion {
+            key: None,
             id: Some(id),
             rect: DamageRect::new(0, 0, 8, 2),
             focusable: true,

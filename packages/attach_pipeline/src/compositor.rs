@@ -56,6 +56,8 @@ pub struct RetainedInteractiveRegion {
     pub focusable: bool,
     pub cursor: bmux_plugin::surface::PluginSurfaceCursor,
     pub endpoint: Option<bmux_plugin::AttachInputEndpoint>,
+    /// The producer's typed key for this region.
+    pub key: Option<bmux_presentation_scene::scene::HitKey>,
 }
 
 impl PartialEq<DamageRect> for RetainedInteractiveRegion {
@@ -202,6 +204,7 @@ impl RetainedSurface {
         self.interactive_regions = interactive_regions
             .into_iter()
             .map(|rect| RetainedInteractiveRegion {
+                key: None,
                 id: None,
                 rect,
                 focusable: false,
@@ -382,6 +385,7 @@ pub fn retained_surfaces_from_plugin_surfaces_within(
                             focusable: region.focusable,
                             cursor: region.cursor,
                             endpoint: region.endpoint.clone(),
+                            key: region.key,
                         })
                     })
                     .collect()
@@ -564,6 +568,7 @@ impl RetainedSurfaceBuilder {
         self.surface
             .interactive_regions
             .push(RetainedInteractiveRegion {
+                key: None,
                 id: None,
                 rect: region,
                 focusable: false,
@@ -578,6 +583,7 @@ impl RetainedSurfaceBuilder {
         self.surface.interactive_regions = regions
             .into_iter()
             .map(|rect| RetainedInteractiveRegion {
+                key: None,
                 id: None,
                 rect,
                 focusable: false,
@@ -1646,6 +1652,25 @@ impl RetainedCompositor {
                 (region.id.as_ref() == Some(target))
                     .then_some(region.endpoint.as_ref())
                     .flatten()
+            })
+        })
+    }
+
+    /// The region an input event is addressed to, with the revision and key
+    /// the producer published it with.
+    #[must_use]
+    pub fn input_target(
+        &self,
+        target: &PluginSurfaceRegionId,
+    ) -> Option<bmux_plugin::AttachInputTarget> {
+        self.surfaces.values().find_map(|surface| {
+            surface.interactive_regions.iter().find_map(|region| {
+                (region.id.as_ref() == Some(target)).then(|| bmux_plugin::AttachInputTarget {
+                    surface: target.surface_local_id.clone(),
+                    region: target.region_local_id.clone(),
+                    revision: surface.revision.unwrap_or_default(),
+                    key: region.key,
+                })
             })
         })
     }
@@ -2790,6 +2815,7 @@ mod tests {
             clip_rect: None,
             metadata: None,
             interactive_regions: vec![PluginSurfaceRegion {
+                key: None,
                 local_id: "link".to_owned(),
                 rect: ExtensionRect::new(0, 0, 8, 4),
                 focusable: false,
@@ -2855,6 +2881,7 @@ mod tests {
             clip_rect: None,
             metadata: None,
             interactive_regions: vec![PluginSurfaceRegion {
+                key: None,
                 local_id: "field".to_owned(),
                 rect: ExtensionRect::new(0, 0, 8, 4),
                 focusable: true,
@@ -2947,6 +2974,7 @@ mod tests {
             clip_rect: None,
             metadata: None,
             interactive_regions: vec![PluginSurfaceRegion {
+                key: None,
                 local_id: "field".to_owned(),
                 rect: ExtensionRect::new(0, 0, 8, 4),
                 focusable: true,
@@ -3503,6 +3531,7 @@ mod tests {
                     .modal(layer > 0)
                     .build();
             surface.interactive_regions.push(RetainedInteractiveRegion {
+                key: None,
                 id: Some(PluginSurfaceRegionId {
                     owner_plugin_id: format!("owner-{id}"),
                     surface_local_id: "control".into(),
@@ -3575,6 +3604,7 @@ mod tests {
         let mut source =
             RetainedSurface::builder(Uuid::from_u128(1), DamageRect::new(0, 0, 8, 4)).build();
         source.interactive_regions.push(RetainedInteractiveRegion {
+            key: None,
             id: Some(target.clone()),
             rect: source.rect,
             focusable: true,
@@ -3637,6 +3667,7 @@ mod tests {
             metadata: None,
             interactive_regions: vec![
                 bmux_plugin::surface::PluginSurfaceRegion {
+                    key: None,
                     local_id: "whole".to_owned(),
                     rect: ExtensionRect::new(0, 0, 8, 4),
                     focusable: false,
@@ -3644,6 +3675,7 @@ mod tests {
                     endpoint: None,
                 },
                 bmux_plugin::surface::PluginSurfaceRegion {
+                    key: None,
                     local_id: "inner".to_owned(),
                     rect: ExtensionRect::new(3, 1, 2, 1),
                     focusable: false,
