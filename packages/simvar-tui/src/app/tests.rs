@@ -391,6 +391,18 @@ fn pages_and_sim_views_drill_in_by_clicks() {
     click(&mut app, "entity.p1");
     let text = draw(&mut app);
     assert!(text.contains("card of p1"), "{text}");
+    // Pointing at another row highlights it but leaves the card alone.
+    let other = region(&app, "entity.p0");
+    app.input(
+        &Event::Mouse(MouseEvent::new(
+            MouseEventKind::Move,
+            bmux_tui::geometry::Point::new(other.x, other.y),
+        )),
+        Instant::now(),
+    );
+    let text = draw(&mut app);
+    assert!(text.contains("card of p1"), "{text}");
+    assert!(!text.contains("card of p0"), "{text}");
     // A second click opens it in full.
     click(&mut app, "entity.p1");
     assert_eq!(app.current_run().unwrap().entity.as_deref(), Some("p1"));

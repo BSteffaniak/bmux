@@ -49,7 +49,7 @@ A run's tab shows the run, live or replayed:
   a hundred), `[ ]`, `home`/`end`.
 - **Pages**: Overview, Threads (each thread's state and the decisions it was
   in), Invariants, Decisions, then the simulation's own views (`SimView`):
-  lists of entities that show a card when pointed at and open a full page when
+  lists of entities that show a card when clicked and open a full page when
   clicked again (the kernel's processes and terminals, the pane runtime's
   panes).
 
@@ -61,7 +61,7 @@ running meanwhile. Breakpoints: `b` (the next decision), or commands such as
 
 ## Everywhere
 
-Everything responds to the pointer: click, hover for a card, and scroll the
+Everything responds to the pointer: click to select and show a card, click again to open, and scroll the
 list under the pointer. `:` or `ctrl+k` opens a fuzzy command palette
 (`goto N`, `back N`, `parallel N`, …), `esc` goes back, `t` switches between
 dark and light, and `?` shows every key.

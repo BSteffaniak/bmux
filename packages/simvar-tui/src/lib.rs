@@ -8,7 +8,7 @@
 //!   thread ran when and the simulation's events; play, pause, step, scrub and jump to events,
 //!   going back by replaying from parked keyframes ([`timetravel`]). Drill from the run into
 //!   its threads, invariants, decisions, and whatever the simulation shows ([`SimView`]):
-//!   rows, cards on hover, pages when opened.
+//!   rows, cards when selected, pages when opened.
 //!
 //! Everything is clickable, hoverable and scrollable with the mouse, and every action has a
 //! key (`?` lists them; `:` or `ctrl+k` opens the command palette).

@@ -928,13 +928,7 @@ fn failures(app: &App, ui: &mut Ui<'_, '_, '_>, area: Rect) {
 #[allow(clippy::too_many_lines)] // the card's sections are drawn together
 fn failure_card(app: &App, ui: &mut Ui<'_, '_, '_>, area: Rect) {
     let theme = ui.theme;
-    let shown = app
-        .hover
-        .as_deref()
-        .and_then(|h| h.strip_prefix("failure."))
-        .and_then(|rest| rest.split('.').next())
-        .and_then(|n| n.parse::<usize>().ok())
-        .unwrap_or(app.selected_failure);
+    let shown = app.selected_failure;
     let Some(group) = app.store.failures.get(shown) else {
         let inner = ui.pane(
             "pane.failure",
@@ -1763,13 +1757,8 @@ fn threads(app: &App, ui: &mut Ui<'_, '_, '_>, area: Rect) {
         );
         ui.hit(id, line_area);
     }
-    // The selected (or hovered) thread in detail.
-    let focus = app
-        .hover
-        .as_deref()
-        .and_then(|h| h.strip_prefix("lane."))
-        .and_then(|n| n.parse::<usize>().ok())
-        .or(selected);
+    // The selected thread in detail.
+    let focus = selected;
     let detail = ui.pane(
         "pane.thread",
         one(span(" Thread ", theme.strong())),
@@ -1780,10 +1769,7 @@ fn threads(app: &App, ui: &mut Ui<'_, '_, '_>, area: Rect) {
     let Some(focus) = focus else {
         ui.line(
             row(detail, 0),
-            &one(span(
-                " Point at a thread to see it; click to keep it.",
-                theme.muted(),
-            )),
+            &one(span(" Click a thread to see it here.", theme.muted())),
         );
         return;
     };
@@ -1988,12 +1974,7 @@ fn sim_view(app: &App, ui: &mut Ui<'_, '_, '_>, area: Rect, view_index: usize) {
         );
         ui.hit(id, line_area);
     }
-    let focus = app
-        .hover
-        .as_deref()
-        .and_then(|h| h.strip_prefix("entity."))
-        .map(str::to_owned)
-        .or_else(|| tab.selected.clone());
+    let focus = tab.selected.clone();
     let card = ui.pane(
         "pane.card",
         one(span(" Details ", theme.strong())),
@@ -2008,7 +1989,7 @@ fn sim_view(app: &App, ui: &mut Ui<'_, '_, '_>, area: Rect, view_index: usize) {
         }
         None => ui.line(
             row(card, 0),
-            &one(span(" Point at something to see it here.", theme.muted())),
+            &one(span(" Click something to see it here.", theme.muted())),
         ),
     }
 }
@@ -2315,7 +2296,7 @@ fn help(app: &App, ui: &mut Ui<'_, '_, '_>, area: Rect) {
             "click",
             "open what you click: workers, failures, events, threads, entities",
         ),
-        key("hover", "preview: cards show what the pointer is over"),
+        key("click again", "open what is selected in full (entities)"),
         key(
             "wheel",
             "scroll the list under the pointer; step the timeline",
