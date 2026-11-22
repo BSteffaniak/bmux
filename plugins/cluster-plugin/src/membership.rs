@@ -244,7 +244,8 @@ impl FromStr for NodeId {
     }
 }
 
-#[cfg(test)]
+/// A deterministic identity for tests and simulations: a valid public key
+/// derived from a fixed secret. Constructing one confers no authentication.
 impl From<u64> for NodeId {
     fn from(value: u64) -> Self {
         let mut bytes = [0; 32];

@@ -95,6 +95,23 @@ pub struct Status {
     pub leader: Option<NodeId>,
     pub commit: Option<LogIdentity>,
     pub applied: Option<LogIdentity>,
+    /// Voters in the committed uniform configuration; zero while joint or absent.
+    pub committed_voters: usize,
+}
+
+fn status(engine: &Engine) -> Status {
+    Status {
+        term: engine.term(),
+        leader: engine.leader_hint(),
+        commit: engine.commit(),
+        applied: engine.applied(),
+        committed_voters: engine.committed_membership().map_or(0, |stored| {
+            match stored.membership.configurations() {
+                [voters] => voters.len(),
+                _ => 0,
+            }
+        }),
+    }
 }
 
 enum Command<V> {
@@ -112,6 +129,9 @@ enum Command<V> {
         respond: oneshot::Sender<Result<LogIdentity, ClientError>>,
     },
     Read {
+        respond: oneshot::Sender<Result<V, ClientError>>,
+    },
+    ReadLocal {
         respond: oneshot::Sender<Result<V, ClientError>>,
     },
     Shutdown,
@@ -169,13 +189,7 @@ impl<V: Send + Unpin + 'static> Driver<V> {
         T: Transport,
     {
         let (commands, inbox) = mpsc::channel(INBOX_CAPACITY);
-        let status = Status {
-            term: engine.term(),
-            leader: engine.leader_hint(),
-            commit: engine.commit(),
-            applied: engine.applied(),
-        };
-        let (status_tx, status_rx) = watch::channel(status);
+        let (status_tx, status_rx) = watch::channel(status(&engine));
         let loopback = commands.downgrade();
         let task = switchy_async::task::spawn(async move {
             run(Run {
@@ -252,6 +266,18 @@ impl<V: Send + Unpin + 'static> Driver<V> {
         let (respond, receive) = oneshot::channel();
         self.commands
             .send(Command::Read { respond })
+            .await
+            .map_err(|_| ClientError::Stopped(None))?;
+        receive.await.map_err(|_| ClientError::Stopped(None))?
+    }
+
+    /// This node's applied state without quorum confirmation; it may be stale.
+    /// # Errors
+    /// Stop or storage read failure.
+    pub async fn read_local(&self) -> Result<V, ClientError> {
+        let (respond, receive) = oneshot::channel();
+        self.commands
+            .send(Command::ReadLocal { respond })
             .await
             .map_err(|_| ClientError::Stopped(None))?;
         receive.await.map_err(|_| ClientError::Stopped(None))?
@@ -351,12 +377,7 @@ async fn run<S: Storage, T: Transport>(run: Run<S, T>) {
             &loopback,
             &mut jitter,
         );
-        let _ = status.send(Status {
-            term: engine.term(),
-            leader: engine.leader_hint(),
-            commit: engine.commit(),
-            applied: engine.applied(),
-        });
+        let _ = status.send(self::status(&engine));
         if stopped {
             fail_all(&mut state, engine.stopped());
             break;
@@ -384,7 +405,9 @@ async fn run<S: Storage, T: Transport>(run: Run<S, T>) {
             command = inbox.recv() => {
                 match command {
                     None | Some(Command::Shutdown) => break,
-                    Some(command) => effects = on_command(&mut engine, &mut state, command),
+                    Some(command) => {
+                        effects = on_command(&mut engine, &mut state, command, &operations);
+                    }
                 }
             }
             () = sleep => {
@@ -426,7 +449,12 @@ fn fail_all<V>(state: &mut Loop<V>, reason: Option<StopReason>) {
     state.proposed.clear();
 }
 
-fn on_command<V>(engine: &mut Engine, state: &mut Loop<V>, command: Command<V>) -> Vec<Effect> {
+fn on_command<V>(
+    engine: &mut Engine,
+    state: &mut Loop<V>,
+    command: Command<V>,
+    operations: &mpsc::UnboundedSender<Operation>,
+) -> Vec<Effect> {
     state.next_token += 1;
     let token = state.next_token;
     match command {
@@ -451,6 +479,12 @@ fn on_command<V>(engine: &mut Engine, state: &mut Loop<V>, command: Command<V>) 
         Command::Read { respond } => {
             state.reads.insert(token, respond);
             engine.handle(Input::Read { token })
+        }
+        Command::ReadLocal { respond } => {
+            // Queued behind every apply already issued, like a confirmed read.
+            state.reads.insert(token, respond);
+            let _ = operations.send(Operation::Read(token));
+            Vec::new()
         }
         Command::Shutdown => Vec::new(),
     }

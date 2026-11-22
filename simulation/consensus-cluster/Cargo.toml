@@ -1,0 +1,22 @@
+[package]
+description = "Deterministic simulation of a bmux owned-consensus cluster under faults"
+edition     = { workspace = true }
+license     = { workspace = true }
+name        = "consensus-cluster"
+publish     = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_cluster_plugin     = { workspace = true }
+bmux_cluster_plugin_api = { workspace = true }
+simvar                  = { workspace = true, features = ["fs", "random", "time"] }
+switchy_async           = { workspace = true, features = ["simulator", "time"] }
+switchy_fs              = { workspace = true, features = ["simulator", "sync"] }
+switchy_time            = { workspace = true, features = ["simulator"] }
+uuid                    = { workspace = true }
+
+[features]
+default = []
+
+fail-on-warnings = []

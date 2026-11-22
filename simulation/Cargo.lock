@@ -416,6 +416,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "switchy_async 0.5.0",
+ "switchy_fs 0.5.0",
  "tempfile",
  "tokio",
  "toml",
@@ -1177,6 +1178,19 @@ version = "0.0.0"
 dependencies = [
  "bmux_cluster_plugin",
  "simvar",
+]
+
+[[package]]
+name = "consensus-cluster"
+version = "0.0.0"
+dependencies = [
+ "bmux_cluster_plugin",
+ "bmux_cluster_plugin_api",
+ "simvar",
+ "switchy_async 0.5.0",
+ "switchy_fs 0.5.0",
+ "switchy_time",
+ "uuid",
 ]
 
 [[package]]
@@ -4712,6 +4726,7 @@ dependencies = [
  "rustix",
  "switchy_async 0.5.0",
  "switchy_simulation",
+ "tempfile",
  "tokio",
  "windows-sys 0.61.2",
 ]
@@ -4994,6 +5009,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",

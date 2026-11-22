@@ -210,23 +210,42 @@ const MAX_RETAINED_ENTRIES: u64 = 4096;
 // budget counts the complete canonical log entry, not just command payload.
 const APPLICATION_ENTRY_BUDGET: usize = 1024 * 1024;
 
-// Bound aggregate scratch use in this process, not just each file. Never queue
-// startup attempts behind slow recovery; the caller may retry explicit Busy.
-static PREFLIGHT_ADMISSION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Bounds concurrent recovery scratch copies among the stores that share it.
+///
+/// Never queues startup behind slow recovery; the caller may retry explicit Busy.
+/// Each owner (a plugin instance, a simulated run) holds its own, so independent
+/// owners never contend through process-wide state.
+#[derive(Debug, Clone, Default)]
+pub struct PreflightAdmission(std::sync::Arc<std::sync::Mutex<()>>);
 
-fn admit_preflight() -> io::Result<std::sync::MutexGuard<'static, ()>> {
-    PREFLIGHT_ADMISSION.try_lock().map_err(|error| match error {
-        std::sync::TryLockError::WouldBlock => {
-            io::Error::new(io::ErrorKind::WouldBlock, "owned preflight busy")
-        }
-        std::sync::TryLockError::Poisoned(_) => {
-            io::Error::other("owned preflight stopped after panic")
-        }
-    })
+impl PreflightAdmission {
+    fn admit(&self) -> io::Result<std::sync::MutexGuard<'_, ()>> {
+        self.0.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => {
+                io::Error::new(io::ErrorKind::WouldBlock, "owned preflight busy")
+            }
+            std::sync::TryLockError::Poisoned(_) => {
+                io::Error::other("owned preflight stopped after panic")
+            }
+        })
+    }
 }
 
-fn preflight_payload(backend: &OwnedBackend, cluster: &str) -> io::Result<()> {
-    let admission = admit_preflight()?;
+// The legacy executor path bounds scratch use across this process.
+static PROCESS_PREFLIGHT: std::sync::LazyLock<PreflightAdmission> =
+    std::sync::LazyLock::new(PreflightAdmission::default);
+
+#[cfg(test)]
+fn admit_preflight() -> io::Result<std::sync::MutexGuard<'static, ()>> {
+    PROCESS_PREFLIGHT.admit()
+}
+
+fn preflight_payload(
+    backend: &OwnedBackend,
+    cluster: &str,
+    admission: &PreflightAdmission,
+) -> io::Result<()> {
+    let admission = admission.admit()?;
     let scratch = switchy_fs::sync::tempfile()?;
     let scratch_backend = OwnedBackend::initialize(scratch, cluster)?;
     backend.operate(|file| {
@@ -3949,10 +3968,21 @@ impl OwnedVoteStore {
     /// Missing metadata, unknown formats, wrong clusters and corrupt votes fail.
     /// redb holds exclusive database ownership for this handle's lifetime.
     pub fn open(path: &Path, cluster: &str) -> io::Result<Self> {
+        Self::open_with(path, cluster, &PROCESS_PREFLIGHT)
+    }
+
+    /// Like [`Self::open`], bounding the recovery copy with the caller's admission.
+    /// # Errors
+    /// As [`Self::open`]; `WouldBlock` when that admission is busy.
+    pub fn open_with(
+        path: &Path,
+        cluster: &str,
+        admission: &PreflightAdmission,
+    ) -> io::Result<Self> {
         // Validate identification while holding the same inode lock that redb
         // retains through recovery. Unsupported files never reach writable redb.
         let backend = OwnedBackend::open(path, cluster)?;
-        preflight_payload(&backend, cluster)?;
+        preflight_payload(&backend, cluster, admission)?;
         // A previous initializer may have published this inode but failed before
         // directory sync. Complete that durability boundary before exposing it.
         backend.operate(|file| file.sync_all())?;
