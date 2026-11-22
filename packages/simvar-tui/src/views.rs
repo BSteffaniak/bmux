@@ -770,19 +770,20 @@ fn invariants_exercised(app: &App, ui: &mut Ui<'_, '_, '_>, area: Rect) {
 
 /// A failure group's status glyphs: reproduction and shrinking.
 fn failure_status(theme: &Theme, group: &crate::store::FailureGroup, tick: u64) -> Vec<Span> {
+    use crate::store::Verdict;
     let mut out = Vec::new();
-    if group.confirming.is_some() {
-        out.push(span(
-            format!(" {} reproducing", spinner(tick)),
-            theme.info(),
-        ));
-    } else {
-        match group.reproduced {
-            Some(true) => out.push(span(" ↺✓", theme.good())),
-            Some(false) => out.push(span(" ↺✗ nondeterministic?", theme.warn())),
-            None if group.saved => out.push(span(" saved", theme.muted())),
-            None => {}
-        }
+    let verdict = group.verdict();
+    let (text, style) = match verdict {
+        Verdict::Replaying => (format!(" {} replaying", spinner(tick)), theme.info()),
+        Verdict::Reproduced => (" ↺✓ reproduced".into(), theme.good()),
+        Verdict::Nondeterministic => (" ↺✗ nondeterministic".into(), theme.warn()),
+        Verdict::EarlierBuild => (" ◷ earlier build".into(), theme.muted()),
+        Verdict::StillFails => (" ↺✓ still fails".into(), theme.bad()),
+        Verdict::PassesNow => (" ✔ passes now".into(), theme.good()),
+        Verdict::Unconfirmed => (String::new(), theme.muted()),
+    };
+    if !text.is_empty() {
+        out.push(span(text, style));
     }
     if let Some(shrink) = &group.shrink {
         if shrink.done && shrink.best == 0 {
@@ -996,12 +997,19 @@ fn failure_card(app: &App, ui: &mut Ui<'_, '_, '_>, area: Rect) {
         shape.push(span(" ", theme.text()));
     }
     facts.push(Line::from_spans(shape));
-    let mut status = vec![span(" state", theme.muted())];
-    status.extend(failure_status(theme, group, ui.tick));
-    if status.len() == 1 {
-        status.push(span(" not yet reproduced", theme.muted()));
+    facts.push(Line::from_spans(vec![
+        span(" state ", theme.muted()),
+        span(
+            group.verdict().describe(),
+            theme.text().add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    if group.stale {
+        facts.push(one(span(
+            " saved by another build: its seed may run differently on this one (↺ checks it, ✕ forgets it)",
+            theme.muted(),
+        )));
     }
-    facts.push(Line::from_spans(status));
     ui.lines(parts[0], &facts);
     if let Some(shrink) = &group.shrink {
         let value = if shrink.done || shrink.original == 0 {
@@ -1040,24 +1048,15 @@ fn failure_card(app: &App, ui: &mut Ui<'_, '_, '_>, area: Rect) {
             inset(row(parts[1], 1), 0),
         );
     }
-    // What failed first, then the rest of the harness's report.
-    let (before, error) = group
-        .report
-        .split_once("Error:")
-        .map_or(("", group.report.as_str()), |(before, after)| {
-            (before, after)
-        });
-    let report: Vec<Line> = error
-        .lines()
-        .filter(|line| !line.trim().is_empty() && !line.starts_with("To run"))
+    // What failed, then the few facts of the harness's report that matter.
+    let report: Vec<Line> = failure_lines(&group.report)
+        .into_iter()
         .map(|line| one(span(format!(" {line}"), theme.bad())))
         .chain(std::iter::once(Line::raw("")))
-        .chain(
-            before
-                .lines()
-                .filter(|line| !line.trim().is_empty() && !line.starts_with('='))
-                .map(|line| one(span(format!(" {line}"), theme.muted()))),
-        )
+        .chain(std::iter::once(one(span(
+            format!(" {}", run_facts(&group.report)),
+            theme.muted(),
+        ))))
         .collect();
     ui.hit_as("list.report", parts[2], HitRole::Scroll);
     let offset = usize::from(app.scroll.get("report").copied().unwrap_or(0))
@@ -1093,13 +1092,54 @@ fn failure_card(app: &App, ui: &mut Ui<'_, '_, '_>, area: Rect) {
         " ↺ Reproduce ",
         theme.info(),
     ) + 1;
-    ui.button(
+    x += ui.button(
         &format!("failure.{shown}.shrink"),
         x,
         y,
         " ⇲ Shrink ",
         theme.replay(),
+    ) + 1;
+    ui.button(
+        &format!("failure.{shown}.forget"),
+        x,
+        y,
+        " ✕ Forget ",
+        theme.muted(),
     );
+}
+
+/// The lines of a report that say what failed: after `Error:`, up to the harness's own
+/// summary.
+fn failure_lines(report: &str) -> Vec<String> {
+    report
+        .split_once("Error:")
+        .map_or(report, |(_, rest)| rest)
+        .lines()
+        .map(str::trim_end)
+        .take_while(|line| !line.starts_with('=') && !line.starts_with("To run"))
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The facts of a harness report worth a glance: run, steps, real and simulated time.
+fn run_facts(report: &str) -> String {
+    let field = |name: &str| {
+        report
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .map(str::trim)
+    };
+    [
+        field("run").map(|v| format!("run {v}")),
+        field("steps").map(|v| format!("{v} steps")),
+        field("real_time_elapsed").map(|v| format!("{v} real")),
+        field("simulated_time_elapsed").map(|v| format!("{v} simulated")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ")
 }
 
 /// The scheduler of the run shown, and its timeline index.
@@ -1519,13 +1559,61 @@ fn invariants_summary(app: &App, ui: &mut Ui<'_, '_, '_>, area: Rect) {
     ui.lines(inner, &lines);
 }
 
-fn events_near(app: &App, ui: &mut Ui<'_, '_, '_>, area: Rect) {
+/// When the run shown failed (or was opened for a failure), what failed and where the replay
+/// stopped, at the top of `area`; returns what is left of it.
+fn why_it_failed(
+    app: &App,
+    ui: &mut Ui<'_, '_, '_>,
+    area: Rect,
+    origin: Option<&RunRecord>,
+) -> Rect {
     let theme = ui.theme;
-    let (origin, _, index) = run_data(app);
-    if let Some(outcome) = origin
+    let tab = app.current_run();
+    let report = origin
         .and_then(|o| o.outcome.as_ref())
         .filter(|o| !o.success)
-    {
+        .map(|o| o.report.clone())
+        .or_else(|| {
+            let signature = tab?.failure.as_ref()?;
+            app.store
+                .failures
+                .iter()
+                .find(|g| &g.signature == signature)
+                .map(|g| g.report.clone())
+        });
+    if let Some(report) = report {
+        let mut lines: Vec<Line> = failure_lines(&report)
+            .into_iter()
+            .map(|line| one(span(format!(" {line}"), theme.bad())))
+            .collect();
+        let travel = tab.and_then(|t| t.travel.as_ref());
+        match travel.and_then(|t| t.cursor.control.hit()) {
+            Some(hit) => lines.push(one(span(
+                format!(" ◆ the replay stopped here: {hit}"),
+                theme.warn(),
+            ))),
+            None if travel.is_some_and(|t| !t.settled()) => lines.push(one(span(
+                format!(" {} replaying to the failure…", spinner(ui.tick)),
+                theme.replay(),
+            ))),
+            None if travel
+                .and_then(|t| t.cursor.run)
+                .and_then(|id| app.store.runs.get(&id))
+                .and_then(|r| r.outcome.as_ref())
+                .is_some_and(|o| o.success) =>
+            {
+                lines.push(one(span(
+                    " ✔ this replay passed: the failure does not happen on this build",
+                    theme.good().add_modifier(Modifier::BOLD),
+                )));
+            }
+            None => {}
+        }
+        lines.push(one(span(format!(" {}", run_facts(&report)), theme.muted())));
+        let height = u16::try_from(lines.len() + 2)
+            .unwrap_or(u16::MAX)
+            .min(area.height / 2);
+        let parts = rows(area, &[Size::Fixed(height), Size::Fill(1)]);
         let inner = ui.pane(
             "pane.run.failure",
             one(span(
@@ -1533,20 +1621,20 @@ fn events_near(app: &App, ui: &mut Ui<'_, '_, '_>, area: Rect) {
                 theme.bad().add_modifier(Modifier::BOLD),
             )),
             None,
-            area,
+            parts[0],
             true,
         );
-        let lines: Vec<Line> = outcome
-            .report
-            .split_once("Error:")
-            .map_or(outcome.report.as_str(), |(_, rest)| rest)
-            .lines()
-            .take_while(|line| !line.starts_with("To run"))
-            .map(|line| one(span(format!(" {line}"), theme.bad())))
-            .collect();
         ui.lines(inner, &lines);
-        return;
+        parts[1]
+    } else {
+        area
     }
+}
+
+fn events_near(app: &App, ui: &mut Ui<'_, '_, '_>, area: Rect) {
+    let theme = ui.theme;
+    let (origin, _, index) = run_data(app);
+    let area = why_it_failed(app, ui, area, origin);
     let inner = ui.pane(
         "pane.run.events",
         one(span(" Events ", theme.strong())),
@@ -1998,6 +2086,7 @@ fn hints(app: &App, ui: &mut Ui<'_, '_, '_>, area: Rect) {
             KeyHint::new("enter", "debug"),
             KeyHint::new("c", "reproduce"),
             KeyHint::new("s", "shrink"),
+            KeyHint::new("x", "forget"),
             KeyHint::new("esc", "fleet"),
             KeyHint::new(":", "commands"),
             KeyHint::new("?", "keys"),
@@ -2051,12 +2140,14 @@ fn toasts(app: &App, ui: &mut Ui<'_, '_, '_>, area: Rect) {
     let theme = ui.theme;
     let width = 46.min(area.width.saturating_sub(2));
     let height = 4;
-    let mut bottom = area.bottom().saturating_sub(2);
-    for toast in app.toasts.iter().rev() {
-        if bottom < area.y + 3 + height {
+    // Newest first, from just under the tabs, at most two (each fades after a few seconds,
+    // or goes when clicked).
+    let mut top = area.y + 2;
+    for toast in app.toasts.iter().rev().take(2) {
+        if top + height > area.bottom().saturating_sub(2) {
             break;
         }
-        let y = bottom - height;
+        let y = top;
         let rect = Rect::new(area.right().saturating_sub(width + 1), y, width, height);
         let id = format!("toast.{}", toast.id);
         let tone = theme.tone(toast.tone);
@@ -2102,7 +2193,7 @@ fn toasts(app: &App, ui: &mut Ui<'_, '_, '_>, area: Rect) {
                 .hoverable(true)
                 .layer(5),
         );
-        bottom = y;
+        top = y + height;
     }
 }
 
@@ -2245,8 +2336,8 @@ fn help(app: &App, ui: &mut Ui<'_, '_, '_>, area: Rect) {
         key("click a tag", "show only runs with that tag"),
         section("Failures"),
         key(
-            "enter · c · s",
-            "debug · reproduce · shrink the selected failure",
+            "enter · c · s · x",
+            "debug · reproduce · shrink · forget the selected failure",
         ),
         section("A run (time travel)"),
         key("space", "play / pause (pausing a live run starts a replay)"),

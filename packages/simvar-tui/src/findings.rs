@@ -78,6 +78,7 @@ impl Finding {
             confirming: None,
             shrink: None,
             saved: true,
+            stale: self.build != build,
         }
     }
 }
@@ -120,6 +121,22 @@ impl Findings {
             .collect()
     }
 
+    /// Delete the finding with `signature`, if saved.
+    ///
+    /// # Errors
+    ///
+    /// * If it exists and cannot be deleted
+    pub fn forget(&self, signature: &str) -> io::Result<()> {
+        match std::fs::remove_file(self.path(signature)) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+            _ => Ok(()),
+        }
+    }
+
+    fn path(&self, signature: &str) -> PathBuf {
+        self.dir.join(format!("{:016x}.json", fnv(signature)))
+    }
+
     /// Save `finding`, replacing an earlier one with the same signature.
     ///
     /// # Errors
@@ -127,9 +144,7 @@ impl Findings {
     /// * If the directory or file cannot be written
     pub fn save(&self, finding: &Finding) -> io::Result<()> {
         std::fs::create_dir_all(&self.dir)?;
-        let path = self
-            .dir
-            .join(format!("{:016x}.json", fnv(&finding.signature)));
+        let path = self.path(&finding.signature);
         let staging = path.with_extension("json.tmp");
         std::fs::write(
             &staging,
@@ -139,11 +154,15 @@ impl Findings {
     }
 }
 
-/// The default findings directory for `simulation`: `target/sim-findings/<simulation>` beside
-/// the running executable's target directory when it can be found, else under the working
-/// directory.
+/// The findings directory for `simulation`.
+///
+/// It is under `SIMULATOR_FINDINGS` when set, else `target/sim-findings/<simulation>` in the running executable's target directory when it can
+/// be found, else under the working directory.
 #[must_use]
 pub fn default_dir(simulation: &str) -> PathBuf {
+    if let Some(dir) = std::env::var_os("SIMULATOR_FINDINGS") {
+        return PathBuf::from(dir).join(simulation);
+    }
     let target = std::env::current_exe().ok().and_then(|exe| {
         exe.ancestors()
             .find(|dir| dir.file_name().is_some_and(|name| name == "target"))
@@ -209,6 +228,11 @@ mod tests {
         assert_eq!(group.reproduced, None);
         assert!(group.saved);
         assert_eq!(finding.group("b", Instant::now()).reproduced, Some(true));
+        assert!(group.stale);
+        assert!(!finding.group("b", Instant::now()).stale);
+        findings.forget(&finding.signature).unwrap();
+        assert_eq!(findings.load(), []);
+        findings.forget(&finding.signature).unwrap();
         let _ = std::fs::remove_dir_all(dir);
     }
 }

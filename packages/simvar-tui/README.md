@@ -19,12 +19,20 @@ simulation: `cargo sim pane-runtime --tui`.
   runs showed each shape (`crash`, `restart`, …).
 - **Invariants exercised**: how often the fleet checked each invariant;
   rarely or never checked ones are flagged.
-- **Failures**: kept, not fatal. They are grouped by what failed, then
-  confirmed by a replay (`↺✓`, or `↺✗` when a replay passes, which means
-  nondeterminism), shrunk in the background (`⇲`), announced in a toast, and
-  saved under `target/sim-findings/<simulation>/`, which outlives the session.
-  The Failures tab shows each group with its report, its replay command, and
-  buttons to open, reproduce and shrink it.
+- **Failures**: kept, not fatal. They are grouped by what failed, replayed
+  to confirm them, shrunk in the background (`⇲`), announced in a toast, and
+  saved under `target/sim-findings/<simulation>/` (or `$SIMULATOR_FINDINGS`),
+  which outlives the session. What a replay says:
+  - `↺✓ reproduced`: it failed the same way.
+  - `↺✗ nondeterministic`: it passed on the same build, so the seed ran
+    differently.
+  - `◷ earlier build`: saved by another build. Seeds replay only on the build
+    that ran them, so `↺` checks it on this one: `↺✓ still fails` or
+    `✔ passes now` (fixed, or the code changed).
+
+  The Failures tab shows each group with what failed, its replay command, and
+  buttons to open, reproduce, shrink and forget it (`enter`, `c`, `s`, `x`).
+  Opening a failure replays its run up to the failure, beside why it failed.
 
 `p` pauses or resumes the fleet, and `+`/`-` change how many runs go at once.
 

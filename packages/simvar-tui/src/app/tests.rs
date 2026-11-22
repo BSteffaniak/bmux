@@ -339,6 +339,46 @@ fn opening_a_finished_run_replays_it_and_the_transport_steps_it() {
 }
 
 #[test]
+fn a_failed_run_opens_at_its_failure() {
+    let (mut app, _) = app();
+    start(&mut app, id(1, 1), 99);
+    let mut index = RunIndex::default();
+    for n in 0..400 {
+        index.record(n, 0, || "main".into());
+    }
+    index.event(TimelineEvent {
+        decision: 250,
+        kind: "failure".into(),
+        label: "6. broken".into(),
+        tone: Tone::Bad,
+        entity: None,
+    });
+    index.finished = true;
+    app.event(
+        SimEvent::Telemetry {
+            id: id(1, 1),
+            payload: Arc::new(index),
+        },
+        Instant::now(),
+    );
+    app.event(
+        SimEvent::RunFinished {
+            id: id(1, 1),
+            seed: 99,
+            success: false,
+            report: "Error:\n6. broken\n".into(),
+            steps: 1,
+            real_time: Duration::ZERO,
+            sim_time: Duration::ZERO,
+        },
+        Instant::now(),
+    );
+    app.act(Action::OpenRun(id(1, 1)));
+    let travel = app.current_run().unwrap().travel.as_ref().unwrap();
+    assert_eq!(travel.cursor.target, 250);
+}
+
+#[test]
 fn pages_and_sim_views_drill_in_by_clicks() {
     let (mut app, _) = app();
     start(&mut app, id(1, 1), 5);
@@ -513,4 +553,96 @@ fn print_frames() {
     println!("{}", draw(&mut app));
     app.act(Action::OpenRun(id(9, 4)));
     println!("{}", draw(&mut app));
+}
+
+fn stale_group() -> crate::store::FailureGroup {
+    crate::findings::Finding {
+        signature: "6. the crashed server's sessions still run [#] after recovery".into(),
+        seed: 77,
+        epoch_offset: 4,
+        report: "Error:\n6. the crashed server's sessions still run [12] after recovery\n=====\nrun=3/forever\nsteps=142\n".into(),
+        shape: vec!["personality:macos".into()],
+        count: 67,
+        build: "an earlier build".into(),
+        reproduced: Some(false),
+        schedule: None,
+        shrunk: None,
+        last_seen: 0,
+    }
+    .group("this build", Instant::now())
+}
+
+#[test]
+fn a_saved_failure_that_passes_now_is_not_called_nondeterministic() {
+    let (mut app, fake) = app();
+    app.store.add_saved(stale_group());
+    assert_eq!(
+        app.store.failures[0].verdict(),
+        crate::store::Verdict::EarlierBuild
+    );
+    app.act(Action::Confirm(0));
+    app.tick(Instant::now());
+    let job = app.store.failures[0].confirming.unwrap();
+    assert_eq!(fake.0.lock().unwrap().replays, [(77, false)]);
+    app.event(
+        SimEvent::RunStarted {
+            id: job,
+            seed: 77,
+            props: vec![],
+            steps: None,
+            worker: 0,
+            kind: RunKind::Replay,
+            epoch_offset: 4,
+        },
+        Instant::now(),
+    );
+    app.event(
+        SimEvent::RunFinished {
+            id: job,
+            seed: 77,
+            success: true,
+            report: String::new(),
+            steps: 1,
+            real_time: Duration::ZERO,
+            sim_time: Duration::ZERO,
+        },
+        Instant::now(),
+    );
+    assert_eq!(
+        app.store.failures[0].verdict(),
+        crate::store::Verdict::PassesNow
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.title.contains("Passes on this build"))
+    );
+    app.act(Action::Tab(1));
+    let text = draw(&mut app);
+    assert!(text.contains("passes on this build"), "{text}");
+    assert!(!text.contains("nondeterministic"), "{text}");
+    click(&mut app, "failure.0.forget");
+    assert!(app.store.failures.is_empty());
+}
+
+#[test]
+fn opening_a_saved_failure_replays_up_to_the_failure_and_says_why() {
+    let (mut app, fake) = app();
+    app.store.add_saved(stale_group());
+    app.act(Action::OpenFailure(0));
+    let travel = app.current_run().unwrap().travel.as_ref().unwrap();
+    assert_eq!(travel.cursor.target, u64::MAX);
+    assert!(
+        travel
+            .cursor
+            .control
+            .breakpoints()
+            .contains(&simvar_observer::Breakpoint::Failure)
+    );
+    assert_eq!(fake.0.lock().unwrap().replays.len(), 1);
+    let text = draw(&mut app);
+    assert!(text.contains("Why it failed"), "{text}");
+    assert!(text.contains("still run [12] after recovery"), "{text}");
+    assert!(text.contains("replaying to the failure"), "{text}");
+    assert!(text.contains("run 3/forever · 142 steps"), "{text}");
 }

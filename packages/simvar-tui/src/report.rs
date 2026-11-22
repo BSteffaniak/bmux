@@ -42,11 +42,7 @@ pub fn failure(group: &FailureGroup) -> Vec<String> {
     if !group.shape.is_empty() {
         lines.push(format!("  shape: {}", group.shape.join(" ")));
     }
-    match group.reproduced {
-        Some(true) => lines.push("  reproduced by a replay".into()),
-        Some(false) => lines.push("  did NOT reproduce in a replay (nondeterminism?)".into()),
-        None => {}
-    }
+    lines.push(format!("  {}", group.verdict().describe()));
     if let Some(shrink) = group.shrink.as_ref().filter(|s| s.done) {
         lines.push(format!(
             "  shrunk from {} to {} scheduling choices",

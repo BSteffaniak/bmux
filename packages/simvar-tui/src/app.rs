@@ -75,6 +75,8 @@ pub struct RunTab {
     pub travel: Option<TimeTravel>,
     /// The decision range the timeline shows, when zoomed.
     pub zoom: Option<(u64, u64)>,
+    /// The failure group this run was opened for (its signature).
+    pub failure: Option<String>,
 }
 
 impl RunTab {
@@ -107,6 +109,7 @@ pub enum Action {
     SelectFailure(usize),
     Confirm(usize),
     Shrink(usize),
+    Forget(usize),
     Page(Page),
     Select(String),
     Open(String),
@@ -162,6 +165,7 @@ impl Action {
                     Some("open") => Self::OpenFailure(group),
                     Some("confirm") => Self::Confirm(group),
                     Some("shrink") => Self::Shrink(group),
+                    Some("forget") => Self::Forget(group),
                     _ => Self::SelectFailure(group),
                 }
             }
@@ -397,24 +401,23 @@ impl App {
             }
             Notice::RepeatFailure(group) => self.save(group),
             Notice::Confirmed(group, reproduced) => {
-                let signature = self.store.failures[group].signature.clone();
+                let failure = &self.store.failures[group];
+                let signature = failure.signature.clone();
+                let (tone, title) = match (reproduced, failure.stale) {
+                    (true, false) => (Tone::Info, "Failure reproduced"),
+                    (true, true) => (Tone::Info, "Still fails on this build"),
+                    (false, false) => (Tone::Warn, "Did not reproduce: nondeterministic"),
+                    (false, true) => (Tone::Good, "Passes on this build (fixed?)"),
+                };
+                self.toast(
+                    tone,
+                    title,
+                    signature,
+                    Some(Action::OpenFailure(group)),
+                    now,
+                );
                 if reproduced {
-                    self.toast(
-                        Tone::Info,
-                        "Failure reproduced",
-                        signature,
-                        Some(Action::OpenFailure(group)),
-                        now,
-                    );
                     self.jobs.shrink.push_back(group);
-                } else {
-                    self.toast(
-                        Tone::Warn,
-                        "Failure did not reproduce",
-                        format!("{signature} (nondeterminism?)"),
-                        Some(Action::OpenFailure(group)),
-                        now,
-                    );
                 }
                 self.save(group);
             }
@@ -509,12 +512,29 @@ impl App {
                 .and_then(|r| r.index.as_ref())
                 .filter(|index| index.finished)
                 .map(|index| index.decisions);
-            if let Some(travel) = &mut run.travel {
-                if let Some(length) = length {
-                    travel.set_length(controller, length);
-                }
-                travel.frame(controller);
+            let Some(travel) = &mut run.travel else {
+                continue;
+            };
+            if travel.adopt_stop() {
+                self.dirty = true;
             }
+            if travel
+                .cursor
+                .run
+                .and_then(|id| self.store.runs.get(&id))
+                .is_some_and(|record| !record.live())
+            {
+                travel.cursor_ended();
+            }
+            // A run stopped at its failure is as long as it got.
+            let length = length.or_else(|| {
+                (travel.length.is_none() && travel.cursor.control.hit().is_some())
+                    .then(|| travel.position() + 1)
+            });
+            if let Some(length) = length {
+                travel.set_length(controller, length);
+            }
+            travel.frame(controller);
         }
     }
 
@@ -873,6 +893,7 @@ impl App {
             KeyCode::Enter => self.enter()?,
             KeyCode::Char('c') if self.tab == 1 => Action::Confirm(self.selected_failure),
             KeyCode::Char('s') if self.tab == 1 => Action::Shrink(self.selected_failure),
+            KeyCode::Char('x') if self.tab == 1 => Action::Forget(self.selected_failure),
             _ => return None,
         })
     }
@@ -983,6 +1004,7 @@ impl App {
                     self.jobs.confirm.push_back(group);
                 }
             }
+            Action::Forget(group) => self.forget(group),
             Action::Shrink(group) => {
                 if self.store.failures.get(group).is_some() {
                     self.jobs.shrink.push_back(group);
@@ -1120,6 +1142,37 @@ impl App {
         }
     }
 
+    /// Forget failure group `group`, here and on disk.
+    fn forget(&mut self, group: usize) {
+        let Some(failure) = self.store.forget(group) else {
+            return;
+        };
+        if let Some(findings) = &self.findings
+            && let Err(error) = findings.forget(&failure.signature)
+        {
+            self.say(&format!("could not delete the saved finding: {error}"));
+        }
+        let shift = |queue: &mut VecDeque<usize>| {
+            queue.retain(|g| *g != group);
+            for g in queue.iter_mut() {
+                if *g > group {
+                    *g -= 1;
+                }
+            }
+        };
+        shift(&mut self.jobs.confirm);
+        shift(&mut self.jobs.shrink);
+        self.jobs.shrinking = match self.jobs.shrinking {
+            Some(g) if g == group => None,
+            Some(g) if g > group => Some(g - 1),
+            other => other,
+        };
+        self.selected_failure = self
+            .selected_failure
+            .min(self.store.failures.len().saturating_sub(1));
+        self.say("forgot that failure");
+    }
+
     fn say(&mut self, message: &str) {
         self.message = Some((message.to_owned(), self.now));
     }
@@ -1206,15 +1259,21 @@ impl App {
             selected: None,
             travel: None,
             zoom: None,
+            failure: None,
         };
         let finished = !record.live();
         self.store.pin(id, true);
         self.tabs.push(Tab::Run(Box::new(tab)));
         self.tab = self.tabs.len() - 1;
         if finished {
-            // A finished run is shown by replaying it, at its end.
+            // A finished run is shown by replaying it: at its failure, or at its end.
             self.start_travel();
-            self.act(Action::End);
+            let failure = self.index(id).and_then(|index| {
+                index
+                    .previous_event(u64::MAX, Some("failure"))
+                    .map(|e| e.decision)
+            });
+            self.act(failure.map_or(Action::End, Action::Seek));
         }
     }
 
@@ -1222,14 +1281,21 @@ impl App {
         let Some(failure) = self.store.failures.get(group) else {
             return;
         };
+        let signature = Some(failure.signature.clone());
         if let Some(run) = failure.runs.last().copied()
             && self.store.runs.contains_key(&run)
         {
             self.open_run(run);
+            if let Some(tab) = self.current_run_mut() {
+                tab.failure = signature;
+            }
             return;
         }
         let (seed, epoch_offset) = (failure.seed, failure.epoch_offset);
         self.open_seed(seed, epoch_offset);
+        if let Some(tab) = self.current_run_mut() {
+            tab.failure = signature;
+        }
     }
 
     /// Open the run of `seed` and `epoch_offset`, which this dashboard did not see run: it is
@@ -1248,16 +1314,24 @@ impl App {
             selected: None,
             travel: None,
             zoom: None,
+            failure: None,
         };
         self.tabs.push(Tab::Run(Box::new(tab)));
         self.tab = self.tabs.len() - 1;
-        self.start_travel();
-        if let Some(Tab::Run(run)) = self.tabs.get_mut(self.tab)
-            && let Some(travel) = &run.travel
-            && let Some(replay) = travel.cursor.run
-        {
-            // The first replay stands in for the run itself.
-            run.origin = replay;
+        let Some(controller) = self.controller.as_deref() else {
+            self.say("this simulation cannot be replayed from the dashboard");
+            return;
+        };
+        // Run it to where it fails (or to its end), and show it there.
+        let travel = TimeTravel::start(controller, seed, epoch_offset, u64::MAX, None);
+        travel.cursor.control.add_breakpoint(Breakpoint::Failure);
+        if let Some(Tab::Run(run)) = self.tabs.get_mut(self.tab) {
+            if let Some(replay) = travel.cursor.run {
+                // The first replay stands in for the run itself.
+                run.origin = replay;
+                self.store.pin(replay, true);
+            }
+            run.travel = Some(travel);
         }
     }
 

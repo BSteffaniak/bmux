@@ -76,6 +76,8 @@ pub struct TimeTravel {
     pub keyframes: Vec<Replay>,
     /// Decisions to advance per frame while playing, when playing.
     pub playing: Option<u64>,
+    /// The shown replay's run ended, so it cannot go further: moves start elsewhere.
+    pub ended: bool,
 }
 
 impl TimeTravel {
@@ -95,6 +97,7 @@ impl TimeTravel {
             cursor: Replay::start(controller, seed, epoch_offset, at),
             keyframes: Vec::new(),
             playing: None,
+            ended: false,
         };
         travel.park_keyframes(controller);
         travel
@@ -149,10 +152,32 @@ impl TimeTravel {
         self.cursor.target
     }
 
-    /// Whether the replay shown is where it was sent.
+    /// Whether the replay shown is where it was sent (or as far as it goes).
     #[must_use]
     pub fn settled(&self) -> bool {
-        self.cursor.parked()
+        self.ended || self.cursor.parked()
+    }
+
+    /// Note where the shown replay stopped on its own (at a breakpoint, a failure), so that is
+    /// where it is: returns whether it had.
+    pub fn adopt_stop(&mut self) -> bool {
+        let (mode, at) = self.cursor.control.status();
+        if matches!(mode, ReplayMode::Pause) && at != self.cursor.target {
+            self.cursor.target = at;
+            self.playing = None;
+            return true;
+        }
+        false
+    }
+
+    /// The shown replay's run ended (it ran to its end): it stays shown where it ended, and
+    /// later moves start from a keyframe or a new replay.
+    pub fn cursor_ended(&mut self) {
+        if !self.ended {
+            self.ended = true;
+            self.cursor.target = self.cursor.position();
+            self.playing = None;
+        }
     }
 
     /// Show decision `target`.
@@ -161,8 +186,8 @@ impl TimeTravel {
             .length
             .map_or(target, |length| target.min(length.saturating_sub(1)));
         let here = self.cursor.position();
-        // The shown replay only goes forward.
-        if here <= target {
+        // The shown replay only goes forward, while its run lasts.
+        if !self.ended && here <= target {
             self.cursor.target = target;
             self.cursor.control.set(ReplayMode::Until(target));
             return;
@@ -191,6 +216,7 @@ impl TimeTravel {
         };
         let previous = std::mem::replace(&mut self.cursor, next);
         previous.release();
+        self.ended = false;
         self.cursor.target = target;
         self.cursor.control.set(ReplayMode::Until(target));
     }
@@ -220,7 +246,7 @@ impl TimeTravel {
             return true;
         }
         let end = self.length.map(|l| l.saturating_sub(1));
-        if end.is_some_and(|end| self.position() >= end) {
+        if self.ended || end.is_some_and(|end| self.position() >= end) {
             self.playing = None;
             return false;
         }
@@ -328,6 +354,27 @@ mod tests {
         controller.settle();
         assert_eq!(travel.position(), 400);
         assert_eq!(controller.replays.lock().unwrap().len(), started + 1);
+    }
+
+    #[test]
+    fn a_replay_that_stops_on_its_own_or_ends_stays_where_it_stopped() {
+        let controller = FakeController::default();
+        let mut travel = TimeTravel::start(&controller, 1, 0, u64::MAX, None);
+        travel
+            .cursor
+            .control
+            .add_breakpoint(simvar_observer::Breakpoint::Decision(40));
+        controller.settle();
+        assert!(travel.adopt_stop());
+        assert_eq!(travel.position(), 40);
+        assert!(travel.settled());
+        // Its run ends: going back needs a new replay.
+        travel.cursor_ended();
+        assert!(travel.settled());
+        let before = controller.replays.lock().unwrap().len();
+        travel.seek(&controller, 41);
+        assert_eq!(controller.replays.lock().unwrap().len(), before + 1);
+        assert!(!travel.ended);
     }
 
     #[test]

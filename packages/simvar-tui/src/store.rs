@@ -266,13 +266,65 @@ pub struct FailureGroup {
     pub shrink: Option<ShrinkStatus>,
     /// Loaded from saved findings rather than seen in this session.
     pub saved: bool,
+    /// Saved by another build: its seed may not replay the same run on this one, so a replay
+    /// that passes means "no longer fails here", not nondeterminism.
+    pub stale: bool,
 }
 
 impl FailureGroup {
+    /// Where it stands, in words.
+    #[must_use]
+    pub const fn verdict(&self) -> Verdict {
+        match (self.reproduced, self.stale) {
+            (_, _) if self.confirming.is_some() => Verdict::Replaying,
+            (Some(true), false) => Verdict::Reproduced,
+            (Some(true), true) => Verdict::StillFails,
+            (Some(false), false) => Verdict::Nondeterministic,
+            (Some(false), true) => Verdict::PassesNow,
+            (None, true) => Verdict::EarlierBuild,
+            (None, false) => Verdict::Unconfirmed,
+        }
+    }
+
     /// The command that replays the first failing run, from its report.
     #[must_use]
     pub fn replay_command(&self) -> Option<String> {
         replay_command(&self.report)
+    }
+}
+
+/// Where a failure group stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    /// Not replayed yet.
+    Unconfirmed,
+    /// A replay is running.
+    Replaying,
+    /// A replay on this build failed the same way.
+    Reproduced,
+    /// A replay on this build passed: the same seed ran differently.
+    Nondeterministic,
+    /// Saved by an earlier build, not replayed on this one.
+    EarlierBuild,
+    /// Saved by an earlier build, and still failing on this one.
+    StillFails,
+    /// Saved by an earlier build, and passing on this one (fixed, or the code changed).
+    PassesNow,
+}
+
+impl Verdict {
+    /// A short phrase for it.
+    #[must_use]
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::Unconfirmed => "not replayed yet",
+            Self::Replaying => "replaying",
+            Self::Reproduced => "reproduced",
+            Self::Nondeterministic => "did not reproduce: nondeterministic",
+            Self::EarlierBuild => "found by an earlier build",
+            Self::StillFails => "still fails on this build",
+            Self::PassesNow => "passes on this build (fixed?)",
+        }
     }
 }
 
@@ -627,6 +679,7 @@ impl Store {
                     confirming: None,
                     shrink: None,
                     saved: false,
+                    stale: false,
                 });
                 notices.push(Notice::NewFailure(self.failures.len() - 1));
             }
@@ -684,6 +737,11 @@ impl Store {
                 schedule: None,
             });
         }
+    }
+
+    /// Forget failure group `group`; returns it.
+    pub fn forget(&mut self, group: usize) -> Option<FailureGroup> {
+        (group < self.failures.len()).then(|| self.failures.remove(group))
     }
 
     /// Add a failure group loaded from saved findings (unless one with its signature exists).
