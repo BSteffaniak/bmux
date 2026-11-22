@@ -133,11 +133,22 @@ impl Side {
     }
 }
 
+/// The area an anchored overlay is placed in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum OverlayArea {
+    /// What is left after layout splits (sidebars, bars) are reserved.
+    #[default]
+    Remaining,
+    /// The whole terminal.
+    Viewport,
+}
+
 /// A host-resolved overlay position.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum OverlayPlacement {
-    /// Anchored inside the area left after layout splits.
+    /// Anchored inside an area.
     Anchored {
+        area: OverlayArea,
         anchor: Anchor,
         size: Size,
         margin: Insets,
@@ -146,7 +157,8 @@ pub enum OverlayPlacement {
     Attached {
         /// Owner-local id of the surface holding the region.
         surface: String,
-        region: HitKey,
+        /// Owner-local id of the region within that surface.
+        region: String,
         side: Side,
         align: Align,
         size: Size,

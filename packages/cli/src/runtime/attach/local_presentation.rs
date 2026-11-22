@@ -1,16 +1,17 @@
-use bmux_plugin::layout::{PluginLayoutRegistry, resolve_plugin_layout};
 use bmux_plugin::surface::{
     PluginSurface, PluginSurfaceId, PluginSurfaceRegistry, PluginSurfaceSnapshot,
     PluginSurfaceTarget,
 };
 use bmux_plugin::{ExtensionRect, RenderOp, RenderStyle};
+use bmux_presentation_scene::scene::{Anchor, Insets, Length, OverlayArea, OverlayPlacement, Size};
 use uuid::Uuid;
 
 const OWNER: &str = "bmux.attach_local";
 const SURFACE_ID: &str = "notification";
 
+/// Show `message` on the bottom row of the area left after layout splits
+/// (the host resolves where that is), or remove it.
 pub fn publish_notification(
-    layouts: &PluginLayoutRegistry,
     registry: &PluginSurfaceRegistry,
     message: Option<&str>,
     cols: u16,
@@ -22,30 +23,31 @@ pub fn publish_notification(
         .map_or(1, |snapshot| snapshot.revision.saturating_add(1).max(1));
     let surfaces = message
         .filter(|message| !message.is_empty() && cols > 0 && rows > 0)
-        .map(|message| {
-            let viewport = ExtensionRect::new(0, 0, cols, rows);
-            let remaining = resolve_plugin_layout(viewport, (1, 1), &layouts.requests())
-                .map_or(viewport, |layout| layout.remaining);
-            let row = remaining.y.saturating_add(remaining.h).saturating_sub(1);
-            let rect = ExtensionRect::new(remaining.x, row, remaining.w, 1);
-            PluginSurface {
-                id: PluginSurfaceId::new(OWNER, SURFACE_ID, Uuid::nil()),
-                revision,
-                target: PluginSurfaceTarget::Explicit(rect),
-                clip_rect: Some(ExtensionRect::new(0, 0, remaining.w, 1)),
-                metadata: None,
-                interactive_regions: Vec::new(),
-                accepts_input: false,
-                layer: 40,
-                z: i32::MAX,
-                opaque: true,
-                modal: false,
-                visible: true,
-                ops: vec![
-                    RenderOp::clear_rect(rect, RenderStyle::new()),
-                    RenderOp::text_run(0, 0, message, RenderStyle::new().bold()),
-                ],
-            }
+        .map(|message| PluginSurface {
+            id: PluginSurfaceId::new(OWNER, SURFACE_ID, Uuid::nil()),
+            revision,
+            target: PluginSurfaceTarget::Overlay(OverlayPlacement::Anchored {
+                area: OverlayArea::Remaining,
+                anchor: Anchor::Bottom,
+                size: Size {
+                    width: Length::Fill,
+                    height: Length::Cells(1),
+                },
+                margin: Insets::default(),
+            }),
+            clip_rect: None,
+            metadata: None,
+            interactive_regions: Vec::new(),
+            accepts_input: false,
+            layer: 40,
+            z: i32::MAX,
+            opaque: true,
+            modal: false,
+            visible: true,
+            ops: vec![
+                RenderOp::clear_rect(ExtensionRect::new(0, 0, cols, 1), RenderStyle::new()),
+                RenderOp::text_run(0, 0, message, RenderStyle::new().bold()),
+            ],
         })
         .into_iter()
         .collect::<Vec<_>>();
@@ -88,24 +90,42 @@ mod tests {
     use super::*;
 
     use bmux_plugin::layout::{
-        LayoutEdge, LayoutExtent, PluginLayoutId, PluginLayoutRequest, PluginLayoutSnapshot,
+        LayoutEdge, LayoutExtent, PluginLayoutId, PluginLayoutRegistry, PluginLayoutRequest,
+        PluginLayoutSnapshot, resolve_plugin_layout,
     };
+    use std::collections::BTreeMap;
+
+    /// Where the host places the notification with `layouts` reserved.
+    fn resolved_rect(
+        layouts: &PluginLayoutRegistry,
+        surfaces: &PluginSurfaceRegistry,
+    ) -> ExtensionRect {
+        let viewport = ExtensionRect::new(0, 0, 80, 24);
+        let layout = resolve_plugin_layout(viewport, (1, 1), &layouts.requests()).unwrap();
+        let rects = bmux_attach_pipeline::resolve_plugin_surface_rects(
+            &surfaces.surfaces(),
+            &BTreeMap::new(),
+            layout.remaining,
+            bmux_attach_pipeline::DamageRect::new(0, 0, 80, 24),
+        );
+        *rects.get(&0).expect("notification resolves")
+    }
 
     #[test]
-    fn notification_uses_generic_explicit_surface_and_removes_cleanly() {
+    fn notification_uses_generic_overlay_surface_and_removes_cleanly() {
         let layouts = PluginLayoutRegistry::new(4);
         let surfaces = PluginSurfaceRegistry::new(4);
-        publish_notification(&layouts, &surfaces, Some("saved"), 80, 24);
+        publish_notification(&surfaces, Some("saved"), 80, 24);
         let snapshot = surfaces
             .owner_snapshot(OWNER)
             .expect("notification snapshot");
         assert_eq!(snapshot.surfaces.len(), 1);
         assert_eq!(
-            snapshot.surfaces[0].target,
-            PluginSurfaceTarget::Explicit(ExtensionRect::new(0, 23, 80, 1))
+            resolved_rect(&layouts, &surfaces),
+            ExtensionRect::new(0, 23, 80, 1)
         );
 
-        publish_notification(&layouts, &surfaces, None, 80, 24);
+        publish_notification(&surfaces, None, 80, 24);
         let removed = surfaces
             .owner_snapshot(OWNER)
             .expect("empty replacement snapshot");
@@ -135,13 +155,10 @@ mod tests {
             )
             .expect("bottom layout should publish");
 
-        publish_notification(&layouts, &surfaces, Some("saved"), 80, 24);
-        let snapshot = surfaces
-            .owner_snapshot(OWNER)
-            .expect("notification snapshot");
+        publish_notification(&surfaces, Some("saved"), 80, 24);
         assert_eq!(
-            snapshot.surfaces[0].target,
-            PluginSurfaceTarget::Explicit(ExtensionRect::new(0, 22, 80, 1))
+            resolved_rect(&layouts, &surfaces),
+            ExtensionRect::new(0, 22, 80, 1)
         );
 
         uninstall(&surfaces);

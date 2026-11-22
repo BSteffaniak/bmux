@@ -5,11 +5,15 @@ use super::{
     input_endpoint, republish_companion, tabs_commands,
 };
 use bmux_plugin::component_viewport::{CommittedComponentViewport, ComponentViewport};
-use bmux_plugin::layout::{PluginLayoutId, resolve_plugin_layout};
+use bmux_plugin::layout::PluginLayoutId;
 use bmux_plugin::surface::{
     PluginSurface, PluginSurfaceId, PluginSurfaceRegion, PluginSurfaceTarget,
 };
 use bmux_plugin::{AttachInputEvent, AttachInputResult, ExtensionRect};
+use bmux_presentation_scene::scene::{
+    Align, Anchor, Insets as SceneInsets, Length, OverlayArea, OverlayPlacement, Side,
+    Size as SceneSize,
+};
 use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::geometry::{Insets, Point, Rect, Size};
 use std::cell::Cell;
@@ -21,49 +25,34 @@ use uuid::Uuid;
 
 const LABELS: [&str; 3] = ["Switch", "Rename", "Close"];
 
-fn popup_rect(companion: &CompanionState) -> Option<ExtensionRect> {
-    let viewport = ExtensionRect::new(
-        0,
-        0,
-        companion.local_presentation.viewport_cols,
-        companion.local_presentation.viewport_rows,
-    );
-    if viewport.w == 0 || viewport.h == 0 {
+/// The popup's size and the strip region it is attached to. The host places
+/// it next to that region (flipping when the preferred side has no room).
+struct PopupGeometry {
+    width: u16,
+    height: u16,
+    region: String,
+}
+
+fn popup_geometry(companion: &CompanionState) -> Option<PopupGeometry> {
+    let cols = companion.local_presentation.viewport_cols;
+    let rows = companion.local_presentation.viewport_rows;
+    if cols == 0 || rows == 0 {
         return None;
     }
-    let mut requests = companion.layouts.requests();
-    // Use this companion's layout intent even before its first publication.
-    requests.retain(|request| request.id.owner_plugin_id != OWNER);
-    let mut settings = companion.settings.clone();
-    settings.height = super::build_surface_with_editor(companion, companion.revision)
-        .2
-        .height;
-    requests.push(super::layout_request(&settings));
-    let layout = resolve_plugin_layout(viewport, (1, 1), &requests).ok()?;
-    let strip = layout
-        .allocations
-        .iter()
-        .find(|allocation| allocation.id == PluginLayoutId::new(OWNER, LAYOUT_ID))?
-        .rect;
-    let tab = super::build_surface(companion, companion.revision)
+    let target = companion.menu_tab_id?;
+    let region = format!(
+        "{}:{target}",
+        if companion.menu.workspace {
+            "workspace"
+        } else {
+            "tab"
+        }
+    );
+    super::build_surface(companion, companion.revision)
         .interactive_regions
-        .into_iter()
-        .find(|region| {
-            Some(region.local_id.as_str())
-                == companion
-                    .menu_tab_id
-                    .map(|id| {
-                        format!(
-                            "{}:{id}",
-                            if companion.menu.workspace {
-                                "workspace"
-                            } else {
-                                "tab"
-                            }
-                        )
-                    })
-                    .as_deref()
-        })?;
+        .iter()
+        .any(|candidate| candidate.local_id == region)
+        .then_some(())?;
     let width = (if !companion.menu.group.is_empty() || companion.menu.confirming {
         48
     } else if companion.menu.workspace {
@@ -71,16 +60,29 @@ fn popup_rect(companion: &CompanionState) -> Option<ExtensionRect> {
     } else {
         12
     })
-    .min(viewport.w);
+    .min(cols);
     let height = u16::try_from(items(companion).len().saturating_add(2))
         .unwrap_or(u16::MAX)
-        .min(viewport.h);
-    let x = strip.x.saturating_add(tab.rect.x).min(viewport.w - width);
-    let y = match companion.settings.placement {
-        Placement::Top => strip.y.saturating_add(strip.h).min(viewport.h - height),
-        Placement::Bottom => strip.y.saturating_sub(height),
-    };
-    Some(ExtensionRect::new(x, y, width, height))
+        .min(rows);
+    Some(PopupGeometry {
+        width,
+        height,
+        region,
+    })
+}
+
+fn popup_placement(companion: &CompanionState, geometry: &PopupGeometry) -> OverlayPlacement {
+    OverlayPlacement::Attached {
+        surface: super::SURFACE_ID.to_string(),
+        region: geometry.region.clone(),
+        side: match companion.settings.placement {
+            Placement::Top => Side::Below,
+            Placement::Bottom => Side::Above,
+        },
+        align: Align::Start,
+        size: SceneSize::cells(geometry.width, geometry.height),
+        flip: true,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -199,8 +201,9 @@ fn component<'a>(
 }
 
 pub fn viewport(companion: &CompanionState) -> Option<ComponentViewport> {
-    companion.menu_tab_id?;
-    let rect = popup_rect(companion)?;
+    let geometry = popup_geometry(companion)?;
+    // Component-local: the host decides where the popup is shown.
+    let rect = ExtensionRect::new(0, 0, geometry.width, geometry.height);
     let items = items(companion);
     let state = Cell::new(companion.menu.state);
     let outcome = Cell::new(MenuOutcome::Ignored);
@@ -226,6 +229,9 @@ pub fn surfaces(companion: &CompanionState, revision: u64) -> Vec<PluginSurface>
     let outcome = Cell::new(MenuOutcome::Ignored);
     let rect = ExtensionRect::new(rect.x, rect.y, rect.width, rect.height);
     let painted = viewport.paint(&component(companion, rect, &items, &state, &outcome));
+    let Some(geometry) = popup_geometry(companion) else {
+        return Vec::new();
+    };
     let full = ExtensionRect::new(
         0,
         0,
@@ -245,7 +251,15 @@ pub fn surfaces(companion: &CompanionState, revision: u64) -> Vec<PluginSurface>
     .order(100, 0)
     .modal(true)
     .interactive_region(PluginSurfaceRegion::new("dismiss", full).endpoint(input_endpoint()));
-    backdrop.target = PluginSurfaceTarget::Explicit(full);
+    backdrop.target = PluginSurfaceTarget::Overlay(OverlayPlacement::Anchored {
+        area: OverlayArea::Viewport,
+        anchor: Anchor::Center,
+        size: SceneSize {
+            width: Length::Fill,
+            height: Length::Fill,
+        },
+        margin: SceneInsets::default(),
+    });
     let mut popup = PluginSurface::layout(
         PluginSurfaceId::new(
             OWNER,
@@ -259,7 +273,7 @@ pub fn surfaces(companion: &CompanionState, revision: u64) -> Vec<PluginSurface>
     .order(100, 1)
     .opaque(true)
     .modal(true);
-    popup.target = PluginSurfaceTarget::Explicit(rect);
+    popup.target = PluginSurfaceTarget::Overlay(popup_placement(companion, &geometry));
     for mut hit in painted.hits {
         hit.rect.x = hit.rect.x.saturating_sub(rect.x);
         hit.rect.y = hit.rect.y.saturating_sub(rect.y);
@@ -325,7 +339,7 @@ fn transition(
                 .collect();
         }
         companion.menu_tab_id = Some(target);
-        if popup_rect(companion).is_none() {
+        if popup_geometry(companion).is_none() {
             companion.menu_tab_id = None;
             return Some(AttachInputResult::default());
         }
@@ -632,30 +646,33 @@ mod tests {
     }
 
     #[test]
-    fn popup_geometry_uses_the_companions_layout_registry() {
-        let mut first = companion();
-        first.layouts = std::sync::Arc::new(bmux_plugin::layout::PluginLayoutRegistry::new(4));
-        first.menu_tab_id = Some(Uuid::from_u128(7));
-        let mut second = first.clone();
-        second.layouts = std::sync::Arc::new(bmux_plugin::layout::PluginLayoutRegistry::new(4));
-        let baseline = popup_rect(&second).unwrap();
-        first
-            .layouts
-            .publish(
-                "sidebar",
-                bmux_plugin::layout::PluginLayoutSnapshot {
-                    revision: 1,
-                    requests: vec![bmux_plugin::layout::PluginLayoutRequest::split(
-                        PluginLayoutId::new("sidebar", "left"),
-                        i32::MIN,
-                        bmux_plugin::layout::LayoutEdge::Left,
-                        bmux_plugin::layout::LayoutExtent::Cells(20),
-                    )],
-                },
-            )
-            .unwrap();
-        assert_eq!(popup_rect(&first).unwrap().x, baseline.x + 20);
-        assert_eq!(popup_rect(&second).unwrap(), baseline);
+    fn popup_is_attached_to_its_tab_region_and_placed_by_the_host() {
+        let mut companion = companion();
+        companion.menu_tab_id = Some(Uuid::from_u128(7));
+        let popup = surfaces(&companion, 1).pop().unwrap();
+        let PluginSurfaceTarget::Overlay(OverlayPlacement::Attached {
+            surface,
+            region,
+            side,
+            flip,
+            ..
+        }) = &popup.target
+        else {
+            panic!("the popup should be attached: {:?}", popup.target);
+        };
+        assert_eq!(surface, super::super::SURFACE_ID);
+        assert_eq!(region, &format!("tab:{}", Uuid::from_u128(7)));
+        assert!(*flip);
+        assert_eq!(
+            *side,
+            match companion.settings.placement {
+                Placement::Top => Side::Below,
+                Placement::Bottom => Side::Above,
+            }
+        );
+        // A tab that is not on the strip has nowhere to attach.
+        companion.menu_tab_id = Some(Uuid::from_u128(999));
+        assert_eq!(surfaces(&companion, 1).len(), 0);
     }
 
     #[test]
@@ -1069,8 +1086,9 @@ mod tests {
                 companion.local_presentation.viewport_cols = cols;
                 companion.local_presentation.viewport_rows = rows;
                 let opened = open(&mut companion);
-                if let Some(rect) = popup_rect(&companion) {
-                    assert!(rect.x + rect.w <= cols && rect.y + rect.h <= rows);
+                // The host keeps the popup on screen; its size never exceeds it.
+                if let Some(geometry) = popup_geometry(&companion) {
+                    assert!(geometry.width <= cols && geometry.height <= rows);
                 } else {
                     // Extremely narrow strips have no hittable tab to anchor to.
                     assert!(!opened.consumed);

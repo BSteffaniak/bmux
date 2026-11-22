@@ -404,7 +404,6 @@ pub trait AttachVisualAdapter: Send + Sync {
     }
 }
 
-
 /// Generic presentation role supplied to render extensions.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RenderSurfaceRole {

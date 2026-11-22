@@ -21,7 +21,7 @@ use bmux_attach_pipeline::{
     frame_damage_from_retained_repaint_plan, merge_retained_damages,
     queue_render_ops_with_capabilities, retained_damage_from_absolute_rects,
     retained_frame_damage_from_frame_damage, retained_layer_order,
-    retained_surfaces_from_attach_scene, retained_surfaces_from_plugin_surfaces,
+    retained_surfaces_from_attach_scene, retained_surfaces_from_plugin_surfaces_within,
     update_protocol_hints_from_state,
 };
 use bmux_attach_view_protocol::{AttachLocalPresentationSnapshot, AttachViewComponent};
@@ -6301,7 +6301,6 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
             &runtime_appearance,
         );
         super::local_presentation::publish_notification(
-            &view_state.presentation_layouts,
             &view_state.presentation_surfaces,
             view_state.transient_status.as_deref(),
             geometry.cols,
@@ -10658,13 +10657,14 @@ fn retained_plugin_surfaces(
             .presentation_allocations
             .notify(&allocation.id, allocation.rect);
     }
+    let remaining = plugin_layout.remaining;
     let allocations = plugin_layout
         .allocations
         .into_iter()
         .map(|allocation| (allocation.id, allocation.rect))
         .collect::<BTreeMap<_, _>>();
     let surfaces = view_state.presentation_surfaces.surfaces();
-    retained_surfaces_from_plugin_surfaces(&surfaces, &allocations, viewport)
+    retained_surfaces_from_plugin_surfaces_within(&surfaces, &allocations, remaining, viewport)
 }
 
 fn replace_retained_surfaces(
@@ -20100,6 +20100,7 @@ mod tests {
         AttachEventAction, AttachMouseSelectionDrag, AttachScrollbackCursor,
         AttachScrollbackPosition, AttachUiMode, AttachViewState, PaneRenderBuffer,
     };
+    use bmux_attach_pipeline::compositor::retained_surfaces_from_plugin_surfaces;
     use bmux_attach_pipeline::render::append_pane_output;
     use bmux_plugin::RenderStyle;
 
@@ -21711,7 +21712,6 @@ mod tests {
         let second = create();
         let viewport = DamageRect::new(0, 0, 80, 24);
         super::super::local_presentation::publish_notification(
-            &first.presentation_layouts,
             &first.presentation_surfaces,
             Some("first"),
             80,
@@ -21723,7 +21723,6 @@ mod tests {
             [] as [bmux_attach_pipeline::RetainedSurface; 0]
         );
         super::super::local_presentation::publish_notification(
-            &second.presentation_layouts,
             &second.presentation_surfaces,
             Some("second"),
             80,

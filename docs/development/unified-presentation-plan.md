@@ -47,9 +47,8 @@ Four paths draw non-pane UI in the attach client today.
 - Path A paint clips to `surface.rect` and ignores `clip_rect`. Fixed in phase 2.
 - `retained_surface_metadata_equal` ignores `modal`.
 - Path B never reaches the native terminal, and its hits are never routed back.
-- Path A layout is resolved and every allocation callback notified on every
-  reconcile, rather than only when an allocation changes.
 - Tab-bar menus and toasts recompute absolute rects from the viewport themselves.
+  Fixed in phase 3.
 - Every producer parses string hook ids (`strip_prefix("bmux.sidebar:sidebar:tab:")`).
 - Under-content glyphs dropped named colours (`render_color_to_cell_color` mapped
   `RenderColor::Named` to the default colour). Fixed in phase 0; the parity golden
@@ -197,9 +196,16 @@ Each phase lands with the parity harness and the targeted tests green.
    occluders by the decoration renderer, validated on publish). Plugin surfaces
    paint in `(layer, z)` order and are clipped to their `clip_rect` on every
    frame. Graphics and images on root scenes move to phase 5 with keyed items.
-3. **Placement.** `Overlay` anchors, `AnchoredTo`, `Fill`; allocation callbacks
-   only on change. Tab-bar menu, toasts and the host notification move off
-   explicit rects.
+3. **Placement.** `PluginSurfaceTarget::Overlay`: `Anchored` (corner, edge or
+   centre of the remaining area or the whole viewport, with size and margin) and
+   `Attached` (next to a region of another of the owner's surfaces, aligned,
+   flipping when the preferred side has no room, kept on screen). The host
+   resolves both (`resolve_plugin_surface_rects`); publishing rejects attachments
+   to unknown surfaces. The tab-bar menu (attached to its tab), its dismiss
+   backdrop and toasts (anchored) and the host notification (anchored to the
+   bottom row) no longer compute positions. Allocation callbacks stay as they are:
+   they fire only when retained surfaces are reconciled, and repeat delivery lets a
+   producer retry a rejected publication.
 4. **Typed hits.** `HitKey` + `HitTable<K>`; sidebar, tab bar, menu move off
    string parsing.
 5. **Pane targets and facets.** Under/over/chrome depths painted through the

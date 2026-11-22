@@ -230,14 +230,126 @@ pub fn retained_surfaces_from_plugin_surfaces(
     allocations: &BTreeMap<bmux_plugin::layout::PluginLayoutId, ExtensionRect>,
     viewport: DamageRect,
 ) -> Vec<RetainedSurface> {
+    let whole = ExtensionRect::new(viewport.x, viewport.y, viewport.w, viewport.h);
+    retained_surfaces_from_plugin_surfaces_within(surfaces, allocations, whole, viewport)
+}
+
+/// Resolve every visible surface's absolute rect.
+///
+/// Layout, explicit and anchored targets resolve directly; anchored overlays
+/// use `remaining` (the area left after layout splits) or the whole viewport.
+/// Attached overlays resolve against a region of another surface of the same
+/// owner once that surface is resolved, so chains work and cycles resolve to
+/// nothing.
+#[must_use]
+pub fn resolve_plugin_surface_rects(
+    surfaces: &[PluginSurface],
+    allocations: &BTreeMap<bmux_plugin::layout::PluginLayoutId, ExtensionRect>,
+    remaining: ExtensionRect,
+    viewport: DamageRect,
+) -> BTreeMap<usize, ExtensionRect> {
+    use bmux_presentation_scene::scene::{
+        OverlayArea, OverlayPlacement, resolve_anchored, resolve_attached,
+    };
+    let whole = ExtensionRect::new(viewport.x, viewport.y, viewport.w, viewport.h);
+    let mut resolved = BTreeMap::new();
+    let mut pending = Vec::new();
+    for (index, surface) in surfaces.iter().enumerate() {
+        if !surface.visible {
+            continue;
+        }
+        let rect = match &surface.target {
+            PluginSurfaceTarget::Layout(id) => allocations.get(id).copied(),
+            PluginSurfaceTarget::Explicit(rect) => Some(*rect),
+            PluginSurfaceTarget::Overlay(OverlayPlacement::Anchored {
+                area,
+                anchor,
+                size,
+                margin,
+            }) => {
+                let area = match area {
+                    OverlayArea::Remaining => remaining,
+                    OverlayArea::Viewport => whole,
+                };
+                resolve_anchored(area, *anchor, *size, *margin)
+            }
+            PluginSurfaceTarget::Overlay(OverlayPlacement::Attached { .. }) => {
+                pending.push(index);
+                None
+            }
+        };
+        if let Some(rect) = rect {
+            resolved.insert(index, rect);
+        }
+    }
+    // Each pass resolves every attachment whose target is resolved; a pass that
+    // resolves nothing ends the loop (missing targets and cycles).
+    while !pending.is_empty() {
+        let before = pending.len();
+        pending.retain(|&index| {
+            let surface = &surfaces[index];
+            let PluginSurfaceTarget::Overlay(OverlayPlacement::Attached {
+                surface: target,
+                region,
+                side,
+                align,
+                size,
+                flip,
+            }) = &surface.target
+            else {
+                return false;
+            };
+            let Some((target_index, target_surface)) =
+                surfaces.iter().enumerate().find(|(_, candidate)| {
+                    candidate.id.owner_plugin_id == surface.id.owner_plugin_id
+                        && candidate.id.local_id == *target
+                })
+            else {
+                return false;
+            };
+            let Some(target_rect) = resolved.get(&target_index).copied() else {
+                return true;
+            };
+            let Some(region) = target_surface
+                .interactive_regions
+                .iter()
+                .find(|candidate| candidate.local_id == *region)
+            else {
+                return false;
+            };
+            let region_rect = ExtensionRect::new(
+                target_rect.x.saturating_add(region.rect.x),
+                target_rect.y.saturating_add(region.rect.y),
+                region.rect.w,
+                region.rect.h,
+            );
+            if let Some(rect) = resolve_attached(whole, region_rect, *side, *align, *size, *flip) {
+                resolved.insert(index, rect);
+            }
+            false
+        });
+        if pending.len() == before {
+            break;
+        }
+    }
+    resolved
+}
+
+/// [`retained_surfaces_from_plugin_surfaces`] with the area left after layout
+/// splits, which anchored overlays are placed in.
+#[must_use]
+pub fn retained_surfaces_from_plugin_surfaces_within(
+    surfaces: &[PluginSurface],
+    allocations: &BTreeMap<bmux_plugin::layout::PluginLayoutId, ExtensionRect>,
+    remaining: ExtensionRect,
+    viewport: DamageRect,
+) -> Vec<RetainedSurface> {
+    let rects = resolve_plugin_surface_rects(surfaces, allocations, remaining, viewport);
     surfaces
         .iter()
-        .filter(|surface| surface.visible)
-        .filter_map(|surface| {
-            let rect = match &surface.target {
-                PluginSurfaceTarget::Layout(id) => allocations.get(id).copied()?,
-                PluginSurfaceTarget::Explicit(rect) => *rect,
-            };
+        .enumerate()
+        .filter_map(|(index, surface)| {
+            let rect = *rects.get(&index)?;
             let rect = DamageRect::new(rect.x, rect.y, rect.w, rect.h);
             if rect.w == 0 || rect.h == 0 {
                 return None;
@@ -2402,6 +2514,107 @@ mod tests {
         assert_eq!(repaint[0].surface_id, Uuid::from_u128(621));
         assert_eq!(repaint[0].damage, vec![DamageRect::new(0, 0, 12, 24)]);
         assert_eq!(resolution.remaining, ExtensionRect::new(12, 0, 68, 24));
+    }
+
+    #[test]
+    fn overlay_targets_resolve_anchored_and_attached_geometry() {
+        use bmux_plugin::surface::PluginSurfaceRegion;
+        use bmux_presentation_scene::scene::{
+            Align, Anchor, Insets, OverlayArea, OverlayPlacement, Side, Size,
+        };
+        let owner = "example.overlays";
+        let strip_id = bmux_plugin::layout::PluginLayoutId::new(owner, "strip");
+        let allocations = BTreeMap::from([(strip_id.clone(), ExtensionRect::new(0, 23, 80, 1))]);
+        let remaining = ExtensionRect::new(0, 0, 80, 23);
+        let viewport = DamageRect::new(0, 0, 80, 24);
+        let overlay = |local: &str, id: u128, placement| {
+            PluginSurface::layout(
+                PluginSurfaceId::new(owner, local, Uuid::from_u128(id)),
+                1,
+                strip_id.clone(),
+                Vec::new(),
+            )
+            .opaque(true)
+            .target_overlay(placement)
+        };
+        let strip = PluginSurface::layout(
+            PluginSurfaceId::new(owner, "strip", Uuid::from_u128(1)),
+            1,
+            strip_id.clone(),
+            Vec::new(),
+        )
+        .interactive_region(PluginSurfaceRegion::new(
+            "tab:2",
+            ExtensionRect::new(70, 0, 6, 1),
+        ));
+        let surfaces = [
+            // Attached before its target in the list: still resolved.
+            overlay(
+                "menu",
+                2,
+                OverlayPlacement::Attached {
+                    surface: "strip".to_string(),
+                    region: "tab:2".to_string(),
+                    side: Side::Below,
+                    align: Align::Start,
+                    size: Size::cells(12, 4),
+                    flip: true,
+                },
+            ),
+            strip,
+            overlay(
+                "toast",
+                3,
+                OverlayPlacement::Anchored {
+                    area: OverlayArea::Remaining,
+                    anchor: Anchor::TopRight,
+                    size: Size::cells(16, 2),
+                    margin: Insets {
+                        right: 1,
+                        ..Insets::default()
+                    },
+                },
+            ),
+            overlay(
+                "backdrop",
+                4,
+                OverlayPlacement::Anchored {
+                    area: OverlayArea::Viewport,
+                    anchor: Anchor::Center,
+                    size: Size {
+                        width: bmux_presentation_scene::scene::Length::Fill,
+                        height: bmux_presentation_scene::scene::Length::Fill,
+                    },
+                    margin: Insets::default(),
+                },
+            ),
+            overlay(
+                "orphan",
+                5,
+                OverlayPlacement::Attached {
+                    surface: "strip".to_string(),
+                    region: "missing".to_string(),
+                    side: Side::Below,
+                    align: Align::Start,
+                    size: Size::cells(4, 4),
+                    flip: true,
+                },
+            ),
+        ];
+        let rects = resolve_plugin_surface_rects(&surfaces, &allocations, remaining, viewport);
+        // The tab is on the bottom row: the menu flips above it and is kept on screen.
+        assert_eq!(rects.get(&0), Some(&ExtensionRect::new(68, 19, 12, 4)));
+        assert_eq!(rects.get(&1), Some(&ExtensionRect::new(0, 23, 80, 1)));
+        assert_eq!(rects.get(&2), Some(&ExtensionRect::new(63, 0, 16, 2)));
+        assert_eq!(rects.get(&3), Some(&ExtensionRect::new(0, 0, 80, 24)));
+        assert_eq!(rects.get(&4), None, "an unknown region resolves to nothing");
+        let lowered = retained_surfaces_from_plugin_surfaces_within(
+            &surfaces,
+            &allocations,
+            remaining,
+            viewport,
+        );
+        assert_eq!(lowered.len(), 4);
     }
 
     #[test]

@@ -534,7 +534,6 @@ fn parity_pane_extension_under_and_after_content() {
 fn parity_host_notification_row() {
     let mut harness = Harness::new(full_pane(), b"pane");
     super::super::local_presentation::publish_notification(
-        &harness.view.presentation_layouts,
         &harness.view.presentation_surfaces,
         Some("saved layout"),
         COLS,
@@ -569,4 +568,98 @@ fn parity_cell_block_graphemes_transparency_and_clip() {
     surface.clip_rect = Some(ExtensionRect::new(0, 0, 6, 2));
     harness.surfaces(OWNER, vec![surface]);
     assert_golden("cell_block_graphemes", &harness.render());
+}
+
+#[test]
+#[serial]
+fn parity_host_placed_menu_and_toast() {
+    use bmux_plugin::surface::PluginSurfaceRegion;
+    use bmux_presentation_scene::scene::{
+        Align, Anchor, Insets, OverlayArea, OverlayPlacement, Side, Size,
+    };
+    const OWNER: &str = "parity.placed";
+    let mut harness = Harness::new(
+        AttachRect {
+            x: 0,
+            y: 0,
+            w: COLS,
+            h: ROWS - 1,
+        },
+        b"$ make",
+    );
+    let id = PluginLayoutId::new(OWNER, "strip");
+    harness.layouts(
+        OWNER,
+        vec![PluginLayoutRequest::split(
+            id.clone(),
+            0,
+            LayoutEdge::Bottom,
+            LayoutExtent::Cells(1),
+        )],
+    );
+    let strip = PluginSurface::layout(
+        PluginSurfaceId::new(OWNER, "strip", Uuid::from_u128(0xe1)),
+        1,
+        id,
+        vec![RenderOp::text_run(
+            0,
+            0,
+            " 1:main  2:logs  3:build",
+            RenderStyle::new(),
+        )],
+    )
+    .opaque(true)
+    .interactive_region(PluginSurfaceRegion::new(
+        "tab:3",
+        ExtensionRect::new(33, 0, 7, 1),
+    ));
+    // The tab sits near the right edge on the bottom row: the menu opens above
+    // it and is pulled back on screen.
+    let menu = explicit(
+        PluginSurfaceId::new(OWNER, "menu", Uuid::from_u128(0xe2)),
+        1,
+        ExtensionRect::new(0, 0, 0, 0),
+        vec![
+            RenderOp::border(
+                ExtensionRect::new(0, 0, 12, 3),
+                BorderGlyphs::rounded(),
+                RenderStyle::new(),
+            ),
+            RenderOp::text_run(1, 1, "Close", RenderStyle::new()),
+        ],
+    )
+    .opaque(true)
+    .order(100, 1)
+    .target_overlay(OverlayPlacement::Attached {
+        surface: "strip".to_string(),
+        region: "tab:3".to_string(),
+        side: Side::Below,
+        align: Align::Start,
+        size: Size::cells(12, 3),
+        flip: true,
+    });
+    let toast = explicit(
+        PluginSurfaceId::new(OWNER, "toast", Uuid::from_u128(0xe3)),
+        1,
+        ExtensionRect::new(0, 0, 0, 0),
+        vec![RenderOp::text_run(
+            0,
+            0,
+            " done ",
+            styled(RenderNamedColor::Black, RenderNamedColor::Green),
+        )],
+    )
+    .opaque(true)
+    .order(100, 2)
+    .target_overlay(OverlayPlacement::Anchored {
+        area: OverlayArea::Remaining,
+        anchor: Anchor::TopRight,
+        size: Size::cells(6, 1),
+        margin: Insets {
+            right: 1,
+            ..Insets::default()
+        },
+    });
+    harness.surfaces(OWNER, vec![strip, menu, toast]);
+    assert_golden("host_placed_menu_toast", &harness.render());
 }

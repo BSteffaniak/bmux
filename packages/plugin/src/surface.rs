@@ -75,8 +75,11 @@ impl PluginSurfaceId {
 pub enum PluginSurfaceTarget {
     /// Follow one allocation from the generic plugin layout resolver.
     Layout(PluginLayoutId),
-    /// Use explicit terminal-cell geometry, normally for overlays.
+    /// Use explicit terminal-cell geometry.
     Explicit(ExtensionRect),
+    /// A host-resolved overlay: anchored in an area, or attached to a region of
+    /// another of the owner's surfaces. Producers never compute its position.
+    Overlay(bmux_presentation_scene::scene::OverlayPlacement),
 }
 
 /// Stable namespaced identity for one input region.
@@ -208,6 +211,16 @@ impl PluginSurface {
         self.z = z;
         self
     }
+
+    /// Place this surface as a host-resolved overlay.
+    #[must_use]
+    pub fn target_overlay(
+        mut self,
+        placement: bmux_presentation_scene::scene::OverlayPlacement,
+    ) -> Self {
+        self.target = PluginSurfaceTarget::Overlay(placement);
+        self
+    }
 }
 
 impl PluginSurfaceRegion {
@@ -334,6 +347,11 @@ pub enum PluginSurfacePublishError {
     MalformedCells {
         id: PluginSurfaceId,
     },
+    /// An attached overlay naming no surface of the same snapshot.
+    UnknownAttachTarget {
+        id: PluginSurfaceId,
+        surface: String,
+    },
 }
 
 impl std::fmt::Display for PluginSurfacePublishError {
@@ -415,6 +433,11 @@ impl std::fmt::Display for PluginSurfacePublishError {
             Self::MalformedCells { id } => {
                 write!(formatter, "malformed cell block in {}", id.local_id)
             }
+            Self::UnknownAttachTarget { id, surface } => write!(
+                formatter,
+                "{} is attached to unknown surface {surface}",
+                id.local_id
+            ),
             Self::ConflictingRevision => {
                 formatter.write_str("surface revision conflicts with retained owner state")
             }
@@ -837,15 +860,40 @@ fn validate_snapshot(
                 id: surface.id.clone(),
             });
         }
-        if let PluginSurfaceTarget::Layout(layout_id) = &surface.target
-            && layout_id.owner_plugin_id != owner_plugin_id
-        {
-            return Err(PluginSurfacePublishError::ForeignLayoutTarget {
-                id: layout_id.clone(),
-            });
-        }
+        validate_surface_target(owner_plugin_id, snapshot, surface)?;
     }
     Ok(())
+}
+
+/// Layouts must be the owner's own; attachments must name a surface of the
+/// same snapshot.
+fn validate_surface_target(
+    owner_plugin_id: &str,
+    snapshot: &PluginSurfaceSnapshot,
+    surface: &PluginSurface,
+) -> Result<(), PluginSurfacePublishError> {
+    match &surface.target {
+        PluginSurfaceTarget::Layout(layout_id) if layout_id.owner_plugin_id != owner_plugin_id => {
+            Err(PluginSurfacePublishError::ForeignLayoutTarget {
+                id: layout_id.clone(),
+            })
+        }
+        PluginSurfaceTarget::Overlay(
+            bmux_presentation_scene::scene::OverlayPlacement::Attached {
+                surface: target, ..
+            },
+        ) if !snapshot
+            .surfaces
+            .iter()
+            .any(|candidate| candidate.id.local_id == *target) =>
+        {
+            Err(PluginSurfacePublishError::UnknownAttachTarget {
+                id: surface.id.clone(),
+                surface: target.clone(),
+            })
+        }
+        _ => Ok(()),
+    }
 }
 
 fn validate_surface_metadata(

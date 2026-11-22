@@ -7,10 +7,12 @@
 
 use std::cell::Cell;
 
-use bmux_plugin::ExtensionRect;
 use bmux_plugin::component_viewport::ComponentViewport;
 use bmux_plugin::layout::PluginLayoutId;
 use bmux_plugin::surface::{PluginSurface, PluginSurfaceId, PluginSurfaceTarget};
+use bmux_presentation_scene::scene::{
+    Anchor, Insets, OverlayArea, OverlayPlacement, Size as SceneSize,
+};
 use bmux_tab_bar_plugin_api::{notifications_list::Notification, status_items_list::Severity};
 use bmux_tui::component::{Component, Constraints, LayoutCx};
 use bmux_tui::geometry::{Point, Rect, Size};
@@ -21,7 +23,7 @@ use bmux_tui_components::toast_stack::{
 };
 use uuid::Uuid;
 
-use super::{CompanionState, LAYOUT_ID, OWNER, Placement, external::notification_expired};
+use super::{CompanionState, LAYOUT_ID, OWNER, external::notification_expired};
 
 const SURFACE_UUID: Uuid = Uuid::from_u128(0x626d_7578_5f74_6162_5f73_7472_6970_0004);
 
@@ -123,12 +125,9 @@ pub fn surface(companion: &CompanionState, revision: u64, now_ms: u64) -> Option
     let h = u16::try_from(layout.size.height)
         .unwrap_or(available_rows)
         .min(available_rows);
-    let x = local.viewport_cols.saturating_sub(w).saturating_sub(1);
-    let y = match companion.settings.placement {
-        Placement::Top => bar_rows,
-        Placement::Bottom => 0,
-    };
-    let viewport = ComponentViewport::new(layout, Rect::new(x, y, w, h), Point::new(0, 0))?;
+    // Component-local: the host places the stack top-right of the area left
+    // after layout splits (so it clears this bar and any sidebar).
+    let viewport = ComponentViewport::new(layout, Rect::new(0, 0, w, h), Point::new(0, 0))?;
     let painted = viewport.paint(&component);
     let mut surface = PluginSurface::layout(
         PluginSurfaceId::new(OWNER, "toasts", SURFACE_UUID),
@@ -138,7 +137,15 @@ pub fn surface(companion: &CompanionState, revision: u64, now_ms: u64) -> Option
     )
     .order(100, 2)
     .opaque(true);
-    surface.target = PluginSurfaceTarget::Explicit(ExtensionRect::new(x, y, w, h));
+    surface.target = PluginSurfaceTarget::Overlay(OverlayPlacement::Anchored {
+        area: OverlayArea::Remaining,
+        anchor: Anchor::TopRight,
+        size: SceneSize::cells(w, h),
+        margin: Insets {
+            right: 1,
+            ..Insets::default()
+        },
+    });
     Some(surface)
 }
 

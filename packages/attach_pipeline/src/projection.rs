@@ -293,8 +293,9 @@ pub fn prepare_content_overlays(
                         let Some(x) = block.x.checked_add(column) else {
                             break;
                         };
-                        let Some(symbol) =
-                            block.get(column, row_index).and_then(|cell| cell.symbol.as_ref())
+                        let Some(symbol) = block
+                            .get(column, row_index)
+                            .and_then(|cell| cell.symbol.as_ref())
                         else {
                             continue;
                         };

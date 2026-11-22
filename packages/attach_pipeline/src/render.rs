@@ -775,7 +775,13 @@ fn lower_render_cell_block(
                 continue;
             }
             let mut buffer = [0; 4];
-            lower_text(target, cell_x, cell_y, symbol.as_str(&mut buffer), cell.style);
+            lower_text(
+                target,
+                cell_x,
+                cell_y,
+                symbol.as_str(&mut buffer),
+                cell.style,
+            );
             wrote = true;
         }
     }
