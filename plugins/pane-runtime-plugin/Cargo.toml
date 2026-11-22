@@ -69,7 +69,8 @@ uuid      = { workspace = true, features = ["serde", "std"] }
 
 [dev-dependencies]
 bmux_sim_primitives_check = { workspace = true }
-tempfile                  = { workspace = true }
+switchy_async_cargo       = { workspace = true }
+tempfile                 = { workspace = true }
 
 [features]
 # Package this crate as a dynamic library for one component. Only the

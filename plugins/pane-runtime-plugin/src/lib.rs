@@ -27,26 +27,30 @@ use bmux_plugin_sdk::prelude::*;
 use bmux_plugin_sdk::{TypedServiceRegistrationContext, TypedServiceRegistry};
 use std::collections::BTreeMap;
 
-mod application_resurrection;
-mod atomic_state;
-mod capture_handshake;
-mod commands;
-mod dir_order;
-mod files;
-mod handlers;
-mod ids;
-pub mod observation;
-mod padding;
-mod padding_api;
-mod platform;
-mod private_input;
-mod readiness;
-mod run_shared;
-mod runtime;
+// Every module is loaded through `inject_yields_mod!`: under the simulator, each `.await` in
+// it (and in the modules it declares) becomes a seeded point where another task may run.
+// Natively it expands to the plain declaration. `tests/yields.rs` fails on async code no
+// module or `#[switchy_async::inject_yields]` covers.
+switchy_async::inject_yields_mod!(mod application_resurrection;);
+switchy_async::inject_yields_mod!(mod atomic_state;);
+switchy_async::inject_yields_mod!(mod capture_handshake;);
+switchy_async::inject_yields_mod!(mod commands;);
+switchy_async::inject_yields_mod!(mod dir_order;);
+switchy_async::inject_yields_mod!(mod files;);
+switchy_async::inject_yields_mod!(mod handlers;);
+switchy_async::inject_yields_mod!(mod ids;);
+switchy_async::inject_yields_mod!(pub mod observation;);
+switchy_async::inject_yields_mod!(mod padding;);
+switchy_async::inject_yields_mod!(mod padding_api;);
+switchy_async::inject_yields_mod!(mod platform;);
+switchy_async::inject_yields_mod!(mod private_input;);
+switchy_async::inject_yields_mod!(mod readiness;);
+switchy_async::inject_yields_mod!(mod run_shared;);
+switchy_async::inject_yields_mod!(mod runtime;);
 #[cfg(feature = "simulator")]
 pub use runtime::simulation;
-mod snapshot;
-mod snapshot_v1_migration;
+switchy_async::inject_yields_mod!(mod snapshot;);
+switchy_async::inject_yields_mod!(mod snapshot_v1_migration;);
 
 #[cfg(test)]
 mod retired_execution_tests;
