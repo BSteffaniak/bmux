@@ -58,6 +58,13 @@ impl SessionAuthority {
         }
     }
 
+    /// Set whether ordinary panes sweep leftover jobs after their shell exits (as the
+    /// `execution.sweep_on_exit` setting does).
+    #[cfg(feature = "simulator")]
+    pub(crate) fn set_sweep_on_exit(&self, sweep: bool) {
+        self.sweep_on_exit.store(sweep, Ordering::SeqCst);
+    }
+
     /// From now on, act as a server that died: stop, inspect, release and forget nothing, so
     /// what the sessions' processes and records do next is what a crash leaves (the operating
     /// system still closes handles, so a Windows job's kill-on-close still ends its processes).

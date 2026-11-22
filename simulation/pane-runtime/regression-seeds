@@ -12,3 +12,4 @@
 3 1000 SIMULATOR_PTY_PERSONALITY=windows PANE_RUNTIME_SIM_PROFILE=drivers=1,steps=20,panes=3,open=6,type=1,crash=2,restart=2,wait=1  # a crash during a restart's console close
 7017113770625937869  # crash cancellation woke drivers in an unseeded order (tokio's watch)
 5 1000 SIMULATOR_PTY_PERSONALITY=linux PANE_RUNTIME_SIM_PROFILE=drivers=1,steps=20,panes=3,open=6,type=1,power=2,wait=1,close=1  # power loss and recovery
+14328908403878130441 23729355318725 SIMULATOR_PTY_PERSONALITY=linux PANE_RUNTIME_SIM_PROFILE=drivers=1,steps=8,panes=4,clock=10,open=4,type=5,resize=1,close=0,crash=0,restart=0,wait=8,late=0.2,query=1,reuse=0.3,sweep=0,p.shell=3,p.daemonizer=3,p.orphaner=3,p.flood=1,p.garbage=1  # sweep_on_exit off: a stopped pane released the jobs it should have ended

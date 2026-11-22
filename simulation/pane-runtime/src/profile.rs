@@ -30,6 +30,10 @@ pub enum Kind {
     Restart,
     /// Do nothing for a while.
     Wait,
+    /// Split a pane: a new pane, in its session, runs a new program.
+    Split,
+    /// Interrupt a pane's program (`ctrl+c`).
+    Interrupt,
     /// Lose power: every process dies, and the file system keeps only what was made durable
     /// (and a random part of the rest), then a new server recovers.
     PowerLoss,
@@ -37,7 +41,7 @@ pub enum Kind {
 
 impl Kind {
     /// Every kind, in the order profiles list them.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 10] = [
         Self::Open,
         Self::Type,
         Self::Resize,
@@ -46,6 +50,8 @@ impl Kind {
         Self::Restart,
         Self::Wait,
         Self::PowerLoss,
+        Self::Split,
+        Self::Interrupt,
     ];
 
     /// Its name in a profile.
@@ -60,6 +66,8 @@ impl Kind {
             Self::Restart => "restart",
             Self::Wait => "wait",
             Self::PowerLoss => "power",
+            Self::Split => "split",
+            Self::Interrupt => "interrupt",
         }
     }
 }
@@ -105,6 +113,8 @@ pub struct Profile {
     pub weights: [u64; Kind::ALL.len()],
     /// The kernel's faults.
     pub faults: FaultRates,
+    /// Whether panes' programs' leftover jobs are swept when the program exits.
+    pub sweep: bool,
     /// Each program's weight among those panes run (0 for never), in
     /// [`programs::Kind::ALL`]'s order.
     pub programs: [u64; programs::Kind::ALL.len()],
@@ -118,12 +128,13 @@ impl Default for Profile {
             steps: 20,
             panes: 3,
             clock: 1,
-            weights: [3, 4, 2, 2, 1, 1, 3, 0],
+            weights: [3, 4, 2, 2, 1, 1, 3, 0, 0, 0],
             faults: FaultRates {
                 pid_reuse: 0.3,
                 ..FaultRates::default()
             },
             programs: [1, 0, 0, 0, 0, 0, 0, 0, 0],
+            sweep: true,
         }
     }
 }
@@ -176,6 +187,13 @@ impl Profile {
         }
         Self {
             programs,
+            // Kept on (the draw stays, so turning it back on shifts nothing): with it off, a
+            // Windows pane whose shell left an attached job can fail to close (an open finding
+            // of phase 18; see the plan). Force it off with `sweep=0` to explore that.
+            sweep: {
+                let _off = draw(4) == 0;
+                true
+            },
             drivers: 1 + draw(4),
             steps: 5 + draw(56),
             panes: 1 + usize::try_from(draw(5)).unwrap_or(0),
@@ -226,6 +244,9 @@ impl Profile {
         if self.faults.file > 0 {
             tags.push("fault:file".into());
         }
+        if !self.sweep {
+            tags.push("no sweep".into());
+        }
         for (kind, weight) in programs::Kind::ALL.iter().zip(self.programs).skip(1) {
             if weight > 0 {
                 tags.push(format!("program:{}", kind.name()));
@@ -275,6 +296,7 @@ impl fmt::Display for Profile {
             write!(f, " {name}={rate}")?;
         }
         write!(f, " fsfault={}", self.faults.file)?;
+        write!(f, " sweep={}", u8::from(self.sweep))?;
         for (kind, weight) in programs::Kind::ALL.iter().zip(self.programs) {
             write!(f, " p.{}={weight}", kind.name())?;
         }
@@ -323,6 +345,7 @@ impl std::str::FromStr for Profile {
                 "query" => faults.startup_query = rate()?,
                 "reuse" => faults.pid_reuse = rate()?,
                 "fsfault" => faults.file = number()?,
+                "sweep" => profile.sweep = number()? != 0,
                 other if other.starts_with("p.") => {
                     let index = programs::Kind::ALL
                         .iter()

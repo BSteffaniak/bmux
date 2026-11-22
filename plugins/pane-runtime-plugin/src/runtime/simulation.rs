@@ -11,7 +11,9 @@
 //! requests do: a pane may be closed while another opens, restarted while it is typed into,
 //! or crashed while it starts.
 
+use bmux_attach_layout_protocol::{PaneSelector, PaneSplitDirection};
 use bmux_session_models::SessionId;
+use uuid::Uuid;
 use switchy_thread::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, Ordering},
@@ -53,9 +55,12 @@ struct Server {
     exits: Mutex<mpsc::UnboundedReceiver<PaneExitEvent>>,
 }
 
-/// One pane (each in a session of its own).
+/// One pane: a session's (each session starts with one; splits add more).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Pane(SessionId);
+pub struct Pane {
+    session: SessionId,
+    pane: Uuid,
+}
 
 /// How closing a pane went.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,18 +105,44 @@ impl Server {
         let manager = lock(&self.manager);
         manager
             .runtimes
-            .get(&pane.0)
-            .and_then(|runtime| runtime.panes.values().next())
+            .get(&pane.session)
+            .and_then(|runtime| runtime.panes.get(&pane.pane))
             .map(f)
     }
 
     fn panes(&self) -> Vec<Pane> {
         lock(&self.manager)
             .runtimes
-            .keys()
-            .copied()
-            .map(Pane)
+            .iter()
+            .flat_map(|(session, runtime)| {
+                runtime.panes.keys().map(|pane| Pane {
+                    session: *session,
+                    pane: *pane,
+                })
+            })
             .collect()
+    }
+
+    /// Wait until `pane`'s program (`program`, its pane's id) runs, failed to start, or the pane
+    /// went (or now runs another program).
+    async fn started(&self, pane: Pane, program: Uuid) -> Restarted {
+        loop {
+            let state = self.with_pane(pane, |handle| {
+                (handle.meta.id == program).then(|| {
+                    (
+                        handle.process_id.lock().ok().and_then(|pid| *pid),
+                        handle.exited.load(Ordering::SeqCst),
+                    )
+                })
+            });
+            match state {
+                None | Some(None) => return Restarted::Gone,
+                Some(Some((Some(pid), _))) => return Restarted::Running(pid),
+                Some(Some((None, true))) => return Restarted::Failed,
+                Some(Some((None, false))) => {}
+            }
+            switchy_async::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
     }
 
     async fn open(&self, rows: u16, cols: u16) -> anyhow::Result<Pane> {
@@ -124,22 +155,68 @@ impl Server {
         );
         let mut prepared = prepared?;
         prepared.wait_until_ready().await?;
-        lock(&self.manager).commit_fresh_runtime(session_id, &mut prepared, || Ok(()))?;
-        Ok(Pane(session_id))
+        let mut manager = lock(&self.manager);
+        manager.commit_fresh_runtime(session_id, &mut prepared, || Ok(()))?;
+        let pane = manager
+            .runtimes
+            .get(&session_id)
+            .and_then(|runtime| runtime.panes.keys().next().copied())
+            .ok_or_else(|| anyhow::anyhow!("the opened session has no pane"))?;
+        Ok(Pane {
+            session: session_id,
+            pane,
+        })
+    }
+
+    async fn split(&self, pane: Pane, vertical: bool) -> anyhow::Result<(Pane, Restarted)> {
+        let direction = if vertical {
+            PaneSplitDirection::Vertical
+        } else {
+            PaneSplitDirection::Horizontal
+        };
+        let created = lock(&self.manager).create_split_pane(
+            pane.session,
+            Some(PaneSelector::ById(pane.pane)),
+            direction,
+            None,
+            None,
+            None,
+        )?;
+        let new = Pane {
+            session: pane.session,
+            pane: created,
+        };
+        Ok((new, self.started(new, created).await))
     }
 
     async fn close(&self, pane: Pane) -> anyhow::Result<Closed> {
         let (execution, removed) = {
             let mut manager = lock(&self.manager);
+            let runtime = manager
+                .runtimes
+                .get(&pane.session)
+                .ok_or_else(|| anyhow::anyhow!("no session {:?}", pane.session))?;
             let execution = Arc::clone(
-                &manager
-                    .runtimes
-                    .get(&pane.0)
-                    .and_then(|runtime| runtime.panes.values().next())
-                    .ok_or_else(|| anyhow::anyhow!("no pane {:?}", pane.0))?
+                &runtime
+                    .panes
+                    .get(&pane.pane)
+                    .ok_or_else(|| anyhow::anyhow!("no pane {:?}", pane.pane))?
                     .execution,
             );
-            (execution, manager.remove_runtime(pane.0)?)
+            // Its session's last pane closes with the session; another closes alone, its
+            // shutdown in the background (as a client's close-pane request does).
+            if runtime.panes.len() > 1 {
+                manager.close_pane(pane.session, Some(PaneSelector::ById(pane.pane)))?;
+                (execution, None)
+            } else {
+                (execution, Some(manager.remove_runtime(pane.session)?))
+            }
+        };
+        let Some(removed) = removed else {
+            return Ok(Closed {
+                drained: false,
+                cleanup_error: None,
+            });
         };
         shutdown_runtime_handle(&self.host, removed).await;
         Ok(Closed {
@@ -149,25 +226,9 @@ impl Server {
     }
 
     async fn restart(&self, pane: Pane) -> anyhow::Result<Restarted> {
-        // The new program may reuse the old one's id: tell them apart by pane.
-        let restarted = lock(&self.manager).restart_pane(pane.0, None)?;
-        loop {
-            let state = self.with_pane(pane, |handle| {
-                (handle.meta.id == restarted).then(|| {
-                    (
-                        handle.process_id.lock().ok().and_then(|pid| *pid),
-                        handle.exited.load(Ordering::SeqCst),
-                    )
-                })
-            });
-            match state {
-                None | Some(None) => return Ok(Restarted::Gone),
-                Some(Some((Some(pid), _))) => return Ok(Restarted::Running(pid)),
-                Some(Some((None, true))) => return Ok(Restarted::Failed),
-                Some(Some((None, false))) => {}
-            }
-            switchy_async::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        let restarted = lock(&self.manager)
+            .restart_pane(pane.session, Some(PaneSelector::ById(pane.pane)))?;
+        Ok(self.started(pane, restarted).await)
     }
 }
 
@@ -222,6 +283,33 @@ impl Panes {
             runtime,
             stop,
         }
+    }
+
+    /// Whether panes' programs' leftover jobs are swept when the program exits (the
+    /// `execution.sweep_on_exit` setting; on by default).
+    pub fn set_sweep_on_exit(&self, sweep: bool) {
+        self.server.host.sessions().set_sweep_on_exit(sweep);
+    }
+
+    /// Split `pane` (side by side, or one above the other): a new pane in its session runs a
+    /// new program. Waits until that program runs, fails to start, or the pane goes.
+    ///
+    /// # Errors
+    ///
+    /// * If the split is refused, or the server died first
+    pub async fn split(&self, pane: Pane, vertical: bool) -> anyhow::Result<(Pane, Restarted)> {
+        self.on_server(move |server| Box::pin(async move { server.split(pane, vertical).await }))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("the server died"))?
+    }
+
+    /// The panes `pane`'s session has (with it).
+    #[must_use]
+    pub fn siblings(&self, pane: Pane) -> Vec<Pane> {
+        self.panes()
+            .into_iter()
+            .filter(|other| other.session == pane.session)
+            .collect()
     }
 
     /// Stop the server's executor, once its panes are closed: as a server exits, it stops
@@ -383,7 +471,10 @@ impl Panes {
         let mut panes = Vec::new();
         while let Ok(event) = exits.try_recv() {
             if event.is_current(&lock(&self.server.manager)) {
-                panes.push(Pane(event.session_id));
+                panes.push(Pane {
+                    session: event.session_id,
+                    pane: event.pane_id,
+                });
             }
         }
         panes

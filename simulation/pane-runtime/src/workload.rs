@@ -101,6 +101,9 @@ struct Opened {
     restarting: bool,
     /// Bumped by each resize, so a resize's check knows when a later one superseded it.
     resizes: u64,
+    /// Bumped by whatever may signal its program (an interrupt, a restart), so a check of
+    /// what another action did to it knows when one interfered.
+    touched: u64,
 }
 
 /// A process started outside the pane runtime, after a crash.
@@ -295,7 +298,11 @@ impl Shared {
         let settle = SETTLE * u32::try_from(profile.clock).unwrap_or(1);
         Arc::new(Self {
             state: Mutex::new(State {
-                panes: Arc::new(Panes::recovering(SHELL, &records)),
+                panes: {
+                    let panes = Arc::new(Panes::recovering(SHELL, &records));
+                    panes.set_sweep_on_exit(profile.sweep);
+                    panes
+                },
                 open: BTreeMap::new(),
                 opening: 0,
                 steps_left: profile.steps,
@@ -443,6 +450,8 @@ impl Shared {
             Kind::Close => self.close_one(driver).await,
             Kind::Restart => self.restart(driver).await,
             Kind::Crash | Kind::PowerLoss => {}
+            Kind::Split => self.split(driver).await,
+            Kind::Interrupt => self.interrupt(driver),
             Kind::Wait => switchy_async::time::sleep(Duration::from_millis(draw(50))).await,
         }
     }
@@ -562,6 +571,7 @@ impl Shared {
                 programs: 1,
                 restarting: false,
                 resizes: 0,
+                touched: 0,
             },
         );
     }
@@ -576,6 +586,9 @@ impl Shared {
         };
         let line: String = if draw(5) == 0 {
             "bg".to_owned()
+        } else if draw(20) == 0 {
+            // The shell ends: the pane stays, its program exited.
+            "exit".to_owned()
         } else {
             (0..=draw(20))
                 .map(|_| char::from(b'a' + u8::try_from(draw(26)).unwrap_or(0)))
@@ -595,6 +608,72 @@ impl Shared {
         );
         opened.typed.push(line);
         Board::typed(&format!("{pane:?}"));
+    }
+
+    /// Split a pane: its session gains a pane running a new program, checking invariant 1.
+    async fn split(&self, driver: u64) {
+        let (pane, panes) = {
+            let mut state = self.lock();
+            if state.open.len() + state.opening >= self.profile.panes {
+                return;
+            }
+            let Some(pane) = Self::pick(&state) else {
+                return;
+            };
+            state.opening += 1;
+            (pane, Arc::clone(&state.panes))
+        };
+        let _opening = Opening(self, self.generation.load(Ordering::SeqCst));
+        let (new, pid) = match panes.split(pane, draw(2) == 0).await {
+            Ok((new, Restarted::Running(pid))) => (new, pid),
+            Ok((_, Restarted::Gone)) => return,
+            Ok((_, Restarted::Failed)) | Err(_) => {
+                self.lock().stats.failed_opens += 1;
+                // A split of a pane closed meanwhile, or a program failing to start, is refused.
+                return;
+            }
+        };
+        let serial = panes
+            .program_serial(new)
+            .or_else(|| simulator::serial_of(pid))
+            .unwrap_or(0);
+        Board::checked(1);
+        if let Some(problem) = self.leads_own_session(&panes, new, pid, serial).await {
+            self.violated(format!("1. split pane process {pid} does not lead its own session: {problem}"));
+        }
+        event(
+            "split",
+            format!("d{driver}: pane {pid} split off on {}", terminal_of(pid)),
+            Tone::Info,
+        );
+        let mut state = self.lock();
+        state.stats.opened += 1;
+        state.open.insert(
+            new,
+            Opened {
+                pid,
+                serial,
+                typed: Vec::new(),
+                programs: 1,
+                restarting: false,
+                resizes: 0,
+                touched: 0,
+            },
+        );
+    }
+
+    /// Interrupt a pane's program (`ctrl+c`): its foreground program usually ends.
+    fn interrupt(&self, driver: u64) {
+        let mut state = self.lock();
+        let Some(pane) = Self::pick(&state) else {
+            return;
+        };
+        if state.panes.input(pane, b"\x03")
+            && let Some(opened) = state.open.get_mut(&pane)
+        {
+            opened.touched += 1;
+            event("interrupt", format!("d{driver}: interrupted {}", opened.pid), Tone::Neutral);
+        }
     }
 
     /// Resize a pane, checking invariant 3.
@@ -703,6 +782,9 @@ impl Shared {
             }
         }
         let session = session_of(opened.serial);
+        // 11. Closing a pane leaves its siblings (its session's other panes) alone.
+        let siblings = self.siblings_of(panes, pane);
+        let signalled_before: usize = simulator::signal_log().len();
         match panes.close(pane).await {
             Ok(closed) => {
                 // 4. Closing drains, cleans up, and leaves nothing running in the session.
@@ -729,6 +811,88 @@ impl Shared {
             }
             Err(error) => self.violated(format!("4. closing a pane failed: {error:#}")),
         }
+        self.check_siblings(pid, session, siblings, signalled_before).await;
+    }
+
+    /// The panes `pane`'s session has besides it, with their programs (id, serial) and how
+    /// often they were touched, for invariant 11.
+    fn siblings_of(&self, panes: &Panes, pane: Pane) -> Vec<(Pane, u32, u64, u64)> {
+        let state = self.lock();
+        panes
+            .siblings(pane)
+            .into_iter()
+            .filter(|other| *other != pane)
+            .filter_map(|other| {
+                state
+                    .open
+                    .get(&other)
+                    .map(|o| (other, o.pid, o.serial, o.touched))
+            })
+            .collect()
+    }
+
+    /// Invariant 11: the close of pane process `pid` (whose session was `session`; signals from
+    /// index `signalled_before` of the log on) sent nothing that ends a sibling.
+    async fn check_siblings(
+        &self,
+        pid: u32,
+        session: Option<u64>,
+        siblings: Vec<(Pane, u32, u64, u64)>,
+        signalled_before: usize,
+    ) {
+        // Only when attribution is exact: no other driver acts meanwhile, and the siblings run
+        // shells that end only when told to (so any signal that ends one is the close's).
+        let siblings: Vec<_> = if self.profile.drivers == 1 {
+            let state = self.lock();
+            siblings
+                .into_iter()
+                .filter(|(other, _, serial, _)| {
+                    matches!(
+                        crate::programs::kind_of(*serial),
+                        Some(crate::programs::Kind::Shell | crate::programs::Kind::Stubborn)
+                    ) && state
+                        .open
+                        .get(other)
+                        .is_some_and(|o| !o.typed.iter().any(|line| line == "exit"))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if !siblings.is_empty() {
+            Board::checked(11);
+            // Let the close finish (another pane's closes in the background).
+            let _ = self.settle(|| session.is_none_or(|s| running_in(&[s]).is_empty())).await;
+            // Only what would end them counts, and only for siblings nothing else touched
+            // meanwhile (another driver may interrupt, restart or close them).
+            // (A restart under way when the close began ends the sibling's old program: it then
+            // runs another.)
+            let untouched = |other: Pane, serial: u64, touched: u64| {
+                self.lock().open.get(&other).is_some_and(|o| {
+                    o.touched == touched && !o.restarting && o.serial == serial
+                })
+            };
+            for record in simulator::signal_log().iter().skip(signalled_before) {
+                if record.by_fault
+                    || !matches!(
+                        record.signal,
+                        switchy_pty::Signal::Kill
+                            | switchy_pty::Signal::Hangup
+                            | switchy_pty::Signal::Terminate
+                    )
+                {
+                    continue;
+                }
+                if let Some((_, sibling, _, _)) = siblings.iter().find(|(other, _, serial, touched)| {
+                    *serial == record.serial && untouched(*other, *serial, *touched)
+                }) {
+                    self.violated(format!(
+                        "11. closing pane process {pid} sent {:?} to its sibling pane's process {sibling}",
+                        record.signal
+                    ));
+                }
+            }
+        }
     }
 
     /// Restart a pane, checking invariant 7.
@@ -747,6 +911,7 @@ impl Shared {
             };
             // Lines typed from now on go to the new program.
             opened.restarting = true;
+            opened.touched += 1;
             opened.programs += 1;
             opened.typed.clear();
             (pane, opened.pid, old_session, panes)
@@ -884,6 +1049,7 @@ impl Shared {
             }
         }
         let fresh = Arc::new(Panes::recovering(SHELL, &self.records));
+        fresh.set_sweep_on_exit(self.profile.sweep);
         let outside: Vec<u64> = {
             let mut state = self.lock();
             for pane in state.open.keys() {
@@ -989,7 +1155,19 @@ impl Shared {
             let Some((pane, opened, panes)) = next else {
                 break;
             };
-            self.close(&panes, pane, &opened).await;
+            let limit = ACTION_LIMIT * u32::try_from(self.profile.clock).unwrap_or(1);
+            let closed = switchy_async::select! {
+                () = self.close(&panes, pane, &opened) => true,
+                () = switchy_async::time::sleep(limit) => false,
+            };
+            if !closed {
+                self.violated(format!(
+                    "5. closing pane process {} at the end did not finish within {limit:?} \
+                     (threads: {:?})",
+                    opened.pid,
+                    live_threads()
+                ));
+            }
             Board::closed(&format!("{pane:?}"));
         }
         self.collect_exits();

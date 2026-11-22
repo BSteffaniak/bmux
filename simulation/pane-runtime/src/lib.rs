@@ -34,6 +34,7 @@
 //! 9. Once every pane closed, nothing is left: no terminal's master side open, no process but
 //!    those started outside the runtime, no session record.
 //! 10. A pane whose program ended says so.
+//! 11. Closing a pane leaves its siblings (its session's other panes, from splits) alone.
 //!
 //! Panes run programs that misbehave as real ones do (see [`programs`]): they ignore
 //! termination, detach daemons, leave children holding the terminal, exit at once, flood
