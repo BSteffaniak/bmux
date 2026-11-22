@@ -36,6 +36,10 @@ pub const SHELL: &str = "/bin/sh";
 /// of one millisecond per step (scaled with the clock).
 const SETTLE: Duration = Duration::from_secs(5);
 
+/// How long one action may take, in simulated time at a clock of one millisecond per step
+/// (scaled with the clock).
+const ACTION_LIMIT: Duration = Duration::from_secs(60);
+
 /// Draw a number below `bound` from the workload's stream.
 pub fn draw(bound: u64) -> u64 {
     switchy_simulation::stream("pane_runtime_workload")
@@ -410,9 +414,19 @@ impl Shared {
                 switchy_async::time::sleep(Duration::from_millis(1)).await;
             }
         };
+        // An action that never ends is a livelock (or a lost wakeup) in the runtime.
+        let limit = ACTION_LIMIT * u32::try_from(self.profile.clock).unwrap_or(1);
         let cancelled = switchy_async::select! {
             () = self.act(driver, kind) => false,
             () = crashed => true,
+            () = switchy_async::time::sleep(limit) => {
+                self.violated(format!(
+                    "5. d{driver}: {} did not finish within {limit:?} (threads: {:?})",
+                    kind.name(),
+                    live_threads()
+                ));
+                false
+            }
         };
         let mut state = self.lock();
         state.busy -= 1;
@@ -470,10 +484,19 @@ impl Shared {
         }
     }
 
-    /// Whether a fault the profile has on may make opening a pane fail.
+    /// Whether a fault the profile has on may make opening a pane fail, or a program it may
+    /// run exits before its pane is ready (the runtime then refuses the pane).
     fn opens_may_fail(&self) -> bool {
         let faults = &self.profile.faults;
-        faults.spawn > 0.0 || faults.kill > 0.0 || faults.read_error > 0.0
+        faults.spawn > 0.0
+            || faults.kill > 0.0
+            || faults.read_error > 0.0
+            || self.profile.program_mix().iter().any(|(kind, _)| {
+                matches!(
+                    kind,
+                    crate::programs::Kind::Instant | crate::programs::Kind::Orphaner
+                )
+            })
     }
 
     /// Open a pane, checking invariant 1.
@@ -502,7 +525,11 @@ impl Shared {
             self.violated("1. an opened pane has no process".into());
             return;
         };
-        let serial = simulator::serial_of(pid).unwrap_or(0);
+        // By the runtime's own record: the id may already be another process's.
+        let serial = panes
+            .program_serial(pane)
+            .or_else(|| simulator::serial_of(pid))
+            .unwrap_or(0);
         // 1. Its program leads its own session (and if it already ended, the runtime knows).
         Board::checked(1);
         if let Some(problem) = self.leads_own_session(&panes, pane, pid, serial).await {
@@ -663,6 +690,17 @@ impl Shared {
                 terminal_state(pid)
             ));
         }
+        // 10. A pane whose program ended says so.
+        if alive(opened.serial).is_none() {
+            Board::checked(10);
+            if !self.settle(|| panes.exited(pane) || panes.pid(pane) != Some(pid)).await {
+                self.violated(format!(
+                    "10. pane process {pid} ({}) ended but its pane never said so",
+                    crate::programs::kind_of(opened.serial)
+                        .map_or("unknown program", crate::programs::Kind::name)
+                ));
+            }
+        }
         let session = session_of(opened.serial);
         match panes.close(pane).await {
             Ok(closed) => {
@@ -734,7 +772,10 @@ impl Shared {
                 return;
             }
         };
-        let serial = simulator::serial_of(pid).unwrap_or(0);
+        let serial = panes
+            .program_serial(pane)
+            .or_else(|| simulator::serial_of(pid))
+            .unwrap_or(0);
         {
             let mut state = self.lock();
             state.stats.restarted += 1;
@@ -788,7 +829,9 @@ impl Shared {
         panes.crash();
         drop(panes);
         // Everything running now that no outsider started belongs to the dead server.
-        let outsiders: Vec<u64> = self.lock().witnesses.iter().map(|w| w.serial).collect();
+        // (So do the daemons panes' programs detached, by design.)
+        let mut outsiders: Vec<u64> = self.lock().witnesses.iter().map(|w| w.serial).collect();
+        outsiders.extend(crate::programs::detached());
         let owned: Vec<u64> = simulator::snapshot()
             .processes
             .iter()
@@ -862,7 +905,8 @@ impl Shared {
     /// master side open, no process running but those started outside it, no session record.
     async fn check_nothing_leaks(&self) {
         Board::checked(9);
-        let outsiders: Vec<u64> = self.lock().witnesses.iter().map(|w| w.serial).collect();
+        let mut outsiders: Vec<u64> = self.lock().witnesses.iter().map(|w| w.serial).collect();
+        outsiders.extend(crate::programs::detached());
         let strays = || -> Vec<String> {
             simulator::snapshot()
                 .processes

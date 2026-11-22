@@ -33,6 +33,11 @@
 //!    restart replaced.
 //! 9. Once every pane closed, nothing is left: no terminal's master side open, no process but
 //!    those started outside the runtime, no session record.
+//! 10. A pane whose program ended says so.
+//!
+//! Panes run programs that misbehave as real ones do (see [`programs`]): they ignore
+//! termination, detach daemons, leave children holding the terminal, exit at once, flood
+//! output, write garbage, query the terminal, or switch screens.
 //!
 //! Faults excuse only what they cause: a pane whose program the outside killer killed need
 //! not answer what was typed, and opening may fail while spawns, reads or kills fail.
@@ -41,6 +46,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
 pub mod profile;
+pub mod programs;
 pub mod telemetry;
 pub mod workload;
 
@@ -81,37 +87,6 @@ impl SimBootstrap for PaneRuntimeBootstrap {
                     as Box<dyn std::error::Error + Send>
             })
         });
-    }
-}
-
-/// The simulated shell the panes run: it answers each line it reads with `got:<line>`, starts
-/// a job that ignores hang-ups in its session at `bg`, and ends at `exit` or end of input.
-fn shell(process: &mut simulator::Process) -> i32 {
-    let mut line = Vec::new();
-    let mut buffer = [0_u8; 256];
-    loop {
-        match process.read(&mut buffer) {
-            Ok(0) | Err(_) => return 0,
-            Ok(read) => {
-                for &byte in &buffer[..read] {
-                    if byte != b'\n' {
-                        line.push(byte);
-                        continue;
-                    }
-                    let text = String::from_utf8_lossy(&line).into_owned();
-                    line.clear();
-                    if text == "exit" {
-                        return 0;
-                    }
-                    if text == "bg" && process.spawn(&["ignore-hup"], false).is_err() {
-                        return 1;
-                    }
-                    if process.write(format!("got:{text}\n").as_bytes()).is_err() {
-                        return 1;
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -205,7 +180,8 @@ pub async fn run_workload() -> Result<(), Vec<String>> {
         },
     });
     simulator::install_default_programs();
-    simulator::register_program("sh", shell);
+    programs::set_mix(profile.program_mix());
+    simulator::register_program("sh", programs::program);
     let mut shape = vec![
         format!(
             "personality:{}",

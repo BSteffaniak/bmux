@@ -11,6 +11,8 @@
 
 use std::fmt;
 
+use crate::programs;
+
 /// What a driver can do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
@@ -96,6 +98,9 @@ pub struct Profile {
     pub weights: [u64; Kind::ALL.len()],
     /// The kernel's faults.
     pub faults: FaultRates,
+    /// Each program's weight among those panes run (0 for never), in
+    /// [`programs::Kind::ALL`]'s order.
+    pub programs: [u64; programs::Kind::ALL.len()],
 }
 
 impl Default for Profile {
@@ -111,6 +116,7 @@ impl Default for Profile {
                 pid_reuse: 0.3,
                 ..FaultRates::default()
             },
+            programs: [1, 0, 0, 0, 0, 0, 0, 0, 0],
         }
     }
 }
@@ -145,7 +151,19 @@ impl Profile {
             startup_query: chosen(3, &[0.3, 1.0]),
             pid_reuse: [0.0, 0.3, 0.6, 1.0][usize::try_from(draw(4)).unwrap_or(0)],
         };
+        let mut programs = [0; programs::Kind::ALL.len()];
+        for (index, weight) in programs.iter_mut().enumerate() {
+            // Mostly well-behaved shells; each misbehaving program in one run in three.
+            *weight = if index == 0 {
+                2 + draw(5)
+            } else if draw(3) == 0 {
+                1 + draw(3)
+            } else {
+                0
+            };
+        }
         Self {
+            programs,
             drivers: 1 + draw(4),
             steps: 5 + draw(56),
             panes: 1 + usize::try_from(draw(5)).unwrap_or(0),
@@ -193,7 +211,23 @@ impl Profile {
                 tags.push(format!("fault:{name}"));
             }
         }
+        for (kind, weight) in programs::Kind::ALL.iter().zip(self.programs).skip(1) {
+            if weight > 0 {
+                tags.push(format!("program:{}", kind.name()));
+            }
+        }
         tags
+    }
+
+    /// The program mix, for [`programs::set_mix`].
+    #[must_use]
+    pub fn program_mix(&self) -> Vec<(programs::Kind, u64)> {
+        programs::Kind::ALL
+            .iter()
+            .copied()
+            .zip(self.programs)
+            .filter(|(_, weight)| *weight > 0)
+            .collect()
     }
 
     const fn fault_list(&self) -> [(&'static str, f64); 9] {
@@ -224,6 +258,9 @@ impl fmt::Display for Profile {
         }
         for (name, rate) in self.fault_list() {
             write!(f, " {name}={rate}")?;
+        }
+        for (kind, weight) in programs::Kind::ALL.iter().zip(self.programs) {
+            write!(f, " p.{}={weight}", kind.name())?;
         }
         Ok(())
     }
@@ -266,6 +303,13 @@ impl std::str::FromStr for Profile {
                 "late" => faults.signal_delay = rate()?,
                 "query" => faults.startup_query = rate()?,
                 "reuse" => faults.pid_reuse = rate()?,
+                other if other.starts_with("p.") => {
+                    let index = programs::Kind::ALL
+                        .iter()
+                        .position(|kind| kind.name() == &other[2..])
+                        .ok_or_else(|| format!("unknown program '{other}'"))?;
+                    profile.programs[index] = number()?;
+                }
                 other => {
                     let index = Kind::ALL
                         .iter()
