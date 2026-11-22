@@ -30,6 +30,8 @@ use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 mod snapshot;
+#[cfg(test)]
+mod tests;
 
 pub use snapshot::SnapshotStaging;
 
