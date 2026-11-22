@@ -331,8 +331,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "switchy_async 0.5.0",
- "switchy_fs 0.5.0",
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
+ "switchy_fs 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "tempfile",
  "tokio",
  "toml",
@@ -467,7 +467,7 @@ version = "0.0.1-alpha.4"
 dependencies = [
  "anyhow",
  "bmux_pty",
- "switchy_async 0.5.0",
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "tokio",
 ]
 
@@ -510,8 +510,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "switchy_async 0.5.0",
- "switchy_env 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
+ "switchy_env",
  "switchy_pty",
  "switchy_simulation",
  "switchy_thread",
@@ -999,8 +999,8 @@ dependencies = [
  "bmux_cluster_plugin",
  "bmux_cluster_plugin_api",
  "simvar",
- "switchy_async 0.5.0",
- "switchy_fs 0.5.0",
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
+ "switchy_fs 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "switchy_time",
  "uuid",
 ]
@@ -1195,7 +1195,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c54e03a951783e8b327515db3f2a2fd0e3bed362a96b066f341ce66ed49b4ead"
 dependencies = [
  "data-encoding",
- "syn 3.0.10",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -2462,7 +2462,7 @@ dependencies = [
  "bmux_simvar_tui",
  "sim_support",
  "simvar",
- "switchy_async 0.5.0",
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "switchy_pty",
  "switchy_simulation",
  "switchy_thread",
@@ -2593,6 +2593,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_assert"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "colored",
  "moosicbox_env_utils",
@@ -2601,12 +2602,14 @@ dependencies = [
 [[package]]
 name = "moosicbox_env_utils"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 
 [[package]]
 name = "moosicbox_log_runtime"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
- "switchy_fs 0.5.0",
+ "switchy_fs 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "thiserror 2.0.21",
  "tracing-appender",
  "tracing-log",
@@ -2616,8 +2619,9 @@ dependencies = [
 [[package]]
 name = "moosicbox_profiles"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
- "switchy_async 0.5.0",
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
 ]
 
 [[package]]
@@ -3091,8 +3095,8 @@ dependencies = [
  "bmux_tui",
  "sim_support",
  "simvar",
- "switchy_async 0.5.0",
- "switchy_env 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
+ "switchy_env",
  "switchy_pty",
  "switchy_simulation",
  "switchy_thread",
@@ -4012,6 +4016,7 @@ dependencies = [
 [[package]]
 name = "simvar"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "simvar_explore",
  "simvar_harness",
@@ -4020,6 +4025,7 @@ dependencies = [
 [[package]]
 name = "simvar_explore"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "switchy_simulation",
 ]
@@ -4027,6 +4033,7 @@ dependencies = [
 [[package]]
 name = "simvar_harness"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "btparse",
  "color-backtrace",
@@ -4036,19 +4043,21 @@ dependencies = [
  "shell-words",
  "simvar_observer",
  "simvar_utils",
- "switchy 0.5.0",
+ "switchy 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "simvar_observer"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 
 [[package]]
 name = "simvar_utils"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
- "switchy 0.5.0",
+ "switchy 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
 ]
 
 [[package]]
@@ -4183,29 +4192,6 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "switchy"
 version = "0.5.0"
-dependencies = [
- "switchy_async 0.5.0",
- "switchy_async_macros",
- "switchy_database",
- "switchy_database_connection",
- "switchy_fs 0.5.0",
- "switchy_http",
- "switchy_mdns",
- "switchy_network",
- "switchy_random 0.5.0",
- "switchy_simulation",
- "switchy_tcp",
- "switchy_telemetry",
- "switchy_thread",
- "switchy_time",
- "switchy_upnp",
- "switchy_uuid",
- "switchy_web_server",
-]
-
-[[package]]
-name = "switchy"
-version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55334b2f67eca743ddbe89ea73611523afef1e710a4eabe39f3cbf55d912b6e1"
 dependencies = [
@@ -4215,21 +4201,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "switchy_async"
+name = "switchy"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
- "flume",
- "futures",
- "log",
- "pin-project-lite",
- "scoped-tls",
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "switchy_async_macros",
- "switchy_random 0.5.0",
+ "switchy_database",
+ "switchy_database_connection",
+ "switchy_fs 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
+ "switchy_http",
+ "switchy_mdns",
+ "switchy_network",
+ "switchy_random 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
+ "switchy_simulation",
+ "switchy_tcp",
+ "switchy_telemetry",
  "switchy_thread",
  "switchy_time",
- "thiserror 2.0.21",
- "tokio",
- "tokio-util",
+ "switchy_upnp",
+ "switchy_uuid",
+ "switchy_web_server",
 ]
 
 [[package]]
@@ -4246,8 +4238,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "switchy_async"
+version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
+dependencies = [
+ "flume",
+ "futures",
+ "log",
+ "pin-project-lite",
+ "scoped-tls",
+ "switchy_async_macros",
+ "switchy_random 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
+ "switchy_thread",
+ "switchy_time",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "switchy_async_macros"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "log",
  "proc-macro-crate",
@@ -4259,6 +4271,7 @@ dependencies = [
 [[package]]
 name = "switchy_database"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4267,7 +4280,7 @@ dependencies = [
  "moosicbox_profiles",
  "regex",
  "rusqlite",
- "switchy_async 0.5.0",
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "switchy_time",
  "thiserror 2.0.21",
  "tokio",
@@ -4276,45 +4289,23 @@ dependencies = [
 [[package]]
 name = "switchy_database_connection"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "log",
- "switchy_async 0.5.0",
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "switchy_database",
- "switchy_env 0.5.0",
+ "switchy_env",
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "switchy_env"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "log",
  "switchy_simulation",
  "thiserror 2.0.21",
-]
-
-[[package]]
-name = "switchy_env"
-version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#fd4de6943cdf3d48c6cb611de80791fcf4d730ce"
-dependencies = [
- "log",
- "switchy_simulation",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "switchy_fs"
-version = "0.5.0"
-dependencies = [
- "libc",
- "log",
- "rustix",
- "switchy_async 0.5.0",
- "switchy_simulation",
- "tempfile",
- "tokio",
- "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4329,8 +4320,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "switchy_fs"
+version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
+dependencies = [
+ "libc",
+ "log",
+ "rustix",
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
+ "switchy_simulation",
+ "tempfile",
+ "tokio",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "switchy_http"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4345,6 +4352,7 @@ dependencies = [
 [[package]]
 name = "switchy_http_models"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "strum",
  "thiserror 2.0.21",
@@ -4353,6 +4361,7 @@ dependencies = [
 [[package]]
 name = "switchy_mdns"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "async-trait",
  "hostname",
@@ -4364,6 +4373,7 @@ dependencies = [
 [[package]]
 name = "switchy_network"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "log",
  "switchy_simulation",
@@ -4374,20 +4384,12 @@ dependencies = [
 [[package]]
 name = "switchy_pty"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "libc",
  "switchy_simulation",
  "switchy_thread",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "switchy_random"
-version = "0.5.0"
-dependencies = [
- "log",
- "rand 0.8.5",
- "switchy_simulation",
 ]
 
 [[package]]
@@ -4401,12 +4403,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "switchy_random"
+version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
+dependencies = [
+ "log",
+ "rand 0.8.5",
+ "switchy_simulation",
+]
+
+[[package]]
 name = "switchy_simulation"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 
 [[package]]
 name = "switchy_tcp"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "async-trait",
  "bytes",
@@ -4414,7 +4428,7 @@ dependencies = [
  "log",
  "paste",
  "scoped-tls",
- "switchy_async 0.5.0",
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "switchy_network",
  "thiserror 2.0.21",
  "tokio",
@@ -4423,13 +4437,14 @@ dependencies = [
 [[package]]
 name = "switchy_telemetry"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "log",
  "moosicbox_log_runtime",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
- "switchy_env 0.5.0",
+ "switchy_env",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -4438,6 +4453,7 @@ dependencies = [
 [[package]]
 name = "switchy_thread"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "switchy_simulation",
  "switchy_time",
@@ -4446,15 +4462,17 @@ dependencies = [
 [[package]]
 name = "switchy_time"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "chrono",
- "switchy_random 0.5.0",
+ "switchy_random 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "switchy_simulation",
 ]
 
 [[package]]
 name = "switchy_upnp"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "async-recursion",
  "async-trait",
@@ -4466,7 +4484,7 @@ dependencies = [
  "roxmltree 0.21.2",
  "rupnp",
  "serde",
- "switchy_async 0.5.0",
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "thiserror 2.0.21",
  "tokio",
  "xml",
@@ -4475,6 +4493,7 @@ dependencies = [
 [[package]]
 name = "switchy_uuid"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "switchy_simulation",
  "uuid",
@@ -4483,6 +4502,7 @@ dependencies = [
 [[package]]
 name = "switchy_web_server"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -4491,7 +4511,7 @@ dependencies = [
  "paste",
  "serde",
  "serde-querystring",
- "switchy_fs 0.5.0",
+ "switchy_fs 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "switchy_http_models",
  "switchy_web_server_core",
  "thiserror 2.0.21",
@@ -4501,6 +4521,7 @@ dependencies = [
 [[package]]
 name = "switchy_web_server_core"
 version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 
 [[package]]
 name = "symlink"
