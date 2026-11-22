@@ -15,6 +15,9 @@ anyhow              = { workspace = true, features = ["std"] }
 bmux_session_models = { workspace = true, features = ["serde"] }
 serde               = { workspace = true, features = ["derive", "std"] }
 
+[dev-dependencies]
+bmux_sim_primitives_check = { workspace = true }
+
 [features]
 default          = []
 fail-on-warnings = ["bmux_session_models/fail-on-warnings"]

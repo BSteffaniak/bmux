@@ -37,6 +37,7 @@ pub struct RemovedRuntimeInfo {
     /// removed runtime asynchronously. Kept behind an `Any` so server
     /// can round-trip it back through `shutdown_runtime_handle`
     /// without interpreting it.
+    // simulation-safe: taken once, uncontended, by the removed runtime's single owner
     pub shutdown_token: Arc<std::sync::Mutex<Option<Box<dyn std::any::Any + Send + 'static>>>>,
 }
 

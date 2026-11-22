@@ -119,6 +119,7 @@ pub struct StylePalette {
 #[derive(Debug, Clone, Default)]
 struct StyleIndex {
     /// Keyed by styles programs choose: a seeded hasher, but a fast one.
+    // simulation-safe: lookup only, never iterated
     ids: std::collections::HashMap<Style, u32, foldhash::fast::RandomState>,
     covered: usize,
 }

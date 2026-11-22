@@ -43,7 +43,12 @@
 //! communal and never owned by the activation that happened to create it.
 
 use std::any::{Any, TypeId};
+// simulation-safe: keyed by type, lookup only, never iterated
 use std::collections::HashMap;
+// The registry's lock and its entries' type (`Arc<RwLock<T>>`, the host's state API). The
+// registry's own lock is held only around a map operation (and an initializer, which must not
+// block).
+// simulation-safe: never held across a switch point
 use std::sync::{Arc, RwLock};
 
 type StateEntry = Arc<dyn Any + Send + Sync>;
@@ -52,6 +57,7 @@ type StateEntry = Arc<dyn Any + Send + Sync>;
 #[derive(Default)]
 struct StateCore {
     registrations: ActivationRegistrationRegistry,
+    // simulation-safe: keyed by type, lookup only, never iterated
     entries: RwLock<HashMap<TypeId, StateEntry>>,
 }
 
@@ -365,6 +371,9 @@ use bmux_plugin_runtime::{
 };
 use bmux_plugin_sdk::{RegistrationContract, RegistrationKind};
 use std::collections::{BTreeMap, VecDeque};
+// Activation registrations and scoped views' ownership: only hosts that activate plugins use
+// them, never a simulated pane runtime (whose registry is a bare root).
+// simulation-safe: unused in simulation
 use std::sync::Mutex;
 
 const MAX_REGISTRATIONS: usize = 1024;
@@ -434,6 +443,7 @@ struct RegistrationEntry {
 
 struct RegistrationState {
     owners: BTreeMap<PluginActivationId, ActivationScope>,
+    // simulation-safe: activation registrations only (never in simulation)
     changed: tokio::sync::watch::Sender<u64>,
     revision: u64,
     entries: BTreeMap<(PluginActivationId, RegistrationContract), RegistrationEntry>,
@@ -447,6 +457,7 @@ impl Default for RegistrationState {
     fn default() -> Self {
         Self {
             owners: BTreeMap::new(),
+            // simulation-safe: created with a bare root, but never sent on or watched there
             changed: tokio::sync::watch::channel(0).0,
             revision: 0,
             entries: BTreeMap::new(),
@@ -516,6 +527,7 @@ pub struct ActivationRegistrationPort {
 pub struct RegistrationSubscription {
     registry: ActivationRegistrationRegistry,
     cursor: u64,
+    // simulation-safe: activation registrations only (never in simulation)
     changed: tokio::sync::watch::Receiver<u64>,
     disconnected: bool,
 }

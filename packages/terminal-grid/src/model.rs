@@ -12,6 +12,8 @@ pub use content::{
 pub use frame::{FrameApplied, FrameApplyError, FrameSummary, ReplicaCursor};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+// A line's memo, locked only around its own read or write.
+// simulation-safe: never held across a switch point
 use std::sync::{Mutex, OnceLock};
 use thiserror::Error;
 

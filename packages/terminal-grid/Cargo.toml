@@ -21,8 +21,9 @@ serde                     = { workspace = true, features = ["derive", "std", "rc
 thiserror                 = { workspace = true }
 
 [dev-dependencies]
-bmux_tui   = { workspace = true }
-serde_json = { workspace = true }
+bmux_sim_primitives_check = { workspace = true }
+bmux_tui                  = { workspace = true }
+serde_json                = { workspace = true }
 
 [features]
 default          = []

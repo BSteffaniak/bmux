@@ -1,10 +1,12 @@
 //! Small observational shutdown counter. Only completed work advances it.
 use serde::{Deserialize, Serialize};
-use std::{
-    path::PathBuf,
-    sync::{Arc, Mutex},
-    time::{Duration, Instant},
-};
+use std::{path::PathBuf, time::Duration};
+// Locked only around a counter update, and around publication, which writes host files only
+// after the server's `configure` (never in a simulated pane runtime).
+// simulation-safe: never held across a switch point in simulation
+use std::sync::{Arc, Mutex};
+// simulation-safe: the CLI's idle timer compares the instants it is handed; nothing here reads a clock
+use std::time::Instant;
 
 /// Local observation, never authority to release resources or declare success.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -103,7 +105,9 @@ fn publish(state: &mut State, step: &str) -> Result<(), String> {
     // ones. No fsync: this is a replaceable observation, not a durable receipt.
     let staged = path.with_extension(format!("{}.next", snapshot.pid));
     let bytes = serde_json::to_vec(snapshot).map_err(|error| error.to_string())?;
+    // simulation-safe: published only after `configure` (the server's shutdown)
     std::fs::write(&staged, bytes).map_err(|error| error.to_string())?;
+    // simulation-safe: published only after `configure` (the server's shutdown)
     std::fs::rename(staged, path).map_err(|error| error.to_string())
 }
 

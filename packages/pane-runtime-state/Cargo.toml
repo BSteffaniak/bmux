@@ -21,7 +21,8 @@ thiserror                   = { workspace = true }
 uuid                        = { workspace = true, features = ["serde", "std"] }
 
 [dev-dependencies]
-serde_json = { workspace = true }
+bmux_sim_primitives_check = { workspace = true }
+serde_json                = { workspace = true }
 
 [features]
 default = []
