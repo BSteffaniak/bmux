@@ -4922,7 +4922,7 @@ dependencies = [
  "iroh",
  "openraft",
  "redb",
- "rustix 1.1.5",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
  "serial_test",
