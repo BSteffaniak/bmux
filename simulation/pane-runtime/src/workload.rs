@@ -678,12 +678,14 @@ impl Shared {
             Arc::clone(&state.panes)
         };
         event("crash", format!("d{driver}: the server crashed"), Tone::Warn);
-        // Die: nothing the old server still does ends a session, and its work under way stops.
-        panes.abandon();
+        // The drivers' work under way stops with the server.
         self.generation.send_modify(|generation| *generation += 1);
         while self.lock().busy > 0 {
             switchy_async::time::sleep(Duration::from_millis(1)).await;
         }
+        // Die: every task and thread of the server stops where it is.
+        panes.crash();
+        drop(panes);
         // Everything running now that no outsider started belongs to the dead server.
         let outsiders: Vec<u64> = self.lock().witnesses.iter().map(|w| w.serial).collect();
         let owned: Vec<u64> = simulator::snapshot()
@@ -692,8 +694,6 @@ impl Shared {
             .filter(|p| p.state == ProcessState::Running && !outsiders.contains(&p.serial))
             .map(|p| p.session_serial)
             .collect();
-        panes.crash().await;
-        drop(panes);
         // Processes started while the crashed sessions linger (their ids may be reused).
         let mut witnesses = Vec::new();
         for _ in 0..=draw(2) {
@@ -730,8 +730,10 @@ impl Shared {
         };
         // 6. Nothing the crashed server owned runs; everything else does.
         Board::checked(6);
+        // (Programs the dead server's closed terminals hung up on take a moment to end.)
+        let ended = self.settle(|| running_in(&owned).is_empty()).await;
         let survivors = running_in(&owned);
-        if !survivors.is_empty() {
+        if !ended {
             self.violated(format!(
                 "6. the crashed server's sessions still run {survivors:?} after recovery"
             ));
@@ -768,6 +770,8 @@ impl Shared {
         }
         self.collect_exits();
         self.lock().stats.record();
+        let panes = Arc::clone(&self.lock().panes);
+        panes.shut_down();
         simulator::kill_all();
         self.lock().witnesses.clear();
         // 5. Let the panes' threads see their processes end before the run does.

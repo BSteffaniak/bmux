@@ -12,7 +12,10 @@
 //! or crashed while it starts.
 
 use bmux_session_models::SessionId;
-use switchy_thread::sync::{Arc, Mutex, atomic::Ordering};
+use switchy_thread::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 use tokio::sync::mpsc;
 
 use super::{
@@ -31,8 +34,20 @@ pub fn platform_conformance() -> Vec<(&'static str, Result<(), String>)> {
         .collect()
 }
 
-/// A pane runtime under simulation.
+/// A pane runtime under simulation: a server of its own, whose work runs on its own executor,
+/// as a server process's does. The run's executor drives it (a pump task runs one of its tasks
+/// per turn), so it shares the run's clock.
 pub struct Panes {
+    server: Arc<Server>,
+    /// The server's executor. Every operation runs there, so everything the pane runtime starts
+    /// (tasks, and the threads they start) belongs to the server and dies with it.
+    runtime: switchy_async::runtime::Runtime,
+    /// Ends the task that drives the executor.
+    stop: Arc<AtomicBool>,
+}
+
+/// What a server holds.
+struct Server {
     manager: Mutex<SessionRuntimeManager>,
     host: PaneRuntimeHost,
     exits: Mutex<mpsc::UnboundedReceiver<PaneExitEvent>>,
@@ -66,10 +81,93 @@ impl std::fmt::Debug for Panes {
     }
 }
 
+impl Drop for Panes {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> switchy_thread::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(switchy_thread::sync::PoisonError::into_inner)
+}
+
+impl Server {
+    fn with_pane<R>(&self, pane: Pane, f: impl FnOnce(&PaneRuntimeHandle) -> R) -> Option<R> {
+        let manager = lock(&self.manager);
+        manager
+            .runtimes
+            .get(&pane.0)
+            .and_then(|runtime| runtime.panes.values().next())
+            .map(f)
+    }
+
+    fn panes(&self) -> Vec<Pane> {
+        lock(&self.manager)
+            .runtimes
+            .keys()
+            .copied()
+            .map(Pane)
+            .collect()
+    }
+
+    async fn open(&self, rows: u16, cols: u16) -> anyhow::Result<Pane> {
+        let session_id = SessionId(crate::ids::new_uuid());
+        let prepared = lock(&self.manager).prepare_fresh_program_runtime(
+            session_id,
+            None,
+            None,
+            (rows, cols),
+        );
+        let mut prepared = prepared?;
+        prepared.wait_until_ready().await?;
+        lock(&self.manager).commit_fresh_runtime(session_id, &mut prepared, || Ok(()))?;
+        Ok(Pane(session_id))
+    }
+
+    async fn close(&self, pane: Pane) -> anyhow::Result<Closed> {
+        let (execution, removed) = {
+            let mut manager = lock(&self.manager);
+            let execution = Arc::clone(
+                &manager
+                    .runtimes
+                    .get(&pane.0)
+                    .and_then(|runtime| runtime.panes.values().next())
+                    .ok_or_else(|| anyhow::anyhow!("no pane {:?}", pane.0))?
+                    .execution,
+            );
+            (execution, manager.remove_runtime(pane.0)?)
+        };
+        shutdown_runtime_handle(&self.host, removed).await;
+        Ok(Closed {
+            drained: execution.output_drained.load(Ordering::SeqCst),
+            cleanup_error: execution.cleanup_error(),
+        })
+    }
+
+    async fn restart(&self, pane: Pane) -> anyhow::Result<Restarted> {
+        // The new program may reuse the old one's id: tell them apart by pane.
+        let restarted = lock(&self.manager).restart_pane(pane.0, None)?;
+        let deadline = switchy_time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let state = self.with_pane(pane, |handle| {
+                (handle.meta.id == restarted)
+                    .then(|| handle.process_id.lock().ok().and_then(|pid| *pid))
+                    .flatten()
+            });
+            match state {
+                None => return Ok(Restarted::Gone),
+                Some(Some(pid)) => return Ok(Restarted::Running(pid)),
+                Some(None) => {}
+            }
+            anyhow::ensure!(
+                switchy_time::Instant::now() < deadline,
+                "the restarted pane's program never started"
+            );
+            switchy_async::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
 }
 
 impl Panes {
@@ -104,128 +202,135 @@ impl Panes {
         if let Some(records) = records {
             host.sessions().install_records(records.to_path_buf());
         }
+        let runtime = switchy_async::runtime::Runtime::new();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (pumped, stopped) = (runtime.clone(), Arc::clone(&stop));
+        // On the current (the run's) executor, not the server's: it is the server's processor.
+        drop(switchy_async::task::spawn(async move {
+            while !stopped.load(Ordering::SeqCst) && !pumped.is_shut_down() {
+                pumped.tick();
+                switchy_async::task::yield_now().await;
+            }
+        }));
         Self {
-            manager: Mutex::new(manager),
-            host,
-            exits: Mutex::new(exits),
+            server: Arc::new(Server {
+                manager: Mutex::new(manager),
+                host,
+                exits: Mutex::new(exits),
+            }),
+            runtime,
+            stop,
         }
+    }
+
+    /// Stop the server's executor, once its panes are closed: as a server exits, it stops
+    /// running anything.
+    pub fn shut_down(&self) {
+        self.stop();
+    }
+
+    /// End the task that drives the server's executor.
+    fn stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+    }
+
+    /// Run `work` on the server's executor; `None` if the server died first.
+    async fn on_server<T: Send + Unpin + 'static>(
+        &self,
+        work: impl FnOnce(Arc<Server>) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>,
+    ) -> Option<T> {
+        self.runtime
+            .handle()
+            .spawn(work(Arc::clone(&self.server)))
+            .await
+            .ok()
     }
 
     /// Open a pane of `rows` by `cols`, once its program is ready.
     ///
     /// # Errors
     ///
-    /// * If the pane cannot be prepared, started or committed
+    /// * If the pane cannot be prepared, started or committed, or the server died first
     pub async fn open(&self, rows: u16, cols: u16) -> anyhow::Result<Pane> {
-        let session_id = SessionId(crate::ids::new_uuid());
-        let prepared = lock(&self.manager).prepare_fresh_program_runtime(
-            session_id,
-            None,
-            None,
-            (rows, cols),
-        );
-        let mut prepared = prepared?;
-        prepared.wait_until_ready().await?;
-        lock(&self.manager).commit_fresh_runtime(session_id, &mut prepared, || Ok(()))?;
-        Ok(Pane(session_id))
-    }
-
-    fn with_pane<R>(&self, pane: Pane, f: impl FnOnce(&PaneRuntimeHandle) -> R) -> Option<R> {
-        let manager = lock(&self.manager);
-        manager
-            .runtimes
-            .get(&pane.0)
-            .and_then(|runtime| runtime.panes.values().next())
-            .map(f)
+        self.on_server(move |server| Box::pin(async move { server.open(rows, cols).await }))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("the server died"))?
     }
 
     /// The panes open.
     #[must_use]
     pub fn panes(&self) -> Vec<Pane> {
-        lock(&self.manager)
-            .runtimes
-            .keys()
-            .copied()
-            .map(Pane)
-            .collect()
+        self.server.panes()
     }
 
     /// Type `bytes` into `pane`. Returns whether the pane took them.
     #[must_use]
     pub fn input(&self, pane: Pane, bytes: &[u8]) -> bool {
-        self.with_pane(pane, |handle| {
-            handle
-                .input_tx
-                .send(PaneRuntimeCommand::Input(bytes.to_vec()))
-                .is_ok()
-        })
-        .unwrap_or(false)
+        self.server
+            .with_pane(pane, |handle| {
+                handle
+                    .input_tx
+                    .send(PaneRuntimeCommand::Input(bytes.to_vec()))
+                    .is_ok()
+            })
+            .unwrap_or(false)
     }
 
     /// Resize `pane`'s terminal. Returns whether the pane exists.
     #[must_use]
     pub fn resize(&self, pane: Pane, rows: u16, cols: u16) -> bool {
-        self.with_pane(pane, |handle| handle.resize_pty(rows, cols))
+        self.server
+            .with_pane(pane, |handle| handle.resize_pty(rows, cols))
             .is_some()
     }
 
     /// The size last requested for `pane`.
     #[must_use]
     pub fn requested_size(&self, pane: Pane) -> Option<(u16, u16)> {
-        self.with_pane(pane, |handle| {
-            handle.last_requested_size.lock().ok().map(|size| *size)
-        })
-        .flatten()
+        self.server
+            .with_pane(pane, |handle| {
+                handle.last_requested_size.lock().ok().map(|size| *size)
+            })
+            .flatten()
     }
 
     /// The id of `pane`'s program, while known.
     #[must_use]
     pub fn pid(&self, pane: Pane) -> Option<u32> {
-        self.with_pane(pane, |handle| {
-            handle.process_id.lock().ok().and_then(|pid| *pid)
-        })
-        .flatten()
+        self.server
+            .with_pane(pane, |handle| {
+                handle.process_id.lock().ok().and_then(|pid| *pid)
+            })
+            .flatten()
     }
 
     /// Whether `pane`'s program exited.
     #[must_use]
     pub fn exited(&self, pane: Pane) -> bool {
-        self.with_pane(pane, |handle| handle.exited.load(Ordering::SeqCst))
+        self.server
+            .with_pane(pane, |handle| handle.exited.load(Ordering::SeqCst))
             .unwrap_or(false)
     }
 
     /// Bytes of output `pane` has taken in.
     #[must_use]
     pub fn output_bytes(&self, pane: Pane) -> u64 {
-        self.with_pane(pane, |handle| {
-            handle.execution.output_watermark.load(Ordering::SeqCst)
-        })
-        .unwrap_or(0)
+        self.server
+            .with_pane(pane, |handle| {
+                handle.execution.output_watermark.load(Ordering::SeqCst)
+            })
+            .unwrap_or(0)
     }
 
     /// Close `pane` and wait for its runtime to shut down.
     ///
     /// # Errors
     ///
-    /// * If there is no such pane
+    /// * If there is no such pane, or the server died first
     pub async fn close(&self, pane: Pane) -> anyhow::Result<Closed> {
-        let (execution, removed) = {
-            let mut manager = lock(&self.manager);
-            let execution = Arc::clone(
-                &manager
-                    .runtimes
-                    .get(&pane.0)
-                    .and_then(|runtime| runtime.panes.values().next())
-                    .ok_or_else(|| anyhow::anyhow!("no pane {:?}", pane.0))?
-                    .execution,
-            );
-            (execution, manager.remove_runtime(pane.0)?)
-        };
-        shutdown_runtime_handle(&self.host, removed).await;
-        Ok(Closed {
-            drained: execution.output_drained.load(Ordering::SeqCst),
-            cleanup_error: execution.cleanup_error(),
-        })
+        self.on_server(move |server| Box::pin(async move { server.close(pane).await }))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("the server died"))?
     }
 
     /// Restart `pane`: its program is shut down in the background and a fresh shell starts in
@@ -236,59 +341,32 @@ impl Panes {
     ///
     /// * If there is no such pane, or the new program never starts
     pub async fn restart(&self, pane: Pane) -> anyhow::Result<Restarted> {
-        // The new program may reuse the old one's id: tell them apart by pane.
-        let restarted = lock(&self.manager).restart_pane(pane.0, None)?;
-        let deadline = switchy_time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let state = self.with_pane(pane, |handle| {
-                (handle.meta.id == restarted)
-                    .then(|| handle.process_id.lock().ok().and_then(|pid| *pid))
-                    .flatten()
-            });
-            match state {
-                None => return Ok(Restarted::Gone),
-                Some(Some(pid)) => return Ok(Restarted::Running(pid)),
-                Some(None) => {}
-            }
-            anyhow::ensure!(
-                switchy_time::Instant::now() < deadline,
-                "the restarted pane's program never started"
-            );
-            switchy_async::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        self.on_server(move |server| Box::pin(async move { server.restart(pane).await }))
+            .await
+            .unwrap_or(Ok(Restarted::Gone))
     }
 
-    /// Stop inspecting and cleaning up sessions, as a dying server does: from now on nothing
-    /// this runtime still does (operations under way, handles dropped) ends a session.
-    pub fn abandon(&self) {
-        self.host.sessions().abandon();
-    }
-
-    /// Die: from now on the runtime stops, inspects and cleans up none of its sessions (the
-    /// operating system still closes its handles), then everything in it is torn down, leaving
-    /// the sessions' processes and records as a crash would.
-    pub async fn crash(&self) {
-        self.abandon();
-        // The operating system closes the dead server's terminals.
-        let terminals: Vec<String> = self
-            .panes()
-            .into_iter()
-            .filter_map(|pane| self.pid(pane))
-            .filter_map(|pid| switchy_pty::simulator::process_io(pid)?.terminal)
-            .collect();
-        switchy_pty::simulator::close_masters(&terminals);
-        for pane in self.panes() {
-            let _ = self.close(pane).await;
-        }
+    /// Die, as a killed server process does: from now on its sessions are neither stopped,
+    /// inspected nor cleaned up, and then every task and thread it has stops where it is. What
+    /// they held is dropped as the operating system closes a dead process's handles (a
+    /// terminal's master side hangs up; a Windows job ends its processes), and everything else
+    /// (processes, session records) is left as a crash leaves it.
+    pub fn crash(&self) {
+        self.server.host.sessions().abandon();
+        self.runtime.shutdown_now();
+        self.stop();
+        // What the dead server's manager still holds closes too.
+        let runtimes = lock(&self.server.manager).remove_all_runtimes();
+        drop(runtimes);
     }
 
     /// The panes whose exits the runtime acted on since last asked, one per notice (as its
     /// exit processing does, it drops notices about a program a restart replaced).
     pub fn take_exits(&self) -> Vec<Pane> {
-        let mut exits = lock(&self.exits);
+        let mut exits = lock(&self.server.exits);
         let mut panes = Vec::new();
         while let Ok(event) = exits.try_recv() {
-            if event.is_current(&lock(&self.manager)) {
+            if event.is_current(&lock(&self.server.manager)) {
                 panes.push(Pane(event.session_id));
             }
         }

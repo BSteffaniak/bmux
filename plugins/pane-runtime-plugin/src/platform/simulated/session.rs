@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use switchy_thread::sync::atomic::{AtomicBool, Ordering};
+use switchy_thread::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 use switchy_pty::{
@@ -24,28 +24,55 @@ use switchy_pty::{
 /// How long a sweep waits for killed members to exit, in simulated time.
 const SWEEP_BUDGET: Duration = Duration::from_secs(5);
 
-#[derive(Debug)]
-pub(crate) struct Preparation;
+/// Windows: the job the program is spawned into (by its session's serial, 0 before the
+/// spawn), from its creation, as the native backend's job handle is: dropping the preparation
+/// before [`Session::adopt`] takes the job over closes it, ending its processes.
+#[derive(Debug, Default)]
+pub(crate) struct Preparation {
+    job: AtomicU64,
+}
 
 #[expect(
     clippy::unnecessary_wraps,
     reason = "same signature as the Windows backend, which can fail"
 )]
 pub(crate) fn prepare() -> anyhow::Result<Preparation> {
-    Ok(Preparation)
+    Ok(Preparation::default())
 }
 
 impl Preparation {
-    #[expect(
-        clippy::unused_self,
-        reason = "the Windows preparation carries the job to spawn into"
-    )]
     pub(crate) fn spawn(
         &self,
         slave: &bmux_pty::PtySlave,
         command: &bmux_pty::SpawnCommand,
     ) -> std::io::Result<Box<dyn crate::runtime::pty::Child + Send + Sync>> {
-        Ok(Box::new(slave.spawn(command)?))
+        let child = slave.spawn(command)?;
+        if super::windows()
+            && let Some(serial) = simulator::snapshot()
+                .processes
+                .into_iter()
+                .find(|process| process.pid == child.id())
+                .map(|process| process.session_serial)
+        {
+            self.job.store(serial, Ordering::SeqCst);
+        }
+        Ok(Box::new(child))
+    }
+
+    /// The job, taken over (the preparation no longer closes it).
+    fn take_job(&self) -> Option<u64> {
+        Some(self.job.swap(0, Ordering::SeqCst)).filter(|job| *job != 0)
+    }
+}
+
+impl Drop for Preparation {
+    fn drop(&mut self) {
+        // The job's handle closes: kill-on-close ends what runs in it.
+        if let Some(job) = self.take_job() {
+            for pid in job_members(job) {
+                let _ = simulator::signal_process(pid, Signal::Kill);
+            }
+        }
     }
 }
 
@@ -155,7 +182,7 @@ fn sweep_job(serial: u64) -> std::io::Result<()> {
 
 impl Session {
     pub(crate) fn adopt(
-        _preparation: Preparation,
+        preparation: Preparation,
         leader: u32,
         _master: &bmux_pty::PtyMaster,
     ) -> anyhow::Result<Self> {
@@ -167,15 +194,7 @@ impl Session {
         Ok(Self {
             sid: leader,
             start: crate::platform::process_start_identity(leader),
-            job: super::windows()
-                .then(|| {
-                    simulator::snapshot()
-                        .processes
-                        .into_iter()
-                        .find(|process| process.pid == leader)
-                        .map(|process| process.session_serial)
-                })
-                .flatten(),
+            job: preparation.take_job(),
             kill_on_close: AtomicBool::new(true),
             released: AtomicBool::new(false),
         })
