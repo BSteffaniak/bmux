@@ -113,8 +113,9 @@ pub struct Node {
     store: Store,
     /// Issued durable operations, completed in order.
     pending: Vec<Effect>,
-    election: u64,
-    heartbeat: u64,
+    /// Armed timers, as the driver keeps them: firing consumes the timer.
+    election: Option<u64>,
+    heartbeat: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -241,8 +242,8 @@ impl Raft {
                     Effect::SetTimer {
                         kind, generation, ..
                     } => match kind {
-                        TimerKind::Election => state.nodes[index].election = generation,
-                        TimerKind::Heartbeat => state.nodes[index].heartbeat = generation,
+                        TimerKind::Election => state.nodes[index].election = Some(generation),
+                        TimerKind::Heartbeat => state.nodes[index].heartbeat = Some(generation),
                     },
                     Effect::Apply { through } => {
                         // Application is local and durable with its watermark.
@@ -405,6 +406,22 @@ fn commit_never_exceeds_log(_: &Raft, state: &State) -> bool {
     })
 }
 
+/// An initialized voter that is not leading always has an election deadline, or
+/// a lost leader could never be replaced.
+fn election_timer_armed(_: &Raft, state: &State) -> bool {
+    state.nodes.iter().all(|node| {
+        let engine = &node.engine;
+        let voter = engine.effective_membership().is_some_and(|stored| {
+            stored
+                .membership
+                .configurations()
+                .iter()
+                .any(|voters| voters.contains(&engine.id()))
+        });
+        engine.is_leader() || !voter || node.election.is_some()
+    })
+}
+
 const fn never_stopped(_: &Raft, state: &State) -> bool {
     !state.stopped
 }
@@ -453,8 +470,8 @@ impl Model for Raft {
                 engine,
                 store: store.clone(),
                 pending: Vec::new(),
-                election: 1,
-                heartbeat: 0,
+                election: Some(1),
+                heartbeat: None,
             });
         }
         Self::observe(&mut state);
@@ -485,7 +502,7 @@ impl Model for Raft {
                 actions.push(Action::Persist(index));
             }
             if node.engine.is_leader() {
-                if state.heartbeats < self.bounds.heartbeats {
+                if state.heartbeats < self.bounds.heartbeats && node.heartbeat.is_some() {
                     actions.push(Action::Heartbeat(index));
                 }
                 if state.proposals < self.bounds.proposals {
@@ -494,7 +511,11 @@ impl Model for Raft {
                 if self.bounds.membership_change && !state.changed {
                     actions.push(Action::ChangeMembership(index));
                 }
-            } else if node.engine.term().0 < self.bounds.max_term {
+            }
+            // Leaders ignore a stale election timer, but it is still consumed.
+            if node.election.is_some()
+                && (node.engine.is_leader() || node.engine.term().0 < self.bounds.max_term)
+            {
                 actions.push(Action::Election(index));
             }
             if state.crashes < self.bounds.crashes {
@@ -528,7 +549,7 @@ impl Model for Raft {
             }
             Action::Persist(index) => Self::persist(&mut next, index),
             Action::Election(index) => {
-                let generation = next.nodes[index].election;
+                let generation = next.nodes[index].election.take()?;
                 Self::step(
                     &mut next,
                     index,
@@ -540,7 +561,7 @@ impl Model for Raft {
             }
             Action::Heartbeat(index) => {
                 next.heartbeats += 1;
-                let generation = next.nodes[index].heartbeat;
+                let generation = next.nodes[index].heartbeat.take()?;
                 Self::step(
                     &mut next,
                     index,
@@ -580,8 +601,8 @@ impl Model for Raft {
                 let (engine, _) = Self::recover(index, &node.store);
                 node.engine = engine;
                 node.pending.clear();
-                node.election = 1;
-                node.heartbeat = 0;
+                node.election = Some(1);
+                node.heartbeat = None;
                 Self::observe(&mut next);
             }
         }
@@ -596,6 +617,10 @@ impl Model for Raft {
             .always("leader completeness", leader_completeness)
             .always("commit and apply within the log", commit_never_exceeds_log)
             .always("no node stops", never_stopped)
+            .always(
+                "non-leader voters keep an election deadline",
+                election_timer_armed,
+            )
             .sometimes("a proposal commits", proposal_committed);
         if self.bounds.membership_change {
             properties.sometimes("a learner is promoted", membership_changed);

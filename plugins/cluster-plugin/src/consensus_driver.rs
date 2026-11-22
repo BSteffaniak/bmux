@@ -97,6 +97,8 @@ pub struct Status {
     pub applied: Option<LogIdentity>,
     /// Voters in the committed uniform configuration; zero while joint or absent.
     pub committed_voters: usize,
+    pub last_log: Option<LogIdentity>,
+    pub voted_for: Option<NodeId>,
 }
 
 fn status(engine: &Engine) -> Status {
@@ -111,6 +113,8 @@ fn status(engine: &Engine) -> Status {
                 _ => 0,
             }
         }),
+        last_log: engine.last_log(),
+        voted_for: engine.hard_state().voted_for,
     }
 }
 

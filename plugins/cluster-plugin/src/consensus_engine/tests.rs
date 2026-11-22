@@ -641,3 +641,33 @@ fn heartbeat_is_sent_even_when_the_pipeline_is_full() {
         .count();
     assert!(to_two >= 1, "{effects:?}");
 }
+
+#[test]
+fn deposed_leader_rearms_its_election_deadline() {
+    let mut cluster = Cluster::new(&[1, 2, 3], &[]);
+    cluster.elect(1);
+    // A vote request with a higher term deposes the leader without a grant
+    // (the candidate's log is stale), and the deposed leader must be able to
+    // campaign again.
+    let effects = cluster.input(
+        1,
+        Input::Message {
+            from: node(3),
+            message: Message::Vote {
+                term: Term(9),
+                last_log: None,
+            },
+        },
+    );
+    assert!(!cluster.engine(1).is_leader());
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SetTimer {
+                kind: TimerKind::Election,
+                ..
+            }
+        )),
+        "{effects:?}"
+    );
+}

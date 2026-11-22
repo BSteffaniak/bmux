@@ -1016,12 +1016,18 @@ impl Engine {
             Role::Follower { leader: current } => *current != leader,
             _ => true,
         };
+        let was_leader = matches!(self.role, Role::Leader(_));
         if let Role::Leader(state) = &mut self.role {
             for read in state.reads.drain(..) {
                 effects.push(Effect::ReadFailed { token: read.token });
             }
         }
         self.role = Role::Follower { leader };
+        if was_leader {
+            // A leader keeps no election deadline; without a fresh one a deposed
+            // leader with the freshest log could never campaign again.
+            self.reset_election_timer(effects);
+        }
         if changed {
             effects.push(Effect::Leadership {
                 term: self.hard_state.term,
