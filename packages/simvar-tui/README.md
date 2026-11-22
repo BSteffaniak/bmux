@@ -1,27 +1,71 @@
 # bmux_simvar_tui
 
-A terminal interface for watching and replaying
+The simulation dashboard for
 [simvar](https://github.com/MoosicBox/MoosicBox/tree/master/packages/simvar)
-simulations, built on bmux's TUI crates. Register its observer with simvar and
-run the dashboard:
+simulations, built on bmux's TUI crates. It runs a fleet of simulations
+continuously and travels in time through any one run. Run it through a
+simulation: `cargo sim pane-runtime --tui`.
 
-- **Runs**: every run's seed, progress and result, with each failure's report
-  and replay command.
-- **Scheduler**: the selected run's simulated threads (state, what each is
-  blocked on), latest scheduling decisions and decision rate, from
-  `SchedulerView` telemetry, and each invariant's status from `Invariants`
-  telemetry.
-- **Panels** a simulation adds through `SimPanel`, for its own telemetry
-  (the bmux_pty simulator adds its processes and terminals).
+## Fleet
 
-With a `ReplayControl`, space pauses and resumes a run at scheduling decisions,
-`n` steps one decision and `N` a hundred, and `b` and `B` go back one and a
-hundred. `:` opens a command line: `goto N`, `back N`, `break decision N`,
-`break step N`, `break block THREAD [ON]`, `break fail` and `clear`. Going back
-ends the dashboard with `Exit::Seek`; `seek` then reruns the program as that
-run's seed, paused at the decision (`replay_control` reads where to pause from
-`SIMVAR_TUI_PAUSE_AT`). Pausing stops only real time, so the run is the same
-either way.
+- **Workers**: each worker's latest outcomes as a strip (green passed, red
+  failed), its run count, and the run it is making. Click one (or pick it with
+  `↑↓` and press `enter`) to open its run.
+- **Throughput**: runs per second, scheduling decisions per second, and how
+  much faster than real time the runs go.
+- **Outcomes**: passed and failed, split by the shapes runs report (each
+  personality, for example). Click one to show only those runs.
+- **Coverage**: distinct thread schedules among finished runs, and how many
+  runs showed each shape (`crash`, `restart`, …).
+- **Invariants exercised**: how often the fleet checked each invariant;
+  rarely or never checked ones are flagged.
+- **Failures**: kept, not fatal. They are grouped by what failed, then
+  confirmed by a replay (`↺✓`, or `↺✗` when a replay passes, which means
+  nondeterminism), shrunk in the background (`⇲`), announced in a toast, and
+  saved under `target/sim-findings/<simulation>/`, which outlives the session.
+  The Failures tab shows each group with its report, its replay command, and
+  buttons to open, reproduce and shrink it.
+
+`p` pauses or resumes the fleet, and `+`/`-` change how many runs go at once.
+
+## A run
+
+A run's tab shows the run, live or replayed:
+
+- **Timeline**: one lane per simulated thread, darker where it ran more, with
+  the simulation's events (opens, crashes, failures, …) below. Click or drag
+  on it to go to a decision, click an event to jump there, and click a lane to
+  open that thread.
+- **Transport**: start, previous event, -100, -1, play/pause, +1, +100, next
+  event, end, and a scrubber over the whole run. Keys: `space`, `←→` (`⇧` for
+  a hundred), `[ ]`, `home`/`end`.
+- **Pages**: Overview, Threads (each thread's state and the decisions it was
+  in), Invariants, Decisions, then the simulation's own views (`SimView`):
+  lists of entities that show a card when pointed at and open a full page when
+  clicked again (the kernel's processes and terminals, the pane runtime's
+  panes).
+
+Going back in time replays the run's seed in the simulation's process. A few
+replays are kept parked at keyframes along the run, so going anywhere costs
+at most one keyframe's worth of decisions (`timetravel`). The fleet keeps
+running meanwhile. Breakpoints: `b` (the next decision), or commands such as
+`break 1200`, `break fail` and `break crash` (pause at that kind of event).
+
+## Everywhere
+
+Everything responds to the pointer: click, hover for a card, and scroll the
+list under the pointer. `:` or `ctrl+k` opens a fuzzy command palette
+(`goto N`, `back N`, `parallel N`, …), `esc` goes back, `t` switches between
+dark and light, and `?` shows every key.
+
+## Embedding
+
+A simulation registers `observer()` with simvar, emits `telemetry` (`Pulse`,
+`RunIndex`, `Invariants`, `Shape`, its own data for its `SimView`s), implements
+`Controller` over simvar's fleet control, and runs `Dashboard::new(options,
+events).run()`; `sim_support` in bmux's `simulation/` workspace does all of
+this. The `store` and `report` modules are the same model without the
+dashboard, for headless runs (`cargo sim NAME --fleet`).
 
 It depends on `simvar_observer` and bmux's TUI crates only, never on simvar or
 switchy, so it cannot enable simulator features in bmux's workspace.
