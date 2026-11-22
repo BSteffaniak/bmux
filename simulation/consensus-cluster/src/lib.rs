@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bmux_cluster_plugin::consensus_driver::{
-    ClientError, Driver, DriverConfig, Jitter, Reply, Storage, Transport,
+    ClientError, Driver, DriverConfig, Jitter, Reply, SnapshotObject, Storage, Transport,
 };
 use bmux_cluster_plugin::consensus_engine::{Config, Engine, Message, NodeId, Rejection, Write};
 use bmux_cluster_plugin::consensus_model::{LogIdentity, Membership, StoredMembership, Term};
@@ -63,14 +63,32 @@ struct World {
     /// Per run, so parallel runs never contend through process-wide state.
     preflight: bmux_cluster_plugin::owned_vote_store::PreflightAdmission,
     drivers: BTreeMap<usize, Arc<Driver<ControlState>>>,
+    /// Snapshot bytes staged on each node, by sender and boundary index. Staging
+    /// is disposable: a crash clears the node's entries.
+    staged: BTreeMap<usize, BTreeMap<(NodeId, u64), Vec<u8>>>,
     proposed: BTreeSet<uuid::Uuid>,
     acknowledged: BTreeSet<uuid::Uuid>,
     /// The membership has all three voters; faults may begin.
     formed: bool,
     /// The nemesis healed everything; the workload stops proposing.
     quiet: bool,
+    /// The workload stopped and has no proposal in flight.
+    workload_done: bool,
     violations: Vec<String>,
     faults: usize,
+    /// A voter the nemesis removed from the configuration, if any.
+    removed: Option<usize>,
+    membership_changes: usize,
+    snapshot_installs: usize,
+    /// Debug history (`SIM_DEBUG`): faults, membership changes and acknowledgements.
+    events: Vec<String>,
+}
+
+fn event(world: &Shared, text: impl std::fmt::Display) {
+    if std::env::var("SIM_DEBUG").is_ok() {
+        let now = switchy_async::time::Instant::now();
+        lock(world).events.push(format!("{now:?} {text}"));
+    }
 }
 
 type Shared = Arc<Mutex<World>>;
@@ -83,14 +101,72 @@ fn lock(world: &Shared) -> std::sync::MutexGuard<'_, World> {
 struct Scoped {
     filesystem: Arc<Filesystem>,
     inner: OwnedStorage,
+    index: usize,
+}
+
+fn trace(index: usize, text: impl FnOnce() -> String) {
+    if std::env::var("SIM_TRACE").is_ok() {
+        eprintln!("store n{} {}", index + 1, text());
+    }
+}
+
+impl Scoped {
+    fn state_summary(&mut self) -> String {
+        if std::env::var("SIM_SUMMARY").is_err() {
+            return String::new();
+        }
+        let filesystem = self.filesystem.clone();
+        with_filesystem(&filesystem, || self.inner.read())
+            .map(|state| format!(" [rev={} ws={}]", state.revision, state.workspaces.len()))
+            .unwrap_or_default()
+    }
 }
 
 impl Storage for Scoped {
     type View = ControlState;
 
     fn write(&mut self, write: &Write) -> io::Result<()> {
+        trace(self.index, || {
+            format!(
+                "write hs={:?} truncate={:?} entries={:?} commit={:?}",
+                write.hard_state.map(|h| h.term.0),
+                write.truncate_from.map(|t| t.0),
+                write
+                    .entries
+                    .iter()
+                    .map(|e| {
+                        let what = match &e.payload {
+                            bmux_cluster_plugin::consensus_model::EntryPayload::Application(
+                                bytes,
+                            ) => bmux_cluster_plugin::control_codec::decode_control_command(bytes)
+                                .map_or_else(
+                                    |_| "?".into(),
+                                    |c| format!("{:x}", c.command_id.value.as_u128()),
+                                ),
+                            bmux_cluster_plugin::consensus_model::EntryPayload::NoOp => {
+                                "noop".into()
+                            }
+                            bmux_cluster_plugin::consensus_model::EntryPayload::Membership(m) => {
+                                format!(
+                                    "cfg{:?}",
+                                    m.configurations()
+                                        .iter()
+                                        .map(BTreeSet::len)
+                                        .collect::<Vec<_>>()
+                                )
+                            }
+                        };
+                        (e.identity.term.0, e.identity.index.0, what)
+                    })
+                    .collect::<Vec<_>>(),
+                write.commit.map(|c| (c.term.0, c.index.0))
+            )
+        });
         let filesystem = self.filesystem.clone();
-        with_filesystem(&filesystem, || self.inner.write(write))
+        let result = with_filesystem(&filesystem, || self.inner.write(write));
+        let summary = self.state_summary();
+        trace(self.index, || format!("  after write{summary}"));
+        result
     }
 
     fn install_snapshot(
@@ -99,6 +175,12 @@ impl Storage for Scoped {
         last_included: LogIdentity,
         membership: &StoredMembership,
     ) -> io::Result<()> {
+        trace(self.index, || {
+            format!(
+                "install {:?}",
+                (last_included.term.0, last_included.index.0)
+            )
+        });
         let filesystem = self.filesystem.clone();
         with_filesystem(&filesystem, || {
             self.inner.install_snapshot(from, last_included, membership)
@@ -107,17 +189,52 @@ impl Storage for Scoped {
 
     fn apply(&mut self, through: LogIdentity) -> io::Result<Vec<(LogIdentity, Vec<u8>)>> {
         let filesystem = self.filesystem.clone();
-        with_filesystem(&filesystem, || self.inner.apply(through))
+        let result = with_filesystem(&filesystem, || self.inner.apply(through));
+        let summary = self.state_summary();
+        trace(self.index, || format!("  after apply{summary}"));
+        trace(self.index, || {
+            format!(
+                "apply through={:?} outcomes={:?}",
+                (through.term.0, through.index.0),
+                result
+                    .as_ref()
+                    .map(|o| o.iter().map(|(i, _)| i.index.0).collect::<Vec<_>>())
+            )
+        });
+        result
     }
 
     fn compact(&mut self) -> io::Result<Option<(LogIdentity, StoredMembership)>> {
         let filesystem = self.filesystem.clone();
-        with_filesystem(&filesystem, || self.inner.compact())
+        let result = with_filesystem(&filesystem, || self.inner.compact());
+        let summary = self.state_summary();
+        trace(self.index, || format!("  after compact{summary}"));
+        trace(self.index, || {
+            format!(
+                "compact {:?}",
+                result.as_ref().map(|r| r.as_ref().map(|(b, _)| b.index.0))
+            )
+        });
+        result
+    }
+
+    fn snapshot(&mut self) -> io::Result<Option<SnapshotObject>> {
+        let filesystem = self.filesystem.clone();
+        with_filesystem(&filesystem, || self.inner.snapshot())
     }
 
     fn read(&mut self) -> io::Result<ControlState> {
         let filesystem = self.filesystem.clone();
-        with_filesystem(&filesystem, || self.inner.read())
+        let result = with_filesystem(&filesystem, || self.inner.read());
+        trace(self.index, || {
+            format!(
+                "read {:?}",
+                result
+                    .as_ref()
+                    .map(|state| (state.revision, state.workspaces.len()))
+            )
+        });
+        result
     }
 
     fn close(self) -> io::Result<()> {
@@ -157,9 +274,56 @@ impl Transport for SimTransport {
         })
     }
 
-    fn send_snapshot(&self, _: NodeId, _: Term, _: u64) -> Reply {
-        // Snapshot transfer is exercised once compaction is enabled here.
-        Box::pin(async { None })
+    fn send_snapshot(&self, to: NodeId, term: Term, seq: u64, snapshot: SnapshotObject) -> Reply {
+        let local = self.local;
+        let world = self.world.clone();
+        Box::pin(async move {
+            let count = lock(&world).nodes;
+            let target = index_of(to, count)?;
+            let (from, peer) = (name(local), name(target));
+            let (from, peer) = (from.as_str(), peer.as_str());
+            if !network::can_reach(from, peer) || dropped(from, peer) {
+                return None;
+            }
+            // Staging the object costs one transfer's latency before the install.
+            sleep(network::sample_latency(from, peer)).await;
+            let driver = {
+                let mut world = lock(&world);
+                world.staged.entry(target).or_default().insert(
+                    (node_id(local), snapshot.last_included.index.0),
+                    snapshot.bytes,
+                );
+                world.drivers.get(&target).cloned()?
+            };
+            let reply = timeout(
+                REQUEST_TIMEOUT,
+                driver.request(
+                    node_id(local),
+                    Message::Snapshot {
+                        term,
+                        seq,
+                        last_included: snapshot.last_included,
+                        membership: snapshot.membership,
+                    },
+                ),
+            )
+            .await
+            .ok()??;
+            if !network::can_reach(peer, from) || dropped(peer, from) {
+                return None;
+            }
+            sleep(network::sample_latency(peer, from)).await;
+            if matches!(
+                reply,
+                Message::SnapshotReply {
+                    installed: Some(_),
+                    ..
+                }
+            ) {
+                lock(&world).snapshot_installs += 1;
+            }
+            Some(reply)
+        })
     }
 }
 
@@ -203,11 +367,19 @@ fn start(index: usize, world: &Shared) -> io::Result<Driver<ControlState>> {
     let (engine, effects) = Engine::recover(node_id(index), Config::default(), recovered)
         .map_err(|error| io::Error::other(format!("{error:?}")))?;
     let storage = Scoped {
+        index,
         filesystem,
-        inner: OwnedStorage::new(
-            store,
-            Box::new(|_, _| Err(io::Error::other("snapshot transfer not exercised"))),
-        ),
+        inner: OwnedStorage::new(store, {
+            let world = world.clone();
+            Box::new(move |from, boundary| {
+                lock(&world)
+                    .staged
+                    .get(&index)
+                    .and_then(|staged| staged.get(&(from, boundary.index.0)))
+                    .cloned()
+                    .ok_or_else(|| io::Error::other("no staged snapshot"))
+            })
+        }),
     };
     Ok(Driver::start(
         engine,
@@ -219,9 +391,8 @@ fn start(index: usize, world: &Shared) -> io::Result<Driver<ControlState>> {
         }),
         jitter(),
         DriverConfig {
-            // Compaction would require snapshot transfer to followers; keep it off
-            // until the simulated transport stages snapshots.
-            compaction_interval: u64::MAX,
+            // Compact often so lagging followers regularly catch up by snapshot.
+            compaction_interval: 16,
         },
     ))
 }
@@ -262,35 +433,76 @@ fn records(count: usize) -> Vec<(NodeId, String)> {
 }
 
 /// Apply a membership change on whichever node currently leads, retrying.
-async fn change(world: &Shared, voters: &[usize]) {
+/// Propose a membership change on whichever node leads, for up to `rounds` rounds.
+async fn try_change(world: &Shared, voters: &[usize], rounds: usize) -> bool {
     let target = Membership::new(
         vec![voters.iter().map(|index| node_id(*index)).collect()],
         records(lock(world).nodes),
     )
     .expect("valid simulated membership");
-    loop {
+    for _ in 0..rounds {
         for (_, driver) in drivers(world) {
             if let Ok(Ok(_)) =
                 timeout(REQUEST_TIMEOUT, driver.change_membership(target.clone())).await
             {
-                return;
+                return true;
             }
         }
         sleep(Duration::from_millis(50)).await;
     }
+    false
 }
 
-/// Wait until a leader reports the uniform configuration with `count` voters committed.
-async fn wait_voters(world: &Shared, count: usize) {
+fn voters_without(world: &Shared, removed: Option<usize>) -> Vec<usize> {
+    (0..lock(world).nodes)
+        .filter(|index| Some(*index) != removed)
+        .collect()
+}
+
+/// A leader's status once it has nothing uncommitted, so its committed
+/// configuration is final rather than about to be replaced by an in-flight change.
+fn settled_leader(world: &Shared) -> Option<bmux_cluster_plugin::consensus_driver::Status> {
+    drivers(world)
+        .iter()
+        .map(|(index, driver)| (*index, driver.status()))
+        .find(|(index, status)| {
+            status.leader == Some(node_id(*index)) && status.commit == status.last_log
+        })
+        .map(|(_, status)| status)
+}
+
+/// Whether a settled leader reports this committed uniform configuration shape.
+fn committed(world: &Shared, voters: usize, members: usize) -> bool {
+    settled_leader(world).is_some_and(|status| {
+        status.committed_voters == voters && status.committed_members == members
+    })
+}
+
+/// Drive the configuration to `voters` with every node recorded, retrying until it
+/// commits: a proposal is indeterminate until then (a leader change can drop it).
+/// Missing voters first join as learners, then are promoted through joint consensus.
+async fn ensure_membership(world: &Shared, voters: &[usize]) {
+    let count = lock(world).nodes;
+    // Learner records for every node, keeping only committed voters that stay.
     loop {
-        let formed = drivers(world).iter().any(|(index, driver)| {
-            let status = driver.status();
-            status.leader == Some(node_id(*index)) && status.committed_voters == count
-        });
-        if formed {
-            return;
+        if let Some(status) = settled_leader(world) {
+            if status.committed_members == count {
+                break;
+            }
+            let present = (0..count)
+                .filter(|index| {
+                    voters.contains(index) && status.committed_voter_ids.contains(&node_id(*index))
+                })
+                .collect::<Vec<_>>();
+            if !present.is_empty() {
+                try_change(world, &present, 1).await;
+            }
         }
-        sleep(Duration::from_millis(50)).await;
+        sleep(Duration::from_millis(100)).await;
+    }
+    while !committed(world, voters.len(), count) {
+        try_change(world, voters, 1).await;
+        sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -298,9 +510,20 @@ async fn wait_voters(world: &Shared, count: usize) {
 async fn workload(world: Shared) -> simvar::client::ClientResult {
     // Learner records first, then promotion through joint consensus.
     let count = lock(&world).nodes;
-    change(&world, &[0]).await;
-    change(&world, &(0..count).collect::<Vec<_>>()).await;
-    wait_voters(&world, count).await;
+    let all = (0..count).collect::<Vec<_>>();
+    let formation = ensure_membership(&world, &all);
+    if timeout(Duration::from_secs(300), formation).await.is_err() {
+        let statuses = describe(&world);
+        lock(&world)
+            .violations
+            .push(format!("cluster never formed: {statuses}"));
+        let mut world = lock(&world);
+        world.formed = true;
+        world.quiet = true;
+        world.workload_done = true;
+        drop(world);
+        return Ok(());
+    }
     lock(&world).formed = true;
     let mut next = 0u128;
     while !lock(&world).quiet {
@@ -308,9 +531,23 @@ async fn workload(world: Shared) -> simvar::client::ClientResult {
         let id = uuid::Uuid::from_u128(next);
         lock(&world).proposed.insert(id);
         let mut outcome = None;
-        for (_, driver) in drivers(&world) {
+        for (index, driver) in drivers(&world) {
             match timeout(REQUEST_TIMEOUT, driver.propose(command(id))).await {
-                Ok(Ok(_)) => {
+                Ok(Ok(response)) => {
+                    let status = driver.status();
+                    let result =
+                        bmux_cluster_plugin::control_codec::decode_control_response(&response)
+                            .map(|response| format!("{:?}", response.result));
+                    event(
+                        &world,
+                        format!(
+                            "ack {id} result={result:?} by n{} term={:?} commit={:?} voters={:?}",
+                            index + 1,
+                            status.term.0,
+                            status.commit.map(|c| (c.term.0, c.index.0)),
+                            status.committed_voter_ids.len()
+                        ),
+                    );
                     outcome = Some(true);
                     break;
                 }
@@ -330,6 +567,7 @@ async fn workload(world: Shared) -> simvar::client::ClientResult {
         }
         sleep(Duration::from_millis(rng().gen_range(5..50))).await;
     }
+    lock(&world).workload_done = true;
     Ok(())
 }
 
@@ -370,7 +608,9 @@ async fn nemesis(world: Shared) -> simvar::client::ClientResult {
             .filter(|other| *other != victim)
             .collect();
         let victim = victim.as_str();
-        match rng().gen_range(0..6) {
+        let action = rng().gen_range(0..7);
+        event(&world, format!("fault {action} victim={victim}"));
+        match action {
             0 => network::partition([victim], &others),
             1 => network::partition_one_way(&others, [victim]),
             2 => network::isolate(victim),
@@ -380,6 +620,21 @@ async fn nemesis(world: Shared) -> simvar::client::ClientResult {
                     .with_loss(0.2),
             ),
             4 => fault::bounce_after(victim, Duration::from_millis(rng().gen_range(0..1000))),
+            5 => {
+                // Remove a voter through joint consensus, under whatever faults
+                // are active. Best effort: without a leader it is skipped.
+                let removed = lock(&world).removed;
+                if removed.is_none() {
+                    let candidate = rng().gen_range(0..count);
+                    event(&world, format!("remove n{} proposed?", candidate + 1));
+                    if try_change(&world, &voters_without(&world, Some(candidate)), 3).await {
+                        event(&world, format!("remove n{} accepted", candidate + 1));
+                        let mut world = lock(&world);
+                        world.removed = Some(candidate);
+                        world.membership_changes += 1;
+                    }
+                }
+            }
             _ => {
                 network::heal();
                 network::set_default_policy(reliable);
@@ -390,15 +645,79 @@ async fn nemesis(world: Shared) -> simvar::client::ClientResult {
     network::set_default_policy(reliable);
     lock(&world).quiet = true;
     let count = lock(&world).nodes;
-    while (0..count)
-        .any(|index| fault::host_status(&name(index)) != Some(fault::HostStatus::Running))
-    {
-        sleep(Duration::from_millis(50)).await;
+    // Restore full membership: the removed node rejoins as a learner, then is
+    // promoted, before convergence is checked.
+    // Take the value first: a guard in the `if let` scrutinee would be held
+    // for the whole body, and the body locks the world again.
+    let removed = lock(&world).removed.take();
+    if let Some(removed) = removed {
+        let all = voters_without(&world, None);
+        let restore = ensure_membership(&world, &all);
+        // A healed cluster must finish the transition; never pass by running out the clock.
+        if timeout(Duration::from_secs(120), restore).await.is_err() {
+            let statuses = describe(&world);
+            lock(&world).violations.push(format!(
+                "membership restoration of n{} did not complete: {statuses}",
+                removed + 1
+            ));
+            return finish(&world);
+        }
+        lock(&world).membership_changes += 1;
+    }
+    // In-flight proposals can still commit; let the workload finish first.
+    let settled = async {
+        while !lock(&world).workload_done {
+            sleep(Duration::from_millis(50)).await;
+        }
+    };
+    if timeout(Duration::from_secs(60), settled).await.is_err() {
+        lock(&world)
+            .violations
+            .push("workload did not stop after healing".into());
+        return finish(&world);
+    }
+    let running = async {
+        while (0..count)
+            .any(|index| fault::host_status(&name(index)) != Some(fault::HostStatus::Running))
+        {
+            sleep(Duration::from_millis(50)).await;
+        }
+    };
+    if timeout(Duration::from_secs(60), running).await.is_err() {
+        lock(&world)
+            .violations
+            .push("hosts did not restart after healing".into());
+        return finish(&world);
     }
     converge(&world).await
 }
 
-async fn converge(world: &Shared) -> simvar::client::ClientResult {
+fn describe(world: &Shared) -> String {
+    let world = lock(world);
+    world
+        .drivers
+        .iter()
+        .map(|(index, driver)| format!("n{}={:?}", index + 1, driver.status()))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// End the run, failing it if any violation was recorded.
+fn finish(world: &Shared) -> simvar::client::ClientResult {
+    let violations = std::mem::take(&mut lock(world).violations);
+    simvar::utils::cancel_simulation();
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(boxed(violations.join("\n")))
+    }
+}
+
+type NodeWrites = Vec<(usize, BTreeSet<uuid::Uuid>)>;
+
+/// Every node's applied writes, read while the cluster is quiescent; empty if it
+/// never settled.
+async fn read_quiescent(world: &Shared) -> NodeWrites {
     let mut states = Vec::new();
     for _ in 0..600 {
         sleep(Duration::from_millis(100)).await;
@@ -407,17 +726,23 @@ async fn converge(world: &Shared) -> simvar::client::ClientResult {
         if all.len() < lock(world).nodes {
             continue;
         }
-        let leader_commit = all
+        // Read only a quiescent cluster: the leader has nothing uncommitted and
+        // every node applied exactly that point; re-check after reading.
+        let leader = all
             .iter()
             .find(|(index, driver)| driver.status().leader == Some(node_id(*index)))
-            .and_then(|(_, driver)| driver.status().commit);
-        let Some(target) = leader_commit else {
+            .map(|(_, driver)| driver.status());
+        let Some(target) = leader
+            .filter(|status| status.commit.is_some() && status.commit == status.last_log)
+            .and_then(|status| status.commit)
+        else {
             continue;
         };
-        if all
-            .iter()
-            .any(|(_, driver)| driver.status().applied.map(|a| a.index) != Some(target.index))
-        {
+        let settled = |all: &[(usize, Arc<Driver<ControlState>>)]| {
+            all.iter()
+                .all(|(_, driver)| driver.status().applied == Some(target))
+        };
+        if !settled(&all) {
             continue;
         }
         states.clear();
@@ -430,13 +755,36 @@ async fn converge(world: &Shared) -> simvar::client::ClientResult {
                 state.workspaces.keys().copied().collect::<BTreeSet<_>>(),
             ));
         }
-        if states.len() == lock(world).nodes {
+        if states.len() == lock(world).nodes && settled(&all) {
             break;
         }
+        states.clear();
     }
+    states
+}
+
+async fn converge(world: &Shared) -> simvar::client::ClientResult {
+    let states = read_quiescent(world).await;
     let mut world = lock(world);
     if states.len() == world.nodes {
         let reference = states[0].1.clone();
+        if std::env::var("SIM_DEBUG").is_ok() {
+            for (index, workspaces) in &states {
+                let only = workspaces.difference(&reference).collect::<Vec<_>>();
+                let missing = reference.difference(workspaces).collect::<Vec<_>>();
+                let node_status = world.drivers.get(index).map(|driver| driver.status());
+                eprintln!(
+                    "n{} writes={} extra={only:?} missing={missing:?} status={node_status:?}",
+                    index + 1,
+                    workspaces.len()
+                );
+            }
+        }
+        if std::env::var("SIM_DEBUG").is_ok() {
+            for line in &world.events {
+                eprintln!("event {line}");
+            }
+        }
         for (index, workspaces) in &states {
             if *workspaces != reference {
                 world
@@ -473,8 +821,10 @@ async fn converge(world: &Shared) -> simvar::client::ClientResult {
     let violations = std::mem::take(&mut world.violations);
     let acknowledged = world.acknowledged.len();
     println!(
-        "faults={} proposed={} acknowledged={} converged_writes={}",
+        "faults={} membership_changes={} snapshot_installs={} proposed={} acknowledged={} converged_writes={}",
         world.faults,
+        world.membership_changes,
+        world.snapshot_installs,
         world.proposed.len(),
         acknowledged,
         states.first().map_or(0, |(_, workspaces)| workspaces.len()),
@@ -519,7 +869,12 @@ impl SimBootstrap for ClusterBootstrap {
             let crash_world = world.clone();
             sim.on_crash(name(index), move |_| {
                 let mut world = lock(&crash_world);
+                if std::env::var("SIM_DEBUG").is_ok() {
+                    let now = switchy_async::time::Instant::now();
+                    world.events.push(format!("{now:?} crash n{}", index + 1));
+                }
                 world.drivers.remove(&index);
+                world.staged.remove(&index);
                 world.filesystems[index].crash(&CrashPolicy::power_loss());
             });
         }

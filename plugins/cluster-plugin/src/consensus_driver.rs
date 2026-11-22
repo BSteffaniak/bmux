@@ -105,7 +105,7 @@ pub enum ClientError {
     Storage(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
     pub term: Term,
     pub leader: Option<NodeId>,
@@ -113,6 +113,10 @@ pub struct Status {
     pub applied: Option<LogIdentity>,
     /// Voters in the committed uniform configuration; zero while joint or absent.
     pub committed_voters: usize,
+    /// Node records (voters and learners) in the committed uniform configuration.
+    pub committed_members: usize,
+    /// Voters of the committed uniform configuration; empty while joint or absent.
+    pub committed_voter_ids: Vec<NodeId>,
     pub last_log: Option<LogIdentity>,
     pub voted_for: Option<NodeId>,
 }
@@ -129,6 +133,21 @@ fn status(engine: &Engine) -> Status {
                 _ => 0,
             }
         }),
+        committed_members: engine.committed_membership().map_or(0, |stored| {
+            if stored.membership.configurations().len() == 1 {
+                stored.membership.nodes().len()
+            } else {
+                0
+            }
+        }),
+        committed_voter_ids: engine
+            .committed_membership()
+            .map_or_else(Vec::new, |stored| {
+                match stored.membership.configurations() {
+                    [voters] => voters.iter().copied().collect(),
+                    _ => Vec::new(),
+                }
+            }),
         last_log: engine.last_log(),
         voted_for: engine.hard_state().voted_for,
     }
@@ -241,7 +260,7 @@ impl<V: Send + Unpin + 'static> Driver<V> {
 
     #[must_use]
     pub fn status(&self) -> Status {
-        *self.status.borrow()
+        self.status.borrow().clone()
     }
 
     #[must_use]

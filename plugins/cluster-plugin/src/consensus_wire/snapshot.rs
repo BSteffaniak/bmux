@@ -150,7 +150,8 @@ impl SnapshotStaging {
     }
 
     /// Run one staging operation off the async thread, expiring idle transfers first.
-    async fn run<T: Send + 'static>(
+    /// Results cross blocking work, which the simulator requires to be `Unpin`.
+    async fn run<T: Send + Unpin + 'static>(
         self: &Arc<Self>,
         operation: impl FnOnce(&mut Staged, Instant) -> Result<T, TransferError> + Send + 'static,
     ) -> Result<T, TransferError> {

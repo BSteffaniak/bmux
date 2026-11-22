@@ -1,6 +1,7 @@
 # consensus-cluster
 
-A bmux owned-consensus cluster (three voters by default, `--nodes 5` for five) under faults. Each host runs the real
+A bmux owned-consensus cluster (three voters by default, `--nodes 5` for five)
+under faults. Each host runs the real
 consensus driver over the real redb store, whose file I/O goes through the
 `switchy_fs` simulator in its own namespace; a crash applies power-loss
 semantics (unsynced data and directory changes may be lost) and the host
@@ -22,5 +23,14 @@ SIMULATOR_SEED=42 SIMULATOR_RUNS=1 cargo sim consensus-cluster   # replay
 SIMULATOR_VERIFY_DETERMINISM=1 cargo sim consensus-cluster
 ```
 
-Snapshot transfer is not yet exercised here (compaction is disabled until the
-simulated transport stages snapshots).
+Nodes compact every 16 applied entries, so lagging followers regularly catch
+up by snapshot install. The nemesis also removes a voter through joint
+consensus under faults; healing restores it (learner, then promotion) before
+convergence is checked. Every run must reach a verdict: formation, restoration
+and convergence have simulated-time deadlines, so a stuck run fails instead of
+running out the clock.
+
+Debugging: `SIM_DEBUG=1` prints a fault/membership/acknowledgement history and
+per-node state differences on failure; `SIM_TRACE=1` traces every storage
+operation per node (`SIM_SUMMARY=1` adds state after each, which perturbs the
+schedule).

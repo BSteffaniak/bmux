@@ -37,6 +37,8 @@ pub struct Bounds {
     pub max_messages: usize,
     /// Promote every learner to a voter once (joint consensus).
     pub membership_change: bool,
+    /// Remove one voter (possibly the leader itself) through joint consensus.
+    pub removal: bool,
 }
 
 impl Bounds {
@@ -55,6 +57,7 @@ impl Bounds {
             heartbeats: 2,
             max_messages: 4,
             membership_change: false,
+            removal: false,
         }
     }
 
@@ -72,6 +75,7 @@ impl Bounds {
             heartbeats: 1,
             max_messages: 3,
             membership_change: false,
+            removal: false,
         }
     }
 
@@ -89,6 +93,7 @@ impl Bounds {
             heartbeats: u8::MAX,
             max_messages: 12,
             membership_change: true,
+            removal: true,
         }
     }
 }
@@ -118,6 +123,9 @@ pub struct Node {
     heartbeat: Option<u64>,
 }
 
+// Independent ghost-history and action-budget flags; grouping them would not
+// make the model clearer.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct State {
     nodes: Vec<Node>,
@@ -129,6 +137,7 @@ pub struct State {
     duplicates: u8,
     heartbeats: u8,
     changed: bool,
+    removed: bool,
     /// Ghost history: every (term, leader) and committed entry ever observed.
     leaders: BTreeMap<Term, BTreeSet<usize>>,
     committed: BTreeMap<u64, LogIdentity>,
@@ -146,6 +155,7 @@ pub enum Action {
     Heartbeat(usize),
     Propose(usize),
     ChangeMembership(usize),
+    RemoveVoter { leader: usize, victim: usize },
     Crash(usize),
 }
 
@@ -459,6 +469,7 @@ impl Model for Raft {
             duplicates: 0,
             heartbeats: 0,
             changed: false,
+            removed: false,
             leaders: BTreeMap::new(),
             committed: BTreeMap::new(),
             conflicting_commit: false,
@@ -510,6 +521,14 @@ impl Model for Raft {
                 }
                 if self.bounds.membership_change && !state.changed {
                     actions.push(Action::ChangeMembership(index));
+                }
+                if self.bounds.removal && !state.removed {
+                    for victim in self.voters() {
+                        actions.push(Action::RemoveVoter {
+                            leader: index,
+                            victim,
+                        });
+                    }
                 }
             }
             // Leaders ignore a stale election timer, but it is still consumed.
@@ -592,6 +611,23 @@ impl Model for Raft {
                     Input::ChangeMembership {
                         token: 1_000,
                         target: membership(&all, &all),
+                    },
+                );
+            }
+            Action::RemoveVoter { leader, victim } => {
+                next.removed = true;
+                let all = (0..self.total()).collect::<Vec<_>>();
+                let remaining = self
+                    .voters()
+                    .into_iter()
+                    .filter(|voter| *voter != victim)
+                    .collect::<Vec<_>>();
+                Self::step(
+                    &mut next,
+                    leader,
+                    Input::ChangeMembership {
+                        token: 2_000,
+                        target: membership(&remaining, &all),
                     },
                 );
             }
