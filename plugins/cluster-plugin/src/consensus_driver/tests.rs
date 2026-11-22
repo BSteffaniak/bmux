@@ -322,6 +322,14 @@ fn start_owned(
     path: &std::path::Path,
     local: NodeId,
 ) -> Driver<crate::control_state::ControlState> {
+    start_owned_with(path, local, DriverConfig::default())
+}
+
+fn start_owned_with(
+    path: &std::path::Path,
+    local: NodeId,
+    config: DriverConfig,
+) -> Driver<crate::control_state::ControlState> {
     let mut store = crate::owned_vote_store::OwnedVoteStore::open(path, "owned-driver").unwrap();
     let recovered = store.recovered().unwrap();
     let (engine, effects) = Engine::recover(local, Config::default(), recovered).unwrap();
@@ -335,7 +343,7 @@ fn start_owned(
         storage,
         Arc::new(Unreachable),
         Box::new(|min, _| min),
-        DriverConfig::default(),
+        config,
     )
 }
 
@@ -403,5 +411,86 @@ async fn owned_store_applies_reads_recovers_and_deduplicates() {
             .contains_key(&workspace)
     );
     assert_eq!(driver.propose(command).await.unwrap(), first);
+    driver.shutdown().await;
+}
+
+fn create_workspace(command: u128, workspace: u128) -> Vec<u8> {
+    use bmux_cluster_plugin_api::cluster_types::{
+        CommandId, ControlCommand, ControlCommandRequest, WorkspaceId,
+    };
+    crate::control_codec::encode_control_command(&ControlCommand {
+        schema_version: 1,
+        principal_id: "principal:test".into(),
+        command_id: CommandId {
+            value: uuid::Uuid::from_u128(command),
+        },
+        issued_at_unix_ms: 1,
+        request: ControlCommandRequest::CreateWorkspace {
+            workspace_id: WorkspaceId {
+                value: uuid::Uuid::from_u128(workspace),
+            },
+            name: None,
+        },
+    })
+}
+
+#[switchy_async::test]
+async fn owned_driver_compacts_while_serving_and_recovers_from_the_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("owned.redb");
+    let local = node(1);
+    let membership = Membership::new(vec![vec![local]], vec![(local, String::new())]).unwrap();
+    crate::owned_vote_store::OwnedVoteStore::bootstrap(&path, "owned-driver", local, membership)
+        .unwrap()
+        .close()
+        .unwrap();
+
+    let driver = start_owned_with(
+        &path,
+        local,
+        DriverConfig {
+            compaction_interval: 4,
+        },
+    );
+    wait_leader(&driver, local).await;
+    let mut first = None;
+    for index in 0..12 {
+        let response = driver
+            .propose(create_workspace(100 + index, 200 + index))
+            .await
+            .unwrap();
+        first.get_or_insert(response);
+    }
+    assert_eq!(driver.read().await.unwrap().workspaces.len(), 12);
+    let applied = driver.status().applied.unwrap();
+    driver.shutdown().await;
+
+    // Compaction ran under the driver: recovery starts from a snapshot and
+    // retains only the suffix after it.
+    let mut store = crate::owned_vote_store::OwnedVoteStore::open(&path, "owned-driver").unwrap();
+    let recovered = store.recovered().unwrap();
+    let (boundary, _) = recovered.snapshot.clone().unwrap();
+    assert!(boundary.index.0 >= 4);
+    assert!(boundary.index <= applied.index);
+    assert_eq!(
+        recovered
+            .entries
+            .first()
+            .map(|entry| entry.identity.index.0),
+        (boundary.index < applied.index).then_some(boundary.index.0 + 1)
+    );
+    assert_eq!(recovered.applied, Some(applied));
+    store.close().unwrap();
+
+    // Restart from the compacted store keeps the state and its dedup records.
+    let driver = start_owned(&path, local);
+    wait_leader(&driver, local).await;
+    assert_eq!(driver.read().await.unwrap().workspaces.len(), 12);
+    assert_eq!(
+        driver.propose(create_workspace(100, 200)).await.unwrap(),
+        first.unwrap()
+    );
+    driver.propose(create_workspace(150, 250)).await.unwrap();
+    assert_eq!(driver.read().await.unwrap().workspaces.len(), 13);
     driver.shutdown().await;
 }
