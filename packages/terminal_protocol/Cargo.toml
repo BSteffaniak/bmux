@@ -12,6 +12,11 @@ version     = { workspace = true }
 
 [dependencies]
 serde = { workspace = true, features = ["derive", "std"] }
+# The clock a simulation controls (std's natively).
+switchy_time = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+bmux_sim_primitives_check = { workspace = true }
 
 [features]
 default          = ["kitty-keyboard"]

@@ -13,10 +13,14 @@ version     = { workspace = true }
 [dependencies]
 bmux_plugin_sdk        = { workspace = true }
 bmux_snapshot_protocol = { workspace = true }
-thiserror              = { workspace = true }
+# Atomics and the clock a simulation controls (std's natively).
+switchy_thread = { workspace = true, features = ["std"] }
+switchy_time   = { workspace = true, features = ["std"] }
+thiserror      = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+bmux_sim_primitives_check = { workspace = true }
+tokio                     = { workspace = true, features = ["macros", "rt"] }
 
 [features]
 default = []

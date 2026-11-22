@@ -5,8 +5,10 @@ pub mod pointer_shape;
 
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+// The trace buffer a caller shares (`with_trace`), locked only around a push.
+// simulation-safe: never held across a switch point
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolProfile {
@@ -237,7 +239,7 @@ impl TerminalProtocolEngine {
             return;
         };
         let event = ProtocolTraceEvent {
-            timestamp_ms: SystemTime::now()
+            timestamp_ms: switchy_time::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |dur| dur.as_millis()),
             pane_id: self.pane_id,

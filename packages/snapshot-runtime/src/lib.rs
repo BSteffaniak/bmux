@@ -13,7 +13,11 @@
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+// The plugin state registry's entry type, locked only to register a handle.
+// simulation-safe: uncontended, and never held across a switch
+use std::sync::RwLock;
+
+use switchy_thread::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bmux_plugin_sdk::StatefulPluginHandle;
 pub use bmux_snapshot_protocol::SnapshotStatusReport;
@@ -101,15 +105,15 @@ impl StatefulPluginRegistry {
 pub fn get_or_init_stateful_registry<G, R>(
     get: G,
     register: R,
-) -> std::sync::Arc<std::sync::RwLock<StatefulPluginRegistry>>
+) -> Arc<RwLock<StatefulPluginRegistry>>
 where
-    G: FnOnce() -> Option<std::sync::Arc<std::sync::RwLock<StatefulPluginRegistry>>>,
-    R: FnOnce(&std::sync::Arc<std::sync::RwLock<StatefulPluginRegistry>>),
+    G: FnOnce() -> Option<Arc<RwLock<StatefulPluginRegistry>>>,
+    R: FnOnce(&Arc<RwLock<StatefulPluginRegistry>>),
 {
     if let Some(existing) = get() {
         return existing;
     }
-    let fresh = std::sync::Arc::new(std::sync::RwLock::new(StatefulPluginRegistry::new()));
+    let fresh = Arc::new(RwLock::new(StatefulPluginRegistry::new()));
     register(&fresh);
     fresh
 }
@@ -124,15 +128,15 @@ where
 pub fn get_or_init_stateful_dirty_flag<G, R>(
     get: G,
     register: R,
-) -> std::sync::Arc<std::sync::RwLock<SnapshotDirtyFlagHandle>>
+) -> Arc<RwLock<SnapshotDirtyFlagHandle>>
 where
-    G: FnOnce() -> Option<std::sync::Arc<std::sync::RwLock<SnapshotDirtyFlagHandle>>>,
-    R: FnOnce(&std::sync::Arc<std::sync::RwLock<SnapshotDirtyFlagHandle>>),
+    G: FnOnce() -> Option<Arc<RwLock<SnapshotDirtyFlagHandle>>>,
+    R: FnOnce(&Arc<RwLock<SnapshotDirtyFlagHandle>>),
 {
     if let Some(existing) = get() {
         return existing;
     }
-    let fresh = std::sync::Arc::new(std::sync::RwLock::new(SnapshotDirtyFlagHandle::new()));
+    let fresh = Arc::new(RwLock::new(SnapshotDirtyFlagHandle::new()));
     register(&fresh);
     fresh
 }
@@ -584,9 +588,8 @@ impl SnapshotOrchestrator for NoopSnapshotOrchestrator {
 
 #[allow(clippy::cast_possible_truncation)]
 fn epoch_millis_now() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    switchy_time::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
 }
 
