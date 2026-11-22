@@ -37,7 +37,9 @@ use simvar::{Sim, SimBootstrap, SimConfig, fault, fault::network, fault::network
 use switchy_async::time::{sleep, timeout};
 use switchy_fs::simulator::{CrashPolicy, Filesystem, with_filesystem};
 
-pub const NODES: [&str; 3] = ["n1", "n2", "n3"];
+fn name(index: usize) -> String {
+    format!("n{}", index + 1)
+}
 const CLUSTER: &str = "simulated-cluster";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -45,8 +47,8 @@ fn node_id(index: usize) -> NodeId {
     NodeId::from(index as u64 + 1)
 }
 
-fn index_of(id: NodeId) -> Option<usize> {
-    (0..NODES.len()).find(|index| node_id(*index) == id)
+fn index_of(id: NodeId, count: usize) -> Option<usize> {
+    (0..count).find(|index| node_id(*index) == id)
 }
 
 fn boxed(message: impl Into<String>) -> Box<dyn std::error::Error + Send> {
@@ -56,6 +58,7 @@ fn boxed(message: impl Into<String>) -> Box<dyn std::error::Error + Send> {
 /// What the hosts, workload and nemesis share outside the network.
 #[derive(Default)]
 struct World {
+    nodes: usize,
     filesystems: Vec<Arc<Filesystem>>,
     /// Per run, so parallel runs never contend through process-wide state.
     preflight: bmux_cluster_plugin::owned_vote_store::PreflightAdmission,
@@ -134,8 +137,10 @@ impl Transport for SimTransport {
         let local = self.local;
         let world = self.world.clone();
         Box::pin(async move {
-            let target = index_of(to)?;
-            let (from, peer) = (NODES[local], NODES[target]);
+            let count = lock(&world).nodes;
+            let target = index_of(to, count)?;
+            let (from, peer) = (name(local), name(target));
+            let (from, peer) = (from.as_str(), peer.as_str());
             if !network::can_reach(from, peer) || dropped(from, peer) {
                 return None;
             }
@@ -187,7 +192,7 @@ fn start(index: usize, world: &Shared) -> io::Result<Driver<ControlState>> {
         switchy_fs::sync::sync_directory("/")?;
         if index == 0 {
             let founder = node_id(0);
-            let membership = Membership::new(vec![vec![founder]], vec![(founder, NODES[0].into())])
+            let membership = Membership::new(vec![vec![founder]], vec![(founder, name(0))])
                 .map_err(|error| io::Error::other(format!("{error:?}")))?;
             OwnedVoteStore::bootstrap(&path, CLUSTER, founder, membership)
         } else {
@@ -250,9 +255,9 @@ fn command(id: uuid::Uuid) -> Vec<u8> {
     })
 }
 
-fn records() -> Vec<(NodeId, String)> {
-    (0..NODES.len())
-        .map(|index| (node_id(index), NODES[index].to_owned()))
+fn records(count: usize) -> Vec<(NodeId, String)> {
+    (0..count)
+        .map(|index| (node_id(index), name(index)))
         .collect()
 }
 
@@ -260,7 +265,7 @@ fn records() -> Vec<(NodeId, String)> {
 async fn change(world: &Shared, voters: &[usize]) {
     let target = Membership::new(
         vec![voters.iter().map(|index| node_id(*index)).collect()],
-        records(),
+        records(lock(world).nodes),
     )
     .expect("valid simulated membership");
     loop {
@@ -292,9 +297,10 @@ async fn wait_voters(world: &Shared, count: usize) {
 /// Form the cluster, then propose and read until the nemesis is done.
 async fn workload(world: Shared) -> simvar::client::ClientResult {
     // Learner records first, then promotion through joint consensus.
+    let count = lock(&world).nodes;
     change(&world, &[0]).await;
-    change(&world, &[0, 1, 2]).await;
-    wait_voters(&world, NODES.len()).await;
+    change(&world, &(0..count).collect::<Vec<_>>()).await;
+    wait_voters(&world, count).await;
     lock(&world).formed = true;
     let mut next = 0u128;
     while !lock(&world).quiet {
@@ -357,11 +363,16 @@ async fn nemesis(world: Shared) -> simvar::client::ClientResult {
     for _ in 0..rng().gen_range(10..30) {
         sleep(Duration::from_millis(rng().gen_range(100..1500))).await;
         lock(&world).faults += 1;
-        let victim = NODES[rng().gen_range(0..NODES.len())];
-        let others: Vec<_> = NODES.iter().filter(|name| **name != victim).collect();
+        let count = lock(&world).nodes;
+        let victim = name(rng().gen_range(0..count));
+        let others: Vec<_> = (0..count)
+            .map(name)
+            .filter(|other| *other != victim)
+            .collect();
+        let victim = victim.as_str();
         match rng().gen_range(0..6) {
-            0 => network::partition([victim], others),
-            1 => network::partition_one_way(others, [victim]),
+            0 => network::partition([victim], &others),
+            1 => network::partition_one_way(&others, [victim]),
             2 => network::isolate(victim),
             3 => network::set_default_policy(
                 LinkPolicy::reliable()
@@ -378,9 +389,9 @@ async fn nemesis(world: Shared) -> simvar::client::ClientResult {
     network::heal();
     network::set_default_policy(reliable);
     lock(&world).quiet = true;
-    while NODES
-        .iter()
-        .any(|name| fault::host_status(name) != Some(fault::HostStatus::Running))
+    let count = lock(&world).nodes;
+    while (0..count)
+        .any(|index| fault::host_status(&name(index)) != Some(fault::HostStatus::Running))
     {
         sleep(Duration::from_millis(50)).await;
     }
@@ -393,7 +404,7 @@ async fn converge(world: &Shared) -> simvar::client::ClientResult {
         sleep(Duration::from_millis(100)).await;
         // A leader commits a no-op of its term, so idle followers still converge.
         let all = drivers(world);
-        if all.len() < NODES.len() {
+        if all.len() < lock(world).nodes {
             continue;
         }
         let leader_commit = all
@@ -419,12 +430,12 @@ async fn converge(world: &Shared) -> simvar::client::ClientResult {
                 state.workspaces.keys().copied().collect::<BTreeSet<_>>(),
             ));
         }
-        if states.len() == NODES.len() {
+        if states.len() == lock(world).nodes {
             break;
         }
     }
     let mut world = lock(world);
-    if states.len() == NODES.len() {
+    if states.len() == world.nodes {
         let reference = states[0].1.clone();
         for (index, workspaces) in &states {
             if *workspaces != reference {
@@ -451,9 +462,8 @@ async fn converge(world: &Shared) -> simvar::client::ClientResult {
             .map(|(index, driver)| format!("n{}={:?}", index + 1, driver.status()))
             .collect::<Vec<_>>()
             .join("; ");
-        let hosts = NODES
-            .iter()
-            .map(|name| format!("{name}={:?}", fault::host_status(name)))
+        let hosts = (0..world.nodes)
+            .map(|index| format!("{}={:?}", name(index), fault::host_status(&name(index))))
             .collect::<Vec<_>>()
             .join(" ");
         world.violations.push(format!(
@@ -479,8 +489,16 @@ async fn converge(world: &Shared) -> simvar::client::ClientResult {
     }
 }
 
-/// Three consensus hosts, a workload and a nemesis.
-pub struct ClusterBootstrap;
+/// Consensus hosts (three by default), a workload and a nemesis.
+pub struct ClusterBootstrap {
+    pub nodes: usize,
+}
+
+impl Default for ClusterBootstrap {
+    fn default() -> Self {
+        Self { nodes: 3 }
+    }
+}
 
 impl SimBootstrap for ClusterBootstrap {
     fn build_sim(&self, mut config: SimConfig) -> SimConfig {
@@ -491,12 +509,15 @@ impl SimBootstrap for ClusterBootstrap {
     fn on_start(&self, sim: &mut impl Sim) {
         switchy_time::simulator::set_step_multiplier(1);
         let world = Shared::default();
-        lock(&world).filesystems = NODES.iter().map(|_| Arc::new(Filesystem::new())).collect();
-        for (index, name) in NODES.iter().enumerate() {
+        lock(&world).nodes = self.nodes;
+        lock(&world).filesystems = (0..self.nodes)
+            .map(|_| Arc::new(Filesystem::new()))
+            .collect();
+        for index in 0..self.nodes {
             let host_world = world.clone();
-            sim.host(*name, move || host(index, host_world.clone()));
+            sim.host(name(index), move || host(index, host_world.clone()));
             let crash_world = world.clone();
-            sim.on_crash(*name, move |_| {
+            sim.on_crash(name(index), move |_| {
                 let mut world = lock(&crash_world);
                 world.drivers.remove(&index);
                 world.filesystems[index].crash(&CrashPolicy::power_loss());
