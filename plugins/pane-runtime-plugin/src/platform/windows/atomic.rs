@@ -14,9 +14,10 @@ const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x1;
 /// Unlink the replaced file even while readers still hold it open.
 const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x2;
 
-pub(crate) fn create(path: &Path) -> std::io::Result<std::fs::File> {
+/// Exclusively create the staging file `path`.
+pub(crate) fn create(path: &Path) -> std::io::Result<switchy_fs::sync::File> {
     // The caller's private state directory supplies the inherited Windows ACL.
-    std::fs::OpenOptions::new()
+    switchy_fs::sync::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)

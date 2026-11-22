@@ -196,8 +196,8 @@ pub(super) fn launch_named(
 }
 
 fn validate_authority_directory(directory: &Path) -> Result<(), RecoveryError> {
-    match std::fs::symlink_metadata(directory) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+    match switchy_fs::sync::symlink_metadata(directory) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
         Ok(_) => Err(failed(
             "execution authority path is not a regular directory",
         )),
@@ -235,9 +235,13 @@ fn open_scoped_store(
     let mut store = ReservationStore::open(root)?;
     if let Some(scope) = scope {
         let lock_path = root.join("owner.lock");
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        crate::platform::host::private_file_no_follow(&mut options);
+        let options = crate::platform::files::private_file_no_follow(
+            switchy_fs::sync::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false),
+        );
         let owner = options.open(lock_path).map_err(failed)?;
         owner.try_lock().map_err(|error| {
             failed(format!(
@@ -252,8 +256,8 @@ fn open_scoped_store(
 }
 
 fn verify_or_create_marker(marker: &Path, expected: &str) -> Result<(), RecoveryError> {
-    match std::fs::symlink_metadata(marker) {
-        Ok(metadata) if !metadata.file_type().is_file() || metadata.len() > 131_072 => {
+    match switchy_fs::sync::symlink_metadata(marker) {
+        Ok(metadata) if !metadata.is_file() || metadata.len() > 131_072 => {
             return Err(failed(
                 "managed target marker is not a bounded regular file",
             ));
@@ -265,7 +269,7 @@ fn verify_or_create_marker(marker: &Path, expected: &str) -> Result<(), Recovery
     let root = marker
         .parent()
         .ok_or_else(|| failed("managed target marker parent unavailable"))?;
-    match std::fs::read(marker) {
+    match switchy_fs::sync::read(marker) {
         Ok(identity)
             if serde_json::from_slice::<String>(&identity).ok().as_deref() == Some(expected) => {}
         Ok(_) => return Err(failed("managed execution target identity mismatch")),
@@ -367,19 +371,19 @@ pub(crate) fn idle_blocker(host: &crate::runtime::PaneRuntimeHost) -> Option<Str
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if name.starts_with("launch-") && name.ends_with(".json") {
-                let stored: StoredReservation = serde_json::from_slice(&std::fs::read(entry.path()).map_err(failed)?).map_err(failed)?;
+                let stored: StoredReservation = serde_json::from_slice(&switchy_fs::sync::read(entry.path()).map_err(failed)?).map_err(failed)?;
                 if stored.version != 4 || !matches!(stored.receipt.phase, LaunchPhase::Retired) {
                     return Ok(Some("retained execution admission or recovery authority requires this runtime".into()));
                 }
             } else if name.starts_with("resolve-") && name.ends_with(".json") {
                 use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalResolutionReceipt;
-                let stored: (u32, Vec<u8>, Option<TerminalResolutionReceipt>) = serde_json::from_slice(&std::fs::read(entry.path()).map_err(failed)?).map_err(failed)?;
+                let stored: (u32, Vec<u8>, Option<TerminalResolutionReceipt>) = serde_json::from_slice(&switchy_fs::sync::read(entry.path()).map_err(failed)?).map_err(failed)?;
                 if stored.0 != 4 || stored.2.is_none_or(|receipt| receipt.recovery_required) {
                     return Ok(Some("unresolved execution resolution requires recovery".into()));
                 }
             } else if name.starts_with("input-") && name.ends_with(".json") {
                 use bmux_pane_runtime_plugin_api::pane_runtime_execution_v4::TerminalInputPhase;
-                let stored: StoredInput = serde_json::from_slice(&std::fs::read(entry.path()).map_err(failed)?).map_err(failed)?;
+                let stored: StoredInput = serde_json::from_slice(&switchy_fs::sync::read(entry.path()).map_err(failed)?).map_err(failed)?;
                 if stored.version != 4 || matches!(stored.receipt.phase, TerminalInputPhase::Accepted | TerminalInputPhase::Writing | TerminalInputPhase::Uncertain) {
                     return Ok(Some("unresolved input authority requires recovery".into()));
                 }
@@ -392,15 +396,15 @@ pub(crate) fn idle_blocker(host: &crate::runtime::PaneRuntimeHost) -> Option<Str
 pub(super) struct ReservationStore {
     root: PathBuf,
     // An OS lock, not a PID receipt: another live writer cannot open this target.
-    owner_lock: Option<std::fs::File>,
+    owner_lock: Option<switchy_fs::sync::File>,
 }
 impl ReservationStore {
     pub(super) fn open(root: &Path) -> Result<Self, RecoveryError> {
         // Reject symlinks in this owned component. Ancestors above the domain
         // may be platform aliases and are not ownership evidence.
         validate_authority_directory(root)?;
-        std::fs::create_dir_all(root).map_err(failed)?;
-        crate::platform::host::restrict_directory(root).map_err(failed)?;
+        switchy_fs::sync::create_dir_all(root).map_err(failed)?;
+        crate::platform::files::restrict_directory(root).map_err(failed)?;
         Ok(Self {
             root: root.to_path_buf(),
             owner_lock: None,
@@ -443,7 +447,7 @@ impl ReservationStore {
                     continue;
                 }
                 let mut receipt: StoredInput =
-                    serde_json::from_slice(&std::fs::read(input.path()).map_err(failed)?)
+                    serde_json::from_slice(&switchy_fs::sync::read(input.path()).map_err(failed)?)
                         .map_err(failed)?;
                 if matches!(
                     receipt.receipt.phase,
@@ -470,8 +474,8 @@ impl ReservationStore {
     }
 
     fn read(&self, mutation: uuid::Uuid) -> Result<StoredReservation, RecoveryError> {
-        let bytes =
-            std::fs::read(self.root.join(format!("launch-{mutation}.json"))).map_err(failed)?;
+        let bytes = switchy_fs::sync::read(self.root.join(format!("launch-{mutation}.json")))
+            .map_err(failed)?;
         let stored: StoredReservation = serde_json::from_slice(&bytes).map_err(failed)?;
         if stored.version != 4 && stored.version != 5 {
             return Err(RecoveryError::RecoveryRequired {
@@ -517,7 +521,7 @@ impl ReservationStore {
         authorize: impl Fn(uuid::Uuid) -> Result<(), RecoveryError>,
     ) -> Result<LaunchReservation, RecoveryError> {
         let path = self.root.join(format!("launch-{mutation}.json"));
-        if path.exists() {
+        if switchy_fs::exists(&path) {
             let stored = self.read(mutation)?;
             authorize(stored.receipt.reservation.execution.session_id)?;
             if serde_json::to_vec(&environment).map_err(failed)?
@@ -689,7 +693,7 @@ mod tests {
         verify_or_create_marker(&marker, "{\"target\":\"a\"}").unwrap();
         assert!(verify_or_create_marker(&marker, "{\"target\":\"b\"}").is_err());
         let retained = tempfile::tempdir().unwrap();
-        std::fs::write(retained.path().join("launch-retained.json"), b"unknown").unwrap();
+        switchy_fs::sync::write(retained.path().join("launch-retained.json"), b"unknown").unwrap();
         assert!(
             verify_or_create_marker(&retained.path().join("managed-target.json"), "{}").is_err()
         );
@@ -824,7 +828,7 @@ mod tests {
             Err(RecoveryError::Conflict { .. })
         ));
         let path = root.path().join(format!("launch-{mutation}.json"));
-        std::fs::write(path, b"corrupt").unwrap();
+        switchy_fs::sync::write(path, b"corrupt").unwrap();
         assert!(store.read(mutation).is_err());
     }
 }
@@ -885,7 +889,7 @@ pub(crate) fn reconcile(
             .root
             .join(format!("capture-{}", reference.execution_token));
         let recovering = current.is_err();
-        let boundary = if root.exists() {
+        let boundary = if switchy_fs::exists(&root) {
             Some(if recovering {
                 super::durable_capture::DurableCapture::validate_recovery(&root).map_err(failed)?
             } else {
@@ -1057,7 +1061,7 @@ pub(crate) fn input_receipt(
 > {
     with_store(host, |store| {
         find(store, reference)?;
-        let bytes = std::fs::read(store.root.join(format!(
+        let bytes = switchy_fs::sync::read(store.root.join(format!(
             "input-{}-{mutation}.json",
             reference.execution_token
         )))
@@ -1122,7 +1126,7 @@ fn validate_fresh_input(
     let capture_root = store
         .root
         .join(format!("capture-{}", reference.execution_token));
-    let capture_error = if capture_root.exists() {
+    let capture_error = if switchy_fs::exists(&capture_root) {
         super::durable_capture::DurableCapture::read(&capture_root, 0, 1)
             .map_err(failed)?
             .0
@@ -1160,7 +1164,7 @@ pub(crate) fn send_admitted(
             "input-{}-{mutation}.json",
             reference.execution_token
         ));
-        match std::fs::read(&path) {
+        match switchy_fs::sync::read(&path) {
             Ok(bytes) => {
                 let stored: StoredInput = serde_json::from_slice(&bytes).map_err(failed)?;
                 if stored.version != 4 || stored.receipt.execution != *reference {
@@ -1256,7 +1260,7 @@ pub(crate) fn retire(
             "retire-{}-{mutation}.json",
             reference.execution_token
         ));
-        match std::fs::read(&path) {
+        match switchy_fs::sync::read(&path) {
             Ok(bytes) => {
                 let retained: (u32, u64, TerminalRetirementReceipt) =
                     serde_json::from_slice(&bytes).map_err(failed)?;
@@ -1314,7 +1318,7 @@ pub(crate) fn retire(
                 continue;
             }
             let input: StoredInput =
-                serde_json::from_slice(&std::fs::read(entry.path()).map_err(failed)?)
+                serde_json::from_slice(&switchy_fs::sync::read(entry.path()).map_err(failed)?)
                     .map_err(failed)?;
             if input.version != 4
                 || matches!(
@@ -1373,7 +1377,7 @@ pub(crate) fn resolve(
             "resolve-{}-{mutation}.json",
             reference.execution_token
         ));
-        match std::fs::read(&path) {
+        match switchy_fs::sync::read(&path) {
             Ok(bytes) => {
                 let retained: (u32, Vec<u8>, Option<TerminalResolutionReceipt>) =
                     serde_json::from_slice(&bytes).map_err(failed)?;
@@ -1476,7 +1480,7 @@ fn settle_resolution(
                         .root
                         .join(format!("input-{}-{id}.json", reference.execution_token));
                     let mut value: StoredInput =
-                        serde_json::from_slice(&std::fs::read(&path).map_err(failed)?)
+                        serde_json::from_slice(&switchy_fs::sync::read(&path).map_err(failed)?)
                             .map_err(failed)?;
                     if value.version != 4 || value.receipt.execution != *reference {
                         return Err(RecoveryError::RecoveryRequired {

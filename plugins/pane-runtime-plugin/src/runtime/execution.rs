@@ -724,7 +724,7 @@ pub(crate) fn validate_options(options: &ProgramOptions) -> Result<(), Execution
     }
     if let Some(cwd) = &options.cwd {
         let path = std::path::Path::new(cwd);
-        if cwd.contains('\0') || !path.is_absolute() || !path.is_dir() {
+        if cwd.contains('\0') || !path.is_absolute() || !crate::files::is_dir(path) {
             return Err(invalid(
                 "cwd must be an existing absolute execution-host directory",
             ));

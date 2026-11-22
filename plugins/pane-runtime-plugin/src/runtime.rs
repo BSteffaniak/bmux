@@ -498,7 +498,7 @@ fn shells_support_compatible_replay(previous: &str, resolved: &str) -> bool {
 
 fn valid_resurrection_cwd(cwd: Option<&str>) -> Option<String> {
     cwd.filter(|value| !value.trim().is_empty())
-        .filter(|value| Path::new(value).is_dir())
+        .filter(|value| crate::files::is_dir(Path::new(value)))
         .map(ToOwned::to_owned)
 }
 
@@ -573,7 +573,7 @@ fn validate_explicit_launch(launch: &PaneLaunchSpec) -> anyhow::Result<()> {
         anyhow::bail!("explicit launch program is empty");
     }
     if let Some(cwd) = launch.cwd.as_deref()
-        && (cwd.trim().is_empty() || !Path::new(cwd).is_dir())
+        && (cwd.trim().is_empty() || !crate::files::is_dir(Path::new(cwd)))
     {
         anyhow::bail!("explicit launch cwd is unavailable: '{cwd}'");
     }
@@ -1223,7 +1223,7 @@ fn note_replay_markers_read(bytes: &[u8]) -> Vec<(u64, u128)> {
     enum ReplayLog {}
     let log = crate::run_shared::run_shared::<ReplayLog, _>(|| {
         let path = switchy_env::var_os("BMUX_REPLAY_LOG")?;
-        std::fs::OpenOptions::new()
+        switchy_fs::sync::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
@@ -3949,7 +3949,7 @@ fn clear_managed_launch_env(command: &mut SpawnCommand) {
 
 fn configure_device_seal_broker_env(command: &mut SpawnCommand) {
     if switchy_env::var("BMUX_DEVICE_SEAL_SCOPE").is_ok_and(|scope| scope == "client") {
-        if let Ok(exe) = std::env::current_exe() {
+        if let Ok(exe) = crate::platform::files::current_executable() {
             command.env(
                 "SSHENV_DEVICE_SEAL_COMMAND",
                 format!("{} device-seal-broker", exe.display()),
@@ -4040,17 +4040,17 @@ fn configure_shell_integration_command(
 
 fn write_shell_integration_file(path: &std::path::Path, contents: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
+        switchy_fs::sync::create_dir_all(parent).with_context(|| {
             format!("failed creating shell integration dir {}", parent.display())
         })?;
-        crate::platform::host::restrict_directory(parent)?;
+        crate::platform::files::restrict_directory(parent)?;
     }
-    if let Ok(existing) = std::fs::read_to_string(path)
+    if let Ok(existing) = switchy_fs::sync::read_to_string(path)
         && existing == contents
     {
         return Ok(());
     }
-    std::fs::write(path, contents)
+    switchy_fs::sync::write(path, contents)
         .with_context(|| format!("failed writing shell integration file {}", path.display()))
 }
 
@@ -6970,7 +6970,7 @@ fn validate_initial_shell_options(
     options: Option<&bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1::InitialShellOptions>,
 ) -> Result<()> {
     if let Some(cwd) = options.and_then(|options| options.cwd.as_deref())
-        && (!Path::new(cwd).is_absolute() || !Path::new(cwd).is_dir())
+        && (!Path::new(cwd).is_absolute() || !crate::files::is_dir(Path::new(cwd)))
     {
         anyhow::bail!("initial shell directory must be an available absolute directory: {cwd}");
     }

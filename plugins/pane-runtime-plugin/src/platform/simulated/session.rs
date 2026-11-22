@@ -198,7 +198,7 @@ impl Session {
         if self.job.is_some() {
             return Ok(None);
         }
-        std::fs::create_dir_all(root)?;
+        switchy_fs::sync::create_dir_all(root)?;
         let path = root.join(format!("{token}.json"));
         crate::atomic_state::commit(
             &path,
@@ -281,7 +281,7 @@ impl Drop for Session {
 }
 
 pub(crate) fn recover_record(path: &Path) -> anyhow::Result<()> {
-    let record: Record = serde_json::from_slice(&std::fs::read(path)?)?;
+    let record: Record = serde_json::from_slice(&switchy_fs::sync::read(path)?)?;
     anyhow::ensure!(
         record.version == RECORD_VERSION,
         "unsupported pane session record version {}",

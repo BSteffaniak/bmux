@@ -8,10 +8,15 @@
 //!   feature) on `switchy_pty`'s kernel, which behaves as Linux, macOS or Windows by its
 //!   personality. Terminal differences the core logic branches on come from
 //!   [`bmux_pty::behavior`].
-//! * **The host** ([`host`]): this process's own files, executable and native strings. The
-//!   simulation's files are the host's, so this part is always native.
+//! * **The files** ([`files`]): this process's own files and executable: private files and
+//!   directories, durable replacement, the executable's identity and retained copies. Natively
+//!   these go to the host's file system through `switchy_fs`; simulated (`simulated/files.rs`),
+//!   to the run's `switchy_fs` file system, with a stand-in for the executable.
+//! * **The host** ([`host`]): this process's native strings and errors, which are the host's
+//!   in simulation too, so this part is always native.
 //!
-//! Core code outside this module names no operating system (`tests/primitives.rs` checks).
+//! Core code outside this module names no operating system (`tests/primitives.rs` checks), and
+//! reaches files only through `switchy_fs` (so a simulation runs it on the run's file system).
 
 #[cfg(feature = "simulator")]
 #[path = "simulated/mod.rs"]
@@ -28,6 +33,16 @@ mod native;
 
 #[cfg(any(test, feature = "simulator"))]
 pub(crate) mod conformance;
+
+#[cfg(feature = "simulator")]
+#[path = "simulated/files.rs"]
+pub(crate) mod files;
+#[cfg(all(unix, not(feature = "simulator")))]
+#[path = "unix/files.rs"]
+pub(crate) mod files;
+#[cfg(all(windows, not(feature = "simulator")))]
+#[path = "windows/files.rs"]
+pub(crate) mod files;
 
 #[cfg(unix)]
 #[path = "unix/host/mod.rs"]

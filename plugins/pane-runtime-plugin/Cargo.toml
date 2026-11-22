@@ -53,11 +53,11 @@ switchy_async = { workspace = true, features = [
     "tokio",
 ] }
 switchy_env = { workspace = true, features = ["std"] }
+switchy_fs = { workspace = true, features = ["std", "sync"] }
 switchy_pty = { workspace = true, optional = true }
 switchy_simulation = { workspace = true, optional = true }
 switchy_thread = { workspace = true, features = ["std"] }
 switchy_time = { workspace = true, features = ["std"] }
-tempfile = { workspace = true }
 # Only its runtime-free sync primitives, which run deterministically under either executor;
 # tasks, timers and tests go through switchy_async.
 tokio     = { workspace = true, features = ["sync"] }
@@ -67,6 +67,7 @@ tracing   = { workspace = true, features = ["std"] }
 uuid      = { workspace = true, features = ["serde", "std"] }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 
 [features]
 # Package this crate as a dynamic library for one component. Only the
@@ -118,6 +119,7 @@ simulator = [
     "switchy_pty/simulator",
     "switchy_async/thread-simulator",
     "switchy_env/simulator",
+    "switchy_fs/simulator",
     "switchy_thread/simulator",
     "switchy_time/simulator",
 ]

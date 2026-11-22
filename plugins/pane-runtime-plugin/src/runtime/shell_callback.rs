@@ -17,32 +17,33 @@ pub(super) fn prepare(root: &Path) -> Result<PathBuf> {
     let mut images = images
         .lock()
         .map_err(|_| anyhow::anyhow!("shell callback image lock poisoned"))?;
-    std::fs::create_dir_all(root)?;
-    let root = root.canonicalize()?;
+    switchy_fs::sync::create_dir_all(root)?;
+    let root = switchy_fs::sync::canonicalize(root)?;
     let directory = root.join("callback-images");
     if let Some((path, hash)) = images.get(&root) {
         // Reuse the expected identity, not a fresh digest of possibly corrupt
         // cached bytes. This also works after the original executable is gone.
-        return bmux_plugin::retain_executable(path, &directory, "shell-callback", hash)
+        return crate::platform::files::retain_executable(path, &directory, "shell-callback", hash)
             .map_err(anyhow::Error::msg);
     }
-    let source = std::env::current_exe()
-        .context("locate shell callback executable")?
-        .canonicalize()?;
+    let source = switchy_fs::sync::canonicalize(
+        crate::platform::files::current_executable().context("locate shell callback executable")?,
+    )?;
     // A managed launch already attested this image's digest before activation;
     // retention still verifies the copied bytes against it, so reuse it rather
     // than reading the whole executable an extra time on the startup path.
-    let attested = if crate::platform::host::EXECUTABLE_MAPPED {
+    let attested = if crate::platform::files::EXECUTABLE_MAPPED {
         None
     } else {
         crate::readiness::running_executable_sha256()
     };
     let hash = match attested {
         Some(hash) => hash,
-        None => bmux_plugin::executable_sha256(&source).map_err(anyhow::Error::msg)?,
+        None => crate::platform::files::executable_sha256(&source).map_err(anyhow::Error::msg)?,
     };
-    let path = bmux_plugin::retain_executable(&source, &directory, "shell-callback", &hash)
-        .map_err(anyhow::Error::msg)?;
+    let path =
+        crate::platform::files::retain_executable(&source, &directory, "shell-callback", &hash)
+            .map_err(anyhow::Error::msg)?;
     // Images outlive this manager: nested shells and recovery can still need
     // them. Pruning is deliberately not part of pane teardown.
     images.insert(root, (path.clone(), hash));

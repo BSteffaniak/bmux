@@ -44,7 +44,7 @@ pub(crate) fn bounded_probe_output(
     let permit = Arc::clone(SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4))))
         .try_acquire_owned()
         .map_err(|_| std::io::Error::other("inspection reapers busy"))?;
-    let mut output = tempfile::tempfile()?;
+    let mut output = switchy_fs::standard::sync::tempfile()?.into_inner();
     let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::from(output.try_clone()?))

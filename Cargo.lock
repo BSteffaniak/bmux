@@ -5600,6 +5600,7 @@ dependencies = [
  "sha2 0.11.1",
  "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "switchy_env 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
+ "switchy_fs 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "switchy_pty",
  "switchy_simulation",
  "switchy_thread",
@@ -18352,6 +18353,7 @@ dependencies = [
  "log 0.4.35",
  "rustix 1.1.6",
  "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
+ "switchy_simulation",
  "tempfile",
  "windows-sys 0.61.2",
 ]

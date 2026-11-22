@@ -578,6 +578,7 @@ sshenv_vault               = { git = "https://github.com/BSteffaniak/sshenv", br
 # To develop against a local MoosicBox checkout:
 # [patch."https://github.com/MoosicBox/MoosicBox"]
 # switchy_env           = { path = "../MoosicBox/packages/switchy/env" }
+# switchy_fs            = { path = "../MoosicBox/packages/switchy/fs" }
 # switchy_pty           = { path = "../MoosicBox/packages/switchy/pty" }
 # switchy_simulation    = { path = "../MoosicBox/packages/switchy/simulation" }
 # switchy_thread        = { path = "../MoosicBox/packages/switchy/thread" }

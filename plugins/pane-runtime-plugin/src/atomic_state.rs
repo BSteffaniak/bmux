@@ -3,7 +3,7 @@ use serde::Serialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::platform::host::atomic as native;
+use crate::platform::files::atomic;
 
 pub(crate) fn commit(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(value).map_err(std::io::Error::other)?;
@@ -11,14 +11,14 @@ pub(crate) fn commit(path: &Path, value: &impl Serialize) -> std::io::Result<()>
         .parent()
         .ok_or_else(|| std::io::Error::other("receipt parent missing"))?;
     let temporary: PathBuf = path.with_extension(format!("tmp-{}", std::process::id()));
-    let mut file = native::create(&temporary)
+    let mut file = atomic::create(&temporary)
         .map_err(|error| stage_error("create state staging file", &error))?;
     file.write_all(&bytes)
         .map_err(|error| stage_error("write state staging file", &error))?;
     file.sync_all()
         .map_err(|error| stage_error("flush state staging file", &error))?;
     drop(file);
-    native::publish(&temporary, path, parent)
+    atomic::publish(&temporary, path, parent)
         .map_err(|error| stage_error("publish durable state replacement", &error))
 }
 

@@ -139,12 +139,12 @@ pub(crate) fn recover(records: &Path) {
         let path = entry.path();
         if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
             // Interrupted atomic-commit staging files.
-            let _ = std::fs::remove_file(&path);
+            let _ = switchy_fs::sync::remove_file(&path);
             continue;
         }
         match backend::recover_record(&path) {
             Ok(()) => {
-                let _ = std::fs::remove_file(&path);
+                let _ = switchy_fs::sync::remove_file(&path);
             }
             Err(error) => {
                 tracing::warn!(
@@ -167,12 +167,12 @@ fn remove_legacy_supervisor_state(runtime_dir: &Path, state_dir: &Path) {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if name.starts_with("supervisor-") && name.ends_with(".json") {
-                let _ = std::fs::remove_file(entry.path());
+                let _ = switchy_fs::sync::remove_file(entry.path());
             }
         }
     }
     if state_dir.is_absolute() {
-        let _ = std::fs::remove_dir_all(state_dir.join("auxiliary-images"));
+        let _ = switchy_fs::sync::remove_dir_all(state_dir.join("auxiliary-images"));
     }
 }
 
@@ -304,7 +304,7 @@ impl SessionControl {
             .map_err(|_| anyhow::anyhow!("session record lock poisoned"))?
             .take();
         if let Some(record) = record {
-            match std::fs::remove_file(&record) {
+            match switchy_fs::sync::remove_file(&record) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
@@ -377,9 +377,9 @@ mod tests {
     fn legacy_supervisor_state_is_removed() {
         let runtime = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
-        std::fs::write(runtime.path().join("supervisor-abc.json"), b"{}").unwrap();
-        std::fs::write(runtime.path().join("other.json"), b"{}").unwrap();
-        std::fs::create_dir_all(state.path().join("auxiliary-images/x/y")).unwrap();
+        switchy_fs::sync::write(runtime.path().join("supervisor-abc.json"), b"{}").unwrap();
+        switchy_fs::sync::write(runtime.path().join("other.json"), b"{}").unwrap();
+        switchy_fs::sync::create_dir_all(state.path().join("auxiliary-images/x/y")).unwrap();
         remove_legacy_supervisor_state(runtime.path(), state.path());
         assert!(!runtime.path().join("supervisor-abc.json").exists());
         assert!(runtime.path().join("other.json").exists());

@@ -13,7 +13,7 @@ fn validate_home_directory(home: Option<std::path::PathBuf>) -> Result<String, S
         path: home.to_string_lossy().into_owned(),
         reason: "execution home directory is not UTF-8".into(),
     })?;
-    if !home.is_absolute() || !home.is_dir() {
+    if !home.is_absolute() || !crate::files::is_dir(&home) {
         return Err(SpawnError::InvalidDirectory {
             path: path.into(),
             reason: "execution home must be an available absolute directory".into(),

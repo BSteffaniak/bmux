@@ -15,7 +15,7 @@ pub(super) struct Boundary {
 }
 pub(super) struct DurableCapture {
     root: PathBuf,
-    file: std::fs::File,
+    file: switchy_fs::sync::File,
     boundary: Boundary,
     origin: switchy_time::Instant,
     failed: bool,
@@ -26,10 +26,13 @@ fn persistence_error(stage: &'static str, error: &std::io::Error) -> std::io::Er
 
 impl DurableCapture {
     pub(super) fn create(root: &Path) -> std::io::Result<Self> {
-        std::fs::create_dir_all(root)?;
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create_new(true);
-        crate::platform::host::private_file(&mut options);
+        switchy_fs::sync::create_dir_all(root)?;
+        let options = crate::platform::files::private_file(
+            switchy_fs::sync::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true),
+        );
         let file = options.open(root.join("events.bin"))?;
         let capture = Self {
             root: root.to_path_buf(),
@@ -235,9 +238,10 @@ impl DurableCapture {
         }
         Ok(boundary)
     }
-    fn open(root: &Path) -> std::io::Result<(Boundary, std::fs::File)> {
-        let boundary: Boundary = serde_json::from_slice(&std::fs::read(root.join("capture.json"))?)
-            .map_err(std::io::Error::other)?;
+    fn open(root: &Path) -> std::io::Result<(Boundary, switchy_fs::sync::File)> {
+        let boundary: Boundary =
+            serde_json::from_slice(&switchy_fs::sync::read(root.join("capture.json"))?)
+                .map_err(std::io::Error::other)?;
         if boundary.version != 1 {
             return Err(std::io::Error::other(
                 "unsupported ordered capture schema; raw-only capture requires explicit migration",
@@ -249,7 +253,7 @@ impl DurableCapture {
         {
             return Err(std::io::Error::other("invalid ordered capture boundary"));
         }
-        let file = std::fs::File::open(root.join("events.bin"))?;
+        let file = switchy_fs::sync::File::open(root.join("events.bin"))?;
         if file.metadata()?.len() < boundary.stream_bytes {
             return Err(std::io::Error::other(
                 "capture shorter than durable boundary",

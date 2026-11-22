@@ -32,6 +32,7 @@ mod atomic_state;
 mod capture_handshake;
 mod commands;
 mod dir_order;
+mod files;
 mod handlers;
 mod ids;
 pub mod observation;

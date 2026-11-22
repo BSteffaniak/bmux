@@ -17,13 +17,13 @@ pub(crate) struct Readiness {
 /// Capture and cache executable identity during activation, before serving IPC.
 /// Readiness requests must never trigger a cold executable hash.
 struct ExecutableIdentity {
-    file: Mutex<Option<std::fs::File>>,
+    file: Mutex<Option<switchy_fs::sync::File>>,
     digest: OnceLock<Result<String, String>>,
 }
 
 impl ExecutableIdentity {
     fn capture() -> Self {
-        if !crate::platform::host::EXECUTABLE_MAPPED {
+        if !crate::platform::files::EXECUTABLE_MAPPED {
             let attested = running_executable_sha256()
                 .ok_or_else(|| "immutable bundle startup attestation unavailable".to_string());
             return Self {
@@ -32,7 +32,7 @@ impl ExecutableIdentity {
             };
         }
         let digest = OnceLock::new();
-        let file = match crate::platform::host::open_mapped_executable() {
+        let file = match crate::platform::files::open_mapped_executable() {
             Ok(file) => Some(file),
             Err(error) => {
                 let _ = digest.set(Err(format!(
@@ -110,7 +110,7 @@ pub(crate) fn activate(host: &crate::runtime::PaneRuntimeHost, context: &NativeL
     let managed_target_identity = switchy_env::var("BMUX_MANAGED_TARGET_IDENTITY").ok();
     // Ordinary non-Linux launches may lack mapped-image attestation. Never
     // substitute a mutable current_exe pathname hash for that proof.
-    if (crate::platform::host::EXECUTABLE_MAPPED || managed_target_identity.is_some())
+    if (crate::platform::files::EXECUTABLE_MAPPED || managed_target_identity.is_some())
         && let Err(reason) = verified
     {
         error.get_or_insert(reason);
@@ -150,8 +150,8 @@ fn blocker(host: &crate::runtime::PaneRuntimeHost, state: &RuntimeReadiness) -> 
         std::path::PathBuf::from(&state.state_dir).join("pane-executions-v4"),
         std::path::PathBuf::from(&state.runtime_dir),
     ] {
-        match std::fs::symlink_metadata(&directory) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+        match switchy_fs::sync::symlink_metadata(&directory) {
+            Ok(metadata) if metadata.is_dir() => {}
             Ok(_) => {
                 return Some(format!(
                     "execution authority directory is not a regular directory: {}",
@@ -262,7 +262,7 @@ mod tests {
     use super::*;
     #[test]
     fn executable_identity_is_lazy_cached_and_failure_is_explicit() {
-        let mut file = tempfile::tempfile().unwrap();
+        let mut file = switchy_fs::sync::tempfile().unwrap();
         std::io::Write::write_all(&mut file, b"abc").unwrap();
         std::io::Seek::rewind(&mut file).unwrap();
         let identity = ExecutableIdentity {
@@ -296,7 +296,7 @@ mod tests {
         let path = root.path().join("activation-executable");
         std::fs::write(&path, b"abc").unwrap();
         let identity = ExecutableIdentity {
-            file: Mutex::new(Some(std::fs::File::open(&path).unwrap())),
+            file: Mutex::new(Some(switchy_fs::sync::File::open(&path).unwrap())),
             digest: OnceLock::new(),
         };
         // A later deployment must not change which executable the first, cold

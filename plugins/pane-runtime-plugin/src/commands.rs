@@ -11,7 +11,6 @@ use bmux_plugin_sdk::{
 };
 use bmux_sessions_plugin_api::sessions_state;
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -788,7 +787,7 @@ fn atomic_replace(path: &Path, contents: &[u8]) -> Result<(), PluginCommandError
     let parent = path
         .parent()
         .ok_or_else(|| PluginCommandError::failed("invalid config path"))?;
-    fs::create_dir_all(parent).map_err(|error| {
+    switchy_fs::sync::create_dir_all(parent).map_err(|error| {
         PluginCommandError::failed(format!("cannot create config dir: {error}"))
     })?;
     #[cfg(test)]
@@ -798,7 +797,7 @@ fn atomic_replace(path: &Path, contents: &[u8]) -> Result<(), PluginCommandError
     #[cfg(not(test))]
     let temporary = parent.join(format!(".bmux.toml.{}.tmp", crate::ids::new_uuid()));
     let result = (|| {
-        let mut file = OpenOptions::new()
+        let mut file = switchy_fs::sync::OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(&temporary)
@@ -808,11 +807,11 @@ fn atomic_replace(path: &Path, contents: &[u8]) -> Result<(), PluginCommandError
         file.write_all(contents)
             .and_then(|()| file.sync_all())
             .map_err(|error| PluginCommandError::failed(format!("cannot flush config: {error}")))?;
-        fs::rename(&temporary, path)
+        switchy_fs::sync::rename(&temporary, path)
             .map_err(|error| PluginCommandError::failed(format!("cannot replace config: {error}")))
     })();
     if result.is_err() {
-        let _ = fs::remove_file(&temporary);
+        let _ = switchy_fs::sync::remove_file(&temporary);
     }
     result
 }
@@ -836,7 +835,7 @@ async fn persist_and_install_global_padding(
 }
 
 fn verify_config_unchanged(path: &Path, original: &[u8]) -> Result<(), PluginCommandError> {
-    if fs::read(path).unwrap_or_default() == original {
+    if switchy_fs::sync::read(path).unwrap_or_default() == original {
         Ok(())
     } else {
         Err(PluginCommandError::failed(
@@ -854,7 +853,7 @@ async fn install_global_padding(
     let settings = padding_settings_value(plugin_settings, spec);
     crate::padding::PanePaddingConfig::parse(Some(&settings))
         .map_err(PluginCommandError::invalid_arguments)?;
-    let original = fs::read(path).unwrap_or_default();
+    let original = switchy_fs::sync::read(path).unwrap_or_default();
     let source = String::from_utf8(original.clone())
         .map_err(|_| PluginCommandError::failed("bmux.toml is not valid UTF-8"))?;
     let edited = set_padding_document(&source, spec)?
@@ -1266,6 +1265,7 @@ impl ConfigureTransaction {
 mod tests {
     use super::*;
     use bmux_plugin_sdk::NativeCommandInvocationSource;
+    use switchy_fs::sync as fs;
 
     #[test]
     fn attach_outcome_records_status_without_cli_output_path() {
