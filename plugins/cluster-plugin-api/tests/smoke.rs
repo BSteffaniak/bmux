@@ -3,7 +3,7 @@
 use bmux_cluster_plugin_api::{
     cluster_command, cluster_connection_events, cluster_control_command,
     cluster_control_command_v2, cluster_control_state, cluster_control_state_v2, cluster_peer_auth,
-    cluster_query, cluster_raft_rpc,
+    cluster_query,
     cluster_types::{
         ClusterConnectionEvent, ClusterConnectionState, ClusterConsensusRole, ClusterHostState,
         ClusterHostStatus, ClusterIdentity, ClusterJoinResult, ClusterLaunchStatus,
@@ -15,7 +15,7 @@ use bmux_cluster_plugin_api::{
         EnrollmentTokenResult, ExecutionAssignment, ExecutionId, LogicalPaneId, LogicalPaneRecord,
         LogicalTabId, LogicalTabRecord, ObservedExecution, PaneAvailability, PaneRestartPolicy,
         PeerAuthChallenge, PeerAuthProof, PlacementIntent, PromotionId, RaftRpcRequest,
-        RaftRpcResponse, WorkerAdoptionSpec, WorkerAuthority, WorkerExecution, WorkerExecutionList,
+        WorkerAdoptionSpec, WorkerAuthority, WorkerExecution, WorkerExecutionList,
         WorkerExecutionState, WorkerLaunchResult, WorkerLaunchSpec, WorkerMutationAck,
         WorkerOperationClass, WorkerQueryResult, WorkerRoute, WorkerServiceError, WorkerSignal,
         WorkspaceId, WorkspaceRecord,
@@ -24,17 +24,13 @@ use bmux_cluster_plugin_api::{
 };
 
 #[test]
-fn owned_vote_contract_is_distinct_from_legacy_raft() {
+fn owned_vote_contract_round_trips() {
     use bmux_cluster_plugin_api::{
         cluster_consensus_rpc, cluster_consensus_vote_types::VoteResponse,
     };
     assert_eq!(
         cluster_consensus_rpc::INTERFACE_ID,
         "cluster-consensus-rpc/v1"
-    );
-    assert_ne!(
-        cluster_consensus_rpc::INTERFACE_ID,
-        cluster_raft_rpc::INTERFACE_ID
     );
     let response = VoteResponse {
         request_id: uuid::Uuid::new_v4(),
@@ -133,7 +129,7 @@ fn generated_control_services_expose_consistency_and_structured_errors() {
 }
 
 #[test]
-fn raft_rpc_contract_is_generated_and_identity_bound() {
+fn peer_rpc_request_is_generated_and_identity_bound() {
     let challenge = PeerAuthChallenge {
         protocol_version: 1,
         cluster_id: "cluster:0194f776-7c0d-7000-8000-000000000000".to_string(),
@@ -162,17 +158,10 @@ fn raft_rpc_contract_is_generated_and_identity_bound() {
         bmux_plugin_sdk::decode_service_message::<RaftRpcRequest>(&encoded).unwrap(),
         request
     );
-    let response = RaftRpcResponse {
-        source_node_id: "node:target".to_string(),
-        payload: vec![4, 5],
-        error: None,
-    };
-    let encoded = bmux_plugin_sdk::encode_service_message(&response).unwrap();
     assert_eq!(
-        bmux_plugin_sdk::decode_service_message::<RaftRpcResponse>(&encoded).unwrap(),
-        response
+        bmux_cluster_plugin_api::cluster_peer_read::INTERFACE_ID,
+        "cluster-peer-read/v1"
     );
-    assert_eq!(cluster_raft_rpc::INTERFACE_ID, "cluster-raft-rpc/v1");
 }
 
 #[test]
@@ -554,7 +543,6 @@ fn interface_ids_and_operations_match_schema() {
     assert_eq!(cluster_peer_auth::OP_CHALLENGE, "challenge");
     assert_eq!(cluster_peer_auth::OP_PROVE, "prove");
     assert_eq!(cluster_peer_auth::OP_AUTHENTICATE, "authenticate");
-    assert_eq!(cluster_raft_rpc::INTERFACE_ID, "cluster-raft-rpc/v1");
     assert_eq!(
         cluster_worker_command::INTERFACE_ID,
         "cluster-worker-command/v2"
@@ -590,9 +578,18 @@ fn interface_ids_and_operations_match_schema() {
     );
     assert_eq!(cluster_control_state_v2::OP_READ_STALE, "read_stale");
     assert_eq!(cluster_control_state_v2::OP_FEATURE_FLOOR, "feature-floor");
-    assert_eq!(cluster_raft_rpc::OP_APPEND_ENTRIES, "append_entries");
-    assert_eq!(cluster_raft_rpc::OP_INSTALL_SNAPSHOT, "install_snapshot");
-    assert_eq!(cluster_raft_rpc::OP_VOTE, "vote");
+    assert_eq!(
+        bmux_cluster_plugin_api::cluster_consensus_rpc::OP_VOTE,
+        "vote"
+    );
+    assert_eq!(
+        bmux_cluster_plugin_api::cluster_consensus_rpc::OP_APPEND,
+        "append"
+    );
+    assert_eq!(
+        bmux_cluster_plugin_api::cluster_consensus_rpc_v2::OP_APPEND,
+        "append"
+    );
     assert_eq!(cluster_connection_events::OP_LIST, "list");
 }
 
@@ -693,7 +690,7 @@ fn owned_snapshot_install_contract_is_separate_and_round_trips() {
 fn generated_contract_declares_all_services() {
     let services = bmux_cluster_plugin_api::service_declarations()
         .expect("cluster service declarations should be valid");
-    assert_eq!(services.len(), 26);
+    assert_eq!(services.len(), 23);
     let service_ids = services
         .iter()
         .map(|service| service.interface_id.as_str())
@@ -705,8 +702,6 @@ fn generated_contract_declares_all_services() {
         "cluster-consensus-transfer/v1",
         "cluster-consensus-snapshot/v1",
         "cluster-bounded-control-command/v1",
-        "cluster-raft-rpc/v2",
-        "cluster-raft-decoder/v1",
         "cluster-capability-publication/v1",
         "cluster-protocol-refresh/v1",
         "cluster-principal-bootstrap/v1",
@@ -732,11 +727,19 @@ fn generated_contract_declares_all_services() {
         "provide cluster-control-command@2;",
         "provide cluster-control-state@2;",
         "provide cluster-bounded-control-command;",
+        "provide cluster-consensus-rpc@1;",
+        "provide cluster-consensus-rpc@2;",
     ] {
         assert!(package.contains(provided), "world must {provided}");
     }
-    // Owned-consensus contracts are modeled but not served until ADR-0015 cutover.
-    for unprovided in ["cluster-consensus-transfer", "cluster-consensus-rpc", "cluster-consensus-snapshot"] {
+    // The retired OpenRaft contracts are gone; staged transfer and snapshot
+    // installation are served once their providers land.
+    for unprovided in [
+        "cluster-raft-rpc",
+        "cluster-raft-decoder",
+        "cluster-consensus-transfer",
+        "cluster-consensus-snapshot",
+    ] {
         assert!(
             !package.contains(&format!("provide {unprovided}")),
             "world must not provide {unprovided}"

@@ -30,10 +30,16 @@ const CLUSTER_SCHEMA_VERSION_MIN: u32 = 1;
 const CLUSTER_SCHEMA_VERSION_MAX: u32 = 3;
 const CLUSTER_PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const ATOMIC_LAYOUT_FEATURE: &str = "atomic-layout-mutation-v2";
+// The owned consensus contracts this build serves (ADR-0015). Mandatory: the
+// owned engine is a clean break, so a peer without them cannot participate.
+const OWNED_CONSENSUS_VOTE_FEATURE: &str = "cluster-consensus-rpc/v1";
+const OWNED_CONSENSUS_APPEND_FEATURE: &str = "cluster-consensus-rpc/v2";
 const MANDATORY_CLUSTER_PROTOCOL_FEATURES: &[&str] = &[
     "membership-credential-v1",
     "node-possession-proof-v1",
     "single-use-enrollment-v1",
+    OWNED_CONSENSUS_VOTE_FEATURE,
+    OWNED_CONSENSUS_APPEND_FEATURE,
 ];
 const CLUSTER_PROTOCOL_FEATURES: &[&str] = &[
     "membership-credential-v1",
@@ -42,6 +48,8 @@ const CLUSTER_PROTOCOL_FEATURES: &[&str] = &[
     ATOMIC_LAYOUT_FEATURE,
     "bounded-control-command-v1",
     "principal-bootstrap-v1",
+    OWNED_CONSENSUS_VOTE_FEATURE,
+    OWNED_CONSENSUS_APPEND_FEATURE,
 ];
 
 pub const fn initializer_capabilities() -> ClusterNodeCapabilities {

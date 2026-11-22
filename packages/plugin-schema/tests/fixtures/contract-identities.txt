@@ -19,7 +19,6 @@ plugins/clients-plugin-api/bpdl/clients-plugin.bpdl clients-events e95d79014e0be
 plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-principal-bootstrap-types 5cda148740f9d9bc25a8595beeb2cc3f8623edd9446edf010b5145c723aa15b7
 plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-capability-types 0b198b5e556b3945ee8f0f4fd653bae81bc63780d603eeea00cef8ab2e52356c
 plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-types a81dcb4c350b34cab073acfabbc0ad18e8bdfe84aa95847b82c42d5f4b68cc22
-plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-raft-decoder/v1 3de756df6122b96cc1de5edf3008f98df93277d35e91278635c8e9217ecf15bd
 plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-query/v1 a7e7a987d413e03ddcd37d4ab427a1815f287698b4c887bf23c3fdf320d70c81
 plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-command/v1 5d17a27457034751065eb08d766e062763eb3d9a9e48eb748270e706533ece0a
 plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-protocol-refresh/v1 58c05628dff800e66ec3d20a9db22ab2011eeaa20dd71ae209e05fb697133442
@@ -47,8 +46,6 @@ plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-consensus-snapshot/v
 plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-consensus-vote-types 201bdb585ab4800a646bbdff3ae7f89812a044e47e03cdb89c532bdfc1b9946e
 plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-peer-auth/v1 e0b80fcdc33ae2a42fc133a865ed2a6595a1518d7e189c29e687b588bb6a0e6b
 plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-peer-read/v1 21fb6f7c419daec4ebb74442bbff0fbb31b57f929237b473fa4cd39e913f546b
-plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-raft-rpc/v1 33bbfe6ea2f472100132d799e1dfc9bacfc2b6fc41e647fac8c6883252f2f210
-plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-raft-rpc/v2 5645f00973828f34cf4efb4b0fd3e0f91e712cb68d97c84fee783d6e3938f894
 plugins/cluster-plugin-api/bpdl/cluster-plugin.bpdl cluster-connection-events/v1 fa72a1a5768dc2dec6488316fd6fe3d4e8a581f3da119600a1194f67b5b4fc14
 plugins/connections-plugin-api/bpdl/connections-plugin.bpdl connection-types 98049b39ed4886521356a1b6471324fc20f859d4d39b880aa5a1a5c22a37d515
 plugins/connections-plugin-api/bpdl/connections-plugin.bpdl pairing-types 70016fe41cd6c96c0d3319467dabcd87a62a5a7fdb2ba4cb843b664103cbedc7

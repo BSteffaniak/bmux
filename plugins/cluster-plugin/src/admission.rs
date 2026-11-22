@@ -27,8 +27,13 @@ const REMOTE_PROTOCOLS: &[(&str, &str, &[&str])] = &[
     ),
     (
         "bmux.server_clusters.auth",
-        "cluster-raft-rpc/v1",
-        &["append_entries", "install_snapshot", "vote"],
+        "cluster-consensus-rpc/v1",
+        &["vote"],
+    ),
+    (
+        "bmux.server_clusters.auth",
+        "cluster-consensus-rpc/v2",
+        &["append"],
     ),
 ];
 
