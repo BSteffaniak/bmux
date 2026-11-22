@@ -198,6 +198,23 @@ fn session_of(serial: u64) -> Option<u64> {
         .map(|p| p.session_serial)
 }
 
+/// The serials of daemons panes' programs detached (which outlive their panes by design): by
+/// the kernel's facts, not the programs' word (a program killed as it detaches one never
+/// records it). Started by a process, leading a session of its own, with no terminal.
+fn detached() -> Vec<u64> {
+    simulator::snapshot()
+        .processes
+        .into_iter()
+        .filter(|p| {
+            let started_by_a_process = p.parent.is_some();
+            let without_a_terminal = p.terminal.is_none();
+            let leads_its_session = p.session_serial == p.serial;
+            started_by_a_process && without_a_terminal && leads_its_session
+        })
+        .map(|p| p.serial)
+        .collect()
+}
+
 /// Whether something outside (the kill fault) killed the process of `serial`.
 fn killed_by_fault(serial: u64) -> bool {
     simulator::signal_log()
@@ -247,10 +264,17 @@ fn terminal_state(pid: u32) -> String {
         .map_or_else(
             || format!("terminal {name} gone"),
             |t| {
+                let written = simulator::terminal_written(&name).unwrap_or_default();
+                let tail = &written[written.len().saturating_sub(48)..];
                 format!(
                     "terminal {name}: {} bytes unread by the pane, {} typed bytes unread by the \
-                     program, {} written, masters {}, hung up {}",
-                    t.output_buffered, t.input_buffered, t.written, t.master_handles, t.hung_up
+                     program, {} written, ending \"{}\", masters {}, hung up {}",
+                    t.output_buffered,
+                    t.input_buffered,
+                    t.written,
+                    tail.escape_ascii(),
+                    t.master_handles,
+                    t.hung_up
                 )
             },
         )
@@ -261,9 +285,11 @@ fn answered(pid: u32, lines: &[String]) -> bool {
     let Some(terminal) = simulator::process_io(pid).and_then(|io| io.terminal) else {
         return lines.is_empty();
     };
+    // An interrupt typed while a program reads raw input (a querier waiting for its answers)
+    // is an ordinary byte, so it joins the next line.
     let written =
         String::from_utf8_lossy(&simulator::terminal_written(&terminal).unwrap_or_default())
-            .into_owned();
+            .replace('\x03', "");
     let mut rest = written.as_str();
     lines.iter().all(|line| {
         let answer = format!("got:{line}\r\n");
@@ -765,7 +791,8 @@ impl Shared {
             .await;
         if !reached {
             self.violated(format!(
-                "2. pane process {pid} never answered all of {:?} ({})",
+                "2. pane process {pid} ({}) never answered all of {:?} ({})",
+                crate::programs::kind_of(opened.serial).map_or("unknown program", crate::programs::Kind::name),
                 opened.typed,
                 terminal_state(pid)
             ));
@@ -1017,7 +1044,7 @@ impl Shared {
         // Everything running now that no outsider started belongs to the dead server.
         // (So do the daemons panes' programs detached, by design.)
         let mut outsiders: Vec<u64> = self.lock().witnesses.iter().map(|w| w.serial).collect();
-        outsiders.extend(crate::programs::detached());
+        outsiders.extend(detached());
         let owned: Vec<u64> = simulator::snapshot()
             .processes
             .iter()
@@ -1093,7 +1120,7 @@ impl Shared {
     async fn check_nothing_leaks(&self) {
         Board::checked(9);
         let mut outsiders: Vec<u64> = self.lock().witnesses.iter().map(|w| w.serial).collect();
-        outsiders.extend(crate::programs::detached());
+        outsiders.extend(detached());
         let strays = || -> Vec<String> {
             simulator::snapshot()
                 .processes

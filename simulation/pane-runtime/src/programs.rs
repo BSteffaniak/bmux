@@ -71,8 +71,7 @@ impl Kind {
     }
 }
 
-/// The run's programs: the mix to draw from, what each pane's program turned out to be, and
-/// the detached processes daemons left (which outlive their panes by design).
+/// The run's programs: the mix to draw from, and what each pane's program turned out to be.
 #[derive(Debug, Default)]
 pub struct Programs(Mutex<State>);
 
@@ -80,7 +79,6 @@ pub struct Programs(Mutex<State>);
 struct State {
     mix: Vec<(Kind, u64)>,
     kinds: BTreeMap<u64, Kind>,
-    detached: Vec<u64>,
 }
 
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
@@ -98,12 +96,6 @@ pub fn set_mix(mix: Vec<(Kind, u64)>) {
 #[must_use]
 pub fn kind_of(serial: u64) -> Option<Kind> {
     with(|state| state.kinds.get(&serial).copied())
-}
-
-/// The serials of processes daemons detached.
-#[must_use]
-pub fn detached() -> Vec<u64> {
-    with(|state| state.detached.clone())
 }
 
 fn draw(bound: u64) -> u64 {
@@ -140,12 +132,7 @@ pub fn program(process: &mut Process) -> i32 {
             shell(process, Vec::new())
         }
         Kind::Daemonizer => {
-            if let Ok(pid) = process.spawn_session(&["sleep", "3600000"])
-                && !simulator::personality().is_windows()
-                && let Some(serial) = simulator::serial_of(pid)
-            {
-                with(|state| state.detached.push(serial));
-            }
+            let _ = process.spawn_session(&["sleep", "3600000"]);
             shell(process, Vec::new())
         }
         Kind::Orphaner => {
