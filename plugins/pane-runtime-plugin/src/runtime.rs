@@ -8638,6 +8638,34 @@ impl SessionRuntimeManager {
             let mut owner_exited = false;
             let mut execution_changes = execution_for_task.subscribe();
             execution_for_task.notify();
+            // Stop the pane: end everything in its session, release its lifetime, and reap
+            // its leader.
+            macro_rules! stop_pane {
+                () => {{
+                    let resurrection = Arc::clone(&resurrection_state_for_shutdown);
+                    let execution = Arc::clone(&execution_for_task);
+                    // Checkpoint/service IO and helper cleanup must not block
+                    // executor workers, otherwise multipane shutdown is serial
+                    // even when every pane received stop concurrently.
+                    let stopped = switchy_async::task::spawn_blocking({ let host = host.clone(); move || {
+                        let frozen = resurrection.lock()
+                            .map_err(|_| anyhow::anyhow!("resurrection lock poisoned"))
+                            .and_then(|mut state| state.freeze());
+                        if let Err(error) = frozen {
+                            execution.record_cleanup_error(format!("checkpoint freeze failed: {error}"));
+                        }
+                        if let Err(error) = execution.signal_owned_group(&host, crate::platform::StopAction::Force) {
+                            execution.record_cleanup_error(format!("group stop failed: {error}"));
+                        }
+                        let lifetime = PaneLifetime { execution, resurrection };
+                        lifetime.revoke();
+                    } }).await;
+                    if let Err(error) = stopped {
+                        execution_for_task.record_cleanup_error(format!("pane stop worker failed: {error}"));
+                    }
+                    kill_unreaped_leader(&execution_for_task, &mut child_killer);
+                }};
+            }
             loop {
                 if !startup_ready {
                     break;
@@ -8652,6 +8680,13 @@ impl SessionRuntimeManager {
                             break;
                         }
                         if owner_exited && reader_thread_done.load(Ordering::SeqCst) {
+                            // The pane is being stopped (closed, or refused before its
+                            // commit, which also ends its reader): what its leader left
+                            // running ends with it, rather than being released.
+                            if startup_stop_requested(&mut stop_rx) {
+                                stop_pane!();
+                                break;
+                            }
                             // Members deliberately left running after the
                             // leader exited no longer hold the terminal.
                             execution_for_task.retire_released_session();
@@ -8677,28 +8712,7 @@ impl SessionRuntimeManager {
                         }
                     }
                     _ = &mut stop_rx => {
-                        let resurrection = Arc::clone(&resurrection_state_for_shutdown);
-                        let execution = Arc::clone(&execution_for_task);
-                        // Checkpoint/service IO and helper cleanup must not block
-                        // executor workers, otherwise multipane shutdown is serial
-                        // even when every pane received stop concurrently.
-                        let stopped = switchy_async::task::spawn_blocking({ let host = host.clone(); move || {
-                            let frozen = resurrection.lock()
-                                .map_err(|_| anyhow::anyhow!("resurrection lock poisoned"))
-                                .and_then(|mut state| state.freeze());
-                            if let Err(error) = frozen {
-                                execution.record_cleanup_error(format!("checkpoint freeze failed: {error}"));
-                            }
-                            if let Err(error) = execution.signal_owned_group(&host, crate::platform::StopAction::Force) {
-                                execution.record_cleanup_error(format!("group stop failed: {error}"));
-                            }
-                            let lifetime = PaneLifetime { execution, resurrection };
-                            lifetime.revoke();
-                        } }).await;
-                        if let Err(error) = stopped {
-                            execution_for_task.record_cleanup_error(format!("pane stop worker failed: {error}"));
-                        }
-                        kill_unreaped_leader(&execution_for_task, &mut child_killer);
+                        stop_pane!();
                         break;
                     }
                     child_exit = child_exit_rx.recv() => {
