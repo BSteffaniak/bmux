@@ -341,3 +341,121 @@ fleets and determinism-verified runs), regression seeds for what it finds, and n
 - **Checks.** Pane-runtime regression seeds, 300 determinism-verified pane-runtime runs (swarm
   yield probability), pty regression seeds and 300 verified local-terminal runs all passed
   with the yields in place; no new failures.
+### 19.3 (the pane runtime's profiles)
+
+- **Two new profile faults.** `threadspawn` (switchy_thread's `set_spawn_failures`) and
+  `clockjump` (switchy_time's `set_wall_clock_jumps`, per clock advance). Each is:
+  - drawn per profile;
+  - printed and parsed (the profile string round-trips);
+  - mutated by guided runs;
+  - applied as the run starts, before the workload spawns anything, and only when on, so
+    `SIMULATOR_THREAD_SPAWN_FAILURES` and `SIMULATOR_WALL_CLOCK_JUMPS` still force them.
+
+  A thread spawn failure excuses a failed open or restart, as a kernel spawn failure does.
+- **Old seeds draw as before.** The new fields are drawn after every existing one, so each
+  old field gets the same draws (a test checks the order), and both faults draw from streams
+  of their own, only while on. The one regression seed without a pinned profile draws both
+  off. Every regression seed passes.
+- **Both stay off in drawn and mutated profiles for now** (`THREAD_SPAWN_FAULTS` and
+  `WALL_CLOCK_JUMPS` in `profile.rs`; the draws stay, so turning them on shifts nothing, and
+  `threadspawn=` / `clockjump=` in a profile still force them):
+  - **Thread spawns.** `switchy_async`'s simulator expects the spawns of its own threads to
+    succeed: `spawn_blocking` and the executor's workers call `.expect("a simulated thread
+    starts")`. With failures at 0.5% or 2% of spawns, most runs panic there first (every
+    pane's startup uses `spawn_blocking`), before the plugin's own `.ok()` paths matter.
+    Those paths look sound: a waiter or reader thread that cannot start fails the pane's
+    startup and ends its program. Open in switchy_async: report a failed blocking spawn
+    through the join handle, and start the executor's workers without failing (or exempt
+    its own threads).
+  - **Wall clock jumps.** simvar's harness measures each run's elapsed time on the simulated
+    wall clock after the run (`end.duration_since(start).unwrap()` in `run_once`), outside
+    the run's panic catching. A run whose clock ends behind where it started panics the
+    fleet worker: the run disappears (one seed alone prints `0 runs, 0 failed`), and the
+    runs it cuts short fail their determinism replays. The base build fails the same way
+    with `SIMULATOR_WALL_CLOCK_JUMPS=0.001`; drawn in one profile in four, verified fleets
+    of 300 failed 9 and 13 runs this way. Open in simvar: measure runs on the monotonic
+    clock. No pane runtime failure from the jumps themselves was seen.
+
+### 19.4 (exploration)
+
+- **`--explore <scenario|all> [--delays N]`.** Six scripted scenarios
+  (`simulation/pane-runtime/src/explore.rs`). Each opens a pane (or a pane and a split),
+  then two drivers each take one step at once, then the workload's end closes every pane and
+  checks that nothing is left. Fixed profile (shell programs, no faults, no id reuse), one
+  seed, so only the schedule varies:
+
+  | Scenario | Personality | Setup | Driver 0 | Driver 1 |
+  | --- | --- | --- | --- | --- |
+  | `restart-during-close` | Windows | open | close pane 0 | restart pane 0 |
+  | `crash-during-open` | Linux | open | open | crash |
+  | `resize-during-restart` | macOS | open | restart pane 0 | resize pane 0 |
+  | `close-split-during-restart` | Linux | open, split | restart pane 1 | close pane 0 |
+  | `exit-during-restart` | Linux | open | type `exit` into pane 0 | restart pane 0 |
+  | `interrupt-during-startup` | Windows | open | restart pane 0 | interrupt pane 0 |
+
+- **Scripted drivers in the workload.** `Step`s name a pane by the order panes opened, and
+  run through the workload's own actions and checks. A script may act on a pane mid-restart
+  or one closed meanwhile, which drawn actions never do:
+  - a line typed mid-restart is not expected back (either program may read it);
+  - a restart of a pane closed meanwhile must leave nothing behind (invariant 9);
+  - a restart refused because the pane closed meanwhile is not a violation;
+  - sibling checks (invariant 11) run with two scripted drivers, since what one driver does
+    to a sibling marks it touched.
+- **The bound counts delays, not preemptions.** `switchy_thread`'s `explore_runs` bounds
+  preemptions only: a switch because the running thread blocked is free, so every free
+  choice is branched on. In a pane runtime run they compound. A scenario has 160 to 1,200
+  choice points, many where several threads wake at once; at a bound of 0 preemptions the
+  first scenario passed 5,000 schedules (300 a second) with the tree still widening. It
+  cannot prune either: the simulated kernel and executor use the scheduler's public switch
+  points, so every run is untracked. So `--explore` bounds *delays* instead (Emmi, Qadeer and
+  Rakamarić, 2011): every schedule departing from the default at most `N` times, at choice
+  points from the drivers' start to the run's end. A schedule within `k` preemptions and no
+  other departure is within `k` delays. Runs are made by `switchy_thread::simulator::run_with`
+  replaying each schedule, driven as simvar's step loop drives a run. Each run's choice
+  points are read through the decision hook, and checked against the scheduler's own count
+  and the schedule it followed, so a nondeterministic scenario is reported, not explored
+  wrongly. Open in switchy_thread: delay bounding (or a window of choice points) in
+  `explore_runs`, and footprints from switchy_pty and switchy_async so sleep sets can prune.
+- **Measured** (on a 15-core laptop; with two delays, 12 explorations ran at once beside
+  other builds, so those times are 3 to 4 times a run's unloaded cost, and the larger ones
+  stopped at a 300,000-run cap):
+
+  | Scenario | Workers | Choice points (window) | 1 delay: runs, time | 2 delays: runs, time |
+  | --- | --- | --- | --- | --- |
+  | `restart-during-close` | 1 | 356 (275) | 442, 0.8s | 92,291, 534s |
+  | `restart-during-close` | 2 | 408 (334) | 460, 1.4s | 109,095, 543s |
+  | `crash-during-open` | 1 | 307 (234) | 436, 1.6s | 92,407, 489s |
+  | `crash-during-open` | 2 | 164 (93) | 133, 0.5s | 11,362, 91s |
+  | `resize-during-restart` | 1 | 510 (437) | 722, 3.5s | 255,407, 1,643s |
+  | `resize-during-restart` | 2 | 821 (750) | 1,319, 6.4s | over 300,000 |
+  | `close-split-during-restart` | 1 | 747 (553) | 858, 6.3s | over 300,000 |
+  | `close-split-during-restart` | 2 | 1,217 (1,014) | 1,926, 14.1s | over 300,000 |
+  | `exit-during-restart` | 1 | 325 (252) | 337, 0.7s | 57,065, 352s |
+  | `exit-during-restart` | 2 | 632 (561) | 777, 2.6s | over 300,000 |
+  | `interrupt-during-startup` | 1 | 160 (79) | 131, 0.1s | 7,120, 57s (16s alone) |
+  | `interrupt-during-startup` | 2 | 651 (577) | 881, 6.3s | over 300,000 |
+
+  A run costs 2 to 6 ms. Every scenario to one delay, both worker counts, takes about 40s of
+  processor time (12s on the laptop, in parallel). Two delays take roughly the square of the
+  one-delay count over two: up to about 1.9 million runs (close-split under two workers),
+  a few hours on one core, hence one nightly job per scenario.
+- **Found.**
+  - A workload race, under two workers (`crash-during-open`, schedule `79=7`): a driver chose
+    its action and counted it under way in two locked sections, so a crash between them saw
+    nothing under way and tore the server down under the action ("1. opening a pane failed:
+    the server died"). Fixed: one locked section, with the generation the action acts on.
+  - A scenario check: a restart refused because a scripted close removed its pane meanwhile
+    ("runtime not found for session") is no violation.
+  - No pane runtime bug: every scenario passes every schedule to one delay, and to two delays
+    as far as each ran (table).
+- **Failures** are shrunk with `switchy_thread::simulator::shrink` and printed with their
+  replay command, `--explore <scenario> --workers N --schedule <schedule>` (or
+  `SIMULATOR_SCHEDULE`).
+- **Workers.** `--explore` runs each scenario under 1 and 2 workers, each in a process of its
+  own (`SIMULATOR_ASYNC_WORKERS` is read once per run), as many processes at once as there
+  are processors.
+- **CI.** Per-change CI (`ci.yml`, the PTY Simulation job) runs `cargo sim pane-runtime
+  --explore all --delays 1`. The nightly (`pty-simulation-nightly.yml`, job `explore`) runs
+  each scenario in its own job to its full bound, 2 delays (`cargo sim pane-runtime --explore
+  <scenario>`). Three delays is out of reach: it multiplies each bound-2 count by roughly
+  the number of choice points again.
