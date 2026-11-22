@@ -232,4 +232,117 @@ found is described in the implementation notes below.
 
 ## Implementation notes
 
-(Filled in as the work lands.)
+Status (2026-11-22): 18.1–18.4, 18.7, 18.8 and 18.10 landed. 18.5 and 18.6 landed in part; what
+is missing is listed under "Not done yet".
+
+### What landed
+
+- **Profiles and drivers (18.1, 18.2).** `simulation/pane-runtime/src/profile.rs` draws each
+  run's profile, and `workload.rs` runs 1–4 drivers on one runtime.
+  - A crash cancels the drivers' actions under way, then kills the server.
+  - `PANE_RUNTIME_SIM_PROFILE` forces a profile. Its words may be separated by spaces or
+    commas.
+- **The crash model.** The simulation facade runs its server on an executor of its own,
+  driven from the run's executor. A crash abandons the sessions and calls `shutdown_now`:
+  every task and thread of the server stops where it is, and its handles close as a dead
+  process's would.
+- **Kernel faults (18.3).** New in `switchy_pty`:
+  - an outside killer, at a rate per simulated second;
+  - late signals;
+  - master reads failing with EIO;
+  - stalled master writes;
+  - Windows startup cursor queries that never come or come late.
+
+  Every profile draws its fault rates.
+- **Programs (18.4).** `programs.rs` adds a shell plus programs that ignore termination,
+  detach a daemon (the new `Process::spawn_session`), orphan a child that holds the terminal,
+  exit at once, flood output, write garbage, query the terminal, or switch screens.
+- **Files (18.5).**
+  - The plugin's file I/O goes through `switchy_fs`, and the primitives scan forbids host
+    file I/O.
+  - The run's filesystem takes the kernel's personality, every file operation is a
+    scheduling switch point (`set_operation_hook`), and file faults are drawn per profile.
+  - A crash also crashes the filesystem as a killed process leaves it.
+  - The `power` action kills every process and keeps only what was made durable, then a new
+    server recovers.
+- **Wider workload (18.5, in part).** Splits (the facade now addresses each pane of a
+  session), interrupts, shells told to `exit`, and `sweep_on_exit` off (`sweep=0`).
+- **Invariants (18.6, in part).**
+  - 8: each program's exit is acted on at most once.
+  - 9: nothing is left once every pane closed: no open master, no stray process, no session
+    record.
+  - 10: a pane whose program ended says so.
+  - 11: closing a pane leaves its siblings alone.
+  - 5 now also fails an action that never finishes, naming the live threads.
+- **Scheduling and clock (18.7).** `SIMULATOR_SCHEDULE_STRATEGY=swarm` and
+  `SIMULATOR_WEAK_MEMORY=swarm` (switchy_thread) are every simulation's defaults. Profiles draw
+  the clock rate (1, 10 or 100 ms per step).
+- **Guided runs (18.8).** `--guided` (`guide.rs`) keeps profiles whose runs reached a new
+  outcome, by personality and each action's count bucketed by powers of two. A guided run
+  reports its profile as an environment-named simvar property, which goes in its replay
+  command (new in simvar).
+
+  On 5000 runs, guided fleets reached 2667–2840 distinct outcomes against 2134 unguided.
+- **Regression seeds and CI (18.10).** `sim_support::regression` serves every simulation.
+  Each line is `SEED [EPOCH] [NAME=VALUE ...] # note`. CI and the nightly run every
+  simulation's seeds, and the nightly fleets continue past failures, upload their findings,
+  and include a guided variant.
+
+### Bugs found
+
+In bmux:
+
+1. **Restart reported the live pane exited.** Restarting a pane let the replaced program's
+   exit notice name the pane, so the runtime published `PaneEvent::Exited` for the running
+   pane, on every restart.
+2. **A program exiting before adoption left its session behind.** When a pane's program
+   exited before its session was adopted, its children outlived the pane. On Linux, with the
+   terminal still held, opening the pane hung; macOS natively has the leak.
+3. **A stopped pane could release jobs it should end.** With `sweep_on_exit` off, a stopped
+   pane could release the jobs it was meant to end; a pane refused before its commit always
+   did.
+
+In MoosicBox:
+
+4. **Epoch-offset replays drew one number too few.** A replay with `SIMULATOR_EPOCH_OFFSET`
+   skipped a generator draw, so replays of multi-task runs took different paths (switchy_time).
+5. **`block_on` slept through its own future's wake-up.** The simulator's `block_on` polled
+   its future with a no-op waker (switchy_async).
+6. **Spawning didn't wake the executor.** A spawned task never ran while the executor waited
+   for work (switchy_async).
+7. **Spawning across runtimes panicked.** Spawning onto one simulator runtime from another
+   runtime's task panicked (switchy_async).
+8. **tokio's `watch` woke waiters in no seeded order.** switchy_async's simulator now has its
+   own deterministic watch, and the plugin uses it (the scan forbids tokio's).
+9. **Killed threads parked for good.** A thread killed while its destructor waited on a lock
+   held by another victim, or slept, was parked forever, keeping what it held (switchy_thread).
+10. **The simulated console mishandled early typing.** It echoed typing before its cursor
+    report, and typed withheld bytes without the line discipline (switchy_pty).
+11. **Closing a simulated console spared processes ignoring hang-ups.** Real Windows ends
+    every attached process (`CTRL_CLOSE_EVENT` cannot be ignored); the simulator let them run
+    (switchy_pty).
+12. **simvar_harness's own tests no longer compiled.**
+
+In the simulation itself:
+
+- Windows jobs now start with the spawn. This is held by the `Preparation`, as natively.
+
+### Open
+
+- **A Windows close hang with `sweep_on_exit` off.** A pane whose shell exited while leaving
+  a job attached to the console, after restarts, can fail to close: its capture threads wait
+  for console output that only ends once the console closes. The console is closed only after
+  its owner retires.
+
+  Replay: `SIMULATOR_SEED=3115520519799623519 SIMULATOR_EPOCH_OFFSET=79240133395435` on the
+  build of commit `145a0a38` (its profile is drawn from the seed; it was found before sweeping
+  was kept on by default). Profiles keep sweeping on by default until this is fixed, so CI
+  does not trip over it; `sweep=0` explores it.
+
+### Not done yet
+
+- **Wider workload:** attach and detach with grid snapshots, program executions with exit
+  codes, snapshots and resurrection, managed scopes and reservations.
+- **Grid consistency (18.6):** that what a pane's grid shows matches what its program wrote.
+- **Metamorphic runs (18.6):** the `--metamorphic` mode, one workload under three
+  personalities.
