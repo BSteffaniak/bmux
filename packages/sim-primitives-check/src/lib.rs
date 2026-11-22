@@ -4,8 +4,8 @@
 //! the like), so a simulator build runs it as a pure function of its seed.
 //!
 //! A crate on a simulated path calls [`Scan`] from a test of its own. The scan reads every `.rs`
-//! file under the crate's `src/` (skipping `#[cfg(test)]` items, comments and `*_tests.rs`
-//! files) and reports each line that:
+//! file under the crate's `src/` (skipping `#[cfg(test)]` items, comments, and the test modules
+//! `tests.rs` and `*_tests.rs`) and reports each line that:
 //!
 //! * uses a forbidden primitive ([`FORBIDDEN`]) other than through a `switchy_` crate of the same
 //!   name;
@@ -169,6 +169,8 @@ impl Scan {
                 || self.native.iter().any(|native| relative.starts_with(native.as_str()))
                 || self.exempt.contains(&relative)
                 || relative.ends_with("_tests.rs")
+                || relative == "tests.rs"
+                || relative.ends_with("/tests.rs")
             {
                 continue;
             }
