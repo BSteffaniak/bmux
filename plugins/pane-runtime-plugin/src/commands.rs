@@ -1076,7 +1076,8 @@ impl ConfigureTransaction {
         loop {
             switchy_async::select! {
                 response = &mut responses => {
-                    self.finish(response.ok()).await;
+                    // `inject_yields` cannot see inside `select!`: these yield by hand.
+                    switchy_async::task::yield_after(self.finish(response.ok())).await;
                     return;
                 }
                 () = &mut numeric_debounce, if pending_numeric.is_some() => {
@@ -1087,7 +1088,7 @@ impl ConfigureTransaction {
                         continue;
                     };
                     let next_spec = apply_linked_edge(&values, &field_id, parsed_spec);
-                    if self.update(self.targets.clone(), next_spec).await {
+                    if switchy_async::task::yield_after(self.update(self.targets.clone(), next_spec)).await {
                         self.spec = next_spec;
                     }
                 }
@@ -1107,7 +1108,7 @@ impl ConfigureTransaction {
                         continue;
                     }
                     pending_numeric = None;
-                    self.form_changed(&field_id, &values).await;
+                    switchy_async::task::yield_after(self.form_changed(&field_id, &values)).await;
                 }
             }
         }
@@ -1150,24 +1151,22 @@ impl ConfigureTransaction {
     }
 
     async fn update(&mut self, targets: Vec<Uuid>, spec: PanePaddingSpec) -> bool {
-        matches!(
-            pane_runtime_commands::client::update_pane_padding_preview(
-                &mut self.route,
-                self.token,
-                targets,
-                preview_spec(spec),
-            )
-            .await,
-            Ok(Ok(_))
+        // Awaited outside `matches!`, where `inject_yields` can see it.
+        let updated = pane_runtime_commands::client::update_pane_padding_preview(
+            &mut self.route,
+            self.token,
+            targets,
+            preview_spec(spec),
         )
+        .await;
+        matches!(updated, Ok(Ok(_)))
     }
 
     async fn cancel(&mut self) -> bool {
-        matches!(
+        let cancelled =
             pane_runtime_commands::client::cancel_pane_padding_preview(&mut self.route, self.token)
-                .await,
-            Ok(Ok(_))
-        )
+                .await;
+        matches!(cancelled, Ok(Ok(_)))
     }
 
     async fn finish(mut self, response: Option<PromptResponse>) {

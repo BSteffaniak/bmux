@@ -31,26 +31,26 @@ use std::collections::BTreeMap;
 // it (and in the modules it declares) becomes a seeded point where another task may run.
 // Natively it expands to the plain declaration. `tests/yields.rs` fails on async code no
 // module or `#[switchy_async::inject_yields]` covers.
-switchy_async::inject_yields_mod!(mod application_resurrection;);
-switchy_async::inject_yields_mod!(mod atomic_state;);
-switchy_async::inject_yields_mod!(mod capture_handshake;);
-switchy_async::inject_yields_mod!(mod commands;);
-switchy_async::inject_yields_mod!(mod dir_order;);
-switchy_async::inject_yields_mod!(mod files;);
-switchy_async::inject_yields_mod!(mod handlers;);
-switchy_async::inject_yields_mod!(mod ids;);
-switchy_async::inject_yields_mod!(pub mod observation;);
-switchy_async::inject_yields_mod!(mod padding;);
-switchy_async::inject_yields_mod!(mod padding_api;);
-switchy_async::inject_yields_mod!(mod platform;);
-switchy_async::inject_yields_mod!(mod private_input;);
-switchy_async::inject_yields_mod!(mod readiness;);
-switchy_async::inject_yields_mod!(mod run_shared;);
-switchy_async::inject_yields_mod!(mod runtime;);
+switchy_async::inject_yields_mod! { mod application_resurrection; }
+switchy_async::inject_yields_mod! { mod atomic_state; }
+switchy_async::inject_yields_mod! { mod capture_handshake; }
+switchy_async::inject_yields_mod! { mod commands; }
+switchy_async::inject_yields_mod! { mod dir_order; }
+switchy_async::inject_yields_mod! { mod files; }
+switchy_async::inject_yields_mod! { mod handlers; }
+switchy_async::inject_yields_mod! { mod ids; }
+switchy_async::inject_yields_mod! { pub mod observation; }
+switchy_async::inject_yields_mod! { mod padding; }
+switchy_async::inject_yields_mod! { mod padding_api; }
+switchy_async::inject_yields_mod! { mod platform; }
+switchy_async::inject_yields_mod! { mod private_input; }
+switchy_async::inject_yields_mod! { mod readiness; }
+switchy_async::inject_yields_mod! { mod run_shared; }
+switchy_async::inject_yields_mod! { mod runtime; }
 #[cfg(feature = "simulator")]
 pub use runtime::simulation;
-switchy_async::inject_yields_mod!(mod snapshot;);
-switchy_async::inject_yields_mod!(mod snapshot_v1_migration;);
+switchy_async::inject_yields_mod! { mod snapshot; }
+switchy_async::inject_yields_mod! { mod snapshot_v1_migration; }
 
 #[cfg(test)]
 mod retired_execution_tests;

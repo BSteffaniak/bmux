@@ -44,10 +44,15 @@ fn exemptions_name_real_code() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let findings = switchy_async_cargo::uncovered(root);
     for (file, name, reason) in EXEMPT {
-        assert!(!reason.is_empty(), "exemption {file}::{name} needs a reason");
         assert!(
-            findings.iter().any(|finding| finding.file.ends_with(file)
-                && finding.name.as_deref() == Some(*name)),
+            !reason.is_empty(),
+            "exemption {file}::{name} needs a reason"
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.file.ends_with(file)
+                    && finding.name.as_deref() == Some(*name)),
             "exemption {file}::{name} matches nothing uncovered: remove it"
         );
     }

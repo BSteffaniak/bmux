@@ -7990,7 +7990,8 @@ impl SessionRuntimeManager {
                     if let Some(writer) = &capture_writer { writer.fail("startup rejected before capture drain"); }
                     drop(reader);
                     drop(pty_pair);
-                    let reason = startup_capture::acknowledge_cleanup(&host, capture_owner.take(), &cleanup_tx, previous, reason).await;
+                    // `inject_yields` cannot see inside a macro: yield here by hand.
+                    let reason = switchy_async::task::yield_after(startup_capture::acknowledge_cleanup(&host, capture_owner.take(), &cleanup_tx, previous, reason)).await;
                     child_spawned = true; // Capture cleanup has supplied the actual acknowledgement.
                     fail_startup!(reason);
                 }};
@@ -8647,7 +8648,8 @@ impl SessionRuntimeManager {
                     // Checkpoint/service IO and helper cleanup must not block
                     // executor workers, otherwise multipane shutdown is serial
                     // even when every pane received stop concurrently.
-                    let stopped = switchy_async::task::spawn_blocking({ let host = host.clone(); move || {
+                    // `inject_yields` cannot see inside a macro: yield here by hand.
+                    let stopped = switchy_async::task::yield_after(switchy_async::task::spawn_blocking({ let host = host.clone(); move || {
                         let frozen = resurrection.lock()
                             .map_err(|_| anyhow::anyhow!("resurrection lock poisoned"))
                             .and_then(|mut state| state.freeze());
@@ -8659,7 +8661,7 @@ impl SessionRuntimeManager {
                         }
                         let lifetime = PaneLifetime { execution, resurrection };
                         lifetime.revoke();
-                    } }).await;
+                    } })).await;
                     if let Err(error) = stopped {
                         execution_for_task.record_cleanup_error(format!("pane stop worker failed: {error}"));
                     }
@@ -8698,12 +8700,13 @@ impl SessionRuntimeManager {
                                 execution: Arc::clone(&execution_for_task),
                                 resurrection: Arc::clone(&resurrection_state_for_shutdown),
                             };
-                            let cleanup = switchy_async::task::spawn_blocking({ let host = host.clone(); move || {
+                            // `inject_yields` cannot see inside `select!`: yield here by hand.
+                            let cleanup = switchy_async::task::yield_after(switchy_async::task::spawn_blocking({ let host = host.clone(); move || {
                                 if let Err(error) = lifetime.execution.signal_owned_group(&host, crate::platform::StopAction::Force) {
                                     lifetime.execution.record_cleanup_error(format!("reader-failure group cleanup failed: {error}"));
                                 }
                                 lifetime.revoke();
-                            } }).await;
+                            } })).await;
                             if let Err(error) = cleanup {
                                 execution_for_task.record_cleanup_error(format!("reader cleanup worker failed: {error}"));
                             }
