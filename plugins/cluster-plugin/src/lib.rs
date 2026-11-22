@@ -25,6 +25,7 @@ pub mod consensus_model;
 pub mod consensus_network;
 pub mod consensus_runtime;
 pub mod consensus_storage;
+pub mod consensus_wire;
 pub mod control_codec;
 pub mod control_state;
 mod control_watch;

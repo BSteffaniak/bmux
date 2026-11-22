@@ -3664,12 +3664,41 @@ pub type StagedSnapshot = Box<dyn FnMut(NodeId, LogIdentity) -> io::Result<Vec<u
 pub struct OwnedStorage {
     store: OwnedVoteStore,
     staged: StagedSnapshot,
+    members: Option<crate::consensus_wire::MemberView>,
 }
 
 impl OwnedStorage {
     #[must_use]
     pub fn new(store: OwnedVoteStore, staged: StagedSnapshot) -> Self {
-        Self { store, staged }
+        Self {
+            store,
+            staged,
+            members: None,
+        }
+    }
+
+    /// Keep `members` current with applied member credentials for the wire adapter.
+    /// # Errors
+    /// Reports failure to read the applied state.
+    pub fn with_members(mut self, members: crate::consensus_wire::MemberView) -> io::Result<Self> {
+        self.members = Some(members);
+        self.refresh_members()?;
+        Ok(self)
+    }
+
+    fn refresh_members(&mut self) -> io::Result<()> {
+        let Some(view) = &self.members else {
+            return Ok(());
+        };
+        let state = self.store.read_control_state()?;
+        let cluster = state
+            .members
+            .values()
+            .next()
+            .map(|member| member.cluster_id.clone())
+            .unwrap_or_default();
+        view.update(cluster, state.members.into_values().collect());
+        Ok(())
     }
 }
 
@@ -3698,7 +3727,8 @@ impl crate::consensus_driver::Storage for OwnedStorage {
             ));
         }
         let expected = self.store.state;
-        self.store.install_snapshot(expected, &bytes)
+        self.store.install_snapshot(expected, &bytes)?;
+        self.refresh_members()
     }
 
     fn apply(&mut self, through: LogIdentity) -> io::Result<Vec<(LogIdentity, Vec<u8>)>> {
@@ -3717,6 +3747,7 @@ impl crate::consensus_driver::Storage for OwnedStorage {
                 if !reached {
                     return Err(invalid("application stopped before the durable commit"));
                 }
+                self.refresh_members()?;
                 return Ok(responses);
             }
         }
