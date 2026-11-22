@@ -415,10 +415,14 @@ impl Shared {
                     return;
                 } else {
                     state.steps_left -= 1;
-                    Some(self.profile.choose(draw))
+                    let kind = self.profile.choose(draw);
+                    // Under way from now on, so a crash beginning after this waits for it (or
+                    // cancels it); counted later, a crash could pass it and tear the server
+                    // down under it.
+                    Some((kind, self.begin(&mut state, kind)))
                 }
             };
-            let Some(kind) = kind else {
+            let Some((kind, generation)) = kind else {
                 switchy_async::time::sleep(Duration::from_millis(1)).await;
                 continue;
             };
@@ -437,16 +441,24 @@ impl Shared {
             if kind == Kind::Crash || kind == Kind::PowerLoss {
                 self.crash(driver, kind == Kind::PowerLoss).await;
             } else {
-                self.cancellable(driver, kind).await;
+                self.cancellable(driver, kind, generation).await;
             }
             self.collect_exits();
         }
     }
 
-    /// Run `kind`, cancelled if the server crashes meanwhile.
-    async fn cancellable(&self, driver: u64, kind: Kind) {
-        let current = self.generation.load(Ordering::SeqCst);
-        self.lock().busy += 1;
+    /// Count `kind` under way (unless it crashes the server), with the server generation it
+    /// acts on, which a crash ends.
+    fn begin(&self, state: &mut State, kind: Kind) -> u64 {
+        if !matches!(kind, Kind::Crash | Kind::PowerLoss) {
+            state.busy += 1;
+        }
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Run `kind` (begun on server generation `current`), cancelled if the server crashes
+    /// meanwhile.
+    async fn cancellable(&self, driver: u64, kind: Kind, current: u64) {
         let crashed = async {
             while self.generation.load(Ordering::SeqCst) == current {
                 switchy_async::time::sleep(Duration::from_millis(1)).await;
