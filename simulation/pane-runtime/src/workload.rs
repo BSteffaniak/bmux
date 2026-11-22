@@ -14,12 +14,15 @@ use std::{
     collections::BTreeMap,
     path::PathBuf,
     sync::{
-        Arc, Mutex, MutexGuard, PoisonError,
+        Arc, PoisonError,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
 
+// The run's own lock: drivers may run on several workers at once, so waiting for it must be a
+// switch point the scheduler controls (a std lock would block the whole run).
+use switchy_thread::sync::{Mutex, MutexGuard};
 use bmux_pane_runtime_plugin::simulation::{Pane, Panes, Restarted};
 use bmux_simvar_tui::Tone;
 use switchy_pty::simulator::{self, ProcessState};
@@ -240,7 +243,9 @@ fn live_threads() -> Vec<String> {
         .threads
         .into_iter()
         .skip(1)
-        .filter(|thread| thread.state != switchy_thread::simulator::ThreadState::Finished)
+        .filter(|thread| {
+            !thread.daemon && thread.state != switchy_thread::simulator::ThreadState::Finished
+        })
         .map(|thread| format!("{} ({:?})", thread.name, thread.state))
         .collect()
 }

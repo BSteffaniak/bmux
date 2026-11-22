@@ -881,9 +881,14 @@ impl Controller for FleetController {
 
 /// Vary scheduling per run: unless the environment fixes them, each run draws its scheduling
 /// strategy (random, or PCT with a drawn depth) and whether weak memory is modelled from its
-/// seed (`swarm`; see `switchy_thread`'s `Config::from_env`).
+/// seed (`swarm`; see `switchy_thread`'s `Config::from_env`), and how many workers its async
+/// runtimes poll tasks with at once (see `switchy_async`'s simulator workers).
 fn scheduling_defaults() {
-    for name in ["SIMULATOR_SCHEDULE_STRATEGY", "SIMULATOR_WEAK_MEMORY"] {
+    for name in [
+        "SIMULATOR_SCHEDULE_STRATEGY",
+        "SIMULATOR_WEAK_MEMORY",
+        "SIMULATOR_ASYNC_WORKERS",
+    ] {
         if std::env::var_os(name).is_none() {
             // SAFETY: called before the simulation (or anything else) starts any thread.
             unsafe { std::env::set_var(name, "swarm") };

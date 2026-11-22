@@ -118,6 +118,9 @@ fn trace_decisions() {
     let backtrace_at: Option<u64> = std::env::var("PANE_RUNTIME_SIM_BACKTRACE_AT")
         .ok()
         .and_then(|value| value.parse().ok());
+    let threads_at: Option<u64> = std::env::var("PANE_RUNTIME_SIM_THREADS_AT")
+        .ok()
+        .and_then(|value| value.parse().ok());
     switchy_thread::simulator::set_decision_hook(Some(Arc::new(
         move |decision: &switchy_thread::simulator::Decision,
               snapshot: &dyn Fn() -> switchy_thread::simulator::SchedulerSnapshot| {
@@ -125,6 +128,12 @@ fn trace_decisions() {
                 eprintln!("{}", std::backtrace::Backtrace::force_capture());
             }
             let threads = snapshot().threads;
+            // With `PANE_RUNTIME_SIM_THREADS_AT=N`, every thread's state at decision N.
+            if threads_at == Some(decision.number) {
+                for (index, thread) in threads.iter().enumerate() {
+                    eprintln!("thread {index} {} {:?}", thread.name, thread.state);
+                }
+            }
             let name = |index: usize| threads.get(index).map_or("?", |t| t.name.as_str());
             eprintln!(
                 "decision {} step {} {} {:?} -> {}",
@@ -161,6 +170,30 @@ pub fn run_profile() -> Profile {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .below(bound.max(1))
     })
+}
+
+/// The run's shape tags, as it starts: its kernel, schedule, clock, workers and profile.
+fn run_shape(profile: &Profile) -> Vec<String> {
+    let mut shape = vec![
+        format!(
+            "personality:{}",
+            format!("{:?}", simulator::personality()).to_lowercase()
+        ),
+        format!(
+            "schedule:{}",
+            switchy_thread::simulator::scheduler().config().describe()
+        ),
+        format!("clock:{}", profile.clock),
+        format!(
+            "workers:{}",
+            switchy_async::simulator::runtime::run_workers()
+        ),
+    ];
+    shape.extend(profile.tags());
+    if guide::enabled() {
+        shape.push("guided".into());
+    }
+    shape
 }
 
 /// One run's workload. Returns the violations found, if any.
@@ -225,21 +258,7 @@ pub async fn run_workload() -> Result<(), Vec<String>> {
         );
     }
     simulator::register_program("sh", programs::program);
-    let mut shape = vec![
-        format!(
-            "personality:{}",
-            format!("{:?}", simulator::personality()).to_lowercase()
-        ),
-        format!(
-            "schedule:{}",
-            switchy_thread::simulator::scheduler().config().describe()
-        ),
-        format!("clock:{}", profile.clock),
-    ];
-    shape.extend(profile.tags());
-    if guide::enabled() {
-        shape.push("guided".into());
-    }
+    let mut shape = run_shape(&profile);
     sim_support::shape(shape.clone());
     sim_support::event("profile", profile.to_string(), bmux_simvar_tui::Tone::Neutral);
 
