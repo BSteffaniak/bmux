@@ -206,7 +206,7 @@ bmux_frontend_runtime = { version = "0.0.1-alpha.4", default-features = false, p
 bterm_native_platform = { version = "0.0.1-alpha.4", default-features = false, path = "packages/bterm-native-platform" }
 bterm_native_renderer = { version = "0.0.1-alpha.4", default-features = false, path = "packages/bterm-native-renderer" }
 bytemuck = { version = "1.25", default-features = false }
-cranelift-codegen = { version = "0.137.3", default-features = false, features = [
+cranelift-codegen = { version = "0.138.0", default-features = false, features = [
     "all-native-arch",
 ] }
 pollster = { version = "1.0", default-features = false }
@@ -218,7 +218,7 @@ swash = { version = "0.2", default-features = false, features = [
     "render",
     "std",
 ] }
-wasmtime = { version = "50.0.3", default-features = false, features = [
+wasmtime = { version = "51.0.0", default-features = false, features = [
     "cranelift",
     "runtime",
     "std",
@@ -447,7 +447,7 @@ memchr = { version = "2.8.3", default-features = false, features = ["std"] }
 png = { version = "0.18.1", default-features = false }
 proc-macro2 = { version = "1.0.107", default-features = false }
 proptest = { version = "1.12.0", default-features = false, features = ["std"] }
-qrcode = { version = "0.14.1", default-features = false }
+qrcode = { version = "0.15.0", default-features = false, features = ["std"] }
 quote = { version = "1.0.47", default-features = false }
 rcgen = { version = "0.14.10", default-features = false, features = [
     "pem",
@@ -458,7 +458,7 @@ reqwest = { version = "0.13.5", default-features = false, features = [
     "json",
     "rustls-no-provider",
 ] }
-resvg = { version = "0.49.0", default-features = true }
+resvg = { version = "0.50.0", default-features = true }
 roxmltree = "0.21.2"
 rustc-demangle = { version = "0.1.28", default-features = false }
 rustls = { version = "0.23.46", default-features = false, features = [
@@ -475,11 +475,11 @@ serde_json = { version = "1.0.154", default-features = false, features = [
 ] }
 sha2 = { version = "0.11.1", default-features = false }
 sha2_010 = { package = "sha2", version = "0.11.1", default-features = false }
-signal-hook = { version = "0.3.18", default-features = false }
+signal-hook = { version = "0.4.6", default-features = false }
 ssh2 = { version = "0.9.7" }
 sshenv_vault = { version = "0.0.1-alpha.6", features = ["macos-keychain"] }
 syn = { version = "3.0.10", default-features = false }
-sysinfo = { version = "0.39.6" }
+sysinfo = { version = "0.40.4" }
 tempfile = { version = "3.27.0", default-features = false }
 thiserror = { version = "2.0.21", default-features = false }
 time = { version = "0.3.55", default-features = false }
@@ -519,7 +519,7 @@ zeroize    = { version = "1.9.2", default-features = false, features = ["std"] }
 zstd       = { version = "0.14", default-features = false }
 
 # File-system watcher for config / theme / decoration-script hot-reload.
-notify = { version = "8", default-features = false, features = [
+notify = { version = "9", default-features = false, features = [
     "macos_fsevent",
 ] }
 openraft = { version = "=0.9.24", default-features = false, features = [

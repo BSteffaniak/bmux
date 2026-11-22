@@ -820,7 +820,15 @@ impl PerformancePlugin {
         let task = thread::Builder::new()
             .name("bmux-performance-metrics".into())
             .spawn(move || {
-                let mut system = System::new_all();
+                let mut system = match System::new_all() {
+                    Ok(system) => system,
+                    Err(error) => {
+                        if let Ok(mut slot) = errors.lock() {
+                            *slot = Some(format!("failed initializing system metrics: {error}"));
+                        }
+                        return;
+                    }
+                };
                 while !stopped.load(std::sync::atomic::Ordering::Acquire) {
                     thread::park_timeout(DEFAULT_SAMPLE_INTERVAL);
                     if stopped.load(std::sync::atomic::Ordering::Acquire) {
