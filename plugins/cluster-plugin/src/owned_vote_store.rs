@@ -12,9 +12,10 @@ use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, StorageBackend, TableDefinition,
 };
 use sha2::{Digest, Sha256};
-use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::path::PathBuf;
+use switchy_fs::sync::{File, OpenOptions};
 
 type ReplicationAdmission = Result<
     (String, NodeId, Option<LogIdentity>, Membership),
@@ -152,7 +153,7 @@ struct OwnedBackend {
 
 impl OwnedBackend {
     fn initialize(mut file: File, cluster: &str) -> io::Result<Self> {
-        file.try_lock().map_err(io::Error::other)?;
+        file.try_lock()?;
         let header = owned_header(cluster)?;
         file.write_all(&header)?;
         file.sync_all()?;
@@ -164,7 +165,7 @@ impl OwnedBackend {
 
     fn open(path: &Path, cluster: &str) -> io::Result<Self> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-        file.try_lock().map_err(io::Error::other)?;
+        file.try_lock()?;
         let mut header = [0; HEADER_BYTES];
         file.read_exact(&mut header)?;
         if header != owned_header(cluster)? {
@@ -226,7 +227,7 @@ fn admit_preflight() -> io::Result<std::sync::MutexGuard<'static, ()>> {
 
 fn preflight_payload(backend: &OwnedBackend, cluster: &str) -> io::Result<()> {
     let admission = admit_preflight()?;
-    let scratch = tempfile::tempfile()?;
+    let scratch = switchy_fs::sync::tempfile()?;
     let scratch_backend = OwnedBackend::initialize(scratch, cluster)?;
     backend.operate(|file| {
         let len = file
@@ -3657,6 +3658,49 @@ fn invalid(reason: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, reason)
 }
 
+/// An exclusively created initialization inode, removed unless published.
+struct InitializationFile(Option<PathBuf>);
+
+impl InitializationFile {
+    /// Names are deterministic (first free slot) so simulated runs replay.
+    fn create(parent: &Path) -> io::Result<(Self, File)> {
+        for slot in 0..1024u32 {
+            let path = parent.join(format!(".owned-vote-init-{slot}"));
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+            {
+                Ok(file) => return Ok((Self(Some(path)), file)),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "owned initialization slots exhausted",
+        ))
+    }
+
+    /// Publish without replacing an existing authority.
+    fn publish(mut self, path: &Path) -> io::Result<()> {
+        let temporary = self.0.take().ok_or_else(|| invalid("already published"))?;
+        switchy_fs::sync::rename_noreplace(&temporary, path).inspect_err(|_| {
+            self.0 = Some(temporary.clone());
+        })
+    }
+}
+
+impl Drop for InitializationFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = switchy_fs::sync::remove_file(path);
+        }
+    }
+}
+
 /// Sealed snapshot bytes staged from a leader, found by sender and boundary.
 pub type StagedSnapshot = Box<dyn FnMut(NodeId, LogIdentity) -> io::Result<Vec<u8>> + Send>;
 
@@ -3822,12 +3866,10 @@ impl OwnedVoteStore {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         // Never expose a partially initialized database at the authority path.
-        // persist_noclobber publishes the committed inode without replacing any
+        // A no-replace rename publishes the committed inode without replacing any
         // existing authority; concurrent initializers have exactly one winner.
-        let temporary = tempfile::Builder::new()
-            .prefix(".owned-vote-init-")
-            .tempfile_in(parent)?;
-        let backend = OwnedBackend::initialize(temporary.as_file().try_clone()?, cluster)?;
+        let (temporary, file) = InitializationFile::create(parent)?;
+        let backend = OwnedBackend::initialize(file, cluster)?;
         let status = backend.status.clone();
         let database = Database::builder()
             .create_with_backend(backend)
@@ -3890,13 +3932,10 @@ impl OwnedVoteStore {
         // The database retains its exclusive lock throughout publication.
         #[cfg(test)]
         initialization_crash("before-publish");
-        let published = temporary
-            .persist_noclobber(path)
-            .map_err(io::Error::other)?;
+        temporary.publish(path)?;
         #[cfg(test)]
         initialization_crash("after-publish");
-        published.sync_all()?;
-        File::open(parent)?.sync_all()?;
+        switchy_fs::sync::sync_directory(parent)?;
         Ok(Self {
             database,
             status,
@@ -3917,12 +3956,11 @@ impl OwnedVoteStore {
         // A previous initializer may have published this inode but failed before
         // directory sync. Complete that durability boundary before exposing it.
         backend.operate(|file| file.sync_all())?;
-        File::open(
+        switchy_fs::sync::sync_directory(
             path.parent()
                 .filter(|p| !p.as_os_str().is_empty())
                 .unwrap_or_else(|| Path::new(".")),
-        )?
-        .sync_all()?;
+        )?;
         let status = backend.status.clone();
         let database = Database::builder()
             .create_with_backend(backend)

@@ -3254,7 +3254,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "sshenv_vault",
- "switchy_fs",
+ "switchy_fs 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "tempfile",
  "thiserror 2.0.21",
  "zeroize",
@@ -4927,6 +4927,8 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sha2 0.11.1",
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
+ "switchy_fs 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "tempfile",
  "tokio",
  "toml 1.2.2+spec-1.1.0",
@@ -10772,7 +10774,7 @@ dependencies = [
  "serde",
  "serde_json",
  "switchy_async 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
- "switchy_fs",
+ "switchy_fs 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.21",
 ]
 
@@ -12842,7 +12844,7 @@ version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bfa93c81a31eff32851e5c60a84671747325dbbd486fe8c4caab063d024a35f8"
 dependencies = [
- "switchy_fs",
+ "switchy_fs 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.21",
  "tracing-appender",
  "tracing-log",
@@ -12852,7 +12854,7 @@ dependencies = [
 [[package]]
 name = "moosicbox_log_watch"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#fd4de6943cdf3d48c6cb611de80791fcf4d730ce"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "anyhow",
  "bmux_terminal",
@@ -13254,7 +13256,7 @@ dependencies = [
  "pin-project-lite",
  "rustc-hash 2.1.3",
  "rustls 0.23.46",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
@@ -13297,7 +13299,7 @@ checksum = "716df6621d528211d75608903c0dd54bee78745444cdcbb791bcfbc55717a29f"
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -15249,7 +15251,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash 2.1.3",
  "rustls 0.23.46",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -15287,9 +15289,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -15696,7 +15698,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "rustix 1.1.6",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -17325,7 +17327,7 @@ dependencies = [
 [[package]]
 name = "simvar_observer"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#fd4de6943cdf3d48c6cb611de80791fcf4d730ce"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 
 [[package]]
 name = "simvar_utils"
@@ -17659,7 +17661,7 @@ dependencies = [
  "ssh-key",
  "sshenv_vault_models",
  "switchy_age",
- "switchy_fs",
+ "switchy_fs 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "tempfile",
  "thiserror 2.0.21",
  "windows-sys 0.61.2",
@@ -18410,7 +18412,7 @@ dependencies = [
  "switchy_async_macros 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "switchy_database",
  "switchy_database_connection",
- "switchy_fs",
+ "switchy_fs 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "switchy_http",
  "switchy_http_models",
  "switchy_mdns",
@@ -18458,8 +18460,9 @@ dependencies = [
 [[package]]
 name = "switchy_async"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#fd4de6943cdf3d48c6cb611de80791fcf4d730ce"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
+ "flume 0.12.0",
  "futures 0.3.34",
  "log 0.4.35",
  "pin-project-lite",
@@ -18489,7 +18492,7 @@ dependencies = [
 [[package]]
 name = "switchy_async_macros"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#fd4de6943cdf3d48c6cb611de80791fcf4d730ce"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "log 0.4.35",
  "proc-macro-crate",
@@ -18545,7 +18548,7 @@ dependencies = [
 [[package]]
 name = "switchy_env"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#fd4de6943cdf3d48c6cb611de80791fcf4d730ce"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "log 0.4.35",
  "switchy_simulation",
@@ -18564,6 +18567,19 @@ dependencies = [
  "switchy_async 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "tempfile",
  "tokio",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "switchy_fs"
+version = "0.5.0"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
+dependencies = [
+ "libc",
+ "log 0.4.35",
+ "rustix 1.1.6",
+ "switchy_async 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
+ "tempfile",
  "windows-sys 0.61.2",
 ]
 
@@ -18612,7 +18628,7 @@ dependencies = [
 [[package]]
 name = "switchy_pty"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#fd4de6943cdf3d48c6cb611de80791fcf4d730ce"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "libc",
  "switchy_simulation",
@@ -18633,7 +18649,7 @@ dependencies = [
 [[package]]
 name = "switchy_random"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#fd4de6943cdf3d48c6cb611de80791fcf4d730ce"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "log 0.4.35",
  "rand 0.8.5",
@@ -18655,14 +18671,14 @@ dependencies = [
  "sha2 0.11.1",
  "switchy_async 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "switchy_database",
- "switchy_fs",
+ "switchy_fs 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "switchy_simulation"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#fd4de6943cdf3d48c6cb611de80791fcf4d730ce"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 
 [[package]]
 name = "switchy_tcp"
@@ -18703,7 +18719,7 @@ dependencies = [
 [[package]]
 name = "switchy_thread"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#fd4de6943cdf3d48c6cb611de80791fcf4d730ce"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "switchy_simulation",
  "switchy_time 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
@@ -18724,7 +18740,7 @@ dependencies = [
 [[package]]
 name = "switchy_time"
 version = "0.5.0"
-source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#fd4de6943cdf3d48c6cb611de80791fcf4d730ce"
+source = "git+https://github.com/MoosicBox/MoosicBox?branch=master#e1fed66d5980b1314f72f7bdb9b8099156db3c4a"
 dependencies = [
  "switchy_random 0.5.0 (git+https://github.com/MoosicBox/MoosicBox?branch=master)",
  "switchy_simulation",
@@ -18784,7 +18800,7 @@ dependencies = [
  "paste",
  "serde",
  "serde-querystring",
- "switchy_fs",
+ "switchy_fs 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "switchy_http_models",
  "switchy_web_server_core",
  "switchy_web_server_cors",
@@ -20113,7 +20129,7 @@ version = "2.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 dependencies = [
- "rand 0.9.5",
+ "rand 0.10.4",
 ]
 
 [[package]]

@@ -37,6 +37,7 @@ tempfile            = { version = "3.27.0", default-features = false }
 [patch."https://github.com/MoosicBox/MoosicBox"]
 simvar             = { path = "../../../wt-moosicbox/consensus-sim/packages/simvar" }
 switchy_async      = { path = "../../../wt-moosicbox/consensus-sim/packages/switchy/async" }
+switchy_fs         = { path = "../../../wt-moosicbox/consensus-sim/packages/switchy/fs" }
 switchy_pty        = { path = "../../../wt-moosicbox/consensus-sim/packages/switchy/pty" }
 switchy_simulation = { path = "../../../wt-moosicbox/consensus-sim/packages/switchy/simulation" }
 switchy_thread     = { path = "../../../wt-moosicbox/consensus-sim/packages/switchy/thread" }
