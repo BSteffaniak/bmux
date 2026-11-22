@@ -206,6 +206,14 @@ impl Session {
     }
 }
 
+/// Closing a Windows job handle, as the operating system does for a server that dies, ends its
+/// processes unless they were released.
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 pub(crate) fn recover_record(path: &Path) -> anyhow::Result<()> {
     let record: Record = serde_json::from_slice(&std::fs::read(path)?)?;
     anyhow::ensure!(

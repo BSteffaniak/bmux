@@ -10,8 +10,8 @@
 //! session (SIGKILL, OOM), the next activation for the same runtime sweeps the
 //! recorded sessions before admitting new panes; see [`recover`].
 use std::path::{Path, PathBuf};
-use switchy_thread::sync::Mutex;
 use switchy_thread::sync::atomic::{AtomicBool, Ordering};
+use switchy_thread::sync::{Arc, Mutex};
 
 use crate::platform::session as backend;
 
@@ -25,6 +25,8 @@ const RECORDS: &str = "pane-sessions";
 pub(crate) struct SessionAuthority {
     records: Mutex<Option<PathBuf>>,
     sweep_on_exit: AtomicBool,
+    /// Shared with each session's control (see [`Self::abandon`]).
+    abandoned: Arc<AtomicBool>,
 }
 
 impl Default for SessionAuthority {
@@ -32,6 +34,7 @@ impl Default for SessionAuthority {
         Self {
             records: Mutex::new(None),
             sweep_on_exit: AtomicBool::new(true),
+            abandoned: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -45,6 +48,22 @@ impl SessionAuthority {
 
     fn records(&self) -> Option<PathBuf> {
         self.records.lock().ok().and_then(|root| root.clone())
+    }
+
+    /// Record sessions under `records`, after sweeping those a predecessor recorded there.
+    pub(crate) fn install_records(&self, records: PathBuf) {
+        recover(&records);
+        if let Ok(mut root) = self.records.lock() {
+            *root = Some(records);
+        }
+    }
+
+    /// From now on, act as a server that died: stop, inspect, release and forget nothing, so
+    /// what the sessions' processes and records do next is what a crash leaves (the operating
+    /// system still closes handles, so a Windows job's kill-on-close still ends its processes).
+    #[cfg(feature = "simulator")]
+    pub(crate) fn abandon(&self) {
+        self.abandoned.store(true, Ordering::SeqCst);
     }
 }
 
@@ -106,11 +125,7 @@ pub(crate) fn activate(
         .store(settings.sweep_on_exit, Ordering::SeqCst);
     let runtime_dir = Path::new(&context.connection.runtime_dir);
     if runtime_dir.is_absolute() {
-        let records = runtime_dir.join(RECORDS);
-        if let Ok(mut root) = authority.records.lock() {
-            *root = Some(records.clone());
-        }
-        recover(&records);
+        authority.install_records(runtime_dir.join(RECORDS));
         remove_legacy_supervisor_state(runtime_dir, Path::new(&context.connection.state_dir));
     }
 }
@@ -171,6 +186,8 @@ pub(crate) struct SessionControl {
     leader_exited: AtomicBool,
     /// Set once [`Self::end_lifetime`] gave up authority over the session.
     released: AtomicBool,
+    /// The server is acting as dead (see [`SessionAuthority::abandon`]).
+    abandoned: Arc<AtomicBool>,
     record: Mutex<Option<PathBuf>>,
 }
 
@@ -205,8 +222,13 @@ impl SessionControl {
             leader,
             leader_exited: AtomicBool::new(false),
             released: AtomicBool::new(false),
+            abandoned: Arc::clone(&host.sessions().abandoned),
             record: Mutex::new(record),
         })
+    }
+
+    fn abandoned(&self) -> bool {
+        self.abandoned.load(Ordering::SeqCst)
     }
 
     pub(super) fn leader_exited(&self) -> bool {
@@ -224,7 +246,7 @@ impl SessionControl {
     /// # Errors
     /// Signal delivery failures.
     pub(super) fn terminate_leader(&self) -> std::io::Result<bool> {
-        if self.leader_exited() {
+        if self.leader_exited() || self.abandoned() {
             return Ok(false);
         }
         self.backend.terminate_leader(self.leader)
@@ -238,7 +260,7 @@ impl SessionControl {
     pub(super) fn force_stop(&self) -> std::io::Result<()> {
         // Authority already given up: nothing left is ours to stop. On Windows closing the
         // job ended it; on Unix the session id may belong to someone else by now.
-        if self.released.load(Ordering::SeqCst) {
+        if self.released.load(Ordering::SeqCst) || self.abandoned() {
             return Ok(());
         }
         self.backend.sweep()
@@ -249,7 +271,7 @@ impl SessionControl {
     /// # Errors
     /// Discovery failures.
     pub(super) fn occupied(&self) -> std::io::Result<bool> {
-        if self.released.load(Ordering::SeqCst) {
+        if self.released.load(Ordering::SeqCst) || self.abandoned() {
             return Ok(false);
         }
         self.backend.occupied()
@@ -257,6 +279,9 @@ impl SessionControl {
 
     /// Leave whatever is still running in the session alone from now on.
     pub(super) fn release_survivors(&self) {
+        if self.abandoned() {
+            return;
+        }
         self.backend.release_survivors();
     }
 
@@ -268,7 +293,11 @@ impl SessionControl {
     /// A crash record that cannot be deleted.
     pub(super) fn end_lifetime(&self) -> anyhow::Result<()> {
         self.released.store(true, Ordering::SeqCst);
+        // A dead server's handles still close; its records stay behind.
         self.backend.release();
+        if self.abandoned() {
+            return Ok(());
+        }
         let record = self
             .record
             .lock()

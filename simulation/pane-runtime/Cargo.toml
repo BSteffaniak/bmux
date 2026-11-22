@@ -19,6 +19,7 @@ switchy_pty              = { workspace = true, features = ["simulator"] }
 switchy_simulation       = { workspace = true }
 switchy_thread           = { workspace = true, features = ["simulator"] }
 switchy_time             = { workspace = true, features = ["simulator"] }
+tempfile                 = { workspace = true }
 
 [features]
 default = []

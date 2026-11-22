@@ -48,6 +48,18 @@ impl Panes {
     /// kernel, by its base name).
     #[must_use]
     pub fn new(shell: &str) -> Self {
+        Self::build(shell, None)
+    }
+
+    /// As [`Self::new`], recording each pane's session under `records` (as an activation
+    /// with a runtime directory does), after sweeping the sessions a crashed predecessor
+    /// recorded there.
+    #[must_use]
+    pub fn recovering(shell: &str, records: &std::path::Path) -> Self {
+        Self::build(shell, Some(records))
+    }
+
+    fn build(shell: &str, records: Option<&std::path::Path>) -> Self {
         let (exit_tx, exits) = mpsc::unbounded_channel();
         let host = PaneRuntimeHost::detached();
         let manager = SessionRuntimeManager::new(
@@ -60,6 +72,9 @@ impl Panes {
             PanePaddingConfig::default(),
             exit_tx,
         );
+        if let Some(records) = records {
+            host.sessions().install_records(records.to_path_buf());
+        }
         Self {
             manager,
             host,
@@ -160,6 +175,24 @@ impl Panes {
             drained: execution.output_drained.load(Ordering::SeqCst),
             cleanup_error: execution.cleanup_error(),
         })
+    }
+
+    /// Die: from now on the runtime stops, inspects and cleans up none of its sessions (the
+    /// operating system still closes its handles), then everything in it is torn down, leaving
+    /// the sessions' processes and records as a crash would.
+    pub async fn crash(&mut self) {
+        self.host.sessions().abandon();
+        // The operating system closes the dead server's terminals.
+        let terminals: Vec<String> = self
+            .panes()
+            .into_iter()
+            .filter_map(|pane| self.pid(pane))
+            .filter_map(|pid| switchy_pty::simulator::process_io(pid)?.terminal)
+            .collect();
+        switchy_pty::simulator::close_masters(&terminals);
+        for pane in self.panes() {
+            let _ = self.close(pane).await;
+        }
     }
 
     /// Exit notices the runtime sent since last asked.
