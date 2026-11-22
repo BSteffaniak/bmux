@@ -1,13 +1,18 @@
 //! Disposable, bounded staging I/O. This module grants no peer or consensus authority.
 //! Callers serialize authenticated current-term admission before each operation.
+//!
+//! All I/O goes through `switchy_fs::sync` capability handles and time through
+//! `switchy_async::time`, so staging runs unchanged on the native backend and
+//! under deterministic simulation.
 
-use rustix::fs::{AtFlags, Mode, OFlags};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
+use switchy_async::time::Instant;
+use switchy_fs::sync::{Dir, File, FileKind, Metadata, OpenOptions};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -17,10 +22,29 @@ pub struct TransferKey {
     pub sequence: u64,
 }
 
+impl TransferKey {
+    /// The staged file name for this transfer. It is derived from the key rather
+    /// than drawn at random so simulated runs replay exactly; recovery accepts
+    /// exactly this `transfer-<uuid>` shape. Names only need to be distinct
+    /// among the eight live transfers of one owner, which a domain-separated
+    /// SHA-256 prefix provides; a collision fails exclusive creation safely.
+    fn file_name(&self) -> String {
+        let mut hash = Sha256::new();
+        hash.update(b"bmux transfer staging name v1\0");
+        hash.update(self.peer);
+        hash.update(self.incarnation.as_bytes());
+        hash.update(self.sequence.to_be_bytes());
+        let digest = hash.finalize();
+        let mut bytes = [0; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        format!("transfer-{}", Uuid::from_bytes(bytes))
+    }
+}
+
 #[derive(Debug)]
 struct Incoming {
     file: File,
-    directory: File,
+    directory: StagingDirectory,
     name: String,
     binding: [u8; 32],
     total: u64,
@@ -31,7 +55,7 @@ struct Incoming {
     progress: Instant,
     sealed: bool,
     failed: bool,
-    validation: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    validation: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Owns validation I/O while staging retains the byte/count reservation.
@@ -39,7 +63,7 @@ struct Incoming {
 pub(crate) struct ValidationTicket {
     file: File,
     total: u64,
-    identity: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    identity: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// A ticket whose canonical validator returned success. This does not grant
@@ -68,148 +92,223 @@ pub struct TransferStaging {
     total_bytes: u64,
 }
 
+/// The exclusive owner of one validated staging directory.
+///
+/// Clones share one directory handle and one owner lock. The lock is released
+/// only when the last clone, held by the executor or an admitted transfer, is
+/// dropped.
+#[derive(Debug, Clone)]
+pub struct StagingDirectory(Arc<Owner>);
+
+#[derive(Debug)]
+struct Owner {
+    directory: Dir,
+    // Holds the exclusive advisory lock that makes this process the single
+    // admission authority of the directory. `Dir` has no lock of its own, so
+    // the lock lives on the owner marker *inside* the directory rather than on
+    // a sibling lock-file path: renaming the directory moves the marker inode
+    // with it, so opening the directory under any name still meets the held
+    // lock, and a rename can never create a second admission authority. The
+    // marker sits in an owner-private directory and staging never unlinks it,
+    // so only the owning user could detach the lock from the directory.
+    _marker: File,
+}
+
+impl StagingDirectory {
+    fn dir(&self) -> &Dir {
+        &self.0.directory
+    }
+}
+
 /// Open and validate the same directory handle used for all subsequent I/O.
 /// Unknown leftovers require explicit recovery; this never deletes them.
 #[cfg(test)]
-pub(crate) fn open_directory(path: &Path) -> io::Result<File> {
-    let directory = lock_directory(path)?;
-    require_empty(&directory)?;
-    Ok(directory)
+pub(crate) fn open_directory(path: &Path) -> io::Result<StagingDirectory> {
+    let (owner, _) = lock_directory(path)?;
+    if owner
+        .dir()
+        .entries()?
+        .iter()
+        .any(|entry| entry.name() != OWNER_FILE)
+    {
+        return Err(io::Error::other(
+            "staging directory requires explicit leftover recovery",
+        ));
+    }
+    Ok(owner)
 }
 
-fn lock_directory(path: &Path) -> io::Result<File> {
+/// Take exclusive ownership of the private directory at `path`, creating the
+/// owner marker in an empty directory. Returns whether the marker was created.
+/// A missing marker never authorizes cleanup; partial markers require repair.
+fn lock_directory(path: &Path) -> io::Result<(StagingDirectory, bool)> {
     let directory = open_trusted_path(path)?;
-    let metadata = rustix::fs::fstat(&directory)?;
-    if metadata.st_uid != rustix::process::geteuid().as_raw() || metadata.st_mode & 0o077 != 0 {
+    let metadata = directory.metadata()?;
+    if metadata.uid() != Some(switchy_fs::sync::current_uid()?) || metadata.mode() & 0o077 != 0 {
         return Err(io::Error::other(
             "staging directory must be owned and private",
         ));
     }
-    // Lock the inode, not a sibling lock-file path: renames must not create a
-    // second admission authority. Duplicated handles retain this lock until all
-    // admitted transfers and the executor release their directory handles.
-    rustix::fs::flock(
-        &directory,
-        rustix::fs::FlockOperation::NonBlockingLockExclusive,
-    )?;
-    Ok(directory)
+    let (marker, created) = match directory.metadata_at(OWNER_FILE) {
+        Ok(metadata) => {
+            // Check the entry type before opening: switchy_fs has no O_NONBLOCK,
+            // and opening a FIFO for reading would block. Only the owning user
+            // can replace entries of the private directory in between.
+            require_regular(&metadata)?;
+            let mut marker = directory
+                .open_file_at(OWNER_FILE, &OpenOptions::new().read(true).nofollow(true))?;
+            marker.try_lock()?;
+            validate_owned_file(&marker.metadata()?)?;
+            let mut bytes = Vec::new();
+            (&mut marker).take(128).read_to_end(&mut bytes)?;
+            if bytes != OWNER_BYTES {
+                return Err(io::Error::other("unsupported or corrupt staging marker"));
+            }
+            (marker, false)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            require_empty(&directory)?;
+            // Exclusive creation: of two concurrent initializers only one creates
+            // the marker; the other fails here or on the lock below.
+            let mut marker = directory.open_file_at(
+                OWNER_FILE,
+                &OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .nofollow(true)
+                    .mode(0o600),
+            )?;
+            marker.try_lock()?;
+            marker.write_all(OWNER_BYTES)?;
+            marker.sync_all()?;
+            directory.sync()?;
+            (marker, true)
+        }
+        Err(error) => return Err(error),
+    };
+    Ok((
+        StagingDirectory(Arc::new(Owner {
+            directory,
+            _marker: marker,
+        })),
+        created,
+    ))
 }
 
-fn require_empty(directory: &File) -> io::Result<()> {
-    for entry in rustix::fs::Dir::read_from(directory)? {
-        let entry = entry?;
-        if entry.file_name() != c"." && entry.file_name() != c".." {
-            return Err(io::Error::other(
-                "staging directory requires explicit leftover recovery",
-            ));
-        }
+fn require_empty(directory: &Dir) -> io::Result<()> {
+    if !directory.entries()?.is_empty() {
+        return Err(io::Error::other(
+            "staging directory requires explicit leftover recovery",
+        ));
     }
     Ok(())
 }
 
 const OWNER_FILE: &str = "bmux-staging-v1";
 const OWNER_BYTES: &[u8] = b"BMUX disposable transfer staging version 1\n";
+/// Live transfers per owner, and so the bound on recoverable leftovers.
+const MAX_TRANSFERS: usize = 8;
 
 /// Initialize an empty staging directory or recover its bounded owned files.
 /// A missing marker never authorizes cleanup; partial markers require repair.
 /// # Errors
 /// Rejects untrusted, foreign or partially owned directories.
-pub fn recover_directory(path: &Path) -> io::Result<File> {
-    let directory = lock_directory(path)?;
-    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
-    match rustix::fs::openat(&directory, OWNER_FILE, flags, Mode::empty()) {
-        Ok(marker) => {
-            let mut marker = File::from(marker);
-            validate_owned_file(&marker)?;
-            let mut bytes = Vec::new();
-            (&mut marker).take(128).read_to_end(&mut bytes)?;
-            if bytes != OWNER_BYTES {
-                return Err(io::Error::other("unsupported or corrupt staging marker"));
-            }
-        }
-        Err(rustix::io::Errno::NOENT) => {
-            require_empty(&directory)?;
-            let mut marker = File::from(rustix::fs::openat(
-                &directory,
-                OWNER_FILE,
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::RUSR | Mode::WUSR,
-            )?);
-            marker.write_all(OWNER_BYTES)?;
-            marker.sync_all()?;
-            directory.sync_all()?;
-            return Ok(directory);
-        }
-        Err(error) => return Err(error.into()),
+pub fn recover_directory(path: &Path) -> io::Result<StagingDirectory> {
+    let (owner, created) = lock_directory(path)?;
+    if created {
+        return Ok(owner);
     }
+    let directory = owner.dir();
     // Validate the complete bounded inventory before deleting any file. A crash
     // during deletion leaves the marker and remaining entries for the next run.
+    let entries = directory.entries()?;
+    if entries.len() > MAX_TRANSFERS + 1 {
+        return Err(io::Error::other("unknown or excessive staging leftovers"));
+    }
     let mut names = Vec::new();
-    for entry in rustix::fs::Dir::read_from(&directory)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        if name == c"." || name == c".." || name.to_bytes() == OWNER_FILE.as_bytes() {
+    for entry in entries {
+        if entry.name() == OWNER_FILE {
             continue;
         }
-        let name = name.to_str().map_err(io::Error::other)?;
+        let name = entry.name().to_str().unwrap_or_default();
         let valid = name
             .strip_prefix("transfer-")
             .and_then(|id| Uuid::parse_str(id).ok())
             .is_some_and(|id| name == format!("transfer-{id}"));
-        if !valid || names.len() == 8 {
+        if !valid || names.len() == MAX_TRANSFERS {
             return Err(io::Error::other("unknown or excessive staging leftovers"));
         }
-        let file = File::from(rustix::fs::openat(&directory, name, flags, Mode::empty())?);
-        validate_owned_file(&file)?;
+        require_regular(&directory.metadata_at(name)?)?;
+        let file = directory.open_file_at(name, &OpenOptions::new().read(true).nofollow(true))?;
+        validate_owned_file(&file.metadata()?)?;
         names.push(name.to_owned());
     }
     for name in names {
-        rustix::fs::unlinkat(&directory, name.as_str(), AtFlags::empty())?;
+        directory.remove_file_at(name)?;
     }
-    directory.sync_all()?;
-    Ok(directory)
+    directory.sync()?;
+    Ok(owner)
 }
 
-fn validate_owned_file(file: &File) -> io::Result<()> {
-    let metadata = file.metadata()?;
-    let stat = rustix::fs::fstat(file)?;
+fn require_regular(metadata: &Metadata) -> io::Result<()> {
+    if metadata.kind() != FileKind::File {
+        return Err(io::Error::other("invalid staging file ownership or type"));
+    }
+    Ok(())
+}
+
+fn validate_owned_file(metadata: &Metadata) -> io::Result<()> {
     if !metadata.is_file()
-        || stat.st_uid != rustix::process::geteuid().as_raw()
-        || stat.st_mode & 0o077 != 0
-        || stat.st_nlink != 1
+        || metadata.uid() != Some(switchy_fs::sync::current_uid()?)
+        || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != Some(1)
     {
         return Err(io::Error::other("invalid staging file ownership or type"));
     }
     Ok(())
 }
 
+/// In a sticky directory only an entry's owner (or root) may remove or rename it.
+const STICKY: u32 = 0o1000;
+
+const fn trusted_owner(metadata: &Metadata, uid: u32) -> bool {
+    matches!(metadata.uid(), Some(owner) if owner == 0 || owner == uid)
+}
+
 // Walk from root with no-follow opens: a final-component check alone permits
 // an attacker-controlled ancestor to redirect initial directory selection.
-fn open_trusted_path(path: &Path) -> io::Result<File> {
+//
+// The sticky-bit exception reads real mode bits. The switchy_fs simulator does
+// not model sticky semantics and never sets the bit itself: a simulated shared
+// directory (a `/tmp` analogue with mode 0o777) is rejected, and one given the
+// bit explicitly would be trusted without the protection it implies. Simulations
+// must place staging under a chain of directories that are not group- or
+// world-writable.
+fn open_trusted_path(path: &Path) -> io::Result<Dir> {
     use std::path::Component;
     if !path.is_absolute() {
         return Err(io::Error::other("staging path must be absolute"));
     }
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let mut directory = File::from(rustix::fs::open("/", flags, Mode::empty())?);
+    let uid = switchy_fs::sync::current_uid()?;
+    let mut directory = Dir::open("/")?;
     for component in path.components() {
         let name = match component {
             Component::RootDir => continue,
             Component::Normal(name) => name,
             _ => return Err(io::Error::other("invalid staging path component")),
         };
-        let parent = rustix::fs::fstat(&directory)?;
-        let uid = rustix::process::geteuid().as_raw();
+        let parent = directory.metadata()?;
         // Sticky shared roots (e.g. /tmp) protect entries owned by this user
         // or root. Every opened child is independently ownership-checked below.
-        if (parent.st_uid != 0 && parent.st_uid != uid)
-            || (parent.st_mode & 0o022 != 0 && parent.st_mode & 0o1000 == 0)
+        if !trusted_owner(&parent, uid)
+            || (parent.mode() & 0o022 != 0 && parent.mode() & STICKY == 0)
         {
             return Err(io::Error::other("untrusted staging ancestor"));
         }
-        directory = File::from(rustix::fs::openat(&directory, name, flags, Mode::empty())?);
-        let child = rustix::fs::fstat(&directory)?;
-        if child.st_uid != 0 && child.st_uid != uid {
+        // `open_dir_at` requires a directory and never follows a symbolic link.
+        directory = directory.open_dir_at(name)?;
+        if !trusted_owner(&directory.metadata()?, uid) {
             return Err(io::Error::other("untrusted staging directory owner"));
         }
     }
@@ -253,7 +352,7 @@ impl TransferStaging {
     /// Rejects conflicting identity reuse, capacity exhaustion and file errors.
     pub fn begin(
         &mut self,
-        directory: &File,
+        directory: &StagingDirectory,
         key: TransferKey,
         binding: [u8; 32],
         total: u64,
@@ -293,19 +392,21 @@ impl TransferStaging {
                 "staging capacity unavailable",
             ));
         }
-        let directory = directory.try_clone()?;
-        let name = format!("transfer-{}", Uuid::new_v4());
-        let file = File::from(rustix::fs::openat(
-            &directory,
+        let name = key.file_name();
+        let file = directory.dir().open_file_at(
             name.as_str(),
-            OFlags::CREATE | OFlags::EXCL | OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::RUSR | Mode::WUSR,
-        )?);
+            &OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .nofollow(true)
+                .mode(0o600),
+        )?;
         self.transfers.insert(
             key,
             Incoming {
                 file,
-                directory,
+                directory: directory.clone(),
                 name,
                 binding,
                 total,
@@ -316,7 +417,7 @@ impl TransferStaging {
                 progress: now,
                 sealed: false,
                 failed: false,
-                validation: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                validation: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             },
         );
         Ok(0)
@@ -383,7 +484,7 @@ impl TransferStaging {
             .transfers
             .get_mut(&key)
             .ok_or_else(|| io::Error::other("unknown transfer"))?;
-        if std::sync::Arc::strong_count(&transfer.validation) != 1
+        if Arc::strong_count(&transfer.validation) != 1
             || (transfer.failed
                 && !transfer
                     .validation
@@ -398,11 +499,22 @@ impl TransferStaging {
             .validation
             .store(false, std::sync::atomic::Ordering::SeqCst);
         transfer.file.flush()?;
-        transfer.file.seek(SeekFrom::Start(0))?;
+        // switchy_fs handles cannot be duplicated, so validation reads through
+        // an independent read-only handle opened in the owned directory, and
+        // only if it is provably the same single-link inode this transfer wrote.
+        let file = transfer.directory.dir().open_file_at(
+            transfer.name.as_str(),
+            &OpenOptions::new().read(true).nofollow(true),
+        )?;
+        let reopened = file.metadata()?;
+        validate_owned_file(&reopened)?;
+        if !reopened.is_same_file(&transfer.file.metadata()?) {
+            return Err(io::Error::other("staged transfer file was replaced"));
+        }
         Ok(ValidationTicket {
-            file: transfer.file.try_clone()?,
+            file,
             total: transfer.total,
-            identity: std::sync::Arc::clone(&transfer.validation),
+            identity: Arc::clone(&transfer.validation),
         })
     }
 
@@ -416,7 +528,7 @@ impl TransferStaging {
             .transfers
             .get_mut(&key)
             .ok_or_else(|| io::Error::other("unknown transfer"))?;
-        if !std::sync::Arc::ptr_eq(&ticket.0.identity, &transfer.validation) {
+        if !Arc::ptr_eq(&ticket.0.identity, &transfer.validation) {
             return Err(io::Error::other("stale validation ticket"));
         }
         transfer.sealed = true;
@@ -472,17 +584,16 @@ impl TransferStaging {
     /// Failed deletion keeps the object and its reservation for a later retry.
     pub fn abort(&mut self, key: TransferKey) -> io::Result<()> {
         if let Some(transfer) = self.transfers.get(&key) {
-            if std::sync::Arc::strong_count(&transfer.validation) != 1 {
+            if Arc::strong_count(&transfer.validation) != 1 {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
                     "validation still owns the transfer reservation",
                 ));
             }
-            rustix::fs::unlinkat(
-                &transfer.directory,
-                transfer.name.as_str(),
-                AtFlags::empty(),
-            )?;
+            transfer
+                .directory
+                .dir()
+                .remove_file_at(transfer.name.as_str())?;
         }
         self.transfers.remove(&key);
         Ok(())
@@ -496,7 +607,7 @@ impl TransferStaging {
             .transfers
             .iter()
             .filter(|(_, transfer)| {
-                std::sync::Arc::strong_count(&transfer.validation) == 1
+                Arc::strong_count(&transfer.validation) == 1
                     && now.saturating_duration_since(transfer.progress) >= Duration::from_secs(30)
             })
             .map(|(key, _)| *key)
@@ -714,7 +825,7 @@ mod tests {
         std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o700)).unwrap();
         let directory = open_directory(&original).unwrap();
         assert!(open_directory(&original).is_err());
-        let retained = directory.try_clone().unwrap();
+        let retained = directory.clone();
         std::fs::rename(&original, &moved).unwrap();
         drop(directory);
         assert!(open_directory(&moved).is_err());
@@ -789,6 +900,84 @@ mod tests {
         assert!(staging.chunk(key, 2, b"cd", now).is_err());
         staging.expire(now + Duration::from_secs(30)).unwrap();
         assert!(staging.transfers.is_empty());
-        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        // Only the owner marker remains.
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn staged_names_are_deterministic_and_recoverable() {
+        let key = TransferKey {
+            peer: [7; 32],
+            incarnation: Uuid::from_u128(9),
+            sequence: 3,
+        };
+        assert_eq!(key.file_name(), key.file_name());
+        assert_ne!(
+            key.file_name(),
+            TransferKey { sequence: 4, ..key }.file_name()
+        );
+        assert_ne!(
+            key.file_name(),
+            TransferKey {
+                incarnation: Uuid::from_u128(10),
+                ..key
+            }
+            .file_name()
+        );
+        let root = private_root();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = recover_directory(root.path()).unwrap();
+        let mut staging = TransferStaging::new(8, 16).unwrap();
+        staging
+            .begin(&directory, key, [0; 32], 4, [0; 32], Instant::now())
+            .unwrap();
+        assert!(root.path().join(key.file_name()).is_file());
+        drop(staging);
+        drop(directory);
+        drop(recover_directory(root.path()).unwrap());
+        assert!(!root.path().join(key.file_name()).exists());
+    }
+
+    #[test]
+    fn recovery_rejects_linked_or_excessive_leftovers_without_deleting() {
+        let root = private_root();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        drop(recover_directory(root.path()).unwrap());
+        let name = |sequence| {
+            TransferKey {
+                peer: [1; 32],
+                incarnation: Uuid::nil(),
+                sequence,
+            }
+            .file_name()
+        };
+        let outside = private_root();
+        let target = outside.path().join("target");
+        std::fs::write(&target, b"outside").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        // A well-named symbolic link is never followed or deleted.
+        std::os::unix::fs::symlink(&target, root.path().join(name(1))).unwrap();
+        assert!(recover_directory(root.path()).is_err());
+        assert!(root.path().join(name(1)).symlink_metadata().is_ok());
+        std::fs::remove_file(root.path().join(name(1))).unwrap();
+
+        // A well-named hard link to another file is rejected (nlink != 1).
+        std::fs::hard_link(&target, root.path().join(name(2))).unwrap();
+        assert!(recover_directory(root.path()).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"outside");
+        std::fs::remove_file(root.path().join(name(2))).unwrap();
+
+        // More leftovers than an owner can create are rejected before deletion.
+        for sequence in 0..=8 {
+            let path = root.path().join(name(sequence));
+            std::fs::write(&path, b"").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert!(recover_directory(root.path()).is_err());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 10);
+        std::fs::remove_file(root.path().join(name(8))).unwrap();
+        drop(recover_directory(root.path()).unwrap());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
     }
 }

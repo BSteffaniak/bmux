@@ -328,7 +328,6 @@ dependencies = [
  "bmux_sessions_plugin_api",
  "iroh",
  "redb",
- "rustix",
  "serde",
  "serde_json",
  "sha2",

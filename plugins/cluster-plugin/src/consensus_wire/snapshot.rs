@@ -13,7 +13,7 @@ use super::{
 use crate::consensus_driver::SnapshotObject;
 use crate::consensus_engine::{Message, NodeId};
 use crate::consensus_model::{LogIdentity, Membership, StoredMembership, Term};
-use crate::transfer_staging::{TransferKey, TransferStaging};
+use crate::transfer_staging::{StagingDirectory, TransferKey, TransferStaging};
 use bmux_cluster_plugin_api::cluster_consensus_snapshot_types::{
     InstallError, InstallOutcome, InstallRejection, InstallRequest, InstallResponse,
 };
@@ -30,7 +30,8 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use switchy_async::time::Instant;
 
 /// Raw bytes per chunk, the contract's bound.
 pub(super) const CHUNK_BYTES: usize = 64 * 1024;
@@ -54,7 +55,7 @@ struct Receipt {
 type Accepted = Vec<((NodeId, LogIdentity), Vec<u8>)>;
 
 struct Staged {
-    directory: std::fs::File,
+    directory: StagingDirectory,
     transfers: TransferStaging,
 }
 

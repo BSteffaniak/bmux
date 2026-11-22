@@ -714,7 +714,7 @@ pub(crate) fn transfer_position(
 #[test]
 fn staged_reader_stops_after_cancellation() {
     use std::io::{Read, Seek, Write};
-    let mut file = tempfile::tempfile().unwrap();
+    let mut file = switchy_fs::sync::tempfile().unwrap();
     file.write_all(&[1; 16384]).unwrap();
     file.rewind().unwrap();
     let status = std::sync::atomic::AtomicU8::new(0);
@@ -732,7 +732,7 @@ fn staged_reader_stops_after_cancellation() {
 }
 
 struct CancellableTransferReader<'a> {
-    file: &'a mut std::fs::File,
+    file: &'a mut switchy_fs::sync::File,
     status: &'a std::sync::atomic::AtomicU8,
     closing: &'a std::sync::atomic::AtomicBool,
 }
@@ -768,7 +768,7 @@ impl std::io::Seek for CancellableTransferReader<'_> {
 /// # Errors
 /// Rejects size, checksum or descriptor mismatches and cancelled reads.
 pub fn validate_staged_object(
-    file: &mut std::fs::File,
+    file: &mut switchy_fs::sync::File,
     total: u64,
     header: &bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferHeader,
     status: &std::sync::atomic::AtomicU8,
