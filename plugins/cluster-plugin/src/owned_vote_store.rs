@@ -2704,4 +2704,1575 @@ mod tests {
         assert!(OwnedVoteStore::create(&path, "cluster-a").is_err());
         assert!(decode(&[0; 40]).is_err());
     }
+
+    use crate::consensus_driver::Storage as _;
+    use crate::consensus_engine::Write as EngineWrite;
+    use crate::consensus_model::LogIndex;
+
+    fn single_voter(node: NodeId) -> Membership {
+        Membership::new(vec![vec![node]], vec![(node, String::new())]).unwrap()
+    }
+
+    /// A position led by the founding node of these fixtures.
+    fn at(term: u64, index: u64) -> LogIdentity {
+        LogIdentity {
+            term: Term(term),
+            leader: NodeId::from(1),
+            index: LogIndex(index),
+        }
+    }
+
+    fn noops(indexes: std::ops::RangeInclusive<u64>, term: u64) -> Vec<Entry> {
+        indexes
+            .map(|index| Entry {
+                identity: at(term, index),
+                payload: EntryPayload::NoOp,
+            })
+            .collect()
+    }
+
+    fn term_one_write(entries: Vec<Entry>, commit: Option<LogIdentity>) -> EngineWrite {
+        EngineWrite {
+            hard_state: Some(HardState {
+                term: Term(1),
+                voted_for: Some(NodeId::from(1)),
+            }),
+            truncate_from: None,
+            entries,
+            commit,
+        }
+    }
+
+    /// Apply every committed entry, one bounded transaction at a time.
+    fn apply_all(store: &mut OwnedVoteStore) -> Vec<AppliedOutcome> {
+        let mut outcomes = Vec::new();
+        loop {
+            let batch = store.apply_committed_batch().unwrap();
+            outcomes.extend(batch.outcomes);
+            if !batch.more {
+                return outcomes;
+            }
+        }
+    }
+
+    fn responses(outcomes: Vec<AppliedOutcome>) -> Vec<Vec<u8>> {
+        outcomes
+            .into_iter()
+            .filter_map(|outcome| outcome.response)
+            .collect()
+    }
+
+    /// The durable `[commit, applied, snapshot]` positions.
+    fn positions(store: &OwnedVoteStore) -> [Option<LogIdentity>; 3] {
+        let tx = store.database.begin_read().unwrap();
+        let meta = tx.open_table(TABLE).unwrap();
+        ["commit", "applied", "snapshot"]
+            .map(|key| decode_position(meta.get(key).unwrap().unwrap().value()).unwrap())
+    }
+
+    fn retained(store: &OwnedVoteStore) -> u64 {
+        store
+            .database
+            .begin_read()
+            .unwrap()
+            .open_table(LOG)
+            .unwrap()
+            .len()
+            .unwrap()
+    }
+
+    fn control_bytes(store: &mut OwnedVoteStore) -> Vec<u8> {
+        store
+            .read_control_state()
+            .unwrap()
+            .encode_snapshot()
+            .unwrap()
+    }
+
+    /// Genesis plus one applied, committed no-op at term 1, with a snapshot
+    /// published (not compacted) at that boundary.
+    fn snapshot_install_fixture(path: &Path) -> (OwnedVoteStore, Vec<u8>, LogIdentity) {
+        let node = NodeId::from(1);
+        let mut store =
+            OwnedVoteStore::bootstrap(path, "cluster", node, single_voter(node)).unwrap();
+        apply_all(&mut store);
+        let boundary = at(1, 1);
+        store
+            .append(
+                &AppendRequest {
+                    term: Term(1),
+                    leader: node,
+                    previous: Some(at(0, 0)),
+                    entries: noops(1..=1, 1),
+                    leader_commit: Some(boundary),
+                },
+                (64, 1024 * 1024),
+            )
+            .unwrap();
+        apply_all(&mut store);
+        let bytes = store.publish_snapshot().unwrap();
+        (store, bytes, boundary)
+    }
+
+    fn rewrite_install_snapshot(
+        bytes: &[u8],
+        boundary: LogIdentity,
+        membership: &crate::consensus_model::StoredMembership,
+    ) -> Vec<u8> {
+        let (_, control) = crate::consensus_storage::decode_owned_snapshot(bytes).unwrap();
+        crate::consensus_storage::encode_owned_snapshot(
+            "cluster",
+            "replacement",
+            boundary,
+            membership,
+            &control,
+        )
+        .unwrap()
+    }
+
+    fn snapshot_membership(bytes: &[u8]) -> crate::consensus_model::StoredMembership {
+        crate::consensus_storage::decode_owned_snapshot(bytes)
+            .unwrap()
+            .0
+            .membership
+            .unwrap()
+    }
+
+    fn proposal_command() -> bmux_cluster_plugin_api::cluster_types::ControlCommand {
+        workspace_command(11, 21)
+    }
+
+    fn workspace_command(
+        command: u128,
+        workspace: u128,
+    ) -> bmux_cluster_plugin_api::cluster_types::ControlCommand {
+        use bmux_cluster_plugin_api::cluster_types::{
+            CommandId, ControlCommand, ControlCommandRequest, WorkspaceId,
+        };
+        ControlCommand {
+            schema_version: 1,
+            principal_id: "principal:test".into(),
+            command_id: CommandId {
+                value: uuid::Uuid::from_u128(command),
+            },
+            issued_at_unix_ms: 50,
+            request: ControlCommandRequest::CreateWorkspace {
+                workspace_id: WorkspaceId {
+                    value: uuid::Uuid::from_u128(workspace),
+                },
+                name: Some("owned".into()),
+            },
+        }
+    }
+
+    /// A command whose canonical log entry at `identity` is exactly `size` bytes.
+    fn proposal_at_framed_size(
+        identity: LogIdentity,
+        size: usize,
+    ) -> bmux_cluster_plugin_api::cluster_types::ControlCommand {
+        let mut command = proposal_command();
+        command.request =
+            bmux_cluster_plugin_api::cluster_types::ControlCommandRequest::CompleteWorkflow {
+                original_command_id: command.command_id.clone(),
+                response: Vec::new(),
+            };
+        let overhead = crate::consensus_storage::encode_owned_entry(&Entry {
+            identity,
+            payload: EntryPayload::Application(crate::control_codec::encode_control_command(
+                &command,
+            )),
+        })
+        .unwrap()
+        .len();
+        if let bmux_cluster_plugin_api::cluster_types::ControlCommandRequest::CompleteWorkflow {
+            response,
+            ..
+        } = &mut command.request
+        {
+            response.resize(size.checked_sub(overhead).unwrap(), 0);
+        }
+        command
+    }
+
+    fn framed_len(identity: LogIdentity, payload: &[u8]) -> usize {
+        crate::consensus_storage::encode_owned_entry(&Entry {
+            identity,
+            payload: EntryPayload::Application(payload.to_vec()),
+        })
+        .unwrap()
+        .len()
+    }
+
+    #[test]
+    fn snapshot_install_rejects_membership_rewrite_at_matching_and_missing_boundaries() {
+        for compact in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("authority");
+            let (mut store, bytes, boundary) = snapshot_install_fixture(&path);
+            if compact {
+                store.compact_snapshot().unwrap();
+            }
+            let mut membership = snapshot_membership(&bytes);
+            let node = boundary.leader;
+            membership.membership =
+                Membership::new(vec![vec![node]], vec![(node, "changed".into())]).unwrap();
+            for boundary in [
+                boundary,
+                LogIdentity {
+                    index: LogIndex(4),
+                    ..boundary
+                },
+            ] {
+                let altered = rewrite_install_snapshot(&bytes, boundary, &membership);
+                assert!(store.install_snapshot(store.state(), &altered).is_err());
+                assert!(!store.failed);
+                validate_log_recovery(&store.database.begin_read().unwrap()).unwrap();
+            }
+            drop(store);
+            OwnedVoteStore::open(&path, "cluster").unwrap();
+        }
+    }
+
+    #[test]
+    fn snapshot_install_rejects_equal_term_other_leader_and_replaces_uncommitted_suffix() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let (mut store, bytes, boundary) = snapshot_install_fixture(&path);
+        let membership = snapshot_membership(&bytes);
+        let other = LogIdentity {
+            leader: NodeId::from(2),
+            index: LogIndex(2),
+            ..boundary
+        };
+        let contradiction = rewrite_install_snapshot(&bytes, other, &membership);
+        assert!(
+            store
+                .install_snapshot(store.state(), &contradiction)
+                .is_err()
+        );
+        assert!(!store.failed);
+        let uncommitted = at(1, 2);
+        store
+            .append(
+                &AppendRequest {
+                    term: boundary.term,
+                    leader: boundary.leader,
+                    previous: Some(boundary),
+                    entries: noops(2..=2, 1),
+                    leader_commit: Some(boundary),
+                },
+                (1, 1024),
+            )
+            .unwrap();
+        store
+            .persist(HardState {
+                term: Term(2),
+                voted_for: None,
+            })
+            .unwrap();
+        let replacement = LogIdentity {
+            term: Term(2),
+            ..uncommitted
+        };
+        let replacement_bytes = rewrite_install_snapshot(&bytes, replacement, &membership);
+        store
+            .install_snapshot(store.state(), &replacement_bytes)
+            .unwrap();
+        drop(store);
+        let mut store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        assert_eq!(
+            positions(&store),
+            [Some(replacement), Some(replacement), Some(replacement)]
+        );
+        // The divergent uncommitted suffix is gone, not retained beside the boundary.
+        assert_eq!(retained(&store), 0);
+        let recovered = store.recovered().unwrap();
+        assert_eq!(recovered.snapshot, Some((replacement, membership)));
+        assert_eq!(recovered.entries, []);
+    }
+
+    #[test]
+    fn snapshot_install_capacity_is_conservative_checked_and_nonpoisoning() {
+        assert!(!snapshot_install_fits(0, 24 * 1024 * 1024, 0, 0));
+        assert!(!snapshot_install_fits(u64::MAX, 1, 1, 1));
+        assert!(!snapshot_install_fits(0, u64::MAX, 0, 0));
+        assert!(!snapshot_install_fits(24 * 1024 * 1024, 1, 1, 1));
+        assert!(!snapshot_install_fits(0, 1, 1, 8 * 1024 * 1024));
+        assert!(snapshot_install_fits(1024 * 1024, 1024, 1024, 1024));
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let (mut store, bytes, _) = snapshot_install_fixture(&path);
+        // A large canonical control state: many individually bounded names,
+        // not a malformed oversized field that the codec would reject first.
+        let (descriptor, control) =
+            crate::consensus_storage::decode_owned_snapshot(&bytes).unwrap();
+        let mut control = crate::control_state::ControlState::decode_snapshot(&control).unwrap();
+        for index in 0..6144u128 {
+            let value = uuid::Uuid::from_u128(index + 100);
+            control.workspaces.insert(
+                value,
+                bmux_cluster_plugin_api::cluster_types::WorkspaceRecord {
+                    workspace_id: bmux_cluster_plugin_api::cluster_types::WorkspaceId { value },
+                    name: Some("x".repeat(4096)),
+                    revision: 0,
+                },
+            );
+        }
+        let large = crate::consensus_storage::encode_owned_snapshot(
+            "cluster",
+            "large",
+            descriptor
+                .last_included
+                .expect("fixture snapshot is nonempty"),
+            &descriptor.membership.unwrap(),
+            &control.encode_snapshot().unwrap(),
+        )
+        .unwrap();
+        assert!(large.len() > 24 * 1024 * 1024);
+        assert_eq!(
+            store
+                .install_snapshot(store.state(), &large)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::StorageFull
+        );
+        assert!(!store.failed);
+        store.install_snapshot(store.state(), &bytes).unwrap();
+        drop(store);
+        OwnedVoteStore::open(&path, "cluster").unwrap();
+    }
+
+    #[test]
+    fn snapshot_install_capacity_counts_retained_suffix_without_poisoning() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let (mut store, bytes, boundary) = snapshot_install_fixture(&path);
+        store
+            .append(
+                &AppendRequest {
+                    term: boundary.term,
+                    leader: boundary.leader,
+                    previous: Some(boundary),
+                    entries: vec![Entry {
+                        identity: at(1, 2),
+                        payload: EntryPayload::Application(vec![0; 6 * 1024 * 1024]),
+                    }],
+                    leader_commit: Some(boundary),
+                },
+                (1, 6 * 1024 * 1024),
+            )
+            .unwrap();
+        let before = store.recovered().unwrap();
+        assert_eq!(
+            store
+                .install_snapshot(store.state(), &bytes)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::StorageFull
+        );
+        assert!(!store.failed);
+        assert_eq!(store.recovered().unwrap(), before);
+        drop(store);
+        let mut store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        assert_eq!(store.recovered().unwrap(), before);
+    }
+
+    #[test]
+    fn snapshot_install_roundtrip_preserves_vote_and_continuation() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, bytes, boundary) = snapshot_install_fixture(&root.path().join("source"));
+        let path = root.path().join("target");
+        let mut target = OwnedVoteStore::create(&path, "cluster").unwrap();
+        target.persist(source.state()).unwrap();
+        let expected = target.state();
+        target.install_snapshot(expected, &bytes).unwrap();
+        // Reinstalling the same object at the same boundary is idempotent.
+        target.install_snapshot(expected, &bytes).unwrap();
+        drop(target);
+        let mut target = OwnedVoteStore::open(&path, "cluster").unwrap();
+        assert_eq!(target.state(), expected);
+        {
+            let tx = target.database.begin_read().unwrap();
+            validate_log_recovery(&tx).unwrap();
+            let meta = tx.open_table(TABLE).unwrap();
+            assert_eq!(
+                meta.get("compacted_snapshot").unwrap().unwrap().value(),
+                bytes
+            );
+        }
+        assert_eq!(
+            positions(&target),
+            [Some(boundary), Some(boundary), Some(boundary)]
+        );
+        target
+            .append(
+                &AppendRequest {
+                    term: expected.term,
+                    leader: boundary.leader,
+                    previous: Some(boundary),
+                    entries: noops(2..=2, 1),
+                    leader_commit: Some(at(1, 2)),
+                },
+                (64, 1024 * 1024),
+            )
+            .unwrap();
+        assert_eq!(
+            apply_all(&mut target),
+            vec![AppliedOutcome {
+                identity: at(1, 2),
+                response: None
+            }]
+        );
+        validate_log_recovery(&target.database.begin_read().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn snapshot_install_preserves_committed_suffix_and_rejects_rollback() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let (mut store, bytes, boundary) = snapshot_install_fixture(&path);
+        let next = at(1, 2);
+        store
+            .append(
+                &AppendRequest {
+                    term: store.state().term,
+                    leader: boundary.leader,
+                    previous: Some(boundary),
+                    entries: noops(2..=2, 1),
+                    leader_commit: Some(next),
+                },
+                (64, 1024 * 1024),
+            )
+            .unwrap();
+        let expected = store.state();
+        store.install_snapshot(expected, &bytes).unwrap();
+        drop(store);
+        let mut store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        validate_log_recovery(&store.database.begin_read().unwrap()).unwrap();
+        // The acknowledged commit and its matching suffix survive the install.
+        assert_eq!(
+            positions(&store),
+            [Some(next), Some(boundary), Some(boundary)]
+        );
+        assert_eq!(retained(&store), 1);
+        assert_eq!(apply_all(&mut store).len(), 1);
+        // Installing behind the applied position would roll back application.
+        assert!(store.install_snapshot(expected, &bytes).is_err());
+        assert!(!store.failed);
+        validate_log_recovery(&store.database.begin_read().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn snapshot_install_rejects_stale_corrupt_and_foreign_objects() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut source, bytes, _) = snapshot_install_fixture(&root.path().join("source"));
+        assert!(
+            source
+                .install_snapshot(
+                    HardState {
+                        term: Term(0),
+                        voted_for: None
+                    },
+                    &bytes
+                )
+                .is_err()
+        );
+        let expected = source.state();
+        let mut corrupt = bytes.clone();
+        corrupt[0] ^= 1;
+        assert!(source.install_snapshot(expected, &corrupt).is_err());
+        let mut unsupported = bytes.clone();
+        // Durable header: eight-byte magic, then the u16 format version.
+        unsupported[8..10].copy_from_slice(&u16::MAX.to_le_bytes());
+        let payload = unsupported.len() - 32;
+        let checksum = Sha256::digest(&unsupported[..payload]);
+        unsupported[payload..].copy_from_slice(&checksum);
+        assert!(source.install_snapshot(expected, &unsupported).is_err());
+        assert!(!source.failed);
+        source.install_snapshot(expected, &bytes).unwrap();
+        let mut foreign = OwnedVoteStore::create(&root.path().join("foreign"), "other").unwrap();
+        foreign.persist(expected).unwrap();
+        assert!(foreign.install_snapshot(expected, &bytes).is_err());
+        assert!(!foreign.failed);
+        validate_log_recovery(&foreign.database.begin_read().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn snapshot_install_crash_recovers_one_atomic_authority() {
+        for point in ["before-commit", "after-commit"] {
+            let root = tempfile::tempdir().unwrap();
+            let (source, bytes, boundary) = snapshot_install_fixture(&root.path().join("source"));
+            let snapshot = root.path().join("snapshot");
+            std::fs::write(&snapshot, &bytes).unwrap();
+            let path = root.path().join("target");
+            let mut target = OwnedVoteStore::create(&path, "cluster").unwrap();
+            target.persist(source.state()).unwrap();
+            let empty_control = control_bytes(&mut target);
+            target.close().unwrap();
+            crash_snapshot_install(&path, &snapshot, point);
+            let mut target = OwnedVoteStore::open(&path, "cluster").unwrap();
+            assert_eq!(target.state(), source.state());
+            validate_log_recovery(&target.database.begin_read().unwrap()).unwrap();
+            let installed = point == "after-commit";
+            assert_eq!(positions(&target), [installed.then_some(boundary); 3]);
+            {
+                let tx = target.database.begin_read().unwrap();
+                let meta = tx.open_table(TABLE).unwrap();
+                assert_eq!(meta.get("compacted_snapshot").unwrap().is_some(), installed);
+                assert_eq!(meta.get("published_snapshot").unwrap().is_some(), installed);
+            }
+            let (_, snapshot_control) =
+                crate::consensus_storage::decode_owned_snapshot(&bytes).unwrap();
+            assert_eq!(
+                control_bytes(&mut target),
+                if installed {
+                    snapshot_control
+                } else {
+                    empty_control
+                }
+            );
+            // Whichever state survived is a complete authority that can still install.
+            target.install_snapshot(target.state(), &bytes).unwrap();
+            assert_eq!(positions(&target), [Some(boundary); 3]);
+        }
+    }
+
+    fn crash_snapshot_install(path: &Path, snapshot: &Path, point: &str) {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "owned_vote_store::tests::snapshot_install_crash_child",
+                "--nocapture",
+            ])
+            .env("BMUX_OWNED_INSTALL_PATH", path)
+            .env("BMUX_OWNED_INSTALL_BYTES", snapshot)
+            .env("BMUX_OWNED_INSTALL_CRASH", point)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(75));
+    }
+
+    // Keep process-exit recovery of acknowledged application state together.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn snapshot_install_crash_replacement_preserves_acknowledged_state() {
+        for point in ["before-commit", "after-commit"] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("target");
+            let (mut target, _, boundary) = snapshot_install_fixture(&path);
+            let command = proposal_command();
+            let applied = at(1, 2);
+            target
+                .append(
+                    &AppendRequest {
+                        term: boundary.term,
+                        leader: boundary.leader,
+                        previous: Some(boundary),
+                        entries: vec![Entry {
+                            identity: applied,
+                            payload: EntryPayload::Application(
+                                crate::control_codec::encode_control_command(&command),
+                            ),
+                        }],
+                        leader_commit: Some(applied),
+                    },
+                    (1, 1_048_576),
+                )
+                .unwrap();
+            apply_all(&mut target);
+            let old_control = control_bytes(&mut target);
+            let old_snapshot = target.publish_snapshot().unwrap();
+            target.compact_snapshot().unwrap();
+            target
+                .persist(HardState {
+                    term: Term(2),
+                    voted_for: None,
+                })
+                .unwrap();
+            let expected = target.state();
+            let replacement = at(2, 3);
+            let bytes = rewrite_install_snapshot(
+                &old_snapshot,
+                replacement,
+                &snapshot_membership(&old_snapshot),
+            );
+            let snapshot = root.path().join("snapshot");
+            std::fs::write(&snapshot, &bytes).unwrap();
+            target.close().unwrap();
+            crash_snapshot_install(&path, &snapshot, point);
+            let mut target = OwnedVoteStore::open(&path, "cluster").unwrap();
+            assert_eq!(target.state(), expected);
+            let [commit, applied_position, snapshot_position] = positions(&target);
+            let (position, compacted) = if point == "before-commit" {
+                (applied, applied)
+            } else {
+                (replacement, replacement)
+            };
+            assert_eq!(applied_position, Some(position));
+            assert_eq!(commit, Some(position));
+            assert_eq!(snapshot_position, Some(compacted));
+            // The control state carries the same mutation and its dedup record
+            // either way; it is never reset by a half-installed snapshot.
+            assert_eq!(control_bytes(&mut target), old_control);
+            let mut state = target.read_control_state().unwrap();
+            assert_eq!(state.apply(&command).control_revision, 1);
+            assert_eq!(state.revision, 1);
+            validate_log_recovery(&target.database.begin_read().unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn application_crash_child() {
+        let Some(path) = std::env::var_os("BMUX_OWNED_APPLY_PATH") else {
+            return;
+        };
+        let mut store = OwnedVoteStore::open(Path::new(&path), "cluster").unwrap();
+        apply_all(&mut store);
+        panic!("application crash hook not reached");
+    }
+
+    fn crash_application(path: &Path, point: &str) {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "owned_vote_store::tests::application_crash_child",
+                "--nocapture",
+            ])
+            .env("BMUX_OWNED_APPLY_PATH", path)
+            .env("BMUX_OWNED_APPLY_CRASH", point)
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(74));
+    }
+
+    /// Publish at `position` and install the real canonical mutation/dedup
+    /// state elsewhere, not just an empty control snapshot.
+    fn assert_snapshot(store: &mut OwnedVoteStore, position: LogIdentity) {
+        let snapshot = store.publish_snapshot().unwrap();
+        let (descriptor, control) =
+            crate::consensus_storage::decode_owned_snapshot(&snapshot).unwrap();
+        assert_eq!(descriptor.last_included, Some(position));
+        let restored = crate::control_state::ControlState::decode_snapshot(&control).unwrap();
+        assert_eq!(restored.revision, 1);
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("installed");
+        let mut installed = OwnedVoteStore::create(&path, "cluster").unwrap();
+        installed.persist(store.state()).unwrap();
+        installed
+            .install_snapshot(installed.state(), &snapshot)
+            .unwrap();
+        drop(installed);
+        let installed = OwnedVoteStore::open(&path, "cluster").unwrap();
+        let tx = installed.database.begin_read().unwrap();
+        validate_log_recovery(&tx).unwrap();
+        let meta = tx.open_table(TABLE).unwrap();
+        assert_eq!(meta.get("control").unwrap().unwrap().value(), control);
+    }
+
+    #[test]
+    fn application_crash_recovers_mutation_and_duplicate_together() {
+        for point in ["before-commit", "after-commit"] {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("authority.redb");
+            let node = NodeId::from(1);
+            let command = workspace_command(10, 20);
+            let bytes = crate::control_codec::encode_control_command(&command);
+            let mut store =
+                OwnedVoteStore::bootstrap(&path, "cluster", node, single_voter(node)).unwrap();
+            apply_all(&mut store);
+            store
+                .append(
+                    &AppendRequest {
+                        term: Term(1),
+                        leader: node,
+                        previous: Some(at(0, 0)),
+                        entries: vec![
+                            Entry {
+                                identity: at(1, 1),
+                                payload: EntryPayload::Application(bytes.clone()),
+                            },
+                            Entry {
+                                identity: at(1, 2),
+                                payload: EntryPayload::Application(bytes),
+                            },
+                        ],
+                        leader_commit: Some(at(1, 2)),
+                    },
+                    (16, 4096),
+                )
+                .unwrap();
+            store.close().unwrap();
+            crash_application(&path, point);
+            let mut store = OwnedVoteStore::open(&path, "cluster").unwrap();
+            let crashed_before = point == "before-commit";
+            // The mutation, its duplicate's dedup record and the applied
+            // position commit together or not at all.
+            assert_eq!(
+                positions(&store)[1],
+                Some(if crashed_before { at(0, 0) } else { at(1, 2) })
+            );
+            assert_eq!(
+                store.read_control_state().unwrap().revision,
+                u64::from(!crashed_before)
+            );
+            let replies = responses(apply_all(&mut store));
+            if crashed_before {
+                assert_eq!(replies.len(), 2);
+                assert_eq!(replies[0], replies[1]);
+            } else {
+                assert_eq!(replies, [] as [Vec<u8>; 0]);
+            }
+            assert_snapshot(&mut store, at(1, 2));
+            let mut state = store.read_control_state().unwrap();
+            let response = state.apply(&command);
+            assert_eq!(response.control_revision, 1);
+            assert_eq!(state.revision, 1);
+        }
+    }
+
+    // Validate exact identities across mixed entries and a count-boundary turn,
+    // including canonical dedup/conflict outcomes and restart continuity.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn applied_batch_mixed_entries_boundary_dedup_conflict_and_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let node = NodeId::from(1);
+        let membership = single_voter(node);
+        let mut store =
+            OwnedVoteStore::bootstrap(&path, "cluster", node, membership.clone()).unwrap();
+        let first = store.apply_committed_batch().unwrap();
+        let genesis = first.applied.unwrap();
+        assert_eq!(
+            first.outcomes,
+            vec![AppliedOutcome {
+                identity: genesis,
+                response: None
+            }]
+        );
+        assert!(!first.more);
+        let command = proposal_command();
+        let mut conflict = command.clone();
+        conflict.request =
+            bmux_cluster_plugin_api::cluster_types::ControlCommandRequest::CreateWorkspace {
+                workspace_id: bmux_cluster_plugin_api::cluster_types::WorkspaceId {
+                    value: uuid::Uuid::from_u128(99),
+                },
+                name: None,
+            };
+        let application = |command| {
+            EntryPayload::Application(crate::control_codec::encode_control_command(command))
+        };
+        let mut entries = vec![
+            Entry {
+                identity: at(1, 1),
+                payload: EntryPayload::NoOp,
+            },
+            Entry {
+                identity: at(1, 2),
+                payload: EntryPayload::Membership(membership),
+            },
+            Entry {
+                identity: at(1, 3),
+                payload: application(&command),
+            },
+            Entry {
+                identity: at(1, 4),
+                payload: application(&command),
+            },
+            Entry {
+                identity: at(1, 5),
+                payload: application(&conflict),
+            },
+        ];
+        entries.extend(noops(6..=65, 1));
+        assert!(
+            store
+                .append(
+                    &AppendRequest {
+                        term: Term(1),
+                        leader: node,
+                        previous: Some(genesis),
+                        entries,
+                        leader_commit: Some(at(1, 65)),
+                    },
+                    (128, APPLICATION_ENTRY_BUDGET)
+                )
+                .unwrap()
+                .outcome
+                .is_ok()
+        );
+        let batch = store.apply_committed_batch().unwrap();
+        assert_eq!(batch.outcomes.len(), 64);
+        assert_eq!(batch.applied, Some(at(1, 64)));
+        assert!(batch.more);
+        let mut expected_state = crate::control_state::ControlState::new("cluster");
+        let expected =
+            crate::control_codec::encode_control_response(&expected_state.apply(&command));
+        let conflicting =
+            crate::control_codec::encode_control_response(&expected_state.apply(&conflict));
+        assert_ne!(expected, conflicting);
+        for (index, outcome) in (1..=64).zip(&batch.outcomes) {
+            assert_eq!(outcome.identity, at(1, index));
+            let response = match index {
+                3 | 4 => Some(expected.clone()),
+                5 => Some(conflicting.clone()),
+                _ => None,
+            };
+            assert_eq!(outcome.response, response);
+        }
+        let state = store.read_control_state().unwrap();
+        assert_eq!(state.revision, 1);
+        assert_eq!(positions(&store)[1], batch.applied);
+        // The membership entry inside the batch became the applied membership.
+        assert_eq!(
+            store.read_applied().unwrap().1.unwrap().introduced_at,
+            Some(at(1, 2))
+        );
+        store.close().unwrap();
+        let mut store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        let batch = store.apply_committed_batch().unwrap();
+        assert_eq!(
+            batch,
+            AppliedBatch {
+                outcomes: vec![AppliedOutcome {
+                    identity: at(1, 65),
+                    response: None
+                }],
+                applied: Some(at(1, 65)),
+                more: false
+            }
+        );
+        assert_eq!(
+            store.apply_committed_batch().unwrap(),
+            AppliedBatch {
+                outcomes: Vec::new(),
+                applied: Some(at(1, 65)),
+                more: false
+            }
+        );
+        assert_eq!(control_bytes(&mut store), state.encode_snapshot().unwrap());
+    }
+
+    #[test]
+    fn applied_batch_byte_boundary_preserves_next_exact_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut store, _, previous) = snapshot_install_fixture(&root.path().join("authority"));
+        let command = proposal_at_framed_size(at(1, 2), 600 * 1024);
+        let canonical = crate::control_codec::encode_control_command(&command);
+        store
+            .append(
+                &AppendRequest {
+                    term: previous.term,
+                    leader: previous.leader,
+                    previous: Some(previous),
+                    entries: vec![
+                        Entry {
+                            identity: at(1, 2),
+                            payload: EntryPayload::Application(canonical.clone()),
+                        },
+                        Entry {
+                            identity: at(1, 3),
+                            payload: EntryPayload::Application(canonical),
+                        },
+                    ],
+                    leader_commit: Some(at(1, 3)),
+                },
+                (2, 2 * APPLICATION_ENTRY_BUDGET),
+            )
+            .unwrap();
+        let first = store.apply_committed_batch().unwrap();
+        assert_eq!(first.outcomes.len(), 1);
+        assert_eq!(first.outcomes[0].identity, at(1, 2));
+        assert_eq!(first.applied, Some(at(1, 2)));
+        assert!(first.more);
+        let second = store.apply_committed_batch().unwrap();
+        assert_eq!(second.outcomes.len(), 1);
+        assert_eq!(second.outcomes[0].identity, at(1, 3));
+        assert_eq!(second.outcomes[0].response, first.outcomes[0].response);
+        assert_eq!(second.applied, Some(at(1, 3)));
+        assert!(!second.more);
+        let empty = store.apply_committed_batch().unwrap();
+        assert_eq!(empty.outcomes, [] as [AppliedOutcome; 0]);
+        assert_eq!(empty.applied, second.applied);
+        assert!(!empty.more);
+    }
+
+    #[test]
+    fn committed_entry_beyond_application_budget_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let node = NodeId::from(1);
+        let mut store =
+            OwnedVoteStore::bootstrap(&path, "cluster", node, single_voter(node)).unwrap();
+        apply_all(&mut store);
+        // An entry framed at exactly the budget is applicable on its own.
+        let fits = crate::control_codec::encode_control_command(&proposal_at_framed_size(
+            at(1, 1),
+            APPLICATION_ENTRY_BUDGET,
+        ));
+        assert_eq!(framed_len(at(1, 1), &fits), APPLICATION_ENTRY_BUDGET);
+        store
+            .write(&term_one_write(
+                vec![Entry {
+                    identity: at(1, 1),
+                    payload: EntryPayload::Application(fits),
+                }],
+                Some(at(1, 1)),
+            ))
+            .unwrap();
+        let batch = store.apply_committed_batch().unwrap();
+        assert_eq!(batch.applied, Some(at(1, 1)));
+        assert!(batch.outcomes[0].response.is_some());
+        assert!(!batch.more);
+        // One byte more can never be applied by a bounded turn: stop rather
+        // than skip it or acknowledge anything after it.
+        let oversized = crate::control_codec::encode_control_command(&proposal_at_framed_size(
+            at(1, 2),
+            APPLICATION_ENTRY_BUDGET + 1,
+        ));
+        store
+            .write(&EngineWrite {
+                hard_state: None,
+                truncate_from: None,
+                entries: [
+                    Entry {
+                        identity: at(1, 2),
+                        payload: EntryPayload::Application(oversized),
+                    },
+                    noops(3..=3, 1).remove(0),
+                ]
+                .into(),
+                commit: Some(at(1, 3)),
+            })
+            .unwrap();
+        let before = control_bytes(&mut store);
+        let error = store.apply_committed_batch().unwrap_err();
+        assert!(error.to_string().contains("exceeds application budget"));
+        assert!(store.failed);
+        assert!(store.read_control_state().is_err());
+        drop(store);
+        let mut store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        assert_eq!(positions(&store)[..2], [Some(at(1, 3)), Some(at(1, 1))]);
+        assert_eq!(control_bytes(&mut store), before);
+    }
+
+    #[test]
+    fn applied_batch_decode_failure_never_acknowledges_partial_transaction() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let (mut store, _, previous) = snapshot_install_fixture(&path);
+        let before = control_bytes(&mut store);
+        store
+            .append(
+                &AppendRequest {
+                    term: previous.term,
+                    leader: previous.leader,
+                    previous: Some(previous),
+                    entries: vec![
+                        Entry {
+                            identity: at(1, 2),
+                            payload: EntryPayload::NoOp,
+                        },
+                        Entry {
+                            identity: at(1, 3),
+                            payload: EntryPayload::Application(vec![255]),
+                        },
+                    ],
+                    leader_commit: Some(at(1, 3)),
+                },
+                (2, 1024),
+            )
+            .unwrap();
+        assert!(store.apply_committed_batch().is_err());
+        assert!(store.failed);
+        drop(store);
+        let mut store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        // The no-op before the undecodable entry was not acknowledged either.
+        assert_eq!(positions(&store)[1], Some(previous));
+        assert_eq!(control_bytes(&mut store), before);
+        assert!(store.apply_committed_batch().is_err());
+    }
+
+    #[test]
+    fn application_rejects_missing_committed_entry_atomically() {
+        let root = tempfile::tempdir().unwrap();
+        let node = NodeId::from(1);
+        let mut store = OwnedVoteStore::bootstrap(
+            &root.path().join("authority.redb"),
+            "cluster",
+            node,
+            single_voter(node),
+        )
+        .unwrap();
+        let tx = store.database.begin_write().unwrap();
+        tx.open_table(LOG).unwrap().remove(0).unwrap();
+        tx.commit().unwrap();
+        assert!(
+            store
+                .apply_committed_batch()
+                .unwrap_err()
+                .to_string()
+                .contains("missing committed")
+        );
+        assert!(store.failed);
+        let tx = store.database.begin_read().unwrap();
+        let meta = tx.open_table(TABLE).unwrap();
+        assert_eq!(
+            decode_position(meta.get("applied").unwrap().unwrap().value()).unwrap(),
+            None
+        );
+        assert_eq!(
+            meta.get("applied_membership").unwrap().unwrap().value(),
+            b""
+        );
+    }
+
+    #[test]
+    fn compaction_frees_capacity_beyond_absolute_index_limit() {
+        check_compaction_capacity(0);
+    }
+
+    #[test]
+    fn partial_compaction_preserves_unapplied_suffix_at_capacity() {
+        check_compaction_capacity(16);
+    }
+
+    fn check_compaction_capacity(unapplied: u64) {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("capacity.redb");
+        let node = NodeId::from(1);
+        let mut store =
+            OwnedVoteStore::bootstrap(&path, "cluster", node, single_voter(node)).unwrap();
+        store
+            .append(
+                &AppendRequest {
+                    term: Term(1),
+                    leader: node,
+                    previous: Some(at(0, 0)),
+                    entries: noops(1..=MAX_RETAINED_ENTRIES - 1, 1),
+                    leader_commit: Some(at(1, MAX_RETAINED_ENTRIES - 1 - unapplied)),
+                },
+                (4096, 4096),
+            )
+            .unwrap();
+        let request = AppendRequest {
+            term: Term(1),
+            leader: node,
+            previous: Some(at(1, MAX_RETAINED_ENTRIES - 1)),
+            entries: noops(MAX_RETAINED_ENTRIES..=MAX_RETAINED_ENTRIES, 1),
+            leader_commit: Some(at(1, MAX_RETAINED_ENTRIES)),
+        };
+        // Retention is full: admission backs off without stopping the store.
+        assert_eq!(
+            store.append(&request, (1, 4096)).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert!(!store.failed);
+        apply_all(&mut store);
+        store.publish_snapshot().unwrap();
+        store.compact_snapshot().unwrap();
+        assert_eq!(retained(&store), unapplied);
+        assert!(store.append(&request, (1, 4096)).unwrap().outcome.is_ok());
+        store.close().unwrap();
+        let mut store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        assert_eq!(apply_all(&mut store).len() as u64, unapplied + 1);
+    }
+
+    #[test]
+    fn engine_write_beyond_retention_requires_compaction_and_commits_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("capacity.redb");
+        let node = NodeId::from(1);
+        let mut store =
+            OwnedVoteStore::bootstrap(&path, "cluster", node, single_voter(node)).unwrap();
+        let last = MAX_RETAINED_ENTRIES - 1;
+        store
+            .write(&term_one_write(noops(1..=last, 1), Some(at(1, last))))
+            .unwrap();
+        assert_eq!(retained(&store), MAX_RETAINED_ENTRIES);
+        let overflow = EngineWrite {
+            hard_state: Some(HardState {
+                term: Term(2),
+                voted_for: Some(node),
+            }),
+            truncate_from: None,
+            entries: noops(last + 1..=last + 1, 1),
+            commit: Some(at(1, last + 1)),
+        };
+        let error = store.write(&overflow).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error.to_string().contains("requires compaction"));
+        // An engine write failure stops the handle, and nothing of the
+        // rejected transaction (vote, entry or commit) became durable.
+        assert!(store.failed);
+        assert!(store.recovered().is_err());
+        drop(store);
+        let mut store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        assert_eq!(store.state().term, Term(1));
+        let recovered = store.recovered().unwrap();
+        assert_eq!(recovered.entries.len() as u64, MAX_RETAINED_ENTRIES);
+        assert_eq!(recovered.commit, Some(at(1, last)));
+        // A suffix replacement that keeps the count within the limit is admitted.
+        store
+            .write(&EngineWrite {
+                hard_state: None,
+                truncate_from: Some(LogIndex(last)),
+                entries: noops(last..=last, 1),
+                commit: None,
+            })
+            .unwrap();
+        apply_all(&mut store);
+        store.publish_snapshot().unwrap();
+        store.compact_snapshot().unwrap();
+        store.write(&overflow).unwrap();
+        let recovered = store.recovered().unwrap();
+        assert_eq!(recovered.snapshot.as_ref().unwrap().0, at(1, last));
+        assert_eq!(recovered.entries, noops(last + 1..=last + 1, 1));
+        assert_eq!(recovered.commit, Some(at(1, last + 1)));
+        store.close().unwrap();
+        let mut store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        assert_eq!(store.state().term, Term(2));
+        crate::consensus_engine::Engine::recover(
+            node,
+            crate::consensus_engine::Config::default(),
+            store.recovered().unwrap(),
+        )
+        .unwrap();
+    }
+
+    // Keep the publish/compact/republish sequence and its recovery together.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn publishing_never_compacts_and_compaction_follows_the_published_boundary() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let node = NodeId::from(1);
+        let mut store =
+            OwnedVoteStore::bootstrap(&path, "cluster", node, single_voter(node)).unwrap();
+        // Compaction only ever uses a published snapshot.
+        assert!(store.published_snapshot().unwrap().is_none());
+        store
+            .write(&term_one_write(noops(1..=3, 1), Some(at(1, 3))))
+            .unwrap();
+        apply_all(&mut store);
+        let published = store.publish_snapshot().unwrap();
+        let (descriptor, _) = crate::consensus_storage::decode_owned_snapshot(&published).unwrap();
+        assert_eq!(descriptor.last_included, Some(at(1, 3)));
+        assert_eq!(descriptor.membership.unwrap().introduced_at, Some(at(0, 0)));
+        // Publishing leaves the full log authoritative.
+        assert_eq!(positions(&store)[2], None);
+        assert_eq!(retained(&store), 4);
+        assert_eq!(store.published_snapshot().unwrap(), Some(published.clone()));
+
+        // Application moves past the published boundary before compaction.
+        store
+            .write(&EngineWrite {
+                hard_state: None,
+                truncate_from: None,
+                entries: noops(4..=5, 1),
+                commit: Some(at(1, 5)),
+            })
+            .unwrap();
+        apply_all(&mut store);
+        store.compact_snapshot().unwrap();
+        assert_eq!(
+            positions(&store),
+            [Some(at(1, 5)), Some(at(1, 5)), Some(at(1, 3))]
+        );
+        assert_eq!(retained(&store), 2);
+        assert_eq!(store.published_snapshot().unwrap(), Some(published.clone()));
+        let recovered = store.recovered().unwrap();
+        assert_eq!(recovered.snapshot.as_ref().unwrap().0, at(1, 3));
+        assert_eq!(recovered.entries, noops(4..=5, 1));
+        crate::consensus_engine::Engine::recover(
+            node,
+            crate::consensus_engine::Config::default(),
+            recovered.clone(),
+        )
+        .unwrap();
+        // Compacting again at the same published boundary changes nothing.
+        store.compact_snapshot().unwrap();
+        assert_eq!(store.recovered().unwrap(), recovered);
+        store.close().unwrap();
+
+        let mut store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        assert_eq!(store.recovered().unwrap(), recovered);
+        assert_eq!(store.published_snapshot().unwrap(), Some(published.clone()));
+        // A fresh publication advances to applied; compaction then empties the log.
+        let republished = store.publish_snapshot().unwrap();
+        assert_ne!(republished, published);
+        store.compact_snapshot().unwrap();
+        assert_eq!(positions(&store)[2], Some(at(1, 5)));
+        assert_eq!(retained(&store), 0);
+        // Appending after a fully compacted log continues from the boundary.
+        store
+            .write(&EngineWrite {
+                hard_state: None,
+                truncate_from: None,
+                entries: noops(6..=6, 1),
+                commit: Some(at(1, 6)),
+            })
+            .unwrap();
+        assert_eq!(apply_all(&mut store).len(), 1);
+        store.close().unwrap();
+        let mut store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        let recovered = store.recovered().unwrap();
+        assert_eq!(recovered.snapshot.unwrap().0, at(1, 5));
+        assert_eq!(recovered.entries, noops(6..=6, 1));
+        assert_eq!(recovered.applied, Some(at(1, 6)));
+    }
+
+    /// One way a recovered store can describe incoherent positions.
+    type Incoherence = fn(&redb::WriteTransaction, &[u8]);
+
+    fn put_position(tx: &redb::WriteTransaction, key: &str, position: Option<LogIdentity>) {
+        tx.open_table(TABLE)
+            .unwrap()
+            .insert(key, encode_position(position).as_slice())
+            .unwrap();
+    }
+
+    // Each case corrupts one coherent authority; recovery must reject it
+    // before touching the file.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn recovery_rejects_incoherent_positions_without_mutating_authority() {
+        let cases: [(&str, bool, Incoherence); 12] = [
+            ("applied ahead of commit", false, |tx, _| {
+                put_position(tx, "commit", Some(at(1, 1)));
+                put_position(tx, "applied", Some(at(1, 2)));
+            }),
+            ("commit outside the durable log", false, |tx, _| {
+                put_position(tx, "commit", Some(at(1, 3)));
+            }),
+            ("commit identity differs from its entry", false, |tx, _| {
+                put_position(tx, "commit", Some(at(2, 2)));
+            }),
+            ("applied leader differs from its entry", false, |tx, _| {
+                put_position(
+                    tx,
+                    "applied",
+                    Some(LogIdentity {
+                        leader: NodeId::from(2),
+                        ..at(1, 1)
+                    }),
+                );
+            }),
+            (
+                "snapshot marker without compacted object",
+                false,
+                |tx, _| {
+                    put_position(tx, "snapshot", Some(at(1, 1)));
+                },
+            ),
+            ("published snapshot beyond applied", false, |tx, bytes| {
+                let ahead = rewrite_install_snapshot(bytes, at(1, 2), &snapshot_membership(bytes));
+                tx.open_table(TABLE)
+                    .unwrap()
+                    .insert("published_snapshot", ahead.as_slice())
+                    .unwrap();
+            }),
+            ("gap in the retained log", false, |tx, _| {
+                tx.open_table(LOG).unwrap().remove(1).unwrap();
+            }),
+            ("orphan membership index", false, |tx, _| {
+                let genesis = tx
+                    .open_table(MEMBERSHIPS)
+                    .unwrap()
+                    .get(0)
+                    .unwrap()
+                    .unwrap()
+                    .value()
+                    .to_vec();
+                tx.open_table(MEMBERSHIPS)
+                    .unwrap()
+                    .insert(2, genesis.as_slice())
+                    .unwrap();
+            }),
+            ("applied membership mismatch", false, |tx, _| {
+                tx.open_table(TABLE)
+                    .unwrap()
+                    .insert("applied_membership", &[][..])
+                    .unwrap();
+            }),
+            ("effective membership mismatch", false, |tx, _| {
+                tx.open_table(TABLE)
+                    .unwrap()
+                    .insert("membership", &[][..])
+                    .unwrap();
+            }),
+            (
+                "snapshot marker disagrees with compacted object",
+                true,
+                |tx, _| {
+                    put_position(tx, "snapshot", Some(at(0, 0)));
+                },
+            ),
+            (
+                "retained log does not continue the snapshot",
+                true,
+                |tx, _| {
+                    let mut log = tx.open_table(LOG).unwrap();
+                    let entry = log.remove(2).unwrap().unwrap().value().to_vec();
+                    drop(log);
+                    let mut moved = crate::consensus_storage::decode_owned_entry(&entry).unwrap();
+                    moved.identity = at(1, 3);
+                    tx.open_table(LOG)
+                        .unwrap()
+                        .insert(
+                            3,
+                            crate::consensus_storage::encode_owned_entry(&moved)
+                                .unwrap()
+                                .as_slice(),
+                        )
+                        .unwrap();
+                    put_position(tx, "commit", Some(at(1, 3)));
+                },
+            ),
+        ];
+        for (name, compact, corrupt) in cases {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("authority");
+            // Coherent base: genesis, applied boundary 1 (published), committed 2.
+            let (mut store, bytes, _) = snapshot_install_fixture(&path);
+            store
+                .write(&EngineWrite {
+                    hard_state: None,
+                    truncate_from: None,
+                    entries: noops(2..=2, 1),
+                    commit: Some(at(1, 2)),
+                })
+                .unwrap();
+            if compact {
+                store.compact_snapshot().unwrap();
+            }
+            validate_log_recovery(&store.database.begin_read().unwrap()).unwrap();
+            let tx = store.database.begin_write().unwrap();
+            corrupt(&tx, &bytes);
+            tx.commit().unwrap();
+            store.close().unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let error = OwnedVoteStore::open(&path, "cluster")
+                .err()
+                .unwrap_or_else(|| panic!("{name}: incoherent authority recovered"));
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{name}: {error}");
+            assert_eq!(std::fs::read(&path).unwrap(), before, "{name}");
+        }
+    }
+
+    #[test]
+    fn remote_snapshot_receipts_reject_future_applied_conflict_and_term_on_read_and_reopen() {
+        for corruption in 0..3 {
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("authority");
+            let (mut store, _, boundary) = snapshot_install_fixture(&path);
+            let mut receipt = [0; INSTALL_RECEIPT_BYTES];
+            let invalid_boundary = match corruption {
+                0 => LogIdentity {
+                    index: LogIndex(boundary.index.0 + 1),
+                    ..boundary
+                },
+                1 => LogIdentity {
+                    leader: NodeId::from(2),
+                    ..boundary
+                },
+                _ => boundary,
+            };
+            receipt[104..152].copy_from_slice(&encode_position(Some(invalid_boundary)));
+            let term = store.state().term.0 + u64::from(corruption == 2);
+            receipt[152..160].copy_from_slice(&term.to_le_bytes());
+            validate_install_receipts(&receipt).unwrap();
+            let tx = store.database.begin_write().unwrap();
+            tx.open_table(TABLE)
+                .unwrap()
+                .insert("install_receipts", receipt.as_slice())
+                .unwrap();
+            tx.commit().unwrap();
+            assert!(store.install_replay(&receipt).is_err());
+            assert!(store.failed);
+            drop(store);
+            assert!(OwnedVoteStore::open(&path, "cluster").is_err());
+        }
+    }
+
+    #[test]
+    fn remote_snapshot_receipt_window_corruption_and_old_format_fail_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let (mut store, bytes, boundary) = snapshot_install_fixture(&path);
+        let mut first = [0; INSTALL_RECEIPT_BYTES];
+        let mut latest = first;
+        for sequence in 0..=MAX_INSTALL_RECEIPTS as u64 {
+            let mut receipt = [0; INSTALL_RECEIPT_BYTES];
+            receipt[..16].copy_from_slice(uuid::Uuid::from_u128(u128::from(sequence)).as_bytes());
+            receipt[16..48].copy_from_slice(boundary.leader.as_bytes());
+            receipt[64..72].copy_from_slice(&sequence.to_le_bytes());
+            receipt[72..104].copy_from_slice(&Sha256::digest(&bytes));
+            receipt[104..152].copy_from_slice(&encode_position(Some(boundary)));
+            receipt[152..160].copy_from_slice(&store.state().term.0.to_le_bytes());
+            if sequence == 0 {
+                first = receipt;
+            }
+            store
+                .install_snapshot_recorded(store.state(), &bytes, Some(&receipt))
+                .unwrap();
+            latest = receipt;
+        }
+        // The window keeps the newest receipts; the oldest is forgotten.
+        assert_eq!(store.install_replay(&first).unwrap(), None);
+        assert_eq!(store.install_replay(&latest).unwrap(), Some(true));
+        let mut conflict = latest;
+        conflict[72] ^= 1;
+        assert_eq!(store.install_replay(&conflict).unwrap(), Some(false));
+        drop(store);
+        let mut store = OwnedVoteStore::open(&path, "cluster").unwrap();
+        assert_eq!(store.install_replay(&latest).unwrap(), Some(true));
+        {
+            let tx = store.database.begin_write().unwrap();
+            tx.open_table(TABLE)
+                .unwrap()
+                .insert("format", &b"BMOWNV05"[..])
+                .unwrap();
+            tx.commit().unwrap();
+        }
+        drop(store);
+        assert!(OwnedVoteStore::open(&path, "cluster").is_err());
+        assert!(validate_install_receipts(&[0; 1]).is_err());
+        assert!(
+            validate_install_receipts(&[0; INSTALL_RECEIPT_BYTES * (MAX_INSTALL_RECEIPTS + 1)])
+                .is_err()
+        );
+    }
+
+    type Staged = std::sync::Arc<std::sync::Mutex<(Vec<u8>, Vec<(NodeId, LogIdentity)>)>>;
+
+    fn staged_storage(store: OwnedVoteStore, staged: &Staged) -> OwnedStorage {
+        let staged = staged.clone();
+        OwnedStorage::new(
+            store,
+            Box::new(move |from, boundary| {
+                let mut staged = staged.lock().unwrap();
+                staged.1.push((from, boundary));
+                Ok(staged.0.clone())
+            }),
+        )
+    }
+
+    #[test]
+    fn owned_storage_installs_only_the_exact_accepted_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let (source, bytes, boundary) = snapshot_install_fixture(&root.path().join("source"));
+        let membership = snapshot_membership(&bytes);
+        let path = root.path().join("target");
+        let mut target = OwnedVoteStore::create(&path, "cluster").unwrap();
+        target.persist(source.state()).unwrap();
+        let staged = Staged::default();
+        staged.lock().unwrap().0.clone_from(&bytes);
+        let mut storage = staged_storage(target, &staged);
+        let leader = NodeId::from(1);
+        // The staged object must match the boundary and membership the engine
+        // accepted; a mismatch is rejected before the store is touched.
+        let elsewhere = LogIdentity {
+            index: LogIndex(4),
+            ..boundary
+        };
+        assert!(
+            storage
+                .install_snapshot(leader, elsewhere, &membership)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+        let mut other = membership.clone();
+        other.membership =
+            Membership::new(vec![vec![leader]], vec![(leader, "changed".into())]).unwrap();
+        assert!(
+            storage
+                .install_snapshot(leader, boundary, &other)
+                .unwrap_err()
+                .to_string()
+                .contains("does not match")
+        );
+        assert!(storage.store.recovered().unwrap().snapshot.is_none());
+        storage
+            .install_snapshot(leader, boundary, &membership)
+            .unwrap();
+        assert_eq!(
+            staged.lock().unwrap().1,
+            vec![(leader, elsewhere), (leader, boundary), (leader, boundary)]
+        );
+        let (_, control) = crate::consensus_storage::decode_owned_snapshot(&bytes).unwrap();
+        assert_eq!(storage.read().unwrap().encode_snapshot().unwrap(), control);
+        assert_eq!(storage.applied().unwrap().1, Some(membership.clone()));
+        // The installed object is what this node now serves to others.
+        let served = storage.snapshot().unwrap().unwrap();
+        assert_eq!(served.bytes, bytes);
+        assert_eq!(served.last_included, boundary);
+        assert_eq!(served.membership, membership);
+        storage.close().unwrap();
+        let mut target = OwnedVoteStore::open(&path, "cluster").unwrap();
+        assert_eq!(
+            target.recovered().unwrap().snapshot,
+            Some((boundary, membership))
+        );
+    }
+
+    #[test]
+    fn owned_storage_applies_across_bounded_batches_and_never_short() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("authority");
+        let node = NodeId::from(1);
+        let store = OwnedVoteStore::bootstrap(&path, "cluster", node, single_voter(node)).unwrap();
+        let mut storage = staged_storage(store, &Staged::default());
+        assert_eq!(
+            storage.apply(at(0, 0)).unwrap(),
+            [] as [(LogIdentity, Vec<u8>); 0]
+        );
+        // Every tenth entry is a distinct command; the rest are no-ops.
+        let entries = (1..=150)
+            .map(|index| Entry {
+                identity: at(1, index),
+                payload: if index % 10 == 0 {
+                    EntryPayload::Application(crate::control_codec::encode_control_command(
+                        &workspace_command(u128::from(index), u128::from(index) + 1000),
+                    ))
+                } else {
+                    EntryPayload::NoOp
+                },
+            })
+            .collect();
+        storage
+            .write(&term_one_write(entries, Some(at(1, 150))))
+            .unwrap();
+        // One call spans three bounded transactions (64 + 64 + 22).
+        let applied = storage.apply(at(1, 150)).unwrap();
+        assert_eq!(
+            applied
+                .iter()
+                .map(|(identity, _)| *identity)
+                .collect::<Vec<_>>(),
+            (1..=15).map(|step| at(1, step * 10)).collect::<Vec<_>>()
+        );
+        assert_eq!(storage.read().unwrap().workspaces.len(), 15);
+        assert_eq!(positions(&storage.store)[1], Some(at(1, 150)));
+        // Asking for more than is durably committed is an error, not a short
+        // success the engine could mistake for application.
+        assert!(
+            storage
+                .apply(at(1, 151))
+                .unwrap_err()
+                .to_string()
+                .contains("stopped before the durable commit")
+        );
+        // Compaction snapshots through applied and reports that boundary.
+        let (through, membership) = storage.compact().unwrap().unwrap();
+        assert_eq!(through, at(1, 150));
+        assert_eq!(membership.introduced_at, Some(at(0, 0)));
+        assert_eq!(retained(&storage.store), 0);
+        // The published compaction snapshot is served without republishing.
+        let published = storage.store.published_snapshot().unwrap().unwrap();
+        assert_eq!(storage.snapshot().unwrap().unwrap().bytes, published);
+        storage.close().unwrap();
+    }
 }
