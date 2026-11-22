@@ -577,6 +577,29 @@ impl EventBus {
         }
     }
 
+    /// Await a state provider's registration without polling, like
+    /// [`Self::subscribe_when_registered`] for retained state channels.
+    ///
+    /// # Errors
+    /// Returns incompatible channel type or delivery errors immediately.
+    pub async fn subscribe_state_when_registered<T>(
+        &self,
+        interface: &PluginEventKind,
+    ) -> EventBusResult<(Arc<T>, watch::Receiver<Arc<T>>)>
+    where
+        T: Any + Send + Sync + 'static,
+    {
+        let mut registrations = self.core.registrations.subscribe();
+        loop {
+            match self.subscribe_state::<T>(interface) {
+                Err(EventBusError::ChannelNotRegistered { .. }) => {
+                    let _ = registrations.changed().await;
+                }
+                result => return result,
+            }
+        }
+    }
+
     /// Register a broadcast channel for `E` keyed by `interface`.
     ///
     /// Returns the `Sender` so the registering plugin can keep a

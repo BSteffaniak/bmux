@@ -77,11 +77,45 @@ the ANSI 256-color cube when truecolor is unavailable, and Unicode borders
 degrade to ASCII when box drawing is unavailable. Producers can use the same
 `TerminalRenderCapabilities` facts for product-specific glyph choices.
 
-The in-process global registries are the current attach-host publication
-mechanism. They support late subscribers through retained snapshots and watch
-revisions. They are not a cross-process transport; a plugin execution model
-that runs outside the attach process must first provide an equivalent retained,
-revisioned publication channel rather than bypassing the canonical registries.
+The in-process registries are the attach host's publication mechanism. They
+support late subscribers through retained snapshots and watch revisions.
+
+### Presentations from plugins outside the attach client
+
+A plugin that does not run inside the attach client (a dynamic library loaded
+by the server, for example) draws attach UI by publishing its whole
+presentation as retained JSON state on `<plugin id>/presentation`:
+
+```toml
+[[event_publications]]
+delivery                     = "state"
+forward_to_streaming_clients = true
+kind                         = "example.presentation/presentation"
+```
+
+The payload is `bmux_plugin::surface::PublishedPresentation`: a revision, the
+plugin's layout requests and its surfaces. Everything on a surface beyond its
+id, revision and target is optional on the wire. At activation the plugin
+registers the channel and publishes through its host services
+(`register_event_channel(kind, true)`, `publish_event(kind, json)`), and
+publishes again whenever its presentation changes. `examples/presentation-plugin`
+is a complete example.
+
+- The server forwards any declared state kind it has no typed specialization
+  for as JSON, waiting for the channel to be registered and following it when
+  a reloaded plugin registers it again. Clients that attach later receive the
+  retained value.
+- Each attach client follows the presentation of every enabled plugin that
+  declares the kind, and lowers each snapshot into the same layout and surface
+  registries under the plugin's own id, so the same ownership, revision and
+  size validation applies. A restarted plugin may count its revisions from the
+  start again.
+- Input on a published region invokes the region's endpoint with the
+  `AttachInputEvent` encoded as a service message; the service returns an
+  `AttachInputResult`. Pointer moves are not forwarded (enter and leave are).
+  The plugin answers by publishing a new presentation.
+- Process (`runtime = "process"`) plugins cannot publish events yet: their
+  protocol has no plugin-to-host channel.
 
 See the executable split-surface example and stable update guidance in
 `packages/plugin/src/surface.rs`, and the deterministic layout contract in
@@ -102,13 +136,10 @@ ownership or form competing renderers:
 | `packages/attach-layout-protocol`                | Authoritative host pane scene, content rectangles, focus, and pane interactive summaries                     | It describes runtime-owned pane surfaces, not plugin presentation projection.                                                                               |
 | `packages/attach_pipeline/src/compositor.rs`     | Canonical composed retained graph, hit testing, damage, occlusion, repaint order, focus, and pointer routing | Both runtime pane surfaces and lowered plugin surfaces become `RetainedSurface`s here. This is the only in-process compositor representation.               |
 
-Independent presentation state has no generic cross-process wire scene. The
-selected attach-client companion consumes typed domain state and publishes
-`PluginLayoutSnapshot` and `PluginSurfaceSnapshot` in process. Adding a second
-serialized scene contract would duplicate identity, revisions, limits, and
-lifecycle semantics. If a future execution environment cannot publish in
-process, it must transport these same owner-scoped snapshot semantics and lower
-into the existing registries rather than introducing another compositor model.
+Independent presentation state has one serialized form: the same
+owner-scoped layout and surface snapshots, carried by `PublishedPresentation`
+(see above) and lowered into the existing registries. There is no second scene
+contract or compositor model.
 
 The single independent-surface lowering path is:
 

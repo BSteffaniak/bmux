@@ -5485,10 +5485,16 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
         local_state_dir: Some(attach_config_paths().state_dir()),
     };
     let mut started_companions = Vec::new();
-    for companion in super::super::plugin_runtime::attach_companions_for_config(
+    let presentation_plugins = super::super::plugin_runtime::attach_companions_for_config(
         &attach_config,
         &attach_config_paths(),
-    ) {
+    );
+    // Held for the attach's lifetime; dropping it withdraws what it lowered.
+    let _published_presentations = super::published_presentations::PublishedPresentations::install(
+        &presentation_plugins.published,
+        &presentation_resources,
+    );
+    for companion in presentation_plugins.companions {
         let id = companion.id().to_owned();
         match companion.start_with_resources(&presentation_resources) {
             Ok(started) => started_companions.push(started),

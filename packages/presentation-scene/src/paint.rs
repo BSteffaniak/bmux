@@ -193,6 +193,7 @@ pub enum RenderNamedColor {
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
 )]
+#[serde(default)]
 pub struct RenderStyle {
     pub fg: Option<RenderColor>,
     pub bg: Option<RenderColor>,

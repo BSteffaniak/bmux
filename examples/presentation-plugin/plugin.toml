@@ -1,0 +1,11 @@
+component_roles = ["backend"]
+id              = "example.presentation"
+name            = "Presentation Example"
+version         = "0.0.1"
+
+# The presentation is retained state forwarded to every attach client, which
+# draws it. The kind is always `<plugin id>/presentation`.
+[[event_publications]]
+delivery                     = "state"
+forward_to_streaming_clients = true
+kind                         = "example.presentation/presentation"

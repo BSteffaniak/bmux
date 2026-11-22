@@ -1,0 +1,8 @@
+// The presentation example draws attach UI by publishing retained state; it
+// provides and requires no services.
+plugin example.presentation version 1;
+
+/// Print the presentation this plugin publishes.
+command presentation() title "Print the published presentation";
+
+world presentation {}

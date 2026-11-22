@@ -241,3 +241,89 @@ fn generated_clients_reach_a_generated_provider_across_dylibs() {
     );
     sandbox.wait_for_log(&["watcher: observed 10"]);
 }
+
+/// A dylib plugin draws attach UI by publishing its presentation as retained
+/// state: the server forwards it to streaming clients (replayed to a client
+/// that connects after it was published), and the snapshot it sends lowers
+/// into the same layout and surface registries attach clients draw from.
+#[test]
+fn a_dylib_plugin_presentation_reaches_streaming_clients() {
+    let presentation = build_cdylib("presentation-plugin");
+    let mut sandbox = Sandbox::new(&[("example.presentation", &presentation)]);
+    sandbox.start();
+    sandbox.wait_for_log(&["presentation: published"]);
+
+    let paths = bmux_config::ConfigPaths::new(
+        sandbox.env.config_dir.clone(),
+        sandbox.env.runtime_dir.clone(),
+        sandbox.env.data_dir.clone(),
+        sandbox.env.state_dir.clone(),
+    );
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime");
+    let published = runtime.block_on(async {
+        let client = bmux_client::BmuxClient::connect_with_paths_and_timeout(
+            &paths,
+            "presentation-test",
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("connect");
+        let mut client =
+            bmux_client::StreamingBmuxClient::from_client(client).expect("streaming client");
+        client.enable_event_push().await.expect("enable event push");
+        let kind = bmux_plugin::surface::presentation_event_kind("example.presentation");
+        loop {
+            let event =
+                tokio::time::timeout(Duration::from_secs(10), client.event_receiver().recv())
+                    .await
+                    .expect("the retained presentation is replayed")
+                    .expect("event stream open");
+            if let bmux_client::ServerEvent::PluginBusEvent {
+                kind: event_kind,
+                payload,
+            } = event
+                && event_kind == kind
+            {
+                break serde_json::from_slice::<bmux_plugin::surface::PublishedPresentation>(
+                    &payload,
+                )
+                .expect("a published presentation");
+            }
+        }
+    });
+
+    let layouts = bmux_plugin::layout::PluginLayoutRegistry::new(8);
+    layouts
+        .publish(
+            "example.presentation",
+            bmux_plugin::layout::PluginLayoutSnapshot {
+                revision: published.revision,
+                requests: published.layouts.clone(),
+            },
+        )
+        .expect("the plugin's own layout");
+    let surfaces = bmux_plugin::surface::PluginSurfaceRegistry::new(8);
+    surfaces
+        .publish(
+            "example.presentation",
+            bmux_plugin::surface::PluginSurfaceSnapshot {
+                revision: published.revision,
+                surfaces: published.surfaces.clone(),
+            },
+        )
+        .expect("the plugin's own surfaces");
+    let resolved = bmux_plugin::layout::resolve_plugin_layout(
+        bmux_plugin::ExtensionRect::new(0, 0, 80, 24),
+        (1, 1),
+        &layouts.requests(),
+    )
+    .expect("layout resolves");
+    assert_eq!(
+        resolved.allocations[0].rect,
+        bmux_plugin::ExtensionRect::new(62, 0, 18, 24)
+    );
+    assert_eq!(published.surfaces[0].ops.len(), 2);
+}

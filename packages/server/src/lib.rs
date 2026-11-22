@@ -2236,6 +2236,88 @@ impl BmuxServer {
         Ok(())
     }
 
+    /// Forward a plugin's serialized (JSON) state channel to streaming
+    /// clients, for kinds the server has no typed specialization for.
+    ///
+    /// Unlike the typed forwarders, this waits for the channel to be
+    /// registered and subscribes again whenever it is re-registered (a
+    /// plugin reload replaces the channel), so declaring a forwarded kind is
+    /// enough for it to reach clients. State that was never published
+    /// (`null`) is not sent. Newly attached clients receive the retained
+    /// value through the same replay as typed forwarders.
+    ///
+    /// # Errors
+    /// Never; kept fallible for symmetry with the typed forwarders.
+    pub fn spawn_plugin_bus_json_state_forwarder(
+        &self,
+        kind: &bmux_plugin_sdk::PluginEventKind,
+    ) -> Result<()> {
+        let kind_string = kind.as_str().to_string();
+        let replay_kind = kind.clone();
+        let replay_kind_string = kind_string.clone();
+        let replay_bus = Arc::downgrade(&self.state.plugin_events);
+        if let Ok(mut replayers) = self.state.plugin_state_replayers.lock() {
+            replayers.push(Arc::new(move || {
+                let (current, _rx) = replay_bus
+                    .upgrade()?
+                    .subscribe_state::<serde_json::Value>(&replay_kind)
+                    .ok()?;
+                if current.is_null() {
+                    return None;
+                }
+                Some(Event::PluginBusEvent {
+                    kind: replay_kind_string.clone(),
+                    payload: serde_json::to_vec(current.as_ref()).ok()?,
+                })
+            }));
+        }
+        let state = Arc::downgrade(&self.state);
+        let bus = Arc::downgrade(&self.state.plugin_events);
+        let kind = kind.clone();
+        tokio::spawn(async move {
+            loop {
+                let Some(events) = bus.upgrade() else {
+                    return;
+                };
+                let subscription = events
+                    .subscribe_state_when_registered::<serde_json::Value>(&kind)
+                    .await;
+                drop(events);
+                let (initial, mut rx) = match subscription {
+                    Ok(subscribed) => subscribed,
+                    Err(error) => {
+                        tracing::warn!(
+                            kind = %kind_string,
+                            error = %error,
+                            "plugin bus kind is not a serialized state channel; not forwarding",
+                        );
+                        return;
+                    }
+                };
+                // What was published before this subscription (a plugin may
+                // publish as soon as it registers) is forwarded first; a
+                // replaced channel drops its sender, so the loop then ends and
+                // the next pass subscribes to the new one.
+                let mut snapshot = Some(initial);
+                loop {
+                    if let Some(value) = snapshot.take()
+                        && !value.is_null()
+                    {
+                        let Some(state_ref) = state.upgrade() else {
+                            return;
+                        };
+                        forward_json_state(&state_ref, &kind_string, &value);
+                    }
+                    if rx.changed().await.is_err() {
+                        break;
+                    }
+                    snapshot = Some(rx.borrow_and_update().clone());
+                }
+            }
+        });
+        Ok(())
+    }
+
     /// Run the server accept loop until shutdown is requested.
     ///
     /// # Errors
@@ -3714,6 +3796,20 @@ fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
     Ok(())
 }
 
+/// Send one forwarded JSON state value to streaming clients.
+fn forward_json_state(state: &Arc<ServerState>, kind: &str, value: &serde_json::Value) {
+    let Ok(payload) = serde_json::to_vec(value) else {
+        return;
+    };
+    let event = Event::PluginBusEvent {
+        kind: kind.to_string(),
+        payload,
+    };
+    if let Err(error) = emit_event(state, event) {
+        tracing::warn!(%kind, %error, "failed emitting forwarded plugin bus state event");
+    }
+}
+
 async fn replay_retained_plugin_state_to_client(
     state: &Arc<ServerState>,
     frame_tx: &mpsc::Sender<Vec<u8>>,
@@ -4896,6 +4992,64 @@ fn is_frame_too_large_error(err: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
     use serde::{Deserialize, Serialize};
+
+    async fn next_plugin_bus_event(
+        rx: &mut tokio::sync::broadcast::Receiver<Event>,
+    ) -> (String, serde_json::Value) {
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("forwarded event")
+                .expect("broadcast open");
+            if let Event::PluginBusEvent { kind, payload } = event {
+                return (
+                    kind,
+                    serde_json::from_slice(&payload).expect("JSON payload"),
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn json_state_forwarder_waits_for_and_follows_re_registered_channels() {
+        let server = BmuxServer::new(IpcEndpoint::unix_socket("json-forwarder-test"));
+        let kind =
+            bmux_plugin_sdk::PluginEventKind::from("example.remote/presentation".to_string());
+        let mut events = server.state.event_broadcast.subscribe();
+        // Spawned before the plugin registers its channel.
+        server.spawn_plugin_bus_json_state_forwarder(&kind).unwrap();
+        tokio::task::yield_now().await;
+        let bus = server.state.plugin_events.clone();
+        bus.register_json_state_channel(kind.clone()).unwrap();
+        bus.emit_json(&kind, &serde_json::json!({ "revision": 1 }))
+            .unwrap();
+        assert_eq!(
+            next_plugin_bus_event(&mut events).await,
+            (
+                kind.as_str().to_string(),
+                serde_json::json!({ "revision": 1 })
+            )
+        );
+        // A reloaded plugin replaces its channel; the forwarder follows it.
+        bus.register_json_state_channel(kind.clone()).unwrap();
+        tokio::task::yield_now().await;
+        bus.emit_json(&kind, &serde_json::json!({ "revision": 2 }))
+            .unwrap();
+        assert_eq!(
+            next_plugin_bus_event(&mut events).await.1,
+            serde_json::json!({ "revision": 2 })
+        );
+        // Clients that attach later receive the retained value.
+        let replayers = server.state.plugin_state_replayers.lock().unwrap().clone();
+        let replayed = replayers
+            .iter()
+            .find_map(|replay| replay())
+            .expect("replayed");
+        assert!(matches!(
+            replayed,
+            Event::PluginBusEvent { kind: replayed_kind, .. } if replayed_kind == kind.as_str()
+        ));
+    }
 
     #[cfg(unix)]
     #[tokio::test]

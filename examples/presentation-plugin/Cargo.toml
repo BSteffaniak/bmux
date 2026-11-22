@@ -1,0 +1,30 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Example plugin that draws attach UI by publishing its presentation"
+edition     = { workspace = true }
+keywords    = ["bmux", "example", "plugin"]
+license     = { workspace = true }
+name        = "bmux_example_presentation_plugin"
+publish     = false
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+bmux_plugin_schema_macros = { workspace = true }
+bmux_plugin_sdk           = { workspace = true }
+serde_json                = { workspace = true, features = ["std"] }
+
+[features]
+# Package this crate as a dynamic library for one component. Only the
+# plugin packager enables these, together with `--cfg bmux_plugin_dylib`.
+dynamic-backend = []
+dynamic-frontend = []
+fail-on-warnings = [
+    "bmux_plugin_schema_macros/fail-on-warnings",
+    "bmux_plugin_sdk/fail-on-warnings",
+]

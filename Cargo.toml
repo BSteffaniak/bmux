@@ -7,6 +7,7 @@ members = [
     "examples/counter-plugin",
     "examples/counter-plugin-api",
     "examples/hello-plugin",
+    "examples/presentation-plugin",
     "examples/native-plugin",
     "examples/prompt-showcase",
     "examples/prompt-plugin-showcase",

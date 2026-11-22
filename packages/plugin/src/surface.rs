@@ -47,7 +47,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 /// Stable namespaced identity for an independently composed surface.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct PluginSurfaceId {
     pub owner_plugin_id: String,
     pub local_id: String,
@@ -71,7 +71,7 @@ impl PluginSurfaceId {
 }
 
 /// Geometry source for a plugin-owned surface.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PluginSurfaceTarget {
     /// Follow one allocation from the generic plugin layout resolver.
     Layout(PluginLayoutId),
@@ -90,7 +90,7 @@ pub enum PluginSurfaceTarget {
 }
 
 /// Stable namespaced identity for one input region.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct PluginSurfaceRegionId {
     pub owner_plugin_id: String,
     pub surface_local_id: String,
@@ -108,7 +108,7 @@ impl PluginSurfaceRegionId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PluginSurfaceCursor {
     Default,
     Pointer,
@@ -126,7 +126,7 @@ pub enum PluginSurfaceCursor {
 }
 
 /// Stable owner-local input region within one retained surface.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PluginSurfaceRegion {
     pub local_id: String,
     pub rect: ExtensionRect,
@@ -140,7 +140,7 @@ pub struct PluginSurfaceRegion {
 
 /// Optional caller-owned scene descriptions in surface-local cell geometry.
 /// None is unavailable, while Some(empty) is an explicitly empty producer scene.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct PluginSurfaceMetadata {
     pub selection: Option<bmux_tui::selection::SelectionScene>,
     pub semantics: Option<bmux_tui::semantic::SemanticScene>,
@@ -149,29 +149,46 @@ pub struct PluginSurfaceMetadata {
 
 /// Complete retained visual state for one independent surface.
 #[allow(clippy::struct_excessive_bools)] // Independent visibility, opacity, modal, and input policies.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PluginSurface {
     pub id: PluginSurfaceId,
     /// Must match the containing owner snapshot revision.
     pub revision: u64,
     pub target: PluginSurfaceTarget,
+    // Everything below is optional on the wire, so published presentations
+    // state only what they use.
     /// Optional clip rectangle local to the resolved surface bounds.
+    #[serde(default)]
     pub clip_rect: Option<ExtensionRect>,
     /// Input regions local to the resolved surface bounds.
+    #[serde(default)]
     pub interactive_regions: Vec<PluginSurfaceRegion>,
+    #[serde(default)]
     pub accepts_input: bool,
+    #[serde(default)]
     pub layer: i16,
+    #[serde(default)]
     pub z: i32,
+    #[serde(default)]
     pub opaque: bool,
     /// When true, input cannot fall through to lower composed surfaces.
+    #[serde(default)]
     pub modal: bool,
+    #[serde(default = "visible_by_default")]
     pub visible: bool,
+    #[serde(default)]
     pub ops: Vec<RenderOp>,
     /// Keyed, z-ordered items: ops and terminal graphics in one stream. The host
     /// diffs them by key, so unchanged items are not repainted. Graphics are
     /// drawn only by pane-attached surfaces.
+    #[serde(default)]
     pub items: Vec<crate::RenderSceneItem>,
+    #[serde(default)]
     pub metadata: Option<PluginSurfaceMetadata>,
+}
+
+const fn visible_by_default() -> bool {
+    true
 }
 
 impl PluginSurface {
@@ -313,8 +330,39 @@ impl PluginSurfaceRegion {
     }
 }
 
+/// Suffix of the forwarded state event a plugin publishes its presentation on:
+/// `<plugin id>/presentation`.
+pub const PRESENTATION_EVENT_SUFFIX: &str = "/presentation";
+
+/// The forwarded state event kind `plugin_id` publishes its presentation on.
+#[must_use]
+pub fn presentation_event_kind(plugin_id: &str) -> String {
+    format!("{plugin_id}{PRESENTATION_EVENT_SUFFIX}")
+}
+
+/// A plugin's complete presentation, published as retained state.
+///
+/// It is published on [`presentation_event_kind`] and forwarded to every
+/// attach client, which lowers it into the same layout and surface registries
+/// in-process presentations use. Layout ids and surfaces must be owned by the
+/// publishing plugin.
+///
+/// Input on a published region is delivered by invoking the region's
+/// endpoint with the event encoded as a service message
+/// (`bmux_plugin_sdk::encode_service_message(&AttachInputEvent)`); the service
+/// returns an `AttachInputResult`. Pointer moves are not forwarded (enter and
+/// leave are). The plugin reacts by publishing a new presentation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PublishedPresentation {
+    pub revision: u64,
+    #[serde(default)]
+    pub layouts: Vec<crate::layout::PluginLayoutRequest>,
+    #[serde(default)]
+    pub surfaces: Vec<PluginSurface>,
+}
+
 /// Atomic owner-scoped replacement of independent surfaces.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PluginSurfaceSnapshot {
     pub revision: u64,
     pub surfaces: Vec<PluginSurface>,

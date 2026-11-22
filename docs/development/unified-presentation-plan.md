@@ -233,9 +233,19 @@ Each phase lands with the parity harness and the targeted tests green.
    hooks and visual adapters) and pane text redaction. Moving them needs the
    facets below published as data: content inset, text rules, chrome ownership
    and frame observation.
-6. **Out-of-process transport.** Frontend presentations publish scenes; the
-   native terminal renders them; input is routed back. A test plugin proves a
-   split, an anchored overlay, an under-content layer and clicks.
+6. **Out-of-process transport.** A plugin publishes `PublishedPresentation` (its
+   layout requests and surfaces, serde with optional fields defaulted) as retained
+   JSON state on `<id>/presentation`. The server forwards any declared state kind
+   without a typed specialization as JSON (waiting for the channel and following
+   re-registration; replayed to late clients). Each attach client follows every
+   enabled plugin declaring that kind (`published_presentations.rs`) and lowers
+   snapshots into the same registries under the plugin's id; input on published
+   regions becomes a service invocation of the region's endpoint carrying the
+   event. `examples/presentation-plugin`, packaged as a dylib in a real server,
+   proves the chain to a streaming client and into the registries. Process
+   plugins cannot publish events yet (no plugin-to-host channel in their
+   protocol); frontend portable presentations (path B) have no producers and are
+   deleted in phase 8.
 7. **Host overlays and components.** Prompts and help publish scenes; stock
    components (list, tab strip, menu, toast stack, text input) replace the
    sidebar's and tab bar's hand-written measuring, hover and scrolling.

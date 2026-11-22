@@ -868,6 +868,11 @@ async fn run_server_start_inner(
                         kind,
                     )
                 }
+                // Any other declared state kind is forwarded as serialized
+                // JSON (the form plugins publish through the host services).
+                (_, bmux_plugin_sdk::PluginEventDelivery::State) => {
+                    server.spawn_plugin_bus_json_state_forwarder(kind)
+                }
                 _ => {
                     tracing::warn!(
                         plugin_id = plugin.declaration.id.as_str(),

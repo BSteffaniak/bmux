@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::RwLock;
 
 /// Stable identity of one plugin-owned layout request.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
 pub struct PluginLayoutId {
     pub owner_plugin_id: String,
     pub local_id: String,
@@ -67,7 +67,7 @@ impl AllocationRegistry {
 }
 
 /// Viewport edge from which a region is split.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LayoutEdge {
     Top,
     Right,
@@ -76,7 +76,7 @@ pub enum LayoutEdge {
 }
 
 /// Extent of a split along its edge's axis.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LayoutExtent {
     Cells(u16),
     Percent(u8),
@@ -127,7 +127,7 @@ impl LayoutExtent {
 }
 
 /// How a request participates in allocation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LayoutOperation {
     /// Allocate an edge region and remove it from the remaining region.
     Split {
@@ -147,7 +147,7 @@ pub enum LayoutOperation {
 /// while an overlay or hidden request observes that same remainder without
 /// consuming it. Producers subdivide an allocation internally when they need a
 /// nested arrangement.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PluginLayoutRequest {
     pub id: PluginLayoutId,
     pub order: i32,
@@ -203,7 +203,7 @@ pub struct PluginLayoutResolution {
 }
 
 /// Retained layout intent published by one plugin owner.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PluginLayoutSnapshot {
     pub revision: u64,
     pub requests: Vec<PluginLayoutRequest>,

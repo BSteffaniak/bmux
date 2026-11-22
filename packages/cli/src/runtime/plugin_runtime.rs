@@ -1081,24 +1081,55 @@ pub(super) fn install_enabled_client_adapters(
 pub(in crate::runtime) fn attach_companions_for_config(
     config: &BmuxConfig,
     paths: &ConfigPaths,
-) -> Vec<bmux_plugin::AttachCompanion> {
+) -> AttachPresentationPlugins {
     let companions = host_attach_companions().snapshot();
     let registry = match scan_available_plugins(config, paths) {
         Ok(registry) => registry,
         Err(error) => {
             tracing::warn!(%error, "attach could not scan its plugins; starting installed companions");
-            return companions;
+            return AttachPresentationPlugins {
+                companions,
+                published: Vec::new(),
+            };
         }
     };
     install_enabled_client_adapters(config, &registry, paths);
     let enabled = effective_enabled_plugins(config, &registry)
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
-    host_attach_companions()
-        .snapshot()
-        .into_iter()
-        .filter(|companion| enabled.contains(companion.id()))
-        .collect()
+    let published = registry
+        .iter()
+        .filter(|plugin| enabled.contains(plugin.manifest.id.as_str()))
+        .filter(|plugin| {
+            let kind = bmux_plugin::surface::presentation_event_kind(&plugin.manifest.id);
+            plugin
+                .manifest
+                .event_publications
+                .iter()
+                .any(|publication| {
+                    publication.forward_to_streaming_clients
+                        && publication.delivery == bmux_plugin_sdk::PluginEventDelivery::State
+                        && publication.kind.as_str() == kind
+                })
+        })
+        .map(|plugin| plugin.manifest.id.clone())
+        .collect();
+    AttachPresentationPlugins {
+        companions: host_attach_companions()
+            .snapshot()
+            .into_iter()
+            .filter(|companion| enabled.contains(companion.id()))
+            .collect(),
+        published,
+    }
+}
+
+/// What presents UI in an attach client: in-process companions of enabled
+/// bundled plugins, and enabled plugins that publish their presentation as
+/// forwarded state (`<id>/presentation`).
+pub(in crate::runtime) struct AttachPresentationPlugins {
+    pub companions: Vec<bmux_plugin::AttachCompanion>,
+    pub published: Vec<String>,
 }
 
 pub(super) fn validate_enabled_plugins(
