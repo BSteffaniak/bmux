@@ -396,8 +396,8 @@ impl Shared {
                     simvar::switchy::random::simulator::rng().next_u64()
                 );
             }
-            if kind == Kind::Crash {
-                self.crash(driver).await;
+            if kind == Kind::Crash || kind == Kind::PowerLoss {
+                self.crash(driver, kind == Kind::PowerLoss).await;
             } else {
                 self.cancellable(driver, kind).await;
             }
@@ -442,7 +442,7 @@ impl Shared {
             Kind::Resize => self.resize(driver).await,
             Kind::Close => self.close_one(driver).await,
             Kind::Restart => self.restart(driver).await,
-            Kind::Crash => {}
+            Kind::Crash | Kind::PowerLoss => {}
             Kind::Wait => switchy_async::time::sleep(Duration::from_millis(draw(50))).await,
         }
     }
@@ -491,6 +491,7 @@ impl Shared {
         faults.spawn > 0.0
             || faults.kill > 0.0
             || faults.read_error > 0.0
+            || faults.file > 0
             || self.profile.program_mix().iter().any(|(kind, _)| {
                 matches!(
                     kind,
@@ -706,7 +707,12 @@ impl Shared {
             Ok(closed) => {
                 // 4. Closing drains, cleans up, and leaves nothing running in the session.
                 Board::checked(4);
-                if let Some(error) = &closed.cleanup_error {
+                // (A failing disk may keep a session's record from being deleted.)
+                if let Some(error) = closed
+                    .cleanup_error
+                    .as_ref()
+                    .filter(|_| self.profile.faults.file == 0)
+                {
                     self.violated(format!(
                         "4. closing pane process {pid} failed to clean up: {error}"
                     ));
@@ -809,7 +815,7 @@ impl Shared {
 
     /// Crash the server, start processes it never owned, then start a new server on the same
     /// runtime directory, checking invariant 6.
-    async fn crash(&self, driver: u64) {
+    async fn crash(&self, driver: u64, power_loss: bool) {
         let _one_at_a_time = self.crash.lock().await;
         let panes = {
             let mut state = self.lock();
@@ -819,7 +825,11 @@ impl Shared {
             state.crashing = true;
             Arc::clone(&state.panes)
         };
-        event("crash", format!("d{driver}: the server crashed"), Tone::Warn);
+        if power_loss {
+            event("power", format!("d{driver}: the power failed"), Tone::Warn);
+        } else {
+            event("crash", format!("d{driver}: the server crashed"), Tone::Warn);
+        }
         // The drivers' work under way stops with the server.
         self.generation.fetch_add(1, Ordering::SeqCst);
         while self.lock().busy > 0 {
@@ -828,6 +838,17 @@ impl Shared {
         // Die: every task and thread of the server stops where it is.
         panes.crash();
         drop(panes);
+        let filesystem = switchy_fs::simulator::current_filesystem();
+        if power_loss {
+            // Every process dies, and the disk keeps what was made durable and a random part
+            // of the rest.
+            simulator::kill_all();
+            self.lock().witnesses.clear();
+            filesystem.crash(&switchy_fs::simulator::CrashPolicy::power_loss());
+        } else {
+            // The dead server's open files close; what it wrote stays.
+            filesystem.crash(&switchy_fs::simulator::CrashPolicy::process_crash());
+        }
         // Everything running now that no outsider started belongs to the dead server.
         // (So do the daemons panes' programs detached, by design.)
         let mut outsiders: Vec<u64> = self.lock().witnesses.iter().map(|w| w.serial).collect();
@@ -949,7 +970,7 @@ impl Shared {
                     .collect()
             })
             .unwrap_or_default();
-        if !records.is_empty() {
+        if !records.is_empty() && self.profile.faults.file == 0 {
             self.violated(format!(
                 "9. session records left with every pane closed: {records:?}"
             ));

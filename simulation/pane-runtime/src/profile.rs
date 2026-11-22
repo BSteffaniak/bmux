@@ -30,11 +30,14 @@ pub enum Kind {
     Restart,
     /// Do nothing for a while.
     Wait,
+    /// Lose power: every process dies, and the file system keeps only what was made durable
+    /// (and a random part of the rest), then a new server recovers.
+    PowerLoss,
 }
 
 impl Kind {
     /// Every kind, in the order profiles list them.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Open,
         Self::Type,
         Self::Resize,
@@ -42,6 +45,7 @@ impl Kind {
         Self::Crash,
         Self::Restart,
         Self::Wait,
+        Self::PowerLoss,
     ];
 
     /// Its name in a profile.
@@ -55,6 +59,7 @@ impl Kind {
             Self::Crash => "crash",
             Self::Restart => "restart",
             Self::Wait => "wait",
+            Self::PowerLoss => "power",
         }
     }
 }
@@ -79,6 +84,8 @@ pub struct FaultRates {
     pub signal_delay: f64,
     /// Pseudo-consoles asking for the cursor late or never.
     pub startup_query: f64,
+    /// One file operation in this many fails (`EIO`, `ENOSPC`, short writes); 0 for none.
+    pub file: u64,
     /// New processes reusing an old id.
     pub pid_reuse: f64,
 }
@@ -111,7 +118,7 @@ impl Default for Profile {
             steps: 20,
             panes: 3,
             clock: 1,
-            weights: [3, 4, 2, 2, 1, 1, 3],
+            weights: [3, 4, 2, 2, 1, 1, 3, 0],
             faults: FaultRates {
                 pid_reuse: 0.3,
                 ..FaultRates::default()
@@ -150,6 +157,11 @@ impl Profile {
             signal_delay: chosen(4, &[0.2, 1.0]),
             startup_query: chosen(3, &[0.3, 1.0]),
             pid_reuse: [0.0, 0.3, 0.6, 1.0][usize::try_from(draw(4)).unwrap_or(0)],
+            file: if draw(4) == 0 {
+                [20, 100, 500][usize::try_from(draw(3)).unwrap_or(0)]
+            } else {
+                0
+            },
         };
         let mut programs = [0; programs::Kind::ALL.len()];
         for (index, weight) in programs.iter_mut().enumerate() {
@@ -211,6 +223,9 @@ impl Profile {
                 tags.push(format!("fault:{name}"));
             }
         }
+        if self.faults.file > 0 {
+            tags.push("fault:file".into());
+        }
         for (kind, weight) in programs::Kind::ALL.iter().zip(self.programs).skip(1) {
             if weight > 0 {
                 tags.push(format!("program:{}", kind.name()));
@@ -259,6 +274,7 @@ impl fmt::Display for Profile {
         for (name, rate) in self.fault_list() {
             write!(f, " {name}={rate}")?;
         }
+        write!(f, " fsfault={}", self.faults.file)?;
         for (kind, weight) in programs::Kind::ALL.iter().zip(self.programs) {
             write!(f, " p.{}={weight}", kind.name())?;
         }
@@ -303,6 +319,7 @@ impl std::str::FromStr for Profile {
                 "late" => faults.signal_delay = rate()?,
                 "query" => faults.startup_query = rate()?,
                 "reuse" => faults.pid_reuse = rate()?,
+                "fsfault" => faults.file = number()?,
                 other if other.starts_with("p.") => {
                     let index = programs::Kind::ALL
                         .iter()

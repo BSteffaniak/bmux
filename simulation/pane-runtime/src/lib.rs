@@ -181,6 +181,27 @@ pub async fn run_workload() -> Result<(), Vec<String>> {
     });
     simulator::install_default_programs();
     programs::set_mix(profile.program_mix());
+    // The run's file system: the kernel's personality's, every operation a switch point, and
+    // failing as often as the profile says.
+    if simulator::personality().is_windows() {
+        switchy_fs::simulator::set_run_personality(switchy_fs::simulator::Personality::Windows);
+    }
+    switchy_fs::simulator::set_operation_hook(Some(Arc::new(|_| {
+        switchy_thread::simulator::scheduler().yield_point(switchy_thread::simulator::Op::Io);
+    })));
+    if faults.file > 0 {
+        use switchy_fs::simulator::{Fault, FaultPlan, OpClass, Probability};
+        let rate = Probability::one_in(faults.file);
+        switchy_fs::simulator::current_filesystem().set_fault_plan(
+            FaultPlan::new()
+                .with(OpClass::Write, Fault::Io, rate)
+                .with(OpClass::Write, Fault::NoSpace, rate)
+                .with(OpClass::Write, Fault::ShortWrite, rate)
+                .with(OpClass::Sync, Fault::Io, rate)
+                .with(OpClass::Rename, Fault::Io, rate)
+                .with(OpClass::Open, Fault::Io, rate),
+        );
+    }
     simulator::register_program("sh", programs::program);
     let mut shape = vec![
         format!(
