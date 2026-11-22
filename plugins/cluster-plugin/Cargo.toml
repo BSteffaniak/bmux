@@ -25,7 +25,6 @@ bmux_plugin_schema_macros = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
 bmux_sessions_plugin_api = { workspace = true }
 iroh = { workspace = true }
-openraft = { workspace = true }
 redb = { workspace = true }
 rustix = { workspace = true, features = ["fs", "process"] }
 serde = { workspace = true, features = ["derive", "std"] }

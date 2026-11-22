@@ -375,7 +375,8 @@ pub(crate) fn supports_owned_consensus(
 
 /// Snapshot installation requires its own explicit selection, in addition to
 /// the owned RPC selection and staged transfer. No legacy fallback is permitted.
-pub(crate) fn supports_owned_snapshot_install(
+#[must_use]
+pub fn supports_owned_snapshot_install(
     member: &bmux_cluster_plugin_api::cluster_types::ClusterMember,
 ) -> bool {
     supports_owned_consensus(member)
@@ -395,7 +396,9 @@ pub(crate) fn supports_owned_snapshot_install(
 
 /// Bounded operation-specific input; this is not a transfer finish signature.
 /// The complete immutable reference is signed, including both checksum domains.
-pub(crate) fn owned_snapshot_install_signing_payload(
+/// # Errors
+/// Rejects unbounded or non-canonical install requests.
+pub fn owned_snapshot_install_signing_payload(
     request: &bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallRequest,
 ) -> Result<Vec<u8>, String> {
     use bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferPurpose;
@@ -424,10 +427,13 @@ pub(crate) fn owned_snapshot_install_signing_payload(
 }
 
 /// Authenticate using canonical members supplied by the owning executor.
+///
 /// This does not establish effective voter eligibility, term fencing, sealed
 /// transfer ownership, or durable installation; the executor must check those
 /// in the same authoritative admission as its side effect.
-pub(crate) fn authenticate_owned_snapshot_install(
+/// # Errors
+/// Rejects unselected peers, invalid bindings and revoked or replayed proofs.
+pub fn authenticate_owned_snapshot_install(
     caller: &impl crate::ClusterRuntimeOps,
     local: NodeId,
     members: &[bmux_cluster_plugin_api::cluster_types::ClusterMember],
@@ -461,7 +467,9 @@ pub(crate) fn authenticate_owned_snapshot_install(
 }
 
 /// Response binding proves the exact request, origin and outcome, not a quorum.
-pub(crate) fn owned_snapshot_install_response_signing_payload(
+/// # Errors
+/// Rejects unbounded or non-canonical requests and responses.
+pub fn owned_snapshot_install_response_signing_payload(
     request: &bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallRequest,
     response: &bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallResponse,
 ) -> Result<Vec<u8>, String> {
@@ -494,6 +502,10 @@ pub(crate) fn owned_snapshot_install_response_signing_payload(
     Ok(signed)
 }
 
+/// Verify that an install response is signed by the request's recipient and
+/// bound to that exact request.
+/// # Errors
+/// Rejects malformed, unbound or incorrectly signed responses.
 pub fn verify_owned_snapshot_install_response(
     request: &bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallRequest,
     response: &bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallResponse,
@@ -752,7 +764,10 @@ impl std::io::Seek for CancellableTransferReader<'_> {
     }
 }
 
-pub(crate) fn validate_staged_object(
+/// Validate a sealed staged object against its immutable transfer header.
+/// # Errors
+/// Rejects size, checksum or descriptor mismatches and cancelled reads.
+pub fn validate_staged_object(
     file: &mut std::fs::File,
     total: u64,
     header: &bmux_cluster_plugin_api::cluster_consensus_transfer_types::TransferHeader,
@@ -1489,15 +1504,9 @@ fn control_read_service_error(
         crate::consensus_runtime::ConsensusReadError::QuorumUnavailable(reason) => {
             ControlServiceError::QuorumUnavailable { reason }
         }
-        crate::consensus_runtime::ConsensusReadError::Fatal(error) => {
-            ControlServiceError::Internal {
-                reason: error.to_string(),
-            }
-        }
-        crate::consensus_runtime::ConsensusReadError::Storage(error) => {
-            ControlServiceError::Internal {
-                reason: error.to_string(),
-            }
+        crate::consensus_runtime::ConsensusReadError::Fatal(reason)
+        | crate::consensus_runtime::ConsensusReadError::Storage(reason) => {
+            ControlServiceError::Internal { reason }
         }
     }
 }
@@ -1852,18 +1861,7 @@ impl ConsensusRpcHandle {
     fn providers(
         &self,
     ) -> Result<
-        (
-            Arc<
-                dyn bmux_cluster_plugin_api::cluster_consensus_rpc::ClusterConsensusRpcService
-                    + Send
-                    + Sync,
-            >,
-            Arc<
-                dyn bmux_cluster_plugin_api::cluster_consensus_rpc_v2::ClusterConsensusRpcService
-                    + Send
-                    + Sync,
-            >,
-        ),
+        crate::consensus_runtime::RpcProviders,
         bmux_cluster_plugin_api::cluster_consensus_rpc_types::RpcError,
     > {
         self.nodes
@@ -1933,6 +1931,7 @@ mod tests {
         ClusterConsensusRole, ClusterNodeCapabilities, ControlCommandError, PeerAuthChallenge,
         PeerAuthProof,
     };
+    use bmux_plugin_sdk::decode_service_message;
 
     #[derive(Default)]
     struct SnapshotAuthCaller {
@@ -2006,6 +2005,7 @@ mod tests {
             .unwrap();
         member.negotiated_protocol.features = vec![
             bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID.to_string(),
+            bmux_cluster_plugin_api::cluster_consensus_rpc_v2::INTERFACE_ID.to_string(),
             bmux_cluster_plugin_api::cluster_consensus_transfer::INTERFACE_ID.to_string(),
             bmux_cluster_plugin_api::cluster_consensus_snapshot::INTERFACE_ID.to_string(),
         ];
@@ -2332,6 +2332,7 @@ mod tests {
         );
         member.negotiated_protocol.features = vec![
             bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID.to_string(),
+            bmux_cluster_plugin_api::cluster_consensus_rpc_v2::INTERFACE_ID.to_string(),
             bmux_cluster_plugin_api::cluster_consensus_transfer::INTERFACE_ID.to_string(),
         ];
         assert!(supports_owned_consensus(&member));

@@ -4,7 +4,6 @@ use bmux_cluster_plugin_api::{
     cluster_capability_types::CapabilityReport,
     cluster_types::{ClusterMember, ClusterMemberState},
 };
-use openraft::{BasicNode, StoredMembership};
 
 /// Canonical domain-separated statement, excluding the detached signature.
 /// # Errors
@@ -51,27 +50,6 @@ pub fn signing_payload(report: &CapabilityReport) -> Result<Vec<u8>, String> {
     Ok(w.into_bytes())
 }
 
-/// Verifies report proof against current committed authority, not endpoint access.
-/// The authoritative caller supplies verification time; this function performs no I/O.
-/// # Errors
-/// Rejects stale membership, revoked/expired credentials, mismatched identity or proof.
-pub fn verify_report(
-    report: &CapabilityReport,
-    member: &ClusterMember,
-    membership: &StoredMembership<NodeId, BasicNode>,
-    cluster_id: &str,
-    verified_at_unix_ms: u64,
-) -> Result<(), String> {
-    let owned = owned_publication_membership(membership)?;
-    verify_owned_report(report, member, &owned, cluster_id, verified_at_unix_ms)
-}
-
-pub(crate) fn owned_publication_membership(
-    membership: &StoredMembership<NodeId, BasicNode>,
-) -> Result<crate::consensus_model::StoredMembership, String> {
-    crate::consensus_membership::owned_committed_membership(membership)
-}
-
 /// Verify report authority against owned committed membership without consulting
 /// a consensus runtime or clock. Verification time is explicit replicated input.
 /// # Errors
@@ -114,21 +92,6 @@ pub fn verify_owned_report(
         iroh::Signature::try_from(report.signature.as_slice()).map_err(|e| e.to_string())?;
     key.verify(&payload, &signature)
         .map_err(|_| "invalid capability report signature".into())
-}
-
-/// Validates a complete bridge proof before proposing a new representation.
-/// This is evidence of decoder support, not feature activation or report storage.
-/// # Errors
-/// Rejects incomplete/duplicate evidence, missing active authority, and incompatible recipients.
-pub fn verify_bridge(
-    reports: &[CapabilityReport],
-    members: &std::collections::BTreeMap<String, ClusterMember>,
-    membership: &StoredMembership<NodeId, BasicNode>,
-    cluster_id: &str,
-    verified_at_unix_ms: u64,
-) -> Result<(), String> {
-    let owned = owned_publication_membership(membership)?;
-    verify_owned_bridge(reports, members, &owned, cluster_id, verified_at_unix_ms)
 }
 
 /// Verify complete publication evidence against owned committed membership.
@@ -311,7 +274,7 @@ fn decode_report_payload(
 mod tests {
     use super::*;
     use crate::membership::{ClusterId, NodeIdentity, initializer_capabilities, issue_test_member};
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
 
     #[test]
     fn report_binds_current_authority_and_canonical_capabilities() {
@@ -328,15 +291,12 @@ mod tests {
             initializer_capabilities(),
             42,
         );
-        let membership = StoredMembership::new(
-            Some(openraft::LogId::new(
-                openraft::CommittedLeaderId::new(1, node),
-                2,
-            )),
-            openraft::Membership::new(
-                vec![BTreeSet::from([node])],
-                BTreeMap::from([(node, BasicNode::new("node"))]),
-            ),
+        let membership = crate::consensus_model::test_stored_membership(
+            1,
+            node,
+            2,
+            vec![vec![node]],
+            vec![(node, "node".into())],
         );
         let mut report = CapabilityReport {
             report_version: 1,
@@ -356,10 +316,10 @@ mod tests {
             signature: Vec::new(),
         };
         report.signature = identity.sign(&signing_payload(&report).unwrap());
-        verify_report(&report, &member, &membership, &cluster.to_string(), 43).unwrap();
+        verify_owned_report(&report, &member, &membership, &cluster.to_string(), 43).unwrap();
         let members = BTreeMap::from([(member.node_id.clone(), member.clone())]);
         assert!(
-            verify_bridge(
+            verify_owned_bridge(
                 std::slice::from_ref(&report),
                 &members,
                 &membership,
@@ -373,7 +333,7 @@ mod tests {
             .features
             .insert(0, "capability-publication-v1".into());
         bridge.signature = identity.sign(&signing_payload(&bridge).unwrap());
-        verify_bridge(
+        verify_owned_bridge(
             std::slice::from_ref(&bridge),
             &members,
             &membership,
@@ -381,9 +341,9 @@ mod tests {
             43,
         )
         .unwrap();
-        assert!(verify_bridge(&[], &members, &membership, &cluster.to_string(), 43).is_err());
+        assert!(verify_owned_bridge(&[], &members, &membership, &cluster.to_string(), 43).is_err());
         assert!(
-            verify_bridge(
+            verify_owned_bridge(
                 &[bridge.clone(), bridge.clone()],
                 &members,
                 &membership,
@@ -394,17 +354,17 @@ mod tests {
         );
         assert_publication_state(&bridge, &member, &membership);
         let learner = NodeId::from(94);
-        let expanded = StoredMembership::new(
-            *membership.log_id(),
-            openraft::Membership::new(
-                vec![BTreeSet::from([node])],
-                BTreeMap::from([
-                    (node, BasicNode::new("node")),
-                    (learner, BasicNode::new("learner")),
-                ]),
-            ),
+        let expanded = crate::consensus_model::StoredMembership {
+            introduced_at: membership.introduced_at,
+            membership: crate::consensus_model::Membership::new(
+                vec![vec![node]],
+                vec![(node, "node".into()), (learner, "learner".into())],
+            )
+            .unwrap(),
+        };
+        assert!(
+            verify_owned_bridge(&[bridge], &members, &expanded, &cluster.to_string(), 43).is_err()
         );
-        assert!(verify_bridge(&[bridge], &members, &expanded, &cluster.to_string(), 43).is_err());
         assert_publication_codec(&report);
         assert_report_mutations_rejected(report, &member, &membership, cluster, &identity);
     }
@@ -412,7 +372,7 @@ mod tests {
     fn assert_publication_state(
         report: &CapabilityReport,
         member: &ClusterMember,
-        membership: &StoredMembership<NodeId, BasicNode>,
+        membership: &crate::consensus_model::StoredMembership,
     ) {
         use crate::control_state::ControlState;
         let mut state = ControlState::new(&report.cluster_id);
@@ -428,11 +388,14 @@ mod tests {
         let before = state.clone();
         assert!(
             state
-                .apply_publication(&duplicate_identity, membership)
+                .apply_owned_publication(&duplicate_identity, membership)
                 .is_err()
         );
         assert_eq!(state, before);
-        assert_eq!(state.apply_publication(&command, membership).unwrap(), 1);
+        assert_eq!(
+            state.apply_owned_publication(&command, membership).unwrap(),
+            1
+        );
         let bytes = state.encode_snapshot().unwrap();
         assert!(bytes.starts_with(b"BMSTA006"));
         let mut restored = ControlState::decode_snapshot(&bytes).unwrap();
@@ -440,10 +403,19 @@ mod tests {
         assert_eq!(state, restored);
         let mut retry = command.clone();
         retry.verified_at_unix_ms = 44;
-        assert_eq!(restored.apply_publication(&retry, membership).unwrap(), 1);
+        assert_eq!(
+            restored
+                .apply_owned_publication(&retry, membership)
+                .unwrap(),
+            1
+        );
         let mut conflict = command;
         conflict.reports[0].schema_max += 1;
-        assert!(restored.apply_publication(&conflict, membership).is_err());
+        assert!(
+            restored
+                .apply_owned_publication(&conflict, membership)
+                .is_err()
+        );
         assert_eq!(restored, state);
         let activation = crate::control_codec::FeatureActivationCommand {
             principal_id: member.node_id.clone(),
@@ -465,13 +437,12 @@ mod tests {
             .push('x');
         assert!(matches!(
             invalidated
-                .apply_feature_activation_with_membership(&activation, Some(membership))
+                .apply_owned_feature_activation(&activation, Some(membership))
                 .result,
             bmux_cluster_plugin_api::cluster_types::ControlCommandResult::Rejected { .. }
         ));
         assert_eq!(invalidated.write_schema_floor, 1);
-        let response =
-            restored.apply_feature_activation_with_membership(&activation, Some(membership));
+        let response = restored.apply_owned_feature_activation(&activation, Some(membership));
         assert!(matches!(
             response.result,
             bmux_cluster_plugin_api::cluster_types::ControlCommandResult::Accepted { .. }
@@ -509,17 +480,21 @@ mod tests {
     fn assert_report_mutations_rejected(
         report: CapabilityReport,
         member: &ClusterMember,
-        membership: &StoredMembership<NodeId, BasicNode>,
+        membership: &crate::consensus_model::StoredMembership,
         cluster: ClusterId,
         identity: &NodeIdentity,
     ) {
         let mut changed = report.clone();
         changed.schema_max = 5;
-        assert!(verify_report(&changed, member, membership, &cluster.to_string(), 43).is_err());
+        assert!(
+            verify_owned_report(&changed, member, membership, &cluster.to_string(), 43).is_err()
+        );
         changed = report.clone();
         changed.membership_log_index += 1;
         changed.signature = identity.sign(&signing_payload(&changed).unwrap());
-        assert!(verify_report(&changed, member, membership, &cluster.to_string(), 43).is_err());
+        assert!(
+            verify_owned_report(&changed, member, membership, &cluster.to_string(), 43).is_err()
+        );
         changed = report.clone();
         changed.features.push(changed.features[0].clone());
         assert!(signing_payload(&changed).is_err());
@@ -529,6 +504,8 @@ mod tests {
         changed = report;
         changed.credential_serial.push('x');
         changed.signature = identity.sign(&signing_payload(&changed).unwrap());
-        assert!(verify_report(&changed, member, membership, &cluster.to_string(), 43).is_err());
+        assert!(
+            verify_owned_report(&changed, member, membership, &cluster.to_string(), 43).is_err()
+        );
     }
 }

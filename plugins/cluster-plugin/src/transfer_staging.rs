@@ -112,7 +112,9 @@ const OWNER_BYTES: &[u8] = b"BMUX disposable transfer staging version 1\n";
 
 /// Initialize an empty staging directory or recover its bounded owned files.
 /// A missing marker never authorizes cleanup; partial markers require repair.
-pub(crate) fn recover_directory(path: &Path) -> io::Result<File> {
+/// # Errors
+/// Rejects untrusted, foreign or partially owned directories.
+pub fn recover_directory(path: &Path) -> io::Result<File> {
     let directory = lock_directory(path)?;
     let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
     match rustix::fs::openat(&directory, OWNER_FILE, flags, Mode::empty()) {
@@ -444,7 +446,9 @@ impl TransferStaging {
 
     /// Borrow the exact immutable sealed object under the caller's exclusive
     /// staging owner. The borrowed reader cannot outlive header binding checks.
-    pub(crate) fn sealed_reader(
+    /// # Errors
+    /// Rejects unknown, unsealed or mismatched transfers.
+    pub fn sealed_reader(
         &mut self,
         key: TransferKey,
         binding: [u8; 32],

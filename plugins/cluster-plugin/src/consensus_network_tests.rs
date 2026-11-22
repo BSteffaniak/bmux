@@ -12,7 +12,7 @@ use bmux_cluster_plugin_api::cluster_types::{
     CommandId, ControlCommand, ControlCommandRequest, ControlReadConsistency, WorkspaceId,
 };
 use bmux_connections_plugin_api::{connection_types::ConnectionError, connections_commands};
-use bmux_plugin_sdk::{PluginError, Result as PluginResult, ServiceKind};
+use bmux_plugin_sdk::{PluginError, Result as PluginResult, ServiceKind, decode_service_message};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
@@ -135,10 +135,8 @@ fn append_v2_rejection_cannot_claim_progress_or_reuse_v1_signatures() {
 fn append_v2_requires_explicit_complete_negotiated_bundle() {
     let (_, _, enrollment) = enrolled_forwarding_callers();
     let mut member = enrollment.members[0].clone();
-    member.negotiated_protocol.features = vec![
-        bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID.to_string(),
-        bmux_cluster_plugin_api::cluster_consensus_transfer::INTERFACE_ID.to_string(),
-    ];
+    member.negotiated_protocol.features =
+        vec![bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID.to_string()];
     assert!(!supports_owned_append_v2(&member));
     member
         .negotiated_protocol
@@ -147,7 +145,6 @@ fn append_v2_requires_explicit_complete_negotiated_bundle() {
     assert!(supports_owned_append_v2(&member));
     for missing in [
         bmux_cluster_plugin_api::cluster_consensus_rpc::INTERFACE_ID,
-        bmux_cluster_plugin_api::cluster_consensus_transfer::INTERFACE_ID,
         bmux_cluster_plugin_api::cluster_consensus_rpc_v2::INTERFACE_ID,
     ] {
         let mut incomplete = member.clone();
@@ -157,6 +154,8 @@ fn append_v2_requires_explicit_complete_negotiated_bundle() {
             .retain(|feature| feature != missing.as_str());
         assert!(!supports_owned_append_v2(&incomplete));
     }
+    // Enrollment negotiates exactly the served owned contracts.
+    assert!(supports_owned_append_v2(&enrollment.members[0]));
 }
 
 #[test]
@@ -218,26 +217,20 @@ fn append_v2_authentication_requires_v2_request_signature() {
 }
 
 #[tokio::test]
-async fn append_v2_generated_registry_dispatch_preserves_executor_rejection() {
-    use crate::owned_vote_store::{DurableVoteGate, OwnedVoteStore, VoteExecutor};
+async fn consensus_rpc_dispatch_reports_a_stopped_node_without_progress() {
     use bmux_cluster_plugin_api::{
         cluster_consensus_rpc_types::RpcError,
         cluster_consensus_rpc_v2::{ClusterConsensusRpcClient, ClusterConsensusRpcService},
     };
-    let root = tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
     let (_, request, _) = signed_append_v2_fixture();
-    let store =
-        OwnedVoteStore::create(&root.path().join("authority.redb"), &request.cluster_id).unwrap();
-    let executor = Arc::new(VoteExecutor::new(DurableVoteGate::new(1, store)));
-    let caller = Arc::new(ForwardingCaller::default());
     let local = transfer_node(&request.recipient).unwrap();
-    let direct = OwnedAppendService {
-        caller: caller.clone(),
+    let handle = Arc::new(ConsensusRpcHandle::new(
         local,
-        executor: executor.clone(),
-    };
+        ConsensusNodeRegistry::default(),
+    ));
     let mut registry = bmux_plugin_sdk::TypedServiceRegistry::new();
-    OwnedAppendService::register_append_v2(&mut registry, caller, local, executor.clone()).unwrap();
+    bmux_cluster_plugin_api::cluster_consensus_rpc_v2::register_provider(&mut registry, handle)
+        .unwrap();
     assert_eq!(registry.len(), 1);
     let (_, handle) = registry.iter().next().unwrap();
     assert_eq!(handle.interface_id().as_str(), "cluster-consensus-rpc/v2");
@@ -245,12 +238,8 @@ async fn append_v2_generated_registry_dispatch_preserves_executor_rejection() {
         .provider_as_trait::<dyn ClusterConsensusRpcService + Send + Sync>()
         .unwrap();
     let client = ClusterConsensusRpcClient::new(provider);
-    // Cryptographic fixture is not an enrolled peer in this empty authority.
-    // Generated dispatch must preserve rejection, never synthesize signed progress.
-    let expected = ClusterConsensusRpcService::append(&direct, request.clone()).await;
-    assert_eq!(expected, Err(RpcError::Unauthorized));
-    assert_eq!(client.append(request).await, expected);
-    executor.shutdown().await.unwrap();
+    // No local node runs: dispatch must report it, never synthesize signed progress.
+    assert_eq!(client.append(request).await, Err(RpcError::Stopped));
 }
 
 struct ForwardingCaller {
@@ -589,44 +578,32 @@ async fn start_forwarding_nodes(
     follower_id: NodeId,
     cluster_id: &str,
 ) -> (ConsensusNode, ConsensusNode) {
-    let network = crate::consensus_runtime::tests::InMemoryNetworkFactory::default();
-    let leader = ConsensusNode::start(leader_root.path(), cluster_id, leader_id, network.clone())
-        .await
-        .unwrap();
-    let follower = ConsensusNode::start(
+    use crate::consensus_runtime::Provisioning;
+    let network = crate::consensus_runtime::tests::MemoryNetwork::default();
+    let leader = crate::consensus_runtime::tests::start_node_as(
+        leader_root.path(),
+        cluster_id,
+        leader_id,
+        &network,
+        Provisioning::Founder {
+            endpoint: "tls://leader:7443".into(),
+        },
+    )
+    .await;
+    let follower = crate::consensus_runtime::tests::start_node_as(
         follower_root.path(),
         cluster_id,
         follower_id,
-        network.clone(),
+        &network,
+        Provisioning::Joiner,
     )
-    .await
-    .unwrap();
-    network.register(
-        leader_id,
-        BasicNode::new("tls://leader:7443"),
-        leader.raft().clone(),
-    );
-    network.register(
-        follower_id,
-        BasicNode::new("tls://follower:7443"),
-        follower.raft().clone(),
-    );
-    leader
-        .initialize_single(leader_id, "tls://leader:7443")
-        .await
-        .unwrap();
+    .await;
     crate::consensus_runtime::tests::wait_for_leader(&[&leader]).await;
     leader
-        .raft()
-        .add_learner(follower_id, BasicNode::new("tls://follower:7443"), true)
-        .await
-        .unwrap();
-    leader
-        .raft()
-        .change_membership(
-            std::collections::BTreeSet::from([leader_id, follower_id]),
-            false,
-        )
+        .change_voters(std::collections::BTreeMap::from([
+            (leader_id, "tls://leader:7443".to_string()),
+            (follower_id, "tls://follower:7443".to_string()),
+        ]))
         .await
         .unwrap();
     (leader, follower)
@@ -809,7 +786,7 @@ async fn activate_bounded_members(leader: &ConsensusNode) {
                 value: uuid::Uuid::from_u128(500),
             },
             issued_at_unix_ms: 500,
-            expected_control_revision: leader.persisted_control_state().unwrap().revision,
+            expected_control_revision: leader.persisted_control_state().revision,
             read_schema_floor: 2,
             write_schema_floor: 2,
             feature: "bounded-control-command-v1".into(),
@@ -832,12 +809,12 @@ async fn assert_activated_forwarding(
         ClusterBoundedControlCommandService::mutate(service, command(600, 600)).await,
         Err(ControlServiceError::RuntimeUnavailable { .. })
     ));
-    let revision = leader.persisted_control_state().unwrap().revision;
+    let revision = leader.persisted_control_state().revision;
     let response = ClusterBoundedControlCommandService::mutate(service, command(600, 600))
         .await
         .unwrap();
     assert_eq!(response.control_revision, revision);
-    assert_eq!(leader.persisted_control_state().unwrap().revision, revision);
+    assert_eq!(leader.persisted_control_state().revision, revision);
     let mut oversized = command(601, 0);
     oversized.request = ControlCommandRequest::CompleteWorkflow {
         original_command_id: CommandId {
@@ -849,7 +826,7 @@ async fn assert_activated_forwarding(
         ClusterBoundedControlCommandService::mutate(service, oversized).await,
         Err(ControlServiceError::Rejected { .. })
     ));
-    assert_eq!(leader.persisted_control_state().unwrap().revision, revision);
+    assert_eq!(leader.persisted_control_state().revision, revision);
     assert_eq!(*caller.forwarded.lock().unwrap(), bounded_invocations(3));
 }
 
@@ -881,7 +858,6 @@ async fn assert_bounded_forwarding(
     assert!(
         !leader
             .persisted_control_state()
-            .unwrap()
             .workspaces
             .contains_key(&uuid::Uuid::from_u128(300))
     );

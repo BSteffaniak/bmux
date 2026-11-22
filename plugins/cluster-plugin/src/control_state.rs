@@ -243,19 +243,6 @@ impl ControlState {
         !self.publication_history.is_empty()
     }
 
-    /// Applies a complete signed publication batch atomically in log order.
-    /// # Errors
-    /// Rejects stale revisions, conflicting identities, invalid authority and exhaustion.
-    pub fn apply_publication(
-        &mut self,
-        command: &crate::capability_publication::PublicationCommand,
-        membership: &openraft::StoredMembership<crate::membership::NodeId, openraft::BasicNode>,
-    ) -> Result<u64, String> {
-        self.apply_publication_with_membership(command, || {
-            crate::capability_publication::owned_publication_membership(membership)
-        })
-    }
-
     /// Apply publication using owned committed membership and existing deduplication.
     /// # Errors
     /// Rejects stale revisions, conflicting identities, invalid authority and exhaustion.
@@ -327,26 +314,10 @@ impl ControlState {
         Ok(revision)
     }
 
-    /// Applies a replicated bootstrap command against the committed voter configuration.
-    /// No wall clock, network, or external policy service is consulted during apply.
-    pub fn apply_bootstrap_command(
-        &mut self,
-        command: &crate::principal_bootstrap::BootstrapCommand,
-        membership: &openraft::StoredMembership<crate::membership::NodeId, openraft::BasicNode>,
-    ) -> ControlResponse {
-        self.apply_verified_bootstrap(command, |state| {
-            crate::principal_bootstrap::verify_proof(
-                &command.proof,
-                &state.cluster_id,
-                membership,
-                &state.members,
-                command.verified_at_unix_ms,
-            )
-        })
-    }
-
-    /// Apply bootstrap using owned committed membership. Completed retries retain
-    /// their original result even after membership changes.
+    /// Applies a replicated bootstrap command against the committed voter
+    /// configuration. No wall clock, network, or external policy service is
+    /// consulted during apply. Completed retries retain their original result
+    /// even after membership changes.
     pub fn apply_owned_bootstrap_command(
         &mut self,
         command: &crate::principal_bootstrap::BootstrapCommand,
@@ -741,29 +712,12 @@ impl ControlState {
         &mut self,
         command: &FeatureActivationCommand,
     ) -> ControlResponse {
-        self.apply_feature_activation_with_membership(command, None)
+        self.apply_owned_feature_activation(command, None)
     }
 
     /// Applies against the membership committed immediately before this command.
     /// Missing membership cannot authorize first bootstrap activation.
     ///
-    /// # Panics
-    /// Panics on unrecoverable control revision overflow.
-    pub fn apply_feature_activation_with_membership(
-        &mut self,
-        command: &FeatureActivationCommand,
-        membership: Option<
-            &openraft::StoredMembership<crate::membership::NodeId, openraft::BasicNode>,
-        >,
-    ) -> ControlResponse {
-        self.apply_feature_activation_resolved(command, || {
-            membership
-                .map(crate::capability_publication::owned_publication_membership)
-                .transpose()
-        })
-    }
-
-    /// Apply activation with owned committed membership.
     /// # Panics
     /// Panics on unrecoverable control revision overflow.
     pub fn apply_owned_feature_activation(
@@ -2078,7 +2032,6 @@ mod tests {
         use crate::membership::{
             ClusterId, NodeIdentity, initializer_capabilities, issue_test_member,
         };
-        use openraft::{BasicNode, CommittedLeaderId, LogId, Membership, StoredMembership};
         let identity = NodeIdentity::new_for_test(96);
         let id = *identity.node_id();
         let learner = crate::membership::NodeId::from(97);
@@ -2095,15 +2048,12 @@ mod tests {
             42,
         );
         state.members.insert(member.node_id.clone(), member);
-        let membership = StoredMembership::new(
-            Some(LogId::new(CommittedLeaderId::new(1, id), 1)),
-            Membership::new(
-                vec![BTreeSet::from([id])],
-                BTreeMap::from([
-                    (id, BasicNode::new("node")),
-                    (learner, BasicNode::new("learner")),
-                ]),
-            ),
+        let membership = crate::consensus_model::test_stored_membership(
+            1,
+            id,
+            1,
+            vec![vec![id]],
+            vec![(id, "node".into()), (learner, "learner".into())],
         );
         let command = FeatureActivationCommand {
             principal_id: id.to_string(),
@@ -2116,7 +2066,7 @@ mod tests {
             write_schema_floor: 3,
             feature: "principal-bootstrap-v1".into(),
         };
-        let response = state.apply_feature_activation_with_membership(&command, Some(&membership));
+        let response = state.apply_owned_feature_activation(&command, Some(&membership));
         assert!(matches!(
             response.result,
             ControlCommandResult::Rejected { .. }
@@ -2124,7 +2074,7 @@ mod tests {
         assert_eq!(state.revision, 0);
         assert!(!state.activated_features.contains("principal-bootstrap-v1"));
         assert_eq!(
-            state.apply_feature_activation_with_membership(&command, None),
+            state.apply_owned_feature_activation(&command, None),
             response
         );
     }
@@ -2155,7 +2105,6 @@ mod tests {
         use crate::membership::{
             ClusterId, NodeIdentity, initializer_capabilities, issue_test_member,
         };
-        use openraft::{BasicNode, CommittedLeaderId, LogId, Membership, StoredMembership};
         let identity = NodeIdentity::new_for_test(96);
         let node = *identity.node_id();
         let cluster: ClusterId = "cluster:00000000-0000-0000-0000-000000000096"
@@ -2178,12 +2127,12 @@ mod tests {
             .features
             .push("protocol-refresh-v1".into());
         state.members.insert(member.node_id.clone(), member);
-        let membership = StoredMembership::new(
-            Some(LogId::new(CommittedLeaderId::new(1, node), 1)),
-            Membership::new(
-                vec![BTreeSet::from([node])],
-                BTreeMap::from([(node, BasicNode::new("node"))]),
-            ),
+        let membership = crate::consensus_model::test_stored_membership(
+            1,
+            node,
+            1,
+            vec![vec![node]],
+            vec![(node, "node".into())],
         );
         let command = FeatureActivationCommand {
             principal_id: node.to_string(),
@@ -2198,7 +2147,7 @@ mod tests {
             |state: &mut ControlState, command: &FeatureActivationCommand, membership| {
                 assert!(matches!(
                     state
-                        .apply_feature_activation_with_membership(command, membership)
+                        .apply_owned_feature_activation(command, membership)
                         .result,
                     ControlCommandResult::Rejected { .. }
                 ));
@@ -2229,23 +2178,20 @@ mod tests {
             .clear();
         rejected(&mut missing_feature, &command, Some(&membership));
         let learner = crate::membership::NodeId::from(97);
-        let mismatch = StoredMembership::new(
-            Some(LogId::new(CommittedLeaderId::new(1, node), 1)),
-            Membership::new(
-                vec![BTreeSet::from([node])],
-                BTreeMap::from([
-                    (node, BasicNode::new("node")),
-                    (learner, BasicNode::new("learner")),
-                ]),
-            ),
+        let mismatch = crate::consensus_model::test_stored_membership(
+            1,
+            node,
+            1,
+            vec![vec![node]],
+            vec![(node, "node".into()), (learner, "learner".into())],
         );
         rejected(&mut state.clone(), &command, Some(&mismatch));
-        let response = state.apply_feature_activation_with_membership(&command, Some(&membership));
+        let response = state.apply_owned_feature_activation(&command, Some(&membership));
         assert_accepted(&response);
         assert_eq!(state.revision, 1);
         assert_eq!(state.write_schema_floor, 4);
         assert_eq!(
-            state.apply_feature_activation_with_membership(&command, Some(&membership)),
+            state.apply_owned_feature_activation(&command, Some(&membership)),
             response
         );
     }

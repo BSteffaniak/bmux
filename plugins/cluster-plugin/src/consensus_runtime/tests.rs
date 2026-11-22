@@ -92,9 +92,19 @@ pub async fn start_node(
     } else {
         Provisioning::Joiner
     };
+    start_node_as(root, "cluster-test", id, network, provisioning).await
+}
+
+pub async fn start_node_as(
+    root: &Path,
+    cluster_id: &str,
+    id: NodeId,
+    network: &MemoryNetwork,
+    provisioning: Provisioning,
+) -> ConsensusNode {
     let node = ConsensusNode::start(
         root,
-        "cluster-test",
+        cluster_id,
         id,
         provisioning,
         &PreflightAdmission::default(),
@@ -198,7 +208,16 @@ async fn bounded_submission_requires_activation() {
     let cluster: crate::membership::ClusterId = "cluster:00000000-0000-0000-0000-000000000093"
         .parse()
         .unwrap();
-    let node = start_node(root.path(), *identity.node_id(), &network, true).await;
+    let node = start_node_as(
+        root.path(),
+        &cluster.to_string(),
+        *identity.node_id(),
+        &network,
+        Provisioning::Founder {
+            endpoint: "tls://127.0.0.1:49993".into(),
+        },
+    )
+    .await;
     wait_for_leader(&[&node]).await;
     assert!(matches!(
         node.mutate_bounded(command(1, 0)).await,

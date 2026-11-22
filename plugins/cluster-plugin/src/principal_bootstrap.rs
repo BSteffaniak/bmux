@@ -4,7 +4,6 @@ use bmux_cluster_plugin_api::cluster_principal_bootstrap_types::{
     BootstrapProof, BootstrapStatement,
 };
 use bmux_cluster_plugin_api::cluster_types::{ClusterMember, ClusterMemberState};
-use openraft::{BasicNode, StoredMembership};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::membership::NodeId;
@@ -166,30 +165,12 @@ pub fn signing_payload(statement: &BootstrapStatement) -> Result<Vec<u8>, String
     Ok(bytes)
 }
 
-/// Verifies proof against caller-supplied authoritative committed membership.
+/// Verify bootstrap against owned committed authority and explicit verification time.
 ///
 /// Callers must recheck this membership and unused-bootstrap precondition at
 /// commit; successful validation is neither authorization for other operations
 /// nor an acknowledgment of durable bootstrap.
 ///
-/// # Errors
-/// Rejects stale membership, bad proofs, duplicate signers and missing majorities.
-pub fn verify_proof(
-    proof: &BootstrapProof,
-    cluster_id: &str,
-    membership: &StoredMembership<NodeId, BasicNode>,
-    members: &BTreeMap<String, ClusterMember>,
-    now_unix_ms: u64,
-) -> Result<(), String> {
-    membership
-        .log_id()
-        .as_ref()
-        .ok_or("bootstrap requires committed membership")?;
-    let owned = crate::consensus_membership::owned_committed_membership(membership)?;
-    verify_owned_proof(proof, cluster_id, &owned, members, now_unix_ms)
-}
-
-/// Verify bootstrap against owned committed authority and explicit verification time.
 /// # Errors
 /// Rejects invalid identity, signatures, credentials or insufficient joint quorum.
 pub fn verify_owned_proof(
@@ -268,7 +249,6 @@ pub fn verify_owned_proof(
 mod tests {
     use super::*;
     use bmux_cluster_plugin_api::cluster_types::CommandId;
-    use openraft::{CommittedLeaderId, LogId, Membership};
 
     fn statement() -> BootstrapStatement {
         BootstrapStatement {
@@ -344,7 +324,7 @@ mod tests {
     fn assert_command_application(
         proof: &BootstrapProof,
         cluster: &str,
-        membership: &StoredMembership<NodeId, BasicNode>,
+        membership: &crate::consensus_model::StoredMembership,
         members: &BTreeMap<String, ClusterMember>,
     ) {
         let command = super::BootstrapCommand {
@@ -370,21 +350,25 @@ mod tests {
         state
             .activated_features
             .insert("principal-bootstrap-v1".into());
-        let stale_membership = StoredMembership::default();
-        let rejected = state.apply_bootstrap_command(&command, &stale_membership);
+        // A configuration without a committed position cannot authorize.
+        let stale_membership = crate::consensus_model::StoredMembership {
+            introduced_at: None,
+            membership: membership.membership.clone(),
+        };
+        let rejected = state.apply_owned_bootstrap_command(&command, &stale_membership);
         assert!(matches!(
             rejected.result,
             bmux_cluster_plugin_api::cluster_types::ControlCommandResult::Rejected { .. }
         ));
         assert!(state.principal_bootstrap.is_none());
-        let accepted = state.apply_bootstrap_command(&command, membership);
+        let accepted = state.apply_owned_bootstrap_command(&command, membership);
         assert!(matches!(
             accepted.result,
             bmux_cluster_plugin_api::cluster_types::ControlCommandResult::Accepted { .. }
         ));
         assert_eq!(accepted.control_revision, 1);
         assert_eq!(
-            state.apply_bootstrap_command(&command, &stale_membership),
+            state.apply_owned_bootstrap_command(&command, &stale_membership),
             accepted
         );
     }
@@ -405,13 +389,12 @@ mod tests {
             .iter()
             .map(|identity| *identity.node_id())
             .collect();
-        let configs = vec![
-            BTreeSet::from([ids[0], ids[1]]),
-            BTreeSet::from([ids[1], ids[2]]),
-        ];
-        let membership = StoredMembership::new(
-            Some(LogId::new(CommittedLeaderId::new(3, ids[0]), 7)),
-            Membership::<NodeId, BasicNode>::new(configs, None),
+        let membership = crate::consensus_model::test_stored_membership(
+            3,
+            ids[0],
+            7,
+            vec![vec![ids[0], ids[1]], vec![ids[1], ids[2]]],
+            ids.iter().map(|id| (*id, String::new())).collect(),
         );
         let mut statement = statement();
         statement.cluster_id = cluster.to_string();
@@ -457,27 +440,27 @@ mod tests {
                 .collect(),
         };
         assert_eq!(
-            verify_proof(&proof, &cluster.to_string(), &membership, &members, 100),
+            verify_owned_proof(&proof, &cluster.to_string(), &membership, &members, 100),
             Ok(())
         );
         assert_command_application(&proof, &cluster.to_string(), &membership, &members);
         let last = proof.voter_approvals.pop().unwrap();
         assert!(
-            verify_proof(&proof, &cluster.to_string(), &membership, &members, 100)
+            verify_owned_proof(&proof, &cluster.to_string(), &membership, &members, 100)
                 .unwrap_err()
                 .contains("majority")
         );
         proof.voter_approvals.push(last);
         proof.voter_approvals.push(proof.voter_approvals[0].clone());
         assert!(
-            verify_proof(&proof, &cluster.to_string(), &membership, &members, 100)
+            verify_owned_proof(&proof, &cluster.to_string(), &membership, &members, 100)
                 .unwrap_err()
                 .contains("duplicate")
         );
         proof.voter_approvals.pop();
         members.get_mut(&ids[0].to_string()).unwrap().cluster_id = "cluster:other".into();
         assert!(
-            verify_proof(&proof, &cluster.to_string(), &membership, &members, 100)
+            verify_owned_proof(&proof, &cluster.to_string(), &membership, &members, 100)
                 .unwrap_err()
                 .contains("another cluster")
         );
@@ -487,9 +470,12 @@ mod tests {
     fn principal_proof_does_not_replace_voter_majority() {
         let statement = statement();
         let key = iroh::SecretKey::from_bytes(&[9; 32]);
-        let membership = StoredMembership::new(
-            Some(LogId::new(CommittedLeaderId::new(3, NodeId::from(1)), 7)),
-            Membership::<NodeId, BasicNode>::new(vec![BTreeSet::from([NodeId::from(1)])], None),
+        let membership = crate::consensus_model::test_stored_membership(
+            3,
+            NodeId::from(1),
+            7,
+            vec![vec![NodeId::from(1)]],
+            vec![(NodeId::from(1), String::new())],
         );
         let mut proof = BootstrapProof {
             principal_signature: key
@@ -500,19 +486,19 @@ mod tests {
             voter_approvals: Vec::new(),
         };
         assert!(
-            verify_proof(&proof, "cluster:test", &membership, &BTreeMap::new(), 0)
+            verify_owned_proof(&proof, "cluster:test", &membership, &BTreeMap::new(), 0)
                 .unwrap_err()
                 .contains("majority")
         );
         proof.principal_signature[0] ^= 1;
         assert!(
-            verify_proof(&proof, "cluster:test", &membership, &BTreeMap::new(), 0)
+            verify_owned_proof(&proof, "cluster:test", &membership, &BTreeMap::new(), 0)
                 .unwrap_err()
                 .contains("principal proof")
         );
         proof.statement.membership_log_index += 1;
         assert!(
-            verify_proof(&proof, "cluster:test", &membership, &BTreeMap::new(), 0)
+            verify_owned_proof(&proof, "cluster:test", &membership, &BTreeMap::new(), 0)
                 .unwrap_err()
                 .contains("mismatch")
         );

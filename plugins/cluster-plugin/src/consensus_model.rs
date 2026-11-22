@@ -134,6 +134,25 @@ pub struct StoredMembership {
     pub membership: Membership,
 }
 
+/// A committed membership introduced at `(term, leader, index)`, for tests.
+#[cfg(test)]
+pub(crate) fn test_stored_membership(
+    term: u64,
+    leader: NodeId,
+    index: u64,
+    voters: Vec<Vec<NodeId>>,
+    records: Vec<(NodeId, String)>,
+) -> StoredMembership {
+    StoredMembership {
+        introduced_at: Some(LogIdentity {
+            term: Term(term),
+            leader,
+            index: LogIndex(index),
+        }),
+        membership: Membership::new(voters, records).expect("valid test membership"),
+    }
+}
+
 /// Rejected membership-log transition or stale proposal precondition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MembershipTransitionError {

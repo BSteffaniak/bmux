@@ -1,7 +1,6 @@
 use super::*;
-use crate::consensus_runtime::tests::{
-    InMemoryNetworkFactory, wait_for_leader, wait_for_leader_excluding,
-};
+use crate::consensus_runtime::Provisioning;
+use crate::consensus_runtime::tests::{MemoryNetwork, start_node_as, wait_for_leader};
 use crate::membership::{ClusterId, NodeId};
 use crate::worker_runtime::{WorkerLeaseVerifier, WorkerPaneRuntime, WorkerServiceHandle};
 use bmux_cluster_plugin_api::cluster_types::{
@@ -158,7 +157,7 @@ fn command(id: u128, request: ControlCommandRequest) -> ControlCommand {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::too_many_lines)]
 async fn leader_failover_recovers_committed_launch_without_duplicate_execution() {
-    let network = InMemoryNetworkFactory::default();
+    let network = MemoryNetwork::default();
     let roots = [
         TempDir::new().unwrap(),
         TempDir::new().unwrap(),
@@ -168,33 +167,32 @@ async fn leader_failover_recovers_committed_launch_without_duplicate_execution()
     let endpoints = ["memory://one", "memory://two", "memory://three"];
     let mut nodes = Vec::new();
     for index in 0..3 {
-        let node = crate::consensus_runtime::ConsensusNode::start(
-            roots[index].path(),
-            "cluster:00000000-0000-0000-0000-000000000001",
-            ids[index],
-            network.clone(),
-        )
-        .await
-        .unwrap();
-        network.register(
-            ids[index],
-            openraft::BasicNode::new(endpoints[index]),
-            node.raft().clone(),
+        let provisioning = if index == 0 {
+            Provisioning::Founder {
+                endpoint: endpoints[0].into(),
+            }
+        } else {
+            Provisioning::Joiner
+        };
+        nodes.push(
+            start_node_as(
+                roots[index].path(),
+                "cluster:00000000-0000-0000-0000-000000000001",
+                ids[index],
+                &network,
+                provisioning,
+            )
+            .await,
         );
-        nodes.push(node);
     }
-    nodes[0]
-        .initialize_single(ids[0], endpoints[0])
-        .await
-        .unwrap();
-    // Initialization admits membership; it does not acknowledge election.
-    // Await leader readiness before submitting a leader-only membership change.
+    // The founding membership is durable; await leader readiness before
+    // submitting a leader-only membership change.
     assert_eq!(wait_for_leader(&[&nodes[0]]).await, ids[0]);
     nodes[0]
         .change_voters(BTreeMap::from([
-            (ids[0], openraft::BasicNode::new(endpoints[0])),
-            (ids[1], openraft::BasicNode::new(endpoints[1])),
-            (ids[2], openraft::BasicNode::new(endpoints[2])),
+            (ids[0], endpoints[0].to_string()),
+            (ids[1], endpoints[1].to_string()),
+            (ids[2], endpoints[2].to_string()),
         ]))
         .await
         .unwrap();
@@ -363,8 +361,7 @@ async fn leader_failover_recovers_committed_launch_without_duplicate_execution()
     let old_leader = nodes.remove(leader_index);
     network.unregister(leader_id);
     old_leader.shutdown().await.unwrap();
-    let replacement_id =
-        wait_for_leader_excluding(&nodes.iter().collect::<Vec<_>>(), leader_id).await;
+    let replacement_id = wait_for_leader(&nodes.iter().collect::<Vec<_>>()).await;
     let replacement_index = ids.iter().position(|id| *id == replacement_id).unwrap();
     let replacement_node = nodes
         .iter()
