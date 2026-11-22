@@ -305,3 +305,39 @@ fleets and determinism-verified runs), regression seeds for what it finds, and n
   reaches a simulated switch point would let another simulated thread block on that std lock
   for real, hanging the run instead of reporting a deadlock. Initializers now run with the
   registry unlocked; when callers race, all get the first value registered.
+### 19.2 (yields at every await, applied in bmux)
+
+- **Applied.** `src/lib.rs` declares each of the plugin's modules through
+  `switchy_async::inject_yields_mod! { mod name; }` (switchy_async's `macros` feature,
+  already enabled). Under the simulator the macro loads the module's files, recursively, and rewrites
+  every `.await` in them, in `async fn`s, `async` blocks and `async` closures in sync
+  functions alike, into `yield_after(..).await`: a point where another task may run, with the
+  run's seeded probability (`SIMULATOR_YIELD_PROBABILITY`, swarm by default). Natively it
+  expands to the plain declaration. The platform layer is covered too: the macro parses every
+  file a module names, whichever targets its `cfg`s keep. One declaration per module in
+  `lib.rs` covers everything, so new files under a module need nothing.
+- **Effect.** One seed (12345) at probability 1 took 294 simulation steps with only
+  `select!`'s yields and 785 with the plugin's awaits yielding too.
+- **Enforced.** `tests/yields.rs` runs `switchy_async_cargo::uncovered` (MoosicBox's lint,
+  now a workspace dev-dependency) over `src/` and fails listing every `async fn`, `async`
+  block and `async` closure outside `#[cfg(test)]` that no `inject_yields` covers, and every
+  file it could not parse. A module added to `lib.rs` with a plain `mod` fails it. Its
+  `EXEMPT` list (file, function, reason) is empty; a second test rejects stale or unexplained
+  entries.
+- **Inside macros, by hand.** The transformation cannot see into macro invocations, and
+  `select!`'s own yield comes only after a branch's handler finishes (not at all when the
+  handler leaves with `break` or `return`). Awaits there are written
+  `switchy_async::task::yield_after(future).await`, the same rewrite, by hand (a no-op
+  natively):
+  - the `select!` handlers in the pane task (reader-failure cleanup) and in the padding
+    configure transaction;
+  - the `fail_captured_startup!` and `stop_pane!` macros in the pane task.
+
+  The padding preview calls awaited inside `matches!` now await first, where the
+  transformation sees them. The lint cannot see into macros either, so these are not
+  enforced: new awaits in macro invocations need the same treatment.
+- **Exemptions.** None. `include!`d test code (`durable_capture_tests.rs`) is `#[cfg(test)]`
+  and never in a simulator build.
+- **Checks.** Pane-runtime regression seeds, 300 determinism-verified pane-runtime runs (swarm
+  yield probability), pty regression seeds and 300 verified local-terminal runs all passed
+  with the yields in place; no new failures.
