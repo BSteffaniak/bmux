@@ -305,6 +305,7 @@ fleets and determinism-verified runs), regression seeds for what it finds, and n
   reaches a simulated switch point would let another simulated thread block on that std lock
   for real, hanging the run instead of reporting a deadlock. Initializers now run with the
   registry unlocked; when callers race, all get the first value registered.
+
 ### 19.2 (yields at every await, applied in bmux)
 
 - **Applied.** `src/lib.rs` declares each of the plugin's modules through
@@ -341,6 +342,7 @@ fleets and determinism-verified runs), regression seeds for what it finds, and n
 - **Checks.** Pane-runtime regression seeds, 300 determinism-verified pane-runtime runs (swarm
   yield probability), pty regression seeds and 300 verified local-terminal runs all passed
   with the yields in place; no new failures.
+
 ### 19.3 (the pane runtime's profiles)
 
 - **Two new profile faults.** `threadspawn` (switchy_thread's `set_spawn_failures`) and
