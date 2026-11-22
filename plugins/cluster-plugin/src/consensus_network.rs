@@ -506,6 +506,37 @@ pub(crate) fn verify_owned_snapshot_install_response(
     verify_node_signature(&peer.to_string(), &payload, &response.signature)
 }
 
+/// Send a signed install request over generated transport and accept only a
+/// reply bound to that exact request and signed by its recipient. This is
+/// transport evidence only; it never advances local progress.
+pub(crate) async fn exchange_snapshot_install<C>(
+    caller: &C,
+    endpoint: &str,
+    request: &bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallRequest,
+) -> Result<
+    bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallResponse,
+    bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallError,
+>
+where
+    C: ServiceCaller + Sync,
+{
+    use bmux_cluster_plugin_api::cluster_consensus_snapshot_types::InstallError;
+    let mut remote = EndpointDispatchClient::new(caller, endpoint);
+    let response = switchy_async::time::timeout(
+        std::time::Duration::from_secs(5),
+        bmux_cluster_plugin_api::cluster_consensus_snapshot::client::install(
+            &mut remote,
+            request.clone(),
+        ),
+    )
+    .await
+    .map_err(|_| InstallError::ExecutionFailed)?
+    .map_err(|_| InstallError::ExecutionFailed)??;
+    verify_owned_snapshot_install_response(request, &response)
+        .map_err(|_| InstallError::Unauthorized)?;
+    Ok(response)
+}
+
 fn require_owned_consensus(
     members: &[bmux_cluster_plugin_api::cluster_types::ClusterMember],
     source: NodeId,
@@ -2321,20 +2352,7 @@ impl<C: crate::ClusterRuntimeOps + Send + Sync + 'static> OwnedAppendService<C> 
             .as_ref()
             .filter(|endpoint| !endpoint.trim().is_empty())
             .ok_or(InstallError::InvalidRequest)?;
-        let mut remote = EndpointDispatchClient::new(self.caller.as_ref(), endpoint.clone());
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            bmux_cluster_plugin_api::cluster_consensus_snapshot::client::install(
-                &mut remote,
-                request.clone(),
-            ),
-        )
-        .await
-        .map_err(|_| InstallError::ExecutionFailed)?
-        .map_err(|_| InstallError::ExecutionFailed)??;
-        verify_owned_snapshot_install_response(&request, &response)
-            .map_err(|_| InstallError::Unauthorized)?;
-        Ok(response)
+        exchange_snapshot_install(self.caller.as_ref(), endpoint, &request).await
     }
 
     /// Register snapshot v1 separately against the SAME lifecycle-owned executor.

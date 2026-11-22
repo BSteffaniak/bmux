@@ -6,6 +6,8 @@
 //! [`WireService`] authenticates the sender against current member credentials,
 //! hands the decoded message to the driver, and signs the engine's reply. Request
 //! identities carry the sender's incarnation and the engine's sequence number.
+//! Snapshots travel through staged transfer and a separate install call; see
+//! [`snapshot`].
 
 use crate::consensus_driver::{Driver, Reply, SnapshotObject, Transport};
 use crate::consensus_engine::{AppendReplyOutcome, Message, NodeId};
@@ -23,8 +25,13 @@ use bmux_cluster_plugin_api::cluster_consensus_vote_types::{VoteRequest, VoteRes
 use bmux_cluster_plugin_api::cluster_types::ClusterMember;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
+
+mod snapshot;
+
+pub use snapshot::SnapshotStaging;
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -75,6 +82,8 @@ pub struct WireTransport<C> {
     local: NodeId,
     members: MemberView,
     incarnation: u64,
+    /// The last snapshot transfer sequence used by this incarnation.
+    transfers: AtomicU64,
 }
 
 impl<C> WireTransport<C> {
@@ -85,10 +94,12 @@ impl<C> WireTransport<C> {
             local,
             members,
             incarnation,
+            transfers: AtomicU64::new(0),
         }
     }
 }
 
+#[derive(Clone)]
 struct Route {
     cluster: String,
     endpoint: String,
@@ -96,12 +107,13 @@ struct Route {
 }
 
 impl<C> WireTransport<C> {
-    fn route(&self, to: NodeId) -> Option<Route> {
+    /// Route to a peer that negotiated the contract `supports` checks.
+    fn route(&self, to: NodeId, supports: fn(&ClusterMember) -> bool) -> Option<Route> {
         let (cluster, members) = self.members.snapshot();
         let peer = members
             .iter()
             .find(|member| member.node_id == to.to_string())?;
-        if !crate::consensus_network::supports_owned_append_v2(peer) {
+        if !supports(peer) {
             return None;
         }
         let local = members
@@ -126,7 +138,7 @@ where
         let caller = self.caller.clone();
         let local = self.local;
         let incarnation = self.incarnation;
-        let route = self.route(to);
+        let route = self.route(to, crate::consensus_network::supports_owned_append_v2);
         Box::pin(async move {
             let prepared = prepare(caller.as_ref(), local, to, route?).await?;
             match message {
@@ -175,9 +187,21 @@ where
         })
     }
 
-    fn send_snapshot(&self, _: NodeId, _: Term, _: u64, _: SnapshotObject) -> Reply {
-        // Staged snapshot transfer is wired separately; the engine retries.
-        Box::pin(async { None })
+    fn send_snapshot(&self, to: NodeId, term: Term, seq: u64, snapshot: SnapshotObject) -> Reply {
+        let caller = self.caller.clone();
+        let link = snapshot::Link {
+            local: self.local,
+            to,
+            incarnation: self.incarnation,
+            transfer: self.transfers.fetch_add(1, Ordering::SeqCst) + 1,
+        };
+        let route = self.route(
+            to,
+            crate::consensus_network::supports_owned_snapshot_install,
+        );
+        Box::pin(
+            async move { snapshot::send(caller.as_ref(), link, route?, term, seq, snapshot).await },
+        )
     }
 }
 
@@ -328,6 +352,7 @@ pub struct WireService<C, V> {
     local: NodeId,
     members: MemberView,
     driver: Arc<Driver<V>>,
+    staging: Arc<SnapshotStaging>,
 }
 
 impl<C, V> WireService<C, V>
@@ -335,22 +360,27 @@ where
     C: crate::ClusterRuntimeOps + Send + Sync + 'static,
     V: Send + Unpin + 'static,
 {
+    /// `staging` must be the handle whose [`SnapshotStaging::reader`] backs the
+    /// driver's storage, so installs consume what this service sealed.
     #[must_use]
     pub const fn new(
         caller: Arc<C>,
         local: NodeId,
         members: MemberView,
         driver: Arc<Driver<V>>,
+        staging: Arc<SnapshotStaging>,
     ) -> Self {
         Self {
             caller,
             local,
             members,
             driver,
+            staging,
         }
     }
 
-    /// Install both providers. The returned registrations end with the registry.
+    /// Install every consensus provider: vote (v1), append (v2), transfer and
+    /// snapshot install. The registrations end with the registry.
     /// # Errors
     /// Reports registry rejection.
     pub fn register(
@@ -359,8 +389,21 @@ where
     ) -> Result<(), Box<bmux_plugin_sdk::PluginError>> {
         bmux_cluster_plugin_api::cluster_consensus_rpc::register_provider(registry, self.clone())
             .map_err(Box::new)?;
-        bmux_cluster_plugin_api::cluster_consensus_rpc_v2::register_provider(registry, self.clone())
-            .map_err(Box::new)
+        bmux_cluster_plugin_api::cluster_consensus_rpc_v2::register_provider(
+            registry,
+            self.clone(),
+        )
+        .map_err(Box::new)?;
+        bmux_cluster_plugin_api::cluster_consensus_transfer::register_provider(
+            registry,
+            self.clone(),
+        )
+        .map_err(Box::new)?;
+        bmux_cluster_plugin_api::cluster_consensus_snapshot::register_provider(
+            registry,
+            self.clone(),
+        )
+        .map_err(Box::new)
     }
 
     async fn vote(&self, request: VoteRequest) -> Result<VoteResponse, RpcError> {
