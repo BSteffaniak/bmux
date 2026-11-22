@@ -41,8 +41,7 @@ pub(crate) use target::{
 };
 #[cfg(all(unix, test, not(feature = "simulator")))]
 pub(crate) use target::{
-    bounded_probe_output, parse_linux_process_start, parse_ps_process_entry,
-    send_process_signal_command,
+    bounded_probe_output, parse_ps_process_entry, send_process_signal_command,
 };
 
 /// When a process started, as the operating system records it: with its pid, an identity no

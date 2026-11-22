@@ -43,7 +43,18 @@ const FORBIDDEN: &[&str] = &[
     "rand::",
     "HashMap",
     "HashSet",
+    // Addresses differ between runs: never order by them.
+    "as_ptr(",
 ];
+
+/// Whether `line` declares process-wide mutable state, which concurrent simulated runs would
+/// share (use `run_shared`, one per run in simulation).
+fn process_wide(line: &str) -> bool {
+    line.trim_start().starts_with("static ")
+        && ["OnceLock", "LazyLock", "Atomic", "Mutex", "RwLock"]
+            .iter()
+            .any(|kind| line.contains(kind))
+}
 
 /// Native backends: each talks to one operating system and never runs in simulation.
 const NATIVE: &[&str] = &["platform/unix/", "platform/windows/", "platform/native.rs"];
@@ -154,6 +165,12 @@ fn simulated_primitives_only() {
                 || (number >= 2 && raw[number - 2].contains("// simulation-safe:"))
             {
                 continue;
+            }
+            if process_wide(line) {
+                violations.push(format!(
+                    "{relative}:{number}: process-wide: {}",
+                    line.trim()
+                ));
             }
             for pattern in FORBIDDEN {
                 if uses(line, pattern) {

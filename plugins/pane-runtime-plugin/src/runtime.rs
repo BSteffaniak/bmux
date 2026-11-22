@@ -1218,11 +1218,10 @@ mod pointer_query_tests {
 /// Log the replay markers in `bytes` as read, when `BMUX_REPLAY_LOG` asks for it, and return
 /// them (empty without the log), for the frames that carry them to clients.
 fn note_replay_markers_read(bytes: &[u8]) -> Vec<(u64, u128)> {
-    // Process-wide debug log file opened from the process environment; a
-    // diagnostic sink, not per-instance state.
-    static LOG: std::sync::OnceLock<Option<switchy_thread::sync::Mutex<std::fs::File>>> =
-        std::sync::OnceLock::new();
-    let Some(file) = LOG.get_or_init(|| {
+    // A debug log file opened from the environment; a diagnostic sink shared by the
+    // process's (or the simulated run's) activations, not per-instance state.
+    enum ReplayLog {}
+    let log = crate::run_shared::run_shared::<ReplayLog, _>(|| {
         let path = switchy_env::var_os("BMUX_REPLAY_LOG")?;
         std::fs::OpenOptions::new()
             .create(true)
@@ -1230,7 +1229,8 @@ fn note_replay_markers_read(bytes: &[u8]) -> Vec<(u64, u128)> {
             .open(path)
             .ok()
             .map(switchy_thread::sync::Mutex::new)
-    }) else {
+    });
+    let Some(file) = log.as_ref() else {
         return Vec::new();
     };
     let markers = bmux_bench::corpus::markers(bytes);
@@ -1839,22 +1839,31 @@ impl std::io::Write for EncodedByteCount {
     }
 }
 
+/// One pane's output and the offset its snapshot reached.
+type SnapshotCursor = (
+    Uuid,
+    Arc<switchy_thread::sync::Mutex<OutputFanoutBuffer>>,
+    u64,
+);
+
 fn acknowledge_grid_snapshots(
     client_id: ClientId,
-    updates: &mut [(Arc<switchy_thread::sync::Mutex<OutputFanoutBuffer>>, u64)],
+    updates: &mut [SnapshotCursor],
 ) -> Result<(), SessionRuntimeError> {
-    // Concurrent multi-pane snapshots must acquire locks in the same order.
-    updates.sort_unstable_by_key(|(output, _)| Arc::as_ptr(output));
+    // Concurrent multi-pane snapshots must acquire locks in the same order: their panes'
+    // (a deterministic order in simulation, unlike addresses).
+    updates.sort_by_key(|(pane_id, _, _)| *pane_id);
     // Locking the same non-reentrant mutex twice would deadlock. Reject an
     // aliased batch before acquiring locks or acknowledging any output.
-    if updates
-        .windows(2)
-        .any(|pair| Arc::ptr_eq(&pair[0].0, &pair[1].0))
-    {
+    if updates.iter().enumerate().any(|(index, (_, output, _))| {
+        updates[index + 1..]
+            .iter()
+            .any(|(_, other, _)| Arc::ptr_eq(output, other))
+    }) {
         return Err(SessionRuntimeError::Closed);
     }
     let mut guards = Vec::with_capacity(updates.len());
-    for (output, offset) in updates.iter() {
+    for (_, output, offset) in updates.iter() {
         guards.push((
             output.lock().map_err(|_| SessionRuntimeError::Closed)?,
             *offset,
@@ -11953,7 +11962,7 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
             };
             // Encoded output coexists with later projections.
             remaining = remaining.saturating_sub(encoded.len());
-            cursor_updates.push((Arc::clone(&pane.output_buffer), stream_end));
+            cursor_updates.push((pane.pane_id, Arc::clone(&pane.output_buffer), stream_end));
             snapshots.push(bmux_pane_runtime_state::AttachPaneGridSnapshot {
                 pane_id: pane.pane_id,
                 stream_end,
@@ -15012,7 +15021,7 @@ exit 7"#
     // Native checks of the platform layer's Unix target.
     #[cfg(unix)]
     use crate::platform::{
-        bounded_probe_output, parse_linux_process_start, parse_ps_process_entry,
+        bounded_probe_output, parse_ps_process_entry,
         process_directory as observe_process_directory, send_process_signal_command,
     };
 
@@ -17818,17 +17827,6 @@ exit 7"#
             )
             .is_none()
         );
-    }
-
-    #[test]
-    fn linux_process_start_parser_handles_parenthesized_names() {
-        let stat = format!("123 (name (with spaces)) S {} 98765 0", "0 ".repeat(18));
-        assert_eq!(
-            parse_linux_process_start(&stat),
-            Some(ProcessStartIdentity(98765, 0))
-        );
-        assert_eq!(parse_linux_process_start("broken"), None);
-        assert_eq!(parse_linux_process_start("123 (name) S 0"), None);
     }
 
     #[test]
@@ -23245,14 +23243,17 @@ exit 7"#
                 let mut output = OutputFanoutBuffer::new(1024);
                 output.register_client_at_tail(client);
                 output.push_chunk(b"0123456789");
-                Arc::new(switchy_thread::sync::Mutex::new(output))
+                (
+                    crate::ids::new_uuid(),
+                    Arc::new(switchy_thread::sync::Mutex::new(output)),
+                )
             })
             .collect::<Vec<_>>();
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let workers = [false, true].map(|reverse| {
             let mut updates = outputs
                 .iter()
-                .map(|output| (Arc::clone(output), if reverse { 9 } else { 4 }))
+                .map(|(pane, output)| (*pane, Arc::clone(output), if reverse { 9 } else { 4 }))
                 .collect::<Vec<_>>();
             if reverse {
                 updates.reverse();
@@ -23266,16 +23267,16 @@ exit 7"#
         for worker in workers {
             worker.join().unwrap();
         }
-        for output in &outputs {
+        for (_, output) in &outputs {
             assert_eq!(output.lock().unwrap().cursors.get(&client), Some(&9));
         }
         // A snapshot captured earlier may finish encoding after both commits.
         let mut stale = outputs
             .iter()
-            .map(|output| (Arc::clone(output), 2))
+            .map(|(pane, output)| (*pane, Arc::clone(output), 2))
             .collect::<Vec<_>>();
         acknowledge_grid_snapshots(client, &mut stale).unwrap();
-        for output in outputs {
+        for (_, output) in outputs {
             assert_eq!(output.lock().unwrap().cursors.get(&client), Some(&9));
         }
     }
@@ -23287,7 +23288,11 @@ exit 7"#
         output.register_client_at_tail(client);
         output.push_chunk(b"hello");
         let output = Arc::new(switchy_thread::sync::Mutex::new(output));
-        let mut updates = [(Arc::clone(&output), 2), (Arc::clone(&output), 5)];
+        // The same output under two panes: still aliased.
+        let mut updates = [
+            (crate::ids::new_uuid(), Arc::clone(&output), 2),
+            (crate::ids::new_uuid(), Arc::clone(&output), 5),
+        ];
         assert_eq!(
             acknowledge_grid_snapshots(client, &mut updates),
             Err(SessionRuntimeError::Closed)
@@ -23296,7 +23301,7 @@ exit 7"#
         acknowledge_grid_snapshots(client, &mut updates[..1]).unwrap();
         assert_eq!(
             output.lock().unwrap().cursors.get(&client),
-            Some(&updates[0].1)
+            Some(&updates[0].2)
         );
     }
 
@@ -23308,11 +23313,15 @@ exit 7"#
                 let mut output = OutputFanoutBuffer::new(1024);
                 output.register_client_at_tail(client);
                 output.push_chunk(b"hello");
-                (Arc::new(switchy_thread::sync::Mutex::new(output)), 5)
+                (
+                    crate::ids::new_uuid(),
+                    Arc::new(switchy_thread::sync::Mutex::new(output)),
+                    5,
+                )
             })
             .collect::<Vec<_>>();
-        updates.sort_unstable_by_key(|(output, _)| Arc::as_ptr(output));
-        let poisoned = Arc::clone(&updates[1].0);
+        updates.sort_by_key(|(pane, _, _)| *pane);
+        let poisoned = Arc::clone(&updates[1].1);
         assert!(
             switchy_thread::thread::spawn(move || {
                 let _guard = poisoned.lock().unwrap();
@@ -23325,7 +23334,7 @@ exit 7"#
             acknowledge_grid_snapshots(client, &mut updates),
             Err(SessionRuntimeError::Closed)
         );
-        assert_eq!(updates[0].0.lock().unwrap().cursors.get(&client), Some(&0));
+        assert_eq!(updates[0].1.lock().unwrap().cursors.get(&client), Some(&0));
     }
 
     #[test]

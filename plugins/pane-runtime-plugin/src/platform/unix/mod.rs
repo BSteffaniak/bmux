@@ -7,7 +7,6 @@ pub(crate) mod session;
 mod session_sweep;
 
 use super::{ProcessStartIdentity, PsProcessEntry};
-use std::path::Path;
 use std::time::Duration;
 
 pub(crate) use super::native::{path_is_usable_program, program_name_is_on_path};
@@ -161,7 +160,7 @@ pub(crate) fn process_directory(pid: u32) -> Option<String> {
             .collect::<Vec<_>>();
         String::from_utf8(bytes)
             .ok()
-            .filter(|path| Path::new(path).is_absolute())
+            .filter(|path| std::path::Path::new(path).is_absolute())
     }
     #[cfg(target_os = "linux")]
     {
@@ -185,4 +184,20 @@ pub(crate) fn is_executable(metadata: &std::fs::Metadata) -> bool {
 /// Extensions a program name may omit (none on Unix).
 pub(crate) const fn executable_extensions() -> Vec<String> {
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linux_process_start_parser_handles_parenthesized_names() {
+        let stat = format!("123 (name (with spaces)) S {} 98765 0", "0 ".repeat(18));
+        assert_eq!(
+            parse_linux_process_start(&stat),
+            Some(ProcessStartIdentity(98765, 0))
+        );
+        assert_eq!(parse_linux_process_start("broken"), None);
+        assert_eq!(parse_linux_process_start("123 (name) S 0"), None);
+    }
 }

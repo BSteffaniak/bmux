@@ -294,7 +294,7 @@ mod tests {
     fn a_sweep_ends_the_leader_and_its_descendants() {
         let pair = console();
         let preparation = prepare().unwrap();
-        let mut child = preparation.spawn(&pair.slave, long_running()).unwrap();
+        let mut child = preparation.spawn(&pair.slave, &long_running()).unwrap();
         let leader = child.process_id().unwrap();
         let session = Session::adopt(preparation, leader, &pair.master).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -313,7 +313,7 @@ mod tests {
     fn released_survivors_outlive_the_job_handle() {
         let pair = console();
         let preparation = prepare().unwrap();
-        let mut child = preparation.spawn(&pair.slave, long_running()).unwrap();
+        let mut child = preparation.spawn(&pair.slave, &long_running()).unwrap();
         let session =
             Session::adopt(preparation, child.process_id().unwrap(), &pair.master).unwrap();
         session.release_survivors();
@@ -331,7 +331,7 @@ mod tests {
     fn closing_the_job_ends_its_processes() {
         let pair = console();
         let preparation = prepare().unwrap();
-        let mut child = preparation.spawn(&pair.slave, long_running()).unwrap();
+        let mut child = preparation.spawn(&pair.slave, &long_running()).unwrap();
         let session =
             Session::adopt(preparation, child.process_id().unwrap(), &pair.master).unwrap();
         session.release();

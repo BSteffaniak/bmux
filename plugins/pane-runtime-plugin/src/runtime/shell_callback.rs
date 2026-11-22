@@ -6,12 +6,15 @@ use std::path::{Path, PathBuf};
 pub(super) fn prepare(root: &Path) -> Result<PathBuf> {
     // Prepare before the first pane. Later panes must not reopen build outputs
     // which may have been removed or replaced since this process started.
-    // Process-wide by design: it pins this process's own executable images.
-    static IMAGES: std::sync::OnceLock<
-        switchy_thread::sync::Mutex<std::collections::BTreeMap<PathBuf, (PathBuf, String)>>,
-    > = std::sync::OnceLock::new();
-    let mut images = IMAGES
-        .get_or_init(switchy_thread::sync::Mutex::default)
+    // Process-wide by design (one per simulated run): it pins this process's own executable
+    // images.
+    enum Images {}
+    let images = crate::run_shared::run_shared::<Images, _>(|| {
+        switchy_thread::sync::Mutex::new(
+            std::collections::BTreeMap::<PathBuf, (PathBuf, String)>::new(),
+        )
+    });
+    let mut images = images
         .lock()
         .map_err(|_| anyhow::anyhow!("shell callback image lock poisoned"))?;
     std::fs::create_dir_all(root)?;
