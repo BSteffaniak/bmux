@@ -16,23 +16,23 @@ bmux_plugin_sdk = { workspace = true }
 
 bmux_plugin_runtime = { workspace = true }
 # External dependencies (host-side only)
-bmux_cell_geometry  = { workspace = true }
-bmux_codec          = { workspace = true }
-bmux_ipc            = { workspace = true }
-bmux_keyboard       = { workspace = true, optional = true }
-bmux_perf_telemetry = { workspace = true }
-bmux_tui            = { workspace = true, features = ["serde"], optional = true }
-libloading          = { workspace = true }
-regex               = { workspace = true, features = ["perf", "unicode"] }
-serde               = { workspace = true, features = ["derive", "std"] }
-serde_json          = { workspace = true }
-sha2                = { workspace = true }
-tempfile            = { workspace = true }
-thiserror           = { workspace = true }
-tokio               = { workspace = true, features = ["rt", "sync", "time"] }
-toml                = { workspace = true, features = ["parse"] }
-tracing             = { workspace = true, features = ["std"] }
-uuid                = { workspace = true, features = ["serde", "std"] }
+bmux_codec              = { workspace = true }
+bmux_ipc                = { workspace = true }
+bmux_keyboard           = { workspace = true, optional = true }
+bmux_perf_telemetry     = { workspace = true }
+bmux_presentation_scene = { workspace = true }
+bmux_tui                = { workspace = true, features = ["serde"], optional = true }
+libloading              = { workspace = true }
+regex                   = { workspace = true, features = ["perf", "unicode"] }
+serde                   = { workspace = true, features = ["derive", "std"] }
+serde_json              = { workspace = true }
+sha2                    = { workspace = true }
+tempfile                = { workspace = true }
+thiserror               = { workspace = true }
+tokio                   = { workspace = true, features = ["rt", "sync", "time"] }
+toml                    = { workspace = true, features = ["parse"] }
+tracing                 = { workspace = true, features = ["std"] }
+uuid                    = { workspace = true, features = ["serde", "std"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -71,4 +71,5 @@ fail-on-warnings = [
     "bmux_tui?/fail-on-warnings",
     "bmux_keyboard?/fail-on-warnings",
     "bmux_perf_telemetry/fail-on-warnings",
+    "bmux_presentation_scene/fail-on-warnings",
 ]

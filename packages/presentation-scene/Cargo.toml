@@ -1,0 +1,19 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Neutral retained presentation contract for bmux: paint vocabulary, scenes, placement and typed interaction"
+edition     = { workspace = true }
+keywords    = ["bmux", "terminal", "presentation", "scene"]
+license     = { workspace = true }
+name        = "bmux_presentation_scene"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_cell_geometry = { workspace = true }
+serde              = { workspace = true, features = ["derive", "rc"] }
+
+[features]
+default          = []
+fail-on-warnings = ["bmux_cell_geometry/fail-on-warnings"]

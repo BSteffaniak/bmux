@@ -62,6 +62,7 @@ members = [
     "plugins/playbook-plugin-api",
     "packages/keybind",
     "packages/performance-state",
+    "packages/presentation-scene",
     "packages/presentation-state",
     "packages/perf-telemetry",
     "packages/plugin",
@@ -300,6 +301,7 @@ bmux_plugin_schema = { version = "0.0.1-alpha.4", default-features = false, path
 bmux_plugin_schema_macros = { version = "0.0.1-alpha.4", default-features = false, path = "packages/plugin-schema-macros" }
 bmux_plugin_sdk = { version = "0.0.1-alpha.4", default-features = false, path = "packages/plugin-sdk" }
 bmux_plugin_test = { version = "0.0.1-alpha.4", default-features = false, path = "packages/plugin-test" }
+bmux_presentation_scene = { version = "0.0.1-alpha.4", default-features = false, path = "packages/presentation-scene" }
 bmux_presentation_state = { version = "0.0.1-alpha.4", default-features = false, path = "packages/presentation-state" }
 bmux_presenter = { version = "0.0.1-alpha.4", default-features = false, path = "packages/presenter" }
 bmux_presenter_plugin = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/presenter-plugin" }

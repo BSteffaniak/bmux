@@ -575,12 +575,12 @@ dependencies = [
 name = "bmux_plugin"
 version = "0.0.1-alpha.4"
 dependencies = [
- "bmux_cell_geometry",
  "bmux_codec",
  "bmux_ipc",
  "bmux_perf_telemetry",
  "bmux_plugin_runtime",
  "bmux_plugin_sdk",
+ "bmux_presentation_scene",
  "libc",
  "libloading",
  "regex",
@@ -645,6 +645,14 @@ dependencies = [
  "toml",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "bmux_presentation_scene"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_cell_geometry",
+ "serde",
 ]
 
 [[package]]

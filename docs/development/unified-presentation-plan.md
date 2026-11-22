@@ -56,16 +56,21 @@ Four paths draw non-pane UI in the attach client today.
   `pane_extension_layers` records the corrected colour.
 - Ops cannot inherit what is beneath them: `Canvas::text` turns a `None` colour into
   the terminal default, so a text run over a filled surface resets the fill's
-  background (visible in the `sidebar_split` golden). The contract makes `None`
-  mean "inherit" and `Default` mean "terminal default".
+  background (visible in the `sidebar_split` golden). This is kept as the
+  contract's meaning (changing it would restyle every producer); show-through is
+  explicit through transparent cells.
 
 ## Target design
 
 ### One contract, owned by a neutral crate
 
-The contract types live in `bmux_tui::scene` (serde behind the existing `serde`
-feature). `bmux_tui` is already neutral and already what plugin authors import.
-`bmux_plugin::render` re-exports the paint vocabulary for existing callers.
+The contract types live in the neutral crate `bmux_presentation_scene`
+(`packages/presentation-scene`): `paint` holds the drawing vocabulary moved out
+of `bmux_plugin::render` (which re-exports it for existing callers), and `scene`
+holds placement, cell blocks and typed hits. Everything is plain serde data with
+no runtime, so the same types are published in process and encoded across a
+plugin boundary. (`bmux_scene_protocol` is unrelated: it is the decoration
+plugin's server protocol.)
 
 A publication from one owner is a snapshot of scenes:
 
@@ -124,7 +129,9 @@ ItemKind::Image(ImagePlacement)
   `RenderCell::sparse` and `PortablePresentation::cells`.
 - Graphics and images share the scene's z stream with text. The host keeps the
   existing order guarantee (pending text flushes before a graphic).
-- Style is `RenderStyle`, extended to the union of both style models (`hidden`).
+- Style is `RenderStyle`. A `None` colour keeps today's meaning (the terminal
+  default), so existing producers render unchanged; show-through is expressed
+  only by transparent cells (`SceneCell { symbol: None }`, sparse `RenderCell`).
   Underline style/colour and hyperlinks are reserved for later.
 - The host diffs items by key (as `extension_retained` does for path C today), so
   revision skipping and keyed damage apply to every producer.
@@ -181,9 +188,9 @@ Each phase lands with the parity harness and the targeted tests green.
 0. **Inventory, harness, baselines.** This document; golden full-frame tests for
    every path (`packages/cli/src/runtime/attach/presentation_parity_tests.rs`);
    perf baselines from `scripts/perf-render.py`.
-1. **Contract types** in `bmux_tui::scene` with serde, plus conversions from every
-   current representation (`RenderOp` lists, `RenderLayerScene`,
-   `PortablePresentation`).
+1. **Contract types** in `bmux_presentation_scene` with serde: the paint
+   vocabulary moved out of `bmux_plugin::render`, plus placement resolution
+   (`resolve_anchored`, `resolve_attached`), `CellBlock`, `HitKey`/`HitTable`.
 2. **Unified root lowering and ordering.** Path A surfaces carry scene items; root
    scenes paint in `(layer, z)` order; `clip_rect` honoured on full repaints;
    cells with transparency and graphemes; graphics and images on root scenes.
