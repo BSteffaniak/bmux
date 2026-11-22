@@ -1,13 +1,13 @@
-use super::StopAction;
+use crate::platform::StopAction;
 use std::io;
 
-pub(in super::super) fn supports_cooperative_stop() -> bool {
+pub(crate) fn supports_cooperative_stop() -> bool {
     // Windows panes run in a Job Object, which can only be terminated as a
     // whole: callers escalate straight to a forced sweep of the job.
     false
 }
 
-pub(in super::super) fn stop_foreground_group(
+pub(crate) fn stop_foreground_group(
     _master: &bmux_pty::PtyMaster,
     _action: StopAction,
 ) -> io::Result<Option<bool>> {
@@ -17,7 +17,7 @@ pub(in super::super) fn stop_foreground_group(
     ))
 }
 
-pub(in super::super) fn send_process_signal(
+pub(crate) fn send_process_signal(
     _process: &bmux_pane_runtime_state::PaneProcessIdentity,
     _signal: bmux_pane_runtime_state::PaneProcessSignal,
 ) -> anyhow::Result<()> {

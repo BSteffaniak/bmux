@@ -237,11 +237,7 @@ fn open_scoped_store(
         let lock_path = root.join("owner.lock");
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
+        crate::platform::host::private_file_no_follow(&mut options);
         let owner = options.open(lock_path).map_err(failed)?;
         owner.try_lock().map_err(|error| {
             failed(format!(
@@ -404,12 +400,7 @@ impl ReservationStore {
         // may be platform aliases and are not ownership evidence.
         validate_authority_directory(root)?;
         std::fs::create_dir_all(root).map_err(failed)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700))
-                .map_err(failed)?;
-        }
+        crate::platform::host::restrict_directory(root).map_err(failed)?;
         Ok(Self {
             root: root.to_path_buf(),
             owner_lock: None,

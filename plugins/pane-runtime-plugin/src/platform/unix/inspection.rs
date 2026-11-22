@@ -1,11 +1,10 @@
 //! Unix process observation and legacy user-directed signaling.
-#[cfg(all(not(target_os = "macos"), not(feature = "simulator")))]
-use super::super::bounded_probe_output;
-#[cfg(all(not(target_os = "macos"), not(feature = "simulator")))]
+#[cfg(not(target_os = "macos"))]
+use super::probe::bounded_probe_output;
+#[cfg(not(target_os = "macos"))]
 use std::time::Duration;
 
-#[cfg(not(feature = "simulator"))]
-pub(in super::super) fn send_process_signal_command(
+pub(crate) fn send_process_signal_command(
     program: &str,
     process: &bmux_pane_runtime_state::PaneProcessIdentity,
     signal: bmux_pane_runtime_state::PaneProcessSignal,
@@ -36,48 +35,15 @@ pub(in super::super) fn send_process_signal_command(
     }
 }
 
-#[cfg(not(feature = "simulator"))]
-pub(in super::super) fn send_process_signal(
+pub(crate) fn send_process_signal(
     process: &bmux_pane_runtime_state::PaneProcessIdentity,
     signal: bmux_pane_runtime_state::PaneProcessSignal,
 ) -> anyhow::Result<()> {
     send_process_signal_command("kill", process, signal)
 }
 
-pub(in super::super) fn process_command_looks_like_shell(command: &str, shell_path: &str) -> bool {
-    let Some(first) = command.split_whitespace().next() else {
-        return false;
-    };
-    let name = std::path::Path::new(first)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or(first)
-        .trim_start_matches('-')
-        .to_ascii_lowercase();
-    let shell_name = std::path::Path::new(shell_path)
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or(shell_path)
-        .trim_start_matches('-')
-        .to_ascii_lowercase();
-    name == shell_name
-        || matches!(
-            name.as_str(),
-            "sh" | "bash"
-                | "zsh"
-                | "fish"
-                | "nu"
-                | "nushell"
-                | "dash"
-                | "ksh"
-                | "mksh"
-                | "csh"
-                | "tcsh"
-        )
-}
-
-#[cfg(all(target_os = "macos", not(feature = "simulator")))]
-pub(in super::super) fn resolve_process_working_directory(pid: u32) -> Option<String> {
+#[cfg(target_os = "macos")]
+pub(crate) fn resolve_process_working_directory(pid: u32) -> Option<String> {
     let pid = i32::try_from(pid).ok()?;
     // SAFETY: integer-only C storage is initialized and the kernel receives its
     // exact size. No process-table subprocess or filesystem-wide lsof scan.
@@ -107,8 +73,8 @@ pub(in super::super) fn resolve_process_working_directory(pid: u32) -> Option<St
     std::path::Path::new(&path).is_absolute().then_some(path)
 }
 
-#[cfg(all(unix, not(target_os = "macos"), not(feature = "simulator")))]
-pub(in super::super) fn resolve_process_working_directory(pid: u32) -> Option<String> {
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn resolve_process_working_directory(pid: u32) -> Option<String> {
     let proc_cwd = std::path::PathBuf::from(format!("/proc/{pid}/cwd"));
     if let Ok(path) = std::fs::read_link(&proc_cwd)
         && !path.as_os_str().is_empty()

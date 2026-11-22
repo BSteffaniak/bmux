@@ -37,6 +37,7 @@ mod ids;
 pub mod observation;
 mod padding;
 mod padding_api;
+mod platform;
 mod private_input;
 mod readiness;
 mod run_shared;
@@ -45,8 +46,6 @@ mod runtime;
 pub use runtime::simulation;
 mod snapshot;
 mod snapshot_v1_migration;
-#[cfg(windows)]
-mod windows_environment;
 
 #[cfg(test)]
 mod retired_execution_tests;
@@ -437,9 +436,7 @@ impl PaneRuntimePlugin {
                 shell: switchy_env::var("SHELL")
                     .ok()
                     .filter(|shell| !shell.trim().is_empty())
-                    .unwrap_or_else(|| {
-                        if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }.to_string()
-                    }),
+                    .unwrap_or_else(|| crate::platform::baseline_shell().to_string()),
                 pane_term: "xterm-256color".to_string(),
                 bracketed_paste: true,
                 shell_integration_root: None,

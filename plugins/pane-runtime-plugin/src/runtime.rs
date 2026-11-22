@@ -1,8 +1,7 @@
 //! Concrete pane runtime implementation owned by the pane-runtime plugin.
 
 mod capture_writer;
-#[cfg(all(unix, not(feature = "simulator")))]
-mod crash_guard;
+mod console_startup;
 mod durable_capture;
 mod environment;
 pub(crate) mod execution;
@@ -13,23 +12,19 @@ pub(crate) mod input_authority;
 pub(crate) mod live_presentation;
 pub(crate) mod managed_idle;
 mod managed_scope;
-mod native_process;
 pub(crate) mod output_filters;
 pub(crate) mod pty;
 pub(crate) mod reservations;
 pub(crate) mod session_control;
-#[cfg(all(unix, not(feature = "simulator")))]
-mod session_sweep;
 mod shell_callback;
 #[cfg(feature = "simulator")]
 pub mod simulation;
 mod startup_capture;
 
-use native_process::send_process_signal;
-#[cfg(all(unix, test))]
-use native_process::send_process_signal_command;
-#[cfg(unix)]
-use native_process::{process_command_looks_like_shell, resolve_process_working_directory};
+use crate::platform::{
+    ProcessStartIdentity, PsProcessEntry, process_start_identity as process_start_identity_for_pid,
+    resolve_process_working_directory, send_process_signal,
+};
 
 use anyhow::{Context, Result};
 use bmux_attach_layout_protocol::{
@@ -63,8 +58,6 @@ use bmux_terminal_grid::{
     StreamedString, TerminalGrid, TerminalGridStream,
 };
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
-#[cfg(all(test, unix))]
-use pty::Slave as _;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -446,6 +439,7 @@ impl PaneRuntimeHost {
     /// std's lock).
     pub(crate) fn fact_service(
         &self,
+        // simulation-safe: core's state registry type, written only at registration
     ) -> Arc<std::sync::RwLock<bmux_presentation_state::PresentationFactHostService>> {
         self.states
             .get_or_insert_with(bmux_presentation_state::PresentationFactHostService::new)
@@ -473,62 +467,14 @@ fn path_like_program(program: &str) -> bool {
     path.is_absolute() || path.components().count() > 1
 }
 
-fn path_is_usable_program(path: &Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
-fn program_name_is_on_path(program: &str) -> bool {
-    let Some(path) = switchy_env::var_os("PATH") else {
-        return false;
-    };
-    for directory in std::env::split_paths(&path) {
-        let candidate = directory.join(program);
-        if path_is_usable_program(&candidate) {
-            return true;
-        }
-        #[cfg(windows)]
-        if candidate.extension().is_none() {
-            let path_ext =
-                switchy_env::var_os("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
-            for extension in path_ext.to_string_lossy().split(';') {
-                let extension = extension.trim().trim_start_matches('.');
-                if !extension.is_empty()
-                    && path_is_usable_program(&candidate.with_extension(extension))
-                {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
 fn program_is_usable(program: &str) -> bool {
     let program = program.trim();
     !program.is_empty()
         && if path_like_program(program) {
-            path_is_usable_program(Path::new(program))
+            crate::platform::path_is_usable_program(Path::new(program))
         } else {
-            program_name_is_on_path(program)
+            crate::platform::program_name_is_on_path(program)
         }
-}
-
-fn platform_baseline_shell() -> &'static str {
-    if cfg!(windows) { "cmd.exe" } else { "/bin/sh" }
 }
 
 fn shell_basename(shell: &str) -> Option<String> {
@@ -582,7 +528,7 @@ fn resolve_pane_launch(
         resolve_shell_with_baseline(
             &pane_meta.shell,
             configured_shell,
-            platform_baseline_shell(),
+            crate::platform::baseline_shell(),
         )?
     };
     let cwd = valid_resurrection_cwd(pane_meta.resurrection.last_known_cwd.as_deref());
@@ -880,7 +826,7 @@ async fn shutdown_panes_owned(
                 // even when that operation failed or remained uncertain.
                 if let Err(error) = lifetime
                     .execution
-                    .signal_owned_group(host, native_process::StopAction::Force)
+                    .signal_owned_group(host, crate::platform::StopAction::Force)
                 {
                     lifetime
                         .execution
@@ -1387,50 +1333,6 @@ fn kill_unreaped_leader(
     }
     let _ = killer.kill();
 }
-
-/// Block until `pid` (our child) has exited, without reaping it.
-#[cfg(feature = "simulator")]
-fn wait_for_exit_without_reaping(pid: u32) {
-    use switchy_pty::simulator::ProcessState;
-    // Polled on the run's clock: the simulated kernel has no waitid.
-    while switchy_pty::simulator::snapshot()
-        .processes
-        .iter()
-        .any(|process| process.pid == pid && process.state == ProcessState::Running)
-    {
-        switchy_thread::thread::sleep(Duration::from_millis(1));
-    }
-}
-
-/// Block until `pid` (our child) has exited, without reaping it.
-#[cfg(all(unix, not(feature = "simulator")))]
-fn wait_for_exit_without_reaping(pid: u32) {
-    let pid = libc::id_t::from(pid);
-    loop {
-        // SAFETY: zeroed siginfo is valid output storage.
-        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: waiting on our own child; WNOWAIT leaves it to child.wait().
-        let result = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                pid,
-                &raw mut info,
-                libc::WEXITED | libc::WNOWAIT,
-            )
-        };
-        if result == 0 {
-            return;
-        }
-        if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-            // ECHILD and friends: the caller's own wait reports the outcome.
-            return;
-        }
-    }
-}
-
-/// Windows process handles stay valid after exit, so there is no pid to fence.
-#[cfg(not(any(unix, feature = "simulator")))]
-const fn wait_for_exit_without_reaping(_pid: u32) {}
 
 struct StartupChild {
     child: Option<Box<dyn crate::runtime::pty::Child + Send + Sync>>,
@@ -2596,12 +2498,14 @@ impl ReaderImages for FollowImages<'_, '_> {
 }
 
 /// Output filters shared through core's state registry, behind std's lock.
+// simulation-safe: read for one chunk's parse, with no switch point inside
 type SharedFilters = Arc<std::sync::RwLock<bmux_terminal_grid::SequenceFilters>>;
 
 /// The registered filters, read for one chunk (a poisoned lock reads as none: filters shape what
 /// panes show, they gate no access).
 fn read_filters(
     shared: Option<&SharedFilters>,
+    // simulation-safe: see SharedFilters
 ) -> Option<std::sync::RwLockReadGuard<'_, bmux_terminal_grid::SequenceFilters>> {
     shared.and_then(|filters| filters.read().ok())
 }
@@ -3986,7 +3890,6 @@ fn shell_kind_for_path(shell: &str) -> ShellKind {
         .trim_start_matches('-')
         .to_ascii_lowercase();
     // Windows shells are executables such as `nu.exe`.
-    #[cfg(windows)]
     let basename = basename
         .strip_suffix(".exe")
         .map_or_else(|| basename.clone(), str::to_owned);
@@ -4131,11 +4034,7 @@ fn write_shell_integration_file(path: &std::path::Path, contents: &str) -> Resul
         std::fs::create_dir_all(parent).with_context(|| {
             format!("failed creating shell integration dir {}", parent.display())
         })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
-        }
+        crate::platform::host::restrict_directory(parent)?;
     }
     if let Ok(existing) = std::fs::read_to_string(path)
         && existing == contents
@@ -6986,9 +6885,6 @@ fn layout_from_panes(panes: &[PaneRuntimeMeta]) -> Option<PaneLayoutNode> {
     Some(root)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ProcessStartIdentity(u64, u64);
-
 // Process-wide bound on in-flight OS process-identity probes: they occupy OS
 // threads shared by every activation in this process.
 /// Process start identity probes running (see [`crate::run_shared`]).
@@ -7050,64 +6946,6 @@ async fn bounded_start_identity_probe(
         .ok()?
 }
 
-fn process_start_identity_for_pid(pid: u32) -> Option<ProcessStartIdentity> {
-    // A simulated process's serial is unique for the whole run, as a start time is.
-    #[cfg(feature = "simulator")]
-    {
-        switchy_pty::simulator::serial_of(pid).map(|serial| ProcessStartIdentity(serial, 0))
-    }
-    #[cfg(all(target_os = "macos", not(feature = "simulator")))]
-    {
-        let pid = i32::try_from(pid).ok()?;
-        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
-        let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
-        // SAFETY: the writable buffer has exactly the advertised record size.
-        let written = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDTBSDINFO,
-                0,
-                info.as_mut_ptr().cast(),
-                size,
-            )
-        };
-        if written != size {
-            return None;
-        }
-        // SAFETY: proc_pidinfo returned the complete initialized record.
-        let info = unsafe { info.assume_init() };
-        Some(ProcessStartIdentity(
-            info.pbi_start_tvsec,
-            info.pbi_start_tvusec,
-        ))
-    }
-    #[cfg(all(target_os = "linux", not(feature = "simulator")))]
-    {
-        use std::io::Read;
-        let mut stat = String::new();
-        std::fs::File::open(format!("/proc/{pid}/stat"))
-            .ok()?
-            .take(8192)
-            .read_to_string(&mut stat)
-            .ok()?;
-        parse_linux_process_start(&stat)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", feature = "simulator")))]
-    {
-        let _ = pid;
-        None
-    }
-}
-
-#[cfg(any(all(target_os = "linux", not(feature = "simulator")), test))]
-fn parse_linux_process_start(stat: &str) -> Option<ProcessStartIdentity> {
-    // comm is parenthesized and may itself contain spaces and parentheses.
-    // The suffix begins at field 3; starttime is field 22.
-    let (_, suffix) = stat.rsplit_once(')')?;
-    let ticks = suffix.split_whitespace().nth(19)?.parse().ok()?;
-    Some(ProcessStartIdentity(ticks, 0))
-}
-
 fn observe_process_directory_for_identity(
     pid: u32,
     expected: ProcessStartIdentity,
@@ -7115,63 +6953,8 @@ fn observe_process_directory_for_identity(
     if process_start_identity_for_pid(pid)? != expected {
         return None;
     }
-    let directory = observe_process_directory(pid)?;
+    let directory = crate::platform::process_directory(pid)?;
     (process_start_identity_for_pid(pid)? == expected).then_some(directory)
-}
-
-fn observe_process_directory(pid: u32) -> Option<String> {
-    #[cfg(feature = "simulator")]
-    {
-        switchy_pty::simulator::snapshot()
-            .processes
-            .into_iter()
-            .find(|process| process.pid == pid)
-            .map(|process| process.cwd.to_string_lossy().into_owned())
-    }
-    #[cfg(all(target_os = "macos", not(feature = "simulator")))]
-    {
-        let pid = i32::try_from(pid).ok()?;
-        let mut info = std::mem::MaybeUninit::<libc::proc_vnodepathinfo>::zeroed();
-        let size = i32::try_from(std::mem::size_of::<libc::proc_vnodepathinfo>()).ok()?;
-        // SAFETY: info points to writable storage of exactly the supplied size.
-        // proc_pidinfo initializes this fixed-size record on a complete result.
-        let written = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDVNODEPATHINFO,
-                0,
-                info.as_mut_ptr().cast(),
-                size,
-            )
-        };
-        if written != size {
-            return None;
-        }
-        // SAFETY: the OS returned a complete initialized record above.
-        let info = unsafe { info.assume_init() };
-        let bytes = info
-            .pvi_cdir
-            .vip_path
-            .into_iter()
-            .flatten()
-            .map(|byte| byte.to_ne_bytes()[0])
-            .take_while(|byte| *byte != 0)
-            .collect::<Vec<_>>();
-        String::from_utf8(bytes)
-            .ok()
-            .filter(|path| Path::new(path).is_absolute())
-    }
-    #[cfg(all(target_os = "linux", not(feature = "simulator")))]
-    {
-        std::fs::read_link(format!("/proc/{pid}/cwd"))
-            .ok()
-            .and_then(|path| path.into_os_string().into_string().ok())
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "linux", feature = "simulator")))]
-    {
-        let _ = pid;
-        None
-    }
 }
 
 fn validate_initial_shell_options(
@@ -8070,25 +7853,31 @@ impl SessionRuntimeManager {
                     return;
                 }
             };
-            // ConPTY asks for its inherited cursor before the program it hosts
-            // can run. Own this PTY's writer before starting the raw drain so
-            // the bootstrap reader can answer before the spawn below.
-            #[cfg(windows)]
-            let early_writer = match pty_pair.master.take_writer() {
-                Ok(writer) => Arc::new(switchy_thread::sync::Mutex::new(
-                    Box::new(writer) as Box<dyn std::io::Write + Send>
-                )),
-                Err(error) => {
-                    fail_startup!(format!("failed to open startup PTY writer: {error}"));
-                    return;
+            // A pseudo-console (ConPTY) asks for its inherited cursor before the
+            // program it hosts can run. Own this PTY's writer before starting the
+            // raw drain so the bootstrap reader can answer before the spawn below.
+            let console_query = bmux_pty::behavior().startup_cursor_query;
+            let early_writer = if console_query {
+                match pty_pair.master.take_writer() {
+                    Ok(writer) => Some(Arc::new(switchy_thread::sync::Mutex::new(
+                        Box::new(writer) as Box<dyn std::io::Write + Send>,
+                    ))),
+                    Err(error) => {
+                        fail_startup!(format!("failed to open startup PTY writer: {error}"));
+                        return;
+                    }
                 }
+            } else {
+                None
             };
-            #[cfg(windows)]
-            let raw_reader = Box::new(native_process::conpty_startup::BootstrapReader::new(
-                raw_reader,
-                Arc::clone(&early_writer),
-                pane_id,
-            )) as Box<dyn Read + Send>;
+            let raw_reader = match &early_writer {
+                Some(writer) => Box::new(console_startup::BootstrapReader::new(
+                    raw_reader,
+                    Arc::clone(writer),
+                    pane_id,
+                )) as Box<dyn Read + Send>,
+                None => raw_reader,
+            };
             // Reserved capture was installed before the launch permit opened.
             // Transfer the sole disk owner before starting any raw PTY reader.
             let pending_capture = execution_for_task
@@ -8198,7 +7987,7 @@ impl SessionRuntimeManager {
             let (startup_cleanup_tx, _) = watch::channel(None);
             let spawned = match execution_for_task.authorize_spawn() {
                 Ok(()) => session_preparation
-                    .spawn(&pty_pair.slave, command)
+                    .spawn(&pty_pair.slave, &command)
                     .map(|child| StartupChild::new(&host, child))
                     .map_err(anyhow::Error::from),
                 Err(error) => Err(error),
@@ -8213,11 +8002,10 @@ impl SessionRuntimeManager {
                     return;
                 }
             };
-            // Only the later Unix writer-installation failure still needs
-            // this flag. Windows already owns its writer; all later failure
+            // Only the later writer-installation failure still needs this
+            // flag. A pseudo-console's writer is already owned; all later failure
             // paths supply capture cleanup explicitly in fail_captured_startup.
-            #[cfg(not(windows))]
-            {
+            if early_writer.is_none() {
                 child_spawned = true;
             }
             let target_pid = child.process_id();
@@ -8321,9 +8109,17 @@ impl SessionRuntimeManager {
 
             let master = pty_pair.master;
 
-            #[cfg(not(windows))]
-            let writer = match master.take_writer() {
-                Ok(writer) => Box::new(writer) as Box<dyn std::io::Write + Send>,
+            let writer = match early_writer.map_or_else(
+                || {
+                    master.take_writer().map(|writer| {
+                        Arc::new(switchy_thread::sync::Mutex::new(
+                            Box::new(writer) as Box<dyn std::io::Write + Send>
+                        ))
+                    })
+                },
+                Ok,
+            ) {
+                Ok(writer) => writer,
                 Err(error) => {
                     // Kill the adopted session as a whole, not just its leader.
                     if let Err(cleanup) = execution_for_task.release_session() {
@@ -8356,10 +8152,6 @@ impl SessionRuntimeManager {
                     return;
                 }
             };
-            #[cfg(not(windows))]
-            let writer = Arc::new(switchy_thread::sync::Mutex::new(writer));
-            #[cfg(windows)]
-            let writer = early_writer;
             *execution_for_task
                 .master
                 .lock()
@@ -8400,7 +8192,7 @@ impl SessionRuntimeManager {
                     // Observe the exit without reaping, fence the leader's pid,
                     // then reap: from here on nothing signals that pid again.
                     if let Some(pid) = child.process_id() {
-                        wait_for_exit_without_reaping(pid);
+                        crate::platform::wait_for_exit_without_reaping(pid);
                     }
                     execution_for_waiter.mark_leader_exited();
                     let wait_result = child.wait();
@@ -8480,8 +8272,8 @@ impl SessionRuntimeManager {
                     }
                     tracing::debug!(pane_id = %pane_id, "execution reader publication released");
                     let mut buffer = [0_u8; 8192];
-                    #[cfg(windows)]
-                    let mut conpty_projection = native_process::conpty_startup::PrefixQuery::default();
+                    let mut conpty_projection =
+                        console_query.then(console_startup::PrefixQuery::default);
                     let mut protocol_engine = TerminalProtocolEngine::new(protocol_profile)
                         .with_bracketed_paste_support(bracketed_paste_supported);
                     let mut capture_handshake = crate::capture_handshake::CaptureHandshake::default();
@@ -8540,12 +8332,11 @@ impl SessionRuntimeManager {
                                 // execution's leading transport query. Keep it in
                                 // durable capture, but never replay its reply after
                                 // publication or interpret it as application input.
-                                #[cfg(windows)]
-                                let projected = conpty_projection.project(&buffer[..bytes_read]).0;
-                                #[cfg(windows)]
-                                let protocol_chunk = projected.as_ref();
-                                #[cfg(not(windows))]
-                                let protocol_chunk = &buffer[..bytes_read];
+                                let projected = conpty_projection
+                                    .as_mut()
+                                    .map(|projection| projection.project(&buffer[..bytes_read]).0);
+                                let protocol_chunk =
+                                    projected.as_deref().unwrap_or(&buffer[..bytes_read]);
                                 let (capture_output, capture_reply) = capture_handshake.process_with_fence(&host, protocol_chunk, pane_id, || {
                                     let (sent, received) = switchy_thread::sync::mpsc::sync_channel(1);
                                     fence_input_for_reader.send(PaneRuntimeCommand::InputFence(sent)).is_ok()
@@ -8813,7 +8604,7 @@ impl SessionRuntimeManager {
                     "failed to start pane I/O supervision threads".into()
                 )));
                 if let Err(error) =
-                    execution_for_task.signal_owned_group(&host, native_process::StopAction::Force)
+                    execution_for_task.signal_owned_group(&host, crate::platform::StopAction::Force)
                 {
                     execution_for_task.record_cleanup_error(format!(
                         "startup-thread group cleanup failed: {error}"
@@ -8851,7 +8642,7 @@ impl SessionRuntimeManager {
                                 resurrection: Arc::clone(&resurrection_state_for_shutdown),
                             };
                             let cleanup = switchy_async::task::spawn_blocking({ let host = host.clone(); move || {
-                                if let Err(error) = lifetime.execution.signal_owned_group(&host, native_process::StopAction::Force) {
+                                if let Err(error) = lifetime.execution.signal_owned_group(&host, crate::platform::StopAction::Force) {
                                     lifetime.execution.record_cleanup_error(format!("reader-failure group cleanup failed: {error}"));
                                 }
                                 lifetime.revoke();
@@ -8876,7 +8667,7 @@ impl SessionRuntimeManager {
                             if let Err(error) = frozen {
                                 execution.record_cleanup_error(format!("checkpoint freeze failed: {error}"));
                             }
-                            if let Err(error) = execution.signal_owned_group(&host, native_process::StopAction::Force) {
+                            if let Err(error) = execution.signal_owned_group(&host, crate::platform::StopAction::Force) {
                                 execution.record_cleanup_error(format!("group stop failed: {error}"));
                             }
                             let lifetime = PaneLifetime { execution, resurrection };
@@ -8941,7 +8732,7 @@ impl SessionRuntimeManager {
                                     // Sweep while the live PTY/session still
                                     // supplies group authority; killing its leader
                                     // first can strand descendants on direct paths.
-                                    if let Err(error) = execution_for_task.signal_owned_group(&host, native_process::StopAction::Force) {
+                                    if let Err(error) = execution_for_task.signal_owned_group(&host, crate::platform::StopAction::Force) {
                                         execution_for_task.record_cleanup_error(format!("input-failure group cleanup failed: {error}"));
                                     }
                                     kill_unreaped_leader(&execution_for_task, &mut child_killer);
@@ -8968,8 +8759,9 @@ impl SessionRuntimeManager {
             // deciding about the console below: ConPTY output ends only at
             // ClosePseudoConsole, so keeping the console here would leave the
             // reader, and the supervision join after it, waiting forever.
-            #[cfg(windows)]
-            while execution_for_task.group_kill_issued.load(Ordering::SeqCst)
+            let console_owns_output = bmux_pty::behavior().output_ends_with_console;
+            while console_owns_output
+                && execution_for_task.group_kill_issued.load(Ordering::SeqCst)
                 && !execution_for_task
                     .terminal_owner_retired
                     .load(Ordering::SeqCst)
@@ -8985,19 +8777,17 @@ impl SessionRuntimeManager {
             // owner has retired, close the console concurrently with the live
             // raw/projection readers: ClosePseudoConsole itself may wait for
             // their drain. Never infer EOF or an exit outcome from this close.
-            #[cfg(windows)]
-            if execution_for_task
-                .terminal_owner_retired
-                .load(Ordering::SeqCst)
+            if console_owns_output
+                && execution_for_task
+                    .terminal_owner_retired
+                    .load(Ordering::SeqCst)
             {
                 let master = execution_for_task
                     .master
                     .lock()
                     .expect("master lock")
                     .take();
-                if let Err(error) =
-                    native_process::conpty_startup::close_retired_console(master).await
-                {
+                if let Err(error) = console_startup::close_retired_console(master).await {
                     execution_for_task
                         .record_cleanup_error(format!("retired console close failed: {error}"));
                 }
@@ -9013,7 +8803,7 @@ impl SessionRuntimeManager {
                             .is_ok_and(|outcome| outcome.2.is_some())
                     {
                         if let Err(error) = execution_for_task
-                            .signal_owned_group(&host, native_process::StopAction::Force)
+                            .signal_owned_group(&host, crate::platform::StopAction::Force)
                         {
                             execution_for_task.record_cleanup_error(format!(
                                 "failed-reader group cleanup failed: {error}"
@@ -9027,7 +8817,7 @@ impl SessionRuntimeManager {
                 }
                 if !execution_for_task.output_drained.load(Ordering::SeqCst) {
                     if let Err(error) = execution_for_task
-                        .signal_owned_group(&host, native_process::StopAction::Force)
+                        .signal_owned_group(&host, crate::platform::StopAction::Force)
                     {
                         execution_for_task.record_cleanup_error(format!(
                             "reader-failure group cleanup failed: {error}"
@@ -11159,6 +10949,7 @@ impl ServerSessionRuntimeAdapter {
             session_id,
             attached_clients: attached,
             // Core's server type holds the token behind std's lock.
+            // simulation-safe: taken once by its single owner
             shutdown_token: Arc::new(std::sync::Mutex::new(Some(boxed))),
         }
     }
@@ -13663,32 +13454,6 @@ struct ProcessInspectionResult {
     cwd: Option<String>,
 }
 
-#[cfg(unix)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PsProcessEntry {
-    pid: u32,
-    pgid: i32,
-    state: String,
-    command: String,
-}
-
-#[cfg(unix)]
-fn parse_ps_process_entry(line: &str) -> Option<PsProcessEntry> {
-    let mut parts = line.split_whitespace();
-    let pid = parts.next()?.parse::<u32>().ok()?;
-    let process_group = parts.next()?.parse::<i32>().ok()?;
-    let state = parts.next()?.to_string();
-    let command = parts.collect::<Vec<_>>().join(" ");
-
-    Some(PsProcessEntry {
-        pid,
-        pgid: process_group,
-        state,
-        command,
-    })
-}
-
-#[cfg(unix)]
 fn inspect_process_group_entries_with_resolver<F>(
     entries: &[PsProcessEntry],
     process_group_id: i32,
@@ -13742,118 +13507,14 @@ where
     Some(ProcessInspectionResult { command, cwd })
 }
 
-#[cfg(unix)]
-struct InspectionChild {
-    child: Option<std::process::Child>,
-    permit: Option<tokio::sync::OwnedSemaphorePermit>,
-}
-
-#[cfg(unix)]
-impl Drop for InspectionChild {
-    fn drop(&mut self) {
-        if let (Some(child), Some(permit)) = (self.child.take(), self.permit.take()) {
-            retire_inspection_child(child, permit);
-        }
-    }
-}
-
-#[cfg(unix)]
-fn retire_inspection_child(
-    mut child: std::process::Child,
-    permit: tokio::sync::OwnedSemaphorePermit,
-) {
-    let _ = child.kill();
-    if matches!(child.try_wait(), Ok(Some(_))) {
-        return;
-    }
-    switchy_thread::thread::spawn(move || {
-        let _permit = permit;
-        let _ = child.wait();
-    });
-}
-
-/// Deadline-bound observation. A kernel-stuck child retains an admission slot
-/// and its exact owned reaper, never extending the observation caller's wait.
-#[cfg(unix)]
-fn bounded_probe_output(
-    command: &mut std::process::Command,
-    timeout: Duration,
-) -> std::io::Result<Vec<u8>> {
-    use std::io::{Read, Seek};
-    use std::process::Stdio;
-    // Process-wide bound on concurrent OS subprocess probes (threads and pipes
-    // shared by every activation in this process).
-    static SLOTS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
-    let permit = Arc::clone(SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(4))))
-        .try_acquire_owned()
-        .map_err(|_| std::io::Error::other("inspection reapers busy"))?;
-    let mut output = tempfile::tempfile()?;
-    let child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(output.try_clone()?))
-        .stderr(Stdio::null())
-        .spawn()?;
-    let mut owned = InspectionChild {
-        child: Some(child),
-        permit: Some(permit),
-    };
-    let child = owned.child.as_mut().expect("inspection child owned");
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        let oversized = output.metadata().is_ok_and(|meta| meta.len() > 1_048_576);
-        if oversized {
-            return Err(std::io::Error::other(
-                "process inspection output exceeds limit",
-            ));
-        }
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => {
-                switchy_thread::thread::sleep(Duration::from_millis(2));
-            }
-            result => {
-                return Err(match result {
-                    Err(error) => error,
-                    _ => std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "process inspection timed out",
-                    ),
-                });
-            }
-        }
-    };
-    if !status.success() {
-        return Err(std::io::Error::other("process inspection failed"));
-    }
-    output.rewind()?;
-    let mut bytes = Vec::new();
-    output.take(1_048_577).read_to_end(&mut bytes)?;
-    if bytes.len() > 1_048_576 {
-        return Err(std::io::Error::other(
-            "process inspection output exceeds limit",
-        ));
-    }
-    Ok(bytes)
-}
-
-#[cfg(unix)]
+/// The command and working directory of what runs in process group `process_group_id`.
 fn inspect_process_group_command_and_cwd(
     process_group_id: Option<i32>,
     shell_pid: Option<u32>,
     shell_path: &str,
 ) -> Option<ProcessInspectionResult> {
     let process_group_id = process_group_id?;
-    let bytes = bounded_probe_output(
-        std::process::Command::new("ps").args(["-A", "-o", "pid=,pgid=,state=,command="]),
-        Duration::from_millis(200),
-    )
-    .ok()?;
-
-    let entries = String::from_utf8_lossy(&bytes)
-        .lines()
-        .filter_map(parse_ps_process_entry)
-        .collect::<Vec<_>>();
-
+    let entries = crate::platform::process_table()?;
     inspect_process_group_entries_with_resolver(
         &entries,
         process_group_id,
@@ -13863,13 +13524,36 @@ fn inspect_process_group_command_and_cwd(
     )
 }
 
-#[cfg(not(unix))]
-fn inspect_process_group_command_and_cwd(
-    _process_group_id: Option<i32>,
-    _shell_pid: Option<u32>,
-    _shell_path: &str,
-) -> Option<ProcessInspectionResult> {
-    None
+fn process_command_looks_like_shell(command: &str, shell_path: &str) -> bool {
+    let Some(first) = command.split_whitespace().next() else {
+        return false;
+    };
+    let name = std::path::Path::new(first)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(first)
+        .trim_start_matches('-')
+        .to_ascii_lowercase();
+    let shell_name = std::path::Path::new(shell_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(shell_path)
+        .trim_start_matches('-')
+        .to_ascii_lowercase();
+    name == shell_name
+        || matches!(
+            name.as_str(),
+            "sh" | "bash"
+                | "zsh"
+                | "fish"
+                | "nu"
+                | "nushell"
+                | "dash"
+                | "ksh"
+                | "mksh"
+                | "csh"
+                | "tcsh"
+        )
 }
 
 fn with_padding_manager<R>(
@@ -14240,14 +13924,17 @@ pub(crate) fn activate_pane_runtime(
     // Core's state registry holds its entries behind std's locks.
     host.states()
         .register::<bmux_pane_runtime_state::SessionRuntimeManagerHandle>(&Arc::new(
+            // simulation-safe: core's state registry type, written only at registration
             std::sync::RwLock::new(runtime_handle),
         ));
     host.states()
+        // simulation-safe: core's state registry type, written only at registration
         .register::<PanePaddingRuntimeHandle>(&Arc::new(std::sync::RwLock::new(
             PanePaddingRuntimeHandle(Arc::clone(&manager)),
         )));
 
     host.states()
+        // simulation-safe: core's state registry type, written only at registration
         .register::<SpawnRuntimeHandle>(&Arc::new(std::sync::RwLock::new(SpawnRuntimeHandle(
             Arc::clone(&manager),
             switchy_async::runtime::Handle::current(),
@@ -14935,7 +14622,7 @@ mod tests {
             }
             if let Err(error) = self
                 .0
-                .signal_owned_group(host, native_process::StopAction::Force)
+                .signal_owned_group(host, crate::platform::StopAction::Force)
             {
                 eprintln!("test process cleanup requires recovery: {error}");
             }
@@ -15098,13 +14785,13 @@ exit 7"#
         assert!(
             !pane
                 .execution
-                .signal_owned_group(host, native_process::StopAction::Cooperative)
+                .signal_owned_group(host, crate::platform::StopAction::Cooperative)
                 .unwrap()
         );
         assert!(
             !pane
                 .execution
-                .signal_owned_group(host, native_process::StopAction::Force)
+                .signal_owned_group(host, crate::platform::StopAction::Force)
                 .unwrap()
         );
         assert_eq!(process_start_identity_for_pid(descendant), Some(identity));
@@ -15322,6 +15009,12 @@ exit 7"#
     }
 
     use super::*;
+    // Native checks of the platform layer's Unix target.
+    #[cfg(unix)]
+    use crate::platform::{
+        bounded_probe_output, parse_linux_process_start, parse_ps_process_entry,
+        process_directory as observe_process_directory, send_process_signal_command,
+    };
 
     #[test]
     fn nested_program_environment_cannot_inherit_managed_launch_authority() {
@@ -17999,7 +17692,7 @@ exit 7"#
         let pair = bmux_pty::PtyPair::open(PtySize { rows: 24, cols: 80 }).unwrap();
         let mut command = SpawnCommand::new("/bin/sh");
         command.args(["-c", "exec sleep 60"]);
-        let child = pair.slave.spawn_command(command).unwrap();
+        let child = pty::spawn(&pair.slave, &command).unwrap();
         let pid = child.process_id().unwrap();
         let reason =
             cleanup_failed_startup_child(host, child, "injected startup failure".into()).await;
@@ -18015,7 +17708,7 @@ exit 7"#
         let pair = bmux_pty::PtyPair::open(PtySize { rows: 24, cols: 80 }).unwrap();
         let mut command = SpawnCommand::new("/bin/sh");
         command.args(["-c", "exec sleep 60"]);
-        let child = pair.slave.spawn_command(command).unwrap();
+        let child = pty::spawn(&pair.slave, &command).unwrap();
         let pid = child.process_id().unwrap();
         let identity = process_start_identity_for_pid(pid).unwrap();
         let (acknowledgement, mut cleanup) = watch::channel(None);
@@ -18048,7 +17741,7 @@ exit 7"#
         let pair = bmux_pty::PtyPair::open(PtySize { rows: 24, cols: 80 }).unwrap();
         let mut command = SpawnCommand::new("/bin/sh");
         command.args(["-c", "exec sleep 60"]);
-        let child = pair.slave.spawn_command(command).unwrap();
+        let child = pty::spawn(&pair.slave, &command).unwrap();
         let pid = child.process_id().unwrap();
         let identity = process_start_identity_for_pid(pid).unwrap();
         let guard = StartupChild::new(host, child);
@@ -18079,7 +17772,7 @@ exit 7"#
         let pair = bmux_pty::PtyPair::open(PtySize { rows: 24, cols: 80 }).unwrap();
         let mut command = SpawnCommand::new("/bin/sh");
         command.args(["-c", "exec sleep 60"]);
-        let child = pair.slave.spawn_command(command).unwrap();
+        let child = pty::spawn(&pair.slave, &command).unwrap();
         let pid = child.process_id().unwrap();
         let identity = process_start_identity_for_pid(pid).unwrap();
         let guard = StartupChild::new(host, child);

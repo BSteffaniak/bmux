@@ -13,15 +13,7 @@ use std::path::{Path, PathBuf};
 use switchy_thread::sync::Mutex;
 use switchy_thread::sync::atomic::{AtomicBool, Ordering};
 
-#[cfg(feature = "simulator")]
-#[path = "session_control/simulated.rs"]
-mod backend;
-#[cfg(all(unix, not(feature = "simulator")))]
-#[path = "session_control/unix.rs"]
-mod backend;
-#[cfg(all(windows, not(feature = "simulator")))]
-#[path = "session_control/windows.rs"]
-mod backend;
+use crate::platform::session as backend;
 
 pub(super) use backend::Preparation;
 
@@ -177,6 +169,8 @@ pub(crate) struct SessionControl {
     /// Set, under the execution's session lock, once the leader has exited
     /// and before it is reaped. Signals to the leader pid are refused after.
     leader_exited: AtomicBool,
+    /// Set once [`Self::end_lifetime`] gave up authority over the session.
+    released: AtomicBool,
     record: Mutex<Option<PathBuf>>,
 }
 
@@ -210,6 +204,7 @@ impl SessionControl {
             backend,
             leader,
             leader_exited: AtomicBool::new(false),
+            released: AtomicBool::new(false),
             record: Mutex::new(record),
         })
     }
@@ -241,6 +236,11 @@ impl SessionControl {
     /// # Errors
     /// Discovery or signal failures, or members that survive verification.
     pub(super) fn force_stop(&self) -> std::io::Result<()> {
+        // Authority already given up: nothing left is ours to stop. On Windows closing the
+        // job ended it; on Unix the session id may belong to someone else by now.
+        if self.released.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         self.backend.sweep()
     }
 
@@ -249,6 +249,9 @@ impl SessionControl {
     /// # Errors
     /// Discovery failures.
     pub(super) fn occupied(&self) -> std::io::Result<bool> {
+        if self.released.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
         self.backend.occupied()
     }
 
@@ -264,6 +267,7 @@ impl SessionControl {
     /// # Errors
     /// A crash record that cannot be deleted.
     pub(super) fn end_lifetime(&self) -> anyhow::Result<()> {
+        self.released.store(true, Ordering::SeqCst);
         self.backend.release();
         let record = self
             .record

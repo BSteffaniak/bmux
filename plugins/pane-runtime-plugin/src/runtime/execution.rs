@@ -13,7 +13,7 @@ use switchy_thread::sync::{
 };
 use tokio::sync::Semaphore;
 
-use super::native_process::{self, StopAction};
+use crate::platform::{self, StopAction};
 
 type SpawnAuthorization = Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>;
 
@@ -351,7 +351,7 @@ impl ExecutionCapture {
             return match action {
                 StopAction::Cooperative => {
                     if self.group_kill_issued.load(Ordering::SeqCst)
-                        || !native_process::supports_cooperative_stop()
+                        || !platform::supports_cooperative_stop()
                     {
                         // Unsupported soft termination is not a cleanup failure;
                         // the bounded caller escalates to a forced stop.
@@ -402,7 +402,7 @@ impl ExecutionCapture {
         };
         // Before the session is adopted, only the live PTY supplies authority.
         // A saved PID or PGID is never authority to signal a recycled group.
-        let Some(signaled) = native_process::stop_foreground_group(master, action)? else {
+        let Some(signaled) = platform::stop_foreground_group(master, action)? else {
             if self.output_drained.load(Ordering::SeqCst)
                 && !self.managed_program.load(Ordering::SeqCst)
             {
@@ -965,8 +965,8 @@ where
         }
         // No runtime on this thread: drive the owner from it.
         Err(_) => Ok(runtime.block_on(future)),
-        // native-only: a current-thread runtime cannot block in place, so another thread
-        // drives the owner (simulated runtimes report MultiThread).
+        // A current-thread runtime cannot block in place, so another thread drives the owner.
+        // simulation-safe: simulated runtimes report MultiThread, so only native builds get here
         Ok(_) => std::thread::scope(|scope| scope.spawn(|| runtime.block_on(future)).join())
             .map_err(|_| failed("pane startup bridge thread panicked")),
     }

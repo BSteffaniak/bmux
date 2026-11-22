@@ -25,20 +25,20 @@ use switchy_time::Instant;
 
 /// One live, non-zombie session member.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) struct Member {
-    pub(super) pid: i32,
-    pub(super) group: i32,
+pub(crate) struct Member {
+    pub(crate) pid: i32,
+    pub(crate) group: i32,
 }
 
 /// The default whole-sweep budget: discovery, kill passes and verification.
-pub(super) const SWEEP_BUDGET: Duration = Duration::from_secs(2);
+pub(crate) const SWEEP_BUDGET: Duration = Duration::from_secs(2);
 
 /// Kill every live member of `sid` and verify that none remain.
 ///
 /// # Errors
 /// Discovery failures, signal failures other than "already gone", and members
 /// that are still alive once verification gives up.
-pub(super) fn sweep(sid: i32) -> io::Result<()> {
+pub(crate) fn sweep(sid: i32) -> io::Result<()> {
     if sid <= 1 {
         return Err(io::Error::other("refusing to sweep an invalid session"));
     }
@@ -54,7 +54,7 @@ pub(super) fn sweep(sid: i32) -> io::Result<()> {
 ///
 /// # Errors
 /// Discovery failures.
-pub(super) fn member_pids(sid: i32) -> io::Result<Vec<i32>> {
+pub(crate) fn member_pids(sid: i32) -> io::Result<Vec<i32>> {
     Ok(members(sid, Instant::now() + SWEEP_BUDGET)?
         .into_iter()
         .map(|member| member.pid)
@@ -65,7 +65,7 @@ pub(super) fn member_pids(sid: i32) -> io::Result<Vec<i32>> {
 ///
 /// # Errors
 /// Discovery failures.
-pub(super) fn occupied(sid: i32) -> io::Result<bool> {
+pub(crate) fn occupied(sid: i32) -> io::Result<bool> {
     Ok(!members(sid, Instant::now() + SWEEP_BUDGET)?.is_empty())
 }
 

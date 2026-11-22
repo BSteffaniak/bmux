@@ -36,8 +36,8 @@ use switchy_thread::sync::{Arc, Mutex, PoisonError, mpsc};
 pub use switchy_pty::PtySize;
 #[cfg(any(unix, windows))]
 pub use switchy_pty::{
-    ChildExit, PtyChild, PtyChildKiller, PtyInput, PtyMaster, PtyPair, PtyReader, PtySlave,
-    SpawnCommand,
+    Behavior, ChildExit, PtyChild, PtyChildKiller, PtyInput, PtyMaster, PtyPair, PtyReader,
+    PtySlave, SpawnCommand, behavior,
 };
 
 /// Events queued between the reader threads and the consumer before readers wait.

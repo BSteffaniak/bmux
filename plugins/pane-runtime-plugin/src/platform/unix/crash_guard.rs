@@ -27,7 +27,7 @@ static INSTALLED: OnceLock<()> = OnceLock::new();
 
 /// One registered pane session; dropping it removes the registration.
 #[derive(Debug)]
-pub(super) struct Registration(usize);
+pub(crate) struct Registration(usize);
 
 impl Drop for Registration {
     fn drop(&mut self) {
@@ -38,7 +38,7 @@ impl Drop for Registration {
 
 /// Register a live pane session. `None` when the table is full; the startup
 /// sweep still covers such a pane after a crash.
-pub(super) fn register(sid: i32, master_fd: Option<i32>) -> Option<Registration> {
+pub(crate) fn register(sid: i32, master_fd: Option<i32>) -> Option<Registration> {
     if sid <= 1 {
         return None;
     }

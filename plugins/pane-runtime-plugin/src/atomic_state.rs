@@ -3,12 +3,7 @@ use serde::Serialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-#[cfg(unix)]
-#[path = "atomic_state/unix.rs"]
-mod native;
-#[cfg(windows)]
-#[path = "atomic_state/windows.rs"]
-mod native;
+use crate::platform::host::atomic as native;
 
 pub(crate) fn commit(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(value).map_err(std::io::Error::other)?;

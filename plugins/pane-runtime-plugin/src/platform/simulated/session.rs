@@ -1,13 +1,19 @@
 //! Pane terminal sessions on `switchy_pty`'s simulated kernel (the `simulator` feature).
 //!
-//! The same authority as the Unix backend: the pane's program leads its own session, which is
-//! swept of every member after it ends, and each live session leaves a crash record that a
-//! later activation recovers. Processes come from the simulated kernel; a simulated process's
-//! serial stands in for its start time. There is no crash guard: a simulated server cannot die
-//! out from under its processes.
+//! The authority the native backend of the run's personality has:
+//!
+//! * **Unix** (Linux, macOS): the pane's program leads its own session, which is swept of every
+//!   member after it ends, and each live session leaves a crash record that a later activation
+//!   recovers. A simulated process's serial stands in for its start time. There is no crash
+//!   guard: a simulated server cannot die out from under its processes.
+//! * **Windows**: the pane's processes form a kill-on-close job (the kernel's session: a Windows
+//!   process cannot leave the console session it was created in, so its members are the job's,
+//!   descendants that outlived their parent included). There is no cooperative stop and no crash
+//!   record; releasing the job ends what is left unless its survivors were released first.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use switchy_thread::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use switchy_pty::{
@@ -19,13 +25,13 @@ use switchy_pty::{
 const SWEEP_BUDGET: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
-pub(in crate::runtime) struct Preparation;
+pub(crate) struct Preparation;
 
 #[expect(
     clippy::unnecessary_wraps,
     reason = "same signature as the Windows backend, which can fail"
 )]
-pub(super) fn prepare() -> anyhow::Result<Preparation> {
+pub(crate) fn prepare() -> anyhow::Result<Preparation> {
     Ok(Preparation)
 }
 
@@ -34,19 +40,25 @@ impl Preparation {
         clippy::unused_self,
         reason = "the Windows preparation carries the job to spawn into"
     )]
-    pub(in crate::runtime) fn spawn(
+    pub(crate) fn spawn(
         &self,
         slave: &bmux_pty::PtySlave,
-        command: bmux_pty::SpawnCommand,
+        command: &bmux_pty::SpawnCommand,
     ) -> std::io::Result<Box<dyn crate::runtime::pty::Child + Send + Sync>> {
-        crate::runtime::pty::Slave::spawn_command(slave, command)
+        Ok(Box::new(slave.spawn(command)?))
     }
 }
 
 #[derive(Debug)]
-pub(super) struct Session {
+pub(crate) struct Session {
     sid: u32,
-    start: Option<crate::runtime::ProcessStartIdentity>,
+    start: Option<crate::platform::ProcessStartIdentity>,
+    /// The Windows job's semantics, rather than a Unix session's.
+    job: bool,
+    /// Windows: releasing the job ends its processes.
+    kill_on_close: AtomicBool,
+    /// Windows: the job handle was released.
+    released: AtomicBool,
 }
 
 const RECORD_VERSION: u32 = 1;
@@ -104,7 +116,7 @@ fn sweep_session(sid: u32) -> std::io::Result<()> {
 }
 
 impl Session {
-    pub(super) fn adopt(
+    pub(crate) fn adopt(
         _preparation: Preparation,
         leader: u32,
         _master: &bmux_pty::PtyMaster,
@@ -116,15 +128,30 @@ impl Session {
         );
         Ok(Self {
             sid: leader,
-            start: crate::runtime::process_start_identity_for_pid(leader),
+            start: crate::platform::process_start_identity(leader),
+            job: super::windows(),
+            kill_on_close: AtomicBool::new(true),
+            released: AtomicBool::new(false),
         })
     }
 
-    pub(super) fn commit_record(
+    /// Windows: operations on a released job fail, as on a closed handle.
+    fn open(&self) -> std::io::Result<()> {
+        if self.job && self.released.load(Ordering::SeqCst) {
+            return Err(std::io::Error::other("pane job already released"));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn commit_record(
         &self,
         root: &Path,
         token: uuid::Uuid,
     ) -> anyhow::Result<Option<PathBuf>> {
+        // The job's kill-on-close covers a crashed server on Windows; nothing to record.
+        if self.job {
+            return Ok(None);
+        }
         std::fs::create_dir_all(root)?;
         let path = root.join(format!("{token}.json"));
         crate::atomic_state::commit(
@@ -138,8 +165,11 @@ impl Session {
         Ok(Some(path))
     }
 
-    #[expect(clippy::unused_self, reason = "same signature as the Windows backend")]
-    pub(super) fn terminate_leader(&self, leader: u32) -> std::io::Result<bool> {
+    pub(crate) fn terminate_leader(&self, leader: u32) -> std::io::Result<bool> {
+        // Cooperative stop is unsupported on Windows; the caller escalates.
+        if self.job {
+            return Ok(false);
+        }
         match simulator::signal_process(leader, Signal::Terminate) {
             Ok(()) => Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -147,32 +177,36 @@ impl Session {
         }
     }
 
-    pub(super) fn sweep(&self) -> std::io::Result<()> {
+    pub(crate) fn sweep(&self) -> std::io::Result<()> {
+        self.open()?;
         sweep_session(self.sid)
     }
 
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "same signature as the Unix backend, whose discovery can fail"
-    )]
-    pub(super) fn occupied(&self) -> std::io::Result<bool> {
+    pub(crate) fn occupied(&self) -> std::io::Result<bool> {
+        self.open()?;
         Ok(!members(self.sid).is_empty())
     }
 
-    #[expect(
-        clippy::unused_self,
-        reason = "Windows needs the session to release its job"
-    )]
-    pub(super) const fn release_survivors(&self) {}
+    /// Windows: clear kill-on-close so releasing the job leaves its processes running.
+    pub(crate) fn release_survivors(&self) {
+        self.kill_on_close.store(false, Ordering::SeqCst);
+    }
 
-    #[expect(
-        clippy::unused_self,
-        reason = "no crash guard to release in simulation"
-    )]
-    pub(super) const fn release(&self) {}
+    /// Windows: close the job, ending its processes unless released. Unix: nothing to release
+    /// (there is no crash guard in simulation).
+    pub(crate) fn release(&self) {
+        if !self.job || self.released.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if self.kill_on_close.load(Ordering::SeqCst) {
+            for pid in members(self.sid) {
+                let _ = simulator::signal_process(pid, Signal::Kill);
+            }
+        }
+    }
 }
 
-pub(super) fn recover_record(path: &Path) -> anyhow::Result<()> {
+pub(crate) fn recover_record(path: &Path) -> anyhow::Result<()> {
     let record: Record = serde_json::from_slice(&std::fs::read(path)?)?;
     anyhow::ensure!(
         record.version == RECORD_VERSION,
@@ -183,7 +217,7 @@ pub(super) fn recover_record(path: &Path) -> anyhow::Result<()> {
     let leader = u32::try_from(record.sid)?;
     let recorded = record
         .leader_start
-        .map(|(serial, fraction)| crate::runtime::ProcessStartIdentity(serial, fraction));
+        .map(|(serial, fraction)| crate::platform::ProcessStartIdentity(serial, fraction));
     if still_ours(leader, recorded) {
         sweep_session(leader)?;
     }
@@ -192,18 +226,18 @@ pub(super) fn recover_record(path: &Path) -> anyhow::Result<()> {
 
 /// Whether session `leader` is still the one recorded: its leader runs with the recorded serial,
 /// or (the leader gone) every remaining member started after it.
-fn still_ours(leader: u32, recorded: Option<crate::runtime::ProcessStartIdentity>) -> bool {
+fn still_ours(leader: u32, recorded: Option<crate::platform::ProcessStartIdentity>) -> bool {
     let Some(recorded) = recorded else {
         // Without a start identity there is no way to rule out reuse.
         return false;
     };
-    if let Some(current) = crate::runtime::process_start_identity_for_pid(leader)
+    if let Some(current) = crate::platform::process_start_identity(leader)
         && session_of(leader).is_some()
     {
         return session_of(leader) == Some(leader) && current == recorded;
     }
     members(leader).into_iter().all(|pid| {
-        crate::runtime::process_start_identity_for_pid(pid)
+        crate::platform::process_start_identity(pid)
             .is_some_and(|start| (start.0, start.1) >= (recorded.0, recorded.1))
     })
 }

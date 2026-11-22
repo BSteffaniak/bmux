@@ -29,10 +29,11 @@ pub(super) fn prepare(root: &Path) -> Result<PathBuf> {
     // A managed launch already attested this image's digest before activation;
     // retention still verifies the copied bytes against it, so reuse it rather
     // than reading the whole executable an extra time on the startup path.
-    #[cfg(not(target_os = "linux"))]
-    let attested = crate::readiness::running_executable_sha256();
-    #[cfg(target_os = "linux")]
-    let attested = None;
+    let attested = if crate::platform::host::EXECUTABLE_MAPPED {
+        None
+    } else {
+        crate::readiness::running_executable_sha256()
+    };
     let hash = match attested {
         Some(hash) => hash,
         None => bmux_plugin::executable_sha256(&source).map_err(anyhow::Error::msg)?,

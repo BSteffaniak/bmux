@@ -1,12 +1,7 @@
 //! Native environment transport belongs to the execution contract, not bootstrap.
 use bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry;
 
-#[cfg(unix)]
-#[path = "environment/unix.rs"]
-mod native;
-#[cfg(windows)]
-#[path = "environment/windows.rs"]
-mod native;
+use crate::platform::host::environment as native;
 
 pub(super) fn validate(entries: &[EnvironmentEntry]) -> Result<(), String> {
     if entries.len() > 4096 {

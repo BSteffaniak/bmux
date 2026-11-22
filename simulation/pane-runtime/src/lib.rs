@@ -1,8 +1,10 @@
 //! Deterministic simulation testing for the pane runtime.
 //!
 //! Each simvar run starts a pane runtime (the real `bmux_pane_runtime_plugin` code, through its
-//! `simulation` driver) whose panes run a simulated shell on switchy's simulated kernel, then
-//! does random things to it: opens panes, types lines into them, resizes and closes them, and
+//! `simulation` driver) whose panes run a simulated shell on switchy's simulated kernel, which
+//! behaves as Linux, macOS or Windows (drawn from the seed, or `SIMULATOR_PTY_PERSONALITY`) on
+//! any host, so the runtime takes that system's paths: on Windows its pseudo-console startup
+//! handshake, console closing, and job-based stops. Then the run does random things to it: opens panes, types lines into them, resizes and closes them, and
 //! waits. Its tasks, threads, timers, terminals and processes all belong to the run, so the seed
 //! decides every interleaving and a failing run replays exactly.
 //!
@@ -15,7 +17,6 @@
 //! 5. The workload finishes within a budget of simulated time (no livelock), with no deadlock
 //!    or leaked simulated thread (checked by the scheduler and simvar).
 
-#![cfg(unix)]
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery)]
 
@@ -25,7 +26,7 @@ use std::{collections::BTreeMap, io, time::Duration};
 
 use bmux_pane_runtime_plugin::simulation::{Pane, Panes};
 use simvar::{Sim, SimBootstrap, SimConfig};
-use switchy_pty::simulator::{self, Config, Faults, Personality, Process, ProcessState};
+use switchy_pty::simulator::{self, Config, Faults, Process, ProcessState};
 use telemetry::{Board, PaneView};
 
 /// Simulated time the workload has to finish in; more means a livelock.
@@ -364,7 +365,7 @@ pub async fn run_workload() -> Result<(), Vec<String>> {
         ((*name).to_string(), (*value).to_string())
     }));
     simulator::configure(Config {
-        personality: Personality::Linux,
+        personality: Config::from_env().personality,
         pid_reuse: 0.3,
         faults: Faults::default(),
     });
@@ -417,10 +418,10 @@ async fn close(panes: &mut Panes, pane: Pane, opened: &Opened, violations: &mut 
         Ok(closed) => {
             // 4. Closing drains, cleans up, and leaves nothing running in the session.
             Board::checked(4);
-            if closed.cleanup_failed {
+            if let Some(error) = &closed.cleanup_error {
                 violated(
                     violations,
-                    format!("4. closing pane process {pid} failed to clean up"),
+                    format!("4. closing pane process {pid} failed to clean up: {error}"),
                 );
             }
             if let Some(session) = session {

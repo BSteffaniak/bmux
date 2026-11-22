@@ -14,7 +14,7 @@ const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 0x1;
 /// Unlink the replaced file even while readers still hold it open.
 const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 0x2;
 
-pub(super) fn create(path: &Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn create(path: &Path) -> std::io::Result<std::fs::File> {
     // The caller's private state directory supplies the inherited Windows ACL.
     std::fs::OpenOptions::new()
         .write(true)
@@ -29,7 +29,7 @@ pub(super) fn create(path: &Path) -> std::io::Result<std::fs::File> {
 /// while they do, so rename with POSIX semantics, which unlinks the old file
 /// and leaves open readers on their snapshot. File systems without POSIX
 /// renames (FAT, some network shares) fall back to `MoveFileExW`.
-pub(super) fn publish(temporary: &Path, path: &Path, _parent: &Path) -> std::io::Result<()> {
+pub(crate) fn publish(temporary: &Path, path: &Path, _parent: &Path) -> std::io::Result<()> {
     match rename_posix(temporary, path) {
         Err(error)
             if [ERROR_INVALID_PARAMETER, ERROR_NOT_SUPPORTED]

@@ -1,21 +1,21 @@
 use bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry;
 use std::os::unix::ffi::OsStrExt as _;
 
-pub(super) const ENCODING: &str = "unix-bytes";
-pub(super) fn encode(value: &std::ffi::OsStr) -> Vec<u8> {
+pub(crate) const ENCODING: &str = "unix-bytes";
+pub(crate) fn encode(value: &std::ffi::OsStr) -> Vec<u8> {
     value.as_bytes().to_vec()
 }
 #[expect(
     clippy::unnecessary_wraps,
     reason = "UTF-16 decoding on Windows can fail"
 )]
-pub(super) fn decode(bytes: &[u8]) -> Option<std::ffi::OsString> {
+pub(crate) fn decode(bytes: &[u8]) -> Option<std::ffi::OsString> {
     Some(std::ffi::OsStr::from_bytes(bytes).to_owned())
 }
-pub(super) fn keys_equal(left: &[u8], right: &[u8]) -> bool {
+pub(crate) fn keys_equal(left: &[u8], right: &[u8]) -> bool {
     left == right
 }
-pub(super) fn valid(entry: &EnvironmentEntry) -> bool {
+pub(crate) fn valid(entry: &EnvironmentEntry) -> bool {
     entry
         .encoding
         .as_deref()

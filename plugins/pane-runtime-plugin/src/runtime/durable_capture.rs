@@ -29,11 +29,7 @@ impl DurableCapture {
         std::fs::create_dir_all(root)?;
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
+        crate::platform::host::private_file(&mut options);
         let file = options.open(root.join("events.bin"))?;
         let capture = Self {
             root: root.to_path_buf(),

@@ -7,8 +7,6 @@
 use std::io;
 
 use bmux_pty::{ChildExit, PtyChild, PtyChildKiller};
-#[cfg(unix)]
-use bmux_pty::{PtySlave, SpawnCommand};
 
 /// Ends a process from wherever the handle was cloned to.
 pub(crate) trait ChildKiller: std::fmt::Debug + Send {
@@ -33,17 +31,13 @@ pub(crate) trait Child: ChildKiller {
     fn process_id(&self) -> Option<u32>;
 }
 
-/// Where a process can be started on a terminal. Windows spawns into the pane's job instead.
-#[cfg(unix)]
-pub(crate) trait Slave {
-    fn spawn_command(&self, command: SpawnCommand) -> io::Result<Box<dyn Child + Send + Sync>>;
-}
-
-#[cfg(unix)]
-impl Slave for PtySlave {
-    fn spawn_command(&self, command: SpawnCommand) -> io::Result<Box<dyn Child + Send + Sync>> {
-        Ok(Box::new(self.spawn(&command)?))
-    }
+/// Start `command` on `slave` (as the platform's session backends do), for tests.
+#[cfg(test)]
+pub(crate) fn spawn(
+    slave: &bmux_pty::PtySlave,
+    command: &bmux_pty::SpawnCommand,
+) -> io::Result<Box<dyn Child + Send + Sync>> {
+    Ok(Box::new(slave.spawn(command)?))
 }
 
 impl ChildKiller for PtyChild {
@@ -93,13 +87,14 @@ impl ChildKiller for Killer {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use bmux_pty::SpawnCommand;
 
     #[test]
     fn spawned_processes_wait_kill_and_clone_killers() {
         let pair = bmux_pty::PtyPair::open(bmux_pty::PtySize { cols: 80, rows: 24 }).unwrap();
         let mut command = SpawnCommand::new("/bin/sh");
         command.args(["-c", "sleep 30"]);
-        let mut child = pair.slave.spawn_command(command).unwrap();
+        let mut child = spawn(&pair.slave, &command).unwrap();
         drop(pair.slave);
         assert!(child.process_id().is_some());
         assert!(child.try_wait().unwrap().is_none());

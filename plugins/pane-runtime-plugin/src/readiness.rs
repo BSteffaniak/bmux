@@ -23,21 +23,16 @@ struct ExecutableIdentity {
 
 impl ExecutableIdentity {
     fn capture() -> Self {
-        #[cfg(target_os = "linux")]
-        let opened = std::fs::File::open("/proc/self/exe");
-        #[cfg(not(target_os = "linux"))]
-        let opened = running_executable_sha256().ok_or_else(|| {
-            std::io::Error::other("immutable bundle startup attestation unavailable")
-        });
-        #[cfg(not(target_os = "linux"))]
-        return Self {
-            file: Mutex::new(None),
-            digest: OnceLock::from(opened.map_err(|error| error.to_string())),
-        };
-        #[cfg(target_os = "linux")]
+        if !crate::platform::host::EXECUTABLE_MAPPED {
+            let attested = running_executable_sha256()
+                .ok_or_else(|| "immutable bundle startup attestation unavailable".to_string());
+            return Self {
+                file: Mutex::new(None),
+                digest: OnceLock::from(attested),
+            };
+        }
         let digest = OnceLock::new();
-        #[cfg(target_os = "linux")]
-        let file = match opened {
+        let file = match crate::platform::host::open_mapped_executable() {
             Ok(file) => Some(file),
             Err(error) => {
                 let _ = digest.set(Err(format!(
@@ -46,12 +41,9 @@ impl ExecutableIdentity {
                 None
             }
         };
-        #[cfg(target_os = "linux")]
-        {
-            Self {
-                file: Mutex::new(file),
-                digest,
-            }
+        Self {
+            file: Mutex::new(file),
+            digest,
         }
     }
 
@@ -97,7 +89,6 @@ fn sha256_reader(mut input: impl std::io::Read) -> std::io::Result<String> {
         }))
 }
 
-#[cfg(not(target_os = "linux"))]
 pub(crate) fn running_executable_sha256() -> Option<String> {
     // This is an explicit startup attestation, not a hash of current_exe(). The
     // application must verify its immutable bundle/manifest before activation.
@@ -119,7 +110,7 @@ pub(crate) fn activate(host: &crate::runtime::PaneRuntimeHost, context: &NativeL
     let managed_target_identity = switchy_env::var("BMUX_MANAGED_TARGET_IDENTITY").ok();
     // Ordinary non-Linux launches may lack mapped-image attestation. Never
     // substitute a mutable current_exe pathname hash for that proof.
-    if (cfg!(target_os = "linux") || managed_target_identity.is_some())
+    if (crate::platform::host::EXECUTABLE_MAPPED || managed_target_identity.is_some())
         && let Err(reason) = verified
     {
         error.get_or_insert(reason);

@@ -27,12 +27,12 @@ pub struct Panes {
 pub struct Pane(SessionId);
 
 /// How closing a pane went.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Closed {
     /// Its output was drained before the pane ended.
     pub drained: bool,
-    /// Cleaning up its process or terminal failed.
-    pub cleanup_failed: bool,
+    /// Cleaning up its process or terminal failed: the first error, if so.
+    pub cleanup_error: Option<String>,
 }
 
 impl std::fmt::Debug for Panes {
@@ -158,7 +158,7 @@ impl Panes {
         shutdown_runtime_handle(&self.host, removed).await;
         Ok(Closed {
             drained: execution.output_drained.load(Ordering::SeqCst),
-            cleanup_failed: execution.cleanup_failed.load(Ordering::SeqCst),
+            cleanup_error: execution.cleanup_error(),
         })
     }
 

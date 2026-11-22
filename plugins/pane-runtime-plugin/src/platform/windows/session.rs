@@ -26,26 +26,22 @@ const SWEPT_EXIT_CODE: u32 = 1;
 
 /// The pane's job, which must exist before the spawn so the program starts in it.
 #[derive(Debug)]
-pub(in crate::runtime) struct Preparation {
+pub(crate) struct Preparation {
     job: OwnedHandle,
 }
 
-pub(super) fn prepare() -> anyhow::Result<Preparation> {
+pub(crate) fn prepare() -> anyhow::Result<Preparation> {
     Ok(Preparation { job: job()? })
 }
 
 impl Preparation {
     /// Spawn the pane's program on `slave`, inside the job from its creation.
-    // By value to match the Unix backend, which hands the command to the spawn.
-    #[allow(clippy::needless_pass_by_value)]
-    pub(in crate::runtime) fn spawn(
+    pub(crate) fn spawn(
         &self,
         slave: &bmux_pty::PtySlave,
-        command: bmux_pty::SpawnCommand,
+        command: &bmux_pty::SpawnCommand,
     ) -> io::Result<Box<dyn crate::runtime::pty::Child + Send + Sync>> {
-        Ok(Box::new(
-            slave.spawn_in_job(&command, self.job.as_handle())?,
-        ))
+        Ok(Box::new(slave.spawn_in_job(command, self.job.as_handle())?))
     }
 }
 
@@ -128,13 +124,13 @@ fn contains(job: &OwnedHandle, pid: u32) -> io::Result<bool> {
 }
 
 #[derive(Debug)]
-pub(super) struct Session {
+pub(crate) struct Session {
     /// `None` once released.
     job: Mutex<Option<OwnedHandle>>,
 }
 
 impl Session {
-    pub(super) fn adopt(
+    pub(crate) fn adopt(
         preparation: Preparation,
         leader: u32,
         _master: &bmux_pty::PtyMaster,
@@ -152,7 +148,7 @@ impl Session {
 
     /// The job's kill-on-close covers a crashed server; nothing to record.
     #[allow(clippy::unnecessary_wraps, clippy::unused_self)] // Unix records sessions.
-    pub(super) const fn commit_record(
+    pub(crate) const fn commit_record(
         &self,
         _root: &Path,
         _token: uuid::Uuid,
@@ -162,7 +158,7 @@ impl Session {
 
     /// Cooperative stop is unsupported on Windows; the caller escalates.
     #[allow(clippy::unnecessary_wraps, clippy::unused_self)] // Unix signals the leader.
-    pub(super) const fn terminate_leader(&self, _leader: u32) -> io::Result<bool> {
+    pub(crate) const fn terminate_leader(&self, _leader: u32) -> io::Result<bool> {
         Ok(false)
     }
 
@@ -178,7 +174,7 @@ impl Session {
     }
 
     /// End every process in the job and wait until none remain.
-    pub(super) fn sweep(&self) -> io::Result<()> {
+    pub(crate) fn sweep(&self) -> io::Result<()> {
         self.with_job(|job| {
             // SAFETY: an open job handle.
             if unsafe { TerminateJobObject(job.as_raw_handle(), SWEPT_EXIT_CODE) } == 0 {
@@ -205,18 +201,18 @@ impl Session {
         })
     }
 
-    pub(super) fn occupied(&self) -> io::Result<bool> {
+    pub(crate) fn occupied(&self) -> io::Result<bool> {
         self.with_job(|job| Ok(active_processes(job)? > 0))
     }
 
     /// Clear kill-on-close so releasing the job leaves its processes running.
-    pub(super) fn release_survivors(&self) {
+    pub(crate) fn release_survivors(&self) {
         if let Err(error) = self.with_job(|job| set_kill_on_close(job, false)) {
             tracing::warn!(%error, "could not release the pane job's remaining processes");
         }
     }
 
-    pub(super) fn release(&self) {
+    pub(crate) fn release(&self) {
         if let Ok(mut job) = self.job.lock() {
             job.take();
         }
@@ -225,7 +221,7 @@ impl Session {
 
 /// Windows writes no crash records.
 #[allow(clippy::unnecessary_wraps)] // Unix sweeps the recorded session.
-pub(super) const fn recover_record(_path: &Path) -> anyhow::Result<()> {
+pub(crate) const fn recover_record(_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 

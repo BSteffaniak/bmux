@@ -194,8 +194,9 @@ pub(super) fn start_ordered(
                         Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                         // PTY adapters use EIO for last-slave closure. This is
                         // the sole normalization point for the ordered path.
-                        #[cfg(unix)]
-                        Err(error) if error.raw_os_error() == Some(libc::EIO) => break Ok(0),
+                        Err(error) if crate::platform::host::is_terminal_end(&error) => {
+                            break Ok(0);
+                        }
                         result => break result,
                     }
                 };

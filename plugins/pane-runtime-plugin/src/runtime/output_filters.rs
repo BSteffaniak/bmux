@@ -22,6 +22,7 @@ const MAX_REPLACEMENT_BYTES: usize = 4096;
 /// each.
 pub(crate) fn set_rules(
     // In core's state registry, so behind std's lock.
+    // simulation-safe: held only to replace one caller's rules, with no switch point inside
     filters: &std::sync::RwLock<SequenceFilters>,
     caller: &str,
     rules: Vec<OutputRule>,

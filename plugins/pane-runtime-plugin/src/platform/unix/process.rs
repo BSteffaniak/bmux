@@ -1,7 +1,7 @@
-use super::StopAction;
+use crate::platform::StopAction;
 use std::io;
 
-pub(in super::super) fn supports_cooperative_stop() -> bool {
+pub(crate) fn supports_cooperative_stop() -> bool {
     true
 }
 
@@ -10,7 +10,7 @@ fn foreground_group(master: &bmux_pty::PtyMaster) -> Option<i32> {
 }
 
 /// `None` means the live terminal supplies no foreground-group authority.
-pub(in super::super) fn stop_foreground_group(
+pub(crate) fn stop_foreground_group(
     master: &bmux_pty::PtyMaster,
     action: StopAction,
 ) -> io::Result<Option<bool>> {

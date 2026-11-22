@@ -8,12 +8,12 @@ use std::borrow::Cow;
 use std::io::{self, Read, Write};
 use switchy_thread::sync::{Arc, Mutex};
 
-pub(in super::super) type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
+pub(super) type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
 const QUERY: &[u8] = b"\x1b[6n";
 const REPLY: &[u8] = b"\x1b[1;1R";
 
 #[derive(Default)]
-pub(in super::super) struct PrefixQuery {
+pub(super) struct PrefixQuery {
     prefix: Vec<u8>,
     finished: bool,
 }
@@ -21,7 +21,7 @@ pub(in super::super) struct PrefixQuery {
 impl PrefixQuery {
     /// Retains at most three bytes between reads. A mismatch releases every
     /// byte unchanged and disables recognition for the rest of this execution.
-    pub(in super::super) fn project<'a>(&mut self, bytes: &'a [u8]) -> (Cow<'a, [u8]>, bool) {
+    pub(super) fn project<'a>(&mut self, bytes: &'a [u8]) -> (Cow<'a, [u8]>, bool) {
         if self.finished {
             return (Cow::Borrowed(bytes), false);
         }
@@ -64,7 +64,7 @@ fn diagnostic(owner: uuid::Uuid, stage: &'static str, total: u64, bytes: &[u8]) 
     eprintln!("ConPTY bootstrap owner={owner} stage={stage} total={total} classes={classes}");
 }
 
-pub(in super::super) struct BootstrapReader {
+pub(super) struct BootstrapReader {
     owner: uuid::Uuid,
     raw: Box<dyn Read + Send>,
     writer: Writer,
@@ -74,11 +74,7 @@ pub(in super::super) struct BootstrapReader {
 }
 
 impl BootstrapReader {
-    pub(in super::super) fn new(
-        raw: Box<dyn Read + Send>,
-        writer: Writer,
-        owner: uuid::Uuid,
-    ) -> Self {
+    pub(super) fn new(raw: Box<dyn Read + Send>, writer: Writer, owner: uuid::Uuid) -> Self {
         Self {
             owner,
             raw,
@@ -138,10 +134,7 @@ impl Read for BootstrapReader {
 
 /// Closing a retired console can synchronously wait for its output drain.
 /// Keep it off the executor; the independent reader remains the sole EOF owner.
-#[cfg(any(windows, test))]
-pub(in super::super) async fn close_retired_console<T: Send + 'static>(
-    console: T,
-) -> anyhow::Result<()> {
+pub(super) async fn close_retired_console<T: Send + 'static>(console: T) -> anyhow::Result<()> {
     switchy_async::task::spawn_blocking(move || drop(console)).await?;
     Ok(())
 }

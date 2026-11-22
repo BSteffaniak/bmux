@@ -2,8 +2,8 @@ use bmux_pane_runtime_plugin_api::pane_runtime_environment_v1::EnvironmentEntry;
 use std::os::windows::ffi::OsStrExt as _;
 use windows_sys::Win32::Globalization::CompareStringOrdinal;
 
-pub(super) const ENCODING: &str = "windows-utf16le";
-pub(super) fn encode(value: &std::ffi::OsStr) -> Vec<u8> {
+pub(crate) const ENCODING: &str = "windows-utf16le";
+pub(crate) fn encode(value: &std::ffi::OsStr) -> Vec<u8> {
     value.encode_wide().flat_map(u16::to_le_bytes).collect()
 }
 fn units(bytes: &[u8]) -> Option<Vec<u16>> {
@@ -19,11 +19,11 @@ fn units(bytes: &[u8]) -> Option<Vec<u16>> {
             .collect(),
     )
 }
-pub(super) fn decode(bytes: &[u8]) -> Option<std::ffi::OsString> {
+pub(crate) fn decode(bytes: &[u8]) -> Option<std::ffi::OsString> {
     use std::os::windows::ffi::OsStringExt as _;
     units(bytes).map(|units| std::ffi::OsString::from_wide(&units))
 }
-pub(super) fn keys_equal(left: &[u8], right: &[u8]) -> bool {
+pub(crate) fn keys_equal(left: &[u8], right: &[u8]) -> bool {
     let (Some(left), Some(right)) = (units(left), units(right)) else {
         return false;
     };
@@ -34,14 +34,14 @@ pub(super) fn keys_equal(left: &[u8], right: &[u8]) -> bool {
     // SAFETY: both buffers contain initialized UTF-16 units for their explicit lengths.
     unsafe { CompareStringOrdinal(left.as_ptr(), left_len, right.as_ptr(), right_len, 1) == 2 }
 }
-pub(super) fn valid(entry: &EnvironmentEntry) -> bool {
+pub(crate) fn valid(entry: &EnvironmentEntry) -> bool {
     if entry.encoding.as_deref() != Some(ENCODING) {
         return false;
     }
     let (Some(key), Some(value)) = (units(&entry.key), units(&entry.value)) else {
         return false;
     };
-    crate::windows_environment::valid_key(&key) && !value.contains(&0)
+    super::environment_keys::valid_key(&key) && !value.contains(&0)
 }
 
 #[cfg(test)]

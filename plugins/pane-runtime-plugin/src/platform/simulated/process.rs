@@ -1,23 +1,30 @@
-//! Process control on `switchy_pty`'s simulated kernel (the `simulator` feature): the same
-//! authority the Unix backend has, over simulated processes.
+//! Process control on `switchy_pty`'s simulated kernel (the `simulator` feature): the authority
+//! the native backend of the run's personality has, over simulated processes.
 
-use super::StopAction;
+use crate::platform::StopAction;
 use std::io;
 use switchy_pty::{
     Signal,
     simulator::{self, ProcessState},
 };
 
-pub(in super::super) const fn supports_cooperative_stop() -> bool {
-    true
+/// Windows panes run in a job, which can only be terminated as a whole.
+pub(crate) fn supports_cooperative_stop() -> bool {
+    !super::windows()
 }
 
 /// Signal the terminal's foreground process group; `None` without one, `Some(false)` when it has
 /// no running process.
-pub(in super::super) fn stop_foreground_group(
+pub(crate) fn stop_foreground_group(
     master: &bmux_pty::PtyMaster,
     action: StopAction,
 ) -> io::Result<Option<bool>> {
+    if super::windows() {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "PTY process-group signaling is unavailable on this platform; panes are stopped through their job",
+        ));
+    }
     let Some(group) = master
         .foreground_process_group()
         .and_then(|group| u32::try_from(group).ok())
@@ -41,11 +48,14 @@ pub(in super::super) fn stop_foreground_group(
 }
 
 /// Signal a pane's process group, or its process when it has no group.
-pub(in super::super) fn send_process_signal(
+pub(crate) fn send_process_signal(
     process: &bmux_pane_runtime_state::PaneProcessIdentity,
     signal: bmux_pane_runtime_state::PaneProcessSignal,
 ) -> anyhow::Result<()> {
     use bmux_pane_runtime_state::PaneProcessSignal;
+    if super::windows() {
+        anyhow::bail!("pane process signaling is unsupported on this platform");
+    }
     let signal = match signal {
         PaneProcessSignal::Interrupt => Signal::Interrupt,
         PaneProcessSignal::Terminate => Signal::Terminate,
@@ -66,7 +76,10 @@ pub(in super::super) fn send_process_signal(
     Ok(())
 }
 
-pub(in super::super) fn resolve_process_working_directory(pid: u32) -> Option<String> {
+pub(crate) fn resolve_process_working_directory(pid: u32) -> Option<String> {
+    if super::windows() {
+        return None;
+    }
     simulator::snapshot()
         .processes
         .into_iter()

@@ -36,6 +36,7 @@ struct InvocationScope {
 #[derive(Default)]
 pub(crate) struct InputScopes(
     switchy_thread::sync::Mutex<
+        // simulation-safe: looked up by the current thread, never iterated
         std::collections::HashMap<switchy_thread::thread::ThreadId, InvocationScope>,
     >,
 );
