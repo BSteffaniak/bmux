@@ -29,7 +29,10 @@
 //!    reused or not, still runs.
 //! 7. Restarting a pane ends everything in its old program's session and starts a new program
 //!    leading a session of its own.
-//! 8. The runtime reports each program's exit at most once.
+//! 8. The runtime acts on each program's exit at most once, and never on that of a program a
+//!    restart replaced.
+//! 9. Once every pane closed, nothing is left: no terminal's master side open, no process but
+//!    those started outside the runtime, no session record.
 //!
 //! Faults excuse only what they cause: a pane whose program the outside killer killed need
 //! not answer what was typed, and opening may fail while spawns, reads or kills fail.

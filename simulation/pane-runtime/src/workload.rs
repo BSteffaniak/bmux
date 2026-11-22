@@ -102,6 +102,8 @@ struct Opened {
 /// A process started outside the pane runtime, after a crash.
 struct Witness {
     serial: u64,
+    /// Its terminal's name.
+    terminal: String,
     _child: switchy_pty::PtyChild,
     _pair: switchy_pty::PtyPair,
 }
@@ -204,6 +206,26 @@ fn running_in(serials: &[u64]) -> Vec<u32> {
         .filter(|p| p.state == ProcessState::Running && serials.contains(&p.session_serial))
         .map(|p| p.pid)
         .collect()
+}
+
+/// The run's simulated threads that have not finished (but the main thread), with what each
+/// waits for, for a failure's message.
+fn live_threads() -> Vec<String> {
+    switchy_thread::simulator::scheduler()
+        .snapshot()
+        .threads
+        .into_iter()
+        .skip(1)
+        .filter(|thread| thread.state != switchy_thread::simulator::ThreadState::Finished)
+        .map(|thread| format!("{} ({:?})", thread.name, thread.state))
+        .collect()
+}
+
+/// The name of `pid`'s terminal, for events.
+fn terminal_of(pid: u32) -> String {
+    simulator::process_io(pid)
+        .and_then(|io| io.terminal)
+        .unwrap_or_else(|| "no terminal".into())
 }
 
 /// `pid`'s terminal as the kernel sees it, for a failure's message.
@@ -488,7 +510,10 @@ impl Shared {
         }
         event(
             "open",
-            format!("d{driver}: pane {pid} opened at {rows}x{cols}"),
+            format!(
+                "d{driver}: pane {pid} opened at {rows}x{cols} on {}",
+                terminal_of(pid)
+            ),
             Tone::Info,
         );
         Board::pane(PaneView {
@@ -722,7 +747,10 @@ impl Shared {
         }
         event(
             "restart",
-            format!("d{driver}: pane {old} restarted as {pid}"),
+            format!(
+                "d{driver}: pane {old} restarted as {pid} on {}",
+                terminal_of(pid)
+            ),
             Tone::Info,
         );
         // 7. The old session ends; the new program leads its own.
@@ -779,9 +807,13 @@ impl Shared {
             else {
                 continue;
             };
+            let terminal = simulator::process_io(child.id())
+                .and_then(|io| io.terminal)
+                .unwrap_or_default();
             if let Some(serial) = simulator::serial_of(child.id()) {
                 witnesses.push(Witness {
                     serial,
+                    terminal,
                     _child: child,
                     _pair: pair,
                 });
@@ -826,6 +858,60 @@ impl Shared {
         }
     }
 
+    /// Invariant 9: with every pane closed, nothing the runtime had is left: no terminal's
+    /// master side open, no process running but those started outside it, no session record.
+    async fn check_nothing_leaks(&self) {
+        Board::checked(9);
+        let outsiders: Vec<u64> = self.lock().witnesses.iter().map(|w| w.serial).collect();
+        let strays = || -> Vec<String> {
+            simulator::snapshot()
+                .processes
+                .into_iter()
+                .filter(|p| p.state == ProcessState::Running && !outsiders.contains(&p.serial))
+                .map(|p| format!("{} ({})", p.pid, p.program))
+                .collect()
+        };
+        // Processes a close or a crash ended may take a moment to exit.
+        if !self.settle(|| strays().is_empty()).await {
+            self.violated(format!(
+                "9. processes still run with every pane closed: {:?}",
+                strays()
+            ));
+        }
+        let outsider_terminals: Vec<String> =
+            self.lock().witnesses.iter().map(|w| w.terminal.clone()).collect();
+        let open = || -> Vec<String> {
+            simulator::snapshot()
+                .terminals
+                .into_iter()
+                // The outsiders' own terminals stay open until the run ends.
+                .filter(|t| t.master_handles > 0 && !outsider_terminals.contains(&t.name))
+                .map(|t| format!("{} ({} master handles)", t.name, t.master_handles))
+                .collect()
+        };
+        if !self.settle(|| open().is_empty()).await {
+            self.violated(format!(
+                "9. terminals' master sides still open with every pane closed: {:?} (threads: \
+                 {:?})",
+                open(),
+                live_threads()
+            ));
+        }
+        let records: Vec<String> = switchy_fs::sync::read_dir_sorted(&self.records)
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !records.is_empty() {
+            self.violated(format!(
+                "9. session records left with every pane closed: {records:?}"
+            ));
+        }
+    }
+
     /// Close every pane, end every process, and check invariant 5's threads. Returns the
     /// violations found, and the run's shape tags.
     pub async fn finish(&self) -> (Vec<String>, Stats) {
@@ -843,8 +929,11 @@ impl Shared {
         }
         self.collect_exits();
         self.lock().stats.record();
+        // While the server still runs, so cleanup under way can finish.
+        self.check_nothing_leaks().await;
         let panes = Arc::clone(&self.lock().panes);
         panes.shut_down();
+        drop(panes);
         simulator::kill_all();
         self.lock().witnesses.clear();
         // 5. Let the panes' threads see their processes end before the run does.
@@ -856,16 +945,9 @@ impl Shared {
             })
             .await;
         if !drained {
-            let left: Vec<String> = switchy_thread::simulator::scheduler()
-                .snapshot()
-                .threads
-                .into_iter()
-                .skip(1)
-                .filter(|thread| thread.state != switchy_thread::simulator::ThreadState::Finished)
-                .map(|thread| format!("{} ({:?})", thread.name, thread.state))
-                .collect();
             self.violated(format!(
-                "5. threads still running after every pane closed: {left:?}"
+                "5. threads still running after every pane closed: {:?}",
+                live_threads()
             ));
         }
         let mut state = self.lock();

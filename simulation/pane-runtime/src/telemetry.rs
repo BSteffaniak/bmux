@@ -17,7 +17,7 @@ use bmux_tui::{
 };
 
 /// The invariants, by number (see the crate documentation).
-const INVARIANTS: [&str; 8] = [
+const INVARIANTS: [&str; 9] = [
     "1. an opened pane leads its own session",
     "2. typed lines reach the program in order",
     "3. the terminal ends up the requested size",
@@ -26,6 +26,7 @@ const INVARIANTS: [&str; 8] = [
     "6. a crash's sessions end, and only they",
     "7. restarting ends the old session",
     "8. each program's exit is reported at most once",
+    "9. nothing is left once every pane closed",
 ];
 
 /// One pane as the dashboard shows it.
