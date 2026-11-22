@@ -275,7 +275,6 @@ pub struct AttachViewState {
     pub(super) presentation_only: bool,
     pub(super) allow_retarget: bool,
     pub(super) viewport_guard: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
-    pub frontend_presentations: super::frontend_presentation::FrontendPresentations,
     pub(super) presentation: bmux_tui::presentation::PresentationState,
     pub(super) observer: Option<super::observer::AttachObserverPublisher>,
     pub async_services: Option<bmux_plugin::AsyncServiceClient>,
@@ -699,7 +698,6 @@ impl AttachViewState {
             presentation_only: false,
             allow_retarget: true,
             viewport_guard: None,
-            frontend_presentations: super::frontend_presentation::FrontendPresentations::default(),
             presentation: bmux_tui::presentation::PresentationState::new(
                 bmux_tui::geometry::Rect::new(0, 0, 0, 0),
             ),

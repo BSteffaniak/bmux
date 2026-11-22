@@ -47,7 +47,9 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 /// Stable namespaced identity for an independently composed surface.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct PluginSurfaceId {
     pub owner_plugin_id: String,
     pub local_id: String,
@@ -90,7 +92,9 @@ pub enum PluginSurfaceTarget {
 }
 
 /// Stable namespaced identity for one input region.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct PluginSurfaceRegionId {
     pub owner_plugin_id: String,
     pub surface_local_id: String,

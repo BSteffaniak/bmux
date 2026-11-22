@@ -47,6 +47,9 @@ Four paths draw non-pane UI in the attach client today.
 - Path A paint clips to `surface.rect` and ignores `clip_rect`. Fixed in phase 2.
 - `retained_surface_metadata_equal` ignores `modal`.
 - Path B never reaches the native terminal, and its hits are never routed back.
+  Removed from the attach client in phase 8 (it had no producers); the inert
+  `bmux_tui::presentation::portable` wire contract stays because the external
+  `bcode` plugin SDK references its contract id.
 - Tab-bar menus and toasts recompute absolute rects from the viewport themselves.
   Fixed in phase 3.
 - Every producer parses string hook ids (`strip_prefix("bmux.sidebar:sidebar:tab:")`).

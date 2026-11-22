@@ -4,7 +4,6 @@
 //! horizontal transform. Producers publish the returned cells through their existing
 //! owner-scoped surface, and retain the viewport only after publication succeeds.
 mod committed;
-pub mod portable;
 pub use committed::CommittedComponentViewport;
 
 use bmux_tui::{
@@ -84,22 +83,6 @@ impl ComponentViewport {
         result.logical_offset = Some((x, y));
         result.raster = viewport;
         Some(result)
-    }
-
-    /// Capture complete, zero-origin portable output through the same scoped
-    /// geometry used for native components. This is prepared off the frame loop;
-    /// replay never calls the producing plugin. Text sources remain caller-owned.
-    #[must_use]
-    pub fn paint_portable(&self, component: &dyn Component) -> portable::PortablePresentation {
-        let mut buffer = Buffer::empty(Rect::new(0, 0, self.viewport.width, self.viewport.height));
-        let mut frame = Frame::new(&mut buffer);
-        let (x, y) = self
-            .logical_offset
-            .unwrap_or_else(|| (i32::from(self.offset.x), i64::from(self.offset.y)));
-        PaintCx::new(&mut frame).with_child_size(-x, -y, self.layout.size, |cx| {
-            component.paint(&self.layout, cx);
-        });
-        portable::PortablePresentation::from_frame(&frame)
     }
 
     #[must_use]

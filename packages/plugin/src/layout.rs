@@ -10,7 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::RwLock;
 
 /// Stable identity of one plugin-owned layout request.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct PluginLayoutId {
     pub owner_plugin_id: String,
     pub local_id: String,

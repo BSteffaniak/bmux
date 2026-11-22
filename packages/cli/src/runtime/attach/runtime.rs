@@ -179,11 +179,6 @@ trait AttachHost {
     fn take_frontend_bindings(&mut self) -> Option<super::frontend_bindings::FrontendBindings> {
         None
     }
-    fn take_frontend_presentations(
-        &mut self,
-    ) -> super::frontend_presentation::FrontendPresentations {
-        super::frontend_presentation::FrontendPresentations::default()
-    }
     fn queue_native_event(&mut self, _event: NativeAttachEvent) {}
     fn viewport_generation(&self) -> Option<u64> {
         None
@@ -711,22 +706,12 @@ pub struct NativeAttachHost {
     config_paths: Option<ConfigPaths>,
     config_loader: Option<NativeConfigLoader>,
     frontend_bindings: Option<super::frontend_bindings::FrontendBindings>,
-    frontend_presentations: super::frontend_presentation::FrontendPresentations,
     clipboard: Option<NativeClipboardCallback>,
 }
 impl NativeAttachHost {
     /// Install bounded activation-owned prompt/action receivers before running.
     pub fn set_frontend_bindings(&mut self, bindings: super::frontend_bindings::FrontendBindings) {
         self.frontend_bindings = Some(bindings);
-    }
-
-    /// Install activation-bound frontend output before attachment starts. The
-    /// runtime transfers the owned resources into its committed display path.
-    pub fn set_frontend_presentations(
-        &mut self,
-        presentations: super::frontend_presentation::FrontendPresentations,
-    ) {
-        self.frontend_presentations = presentations;
     }
 
     /// One-shot notification after the server commits this native attachment.
@@ -821,8 +806,6 @@ impl NativeAttachHost {
                 config_paths: None,
                 config_loader: None,
                 frontend_bindings: None,
-                frontend_presentations:
-                    super::frontend_presentation::FrontendPresentations::default(),
                 clipboard: None,
             },
         ))
@@ -831,11 +814,6 @@ impl NativeAttachHost {
 impl AttachHost for NativeAttachHost {
     fn take_frontend_bindings(&mut self) -> Option<super::frontend_bindings::FrontendBindings> {
         self.frontend_bindings.take()
-    }
-    fn take_frontend_presentations(
-        &mut self,
-    ) -> super::frontend_presentation::FrontendPresentations {
-        std::mem::take(&mut self.frontend_presentations)
     }
     fn attachment_committed(&mut self) {
         if let Some(callback) = self.attach_committed.take() {
@@ -1047,7 +1025,6 @@ fn native_identity_is_current<T: AttachHost + ?Sized>(
         && identity.attached_id == view.attached_id
         && host.viewport_generation() == Some(identity.viewport_generation)
         && host.accepted_revision() == identity.revision
-        && view.frontend_presentations.input_is_current()
         && view
             .observer
             .as_ref()
@@ -5367,7 +5344,6 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     }
 
     let mut view_state = AttachViewState::with_private_presentation(attach_info);
-    view_state.frontend_presentations = terminal.take_frontend_presentations();
     // An embedder may supply its own scoped frontend host; otherwise this
     // attachment owns one, plus the frontend instances bound to it.
     let embedder_frontend_bindings = terminal.take_frontend_bindings();
@@ -5684,9 +5660,6 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
     publication_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut observer_capture_pending = false;
     'attach_loop: loop {
-        if view_state.frontend_presentations.reconcile_closed() {
-            view_state.dirty.mark_overlay_dirty(AttachDirtySource::PromptOverlay);
-        }
         if view_state.prompt.discard_cancelled_scoped() {
             view_state.dirty.mark_overlay_dirty(AttachDirtySource::PromptOverlay);
         }
@@ -6034,20 +6007,6 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                 }
             } => {
                 match frontend_event? {
-                    super::frontend_bindings::FrontendEvent::Presentation(update) => {
-                        match update {
-                            super::frontend_bindings::PresentationUpdate::Install { scope, instance, generation, area, order } => {
-                                let owner = super::frontend_presentation::FrontendPresentationOwner::bind(scope, instance, generation)?;
-                                view_state.frontend_presentations.install(owner, area, order)?;
-                            }
-                            super::frontend_bindings::PresentationUpdate::Publish { scope, admission, instance, revision, bytes } => {
-                                anyhow::ensure!(!scope.is_cancelled()?, "frontend publication owner closed before dequeue");
-                                view_state.frontend_presentations.publish_encoded(instance, revision, &bytes)?;
-                                drop(admission);
-                            }
-                        }
-                        view_state.dirty.mark_overlay_dirty(AttachDirtySource::PromptOverlay);
-                    }
                     super::frontend_bindings::FrontendEvent::Prompt(prompt) => {
                         perf_window.record_wake(AttachWakeSource::Prompt);
                         view_state.prompt.enqueue_scoped(prompt);
@@ -6066,8 +6025,7 @@ async fn run_session_attach_with_host_inner<T: AttachHost + ?Sized>(
                         }
                         drop(admitted);
                     }
-                    super::frontend_bindings::FrontendEvent::OwnerClosed(id) => {
-                        view_state.frontend_presentations.remove(id);
+                    super::frontend_bindings::FrontendEvent::OwnerClosed(_) => {
                         view_state.prompt.discard_cancelled_scoped();
                         view_state.dirty.mark_overlay_dirty(AttachDirtySource::PromptOverlay);
                     }
