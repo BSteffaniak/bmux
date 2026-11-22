@@ -324,7 +324,7 @@ async fn ensure_tls_trust(
 async fn probe_tls_fingerprint(target: &TlsTarget) -> Result<String> {
     let verifier = Arc::new(ProbeCertificateVerifier::default());
     let connector = TlsConnector::from(Arc::new(
-        rustls::ClientConfig::builder()
+        client_config_builder()?
             .dangerous()
             .with_custom_certificate_verifier(verifier.clone())
             .with_no_client_auth(),
@@ -371,9 +371,12 @@ fn tls_connector(
         None
     } else {
         Some(
-            rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
-                .build()
-                .context("building TLS CA verifier")?,
+            rustls::client::WebPkiServerVerifier::builder_with_provider(
+                Arc::new(roots),
+                Arc::new(crypto_provider()),
+            )
+            .build()
+            .context("building TLS CA verifier")?,
         )
     };
     let key = format!("{}:{}", target.host.trim(), target.port);
@@ -391,7 +394,7 @@ fn tls_connector(
         webpki,
     });
     Ok(TlsConnector::from(Arc::new(
-        rustls::ClientConfig::builder()
+        client_config_builder()?
             .dangerous()
             .with_custom_certificate_verifier(verifier)
             .with_no_client_auth(),
@@ -594,9 +597,7 @@ fn verify_tls12_signature(
     certificate: &CertificateDer<'_>,
     signature: &DigitallySignedStruct,
 ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
-    let algorithms = rustls::crypto::CryptoProvider::get_default()
-        .ok_or_else(|| RustlsError::General("rustls crypto provider unavailable".to_string()))?
-        .signature_verification_algorithms;
+    let algorithms = crypto_provider().signature_verification_algorithms;
     rustls::crypto::verify_tls12_signature(message, certificate, signature, &algorithms)
 }
 
@@ -605,18 +606,27 @@ fn verify_tls13_signature(
     certificate: &CertificateDer<'_>,
     signature: &DigitallySignedStruct,
 ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
-    let algorithms = rustls::crypto::CryptoProvider::get_default()
-        .ok_or_else(|| RustlsError::General("rustls crypto provider unavailable".to_string()))?
-        .signature_verification_algorithms;
+    let algorithms = crypto_provider().signature_verification_algorithms;
     rustls::crypto::verify_tls13_signature(message, certificate, signature, &algorithms)
 }
 
 fn supported_verify_schemes() -> Vec<SignatureScheme> {
-    rustls::crypto::CryptoProvider::get_default().map_or_else(Vec::new, |provider| {
-        provider
-            .signature_verification_algorithms
-            .supported_schemes()
-    })
+    crypto_provider()
+        .signature_verification_algorithms
+        .supported_schemes()
+}
+
+/// bmux's TLS crypto: named explicitly, since a process may link more than one rustls
+/// provider (then rustls cannot pick a default).
+fn crypto_provider() -> rustls::crypto::CryptoProvider {
+    rustls::crypto::ring::default_provider()
+}
+
+fn client_config_builder()
+-> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>> {
+    rustls::ClientConfig::builder_with_provider(Arc::new(crypto_provider()))
+        .with_safe_default_protocol_versions()
+        .context("configuring TLS protocol versions")
 }
 
 fn certificate_fingerprint(certificate: &[u8]) -> String {

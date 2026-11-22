@@ -1673,10 +1673,14 @@ fn build_tls_kernel_client_factory(target: &TlsTarget) -> KernelClientFactory {
 #[cfg(feature = "bundled-plugin-connections")]
 fn build_tls_connector(target: &TlsTarget, config: &BmuxConfig) -> Result<TlsConnector> {
     let verifier = build_tls_server_verifier(target, config)?;
-    let config = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .context("configuring TLS protocol versions")?
+    .dangerous()
+    .with_custom_certificate_verifier(verifier)
+    .with_no_client_auth();
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
@@ -1718,9 +1722,12 @@ fn build_tls_server_verifier(
         None
     } else {
         Some(
-            rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
-                .build()
-                .context("failed building TLS server verifier")?
+            rustls::client::WebPkiServerVerifier::builder_with_provider(
+                Arc::new(roots),
+                Arc::new(rustls::crypto::ring::default_provider()),
+            )
+            .build()
+            .context("failed building TLS server verifier")?
                 as Arc<dyn ServerCertVerifier>,
         )
     };
@@ -1817,11 +1824,7 @@ impl ServerCertVerifier for BmuxTlsServerVerifier {
         if let Some(webpki) = self.webpki.as_ref() {
             return webpki.verify_tls12_signature(message, cert, dss);
         }
-        let algorithms = rustls::crypto::CryptoProvider::get_default()
-            .ok_or_else(|| {
-                RustlsError::General("rustls crypto provider is not installed".to_string())
-            })?
-            .signature_verification_algorithms;
+        let algorithms = rustls::crypto::ring::default_provider().signature_verification_algorithms;
         rustls::crypto::verify_tls12_signature(message, cert, dss, &algorithms)
     }
 
@@ -1834,11 +1837,7 @@ impl ServerCertVerifier for BmuxTlsServerVerifier {
         if let Some(webpki) = self.webpki.as_ref() {
             return webpki.verify_tls13_signature(message, cert, dss);
         }
-        let algorithms = rustls::crypto::CryptoProvider::get_default()
-            .ok_or_else(|| {
-                RustlsError::General("rustls crypto provider is not installed".to_string())
-            })?
-            .signature_verification_algorithms;
+        let algorithms = rustls::crypto::ring::default_provider().signature_verification_algorithms;
         rustls::crypto::verify_tls13_signature(message, cert, dss, &algorithms)
     }
 
@@ -1846,11 +1845,9 @@ impl ServerCertVerifier for BmuxTlsServerVerifier {
         if let Some(webpki) = self.webpki.as_ref() {
             return webpki.supported_verify_schemes();
         }
-        rustls::crypto::CryptoProvider::get_default().map_or_else(Vec::new, |provider| {
-            provider
-                .signature_verification_algorithms
-                .supported_schemes()
-        })
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -1956,10 +1953,14 @@ fn trust_tls_gateway(target: &TlsTarget, fingerprint: &str, label: Option<&str>)
 async fn probe_tls_gateway_fingerprint(target: &TlsTarget) -> Result<String> {
     let verifier = Arc::new(ProbeTlsServerVerifier::default());
     let connector = TlsConnector::from(Arc::new(
-        rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(verifier.clone())
-            .with_no_client_auth(),
+        rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .context("configuring TLS protocol versions")?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier.clone())
+        .with_no_client_auth(),
     ));
     let address = format!("{}:{}", target.host, target.port);
     let tcp_stream = tokio::time::timeout(
@@ -2023,11 +2024,7 @@ impl ServerCertVerifier for ProbeTlsServerVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
-        let algorithms = rustls::crypto::CryptoProvider::get_default()
-            .ok_or_else(|| {
-                RustlsError::General("rustls crypto provider is not installed".to_string())
-            })?
-            .signature_verification_algorithms;
+        let algorithms = rustls::crypto::ring::default_provider().signature_verification_algorithms;
         rustls::crypto::verify_tls12_signature(message, cert, dss, &algorithms)
     }
 
@@ -2037,20 +2034,14 @@ impl ServerCertVerifier for ProbeTlsServerVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> std::result::Result<HandshakeSignatureValid, RustlsError> {
-        let algorithms = rustls::crypto::CryptoProvider::get_default()
-            .ok_or_else(|| {
-                RustlsError::General("rustls crypto provider is not installed".to_string())
-            })?
-            .signature_verification_algorithms;
+        let algorithms = rustls::crypto::ring::default_provider().signature_verification_algorithms;
         rustls::crypto::verify_tls13_signature(message, cert, dss, &algorithms)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        rustls::crypto::CryptoProvider::get_default().map_or_else(Vec::new, |provider| {
-            provider
-                .signature_verification_algorithms
-                .supported_schemes()
-        })
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 

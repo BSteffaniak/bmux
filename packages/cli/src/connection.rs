@@ -341,9 +341,13 @@ fn build_tls_connector(target: &TlsTarget) -> Result<TlsConnector> {
         );
     }
 
-    let config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .context("configuring TLS protocol versions")?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
     Ok(TlsConnector::from(Arc::new(config)))
 }
 

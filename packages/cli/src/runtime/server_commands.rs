@@ -768,10 +768,14 @@ async fn prepare_gateway(
     let (cert_file, key_file) = resolve_gateway_tls_files(quick, cert_file, key_file)?;
     let cert_chain = load_cert_chain(&cert_file)?;
     let private_key = load_private_key(&key_file)?;
-    let tls_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(cert_chain, private_key)
-        .context("failed building TLS server config")?;
+    let tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .context("configuring TLS protocol versions")?
+    .with_no_client_auth()
+    .with_single_cert(cert_chain, private_key)
+    .context("failed building TLS server config")?;
     let listener = TcpListener::bind(listen)
         .await
         .with_context(|| format!("failed binding TLS gateway on {listen}"))?;
