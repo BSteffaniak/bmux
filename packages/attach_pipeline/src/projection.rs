@@ -284,6 +284,28 @@ pub fn prepare_content_overlays(
                     }
                 }
             }
+            RenderOp::Cells(block) => {
+                for row_index in 0..block.height {
+                    let Some(y) = block.y.checked_add(row_index) else {
+                        break;
+                    };
+                    for column in 0..block.width {
+                        let Some(x) = block.x.checked_add(column) else {
+                            break;
+                        };
+                        let Some(symbol) =
+                            block.get(column, row_index).and_then(|cell| cell.symbol.as_ref())
+                        else {
+                            continue;
+                        };
+                        let mut buffer = [0; 4];
+                        let style = block
+                            .get(column, row_index)
+                            .map_or_else(RenderStyle::new, |cell| cell.style);
+                        row(x, y, symbol.as_str(&mut buffer), style)?;
+                    }
+                }
+            }
         }
     }
     Ok(output)

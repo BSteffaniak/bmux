@@ -542,3 +542,31 @@ fn parity_host_notification_row() {
     );
     assert_golden("host_notification", &harness.render());
 }
+
+#[test]
+#[serial]
+fn parity_cell_block_graphemes_transparency_and_clip() {
+    use bmux_presentation_scene::scene::{CellBlock, SceneCell};
+    const OWNER: &str = "parity.cells";
+    let mut harness = Harness::new(full_pane(), b"0123456789abcdefghij\r\nKLMNOPQRSTUVWXYZ");
+    // Row 0: a wide emoji, a combining cluster, then transparent cells that
+    // keep the pane's text. Row 1: opaque cells.
+    let mut block = CellBlock::transparent(0, 0, 8, 2);
+    let style = styled(RenderNamedColor::Black, RenderNamedColor::Yellow);
+    block.set(0, 0, SceneCell::cluster("👍🏽", style));
+    block.set(2, 0, SceneCell::cluster("e\u{301}", style));
+    for column in 0..8 {
+        block.set(column, 1, SceneCell::new('=', RenderStyle::new().bold()));
+    }
+    let mut surface = explicit(
+        PluginSurfaceId::new(OWNER, "cells", Uuid::from_u128(0xd1)),
+        1,
+        ExtensionRect::new(4, 0, 8, 2),
+        vec![RenderOp::cells(block)],
+    )
+    .order(10, 0);
+    // Clip away the last two columns of the surface.
+    surface.clip_rect = Some(ExtensionRect::new(0, 0, 6, 2));
+    harness.surfaces(OWNER, vec![surface]);
+    assert_golden("cell_block_graphemes", &harness.render());
+}

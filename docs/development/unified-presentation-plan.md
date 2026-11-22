@@ -41,10 +41,10 @@ Four paths draw non-pane UI in the attach client today.
 ### Defects found while mapping
 
 - On full-scene frames, path A surfaces are painted in `BTreeMap<Uuid>` order, not
-  `(layer, z)` order (`runtime.rs`, `retained_plugin_repaints`).
+  `(layer, z)` order (`runtime.rs`, `retained_plugin_repaints`). Fixed in phase 2.
 - All path A surfaces paint after every scene surface regardless of layer or z,
   although hit testing and occlusion use layer and z.
-- Full-surface repaints clip to `surface.rect` and ignore `clip_rect`.
+- Path A paint clips to `surface.rect` and ignores `clip_rect`. Fixed in phase 2.
 - `retained_surface_metadata_equal` ignores `modal`.
 - Path B never reaches the native terminal, and its hits are never routed back.
 - Path A layout is resolved and every allocation callback notified on every
@@ -191,9 +191,12 @@ Each phase lands with the parity harness and the targeted tests green.
 1. **Contract types** in `bmux_presentation_scene` with serde: the paint
    vocabulary moved out of `bmux_plugin::render`, plus placement resolution
    (`resolve_anchored`, `resolve_attached`), `CellBlock`, `HitKey`/`HitTable`.
-2. **Unified root lowering and ordering.** Path A surfaces carry scene items; root
-   scenes paint in `(layer, z)` order; `clip_rect` honoured on full repaints;
-   cells with transparency and graphemes; graphics and images on root scenes.
+2. **Unified root lowering and ordering.** `RenderOp::Cells(CellBlock)` gives every
+   path grapheme clusters, wide symbols and per-cell transparency (lowered by the
+   attach pipeline, flattened only when every cell is a single scalar, clipped to
+   occluders by the decoration renderer, validated on publish). Plugin surfaces
+   paint in `(layer, z)` order and are clipped to their `clip_rect` on every
+   frame. Graphics and images on root scenes move to phase 5 with keyed items.
 3. **Placement.** `Overlay` anchors, `AnchoredTo`, `Fill`; allocation callbacks
    only on change. Tab-bar menu, toasts and the host notification move off
    explicit rects.

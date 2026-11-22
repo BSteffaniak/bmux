@@ -4528,6 +4528,7 @@ dependencies = [
  "bmux_decoration_plugin_renderer",
  "bmux_image",
  "bmux_plugin",
+ "bmux_presentation_scene",
  "bmux_raster",
  "bmux_scene_protocol",
  "bmux_scene_protocol_render",
@@ -4712,6 +4713,7 @@ dependencies = [
  "bmux_plugin_runtime",
  "bmux_plugin_schema",
  "bmux_plugin_sdk",
+ "bmux_presentation_scene",
  "bmux_presenter_plugin",
  "bmux_prompted_actions_plugin",
  "bmux_recording_bootstrap",
@@ -5228,6 +5230,7 @@ version = "0.0.1-alpha.4"
 dependencies = [
  "bmux_decoration_plugin",
  "bmux_plugin",
+ "bmux_presentation_scene",
  "bmux_scene_protocol",
  "bmux_scene_protocol_render",
  "serde",

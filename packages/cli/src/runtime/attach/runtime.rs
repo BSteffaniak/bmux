@@ -10434,12 +10434,10 @@ fn queue_retained_render_ops(
     let RetainedSurfacePayload::RenderOps(ops) = &surface.payload else {
         return Ok(false);
     };
-    let surface_rect = ExtensionRect::new(
-        surface.rect.x,
-        surface.rect.y,
-        surface.rect.w,
-        surface.rect.h,
-    );
+    // Paint is clipped to the surface's clip (already intersected with its rect
+    // and the viewport when the surface was retained), not just its rect.
+    let clip = surface.clip_rect.unwrap_or(surface.rect);
+    let surface_rect = ExtensionRect::new(clip.x, clip.y, clip.w, clip.h);
     let damage = render_damage_from_retained_damage_rects(&repaint.damage);
     queue_render_ops_with_capabilities(canvas, surface_rect, &damage, ops, capabilities)
         .context("failed queueing retained render ops")
@@ -11443,6 +11441,9 @@ fn render_attach_frame_inner(
                 })
                 .collect::<Vec<_>>()
         };
+        // Paint in stacking order, as hit testing and occlusion see it.
+        let mut retained_plugin_repaints = retained_plugin_repaints;
+        retained_plugin_repaints.sort_by_key(|(surface, _)| (surface.layer, surface.z, surface.id));
         for (surface, repaint) in retained_plugin_repaints {
             overlay_rendered |=
                 queue_retained_render_ops(canvas, &surface, &repaint, retained_capabilities)?;

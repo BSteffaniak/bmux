@@ -1,8 +1,8 @@
 00|                                        |
 01|                                        |
 02|  LLLLLLLLLL                            |
-03|  LLLLLLLLLLHHHH                        |
-04|  LLLLLLLLLLHHHH                        |
+03|  LLLLHHHHHHHHHH                        |
+04|  LLLLHHHHHHHHHH                        |
 05|      HHHHHHHHHH                        |
 06|                                        |
 07|                                        |
@@ -11,8 +11,8 @@
 10|                                        |
 11|                                        |
 02 02-11 fg=7 bg=1
-03 02-11 fg=7 bg=1
-03 12-15 fg=7 bg=2
-04 02-11 fg=7 bg=1
-04 12-15 fg=7 bg=2
+03 02-05 fg=7 bg=1
+03 06-15 fg=7 bg=2
+04 02-05 fg=7 bg=1
+04 06-15 fg=7 bg=2
 05 06-15 fg=7 bg=2

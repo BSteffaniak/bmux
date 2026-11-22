@@ -33,6 +33,15 @@ fn render_op_visible_segment_safe(op: &RenderOp) -> bool {
             .flatten()
             .filter_map(|cell| cell.ch)
             .all(|ch| render_char_display_width_u16(ch) == 1),
+        // Flattening is per scalar cell: blocks with clusters or wide symbols are
+        // lowered directly instead.
+        RenderOp::Cells(block) => block.cells.iter().all(|cell| match &cell.symbol {
+            None => true,
+            Some(bmux_presentation_scene::scene::SceneSymbol::Char(ch)) => {
+                render_char_display_width_u16(*ch) == 1
+            }
+            Some(bmux_presentation_scene::scene::SceneSymbol::Cluster(_)) => false,
+        }),
     }
 }
 
@@ -141,6 +150,10 @@ impl RenderVisibleCellPlan {
             }
             RenderOp::CellGrid { x, y, rows } => {
                 self.paint_cell_grid(surface_rect, layer, *x, *y, rows);
+            }
+            RenderOp::Cells(block) => {
+                let rows = cell_block_rows(block);
+                self.paint_cell_grid(surface_rect, layer, block.x, block.y, &rows);
             }
         }
     }
@@ -455,4 +468,29 @@ fn flush_visible_text_run(ops: &mut Vec<RenderOp>, pending: &mut Option<VisibleT
             style: run.style,
         });
     }
+}
+
+/// A block of single-scalar cells as a sparse cell grid. Clusters are not
+/// representable as one scalar and become transparent here; callers only flatten
+/// blocks that `render_op_visible_segment_safe` accepts.
+pub(super) fn cell_block_rows(
+    block: &bmux_presentation_scene::scene::CellBlock,
+) -> Vec<Vec<bmux_plugin::RenderCell>> {
+    (0..block.height)
+        .map(|row| {
+            (0..block.width)
+                .map(|column| {
+                    block.get(column, row).map_or(
+                        bmux_plugin::RenderCell::sparse(RenderStyle::new()),
+                        |cell| match &cell.symbol {
+                            Some(bmux_presentation_scene::scene::SceneSymbol::Char(ch)) => {
+                                bmux_plugin::RenderCell::new(*ch, cell.style)
+                            }
+                            _ => bmux_plugin::RenderCell::sparse(cell.style),
+                        },
+                    )
+                })
+                .collect()
+        })
+        .collect()
 }

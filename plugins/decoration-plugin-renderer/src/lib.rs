@@ -1332,7 +1332,47 @@ fn push_clipped_render_ops(
                 clip_cell_grid_rows_to_occluders(&mut rows, x, y, occluders);
                 ops.push(RenderOp::CellGrid { x, y, rows });
             }
+            RenderOp::Cells(mut block) => {
+                clip_cell_block_to_occluders(&mut block, occluders);
+                ops.push(RenderOp::Cells(block));
+            }
             RenderOp::StyledText { .. } | RenderOp::Border { .. } => ops.push(op),
+        }
+    }
+}
+
+/// Make every cell an occluder covers transparent. A wide symbol is dropped
+/// when any cell it spans is covered.
+fn clip_cell_block_to_occluders(
+    block: &mut bmux_presentation_scene::scene::CellBlock,
+    occluders: &[ExtensionRect],
+) {
+    for row in 0..block.height {
+        for column in 0..block.width {
+            let Some(width) = block
+                .get(column, row)
+                .and_then(|cell| cell.symbol.as_ref())
+                .map(|symbol| symbol.width().max(1))
+            else {
+                continue;
+            };
+            let covered = ExtensionRect::new(
+                block.x.saturating_add(column),
+                block.y.saturating_add(row),
+                width,
+                1,
+            );
+            if occluders.iter().any(|occluder| occluder.intersects(covered)) {
+                let style = block.get(column, row).map(|cell| cell.style).unwrap_or_default();
+                block.set(
+                    column,
+                    row,
+                    bmux_presentation_scene::scene::SceneCell {
+                        symbol: None,
+                        style,
+                    },
+                );
+            }
         }
     }
 }

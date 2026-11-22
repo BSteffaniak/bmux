@@ -353,6 +353,12 @@ fn translate_surface_render_op(op: &RenderOp, origin_x: u16, origin_y: u16) -> R
             y: origin_y.saturating_add(*y),
             rows: rows.clone(),
         },
+        RenderOp::Cells(block) => {
+            let mut block = block.clone();
+            block.x = origin_x.saturating_add(block.x);
+            block.y = origin_y.saturating_add(block.y);
+            RenderOp::Cells(block)
+        }
     }
 }
 
@@ -2034,6 +2040,7 @@ fn render_op_damage_bounds(op: &RenderOp) -> DamageRect {
                 .unwrap_or(u16::MAX),
             u16::try_from(rows.len()).unwrap_or(u16::MAX),
         ),
+        RenderOp::Cells(block) => DamageRect::new(block.x, block.y, block.width, block.height),
     }
 }
 

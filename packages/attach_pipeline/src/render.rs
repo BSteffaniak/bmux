@@ -459,6 +459,12 @@ fn render_ops_for_capabilities(
                     })
                     .collect(),
             },
+            RenderOp::Cells(mut block) => {
+                for cell in &mut block.cells {
+                    cell.style = cell.style.for_capabilities(capabilities);
+                }
+                RenderOp::Cells(block)
+            }
         })
         .collect::<Vec<_>>()
         .into()
@@ -542,6 +548,7 @@ fn lower_render_ops_directly(
             RenderOp::CellGrid { x, y, rows } => {
                 lower_render_cell_grid(target, surface_rect, *x, *y, rows)
             }
+            RenderOp::Cells(block) => lower_render_cell_block(target, surface_rect, block),
         };
     }
     wrote |= flush_pending_text_run(target, surface_rect, &mut pending_text_run);
@@ -736,6 +743,39 @@ fn lower_render_cell_grid(
                 ch.encode_utf8(&mut [0; 4]),
                 cell.style,
             );
+            wrote = true;
+        }
+    }
+    wrote
+}
+
+/// Paint a block's visible cells; transparent cells keep what is beneath.
+/// A wide symbol is painted only when all of its cells are inside the surface.
+fn lower_render_cell_block(
+    target: &mut Canvas<'_, '_, '_>,
+    surface_rect: ExtensionRect,
+    block: &bmux_presentation_scene::scene::CellBlock,
+) -> bool {
+    let mut wrote = false;
+    for row in 0..block.height {
+        let cell_y = block.y.saturating_add(row);
+        if cell_y < surface_rect.y || cell_y >= surface_rect.bottom() {
+            continue;
+        }
+        for column in 0..block.width {
+            let cell_x = block.x.saturating_add(column);
+            let Some(cell) = block.get(column, row) else {
+                continue;
+            };
+            let Some(symbol) = cell.symbol.as_ref() else {
+                continue;
+            };
+            let width = symbol.width().max(1);
+            if cell_x < surface_rect.x || cell_x.saturating_add(width) > surface_rect.right() {
+                continue;
+            }
+            let mut buffer = [0; 4];
+            lower_text(target, cell_x, cell_y, symbol.as_str(&mut buffer), cell.style);
             wrote = true;
         }
     }
@@ -1080,6 +1120,7 @@ fn render_op_bounds(op: &RenderOp) -> ExtensionRect {
                 .unwrap_or(u16::MAX),
             h: u16::try_from(rows.len()).unwrap_or(u16::MAX),
         },
+        RenderOp::Cells(block) => block.rect(),
     }
 }
 

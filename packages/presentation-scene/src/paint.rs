@@ -491,6 +491,10 @@ pub enum RenderOp {
         y: u16,
         rows: Vec<Vec<RenderCell>>,
     },
+    /// Grapheme-aware cells with per-cell transparency, positioned by the
+    /// block's own `x`/`y`. Transparent cells (`symbol: None`) keep what is
+    /// beneath them; a wide symbol covers the transparent cells after it.
+    Cells(crate::scene::CellBlock),
 }
 
 impl RenderOp {
@@ -544,6 +548,11 @@ impl RenderOp {
             y,
             rows: rows.into(),
         }
+    }
+
+    #[must_use]
+    pub const fn cells(block: crate::scene::CellBlock) -> Self {
+        Self::Cells(block)
     }
 }
 
@@ -940,6 +949,7 @@ impl RenderOp {
                 vec![ExtensionRect::new(*x, *y, *width, 1)]
             }
             Self::CellGrid { x, y, rows } => vec![grid_rect(*x, *y, rows)],
+            Self::Cells(block) => vec![block.rect()],
         }
     }
 }

@@ -330,6 +330,10 @@ pub enum PluginSurfacePublishError {
     InvalidMetadata {
         id: PluginSurfaceId,
     },
+    /// A cell block whose cell count does not match its size.
+    MalformedCells {
+        id: PluginSurfaceId,
+    },
 }
 
 impl std::fmt::Display for PluginSurfacePublishError {
@@ -407,6 +411,9 @@ impl std::fmt::Display for PluginSurfacePublishError {
             ),
             Self::InvalidMetadata { id } => {
                 write!(formatter, "invalid caller metadata for {}", id.local_id)
+            }
+            Self::MalformedCells { id } => {
+                write!(formatter, "malformed cell block in {}", id.local_id)
             }
             Self::ConflictingRevision => {
                 formatter.write_str("surface revision conflicts with retained owner state")
@@ -771,6 +778,7 @@ fn validate_snapshot(
         }
         snapshot_bytes = snapshot_bytes.saturating_add(std::mem::size_of::<PluginSurface>());
         for op in &surface.ops {
+            snapshot_bytes = snapshot_bytes.saturating_add(cell_block_bytes(surface, op)?);
             let text_bytes = render_op_text_bytes(op);
             if text_bytes > maximum_text_bytes {
                 return Err(PluginSurfacePublishError::TextTooLong {
@@ -962,6 +970,25 @@ fn metadata_bytes(metadata: &PluginSurfaceMetadata) -> usize {
         }))
 }
 
+/// Retained bytes of a cell block's cells; malformed blocks are rejected.
+fn cell_block_bytes(
+    surface: &PluginSurface,
+    op: &RenderOp,
+) -> Result<usize, PluginSurfacePublishError> {
+    let RenderOp::Cells(block) = op else {
+        return Ok(0);
+    };
+    if !block.is_well_formed() {
+        return Err(PluginSurfacePublishError::MalformedCells {
+            id: surface.id.clone(),
+        });
+    }
+    Ok(block
+        .cells
+        .len()
+        .saturating_mul(std::mem::size_of::<bmux_presentation_scene::scene::SceneCell>()))
+}
+
 fn render_op_text_bytes(op: &RenderOp) -> usize {
     match op {
         RenderOp::TextRun { text, .. } => text.len(),
@@ -971,6 +998,15 @@ fn render_op_text_bytes(op: &RenderOp) -> usize {
             .flatten()
             .filter_map(|cell| cell.ch)
             .map(char::len_utf8)
+            .sum(),
+        RenderOp::Cells(block) => block
+            .cells
+            .iter()
+            .filter_map(|cell| cell.symbol.as_ref())
+            .map(|symbol| match symbol {
+                bmux_presentation_scene::scene::SceneSymbol::Char(ch) => ch.len_utf8(),
+                bmux_presentation_scene::scene::SceneSymbol::Cluster(cluster) => cluster.len(),
+            })
             .sum(),
         RenderOp::ClearRect { .. }
         | RenderOp::EraseRowSegment { .. }

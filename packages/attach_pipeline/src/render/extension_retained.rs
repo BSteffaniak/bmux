@@ -221,6 +221,7 @@ fn item_bounds(item: &RenderLayerItem) -> ExtensionRect {
                 .unwrap_or(0);
             ExtensionRect::new(*x, *y, width, height)
         }
+        RenderLayerItem::Op(RenderOp::Cells(block)) => block.rect(),
         RenderLayerItem::Graphic(graphic) => graphic.cell_rect,
     }
 }
