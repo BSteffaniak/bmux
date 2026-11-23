@@ -897,6 +897,9 @@ impl Drop for SupervisionCompletion {
     }
 }
 
+/// A pane waiter's work, until its thread (or a startup failure) takes it.
+type PaneWaiterWork = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
 fn supervision_join(
     threads: &mut [Option<switchy_thread::thread::JoinHandle<()>>],
 ) -> switchy_async::task::JoinHandle<std::result::Result<(), String>> {
@@ -8206,9 +8209,10 @@ impl SessionRuntimeManager {
             let child_waiter_done = Arc::new(AtomicBool::new(false));
             let child_waiter_done_for_thread = Arc::clone(&child_waiter_done);
             let publication_for_waiter = Arc::clone(&publication_for_task);
-            let child_waiter = switchy_thread::thread::Builder::new()
-                .name(format!("bmux-server-pane-{pane_id}-wait"))
-                .spawn({ let host = host.clone(); move || {
+            // The waiter's work, held here until its thread takes it: when that thread cannot
+            // start, the startup failure below still runs it, so the leader's exit is observed,
+            // reaped and announced rather than lost with the closure.
+            let waiter_work: PaneWaiterWork = Arc::new(Mutex::new(Some(Box::new({ let host = host.clone(); move || {
                     let _thread_guard = PaneBlockingThreadGuard::new(pane_id, "waiter");
                     let _completion = SupervisionCompletion { done: Arc::clone(&child_waiter_done_for_thread), execution: Arc::clone(&execution_for_waiter) };
                     // Observe the exit without reaping, fence the leader's pid,
@@ -8267,10 +8271,18 @@ impl SessionRuntimeManager {
                     let _ = child_exit_tx.send(ExecutionExitNotice::OwnerExited);
                     child_waiter_done_for_thread.store(true, Ordering::SeqCst);
                         execution_for_waiter.notify();
-                } })
+                } }))));
+            let waiter_work_for_thread = Arc::clone(&waiter_work);
+            let child_waiter = switchy_thread::thread::Builder::new()
+                .name(format!("bmux-server-pane-{pane_id}-wait"))
+                .spawn(move || {
+                    let work = waiter_work_for_thread.lock().ok().and_then(|mut work| work.take());
+                    if let Some(work) = work {
+                        work();
+                    }
+                })
                 .ok();
             if child_waiter.is_none() {
-                child_waiter_done.store(true, Ordering::SeqCst);
                 warn!(%pane_id, "failed spawning pane process waiter thread");
             }
 
@@ -8626,6 +8638,12 @@ impl SessionRuntimeManager {
                 startup_tx.send_replace(Some(Err(
                     "failed to start pane I/O supervision threads".into()
                 )));
+                // Why the pane ended, before the waiter records how its leader did (killed).
+                if let Ok(mut reason) = exit_reason_for_task.lock()
+                    && reason.is_none()
+                {
+                    *reason = Some("pane I/O threads could not be started".into());
+                }
                 if let Err(error) =
                     execution_for_task.signal_owned_group(&host, crate::platform::StopAction::Force)
                 {
@@ -8634,6 +8652,15 @@ impl SessionRuntimeManager {
                     ));
                 }
                 kill_unreaped_leader(&execution_for_task, &mut child_killer);
+                // A waiter that never started leaves its work here: observe, reap and announce
+                // the leader's exit on the blocking pool, as its thread would have.
+                let orphaned = waiter_work.lock().ok().and_then(|mut work| work.take());
+                if let Some(work) = orphaned
+                    && let Err(error) = switchy_async::task::spawn_blocking(work).await
+                {
+                    execution_for_task
+                        .record_cleanup_error(format!("pane waiter fallback failed: {error}"));
+                }
             }
 
             let mut owner_exited = false;
