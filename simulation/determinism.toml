@@ -43,8 +43,8 @@ reason = "Error values (backtraces only when RUST_BACKTRACE asks)."
 [[audit]]
 name = "atomic-waker"
 version = "=1.1.2"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "base64"
@@ -79,8 +79,8 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "btparse"
 version = "=0.2.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "bytes"
@@ -163,8 +163,8 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "deranged"
 version = "=0.5.9"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "digest"
@@ -217,8 +217,8 @@ reason = "Thread-local generator seeded from the OS. No scanned crate may call i
 [[audit]]
 name = "fdeflate"
 version = "=0.3.7"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "flate2"
@@ -235,8 +235,8 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "fnv"
 version = "=1.0.7"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "foldhash"
@@ -253,8 +253,8 @@ reason = "Form encoding."
 [[audit]]
 name = "futures"
 version = "=0.3.34"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "futures-channel"
@@ -277,20 +277,20 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "futures-io"
 version = "=0.3.34"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "futures-sink"
 version = "=0.3.34"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "futures-task"
 version = "=0.3.34"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "futures-util"
@@ -307,8 +307,8 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "genawaiter-macro"
 version = "=0.99.1"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "getrandom"
@@ -356,7 +356,7 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 name = "hostname"
 version = "=0.4.2"
 verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet. Scanned clean, but reads the host's name through libc, which the scan does not see: not pure."
 
 [[audit]]
 name = "http"
@@ -367,14 +367,14 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "http-body"
 version = "=1.1.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "http-body-util"
 version = "=0.1.5"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "httparse"
@@ -403,8 +403,8 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "hyper-rustls"
 version = "=0.27.10"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "hyper-timeout"
@@ -421,8 +421,8 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "hyperchad_docs_config"
 version = "=0.5.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "iana-time-zone"
@@ -433,14 +433,14 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "icu_collections"
 version = "=2.4.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "icu_locale_core"
 version = "=2.4.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "icu_normalizer"
@@ -451,20 +451,20 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "icu_normalizer_data"
 version = "=2.4.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "icu_properties"
 version = "=2.4.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "icu_properties_data"
 version = "=2.4.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "icu_provider"
@@ -475,14 +475,14 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "idna"
 version = "=1.1.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "idna_adapter"
 version = "=1.2.2"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "if-addrs"
@@ -505,8 +505,8 @@ reason = "Insertion-ordered, but its default hasher is randomly seeded; HashMap-
 [[audit]]
 name = "ipnet"
 version = "=2.12.2"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "itertools"
@@ -524,7 +524,7 @@ reason = "Integer formatting."
 name = "lazy_static"
 version = "=1.5.1"
 verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet. Scanned clean itself, but its macro puts a process-wide lazy static into the calling crate."
 
 [[audit]]
 name = "lexical"
@@ -584,19 +584,19 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 name = "libsqlite3-sys"
 version = "=0.30.1"
 verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet. Scanned clean, but its work (files included) is in SQLite's C code, which the scan does not see."
 
 [[audit]]
 name = "litemap"
 version = "=0.8.3"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "lock_api"
 version = "=0.4.14"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "log"
@@ -607,8 +607,8 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "matchers"
 version = "=0.2.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "mdns-sd"
@@ -625,14 +625,14 @@ reason = "Byte searching."
 [[audit]]
 name = "miniz_oxide"
 version = "=0.8.9"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "miniz_oxide"
 version = "=0.9.1"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "mio"
@@ -643,14 +643,14 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "moosicbox_assert"
 version = "=0.5.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "moosicbox_env_utils"
 version = "=0.5.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "moosicbox_log_runtime"
@@ -679,8 +679,8 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "num-conv"
 version = "=0.2.2"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "num-traits"
@@ -697,8 +697,8 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "objc2-encode"
 version = "=4.1.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "once_cell"
@@ -715,8 +715,8 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "opentelemetry-http"
 version = "=0.33.1"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "opentelemetry-otlp"
@@ -763,14 +763,14 @@ reason = "Pin helpers."
 [[audit]]
 name = "png"
 version = "=0.18.1"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "potential_utf"
 version = "=0.1.6"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "powerfmt"
@@ -895,8 +895,8 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "rustc-demangle"
 version = "=0.1.28"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "rustix"
@@ -925,14 +925,14 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "rustls-webpki"
 version = "=0.103.17"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "scoped-tls"
 version = "=1.0.1"
 verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+reason = "Baseline of 2026-11-22: linked when the check began, not audited yet. Scanned clean itself, but its macro puts a thread-local into the calling crate."
 
 [[audit]]
 name = "scopeguard"
@@ -961,8 +961,8 @@ reason = "Serialization framework: no I/O, clocks, randomness or threads."
 [[audit]]
 name = "serde-querystring"
 version = "=0.3.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "serde_core"
@@ -1231,8 +1231,8 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "sync_wrapper"
 version = "=1.0.2"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "tempfile"
@@ -1267,8 +1267,8 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "time-core"
 version = "=0.1.9"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "tinystr"
@@ -1339,8 +1339,8 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "tonic-prost"
 version = "=0.14.9"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "tonic-types"
@@ -1357,26 +1357,26 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "tower-http"
 version = "=0.6.11"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "tower-layer"
 version = "=0.3.3"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "tower-service"
 version = "=0.3.3"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "tracing"
 version = "=0.1.44"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "tracing-appender"
@@ -1411,8 +1411,8 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "try-lock"
 version = "=0.2.5"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "typenum"
@@ -1423,8 +1423,8 @@ reason = "Type-level numbers."
 [[audit]]
 name = "untrusted"
 version = "=0.9.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "url"
@@ -1447,8 +1447,8 @@ reason = "UTF-8 iteration."
 [[audit]]
 name = "utf_types"
 version = "=1.0.0"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "uuid"
@@ -1483,8 +1483,8 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "yoke"
 version = "=0.8.4"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "zerocopy"
@@ -1495,20 +1495,20 @@ reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
 [[audit]]
 name = "zerofrom"
 version = "=0.1.8"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "zeroize"
 version = "=1.9.2"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "zerotrie"
 version = "=0.2.5"
-verdict = "unaudited"
-reason = "Baseline of 2026-11-22: linked when the check began, not audited yet."
+verdict = "pure"
+reason = "Scanned clean by `switchy_cargo --scan-external` (2026-11-22, the simulations' features): its compiled code reaches no clock, randomness, thread, file, environment or process-wide state, and declares no foreign functions."
 
 [[audit]]
 name = "zerovec"

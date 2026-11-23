@@ -246,7 +246,7 @@ exemption.
   Nothing else differed in 1000 pane runtime runs (guided ones too), and 300 each of pty
   and local terminal.
 
-### 20.2 (MoosicBox `f28ef693f`)
+### 20.2 (MoosicBox `f28ef693f`, `af3931b78`)
 
 - **The check.** `switchy_cargo` resolves a simulation's graph with `cargo metadata`:
   normal dependencies for the host, not entering proc macros. `cargo sim NAME --check` runs
@@ -275,11 +275,38 @@ exemption.
   - 26 `controlled`: switchy and simvar.
   - 19 `restricted`: `uuid`, `rand`, `getrandom`, `tokio`, the hashers, `tempfile` and
     others, whose non-deterministic entry points the rules forbid.
-  - 59 `pure`.
-  - 148 `unaudited`: a baseline of 2026-11-22, pinned to exact versions.
+  - 110 `pure`: 59 read, and 51 of the baseline that `--scan-external` found clean (below).
+  - 97 `unaudited`: a baseline of 2026-11-22, pinned to exact versions.
+- **The parsing scan** (`af3931b78`). The line scan gave way to one that parses each crate
+  (`syn`) from its roots:
+  - It follows `mod` declarations as rustc does, reading only the files the crate compiles.
+    `#[path]` is followed, and so are modules declared inside a macro. The pane runtime's
+    `inject_yields_mod!` modules had never been scanned before.
+  - `cfg`s are evaluated for a simulation build: `test` is false, features come from the
+    resolved graph, and an OS predicate is scanned on both sides.
+  - Paths are resolved before they are judged (`use` groups, aliases, globs,
+    `self`/`super`/`crate`, the crate's own re-exports, 2018 uniform paths). A planted
+    `use std::sync::Mutex as Lock;` and an `env::var` inside `dbg!` are both caught.
+  - Imports are judged first; an imported primitive is reported once, at its `use`.
+  - `thread_local!` counts as process-wide state.
+
+  The three simulations scan with 0 findings. `SWITCHY_CARGO_SHOW_UNREACHED=1` lists the
+  source files no `mod` reaches: tests, other platforms, feature-gated code, and one dead
+  file (`plugins/pane-runtime-plugin/src/runtime/terminal_session.rs`, declared nowhere).
+- **Evidence for audits.** `switchy_cargo --scan-external` scans every external crate by the
+  shared rules, with the simulations' features (252 crates in about 11 s). 55 baseline crates
+  scanned clean. 51 of them are now `pure`, with that as their reason. Four stay
+  `unaudited`, with a note: `hostname` (reads the host name through libc) and
+  `libsqlite3-sys` (C code), which the scan cannot see into; `lazy_static` and `scoped-tls`,
+  whose macros put state in the calling crate. The first external scan hung on `dispatch2`:
+  objc2's generated module and the crate root glob-import each other, and the resolver
+  expanded globs through globs exponentially. It now expands a glob once per path.
 - **Not yet.**
-  - The scan is still line-based (the `syn`-based scan with path resolution is still to
-    come).
+  - Foreign functions and `libc` calls are invisible to the scan; for local crates they sit
+    in native-only files, but an external crate's clean scan says nothing about them.
+  - Macros are scanned as tokens, not expanded: a macro from another crate that reaches a
+    primitive (`lazy_static!`, `scoped_thread_local!`) is seen only through its audit.
   - `runs = false` is a claim nothing checks at run time yet (20.4, or a nightly coverage
     run).
-  - The 148 baseline crates are still to be audited.
+  - The 97 remaining baseline crates are still to be audited; most of their findings are
+    patterns (ordering by address, OS `cfg`s, `HashMap`) that need reading, not rules.
