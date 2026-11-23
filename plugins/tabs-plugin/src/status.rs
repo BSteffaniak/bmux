@@ -22,8 +22,6 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bmux_agents_plugin_api::agent_states::{AgentSnapshot, AgentState, PaneAgent};
-use bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent;
-use bmux_pane_runtime_plugin_api::pane_runtime_terminal_events::{PromptMarkKind, TerminalEvent};
 use bmux_tabs_plugin_api::tabs_status::{AgentActivity, GitStatus, TabAgent, TabStatus};
 use uuid::Uuid;
 
@@ -106,9 +104,24 @@ pub struct TabPanes {
     pub panes: Vec<PaneInfo>,
 }
 
+/// What a pane's program last signalled, as the pane runtime retains it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetainedSignals {
+    pub pane_id: Uuid,
+    pub title: Option<String>,
+    pub working_directory: Option<String>,
+    pub notifications: u64,
+    pub last_notification: Option<String>,
+    pub bells: u64,
+    pub exit_status: Option<u32>,
+    pub screen_revision: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct StatusBoard {
     panes: HashMap<Uuid, PaneSignals>,
+    /// Each pane's retained signals as last taken.
+    seen: HashMap<Uuid, RetainedSignals>,
     /// Each pane's agent, from the agents plugin.
     agents: HashMap<Uuid, PaneAgent>,
     git: HashMap<String, (Instant, Option<GitStatus>)>,
@@ -150,71 +163,54 @@ impl StatusBoard {
             })
     }
 
-    /// Record a terminal signal.
-    pub fn apply_terminal(&mut self, event: &TerminalEvent, now_ms: u64) {
-        match event {
-            TerminalEvent::Title { pane_id, title, .. } => {
-                self.panes.entry(*pane_id).or_default().title =
-                    (!title.trim().is_empty()).then(|| title.clone());
-            }
-            TerminalEvent::WorkingDirectory {
-                pane_id, location, ..
-            } => {
-                self.panes.entry(*pane_id).or_default().reported =
-                    parse_location(location, local_hostname()).map(|location| Reported {
+    /// Take every pane's retained signals at `now_ms`. What changed since the
+    /// board last looked is new: a reported directory, a notification or
+    /// bell (attention), a finished command's status, or the screen's
+    /// content changing (output). Reading state rather than events, nothing
+    /// is missed when events are.
+    pub fn apply_signals(&mut self, panes: &[RetainedSignals], now_ms: u64) {
+        for retained in panes {
+            let seen = self.seen.insert(retained.pane_id, retained.clone());
+            // Counters that went back belong to a restarted program.
+            let seen = seen.filter(|seen| {
+                seen.notifications <= retained.notifications && seen.bells <= retained.bells
+            });
+            let signals = self.panes.entry(retained.pane_id).or_default();
+            signals.title = retained
+                .title
+                .clone()
+                .filter(|title| !title.trim().is_empty());
+            if retained.working_directory.is_some()
+                && seen
+                    .as_ref()
+                    .is_none_or(|seen| seen.working_directory != retained.working_directory)
+            {
+                signals.reported = retained
+                    .working_directory
+                    .as_deref()
+                    .and_then(|location| parse_location(location, local_hostname()))
+                    .map(|location| Reported {
                         location,
                         binding: Binding::Pending,
                     });
             }
-            TerminalEvent::Notification {
-                pane_id,
-                title,
-                body,
-                ..
-            } => {
-                let signals = self.panes.entry(*pane_id).or_default();
-                signals.attention_at_ms = Some(now_ms);
-                signals.attention = Some(match title {
-                    Some(title) if !title.is_empty() => format!("{title}: {body}"),
-                    _ => body.clone(),
-                });
-            }
-            TerminalEvent::Bell { pane_id, .. } => {
-                self.panes.entry(*pane_id).or_default().attention_at_ms = Some(now_ms);
-            }
-            TerminalEvent::PromptMark {
-                pane_id,
-                kind,
-                exit_status,
-                ..
-            } => {
-                let signals = self.panes.entry(*pane_id).or_default();
-                match kind {
-                    PromptMarkKind::CommandFinished => {
-                        if let Some(status) = exit_status {
-                            signals.last_exit = Some((now_ms, *status));
-                        }
-                    }
-                    // A new command clears the previous one's exit status.
-                    PromptMarkKind::CommandExecuted => signals.last_exit = None,
-                    PromptMarkKind::PromptStart | PromptMarkKind::CommandStart => {}
+            if let Some(seen) = &seen {
+                if retained.notifications > seen.notifications {
+                    signals.attention_at_ms = Some(now_ms);
+                    signals.attention.clone_from(&retained.last_notification);
+                } else if retained.bells > seen.bells {
+                    signals.attention_at_ms = Some(now_ms);
+                }
+                if retained.screen_revision != seen.screen_revision {
+                    signals.output_at_ms = Some(now_ms);
                 }
             }
-            // Agent state is the agents plugin's; tabs take it from there.
-            TerminalEvent::AgentReport { .. } | TerminalEvent::Progress { .. } => {}
-        }
-    }
-
-    /// Record a pane lifecycle or output event.
-    pub fn apply_pane(&mut self, event: &PaneEvent, now_ms: u64) {
-        match event {
-            PaneEvent::OutputAvailable { pane_id, .. } => {
-                self.panes.entry(*pane_id).or_default().output_at_ms = Some(now_ms);
+            if seen
+                .as_ref()
+                .is_none_or(|seen| seen.exit_status != retained.exit_status)
+            {
+                signals.last_exit = retained.exit_status.map(|status| (now_ms, status));
             }
-            PaneEvent::Restarted { pane_id, .. } => {
-                self.panes.remove(pane_id);
-            }
-            _ => {}
         }
     }
 
@@ -231,6 +227,7 @@ impl StatusBoard {
             .flat_map(|tab| tab.panes.iter().map(|pane| pane.id))
             .collect::<std::collections::HashSet<_>>();
         self.panes.retain(|pane, _| live.contains(pane));
+        self.seen.retain(|pane, _| live.contains(pane));
         for pane in tabs.iter().flat_map(|tab| &tab.panes) {
             if let Some(signals) = self.panes.get_mut(&pane.id) {
                 settle(signals, pane);
@@ -620,12 +617,12 @@ mod tests {
             }]
         };
         let report = |board: &mut StatusBoard, location: &str| {
-            board.apply_terminal(
-                &TerminalEvent::WorkingDirectory {
-                    session_id: Uuid::nil(),
+            board.apply_signals(
+                &[RetainedSignals {
                     pane_id: pane,
-                    location: location.into(),
-                },
+                    working_directory: Some(location.into()),
+                    ..RetainedSignals::default()
+                }],
                 0,
             );
         };
@@ -717,51 +714,30 @@ mod tests {
     #[test]
     fn tabs_summarize_their_panes_signals() {
         let mut board = StatusBoard::default();
-        let session = Uuid::from_u128(9);
         let focused = Uuid::from_u128(11);
         let other = Uuid::from_u128(12);
-        board.apply_terminal(
-            &TerminalEvent::WorkingDirectory {
-                session_id: session,
-                pane_id: focused,
-                location: "file:///repo".into(),
-            },
-            10,
-        );
-        board.apply_terminal(
-            &TerminalEvent::Title {
-                session_id: session,
-                pane_id: focused,
-                title: "vim".into(),
-            },
-            11,
-        );
-        board.apply_pane(
-            &PaneEvent::OutputAvailable {
-                session_id: session,
-                pane_id: other,
-            },
-            20,
-        );
-        board.apply_terminal(
-            &TerminalEvent::Notification {
-                session_id: session,
-                pane_id: other,
-                title: Some("claude".into()),
-                body: "needs input".into(),
-            },
-            30,
-        );
-        board.apply_terminal(
-            &TerminalEvent::PromptMark {
-                session_id: session,
-                pane_id: other,
-                kind: PromptMarkKind::CommandFinished,
-                line: 0,
-                exit_status: Some(1),
-            },
-            40,
-        );
+        // First look: the focused pane's directory and title; the other pane
+        // as it was.
+        let focused_signals = RetainedSignals {
+            pane_id: focused,
+            title: Some("vim".into()),
+            working_directory: Some("file:///repo".into()),
+            ..RetainedSignals::default()
+        };
+        let mut other_signals = RetainedSignals {
+            pane_id: other,
+            ..RetainedSignals::default()
+        };
+        board.apply_signals(&[focused_signals.clone(), other_signals.clone()], 10);
+        // Then the other pane's screen changed, it asked for attention, and
+        // its command failed: seen however many events about it were missed.
+        other_signals.screen_revision = 7;
+        other_signals.notifications = 1;
+        other_signals.last_notification = Some("claude: needs input".into());
+        other_signals.exit_status = Some(1);
+        board.apply_signals(&[focused_signals, other_signals.clone()], 30);
+        // Redraws that change nothing are not output.
+        board.apply_signals(&[other_signals], 40);
         let mut git_reads = 0;
         let tabs = [tab(1, &[(11, true, Some("nvim")), (12, false, None)])];
         let built = board.build(&tabs, &mut |cwd| {
@@ -784,7 +760,7 @@ mod tests {
             Some("main")
         );
         assert_eq!(status.last_exit, Some(1));
-        assert_eq!(status.output_at_ms, Some(20));
+        assert_eq!(status.output_at_ms, Some(30));
         assert_eq!(status.attention_at_ms, Some(30));
         assert_eq!(status.attention.as_deref(), Some("claude: needs input"));
         assert_eq!(status.agent, None);

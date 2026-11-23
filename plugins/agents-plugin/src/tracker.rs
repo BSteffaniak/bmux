@@ -1,50 +1,64 @@
-//! What each pane's agent is doing, from everything that says so.
+//! What each pane's agent is doing, decided from what its pane shows now.
 //!
 //! A pane runs an agent while its foreground job is one (see
-//! [`crate::identify`]) or while a process in it reports being one. Its state
-//! is decided, most authoritative first, by:
+//! [`crate::identify`]) or while a program in it reports being one. Its state
+//! answers two questions, each from the pane's current state (its retained
+//! signals and its screen), never from which events happened to arrive:
 //!
-//! 1. a screen rule showing a blocker (a permission dialog);
-//! 2. a screen rule plainly showing work (a spinner with "esc to interrupt");
-//! 3. the agent's own report (its hooks, or `bmux agents report`), except
-//!    that a stale "working" yields to a visible idle prompt once output stops;
-//! 4. any other matching screen rule;
-//! 5. for an agent with no rules that never reported, its output: working
-//!    while it keeps printing.
+//! 1. Is it working? The first channel that says either way decides: the
+//!    agent's title (OSC 0/2) or progress report (OSC 9;4) by its rules, its
+//!    own report (its hooks, or `bmux agents report`), then its screen by its
+//!    rules. An agent with no rules is working while its visible screen keeps
+//!    changing.
+//! 2. When it is not working, is it waiting for an answer? A blocker on its
+//!    screen (a permission or question dialog) or its own report says so.
 //!
-//! A report binds to the job that runs when it arrives and ends with it.
-//! Going idle waits briefly for the screen to settle, unless the agent said
-//! so itself.
+//! Asking only when not working keeps text that merely looks like a dialog
+//! (in an agent's transcript) from turning a working agent into a waiting
+//! one. A title or progress the pane had before the agent started is not
+//! the agent's, so it counts only once it changes.
 
 use std::collections::{BTreeMap, HashMap};
 
 use bmux_agents_plugin_api::agent_states::{AgentSource, AgentState, PaneAgent};
-use bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent;
-use bmux_pane_runtime_plugin_api::pane_runtime_terminal_events::TerminalEvent;
 use uuid::Uuid;
 
 use crate::identify::Catalog;
-use crate::rules::{self, RuleState};
+use crate::rules::{self, Channel, RuleState};
 
-/// Output this recent means an agent without rules is working, and keeps a
-/// reported "working" alive against an idle-looking screen.
+/// An agent with no rules is working while its screen changed this recently.
 pub const ACTIVE_WINDOW_MS: u64 = 3_000;
-/// How long the screen must look idle before a working agent counts as idle.
-pub const IDLE_SETTLE_MS: u64 = 1_200;
 
-/// What a pane's program signalled, kept whether or not it runs an agent.
-#[derive(Debug, Clone, Default)]
-struct Signals {
-    title: String,
-    progress: String,
-    output_at_ms: Option<u64>,
-    notification: Option<String>,
+/// A program's report of its own state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Report {
+    pub state: String,
+    pub agent: Option<String>,
+    pub message: Option<String>,
 }
 
+/// What a pane signals beyond its screen, as the pane runtime retains it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Report {
-    state: AgentState,
-    message: Option<String>,
+pub struct PaneView {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+    pub title: Option<String>,
+    pub progress: Option<String>,
+    pub last_notification: Option<String>,
+    pub report: Option<Report>,
+    /// How many reports the pane has had: a new one is a report to apply.
+    pub reports: u64,
+    /// Changes whenever the screen may have.
+    pub screen_revision: u64,
+}
+
+/// One pane's foreground job, as the pane runtime lists it.
+#[derive(Debug, Clone)]
+pub struct Job {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+    pub process_group_id: i32,
+    pub commands: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,147 +72,120 @@ struct Track {
     identified: bool,
     /// Listings of the pane's jobs a reported agent has gone unseen in.
     unseen: u8,
-    report: Option<Report>,
-    screen: Option<rules::Verdict>,
-    /// The screen changed since rules last read it.
-    screen_dirty: bool,
+    report: Option<(AgentState, Option<String>)>,
+    /// The title and progress the pane had when the agent appeared: not the
+    /// agent's until they change.
+    inherited: Option<(Option<String>, Option<String>)>,
+    title_live: bool,
+    progress_live: bool,
+    /// The screen revision last read, the text then, and when it last
+    /// visibly changed.
+    screen_revision: Option<u64>,
+    screen: Option<String>,
+    screen_changed_at_ms: Option<u64>,
+    screen_verdict: Option<rules::Verdict>,
     state: Option<(AgentState, AgentSource, Option<String>)>,
     changed_at_ms: u64,
     finished_at_ms: Option<u64>,
-    idle_since_ms: Option<u64>,
 }
 
-/// One pane's foreground job, as the pane runtime lists it.
-#[derive(Debug, Clone)]
-pub struct Job {
-    pub session_id: Uuid,
-    pub pane_id: Uuid,
-    pub process_group_id: i32,
-    pub commands: Vec<String>,
+impl Track {
+    const fn new(session_id: Uuid, agent: String, job: Option<i32>, identified: bool) -> Self {
+        Self {
+            session_id,
+            agent,
+            job,
+            identified,
+            unseen: 0,
+            report: None,
+            inherited: None,
+            title_live: false,
+            progress_live: false,
+            screen_revision: None,
+            screen: None,
+            screen_changed_at_ms: None,
+            screen_verdict: None,
+            state: None,
+            changed_at_ms: 0,
+            finished_at_ms: None,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct Tracker {
-    signals: HashMap<Uuid, Signals>,
+    /// Every pane's retained signals, as last read.
+    views: HashMap<Uuid, PaneView>,
+    /// Reports already applied, by pane.
+    reports_seen: HashMap<Uuid, u64>,
     tracks: BTreeMap<Uuid, Track>,
     published: Option<Vec<PaneAgent>>,
 }
 
 impl Tracker {
-    /// Record a terminal signal.
-    pub fn apply_terminal(&mut self, event: &TerminalEvent) {
-        match event {
-            TerminalEvent::Title { pane_id, title, .. } => {
-                self.signals
-                    .entry(*pane_id)
-                    .or_default()
-                    .title
-                    .clone_from(title);
-                self.mark_dirty(*pane_id);
+    /// Take every pane's current signals. Panes absent from `views` are gone,
+    /// and so are their agents. A report the pane runtime has not shown
+    /// before is applied; the reports a pane had when first seen are history.
+    pub fn set_views(&mut self, views: Vec<PaneView>) {
+        let live = views
+            .iter()
+            .map(|view| view.pane_id)
+            .collect::<std::collections::HashSet<_>>();
+        self.tracks.retain(|pane, _| live.contains(pane));
+        self.reports_seen.retain(|pane, _| live.contains(pane));
+        for view in views {
+            let seen = self.reports_seen.insert(view.pane_id, view.reports);
+            if let Some(report) = view.report.clone()
+                && seen.is_some_and(|seen| view.reports > seen)
+            {
+                self.report(&view, &report);
             }
-            TerminalEvent::Progress { pane_id, value, .. } => {
-                self.signals
-                    .entry(*pane_id)
-                    .or_default()
-                    .progress
-                    .clone_from(value);
-                self.mark_dirty(*pane_id);
+            if let Some(track) = self.tracks.get_mut(&view.pane_id) {
+                let inherited = track
+                    .inherited
+                    .get_or_insert_with(|| (view.title.clone(), view.progress.clone()));
+                track.title_live |= view.title != inherited.0;
+                track.progress_live |= view.progress != inherited.1;
             }
-            TerminalEvent::Notification {
-                pane_id,
-                title,
-                body,
-                ..
-            } => {
-                self.signals.entry(*pane_id).or_default().notification = Some(match title {
-                    Some(title) if !title.is_empty() => format!("{title}: {body}"),
-                    _ => body.clone(),
-                });
-            }
-            TerminalEvent::AgentReport {
-                session_id,
-                pane_id,
-                state,
-                agent,
-                message,
-            } => self.report(
-                *session_id,
-                *pane_id,
-                state,
-                agent.as_deref(),
-                message.clone(),
-            ),
-            TerminalEvent::WorkingDirectory { .. }
-            | TerminalEvent::Bell { .. }
-            | TerminalEvent::PromptMark { .. } => {}
+            self.views.insert(view.pane_id, view);
         }
+        self.views.retain(|pane, _| live.contains(pane));
     }
 
-    /// Record a pane lifecycle or output event at `now_ms`.
-    pub fn apply_pane(&mut self, event: &PaneEvent, now_ms: u64) {
-        match event {
-            PaneEvent::OutputAvailable { pane_id, .. } => {
-                self.signals.entry(*pane_id).or_default().output_at_ms = Some(now_ms);
-                self.mark_dirty(*pane_id);
-            }
-            PaneEvent::Exited { pane_id, .. } | PaneEvent::Restarted { pane_id, .. } => {
-                self.signals.remove(pane_id);
-                self.tracks.remove(pane_id);
-            }
-            _ => {}
-        }
-    }
-
-    fn mark_dirty(&mut self, pane: Uuid) {
-        if let Some(track) = self.tracks.get_mut(&pane) {
-            track.screen_dirty = true;
-        }
-    }
-
-    fn report(
-        &mut self,
-        session_id: Uuid,
-        pane_id: Uuid,
-        state: &str,
-        agent: Option<&str>,
-        message: Option<String>,
-    ) {
-        let state = match state {
+    fn report(&mut self, view: &PaneView, report: &Report) {
+        let state = match report.state.as_str() {
             "working" => AgentState::Working,
             "blocked" => AgentState::Blocked,
             "idle" => AgentState::Idle,
             // The agent is leaving: what it reported no longer holds.
             "release" => {
-                if let Some(track) = self.tracks.get_mut(&pane_id) {
+                if let Some(track) = self.tracks.get_mut(&view.pane_id) {
                     track.report = None;
                     if !track.identified {
-                        self.tracks.remove(&pane_id);
+                        self.tracks.remove(&view.pane_id);
                     }
                 }
                 return;
             }
             _ => return,
         };
-        let track = self.tracks.entry(pane_id).or_insert_with(|| Track {
-            session_id,
-            agent: agent.unwrap_or("agent").to_string(),
-            job: None,
-            identified: false,
-            unseen: 0,
-            report: None,
-            screen: None,
-            screen_dirty: true,
-            state: None,
-            changed_at_ms: 0,
-            finished_at_ms: None,
-            idle_since_ms: None,
+        let track = self.tracks.entry(view.pane_id).or_insert_with(|| {
+            let mut track = Track::new(
+                view.session_id,
+                report.agent.clone().unwrap_or_else(|| "agent".to_string()),
+                None,
+                false,
+            );
+            // A reporting agent's title is its own from the start.
+            track.inherited = Some((None, None));
+            track
         });
-        if let Some(agent) = agent
+        if let Some(agent) = &report.agent
             && !track.identified
         {
-            track.agent = agent.to_string();
+            track.agent.clone_from(agent);
         }
-        track.report = Some(Report { state, message });
+        track.report = Some((state, report.message.clone()));
     }
 
     /// Follow the panes' foreground jobs: identify agents, and end tracks
@@ -228,31 +215,31 @@ impl Tracker {
             let Some(agent) = catalog.identify(&job.commands) else {
                 continue;
             };
-            let track = self.tracks.entry(pane).or_insert_with(|| Track {
-                session_id: job.session_id,
-                agent: agent.clone(),
-                job: Some(job.process_group_id),
-                identified: true,
-                unseen: 0,
-                report: None,
-                screen: None,
-                screen_dirty: true,
-                state: None,
-                changed_at_ms: 0,
-                finished_at_ms: None,
-                idle_since_ms: None,
+            let view = self.views.get(&pane);
+            let track = self.tracks.entry(pane).or_insert_with(|| {
+                let mut track = Track::new(
+                    job.session_id,
+                    agent.clone(),
+                    Some(job.process_group_id),
+                    true,
+                );
+                track.inherited = view.map(|view| (view.title.clone(), view.progress.clone()));
+                track
             });
             track.identified = true;
             track.agent = agent;
         }
     }
 
-    /// Panes whose agent has screen rules and whose screen changed since
-    /// they were last read.
-    pub fn screens_to_read(&self, has_rules: impl Fn(&str) -> bool) -> Vec<(Uuid, Uuid)> {
+    /// Agent panes whose screen changed since it was last read.
+    pub fn screens_to_read(&self) -> Vec<(Uuid, Uuid)> {
         self.tracks
             .iter()
-            .filter(|(_, track)| track.screen_dirty && has_rules(&track.agent))
+            .filter(|(pane, track)| {
+                self.views
+                    .get(pane)
+                    .is_some_and(|view| track.screen_revision != Some(view.screen_revision))
+            })
             .map(|(pane, track)| (track.session_id, *pane))
             .collect()
     }
@@ -263,87 +250,56 @@ impl Tracker {
         self.tracks.get(&pane).map(|track| track.agent.as_str())
     }
 
-    /// Read `pane`'s screen with its agent's rules.
-    pub fn apply_screen(&mut self, pane: Uuid, screen: &str, rules: &rules::Agent) {
-        let signals = self.signals.get(&pane).cloned().unwrap_or_default();
+    /// Take `pane`'s screen as read at `revision` and `now_ms`, with its
+    /// agent's rules when it has them.
+    pub fn apply_screen(
+        &mut self,
+        pane: Uuid,
+        revision: u64,
+        screen: &str,
+        rules: Option<&rules::Agent>,
+        now_ms: u64,
+    ) {
         let Some(track) = self.tracks.get_mut(&pane) else {
             return;
         };
-        track.screen_dirty = false;
-        let verdict = rules.evaluate(&rules::Input {
-            screen,
-            title: &signals.title,
-            progress: &signals.progress,
-        });
-        match verdict {
-            // A viewer or menu says nothing: keep what the screen last said.
-            Some(verdict) if verdict.skip => {}
-            verdict => track.screen = verdict,
+        track.screen_revision = Some(revision);
+        // A redraw that leaves the screen as it was is not activity.
+        if track.screen.as_deref() != Some(screen) {
+            if track.screen.is_some() {
+                track.screen_changed_at_ms = Some(now_ms);
+            }
+            track.screen = Some(screen.to_string());
+        }
+        if let Some(rules) = rules {
+            let verdict = rules.evaluate_channel(
+                &rules::Input {
+                    screen,
+                    ..rules::Input::default()
+                },
+                Channel::Screen,
+            );
+            match verdict {
+                // A viewer or menu says nothing: keep what the screen last said.
+                Some(verdict) if verdict.skip => {}
+                verdict => track.screen_verdict = verdict,
+            }
         }
     }
 
     /// Decide every agent's state at `now_ms`.
-    pub fn settle(&mut self, now_ms: u64, has_rules: impl Fn(&str) -> bool) {
+    pub fn settle<'a>(
+        &mut self,
+        now_ms: u64,
+        rules_for: impl Fn(&str) -> Option<&'a rules::Agent>,
+    ) {
         for (pane, track) in &mut self.tracks {
-            let signals = self.signals.get(pane);
-            let active = signals
-                .and_then(|signals| signals.output_at_ms)
-                .is_some_and(|at| now_ms.saturating_sub(at) < ACTIVE_WINDOW_MS);
-            let screen = track.screen.as_ref();
-            let screen_says = |state| screen.filter(|verdict| verdict.state == state);
-            let report = track.report.as_ref().map(|report| report.state);
-            let (state, source, rule) = if let Some(verdict) = screen_says(RuleState::Blocked) {
-                (
-                    AgentState::Blocked,
-                    AgentSource::Screen,
-                    Some(verdict.rule.clone()),
-                )
-            } else if let Some(verdict) =
-                screen_says(RuleState::Working).filter(|verdict| verdict.visible)
-            {
-                (
-                    AgentState::Working,
-                    AgentSource::Screen,
-                    Some(verdict.rule.clone()),
-                )
-            } else if report == Some(AgentState::Working)
-                && screen_says(RuleState::Idle).is_some_and(|verdict| verdict.visible)
-                && !active
-            {
-                let verdict = screen_says(RuleState::Idle).map(|verdict| verdict.rule.clone());
-                (AgentState::Idle, AgentSource::Screen, verdict)
-            } else if let Some(report) = report {
-                (report, AgentSource::Report, None)
-            } else if let Some(verdict) = screen {
-                let state = match verdict.state {
-                    RuleState::Working => AgentState::Working,
-                    RuleState::Blocked => AgentState::Blocked,
-                    RuleState::Idle | RuleState::Unknown => AgentState::Idle,
-                };
-                (state, AgentSource::Screen, Some(verdict.rule.clone()))
-            } else if has_rules(&track.agent) {
-                // A known agent no rule matches is waiting (as herdr has it).
-                (AgentState::Idle, AgentSource::Screen, None)
-            } else if active {
-                (AgentState::Working, AgentSource::Activity, None)
-            } else {
-                (AgentState::Idle, AgentSource::Activity, None)
-            };
+            let view = self.views.get(pane);
+            let (state, source, rule) = classify(track, view, rules_for(&track.agent), now_ms);
             let previous = track.state.as_ref().map(|(state, ..)| *state);
-            // Settle before leaving work, unless the agent said it is done.
-            if previous == Some(AgentState::Working)
-                && state == AgentState::Idle
-                && source != AgentSource::Report
-            {
-                let since = *track.idle_since_ms.get_or_insert(now_ms);
-                if now_ms.saturating_sub(since) < IDLE_SETTLE_MS {
-                    continue;
-                }
-            }
-            track.idle_since_ms = None;
             if previous != Some(state) {
                 track.changed_at_ms = now_ms;
-                if previous == Some(AgentState::Working) && state == AgentState::Idle {
+                if previous == Some(AgentState::Working) {
                     track.finished_at_ms = Some(now_ms);
                 }
             }
@@ -361,10 +317,10 @@ impl Tracker {
                 let message = track
                     .report
                     .as_ref()
-                    .and_then(|report| report.message.clone())
+                    .and_then(|(_, message)| message.clone())
                     .or_else(|| {
                         (state == AgentState::Blocked)
-                            .then(|| self.signals.get(pane)?.notification.clone())
+                            .then(|| self.views.get(pane)?.last_notification.clone())
                             .flatten()
                     });
                 Some(PaneAgent {
@@ -390,6 +346,84 @@ impl Tracker {
         self.published = Some(panes.to_vec());
         true
     }
+}
+
+/// One agent's state, source and deciding rule (see the module docs).
+fn classify(
+    track: &Track,
+    view: Option<&PaneView>,
+    rules: Option<&rules::Agent>,
+    now_ms: u64,
+) -> (AgentState, AgentSource, Option<String>) {
+    let title = view
+        .and_then(|view| view.title.as_deref())
+        .filter(|_| track.title_live)
+        .unwrap_or("");
+    let progress = view
+        .and_then(|view| view.progress.as_deref())
+        .filter(|_| track.progress_live)
+        .unwrap_or("");
+    let signals = rules::Input {
+        title,
+        progress,
+        ..rules::Input::default()
+    };
+    let says = |verdict: &rules::Verdict| match verdict.state {
+        RuleState::Working => Some(true),
+        RuleState::Idle | RuleState::Blocked => Some(false),
+        RuleState::Unknown => None,
+    };
+    // 1. Is it working?
+    let signalled = rules.and_then(|rules| {
+        [Channel::Title, Channel::Progress]
+            .into_iter()
+            .filter_map(|channel| rules.evaluate_channel(&signals, channel))
+            .filter(|verdict| !verdict.skip)
+            .find_map(|verdict| says(&verdict).map(|working| (working, Some(verdict.rule))))
+    });
+    let working = signalled
+        .map(|(working, rule)| (working, AgentSource::Screen, rule))
+        .or_else(|| {
+            track
+                .report
+                .as_ref()
+                .map(|(state, _)| (*state == AgentState::Working, AgentSource::Report, None))
+        })
+        .or_else(|| {
+            let verdict = track.screen_verdict.as_ref()?;
+            let working = says(verdict)?;
+            Some((working, AgentSource::Screen, Some(verdict.rule.clone())))
+        })
+        .unwrap_or_else(|| {
+            if rules.is_some() {
+                // A known agent no rule matches is waiting (as herdr has it).
+                (false, AgentSource::Screen, None)
+            } else {
+                let active = track
+                    .screen_changed_at_ms
+                    .is_some_and(|at| now_ms.saturating_sub(at) < ACTIVE_WINDOW_MS);
+                (active, AgentSource::Activity, None)
+            }
+        });
+    if working.0 {
+        return (AgentState::Working, working.1, working.2);
+    }
+    // 2. Not working: is it waiting for an answer?
+    if let Some(verdict) = track
+        .screen_verdict
+        .as_ref()
+        .filter(|verdict| verdict.state == RuleState::Blocked)
+    {
+        return (
+            AgentState::Blocked,
+            AgentSource::Screen,
+            Some(verdict.rule.clone()),
+        );
+    }
+    if matches!(track.report, Some((AgentState::Blocked, _))) {
+        return (AgentState::Blocked, AgentSource::Report, None);
+    }
+    (AgentState::Idle, working.1, working.2)
 }
 
 #[cfg(test)]
@@ -427,227 +461,265 @@ mod tests {
         }
     }
 
-    fn report(tracker: &mut Tracker, state: &str, message: Option<&str>) {
-        tracker.apply_terminal(&TerminalEvent::AgentReport {
+    fn view(title: Option<&str>, screen_revision: u64) -> PaneView {
+        PaneView {
             session_id: SESSION,
             pane_id: PANE,
-            state: state.into(),
-            agent: Some("claude".into()),
-            message: message.map(str::to_string),
-        });
+            title: title.map(str::to_string),
+            progress: None,
+            last_notification: None,
+            report: None,
+            reports: 0,
+            screen_revision,
+        }
     }
 
-    fn output(tracker: &mut Tracker, now: u64) {
-        tracker.apply_pane(
-            &PaneEvent::OutputAvailable {
-                session_id: SESSION,
-                pane_id: PANE,
-            },
-            now,
-        );
+    /// A pane: its retained signals, then its screen read at that revision,
+    /// then a settled decision at `now`.
+    struct Pane {
+        tracker: Tracker,
+        rules: rules::Agent,
+        revision: u64,
     }
 
-    fn state(tracker: &Tracker) -> Option<(AgentState, AgentSource)> {
-        tracker
-            .snapshot()
-            .first()
-            .map(|pane| (pane.state, pane.source))
+    impl Pane {
+        fn claude() -> Self {
+            let mut tracker = Tracker::default();
+            tracker.set_views(vec![view(None, 0)]);
+            tracker.set_jobs(
+                &[job(
+                    40,
+                    "/nix/store/x-claude-code/bin/.claude-wrapped_ --resume",
+                )],
+                &catalog(),
+            );
+            Self {
+                tracker,
+                rules: claude(),
+                revision: 0,
+            }
+        }
+
+        fn show(
+            &mut self,
+            title: Option<&str>,
+            screen: &str,
+            now: u64,
+        ) -> (AgentState, AgentSource) {
+            self.revision += 1;
+            self.tracker.set_views(vec![view(title, self.revision)]);
+            for (_, pane) in self.tracker.screens_to_read() {
+                self.tracker
+                    .apply_screen(pane, self.revision, screen, Some(&self.rules), now);
+            }
+            let rules = &self.rules;
+            self.tracker
+                .settle(now, |agent| (agent == "claude").then_some(rules));
+            let pane = self.tracker.snapshot().remove(0);
+            (pane.state, pane.source)
+        }
     }
 
-    const WORKING: &str = "✻ Pondering… (3s · esc to interrupt)\n─────\n❯ \n─────";
-    const BLOCKED: &str = " Bash command\n rm -rf build\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel · Tab to amend";
-    const IDLE: &str = "● Done.\n─────\n❯ \n─────\n  ? for shortcuts";
+    // Claude Code 2.1.318's screens, as captured: working (the prompt box
+    // stays on screen), asking for permission, and idle.
+    const WORKING: &str = "❯ touch marker\n✻ Pondering… (3s · esc to interrupt)\n─────\n❯ \n─────\n  ⏸ manual mode on";
+    const ASKING: &str = " Bash command\n touch marker\n Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel · Tab to amend";
+    const IDLE: &str =
+        "⏺ done\n✻ Crunched for 2s · done 7:05 PM\n─────\n❯ \n─────\n  ⏸ manual mode on";
 
+    /// Working, asking for permission and idle follow Claude's title and
+    /// screen exactly as captured, the moment they change: no settling.
     #[test]
-    fn screens_decide_a_claude_panes_state_and_idle_settles() {
-        let rules = claude();
-        let has_rules = |agent: &str| agent == "claude";
-        let mut tracker = Tracker::default();
-        tracker.set_jobs(
-            &[job(40, "node /x/@anthropic-ai/claude-code/cli.js")],
-            &catalog(),
-        );
-        assert_eq!(tracker.screens_to_read(has_rules), [(SESSION, PANE)]);
-        tracker.apply_screen(PANE, WORKING, &rules);
-        assert_eq!(tracker.screens_to_read(has_rules).len(), 0);
-        tracker.settle(1_000, has_rules);
+    fn claude_works_asks_and_stops_as_its_title_and_screen_say() {
+        let mut pane = Pane::claude();
         assert_eq!(
-            state(&tracker),
-            Some((AgentState::Working, AgentSource::Screen))
+            pane.show(Some("✳ Claude Code"), IDLE, 1_000).0,
+            AgentState::Idle
         );
-
-        output(&mut tracker, 2_000);
-        tracker.apply_screen(PANE, BLOCKED, &rules);
-        tracker.settle(2_000, has_rules);
+        // The spinner in the title: working, though the prompt box shows.
         assert_eq!(
-            state(&tracker),
-            Some((AgentState::Blocked, AgentSource::Screen))
+            pane.show(Some("◐ Touch probe marker file"), WORKING, 2_000)
+                .0,
+            AgentState::Working
         );
-
-        tracker.apply_screen(PANE, WORKING, &rules);
-        tracker.settle(3_000, has_rules);
-        tracker.apply_screen(PANE, IDLE, &rules);
-        // Idle must hold before it counts.
-        tracker.settle(3_100, has_rules);
+        // Waiting for permission: the title stops spinning, a dialog shows.
+        let (state, source) = pane.show(Some("✳ Touch probe marker file"), ASKING, 3_000);
+        assert_eq!((state, source), (AgentState::Blocked, AgentSource::Screen));
         assert_eq!(
-            state(&tracker).map(|(state, _)| state),
-            Some(AgentState::Working)
+            pane.show(Some("◑ Touch probe marker file"), WORKING, 4_000)
+                .0,
+            AgentState::Working
         );
-        tracker.settle(3_100 + IDLE_SETTLE_MS, has_rules);
-        let pane = tracker.snapshot().remove(0);
-        assert_eq!(pane.state, AgentState::Idle);
-        assert_eq!(pane.finished_at_ms, Some(3_100 + IDLE_SETTLE_MS));
-        assert_eq!(pane.rule.as_deref(), Some("live_prompt_box"));
-
-        // The job ending ends the agent.
-        tracker.set_jobs(&[], &catalog());
-        assert_eq!(tracker.snapshot().len(), 0);
+        // Done: idle at once, and finished then.
+        assert_eq!(
+            pane.show(Some("✳ Touch probe marker file"), IDLE, 4_001).0,
+            AgentState::Idle
+        );
+        let pane_agent = pane.tracker.snapshot().remove(0);
+        assert_eq!(pane_agent.finished_at_ms, Some(4_001));
+        assert_eq!(pane_agent.rule.as_deref(), Some("osc_title_idle"));
     }
 
+    /// What one channel shows cannot hide what another says: a working title
+    /// is working even when old transcript text looks like a dialog.
     #[test]
-    fn reports_bind_to_their_job_and_yield_to_what_the_screen_shows() {
-        let rules = claude();
-        let has_rules = |agent: &str| agent == "claude";
-        let mut tracker = Tracker::default();
-        // A report before the job was listed binds to it when it is.
-        report(&mut tracker, "working", None);
-        tracker.settle(0, has_rules);
+    fn a_dialog_in_the_transcript_does_not_stop_a_working_agent() {
+        let mut pane = Pane::claude();
+        pane.show(Some("✳ Claude Code"), IDLE, 1_000);
+        let transcript = format!("{ASKING}\n⏺ ran it\n{WORKING}");
         assert_eq!(
-            state(&tracker),
-            Some((AgentState::Working, AgentSource::Report))
+            pane.show(Some("◐ Next step"), &transcript, 2_000).0,
+            AgentState::Working
         );
+    }
+
+    /// The state follows what the pane shows now, however many changes were
+    /// missed in between.
+    #[test]
+    fn missed_changes_do_not_leave_a_stale_state() {
+        let mut pane = Pane::claude();
+        pane.show(Some("◐ Long task"), WORKING, 1_000);
+        // Many spinner frames and a permission round-trip later: idle.
+        pane.revision += 50;
+        assert_eq!(
+            pane.show(Some("✳ Long task"), IDLE, 60_000).0,
+            AgentState::Idle
+        );
+    }
+
+    /// A title the pane had before the agent started is not the agent's.
+    #[test]
+    fn an_inherited_title_counts_only_once_it_changes() {
+        let mut tracker = Tracker::default();
+        let rules = claude();
+        tracker.set_views(vec![view(Some("◐ old run"), 1)]);
+        tracker.set_jobs(&[job(40, "claude")], &catalog());
+        tracker.set_views(vec![view(Some("◐ old run"), 2)]);
+        tracker.apply_screen(PANE, 2, IDLE, Some(&rules), 1_000);
+        tracker.settle(1_000, |_| Some(&rules));
+        assert_eq!(tracker.snapshot()[0].state, AgentState::Idle);
+        tracker.set_views(vec![view(Some("◑ new run"), 3)]);
+        tracker.settle(2_000, |_| Some(&rules));
+        assert_eq!(tracker.snapshot()[0].state, AgentState::Working);
+    }
+
+    /// An agent's own report decides when its title says nothing, binds to
+    /// its job, and a waiting report or screen blocker shows it asking.
+    #[test]
+    fn reports_bind_to_their_job_and_rank_below_the_title() {
+        let rules = claude();
+        let mut tracker = Tracker::default();
+        let reported = |reports: u64, state: &str, title: Option<&str>| PaneView {
+            report: Some(Report {
+                state: state.into(),
+                agent: Some("claude".into()),
+                message: Some("approve edit?".into()),
+            }),
+            reports,
+            ..view(title, reports)
+        };
+        tracker.set_views(vec![view(None, 0)]);
+        // A report arriving before the job is listed binds to it.
+        tracker.set_views(vec![reported(1, "working", None)]);
+        tracker.settle(0, |_| Some(&rules));
+        assert_eq!(
+            tracker.snapshot()[0].source,
+            AgentSource::Report,
+            "{:?}",
+            tracker.snapshot()
+        );
+        assert_eq!(tracker.snapshot()[0].state, AgentState::Working);
         tracker.set_jobs(&[job(40, "claude")], &catalog());
 
-        // A report outranks an ambiguous screen; a visible blocker outranks it.
-        report(&mut tracker, "blocked", Some("approve edit?"));
-        tracker.settle(100, has_rules);
-        let pane = tracker.snapshot().remove(0);
+        tracker.set_views(vec![reported(2, "blocked", None)]);
+        tracker.settle(100, |_| Some(&rules));
+        let agent = tracker.snapshot().remove(0);
         assert_eq!(
-            (pane.state, pane.source),
+            (agent.state, agent.source),
             (AgentState::Blocked, AgentSource::Report)
         );
-        assert_eq!(pane.message.as_deref(), Some("approve edit?"));
-        report(&mut tracker, "working", None);
-        tracker.apply_screen(PANE, BLOCKED, &rules);
-        tracker.settle(200, has_rules);
-        assert_eq!(
-            state(&tracker),
-            Some((AgentState::Blocked, AgentSource::Screen))
-        );
+        assert_eq!(agent.message.as_deref(), Some("approve edit?"));
 
-        // A stale "working" yields to an idle prompt once output stops.
-        tracker.apply_screen(PANE, IDLE, &rules);
-        output(&mut tracker, 300);
-        tracker.settle(300, has_rules);
-        assert_eq!(
-            state(&tracker),
-            Some((AgentState::Working, AgentSource::Report))
-        );
-        tracker.settle(300 + ACTIVE_WINDOW_MS, has_rules);
-        tracker.settle(300 + ACTIVE_WINDOW_MS + IDLE_SETTLE_MS, has_rules);
-        assert_eq!(
-            state(&tracker),
-            Some((AgentState::Idle, AgentSource::Screen))
-        );
+        // A stale "working" yields to an idle title.
+        tracker.set_views(vec![reported(3, "working", Some("✳ done"))]);
+        tracker.settle(200, |_| Some(&rules));
+        assert_eq!(tracker.snapshot()[0].state, AgentState::Idle);
 
-        // Saying it is done needs no settling.
-        report(&mut tracker, "working", None);
-        tracker.apply_screen(PANE, "", &rules);
-        tracker.settle(10_000, has_rules);
-        report(&mut tracker, "idle", None);
-        tracker.settle(10_001, has_rules);
-        assert_eq!(
-            state(&tracker),
-            Some((AgentState::Idle, AgentSource::Report))
-        );
-
-        // Another job in the pane ends the report with the agent.
+        // Another job in the pane ends the agent and its report.
         tracker.set_jobs(&[job(41, "vim")], &catalog());
         assert_eq!(tracker.snapshot().len(), 0);
     }
 
-    /// Claude installed through Nix runs as `.claude-wrapped_`; its pane
-    /// still reads as working, waiting for an answer, and stopped.
+    /// A report from before the agents plugin saw the pane is history, and a
+    /// released report leaves with an agent that only reported.
     #[test]
-    fn a_nix_wrapped_claude_works_asks_and_stops() {
-        const ASKING: &str = "☐ Layout\n\nWhich layout should the gutter use?\n\n❯ 1. Icon + count\n  2. Count only\n\n─────\nEnter to select · Tab/Arrow keys to navigate · Esc to cancel";
-        let rules = claude();
-        let has_rules = |agent: &str| agent == "claude";
+    fn old_and_released_reports_do_not_make_agents() {
         let mut tracker = Tracker::default();
-        tracker.set_jobs(
-            &[job(
-                40,
-                "/nix/store/9jdr2bi3w9h9jc67lxa76vd84ygsgrp7-claude-code-with-ca-certs/bin/.claude-wrapped_ --resume",
-            )],
-            &catalog(),
-        );
-        assert_eq!(tracker.agent(PANE), Some("claude"));
-
-        tracker.apply_screen(PANE, WORKING, &rules);
-        tracker.settle(1_000, has_rules);
-        assert_eq!(
-            state(&tracker).map(|(state, _)| state),
-            Some(AgentState::Working)
-        );
-
-        tracker.apply_screen(PANE, ASKING, &rules);
-        tracker.settle(2_000, has_rules);
-        assert_eq!(
-            state(&tracker).map(|(state, _)| state),
-            Some(AgentState::Blocked)
-        );
-
-        tracker.apply_screen(PANE, IDLE, &rules);
-        tracker.settle(3_000, has_rules);
-        tracker.settle(3_000 + IDLE_SETTLE_MS, has_rules);
-        assert_eq!(
-            state(&tracker).map(|(state, _)| state),
-            Some(AgentState::Idle)
-        );
+        let report = |reports: u64, state: &str| PaneView {
+            report: Some(Report {
+                state: state.into(),
+                agent: Some("bot".into()),
+                message: None,
+            }),
+            reports,
+            ..view(None, 0)
+        };
+        tracker.set_views(vec![report(5, "working")]);
+        tracker.settle(0, |_| None);
+        assert_eq!(tracker.snapshot().len(), 0);
+        tracker.set_views(vec![report(6, "working")]);
+        tracker.settle(0, |_| None);
+        assert_eq!(tracker.snapshot().len(), 1);
+        tracker.set_views(vec![report(7, "release")]);
+        tracker.settle(0, |_| None);
+        assert_eq!(tracker.snapshot().len(), 0);
+        // Unknown states are ignored.
+        tracker.set_views(vec![report(8, "dancing")]);
+        assert_eq!(tracker.snapshot().len(), 0);
     }
 
+    /// An agent without rules works while its screen changes; redraws that
+    /// leave it as it was are not work.
     #[test]
-    fn agents_without_rules_work_while_they_print() {
-        let has_rules = |_: &str| false;
+    fn agents_without_rules_work_while_their_screen_changes() {
         let mut tracker = Tracker::default();
+        tracker.set_views(vec![view(None, 0)]);
         tracker.set_jobs(&[job(50, "aider")], &catalog());
-        assert_eq!(tracker.screens_to_read(has_rules).len(), 0);
-        output(&mut tracker, 1_000);
-        tracker.settle(1_000, has_rules);
+        let show = |tracker: &mut Tracker, revision: u64, screen: &str, now: u64| {
+            tracker.set_views(vec![view(None, revision)]);
+            for (_, pane) in tracker.screens_to_read() {
+                tracker.apply_screen(pane, revision, screen, None, now);
+            }
+            tracker.settle(now, |_| None);
+            let agent = tracker.snapshot().remove(0);
+            (agent.state, agent.source)
+        };
+        assert_eq!(show(&mut tracker, 1, "> ", 1_000).0, AgentState::Idle);
         assert_eq!(
-            state(&tracker),
-            Some((AgentState::Working, AgentSource::Activity))
+            show(&mut tracker, 2, "> thinking.", 2_000),
+            (AgentState::Working, AgentSource::Activity)
         );
-        tracker.settle(1_000 + ACTIVE_WINDOW_MS + IDLE_SETTLE_MS * 2, has_rules);
-        tracker.settle(1_000 + ACTIVE_WINDOW_MS + IDLE_SETTLE_MS * 3, has_rules);
+        // Empty synchronized redraws move the revision, not the screen.
+        for (revision, now) in [(3, 3_000), (4, 4_000), (5, 5_500)] {
+            show(&mut tracker, revision, "> thinking.", now);
+        }
         assert_eq!(
-            state(&tracker),
-            Some((AgentState::Idle, AgentSource::Activity))
+            show(&mut tracker, 6, "> thinking.", 5_500).0,
+            AgentState::Idle
         );
         // Unknown programs are not agents.
         tracker.set_jobs(&[job(51, "make test")], &catalog());
         assert_eq!(tracker.snapshot().len(), 0);
     }
 
+    /// A pane that is gone takes its agent with it, missed exit event or not.
     #[test]
-    fn a_released_report_leaves_with_its_agent() {
-        let mut tracker = Tracker::default();
-        report(&mut tracker, "working", None);
-        report(&mut tracker, "release", None);
-        tracker.settle(0, |_| false);
-        assert_eq!(tracker.snapshot().len(), 0);
-        // Unknown states are ignored.
-        report(&mut tracker, "dancing", None);
-        assert_eq!(tracker.snapshot().len(), 0);
-        // A report from no job lasts one listing of the pane's jobs.
-        report(&mut tracker, "working", None);
-        tracker.set_jobs(&[], &catalog());
-        tracker.settle(0, |_| false);
-        assert_eq!(tracker.snapshot().len(), 1);
-        tracker.set_jobs(&[], &catalog());
-        assert_eq!(tracker.snapshot().len(), 0);
-        // Unchanged snapshots are published once.
-        assert!(tracker.changed(&[]));
-        assert!(!tracker.changed(&[]));
+    fn a_vanished_pane_ends_its_agent() {
+        let mut pane = Pane::claude();
+        pane.show(Some("◐ x"), WORKING, 1_000);
+        pane.tracker.set_views(Vec::new());
+        assert_eq!(pane.tracker.snapshot().len(), 0);
+        assert!(pane.tracker.changed(&[]));
+        assert!(!pane.tracker.changed(&[]));
     }
 }

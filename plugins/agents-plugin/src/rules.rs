@@ -225,7 +225,26 @@ enum Region {
     AfterLastHorizontalRule,
 }
 
+/// Where a rule's evidence comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    /// The terminal title (OSC 0/2).
+    Title,
+    /// The progress report (OSC 9;4).
+    Progress,
+    /// The visible rows.
+    Screen,
+}
+
 impl Region {
+    const fn channel(self) -> Channel {
+        match self {
+            Self::OscTitle => Channel::Title,
+            Self::OscProgress => Channel::Progress,
+            _ => Channel::Screen,
+        }
+    }
+
     fn parse(spec: &str, engine_version: u32) -> Result<Self, String> {
         let spec = spec.trim();
         let count = |name: &str| {
@@ -386,13 +405,26 @@ impl Agent {
         })
     }
 
-    /// The state the screen shows, by the highest-priority matching rule
-    /// (the earlier on a tie); `None` when none matches.
+    /// The state all channels together show, by the highest-priority
+    /// matching rule (the earlier on a tie); `None` when none matches.
+    #[cfg(test)]
     #[must_use]
     pub fn evaluate(&self, input: &Input<'_>) -> Option<Verdict> {
+        self.evaluate_where(input, |_| true)
+    }
+
+    /// What one channel alone says, by its highest-priority matching rule:
+    /// the title, the progress report, or the screen. Channels are read
+    /// separately so one cannot hide what another shows.
+    #[must_use]
+    pub fn evaluate_channel(&self, input: &Input<'_>, channel: Channel) -> Option<Verdict> {
+        self.evaluate_where(input, |region| region.channel() == channel)
+    }
+
+    fn evaluate_where(&self, input: &Input<'_>, admit: impl Fn(Region) -> bool) -> Option<Verdict> {
         let mut lowered = HashMap::<Region, String>::new();
         let mut best: Option<&Rule> = None;
-        for rule in &self.rules {
+        for rule in self.rules.iter().filter(|rule| admit(rule.region)) {
             if best.is_some_and(|best| best.priority >= rule.priority) {
                 continue;
             }

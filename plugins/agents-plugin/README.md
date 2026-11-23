@@ -24,20 +24,25 @@ started without shell integration count too. The agent ends with its job.
 
 ## What it is doing
 
-In order of authority:
+Every pane's state comes from what the pane shows now: the signals the pane
+runtime retains for it (its title, progress report, notifications and the
+agent's own reports) and its screen. Events only prompt a fresh look, so a
+missed event never leaves a stale state. Two questions decide it:
 
-1. **A blocker on screen.** Each agent's rule file describes its screens: a
-   permission dialog, a spinner with "esc to interrupt", an empty prompt box.
-   A visible blocker always wins.
-2. **Visible work** on screen (a spinner, a busy title).
-3. **The agent's own report** (below). A stale "working" yields to an idle
-   prompt once output stops.
-4. **Any other matching screen rule.** A known agent no rule matches is idle.
-5. **Output.** An agent with no rules that never reported is working while it
-   prints.
+1. **Is it working?** The first of these that says either way:
+   - its **title** or **progress report**, by its rules (Claude Code spins a
+     glyph in its title while it works);
+   - **its own report** (below);
+   - its **screen**, by its rules (a spinner with "esc to interrupt");
+   - for an agent with no rules, whether its screen's content keeps changing
+     (redraws that change nothing do not count).
+2. **If it is not working, is it waiting for an answer?** A blocker on its
+   screen (a permission or question dialog), or its report saying so.
 
-Going from working to idle waits about a second for the screen to settle,
-unless the agent said so itself.
+Each channel is read on its own, so one cannot hide another, and a dialog-like
+line in an agent's transcript cannot make a working agent look like it is
+waiting. A title the pane had before the agent started counts only once it
+changes. States change as soon as the pane does: there is no settling delay.
 
 ## Reports
 

@@ -40,10 +40,14 @@ use bmux_plugin::{ServiceCaller, TypedServiceCaller};
 use bmux_plugin_sdk::author::{Declarations, Plugin};
 use bmux_plugin_sdk::prelude::*;
 
-/// How often the observer reads changed screens and settles states.
-const TICK: Duration = Duration::from_millis(400);
-/// Every how many ticks it lists the panes' foreground jobs.
-const JOBS_EVERY: u32 = 3;
+/// The least time between two passes: a burst of output wakes the observer
+/// once per this, not once per event.
+const MIN_PASS_INTERVAL: Duration = Duration::from_millis(100);
+/// A pass runs at least this often, so time alone (an agent without rules
+/// going quiet) is noticed.
+const SAFETY_PASS: Duration = Duration::from_secs(1);
+/// How often it lists the panes' foreground jobs to identify agents.
+const JOBS_INTERVAL: Duration = Duration::from_millis(1_200);
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -337,98 +341,142 @@ struct Observer {
 }
 
 impl Observer {
+    /// Three loops: terminal and pane events only wake the pass (missing one
+    /// costs nothing, since the pass reads current state); the pass reads
+    /// every pane's retained signals and changed screens, settles and
+    /// publishes; and jobs are listed on their own, never holding a pass up.
     fn spawn(
         self,
         async_handle: &bmux_plugin_sdk::HostAsyncHandle,
     ) -> Result<(), PluginCommandError> {
         use bmux_pane_runtime_plugin_api::pane_runtime_events::{self, PaneEvent};
         use bmux_pane_runtime_plugin_api::pane_runtime_terminal_events::{self, TerminalEvent};
-        let worker = async_handle.clone();
         let observer = Arc::new(self);
+        let wake = Arc::new(tokio::sync::Notify::new());
+
+        let events = Arc::clone(&observer.events);
+        let wake_on_event = Arc::clone(&wake);
         async_handle
-            .spawn_background("agents-observer", move |mut cancellation| async move {
+            .spawn_background("agents-wake", move |mut cancellation| async move {
                 let terminal_kind = pane_runtime_terminal_events::EVENT_KIND;
                 let pane_kind = pane_runtime_events::EVENT_KIND;
                 let mut terminal = None;
                 let mut panes = None;
-                let mut tick = tokio::time::interval(TICK);
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                let mut ticks = 0_u32;
                 loop {
                     tokio::select! {
                         () = cancellation.cancelled() => return Ok(()),
-                        ready = observer.events.subscribe_when_registered::<TerminalEvent>(&terminal_kind), if terminal.is_none() => {
+                        ready = events.subscribe_when_registered::<TerminalEvent>(&terminal_kind), if terminal.is_none() => {
                             terminal = ready.ok();
                         }
-                        ready = observer.events.subscribe_when_registered::<PaneEvent>(&pane_kind), if panes.is_none() => {
+                        ready = events.subscribe_when_registered::<PaneEvent>(&pane_kind), if panes.is_none() => {
                             panes = ready.ok();
                         }
-                        event = receive(&mut terminal) => match event {
-                            Ok(event) => {
-                                if let Ok(mut tracker) = observer.tracker.lock() {
-                                    tracker.apply_terminal(&event);
-                                }
+                        event = receive(&mut terminal) => {
+                            if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                                terminal = None;
                             }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => terminal = None,
-                        },
-                        event = receive(&mut panes) => match event {
-                            Ok(event) => {
-                                if let Ok(mut tracker) = observer.tracker.lock() {
-                                    tracker.apply_pane(&event, now_ms());
-                                }
+                            // An event, or events missed: either way, look again.
+                            wake_on_event.notify_one();
+                        }
+                        event = receive(&mut panes) => {
+                            if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                                panes = None;
                             }
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => panes = None,
-                        },
-                        _ = tick.tick() => {
-                            let list_jobs = ticks.is_multiple_of(JOBS_EVERY);
-                            ticks = ticks.wrapping_add(1);
-                            let observer = Arc::clone(&observer);
-                            worker
-                                .spawn_blocking(move || observer.pass(list_jobs))
-                                .await
-                                .map_err(|error| error.to_string())?;
+                            wake_on_event.notify_one();
                         }
                     }
+                }
+            })
+            .map_err(PluginCommandError::failed)?;
+
+        let worker = async_handle.clone();
+        let jobs_observer = Arc::clone(&observer);
+        let wake_on_jobs = Arc::clone(&wake);
+        async_handle
+            .spawn_background("agents-jobs", move |mut cancellation| async move {
+                let mut tick = tokio::time::interval(JOBS_INTERVAL);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        () = cancellation.cancelled() => return Ok(()),
+                        _ = tick.tick() => {
+                            let observer = Arc::clone(&jobs_observer);
+                            let changed = worker
+                                .spawn_blocking(move || observer.list_jobs())
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            if changed {
+                                wake_on_jobs.notify_one();
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(PluginCommandError::failed)?;
+
+        let worker = async_handle.clone();
+        async_handle
+            .spawn_background("agents-observer", move |mut cancellation| async move {
+                loop {
+                    tokio::select! {
+                        () = cancellation.cancelled() => return Ok(()),
+                        () = wake.notified() => {}
+                        () = tokio::time::sleep(SAFETY_PASS) => {}
+                    }
+                    let pass_observer = Arc::clone(&observer);
+                    worker
+                        .spawn_blocking(move || pass_observer.pass())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    tokio::time::sleep(MIN_PASS_INTERVAL).await;
                 }
             })
             .map_err(PluginCommandError::failed)
     }
 
-    /// One pass: list jobs (when due), read changed screens, settle, publish.
-    fn pass(&self, list_jobs: bool) {
+    /// List the panes' foreground jobs and identify their agents. Returns
+    /// whether that could change any agent.
+    fn list_jobs(&self) -> bool {
+        let Some(jobs) = foreground_jobs(self.caller.as_ref()) else {
+            return false;
+        };
+        let Ok(mut tracker) = self.tracker.lock() else {
+            return false;
+        };
+        tracker.set_jobs(&jobs, &self.knowledge.catalog);
+        true
+    }
+
+    /// One pass: read every pane's retained signals and its agent's changed
+    /// screen, settle, and publish what changed.
+    fn pass(&self) {
         let caller = self.caller.as_ref();
-        if list_jobs
-            && let Some(jobs) = foreground_jobs(caller)
-            && let Ok(mut tracker) = self.tracker.lock()
-        {
-            tracker.set_jobs(&jobs, &self.knowledge.catalog);
-        }
-        let has_rules = |agent: &str| self.knowledge.rules_for(agent).is_some();
-        let screens = self
-            .tracker
-            .lock()
-            .map(|tracker| tracker.screens_to_read(has_rules))
-            .unwrap_or_default();
+        let Some(views) = pane_views(caller) else {
+            return;
+        };
+        let screens = {
+            let Ok(mut tracker) = self.tracker.lock() else {
+                return;
+            };
+            tracker.set_views(views);
+            tracker.screens_to_read()
+        };
         for (session_id, pane_id) in screens {
-            let Some(text) = screen_text(caller, session_id, pane_id) else {
+            let Some((revision, text)) = screen_text(caller, session_id, pane_id) else {
                 continue;
             };
             let Ok(mut tracker) = self.tracker.lock() else {
                 return;
             };
-            if let Some(rules) = tracker
+            let rules = tracker
                 .agent(pane_id)
-                .and_then(|agent| self.knowledge.rules_for(agent))
-            {
-                tracker.apply_screen(pane_id, &text, rules);
-            }
+                .and_then(|agent| self.knowledge.rules_for(agent));
+            tracker.apply_screen(pane_id, revision, &text, rules, now_ms());
         }
         let Ok(mut tracker) = self.tracker.lock() else {
             return;
         };
-        tracker.settle(now_ms(), has_rules);
+        tracker.settle(now_ms(), |agent| self.knowledge.rules_for(agent));
         let panes = tracker.snapshot();
         if !tracker.changed(&panes) {
             return;
@@ -445,6 +493,36 @@ impl Observer {
             tracing::warn!(%error, "cannot publish agent states");
         }
     }
+}
+
+/// Every pane's retained signals.
+fn pane_views(caller: &(impl ServiceCaller + Sync)) -> Option<Vec<tracker::PaneView>> {
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(caller);
+    let panes = bmux_plugin::block_on_typed_dispatch(api_pane_state::client::list_pane_signals(
+        &mut client,
+    ))
+    .map_err(|error| tracing::debug!(%error, "cannot list pane signals"))
+    .ok()?
+    .ok()?;
+    Some(
+        panes
+            .into_iter()
+            .map(|pane| tracker::PaneView {
+                session_id: pane.session_id,
+                pane_id: pane.pane_id,
+                title: pane.title,
+                progress: pane.progress,
+                last_notification: pane.last_notification,
+                report: pane.report.map(|report| tracker::Report {
+                    state: report.state,
+                    agent: report.agent,
+                    message: report.message,
+                }),
+                reports: pane.reports,
+                screen_revision: pane.screen_revision,
+            })
+            .collect(),
+    )
 }
 
 async fn receive<E: Send + Sync>(
@@ -480,7 +558,7 @@ fn screen_text(
     caller: &(impl ServiceCaller + Sync),
     session_id: uuid::Uuid,
     pane_id: uuid::Uuid,
-) -> Option<String> {
+) -> Option<(u64, String)> {
     let mut client = bmux_plugin::ServiceCallerDispatchClient::new(caller);
     bmux_plugin::block_on_typed_dispatch(api_pane_state::client::pane_screen_text(
         &mut client,
@@ -489,7 +567,7 @@ fn screen_text(
     ))
     .ok()?
     .ok()
-    .map(|screen| screen.text)
+    .map(|screen| (screen.revision, screen.text))
 }
 
 fn positional(arguments: &[String], index: usize) -> Option<String> {

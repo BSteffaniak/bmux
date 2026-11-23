@@ -325,6 +325,29 @@ fn list_panes(
     result.map_err(|err| format!("list-panes failed: {err:?}"))
 }
 
+/// Every pane's retained signals; none when the pane runtime cannot say.
+fn pane_signals(caller: &(impl ServiceCaller + Sync)) -> Vec<status::RetainedSignals> {
+    let mut client = dispatch_client(caller);
+    bmux_plugin::block_on_typed_dispatch(api_pane_runtime_state::client::list_pane_signals(
+        &mut client,
+    ))
+    .ok()
+    .and_then(Result::ok)
+    .unwrap_or_default()
+    .into_iter()
+    .map(|pane| status::RetainedSignals {
+        pane_id: pane.pane_id,
+        title: pane.title,
+        working_directory: pane.working_directory,
+        notifications: pane.notifications,
+        last_notification: pane.last_notification,
+        bells: pane.bells,
+        exit_status: pane.exit_status,
+        screen_revision: pane.screen_revision,
+    })
+    .collect()
+}
+
 fn list_floating_panes(
     caller: &(impl ServiceCaller + Sync),
     session_id: Option<Uuid>,
@@ -2669,6 +2692,10 @@ fn spawn_status_observer(
             let mut agents = None;
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // How soon a change a pane signalled is shown, at most.
+            let mut refresh = tokio::time::interval(std::time::Duration::from_millis(250));
+            refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut dirty = false;
             loop {
                 tokio::select! {
                     () = cancellation.cancelled() => return Ok(()),
@@ -2703,24 +2730,30 @@ fn spawn_status_observer(
                             .await
                             .map_err(|error| error.to_string())?;
                     }
-                    event = receive_catalog_event(&mut terminal) => match event {
-                        Ok(event) => {
-                            if let Ok(mut board) = board.lock() {
-                                board.apply_terminal(&event, status::now_ms());
-                            }
+                    // Events only say a pane may have changed: the status
+                    // reads each pane's retained signals, so missing some
+                    // (a lagged channel) costs nothing.
+                    event = receive_catalog_event(&mut terminal) => {
+                        if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                            terminal = None;
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => terminal = None,
+                        dirty = true;
                     },
-                    event = receive_catalog_event(&mut panes) => match event {
-                        Ok(event) => {
-                            if let Ok(mut board) = board.lock() {
-                                board.apply_pane(&event, status::now_ms());
-                            }
+                    event = receive_catalog_event(&mut panes) => {
+                        if matches!(event, Err(tokio::sync::broadcast::error::RecvError::Closed)) {
+                            panes = None;
                         }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => panes = None,
+                        dirty = true;
                     },
+                    _ = refresh.tick(), if dirty => {
+                        dirty = false;
+                        let shared = shared.clone();
+                        let board = Arc::clone(&board);
+                        worker
+                            .spawn_blocking(move || publish_tab_status(&shared, &board))
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    }
                     _ = tick.tick() => {
                         let shared = shared.clone();
                         let board = Arc::clone(&board);
@@ -2790,10 +2823,12 @@ static TAB_STATUS_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 fn publish_tab_status(shared: &TabsSharedState, board: &Mutex<status::StatusBoard>) {
     let caller = shared.caller.as_ref();
     let tabs = tab_panes(caller);
+    let signals = pane_signals(caller);
 
     let Ok(mut board) = board.lock() else {
         return;
     };
+    board.apply_signals(&signals, status::now_ms());
     let statuses = board.build(&tabs, &mut status::git_status);
     if !board.changed(&statuses) {
         return;
