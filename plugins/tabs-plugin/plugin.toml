@@ -55,6 +55,13 @@ delivery                     = "state"
 forward_to_streaming_clients = true
 kind                         = "bmux.tabs/tabs-list"
 
+# What each tab is doing (running command, directory, git status, last
+# exit status, output and attention times), forwarded for status views.
+[[event_publications]]
+delivery                     = "state"
+forward_to_streaming_clients = true
+kind                         = "bmux.tabs/tabs-status"
+
 [[commands]]
 expose_in_cli = true
 name          = "explain-spawn-directory"

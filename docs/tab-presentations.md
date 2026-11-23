@@ -177,18 +177,56 @@ maximum_width = 60
 order = 200
 show_index = true
 heading = "Tabs"
-title_template = "{marker} {index}{name}"
-description_template = ""
+title_template = "{state_icon} {name}"
+description_template = "{detail}"
 status_template = ""
 maximum_visible_items = 20
 content_height = false
 collapse_below_width = 80
 collapsed_width = 8
-visible = true
+agents = ["claude", "codex", "aider", "gemini", "opencode", "amp", "goose", "crush", "cursor-agent", "qwen", "copilot"]
+visible = false
 remember_visibility = false
 ```
 
-Sidebar templates support `{marker}`, `{index}`, `{name}`, `{id}`, `{active}`,
+Each tab is a card: a state glyph, the tab's name and, at the right, its
+running command or state; below it, dimmed, the focused pane's directory and
+git status (branch, `*` when dirty, `↑`/`↓` ahead and behind). The tab you are
+looking at has an accent bar and a tinted background.
+
+```text
+ TABS                         4
+▎ ● editor                 nvim
+▎   ~/bmux · main* ↑2
+  ◉ claude              working
+    ~/bmux/plugins
+  ▲ build              exit 101
+    ~/build
+  ◆ review          needs input
+    approve edit?
+```
+
+States, most urgent first:
+
+| Glyph | State | When |
+| --- | --- | --- |
+| `◆` yellow | blocked | the tab rang the bell or sent a notification since you last looked at it (an agent waiting for input, usually); its notification text replaces the directory line |
+| `▲` red | failed | its last command exited non-zero (needs OSC 133 shell integration) |
+| `◉` green | working | a command or agent is running and produced output in the last few seconds |
+| `●` blue | done | an agent's output stopped since you last looked at the tab |
+| `○` dim | idle | otherwise (the tab you are looking at shows a bright `●`) |
+
+A tab counts as an agent when its running command's program is in `agents`.
+"Since you last looked" is per attach client.
+
+The data comes from the tabs plugin's `bmux.tabs/tabs-status` state, which it
+derives on the server from each pane's terminal signals (title, OSC 7
+directory, bell, OSC 9/777 notifications, OSC 133 exit status), its output, its
+running command and `git status` of the focused pane's directory, so remote
+attach clients see the server's repositories.
+
+Sidebar templates support `{state_icon}`, `{state}`, `{name}`, `{command}`,
+`{cwd}`, `{branch}`, `{detail}`, `{marker}`, `{index}`, `{id}`, `{active}`,
 `{fact}`, `{fact_detail}`, and `{fact_icon}`. The generic layout resolver
 composes it with the bar when enabled.
 

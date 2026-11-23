@@ -10,6 +10,8 @@ pub mod declaration {
     }
 }
 
+mod activity;
+
 use bmux_plugin::layout::{
     LayoutEdge, LayoutExtent, PluginLayoutId, PluginLayoutRequest, PluginLayoutSnapshot,
 };
@@ -17,7 +19,7 @@ use bmux_plugin::surface::{
     PluginSurface, PluginSurfaceId, PluginSurfaceRegion, PluginSurfaceSnapshot,
 };
 use bmux_plugin::{
-    AttachInputEvent, AttachInputResult, BorderGlyphs, ExtensionRect, RenderNamedColor, RenderOp,
+    AttachInputEvent, AttachInputResult, ExtensionRect, RenderColor, RenderNamedColor, RenderOp,
     RenderStyle, ServiceCallerDispatchClient, block_on_typed_dispatch,
 };
 use bmux_plugin_sdk::author::{Declarations, Plugin};
@@ -27,7 +29,7 @@ use bmux_presentation_state::visibility::{
     PresentationVisibility, VisibilityCommand, VisibilitySettings,
 };
 use bmux_presentation_state::{PresentationEntityRef, PresentationFact, PresentationFactRole};
-use bmux_tabs_plugin_api::{tabs_commands, tabs_list};
+use bmux_tabs_plugin_api::{tabs_commands, tabs_list, tabs_status};
 use bmux_tui_components::virtual_list::{CursorInput, CursorOutcome, ItemCursor};
 use std::sync::Mutex;
 use uuid::Uuid;
@@ -60,6 +62,8 @@ struct Settings {
     collapse_below_width: u16,
     collapsed_width: u16,
     visibility: VisibilitySettings,
+    /// Programs treated as coding agents, by the running command's first word.
+    agents: Vec<String>,
 }
 
 impl Default for Settings {
@@ -72,8 +76,8 @@ impl Default for Settings {
             order: 200,
             show_index: true,
             heading: "Tabs".to_string(),
-            title_template: "{marker} {index}{name}".to_string(),
-            description_template: String::new(),
+            title_template: "{state_icon} {name}".to_string(),
+            description_template: "{detail}".to_string(),
             status_template: String::new(),
             maximum_visible_items: 20,
             content_height: false,
@@ -85,6 +89,10 @@ impl Default for Settings {
                 visible: false,
                 ..VisibilitySettings::default()
             },
+            agents: activity::DEFAULT_AGENTS
+                .iter()
+                .map(|agent| (*agent).to_string())
+                .collect(),
         }
     }
 }
@@ -159,6 +167,9 @@ impl Settings {
         }
         if let Some(content_height) = table.get("content_height").and_then(toml::Value::as_bool) {
             settings.content_height = content_height;
+        }
+        if let Some(agents) = table.get("agents") {
+            settings.agents = parse_agents(agents)?;
         }
         for (key, target) in [
             ("visible", &mut settings.visibility.visible),
@@ -254,6 +265,8 @@ struct CompanionState {
     snapshot: tabs_list::TabListSnapshot,
     /// The highlighted tab, moved by the pointer (hover) and the keyboard.
     cursor: ItemCursor<Uuid>,
+    /// What each tab is doing, from the tabs plugin's `tabs-status`.
+    activity: activity::ActivityView,
     scroll: bmux_tui_components::scroll_view::ScrollViewState,
     measured_items: std::cell::RefCell<std::collections::BTreeMap<Uuid, MeasuredSidebarItem>>,
     /// What each published revision's region keys mean.
@@ -291,6 +304,8 @@ impl Drop for CompanionState {
 
 impl CompanionState {
     fn new(settings: Settings, local_state_dir: Option<std::path::PathBuf>) -> Self {
+        let mut activity = activity::ActivityView::default();
+        activity.set_agents(settings.agents.clone());
         Self {
             surfaces: None,
             layouts: None,
@@ -308,6 +323,7 @@ impl CompanionState {
                 revision: 0,
             },
             cursor: ItemCursor::new(),
+            activity,
             scroll: bmux_tui_components::scroll_view::ScrollViewState::new(),
             measured_items: std::cell::RefCell::new(std::collections::BTreeMap::new()),
         }
@@ -381,7 +397,7 @@ impl CompanionState {
             } else {
                 bmux_tui::text::wrap_text(
                     description.trim(),
-                    bmux_tui::text::TextWrapGeometry::uniform(width - 1),
+                    bmux_tui::text::TextWrapGeometry::uniform(width.saturating_sub(2).max(1)),
                     bmux_tui::text::TextWrap::Word,
                 )
                 .into_iter()
@@ -399,7 +415,7 @@ impl CompanionState {
                     TextBlock::new(Text::from_lines(
                         description_lines
                             .iter()
-                            .map(|line| Line::raw(format!(" {line}")))
+                            .map(|line| Line::raw(format!("  {line}")))
                             .collect::<Vec<_>>(),
                     ))
                     .id("description"),
@@ -408,8 +424,8 @@ impl CompanionState {
             if !status.is_empty() {
                 fields.push(
                     TextBlock::new(Text::from_lines(vec![Line::raw(format!(
-                        " {}",
-                        truncate_to_width(&status, width.saturating_sub(1))
+                        "  {}",
+                        truncate_to_width(&status, width.saturating_sub(2))
                     ))]))
                     .id("status"),
                 );
@@ -448,6 +464,11 @@ impl CompanionState {
     fn measured_tab(&self, index: usize) -> std::cell::Ref<'_, MeasuredSidebarItem> {
         let tab = &self.snapshot.tabs[index];
         let fact = self.tab_fact(tab);
+        let width = usize::from(self.allocated_width().saturating_sub(4));
+        let activity = self
+            .activity
+            .activity(tab.id, tab.active)
+            .map(|activity| activity.fitted(width.saturating_sub(2)));
         let render = |template: &str| {
             render_template(
                 template,
@@ -455,14 +476,25 @@ impl CompanionState {
                 index,
                 self.settings.show_index,
                 fact.as_ref(),
+                activity.as_ref(),
             )
+        };
+        // The first line leaves room for the summary painted at its right.
+        let summary = activity
+            .as_ref()
+            .and_then(|activity| activity.summary.as_deref())
+            .map_or(0, |summary| bmux_cell_geometry::display_width(summary) + 1);
+        let title = if summary > 0 && summary + 4 <= width {
+            truncate_to_width(&render(&self.settings.title_template), width - summary)
+        } else {
+            render(&self.settings.title_template)
         };
         self.measure_item(
             tab.id,
-            render(&self.settings.title_template),
+            title,
             render(&self.settings.description_template),
             render(&self.settings.status_template),
-            usize::from(self.allocated_width().saturating_sub(4)),
+            width,
         )
     }
 
@@ -647,6 +679,7 @@ impl SidebarPresentation {
             .subscribe_state::<tabs_list::TabListSnapshot>(&tabs_list::STATE_KIND)
             .map_err(|error| format!("subscribing to tabs list: {error}"))?;
         let mut facts_rx = facts.subscribe()?;
+        let (initial_status, mut status_rx) = subscribe_tab_status(&resources.events)?;
         let presentation = Self::install_with_state(
             settings,
             resources.layouts.clone(),
@@ -664,11 +697,17 @@ impl SidebarPresentation {
                 .as_mut()
                 .ok_or_else(|| "sidebar companion is closed".to_string())?;
             companion.facts = Some(facts);
+            companion.activity.replace(initial_status.as_ref().clone());
             companion.replace_tabs(initial.as_ref().clone());
             publish_companion(companion)?;
             let owner = std::sync::Arc::downgrade(&presentation.owner);
             companion.subscription = Some(handle.spawn(async move {
+                // Ages and working/done states change with time alone.
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
+                    let mut status = None;
+                    let mut ticked = false;
                     let tabs = tokio::select! {
                         result = tabs_rx.changed() => {
                             if result.is_err() { break; }
@@ -677,6 +716,15 @@ impl SidebarPresentation {
                         result = facts_rx.changed() => {
                             if result.is_err() { break; }
                             facts_rx.borrow_and_update();
+                            None
+                        }
+                        result = status_rx.changed() => {
+                            if result.is_err() { break; }
+                            status = Some(status_rx.borrow_and_update().as_ref().clone());
+                            None
+                        }
+                        _ = tick.tick() => {
+                            ticked = true;
                             None
                         }
                     };
@@ -689,14 +737,29 @@ impl SidebarPresentation {
                     let Some(companion) = guard.as_mut() else {
                         break;
                     };
+                    if let Some(active) = companion.snapshot.tabs.iter().find(|tab| tab.active) {
+                        companion.activity.mark_viewed(active.id);
+                    }
+                    if ticked && !companion.activity.time_sensitive() {
+                        continue;
+                    }
+                    let status_changed = status.is_some();
+                    if let Some(status) = status {
+                        companion.activity.replace(status);
+                    }
                     if let Some(tabs) = tabs {
                         companion.replace_tabs(tabs);
                     } else {
-                        // Fact text affects wrapping, row geometry and hit regions.
+                        // Fact and status text affect wrapping, row geometry and
+                        // hit regions. Only a fact change brings the active tab
+                        // back into view; status updates and ticks keep the
+                        // scroll where the user left it.
+                        let facts_changed = !ticked && !status_changed;
                         companion.measured_items.get_mut().clear();
                         companion.revision = companion.revision.saturating_add(1).max(1);
-                        if let Some(active) =
-                            companion.snapshot.tabs.iter().position(|tab| tab.active)
+                        if facts_changed
+                            && let Some(active) =
+                                companion.snapshot.tabs.iter().position(|tab| tab.active)
                         {
                             companion.reveal(active);
                         }
@@ -1020,6 +1083,7 @@ fn render_template(
     index: usize,
     show_index: bool,
     fact: Option<&PresentationFact>,
+    activity: Option<&activity::TabActivity>,
 ) -> String {
     const MARKER_TOKEN: &str = concat!("{", "marker}");
     const INDEX_TOKEN: &str = concat!("{", "index}");
@@ -1047,6 +1111,36 @@ fn render_template(
         .replace(
             "{fact_icon}",
             fact.and_then(|fact| fact.icon_id.as_deref()).unwrap_or(""),
+        )
+        .replace(
+            "{state_icon}",
+            &state_glyph(activity, tab.active).0.to_string(),
+        )
+        .replace(
+            "{state}",
+            activity.map_or("", |activity| activity.state.label()),
+        )
+        .replace(
+            "{command}",
+            activity
+                .and_then(|activity| activity.command.as_deref())
+                .unwrap_or(""),
+        )
+        .replace(
+            "{cwd}",
+            activity
+                .and_then(|activity| activity.cwd.as_deref())
+                .unwrap_or(""),
+        )
+        .replace(
+            "{branch}",
+            activity
+                .and_then(|activity| activity.branch.as_deref())
+                .unwrap_or(""),
+        )
+        .replace(
+            "{detail}",
+            activity.map_or("", |activity| activity.detail.as_str()),
         )
         .replace('\u{0}', "{")
         .replace('\u{1}', "}")
@@ -1194,20 +1288,78 @@ fn paint_sidebar_field(
     }
 }
 
-const fn sidebar_title_style(
-    is_active: bool,
-    hovered: bool,
-    active: RenderStyle,
-    inactive: RenderStyle,
-) -> RenderStyle {
-    if is_active {
-        active
-    } else if hovered {
-        inactive
-            .named_foreground(RenderNamedColor::BrightWhite)
-            .named_background(RenderNamedColor::Blue)
+/// The `agents` setting: a list of program names.
+fn parse_agents(value: &toml::Value) -> Result<Vec<String>, PluginCommandError> {
+    value
+        .as_array()
+        .and_then(|agents| {
+            agents
+                .iter()
+                .map(|agent| agent.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()
+        })
+        .ok_or_else(|| {
+            PluginCommandError::invalid_arguments(
+                "bmux.sidebar agents must be a list of program names",
+            )
+        })
+}
+
+/// A tab's state glyph and color. The tab being shown, when idle, is a solid
+/// bright dot rather than the dim idle ring.
+fn state_glyph(activity: Option<&activity::TabActivity>, active: bool) -> (char, RenderColor) {
+    let state = activity.map_or(activity::TabState::Idle, |activity| activity.state);
+    if active && state == activity::TabState::Idle {
+        ('●', RenderColor::Named(RenderNamedColor::BrightWhite))
     } else {
-        inactive
+        (state.glyph(), state.color())
+    }
+}
+
+/// The sidebar's colors: the terminal's own background, a tinted card for
+/// the active and hovered tabs, muted secondary text and an accent bar.
+#[derive(Debug, Clone, Copy)]
+struct SidebarPalette {
+    base: RenderStyle,
+    heading: RenderStyle,
+    title: RenderStyle,
+    active_title: RenderStyle,
+    muted: RenderStyle,
+    accent: RenderStyle,
+    active_card: RenderStyle,
+    hover_card: RenderStyle,
+}
+
+impl Default for SidebarPalette {
+    fn default() -> Self {
+        Self {
+            base: RenderStyle::new(),
+            heading: RenderStyle::new()
+                .named_foreground(RenderNamedColor::BrightBlack)
+                .bold(),
+            title: RenderStyle::new().named_foreground(RenderNamedColor::White),
+            active_title: RenderStyle::new()
+                .named_foreground(RenderNamedColor::BrightWhite)
+                .bold(),
+            muted: RenderStyle::new().named_foreground(RenderNamedColor::BrightBlack),
+            accent: RenderStyle::new().named_foreground(RenderNamedColor::Blue),
+            active_card: RenderStyle::new().background(RenderColor::Indexed(236)),
+            hover_card: RenderStyle::new().background(RenderColor::Indexed(235)),
+        }
+    }
+}
+
+/// Paint text over a card: its background, keeping the text's own colors.
+trait OverCard {
+    fn background_of(self, card: RenderStyle) -> Self;
+}
+
+impl OverCard for RenderStyle {
+    fn background_of(mut self, card: RenderStyle) -> Self {
+        if card.bg.is_some() {
+            self.bg = card.bg;
+        }
+        self
     }
 }
 
@@ -1240,26 +1392,18 @@ fn build_surface_with_hits(
 ) -> (PluginSurface, HitTable<SidebarHit>) {
     let mut hits = HitTable::new();
     let width = state.allocated_width();
-    let background = RenderStyle::new()
-        .named_foreground(RenderNamedColor::White)
-        .named_background(RenderNamedColor::Black);
-    let active = RenderStyle::new()
-        .named_foreground(RenderNamedColor::BrightWhite)
-        .named_background(RenderNamedColor::Blue)
-        .bold();
-    let inactive = RenderStyle::new()
-        .named_foreground(RenderNamedColor::White)
-        .named_background(RenderNamedColor::Black);
+    let palette = SidebarPalette::default();
     // Content-sized surfaces are finalized from the emitted item geometry below.
     let height = u16::MAX;
+    let heading = state.settings.heading.to_uppercase();
+    let count = state.snapshot.tabs.len().to_string();
+    let count_x = width
+        .saturating_sub(1)
+        .saturating_sub(u16::try_from(count.len()).unwrap_or(u16::MAX));
     let mut ops = vec![
-        RenderOp::fill_rect(ExtensionRect::new(0, 0, width, height), ' ', background),
-        RenderOp::border(
-            ExtensionRect::new(0, 0, width, height),
-            BorderGlyphs::square(),
-            background,
-        ),
-        RenderOp::text_run(2, 0, format!(" {} ", state.settings.heading), active),
+        RenderOp::fill_rect(ExtensionRect::new(0, 0, width, height), ' ', palette.base),
+        RenderOp::text_run(1, 0, heading, palette.heading),
+        RenderOp::text_run(count_x, 0, count, palette.muted),
     ];
     let mut metadata = bmux_plugin::surface::PluginSurfaceMetadata {
         selection: Some(bmux_tui::selection::SelectionScene::new()),
@@ -1283,24 +1427,41 @@ fn build_surface_with_hits(
             continue;
         };
         let fact = state.tab_fact(tab);
+        let activity = state.activity.activity(tab.id, tab.active);
         let start_row = u16::try_from(projected.start + 1).unwrap_or(u16::MAX);
-        let measured = state.measured_tab(index);
-        let item_style = fact.as_ref().map_or_else(
+        let end_row = u16::try_from(projected.end + 1).unwrap_or(u16::MAX);
+        let hovered = state.cursor.hovered() == Some(&tab.id);
+        // The card's background: tinted when active or hovered.
+        let card = if tab.active {
+            palette.active_card
+        } else if hovered {
+            palette.hover_card
+        } else {
+            palette.base
+        };
+        if tab.active || hovered {
+            ops.push(RenderOp::fill_rect(
+                ExtensionRect::new(0, start_row, width, end_row.saturating_sub(start_row)),
+                ' ',
+                card,
+            ));
+        }
+        let title_style = fact.as_ref().map_or_else(
             || {
-                sidebar_title_style(
-                    tab.active,
-                    state.cursor.hovered() == Some(&tab.id),
-                    active,
-                    inactive,
-                )
+                if tab.active {
+                    palette.active_title.background_of(card)
+                } else {
+                    palette.title.background_of(card)
+                }
             },
-            |fact| fact_style(fact.role, if tab.active { active } else { inactive }),
+            |fact| fact_style(fact.role, palette.title).background_of(card),
         );
+        let measured = state.measured_tab(index);
+        let title_text = measured.title.clone();
         for (field, child) in measured.fields.iter().zip(&measured.layout.children) {
             let style = match child.node.id.as_str() {
-                "title" => item_style,
-                "status" if tab.active => active,
-                _ => inactive.dim(),
+                "title" => title_style,
+                _ => palette.muted.background_of(card),
             };
             paint_sidebar_field(
                 field,
@@ -1315,7 +1476,50 @@ fn build_surface_with_hits(
                 ),
             );
         }
-        row = u16::try_from(projected.end + 1).unwrap_or(u16::MAX);
+        drop(measured);
+        // The first line, when it is on screen: the state glyph in its color
+        // and the summary at the right.
+        if projected.start == item.y
+            && let Some(activity) = &activity
+        {
+            let (glyph, color) = state_glyph(Some(activity), tab.active);
+            if title_text.starts_with(glyph) {
+                ops.push(RenderOp::text_run(
+                    2,
+                    start_row,
+                    glyph.to_string(),
+                    RenderStyle::new().foreground(color).background_of(card),
+                ));
+            }
+            if let Some(summary) = &activity.summary {
+                let summary_width =
+                    u16::try_from(bmux_cell_geometry::display_width(summary)).unwrap_or(u16::MAX);
+                let x = width.saturating_sub(1).saturating_sub(summary_width);
+                if x > 3 {
+                    let style = match activity.state {
+                        activity::TabState::Idle => palette.muted,
+                        state => RenderStyle::new().foreground(state.color()),
+                    };
+                    ops.push(RenderOp::text_run(
+                        x,
+                        start_row,
+                        summary.clone(),
+                        style.background_of(card),
+                    ));
+                }
+            }
+        }
+        if tab.active {
+            for bar_row in start_row..end_row {
+                ops.push(RenderOp::text_run(
+                    0,
+                    bar_row,
+                    "▎",
+                    palette.accent.background_of(card),
+                ));
+            }
+        }
+        row = end_row;
         regions.push(sidebar_region(
             tab.id,
             width,
@@ -1326,8 +1530,7 @@ fn build_surface_with_hits(
     }
     if state.settings.content_height {
         let rect = ExtensionRect::new(0, 0, width, row.saturating_add(1));
-        ops[0] = RenderOp::fill_rect(rect, ' ', background);
-        ops[1] = RenderOp::border(rect, BorderGlyphs::square(), background);
+        ops[0] = RenderOp::fill_rect(rect, ' ', palette.base);
     }
     let mut surface = PluginSurface::layout(
         PluginSurfaceId::new(OWNER, SURFACE_ID, RETAINED_ID),
@@ -1341,6 +1544,35 @@ fn build_surface_with_hits(
         surface = surface.interactive_region(region);
     }
     (surface, hits)
+}
+
+/// Follow the tabs plugin's forwarded `tabs-status` state on this runtime's
+/// bus, registering its decoder when nothing has yet.
+fn subscribe_tab_status(
+    events: &std::sync::Arc<bmux_plugin::EventBus>,
+) -> Result<
+    (
+        std::sync::Arc<tabs_status::TabStatusSnapshot>,
+        tokio::sync::watch::Receiver<std::sync::Arc<tabs_status::TabStatusSnapshot>>,
+    ),
+    String,
+> {
+    if let Ok(subscription) =
+        events.subscribe_state::<tabs_status::TabStatusSnapshot>(&tabs_status::STATE_KIND)
+    {
+        return Ok(subscription);
+    }
+    events.register_state_channel_with_decoder(
+        tabs_status::STATE_KIND,
+        tabs_status::TabStatusSnapshot {
+            tabs: Vec::new(),
+            now_ms: 0,
+            revision: 0,
+        },
+    );
+    events
+        .subscribe_state::<tabs_status::TabStatusSnapshot>(&tabs_status::STATE_KIND)
+        .map_err(|error| format!("subscribing to tab status: {error}"))
 }
 
 /// The tab an event is addressed to: through the hit table of the revision it
@@ -1885,7 +2117,7 @@ mod tests {
             Some("building")
         );
         assert_eq!(
-            render_template(concat!("{", "fact}"), &tab, 0, false, fact.as_ref()),
+            render_template(concat!("{", "fact}"), &tab, 0, false, fact.as_ref(), None),
             "building"
         );
     }
@@ -1988,7 +2220,7 @@ mod tests {
         .unwrap();
         let settings = Settings::parse(Some(&settings)).unwrap();
         assert_eq!(settings.placement, Placement::Right);
-        assert_eq!(settings.title_template, "{marker} {index}{name}");
+        assert_eq!(settings.title_template, "{state_icon} {name}");
         assert_eq!(settings.collapse_below_width, 80);
         let invalid: toml::Value =
             toml::from_str("width = 10\nminimum_width = 12\nmaximum_width = 40").unwrap();
@@ -2015,7 +2247,14 @@ mod tests {
             workspace_id: uuid::Uuid::nil(),
         };
         assert_eq!(
-            render_template("{{literal}} {index}{name} {active}", &tab, 1, true, None,),
+            render_template(
+                "{{literal}} {index}{name} {active}",
+                &tab,
+                1,
+                true,
+                None,
+                None
+            ),
             "{literal} 2 build active"
         );
     }
@@ -2044,7 +2283,8 @@ mod tests {
                 &tab,
                 0,
                 true,
-                Some(&fact)
+                Some(&fact),
+                None,
             ),
             "build waiting approval required attention"
         );
@@ -2393,6 +2633,116 @@ mod tests {
         assert_eq!(
             region_tab_id(&tab_region_id(Uuid::from_u128(5))),
             Some(Uuid::from_u128(5))
+        );
+    }
+
+    /// The surface's text, row by row, as text runs paint it.
+    fn surface_text(surface: &PluginSurface, width: u16, rows: u16) -> Vec<String> {
+        let mut grid = vec![vec![' '; usize::from(width)]; usize::from(rows)];
+        for op in &surface.ops {
+            if let RenderOp::TextRun { x, y, text, .. } = op
+                && *y < rows
+            {
+                for (offset, ch) in text.chars().enumerate() {
+                    let column = usize::from(*x) + offset;
+                    if column < usize::from(width) {
+                        grid[usize::from(*y)][column] = ch;
+                    }
+                }
+            }
+        }
+        grid.into_iter()
+            .map(|row| row.into_iter().collect::<String>().trim_end().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn tabs_show_their_activity_as_status_cards() {
+        use bmux_tabs_plugin_api::tabs_status::{GitStatus, TabStatus, TabStatusSnapshot};
+        let mut state = CompanionState::new(shown_settings(), None);
+        state.allocation = Some(ExtensionRect::new(0, 0, 32, 12));
+        let tab = |index: u128, name: &str, active: bool| tabs_list::TabListEntry {
+            id: Uuid::from_u128(index),
+            name: name.to_string(),
+            active,
+            workspace: "default".to_string(),
+            workspace_id: Uuid::nil(),
+        };
+        let status = |index: u128| TabStatus {
+            tab_id: Uuid::from_u128(index),
+            panes: 1,
+            running_command: None,
+            cwd: None,
+            title: None,
+            git: None,
+            last_exit: None,
+            output_at_ms: None,
+            attention_at_ms: None,
+            attention: None,
+        };
+        let now = 600_000;
+        state.activity.replace(TabStatusSnapshot {
+            tabs: vec![
+                TabStatus {
+                    running_command: Some("nvim src/lib.rs".into()),
+                    cwd: Some("/work/bmux".into()),
+                    git: Some(GitStatus {
+                        branch: "main".into(),
+                        dirty: true,
+                        ahead: 2,
+                        behind: 0,
+                    }),
+                    ..status(1)
+                },
+                TabStatus {
+                    running_command: Some("claude".into()),
+                    cwd: Some("/work/bmux/plugins".into()),
+                    output_at_ms: Some(now - 1_000),
+                    ..status(2)
+                },
+                TabStatus {
+                    last_exit: Some(101),
+                    cwd: Some("/work/build".into()),
+                    ..status(3)
+                },
+                TabStatus {
+                    running_command: Some("codex".into()),
+                    output_at_ms: Some(now - 9_000),
+                    attention_at_ms: Some(now - 8_000),
+                    attention: Some("approve edit?".into()),
+                    ..status(4)
+                },
+            ],
+            now_ms: now,
+            revision: 1,
+        });
+        state.replace_tabs(tabs_list::TabListSnapshot {
+            tabs: vec![
+                tab(1, "editor", true),
+                tab(2, "claude", false),
+                tab(3, "build", false),
+                tab(4, "review", false),
+            ],
+            revision: 1,
+        });
+        let surface = build_surface(&state, 1);
+        let text = surface_text(&surface, 32, 10);
+        assert_eq!(
+            text,
+            [
+                " TABS                         4",
+                "▎ ● editor                 nvim",
+                "▎   /work/bmux · main* ↑2",
+                "  ◉ claude              working",
+                "    /work/bmux/plugins",
+                "  ▲ build              exit 101",
+                "    /work/build",
+                "  ◆ review          needs input",
+                "    approve edit?",
+                "",
+            ],
+            "{}",
+            text.join("\n")
         );
     }
 

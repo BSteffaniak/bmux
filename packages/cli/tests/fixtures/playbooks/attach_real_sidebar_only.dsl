@@ -14,9 +14,9 @@ send-keys keys='printf SIDEBAR_ONLY_OK\r'
 wait-for pattern='SIDEBAR_ONLY_OK'
 # The sidebar is enabled by default but starts hidden.
 send-attach key='ctrl+alt+s'
-wait-rendered contains=' Tabs '
-# With the tab bar disabled, the sidebar's bottom border is the last row.
-assert-rendered matches='└─+┘ *$'
+wait-rendered contains=' TABS '
+# The sidebar's heading and tab count head its first row.
+assert-rendered matches='(?m)^ TABS +[0-9]'
 assert-screen contains='SIDEBAR_ONLY_OK'
 send-attach key='ctrl+a c'
 send-attach key='ctrl+s'

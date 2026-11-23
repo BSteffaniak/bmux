@@ -413,6 +413,54 @@ interface tabs-list {
     @state events tab-list-snapshot;
 }
 
+// Reactive state channel carrying what each tab is doing, for status
+// views such as the sidebar. The tabs plugin derives it from the
+// pane runtime's terminal signals (title, OSC 7 directory, bell,
+// notifications, OSC 133 exit status), its output activity, each
+// pane's running command and the git status of the focused pane's
+// directory, and republishes when any of it changes.
+//
+// Times are milliseconds since the Unix epoch on the server; `now-ms`
+// is the server clock at publication, so clients compute ages without
+// comparing clocks.
+interface tabs-status {
+    record git-status {
+        branch: string,
+        // Uncommitted changes (staged, unstaged or untracked).
+        dirty: bool,
+        ahead: u32,
+        behind: u32,
+    }
+
+    record tab-status {
+        tab-id: uuid,
+        panes: u32,
+        // The focused pane's running command, when one runs.
+        running-command: string?,
+        // The focused pane's working directory.
+        cwd: string?,
+        // The focused pane's title, as its program set it.
+        title: string?,
+        git: git-status?,
+        // Exit status of the most recently finished command in the tab.
+        last-exit: u32?,
+        // When any pane of the tab last produced output.
+        output-at-ms: u64?,
+        // When any pane of the tab last rang the bell or sent a notification.
+        attention-at-ms: u64?,
+        // The most recent notification text, when there is one.
+        attention: string?,
+    }
+
+    record tab-status-snapshot {
+        tabs: list<tab-status>,
+        now-ms: u64,
+        revision: u64,
+    }
+
+    @state events tab-status-snapshot;
+}
+
 /// What `bmux.tabs` provides to and requires from the host and other plugins.
 world tabs {
     provide tabs-catalog-v1;

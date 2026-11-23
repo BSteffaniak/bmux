@@ -16,6 +16,7 @@ pub mod declaration {
 mod arrangements;
 mod cwd;
 mod durable_storage;
+mod status;
 mod storage_migration;
 
 use api_contexts_state::{ContextSelector, ContextSummary};
@@ -1350,6 +1351,14 @@ impl TabsPlugin {
                 revision: 0,
             },
         );
+        events.register_state_channel::<bmux_tabs_plugin_api::tabs_status::TabStatusSnapshot>(
+            bmux_tabs_plugin_api::tabs_status::STATE_KIND,
+            bmux_tabs_plugin_api::tabs_status::TabStatusSnapshot {
+                tabs: Vec::new(),
+                now_ms: status::now_ms(),
+                revision: 0,
+            },
+        );
         Ok(())
     }
 
@@ -1513,6 +1522,7 @@ impl TabsPlugin {
             last_selected_by_client: self.last_selected_by_client.clone(),
             runtime_state: self.runtime_state.clone(),
         };
+        spawn_status_observer(&async_handle, shared.clone())?;
         let worker = async_handle.clone();
         async_handle.spawn_background("tabs-catalog-observer", move |mut cancellation| async move {
             let Some(bus) = tab_events(&shared.runtime_state) else {
@@ -2601,6 +2611,156 @@ fn list_tabs(
             }
         })
         .collect())
+}
+
+/// Follow pane signals and publish each tab's status once a second when it
+/// changed (`tabs-status`).
+fn spawn_status_observer(
+    async_handle: &bmux_plugin_sdk::HostAsyncHandle,
+    shared: TabsSharedState,
+) -> std::result::Result<(), PluginCommandError> {
+    use bmux_pane_runtime_plugin_api::pane_runtime_events::{self, PaneEvent};
+    use bmux_pane_runtime_plugin_api::pane_runtime_terminal_events::{self, TerminalEvent};
+    let board = Arc::new(Mutex::new(status::StatusBoard::default()));
+    let worker = async_handle.clone();
+    async_handle
+        .spawn_background("tabs-status-observer", move |mut cancellation| async move {
+            let Some(bus) = tab_events(&shared.runtime_state) else {
+                return Ok(());
+            };
+            let terminal_kind = pane_runtime_terminal_events::EVENT_KIND;
+            let pane_kind = pane_runtime_events::EVENT_KIND;
+            let mut terminal = None;
+            let mut panes = None;
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    () = cancellation.cancelled() => return Ok(()),
+                    ready = bus.subscribe_when_registered::<TerminalEvent>(&terminal_kind), if terminal.is_none() => {
+                        terminal = ready.ok();
+                    }
+                    ready = bus.subscribe_when_registered::<PaneEvent>(&pane_kind), if panes.is_none() => {
+                        panes = ready.ok();
+                    }
+                    event = receive_catalog_event(&mut terminal) => match event {
+                        Ok(event) => {
+                            if let Ok(mut board) = board.lock() {
+                                board.apply_terminal(&event, status::now_ms());
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => terminal = None,
+                    },
+                    event = receive_catalog_event(&mut panes) => match event {
+                        Ok(event) => {
+                            if let Ok(mut board) = board.lock() {
+                                board.apply_pane(&event, status::now_ms());
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => panes = None,
+                    },
+                    _ = tick.tick() => {
+                        let shared = shared.clone();
+                        let board = Arc::clone(&board);
+                        worker
+                            .spawn_blocking(move || publish_tab_status(&shared, &board))
+                            .await
+                            .map_err(|error| error.to_string())?;
+                    }
+                }
+            }
+        })
+        .map_err(PluginCommandError::failed)
+}
+
+/// Every tab with its session's panes, as the pane runtime lists them.
+fn tab_panes(caller: &(impl ServiceCaller + Sync)) -> Vec<status::TabPanes> {
+    let Ok(contexts) = list_contexts(caller) else {
+        return Vec::new();
+    };
+    let mut sessions = std::collections::BTreeMap::new();
+    contexts
+        .into_iter()
+        .filter_map(|context| {
+            let session_id = context
+                .attributes
+                .get("bmux.session_id")
+                .and_then(|id| Uuid::parse_str(id).ok())?;
+            let panes = sessions
+                .entry(session_id)
+                .or_insert_with(|| {
+                    list_panes(caller, Some(session_id))
+                        .map(|list| {
+                            list.panes
+                                .into_iter()
+                                .map(|pane| status::PaneInfo {
+                                    id: pane.id,
+                                    focused: pane.focused,
+                                    running_command: pane.active_command,
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                })
+                .clone();
+            Some(status::TabPanes {
+                tab_id: context.id,
+                session_id,
+                panes,
+            })
+        })
+        .collect()
+}
+
+/// The working directory the pane runtime observes for a pane.
+fn observed_directory(
+    caller: &(impl ServiceCaller + Sync),
+    session_id: Uuid,
+    pane_id: Uuid,
+) -> Option<String> {
+    use bmux_pane_runtime_plugin_api::pane_runtime_spawn_v1;
+    let mut client = bmux_plugin::ServiceCallerDispatchClient::new(caller);
+    let source = bmux_plugin::block_on_typed_dispatch(
+        pane_runtime_spawn_v1::client::capture_source(&mut client, session_id, pane_id),
+    )
+    .ok()?
+    .ok()?;
+    bmux_plugin::block_on_typed_dispatch(pane_runtime_spawn_v1::client::observe_directory(
+        &mut client,
+        source,
+    ))
+    .ok()?
+    .ok()
+    .map(|observation| observation.path)
+}
+
+static TAB_STATUS_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn publish_tab_status(shared: &TabsSharedState, board: &Mutex<status::StatusBoard>) {
+    let caller = shared.caller.as_ref();
+    let tabs = tab_panes(caller);
+    let Ok(mut board) = board.lock() else {
+        return;
+    };
+    let statuses = board.build(
+        &tabs,
+        &mut |session, pane| observed_directory(caller, session, pane),
+        &mut status::git_status,
+    );
+    if !board.changed(&statuses) {
+        return;
+    }
+    drop(board);
+    let snapshot = bmux_tabs_plugin_api::tabs_status::TabStatusSnapshot {
+        tabs: statuses,
+        now_ms: status::now_ms(),
+        revision: TAB_STATUS_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1,
+    };
+    if let Some(events) = tab_events(&shared.runtime_state) {
+        let _ = events.publish_state(&bmux_tabs_plugin_api::tabs_status::STATE_KIND, snapshot);
+    }
 }
 
 /// Monotonic counter for the tabs-list state channel.
