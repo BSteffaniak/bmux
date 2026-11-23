@@ -1024,11 +1024,39 @@ fn publish_for_installation(
     Ok(())
 }
 
+/// A field's selection, semantic and text id: short, since every selectable
+/// word repeats it and the surface's metadata is bounded. Positions are unique
+/// within a surface, which is all the ids must be.
+fn selection_id(index: usize, field: &str) -> String {
+    format!("{index}:{}", field.get(..1).unwrap_or(field))
+}
+
 fn publish_surfaces(
     registry: &bmux_plugin::surface::PluginSurfaceRegistry,
     revision: u64,
-    surfaces: Vec<PluginSurface>,
+    mut surfaces: Vec<PluginSurface>,
 ) -> Result<(), String> {
+    let Err(error) = registry.publish_advancing(
+        OWNER,
+        PluginSurfaceSnapshot {
+            revision,
+            surfaces: surfaces.clone(),
+        },
+    ) else {
+        return Ok(());
+    };
+    // Text selection is the part of the surface that grows with what it
+    // shows; drawing the tabs without it beats drawing nothing.
+    if surfaces.iter().all(|surface| surface.metadata.is_none()) {
+        return Err(format!("publishing sidebar surface: {error:?}"));
+    }
+    tracing::warn!(
+        ?error,
+        "sidebar surface rejected; publishing it without text selection"
+    );
+    for surface in &mut surfaces {
+        surface.metadata = None;
+    }
     registry
         .publish_advancing(OWNER, PluginSurfaceSnapshot { revision, surfaces })
         .map_err(|error| format!("publishing sidebar surface: {error:?}"))?;
@@ -1494,7 +1522,7 @@ fn build_surface_with_hits(
                 &mut ops,
                 (
                     &mut metadata,
-                    format!("{}:{}", tab.id, child.node.id.as_str()),
+                    selection_id(index, child.node.id.as_str()),
                     revision,
                 ),
             );
@@ -2788,6 +2816,91 @@ mod tests {
         grid.into_iter()
             .map(|row| row.into_iter().collect::<String>().trim_end().to_string())
             .collect()
+    }
+
+    /// A tall screen of full status cards keeps its text selection within the
+    /// host's limits, and an extreme one still draws, without it.
+    #[test]
+    fn many_full_cards_publish_within_the_hosts_limits() {
+        use bmux_tabs_plugin_api::tabs_status::{GitStatus, TabStatus, TabStatusSnapshot};
+        let cards = |rows: u16| {
+            let mut state = CompanionState::new(shown_settings(), None);
+            state.allocation = Some(ExtensionRect::new(0, 0, 32, rows));
+            let ids = (1..=120_u128).map(Uuid::from_u128).collect::<Vec<_>>();
+            state.activity.replace(TabStatusSnapshot {
+                tabs: ids
+                    .iter()
+                    .map(|id| TabStatus {
+                        tab_id: *id,
+                        panes: 2,
+                        running_command: Some("cargo nextest run".into()),
+                        cwd: Some("/Users/someone/GitHub/project/plugins/sidebar".into()),
+                        title: None,
+                        git: Some(GitStatus {
+                            branch: "feature/robust-themes".into(),
+                            dirty: true,
+                            ahead: 3,
+                            behind: 1,
+                        }),
+                        last_exit: None,
+                        output_at_ms: Some(5),
+                        attention_at_ms: None,
+                        attention: None,
+                        agent: None,
+                    })
+                    .collect(),
+                now_ms: 10,
+                revision: 1,
+            });
+            state.replace_tabs(tabs_list::TabListSnapshot {
+                tabs: ids
+                    .iter()
+                    .enumerate()
+                    .map(|(index, id)| tabs_list::TabListEntry {
+                        id: *id,
+                        name: format!("code-review {index}"),
+                        active: false,
+                        workspace: "default".to_string(),
+                        workspace_id: Uuid::nil(),
+                    })
+                    .collect(),
+                revision: 1,
+            });
+            let registry = bmux_plugin::surface::PluginSurfaceRegistry::new(4);
+            publish_surfaces(&registry, 1, vec![build_surface(&state, 1)]).unwrap();
+            registry.owner_snapshot(OWNER).unwrap().surfaces.remove(0)
+        };
+        // 100 rows of cards (about 45 tabs) keep their text selection.
+        assert!(cards(100).metadata.is_some());
+        // Far more than the host bounds still draws every visible card.
+        let extreme = cards(1_000);
+        assert!(extreme.metadata.is_none());
+        assert!(extreme.ops.len() > 100);
+    }
+
+    /// A surface the host rejects for its metadata is drawn without it.
+    #[test]
+    fn a_rejected_surface_is_published_without_its_selection() {
+        let mut state = CompanionState::new(shown_settings(), None);
+        state.allocation = Some(ExtensionRect::new(0, 0, 32, 12));
+        state.replace_tabs(tabs_list::TabListSnapshot {
+            tabs: vec![tabs_list::TabListEntry {
+                id: Uuid::from_u128(1),
+                name: "only".to_string(),
+                active: true,
+                workspace: "default".to_string(),
+                workspace_id: Uuid::nil(),
+            }],
+            revision: 1,
+        });
+        let surface = build_surface(&state, 1);
+        // Metadata may hold no more than 16 bytes here; the ops are tiny.
+        let registry =
+            bmux_plugin::surface::PluginSurfaceRegistry::with_limits(4, 4_096, 16, 1 << 20);
+        publish_surfaces(&registry, 1, vec![surface]).unwrap();
+        let published = registry.owner_snapshot(OWNER).unwrap();
+        assert!(published.surfaces[0].metadata.is_none());
+        assert_ne!(published.surfaces[0].ops.len(), 0);
     }
 
     #[test]
