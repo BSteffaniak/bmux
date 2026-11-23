@@ -39,7 +39,8 @@ pub(crate) struct Session {
     guard: Mutex<Option<super::crash_guard::Registration>>,
 }
 
-const RECORD_VERSION: u32 = 1;
+/// Version 2 names the server that wrote the record.
+const RECORD_VERSION: u32 = 2;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Record {
@@ -47,6 +48,16 @@ struct Record {
     sid: i32,
     /// The leader's start identity; `None` when the platform reports none.
     leader_start: Option<(u64, u64)>,
+    /// The server process that recorded the session: its pid and start identity. Absent
+    /// from version 1 records.
+    #[serde(default)]
+    owner: Option<(u32, (u64, u64))>,
+}
+
+/// This process, as a record's owner.
+fn this_process() -> Option<(u32, (u64, u64))> {
+    let pid = crate::platform::files::process_id();
+    crate::platform::process_start_identity(pid).map(|start| (pid, (start.0, start.1)))
 }
 
 impl Session {
@@ -84,6 +95,7 @@ impl Session {
                 version: RECORD_VERSION,
                 sid: self.sid,
                 leader_start: self.start.map(|start| (start.0, start.1)),
+                owner: this_process(),
             },
         )?;
         Ok(Some(path))
@@ -150,24 +162,45 @@ pub(crate) fn sweep_unadopted(leader: u32) -> std::io::Result<()> {
     )
 }
 
-/// Sweep the session one crash record describes, if it is still ours.
-pub(crate) fn recover_record(path: &Path) -> anyhow::Result<()> {
+/// Sweep the session one crash record describes, if the server that recorded it is gone.
+///
+/// Any process activating the pane runtime for this runtime directory recovers its records:
+/// the next server after a crash, but also a command run in a client or the CLI while the
+/// server runs. A record whose server still runs is left alone, and so is a version 1 record
+/// (which names no server) whose session still lives: its server may well be running.
+pub(crate) fn recover_record(path: &Path) -> anyhow::Result<crate::platform::RecordRecovery> {
+    use crate::platform::RecordRecovery;
     let record: Record = serde_json::from_slice(&std::fs::read(path)?)?;
     anyhow::ensure!(
-        record.version == RECORD_VERSION,
+        matches!(record.version, 1 | RECORD_VERSION),
         "unsupported pane session record version {}",
         record.version
     );
     anyhow::ensure!(record.sid > 1, "invalid pane session record");
+    let owner_running = record.owner.is_none_or(|(pid, (seconds, fraction))| {
+        crate::platform::process_start_identity(pid)
+            == Some(crate::platform::ProcessStartIdentity(seconds, fraction))
+    });
+    if record.owner.is_some() && owner_running {
+        return Ok(RecordRecovery::Owned);
+    }
     let leader = u32::try_from(record.sid)?;
     let recorded = record
         .leader_start
         .map(|(seconds, fraction)| crate::platform::ProcessStartIdentity(seconds, fraction));
     if !still_ours(leader, recorded) {
-        return Ok(());
+        return Ok(RecordRecovery::Swept);
+    }
+    if owner_running {
+        // A server that may still run keeps a session that still has members.
+        return Ok(if session_sweep::occupied(record.sid)? {
+            RecordRecovery::Owned
+        } else {
+            RecordRecovery::Swept
+        });
     }
     session_sweep::sweep(record.sid)?;
-    Ok(())
+    Ok(RecordRecovery::Swept)
 }
 
 /// Whether the recorded session still belongs to the pane that wrote it.
@@ -238,17 +271,48 @@ mod tests {
         let start = crate::platform::process_start_identity(pid).unwrap();
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("record.json");
-        crate::atomic_state::commit(
+        let record = |owner| Record {
+            version: RECORD_VERSION,
+            sid: i32::try_from(pid).unwrap(),
+            leader_start: Some((start.0, start.1)),
+            owner,
+        };
+        // Recorded by a running server (this process): left alone.
+        crate::atomic_state::commit(&path, &record(this_process())).unwrap();
+        assert_eq!(
+            recover_record(&path).unwrap(),
+            crate::platform::RecordRecovery::Owned
+        );
+        // An older record naming no server, its session alive: left alone too.
+        std::fs::write(
             &path,
-            &Record {
-                version: RECORD_VERSION,
-                sid: i32::try_from(pid).unwrap(),
-                leader_start: Some((start.0, start.1)),
-            },
+            format!(r#"{{"version":1,"sid":{pid},"leader_start":[{},{}]}}"#, start.0, start.1),
         )
         .unwrap();
-        recover_record(&path).unwrap();
+        assert_eq!(
+            recover_record(&path).unwrap(),
+            crate::platform::RecordRecovery::Owned
+        );
+        assert!(child.try_wait().unwrap().is_none());
+        // Recorded by a server that is gone (this pid, started at another time): swept.
+        let (me, (seconds, fraction)) = this_process().unwrap();
+        let gone = Some((me, (seconds.wrapping_add(1), fraction)));
+        crate::atomic_state::commit(&path, &record(gone)).unwrap();
+        assert_eq!(
+            recover_record(&path).unwrap(),
+            crate::platform::RecordRecovery::Swept
+        );
         let status = child.wait().unwrap();
         assert!(!status.success());
+        // With its session gone, an older record has nothing left to sweep.
+        std::fs::write(
+            &path,
+            format!(r#"{{"version":1,"sid":{pid},"leader_start":[{},{}]}}"#, start.0, start.1),
+        )
+        .unwrap();
+        assert_eq!(
+            recover_record(&path).unwrap(),
+            crate::platform::RecordRecovery::Swept
+        );
     }
 }

@@ -68,6 +68,15 @@ pub(crate) use target::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FileIdentity(pub(crate) [u64; 8]);
 
+/// What recovering one pane session crash record did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecordRecovery {
+    /// Nothing of the session is left to a dead server: the record can go.
+    Swept,
+    /// The session may still belong to a running server: left alone, record kept.
+    Owned,
+}
+
 /// When a process started, as the operating system records it: with its pid, an identity no
 /// later process shares (a reused pid has a different start).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

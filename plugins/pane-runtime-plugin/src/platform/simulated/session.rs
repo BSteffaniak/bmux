@@ -314,7 +314,10 @@ pub(crate) fn sweep_unadopted(leader: u32) -> std::io::Result<()> {
     sweep_session(leader)
 }
 
-pub(crate) fn recover_record(path: &Path) -> anyhow::Result<()> {
+/// The simulated server has no process of its own to name (a crash is modelled by
+/// [`crate::runtime::session_control::SessionAuthority::abandon`] in the same process), so its
+/// records are swept whenever their session is still theirs.
+pub(crate) fn recover_record(path: &Path) -> anyhow::Result<crate::platform::RecordRecovery> {
     let record: Record = serde_json::from_slice(&switchy_fs::sync::read(path)?)?;
     anyhow::ensure!(
         record.version == RECORD_VERSION,
@@ -329,7 +332,7 @@ pub(crate) fn recover_record(path: &Path) -> anyhow::Result<()> {
     if still_ours(leader, recorded) {
         sweep_session(leader)?;
     }
-    Ok(())
+    Ok(crate::platform::RecordRecovery::Swept)
 }
 
 /// Whether session `leader` is still the one recorded: its leader runs with the recorded serial,

@@ -143,7 +143,8 @@ pub(crate) fn sweep_unadopted(leader: u32) -> std::io::Result<()> {
     backend::sweep_unadopted(leader)
 }
 
-/// Sweep every session recorded by a predecessor, then delete its record.
+/// Sweep every session a server that is gone recorded, then delete its record. Records of a
+/// server still running (this activation may be a command run beside it) are left alone.
 pub(crate) fn recover(records: &Path) {
     let Ok(entries) = crate::dir_order::read_dir_sorted(records) else {
         return;
@@ -156,9 +157,10 @@ pub(crate) fn recover(records: &Path) {
             continue;
         }
         match backend::recover_record(&path) {
-            Ok(()) => {
+            Ok(crate::platform::RecordRecovery::Swept) => {
                 let _ = switchy_fs::sync::remove_file(&path);
             }
+            Ok(crate::platform::RecordRecovery::Owned) => {}
             Err(error) => {
                 tracing::warn!(
                     record = %path.display(),

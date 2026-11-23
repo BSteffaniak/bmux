@@ -219,8 +219,6 @@ impl Session {
     }
 }
 
-/// Windows writes no crash records.
-#[allow(clippy::unnecessary_wraps)] // Unix sweeps the recorded session.
 /// Nothing to do: the session's job closed with the preparation adoption consumed, and its
 /// kill-on-close ended every member.
 #[allow(clippy::unnecessary_wraps)] // Unix sweeps the session, which can fail.
@@ -228,8 +226,12 @@ pub(crate) const fn sweep_unadopted(_leader: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-pub(crate) const fn recover_record(_path: &Path) -> anyhow::Result<()> {
-    Ok(())
+/// Windows keeps no records: a job's kill-on-close ends its processes with the server.
+#[allow(clippy::unnecessary_wraps)] // Unix reads and sweeps the record, which can fail.
+pub(crate) const fn recover_record(
+    _path: &Path,
+) -> anyhow::Result<crate::platform::RecordRecovery> {
+    Ok(crate::platform::RecordRecovery::Swept)
 }
 
 #[cfg(test)]
