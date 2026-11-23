@@ -63,6 +63,14 @@ impl Kind {
         Self::Bystander,
     ];
 
+    /// Whether it takes the server to itself: drivers pause, and it waits for every action
+    /// under way to end (a crash cancels them), rather than run beside them and be cancelled by
+    /// a crash.
+    #[must_use]
+    pub const fn exclusive(self) -> bool {
+        matches!(self, Self::Crash | Self::PowerLoss | Self::Bystander)
+    }
+
     /// Its name in a profile.
     #[must_use]
     pub const fn name(self) -> &'static str {

@@ -177,8 +177,9 @@ struct State {
     steps_left: u64,
     /// Actions under way that a crash cancels.
     busy: u64,
-    /// A crash is under way: drivers start nothing until it is done.
-    crashing: bool,
+    /// An exclusive action is under way (see [`Kind::exclusive`]): drivers start nothing
+    /// until it is done.
+    paused: bool,
     /// Exits the runtime acted on, per pane.
     exits: BTreeMap<Pane, u64>,
     violations: Vec<String>,
@@ -202,8 +203,8 @@ pub struct Shared {
     /// with several receivers, it wakes them in an order drawn from `tokio`'s own per-thread
     /// generator, which no seed decides.)
     generation: AtomicU64,
-    /// One crash at a time.
-    crash: tokio::sync::Mutex<()>,
+    /// One exclusive action at a time.
+    exclusive: tokio::sync::Mutex<()>,
     /// Simulated time per unit of [`SETTLE`]: the profile's clock.
     settle: Duration,
 }
@@ -372,6 +373,38 @@ impl Drop for Opening<'_> {
     }
 }
 
+/// The drivers paused for an exclusive action (see [`Shared::pause`]): they start nothing new
+/// until it is resumed or dropped, and no other exclusive action begins until it is dropped.
+struct Paused<'a> {
+    shared: &'a Shared,
+    resumed: bool,
+    _one_at_a_time: tokio::sync::MutexGuard<'a, ()>,
+}
+
+impl Paused<'_> {
+    /// Wait until no action is under way (each ends, or is cancelled by a crash).
+    async fn drained(&self) {
+        while self.shared.lock().busy > 0 {
+            switchy_async::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Let drivers start actions again (with `state`, the shared state, locked), while this
+    /// exclusive action goes on checking what it did.
+    const fn resume(&mut self, state: &mut State) {
+        state.paused = false;
+        self.resumed = true;
+    }
+}
+
+impl Drop for Paused<'_> {
+    fn drop(&mut self) {
+        if !self.resumed {
+            self.shared.lock().paused = false;
+        }
+    }
+}
+
 // Each locked section is a deliberate unit (choose a pane and act on it, or update what is
 // known about one) that no other driver may interleave with; tightening the guards as the
 // lint suggests would split them.
@@ -392,7 +425,7 @@ impl Shared {
                 opening: 0,
                 steps_left: profile.steps,
                 busy: 0,
-                crashing: false,
+                paused: false,
                 exits: BTreeMap::new(),
                 violations: Vec::new(),
                 stats: Stats::default(),
@@ -404,7 +437,7 @@ impl Shared {
             profile,
             records,
             generation: AtomicU64::new(0),
-            crash: tokio::sync::Mutex::new(()),
+            exclusive: tokio::sync::Mutex::new(()),
             settle,
         })
     }
@@ -467,7 +500,7 @@ impl Shared {
             }
             let kind = {
                 let mut state = self.lock();
-                let kind = if state.crashing {
+                let kind = if state.paused {
                     None
                 } else if let Some(scripts) = &mut state.scripts {
                     let Some(step) = usize::try_from(driver)
@@ -510,10 +543,10 @@ impl Shared {
         }
     }
 
-    /// Count `kind` under way (unless it crashes the server), with the server generation it
-    /// acts on, which a crash ends.
+    /// Count `kind` under way (unless it is exclusive: it waits for those under way), with the
+    /// server generation it acts on, which a crash ends.
     fn begin(&self, state: &mut State, kind: Kind) -> u64 {
-        if !matches!(kind, Kind::Crash | Kind::PowerLoss | Kind::Bystander) {
+        if !kind.exclusive() {
             state.busy += 1;
         }
         self.generation.load(Ordering::SeqCst)
@@ -522,10 +555,8 @@ impl Shared {
     /// Take one action begun (see [`Self::begin`]) on server generation `generation`, as
     /// driver `driver`.
     async fn take(&self, driver: u64, kind: Kind, generation: u64) {
-        if kind == Kind::Crash || kind == Kind::PowerLoss {
-            self.crash(driver, kind == Kind::PowerLoss).await;
-        } else if kind == Kind::Bystander {
-            self.bystander(driver).await;
+        if kind.exclusive() {
+            self.act(driver, kind).await;
         } else {
             self.cancellable(driver, kind, generation).await;
         }
@@ -587,7 +618,9 @@ impl Shared {
             Kind::Resize => self.resize(driver).await,
             Kind::Close => self.close_one(driver).await,
             Kind::Restart => self.restart(driver).await,
-            Kind::Crash | Kind::PowerLoss | Kind::Bystander => {}
+            Kind::Crash => self.crash(driver, false).await,
+            Kind::PowerLoss => self.crash(driver, true).await,
+            Kind::Bystander => self.bystander(driver).await,
             Kind::Split => self.split(driver).await,
             Kind::Interrupt => self.interrupt(driver),
             Kind::Wait => switchy_async::time::sleep(Duration::from_millis(draw(50))).await,
@@ -1166,22 +1199,34 @@ impl Shared {
         }
     }
 
+    /// Pause the drivers for an exclusive action (see [`Kind::exclusive`]), one at a time, if
+    /// `wanted` (given the state) says there is anything for it to do. Returns the pause, which
+    /// lets drivers go on when dropped (or [`Paused::resume`]d), and the server's panes.
+    async fn pause(&self, wanted: impl FnOnce(&State) -> bool) -> Option<(Paused<'_>, Arc<Panes>)> {
+        let one_at_a_time = self.exclusive.lock().await;
+        let mut state = self.lock();
+        if !wanted(&state) {
+            return None;
+        }
+        state.paused = true;
+        let panes = Arc::clone(&state.panes);
+        drop(state);
+        let paused = Paused {
+            shared: self,
+            resumed: false,
+            _one_at_a_time: one_at_a_time,
+        };
+        Some((paused, panes))
+    }
+
     /// Activate a second pane runtime on the server's runtime directory while the server runs
     /// (as a command run in a client does), checking invariant 12: it kills nothing the server
     /// runs. Drivers pause meanwhile, so no close or restart of theirs kills a program.
     async fn bystander(&self, driver: u64) {
-        let _one_at_a_time = self.crash.lock().await;
-        let panes = {
-            let mut state = self.lock();
-            if state.open.is_empty() {
-                return;
-            }
-            state.crashing = true;
-            Arc::clone(&state.panes)
+        let Some((paused, panes)) = self.pause(|state| !state.open.is_empty()).await else {
+            return;
         };
-        while self.lock().busy > 0 {
-            switchy_async::time::sleep(Duration::from_millis(1)).await;
-        }
+        paused.drained().await;
         let message = format!("d{driver}: a command activated the pane runtime beside the server");
         event("bystander", message, Tone::Info);
         // The programs of the server's live panes.
@@ -1218,20 +1263,17 @@ impl Shared {
                 ),
             );
         }
-        self.lock().crashing = false;
+        drop(paused);
     }
 
     /// Crash the server, start processes it never owned, then start a new server on the same
     /// runtime directory, checking invariant 6.
     async fn crash(&self, driver: u64, power_loss: bool) {
-        let _one_at_a_time = self.crash.lock().await;
-        let panes = {
-            let mut state = self.lock();
-            if state.open.is_empty() && state.opening == 0 {
-                return;
-            }
-            state.crashing = true;
-            Arc::clone(&state.panes)
+        let Some((mut paused, panes)) = self
+            .pause(|state| !state.open.is_empty() || state.opening != 0)
+            .await
+        else {
+            return;
         };
         if power_loss {
             event("power", format!("d{driver}: the power failed"), Tone::Warn);
@@ -1240,9 +1282,7 @@ impl Shared {
         }
         // The drivers' work under way stops with the server.
         self.generation.fetch_add(1, Ordering::SeqCst);
-        while self.lock().busy > 0 {
-            switchy_async::time::sleep(Duration::from_millis(1)).await;
-        }
+        paused.drained().await;
         // Die: every task and thread of the server stops where it is.
         panes.crash();
         drop(panes);
@@ -1301,7 +1341,7 @@ impl Shared {
             state.open.clear();
             state.opening = 0;
             state.panes = fresh;
-            state.crashing = false;
+            paused.resume(&mut state);
             state.stats.crashed += 1;
             state.witnesses.extend(witnesses);
             state.witnesses.iter().map(|w| w.serial).collect()
