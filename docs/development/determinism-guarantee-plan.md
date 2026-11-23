@@ -197,9 +197,9 @@ exemption.
   cover only a sample.
 - How do we handle macro-generated code `syn` cannot see? Proc macros the graph uses go on the
   audit list. `macro_rules!` bodies are scanned as token streams.
-- Should native bmux code also be held to "switchy everywhere" (the stated end state), letting
-  20.2 run on the whole workspace rather than only the simulated graph? Natively the facades
-  cost nothing, and one rule is simpler than two.
+- **Decided: scope.** 20.2 checks the simulated dependency graph only. All of bmux follows
+  "switchy everywhere" at the end of the simulator migration, but not before. Until then, a
+  crate is held to the rules once a simulation links it.
 
 ## Implementation notes
 
