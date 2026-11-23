@@ -712,6 +712,10 @@ pub(super) fn enter_invoking_transport(
 tokio::task_local! {
     // Set only by the selected host dispatch below, never decoded from requests.
     static SELECTED_PLUGIN_CALLER: String;
+    // Marks selected work a host callback thread is blocked waiting for: a callback that work
+    // needs must not wait for a pool slot (see `HostCallbackExecutor::submit`). Set only by
+    // the selected host dispatch below, never decoded from requests.
+    static AWAITED_BY_HOST_CALLBACK: ();
 }
 
 /// Server-authenticated authority retained for one provider dispatch. Only the
@@ -764,47 +768,118 @@ impl Drop for BlockingPluginWorkerGuard {
 
 type SelectedRequestJob = Box<dyn FnOnce() + Send + 'static>;
 
+/// The bounded pool host callbacks run on (synchronous plugin callbacks never run on a Tokio
+/// worker).
+///
+/// A callback may synchronously call a service whose provider needs a callback of its own,
+/// blocking its slot until that one finishes. So a callback some host callback is waiting for
+/// (nested) never waits for a slot: with the pool full of the callbacks waiting for it, it
+/// would wait forever. It runs on an overflow thread instead, bounded by the depth of the
+/// calls. Any other callback waits for a free slot, at most [`HOST_CALLBACK_SLOT_WAIT`], so a
+/// burst (a server restoring every pane at once) queues rather than fails.
 struct HostCallbackExecutor {
     sender: std::sync::mpsc::SyncSender<SelectedRequestJob>,
     slots: Arc<tokio::sync::Semaphore>,
 }
 
+/// How long a callback no other callback waits for may wait for a free slot.
+const HOST_CALLBACK_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl HostCallbackExecutor {
     fn get() -> bmux_plugin_sdk::Result<&'static Self> {
         static EXECUTOR: OnceLock<Result<HostCallbackExecutor, String>> = OnceLock::new();
         EXECUTOR
-            .get_or_init(|| {
-                const WORKERS: usize = 16;
-                let (sender, receiver) =
-                    std::sync::mpsc::sync_channel::<SelectedRequestJob>(WORKERS);
-                let receiver = Arc::new(Mutex::new(receiver));
-                for index in 0..WORKERS {
-                    let receiver = receiver.clone();
-                    std::thread::Builder::new()
-                        .name(format!("bmux-host-callback-{index}"))
-                        .spawn(move || {
-                            ON_HOST_CALLBACK_THREAD.with(|location| location.set(true));
-                            loop {
-                                let job = match receiver.lock() {
-                                    Ok(receiver) => receiver.recv(),
-                                    Err(_) => break,
-                                };
-                                let Ok(job) = job else { break };
-                                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
-                            }
-                        })
-                        .map_err(|error| {
-                            format!("host callback executor startup failed: {error}")
-                        })?;
-                }
-                Ok(Self {
-                    sender,
-                    slots: Arc::new(tokio::sync::Semaphore::new(WORKERS)),
-                })
-            })
+            .get_or_init(|| Self::start(16))
             .as_ref()
             .map_err(|details| bmux_plugin_sdk::PluginError::ServiceProtocol {
                 details: details.clone(),
+            })
+    }
+
+    fn start(workers: usize) -> Result<Self, String> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<SelectedRequestJob>(workers);
+        let receiver = Arc::new(Mutex::new(receiver));
+        for index in 0..workers {
+            let receiver = receiver.clone();
+            std::thread::Builder::new()
+                .name(format!("bmux-host-callback-{index}"))
+                .spawn(move || {
+                    ON_HOST_CALLBACK_THREAD.with(|location| location.set(true));
+                    loop {
+                        let job = match receiver.lock() {
+                            Ok(receiver) => receiver.recv(),
+                            Err(_) => break,
+                        };
+                        let Ok(job) = job else { break };
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                    }
+                })
+                .map_err(|error| format!("host callback executor startup failed: {error}"))?;
+        }
+        Ok(Self {
+            sender,
+            slots: Arc::new(tokio::sync::Semaphore::new(workers)),
+        })
+    }
+
+    /// Run `job` on a host callback thread: in a free slot, else (if a host callback waits for
+    /// it) on an overflow thread, else once a slot frees, waiting on `runtime` at most `wait`.
+    async fn submit(
+        &self,
+        runtime: &tokio::runtime::Handle,
+        job: SelectedRequestJob,
+        wait: std::time::Duration,
+    ) -> bmux_plugin_sdk::Result<()> {
+        let protocol = |details| bmux_plugin_sdk::PluginError::ServiceProtocol { details };
+        let nested = AWAITED_BY_HOST_CALLBACK.try_with(|()| ()).is_ok();
+        let permit = match self.slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) if nested => return Self::overflow(job),
+            Err(_) => {
+                // Waited on the selected host reactor: the caller may be polling from a
+                // runtime without a timer.
+                let slots = self.slots.clone();
+                runtime
+                    .spawn(async move { tokio::time::timeout(wait, slots.acquire_owned()).await })
+                    .await
+                    .map_err(|_| {
+                        protocol(
+                            "host callback executor unavailable; callback not dispatched".into(),
+                        )
+                    })?
+                    .map_err(|_| {
+                        protocol("host callback executor saturated; callback not dispatched".into())
+                    })?
+                    .map_err(|_| {
+                        protocol(
+                            "host callback executor unavailable; callback not dispatched".into(),
+                        )
+                    })?
+            }
+        };
+        self.sender
+            .try_send(Box::new(move || {
+                let _permit = permit;
+                job();
+            }))
+            .map_err(|_| {
+                protocol("host callback executor unavailable; callback not dispatched".into())
+            })
+    }
+
+    /// Run `job` on a thread of its own, as a host callback thread.
+    fn overflow(job: SelectedRequestJob) -> bmux_plugin_sdk::Result<()> {
+        std::thread::Builder::new()
+            .name("bmux-host-callback-nested".into())
+            .spawn(move || {
+                ON_HOST_CALLBACK_THREAD.with(|location| location.set(true));
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+            })
+            .map(drop)
+            .map_err(|error| bmux_plugin_sdk::PluginError::ServiceProtocol {
+                details: format!(
+                    "host callback overflow thread failed: {error}; callback not dispatched"
+                ),
             })
     }
 }
@@ -1062,39 +1137,41 @@ impl AuthenticatedServiceInvocation {
         let authority = self.clone();
         let request = request.to_vec();
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        let work = async move {
+            let _permit = permit;
+            let result = if authority.cancellation.is_cancelled() {
+                Err(protocol("authenticated invocation cancelled".into()))
+            } else {
+                let execution = authority.context.execute_raw(request);
+                let result = if let Some(caller) = authority.caller_plugin {
+                    SELECTED_PLUGIN_CALLER.scope(caller, execution).await
+                } else {
+                    execution.await
+                };
+                result
+                    .map_err(|error| protocol(format!("authenticated dispatch failed: {error:#}")))
+            };
+            let result = result.and_then(|bytes| {
+                if bytes.len() > bmux_plugin_sdk::abi::MAX_BUFFER_BYTES {
+                    Err(protocol(
+                        "host response exceeds bound; outcome unknown, do not replay".into(),
+                    ))
+                } else {
+                    Ok(bytes)
+                }
+            });
+            let _ = sender.send(result);
+        };
+        // A host callback thread blocks below until this work ends, so any callback the work
+        // needs must not wait for that thread's pool (see `HostCallbackExecutor`).
+        let work: std::pin::Pin<Box<dyn Future<Output = ()> + Send>> = if host_thread {
+            Box::pin(AWAITED_BY_HOST_CALLBACK.scope((), work))
+        } else {
+            Box::pin(work)
+        };
         executor
             .sender
-            .try_send(selected_effect_job(
-                self.runtime.clone(),
-                admission,
-                async move {
-                    let _permit = permit;
-                    let result = if authority.cancellation.is_cancelled() {
-                        Err(protocol("authenticated invocation cancelled".into()))
-                    } else {
-                        let execution = authority.context.execute_raw(request);
-                        let result = if let Some(caller) = authority.caller_plugin {
-                            SELECTED_PLUGIN_CALLER.scope(caller, execution).await
-                        } else {
-                            execution.await
-                        };
-                        result.map_err(|error| {
-                            protocol(format!("authenticated dispatch failed: {error:#}"))
-                        })
-                    };
-                    let result = result.and_then(|bytes| {
-                        if bytes.len() > bmux_plugin_sdk::abi::MAX_BUFFER_BYTES {
-                            Err(protocol(
-                                "host response exceeds bound; outcome unknown, do not replay"
-                                    .into(),
-                            ))
-                        } else {
-                            Ok(bytes)
-                        }
-                    });
-                    let _ = sender.send(result);
-                },
-            ))
+            .try_send(selected_effect_job(self.runtime.clone(), admission, work))
             .map_err(|_| {
                 protocol("selected host executor unavailable; request not dispatched".into())
             })?;
@@ -1150,27 +1227,22 @@ impl AuthenticatedServiceInvocation {
     {
         let protocol = |details| bmux_plugin_sdk::PluginError::ServiceProtocol { details };
         let executor = HostCallbackExecutor::get()?;
-        let permit = executor.slots.clone().try_acquire_owned().map_err(|_| {
-            protocol("host callback executor saturated; callback not dispatched".into())
-        })?;
         let (sender, receiver) = tokio::sync::oneshot::channel();
+        let reactor = runtime.clone();
+        let job: SelectedRequestJob = Box::new(move || {
+            let _entered = runtime.enter();
+            let _worker = BlockingPluginWorkerGuard::enter();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback))
+                .unwrap_or_else(|_| {
+                    Err(protocol(
+                        "host callback panicked; outcome unknown, do not replay".into(),
+                    ))
+                });
+            let _ = sender.send(result);
+        });
         executor
-            .sender
-            .try_send(Box::new(move || {
-                let _permit = permit;
-                let _entered = runtime.enter();
-                let _worker = BlockingPluginWorkerGuard::enter();
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(callback))
-                    .unwrap_or_else(|_| {
-                        Err(protocol(
-                            "host callback panicked; outcome unknown, do not replay".into(),
-                        ))
-                    });
-                let _ = sender.send(result);
-            }))
-            .map_err(|_| {
-                protocol("host callback executor unavailable; callback not dispatched".into())
-            })?;
+            .submit(&reactor, job, HOST_CALLBACK_SLOT_WAIT)
+            .await?;
         receiver.await.map_err(|_| {
             protocol("host callback response lost; outcome unknown, do not replay".into())
         })?
@@ -2707,6 +2779,135 @@ mod tests {
             }
         ));
         assert!(!ON_HOST_CALLBACK_THREAD.with(std::cell::Cell::get));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_service_called_from_a_callback_gets_a_callback_with_the_pool_full() {
+        // A server restoring its panes: every slot but one is busy, and the last callback
+        // synchronously invokes a service whose provider needs a callback of its own.
+        let directory = private_scope_directory();
+        let server = BmuxServer::new(bmux_ipc::IpcEndpoint::unix_socket(
+            directory.path().join("s"),
+        ));
+        server
+            .register_service_handler(
+                "test.nested",
+                InvokeServiceKind::Query,
+                "nested/v1",
+                "read",
+                |_, _, _| async {
+                    AuthenticatedServiceInvocation::dispatch_host_callback(
+                        tokio::runtime::Handle::current(),
+                        || Ok(vec![9]),
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)
+                },
+            )
+            .unwrap();
+        let executor = HostCallbackExecutor::get().unwrap();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = Arc::new(Mutex::new(held));
+        while executor.slots.available_permits() > 1 {
+            let permit = executor.slots.clone().try_acquire_owned().unwrap();
+            let held = held.clone();
+            executor
+                .sender
+                .try_send(Box::new(move || {
+                    let _permit = permit;
+                    let _ = held.lock().unwrap().recv();
+                }))
+                .unwrap();
+        }
+        let authority = AuthenticatedServiceInvocation::new(server.host_service_context());
+        let request = bmux_ipc::encode(&bmux_ipc::Request::InvokeService {
+            capability: "test.nested".into(),
+            kind: InvokeServiceKind::Query,
+            interface_id: "nested/v1".into(),
+            operation: "read".into(),
+            payload: vec![],
+        })
+        .unwrap();
+        let response = AuthenticatedServiceInvocation::dispatch_host_callback(
+            tokio::runtime::Handle::current(),
+            move || authority.execute_response(&request),
+        )
+        .await;
+        drop(release);
+        assert!(
+            matches!(response, Ok(bmux_ipc::ResponsePayload::ServiceInvoked { ref payload }) if payload == &[9]),
+            "{response:?}"
+        );
+    }
+
+    /// A one-slot pool with its slot held until the returned sender is dropped.
+    fn held_pool() -> (HostCallbackExecutor, std::sync::mpsc::Sender<()>) {
+        let pool = HostCallbackExecutor::start(1).unwrap();
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let permit = pool.slots.clone().try_acquire_owned().unwrap();
+        pool.sender
+            .try_send(Box::new(move || {
+                let _permit = permit;
+                let _ = held.recv();
+            }))
+            .unwrap();
+        (pool, release)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_callback_waits_for_a_slot_rather_than_fail() {
+        let (pool, release) = held_pool();
+        let (ran, done) = tokio::sync::oneshot::channel();
+        let job: SelectedRequestJob = Box::new(move || {
+            let _ = ran.send(ON_HOST_CALLBACK_THREAD.with(std::cell::Cell::get));
+        });
+        let runtime = tokio::runtime::Handle::current();
+        let submitted = pool.submit(&runtime, job, std::time::Duration::from_secs(30));
+        let released = async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop(release);
+        };
+        let (submitted, ()) = tokio::join!(submitted, released);
+        submitted.unwrap();
+        assert!(done.await.unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_callback_fails_once_its_wait_for_a_slot_runs_out() {
+        let (pool, _release) = held_pool();
+        let error = pool
+            .submit(
+                &tokio::runtime::Handle::current(),
+                Box::new(|| {}),
+                std::time::Duration::from_millis(20),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("saturated"), "{error}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_callback_a_host_callback_waits_for_never_waits_for_a_slot() {
+        // The pool's only slot is held by a callback waiting for this one: waiting for a slot
+        // would wait forever.
+        let (pool, release) = held_pool();
+        let (ran, done) = tokio::sync::oneshot::channel();
+        let job: SelectedRequestJob = Box::new(move || {
+            let _ = ran.send(ON_HOST_CALLBACK_THREAD.with(std::cell::Cell::get));
+        });
+        AWAITED_BY_HOST_CALLBACK
+            .scope(
+                (),
+                pool.submit(
+                    &tokio::runtime::Handle::current(),
+                    job,
+                    std::time::Duration::ZERO,
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(done.await.unwrap());
+        drop(release);
     }
 
     #[test]
