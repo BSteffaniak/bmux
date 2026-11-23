@@ -7,8 +7,8 @@
 3
 42
 1337
-3645178397112225762  workload: end-of-run cleanup counted as an unexpected signal
-12753484066174446883 simulator: a killed process could still fork (switchy_pty fix)
-2258571551243736516  bmux_pty: kill after reaping reached a process that reused the id
+3645178397112225762  # workload: end-of-run cleanup counted as an unexpected signal
+12753484066174446883 # simulator: a killed process could still fork (switchy_pty fix)
+2258571551243736516  # bmux_pty: kill after reaping reached a process that reused the id
 2908671648205331351
 10903523760680128016

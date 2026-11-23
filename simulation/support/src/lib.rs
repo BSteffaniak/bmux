@@ -1065,9 +1065,15 @@ pub fn regression(name: &str, path: &str) -> Result<(), Box<dyn std::error::Erro
             if let Some((variable, value)) = word.split_once('=') {
                 command.env(variable, value);
                 let _ = write!(replay, " {variable}={value}");
-            } else {
+            } else if word.parse::<u64>().is_ok() {
                 command.env("SIMULATOR_EPOCH_OFFSET", word);
                 let _ = write!(replay, " SIMULATOR_EPOCH_OFFSET={word}");
+            } else {
+                return Err(format!(
+                    "{path}: seed {seed}: {word:?} is neither VARIABLE=VALUE nor an epoch \
+                     offset (notes go after a #)"
+                )
+                .into());
             }
         }
         let status = command.stdout(std::process::Stdio::null()).status()?;
