@@ -43,11 +43,6 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// Kinds whose weights a drawn profile draws after every other field, in this order.
-    /// Kinds added once profiles were in use belong here: drawn last, they leave every earlier
-    /// field (and so every regression seed's profile) as it was.
-    const DRAWN_LAST: [Self; 1] = [Self::Bystander];
-
     /// Every kind, in the order profiles list them.
     pub const ALL: [Self; 11] = [
         Self::Open,
@@ -69,6 +64,30 @@ impl Kind {
     #[must_use]
     pub const fn exclusive(self) -> bool {
         matches!(self, Self::Crash | Self::PowerLoss | Self::Bystander)
+    }
+
+    /// The draw epoch its weight belongs to (see [`LAST_EPOCH`]).
+    const fn epoch(self) -> u8 {
+        match self {
+            Self::Bystander => 2,
+            _ => 0,
+        }
+    }
+
+    /// Draw its weight (0 for off) with `draw(bound)`.
+    fn draw_weight(self, draw: &mut impl FnMut(u64) -> u64) -> u64 {
+        if self.epoch() > 0 {
+            // Added later: on in one profile in three, and lightly.
+            return if draw(3) == 0 { 1 + draw(4) } else { 0 };
+        }
+        // Opening and waiting are always on: without panes nothing else happens, and without
+        // waits nothing has time to.
+        let always = matches!(self, Self::Open | Self::Wait);
+        if always || draw(2) == 0 {
+            1 + draw(8)
+        } else {
+            0
+        }
     }
 
     /// Its name in a profile.
@@ -121,6 +140,132 @@ pub struct FaultRates {
     pub wall_clock: f64,
 }
 
+/// The last of profiles' draw epochs.
+///
+/// A drawn profile draws its fields epoch by epoch: epoch 0 holds the fields profiles began
+/// with, 1 the thread-spawn and wall-clock faults, 2 the bystander. A field added once profiles
+/// are in use belongs to a new epoch, drawn after every earlier one, so every earlier field (and
+/// so every regression seed's profile) draws as before it existed.
+const LAST_EPOCH: u8 = 2;
+
+/// How a rate fault is drawn.
+#[derive(Clone, Copy)]
+enum RateDraw {
+    /// On in one profile in this many, at one of these rates.
+    OneIn(u64, &'static [f64]),
+    /// Always one of these rates.
+    OneOf(&'static [f64]),
+}
+
+/// A rate fault in a profile: its name there, its field, how it is drawn, and its draw epoch.
+struct Rate {
+    name: &'static str,
+    get: fn(&FaultRates) -> f64,
+    set: fn(&mut FaultRates, f64),
+    draw: RateDraw,
+    epoch: u8,
+}
+
+/// Every rate fault, in the order profiles list them (and, within an epoch, draw them).
+const RATES: [Rate; 11] = [
+    Rate {
+        name: "eintr",
+        get: |f| f.interrupted,
+        set: |f, rate| f.interrupted = rate,
+        draw: RateDraw::OneIn(3, &[0.01, 0.05, 0.2]),
+        epoch: 0,
+    },
+    Rate {
+        name: "short",
+        get: |f| f.short,
+        set: |f, rate| f.short = rate,
+        draw: RateDraw::OneIn(3, &[0.05, 0.2, 0.5]),
+        epoch: 0,
+    },
+    Rate {
+        name: "spawn",
+        get: |f| f.spawn,
+        set: |f, rate| f.spawn = rate,
+        draw: RateDraw::OneIn(4, &[0.01, 0.05]),
+        epoch: 0,
+    },
+    Rate {
+        name: "eio",
+        get: |f| f.read_error,
+        set: |f, rate| f.read_error = rate,
+        draw: RateDraw::OneIn(6, &[0.001, 0.01]),
+        epoch: 0,
+    },
+    Rate {
+        name: "stall",
+        get: |f| f.write_stall,
+        set: |f, rate| f.write_stall = rate,
+        draw: RateDraw::OneIn(4, &[0.01, 0.1]),
+        epoch: 0,
+    },
+    Rate {
+        name: "kill",
+        get: |f| f.kill,
+        set: |f, rate| f.kill = rate,
+        draw: RateDraw::OneIn(5, &[0.05, 0.2, 1.0]),
+        epoch: 0,
+    },
+    Rate {
+        name: "late",
+        get: |f| f.signal_delay,
+        set: |f, rate| f.signal_delay = rate,
+        draw: RateDraw::OneIn(4, &[0.2, 1.0]),
+        epoch: 0,
+    },
+    Rate {
+        name: "query",
+        get: |f| f.startup_query,
+        set: |f, rate| f.startup_query = rate,
+        draw: RateDraw::OneIn(3, &[0.3, 1.0]),
+        epoch: 0,
+    },
+    Rate {
+        name: "reuse",
+        get: |f| f.pid_reuse,
+        set: |f, rate| f.pid_reuse = rate,
+        draw: RateDraw::OneOf(&[0.0, 0.3, 0.6, 1.0]),
+        epoch: 0,
+    },
+    Rate {
+        name: "threadspawn",
+        get: |f| f.thread_spawn,
+        set: |f, rate| f.thread_spawn = rate,
+        draw: RateDraw::OneIn(5, &[0.005, 0.02]),
+        epoch: 1,
+    },
+    Rate {
+        name: "clockjump",
+        get: |f| f.wall_clock,
+        set: |f, rate| f.wall_clock = rate,
+        draw: RateDraw::OneIn(4, &[0.0001, 0.001, 0.01]),
+        epoch: 1,
+    },
+];
+
+impl Rate {
+    /// Draw its rate with `draw(bound)`.
+    fn draw(&self, draw: &mut impl FnMut(u64) -> u64) -> f64 {
+        let one_of = |choices: &[f64], draw: &mut dyn FnMut(u64) -> u64| {
+            choices[usize::try_from(draw(choices.len() as u64)).unwrap_or(0)]
+        };
+        match self.draw {
+            RateDraw::OneIn(on_one_in, choices) => {
+                if draw(on_one_in) == 0 {
+                    one_of(choices, draw)
+                } else {
+                    0.0
+                }
+            }
+            RateDraw::OneOf(choices) => one_of(choices, draw),
+        }
+    }
+}
+
 /// One run's profile.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Profile {
@@ -164,44 +309,27 @@ impl Default for Profile {
 
 impl Profile {
     /// Draw a profile with `draw(bound)`, which returns a number below `bound`.
-    pub fn draw(mut draw: impl FnMut(u64) -> u64) -> Self {
+    pub fn draw(draw: impl FnMut(u64) -> u64) -> Self {
+        Self::draw_through(draw, LAST_EPOCH)
+    }
+
+    /// Draw a profile's fields of epochs up to `last` (see [`LAST_EPOCH`]); later epochs'
+    /// fields stay off.
+    fn draw_through(mut draw: impl FnMut(u64) -> u64, last: u8) -> Self {
         let mut weights = [0; Kind::ALL.len()];
         for (kind, weight) in Kind::ALL.iter().zip(weights.iter_mut()) {
-            if Kind::DRAWN_LAST.contains(kind) {
-                continue;
-            }
-            // Opening and waiting are always on: without panes nothing else happens, and
-            // without waits nothing has time to.
-            let always = matches!(kind, Kind::Open | Kind::Wait);
-            if always || draw(2) == 0 {
-                *weight = 1 + draw(8);
+            if kind.epoch() == 0 {
+                *weight = kind.draw_weight(&mut draw);
             }
         }
-        let mut chosen = |on_one_in: u64, choices: &[f64]| {
-            if draw(on_one_in) == 0 {
-                choices[usize::try_from(draw(choices.len() as u64)).unwrap_or(0)]
-            } else {
-                0.0
-            }
-        };
-        let faults = FaultRates {
-            interrupted: chosen(3, &[0.01, 0.05, 0.2]),
-            short: chosen(3, &[0.05, 0.2, 0.5]),
-            spawn: chosen(4, &[0.01, 0.05]),
-            read_error: chosen(6, &[0.001, 0.01]),
-            write_stall: chosen(4, &[0.01, 0.1]),
-            kill: chosen(5, &[0.05, 0.2, 1.0]),
-            signal_delay: chosen(4, &[0.2, 1.0]),
-            startup_query: chosen(3, &[0.3, 1.0]),
-            pid_reuse: [0.0, 0.3, 0.6, 1.0][usize::try_from(draw(4)).unwrap_or(0)],
-            file: if draw(4) == 0 {
-                [20, 100, 500][usize::try_from(draw(3)).unwrap_or(0)]
-            } else {
-                0
-            },
-            // Drawn last (below).
-            thread_spawn: 0.0,
-            wall_clock: 0.0,
+        let mut faults = FaultRates::default();
+        for rate in RATES.iter().filter(|rate| rate.epoch == 0) {
+            (rate.set)(&mut faults, rate.draw(&mut draw));
+        }
+        faults.file = if draw(4) == 0 {
+            [20, 100, 500][usize::try_from(draw(3)).unwrap_or(0)]
+        } else {
+            0
         };
         let mut programs = [0; programs::Kind::ALL.len()];
         for (index, weight) in programs.iter_mut().enumerate() {
@@ -230,19 +358,13 @@ impl Profile {
             weights,
             faults,
         };
-        // Drawn after everything else, so every other field draws as before they existed (and
-        // regression seeds without a profile keep theirs).
-        if draw(5) == 0 {
-            let rate = [0.005, 0.02][usize::try_from(draw(2)).unwrap_or(0)];
-            profile.faults.thread_spawn = rate;
-        }
-        if draw(4) == 0 {
-            let rate = [0.0001, 0.001, 0.01][usize::try_from(draw(3)).unwrap_or(0)];
-            profile.faults.wall_clock = rate;
-        }
-        for kind in Kind::DRAWN_LAST {
-            if draw(3) == 0 {
-                profile.set_weight(kind, 1 + draw(4));
+        for epoch in 1..=last {
+            for rate in RATES.iter().filter(|rate| rate.epoch == epoch) {
+                (rate.set)(&mut profile.faults, rate.draw(&mut draw));
+            }
+            for kind in Kind::ALL.into_iter().filter(|kind| kind.epoch() == epoch) {
+                let weight = kind.draw_weight(&mut draw);
+                profile.set_weight(kind, weight);
             }
         }
         profile
@@ -288,9 +410,9 @@ impl Profile {
                 tags.push(format!("mostly:{}", kind.name()));
             }
         }
-        for (name, rate) in self.fault_list() {
-            if rate > 0.0 && name != "reuse" {
-                tags.push(format!("fault:{name}"));
+        for rate in &RATES {
+            if (rate.get)(&self.faults) > 0.0 && rate.name != "reuse" {
+                tags.push(format!("fault:{}", rate.name));
             }
         }
         if self.faults.file > 0 {
@@ -317,23 +439,6 @@ impl Profile {
             .filter(|(_, weight)| *weight > 0)
             .collect()
     }
-
-    const fn fault_list(&self) -> [(&'static str, f64); 11] {
-        let f = &self.faults;
-        [
-            ("eintr", f.interrupted),
-            ("short", f.short),
-            ("spawn", f.spawn),
-            ("eio", f.read_error),
-            ("stall", f.write_stall),
-            ("kill", f.kill),
-            ("late", f.signal_delay),
-            ("query", f.startup_query),
-            ("reuse", f.pid_reuse),
-            ("threadspawn", f.thread_spawn),
-            ("clockjump", f.wall_clock),
-        ]
-    }
 }
 
 impl fmt::Display for Profile {
@@ -346,8 +451,8 @@ impl fmt::Display for Profile {
         for (kind, weight) in Kind::ALL.iter().zip(self.weights) {
             write!(f, " {}={weight}", kind.name())?;
         }
-        for (name, rate) in self.fault_list() {
-            write!(f, " {name}={rate}")?;
+        for rate in &RATES {
+            write!(f, " {}={}", rate.name, (rate.get)(&self.faults))?;
         }
         write!(f, " fsfault={}", self.faults.file)?;
         write!(f, " sweep={}", u8::from(self.sweep))?;
@@ -389,17 +494,9 @@ impl std::str::FromStr for Profile {
                     profile.panes = usize::try_from(number()?).map_err(|e| e.to_string())?;
                 }
                 "clock" => profile.clock = number()?.max(1),
-                "eintr" => faults.interrupted = rate()?,
-                "short" => faults.short = rate()?,
-                "spawn" => faults.spawn = rate()?,
-                "eio" => faults.read_error = rate()?,
-                "stall" => faults.write_stall = rate()?,
-                "kill" => faults.kill = rate()?,
-                "late" => faults.signal_delay = rate()?,
-                "query" => faults.startup_query = rate()?,
-                "reuse" => faults.pid_reuse = rate()?,
-                "threadspawn" => faults.thread_spawn = rate()?,
-                "clockjump" => faults.wall_clock = rate()?,
+                name if let Some(field) = RATES.iter().find(|field| field.name == name) => {
+                    (field.set)(faults, rate()?);
+                }
                 "fsfault" => faults.file = number()?,
                 "sweep" => profile.sweep = number()? != 0,
                 other if other.starts_with("p.") => {
@@ -486,47 +583,39 @@ mod tests {
         assert_eq!(forced.to_string().parse::<Profile>().unwrap(), forced);
     }
 
+    /// `profile` with the fields of epochs from `epoch` on turned off.
+    fn before_epoch(mut profile: Profile, epoch: u8) -> Profile {
+        for rate in RATES.iter().filter(|rate| rate.epoch >= epoch) {
+            (rate.set)(&mut profile.faults, 0.0);
+        }
+        for kind in Kind::ALL.into_iter().filter(|kind| kind.epoch() >= epoch) {
+            profile.set_weight(kind, 0);
+        }
+        profile
+    }
+
     #[test]
-    fn the_new_faults_and_kinds_are_drawn_after_every_other_field() {
-        // So every other field draws as before they existed.
-        for seed in 0..50_u64 {
-            let mut state = seed;
-            let mut draws: Vec<(u64, u64)> = Vec::new();
-            Profile::draw(|bound| {
-                state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
-                let value = (state >> 33) % bound;
-                draws.push((bound, value));
-                value
-            });
-            let mut at = draws.len();
-            // Kinds drawn last, in reverse: on (then a weight, of four) or not.
-            for _ in Kind::DRAWN_LAST {
-                if draws[at - 1].0 == 4 && draws[at - 2] == (3, 0) {
-                    at -= 2;
-                } else {
-                    at -= 1;
-                    assert_eq!(draws[at].0, 3, "seed {seed}: {draws:?}");
-                    assert_ne!(draws[at].1, 0, "seed {seed}: {draws:?}");
-                }
+    fn each_epoch_leaves_earlier_epochs_draws_as_they_were() {
+        for epoch in 1..=LAST_EPOCH {
+            for seed in 0..100_u64 {
+                let drawn = |last| {
+                    let mut state = seed;
+                    let mut draws = Vec::new();
+                    let profile = Profile::draw_through(
+                        |bound| {
+                            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                            draws.push(bound);
+                            (state >> 33) % bound
+                        },
+                        last,
+                    );
+                    (profile, draws)
+                };
+                let (before, before_draws) = drawn(epoch - 1);
+                let (after, after_draws) = drawn(epoch);
+                assert!(after_draws.starts_with(&before_draws), "epoch {epoch} seed {seed}");
+                assert_eq!(before_epoch(after, epoch), before, "epoch {epoch} seed {seed}");
             }
-            // The wall clock: on (then a rate, of three) or not.
-            if draws[at - 1].0 == 3 && draws[at - 2] == (4, 0) {
-                at -= 2;
-            } else {
-                at -= 1;
-                assert_eq!(draws[at].0, 4, "seed {seed}: {draws:?}");
-                assert_ne!(draws[at].1, 0, "seed {seed}: {draws:?}");
-            }
-            // Thread spawns: on (then a rate, of two) or not.
-            if draws[at - 1].0 == 2 && draws[at - 2] == (5, 0) {
-                at -= 2;
-            } else {
-                at -= 1;
-                assert_eq!(draws[at].0, 5, "seed {seed}: {draws:?}");
-                assert_ne!(draws[at].1, 0, "seed {seed}: {draws:?}");
-            }
-            // The clock's draw (one of three rates) comes just before.
-            assert_eq!(draws[at - 1].0, 3, "seed {seed}: {draws:?}");
         }
     }
 
