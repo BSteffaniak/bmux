@@ -4555,7 +4555,6 @@ dependencies = [
  "bmux_attach_pipeline_models",
  "bmux_attach_view_protocol",
  "bmux_bench",
- "bmux_cell_geometry",
  "bmux_client",
  "bmux_decoration_plugin_renderer",
  "bmux_image",

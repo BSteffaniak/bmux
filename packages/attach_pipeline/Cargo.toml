@@ -28,7 +28,6 @@ bmux_terminal_protocol      = { workspace = true }
 bmux_tui                    = { workspace = true, features = ["terminal-io"] }
 
 anyhow             = { workspace = true, features = ["std"] }
-bmux_cell_geometry = { workspace = true }
 futures-util       = { workspace = true, features = ["std"] }
 tokio              = { workspace = true, features = ["sync", "time"] }
 tracing            = { workspace = true, features = ["std"] }
