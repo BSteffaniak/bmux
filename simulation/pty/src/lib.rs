@@ -26,13 +26,14 @@
 pub mod telemetry;
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fmt::Write as _,
     io,
     time::Duration,
 };
 
 use bmux_pty::{PtyCommand, PtyEvent, PtyExit, PtySize};
+use sim_support::invariants::checked;
 use simvar::{Sim, SimBootstrap, SimConfig};
 use switchy_pty::{
     Signal,
@@ -65,9 +66,8 @@ pub enum Invariant {
     Api,
 }
 
-impl Invariant {
-    /// Every invariant, in order.
-    pub const ALL: [Self; 8] = [
+impl sim_support::invariants::Invariant for Invariant {
+    const ALL: &'static [Self] = &[
         Self::OneExit,
         Self::Delivered,
         Self::ControlKnowsExit,
@@ -78,19 +78,22 @@ impl Invariant {
         Self::Api,
     ];
 
-    /// What it says, briefly.
-    #[must_use]
-    pub const fn describe(self) -> &'static str {
+    fn statement(self) -> &'static str {
         match self {
-            Self::OneExit => "1. exactly one Exited per process, last",
-            Self::Delivered => "2. output delivered is what programs wrote",
-            Self::ControlKnowsExit => "3. the control handle knows the exit first",
-            Self::GroupEnds => "4. a killed or dropped process's group ends",
-            Self::SignalsContained => "5. ending signals reach only signalled sessions",
-            Self::ResizeReported => "6. programs report the last resize",
-            Self::Finishes => "7. the drivers finish, without panicking",
+            Self::OneExit => "exactly one Exited per process, last",
+            Self::Delivered => "output delivered is what programs wrote",
+            Self::ControlKnowsExit => "the control handle knows the exit first",
+            Self::GroupEnds => "a killed or dropped process's group ends",
+            Self::SignalsContained => "ending signals reach only signalled sessions",
+            Self::ResizeReported => "programs report the last resize",
+            Self::Finishes => "the drivers finish, without panicking",
             Self::Api => "bmux_pty calls succeed as documented",
         }
+    }
+
+    /// Only the crate documentation's invariants are numbered, not the API's correctness.
+    fn numbered(self) -> bool {
+        self != Self::Api
     }
 }
 
@@ -98,51 +101,10 @@ impl Invariant {
 // simulation-safe: switchy_simulation's own type for a run's stream.
 type Stream = std::sync::Mutex<switchy_simulation::Rng>;
 
-/// Each invariant's checks and failures in the current run. A std mutex is never a switch
-/// point, so keeping count never changes the run.
-#[derive(Default)]
-// simulation-safe: the run's own invariant bookkeeping, locked briefly with no switch point.
-struct Checks(std::sync::Mutex<BTreeMap<Invariant, (u64, Vec<String>)>>);
-
-fn with_checks<R>(f: impl FnOnce(&mut BTreeMap<Invariant, (u64, Vec<String>)>) -> R) -> R {
-    let checks = switchy_simulation::state::<Checks>();
-    let mut checks = checks
-        .0
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    f(&mut checks)
-}
-
-/// Count a check of `invariant` in the current run.
-fn checked(invariant: Invariant) {
-    with_checks(|checks| checks.entry(invariant).or_default().0 += 1);
-}
-
-/// Every invariant's checks and failures in the current run so far.
-#[must_use]
-pub fn invariants() -> bmux_simvar_tui::Invariants {
-    with_checks(|checks| {
-        bmux_simvar_tui::Invariants(
-            Invariant::ALL
-                .iter()
-                .map(|invariant| {
-                    let (checked, failures) = checks.get(invariant).cloned().unwrap_or_default();
-                    bmux_simvar_tui::InvariantStatus {
-                        name: invariant.describe().to_owned(),
-                        checked,
-                        failures,
-                    }
-                })
-                .collect(),
-        )
-    })
-}
-
 /// Record that `invariant` failed with `message`: as a violation of the run, in the
 /// invariants' status, and to a watching dashboard (which may pause here).
 fn violated(shared: &Mutex<Shared>, invariant: Invariant, message: String) {
-    with_checks(|checks| checks.entry(invariant).or_default().1.push(message.clone()));
-    telemetry::failure(&message);
+    let message = sim_support::invariants::violated(invariant, message);
     lock(shared).violations.push(message);
 }
 

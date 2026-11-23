@@ -29,9 +29,11 @@ use std::{
 use switchy_thread::sync::{Mutex, MutexGuard};
 use bmux_pane_runtime_plugin::simulation::{Pane, Panes, Restarted};
 use bmux_simvar_tui::Tone;
+use sim_support::invariants::checked;
 use switchy_pty::simulator::{self, ProcessState};
 
 use crate::{
+    invariants::Invariant,
     profile::{Kind, Profile},
     telemetry::{Board, PaneView},
 };
@@ -218,12 +220,11 @@ fn event(kind: &str, label: impl Into<String>, tone: Tone) {
 /// Record that an invariant failed with `message` (which starts with the invariant's number):
 /// as a violation of the run, in the dashboard's invariants, and to a dashboard breaking on
 /// failures (which may pause here).
-fn violated(violations: &mut Vec<String>, message: String) {
-    Board::failed(&message);
+fn violated(violations: &mut Vec<String>, invariant: Invariant, what: impl std::fmt::Display) {
+    let message = sim_support::invariants::violated(invariant, what);
     if crate::host_set("PANE_RUNTIME_SIM_EVENTS") {
         eprintln!("[{:?}] VIOLATION: {message}", switchy_time::Instant::now());
     }
-    sim_support::failure(&message);
     violations.push(message);
 }
 
@@ -412,8 +413,8 @@ impl Shared {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn violated(&self, message: String) {
-        violated(&mut self.lock().violations, message);
+    fn violated(&self, invariant: Invariant, what: impl std::fmt::Display) {
+        violated(&mut self.lock().violations, invariant, what);
     }
 
     /// Wait (in simulated time) until `ready` holds, at most the settling time; whether it did.
@@ -440,7 +441,7 @@ impl Shared {
             };
             let (pid, programs) = (opened.pid, opened.programs);
             event("exit", format!("pane {pid} exited"), Tone::Info);
-            Board::checked(8);
+            checked(Invariant::ExitOnce);
             let count = {
                 let count = state.exits.entry(pane).or_default();
                 *count += 1;
@@ -448,8 +449,8 @@ impl Shared {
             };
             if count > programs {
                 let message =
-                    format!("8. pane process {pid} got {count} exits for {programs} programs");
-                violated(&mut state.violations, message);
+                    format!("pane process {pid} got {count} exits for {programs} programs");
+                violated(&mut state.violations, Invariant::ExitOnce, message);
             }
         }
     }
@@ -458,9 +459,10 @@ impl Shared {
     pub async fn drive(self: Arc<Self>, driver: u64, deadline: switchy_time::Instant) {
         loop {
             if switchy_time::Instant::now() >= deadline {
-                self.violated(format!(
-                    "5. the workload did not finish in time (driver {driver}; livelock?)"
-                ));
+                self.violated(
+                    Invariant::Finishes,
+                    format!("the workload did not finish in time (driver {driver}; livelock?)"),
+                );
                 return;
             }
             let kind = {
@@ -563,8 +565,8 @@ impl Shared {
             () = self.act(driver, kind) => false,
             () = crashed => true,
             () = switchy_async::time::sleep(limit) => {
-                self.violated(format!(
-                    "5. d{driver}: {} did not finish within {limit:?} (threads: {:?})",
+                self.violated(Invariant::Finishes, format!(
+                    "d{driver}: {} did not finish within {limit:?} (threads: {:?})",
                     kind.name(),
                     live_threads()
                 ));
@@ -667,13 +669,16 @@ impl Shared {
             Err(error) => {
                 self.lock().stats.failed_opens += 1;
                 if !self.opens_may_fail() {
-                    self.violated(format!("1. opening a pane failed: {error:#}"));
+                    self.violated(
+                        Invariant::SessionLeader,
+                        format!("opening a pane failed: {error:#}"),
+                    );
                 }
                 return;
             }
         };
         let Some(pid) = panes.pid(pane) else {
-            self.violated("1. an opened pane has no process".into());
+            self.violated(Invariant::SessionLeader, "an opened pane has no process");
             return;
         };
         // By the runtime's own record: the id may already be another process's.
@@ -682,9 +687,9 @@ impl Shared {
             .or_else(|| simulator::serial_of(pid))
             .unwrap_or(0);
         // 1. Its program leads its own session (and if it already ended, the runtime knows).
-        Board::checked(1);
+        checked(Invariant::SessionLeader);
         if let Some(problem) = self.leads_own_session(&panes, pane, pid, serial).await {
-            self.violated(format!("1. pane process {pid} does not lead its own session: {problem}"));
+            self.violated(Invariant::SessionLeader, format!("pane process {pid} does not lead its own session: {problem}"));
         }
         event(
             "open",
@@ -789,9 +794,9 @@ impl Shared {
             .program_serial(new)
             .or_else(|| simulator::serial_of(pid))
             .unwrap_or(0);
-        Board::checked(1);
+        checked(Invariant::SessionLeader);
         if let Some(problem) = self.leads_own_session(&panes, new, pid, serial).await {
-            self.violated(format!("1. split pane process {pid} does not lead its own session: {problem}"));
+            self.violated(Invariant::SessionLeader, format!("split pane process {pid} does not lead its own session: {problem}"));
         }
         event(
             "split",
@@ -856,7 +861,7 @@ impl Shared {
         Board::resized(&format!("{pane:?}"), (rows, cols));
         // 3. The terminal ends up the requested size, unless something superseded the resize:
         // a later one, a restart, a close, or the program ending.
-        Board::checked(3);
+        checked(Invariant::RequestedSize);
         let current = || {
             let state = self.lock();
             state
@@ -880,9 +885,10 @@ impl Shared {
             .await;
         if !sized && current().is_some_and(|serial| alive(serial).is_some()) {
             let pid = panes.pid(pane).unwrap_or(0);
-            self.violated(format!(
-                "3. pane process {pid}'s terminal never became {rows}x{cols}"
-            ));
+            self.violated(
+                Invariant::RequestedSize,
+                format!("pane process {pid}'s terminal never became {rows}x{cols}"),
+            );
         }
     }
 
@@ -911,14 +917,14 @@ impl Shared {
     /// Close `pane` (already out of the open set), checking invariants 2 and 4.
     async fn close(&self, panes: &Panes, pane: Pane, opened: &Opened) {
         // 2. Every typed line reached the program, in order (unless it ended meanwhile).
-        Board::checked(2);
+        checked(Invariant::TypedInOrder);
         let pid = opened.pid;
         let reached = self
             .settle(|| answered(pid, &opened.typed) || alive(opened.serial).is_none())
             .await;
         if !reached {
-            self.violated(format!(
-                "2. pane process {pid} ({}) never answered all of {:?} ({})",
+            self.violated(Invariant::TypedInOrder, format!(
+                "pane process {pid} ({}) never answered all of {:?} ({})",
                 crate::programs::kind_of(opened.serial).map_or("unknown program", crate::programs::Kind::name),
                 opened.typed,
                 terminal_state(pid)
@@ -926,10 +932,10 @@ impl Shared {
         }
         // 10. A pane whose program ended says so.
         if alive(opened.serial).is_none() {
-            Board::checked(10);
+            checked(Invariant::EndedSaysSo);
             if !self.settle(|| panes.exited(pane) || panes.pid(pane) != Some(pid)).await {
-                self.violated(format!(
-                    "10. pane process {pid} ({}) ended but its pane never said so",
+                self.violated(Invariant::EndedSaysSo, format!(
+                    "pane process {pid} ({}) ended but its pane never said so",
                     crate::programs::kind_of(opened.serial)
                         .map_or("unknown program", crate::programs::Kind::name)
                 ));
@@ -942,28 +948,35 @@ impl Shared {
         match panes.close(pane).await {
             Ok(closed) => {
                 // 4. Closing drains, cleans up, and leaves nothing running in the session.
-                Board::checked(4);
+                checked(Invariant::CloseCleansUp);
                 // (A failing disk may keep a session's record from being deleted.)
                 if let Some(error) = closed
                     .cleanup_error
                     .as_ref()
                     .filter(|_| self.profile.faults.file == 0)
                 {
-                    self.violated(format!(
-                        "4. closing pane process {pid} failed to clean up: {error}"
-                    ));
+                    self.violated(
+                        Invariant::CloseCleansUp,
+                        format!("closing pane process {pid} failed to clean up: {error}"),
+                    );
                 }
                 if let Some(session) = session {
                     let ended = self.settle(|| running_in(&[session]).is_empty()).await;
                     if !ended {
-                        self.violated(format!(
-                            "4. pane process {pid}'s session still runs {:?} after it closed",
-                            running_in(&[session])
-                        ));
+                        self.violated(
+                            Invariant::CloseCleansUp,
+                            format!(
+                                "pane process {pid}'s session still runs {:?} after it closed",
+                                running_in(&[session])
+                            ),
+                        );
                     }
                 }
             }
-            Err(error) => self.violated(format!("4. closing a pane failed: {error:#}")),
+            Err(error) => self.violated(
+                Invariant::CloseCleansUp,
+                format!("closing a pane failed: {error:#}"),
+            ),
         }
         self.check_siblings(pid, session, siblings, signalled_before).await;
     }
@@ -1016,7 +1029,7 @@ impl Shared {
             Vec::new()
         };
         if !siblings.is_empty() {
-            Board::checked(11);
+            checked(Invariant::SiblingsAlone);
             // Let the close finish (another pane's closes in the background).
             let _ = self.settle(|| session.is_none_or(|s| running_in(&[s]).is_empty())).await;
             // Only what would end them counts, and only for siblings nothing else touched
@@ -1042,8 +1055,8 @@ impl Shared {
                 if let Some((_, sibling, _, _)) = siblings.iter().find(|(other, _, serial, touched)| {
                     *serial == record.serial && untouched(*other, *serial, *touched)
                 }) {
-                    self.violated(format!(
-                        "11. closing pane process {pid} sent {:?} to its sibling pane's process {sibling}",
+                    self.violated(Invariant::SiblingsAlone, format!(
+                        "closing pane process {pid} sent {:?} to its sibling pane's process {sibling}",
                         record.signal
                     ));
                 }
@@ -1095,9 +1108,10 @@ impl Shared {
             Ok(Restarted::Failed) | Err(_) if !self.lock().open.contains_key(&pane) => return,
             Ok(Restarted::Failed) => {
                 if !self.opens_may_fail() {
-                    self.violated(format!(
-                        "7. restarting pane process {old}: its new program failed to start"
-                    ));
+                    self.violated(
+                        Invariant::RestartEndsSession,
+                        format!("restarting pane process {old}: its new program failed to start"),
+                    );
                 }
                 if let Some(opened) = self.lock().open.get_mut(&pane) {
                     opened.restarting = false;
@@ -1106,9 +1120,10 @@ impl Shared {
             }
             Err(error) => {
                 if !self.opens_may_fail() {
-                    self.violated(format!(
-                        "7. restarting pane process {old} failed: {error:#}"
-                    ));
+                    self.violated(
+                        Invariant::RestartEndsSession,
+                        format!("restarting pane process {old} failed: {error:#}"),
+                    );
                 }
                 if let Some(opened) = self.lock().open.get_mut(&pane) {
                     opened.restarting = false;
@@ -1139,13 +1154,13 @@ impl Shared {
             Tone::Info,
         );
         // 7. The old session ends; the new program leads its own.
-        Board::checked(7);
+        checked(Invariant::RestartEndsSession);
         if let Some(problem) = self.leads_own_session(&panes, pane, pid, serial).await {
-            self.violated(format!("7. restarted pane process {pid} does not lead its own session: {problem}"));
+            self.violated(Invariant::RestartEndsSession, format!("restarted pane process {pid} does not lead its own session: {problem}"));
         }
         if !self.settle(|| running_in(&[old_session]).is_empty()).await {
-            self.violated(format!(
-                "7. pane process {old}'s session still runs {:?} after a restart",
+            self.violated(Invariant::RestartEndsSession, format!(
+                "pane process {old}'s session still runs {:?} after a restart",
                 running_in(&[old_session])
             ));
         }
@@ -1182,7 +1197,7 @@ impl Shared {
         bystander.shut_down();
         drop(bystander);
         // 12. It killed none of them (the kill fault aside).
-        Board::checked(12);
+        checked(Invariant::BystanderHarmless);
         let killed: Vec<u64> = simulator::signal_log()
             .get(before..)
             .unwrap_or_default()
@@ -1195,10 +1210,13 @@ impl Shared {
             .map(|record| record.serial)
             .collect();
         if !killed.is_empty() {
-            self.violated(format!(
-                "12. a pane runtime activated beside the running server killed its panes' \
+            self.violated(
+                Invariant::BystanderHarmless,
+                format!(
+                    "a pane runtime activated beside the running server killed its panes' \
                  programs {killed:?}"
-            ));
+                ),
+            );
         }
         self.lock().crashing = false;
     }
@@ -1289,14 +1307,15 @@ impl Shared {
             state.witnesses.iter().map(|w| w.serial).collect()
         };
         // 6. Nothing the crashed server owned runs; everything else does.
-        Board::checked(6);
+        checked(Invariant::CrashSessionsEnd);
         // (Programs the dead server's closed terminals hung up on take a moment to end.)
         let ended = self.settle(|| running_in(&owned).is_empty()).await;
         let survivors = running_in(&owned);
         if !ended {
-            self.violated(format!(
-                "6. the crashed server's sessions still run {survivors:?} after recovery"
-            ));
+            self.violated(
+                Invariant::CrashSessionsEnd,
+                format!("the crashed server's sessions still run {survivors:?} after recovery"),
+            );
         }
         let running: Vec<u64> = simulator::snapshot()
             .processes
@@ -1306,9 +1325,10 @@ impl Shared {
             .collect();
         for serial in outside {
             if !running.contains(&serial) && !killed_by_fault(serial) {
-                self.violated(format!(
-                    "6. recovery ended process serial {serial} it never owned"
-                ));
+                self.violated(
+                    Invariant::CrashSessionsEnd,
+                    format!("recovery ended process serial {serial} it never owned"),
+                );
             }
         }
     }
@@ -1316,7 +1336,7 @@ impl Shared {
     /// Invariant 9: with every pane closed, nothing the runtime had is left: no terminal's
     /// master side open, no process running but those started outside it, no session record.
     async fn check_nothing_leaks(&self) {
-        Board::checked(9);
+        checked(Invariant::NothingLeft);
         let mut outsiders: Vec<u64> = self.lock().witnesses.iter().map(|w| w.serial).collect();
         outsiders.extend(detached());
         let strays = || -> Vec<String> {
@@ -1329,10 +1349,10 @@ impl Shared {
         };
         // Processes a close or a crash ended may take a moment to exit.
         if !self.settle(|| strays().is_empty()).await {
-            self.violated(format!(
-                "9. processes still run with every pane closed: {:?}",
-                strays()
-            ));
+            self.violated(
+                Invariant::NothingLeft,
+                format!("processes still run with every pane closed: {:?}", strays()),
+            );
         }
         let outsider_terminals: Vec<String> =
             self.lock().witnesses.iter().map(|w| w.terminal.clone()).collect();
@@ -1346,12 +1366,15 @@ impl Shared {
                 .collect()
         };
         if !self.settle(|| open().is_empty()).await {
-            self.violated(format!(
-                "9. terminals' master sides still open with every pane closed: {:?} (threads: \
+            self.violated(
+                Invariant::NothingLeft,
+                format!(
+                    "terminals' master sides still open with every pane closed: {:?} (threads: \
                  {:?})",
-                open(),
-                live_threads()
-            ));
+                    open(),
+                    live_threads()
+                ),
+            );
         }
         let records: Vec<String> = switchy_fs::sync::read_dir_sorted(&self.records)
             .map(|entries| {
@@ -1362,9 +1385,10 @@ impl Shared {
             })
             .unwrap_or_default();
         if !records.is_empty() && self.profile.faults.file == 0 {
-            self.violated(format!(
-                "9. session records left with every pane closed: {records:?}"
-            ));
+            self.violated(
+                Invariant::NothingLeft,
+                format!("session records left with every pane closed: {records:?}"),
+            );
         }
     }
 
@@ -1386,12 +1410,15 @@ impl Shared {
                 () = switchy_async::time::sleep(limit) => false,
             };
             if !closed {
-                self.violated(format!(
-                    "5. closing pane process {} at the end did not finish within {limit:?} \
+                self.violated(
+                    Invariant::Finishes,
+                    format!(
+                        "closing pane process {} at the end did not finish within {limit:?} \
                      (threads: {:?})",
-                    opened.pid,
-                    live_threads()
-                ));
+                        opened.pid,
+                        live_threads()
+                    ),
+                );
             }
             Board::closed(&format!("{pane:?}"));
         }
@@ -1405,7 +1432,7 @@ impl Shared {
         simulator::kill_all();
         self.lock().witnesses.clear();
         // 5. Let the panes' threads see their processes end before the run does.
-        Board::checked(5);
+        checked(Invariant::Finishes);
         let drained = self
             .settle(|| {
                 switchy_thread::simulator::try_scheduler()
@@ -1413,10 +1440,13 @@ impl Shared {
             })
             .await;
         if !drained {
-            self.violated(format!(
-                "5. threads still running after every pane closed: {:?}",
-                live_threads()
-            ));
+            self.violated(
+                Invariant::Finishes,
+                format!(
+                    "threads still running after every pane closed: {:?}",
+                    live_threads()
+                ),
+            );
         }
         let mut state = self.lock();
         (

@@ -1,8 +1,9 @@
 //! What the pane runtime simulation shows in `bmux_simvar_tui`: the shared simulation telemetry
 //! (`sim_support`: scheduler, kernel, terminals), plus each pane and the invariants' status.
 //!
-//! The workload keeps a [`Board`] in its run's state (behind a std lock, never a switch point,
-//! so keeping it never changes the run), which telemetry reads.
+//! The workload keeps a [`Board`] of its panes in its run's state (behind a std lock, never a
+//! switch point, so keeping it never changes the run), which telemetry reads; the invariants'
+//! status is `sim_support`'s.
 
 use std::{
     any::Any,
@@ -10,27 +11,11 @@ use std::{
     sync::{Arc, Mutex, PoisonError},
 };
 
-use bmux_simvar_tui::{Entity, InvariantStatus, Invariants, RunId, SimView, Tone};
+use bmux_simvar_tui::{Entity, RunId, SimView, Tone};
 use bmux_tui::{
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
-
-/// The invariants, by number (see the crate documentation).
-const INVARIANTS: [&str; 12] = [
-    "1. an opened pane leads its own session",
-    "2. typed lines reach the program in order",
-    "3. the terminal ends up the requested size",
-    "4. closing drains, cleans up, leaves nothing running",
-    "5. the workload finishes and its threads end",
-    "6. a crash's sessions end, and only they",
-    "7. restarting ends the old session",
-    "8. each program's exit is reported at most once",
-    "9. nothing is left once every pane closed",
-    "10. a pane whose program ended says so",
-    "11. closing a pane leaves its siblings alone",
-    "12. a runtime activated beside the server kills nothing",
-];
 
 /// One pane as the dashboard shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,7 +42,6 @@ pub struct PanesTelemetry {
 #[derive(Debug, Default)]
 struct BoardState {
     panes: Vec<PaneView>,
-    checks: BTreeMap<usize, (u64, Vec<String>)>,
 }
 
 /// The run's panes and checks.
@@ -69,28 +53,6 @@ impl Board {
         let board = switchy_simulation::state::<Self>();
         let mut state = board.0.lock().unwrap_or_else(PoisonError::into_inner);
         f(&mut state)
-    }
-
-    /// Count a check of invariant `number`.
-    pub fn checked(number: usize) {
-        Self::with(|state| state.checks.entry(number).or_default().0 += 1);
-    }
-
-    /// Record a failure, `message` starting with its invariant's number.
-    pub fn failed(message: &str) {
-        let number = message
-            .split('.')
-            .next()
-            .and_then(|n| n.parse().ok())
-            .unwrap_or(5);
-        Self::with(|state| {
-            state
-                .checks
-                .entry(number)
-                .or_default()
-                .1
-                .push(message.to_owned());
-        });
     }
 
     /// A pane opened.
@@ -125,30 +87,13 @@ impl Board {
 /// This simulation's own telemetry: its panes and its invariants' status.
 #[must_use]
 pub fn extra() -> Vec<Arc<dyn Any + Send + Sync>> {
-    Board::with(|state| {
-        let invariants = Invariants(
-            INVARIANTS
-                .iter()
-                .enumerate()
-                .map(|(index, name)| {
-                    let (checked, failures) =
-                        state.checks.get(&(index + 1)).cloned().unwrap_or_default();
-                    InvariantStatus {
-                        name: (*name).to_owned(),
-                        checked,
-                        failures,
-                    }
-                })
-                .collect(),
-        );
-        let panes = PanesTelemetry {
-            panes: state.panes.clone(),
-        };
-        vec![
-            Arc::new(invariants) as Arc<dyn Any + Send + Sync>,
-            Arc::new(panes),
-        ]
-    })
+    let panes = Board::with(|state| PanesTelemetry {
+        panes: state.panes.clone(),
+    });
+    vec![
+        sim_support::invariants::telemetry::<crate::invariants::Invariant>(),
+        Arc::new(panes),
+    ]
 }
 
 /// The dashboard's Panes view: each pane of the run, with its process, size and typing.

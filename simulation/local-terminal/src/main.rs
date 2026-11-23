@@ -18,7 +18,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             title: "local terminal",
             bootstrap: LocalTerminalBootstrap,
             views: Vec::new(),
-            extra: Vec::new,
+            extra: || {
+                vec![sim_support::invariants::telemetry::<
+                    local_terminal::Invariant,
+                >()]
+            },
             regression_seeds: concat!(env!("CARGO_MANIFEST_DIR"), "/regression-seeds"),
         },
         &args,

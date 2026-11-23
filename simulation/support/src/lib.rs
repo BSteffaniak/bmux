@@ -41,6 +41,8 @@ const INTERVAL: Duration = Duration::from_millis(100);
 /// How often every run sends its heartbeat, in real time.
 const PULSE: Duration = Duration::from_millis(250);
 
+pub mod invariants;
+
 static INTEREST: OnceLock<Arc<Interest>> = OnceLock::new();
 
 /// A simulation's own telemetry, taken whenever the rest is (for example its invariants).

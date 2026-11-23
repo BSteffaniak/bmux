@@ -50,6 +50,7 @@
 
 pub mod explore;
 pub mod guide;
+pub mod invariants;
 pub mod profile;
 pub mod programs;
 pub mod telemetry;

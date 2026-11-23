@@ -6,5 +6,5 @@ pub use sim_support::{PtyTelemetry, delivered, event, failure, finish_run, shape
 /// This simulation's own telemetry: its invariants' status.
 #[must_use]
 pub fn extra() -> Vec<std::sync::Arc<dyn std::any::Any + Send + Sync>> {
-    vec![std::sync::Arc::new(crate::invariants())]
+    vec![sim_support::invariants::telemetry::<crate::Invariant>()]
 }
