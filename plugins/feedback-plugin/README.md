@@ -5,6 +5,12 @@ the feedback goes to the Bcode feedback store (`bcode feedback list`) and its in
 with facts about the focused pane. While it triages, the intake agent may attach the span
 of bmux's rolling recording that shows the problem; typed input is never attached.
 
+The feedback and the request to triage it are saved together. A notification says which of
+these happened: triage started; triage is queued because Bcode could not start it yet (Bcode
+keeps retrying on its own, even after bmux closes or Bcode restarts); or triage is blocked
+until you run `bcode feedback triage <id>`. `bcode feedback show <id>` and `bcode feedback
+inbox` show where each item's triage stands.
+
 Bcode is reached through its session bridge and only once feedback is given. By default it
 runs inside the bmux server (the `embedded-bcode` feature) and keeps sessions in the user's
 Bcode store; an installed Bcode is used instead when one is named or selected. Settings:

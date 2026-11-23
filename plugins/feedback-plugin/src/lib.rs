@@ -8,7 +8,8 @@
 //! about the focused pane and opens a draft in the server, which marks that moment in the
 //! rolling recording. The person writes the feedback in a prompt; the server sends it to the
 //! Bcode feedback store and its intake session through Bcode's session bridge
-//! (`bcode_session_bridge_runtime`), and reports the outcome as a notification.
+//! (`bcode_session_bridge_runtime`), and reports the outcome as a notification: saved, and
+//! whether triage started, is queued for Bcode to retry on its own, or is blocked.
 //!
 //! While the intake agent triages, it may call two tools this plugin offers in the intake
 //! session: `bmux.recording_timeline`, which says which span of the rolling recording is

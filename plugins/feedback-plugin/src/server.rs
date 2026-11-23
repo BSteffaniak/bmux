@@ -7,9 +7,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bcode_session_bridge::models::BridgeEvent;
 use bcode_session_bridge::models::bcode_feedback_models::{
-    Facet, MAX_FACET_VALUE_BYTES, MAX_FACETS, RecordFeedbackRequest,
+    Facet, MAX_FACET_VALUE_BYTES, MAX_FACETS, RecordFeedbackRequest, TriageDispatchState,
 };
-use bcode_session_bridge::{BridgeClient, BridgeEvents};
+use bcode_session_bridge::{BridgeClient, BridgeEvents, FeedbackSubmission};
 use bmux_plugin_sdk::PluginHostServices;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -235,18 +235,16 @@ async fn submit(
         .await
     {
         Ok(submission) => {
-            let id = submission.item.id;
-            let body = submission.triage_error.map_or_else(
-                || format!("Bcode is triaging it ({}).", open.runtime),
-                |error| format!("Saved; triage did not start: {}", error.message),
-            );
-            notify(
-                host,
-                &format!("Feedback {id} saved"),
-                &body,
-                Severity::Success,
-            )
-            .await;
+            let notice = Notice::of(&submission, &open.runtime);
+            if notice.severity != Severity::Success {
+                tracing::info!(
+                    id = %submission.item.id,
+                    title = %notice.title,
+                    body = %notice.body,
+                    "bmux.feedback: feedback saved, triage not started"
+                );
+            }
+            notify(host, &notice.title, &notice.body, notice.severity).await;
         }
         Err(error) => {
             tracing::warn!(%error, text = %job.text, "bmux.feedback: feedback not sent");
@@ -261,6 +259,70 @@ async fn submit(
                 // The transport failed: connect again next time.
                 *connection = None;
             }
+        }
+    }
+}
+
+/// What the person is told about saved feedback: saved, and whether triage started, is
+/// queued for Bcode to retry on its own, or is blocked until they ask again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Notice {
+    title: String,
+    body: String,
+    severity: Severity,
+}
+
+impl Notice {
+    fn of(submission: &FeedbackSubmission, runtime: &str) -> Self {
+        let id = submission.item.id;
+        let dispatch = submission.item.triage_dispatch.as_ref();
+        let error = submission
+            .triage_error
+            .as_ref()
+            .map(|error| error.message.as_str());
+        let state = dispatch.map(|dispatch| dispatch.state);
+        match (state, &submission.intake, error) {
+            (Some(TriageDispatchState::Started | TriageDispatchState::Completed), ..)
+            | (None, Some(_), None) => Self {
+                title: format!("Feedback {id} saved"),
+                body: format!("Triage started: Bcode is triaging it ({runtime})."),
+                severity: Severity::Success,
+            },
+            (Some(TriageDispatchState::Queued), ..) => Self {
+                title: format!("Feedback {id} saved · triage queued"),
+                body: error.map_or_else(
+                    || "Bcode will triage it as soon as it can.".to_owned(),
+                    |error| {
+                        format!("Bcode keeps retrying on its own, even if bmux closes. Last error: {error}")
+                    },
+                ),
+                severity: Severity::Info,
+            },
+            (Some(TriageDispatchState::Blocked), ..) => Self {
+                title: format!("Feedback {id} saved · triage blocked"),
+                body: format!(
+                    "{}. Run `bcode feedback triage {id}` to try again.",
+                    dispatch
+                        .and_then(|dispatch| dispatch.blocked_reason.as_deref())
+                        .or(error)
+                        .unwrap_or("Bcode stopped trying")
+                        .trim_end_matches('.')
+                ),
+                severity: Severity::Warning,
+            },
+            (Some(TriageDispatchState::Skipped), ..) | (None, None, None) => Self {
+                title: format!("Feedback {id} saved"),
+                body: "Saved without triage.".to_owned(),
+                severity: Severity::Success,
+            },
+            // A Bcode that predates durable triage: nothing retries it.
+            (None, _, Some(error)) => Self {
+                title: format!("Feedback {id} saved · triage blocked"),
+                body: format!(
+                    "Triage did not start: {error}. Run `bcode feedback triage {id}` to try again."
+                ),
+                severity: Severity::Warning,
+            },
         }
     }
 }
@@ -332,6 +394,114 @@ mod tests {
             key: key.to_owned(),
             value: value.to_owned(),
             sensitive,
+        }
+    }
+
+    mod notices {
+        use bcode_session_bridge::models::bcode_feedback_models::{
+            FeedbackId, FeedbackItem, FeedbackStatus, TriageDispatch, TriageState,
+        };
+        use bcode_session_bridge::models::{BridgeError, FeedbackIntake};
+
+        use super::*;
+
+        fn submission(
+            state: Option<TriageDispatchState>,
+            intake: bool,
+            error: Option<&str>,
+        ) -> FeedbackSubmission {
+            FeedbackSubmission {
+                item: FeedbackItem {
+                    id: FeedbackId(3),
+                    app: "bmux".into(),
+                    text: "the pane froze".into(),
+                    facets: Vec::new(),
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                    triage_state: TriageState::Pending,
+                    triage: None,
+                    status: FeedbackStatus::Open,
+                    status_change: None,
+                    links: Vec::new(),
+                    attachments: Vec::new(),
+                    triage_dispatch: state.map(|state| TriageDispatch {
+                        state,
+                        generation: 1,
+                        attempts: u32::from(error.is_some()),
+                        requested_at_ms: 0,
+                        updated_at_ms: 0,
+                        next_attempt_at_ms: None,
+                        last_error: error.map(str::to_owned),
+                        blocked_reason: (state == TriageDispatchState::Blocked)
+                            .then(|| "the intake session refused the turn".to_owned()),
+                        session_id: None,
+                        turn_id: None,
+                    }),
+                },
+                intake: intake.then(|| FeedbackIntake {
+                    session_id: "s".into(),
+                    turn_id: "t".into(),
+                }),
+                triage_error: error.map(|message| BridgeError {
+                    code: "feedback_triage_queued".into(),
+                    message: message.into(),
+                }),
+            }
+        }
+
+        #[test]
+        fn started_queued_blocked_and_saved_read_differently() {
+            let started = Notice::of(
+                &submission(Some(TriageDispatchState::Started), true, None),
+                "embedded Bcode",
+            );
+            assert_eq!(started.title, "Feedback fb-3 saved");
+            assert!(started.body.starts_with("Triage started"), "{started:?}");
+            assert_eq!(started.severity, Severity::Success);
+
+            let queued = Notice::of(
+                &submission(
+                    Some(TriageDispatchState::Queued),
+                    false,
+                    Some("model unavailable"),
+                ),
+                "embedded Bcode",
+            );
+            assert_eq!(queued.title, "Feedback fb-3 saved · triage queued");
+            assert!(queued.body.contains("model unavailable"), "{queued:?}");
+            assert!(queued.body.contains("even if bmux closes"), "{queued:?}");
+            assert_eq!(queued.severity, Severity::Info);
+
+            let blocked = Notice::of(
+                &submission(Some(TriageDispatchState::Blocked), false, Some("refused")),
+                "embedded Bcode",
+            );
+            assert_eq!(blocked.title, "Feedback fb-3 saved · triage blocked");
+            assert!(
+                blocked.body.contains("the intake session refused the turn"),
+                "{blocked:?}"
+            );
+            assert!(
+                blocked.body.contains("bcode feedback triage fb-3"),
+                "{blocked:?}"
+            );
+            assert_eq!(blocked.severity, Severity::Warning);
+
+            let saved = Notice::of(
+                &submission(Some(TriageDispatchState::Skipped), false, None),
+                "embedded Bcode",
+            );
+            assert_eq!(saved.title, "Feedback fb-3 saved");
+            assert_eq!(saved.body, "Saved without triage.");
+        }
+
+        #[test]
+        fn a_bcode_without_durable_triage_reports_a_failed_start_as_blocked() {
+            let legacy = Notice::of(&submission(None, false, Some("no session")), "installed");
+            assert_eq!(legacy.title, "Feedback fb-3 saved · triage blocked");
+            assert!(legacy.body.contains("no session"), "{legacy:?}");
+            let started = Notice::of(&submission(None, true, None), "installed");
+            assert_eq!(started.severity, Severity::Success);
         }
     }
 
