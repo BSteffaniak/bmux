@@ -306,7 +306,78 @@ exemption.
     in native-only files, but an external crate's clean scan says nothing about them.
   - Macros are scanned as tokens, not expanded: a macro from another crate that reaches a
     primitive (`lazy_static!`, `scoped_thread_local!`) is seen only through its audit.
-  - `runs = false` is a claim nothing checks at run time yet (20.4, or a nightly coverage
-    run).
+  - `runs = false` claims are now checked by a nightly coverage run (20.4 below).
   - The 97 remaining baseline crates are still to be audited; most of their findings are
     patterns (ordering by address, OS `cfg`s, `HashMap`) that need reading, not rules.
+
+### 20.3 (MoosicBox `db9119472`, `974999fa7`, `fade23050`)
+
+- **Randomness.** `simulation/.cargo/config.toml` builds simulations with
+  `--cfg getrandom_backend="custom"`; `cargo sim` runs cargo in `simulation/` so it applies,
+  and real builds never see it. `switchy_random` (simulator feature) defines
+  `__getrandom_v03_custom`, the one symbol `getrandom` 0.3 and 0.4 both call: bytes come from
+  the run's `getrandom` stream, which the digest covers, and a call outside a run panics.
+  `getrandom` 0.3/0.4 are now `controlled` on the audit list.
+  - `getrandom` 0.2 cannot be redirected: its `custom` feature is a fallback after every OS
+    backend. Its callers (`rand` 0.8's `OsRng`, `thread_rng`) stay forbidden.
+  - The hashers in the graph do not seed through `getrandom`: `ahash` (no `runtime-rng` in
+    this build) seeds from addresses, `foldhash` from addresses and the clock. They stay
+    `restricted`: `HashMap`/`HashSet`, where iteration would show the seed, are forbidden in
+    scanned crates, and 20.1's fresh-process replay (a new address layout) catches a slip.
+  - The `Uuid::new_v4` ban stays, though `new_v4` is now a function of the seed: identifiers
+    still come from switchy_uuid or a crate's `ids` module, which say where they come from.
+- **The environment.** Inside a run, `switchy_env` serves a sealed environment per run: the
+  host's `SIMULATOR_*` variables, those passed through (`pass_through`), and the defaults,
+  unless the run `isolate`s its own. Outside a run nothing changed. `switchy_pty`'s simulated
+  spawns already start from a fixed environment.
+- **"Inside a run".** `switchy_simulation` now knows which contexts are runs' (`begin_run`,
+  `in_run`): simvar marks each run's, `switchy_thread::simulator::run` marks its own.
+- **Process-wide counters.** Task, runtime and lock-key ids come from
+  `switchy_simulation::next_id::<Kind>()`: counted per run from 1 inside a run, and from a
+  separate process-wide range outside one. Runtimes compare by identity instead of id. The
+  yields configuration was already per run.
+
+### 20.4 (MoosicBox `fade23050`, `7086c88f0`)
+
+- **Threads outside the scheduler.** `switchy_simulation::require_contexts`: once simvar
+  starts, a thread reaching a switchy simulator without a context panics at that call, naming
+  the problem, instead of getting a fresh clock, seed and schedule of its own. simvar gives its
+  main thread, its workers and each run explicit contexts; simulated threads inherit their
+  run's. All five simulations run clean under it.
+- **Randomness outside a run** panics (20.3).
+- **`runs = false`, checked.** `cargo sim NAME --coverage` builds NAME with
+  `-C instrument-coverage` in `target/sim-coverage`, runs it, merges the profiles with LLVM's
+  tools, and `sim-check NAME --coverage EXPORT` (`switchy_cargo`'s `run_claims`) fails if a file
+  of a `runs = false` crate ran. The nightly workflow runs it for the three pane/pty
+  simulations, guided, 300 runs each.
+- **Found on the way.** With simvar's `fs` feature (which `consensus-cluster` enables, so any
+  simulation built beside it), a run reset its filesystem before its clock, stamping the root
+  with an epoch offset the run then replaced; every process-verified run failed. The clock is
+  now reset first (MoosicBox `e8b38c4db`, with `Found-by`).
+- **Not done: counting real clock reads.** The optional `LD_PRELOAD` shim counting
+  `clock_gettime` inside runs was left out: 20.2 forbids std's clocks on the simulated path,
+  20.1's replay catches a read that changes what a run observes, and the thread tripwire
+  catches the usual way a real clock is reached (an unscheduled thread).
+
+### 20.5 (MoosicBox `239d3dda2`, `b4f712a52`, `a0b0aa529`, `3185c5e7b`, `aa1828257`)
+
+- The simulator's `Mutex`, `RwLock`, `Semaphore`, `Notify`, `oneshot`, `broadcast` and
+  `CancellationToken` are switchy's own, replacing tokio's re-exports (`watch`, `mpsc`, `mpmc`
+  and `Barrier` already were). Waiters are woken oldest first from one ordered list (the one
+  `watch` had, now shared); no shards, no thread-local generator. Semaphore, `RwLock` and
+  `broadcast` mirror tokio's designs (fair permits, the reader-permit trick, the slot ring), so
+  capacity, lag and fairness behave the same.
+- Every leaf future is subject to the spurious-`Pending` fault (19.3). `blocking_*` calls from
+  a simulated thread wait on `switchy_thread`'s scheduler, so its exploration and coverage see
+  them; otherwise, like `watch` and `mpsc`, they are switch points only through the fault.
+- `tests/sync_tokio_contract.rs` runs 17 scenarios against both implementations with
+  recording wakers: results and wake order must match. `tests/sync_determinism.rs` checks
+  first-in-first-out order, replay per seed, and the fault.
+- **Found on the way.** `Runtime::block_on` lost a wake its future sent itself while polled
+  (`yield_now`) when other simulated threads were alive, and waited on the scheduler for
+  another; it now polls again (`aa1828257`).
+- duckdb's gate and `moosicbox_scan` named tokio's lock types beside switchy's locks, which
+  compiled only while switchy re-exported tokio's (`3185c5e7b`).
+- **API differences** from tokio, none used by bmux or MoosicBox: `Semaphore`'s `Debug` text;
+  mapped guards accept unsized targets; `Notified` and the cancellation futures are `Unpin`
+  (and the latter `FusedFuture`); `Mutex::new` and `RwLock::new` are `const`.

@@ -181,8 +181,18 @@ links, found from its dependency graph:
   Patterns forbidden everywhere are listed there too.
 
 Before a simulation starts running a crate marked `runs = false`, remove its table so the
-check scans it. A std lock must never be held across a switch point: simulations poll tasks
-on several workers.
+check scans it; `cargo sim NAME --coverage` (nightly) runs NAME instrumented and fails if a
+line of such a crate ran. A std lock must never be held across a switch point: simulations
+poll tasks on several workers.
+
+Simulation builds (cargo run in `simulation/`, as `cargo sim` does) read
+`simulation/.cargo/config.toml`, which sends `getrandom` 0.3/0.4 (uuid, rand's OS generator,
+hasher seeds) to the run's seed; outside a run it panics. Inside a run, `switchy_env` serves
+only the host's `SIMULATOR_*` variables and the simulator's defaults (or what the simulation
+`isolate`s). A thread that reaches a switchy simulator without a run context (a
+`std::thread::spawn` in simulated code, a dependency's thread pool) panics there: start
+threads through `switchy_thread` or `switchy_async`. See MoosicBox's
+`packages/simvar/SIMULATABLE.md`.
 
 The `SIMULATOR_VERIFY_DETERMINISM=process` checks above replay each run alone in a fresh,
 perturbed process and compare everything it observed (schedule, processes and terminal
