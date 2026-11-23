@@ -3,7 +3,7 @@
 //! nothing is left.
 
 use std::{
-    sync::{Arc, atomic::Ordering},
+    sync::{Arc, atomic::Ordering}, // simulation-safe: the run's own server generation
     time::Duration,
 };
 

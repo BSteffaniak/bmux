@@ -1,7 +1,7 @@
 //! The actions on panes: opening, typing, resizing, interrupting, splitting, restarting and
 //! closing them, and the invariants each checks.
 
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::{Arc, atomic::Ordering}; // simulation-safe: the run's own server generation
 
 use bmux_pane_runtime_plugin::simulation::{Pane, Panes, Restarted};
 use bmux_simvar_tui::Tone;

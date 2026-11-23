@@ -54,7 +54,7 @@ struct Checks<I>(
 
 impl<I> Default for Checks<I> {
     fn default() -> Self {
-        Self(std::sync::Mutex::default())
+        Self(std::sync::Mutex::default()) // simulation-safe: see `Checks`.
     }
 }
 
