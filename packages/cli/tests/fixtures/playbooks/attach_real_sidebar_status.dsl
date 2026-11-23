@@ -16,7 +16,7 @@ wait-rendered contains='TABS'
 # A repository on a branch only this test uses, named without typing it
 # (so the command line cannot satisfy the check). The shell reports its
 # directory with OSC 7, as shell integration does.
-send-keys keys='b=sb; b="${b}test"; cd "$(mktemp -d)" && git -c init.defaultBranch="$b" init -q . && printf "\033]7;file://localhost%s\033\\" "$PWD" && echo READY\r'
+send-keys keys='b=sb; b="${b}test"; cd "$(mktemp -d)" && git -c init.defaultBranch="$b" init -q . && printf "\\033]7;file://localhost%s\\007" "$PWD" && echo READY\r'
 wait-for pattern='READY'
 wait-rendered contains='sbtest'
 # Only within the sidebar's columns.

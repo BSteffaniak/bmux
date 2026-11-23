@@ -5,10 +5,20 @@
 //! second the board turns them, each tab's panes and running commands, and the
 //! git status of the focused pane's directory into one snapshot, published
 //! only when it changed.
+//!
+//! A pane's directory comes from two sources. The pane runtime's listing
+//! carries the directory the shell reported through bmux's shell integration
+//! (or the operating system reported for its process): trusted. OSC 7 is
+//! whatever any output claimed (a program, a remote shell over ssh, or a file
+//! someone printed), so it is shown only while the command that was running
+//! when it arrived still runs, a remote host is named as such, and git only
+//! ever runs in a trusted directory.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent;
@@ -30,11 +40,47 @@ pub fn now_ms() -> u64 {
         })
 }
 
+/// A directory named by OSC 7.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Location {
+    /// A path on this machine.
+    Local(String),
+    /// A path on another machine (for example through ssh).
+    Remote { host: String, path: String },
+}
+
+impl Location {
+    fn display(&self) -> String {
+        match self {
+            Self::Local(path) => path.clone(),
+            Self::Remote { host, path } => format!("{host}:{path}"),
+        }
+    }
+}
+
+/// Which execution an OSC 7 directory describes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Binding {
+    /// Arrived since the board last looked at the pane.
+    Pending,
+    /// The command that was running when it arrived; dropped when that ends.
+    Command(String),
+    /// The shell itself, which reports its directory no other way.
+    Shell,
+}
+
+/// A directory a pane's output reported with OSC 7.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Reported {
+    location: Location,
+    binding: Binding,
+}
+
 /// Signals one pane's program sent.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct PaneSignals {
     title: Option<String>,
-    cwd: Option<String>,
+    reported: Option<Reported>,
     output_at_ms: Option<u64>,
     attention_at_ms: Option<u64>,
     attention: Option<String>,
@@ -47,7 +93,8 @@ pub struct PaneInfo {
     pub id: Uuid,
     pub focused: bool,
     pub running_command: Option<String>,
-    /// The directory shell integration last reported.
+    /// The directory shell integration (or the operating system) last
+    /// reported for the pane's shell: trusted, unlike OSC 7.
     pub cwd: Option<String>,
 }
 
@@ -76,7 +123,11 @@ impl StatusBoard {
             TerminalEvent::WorkingDirectory {
                 pane_id, location, ..
             } => {
-                self.panes.entry(*pane_id).or_default().cwd = directory_from_location(location);
+                self.panes.entry(*pane_id).or_default().reported =
+                    parse_location(location, local_hostname()).map(|location| Reported {
+                        location,
+                        binding: Binding::Pending,
+                    });
             }
             TerminalEvent::Notification {
                 pane_id,
@@ -128,9 +179,9 @@ impl StatusBoard {
         }
     }
 
-    /// Build every tab's status. A pane's directory is what its program last
-    /// reported with OSC 7, else what shell integration last reported; `git`
-    /// reads a directory's status.
+    /// Build every tab's status. A pane's directory is what the running
+    /// command reported with OSC 7, else what its shell reported; `git` reads
+    /// a directory's status and only ever sees a trusted directory.
     pub fn build(
         &mut self,
         tabs: &[TabPanes],
@@ -141,6 +192,11 @@ impl StatusBoard {
             .flat_map(|tab| tab.panes.iter().map(|pane| pane.id))
             .collect::<std::collections::HashSet<_>>();
         self.panes.retain(|pane, _| live.contains(pane));
+        for pane in tabs.iter().flat_map(|tab| &tab.panes) {
+            if let Some(signals) = self.panes.get_mut(&pane.id) {
+                settle(signals, pane);
+            }
+        }
         let now = Instant::now();
         tabs.iter()
             .map(|tab| {
@@ -150,20 +206,28 @@ impl StatusBoard {
                     .find(|pane| pane.focused)
                     .or_else(|| tab.panes.first());
                 let signals = focused.and_then(|pane| self.panes.get(&pane.id)).cloned();
-                let cwd = focused.and_then(|pane| {
-                    signals
-                        .as_ref()
-                        .and_then(|signals| signals.cwd.clone())
-                        .or_else(|| pane.cwd.clone())
-                });
-                let git = cwd.as_deref().and_then(|cwd| match self.git.get(cwd) {
-                    Some((at, status)) if now.duration_since(*at) < GIT_TTL => status.clone(),
-                    _ => {
-                        let status = git(cwd);
-                        self.git.insert(cwd.to_string(), (now, status.clone()));
-                        status
-                    }
-                });
+                let reported = signals
+                    .as_ref()
+                    .and_then(|signals| signals.reported.as_ref());
+                let trusted = focused.and_then(|pane| pane.cwd.clone());
+                let (cwd, git_directory) = match reported.map(|reported| &reported.location) {
+                    Some(Location::Local(path)) => (
+                        Some(path.clone()),
+                        trusted.filter(|trusted| trusted == path),
+                    ),
+                    Some(remote @ Location::Remote { .. }) => (Some(remote.display()), None),
+                    None => (trusted.clone(), trusted),
+                };
+                let git = git_directory
+                    .as_deref()
+                    .and_then(|cwd| match self.git.get(cwd) {
+                        Some((at, status)) if now.duration_since(*at) < GIT_TTL => status.clone(),
+                        _ => {
+                            let status = git(cwd);
+                            self.git.insert(cwd.to_string(), (now, status.clone()));
+                            status
+                        }
+                    });
                 let tab_signals = tab
                     .panes
                     .iter()
@@ -215,27 +279,76 @@ impl StatusBoard {
     }
 }
 
+/// Keep an OSC 7 directory only while it still describes the pane: bound to
+/// the command running when the board first sees it, dropped when that
+/// command ends (the shell's own report is authoritative again), and kept for
+/// a shell with no other way to report its directory.
+fn settle(signals: &mut PaneSignals, pane: &PaneInfo) {
+    let Some(reported) = signals.reported.as_mut() else {
+        return;
+    };
+    let keep = match (&reported.binding, &pane.running_command) {
+        (Binding::Pending, Some(command)) => {
+            reported.binding = Binding::Command(command.clone());
+            true
+        }
+        (Binding::Pending, None) if pane.cwd.is_none() => {
+            reported.binding = Binding::Shell;
+            true
+        }
+        (Binding::Command(bound), Some(command)) => bound == command,
+        (Binding::Shell, _) => pane.cwd.is_none(),
+        (Binding::Pending | Binding::Command(_), None) => false,
+    };
+    if !keep {
+        signals.reported = None;
+    }
+}
+
 /// The directory an OSC 7 location names: `file://host/path` (percent
-/// decoded) or a bare absolute path.
+/// decoded), kitty's `kitty-shell-cwd://host/path` (verbatim) or a bare
+/// absolute path. A host other than this machine (`local_host`, compared by
+/// its first label, case-insensitively) makes it remote.
 #[must_use]
-pub fn directory_from_location(location: &str) -> Option<String> {
-    let path = location.strip_prefix("file://").map_or(location, |rest| {
-        rest.find('/').map_or("", |slash| &rest[slash..])
-    });
-    if !path.starts_with('/') {
+pub fn parse_location(location: &str, local_host: Option<&str>) -> Option<Location> {
+    let (host, path) = if let Some(rest) = location.strip_prefix("file://") {
+        let (host, path) = split_authority(rest)?;
+        (host, percent_decode(path)?)
+    } else if let Some(rest) = location.strip_prefix("kitty-shell-cwd://") {
+        let (host, path) = split_authority(rest)?;
+        (host, path.to_string())
+    } else {
+        ("", location.to_string())
+    };
+    if !path.starts_with('/') || path.chars().any(char::is_control) {
         return None;
     }
+    if is_local_host(host, local_host) {
+        Some(Location::Local(path))
+    } else {
+        Some(Location::Remote {
+            host: host.to_string(),
+            path,
+        })
+    }
+}
+
+fn split_authority(rest: &str) -> Option<(&str, &str)> {
+    let slash = rest.find('/')?;
+    Some((&rest[..slash], &rest[slash..]))
+}
+
+fn percent_decode(path: &str) -> Option<String> {
     let bytes = path.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
     while index < bytes.len() {
-        if bytes[index] == b'%'
-            && index + 2 < bytes.len()
-            && let Some(byte) = std::str::from_utf8(&bytes[index + 1..index + 3])
-                .ok()
-                .and_then(|hex| u8::from_str_radix(hex, 16).ok())
-        {
-            decoded.push(byte);
+        let escape = bytes
+            .get(index + 1..index + 3)
+            .filter(|hex| bytes[index] == b'%' && hex.iter().all(u8::is_ascii_hexdigit));
+        if let Some(hex) = escape {
+            let hex = std::str::from_utf8(hex).ok()?;
+            decoded.push(u8::from_str_radix(hex, 16).ok()?);
             index += 3;
         } else {
             decoded.push(bytes[index]);
@@ -245,6 +358,37 @@ pub fn directory_from_location(location: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
+fn is_local_host(host: &str, local_host: Option<&str>) -> bool {
+    let short = |name: &str| {
+        name.split('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+    };
+    match host {
+        "" | "localhost" | "127.0.0.1" | "::1" | "[::1]" => true,
+        // Without a known name, a host cannot be told apart; git is gated on
+        // the trusted directory regardless.
+        host => local_host.is_none_or(|local| short(local) == short(host)),
+    }
+}
+
+/// This machine's name, read once.
+fn local_hostname() -> Option<&'static str> {
+    static NAME: OnceLock<Option<String>> = OnceLock::new();
+    NAME.get_or_init(|| {
+        let output = Command::new("hostname")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())?;
+        let name = String::from_utf8(output.stdout).ok()?.trim().to_string();
+        (!name.is_empty()).then_some(name)
+    })
+    .as_deref()
+}
+
 /// The git status of `directory`, or `None` outside a repository, when git is
 /// unavailable, or when it takes longer than [`GIT_TIMEOUT`].
 #[must_use]
@@ -252,8 +396,12 @@ pub fn git_status(directory: &str) -> Option<GitStatus> {
     if !Path::new(directory).is_dir() {
         return None;
     }
+    // Repository configuration can name commands git runs during `status`
+    // (`core.fsmonitor`); the board's polling must never start one.
     let mut child = Command::new("git")
         .args([
+            "-c",
+            "core.fsmonitor=false",
             "-C",
             directory,
             "status",
@@ -262,11 +410,19 @@ pub fn git_status(directory: &str) -> Option<GitStatus> {
             "--untracked-files=normal",
         ])
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
+    // Read while git runs: a status larger than the pipe buffer would
+    // otherwise block it until the timeout.
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut output = String::new();
+        stdout.read_to_string(&mut output).ok().map(|_| output)
+    });
     let started = Instant::now();
     loop {
         match child.try_wait() {
@@ -280,9 +436,7 @@ pub fn git_status(directory: &str) -> Option<GitStatus> {
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
         }
     }
-    let mut output = String::new();
-    std::io::Read::read_to_string(child.stdout.as_mut()?, &mut output).ok()?;
-    parse_porcelain(&output)
+    parse_porcelain(&reader.join().ok()??)
 }
 
 /// Parse `git status --porcelain=v2 --branch`.
@@ -333,20 +487,129 @@ mod tests {
                     id: Uuid::from_u128(*id),
                     focused: *focused,
                     running_command: command.map(str::to_string),
-                    cwd: (*id == 13).then(|| "/elsewhere".to_string()),
+                    cwd: match id {
+                        11 => Some("/repo".to_string()),
+                        13 => Some("/elsewhere".to_string()),
+                        _ => None,
+                    },
                 })
                 .collect(),
         }
     }
 
     #[test]
-    fn locations_decode_to_directories() {
+    fn locations_name_local_and_remote_directories() {
+        let local = |path: &str| Some(Location::Local(path.into()));
+        let here = Some("Mac.local");
         assert_eq!(
-            directory_from_location("file://host/Users/me/my%20repo").as_deref(),
-            Some("/Users/me/my repo")
+            parse_location("file://mac/Users/me/my%20repo", here),
+            local("/Users/me/my repo")
         );
-        assert_eq!(directory_from_location("/tmp").as_deref(), Some("/tmp"));
-        assert_eq!(directory_from_location("relative"), None);
+        assert_eq!(parse_location("file:///tmp", here), local("/tmp"));
+        assert_eq!(parse_location("file://localhost/tmp", here), local("/tmp"));
+        assert_eq!(parse_location("file://MAC.lan/tmp", here), local("/tmp"));
+        assert_eq!(
+            parse_location("file://build-box/home/ci", here),
+            Some(Location::Remote {
+                host: "build-box".into(),
+                path: "/home/ci".into(),
+            })
+        );
+        assert_eq!(
+            parse_location("kitty-shell-cwd://mac/a b%20", here),
+            local("/a b%20")
+        );
+        assert_eq!(parse_location("/tmp", here), local("/tmp"));
+        // Malformed escapes stay literal; a host cannot be judged without a name.
+        assert_eq!(parse_location("file:///a%+1%4", here), local("/a%+1%4"));
+        assert_eq!(parse_location("file://any/tmp", None), local("/tmp"));
+        assert_eq!(parse_location("relative", here), None);
+        assert_eq!(parse_location("file://host", here), None);
+        assert_eq!(parse_location("file:///a%0Ab", here), None);
+    }
+
+    #[test]
+    fn reported_directories_last_as_long_as_the_command_that_reported_them() {
+        let pane = Uuid::from_u128(1);
+        let tabs = |command: Option<&str>, cwd: Option<&str>| {
+            [TabPanes {
+                tab_id: Uuid::from_u128(2),
+                panes: vec![PaneInfo {
+                    id: pane,
+                    focused: true,
+                    running_command: command.map(str::to_string),
+                    cwd: cwd.map(str::to_string),
+                }],
+            }]
+        };
+        let report = |board: &mut StatusBoard, location: &str| {
+            board.apply_terminal(
+                &TerminalEvent::WorkingDirectory {
+                    session_id: Uuid::nil(),
+                    pane_id: pane,
+                    location: location.into(),
+                },
+                0,
+            );
+        };
+        let git_reads = std::cell::RefCell::new(Vec::new());
+        let build = |board: &mut StatusBoard, command, cwd| {
+            let built = board.build(&tabs(command, cwd), &mut |dir| {
+                git_reads.borrow_mut().push(dir.to_string());
+                None
+            });
+            built[0].cwd.clone()
+        };
+        let mut board = StatusBoard::default();
+        let repo = Some("/repo");
+
+        // Whatever a program reports is shown while it runs, but git only
+        // ever reads the shell's own directory.
+        report(&mut board, "file:///tmp/planted");
+        assert_eq!(
+            build(&mut board, Some("cat notes"), repo).as_deref(),
+            Some("/tmp/planted")
+        );
+        assert_eq!(
+            build(&mut board, Some("cat notes"), repo).as_deref(),
+            Some("/tmp/planted")
+        );
+        // When it ends, the shell's directory is authoritative again.
+        assert_eq!(build(&mut board, None, repo).as_deref(), Some("/repo"));
+        assert_eq!(*git_reads.borrow(), ["/repo"]);
+
+        // A remote shell's directory names its host and is never read.
+        report(&mut board, "file://build-box.example/home/ci");
+        assert_eq!(
+            build(&mut board, Some("ssh build-box"), repo).as_deref(),
+            Some("build-box.example:/home/ci")
+        );
+        // Another command, even before the board saw the shell's prompt, drops it.
+        assert_eq!(
+            build(&mut board, Some("make"), repo).as_deref(),
+            Some("/repo")
+        );
+        // A report that arrives while the shell sits at its prompt is
+        // superseded by the shell's own report.
+        report(&mut board, "file:///else");
+        assert_eq!(build(&mut board, None, repo).as_deref(), Some("/repo"));
+        // A report agreeing with the shell's directory is read.
+        report(&mut board, "file:///repo");
+        assert_eq!(
+            build(&mut board, Some("nvim"), repo).as_deref(),
+            Some("/repo")
+        );
+
+        // A shell with no other way to report keeps its OSC 7 directory, unread.
+        let mut board = StatusBoard::default();
+        git_reads.borrow_mut().clear();
+        report(&mut board, "file:///srv");
+        assert_eq!(build(&mut board, None, None).as_deref(), Some("/srv"));
+        assert_eq!(
+            build(&mut board, Some("make"), None).as_deref(),
+            Some("/srv")
+        );
+        assert!(git_reads.borrow().is_empty());
     }
 
     #[test]
@@ -384,7 +647,7 @@ mod tests {
             &TerminalEvent::WorkingDirectory {
                 session_id: session,
                 pane_id: focused,
-                location: "file://h/repo".into(),
+                location: "file:///repo".into(),
             },
             10,
         );

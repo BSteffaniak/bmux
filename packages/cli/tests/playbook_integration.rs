@@ -384,6 +384,13 @@ fn playbook_real_attach_sidebar_flags_a_background_bell_as_needing_input() {
 
 #[test]
 #[serial]
+fn playbook_real_attach_sidebar_never_runs_git_where_output_points() {
+    let (json, pass) = run_playbook_fixture("attach_real_sidebar_planted_directory.dsl");
+    assert!(pass, "sidebar planted directory playbook should pass: {json:#}");
+}
+
+#[test]
+#[serial]
 fn playbook_real_attach_sidebar_shows_each_tabs_git_status() {
     let (json, pass) = run_playbook_fixture("attach_real_sidebar_status.dsl");
     assert!(pass, "sidebar status playbook should pass: {json:#}");

@@ -42,6 +42,12 @@ fish and nu, on by default through `behavior.pane_shell_integration`) and
 server's repositories. Without shell integration a tab shows no running command
 and so never counts as working.
 
+A tab's directory is the one its shell reports. A program's OSC 7 directory is
+shown instead while that program runs (an editor, or a remote shell, shown as
+`host:path`) and dropped when it exits. Since any output can carry OSC 7, git
+only ever runs in the directory the shell itself reports, with
+`core.fsmonitor` disabled.
+
 ```toml
 [plugins.settings."bmux.sidebar"]
 placement = "left" # or "right"
