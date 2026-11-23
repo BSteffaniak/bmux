@@ -712,10 +712,10 @@ pub(super) fn enter_invoking_transport(
 tokio::task_local! {
     // Set only by the selected host dispatch below, never decoded from requests.
     static SELECTED_PLUGIN_CALLER: String;
-    // Marks selected work a host callback thread is blocked waiting for: a callback that work
-    // needs must not wait for a pool slot (see `HostCallbackExecutor::submit`). Set only by
-    // the selected host dispatch below, never decoded from requests.
-    static AWAITED_BY_HOST_CALLBACK: ();
+    // Marks selected work, which holds a selected slot while it runs: nothing it does may
+    // wait for a pool slot (see `holds_host_slot`). Set only by the selected host dispatch
+    // below, never decoded from requests.
+    static HOLDING_HOST_SLOT: ();
 }
 
 /// Server-authenticated authority retained for one provider dispatch. Only the
@@ -771,19 +771,46 @@ type SelectedRequestJob = Box<dyn FnOnce() + Send + 'static>;
 /// The bounded pool host callbacks run on (synchronous plugin callbacks never run on a Tokio
 /// worker).
 ///
-/// A callback may synchronously call a service whose provider needs a callback of its own,
-/// blocking its slot until that one finishes. So a callback some host callback is waiting for
-/// (nested) never waits for a slot: with the pool full of the callbacks waiting for it, it
-/// would wait forever. It runs on an overflow thread instead, bounded by the depth of the
-/// calls. Any other callback waits for a free slot, at most [`HOST_CALLBACK_SLOT_WAIT`], so a
-/// burst (a server restoring every pane at once) queues rather than fails.
+/// Host work holds a slot of one of two pools while it runs: a callback one here, selected
+/// work one of [`SelectedRequestExecutor`]'s. Either may need more host work before it can
+/// finish (a callback synchronously invoking a service whose provider needs a callback of its
+/// own; selected work whose provider makes selected requests), so work that holds a slot never
+/// waits for one (see [`holds_host_slot`]): with every slot held by work waiting for slots, it
+/// would wait forever. It is admitted over the bound instead (a callback on an overflow
+/// thread), bounded by the depth of the calls. Work holding no slot waits for a free one, at
+/// most [`HOST_SLOT_WAIT`], so a burst (a server restoring every pane at once) queues rather
+/// than fails.
 struct HostCallbackExecutor {
     sender: std::sync::mpsc::SyncSender<SelectedRequestJob>,
     slots: Arc<tokio::sync::Semaphore>,
 }
 
-/// How long a callback no other callback waits for may wait for a free slot.
-const HOST_CALLBACK_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long host work holding no slot may wait for a free one.
+const HOST_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Whether the caller holds a slot of either host pool: it runs on a host callback thread, or
+/// in selected work. Such a caller must never wait for a slot (see [`HostCallbackExecutor`]).
+fn holds_host_slot() -> bool {
+    ON_HOST_CALLBACK_THREAD.with(std::cell::Cell::get)
+        || HOLDING_HOST_SLOT.try_with(|()| ()).is_ok()
+}
+
+/// Take one of `slots`, waiting (blocking this thread) at most `wait` for one to free.
+fn wait_for_slot(
+    slots: &Arc<tokio::sync::Semaphore>,
+    wait: std::time::Duration,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        if let Ok(permit) = slots.clone().try_acquire_owned() {
+            return Some(permit);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}
 
 impl HostCallbackExecutor {
     fn get() -> bmux_plugin_sdk::Result<&'static Self> {
@@ -822,8 +849,8 @@ impl HostCallbackExecutor {
         })
     }
 
-    /// Run `job` on a host callback thread: in a free slot, else (if a host callback waits for
-    /// it) on an overflow thread, else once a slot frees, waiting on `runtime` at most `wait`.
+    /// Run `job` on a host callback thread: in a free slot, else (if the caller holds a host
+    /// slot) on an overflow thread, else once a slot frees, waiting on `runtime` at most `wait`.
     async fn submit(
         &self,
         runtime: &tokio::runtime::Handle,
@@ -831,7 +858,7 @@ impl HostCallbackExecutor {
         wait: std::time::Duration,
     ) -> bmux_plugin_sdk::Result<()> {
         let protocol = |details| bmux_plugin_sdk::PluginError::ServiceProtocol { details };
-        let nested = AWAITED_BY_HOST_CALLBACK.try_with(|()| ()).is_ok();
+        let nested = holds_host_slot();
         let permit = match self.slots.clone().try_acquire_owned() {
             Ok(permit) => permit,
             Err(_) if nested => return Self::overflow(job),
@@ -1123,9 +1150,23 @@ impl AuthenticatedServiceInvocation {
             ));
         }
         let executor = SelectedRequestExecutor::get()?;
-        let permit = executor.slots.clone().try_acquire_owned().map_err(|_| {
-            protocol("selected host executor saturated; request not dispatched".into())
-        })?;
+        let permit = match executor.slots.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            // Admitted over the bound: a caller holding a host slot never waits for one (see
+            // `HostCallbackExecutor`).
+            Err(_) if holds_host_slot() => None,
+            Err(_) => {
+                let take = || wait_for_slot(&executor.slots, HOST_SLOT_WAIT);
+                let permit = if current.is_some() {
+                    tokio::task::block_in_place(take)
+                } else {
+                    take()
+                };
+                Some(permit.ok_or_else(|| {
+                    protocol("selected host executor saturated; request not dispatched".into())
+                })?)
+            }
+        };
         // Admission belongs to the accepted job, not to recv_timeout below.
         // Closure racing this acquisition either rejects before enqueue or must
         // wait for the owned effect to settle. Queue rejection drops the unused
@@ -1162,19 +1203,25 @@ impl AuthenticatedServiceInvocation {
             });
             let _ = sender.send(result);
         };
-        // A host callback thread blocks below until this work ends, so any callback the work
-        // needs must not wait for that thread's pool (see `HostCallbackExecutor`).
-        let work: std::pin::Pin<Box<dyn Future<Output = ()> + Send>> = if host_thread {
-            Box::pin(AWAITED_BY_HOST_CALLBACK.scope((), work))
-        } else {
-            Box::pin(work)
-        };
-        executor
-            .sender
-            .try_send(selected_effect_job(self.runtime.clone(), admission, work))
-            .map_err(|_| {
-                protocol("selected host executor unavailable; request not dispatched".into())
-            })?;
+        // The work holds a selected slot (or was admitted over the bound for a holder), so
+        // nothing it does may wait for a slot (see `HostCallbackExecutor`).
+        let work = HOLDING_HOST_SLOT.scope((), work);
+        let job = selected_effect_job(self.runtime.clone(), admission, work);
+        // The queue only fills past the slots with work admitted over the bound; its
+        // dispatcher only spawns, so waiting for room is brief.
+        match executor.sender.try_send(job) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::TrySendError::Full(job)) => {
+                executor.sender.send(job).map_err(|_| {
+                    protocol("selected host executor unavailable; request not dispatched".into())
+                })?;
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                return Err(protocol(
+                    "selected host executor unavailable; request not dispatched".into(),
+                ));
+            }
+        }
         let wait = move || {
             receiver
                 .recv_timeout(std::time::Duration::from_secs(30))
@@ -1240,9 +1287,7 @@ impl AuthenticatedServiceInvocation {
                 });
             let _ = sender.send(result);
         });
-        executor
-            .submit(&reactor, job, HOST_CALLBACK_SLOT_WAIT)
-            .await?;
+        executor.submit(&reactor, job, HOST_SLOT_WAIT).await?;
         receiver.await.map_err(|_| {
             protocol("host callback response lost; outcome unknown, do not replay".into())
         })?
@@ -2840,6 +2885,109 @@ mod tests {
         );
     }
 
+    /// A server whose `test.leaf` query answers `[5]`, and whose `test.chain` query makes it
+    /// synchronously from a host callback (as a pane start invokes the resurrection plugin).
+    fn chained_server(directory: &tempfile::TempDir) -> BmuxServer {
+        let server = BmuxServer::new(bmux_ipc::IpcEndpoint::unix_socket(
+            directory.path().join("s"),
+        ));
+        server
+            .register_service_handler(
+                "test.leaf",
+                InvokeServiceKind::Query,
+                "leaf/v1",
+                "read",
+                |_, _, _| async { Ok(vec![5]) },
+            )
+            .unwrap();
+        let context = server.host_service_context();
+        server
+            .register_service_handler(
+                "test.chain",
+                InvokeServiceKind::Query,
+                "chain/v1",
+                "read",
+                move |_, _, _| {
+                    let authority = AuthenticatedServiceInvocation::new(context.clone());
+                    async move {
+                        let response = AuthenticatedServiceInvocation::dispatch_host_callback(
+                            tokio::runtime::Handle::current(),
+                            move || {
+                                authority.execute_response(&service_request("test.leaf", "leaf/v1"))
+                            },
+                        )
+                        .await
+                        .map_err(anyhow::Error::from)?;
+                        match response {
+                            bmux_ipc::ResponsePayload::ServiceInvoked { payload } => Ok(payload),
+                            other => Err(anyhow::anyhow!("unexpected {other:?}")),
+                        }
+                    }
+                },
+            )
+            .unwrap();
+        server
+    }
+
+    fn service_request(capability: &str, interface: &str) -> Vec<u8> {
+        bmux_ipc::encode(&bmux_ipc::Request::InvokeService {
+            capability: capability.into(),
+            kind: InvokeServiceKind::Query,
+            interface_id: interface.into(),
+            operation: "read".into(),
+            payload: vec![],
+        })
+        .unwrap()
+    }
+
+    /// Hold every selected slot but `left`.
+    fn hold_selected_slots(left: usize) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+        let slots = &SelectedRequestExecutor::get().unwrap().slots;
+        let mut held = Vec::new();
+        while slots.available_permits() > left {
+            held.push(slots.clone().try_acquire_owned().unwrap());
+        }
+        held
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn selected_work_gets_the_selected_requests_it_makes_with_the_pool_full() {
+        // Restoring panes: selected work holds every slot, and the last one's provider makes
+        // a selected request of its own from a callback.
+        let directory = private_scope_directory();
+        let server = chained_server(&directory);
+        let held = hold_selected_slots(1);
+        let authority = AuthenticatedServiceInvocation::new(server.host_service_context());
+        let response = tokio::task::spawn_blocking(move || {
+            authority.execute_response(&service_request("test.chain", "chain/v1"))
+        })
+        .await
+        .unwrap();
+        drop(held);
+        assert!(
+            matches!(response, Ok(bmux_ipc::ResponsePayload::ServiceInvoked { ref payload }) if payload == &[5]),
+            "{response:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_selected_request_waits_for_a_slot_rather_than_fail() {
+        let directory = private_scope_directory();
+        let server = chained_server(&directory);
+        let held = hold_selected_slots(0);
+        let authority = AuthenticatedServiceInvocation::new(server.host_service_context());
+        let request = tokio::task::spawn_blocking(move || {
+            authority.execute_response(&service_request("test.leaf", "leaf/v1"))
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        drop(held);
+        let response = request.await.unwrap();
+        assert!(
+            matches!(response, Ok(bmux_ipc::ResponsePayload::ServiceInvoked { ref payload }) if payload == &[5]),
+            "{response:?}"
+        );
+    }
+
     /// A one-slot pool with its slot held until the returned sender is dropped.
     fn held_pool() -> (HostCallbackExecutor, std::sync::mpsc::Sender<()>) {
         let pool = HostCallbackExecutor::start(1).unwrap();
@@ -2887,15 +3035,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_callback_a_host_callback_waits_for_never_waits_for_a_slot() {
-        // The pool's only slot is held by a callback waiting for this one: waiting for a slot
-        // would wait forever.
+    async fn a_callback_from_work_holding_a_slot_never_waits_for_one() {
+        // The pool's only slot is held by a callback waiting for this one (as selected work
+        // holding a slot may be): waiting for a slot would wait forever.
         let (pool, release) = held_pool();
         let (ran, done) = tokio::sync::oneshot::channel();
         let job: SelectedRequestJob = Box::new(move || {
             let _ = ran.send(ON_HOST_CALLBACK_THREAD.with(std::cell::Cell::get));
         });
-        AWAITED_BY_HOST_CALLBACK
+        HOLDING_HOST_SLOT
             .scope(
                 (),
                 pool.submit(
