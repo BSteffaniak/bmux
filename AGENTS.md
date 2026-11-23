@@ -156,15 +156,19 @@ touches `simulation/**`, `packages/pty/**`, `packages/local-terminal/**`,
 - `cargo clippy --manifest-path simulation/Cargo.toml --all-targets -- -D warnings`
 - `cargo test --manifest-path simulation/Cargo.toml -p pane-runtime --test platform`
 - `cargo sim pty --regression`
-- `SIMULATOR_RUNS=500 SIMULATOR_VERIFY_DETERMINISM=1 cargo sim pty`
-- `SIMULATOR_RUNS=300 SIMULATOR_VERIFY_DETERMINISM=1 cargo sim pane-runtime`
-- `SIMULATOR_RUNS=300 SIMULATOR_VERIFY_DETERMINISM=1 cargo sim local-terminal`
+- `SIMULATOR_RUNS=500 SIMULATOR_VERIFY_DETERMINISM=process cargo sim pty`
+- `SIMULATOR_RUNS=300 SIMULATOR_VERIFY_DETERMINISM=process cargo sim pane-runtime`
+- `SIMULATOR_RUNS=300 SIMULATOR_VERIFY_DETERMINISM=process cargo sim local-terminal`
 
 Code the pane runtime simulation runs must stay deterministic: tasks, timers and
 `select!` through `switchy_async`, threads and locks through `switchy_thread`, clocks
 through `switchy_time`, environment reads through `switchy_env`, identifiers through
-the plugin's `ids` module, directory listings through `dir_order`, and process-wide
-state through `run_shared`. Each crate on the simulated path enforces this in its
+the plugin's `ids` module, directory listings through `dir_order`, this process's own id
+through the platform layer's `files`, and process-wide state through `run_shared`. The
+`SIMULATOR_VERIFY_DETERMINISM=process` checks above replay each run alone in a fresh,
+perturbed process and compare everything it observed (schedule, processes and terminal
+output, file tree, random draws, clock); a failure names the first observation that
+differs, with the text around it. Each crate on the simulated path enforces this in its
 `tests/primitives.rs` (the shared `bmux_sim_primitives_check` scan), stating its exemptions;
 a crate the simulation starts running gets one too. A std lock must never be held across a
 switch point: simulations poll tasks on several workers.

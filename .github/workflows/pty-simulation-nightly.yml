@@ -62,15 +62,15 @@ jobs:
           status=0
           env ${{ matrix.env }} \
             SIMULATOR_RUNS="${{ github.event.inputs.runs || '5000' }}" \
-            SIMULATOR_VERIFY_DETERMINISM=1 \
+            SIMULATOR_VERIFY_DETERMINISM=process \
             cargo sim pty | tee "$RUNNER_TEMP/simulation.log" || status=1
           env ${{ matrix.env }} \
             SIMULATOR_RUNS="${{ github.event.inputs.runs || '2000' }}" \
-            SIMULATOR_VERIFY_DETERMINISM=1 \
+            SIMULATOR_VERIFY_DETERMINISM=process \
             cargo sim pane-runtime | tee "$RUNNER_TEMP/pane-runtime-simulation.log" || status=1
           env ${{ matrix.env }} \
             SIMULATOR_RUNS="${{ github.event.inputs.runs || '2000' }}" \
-            SIMULATOR_VERIFY_DETERMINISM=1 \
+            SIMULATOR_VERIFY_DETERMINISM=process \
             cargo sim local-terminal | tee "$RUNNER_TEMP/local-terminal-simulation.log" || status=1
           exit "$status"
 

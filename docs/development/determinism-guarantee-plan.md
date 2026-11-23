@@ -203,4 +203,45 @@ exemption.
 
 ## Implementation notes
 
-(Filled in as the work lands.)
+### 20.1 (MoosicBox `b6a8dbf14`, `93aba9019`)
+
+- **The digest.** `switchy_simulation::digest` keeps, per run, a hash per source, a running
+  total, and the first 100,000 observations as checkpoints with their text (up to 64 KiB
+  each). Simulators observe as things happen (`observe`, `observe_debug`), and through
+  end-of-run observers registered once per process (`on_run_end`). Each observer checks
+  `Context::existing_state` and stays silent for runs that never used its simulator.
+  - `switchy_pty`: each spawn and exit; at the end, the signal log, every byte each
+    terminal and pipe was written, and the processes left.
+  - `switchy_fs`: the whole file system at the end.
+  - Every named random stream's final state, which also encodes its number of draws.
+  - simvar: the schedule's trace hash, the steps, the simulated time and wall clock, and
+    `record()`ed values.
+
+  `switchy_tcp` does not observe yet; no bmux simulation uses it.
+- **Verification.** simvar compares whole digests. `SIMULATOR_VERIFY_DETERMINISM=process`
+  re-executes the simulation for one run with its replay variables and `SIMULATOR_PERTURB`.
+  Perturbing starts switchy's process-wide counters (context, task, runtime, async thread
+  and wait-key ids) at a random offset. The child reports its digest, trace and schedule
+  back through `SIMULATOR_DIGEST_OUT`.
+- **Locating a divergence.** A failure lists:
+  - each source that differs;
+  - the first observation that differs, with the text around the first differing
+    character on both sides;
+  - where the thread schedules part.
+
+  `SIMULATOR_DIGEST_BACKTRACE_AT=N` adds a backtrace to observation N. Re-running both
+  processes up to a decision (the plan's `BACKTRACE_AT`) was not needed: the text located
+  the only divergence found.
+- **Cost.** A fresh process per run costs milliseconds: 1000 pane runtime runs verified
+  this way take 7 seconds. So CI, the nightly job, AGENTS.md's checks and the regression
+  runner all use `process`, not the sample the plan proposed. `=1` stays available.
+- **Found.** The pane runtime's durable-state writer named its staging file
+  `<name>.tmp-<pid>` with the host's process id. A run's final file system depended on
+  which process ran it (2 of 100 runs verified in a fresh process).
+  - The staging name now comes from `ids::new_uuid()`.
+  - The plugin's own process id (readiness) comes from the platform layer's `files`: the
+    host's natively, a stand-in (`1`) simulated.
+  - `bmux_sim_primitives_check` bans `process::id()`.
+
+  Nothing else differed in 1000 pane runtime runs (guided ones too), and 300 each of pty
+  and local terminal.

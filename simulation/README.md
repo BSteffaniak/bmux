@@ -37,7 +37,8 @@ cargo sim pty --regression                         # its pinned seeds
 | `SIMULATOR_ON_FAILURE` | `stop` or `continue` (the default with `--tui` and `--fleet`) |
 | `SIMULATOR_MAX_PARALLEL` | Runs at once (default: CPUs) |
 | `SIMULATOR_SEED` | The first run's seed (default random) |
-| `SIMULATOR_VERIFY_DETERMINISM` | `1`: replay every run, fail if it differs |
+| `SIMULATOR_VERIFY_DETERMINISM` | Replay every run and fail if it observed anything differently (its schedule, processes and terminal output, file tree, random draws, clock): `process` replays it in a fresh, perturbed process (what CI runs), `1` in the same process |
+| `SIMULATOR_DIGEST_BACKTRACE_AT` | Add a backtrace to this observation of a run's digest (a determinism failure names the first one that differs) |
 | `SIMULATOR_SCHEDULE_STRATEGY` | `random`, `pct` or `alternate` (default) |
 | `SIMULATOR_WEAK_MEMORY` | `1`: model weak memory for atomics |
 | `SIMULATOR_SHRINK` | `1`: shrink a failing run's thread schedule |

@@ -1058,7 +1058,7 @@ pub fn regression(name: &str, path: &str) -> Result<(), Box<dyn std::error::Erro
             .env("SIMULATOR_SEED", seed)
             .env("SIMULATOR_RUNS", "1")
             .env("SIMULATOR_MAX_PARALLEL", "1")
-            .env("SIMULATOR_VERIFY_DETERMINISM", "1")
+            .env("SIMULATOR_VERIFY_DETERMINISM", "process")
             .env_remove("SIMULATOR_EPOCH_OFFSET");
         let mut replay = format!("SIMULATOR_SEED={seed}");
         for word in words {

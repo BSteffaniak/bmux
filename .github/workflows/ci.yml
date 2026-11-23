@@ -439,32 +439,34 @@ jobs:
         shell: bash
         run: cargo test --manifest-path simulation/Cargo.toml -p pane-runtime --test platform
 
-      - name: Regression seeds (each replayed to verify determinism)
+      - name: Regression seeds (each replayed in a fresh process to verify determinism)
         shell: bash
         run: |
           cargo sim pty --regression
           cargo sim pane-runtime --regression
           cargo sim local-terminal --regression
 
+      # Each run is replayed alone in a fresh, perturbed process, and must observe exactly
+      # the same (schedule, processes and terminal output, file tree, random draws, clock).
       - name: Random runs, determinism verified
         shell: bash
         env:
           SIMULATOR_RUNS: "500"
-          SIMULATOR_VERIFY_DETERMINISM: "1"
+          SIMULATOR_VERIFY_DETERMINISM: process
         run: cargo sim pty
 
       - name: Pane runtime runs, determinism verified
         shell: bash
         env:
           SIMULATOR_RUNS: "300"
-          SIMULATOR_VERIFY_DETERMINISM: "1"
+          SIMULATOR_VERIFY_DETERMINISM: process
         run: cargo sim pane-runtime
 
       - name: Local terminal runs, determinism verified
         shell: bash
         env:
           SIMULATOR_RUNS: "300"
-          SIMULATOR_VERIFY_DETERMINISM: "1"
+          SIMULATOR_VERIFY_DETERMINISM: process
         run: cargo sim local-terminal
 
       # Every schedule of each scenario that departs from the default once, under one and two
