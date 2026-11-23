@@ -23,7 +23,7 @@ use bmux_plugin::{
     RenderStyle, ServiceCallerDispatchClient, block_on_typed_dispatch,
 };
 use bmux_plugin_sdk::author::{Declarations, Plugin};
-use bmux_plugin_sdk::prelude::*;
+use bmux_plugin_sdk::{TypedServiceEndpoint as _, prelude::*};
 use bmux_presentation_scene::scene::{HitTable, HitTables};
 use bmux_presentation_state::visibility::{
     PresentationVisibility, VisibilityCommand, VisibilitySettings,
@@ -1752,6 +1752,59 @@ fn update_keyboard(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<
     })
 }
 
+/// A left press or Enter on a tab's card switches to that tab: answered here,
+/// as a `switch-tab` invocation the attach client runs, because a handled
+/// endpoint never reaches the plugin's service.
+fn activate_tab(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<AttachInputResult> {
+    if !is_activation(event) {
+        return None;
+    }
+    let target = {
+        let guard = owner.lock().ok()?;
+        hit_tab(guard.as_ref()?, event)?
+    };
+    Some(AttachInputResult {
+        consumed: true,
+        service_invocation: switch_tab_invocation(target),
+        ..AttachInputResult::default()
+    })
+}
+
+/// A left press, or Enter, both of which switch to the tab under them.
+fn is_activation(event: &AttachInputEvent) -> bool {
+    let key = event.event_kind == "key"
+        && matches!(event.phase.as_str(), "press" | "repeat")
+        && event.key.as_deref() == Some("enter");
+    let pointer = event.event_kind == "pointer"
+        && event.phase == "down"
+        && event.button.as_deref() == Some("left");
+    key || pointer
+}
+
+/// The tabs plugin's `switch-tab` command for `tab`, for the client to run.
+fn switch_tab_invocation(tab: Uuid) -> Option<bmux_plugin::AttachInputServiceInvocation> {
+    use tabs_commands::client::{SwitchTabEndpoint as Endpoint, SwitchTabRequest};
+    let payload = bmux_plugin_sdk::encode_service_message(&SwitchTabRequest {
+        target: tab.to_string(),
+    })
+    .ok()?;
+    let payload = bmux_plugin_sdk::service_contract::encode(
+        Endpoint::INTERFACE_ID.as_str(),
+        Endpoint::SERVICE_CONTRACT,
+        &payload,
+    )
+    .ok()?;
+    Some(bmux_plugin::AttachInputServiceInvocation {
+        endpoint: bmux_plugin::AttachInputEndpoint {
+            capability: Endpoint::CAPABILITY.to_string(),
+            interface_id: Endpoint::INTERFACE_ID.to_string(),
+            operation: Endpoint::OPERATION.to_string(),
+        },
+        response_endpoint: None,
+        payload,
+    })
+}
+
 fn handle_local_input(
     owner: &CompanionHandle,
     event: &AttachInputEvent,
@@ -1769,6 +1822,9 @@ fn handle_local_input(
             dirty: publish_companion(companion).is_ok(),
             ..AttachInputResult::default()
         });
+    }
+    if let Some(result) = activate_tab(owner, event) {
+        return Some(result);
     }
     if let Some(result) = update_keyboard(owner, event) {
         return Some(result);
@@ -1794,13 +1850,7 @@ fn handle_local_input(
 }
 
 fn handle_input(context: &NativeServiceContext, event: &AttachInputEvent) -> AttachInputResult {
-    let activate_key = event.event_kind == "key"
-        && matches!(event.phase.as_str(), "press" | "repeat")
-        && event.key.as_deref() == Some("enter");
-    let activate_pointer = event.event_kind == "pointer"
-        && event.phase == "down"
-        && event.button.as_deref() == Some("left");
-    if !activate_key && !activate_pointer {
+    if !is_activation(event) {
         return AttachInputResult::default();
     }
     let Some(target) = event
@@ -2749,6 +2799,79 @@ mod tests {
             region: tab_region_id(tab),
             revision: u64::MAX,
             key: Some(key),
+        }
+    }
+
+    /// Clicking a tab's card, or pressing Enter on it, switches to that tab
+    /// when the input arrives the way the attach client routes it: through
+    /// the presentation's registered endpoint.
+    #[test]
+    fn clicking_or_entering_a_tab_card_switches_to_it() {
+        let input = std::sync::Arc::new(bmux_plugin::AttachPresentationInputRegistry::new());
+        let presentation = SidebarPresentation::install(
+            Some(&shown_toml()),
+            std::sync::Arc::new(bmux_plugin::layout::PluginLayoutRegistry::new(4)),
+            std::sync::Arc::new(bmux_plugin::layout::AllocationRegistry::default()),
+            input.clone(),
+            std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(4)),
+        )
+        .unwrap();
+        let second = Uuid::from_u128(2);
+        let target = {
+            let guard = presentation.owner.lock().unwrap();
+            test_target(guard.as_ref().unwrap(), second)
+        };
+        let event =
+            |kind: &str, phase: &str, button: Option<&str>, key: Option<&str>| AttachInputEvent {
+                target: Some(target.clone()),
+                hook_id: format!("{OWNER}:{SURFACE_ID}:{}", tab_region_id(second)),
+                event_kind: kind.to_string(),
+                phase: phase.to_string(),
+                key: key.map(str::to_string),
+                button: button.map(str::to_string),
+                col: None,
+                row: None,
+                wheel_delta: 0,
+                modifiers: bmux_plugin::render::AttachInputModifiers::default(),
+                focused_pane: None,
+                hovered_pane: None,
+            };
+        for event in [
+            event("pointer", "down", Some("left"), None),
+            event("key", "press", None, Some("enter")),
+        ] {
+            let bmux_plugin::AttachPresentationInputDispatch::Handled(result) =
+                input.dispatch(&input_endpoint(), &event)
+            else {
+                panic!("{} {} was not handled", event.event_kind, event.phase);
+            };
+            assert!(result.consumed);
+            let invocation = result.service_invocation.expect("a switch-tab invocation");
+            assert_eq!(
+                invocation.endpoint.operation,
+                tabs_commands::client::SwitchTabEndpoint::OPERATION.to_string()
+            );
+            let payload = bmux_plugin_sdk::service_contract::decode_for(
+                &invocation.endpoint.interface_id,
+                tabs_commands::SERVICE_CONTRACT,
+                &invocation.payload,
+            )
+            .unwrap();
+            let request: tabs_commands::client::SwitchTabRequest =
+                bmux_plugin_sdk::decode_service_message(payload).unwrap();
+            assert_eq!(request.target, second.to_string());
+        }
+        // Other buttons and phases do not switch tabs.
+        for event in [
+            event("pointer", "down", Some("right"), None),
+            event("pointer", "up", Some("left"), None),
+        ] {
+            let switched = matches!(
+                input.dispatch(&input_endpoint(), &event),
+                bmux_plugin::AttachPresentationInputDispatch::Handled(result)
+                    if result.service_invocation.is_some()
+            );
+            assert!(!switched, "{} {:?}", event.phase, event.button);
         }
     }
 
