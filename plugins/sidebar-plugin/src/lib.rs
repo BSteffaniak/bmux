@@ -62,6 +62,8 @@ struct Settings {
     collapse_below_width: u16,
     collapsed_width: u16,
     visibility: VisibilitySettings,
+    /// Start from the width last dragged or stepped to on this machine.
+    remember_width: bool,
 }
 
 impl Default for Settings {
@@ -87,6 +89,7 @@ impl Default for Settings {
                 visible: false,
                 ..VisibilitySettings::default()
             },
+            remember_width: true,
         }
     }
 }
@@ -165,6 +168,7 @@ impl Settings {
         for (key, target) in [
             ("visible", &mut settings.visibility.visible),
             ("remember_visibility", &mut settings.visibility.remember),
+            ("remember_width", &mut settings.remember_width),
         ] {
             if let Some(value) = table.get(key) {
                 *target = value.as_bool().ok_or_else(|| {
@@ -266,12 +270,35 @@ struct CompanionState {
     measured_items: std::cell::RefCell<std::collections::BTreeMap<Uuid, MeasuredSidebarItem>>,
     /// What each published revision's region keys mean.
     hits: std::cell::RefCell<HitTables<SidebarHit>>,
+    /// The width the sidebar asks for, within its minimum and maximum.
+    width: u16,
+    /// Where the width is remembered, when it is.
+    width_memory: Option<std::path::PathBuf>,
+    /// A drag of the resize edge in progress.
+    resize: Option<ResizeDrag>,
+    /// The pointer is over the resize edge.
+    edge_hovered: bool,
 }
+
+/// A drag of the sidebar's resize edge: where the pointer pressed, on the
+/// screen, and the width then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ResizeDrag {
+    start_col: u16,
+    start_width: u16,
+}
+
+/// Cells `widen` and `narrow` move the edge by.
+const WIDTH_STEP: u16 = 2;
+/// The file in the local state directory that remembers the width.
+const WIDTH_FILE: &str = "sidebar-width";
 
 /// The typed meaning of a sidebar region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SidebarHit {
     Tab(Uuid),
+    /// The edge facing the panes, dragged to resize the sidebar.
+    ResizeEdge,
 }
 
 /// The owner-local region id of a tab row, and its inverse, for events without
@@ -300,7 +327,22 @@ impl Drop for CompanionState {
 impl CompanionState {
     fn new(settings: Settings, local_state_dir: Option<std::path::PathBuf>) -> Self {
         let activity = activity::ActivityView::default();
+        let width_memory = local_state_dir
+            .as_deref()
+            .filter(|_| settings.remember_width)
+            .map(|directory| directory.join(WIDTH_FILE));
+        let width = width_memory
+            .as_deref()
+            .and_then(|file| std::fs::read_to_string(file).ok())
+            .and_then(|text| text.trim().parse::<u16>().ok())
+            .map_or(settings.width, |width| {
+                width.clamp(settings.minimum_width, settings.maximum_width)
+            });
         Self {
+            width,
+            width_memory,
+            resize: None,
+            edge_hovered: false,
             surfaces: None,
             layouts: None,
             facts: None,
@@ -335,8 +377,39 @@ impl CompanionState {
     const fn allocated_width(&self) -> u16 {
         match self.allocation {
             Some(rect) => rect.w,
-            None => self.settings.width,
+            None => self.width,
         }
+    }
+
+    /// Ask for `width`, kept within the minimum and maximum. Returns whether
+    /// the width changed.
+    fn set_width(&mut self, width: u16) -> bool {
+        let width = width.clamp(self.settings.minimum_width, self.settings.maximum_width);
+        if width == self.width {
+            return false;
+        }
+        self.width = width;
+        true
+    }
+
+    /// Remember the width for the next start, when this installation does.
+    ///
+    /// # Errors
+    /// Returns a description of a failure to write the remembered width.
+    fn remember_width(&self) -> Result<(), String> {
+        let Some(file) = &self.width_memory else {
+            return Ok(());
+        };
+        let write = || -> std::io::Result<()> {
+            if let Some(parent) = file.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // Replace the file whole so a concurrent reader never sees a partial write.
+            let temporary = file.with_extension(format!("{}.tmp", std::process::id()));
+            std::fs::write(&temporary, self.width.to_string())?;
+            std::fs::rename(&temporary, file)
+        };
+        write().map_err(|error| format!("remembering sidebar width in {}: {error}", file.display()))
     }
 
     fn resize(&mut self, rect: ExtensionRect) -> bool {
@@ -501,7 +574,7 @@ impl CompanionState {
         use bmux_tui::component::{ChildLayout, LayoutId, LayoutNode, LogicalSize};
         let mut content = LayoutNode::leaf(
             LayoutId::new("sidebar.items"),
-            LogicalSize::new(u64::from(self.settings.width), 0),
+            LogicalSize::new(u64::from(self.width), 0),
         );
         for index in 0..self.snapshot.tabs.len() {
             let item = self.measured_tab(index);
@@ -619,7 +692,7 @@ impl Plugin for SidebarPlugin {
     fn declare(d: &mut Declarations<Self>) {
         d.blocking_activate(|_, a0, a1| Self::activate(a0, a1))
             .blocking_services(|_, a0| Self::invoke_service(a0), None);
-        for name in VisibilityCommand::NAMES {
+        for name in VisibilityCommand::NAMES.into_iter().chain(WIDTH_COMMANDS) {
             d.blocking_command(name, |_, _| Err(presentation_only_command()));
         }
     }
@@ -645,11 +718,12 @@ impl SidebarPlugin {
     }
 }
 
-/// Reached only when no sidebar presentation answered a visibility command,
-/// for example from a shell or in a client without the sidebar installed.
+/// Reached only when no sidebar presentation answered a visibility or width
+/// command, for example from a shell or in a client without the sidebar
+/// installed.
 fn presentation_only_command() -> PluginCommandError {
     PluginCommandError::unavailable(
-        "sidebar visibility commands only apply inside an attach client showing the sidebar",
+        "sidebar visibility and width commands only apply inside an attach client showing the sidebar",
     )
 }
 
@@ -851,6 +925,7 @@ impl SidebarPresentation {
             &|endpoint, handler| input.register(endpoint, handler),
         );
         register_visibility_commands(&owner, &input);
+        register_width_commands(&owner, &input);
         Ok(Self {
             owner,
             layouts,
@@ -907,6 +982,63 @@ fn register_input_callbacks(
         input_endpoint(),
         std::sync::Arc::new(move |event| handle_local_input(&owner, event)),
     );
+}
+
+/// Commands that step the sidebar's width in this runtime.
+const WIDTH_COMMANDS: [&str; 2] = ["widen", "narrow"];
+
+/// Answer `widen` and `narrow` in this runtime: like visibility, the width
+/// one attach client shows is presentation state.
+fn register_width_commands(
+    owner: &CompanionHandle,
+    input: &bmux_plugin::AttachPresentationInputRegistry,
+) {
+    for name in WIDTH_COMMANDS {
+        let owner = std::sync::Arc::downgrade(owner);
+        input.register_command(
+            OWNER,
+            name,
+            std::sync::Arc::new(move |_| {
+                let Some(owner) = owner.upgrade() else {
+                    return AttachInputResult::default();
+                };
+                let Ok(mut guard) = owner.lock() else {
+                    return AttachInputResult::default();
+                };
+                guard
+                    .as_mut()
+                    .map_or_else(AttachInputResult::default, |companion| {
+                        step_width(companion, name == "widen")
+                    })
+            }),
+        );
+    }
+}
+
+/// Widen or narrow the sidebar by [`WIDTH_STEP`] cells and remember it.
+fn step_width(companion: &mut CompanionState, widen: bool) -> AttachInputResult {
+    let width = if widen {
+        companion.width.saturating_add(WIDTH_STEP)
+    } else {
+        companion.width.saturating_sub(WIDTH_STEP)
+    };
+    let changed = companion.set_width(width);
+    if changed {
+        // The edge moved out from under the pointer; the next move re-hovers it.
+        companion.edge_hovered = false;
+    }
+    let dirty = changed && companion.visible() && republish_width(companion, true);
+    let status_message = if changed {
+        companion.remember_width().err()
+    } else {
+        None
+    };
+    AttachInputResult {
+        consumed: true,
+        dirty,
+        status_message,
+        ..AttachInputResult::default()
+    }
 }
 
 /// Answer `toggle`, `show` and `hide` in this runtime: what one attach client
@@ -967,7 +1099,7 @@ fn apply_visibility(
     }
 }
 
-fn layout_request(settings: &Settings, visible: bool) -> PluginLayoutRequest {
+fn layout_request(settings: &Settings, width: u16, visible: bool) -> PluginLayoutRequest {
     let id = PluginLayoutId::new(OWNER, LAYOUT_ID);
     if !visible {
         return PluginLayoutRequest::hidden(id, settings.order);
@@ -980,7 +1112,7 @@ fn layout_request(settings: &Settings, visible: bool) -> PluginLayoutRequest {
             Placement::Right => LayoutEdge::Right,
         },
         LayoutExtent::Responsive {
-            preferred: settings.width,
+            preferred: width,
             collapsed: settings.collapsed_width,
             collapse_below: settings.collapse_below_width,
         },
@@ -992,7 +1124,7 @@ fn publish_layout(companion: &CompanionState) -> Result<(), String> {
     let Some(layouts) = companion.layouts.as_deref() else {
         return Ok(());
     };
-    let request = layout_request(&companion.settings, companion.visible());
+    let request = layout_request(&companion.settings, companion.width, companion.visible());
     if layouts.requests().contains(&request) {
         return Ok(());
     }
@@ -1407,6 +1539,31 @@ impl OverCard for RenderStyle {
     }
 }
 
+/// The owner-local region id of the resize edge.
+const RESIZE_EDGE_REGION: &str = "resize-edge";
+
+/// The column facing the panes, over the sidebar's height (its content's,
+/// `content_rows`, when it is content-sized); none when the sidebar is too
+/// narrow to spare one.
+fn resize_edge(state: &CompanionState, content_rows: u16) -> Option<ExtensionRect> {
+    let width = state.allocated_width();
+    if width < 3 {
+        return None;
+    }
+    let height = if state.settings.content_height {
+        content_rows.saturating_add(1)
+    } else {
+        state
+            .allocation
+            .map_or_else(|| content_rows.saturating_add(1), |rect| rect.h)
+    };
+    let x = match state.settings.placement {
+        Placement::Left => width - 1,
+        Placement::Right => 0,
+    };
+    Some(ExtensionRect::new(x, 0, 1, height.max(1)))
+}
+
 fn sidebar_region(
     id: Uuid,
     width: u16,
@@ -1576,6 +1733,27 @@ fn build_surface_with_hits(
         let rect = ExtensionRect::new(0, 0, width, row.saturating_add(1));
         ops[0] = RenderOp::fill_rect(rect, ' ', palette.base);
     }
+    if let Some(edge) = resize_edge(state, row) {
+        // Drawn while the pointer is on it or dragging it, so it is found
+        // where the resize cursor appears.
+        if state.edge_hovered || state.resize.is_some() {
+            for edge_row in edge.y..edge.y.saturating_add(edge.h) {
+                ops.push(RenderOp::text_run(
+                    edge.x,
+                    edge_row,
+                    "│",
+                    palette.accent.background_of(palette.base),
+                ));
+            }
+        }
+        // Last, so the edge wins over any card beneath it.
+        regions.push(
+            PluginSurfaceRegion::new(RESIZE_EDGE_REGION, edge)
+                .endpoint(input_endpoint())
+                .focusable(bmux_plugin::surface::PluginSurfaceCursor::ResizeHorizontal)
+                .key(hits.key(SidebarHit::ResizeEdge)),
+        );
+    }
     let mut surface = PluginSurface::layout(
         PluginSurfaceId::new(OWNER, SURFACE_ID, RETAINED_ID),
         revision,
@@ -1642,13 +1820,112 @@ fn subscribe_tab_status(
 /// was published with when it carries a typed key (a retired revision resolves
 /// to nothing), otherwise through its owner-local region id.
 fn hit_tab(companion: &CompanionState, event: &AttachInputEvent) -> Option<Uuid> {
+    match hit(companion, event)? {
+        SidebarHit::Tab(id) => Some(id),
+        SidebarHit::ResizeEdge => None,
+    }
+}
+
+/// What an event is addressed to, resolved like [`hit_tab`].
+fn hit(companion: &CompanionState, event: &AttachInputEvent) -> Option<SidebarHit> {
     let target = event.target.as_ref()?;
     match target.key {
-        Some(key) => match companion.hits.borrow().resolve(target.revision, key)? {
-            SidebarHit::Tab(id) => Some(*id),
-        },
-        None => region_tab_id(&target.region),
+        Some(key) => companion
+            .hits
+            .borrow()
+            .resolve(target.revision, key)
+            .copied(),
+        None if target.region == RESIZE_EDGE_REGION => Some(SidebarHit::ResizeEdge),
+        None => region_tab_id(&target.region).map(SidebarHit::Tab),
     }
+}
+
+/// Drag the resize edge: a left press on it captures the pointer, dragging
+/// moves it (the sidebar's width follows the pointer, within its minimum and
+/// maximum), and releasing remembers the width.
+fn update_resize(owner: &CompanionHandle, event: &AttachInputEvent) -> Option<AttachInputResult> {
+    if event.event_kind != "pointer" {
+        return None;
+    }
+    let mut guard = owner.lock().ok()?;
+    let companion = guard.as_mut()?;
+    // Where the pointer is on the screen: a drag past the sidebar's own
+    // edge has no surface column.
+    let screen_col = event.screen_col.or_else(|| {
+        let x = companion.allocation.map_or(0, |rect| rect.x);
+        event.col.map(|col| x.saturating_add(col))
+    })?;
+    let result = match (event.phase.as_str(), companion.resize) {
+        ("down", None)
+            if event.button.as_deref() == Some("left")
+                && hit(companion, event) == Some(SidebarHit::ResizeEdge) =>
+        {
+            companion.resize = Some(ResizeDrag {
+                start_col: screen_col,
+                start_width: companion.width,
+            });
+            AttachInputResult {
+                consumed: true,
+                preserve_focus: true,
+                capture_pointer: true,
+                // Republishing while dragging bumps the revision; keep the drag.
+                preserve_capture_across_revisions: true,
+                dirty: republish_width(companion, false),
+                ..AttachInputResult::default()
+            }
+        }
+        ("drag", Some(drag)) => {
+            let moved = i32::from(screen_col) - i32::from(drag.start_col);
+            let width = match companion.settings.placement {
+                Placement::Left => i32::from(drag.start_width) + moved,
+                Placement::Right => i32::from(drag.start_width) - moved,
+            };
+            let width = u16::try_from(width.max(0)).unwrap_or(u16::MAX);
+            let changed = companion.set_width(width);
+            AttachInputResult {
+                consumed: true,
+                preserve_focus: true,
+                dirty: changed && republish_width(companion, true),
+                ..AttachInputResult::default()
+            }
+        }
+        ("up", Some(_)) => {
+            companion.resize = None;
+            AttachInputResult {
+                consumed: true,
+                preserve_focus: true,
+                release_capture: true,
+                dirty: republish_width(companion, false),
+                status_message: companion.remember_width().err(),
+                ..AttachInputResult::default()
+            }
+        }
+        // The drag owns the pointer until it is released.
+        (_, Some(_)) => AttachInputResult {
+            consumed: true,
+            preserve_focus: true,
+            ..AttachInputResult::default()
+        },
+        _ => return None,
+    };
+    drop(guard);
+    Some(result)
+}
+
+/// Republish after a width or resize-edge change; `layout` when the width
+/// changed and the host must allocate it. Returns whether anything changed.
+fn republish_width(companion: &mut CompanionState, layout: bool) -> bool {
+    companion.revision = companion.revision.saturating_add(1).max(1);
+    let published = if layout {
+        companion.presentation_pending.set(true);
+        publish_layout(companion).and_then(|()| publish_companion(companion))
+    } else {
+        publish_companion(companion)
+    };
+    if let Err(error) = &published {
+        tracing::warn!(%error, "sidebar resize publication failed");
+    }
+    published.is_ok()
 }
 
 fn update_hover(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
@@ -1664,15 +1941,22 @@ fn update_hover(owner: &CompanionHandle, event: &AttachInputEvent) -> bool {
     let hovered = if event.phase == "leave" {
         None
     } else {
-        hit_tab(companion, event)
+        hit(companion, event)
     };
     let previous = companion.cursor.clone();
-    if !companion.cursor.set_hovered(hovered) {
+    let previous_edge = companion.edge_hovered;
+    companion.edge_hovered = hovered == Some(SidebarHit::ResizeEdge);
+    let tab = match hovered {
+        Some(SidebarHit::Tab(id)) => Some(id),
+        _ => None,
+    };
+    if !companion.cursor.set_hovered(tab) && previous_edge == companion.edge_hovered {
         return false;
     }
     companion.revision = companion.revision.saturating_add(1).max(1);
     if publish_companion(companion).is_err() {
         companion.cursor = previous;
+        companion.edge_hovered = previous_edge;
         return false;
     }
     true
@@ -1822,6 +2106,9 @@ fn handle_local_input(
             dirty: publish_companion(companion).is_ok(),
             ..AttachInputResult::default()
         });
+    }
+    if let Some(result) = update_resize(owner, event) {
+        return Some(result);
     }
     if let Some(result) = activate_tab(owner, event) {
         return Some(result);
@@ -2125,13 +2412,14 @@ mod tests {
 
     #[test]
     fn layout_request_places_sidebar_on_configured_edge_and_order() {
-        let left = layout_request(&shown_settings(), true);
+        let left = layout_request(&shown_settings(), 28, true);
         let right = layout_request(
             &Settings {
                 placement: Placement::Right,
                 order: 50,
                 ..shown_settings()
             },
+            28,
             true,
         );
         assert!(matches!(
@@ -2734,6 +3022,8 @@ mod tests {
             modifiers: bmux_plugin::render::AttachInputModifiers::default(),
             focused_pane: None,
             hovered_pane: None,
+            screen_col: None,
+            screen_row: None,
         };
         let rejected = super::handle_local_input(&owner, &event).unwrap();
         assert!(rejected.consumed);
@@ -2802,6 +3092,205 @@ mod tests {
         }
     }
 
+    /// A sidebar installed like an attach client's, shown at `placement`
+    /// and allocated `rect`, remembering its width in `state_dir`.
+    struct Installed {
+        _presentation: SidebarPresentation,
+        layouts: std::sync::Arc<bmux_plugin::layout::PluginLayoutRegistry>,
+        allocations: std::sync::Arc<bmux_plugin::layout::AllocationRegistry>,
+        input: std::sync::Arc<bmux_plugin::AttachPresentationInputRegistry>,
+        surfaces: std::sync::Arc<bmux_plugin::surface::PluginSurfaceRegistry>,
+    }
+
+    impl Installed {
+        fn new(placement: &str, rect: ExtensionRect, state_dir: &std::path::Path) -> Self {
+            let layouts = std::sync::Arc::new(bmux_plugin::layout::PluginLayoutRegistry::new(4));
+            let allocations =
+                std::sync::Arc::new(bmux_plugin::layout::AllocationRegistry::default());
+            let input = std::sync::Arc::new(bmux_plugin::AttachPresentationInputRegistry::new());
+            let surfaces = std::sync::Arc::new(bmux_plugin::surface::PluginSurfaceRegistry::new(4));
+            let mut settings = toml::map::Map::new();
+            settings.insert("visible".into(), toml::Value::Boolean(true));
+            settings.insert("placement".into(), toml::Value::String(placement.into()));
+            let presentation = SidebarPresentation::install_with_state(
+                Some(&toml::Value::Table(settings)),
+                layouts.clone(),
+                allocations.clone(),
+                input.clone(),
+                surfaces.clone(),
+                Some(state_dir.to_path_buf()),
+            )
+            .unwrap();
+            allocations.notify(&PluginLayoutId::new(OWNER, LAYOUT_ID), rect);
+            Self {
+                _presentation: presentation,
+                layouts,
+                allocations,
+                input,
+                surfaces,
+            }
+        }
+
+        /// The width the sidebar asks the host for.
+        fn requested_width(&self) -> u16 {
+            self.layouts
+                .requests()
+                .into_iter()
+                .find_map(|request| match request.operation {
+                    bmux_plugin::layout::LayoutOperation::Split {
+                        extent: LayoutExtent::Responsive { preferred, .. },
+                        ..
+                    } => Some(preferred),
+                    _ => None,
+                })
+                .expect("a split request")
+        }
+
+        /// The published resize edge region.
+        fn edge(&self) -> bmux_plugin::surface::PluginSurfaceRegion {
+            self.surfaces
+                .owner_snapshot(OWNER)
+                .unwrap()
+                .surfaces
+                .into_iter()
+                .flat_map(|surface| surface.interactive_regions)
+                .find(|region| region.local_id == RESIZE_EDGE_REGION)
+                .expect("a resize edge")
+        }
+
+        /// The host allocating a new width, as it does after the request
+        /// changes.
+        fn reallocate(&self, rect: ExtensionRect) {
+            self.allocations
+                .notify(&PluginLayoutId::new(OWNER, LAYOUT_ID), rect);
+        }
+
+        /// A left-button pointer event on the edge at screen column `col`.
+        fn pointer(&self, phase: &str, col: u16) -> bmux_plugin::AttachPresentationInputDispatch {
+            let edge = self.edge();
+            let event = AttachInputEvent {
+                target: Some(bmux_plugin::AttachInputTarget {
+                    surface: SURFACE_ID.to_string(),
+                    region: RESIZE_EDGE_REGION.to_string(),
+                    revision: 0,
+                    key: None,
+                }),
+                hook_id: format!("{OWNER}:{SURFACE_ID}:{RESIZE_EDGE_REGION}"),
+                event_kind: "pointer".to_string(),
+                phase: phase.to_string(),
+                key: None,
+                button: Some("left".to_string()),
+                col: Some(edge.rect.x),
+                row: Some(3),
+                wheel_delta: 0,
+                modifiers: bmux_plugin::render::AttachInputModifiers::default(),
+                focused_pane: None,
+                hovered_pane: None,
+                screen_col: Some(col),
+                screen_row: Some(3),
+            };
+            self.input.dispatch(&input_endpoint(), &event)
+        }
+
+        fn handled(&self, phase: &str, col: u16) -> AttachInputResult {
+            match self.pointer(phase, col) {
+                bmux_plugin::AttachPresentationInputDispatch::Handled(result) => result,
+                _ => panic!("{phase} at {col} was not handled"),
+            }
+        }
+    }
+
+    fn scratch_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bmux-sidebar-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The edge facing the panes shows the resize cursor, and dragging it
+    /// sets the width the sidebar asks for, kept within its bounds, which the
+    /// next start remembers.
+    #[test]
+    fn dragging_the_edge_resizes_the_sidebar_and_remembers_it() {
+        let dir = scratch_dir();
+        let sidebar = Installed::new("left", ExtensionRect::new(0, 0, 28, 20), &dir);
+        let edge = sidebar.edge();
+        assert_eq!((edge.rect.x, edge.rect.w, edge.rect.h), (27, 1, 20));
+        assert_eq!(
+            edge.cursor,
+            bmux_plugin::surface::PluginSurfaceCursor::ResizeHorizontal
+        );
+
+        let pressed = sidebar.handled("down", 27);
+        assert!(pressed.consumed && pressed.capture_pointer);
+        // Past the sidebar into the panes: wider by as much as the pointer moved.
+        assert!(sidebar.handled("drag", 39).consumed);
+        assert_eq!(sidebar.requested_width(), 40);
+        sidebar.reallocate(ExtensionRect::new(0, 0, 40, 20));
+        // Within the maximum and the minimum, however far it goes.
+        sidebar.handled("drag", 500);
+        assert_eq!(sidebar.requested_width(), 60);
+        sidebar.handled("drag", 0);
+        assert_eq!(sidebar.requested_width(), 16);
+        sidebar.handled("drag", 33);
+        assert_eq!(sidebar.requested_width(), 34);
+        let released = sidebar.handled("up", 33);
+        assert!(released.release_capture && released.status_message.is_none());
+        // Once released, a drag is no longer the sidebar's.
+        assert!(!matches!(
+            sidebar.pointer("drag", 50),
+            bmux_plugin::AttachPresentationInputDispatch::Handled(result) if result.consumed
+        ));
+        assert_eq!(sidebar.requested_width(), 34);
+
+        drop(sidebar);
+        let again = Installed::new("left", ExtensionRect::new(0, 0, 34, 20), &dir);
+        assert_eq!(again.requested_width(), 34);
+        drop(again);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// On the right, the edge is the sidebar's first column, and dragging it
+    /// left (past the sidebar, where it has no column of its own) widens it.
+    #[test]
+    fn a_right_sidebar_widens_when_its_edge_is_dragged_left() {
+        let dir = scratch_dir();
+        let sidebar = Installed::new("right", ExtensionRect::new(72, 0, 28, 20), &dir);
+        assert_eq!(sidebar.edge().rect.x, 0);
+        sidebar.handled("down", 72);
+        sidebar.handled("drag", 62);
+        assert_eq!(sidebar.requested_width(), 38);
+        sidebar.handled("drag", 80);
+        assert_eq!(sidebar.requested_width(), 20);
+        sidebar.handled("up", 80);
+        drop(sidebar);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `widen` and `narrow` step the width within its bounds and remember it.
+    #[test]
+    fn widen_and_narrow_commands_step_the_width() {
+        let dir = scratch_dir();
+        let sidebar = Installed::new("left", ExtensionRect::new(0, 0, 28, 20), &dir);
+        let run = |name: &str| sidebar.input.command(OWNER, name, &[]).unwrap();
+        assert!(run("widen").consumed);
+        assert_eq!(sidebar.requested_width(), 30);
+        run("narrow");
+        run("narrow");
+        assert_eq!(sidebar.requested_width(), 26);
+        for _ in 0..20 {
+            run("narrow");
+        }
+        assert_eq!(sidebar.requested_width(), 16);
+        drop(sidebar);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(WIDTH_FILE))
+                .unwrap()
+                .trim(),
+            "16"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// Clicking a tab's card, or pressing Enter on it, switches to that tab
     /// when the input arrives the way the attach client routes it: through
     /// the presentation's registered endpoint.
@@ -2835,6 +3324,8 @@ mod tests {
                 modifiers: bmux_plugin::render::AttachInputModifiers::default(),
                 focused_pane: None,
                 hovered_pane: None,
+                screen_col: None,
+                screen_row: None,
             };
         for event in [
             event("pointer", "down", Some("left"), None),
@@ -2892,6 +3383,8 @@ mod tests {
             modifiers: bmux_plugin::render::AttachInputModifiers::default(),
             focused_pane: None,
             hovered_pane: None,
+            screen_col: None,
+            screen_row: None,
         };
         assert_eq!(
             hit_tab(&state, &event(Some(target.clone()))),
@@ -2912,6 +3405,15 @@ mod tests {
             region_tab_id(&tab_region_id(Uuid::from_u128(5))),
             Some(Uuid::from_u128(5))
         );
+    }
+
+    /// The surface's tab card regions, without the resize edge.
+    fn tab_regions(surface: &PluginSurface) -> Vec<&bmux_plugin::surface::PluginSurfaceRegion> {
+        surface
+            .interactive_regions
+            .iter()
+            .filter(|region| region.local_id.starts_with("tab:"))
+            .collect()
     }
 
     /// The surface's text, row by row, as text runs paint it.
@@ -3277,6 +3779,8 @@ mod tests {
             modifiers: bmux_plugin::render::AttachInputModifiers::default(),
             focused_pane: None,
             hovered_pane: None,
+            screen_col: None,
+            screen_row: None,
         };
         let hovered = |owner: &CompanionHandle| {
             owner
@@ -3335,6 +3839,8 @@ mod tests {
             modifiers: bmux_plugin::render::AttachInputModifiers::default(),
             focused_pane: None,
             hovered_pane: None,
+            screen_col: None,
+            screen_row: None,
         };
         assert!(!update_hover(&owner, &event));
         assert_eq!(
@@ -3408,13 +3914,13 @@ mod tests {
             1,
         );
         let surface = build_surface(&state, 1);
-        assert_eq!(surface.interactive_regions.len(), 2);
+        assert_eq!(tab_regions(&surface).len(), 2);
         assert_eq!(
-            surface.interactive_regions[0].rect,
+            tab_regions(&surface)[0].rect,
             ExtensionRect::new(1, 1, state.settings.width - 2, 1)
         );
         assert_eq!(
-            surface.interactive_regions[1].rect,
+            tab_regions(&surface)[1].rect,
             ExtensionRect::new(1, 2, state.settings.width - 2, 1)
         );
         assert!(
@@ -3429,7 +3935,7 @@ mod tests {
         );
         state.reveal(2);
         assert_eq!(state.scroll.vertical_offset(), 4);
-        assert_eq!(build_surface(&state, 2).interactive_regions.len(), 1);
+        assert_eq!(tab_regions(&build_surface(&state, 2)).len(), 1);
         assert!(state.resize(ExtensionRect::new(0, 0, 12, 5)));
         assert_eq!(state.scroll_layout().size.height, 3);
         assert_eq!(state.allocated_width(), 12);
@@ -3437,8 +3943,8 @@ mod tests {
         assert!(!state.resize(ExtensionRect::new(0, 0, 12, 5)));
         assert!(state.resize(ExtensionRect::new(0, 0, 12, 1)));
         assert_eq!(
-            build_surface(&state, 3).interactive_regions,
-            [] as [bmux_plugin::surface::PluginSurfaceRegion; 0]
+            tab_regions(&build_surface(&state, 3)),
+            [] as [&bmux_plugin::surface::PluginSurfaceRegion; 0]
         );
     }
 
@@ -3463,9 +3969,9 @@ mod tests {
         });
         assert_eq!(state.scroll.vertical_offset(), 3);
         let surface = build_surface(&state, 1);
-        assert_eq!(surface.interactive_regions.len(), 2);
+        assert_eq!(tab_regions(&surface).len(), 2);
         assert_eq!(
-            surface.interactive_regions[1].local_id,
+            tab_regions(&surface)[1].local_id,
             format!("tab:{}", Uuid::from_u128(4))
         );
     }
@@ -3570,7 +4076,7 @@ mod tests {
             }],
             revision: 1,
         });
-        assert_eq!(build_surface(&state, 1).interactive_regions.len(), 1);
+        assert_eq!(tab_regions(&build_surface(&state, 1)).len(), 1);
 
         state.replace_tabs(tabs_list::TabListSnapshot {
             tabs: (0..2_000)
@@ -3585,7 +4091,7 @@ mod tests {
             revision: 2,
         });
         let surface = build_surface(&state, 2);
-        assert_eq!(surface.interactive_regions.len(), 32);
+        assert_eq!(tab_regions(&surface).len(), 32);
         assert_eq!(state.scroll.vertical_offset(), 1_968);
     }
 

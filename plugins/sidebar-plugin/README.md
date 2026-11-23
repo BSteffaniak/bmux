@@ -59,7 +59,7 @@ only ever runs in the directory the shell itself reports, with
 ```toml
 [plugins.settings."bmux.sidebar"]
 placement = "left" # or "right"
-width = 28
+width = 28         # until you resize it
 minimum_width = 16
 maximum_width = 60
 order = 200
@@ -74,6 +74,7 @@ collapse_below_width = 80
 collapsed_width = 8
 visible = false            # closed when a client attaches
 remember_visibility = false # start from the last state set on this machine
+remember_width = true       # start from the width last resized to on this machine
 ```
 
 Templates support `{state_icon}`, `{state}`, `{name}`, `{command}`, `{cwd}`,
@@ -90,3 +91,10 @@ resolver with the independent tab-bar plugin.
 Show or hide it in one attach client with `plugin:bmux.sidebar:toggle`
 (`ctrl+alt+s` by default), `plugin:bmux.sidebar:show` or
 `plugin:bmux.sidebar:hide`. See `docs/tab-presentations.md` for details.
+
+Resize it by dragging the edge that faces the panes (the pointer shows a resize
+cursor there, on terminals that support OSC 22 pointer shapes), or with
+`plugin:bmux.sidebar:widen` and `plugin:bmux.sidebar:narrow` (`ctrl+a >` and
+`ctrl+a <` by default, two cells per press; hold to repeat). The width stays
+within `minimum_width` and `maximum_width`, and is remembered on this machine
+unless `remember_width = false`.

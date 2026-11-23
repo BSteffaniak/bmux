@@ -179,6 +179,8 @@ pub(super) fn event_from_wire(value: wire::InputEvent) -> bmux_plugin::AttachInp
         modifiers: modifiers_from_wire(&value.modifiers),
         focused_pane: value.focused_pane.as_ref().map(pane_from_wire),
         hovered_pane: value.hovered_pane.as_ref().map(pane_from_wire),
+        screen_col: None,
+        screen_row: None,
     }
 }
 
@@ -288,6 +290,8 @@ mod tests {
                 },
             }),
             hovered_pane: None,
+            screen_col: None,
+            screen_row: None,
         }
     }
 

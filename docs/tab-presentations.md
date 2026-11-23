@@ -56,6 +56,11 @@ attached. Each plugin has `toggle`, `show` and `hide` commands:
 | `plugin:bmux.sidebar:show`   | (unbound)    |
 | `plugin:bmux.sidebar:hide`   | (unbound)    |
 
+The sidebar can also be resized: drag the edge facing the panes, or use
+`plugin:bmux.sidebar:widen` (`ctrl+a >`) and `plugin:bmux.sidebar:narrow`
+(`ctrl+a <`). Its width is remembered on this machine unless
+`remember_width = false`.
+
 They are also listed in the command palette. Visibility belongs to one attach
 client: hiding the sidebar in one terminal leaves other clients of the same
 session as they were. A hidden presentation gives its rows or columns back to

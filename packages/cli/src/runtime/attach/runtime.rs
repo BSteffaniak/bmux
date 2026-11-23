@@ -14822,6 +14822,8 @@ async fn invoke_plugin_surface_pointer_event(
         key: None,
         col: Some(event.hit.surface_x),
         row: Some(event.hit.surface_y),
+        screen_col: Some(event.hit.absolute_x),
+        screen_row: Some(event.hit.absolute_y),
         wheel_delta: event.wheel_delta,
         modifiers: AttachInputModifiers {
             control: modifiers.contains(KeyModifiers::CONTROL),
@@ -15031,6 +15033,8 @@ fn dispatch_presentation_escape(view_state: &mut AttachViewState, key_name: &str
             modifiers: AttachInputModifiers::default(),
             focused_pane: None,
             hovered_pane: None,
+            screen_col: None,
+            screen_row: None,
         };
         if let Some(result) = view_state.presentation_input.shortcut(&input) {
             if result.dirty {
@@ -15096,6 +15100,8 @@ async fn try_handle_plugin_surface_key(
         },
         focused_pane: attach_input_focused_context(view_state),
         hovered_pane: None,
+        screen_col: None,
+        screen_row: None,
     };
     let result = match view_state.presentation_input.dispatch(&endpoint, &input) {
         bmux_plugin::AttachPresentationInputDispatch::Handled(result) => result,
@@ -15573,6 +15579,8 @@ async fn try_handle_captured_attach_input_hook_mouse(
             mouse_event.column,
             mouse_event.row,
         ),
+        screen_col: None,
+        screen_row: None,
     };
     let result = match invoke_attach_input_hook(
         client,
@@ -15632,6 +15640,8 @@ async fn try_handle_uncaptured_attach_input_hook_mouse(
             modifiers: attach_input_event_modifiers(mouse_event.modifiers),
             focused_pane: focused.clone(),
             hovered_pane: hovered.clone(),
+            screen_col: None,
+            screen_row: None,
         };
         let result =
             invoke_attach_input_hook(client, &view_state.presentation_extensions, &hook, event)
@@ -15699,6 +15709,8 @@ async fn try_handle_attach_input_hook_key(
             },
             focused_pane: focused.clone(),
             hovered_pane: None,
+            screen_col: None,
+            screen_row: None,
         };
         let result =
             invoke_attach_input_hook(client, &view_state.presentation_extensions, &hook, event)
@@ -18510,6 +18522,8 @@ mod tests {
                 modifiers: bmux_plugin::AttachInputModifiers::default(),
                 focused_pane: None,
                 hovered_pane: None,
+                screen_col: None,
+                screen_row: None,
             };
             let viewport = DamageRect::new(0, 0, 80, 24);
             let surfaces = super::retained_plugin_surfaces(&state, viewport);
@@ -22823,6 +22837,8 @@ mod tests {
             modifiers: AttachInputModifiers::default(),
             focused_pane: None,
             hovered_pane: None,
+            screen_col: None,
+            screen_row: None,
         };
         assert!(
             matches!(invoke_remote_input(&mut client, &registry, &LocalCodec.endpoint(), &event).await,
@@ -22851,6 +22867,8 @@ mod tests {
             modifiers: AttachInputModifiers::default(),
             focused_pane: None,
             hovered_pane: None,
+            screen_col: None,
+            screen_row: None,
         };
         assert!(matches!(
             invoke_remote_input(

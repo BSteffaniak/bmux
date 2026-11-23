@@ -34,6 +34,28 @@ name          = "hide"
 path          = ["sidebar", "hide"]
 summary       = "Hide the sidebar in this client"
 
+# Width commands are answered the same way; the width is remembered.
+[[commands]]
+accepts_repeat = true
+execution      = "caller_process"
+expose_in_cli  = false
+name           = "widen"
+path           = ["sidebar", "widen"]
+summary        = "Widen the sidebar in this client"
+
+[[commands]]
+accepts_repeat = true
+execution      = "caller_process"
+expose_in_cli  = false
+name           = "narrow"
+path           = ["sidebar", "narrow"]
+summary        = "Narrow the sidebar in this client"
+
 # Global so it works in the default modal keymap's INSERT mode.
 [keybindings.global]
 "ctrl+alt+s" = "plugin:bmux.sidebar:toggle"
+
+# After the prefix, like the tabs plugin's tab bindings.
+[keybindings.runtime]
+'<' = "plugin:bmux.sidebar:narrow"
+'>' = "plugin:bmux.sidebar:widen"

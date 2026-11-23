@@ -203,7 +203,7 @@ pub struct AttachInputKeyModes {
     pub bracketed_paste: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AttachInputEvent {
     pub hook_id: String,
     pub event_kind: String,
@@ -215,6 +215,14 @@ pub struct AttachInputEvent {
     /// Signed wheel movement for pointer wheel events; zero otherwise.
     #[serde(default)]
     pub wheel_delta: i16,
+    /// The pointer's column on the attach viewport, for pointer events.
+    /// Unlike `col`, it is not relative to the surface, so a captured drag
+    /// that leaves the surface on any side keeps its true position.
+    #[serde(default)]
+    pub screen_col: Option<u16>,
+    /// The pointer's row on the attach viewport, for pointer events.
+    #[serde(default)]
+    pub screen_row: Option<u16>,
     pub modifiers: AttachInputModifiers,
     pub focused_pane: Option<AttachInputPaneContext>,
     pub hovered_pane: Option<AttachInputPaneContext>,

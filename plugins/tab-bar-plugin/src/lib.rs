@@ -2871,6 +2871,8 @@ mod tests {
             modifiers: bmux_plugin::AttachInputModifiers::default(),
             focused_pane: None,
             hovered_pane: None,
+            screen_col: None,
+            screen_row: None,
         };
         assert!(region.key.is_some());
         assert_eq!(hit(companion, &event), Some(TabBarHit::Tab(id)));
@@ -2919,6 +2921,8 @@ mod tests {
             modifiers: bmux_plugin::AttachInputModifiers::default(),
             focused_pane: None,
             hovered_pane: None,
+            screen_col: None,
+            screen_row: None,
         };
         let revision = presentation
             .owner
@@ -2980,13 +2984,9 @@ mod tests {
             event_kind: "pointer".to_string(),
             phase: "down".to_string(),
             button: Some("right".to_string()),
-            key: None,
             col: Some(3),
             row: Some(0),
-            wheel_delta: 0,
-            modifiers: bmux_plugin::AttachInputModifiers::default(),
-            focused_pane: None,
-            hovered_pane: None,
+            ..AttachInputEvent::default()
         };
         assert!(
             first_resources
@@ -3190,6 +3190,8 @@ mod tests {
             modifiers: bmux_plugin::AttachInputModifiers::default(),
             focused_pane: None,
             hovered_pane: None,
+            screen_col: None,
+            screen_row: None,
         };
         for resources in [&first_resources, &second_resources, &first_resources] {
             resources.input.committed(
@@ -3306,13 +3308,7 @@ mod tests {
             event_kind: "pointer".into(),
             phase: "down".into(),
             button: Some("right".into()),
-            key: None,
-            col: None,
-            row: None,
-            wheel_delta: 0,
-            modifiers: bmux_plugin::AttachInputModifiers::default(),
-            focused_pane: None,
-            hovered_pane: None,
+            ..AttachInputEvent::default()
         };
         let opened = first_resources
             .input
@@ -3838,6 +3834,8 @@ width = 60
             modifiers: bmux_plugin::AttachInputModifiers::default(),
             focused_pane: None,
             hovered_pane: None,
+            screen_col: None,
+            screen_row: None,
         };
         let opened = fixture
             .resources
@@ -4389,6 +4387,8 @@ bar_bg = "#112233"
             modifiers: bmux_plugin::AttachInputModifiers::default(),
             focused_pane: None,
             hovered_pane: None,
+            screen_col: None,
+            screen_row: None,
         };
         commit_scroll_projection(&owner);
         assert!(handle_local_input(&owner, &event).unwrap().consumed);

@@ -593,6 +593,8 @@ mod tests {
             modifiers: bmux_plugin::AttachInputModifiers::default(),
             focused_pane: None,
             hovered_pane: None,
+            screen_col: None,
+            screen_row: None,
         }
     }
 

@@ -7137,6 +7137,8 @@ mod tests {
             modifiers: bmux_plugin::AttachInputModifiers::default(),
             focused_pane: None,
             hovered_pane: None,
+            screen_col: None,
+            screen_row: None,
         };
         assert!(resources.input.invoke(&endpoint, &event).unwrap().consumed);
         let revision = resources

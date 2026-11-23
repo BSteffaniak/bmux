@@ -367,6 +367,8 @@ mod tests {
             modifiers: crate::AttachInputModifiers::default(),
             focused_pane: None,
             hovered_pane: None,
+            screen_col: None,
+            screen_row: None,
         }
     }
 
@@ -477,6 +479,8 @@ mod tests {
             modifiers: crate::AttachInputModifiers::default(),
             focused_pane: None,
             hovered_pane: None,
+            screen_col: None,
+            screen_row: None,
         };
         assert!(registry.invoke(&endpoint, &event).unwrap().consumed);
     }
