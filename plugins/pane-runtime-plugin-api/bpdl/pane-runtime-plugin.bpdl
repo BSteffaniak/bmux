@@ -596,6 +596,44 @@ interface pane-runtime-state {
         commands: list<string>,
     }
 
+    // What a pane's program last signalled beyond its screen, kept as state:
+    // a reader sees the current values even if it missed the terminal events.
+    // `revision` changes whenever any of them does; `screen-revision` whenever
+    // the screen's content does (not for cursor moves or redraws that change
+    // nothing).
+    record pane-signals {
+        session-id: uuid,
+        pane-id: uuid,
+        revision: u64,
+        // The last title (OSC 0/2).
+        title: string?,
+        // The last working directory reported with OSC 7, as sent.
+        working-directory: string?,
+        // The last OSC 9;4 progress, from the `4`.
+        progress: string?,
+        // The last finished command's exit status (OSC 133 D); cleared when a
+        // command starts (OSC 133 C).
+        exit-status: u32?,
+        // How many notifications (OSC 9/777) it sent, and the last one.
+        notifications: u64,
+        last-notification: string?,
+        // How many times it rang the bell.
+        bells: u64,
+        // The last state a program in the pane reported for itself (an agent
+        // through its hooks), and how many reports there were.
+        report: pane-agent-report?,
+        reports: u64,
+        screen-revision: u64,
+    }
+
+    // A program's report of its own state: `state` as sent (`working`,
+    // `blocked`, `idle` or `release`).
+    record pane-agent-report {
+        state: string,
+        agent: string?,
+        message: string?,
+    }
+
     // The rows a pane shows, as text with trailing blanks trimmed.
     // `revision` changes whenever the screen may have.
     record pane-screen-text {
@@ -667,6 +705,8 @@ interface pane-runtime-state {
     // Every pane's foreground job; panes whose shell is in the foreground
     // are left out.
     query list-foreground-jobs() -> result<list<foreground-job>, pane-state-error>;
+    // Every pane's retained signals.
+    query list-pane-signals() -> result<list<pane-signals>, pane-state-error>;
     query pane-screen-text(session_id: uuid, pane_id: uuid)
         -> result<pane-screen-text, pane-state-error>;
 }

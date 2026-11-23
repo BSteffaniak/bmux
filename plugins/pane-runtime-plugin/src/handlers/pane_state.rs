@@ -3,7 +3,7 @@
 use bmux_client_state::FollowStateHandle;
 use bmux_pane_runtime_plugin_api::pane_runtime_state::{
     FloatingPaneList, FloatingPaneSummary, ForegroundJob, PaneProcessIdentity, PaneProcessList,
-    PaneScreenText, PaneStateError, PaneSummary, SessionPaneList,
+    PaneAgentReport, PaneScreenText, PaneSignals, PaneStateError, PaneSummary, SessionPaneList,
 };
 use bmux_pane_runtime_state::{FloatingPaneLayer, FloatingPaneScope};
 use bmux_plugin_sdk::NativeServiceContext;
@@ -205,6 +205,38 @@ pub fn list_foreground_jobs(
             pane_id: job.pane_id,
             process_group_id: job.process_group_id,
             commands: job.commands,
+        })
+        .collect())
+}
+
+pub fn list_pane_signals(
+    host: &crate::runtime::PaneRuntimeHost,
+) -> Result<Vec<PaneSignals>, PaneStateError> {
+    let handle = host
+        .registered_session_runtime()
+        .ok_or(PaneStateError::SessionNotFound)?;
+    Ok(handle
+        .0
+        .pane_signals()
+        .into_iter()
+        .map(|signals| PaneSignals {
+            session_id: signals.session_id.0,
+            pane_id: signals.pane_id,
+            revision: signals.revision,
+            title: signals.title,
+            working_directory: signals.working_directory,
+            progress: signals.progress,
+            exit_status: signals.exit_status,
+            notifications: signals.notifications,
+            last_notification: signals.last_notification,
+            bells: signals.bells,
+            report: signals.report.map(|report| PaneAgentReport {
+                state: report.state,
+                agent: report.agent,
+                message: report.message,
+            }),
+            reports: signals.reports,
+            screen_revision: signals.screen_revision,
         })
         .collect())
 }

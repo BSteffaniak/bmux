@@ -292,6 +292,9 @@ fn route_authorized(
         "pane-runtime-state", "list-foreground-jobs" => |_req: (), _ctx| {
             Ok::<_, ServiceResponse>(pane_state::list_foreground_jobs(host))
         },
+        "pane-runtime-state", "list-pane-signals" => |_req: (), _ctx| {
+            Ok::<_, ServiceResponse>(pane_state::list_pane_signals(host))
+        },
         "pane-runtime-state", "pane-screen-text" => |req: pane_state::PaneScreenTextArgs, _ctx| {
             Ok::<_, ServiceResponse>(pane_state::pane_screen_text(host, &req))
         },

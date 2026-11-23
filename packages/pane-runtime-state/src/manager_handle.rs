@@ -222,6 +222,46 @@ pub struct ForegroundJob {
     pub commands: Vec<String>,
 }
 
+/// What a pane's program last signalled beyond its screen, kept as state so
+/// readers see current values rather than depending on catching every event.
+/// `revision` changes whenever any of them does; `screen_revision` whenever
+/// the screen's content does (not for cursor moves or redraws that change
+/// nothing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneSignals {
+    pub session_id: SessionId,
+    pub pane_id: Uuid,
+    pub revision: u64,
+    /// The last title (OSC 0/2).
+    pub title: Option<String>,
+    /// The last working directory reported with OSC 7, as sent.
+    pub working_directory: Option<String>,
+    /// The last OSC 9;4 progress, from the `4`.
+    pub progress: Option<String>,
+    /// The last finished command's exit status (OSC 133 D); cleared when a
+    /// command starts (OSC 133 C).
+    pub exit_status: Option<u32>,
+    /// How many notifications (OSC 9/777) it has sent, and the last one.
+    pub notifications: u64,
+    pub last_notification: Option<String>,
+    /// How many times it rang the bell.
+    pub bells: u64,
+    /// The last state a program in the pane reported for itself (an agent
+    /// through its hooks), and how many reports there were.
+    pub report: Option<PaneAgentReport>,
+    pub reports: u64,
+    pub screen_revision: u64,
+}
+
+/// A program's report of its own state: `state` as sent (`working`,
+/// `blocked`, `idle` or `release`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneAgentReport {
+    pub state: String,
+    pub agent: Option<String>,
+    pub message: Option<String>,
+}
+
 /// The rows a pane shows, as text with trailing blanks trimmed. `revision`
 /// changes whenever the screen may have.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -491,6 +531,10 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
     fn list_pane_processes(&self) -> Vec<PaneProcessIdentity>;
     /// Every pane's foreground job (see [`ForegroundJob`]).
     fn foreground_jobs(&self) -> Vec<ForegroundJob> {
+        Vec::new()
+    }
+    /// Every pane's retained signals (see [`PaneSignals`]).
+    fn pane_signals(&self) -> Vec<PaneSignals> {
         Vec::new()
     }
     /// The text a pane shows.

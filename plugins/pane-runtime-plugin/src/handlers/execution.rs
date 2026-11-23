@@ -55,6 +55,9 @@ const HOST_INTERNAL_READS: &[(&str, &str, &str)] = &[
     // Agent detection: what runs in each pane's foreground and what it shows.
     ("bmux.agents", "pane-runtime-state", "list-foreground-jobs"),
     ("bmux.agents", "pane-runtime-state", "pane-screen-text"),
+    ("bmux.agents", "pane-runtime-state", "list-pane-signals"),
+    // Tab status: what each pane signalled (title, directory, attention).
+    ("bmux.tabs", "pane-runtime-state", "list-pane-signals"),
 ];
 
 pub(super) fn authorize_route(ctx: &NativeServiceContext) -> Result<(), ServiceResponse> {
@@ -373,6 +376,8 @@ mod tests {
             ("bmux.tabs", "list-panes", "bmux.agents"),
             ("bmux.agents", "list-foreground-jobs", "bmux.tabs"),
             ("bmux.agents", "pane-screen-text", "bmux.tabs"),
+            ("bmux.agents", "list-pane-signals", "bmux.decoration"),
+            ("bmux.tabs", "list-pane-signals", "bmux.decoration"),
         ] {
             *origin.lock().unwrap() = StreamProvenance::HostInternal;
             let mut ctx = context("pane-runtime-state", operation, Vec::new());

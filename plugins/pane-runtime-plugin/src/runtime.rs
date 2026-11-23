@@ -2180,6 +2180,8 @@ struct PaneRuntimeHandle {
     input_tx: mpsc::UnboundedSender<PaneRuntimeCommand>,
     output_buffer: Arc<switchy_thread::sync::Mutex<OutputFanoutBuffer>>,
     terminal_grid: Arc<switchy_thread::sync::Mutex<TerminalGridStream>>,
+    /// What the pane's program last signalled beyond its screen.
+    signals: Arc<switchy_thread::sync::Mutex<RetainedPaneSignals>>,
     /// Each attached client's replica of the grid: what it was last sent frames from.
     frame_replicas: Arc<switchy_thread::sync::Mutex<BTreeMap<ClientId, PaneFrameReplica>>>,
     exited: Arc<AtomicBool>,
@@ -2630,6 +2632,84 @@ impl ReaderFilters for &bmux_terminal_grid::SequenceFilters {
     ) -> FilterVerdict {
         bmux_terminal_grid::SequenceFilters::filter_esc(self, intermediates, byte, replacement)
     }
+}
+
+/// What a pane's program last signalled beyond its screen (see
+/// [`bmux_pane_runtime_state::PaneSignals`]), kept so readers see current
+/// values even when they missed the events.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct RetainedPaneSignals {
+    revision: u64,
+    title: Option<String>,
+    working_directory: Option<String>,
+    progress: Option<String>,
+    /// The last finished command's exit status; cleared when one starts.
+    exit_status: Option<u32>,
+    notifications: u64,
+    last_notification: Option<String>,
+    bells: u64,
+    /// The last state a program in the pane reported for itself, and how many
+    /// reports there were.
+    report: Option<bmux_pane_runtime_state::PaneAgentReport>,
+    reports: u64,
+}
+
+impl RetainedPaneSignals {
+    /// Keep a program's report of its own state.
+    fn report(&mut self, state: &str, agent: Option<&str>, message: Option<&str>) {
+        self.report = Some(bmux_pane_runtime_state::PaneAgentReport {
+            state: state.to_string(),
+            agent: agent.map(str::to_string),
+            message: message.map(str::to_string),
+        });
+        self.reports = self.reports.wrapping_add(1);
+        self.revision = self.revision.wrapping_add(1);
+    }
+
+    /// Keep what `signal` says; returns whether anything changed.
+    fn apply(&mut self, signal: &PaneSignal) -> bool {
+        let changed = match signal {
+            PaneSignal::Title(title) => replace_if_changed(&mut self.title, title),
+            PaneSignal::Progress(value) => replace_if_changed(&mut self.progress, value),
+            PaneSignal::Notification { title, body } => {
+                self.notifications = self.notifications.wrapping_add(1);
+                self.last_notification = Some(match title {
+                    Some(title) if !title.is_empty() => format!("{title}: {body}"),
+                    _ => body.clone(),
+                });
+                true
+            }
+            PaneSignal::Bell => {
+                self.bells = self.bells.wrapping_add(1);
+                true
+            }
+            PaneSignal::WorkingDirectory(location) => {
+                replace_if_changed(&mut self.working_directory, location)
+            }
+            PaneSignal::PromptMark {
+                kind: PromptMarkKind::CommandExecuted,
+                ..
+            } => self.exit_status.take().is_some(),
+            PaneSignal::PromptMark {
+                kind: PromptMarkKind::CommandFinished,
+                exit_status: Some(status),
+                ..
+            } => self.exit_status.replace(*status) != Some(*status),
+            PaneSignal::PromptMark { .. } | PaneSignal::ClipboardWrite { .. } => false,
+        };
+        if changed {
+            self.revision = self.revision.wrapping_add(1);
+        }
+        changed
+    }
+}
+
+fn replace_if_changed(slot: &mut Option<String>, value: &str) -> bool {
+    if slot.as_deref() == Some(value) {
+        return false;
+    }
+    *slot = Some(value.to_string());
+    true
 }
 
 /// Something a pane's program signalled through its output beyond the screen, as the reader saw
@@ -7546,6 +7626,10 @@ impl SessionRuntimeManager {
         let frame_replicas: Arc<switchy_thread::sync::Mutex<BTreeMap<ClientId, PaneFrameReplica>>> =
             Arc::new(switchy_thread::sync::Mutex::new(BTreeMap::new()));
         let frame_replicas_for_reader = Arc::clone(&frame_replicas);
+        let signals = Arc::new(switchy_thread::sync::Mutex::new(
+            RetainedPaneSignals::default(),
+        ));
+        let signals_for_reader = Arc::clone(&signals);
         let last_requested_size = Arc::new(switchy_thread::sync::Mutex::new((
             initial_rows,
             initial_cols,
@@ -8566,6 +8650,9 @@ impl SessionRuntimeManager {
                                 drop(requested_size);
                                 for report in reports {
                                     if let PaneShellMetadataEvent::AgentReport { state, agent, message } = report {
+                                        if let Ok(mut retained) = signals_for_reader.lock() {
+                                            retained.report(&state, agent.as_deref(), message.as_deref());
+                                        }
                                         host.publish_terminal_event(
                                             pane_runtime_terminal_events::TerminalEvent::AgentReport {
                                                 session_id: session_id.0,
@@ -8660,6 +8747,11 @@ impl SessionRuntimeManager {
                                             }
                                         }
                                         continue;
+                                    }
+                                    // Retain before publishing, so anyone woken by
+                                    // the event reads the new value.
+                                    if let Ok(mut retained) = signals_for_reader.lock() {
+                                        retained.apply(&signal);
                                     }
                                     host.publish_terminal_event(
                                         signal.into_event(session_id.0, pane_id),
@@ -9040,6 +9132,7 @@ impl SessionRuntimeManager {
             input_tx,
             output_buffer,
             terminal_grid,
+            signals,
             frame_replicas,
             exited,
             last_requested_size,
@@ -11566,6 +11659,51 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
                     pane_id,
                     process_group_id: group,
                     commands,
+                })
+            })
+            .collect()
+    }
+
+    fn pane_signals(&self) -> Vec<bmux_pane_runtime_state::PaneSignals> {
+        // Copy the handles out so no pane's state is read under the manager.
+        let panes = self
+            .with_lock_read_named("pane_signals", |manager| {
+                manager
+                    .runtimes
+                    .iter()
+                    .flat_map(|(session_id, runtime)| {
+                        runtime.panes.iter().map(|(pane_id, pane)| {
+                            (
+                                *session_id,
+                                *pane_id,
+                                Arc::clone(&pane.signals),
+                                Arc::clone(&pane.terminal_grid),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        panes
+            .into_iter()
+            .filter_map(|(session_id, pane_id, signals, grid)| {
+                let signals = signals.lock().ok()?.clone();
+                // Content, not cursor moves or redraws that change nothing.
+                let screen_revision = grid.lock().ok()?.grid().content_revision();
+                Some(bmux_pane_runtime_state::PaneSignals {
+                    session_id,
+                    pane_id,
+                    revision: signals.revision,
+                    title: signals.title,
+                    working_directory: signals.working_directory,
+                    progress: signals.progress,
+                    exit_status: signals.exit_status,
+                    notifications: signals.notifications,
+                    last_notification: signals.last_notification,
+                    bells: signals.bells,
+                    report: signals.report,
+                    reports: signals.reports,
+                    screen_revision,
                 })
             })
             .collect()
@@ -17796,6 +17934,7 @@ exit 7"#
                 TerminalGridStream::new(1, 1, GridLimits::default())
                     .expect("dummy pane terminal grid dimensions are valid"),
             )),
+            signals: Arc::new(switchy_thread::sync::Mutex::new(RetainedPaneSignals::default())),
             frame_replicas: Arc::new(switchy_thread::sync::Mutex::new(BTreeMap::new())),
             exited: Arc::new(AtomicBool::new(false)),
             last_requested_size: Arc::new(switchy_thread::sync::Mutex::new((1, 1))),
@@ -19245,6 +19384,55 @@ exit 7"#
                 },
             ]
         );
+    }
+
+    /// What a pane signals is retained as state: a reader that missed every
+    /// event still sees the latest title and progress, how many notifications
+    /// and bells there were, and a revision that moves only when they change.
+    #[test]
+    fn signals_are_retained_as_current_state() {
+        let mut tracker = PaneCursorTracker::new(4, 40);
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        let mut retained = RetainedPaneSignals::default();
+        let mut feed = |bytes: &[u8], retained: &mut RetainedPaneSignals| {
+            let _ = protocol_reply_for_chunk(
+                &mut engine,
+                &mut tracker.reader,
+                &mut tracker.terminal_grid,
+                bytes,
+            );
+            for signal in tracker.reader.signals.drain(..) {
+                retained.apply(&signal);
+            }
+        };
+        // Claude Code's titles as it starts, works and then waits.
+        feed("\x1b]0;✳ Claude Code\x07".as_bytes(), &mut retained);
+        feed("\x1b]0;◐ Claude Code\x07".as_bytes(), &mut retained);
+        feed("\x1b]0;◑ Touch probe marker file\x07".as_bytes(), &mut retained);
+        feed("\x1b]0;✳ Touch probe marker file\x07".as_bytes(), &mut retained);
+        assert_eq!(retained.title.as_deref(), Some("✳ Touch probe marker file"));
+        assert_eq!(retained.revision, 4);
+        // The same title again changes nothing.
+        feed("\x1b]0;✳ Touch probe marker file\x07".as_bytes(), &mut retained);
+        assert_eq!(retained.revision, 4);
+        // Notifications and bells count, so a repeated one is still seen.
+        feed(b"\x1b]9;4;3\x07\x1b]777;notify;Claude;needs you\x07\x07\x07", &mut retained);
+        assert_eq!(retained.progress.as_deref(), Some("4;3"));
+        assert_eq!(retained.notifications, 1);
+        assert_eq!(retained.last_notification.as_deref(), Some("Claude: needs you"));
+        assert_eq!(retained.bells, 2);
+        assert_eq!(retained.revision, 8);
+        // The directory is kept; a prompt starting changes nothing.
+        feed(b"\x1b]7;file://host/tmp\x1b\\\x1b]133;A\x07", &mut retained);
+        assert_eq!(retained.working_directory.as_deref(), Some("file://host/tmp"));
+        assert_eq!(retained.revision, 9);
+        // A finished command's status is kept until the next one starts.
+        feed(b"\x1b]133;C\x07out\r\n\x1b]133;D;2\x07", &mut retained);
+        assert_eq!(retained.exit_status, Some(2));
+        assert_eq!(retained.revision, 10);
+        feed(b"\x1b]133;C\x07", &mut retained);
+        assert_eq!(retained.exit_status, None);
+        assert_eq!(retained.revision, 11);
     }
 
     /// An attached client's frames keep a replica of the pane's grid level with it: a reset frame
