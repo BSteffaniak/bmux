@@ -21,9 +21,10 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use bmux_agents_plugin_api::agent_states::{AgentSnapshot, AgentState, PaneAgent};
 use bmux_pane_runtime_plugin_api::pane_runtime_events::PaneEvent;
 use bmux_pane_runtime_plugin_api::pane_runtime_terminal_events::{PromptMarkKind, TerminalEvent};
-use bmux_tabs_plugin_api::tabs_status::{GitStatus, TabStatus};
+use bmux_tabs_plugin_api::tabs_status::{AgentActivity, GitStatus, TabAgent, TabStatus};
 use uuid::Uuid;
 
 /// How long a git status stays fresh.
@@ -108,11 +109,47 @@ pub struct TabPanes {
 #[derive(Debug, Default)]
 pub struct StatusBoard {
     panes: HashMap<Uuid, PaneSignals>,
+    /// Each pane's agent, from the agents plugin.
+    agents: HashMap<Uuid, PaneAgent>,
     git: HashMap<String, (Instant, Option<GitStatus>)>,
     published: Option<Vec<TabStatus>>,
 }
 
 impl StatusBoard {
+    /// Take the agents plugin's latest snapshot.
+    pub fn set_agents(&mut self, snapshot: &AgentSnapshot) {
+        self.agents = snapshot
+            .panes
+            .iter()
+            .map(|agent| (agent.pane_id, agent.clone()))
+            .collect();
+    }
+
+    /// The tab's most pressing agent: blocked, then working, then the
+    /// focused pane's, then any.
+    fn tab_agent(&self, tab: &TabPanes) -> Option<TabAgent> {
+        let urgency = |state: AgentState| match state {
+            AgentState::Blocked => 2,
+            AgentState::Working => 1,
+            AgentState::Idle => 0,
+        };
+        tab.panes
+            .iter()
+            .filter_map(|pane| Some((pane, self.agents.get(&pane.id)?)))
+            .max_by_key(|(pane, agent)| (urgency(agent.state), pane.focused))
+            .map(|(_, agent)| TabAgent {
+                name: agent.agent.clone(),
+                activity: match agent.state {
+                    AgentState::Idle => AgentActivity::Idle,
+                    AgentState::Working => AgentActivity::Working,
+                    AgentState::Blocked => AgentActivity::Blocked,
+                },
+                message: agent.message.clone(),
+                changed_at_ms: agent.changed_at_ms,
+                finished_at_ms: agent.finished_at_ms,
+            })
+    }
+
     /// Record a terminal signal.
     pub fn apply_terminal(&mut self, event: &TerminalEvent, now_ms: u64) {
         match event {
@@ -163,6 +200,8 @@ impl StatusBoard {
                     PromptMarkKind::PromptStart | PromptMarkKind::CommandStart => {}
                 }
             }
+            // Agent state is the agents plugin's; tabs take it from there.
+            TerminalEvent::AgentReport { .. } | TerminalEvent::Progress { .. } => {}
         }
     }
 
@@ -241,6 +280,7 @@ impl StatusBoard {
                             .map(|at| (at, signals.attention.clone()))
                     })
                     .max_by_key(|(at, _)| *at);
+                let agent = self.tab_agent(tab);
                 TabStatus {
                     tab_id: tab.tab_id,
                     panes: u32::try_from(tab.panes.len()).unwrap_or(u32::MAX),
@@ -259,6 +299,7 @@ impl StatusBoard {
                         .max(),
                     attention_at_ms: attention.as_ref().map(|(at, _)| *at),
                     attention: attention.and_then(|(_, text)| text),
+                    agent,
                 }
             })
             .collect()
@@ -529,6 +570,42 @@ mod tests {
     }
 
     #[test]
+    fn tabs_carry_their_most_pressing_agent() {
+        let mut board = StatusBoard::default();
+        let session = Uuid::from_u128(9);
+        let tabs = [tab(1, &[(11, true, Some("claude")), (12, false, None)])];
+        // The tab's most pressing agent is folded in.
+        let agent = |pane: u128, state| PaneAgent {
+            session_id: session,
+            pane_id: Uuid::from_u128(pane),
+            agent: format!("agent{pane}"),
+            state,
+            source: bmux_agents_plugin_api::agent_states::AgentSource::Report,
+            rule: None,
+            message: Some("approve?".into()),
+            changed_at_ms: 5,
+            finished_at_ms: None,
+        };
+        board.set_agents(&AgentSnapshot {
+            panes: vec![agent(11, AgentState::Idle), agent(12, AgentState::Blocked)],
+            revision: 1,
+        });
+        let with_agents = board.build(&tabs, &mut |_| None);
+        let tab_agent = with_agents[0].agent.as_ref().unwrap();
+        assert_eq!(
+            (tab_agent.name.as_str(), tab_agent.activity),
+            ("agent12", AgentActivity::Blocked)
+        );
+        assert_eq!(tab_agent.message.as_deref(), Some("approve?"));
+        board.set_agents(&AgentSnapshot {
+            panes: vec![agent(11, AgentState::Idle), agent(12, AgentState::Idle)],
+            revision: 2,
+        });
+        let focused_agent = board.build(&tabs, &mut |_| None);
+        assert_eq!(focused_agent[0].agent.as_ref().unwrap().name, "agent11");
+    }
+
+    #[test]
     fn reported_directories_last_as_long_as_the_command_that_reported_them() {
         let pane = Uuid::from_u128(1);
         let tabs = |command: Option<&str>, cwd: Option<&str>| {
@@ -710,6 +787,7 @@ mod tests {
         assert_eq!(status.output_at_ms, Some(20));
         assert_eq!(status.attention_at_ms, Some(30));
         assert_eq!(status.attention.as_deref(), Some("claude: needs input"));
+        assert_eq!(status.agent, None);
         // Git status is cached.
         board.build(&tabs, &mut |_| unreachable!("cached"));
         assert_eq!(git_reads, 1);

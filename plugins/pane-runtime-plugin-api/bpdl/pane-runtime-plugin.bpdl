@@ -585,6 +585,26 @@ interface pane-runtime-state {
         panes: list<pane-process-identity>,
     }
 
+    // What runs in the foreground of a pane's terminal when that is not the
+    // pane's own shell (a job the shell started, or the pane's launched
+    // program): the command line of each process in the terminal's
+    // foreground process group, its leader first.
+    record foreground-job {
+        session_id: uuid,
+        pane_id: uuid,
+        process_group_id: i32,
+        commands: list<string>,
+    }
+
+    // The rows a pane shows, as text with trailing blanks trimmed.
+    // `revision` changes whenever the screen may have.
+    record pane-screen-text {
+        session_id: uuid,
+        pane_id: uuid,
+        revision: u64,
+        text: string,
+    }
+
     variant pane-state-error {
         session-not-found,
         pane-not-found,
@@ -644,6 +664,11 @@ interface pane-runtime-state {
     query list-pane-processes() -> result<pane-process-list, pane-state-error>;
     query get-pane-process(session_id: uuid, pane_id: uuid)
         -> result<pane-process-identity, pane-state-error>;
+    // Every pane's foreground job; panes whose shell is in the foreground
+    // are left out.
+    query list-foreground-jobs() -> result<list<foreground-job>, pane-state-error>;
+    query pane-screen-text(session_id: uuid, pane_id: uuid)
+        -> result<pane-screen-text, pane-state-error>;
 }
 
 @capability(PANE_RUNTIME_WRITE)
@@ -1534,7 +1559,8 @@ interface pane-runtime-events {
 
 // What a pane's program signals through its output beyond the screen: its title, its working
 // directory, desktop notifications, the bell, and shell prompt marks (OSC 0/2, 7, 9 and 777,
-// BEL, 133). Taken from the pane's one parse, they cost nothing until a program sends one.
+// BEL, 133), and state reports. Taken from the pane's one parse, they cost nothing until a
+// program sends one.
 interface pane-runtime-terminal-events {
     enum prompt-mark-kind {
         // OSC 133 A: the prompt begins.
@@ -1561,6 +1587,21 @@ interface pane-runtime-terminal-events {
             kind: prompt-mark-kind,
             line: u64,
             exit_status: u32?,
+        },
+        // OSC 9;4 progress as sent, from the `4` (`4;1;50`: 50% done;
+        // `4;0`: no progress).
+        progress { session_id: uuid, pane_id: uuid, value: string },
+        // A program in the pane reported its own state (for example an agent
+        // through its hooks): `OSC 633;bmux;<BMUX_SHELL_MARKER>;agent;<state>;
+        // <base64 agent>;<base64 message>`. Only processes holding the pane's
+        // marker can send one, so printed output cannot forge it. `state` is
+        // as sent (`working`, `blocked`, `idle` or `release`).
+        agent-report {
+            session_id: uuid,
+            pane_id: uuid,
+            state: string,
+            agent: string?,
+            message: string?,
         },
     }
 

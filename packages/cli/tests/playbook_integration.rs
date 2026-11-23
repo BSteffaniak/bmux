@@ -386,7 +386,27 @@ fn playbook_real_attach_sidebar_flags_a_background_bell_as_needing_input() {
 #[serial]
 fn playbook_real_attach_sidebar_never_runs_git_where_output_points() {
     let (json, pass) = run_playbook_fixture("attach_real_sidebar_planted_directory.dsl");
-    assert!(pass, "sidebar planted directory playbook should pass: {json:#}");
+    assert!(
+        pass,
+        "sidebar planted directory playbook should pass: {json:#}"
+    );
+}
+
+#[test]
+#[serial]
+fn playbook_real_attach_sidebar_shows_an_agents_own_report() {
+    let (json, pass) = run_playbook_fixture("attach_real_sidebar_agent_report.dsl");
+    assert!(pass, "sidebar agent report playbook should pass: {json:#}");
+}
+
+#[test]
+#[serial]
+fn playbook_real_attach_sidebar_shows_a_ruleless_agent_working_while_it_prints() {
+    let (json, pass) = run_playbook_fixture("attach_real_sidebar_agent_activity.dsl");
+    assert!(
+        pass,
+        "sidebar agent activity playbook should pass: {json:#}"
+    );
 }
 
 #[test]

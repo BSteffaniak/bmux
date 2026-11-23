@@ -1,0 +1,41 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Bundled plugin that detects coding agents in panes and what they are doing"
+edition     = { workspace = true }
+keywords    = ["bmux", "plugin", "agents"]
+license     = { workspace = true }
+name        = "bmux_agents_plugin"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bmux_agents_plugin_api       = { workspace = true }
+bmux_pane_runtime_plugin_api = { workspace = true }
+bmux_plugin                  = { workspace = true }
+bmux_plugin_schema_macros    = { workspace = true }
+bmux_plugin_sdk              = { workspace = true }
+# Screen rules use Unicode classes, case folding and code point ranges.
+regex      = { workspace = true, features = ["perf", "unicode"] }
+serde      = { workspace = true, features = ["derive", "std"] }
+serde_json = { workspace = true }
+tokio      = { workspace = true, features = ["rt", "sync", "time"] }
+toml       = { workspace = true }
+tracing    = { workspace = true }
+uuid       = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+# Package this crate as a dynamic library for one component. Only the
+# plugin packager enables these, together with `--cfg bmux_plugin_dylib`.
+dynamic-backend = []
+dynamic-frontend = []
+fail-on-warnings = [
+    "bmux_agents_plugin_api/fail-on-warnings",
+    "bmux_pane_runtime_plugin_api/fail-on-warnings",
+    "bmux_plugin/fail-on-warnings",
+    "bmux_plugin_schema_macros/fail-on-warnings",
+    "bmux_plugin_sdk/fail-on-warnings",
+]

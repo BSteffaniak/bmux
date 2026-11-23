@@ -11,6 +11,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bmux_agents_plugin_api       = { workspace = true }
 bmux_clients_plugin_api      = { workspace = true }
 bmux_contexts_plugin_api     = { workspace = true }
 bmux_ipc                     = { workspace = true }
@@ -45,6 +46,7 @@ bmux_tab_bar_plugin       = { workspace = true }
 dynamic-backend = []
 dynamic-frontend = []
 fail-on-warnings = [
+    "bmux_agents_plugin_api/fail-on-warnings",
     "bmux_ipc/fail-on-warnings",
     "bmux_plugin/fail-on-warnings",
     "bmux_plugin_schema_macros/fail-on-warnings",

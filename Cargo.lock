@@ -4459,6 +4459,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_agents_plugin"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_agents_plugin_api",
+ "bmux_pane_runtime_plugin_api",
+ "bmux_plugin",
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml 1.2.2+spec-1.1.0",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "bmux_agents_plugin_api"
+version = "0.0.1-alpha.4"
+dependencies = [
+ "bmux_ipc",
+ "bmux_plugin_schema_macros",
+ "bmux_plugin_sdk",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
 name = "bmux_appearance"
 version = "0.0.1-alpha.4"
 dependencies = [
@@ -4655,6 +4686,7 @@ name = "bmux_cli"
 version = "0.0.1-alpha.4"
 dependencies = [
  "anyhow",
+ "bmux_agents_plugin",
  "bmux_appearance",
  "bmux_application_resurrection_plugin",
  "bmux_attach_image_protocol",
@@ -6483,6 +6515,7 @@ dependencies = [
 name = "bmux_tabs_plugin"
 version = "0.0.1-alpha.4"
 dependencies = [
+ "bmux_agents_plugin_api",
  "bmux_attach_view_protocol",
  "bmux_client",
  "bmux_clients_plugin_api",

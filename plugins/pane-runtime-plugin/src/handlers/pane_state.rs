@@ -2,8 +2,8 @@
 
 use bmux_client_state::FollowStateHandle;
 use bmux_pane_runtime_plugin_api::pane_runtime_state::{
-    FloatingPaneList, FloatingPaneSummary, PaneProcessIdentity, PaneProcessList, PaneStateError,
-    PaneSummary, SessionPaneList,
+    FloatingPaneList, FloatingPaneSummary, ForegroundJob, PaneProcessIdentity, PaneProcessList,
+    PaneScreenText, PaneStateError, PaneSummary, SessionPaneList,
 };
 use bmux_pane_runtime_state::{FloatingPaneLayer, FloatingPaneScope};
 use bmux_plugin_sdk::NativeServiceContext;
@@ -27,6 +27,12 @@ pub struct GetPaneArgs {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GetPaneProcessArgs {
+    pub session_id: Uuid,
+    pub pane_id: Uuid,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneScreenTextArgs {
     pub session_id: Uuid,
     pub pane_id: Uuid,
 }
@@ -182,6 +188,44 @@ pub fn list_pane_processes(
             .map(|identity| to_api_process_identity(&identity))
             .collect(),
     })
+}
+
+pub fn list_foreground_jobs(
+    host: &crate::runtime::PaneRuntimeHost,
+) -> Result<Vec<ForegroundJob>, PaneStateError> {
+    let handle = host
+        .registered_session_runtime()
+        .ok_or(PaneStateError::SessionNotFound)?;
+    Ok(handle
+        .0
+        .foreground_jobs()
+        .into_iter()
+        .map(|job| ForegroundJob {
+            session_id: job.session_id.0,
+            pane_id: job.pane_id,
+            process_group_id: job.process_group_id,
+            commands: job.commands,
+        })
+        .collect())
+}
+
+pub fn pane_screen_text(
+    host: &crate::runtime::PaneRuntimeHost,
+    req: &PaneScreenTextArgs,
+) -> Result<PaneScreenText, PaneStateError> {
+    let handle = host
+        .registered_session_runtime()
+        .ok_or(PaneStateError::SessionNotFound)?;
+    handle
+        .0
+        .pane_screen_text(SessionId(req.session_id), req.pane_id)
+        .map(|screen| PaneScreenText {
+            session_id: req.session_id,
+            pane_id: req.pane_id,
+            revision: screen.revision,
+            text: screen.text,
+        })
+        .ok_or(PaneStateError::PaneNotFound)
 }
 
 pub fn get_pane_process(

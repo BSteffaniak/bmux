@@ -2067,7 +2067,7 @@ impl PaneResurrectionRuntime {
                 self.active_command = None;
                 self.active_command_source = None;
             }
-            PaneShellMetadataEvent::NestedReplay => {}
+            PaneShellMetadataEvent::NestedReplay | PaneShellMetadataEvent::AgentReport { .. } => {}
         }
     }
 }
@@ -2077,6 +2077,13 @@ enum PaneShellMetadataEvent {
     CommandStart { command: String, cwd: String },
     Prompt { cwd: String },
     NestedReplay,
+    /// A program holding the pane's marker reported its own state; published
+    /// as a terminal event and never applied to the shell's metadata.
+    AgentReport {
+        state: String,
+        agent: Option<String>,
+        message: Option<String>,
+    },
 }
 
 fn apply_shell_metadata_events_and_take_prompt_replay(
@@ -2631,6 +2638,8 @@ impl ReaderFilters for &bmux_terminal_grid::SequenceFilters {
 enum PaneSignal {
     Title(String),
     WorkingDirectory(String),
+    /// OSC 9;4, from the `4`.
+    Progress(String),
     Notification {
         title: Option<String>,
         body: String,
@@ -2666,14 +2675,16 @@ fn clipboard_write(payload: &[u8]) -> Option<PaneSignal> {
 
 impl PaneSignal {
     /// The signal an OSC string carries, if any: OSC 0 and 2 (title), 7 (working directory),
-    /// 9 (a notification; 9;4 reports progress instead), 777;notify (a titled notification) and
-    /// 133 (prompt marks), with the line the cursor is on.
+    /// 9 (a notification, or with 9;4 progress), 777;notify (a titled notification) and 133
+    /// (prompt marks), with the line the cursor is on.
     fn from_osc(params: &[&[u8]], line: u64) -> Option<Self> {
         let text = |parts: &[&[u8]]| String::from_utf8_lossy(&parts.join(&b';')).into_owned();
         match params {
             [b"0" | b"2", rest @ ..] if !rest.is_empty() => Some(Self::Title(text(rest))),
             [b"7", rest @ ..] if !rest.is_empty() => Some(Self::WorkingDirectory(text(rest))),
-            [b"9", first, ..] if *first == b"4" => None,
+            [b"9", rest @ ..] if rest.first() == Some(&b"4".as_slice()) => {
+                Some(Self::Progress(text(rest)))
+            }
             [b"9", rest @ ..] if !rest.is_empty() => Some(Self::Notification {
                 title: None,
                 body: text(rest),
@@ -2720,6 +2731,11 @@ impl PaneSignal {
                 session_id,
                 pane_id,
                 location,
+            },
+            Self::Progress(value) => TerminalEvent::Progress {
+                session_id,
+                pane_id,
+                value,
             },
             Self::Notification { title, body } => TerminalEvent::Notification {
                 session_id,
@@ -3808,6 +3824,10 @@ fn decode_bound_shell_metadata(
     if rest == "nested-ready" {
         return Some(PaneShellMetadataEvent::NestedReplay);
     }
+    // Only a marked payload may report: printed output cannot know the marker.
+    if let Some(report) = rest.strip_prefix("agent;") {
+        return decode_agent_report(report);
+    }
     decode_shell_metadata_payload(format!("{BMUX_SHELL_METADATA_PREFIX}{rest}").as_bytes())
 }
 
@@ -3834,6 +3854,40 @@ fn decode_shell_metadata_payload(payload: &[u8]) -> Option<PaneShellMetadataEven
         }
         _ => None,
     }
+}
+
+/// Longest agent name and message a report may carry.
+const MAX_AGENT_REPORT_NAME: usize = 64;
+const MAX_AGENT_REPORT_MESSAGE: usize = 512;
+
+/// `<state>[;<base64 agent>[;<base64 message>]]`; an empty field is absent.
+fn decode_agent_report(report: &str) -> Option<PaneShellMetadataEvent> {
+    let mut fields = report.split(';');
+    let state = fields.next()?;
+    if !matches!(state, "working" | "blocked" | "idle" | "release") {
+        return None;
+    }
+    let mut optional = |limit: usize| -> Option<Option<String>> {
+        match fields.next() {
+            None | Some("") => Some(None),
+            Some(field) => {
+                let text = decode_shell_metadata_field(field)?;
+                let text = text.trim();
+                (!text.chars().any(char::is_control))
+                    .then(|| (!text.is_empty()).then(|| text.chars().take(limit).collect()))
+            }
+        }
+    };
+    let agent = optional(MAX_AGENT_REPORT_NAME)?;
+    let message = optional(MAX_AGENT_REPORT_MESSAGE)?;
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(PaneShellMetadataEvent::AgentReport {
+        state: state.to_string(),
+        agent,
+        message,
+    })
 }
 
 fn decode_shell_metadata_field(value: &str) -> Option<String> {
@@ -8495,7 +8549,10 @@ impl SessionRuntimeManager {
                                     }
                                     drop(registry);
                                 }
-                                let metadata_events = std::mem::take(&mut reader_state.metadata_events);
+                                let (reports, metadata_events): (Vec<_>, Vec<_>) =
+                                    std::mem::take(&mut reader_state.metadata_events)
+                                        .into_iter()
+                                        .partition(|event| matches!(event, PaneShellMetadataEvent::AgentReport { .. }));
                                 execution_for_reader.output_watermark.fetch_add(
                                     u64::try_from(bytes_read).unwrap_or(u64::MAX), Ordering::SeqCst,
                                 );
@@ -8507,6 +8564,19 @@ impl SessionRuntimeManager {
                                 if execution_for_reader.commit_projection().is_err() { break; }
                                 execution_for_reader.notify();
                                 drop(requested_size);
+                                for report in reports {
+                                    if let PaneShellMetadataEvent::AgentReport { state, agent, message } = report {
+                                        host.publish_terminal_event(
+                                            pane_runtime_terminal_events::TerminalEvent::AgentReport {
+                                                session_id: session_id.0,
+                                                pane_id,
+                                                state,
+                                                agent,
+                                                message,
+                                            },
+                                        );
+                                    }
+                                }
                                 // Metadata callbacks can acquire the runtime manager. Never
                                 // invoke them while holding image/grid/output capture locks.
                                 if !metadata_events.is_empty() {
@@ -11424,6 +11494,95 @@ impl bmux_pane_runtime_state::SessionRuntimeManagerApi for ServerSessionRuntimeA
         .flatten()
     }
 
+    fn foreground_jobs(&self) -> Vec<bmux_pane_runtime_state::ForegroundJob> {
+        // The live terminal names its foreground group: a job is any group
+        // but the shell's own (a launched program is its pane's job). Copy
+        // the panes' handles out so no terminal is asked under the manager.
+        let panes = self
+            .with_lock_read_named("foreground_jobs", |manager| {
+                manager
+                    .runtimes
+                    .iter()
+                    .flat_map(|(session_id, runtime)| {
+                        runtime.panes.iter().map(|(pane_id, pane)| {
+                            (
+                                *session_id,
+                                *pane_id,
+                                Arc::clone(&pane.execution),
+                                Arc::clone(&pane.process_group_id),
+                                Arc::clone(&pane.exited),
+                                pane.meta.launch.is_some(),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let groups = panes
+            .into_iter()
+            .filter(|(.., exited, _)| !exited.load(Ordering::SeqCst))
+            .filter_map(|(session_id, pane_id, execution, own_group, _, launched)| {
+                let group = execution.master.lock().ok().and_then(|master| {
+                    master
+                        .as_ref()?
+                        .foreground_process_group()
+                        .filter(|group| *group > 0)
+                })?;
+                let own = own_group.lock().ok().and_then(|group| *group);
+                (launched || own != Some(group)).then_some((session_id, pane_id, group))
+            })
+            .collect::<Vec<_>>();
+        if groups.is_empty() {
+            return Vec::new();
+        }
+        // One process-table read for every pane, outside the manager lock.
+        let Some(table) = crate::platform::process_table() else {
+            return Vec::new();
+        };
+        groups
+            .into_iter()
+            .filter_map(|(session_id, pane_id, group)| {
+                let commands = foreground_group_commands(&table, group);
+                (!commands.is_empty()).then_some(bmux_pane_runtime_state::ForegroundJob {
+                    session_id,
+                    pane_id,
+                    process_group_id: group,
+                    commands,
+                })
+            })
+            .collect()
+    }
+
+    fn pane_screen_text(
+        &self,
+        session_id: SessionId,
+        pane_id: Uuid,
+    ) -> Option<bmux_pane_runtime_state::PaneScreenText> {
+        let grid = self
+            .with_lock_read(|manager| {
+                manager
+                    .runtimes
+                    .get(&session_id)?
+                    .panes
+                    .get(&pane_id)
+                    .map(|pane| Arc::clone(&pane.terminal_grid))
+            })
+            .flatten()?;
+        let stream = grid.lock().ok()?;
+        let grid = stream.grid();
+        let mut lines = bmux_terminal_grid::visible_text_lines(grid, 0, grid.height())
+            .into_iter()
+            .map(|line| line.trim_end().to_string())
+            .collect::<Vec<_>>();
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        Some(bmux_pane_runtime_state::PaneScreenText {
+            revision: grid.revision(),
+            text: lines.join("\n"),
+        })
+    }
+
     fn list_pane_processes(&self) -> Vec<bmux_pane_runtime_state::PaneProcessIdentity> {
         self.with_lock_read(|m| {
             let mut identities = Vec::new();
@@ -13597,6 +13756,24 @@ where
     }
 
     Some(ProcessInspectionResult { command, cwd })
+}
+
+/// How many of a foreground group's processes a job lists.
+const MAX_FOREGROUND_COMMANDS: usize = 8;
+
+/// The command lines of process group `group`'s live processes, its leader
+/// first, then by pid.
+fn foreground_group_commands(entries: &[PsProcessEntry], group: i32) -> Vec<String> {
+    let mut members = entries
+        .iter()
+        .filter(|entry| entry.pgid == group && !entry.command.is_empty() && !entry.state.contains('Z'))
+        .collect::<Vec<_>>();
+    members.sort_by_key(|entry| (i64::from(entry.pid) != i64::from(group), entry.pid));
+    members
+        .into_iter()
+        .take(MAX_FOREGROUND_COMMANDS)
+        .map(|entry| entry.command.clone())
+        .collect()
 }
 
 /// The command and working directory of what runs in process group `process_group_id`.
@@ -19019,7 +19196,7 @@ exit 7"#
     }
 
     /// What a program signals beyond the screen reaches the reader in order: titles (even with
-    /// `;` in them), working directories, notifications (not progress reports), the bell, and
+    /// `;` in them), working directories, notifications, progress reports, the bell, and
     /// prompt marks with the line they mark and a finished command's status.
     #[test]
     fn the_reader_collects_what_programs_signal_beyond_the_screen() {
@@ -19041,6 +19218,7 @@ exit 7"#
                     title: Some("Build".into()),
                     body: "done; ok".into(),
                 },
+                PaneSignal::Progress("4;1;50".into()),
                 PaneSignal::Bell,
                 PaneSignal::PromptMark {
                     kind: PromptMarkKind::CommandFinished,
@@ -21740,6 +21918,77 @@ exit 7"#
             );
             assert_eq!(result.filtered, marker);
         }
+    }
+
+    /// Programs holding the pane's marker report their state; nothing else can.
+    #[test]
+    fn agent_reports_need_the_launch_token() {
+        let parse = |marker: &[u8], token: Option<&str>| {
+            let mut parser = PaneShellMetadataParser {
+                token: token.map(str::to_string),
+                ..Default::default()
+            };
+            let result = parser.process_chunk(marker);
+            (result.events, result.filtered.into_owned())
+        };
+        // "claude" and "approve?" in base64.
+        let (events, filtered) = parse(
+            b"before\x1b]633;bmux;launch-token;agent;blocked;Y2xhdWRl;YXBwcm92ZT8=\x07after",
+            Some("launch-token"),
+        );
+        assert_eq!(
+            events,
+            vec![PaneShellMetadataEvent::AgentReport {
+                state: "blocked".into(),
+                agent: Some("claude".into()),
+                message: Some("approve?".into()),
+            }]
+        );
+        assert_eq!(filtered, b"beforeafter");
+        let (events, _) = parse(b"\x1b]633;bmux;launch-token;agent;working\x07", Some("launch-token"));
+        assert_eq!(
+            events,
+            vec![PaneShellMetadataEvent::AgentReport {
+                state: "working".into(),
+                agent: None,
+                message: None,
+            }]
+        );
+        for marker in [
+            // Without the marker, or with another pane's, or with no token at all.
+            (b"\x1b]633;bmux;agent;working\x07".as_slice(), Some("launch-token")),
+            (b"\x1b]633;bmux;old-token;agent;working\x07", Some("launch-token")),
+            (b"\x1b]633;bmux;agent;working\x07", None),
+            // Unknown states, extra fields, bad encodings and control characters.
+            (b"\x1b]633;bmux;launch-token;agent;sleeping\x07", Some("launch-token")),
+            (b"\x1b]633;bmux;launch-token;agent;idle;;;extra\x07", Some("launch-token")),
+            (b"\x1b]633;bmux;launch-token;agent;idle;***\x07", Some("launch-token")),
+            (b"\x1b]633;bmux;launch-token;agent;idle;YQph\x07", Some("launch-token")),
+        ] {
+            assert_eq!(parse(marker.0, marker.1).0, [], "{:?}", String::from_utf8_lossy(marker.0));
+        }
+    }
+
+    #[test]
+    fn foreground_jobs_list_their_leader_first_and_skip_zombies() {
+        let entry = |pid, pgid, state: &str, command: &str| PsProcessEntry {
+            pid,
+            pgid,
+            state: state.into(),
+            command: command.into(),
+        };
+        let table = [
+            entry(12, 10, "S", "tee log"),
+            entry(11, 10, "Z", "dead"),
+            entry(10, 10, "S", "node /opt/claude/cli.js"),
+            entry(20, 20, "S", "other"),
+            entry(13, 10, "S", ""),
+        ];
+        assert_eq!(
+            foreground_group_commands(&table, 10),
+            ["node /opt/claude/cli.js", "tee log"]
+        );
+        assert_eq!(foreground_group_commands(&table, 99).len(), 0);
     }
 
     /// A chunk carrying no metadata (escapes, but no OSC) passes through without being copied,

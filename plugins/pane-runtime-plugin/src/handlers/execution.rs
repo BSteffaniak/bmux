@@ -47,6 +47,16 @@ pub(crate) fn migrated_route(interface: &str, operation: &str) -> bool {
     )
 }
 
+/// Read-only queries in-process plugins make from background observers, which
+/// act for no client: (plugin, interface, operation).
+const HOST_INTERNAL_READS: &[(&str, &str, &str)] = &[
+    // Tab status: each tab's panes, focus, running command and directory.
+    ("bmux.tabs", "pane-runtime-state", "list-panes"),
+    // Agent detection: what runs in each pane's foreground and what it shows.
+    ("bmux.agents", "pane-runtime-state", "list-foreground-jobs"),
+    ("bmux.agents", "pane-runtime-state", "pane-screen-text"),
+];
+
 pub(super) fn authorize_route(ctx: &NativeServiceContext) -> Result<(), ServiceResponse> {
     use bmux_plugin::StreamOrigin as StreamProvenance;
     let provenance = super::spawn::caller_provenance(ctx)
@@ -73,14 +83,15 @@ pub(super) fn authorize_route(ctx: &NativeServiceContext) -> Result<(), ServiceR
         {
             Ok(())
         }
-        // The tabs plugin, in process, lists panes (ids, focus, running
-        // command, directory) from its status observer, which has no client:
-        // read-only, the same list it reads while handling requests.
+        // In-process observers with no client make these reads (see
+        // `HOST_INTERNAL_READS`).
         StreamProvenance::HostInternal
             if ctx.caller_client_id.is_none()
-                && ctx.request.caller_plugin_id == "bmux.tabs"
-                && ctx.request.service.interface_id == "pane-runtime-state"
-                && ctx.request.operation == "list-panes" =>
+                && HOST_INTERNAL_READS.contains(&(
+                    ctx.request.caller_plugin_id.as_str(),
+                    ctx.request.service.interface_id.as_str(),
+                    ctx.request.operation.as_str(),
+                )) =>
         {
             Ok(())
         }
@@ -357,21 +368,29 @@ mod tests {
             *origin.lock().unwrap() = StreamProvenance::Invalid;
             assert!(authorize_route(&ctx).is_err());
         }
-        // Only the tabs plugin's status observer may list panes without a client.
-        *origin.lock().unwrap() = StreamProvenance::HostInternal;
-        let mut ctx = context("pane-runtime-state", "list-panes", Vec::new());
-        ctx.caller_client_id = None;
-        assert!(authorize_route(&ctx).is_err());
-        ctx.request.caller_plugin_id = "bmux.tabs".into();
-        assert!(authorize_route(&ctx).is_ok());
-        ctx.caller_client_id = Some(crate::ids::new_uuid());
-        assert!(authorize_route(&ctx).is_err());
-        ctx.caller_client_id = None;
-        ctx.request.operation = "focus-pane".into();
-        assert!(authorize_route(&ctx).is_err());
-        ctx.request.operation = "list-panes".into();
-        *origin.lock().unwrap() = StreamProvenance::Invalid;
-        assert!(authorize_route(&ctx).is_err());
+        // Only the listed observers may make their reads without a client.
+        for (plugin, operation, other_plugin) in [
+            ("bmux.tabs", "list-panes", "bmux.agents"),
+            ("bmux.agents", "list-foreground-jobs", "bmux.tabs"),
+            ("bmux.agents", "pane-screen-text", "bmux.tabs"),
+        ] {
+            *origin.lock().unwrap() = StreamProvenance::HostInternal;
+            let mut ctx = context("pane-runtime-state", operation, Vec::new());
+            ctx.caller_client_id = None;
+            assert!(authorize_route(&ctx).is_err());
+            ctx.request.caller_plugin_id = other_plugin.into();
+            assert!(authorize_route(&ctx).is_err());
+            ctx.request.caller_plugin_id = plugin.into();
+            assert!(authorize_route(&ctx).is_ok());
+            ctx.caller_client_id = Some(crate::ids::new_uuid());
+            assert!(authorize_route(&ctx).is_err());
+            ctx.caller_client_id = None;
+            ctx.request.operation = "focus-pane".into();
+            assert!(authorize_route(&ctx).is_err());
+            ctx.request.operation = operation.into();
+            *origin.lock().unwrap() = StreamProvenance::Invalid;
+            assert!(authorize_route(&ctx).is_err());
+        }
         *origin.lock().unwrap() = StreamProvenance::HostInternal;
         for (interface, operation) in [
             ("attach-runtime-state/v2", "observe-pane-frames-future"),

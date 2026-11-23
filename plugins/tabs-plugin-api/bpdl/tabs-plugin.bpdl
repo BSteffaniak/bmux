@@ -579,6 +579,25 @@ interface tabs-status {
         behind: u32,
     }
 
+    enum agent-activity {
+        @default idle,
+        working,
+        // Needs the user to answer or approve something.
+        blocked,
+    }
+
+    // The tab's most pressing coding agent (blocked, then working, then the
+    // focused pane's), from the agents plugin.
+    record tab-agent {
+        name: string,
+        activity: agent-activity,
+        // What the agent last said (a report's or a notification's message).
+        message: string?,
+        changed-at-ms: u64,
+        // When it last finished work (went from working to idle).
+        finished-at-ms: u64?,
+    }
+
     record tab-status {
         tab-id: uuid,
         panes: u32,
@@ -597,6 +616,7 @@ interface tabs-status {
         attention-at-ms: u64?,
         // The most recent notification text, when there is one.
         attention: string?,
+        agent: tab-agent?,
     }
 
     record tab-status-snapshot {

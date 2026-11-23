@@ -1,0 +1,64 @@
+// Public, typed contract of the bundled agents plugin: which panes run a
+// coding agent, and what each agent is doing.
+//
+// Interfaces:
+// - `agent-states` — reactive state channel with every pane's agent.
+// - `agents-state` — the same snapshot on request (`bmux agents status`).
+plugin bmux.agents version 1;
+capability READ = bmux.agents.read;
+
+// Every pane running an agent and what it is doing, published whenever any
+// of it changes.
+interface agent-states {
+    enum agent-state {
+        // Waiting for the user, its work done.
+        @default idle,
+        working,
+        // Needs the user to answer or approve something.
+        blocked,
+    }
+
+    // What decided a pane's state.
+    enum agent-source {
+        // The agent reported it (its hooks, or `bmux agents report`).
+        report,
+        // A screen rule for the agent matched.
+        @default screen,
+        // Output activity: an agent with no rules that never reported.
+        activity,
+    }
+
+    record pane-agent {
+        session-id: uuid,
+        pane-id: uuid,
+        agent: string,
+        state: agent-state,
+        source: agent-source,
+        // The screen rule that matched, when `source` is `screen`.
+        rule: string?,
+        // What the agent last said: a report's or a notification's message.
+        message: string?,
+        // When `state` last changed, and when the agent last finished work
+        // (went from working to idle).
+        changed-at-ms: u64,
+        finished-at-ms: u64?,
+    }
+
+    record agent-snapshot {
+        panes: list<pane-agent>,
+        revision: u64,
+    }
+
+    @state events agent-snapshot;
+}
+
+@capability(READ)
+interface agents-state {
+    query list-agents() -> agent-states.agent-snapshot;
+}
+
+/// What `bmux.agents` provides to and requires from the host and other plugins.
+world agents {
+    provide agents-state;
+    require capability bmux.pane_runtime.read;
+}

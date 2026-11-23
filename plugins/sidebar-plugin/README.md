@@ -24,14 +24,17 @@ States, most urgent first:
 
 | Glyph | State | When |
 | --- | --- | --- |
-| `◆` yellow | blocked | the tab rang the bell or sent a notification since you last looked at it (an agent waiting for input, usually); its notification text replaces the directory line |
+| `◆` yellow | blocked | its agent needs you to answer or approve something, or (any other program) the tab rang the bell or sent a notification since you last looked at it; the message replaces the directory line |
 | `▲` red | failed | its last command exited non-zero (needs OSC 133 shell integration) |
-| `◉` green | working | a command or agent is running and produced output in the last few seconds |
-| `●` blue | done | an agent's output stopped since you last looked at the tab |
+| `◉` green | working | its agent is working, or another command is running and produced output in the last few seconds |
+| `●` blue | done | its agent finished since you last looked at the tab |
 | `○` dim | idle | otherwise (the tab you are looking at shows a bright `●`) |
 
-A tab counts as an agent when its running command's program is in `agents`.
-"Since you last looked" is per attach client.
+A tab's agent state comes from the agents plugin (`bmux.agents`, see
+`plugins/agents-plugin/README.md`), which recognizes coding agents in each
+pane's foreground and reads what they are doing from their screens and their
+own reports; a tab with several shows its most pressing. "Since you last
+looked" is per attach client.
 
 The data comes from the tabs plugin's `bmux.tabs/tabs-status` state, which it
 derives on the server from each pane's terminal signals (title, OSC 7
@@ -40,7 +43,7 @@ the running command and directory bmux's shell integration reports (bash, zsh,
 fish and nu, on by default through `behavior.pane_shell_integration`) and
 `git status` of the focused pane's directory, so remote attach clients see the
 server's repositories. Without shell integration a tab shows no running command
-and so never counts as working.
+(agents are still recognized, from the pane's foreground processes).
 
 A tab's directory is the one its shell reports. A program's OSC 7 directory is
 shown instead while that program runs (an editor, or a remote shell, shown as
@@ -64,7 +67,6 @@ maximum_visible_items = 20
 content_height = false
 collapse_below_width = 80
 collapsed_width = 8
-agents = ["claude", "codex", "aider", "gemini", "opencode", "amp", "goose", "crush", "cursor-agent", "qwen", "copilot"]
 visible = false            # closed when a client attaches
 remember_visibility = false # start from the last state set on this machine
 ```

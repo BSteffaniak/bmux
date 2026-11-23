@@ -381,6 +381,10 @@ declare_bundled_plugins! {
     id = "bmux.sidebar",
     definition = bmux_sidebar_plugin::plugin_definition();
 
+    feature = "bundled-plugin-agents",
+    id = "bmux.agents",
+    definition = bmux_agents_plugin::plugin_definition();
+
     feature = "bundled-plugin-tab-bar",
     id = "bmux.tab_bar",
     definition = bmux_tab_bar_plugin::plugin_definition();

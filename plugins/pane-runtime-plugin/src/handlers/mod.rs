@@ -289,6 +289,12 @@ fn route_authorized(
         "pane-runtime-state", "get-pane-process" => |req: pane_state::GetPaneProcessArgs, _ctx| {
             Ok::<_, ServiceResponse>(pane_state::get_pane_process(host, &req))
         },
+        "pane-runtime-state", "list-foreground-jobs" => |_req: (), _ctx| {
+            Ok::<_, ServiceResponse>(pane_state::list_foreground_jobs(host))
+        },
+        "pane-runtime-state", "pane-screen-text" => |req: pane_state::PaneScreenTextArgs, _ctx| {
+            Ok::<_, ServiceResponse>(pane_state::pane_screen_text(host, &req))
+        },
 
         // pane-runtime-commands mutations.
         "pane-runtime-commands", "set-pane-padding" => |req: padding::SetPanePaddingArgs, _ctx| {

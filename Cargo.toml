@@ -151,6 +151,8 @@ members = [
     "plugins/visual-adapters-plugin-renderer",
     "plugins/tabs-plugin",
     "plugins/tabs-plugin-api",
+    "plugins/agents-plugin",
+    "plugins/agents-plugin-api",
     "plugins/workspaces-plugin",
     "plugins/workspaces-plugin-api",
 ]
@@ -379,6 +381,8 @@ bmux_tab_bar_plugin                      = { version = "0.0.1-alpha.4", default-
 bmux_tab_bar_plugin_api                  = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/tab-bar-plugin-api" }
 bmux_tabs_plugin                         = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/tabs-plugin" }
 bmux_tabs_plugin_api                     = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/tabs-plugin-api" }
+bmux_agents_plugin                       = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/agents-plugin" }
+bmux_agents_plugin_api                   = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/agents-plugin-api" }
 bmux_theme_plugin                        = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/theme-plugin" }
 bmux_visual_adapters_plugin_renderer     = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/visual-adapters-plugin-renderer" }
 bmux_workspaces_plugin                   = { version = "0.0.1-alpha.4", default-features = false, path = "plugins/workspaces-plugin" }

@@ -134,6 +134,74 @@
       ],
       "frozen_help": true
     },
+    "agents": {
+      "disposition": "composed-namespace",
+      "owners": [
+        "bmux.agents"
+      ],
+      "reason": "namespace",
+      "frozen_help": false
+    },
+    "agents install": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.agents",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.agents",
+          "command": "install",
+          "manifest": "plugins/agents-plugin/plugin.toml",
+          "canonical": "agents install",
+          "exposed": true
+        }
+      ],
+      "frozen_help": false
+    },
+    "agents report": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.agents",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.agents",
+          "command": "report",
+          "manifest": "plugins/agents-plugin/plugin.toml",
+          "canonical": "agents report",
+          "exposed": true
+        }
+      ],
+      "frozen_help": false
+    },
+    "agents status": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.agents",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.agents",
+          "command": "status",
+          "manifest": "plugins/agents-plugin/plugin.toml",
+          "canonical": "agents status",
+          "exposed": true
+        }
+      ],
+      "frozen_help": false
+    },
+    "agents uninstall": {
+      "disposition": "retain-plugin",
+      "owner": "bmux.agents",
+      "reason": "plugin",
+      "declarations": [
+        {
+          "owner": "bmux.agents",
+          "command": "uninstall",
+          "manifest": "plugins/agents-plugin/plugin.toml",
+          "canonical": "agents uninstall",
+          "exposed": true
+        }
+      ],
+      "frozen_help": false
+    },
     "attach": {
       "disposition": "retain-core",
       "owner": "core",

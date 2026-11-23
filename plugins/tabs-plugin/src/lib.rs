@@ -2661,8 +2661,12 @@ fn spawn_status_observer(
             };
             let terminal_kind = pane_runtime_terminal_events::EVENT_KIND;
             let pane_kind = pane_runtime_events::EVENT_KIND;
+            let agents_kind = bmux_agents_plugin_api::agent_states::STATE_KIND;
             let mut terminal = None;
             let mut panes = None;
+            // Without the agents plugin this never registers, and tabs carry
+            // no agent.
+            let mut agents = None;
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -2673,6 +2677,31 @@ fn spawn_status_observer(
                     }
                     ready = bus.subscribe_when_registered::<PaneEvent>(&pane_kind), if panes.is_none() => {
                         panes = ready.ok();
+                    }
+                    ready = bus.subscribe_state_when_registered::<bmux_agents_plugin_api::agent_states::AgentSnapshot>(&agents_kind), if agents.is_none() => {
+                        if let Ok((current, receiver)) = ready {
+                            if let Ok(mut board) = board.lock() {
+                                board.set_agents(&current);
+                            }
+                            agents = Some(receiver);
+                        }
+                    }
+                    changed = agents_changed(&mut agents) => {
+                        let Some(receiver) = agents.as_ref().filter(|_| changed) else {
+                            agents = None;
+                            continue;
+                        };
+                        let snapshot = receiver.borrow().clone();
+                        if let Ok(mut board) = board.lock() {
+                            board.set_agents(&snapshot);
+                        }
+                        // Agent states change at their own pace: show them now.
+                        let shared = shared.clone();
+                        let board = Arc::clone(&board);
+                        worker
+                            .spawn_blocking(move || publish_tab_status(&shared, &board))
+                            .await
+                            .map_err(|error| error.to_string())?;
                     }
                     event = receive_catalog_event(&mut terminal) => match event {
                         Ok(event) => {
@@ -2704,6 +2733,17 @@ fn spawn_status_observer(
             }
         })
         .map_err(PluginCommandError::failed)
+}
+
+/// Whether the agents channel changed (`false` once it closed); pending
+/// while not subscribed.
+async fn agents_changed<T: Send + Sync>(
+    receiver: &mut Option<tokio::sync::watch::Receiver<Arc<T>>>,
+) -> bool {
+    match receiver {
+        Some(receiver) => receiver.changed().await.is_ok(),
+        None => std::future::pending().await,
+    }
 }
 
 /// Every tab with its session's panes, as the pane runtime lists them.

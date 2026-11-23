@@ -211,6 +211,25 @@ pub struct PaneProcessIdentity {
     pub process_group_id: Option<i32>,
 }
 
+/// What runs in the foreground of a pane's terminal when that is not the
+/// pane's own shell: each process of the terminal's foreground process group
+/// by its command line, the group leader first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForegroundJob {
+    pub session_id: SessionId,
+    pub pane_id: Uuid,
+    pub process_group_id: i32,
+    pub commands: Vec<String>,
+}
+
+/// The rows a pane shows, as text with trailing blanks trimmed. `revision`
+/// changes whenever the screen may have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneScreenText {
+    pub revision: u64,
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneProcessSignal {
     Interrupt,
@@ -470,6 +489,14 @@ pub trait SessionRuntimeManagerApi: Send + Sync {
     ) -> Option<PaneScrollbackMetadata>;
 
     fn list_pane_processes(&self) -> Vec<PaneProcessIdentity>;
+    /// Every pane's foreground job (see [`ForegroundJob`]).
+    fn foreground_jobs(&self) -> Vec<ForegroundJob> {
+        Vec::new()
+    }
+    /// The text a pane shows.
+    fn pane_screen_text(&self, _session_id: SessionId, _pane_id: Uuid) -> Option<PaneScreenText> {
+        None
+    }
     fn pane_process_identity(
         &self,
         session_id: SessionId,

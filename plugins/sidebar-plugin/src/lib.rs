@@ -62,8 +62,6 @@ struct Settings {
     collapse_below_width: u16,
     collapsed_width: u16,
     visibility: VisibilitySettings,
-    /// Programs treated as coding agents, by the running command's first word.
-    agents: Vec<String>,
 }
 
 impl Default for Settings {
@@ -89,10 +87,6 @@ impl Default for Settings {
                 visible: false,
                 ..VisibilitySettings::default()
             },
-            agents: activity::DEFAULT_AGENTS
-                .iter()
-                .map(|agent| (*agent).to_string())
-                .collect(),
         }
     }
 }
@@ -167,9 +161,6 @@ impl Settings {
         }
         if let Some(content_height) = table.get("content_height").and_then(toml::Value::as_bool) {
             settings.content_height = content_height;
-        }
-        if let Some(agents) = table.get("agents") {
-            settings.agents = parse_agents(agents)?;
         }
         for (key, target) in [
             ("visible", &mut settings.visibility.visible),
@@ -308,8 +299,7 @@ impl Drop for CompanionState {
 
 impl CompanionState {
     fn new(settings: Settings, local_state_dir: Option<std::path::PathBuf>) -> Self {
-        let mut activity = activity::ActivityView::default();
-        activity.set_agents(settings.agents.clone());
+        let activity = activity::ActivityView::default();
         Self {
             surfaces: None,
             layouts: None,
@@ -1336,23 +1326,6 @@ fn paint_sidebar_field(
             style,
         ));
     }
-}
-
-/// The `agents` setting: a list of program names.
-fn parse_agents(value: &toml::Value) -> Result<Vec<String>, PluginCommandError> {
-    value
-        .as_array()
-        .and_then(|agents| {
-            agents
-                .iter()
-                .map(|agent| agent.as_str().map(str::to_string))
-                .collect::<Option<Vec<_>>>()
-        })
-        .ok_or_else(|| {
-            PluginCommandError::invalid_arguments(
-                "bmux.sidebar agents must be a list of program names",
-            )
-        })
 }
 
 /// A tab's state glyph and color. The tab being shown, when idle, is a solid
@@ -2819,7 +2792,9 @@ mod tests {
 
     #[test]
     fn tabs_show_their_activity_as_status_cards() {
-        use bmux_tabs_plugin_api::tabs_status::{GitStatus, TabStatus, TabStatusSnapshot};
+        use bmux_tabs_plugin_api::tabs_status::{
+            AgentActivity, GitStatus, TabAgent, TabStatus, TabStatusSnapshot,
+        };
         let mut state = CompanionState::new(shown_settings(), None);
         state.allocation = Some(ExtensionRect::new(0, 0, 32, 12));
         let tab = |index: u128, name: &str, active: bool| tabs_list::TabListEntry {
@@ -2840,8 +2815,16 @@ mod tests {
             output_at_ms: None,
             attention_at_ms: None,
             attention: None,
+            agent: None,
         };
         let now = 600_000;
+        let agent = |name: &str, activity, message: Option<&str>| TabAgent {
+            name: name.into(),
+            activity,
+            message: message.map(str::to_string),
+            changed_at_ms: now - 5_000,
+            finished_at_ms: None,
+        };
         state.activity.replace(TabStatusSnapshot {
             tabs: vec![
                 TabStatus {
@@ -2859,6 +2842,7 @@ mod tests {
                     running_command: Some("claude".into()),
                     cwd: Some("/work/bmux/plugins".into()),
                     output_at_ms: Some(now - 1_000),
+                    agent: Some(agent("claude", AgentActivity::Working, None)),
                     ..status(2)
                 },
                 TabStatus {
@@ -2869,8 +2853,11 @@ mod tests {
                 TabStatus {
                     running_command: Some("codex".into()),
                     output_at_ms: Some(now - 9_000),
-                    attention_at_ms: Some(now - 8_000),
-                    attention: Some("approve edit?".into()),
+                    agent: Some(agent(
+                        "codex",
+                        AgentActivity::Blocked,
+                        Some("approve edit?"),
+                    )),
                     ..status(4)
                 },
             ],

@@ -1,16 +1,19 @@
 //! What each tab is doing, as this client shows it.
 //!
 //! The tabs plugin publishes each tab's status (`tabs-status`): its running
-//! command, directory, git status, last exit status, and when it last produced
-//! output or asked for attention. This turns that, plus when this client last
-//! viewed each tab, into one state per tab:
+//! command, directory, git status, last exit status, when it last produced
+//! output or asked for attention, and its most pressing coding agent (from the
+//! agents plugin). This turns that, plus when this client last viewed each
+//! tab, into one state per tab. A tab running an agent shows the agent's:
 //!
-//! - **blocked**: it rang the bell or sent a notification since it was viewed
-//!   (an agent waiting for input, usually);
-//! - **failed**: its last command exited non-zero;
-//! - **working**: a command or agent is running and produced output recently;
-//! - **done**: an agent's output stopped since the tab was last viewed;
+//! - **blocked**: it needs the user to answer or approve something;
+//! - **working**: it is working;
+//! - **done**: it finished since this client last viewed the tab;
 //! - **idle**: otherwise.
+//!
+//! Any other tab is **blocked** when it rang the bell or sent a notification
+//! since it was viewed, **failed** when its last command exited non-zero,
+//! **working** while a command runs and prints, and **idle** otherwise.
 //!
 //! Server times are compared with the server's own clock (`now-ms` at
 //! publication, advanced by the time since it arrived), never this client's.
@@ -20,26 +23,11 @@ use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use bmux_plugin::{RenderColor, RenderNamedColor};
-use bmux_tabs_plugin_api::tabs_status::{TabStatus, TabStatusSnapshot};
+use bmux_tabs_plugin_api::tabs_status::{AgentActivity, TabAgent, TabStatus, TabStatusSnapshot};
 use uuid::Uuid;
 
 /// Output within this long counts as working.
 const WORKING_WINDOW: Duration = Duration::from_secs(3);
-
-/// Programs treated as coding agents (by the running command's first word).
-pub const DEFAULT_AGENTS: &[&str] = &[
-    "claude",
-    "codex",
-    "aider",
-    "gemini",
-    "opencode",
-    "amp",
-    "goose",
-    "crush",
-    "cursor-agent",
-    "qwen",
-    "copilot",
-];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabState {
@@ -96,7 +84,8 @@ pub struct TabActivity {
     pub command: Option<String>,
     pub cwd: Option<String>,
     pub branch: Option<String>,
-    pub agent: bool,
+    /// The agent running in the tab, if any.
+    pub agent: Option<String>,
 }
 
 impl TabActivity {
@@ -121,7 +110,6 @@ pub struct ActivityView {
     snapshot: Option<(TabStatusSnapshot, Instant)>,
     /// When this client last viewed each tab, on the server clock.
     viewed: HashMap<Uuid, u64>,
-    agents: Vec<String>,
     home: Option<String>,
 }
 
@@ -130,21 +118,12 @@ impl Default for ActivityView {
         Self {
             snapshot: None,
             viewed: HashMap::new(),
-            agents: DEFAULT_AGENTS
-                .iter()
-                .map(|agent| (*agent).to_string())
-                .collect(),
             home: std::env::var("HOME").ok().filter(|home| !home.is_empty()),
         }
     }
 }
 
 impl ActivityView {
-    /// Replace the agent programs (from settings).
-    pub fn set_agents(&mut self, agents: Vec<String>) {
-        self.agents = agents;
-    }
-
     /// Take a new status snapshot.
     pub fn replace(&mut self, snapshot: TabStatusSnapshot) {
         self.snapshot = Some((snapshot, Instant::now()));
@@ -172,16 +151,6 @@ impl ActivityView {
             .and_then(|(snapshot, _)| snapshot.tabs.iter().find(|status| status.tab_id == tab))
     }
 
-    fn is_agent(&self, command: Option<&str>) -> bool {
-        let Some(program) = command
-            .and_then(|command| command.split_whitespace().next())
-            .map(|program| program.rsplit('/').next().unwrap_or(program))
-        else {
-            return false;
-        };
-        self.agents.iter().any(|agent| agent == program)
-    }
-
     /// `tab`'s activity; `active` when this client is showing it.
     #[must_use]
     pub fn activity(&self, tab: Uuid, active: bool) -> Option<TabActivity> {
@@ -193,33 +162,14 @@ impl ActivityView {
             self.viewed.get(&tab).copied().unwrap_or(0)
         };
         let command = status.running_command.clone();
-        let agent = self.is_agent(command.as_deref());
-        let recent_output = status.output_at_ms.is_some_and(|at| {
-            now.saturating_sub(at) < u64::try_from(WORKING_WINDOW.as_millis()).unwrap_or(u64::MAX)
-        });
-        let unseen_attention = status.attention_at_ms.is_some_and(|at| at > viewed);
-        let state = if unseen_attention {
-            TabState::Blocked
-        } else if status.last_exit.is_some_and(|code| code != 0) && command.is_none() {
-            TabState::Failed
-        } else if recent_output && (agent || command.is_some()) {
-            TabState::Working
-        } else if agent && status.output_at_ms.is_some_and(|at| at > viewed) {
-            TabState::Done
-        } else {
-            TabState::Idle
-        };
         let program = command
             .as_deref()
             .and_then(|command| command.split_whitespace().next())
             .map(|program| program.rsplit('/').next().unwrap_or(program).to_string());
-        let summary = match state {
-            TabState::Blocked => Some("needs input".to_string()),
-            TabState::Failed => status.last_exit.map(|code| format!("exit {code}")),
-            TabState::Working if agent => Some("working".to_string()),
-            TabState::Done => Some("done".to_string()),
-            _ => program.clone(),
-        };
+        let (state, summary, message) = status.agent.as_ref().map_or_else(
+            || Self::program_state(status, now, viewed, program.as_deref()),
+            |agent| Self::agent_state(agent, viewed),
+        );
         let cwd = status.cwd.as_deref().map(|cwd| self.shorten_home(cwd));
         let branch = status.git.as_ref().map(|git| {
             let mut branch = git.branch.clone();
@@ -235,9 +185,9 @@ impl ActivityView {
             branch
         });
         let detail = if state == TabState::Blocked
-            && let Some(attention) = status.attention.as_deref()
+            && let Some(message) = message.or_else(|| status.attention.clone())
         {
-            attention.to_string()
+            message
         } else {
             let mut parts = Vec::new();
             if let Some(cwd) = &cwd {
@@ -246,9 +196,12 @@ impl ActivityView {
             if let Some(branch) = &branch {
                 parts.push(branch.clone());
             }
+            // How long an agent has waited since it finished.
             if matches!(state, TabState::Done | TabState::Idle)
-                && agent
-                && let Some(at) = status.output_at_ms
+                && let Some(at) = status
+                    .agent
+                    .as_ref()
+                    .map(|agent| agent.finished_at_ms.unwrap_or(agent.changed_at_ms))
             {
                 parts.push(format_age(now.saturating_sub(at)));
             }
@@ -261,17 +214,63 @@ impl ActivityView {
             command: program,
             cwd,
             branch,
-            agent,
+            agent: status.agent.as_ref().map(|agent| agent.name.clone()),
         })
+    }
+
+    /// An agent's state, summary and message: done once it finished since
+    /// the tab was viewed.
+    fn agent_state(agent: &TabAgent, viewed: u64) -> (TabState, Option<String>, Option<String>) {
+        match agent.activity {
+            AgentActivity::Blocked => (
+                TabState::Blocked,
+                Some("needs input".to_string()),
+                agent.message.clone(),
+            ),
+            AgentActivity::Working => (TabState::Working, Some("working".to_string()), None),
+            AgentActivity::Idle if agent.finished_at_ms.is_some_and(|at| at > viewed) => {
+                (TabState::Done, Some("done".to_string()), None)
+            }
+            AgentActivity::Idle => (TabState::Idle, Some(agent.name.clone()), None),
+        }
+    }
+
+    /// Any other program's state and summary, from its signals.
+    fn program_state(
+        status: &TabStatus,
+        now: u64,
+        viewed: u64,
+        program: Option<&str>,
+    ) -> (TabState, Option<String>, Option<String>) {
+        let recent_output = status.output_at_ms.is_some_and(|at| {
+            now.saturating_sub(at) < u64::try_from(WORKING_WINDOW.as_millis()).unwrap_or(u64::MAX)
+        });
+        let running = status.running_command.is_some();
+        if status.attention_at_ms.is_some_and(|at| at > viewed) {
+            (TabState::Blocked, Some("needs input".to_string()), None)
+        } else if status.last_exit.is_some_and(|code| code != 0) && !running {
+            (
+                TabState::Failed,
+                status.last_exit.map(|code| format!("exit {code}")),
+                None,
+            )
+        } else if recent_output && running {
+            (TabState::Working, program.map(str::to_string), None)
+        } else {
+            (TabState::Idle, program.map(str::to_string), None)
+        }
     }
 
     /// Whether any tab's shown state can change with time alone (output
     /// stopping, ages ticking), so the view should be refreshed.
     #[must_use]
     pub fn time_sensitive(&self) -> bool {
-        self.snapshot
-            .as_ref()
-            .is_some_and(|(snapshot, _)| snapshot.tabs.iter().any(|tab| tab.output_at_ms.is_some()))
+        self.snapshot.as_ref().is_some_and(|(snapshot, _)| {
+            snapshot
+                .tabs
+                .iter()
+                .any(|tab| tab.output_at_ms.is_some() || tab.agent.is_some())
+        })
     }
 
     fn shorten_home(&self, cwd: &str) -> String {
@@ -332,6 +331,17 @@ mod tests {
             output_at_ms: None,
             attention_at_ms: None,
             attention: None,
+            agent: None,
+        }
+    }
+
+    fn agent(activity: AgentActivity, finished_at_ms: Option<u64>) -> TabAgent {
+        TabAgent {
+            name: "claude".into(),
+            activity,
+            message: (activity == AgentActivity::Blocked).then(|| "approve edit?".into()),
+            changed_at_ms: 1_000,
+            finished_at_ms,
         }
     }
 
@@ -349,54 +359,64 @@ mod tests {
     }
 
     #[test]
-    fn agents_move_through_working_done_and_idle() {
+    fn agents_move_through_working_blocked_done_and_idle() {
         let tab = Uuid::from_u128(1);
-        let mut agent = status(1);
-        agent.running_command = Some("claude --resume".into());
-        agent.output_at_ms = Some(9_000);
-        agent.cwd = Some("/home/me/repo".into());
-        agent.git = Some(GitStatus {
+        let mut status = status(1);
+        status.running_command = Some("claude --resume".into());
+        status.cwd = Some("/home/me/repo".into());
+        status.git = Some(GitStatus {
             branch: "main".into(),
             dirty: true,
             ahead: 2,
             behind: 0,
         });
-        let working = view(vec![agent.clone()], 10_000);
-        let activity = working.activity(tab, false).unwrap();
+        status.agent = Some(agent(AgentActivity::Working, None));
+        let activity = view(vec![status.clone()], 10_000)
+            .activity(tab, false)
+            .unwrap();
         assert_eq!(activity.state, TabState::Working);
         assert_eq!(activity.summary.as_deref(), Some("working"));
         assert_eq!(activity.detail, "~/repo · main* ↑2");
-        assert!(activity.agent);
-        // Output stopped a minute ago and nobody looked: done.
-        let mut done = view(vec![agent], 70_000);
-        assert_eq!(done.activity(tab, false).unwrap().state, TabState::Done);
-        assert_eq!(
-            done.activity(tab, false).unwrap().detail,
-            "~/repo · main* ↑2 · 1m"
-        );
-        // Viewing it makes it idle.
+        assert_eq!(activity.agent.as_deref(), Some("claude"));
+
+        status.agent = Some(agent(AgentActivity::Blocked, None));
+        let activity = view(vec![status.clone()], 10_000)
+            .activity(tab, false)
+            .unwrap();
+        assert_eq!(activity.state, TabState::Blocked);
+        assert_eq!(activity.summary.as_deref(), Some("needs input"));
+        assert_eq!(activity.detail, "approve edit?");
+
+        // It finished a minute ago and nobody looked: done.
+        status.agent = Some(agent(AgentActivity::Idle, Some(9_000)));
+        let mut done = view(vec![status], 70_000);
+        let activity = done.activity(tab, false).unwrap();
+        assert_eq!(activity.state, TabState::Done);
+        assert_eq!(activity.detail, "~/repo · main* ↑2 · 1m");
+        // Viewing it makes it idle, named by its agent.
         done.mark_viewed(tab);
-        assert_eq!(done.activity(tab, false).unwrap().state, TabState::Idle);
+        let activity = done.activity(tab, false).unwrap();
+        assert_eq!(activity.state, TabState::Idle);
+        assert_eq!(activity.summary.as_deref(), Some("claude"));
         assert_eq!(done.activity(tab, true).unwrap().state, TabState::Idle);
     }
 
     #[test]
-    fn attention_and_failures_outrank_activity() {
+    fn other_programs_show_attention_failures_and_output() {
         let tab = Uuid::from_u128(2);
         let mut blocked = status(2);
-        blocked.running_command = Some("codex".into());
+        blocked.running_command = Some("make watch".into());
         blocked.output_at_ms = Some(9_900);
         blocked.attention_at_ms = Some(9_950);
-        blocked.attention = Some("approve edit?".into());
+        blocked.attention = Some("tests failed".into());
         let mut view_blocked = view(vec![blocked], 10_000);
         let activity = view_blocked.activity(tab, false).unwrap();
         assert_eq!(activity.state, TabState::Blocked);
-        assert_eq!(activity.detail, "approve edit?");
+        assert_eq!(activity.detail, "tests failed");
         view_blocked.mark_viewed(tab);
-        assert_eq!(
-            view_blocked.activity(tab, false).unwrap().state,
-            TabState::Working
-        );
+        let activity = view_blocked.activity(tab, false).unwrap();
+        assert_eq!(activity.state, TabState::Working);
+        assert_eq!(activity.summary.as_deref(), Some("make"));
 
         let mut failed = status(2);
         failed.last_exit = Some(101);
@@ -404,12 +424,13 @@ mod tests {
         assert_eq!(activity.state, TabState::Failed);
         assert_eq!(activity.summary.as_deref(), Some("exit 101"));
 
+        // A program's name alone does not make it an agent any more.
         let mut plain = status(2);
-        plain.running_command = Some("/usr/bin/nvim notes.md".into());
+        plain.running_command = Some("/usr/bin/claude".into());
         let activity = view(vec![plain], 10_000).activity(tab, false).unwrap();
         assert_eq!(activity.state, TabState::Idle);
-        assert_eq!(activity.summary.as_deref(), Some("nvim"));
-        assert!(!activity.agent);
+        assert_eq!(activity.summary.as_deref(), Some("claude"));
+        assert!(activity.agent.is_none());
     }
 
     #[test]

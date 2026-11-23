@@ -1,0 +1,89 @@
+bundled_only      = "uses Tokio tasks and timers directly instead of plug-rt"
+component_roles   = ["backend"]
+execution_class   = "native_fast"
+id                = "bmux.agents"
+name              = "bmux Agents"
+owns_namespaces   = ["agents"]
+provided_features = ["bmux.agents"]
+version           = "0.0.1-alpha.0"
+
+[[dependencies]]
+plugin_id   = "bmux.pane_runtime"
+version_req = ">=0.0.1-alpha.0"
+
+# Every pane's agent and what it is doing. Consumed on the server (the tabs
+# plugin folds it into each tab's status), so it is not forwarded.
+[[event_publications]]
+delivery = "state"
+kind     = "bmux.agents/agent-states"
+
+[[commands]]
+expose_in_cli = true
+name          = "status"
+path          = ["agents", "status"]
+summary       = "List the panes running coding agents and what each is doing"
+
+[[commands.arguments]]
+kind    = "boolean"
+long    = "json"
+name    = "json"
+summary = "Print JSON"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "report"
+path          = ["agents", "report"]
+summary       = "Report what the agent running in this pane is doing"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "state"
+position   = 0
+required   = true
+summary    = "working, blocked, idle, or release (the agent is leaving)"
+value_name = "STATE"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "agent"
+name       = "agent"
+summary    = "The agent's name"
+value_name = "NAME"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "message"
+name       = "message"
+summary    = "What the agent needs or did"
+value_name = "TEXT"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "install"
+path          = ["agents", "install"]
+summary       = "Install hooks so an agent reports its own state (claude)"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "agent"
+position   = 0
+required   = true
+summary    = "The agent to install hooks for"
+value_name = "AGENT"
+
+[[commands]]
+execution     = "caller_process"
+expose_in_cli = true
+name          = "uninstall"
+path          = ["agents", "uninstall"]
+summary       = "Remove the hooks `bmux agents install` added"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "agent"
+position   = 0
+required   = true
+summary    = "The agent to remove hooks for"
+value_name = "AGENT"
